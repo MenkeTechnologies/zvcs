@@ -303,14 +303,29 @@ impl Case {
     /// off the front of a failure header to file the block under a subcommand,
     /// so the two leading segments must stay first and must stay free of spaces.
     pub fn id(&self) -> String {
+        format!("{}{}", self.id_head(), self.id_tail())
+    }
+
+    /// `[!]<shape>::<cmd>::` — the two segments a failure is *filed* under.
+    ///
+    /// Split out of [`Case::id`] so [`Sequence::step_id`] renders the identical
+    /// head rather than a second copy of the format string. A sequence whose head
+    /// drifted from this one would still print, and would then be filed under no
+    /// subcommand at all by `scripts/split_failures.pl` — a failure that silently
+    /// disappears from the per-command briefs is worse than one that shouts.
+    fn id_head(&self) -> String {
         let strict = if self.compare_stderr { "!" } else { "" };
-        let mut id = format!(
-            "{}{}::{}::{}",
-            strict,
-            self.shape.name(),
-            self.cmd,
-            self.argv().join(" ")
-        );
+        format!("{}{}::{}::", strict, self.shape.name(), self.cmd)
+    }
+
+    /// The rest of a case's identity: its argv, then the working directory,
+    /// environment and stdin segments it actually carries.
+    ///
+    /// Everything here describes *one invocation*, which is why a sequence reuses
+    /// it verbatim for the step it is reporting: the step's own argv and payload
+    /// are what a reader needs to see beside "step 3 of 7".
+    fn id_tail(&self) -> String {
+        let mut id = self.argv().join(" ");
         if let Some(cwd) = self.cwd {
             id.push_str(&format!("::cwd[{cwd}]"));
         }
@@ -334,6 +349,279 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+// ---------------------------------------------------------------------------
+// Sequences: several invocations against one repository
+// ---------------------------------------------------------------------------
+
+/// One invocation inside a [`Sequence`]: an argv and the bytes fed to it.
+///
+/// Exactly two dimensions, and the choice of *which* two is the whole design of
+/// the sequence corpus — see [`Sequence`] for the argument. `stdin` is here
+/// rather than on the sequence because the operations sequences exist to reach
+/// are precisely the ones that take a payload on one step and nothing on the
+/// next: `am` reads a mailbox and then `am --skip` reads nothing, `rebase -i`
+/// reads a todo through its editor and then `--continue` reads nothing. A
+/// per-sequence payload would be delivered to every step, and a step that is
+/// handed input it did not ask for is a different invocation from the one the
+/// corpus meant to write.
+#[derive(Clone, Debug)]
+pub struct Step {
+    pub args: Vec<String>,
+    pub stdin: Option<&'static [u8]>,
+}
+
+impl Step {
+    /// `<argv>` for the script listing, with the payload named when there is one.
+    /// Rendered from the same [`fnv1a64`] digest [`Case::id`] uses, so the same
+    /// bytes read as the same token wherever a reader meets them.
+    fn render(&self) -> String {
+        match self.stdin {
+            None => self.args.join(" "),
+            Some(b) => format!("{} <stdin[{}B/{:016x}]", self.args.join(" "), b.len(), fnv1a64(b)),
+        }
+    }
+}
+
+/// An ordered list of invocations run against **one** repository per side, with
+/// the full comparison taken after every step.
+///
+/// # Why this dimension exists
+///
+/// Every other case in this harness is a single invocation against a pristine
+/// fixture, and git's stateful operations are multi-step by construction. The
+/// interesting divergences live *between* the steps: a conflicted `cherry-pick`
+/// and then `--continue`; a `rebase -i` that writes a todo and then `--skip`; an
+/// `am` that stops mid-mailbox and then `--abort`; `bisect start`/`good`/`bad`
+/// walking to a verdict. Reaching those states from one argv means the fixture
+/// has to *be* the interrupted operation, which pins one moment of it and leaves
+/// the transitions — the part that actually breaks — unmeasured.
+///
+/// # What is per step and what is per case
+///
+/// A step carries **argv and stdin**. Everything else — shape, working
+/// directory, extra environment, `-c` overrides, global options, whether stderr
+/// is compared, and the subcommand the whole thing is scored under — lives on
+/// the [`Case`] envelope and is shared by every step.
+///
+/// The split is not arbitrary. Those shared fields are what decide *which
+/// repository is being talked to and how its inputs are interpreted*: the shape
+/// is the repository, `cwd` and the `GIT_DIR`-family variables are how discovery
+/// finds it, and `-c`/globals are the configuration the invocation is read
+/// under. Holding them constant is what makes a sequence one workflow rather
+/// than a bag of unrelated invocations that happen to share a directory. argv
+/// and stdin are the only two things that genuinely differ step to step in the
+/// workflows this corpus is written to reach.
+///
+/// The alternative — every dimension per step — was rejected for two reasons.
+/// It would put six dimensions per step into [`Sequence::step_id`], and an id
+/// nobody can read is an id nobody reproduces by hand. And the shape *cannot* be
+/// per step in any case: a second shape means a second repository, which throws
+/// away the state the previous steps built, which is the entire point. The cost
+/// is a real expressiveness limit — a workflow needing `-c` on one step only, or
+/// needing to run one step from inside a linked worktree, cannot be written
+/// today. It is recorded here rather than left to be discovered: the fix is to
+/// move that one field onto [`Step`] as an override with the envelope's value as
+/// the default, and no comparison changes when it happens.
+///
+/// The envelope is a real [`Case`] rather than a copy of its fields so the two
+/// units cannot drift: a dimension added to `Case` tomorrow is available to a
+/// sequence the same day, delivered to both sides by the same [`run_side`] that
+/// delivers it for a single case. Its `args` and `stdin` are always overwritten
+/// by the step being run and are never themselves executed.
+///
+/// # Cost
+///
+/// A sequence of N steps costs N invocations and N state probes **per side**,
+/// plus the two fixture instantiations every case already pays. It is the cheap
+/// shape of this for three reasons:
+///
+///  * **One repository per side for the whole sequence.** The obvious
+///    alternative — replay steps 1..i from a pristine copy for each i — is
+///    O(N²) invocations and buys nothing, because the state a step needs is
+///    exactly the state the previous step left.
+///  * **It stops at the first divergence.** A sequence that breaks at step 2 of
+///    7 pays for 2 steps, not 7. Continuing would be worse than useless: past
+///    the first difference the two repositories are no longer the same premise,
+///    so every later step would compare two different questions and report
+///    differences that are consequences of the first one.
+///  * **The repeat stays failure-triggered**, exactly as it is for a single
+///    case. Only a failing sequence replays its prefix
+///    ([`repeat_sequence_side`]), and only up to the step that failed.
+///
+/// The price is reported rather than estimated: `main` prints how many
+/// sequences are in the run and the total invocation count per side beside the
+/// case count, so the difference between "cases" and "invocations" is on the
+/// first screen of every sweep instead of being inferred from a wall clock.
+/// Deliberately not written as a percentage here — a number in a comment goes
+/// stale the first time a sequence is added, and the run states the real one.
+///
+/// # Why the comparison is taken at every step
+///
+/// Reporting only the end state would make a sequence barely better than a
+/// single case: "these two repositories differ after seven commands" names no
+/// command. Comparing at each step means a divergence is attributed to the argv
+/// that caused it, and — the stronger property — every step after the first runs
+/// on a premise that has been *proven* equal on both sides rather than assumed.
+/// A `cherry-pick --continue` that fails because the preceding `add` staged the
+/// wrong thing is reported as the `add`, which is where the bug is.
+pub struct Sequence {
+    /// Short stable slug naming the workflow, rendered into every step id. It is
+    /// how a reader finds the sequence in `corpus/sequences.rs` again.
+    pub name: &'static str,
+    /// Everything a step does not carry. See the type docs for the split.
+    pub envelope: Case,
+    pub steps: Vec<Step>,
+}
+
+impl Sequence {
+    /// A sequence scored under `cmd` and named `name`, over `shape`.
+    ///
+    /// `cmd` is the workflow's headline verb, not necessarily the verb of every
+    /// step: the stash-conflict workflow runs `checkout --theirs` and `add` in
+    /// the middle and is still a statement about `stash`. Scoring the whole
+    /// sequence under one command is what puts it in that command's brief in
+    /// `scripts/split_failures.pl`, which is where somebody fixing `stash` will
+    /// look for it.
+    pub fn new(cmd: &'static str, name: &'static str, shape: Shape) -> Self {
+        Self { name, envelope: Case::new(cmd, &[], shape), steps: Vec::new() }
+    }
+
+    /// Append a step.
+    pub fn step(mut self, args: &[&str]) -> Self {
+        self.steps.push(Step { args: args.iter().map(|s| s.to_string()).collect(), stdin: None });
+        self
+    }
+
+    /// Append a step fed `stdin`, byte-identically to both sides.
+    pub fn step_stdin(mut self, args: &[&str], stdin: &'static [u8]) -> Self {
+        self.steps
+            .push(Step { args: args.iter().map(|s| s.to_string()).collect(), stdin: Some(stdin) });
+        self
+    }
+
+    /// Compare stderr byte for byte on every step, as [`Case::strict`] does for a
+    /// single invocation.
+    pub fn strict(self) -> Self {
+        self.map_envelope(|c| Case { compare_stderr: true, ..c })
+    }
+
+    /// Run every step from `cwd`, a path relative to the fixture root.
+    pub fn in_dir(self, cwd: &'static str) -> Self {
+        self.map_envelope(|c| c.in_dir(cwd))
+    }
+
+    /// Run every step with `env` added on top of [`crate::env::harden`].
+    pub fn with_env(self, env: &[(&str, &str)]) -> Self {
+        self.map_envelope(|c| c.with_env(env))
+    }
+
+    /// Run every step with `-c key=value` in front of its subcommand.
+    pub fn with_config(self, config: &[(&str, &str)]) -> Self {
+        self.map_envelope(|c| c.with_config(config))
+    }
+
+    /// Run every step with these global options in front of its subcommand.
+    pub fn with_globals(self, globals: &[&[&str]]) -> Self {
+        self.map_envelope(|c| c.with_globals(globals))
+    }
+
+    /// Apply one of [`Case`]'s own builders to the envelope.
+    ///
+    /// The builders are reused rather than reimplemented so a sequence's
+    /// envelope can never be constructed in a way a single case could not be —
+    /// including the invariants `Case::with_env`'s callers rely on.
+    fn map_envelope(self, f: impl FnOnce(Case) -> Case) -> Self {
+        Self { envelope: f(self.envelope), ..self }
+    }
+
+    pub fn cmd(&self) -> &'static str {
+        self.envelope.cmd
+    }
+
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// The [`Case`] for step `index`: the envelope, with that step's argv and
+    /// payload substituted in.
+    ///
+    /// This is the whole mechanism by which a sequence reaches both sides
+    /// identically — there is no second delivery path to keep in sync with
+    /// [`run_side`], and a dimension the envelope carries is applied to a step
+    /// exactly as it would be to a single case.
+    pub fn step_case(&self, index: usize) -> Case {
+        let step = &self.steps[index];
+        assert!(!step.args.is_empty(), "sequence {} step {index} has no argv", self.name);
+        Case { args: step.args.clone(), stdin: step.stdin, ..self.envelope.clone() }
+    }
+
+    /// Every step rendered as `<n>  <argv>`, for the failure block. The failing
+    /// step is marked, because a script that does not say where it stopped makes
+    /// a reader count lines.
+    pub fn script(&self, failing: usize) -> Vec<String> {
+        self.steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mark = if i == failing { "->" } else { "  " };
+                format!("{mark} {}  {}", i + 1, s.render())
+            })
+            .collect()
+    }
+
+    /// Identity of one step, in a grammar that extends [`Case::id`] rather than
+    /// competing with it:
+    ///
+    /// ```text
+    /// [!]<shape>::<cmd>::seq[<name>]::step<i>/<n>::<argv>[::cwd[…]][::env[…]][::stdin[…]]::script[<argv1> | <argv2> | …]
+    /// ```
+    ///
+    /// Three properties are deliberate.
+    ///
+    /// **The head is unchanged**, so `scripts/split_failures.pl` — which matches
+    /// `<shape>::<cmd>::` off the front of a failure header — files a sequence
+    /// failure under its subcommand exactly as it files everything else, and a
+    /// case that is *not* a sequence keeps byte for byte the id it has today.
+    ///
+    /// **The step is named before its argv**, because "step 2 of 5, running
+    /// `cherry-pick --continue`" is the finding. A sequence that reported only
+    /// its last step, or reported a state difference with no argv attached,
+    /// would be barely better than the single-invocation case it replaces.
+    ///
+    /// **The whole script is in the id**, because a step is not reproducible
+    /// without the steps that built its premise. The alternative — naming the
+    /// sequence and making a reader find it in the corpus — makes the id
+    /// dependent on a source file that changes, which is exactly what an id is
+    /// for avoiding. It is long; it is also sufficient, and the report prints the
+    /// script line by line beneath it for reading rather than copying.
+    pub fn step_id(&self, index: usize) -> String {
+        let case = self.step_case(index);
+        let script: Vec<String> = self.steps.iter().map(Step::render).collect();
+        format!(
+            "{}seq[{}]::step{}/{}::{}::script[{}]",
+            case.id_head(),
+            self.name,
+            index + 1,
+            self.steps.len(),
+            case.id_tail(),
+            script.join(" | ")
+        )
+    }
+}
+
+/// Where in a sequence an [`Outcome`] came from, and what the whole sequence was.
+#[derive(Clone, Debug)]
+pub struct StepRef {
+    /// 1-based, as it is printed.
+    pub index: usize,
+    pub total: usize,
+    /// The sequence-aware id, rendered by [`Sequence::step_id`].
+    pub id: String,
+    /// Every step, with the reported one marked. Printed under the failure so a
+    /// reader sees the premise without parsing it back out of the id.
+    pub script: Vec<String>,
 }
 
 /// Why a case did not match. Ordered roughly by how damning it is.
@@ -494,6 +782,16 @@ struct Side {
 /// enough detail to act on without re-running.
 pub struct Outcome {
     pub case: Case,
+    /// Present exactly when this outcome came from a [`Sequence`]: which step was
+    /// compared, and the script it sits in.
+    ///
+    /// `case` still holds the *step's* invocation — the same argv, shape,
+    /// environment and payload a single case would carry — so everything that
+    /// reads an outcome (the per-command tally, the state diff, the repeat
+    /// report) works on a sequence step without knowing it is one. This field is
+    /// what the two things that must know consult: [`Outcome::id`], and the
+    /// failure block that prints the script.
+    pub step: Option<StepRef>,
     pub verdict: Verdict,
     pub stock_stdout: String,
     pub zvcs_stdout: String,
@@ -510,6 +808,22 @@ pub struct Outcome {
     /// reproduced" is the fact a reader most wants attached to a failure they
     /// are about to spend an afternoon on, and it has already been paid for.
     pub zvcs_repeat: Option<Repeat>,
+}
+
+impl Outcome {
+    /// What this outcome is called in the report and in `split_failures.pl`'s
+    /// briefs: the step id for a sequence, the plain case id for everything else.
+    ///
+    /// One accessor rather than two call sites choosing between the fields,
+    /// because the choice is not the reader's business and getting it wrong is
+    /// silent — a sequence printed under its bare step argv reads as an ordinary
+    /// failure against a pristine repository, which is the one thing it is not.
+    pub fn id(&self) -> String {
+        match &self.step {
+            Some(s) => s.id.clone(),
+            None => self.case.id(),
+        }
+    }
 }
 
 /// One repeat run of a side, reduced to the surfaces the repeat compares.
@@ -1402,6 +1716,48 @@ pub fn run_case(
     templates.instantiate(case.shape, &zvcs_repo)?;
 
     let home = &templates.home;
+    let stock_exec = stock_exec_dir(home);
+    let zvcs_exec = zvcs_exec_dir(zvcs_bin, home);
+    compare_in(
+        case,
+        zvcs_bin,
+        &stock_repo,
+        &zvcs_repo,
+        home,
+        &mut || {
+            repeat_side(crate::stock::git()?, case, templates, workdir, "stock-repeat", stock_exec)
+        },
+        &mut || repeat_side(zvcs_bin, case, templates, workdir, "zvcs-repeat", zvcs_exec),
+    )
+}
+
+/// Run one invocation in two repositories that are **already prepared**, and
+/// judge it.
+///
+/// Extracted from [`run_case`] when sequences arrived, because a sequence step
+/// and a standalone case are the same act of measurement performed against
+/// different premises: the case runs in a pristine copy, the step runs in
+/// whatever the steps before it left. Everything after "the repositories exist" —
+/// which binary runs where, which surfaces are normalized against which root,
+/// which repeat is taken and when — is identical, and a second copy of it would
+/// be a second place for the two to drift into comparing different things.
+///
+/// The repeats stay closures rather than becoming arguments of their own,
+/// because *what it means to reproduce this invocation* is precisely what
+/// differs: a case re-runs one argv in a fresh copy, a step has to replay its
+/// whole prefix (see [`repeat_sequence_side`]). [`judge`] calls them only on a
+/// failure, so neither is paid for on the common path.
+#[allow(clippy::too_many_arguments)]
+fn compare_in(
+    case: &Case,
+    zvcs_bin: &Path,
+    stock_repo: &Path,
+    zvcs_repo: &Path,
+    home: &Path,
+    stock_repeat: &mut dyn FnMut() -> Result<Repeat>,
+    zvcs_repeat: &mut dyn FnMut() -> Result<Repeat>,
+) -> Result<Outcome> {
+    let (stock_repo, zvcs_repo) = (stock_repo.to_path_buf(), zvcs_repo.to_path_buf());
     let stock = run_side(crate::stock::git()?, &stock_repo, home, case)?;
     let zvcs = run_side(zvcs_bin, &zvcs_repo, home, case)?;
 
@@ -1441,14 +1797,13 @@ pub fn run_case(
             stderr: &zvcs_stderr,
             state: &zvcs_state_n,
         },
-        &mut || {
-            repeat_side(crate::stock::git()?, case, templates, workdir, "stock-repeat", stock_exec)
-        },
-        &mut || repeat_side(zvcs_bin, case, templates, workdir, "zvcs-repeat", zvcs_exec),
+        stock_repeat,
+        zvcs_repeat,
     )?;
 
     Ok(Outcome {
         case: case.clone(),
+        step: None,
         verdict,
         stock_stdout,
         zvcs_stdout,
@@ -1460,6 +1815,176 @@ pub fn run_case(
         zvcs_state: zvcs_state_n,
         zvcs_repeat,
     })
+}
+
+/// Whether the sequence stops here: because this step diverged, or because it
+/// was the last one.
+///
+/// A rule rather than an `if` buried in the loop, because it is the whole
+/// semantics of a sequence and both halves of it are load-bearing.
+///
+/// **Stop on the first divergence.** Past it the two repositories are no longer
+/// the same premise, so every later step would be comparing two different
+/// questions: a `cherry-pick --continue` run against a repo whose preceding
+/// `add` staged nothing is not the same invocation as the one stock ran, and
+/// reporting its difference as a second finding would file one bug twice and
+/// point the second copy at innocent code. The steps that were not run are named
+/// in the failure block, so nothing is hidden — they are *unmeasured*, which is a
+/// different claim from *passing*, and the report never makes the second one.
+///
+/// **Stop at the end.** The last step's outcome is the sequence's outcome when
+/// nothing diverged, so a clean sequence scores exactly one `Match` — the same
+/// weight in the parity denominator as any other case. Counting one per step
+/// instead would let a seven-step sequence outvote seven single-invocation cases
+/// on nothing but its length, which is a way of tuning a number by writing
+/// longer corpus entries.
+fn step_is_final(verdict: Verdict, index: usize, total: usize) -> bool {
+    !verdict.is_match() || index + 1 == total
+}
+
+/// Run a whole sequence against both implementations, comparing after every step.
+///
+/// One repository per side for the entire sequence — that is what makes step 4's
+/// premise be step 3's result rather than a fixture that was hand-built to
+/// resemble it. The comparison is taken after each step and the first divergence
+/// ends the run; see [`step_is_final`] for why, and [`Sequence`] for the cost.
+pub fn run_sequence(
+    seq: &Sequence,
+    zvcs_bin: &Path,
+    templates: &Templates,
+    workdir: &Path,
+) -> Result<Outcome> {
+    anyhow::ensure!(!seq.steps.is_empty(), "sequence {} has no steps", seq.name);
+
+    let stock_repo = workdir.join("stock");
+    let zvcs_repo = workdir.join("zvcs");
+    let _ = std::fs::remove_dir_all(&stock_repo);
+    let _ = std::fs::remove_dir_all(&zvcs_repo);
+    templates.instantiate(seq.envelope.shape, &stock_repo)?;
+    templates.instantiate(seq.envelope.shape, &zvcs_repo)?;
+
+    let home = &templates.home;
+    let stock_exec = stock_exec_dir(home);
+    let zvcs_exec = zvcs_exec_dir(zvcs_bin, home);
+
+    for index in 0..seq.steps.len() {
+        let case = seq.step_case(index);
+        let mut outcome = compare_in(
+            &case,
+            zvcs_bin,
+            &stock_repo,
+            &zvcs_repo,
+            home,
+            &mut || {
+                repeat_sequence_side(
+                    crate::stock::git()?,
+                    seq,
+                    index,
+                    templates,
+                    workdir,
+                    "stock-repeat",
+                    stock_exec,
+                )
+            },
+            &mut || {
+                repeat_sequence_side(
+                    zvcs_bin, seq, index, templates, workdir, "zvcs-repeat", zvcs_exec,
+                )
+            },
+        )?;
+        if step_is_final(outcome.verdict, index, seq.steps.len()) {
+            outcome.step = Some(StepRef {
+                index: index + 1,
+                total: seq.steps.len(),
+                id: seq.step_id(index),
+                script: seq.script(index),
+            });
+            return Ok(outcome);
+        }
+    }
+    unreachable!("the last step is always final")
+}
+
+/// Replay a sequence's first `index + 1` steps in a fresh repository and report
+/// what the last of them produced, so the caller can ask whether that side
+/// reproduces *itself*.
+///
+/// The prefix has to be replayed, not just the failing step: the step's answer is
+/// a function of the state the steps before it built, and re-running
+/// `cherry-pick --continue` alone in a pristine copy would produce "no cherry-pick
+/// in progress" on both sides and prove nothing about the case that failed. That
+/// is the one difference from [`repeat_side`], and it is why the repeat is a
+/// closure the caller supplies rather than something [`compare_in`] decides.
+///
+/// Cost is bounded by the same rule everything else here follows: [`judge`] calls
+/// this only on a failure, and only up to the step that failed.
+fn repeat_sequence_side(
+    bin: &Path,
+    seq: &Sequence,
+    index: usize,
+    templates: &Templates,
+    workdir: &Path,
+    sub: &str,
+    exec_dir: &Path,
+) -> Result<Repeat> {
+    let repo = workdir.join(sub);
+    let _ = std::fs::remove_dir_all(&repo);
+    templates.instantiate(seq.envelope.shape, &repo)?;
+    let home = &templates.home;
+
+    let mut again = None;
+    for i in 0..=index {
+        again = Some(run_side(bin, &repo, home, &seq.step_case(i))?);
+    }
+    let again = again.expect("the loop runs at least once");
+    Ok(Repeat {
+        timed_out: again.timed_out,
+        code: again.code,
+        stdout: normalize(&again.stdout, &repo, home, exec_dir),
+        state: normalize(probe_state(&repo, home).as_bytes(), &repo, home, exec_dir),
+        disagreement: None,
+    })
+}
+
+/// One unit of work for the runner pool: a single invocation, or a whole
+/// sequence of them.
+///
+/// The pool schedules by index and writes results back into per-index slots, so
+/// it needs one list of things to run and one way to run them. Two lists run in
+/// two passes would report every sequence after every case regardless of what
+/// order the corpus declares them in, and would need the progress counter, the
+/// `--only` filter and the error latch written twice.
+pub enum Job {
+    Single(Case),
+    Sequence(Sequence),
+}
+
+impl Job {
+    /// The subcommand this job is scored under — the case's verb, or the
+    /// sequence's headline verb. `--only` filters on it.
+    pub fn cmd(&self) -> &'static str {
+        match self {
+            Job::Single(c) => c.cmd,
+            Job::Sequence(s) => s.cmd(),
+        }
+    }
+
+    /// How many invocations per side this job costs, before any repeat. Reported
+    /// at startup so the price of the sequence corpus is visible rather than
+    /// inferred from a wall clock.
+    pub fn invocations(&self) -> usize {
+        match self {
+            Job::Single(_) => 1,
+            Job::Sequence(s) => s.len(),
+        }
+    }
+
+    pub fn run(&self, zvcs_bin: &Path, templates: &Templates, workdir: &Path) -> Result<Outcome> {
+        match self {
+            Job::Single(c) => run_case(c, zvcs_bin, templates, workdir),
+            Job::Sequence(s) => run_sequence(s, zvcs_bin, templates, workdir),
+        }
+    }
 }
 
 /// Re-run one side in a second pristine repo and report what it produced, so the
@@ -1536,8 +2061,9 @@ pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        case_timeout, is_unsupported, judge, probe_op_state, repeat_disagreement, Case, Compared,
-        Repeat, Surface, Verdict, CASE_TIMEOUT, OP_STATE_DIRS, OP_STATE_FILES,
+        case_timeout, is_unsupported, judge, probe_op_state, repeat_disagreement, step_is_final,
+        Case, Compared, Outcome, Repeat, Sequence, StepRef, Surface, Verdict, CASE_TIMEOUT,
+        OP_STATE_DIRS, OP_STATE_FILES,
     };
     use crate::fixture::Shape;
     use std::path::PathBuf;
@@ -1834,5 +2360,222 @@ mod tests {
 
         // The prefix alone is not enough; the line must actually claim a gap.
         assert!(!is_unsupported("zvcs: commit: nothing to commit\n"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Sequences
+    // -----------------------------------------------------------------------
+
+    /// A four-step workflow with a payload on one step, used by the id and
+    /// composition tests below.
+    fn workflow() -> Sequence {
+        Sequence::new("cherry-pick", "conflict-continue", Shape::Conflicted)
+            .step(&["merge", "--abort"])
+            .step(&["cherry-pick", "theirs"])
+            .step_stdin(&["am"], b"payload\n")
+            .step(&["cherry-pick", "--continue"])
+    }
+
+    /// The identity of a case that is **not** a sequence is byte for byte what
+    /// it was before sequences existed.
+    ///
+    /// Spelled as literals rather than derived from the code, which is the whole
+    /// point: the report and `scripts/split_failures.pl` key on these strings,
+    /// and a refactor that renamed every existing failure would be invisible to
+    /// a test that rebuilt the expectation the same way `id()` does.
+    #[test]
+    fn a_plain_case_id_is_unchanged_by_the_sequence_grammar() {
+        assert_eq!(
+            Case::new("status", &["status", "--porcelain"], Shape::Dirty).id(),
+            "dirty::status::status --porcelain"
+        );
+        assert_eq!(
+            Case::strict("reset", &["reset", "--mixed"], Shape::BehindRemote)
+                .in_dir(".remote.git")
+                .id(),
+            "!behind-remote::reset::reset --mixed::cwd[.remote.git]"
+        );
+        assert_eq!(
+            Case::new("log", &["log", "--oneline"], Shape::Branched)
+                .with_config(&[("core.abbrev", "4")])
+                .with_globals(&[&["-C", "src"]])
+                .id(),
+            "branched::log::-c core.abbrev=4 -C src log --oneline"
+        );
+        assert_eq!(
+            Case::with_stdin("mktree", &["mktree"], Shape::Linear, b"garbage\n")
+                .with_env(&[("GIT_DIR", "{repo}/.git")])
+                .id(),
+            "linear::mktree::mktree::env[GIT_DIR={repo}/.git]::stdin[8B/4c4485da341d8b72]"
+        );
+    }
+
+    /// A step's identity names the step, its own argv, and the whole script —
+    /// the three things a reader needs to know *what failed* and *how to get
+    /// back to it*.
+    #[test]
+    fn a_sequence_step_id_names_the_step_and_carries_the_whole_script() {
+        let seq = workflow();
+        assert_eq!(
+            seq.step_id(1),
+            "conflicted::cherry-pick::seq[conflict-continue]::step2/4::cherry-pick theirs\
+             ::script[merge --abort | cherry-pick theirs | am <stdin[8B/acb27c196e1c811d] \
+             | cherry-pick --continue]"
+        );
+        // The step's own payload is in its identity as well, exactly as it is
+        // for a single case — two steps with one argv and different input are
+        // different invocations.
+        assert!(seq.step_id(2).contains("::step3/4::am::stdin[8B/acb27c196e1c811d]::script["));
+        // Each step is named by its own index; nothing collapses to the last.
+        for i in 0..seq.len() {
+            assert!(seq.step_id(i).contains(&format!("::step{}/4::", i + 1)));
+        }
+    }
+
+    /// A sequence failure header is filed under its subcommand by
+    /// `scripts/split_failures.pl`, whose regex is reproduced here verbatim.
+    ///
+    /// The script is the only route from a report to a per-command brief, and it
+    /// fails *silently* — an id whose first two segments stopped being a
+    /// space-free shape and command would simply not match, and every sequence
+    /// failure would vanish from the briefs while the summary still counted it.
+    #[test]
+    fn a_sequence_header_still_files_under_its_subcommand() {
+        let re = regex::Regex::new(r"^\[([A-Z-]+)\]\s+\S+?::(\S+?)::").unwrap();
+        let seq = workflow();
+        for i in 0..seq.len() {
+            let header = format!("[STATE-DIFF] {}", seq.step_id(i));
+            let caps = re.captures(&header).unwrap_or_else(|| {
+                panic!("split_failures.pl would not file this header:\n{header}")
+            });
+            assert_eq!(&caps[1], "STATE-DIFF");
+            assert_eq!(&caps[2], "cherry-pick");
+        }
+        // And a strict sequence keeps the `!` in front of the shape, where the
+        // regex tolerates it, rather than growing a segment of its own.
+        let strict = Sequence::new("merge", "refusals", Shape::Linear).strict().step(&["merge"]);
+        assert!(strict.step_id(0).starts_with("!linear::merge::seq["));
+        assert!(re.is_match(&format!("[STDERR-DIFF] {}", strict.step_id(0))));
+    }
+
+    /// Every envelope dimension reaches every step, and only argv and stdin
+    /// differ between them. This is the composition rule the sequence corpus is
+    /// written against; a step that quietly lost the envelope's `-c` or `cwd`
+    /// would still run, and would measure a different invocation than the one
+    /// the corpus spells.
+    #[test]
+    fn a_sequence_step_inherits_every_envelope_dimension() {
+        let seq = Sequence::new("cherry-pick", "env-carried", Shape::Conflicted)
+            .strict()
+            .in_dir("src")
+            .with_env(&[("GIT_DIR", "{repo}/.git")])
+            .with_config(&[("rerere.enabled", "true")])
+            .with_globals(&[&["--no-advice"]])
+            .step(&["cherry-pick", "theirs"])
+            .step_stdin(&["am"], b"payload\n");
+
+        for i in 0..seq.len() {
+            let case = seq.step_case(i);
+            assert_eq!(case.cmd, "cherry-pick");
+            assert_eq!(case.shape, Shape::Conflicted);
+            assert!(case.compare_stderr);
+            assert_eq!(case.cwd, Some("src"));
+            assert_eq!(case.env, vec![("GIT_DIR".to_string(), "{repo}/.git".to_string())]);
+            assert_eq!(
+                case.config,
+                vec![("rerere.enabled".to_string(), "true".to_string())]
+            );
+            assert_eq!(case.globals, vec![vec!["--no-advice".to_string()]]);
+            // The envelope's own argv and payload are never executed: the step's
+            // are substituted in every time.
+            assert_eq!(case.args, seq.steps[i].args);
+            assert_eq!(case.stdin, seq.steps[i].stdin);
+        }
+        // …and the config and globals are rendered into the step's command line
+        // in the same order a single case renders them.
+        assert_eq!(
+            seq.step_case(0).argv(),
+            vec!["-c", "rerere.enabled=true", "--no-advice", "cherry-pick", "theirs"]
+        );
+    }
+
+    /// A sequence reports the *first* step that diverged, and otherwise its
+    /// last step — never a middle step that matched, and never a step after a
+    /// divergence.
+    ///
+    /// Continuing past a difference would compare two repositories that are no
+    /// longer the same premise, and would file the consequences of one bug as
+    /// further bugs against innocent commands.
+    #[test]
+    fn a_sequence_stops_at_the_first_divergence_or_at_its_end() {
+        // A matching middle step is not final: the workflow goes on.
+        assert!(!step_is_final(Verdict::Match, 0, 5));
+        assert!(!step_is_final(Verdict::Match, 3, 5));
+        // The last step is, match or not — that is how a clean sequence scores
+        // exactly one `Match` rather than one per step.
+        assert!(step_is_final(Verdict::Match, 4, 5));
+        assert!(step_is_final(Verdict::Match, 0, 1));
+        // Every way of not matching stops it, including the buckets nothing can
+        // score: a step whose oracle timed out has no premise to hand forward
+        // either.
+        for v in [
+            Verdict::Unsupported,
+            Verdict::StdoutDiff,
+            Verdict::ExitDiff,
+            Verdict::StateDiff,
+            Verdict::StderrDiff,
+            Verdict::Crash,
+            Verdict::Hang,
+            Verdict::ZvcsNondeterministic,
+            Verdict::Nondeterministic,
+            Verdict::StockTimeout,
+        ] {
+            assert!(step_is_final(v, 1, 5), "{} must end the sequence", v.label());
+        }
+    }
+
+    /// The report asks the outcome for its name, and the outcome answers with
+    /// the step id when it has one.
+    ///
+    /// Getting this wrong is silent: a sequence step printed under its bare argv
+    /// reads as an ordinary failure against a pristine repository, which is the
+    /// one thing it is not, and a reader would try to reproduce it by running
+    /// that one command.
+    #[test]
+    fn an_outcome_reports_the_step_id_when_it_has_one() {
+        let plain = Outcome {
+            case: Case::new("status", &["status"], Shape::Dirty),
+            step: None,
+            verdict: Verdict::StdoutDiff,
+            stock_stdout: String::new(),
+            zvcs_stdout: String::new(),
+            stock_stderr: String::new(),
+            zvcs_stderr: String::new(),
+            stock_code: Some(0),
+            zvcs_code: Some(0),
+            stock_state: String::new(),
+            zvcs_state: String::new(),
+            zvcs_repeat: None,
+        };
+        assert_eq!(plain.id(), "dirty::status::status");
+
+        let seq = workflow();
+        let stepped = Outcome {
+            case: seq.step_case(1),
+            step: Some(StepRef {
+                index: 2,
+                total: seq.len(),
+                id: seq.step_id(1),
+                script: seq.script(1),
+            }),
+            ..plain
+        };
+        assert_eq!(stepped.id(), seq.step_id(1));
+        // The script marks the reported step and nothing else, so the failure
+        // block says where the run stopped without a reader counting lines.
+        let script = seq.script(1);
+        assert_eq!(script[1], "-> 2  cherry-pick theirs");
+        assert_eq!(script[0], "   1  merge --abort");
+        assert_eq!(script.iter().filter(|l| l.starts_with("->")).count(), 1);
     }
 }

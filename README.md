@@ -204,6 +204,18 @@ cargo run -p zvcs-parity -- --fuzz 12    # plus generated flag combinations
 It builds fixture repositories with stock git, runs each invocation against both
 binaries, and compares stdout, exit code, and the resulting repository state.
 
+Cases come in two shapes. Most are a single invocation against a pristine copy of
+a fixture. The rest are **sequences** — an ordered list of invocations against one
+repository, compared after *every* step — because git's stateful operations are
+multi-step by construction and the state that makes `--continue`, `--skip` and
+`--abort` work (`.git/sequencer/todo`, `.git/rebase-merge/`, `MERGE_HEAD`,
+`BISECT_*`, `ORIG_HEAD`, the reflog trail) is written by one invocation and read
+by the next. A sequence stops at the first divergence and reports it against that
+step's own argv, so a conflicted `cherry-pick` whose `--continue` writes the wrong
+reflog message is named as step 6 of 7 rather than as a difference that appeared
+somewhere in a workflow. Every step after the first therefore runs on a premise
+already proven identical on both sides.
+
 A case that fails is then re-run on **both** sides, because a byte comparison is
 only meaningful between values each binary can produce twice. A case stock git
 cannot reproduce itself (a temp name, a wall-clock stamp) is excluded from the

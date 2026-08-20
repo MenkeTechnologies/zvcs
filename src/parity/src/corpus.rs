@@ -11,7 +11,7 @@
 //! `pub fn cases(out: &mut Vec<Case>)` and is called from [`cases`].
 
 use crate::fixture::Shape;
-use crate::runner::Case;
+use crate::runner::{Case, Sequence};
 
 mod diff_family;
 mod discovery;
@@ -24,6 +24,7 @@ mod merge_family;
 mod misc_commands;
 mod plumbing_objects;
 mod plumbing_refs;
+mod sequences;
 mod shape_reach;
 mod transport_local;
 mod worktree_index;
@@ -47,6 +48,18 @@ pub(crate) fn read_only(cmd: &'static str, args: &[&str], out: &mut Vec<Case>) {
 /// An index file that is not there. `{repo}` is [`crate::runner::REPO_PLACEHOLDER`],
 /// replaced with the running side's own fixture root.
 const NO_INDEX: &[(&str, &str)] = &[("GIT_INDEX_FILE", "{repo}/.git/no-such-index")];
+
+/// The curated **multi-step** corpus: workflows whose steps run against one
+/// repository, compared after every step.
+///
+/// Separate from [`cases`] rather than folded into it because a sequence is a
+/// different unit of work, not a `Case` with more fields — see
+/// [`crate::runner::Sequence`]. Both lists are merged into one `Job` list by
+/// `main`, so a sequence is scheduled, filtered by `--only` and scored exactly
+/// like every other case.
+pub fn sequences() -> Vec<Sequence> {
+    sequences::sequences()
+}
 
 /// The full curated corpus.
 pub fn cases() -> Vec<Case> {

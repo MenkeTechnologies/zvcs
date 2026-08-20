@@ -280,7 +280,7 @@ impl Report {
             if !unscored.is_empty() {
                 println!("\n--- unmeasurable + flaky ({}) ---", unscored.len());
                 for f in unscored {
-                    println!("  [{}] {}", f.verdict.label(), f.case.id());
+                    println!("  [{}] {}", f.verdict.label(), f.id());
                     if let Some(reason) = f.verdict.exclusion_reason() {
                         println!("      {reason}");
                     }
@@ -291,7 +291,26 @@ impl Report {
         if verbose && !self.failures.is_empty() {
             println!("\n--- failures ({}) ---", self.failures.len());
             for f in &self.failures {
-                println!("\n[{}] {}", f.verdict.label(), f.case.id());
+                println!("\n[{}] {}", f.verdict.label(), f.id());
+                // The script, with the reported step marked. A sequence failure
+                // is a statement about one invocation *and* about the premise the
+                // steps before it built, and a reader who cannot see the premise
+                // cannot tell a broken `--continue` from a broken `add` two lines
+                // above it. The steps below the mark did not run: after a
+                // divergence the two repositories are no longer the same premise,
+                // so they are unmeasured — which the heading says, because
+                // "unmeasured" and "passed" are different claims.
+                if let Some(s) = &f.step {
+                    println!(
+                        "  sequence: step {} of {} ({} later step(s) not run)",
+                        s.index,
+                        s.total,
+                        s.total - s.index
+                    );
+                    for line in &s.script {
+                        println!("    {line}");
+                    }
+                }
                 println!("  exit: stock={:?} zvcs={:?}", f.stock_code, f.zvcs_code);
                 if f.stock_stdout != f.zvcs_stdout {
                     println!("  stock stdout:\n{}", clip(&f.stock_stdout, 12));

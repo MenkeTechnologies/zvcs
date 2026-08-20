@@ -28,7 +28,7 @@ mod runner;
 mod stock;
 
 use anyhow::{Context, Result};
-use runner::{run_case, Case};
+use runner::{run_case, Job};
 use std::process::ExitCode;
 
 struct Args {
@@ -125,15 +125,28 @@ fn real_main() -> Result<ExitCode> {
     eprintln!("building fixtures…");
     let templates = fixture::Templates::build_all(&root)?;
 
-    let mut cases: Vec<Case> = corpus::cases();
+    // Single invocations and multi-step sequences share one list: the pool
+    // schedules by index, and two lists would mean two passes over the same
+    // machinery. `Job::cmd` is what `--only` filters on either way.
+    let mut cases: Vec<Job> = corpus::cases().into_iter().map(Job::Single).collect();
+    cases.extend(corpus::sequences().into_iter().map(Job::Sequence));
     if args.fuzz_per_cmd > 0 {
         eprintln!("fuzzing  : {} cases/cmd, seed {}", args.fuzz_per_cmd, args.seed);
-        cases.extend(fuzz::generate(args.seed, args.fuzz_per_cmd));
+        cases.extend(fuzz::generate(args.seed, args.fuzz_per_cmd).into_iter().map(Job::Single));
     }
     if !args.only.is_empty() {
-        cases.retain(|c| args.only.iter().any(|o| o == c.cmd));
+        cases.retain(|c| args.only.iter().any(|o| o == c.cmd()));
     }
-    eprintln!("cases    : {}", cases.len());
+    // Sequences are counted apart from the invocations they cost, so the price of
+    // the multi-step corpus is stated rather than left to be inferred from a
+    // wall clock: one sequence of seven steps is one case in the parity
+    // denominator and seven child processes per side.
+    let sequences = cases.iter().filter(|j| matches!(j, Job::Sequence(_))).count();
+    let invocations: usize = cases.iter().map(Job::invocations).sum();
+    eprintln!(
+        "cases    : {} ({sequences} sequences; {invocations} invocations per side)",
+        cases.len()
+    );
 
     let workdir = root.join("run");
     std::fs::create_dir_all(&workdir)?;
@@ -173,7 +186,7 @@ fn real_main() -> Result<ExitCode> {
                     if i >= total || first_err.lock().unwrap().is_some() {
                         break;
                     }
-                    match run_case(&cases[i], zvcs_bin, templates, &wdir) {
+                    match cases[i].run(zvcs_bin, templates, &wdir) {
                         Ok(o) => *slots[i].lock().unwrap() = Some(o),
                         Err(e) => {
                             *first_err.lock().unwrap() = Some(e);
@@ -260,6 +273,17 @@ fn real_main() -> Result<ExitCode> {
             // fails, and a predicate that answers from a coin flip walks to
             // whichever argv flaked next and prints it as the culprit.
             if !f.verdict.is_measured_failure() {
+                continue;
+            }
+            // A sequence step cannot be shrunk by this shrinker. Its failure is a
+            // function of the steps that ran before it, and `fuzz::shrink` re-runs
+            // one `Case` against a pristine copy — which for a step means running
+            // `cherry-pick --continue` with no cherry-pick in progress, a
+            // predicate that answers "still fails" for reasons that have nothing
+            // to do with the token it just dropped. It would print a confident
+            // minimal case that never reproduced anything, which is exactly the
+            // failure mode `is_measured_failure` exists to prevent above.
+            if f.step.is_some() {
                 continue;
             }
             let minimal = fuzz::shrink(&f.case, &mut |c| {

@@ -25,11 +25,18 @@ make_path($outdir);
 
 # Per-subcommand parity, straight from the report's own table, so the ranking
 # matches what the harness reported rather than being recomputed here.
+# The number of per-verdict columns between `match` and `parity` is not fixed —
+# a `flaky` column joined `out`/`exit`/`state` when the harness started reporting
+# cases zvcs would not reproduce — so the row is matched as "a name, one or more
+# counts, a percentage" and only the first two counts and the percentage are
+# read. Pinning the column count meant a new bucket silently emptied %parity and
+# ranked every subcommand at the same default.
 my %parity;
 for my $l (@lines) {
-    next unless $l =~ /^(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)%\s*$/;
-    my ($cmd, $total, $match, $pct) = ($1, $2, $3, $8);
+    next unless $l =~ /^(\S+)((?:\s+\d+)+)\s+([\d.]+)%\s*$/;
+    my ($cmd, $counts, $pct) = ($1, $2, $3);
     next if $cmd eq 'cmd';
+    my ($total, $match) = ($counts =~ /(\d+)/g)[0, 1];
     $parity{$cmd} = { total => $total, match => $match, pct => $pct };
 }
 

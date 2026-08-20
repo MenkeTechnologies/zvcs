@@ -9,6 +9,38 @@
 //! surface and zvcs is specified to be terser than git. It is still recorded so
 //! a human can read it, and whether the command *errored at all* is compared
 //! via the exit code.
+//!
+//! # Both sides are asked to reproduce themselves
+//!
+//! A byte comparison is only meaningful between two values that each side can
+//! produce twice. The stock side has been re-run on failure since the beginning
+//! ([`Verdict::Nondeterministic`]); the zvcs side was not, so a zvcs-side flake
+//! was reported as a hard parity failure with a specific diff attached and was
+//! indistinguishable from a real bug. Two failures from one loaded fuzz run —
+//! a `merge` state-diff and a `filter-branch` stdout-diff — were handed on as
+//! defects and turned out to be irreproducible by hand and through the harness.
+//! Engineering time spent chasing a non-bug is exactly the cost this crate
+//! exists to prevent, so the repeat is now symmetric: both sides are asked, and
+//! a side that disagrees with *itself* is reported as that
+//! ([`Verdict::ZvcsNondeterministic`]) rather than as a difference between the
+//! two.
+//!
+//! **The repeat is failure-triggered, not unconditional.** An unconditional
+//! second zvcs run would double the wall clock of every sweep — 4000+ cases,
+//! each already paying two child processes and two full state probes — for
+//! evidence that is only ever consulted on the <1% of cases that fail. Runtime
+//! is not a neutral cost here: a harness people run less often measures less.
+//! The blind spot the cheap version accepts is a case where zvcs is
+//! nondeterministic *and* the sampled run happened to land on stock's answer;
+//! that case scores `Match` and no repeat is taken. That is the same blind spot
+//! the stock repeat has always had, it errs toward the port being asked to be
+//! right rather than toward an exclusion, and the flake surfaces the first time
+//! the coin lands the other way.
+//!
+//! **A flake is counted, not excluded.** It gets its own verdict, its own
+//! counter and its own column, and it stays inside the parity denominator as a
+//! failure — see [`Verdict::ZvcsNondeterministic`] for why excluding it would be
+//! the one kind of exclusion this harness must never have.
 
 use crate::env;
 use crate::fixture::{Shape, Templates};
@@ -25,6 +57,44 @@ pub struct Case {
     pub cmd: &'static str,
     /// Full argv after the binary name, including the subcommand.
     pub args: Vec<String>,
+    /// `-c key=value` overrides, rendered ahead of the subcommand and applied
+    /// identically to both sides.
+    ///
+    /// The largest surface the harness could not reach. Git's behaviour is a
+    /// function of its configuration at least as much as of its argv —
+    /// `core.abbrev` decides how wide every id prints, `diff.renames` decides
+    /// whether a rename is a rename, `status.showUntrackedFiles` decides what
+    /// `status` even lists — and with no case able to set a key, every one of
+    /// those defaults was the only value ever measured. A port that ignores a
+    /// setting entirely scored exactly the same as one that honours it.
+    ///
+    /// `-c` rather than writing `.git/config`: a case is one invocation against
+    /// a pristine copy and cannot write a file first, and the command line is
+    /// the one config source that needs no prior state. It also keeps the
+    /// setting visible in [`Case::id`], so a failure names the key.
+    ///
+    /// A key that makes stock git **die** is kept, not filtered. Agreeing on the
+    /// refusal is parity; excluding it would be measuring only the values git
+    /// likes, which is the same error as scoring an unported command as a skip.
+    ///
+    /// Values are literal, like every other argv token — nothing here is
+    /// substituted, so a value must not name an absolute path for the same
+    /// reason [`Case::env`] values may not.
+    pub config: Vec<(String, String)>,
+    /// Global options that precede the subcommand — `--no-pager`, `-C <dir>`,
+    /// `--namespace=<n>`, `--literal-pathspecs`, and the rest of the set git
+    /// parses in `git.c:handle_options` before it dispatches a verb.
+    ///
+    /// Entirely unmeasured before this field existed: every case's argv started
+    /// at the subcommand, so the whole of `handle_options` was reachable only by
+    /// whatever a subcommand happened to re-implement. `git --list-cmds=main`,
+    /// for one, is not supported by the port and no case could have caught it.
+    ///
+    /// One element is one *whole* option including its argument, so `-C src` is
+    /// `["-C", "src"]` and not two independent tokens. That is what lets
+    /// [`crate::fuzz::shrink`] drop an option without leaving its operand behind
+    /// as a stray positional.
+    pub globals: Vec<Vec<String>>,
     /// Repository shape the case runs against.
     pub shape: Shape,
     /// Bytes fed to the child on stdin, byte-identically to both sides.
@@ -88,7 +158,14 @@ pub struct Case {
     /// may not: the two sides run in different directories. Write
     /// [`REPO_PLACEHOLDER`] instead and it is replaced with that side's own
     /// fixture root.
-    pub env: &'static [(&'static str, &'static str)],
+    ///
+    /// Owned rather than `&'static [(&'static str, &'static str)]`, which is what
+    /// it was while every environment in the harness was a curated literal. The
+    /// fuzzer draws a *variable* and a *value* independently from two pools, so
+    /// the pair it produces exists only at run time and cannot be a `'static`
+    /// reference to anything. Curated call sites are unaffected: [`Case::with_env`]
+    /// still takes a borrowed slice of string pairs and copies it in.
+    pub env: Vec<(String, String)>,
 }
 
 /// Stands in for the running side's fixture root inside a case's [`Case::env`]
@@ -100,11 +177,13 @@ impl Case {
         Self {
             cmd,
             args: args.iter().map(|s| s.to_string()).collect(),
+            config: Vec::new(),
+            globals: Vec::new(),
             shape,
             stdin: None,
             compare_stderr: false,
             cwd: None,
-            env: &[],
+            env: Vec::new(),
         }
     }
 
@@ -134,8 +213,67 @@ impl Case {
     }
 
     /// Run this case with `env` added on top of [`crate::env::harden`].
-    pub fn with_env(self, env: &'static [(&'static str, &'static str)]) -> Self {
-        Self { env, ..self }
+    pub fn with_env(self, env: &[(&str, &str)]) -> Self {
+        Self { env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..self }
+    }
+
+    /// Run this case with `-c key=value` in front of the subcommand.
+    pub fn with_config(self, config: &[(&str, &str)]) -> Self {
+        Self {
+            config: config.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ..self
+        }
+    }
+
+    /// Run this case with global options in front of the subcommand. Each inner
+    /// slice is one whole option including its argument: `&[&["-C", "src"]]`.
+    pub fn with_globals(self, globals: &[&[&str]]) -> Self {
+        Self {
+            globals: globals
+                .iter()
+                .map(|g| g.iter().map(|t| t.to_string()).collect())
+                .collect(),
+            ..self
+        }
+    }
+
+    /// The full argv handed to the binary: config overrides, then global
+    /// options, then the subcommand and its own arguments.
+    ///
+    /// Config comes first because `-c` commutes with every other global option —
+    /// it only appends to the parameter config list — while `-C` and
+    /// `--git-dir` do not commute with *each other* (`--git-dir` is resolved
+    /// relative to the directory `-C` has already moved to). Keeping the
+    /// sampled globals adjacent and in the order they were drawn preserves that
+    /// relationship; hoisting `-c` out of the way keeps it from splitting a
+    /// pair whose order is load-bearing.
+    ///
+    /// Assembled here rather than stored flattened so [`crate::fuzz::shrink`]
+    /// can drop one config pair or one whole global option, which it could not
+    /// do if they were already spliced into `args` as loose tokens.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = Vec::with_capacity(self.config.len() * 2 + self.globals.len() + self.args.len());
+        for (key, value) in &self.config {
+            argv.push("-c".to_string());
+            argv.push(format!("{key}={value}"));
+        }
+        for global in &self.globals {
+            argv.extend(global.iter().cloned());
+        }
+        argv.extend(self.args.iter().cloned());
+        argv
+    }
+
+    /// How many independently droppable pieces this case has, across every
+    /// dimension the shrinker minimizes. Used to report whether shrinking
+    /// achieved anything; the subcommand at `args[0]` is never droppable.
+    pub fn size(&self) -> usize {
+        self.args.len().saturating_sub(1)
+            + self.config.len()
+            + self.globals.len()
+            + self.env.len()
+            + usize::from(self.cwd.is_some())
+            + usize::from(self.stdin.is_some())
     }
 
     /// Stable identity for reporting and for reproducing a single failure.
@@ -152,10 +290,27 @@ impl Case {
     /// already had — the report and `scripts/split_failures.pl` key on these
     /// strings, and the environment is rendered unsubstituted so the id is the
     /// same on every machine.
+    ///
+    /// Config overrides and global options are rendered *inside* the argv
+    /// segment rather than as segments of their own, because that is what they
+    /// are: `-c core.abbrev=4 --no-pager status` is one command line, and a
+    /// reader who copies the segment after `::<cmd>::` onto a `git` prefix gets
+    /// the invocation back. A case that sets neither keeps byte-for-byte the id
+    /// it had before those fields existed, so no existing failure is renamed.
+    ///
+    /// The grammar `[!]<shape>::<cmd>::<argv>[::cwd[…]][::env[…]][::stdin[…]]`
+    /// is load-bearing: `scripts/split_failures.pl` matches `<shape>::<cmd>::`
+    /// off the front of a failure header to file the block under a subcommand,
+    /// so the two leading segments must stay first and must stay free of spaces.
     pub fn id(&self) -> String {
         let strict = if self.compare_stderr { "!" } else { "" };
-        let mut id =
-            format!("{}{}::{}::{}", strict, self.shape.name(), self.cmd, self.args.join(" "));
+        let mut id = format!(
+            "{}{}::{}::{}",
+            strict,
+            self.shape.name(),
+            self.cmd,
+            self.argv().join(" ")
+        );
         if let Some(cwd) = self.cwd {
             id.push_str(&format!("::cwd[{cwd}]"));
         }
@@ -206,6 +361,37 @@ pub enum Verdict {
     /// zvcs did not exit within the case timeout while stock git did. Tracked
     /// apart from Crash: a hang is usually a wait on input git does not want.
     Hang,
+    /// zvcs does not agree with *itself* on this invocation: a second run in a
+    /// second pristine repo produced different stdout or left a different
+    /// post-state. Established the same way the stock side's non-determinism is
+    /// — by re-running and diffing — never asserted from a pattern.
+    ///
+    /// **Counted as a failure, inside the parity denominator, never excluded.**
+    /// That is the whole difference between this verdict and
+    /// [`Verdict::Nondeterministic`], and it is deliberate. Stock's exclusion is
+    /// safe because it is triggered by a property of the *oracle*: no zvcs
+    /// behaviour can reach it, so it cannot be aimed at a zvcs bug. This one is
+    /// triggered by the behaviour of the binary under test, so excluding it
+    /// would mean a port that is *randomly* wrong quietly removes its own cases
+    /// from the denominator and outscores a port that is deterministically
+    /// wrong. A self-serving exclusion is the one thing measurement
+    /// infrastructure must never have, so the error is taken in the other
+    /// direction.
+    ///
+    /// The honest counter-argument, recorded rather than hidden: some cases in
+    /// here are not zvcs's fault at all — a `filter-branch` progress line prints
+    /// `(N seconds passed, remaining M predicted)`, and on a loaded machine one
+    /// side reads a different clock than the other while stock's two samples
+    /// happen to agree. No implementation can match a value stock does not
+    /// stably produce either, so counting it marks the port down for a case
+    /// nothing could pass. Two facts make that the better error: it is bounded
+    /// and named (`--verbose` lists every one with its id), and it moves the
+    /// number *down*, which is the safe direction for a number nobody may tune
+    /// upward. Widening this into an exclusion, if it is ever worth doing, needs
+    /// evidence that the case is unmeasurable for both binaries — which is what
+    /// the stock repeat already tests and this one deliberately does not
+    /// duplicate.
+    ZvcsNondeterministic,
     /// Stock git does not agree with *itself* on this invocation, so byte
     /// comparison cannot measure anything. Established by re-running the stock
     /// side in a second pristine repo and diffing the two stock outputs — never
@@ -236,6 +422,27 @@ impl Verdict {
         self == Verdict::Match
     }
 
+    /// True for the verdicts that mean *nothing could be measured*, as opposed
+    /// to *something was measured and it differed*. These are exactly the cases
+    /// `report.rs` leaves out of the parity denominator (`Tally::scored`).
+    ///
+    /// [`Verdict::ZvcsNondeterministic`] is deliberately **not** here: it is
+    /// measured (both zvcs runs completed and disagreed) and it is counted.
+    pub fn is_unmeasurable(self) -> bool {
+        matches!(self, Verdict::Nondeterministic | Verdict::StockTimeout)
+    }
+
+    /// True for a failure the harness can expect to reproduce on demand.
+    ///
+    /// The shrinker needs this: minimizing a case is a search whose predicate is
+    /// "does this still fail", and a predicate that answers from a coin flip —
+    /// an unmeasurable case, or one zvcs does not reproduce — minimizes toward
+    /// whichever argv happened to flake next and prints a "minimal" case that
+    /// never reproduced anything.
+    pub fn is_measured_failure(self) -> bool {
+        !self.is_match() && !self.is_unmeasurable() && self != Verdict::ZvcsNondeterministic
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Verdict::Match => "MATCH",
@@ -246,8 +453,31 @@ impl Verdict {
             Verdict::StderrDiff => "STDERR-DIFF",
             Verdict::Crash => "CRASH",
             Verdict::Hang => "HANG",
+            Verdict::ZvcsNondeterministic => "ZVCS-NONDETERMINISTIC",
             Verdict::Nondeterministic => "NONDETERMINISTIC",
             Verdict::StockTimeout => "STOCK-TIMEOUT",
+        }
+    }
+
+    /// One line saying why a case is in an unscored or unreproducible bucket, for
+    /// the listing `--verbose` prints. A count with no names and no reasons reads
+    /// as "nothing to see here", which is precisely what a silent exclusion must
+    /// never be allowed to look like.
+    pub fn exclusion_reason(self) -> Option<&'static str> {
+        match self {
+            Verdict::Nondeterministic => Some(
+                "stock git did not reproduce its own stdout or post-state; \
+                 excluded from the parity denominator",
+            ),
+            Verdict::StockTimeout => Some(
+                "stock git did not answer inside the case timeout, so there was no oracle; \
+                 excluded from the parity denominator",
+            ),
+            Verdict::ZvcsNondeterministic => Some(
+                "zvcs did not reproduce its own stdout or post-state while stock did; \
+                 counted as a failure, not excluded",
+            ),
+            _ => None,
         }
     }
 }
@@ -273,12 +503,98 @@ pub struct Outcome {
     pub zvcs_code: Option<i32>,
     pub stock_state: String,
     pub zvcs_state: String,
+    /// The second zvcs run, present exactly when one was taken — that is, on a
+    /// case that failed and whose stock side reproduced itself.
+    ///
+    /// Kept even when it *agreed* with the first run, because "this failure was
+    /// reproduced" is the fact a reader most wants attached to a failure they
+    /// are about to spend an afternoon on, and it has already been paid for.
+    pub zvcs_repeat: Option<Repeat>,
+}
+
+/// One repeat run of a side, reduced to the surfaces the repeat compares.
+#[derive(Clone, Debug, Default)]
+pub struct Repeat {
+    /// The repeat hit the case timeout. Such a run proves nothing in either
+    /// direction — see [`repeat_disagreement`].
+    pub timed_out: bool,
+    pub code: Option<i32>,
+    /// Normalized exactly like the first run's, against the repeat's own repo.
+    pub stdout: String,
+    pub state: String,
+    /// Which surface this repeat disagreed with the first run on, filled in by
+    /// [`judge`] — the one place that holds both runs.
+    ///
+    /// Recorded rather than left for the report to recompute: the verdict and the
+    /// printed explanation must come from the same comparison, or a report can
+    /// say "did not reproduce its post-state" about a case classified on stdout.
+    pub disagreement: Option<Surface>,
+}
+
+/// The surface a repeat run disagreed with the first run on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    Stdout,
+    State,
+}
+
+impl Surface {
+    pub fn name(self) -> &'static str {
+        match self {
+            Surface::Stdout => "stdout",
+            Surface::State => "post-state",
+        }
+    }
 }
 
 /// Ceiling on a single invocation. Fuzzing reaches commands that wait on input
 /// or spin; without a bound, one such case stalls the whole run rather than
 /// being reported as the defect it is.
+///
+/// This is the *base* budget; see [`case_timeout`] for the one command that
+/// needs more and why raising this number instead would be wrong.
 const CASE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Extra seconds for the commands whose **correct** behaviour includes sleeping.
+///
+/// A ceiling exists to catch a hang. A command that is *specified* to sit still
+/// for ten seconds spends half of the 20s budget doing the right thing, so on a
+/// loaded machine — the fuzz runs use every core but one — it flips between
+/// finishing and being killed, and the harness reports its own kill as a defect.
+/// That is how `branched::filter-branch::filter-branch --force HEAD` came to be
+/// filed as a stdout-diff.
+///
+/// Both alternatives are worse. Raising [`CASE_TIMEOUT`] to cover it buys the
+/// slowest command in the corpus a budget that every other command then also
+/// gets, so a real hang in `status` would have to burn 30s before it is
+/// reported — the ceiling stops meaning anything. Excluding `filter-branch` from
+/// the corpus deletes the measurement outright, which is the failure mode this
+/// crate is built to refuse.
+///
+/// So the allowance is per command, additive on top of the base ceiling, and
+/// each entry is cited to the sleep it pays for:
+///
+///  * `filter-branch` — 10s. Git's `git-filter-branch.sh` prints its
+///    "this is not the recommended way" warning and then `sleep 10` before doing
+///    anything, so a user can interrupt; the port reproduces that faithfully at
+///    `src/extensions/src/porcelain/filter_branch.rs:585-588`. It is skipped only
+///    when `FILTER_BRANCH_SQUELCH_WARNING` is set, and [`env::harden`] clears the
+///    environment, so under this harness the sleep always happens.
+///
+/// An entry here can only ever let a *correct* run finish. It cannot hide a hang
+/// in any other command, and it cannot turn a difference into a match: a case
+/// that completes inside the budget is compared exactly as before.
+const SLEEP_ALLOWANCE: &[(&str, u64)] = &[("filter-branch", 10)];
+
+/// The wall-clock ceiling for one invocation of `case`: the base ceiling plus
+/// whatever [`SLEEP_ALLOWANCE`] documents for its subcommand.
+fn case_timeout(case: &Case) -> Duration {
+    let extra = SLEEP_ALLOWANCE
+        .iter()
+        .find(|(cmd, _)| *cmd == case.cmd)
+        .map_or(0, |(_, secs)| *secs);
+    CASE_TIMEOUT + Duration::from_secs(extra)
+}
 
 /// The directory a case runs in, created if the fixture does not contain it.
 ///
@@ -302,7 +618,7 @@ fn case_dir(repo: &Path, cwd: Option<&str>) -> Result<PathBuf> {
 /// side's fixture root through [`REPO_PLACEHOLDER`] rather than as a literal
 /// path. A corpus-wide test checks both statically; the asserts catch a case
 /// added without running it.
-fn apply_case_env(cmd: &mut Command, repo: &Path, extra: &[(&'static str, &'static str)]) {
+fn apply_case_env(cmd: &mut Command, repo: &Path, extra: &[(String, String)]) {
     for (key, value) in extra {
         assert!(
             !env::is_pinned(key),
@@ -316,21 +632,20 @@ fn apply_case_env(cmd: &mut Command, repo: &Path, extra: &[(&'static str, &'stat
     }
 }
 
-fn run_side(
-    bin: &Path,
-    repo: &Path,
-    home: &Path,
-    args: &[String],
-    stdin: Option<&'static [u8]>,
-    cwd: Option<&str>,
-    extra_env: &[(&'static str, &'static str)],
-) -> Result<Side> {
-    let dir = case_dir(repo, cwd)?;
+/// Run one side of a case.
+///
+/// Takes the whole [`Case`] rather than a parameter per dimension: every
+/// dimension a case can carry — argv, config, globals, stdin, cwd, environment —
+/// has to reach both sides identically, and a six-argument call is a standing
+/// invitation to add a seventh dimension and forget one of its two call sites.
+fn run_side(bin: &Path, repo: &Path, home: &Path, case: &Case) -> Result<Side> {
+    let stdin = case.stdin;
+    let dir = case_dir(repo, case.cwd)?;
     let mut cmd = Command::new(bin);
     env::harden(&mut cmd, home);
-    apply_case_env(&mut cmd, repo, extra_env);
+    apply_case_env(&mut cmd, repo, &case.env);
     cmd.current_dir(&dir)
-        .args(args)
+        .args(case.argv())
         // Closed stdin stays the default. A command that reads input it was not
         // given must still hit EOF rather than block, or the `Hang` verdict
         // stops meaning anything.
@@ -339,7 +654,7 @@ fn run_side(
         .stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn {} {:?}", bin.display(), args))?;
+        .with_context(|| format!("spawn {} {:?}", bin.display(), case.argv()))?;
 
     // Written from a helper thread, not inline: a command that both consumes a
     // payload and prints while consuming it (`stripspace`, `column`, `apply
@@ -355,11 +670,12 @@ fn run_side(
     });
 
     let start = Instant::now();
+    let ceiling = case_timeout(case);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
-        if start.elapsed() >= CASE_TIMEOUT {
+        if start.elapsed() >= ceiling {
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -384,6 +700,12 @@ fn run_side(
         let _ = h.read_to_end(&mut stderr);
     }
 
+    // A killed child's pipes still hold whatever it managed to write. Those bytes
+    // are kept for a human to read, and `timed_out` is the flag that keeps them
+    // out of every comparison: [`classify`] answers `StockTimeout`/`Hang` before
+    // any content is looked at, and [`repeat_disagreement`] refuses to draw a
+    // conclusion from a repeat that was killed. Half an answer compared against a
+    // whole one is a difference the case did not have.
     match status {
         Some(s) => Ok(Side { stdout, stderr, code: s.code(), timed_out: false }),
         None => Ok(Side { stdout, stderr, code: None, timed_out: true }),
@@ -918,6 +1240,153 @@ fn looks_like_panic(stderr: &str) -> bool {
     stderr.contains("panicked at") || stderr.contains("RUST_BACKTRACE")
 }
 
+/// One side reduced to exactly what the comparison reads: whether it answered at
+/// all, its exit code, and its three normalized surfaces.
+///
+/// Exists so [`classify`] is a pure function of the things being compared and can
+/// be exercised without a git, a fixture or a clock — the classification rules
+/// are the part of this crate a bug would be most expensive in, and they were
+/// previously reachable only by running a real sweep.
+pub struct Compared<'a> {
+    pub timed_out: bool,
+    pub code: Option<i32>,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub state: &'a str,
+}
+
+/// Judge one case from the two sides' comparable projections.
+///
+/// Ordering matters: a crash outranks a gap, and a gap outranks the ordinary
+/// diffs it would otherwise masquerade as.
+///
+/// The stock timeout is checked first because it is not a verdict about zvcs at
+/// all. `timed_out` was recorded for both sides and only ever read for one, so a
+/// stock side the harness had killed fell through to the exit-code comparison
+/// and was scored against the port: `stock=None` against a perfectly good exit
+/// code reads as `exit-diff`. That is the same error the `Nondeterministic`
+/// bucket exists to avoid — "counting an unmeasurable case as a failure is as
+/// wrong as counting it as a pass".
+///
+/// It is not hypothetical. `difftool --tool-help` and `mergetool --tool-help`
+/// shell out to probe every tool on `PATH`; stock takes 1.6s for the first on an
+/// idle machine and was measured at 29.7s under sixteen concurrent agents, past
+/// the 20s ceiling, while this port answers in 88ms. Given the time, the two
+/// agree byte for byte on stdout and stderr — verified — so every one of those
+/// 60-odd failures in a loaded sweep was the harness timing out its own oracle.
+///
+/// Both timeout arms sit above every content comparison, which is what keeps a
+/// killed child's partial output out of the diff: whatever bytes it wrote before
+/// the kill are recorded for a human but can never *be* the verdict.
+fn classify(stock: &Compared<'_>, zvcs: &Compared<'_>, compare_stderr: bool) -> Verdict {
+    if stock.timed_out {
+        Verdict::StockTimeout
+    } else if zvcs.timed_out {
+        Verdict::Hang
+    } else if looks_like_panic(zvcs.stderr) || zvcs.code.is_none() {
+        Verdict::Crash
+    } else if is_unsupported(zvcs.stderr) {
+        Verdict::Unsupported
+    } else if stock.code != zvcs.code {
+        Verdict::ExitDiff
+    } else if stock.stdout != zvcs.stdout {
+        Verdict::StdoutDiff
+    } else if stock.state != zvcs.state {
+        Verdict::StateDiff
+    } else if compare_stderr && stock.stderr != zvcs.stderr {
+        Verdict::StderrDiff
+    } else {
+        Verdict::Match
+    }
+}
+
+/// Whether a repeat run disagrees with the first run, and on which surface.
+///
+/// The only evidence accepted for calling a side non-reproducible, and it is
+/// shared by both sides so the two can never drift into asking different
+/// questions.
+///
+/// **A repeat that timed out proves nothing.** It is not evidence of
+/// non-determinism — a killed child's partial stdout differs from a complete
+/// one every time, which would let a busy machine manufacture "stock does not
+/// reproduce itself" out of a real, measured zvcs failure and drop it from the
+/// denominator. That is a flattering exclusion driven by machine load, and it
+/// was live: the stock repeat compared `again.stdout` without ever looking at
+/// `again.timed_out`. Nor is it evidence of determinism, so the caller keeps
+/// whatever verdict it already had — a difference two completed runs produced
+/// stands on its own.
+///
+/// **Exit code is deliberately not a surface here.** Adding it would widen the
+/// stock side's exclusion — cases that are failures today would become
+/// unmeasurable and leave the denominator — and this harness does not widen
+/// exclusions to make numbers move. The consequence on the zvcs side is that a
+/// port whose exit code alone is unstable is reported as `exit-diff` rather than
+/// as a flake, which errs toward the port being asked to be right.
+fn repeat_disagreement(first_stdout: &str, first_state: &str, again: &Repeat) -> Option<Surface> {
+    if again.timed_out {
+        return None;
+    }
+    if again.stdout != first_stdout {
+        return Some(Surface::Stdout);
+    }
+    if again.state != first_state {
+        return Some(Surface::State);
+    }
+    None
+}
+
+/// Classify a case, then — only if it failed — ask each side to reproduce itself.
+///
+/// The repeats are closures rather than calls so the whole decision procedure is
+/// testable against deterministic fakes: "a side that disagrees with itself lands
+/// in the flake bucket" is a rule, and a rule nothing tests is a rule that drifts.
+///
+/// Precedence is stock first, and that is load-bearing rather than incidental.
+/// When both sides are non-reproducible, the stock finding is the stronger
+/// statement — *no* implementation could match a value stock does not stably
+/// produce — so it wins, and every case classified `Nondeterministic` before this
+/// function existed is still classified `Nondeterministic`. The zvcs repeat is
+/// not even taken in that case: its answer could not change anything.
+fn judge(
+    compare_stderr: bool,
+    stock: &Compared<'_>,
+    zvcs: &Compared<'_>,
+    stock_repeat: &mut dyn FnMut() -> Result<Repeat>,
+    zvcs_repeat: &mut dyn FnMut() -> Result<Repeat>,
+) -> Result<(Verdict, Option<Repeat>)> {
+    let verdict = classify(stock, zvcs, compare_stderr);
+    // Done lazily, on failure only, so the common path still costs one run per
+    // side. See the module header for why the repeat is not unconditional.
+    if verdict.is_match() {
+        return Ok((verdict, None));
+    }
+
+    // A side that was killed has no first answer to reproduce — only the bytes it
+    // got out before the kill. Comparing a complete repeat against that partial
+    // capture reports a disagreement every time, which would quietly relabel a
+    // `Hang` (a serious, specific defect) as a flake and a `StockTimeout` as
+    // stock non-determinism. Neither reclassification is measured; both are the
+    // timeout being laundered into a different word for it. So the timeout
+    // verdicts stand as they are, and neither repeat is paid for.
+    if stock.timed_out || zvcs.timed_out {
+        return Ok((verdict, None));
+    }
+
+    let stock_again = stock_repeat()?;
+    if repeat_disagreement(stock.stdout, stock.state, &stock_again).is_some() {
+        return Ok((Verdict::Nondeterministic, None));
+    }
+
+    let mut zvcs_again = zvcs_repeat()?;
+    zvcs_again.disagreement = repeat_disagreement(zvcs.stdout, zvcs.state, &zvcs_again);
+    let verdict = if zvcs_again.disagreement.is_some() {
+        Verdict::ZvcsNondeterministic
+    } else {
+        verdict
+    };
+    Ok((verdict, Some(zvcs_again)))
+}
+
 /// Run one case against both implementations and judge it.
 pub fn run_case(
     case: &Case,
@@ -933,8 +1402,8 @@ pub fn run_case(
     templates.instantiate(case.shape, &zvcs_repo)?;
 
     let home = &templates.home;
-    let stock = run_side(crate::stock::git()?, &stock_repo, home, &case.args, case.stdin, case.cwd, case.env)?;
-    let zvcs = run_side(zvcs_bin, &zvcs_repo, home, &case.args, case.stdin, case.cwd, case.env)?;
+    let stock = run_side(crate::stock::git()?, &stock_repo, home, case)?;
+    let zvcs = run_side(zvcs_bin, &zvcs_repo, home, case)?;
 
     let stock_state = probe_state(&stock_repo, home);
     let zvcs_state = probe_state(&zvcs_repo, home);
@@ -952,54 +1421,31 @@ pub fn run_case(
     let stock_state_n = normalize(stock_state.as_bytes(), &stock_repo, home, stock_exec);
     let zvcs_state_n = normalize(zvcs_state.as_bytes(), &zvcs_repo, home, zvcs_exec);
 
-    // Ordering matters: a crash outranks a gap, and a gap outranks the ordinary
-    // diffs it would otherwise masquerade as.
-    //
-    // The stock timeout is checked first because it is not a verdict about zvcs at
-    // all. `timed_out` was recorded for both sides and only ever read for one, so a
-    // stock side the harness had killed fell through to the exit-code comparison
-    // and was scored against the port: `stock=None` against a perfectly good exit
-    // code reads as `exit-diff`. That is the same error the `Nondeterministic`
-    // bucket exists to avoid — "counting an unmeasurable case as a failure is as
-    // wrong as counting it as a pass".
-    //
-    // It is not hypothetical. `difftool --tool-help` and `mergetool --tool-help`
-    // shell out to probe every tool on `PATH`; stock takes 1.6s for the first on an
-    // idle machine and was measured at 29.7s under sixteen concurrent agents, past
-    // the 20s ceiling, while this port answers in 88ms. Given the time, the two
-    // agree byte for byte on stdout and stderr — verified — so every one of those
-    // 60-odd failures in a loaded sweep was the harness timing out its own oracle.
-    let verdict = if stock.timed_out {
-        Verdict::StockTimeout
-    } else if zvcs.timed_out {
-        Verdict::Hang
-    } else if looks_like_panic(&zvcs_stderr) || zvcs.code.is_none() {
-        Verdict::Crash
-    } else if is_unsupported(&zvcs_stderr) {
-        Verdict::Unsupported
-    } else if stock.code != zvcs.code {
-        Verdict::ExitDiff
-    } else if stock_stdout != zvcs_stdout {
-        Verdict::StdoutDiff
-    } else if stock_state_n != zvcs_state_n {
-        Verdict::StateDiff
-    } else if case.compare_stderr && stock_stderr != zvcs_stderr {
-        Verdict::StderrDiff
-    } else {
-        Verdict::Match
-    };
-
-    // A failing case might be one stock git cannot reproduce itself. Re-run the
-    // stock side in a fresh copy and compare stock against stock; only a
-    // disagreement there reclassifies. Done lazily, on failure only, so the
-    // common path still costs one stock run.
-    let verdict = if verdict != Verdict::Match
-        && stock_disagrees_with_itself(case, templates, workdir, &stock_stdout, &stock_state_n)?
-    {
-        Verdict::Nondeterministic
-    } else {
-        verdict
-    };
+    // A failing case might be one neither binary reproduces itself. Each side is
+    // re-run in a fresh copy of the same shape and compared against its own first
+    // answer; only a disagreement there reclassifies. Both repeats are lazy — the
+    // closures are called by `judge` only when the case failed.
+    let (verdict, zvcs_repeat) = judge(
+        case.compare_stderr,
+        &Compared {
+            timed_out: stock.timed_out,
+            code: stock.code,
+            stdout: &stock_stdout,
+            stderr: &stock_stderr,
+            state: &stock_state_n,
+        },
+        &Compared {
+            timed_out: zvcs.timed_out,
+            code: zvcs.code,
+            stdout: &zvcs_stdout,
+            stderr: &zvcs_stderr,
+            state: &zvcs_state_n,
+        },
+        &mut || {
+            repeat_side(crate::stock::git()?, case, templates, workdir, "stock-repeat", stock_exec)
+        },
+        &mut || repeat_side(zvcs_bin, case, templates, workdir, "zvcs-repeat", zvcs_exec),
+    )?;
 
     Ok(Outcome {
         case: case.clone(),
@@ -1012,13 +1458,15 @@ pub fn run_case(
         zvcs_code: zvcs.code,
         stock_state: stock_state_n,
         zvcs_state: zvcs_state_n,
+        zvcs_repeat,
     })
 }
 
-/// Re-run the stock side in a second pristine repo and report whether stock
-/// disagrees with itself — on **either** stdout or resulting repository state.
+/// Re-run one side in a second pristine repo and report what it produced, so the
+/// caller can ask whether that side reproduces *itself* — on **either** stdout or
+/// resulting repository state.
 ///
-/// This is the only evidence accepted for calling a case unmeasurable. Git's
+/// This is the only evidence accepted for calling a side non-reproducible. Git's
 /// output and state carry values that are re-rolled every run, and no
 /// implementation can match a value stock does not reproduce:
 ///   * `unpack-file` prints a randomly named temp file (stdout);
@@ -1031,26 +1479,36 @@ pub fn run_case(
 /// mergetool case as a failure though stock could not reproduce its own state.
 ///
 /// The alternative would be hand-written masks per pattern, which have to be
-/// maintained and quietly widen. Asking the oracle to reproduce itself needs no
-/// pattern and cannot be aimed at a real difference: if stock agrees with stock
-/// on both surfaces, this returns false and the original verdict stands.
-fn stock_disagrees_with_itself(
+/// maintained and quietly widen. Asking a binary to reproduce itself needs no
+/// pattern and cannot be aimed at a real difference: if the two runs agree on
+/// both surfaces, [`repeat_disagreement`] says so and the original verdict stands.
+///
+/// `sub` names the repeat's own directory under the worker's workdir, so the two
+/// sides' repeats never share a repo with each other or with the first runs —
+/// and the normalization is done against *that* repo's path, because a digest
+/// that still carries the repeat's own root would differ from the first run's for
+/// no reason but its location.
+fn repeat_side(
+    bin: &Path,
     case: &Case,
     templates: &Templates,
     workdir: &Path,
-    first_stdout: &str,
-    first_state: &str,
-) -> Result<bool> {
-    let repo = workdir.join("stock-repeat");
+    sub: &str,
+    exec_dir: &Path,
+) -> Result<Repeat> {
+    let repo = workdir.join(sub);
     let _ = std::fs::remove_dir_all(&repo);
     templates.instantiate(case.shape, &repo)?;
     let home = &templates.home;
-    let again = run_side(crate::stock::git()?, &repo, home, &case.args, case.stdin, case.cwd, case.env)?;
-    if normalize(&again.stdout, &repo, home, stock_exec_dir(home)) != *first_stdout {
-        return Ok(true);
-    }
-    let again_state = normalize(probe_state(&repo, home).as_bytes(), &repo, home, stock_exec_dir(home));
-    Ok(again_state != *first_state)
+    let again = run_side(bin, &repo, home, case)?;
+    Ok(Repeat {
+        timed_out: again.timed_out,
+        code: again.code,
+        stdout: normalize(&again.stdout, &repo, home, exec_dir),
+        state: normalize(probe_state(&repo, home).as_bytes(), &repo, home, exec_dir),
+        // Filled by `judge`, which is the only caller holding the first run.
+        disagreement: None,
+    })
 }
 
 /// Locate the zvcs `git` binary. Explicit override wins; otherwise the usual
@@ -1077,8 +1535,210 @@ pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_unsupported, probe_op_state, OP_STATE_DIRS, OP_STATE_FILES};
+    use super::{
+        case_timeout, is_unsupported, judge, probe_op_state, repeat_disagreement, Case, Compared,
+        Repeat, Surface, Verdict, CASE_TIMEOUT, OP_STATE_DIRS, OP_STATE_FILES,
+    };
+    use crate::fixture::Shape;
     use std::path::PathBuf;
+    use std::time::Duration;
+
+    /// A side that answered, with the surfaces spelled out. Everything the
+    /// classification reads and nothing else — no binary, no repo, no clock, so
+    /// these tests can never flake on the thing they exist to detect.
+    fn side<'a>(code: i32, stdout: &'a str, state: &'a str) -> Compared<'a> {
+        Compared { timed_out: false, code: Some(code), stdout, stderr: "", state }
+    }
+
+    /// A side the harness killed. `stdout` is whatever it managed to write before
+    /// the kill — deliberately non-empty in the tests, because the bug being
+    /// guarded is a partial capture reaching the diff.
+    fn killed(stdout: &str) -> Compared<'_> {
+        Compared { timed_out: true, code: None, stdout, stderr: "", state: "" }
+    }
+
+    fn repeat(stdout: &str, state: &str) -> Repeat {
+        Repeat {
+            timed_out: false,
+            code: Some(0),
+            stdout: stdout.to_string(),
+            state: state.to_string(),
+            disagreement: None,
+        }
+    }
+
+    /// A repeat the harness killed: partial stdout, nothing else.
+    fn killed_repeat() -> Repeat {
+        Repeat { timed_out: true, code: None, stdout: "half".into(), ..repeat("", "") }
+    }
+
+    /// Two zvcs runs that disagree are a flake, not the content difference the
+    /// first run made them look like.
+    ///
+    /// This is the whole point of the symmetric repeat: before it, `merge` and
+    /// `filter-branch` cases that no two runs agreed on were reported as a
+    /// state-diff and a stdout-diff and were handed on as bugs to chase.
+    #[test]
+    fn a_zvcs_side_that_disagrees_with_itself_lands_in_the_flake_bucket() {
+        // Differing stdout: stock reproduces itself, zvcs does not.
+        let (v, r) = judge(
+            false,
+            &side(0, "stock\n", "S"),
+            &side(0, "zvcs-a\n", "S"),
+            &mut || Ok(repeat("stock\n", "S")),
+            &mut || Ok(repeat("zvcs-b\n", "S")),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::ZvcsNondeterministic);
+        assert_eq!(r.unwrap().disagreement, Some(Surface::Stdout));
+
+        // Differing post-state, identical stdout — the `merge` shape of the bug.
+        let (v, r) = judge(
+            false,
+            &side(0, "same\n", "stock-state"),
+            &side(0, "same\n", "zvcs-state-a"),
+            &mut || Ok(repeat("same\n", "stock-state")),
+            &mut || Ok(repeat("same\n", "zvcs-state-b")),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::ZvcsNondeterministic);
+        assert_eq!(r.unwrap().disagreement, Some(Surface::State));
+    }
+
+    /// A difference both sides reproduce keeps the content verdict it earned.
+    /// The repeat may only ever explain a failure, never dissolve one.
+    #[test]
+    fn a_reproducible_difference_keeps_its_content_verdict() {
+        for (stock, zvcs, want) in [
+            (side(0, "a\n", "S"), side(0, "b\n", "S"), Verdict::StdoutDiff),
+            (side(0, "a\n", "S"), side(0, "a\n", "T"), Verdict::StateDiff),
+            (side(0, "a\n", "S"), side(1, "a\n", "S"), Verdict::ExitDiff),
+        ] {
+            let (v, r) = judge(
+                false,
+                &stock,
+                &zvcs,
+                &mut || Ok(repeat(stock.stdout, stock.state)),
+                &mut || Ok(repeat(zvcs.stdout, zvcs.state)),
+            )
+            .unwrap();
+            assert_eq!(v, want);
+            // The repeat is kept even when it agreed: "this failure reproduced"
+            // is the fact a reader wants attached to it.
+            assert_eq!(r.unwrap().disagreement, None);
+        }
+    }
+
+    /// A killed child's partial output must never be reportable as a content
+    /// difference. Both timeout arms sit above every byte comparison, so the
+    /// half-written stdout below cannot become the verdict.
+    #[test]
+    fn a_timed_out_side_lands_in_the_timeout_bucket_not_a_content_bucket() {
+        // Stock killed: not a verdict about zvcs at all, and no repeat is worth
+        // taking — the oracle never answered once.
+        let (v, r) = judge(
+            false,
+            &killed("partial"),
+            &side(0, "full\n", "S"),
+            &mut || panic!("no repeat is taken for a timeout"),
+            &mut || panic!("no repeat is taken for a timeout"),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::StockTimeout);
+        assert!(r.is_none());
+
+        // zvcs killed: a hang, never a stdout-diff against its own truncated output.
+        let (v, r) = judge(
+            false,
+            &side(0, "full\n", "S"),
+            &killed("partial"),
+            &mut || panic!("no repeat is taken for a timeout"),
+            &mut || panic!("no repeat is taken for a timeout"),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::Hang);
+        assert!(r.is_none());
+    }
+
+    /// A repeat that hit the timeout is evidence of nothing, in either direction.
+    ///
+    /// Its partial stdout differs from a complete run's every time, so accepting
+    /// it would let a loaded machine manufacture "stock does not reproduce
+    /// itself" out of a real zvcs failure and drop it from the denominator —
+    /// which is what the stock repeat did before it looked at `timed_out`.
+    #[test]
+    fn a_repeat_that_timed_out_proves_nothing() {
+        assert_eq!(repeat_disagreement("full\n", "S", &killed_repeat()), None);
+
+        // Stock's repeat killed: the measured difference stands, un-excluded.
+        let (v, _) = judge(
+            false,
+            &side(0, "stock\n", "S"),
+            &side(0, "zvcs\n", "S"),
+            &mut || Ok(killed_repeat()),
+            &mut || Ok(repeat("zvcs\n", "S")),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::StdoutDiff);
+
+        // zvcs's repeat killed: not a flake either, for the same reason.
+        let (v, _) = judge(
+            false,
+            &side(0, "stock\n", "S"),
+            &side(0, "zvcs\n", "S"),
+            &mut || Ok(repeat("stock\n", "S")),
+            &mut || Ok(killed_repeat()),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::StdoutDiff);
+    }
+
+    /// When neither side reproduces itself, the stock finding wins and the zvcs
+    /// repeat is not even taken: no implementation can match a value stock does
+    /// not stably produce, so its answer could not change anything.
+    #[test]
+    fn stock_nondeterminism_outranks_a_zvcs_flake() {
+        let (v, r) = judge(
+            false,
+            &side(0, "stock-a\n", "S"),
+            &side(0, "zvcs-a\n", "S"),
+            &mut || Ok(repeat("stock-b\n", "S")),
+            &mut || panic!("the zvcs repeat must not be taken once stock has disagreed with itself"),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::Nondeterministic);
+        assert!(r.is_none());
+    }
+
+    /// The repeat is failure-triggered. A matching case pays for neither side's
+    /// second run — the property that keeps a full sweep from doubling.
+    #[test]
+    fn a_matching_case_takes_no_repeat_at_all() {
+        let (v, r) = judge(
+            false,
+            &side(0, "same\n", "S"),
+            &side(0, "same\n", "S"),
+            &mut || panic!("a match must not pay for a repeat"),
+            &mut || panic!("a match must not pay for a repeat"),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::Match);
+        assert!(r.is_none());
+    }
+
+    /// The sleep allowance is additive and reaches exactly the commands whose
+    /// correct behaviour includes sleeping — never a global ceiling raise, which
+    /// would buy every other command a budget that hides a real hang.
+    #[test]
+    fn the_sleep_allowance_reaches_only_the_commands_that_sleep() {
+        let case = |cmd| Case::new(cmd, &[cmd], Shape::Linear);
+        assert_eq!(case_timeout(&case("status")), CASE_TIMEOUT);
+        assert_eq!(case_timeout(&case("merge")), CASE_TIMEOUT);
+        // `git-filter-branch.sh` sleeps 10s before doing anything; the port
+        // reproduces it (`porcelain/filter_branch.rs:587`).
+        assert_eq!(case_timeout(&case("filter-branch")), CASE_TIMEOUT + Duration::from_secs(10));
+    }
+
 
     /// A scratch `.git` tree. The probe only reads the filesystem, so the test
     /// needs no git binary, no network and no fixture — just a temp directory.

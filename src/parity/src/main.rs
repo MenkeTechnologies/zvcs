@@ -140,7 +140,8 @@ fn real_main() -> Result<ExitCode> {
 
     // Cases are independent, so they run across a worker pool. Each worker owns
     // its own workdir subtree (run/w<k>), so the fixed `stock`/`zvcs`/
-    // `stock-repeat` child dirs `run_case` uses never collide between threads.
+    // `stock-repeat`/`zvcs-repeat` child dirs `run_case` uses never collide
+    // between threads.
     // Results are written back by original index, so the report is identical to
     // a sequential run regardless of scheduling — determinism is preserved.
     let n_workers = std::thread::available_parallelism()
@@ -254,13 +255,30 @@ fn real_main() -> Result<ExitCode> {
             if f.verdict == runner::Verdict::Unsupported {
                 continue;
             }
+            // Neither does a case nothing could measure, or one zvcs does not
+            // reproduce: shrinking searches for the smallest case that still
+            // fails, and a predicate that answers from a coin flip walks to
+            // whichever argv flaked next and prints it as the culprit.
+            if !f.verdict.is_measured_failure() {
+                continue;
+            }
             let minimal = fuzz::shrink(&f.case, &mut |c| {
                 run_case(c, &zvcs_bin, &templates, &shrink_dir)
-                    .map(|o| !o.verdict.is_match())
+                    // `is_measured_failure`, not `!is_match`: a re-run that timed
+                    // out its own oracle, or that zvcs answered differently this
+                    // time, is not evidence the dropped argument mattered.
+                    .map(|o| o.verdict.is_measured_failure())
                     .unwrap_or(false)
             });
-            if minimal.args.len() < f.case.args.len() {
-                println!("  {} → git {}", f.case.id(), minimal.args.join(" "));
+            // Compared on `size()`, not on argv length: the shrinker also drops
+            // config keys, global options, environment variables, the working
+            // directory and the stdin payload, and a run that peeled four config
+            // keys off a one-flag case reduced nothing by the old measure.
+            if minimal.size() < f.case.size() {
+                // Both ids in full. The minimal case's argv alone would not say
+                // which environment or working directory survived, and those are
+                // now as likely to be the responsible fact as a flag is.
+                println!("  {} → {}", f.case.id(), minimal.id());
             }
         }
     }

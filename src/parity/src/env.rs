@@ -115,9 +115,33 @@ mod tests {
     /// The variables that select a repository are deliberately *not* pinned:
     /// `harden` clears the environment, so a case that sets one is adding a fact
     /// both sides see rather than overriding a determinism guarantee.
+    ///
+    /// The list is every `GIT_*` variable the fuzzer draws from
+    /// (`fuzz::ENV_VARS`) plus `GIT_COMMON_DIR`, which the curated discovery
+    /// cases reach. Pinning any one of them in `harden` would make the sampled
+    /// dimension unreachable *and* trip the runner's assertion on every case that
+    /// drew it, so the two lists are checked against each other here rather than
+    /// discovered at run time.
     #[test]
     fn repository_selection_vars_are_not_pinned() {
-        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES", "GIT_COMMON_DIR"] {
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_NAMESPACE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ADVICE",
+            "GIT_ATTR_NOSYSTEM",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_FLUSH",
+        ] {
             assert!(!is_pinned(key), "{key} must stay settable by a case");
         }
     }

@@ -11,7 +11,7 @@
 //! together and `Unsupported` counts as a failure rather than a skip.
 
 use crate::env;
-use crate::runner::{Outcome, Verdict};
+use crate::runner::{Outcome, Surface, Verdict};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -81,6 +81,16 @@ pub struct Tally {
     /// counted apart from it because the cause is the machine, not stock.
     pub stock_timeout: usize,
     pub hang: usize,
+    /// Cases where **zvcs** did not reproduce its own stdout or post-state while
+    /// stock reproduced its own.
+    ///
+    /// Inside the denominator, counted as a failure — see
+    /// [`Verdict::ZvcsNondeterministic`] for the argument. Its own field rather
+    /// than a share of `stdout_diff`/`state_diff` because "zvcs is wrong here"
+    /// and "this case is not measurable" are different findings and a reader has
+    /// to be able to tell them apart at a glance; folding a flake into a content
+    /// bucket is how two non-bugs came to be filed as defects.
+    pub zvcs_nondeterministic: usize,
 }
 
 impl Tally {
@@ -96,6 +106,11 @@ impl Tally {
     /// match, and scoring them against zvcs would understate parity as surely
     /// as passing them would overstate it. The count is always printed beside
     /// the percentage so the exclusion is visible, never inferred.
+    ///
+    /// A zvcs-side flake is **in** this number, as a failure. The exclusion above
+    /// is safe only because nothing zvcs does can trigger it; an exclusion the
+    /// binary under test can trigger itself would pay a randomly-wrong port in
+    /// removed cases.
     pub fn scored(&self) -> usize {
         self.matched
             + self.unsupported
@@ -105,6 +120,7 @@ impl Tally {
             + self.stderr_diff
             + self.crash
             + self.hang
+            + self.zvcs_nondeterministic
     }
 
     fn record(&mut self, v: Verdict) {
@@ -117,6 +133,7 @@ impl Tally {
             Verdict::StderrDiff => self.stderr_diff += 1,
             Verdict::Crash => self.crash += 1,
             Verdict::Hang => self.hang += 1,
+            Verdict::ZvcsNondeterministic => self.zvcs_nondeterministic += 1,
             Verdict::Nondeterministic => self.nondeterministic += 1,
             Verdict::StockTimeout => self.stock_timeout += 1,
         }
@@ -195,14 +212,27 @@ impl Report {
             pct_str(self.overall.matched, self.overall.scored())
         );
         println!(
-            "           unsupported={} stdout-diff={} exit-diff={} state-diff={} crash={} hang={}",
+            "           unsupported={} stdout-diff={} exit-diff={} state-diff={} crash={} \
+             hang={} zvcs-flaky={}",
             self.overall.unsupported,
             self.overall.stdout_diff,
             self.overall.exit_diff,
             self.overall.state_diff,
             self.overall.crash,
-            self.overall.hang
+            self.overall.hang,
+            self.overall.zvcs_nondeterministic
         );
+        // Three separate lines, never one "unmeasured" total: they mean different
+        // things and only one of them is counted. Reading a single number here
+        // would leave a reader unable to tell an oracle that would not answer from
+        // a port that will not answer the same way twice.
+        if self.overall.zvcs_nondeterministic > 0 {
+            println!(
+                "           zvcs-flaky is inside the parity denominator above: zvcs did not \
+                 reproduce its own stdout or post-state while stock reproduced its own — \
+                 counted as failures, never as matches; `--verbose` names them"
+            );
+        }
         if self.overall.nondeterministic > 0 {
             println!(
                 "           excluded={} (stock git does not reproduce these itself)",
@@ -218,11 +248,11 @@ impl Report {
         }
 
         println!("\n--- per subcommand ---");
-        println!("{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7}", "cmd", "total", "match", "unsupp", "out", "exit", "state", "parity");
+        println!("{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>6} {:>7}", "cmd", "total", "match", "unsupp", "out", "exit", "state", "flaky", "parity");
         for (cmd, t) in &self.by_cmd {
             println!(
-                "{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>6.1}%",
-                cmd, t.scored(), t.matched, t.unsupported, t.stdout_diff, t.exit_diff, t.state_diff, t.pct()
+                "{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6.1}%",
+                cmd, t.scored(), t.matched, t.unsupported, t.stdout_diff, t.exit_diff, t.state_diff, t.zvcs_nondeterministic, t.pct()
             );
         }
 
@@ -230,6 +260,31 @@ impl Report {
             println!("\n--- not dispatched ({}) ---", missing.len());
             for chunk in missing.chunks(8) {
                 println!("  {}", chunk.join(" "));
+            }
+        }
+
+        // Every case nothing could score, and every case zvcs would not answer
+        // twice the same way, by name and with the reason attached.
+        //
+        // The summary above prints counts, and a count with no names is
+        // indistinguishable from coverage: "excluded=7" reads as housekeeping,
+        // while seven ids under a heading that says why reads as seven cases
+        // nobody measured. Printed ahead of the failures block because a reader
+        // scanning a failing run needs to know what is *not* in it first.
+        if verbose {
+            let unscored: Vec<&Outcome> = self
+                .failures
+                .iter()
+                .filter(|f| f.verdict.exclusion_reason().is_some())
+                .collect();
+            if !unscored.is_empty() {
+                println!("\n--- unmeasurable + flaky ({}) ---", unscored.len());
+                for f in unscored {
+                    println!("  [{}] {}", f.verdict.label(), f.case.id());
+                    if let Some(reason) = f.verdict.exclusion_reason() {
+                        println!("      {reason}");
+                    }
+                }
             }
         }
 
@@ -251,6 +306,42 @@ impl Report {
                     for (a, b) in state_diff_lines(&f.stock_state, &f.zvcs_state).iter().take(6) {
                         println!("     stock| {a}");
                         println!("     zvcs | {b}");
+                    }
+                }
+                // What the second zvcs run did. On a flake this is the whole
+                // finding — the report has to show what differed between the two
+                // zvcs runs, or "not reproducible" is an assertion rather than
+                // evidence. On every other failure it is the confirmation that
+                // the failure is worth an afternoon.
+                if let Some(r) = &f.zvcs_repeat {
+                    match r.disagreement {
+                        Some(Surface::Stdout) => {
+                            println!("  !! zvcs did not reproduce its own {}", Surface::Stdout.name());
+                            println!("  zvcs  stdout (run 1):\n{}", clip(&f.zvcs_stdout, 12));
+                            println!("  zvcs  stdout (run 2):\n{}", clip(&r.stdout, 12));
+                        }
+                        Some(Surface::State) => {
+                            println!("  !! zvcs did not reproduce its own {}", Surface::State.name());
+                            for (a, b) in state_diff_lines(&f.zvcs_state, &r.state).iter().take(6) {
+                                println!("     run 1| {a}");
+                                println!("     run 2| {b}");
+                            }
+                        }
+                        None if r.timed_out => println!(
+                            "  !! zvcs repeat hit the case timeout — no conclusion drawn from it"
+                        ),
+                        None => println!("  (zvcs reproduced this exactly on a second run)"),
+                    }
+                    // Shown, never judged: the repeat compares stdout and
+                    // post-state only (`repeat_disagreement`), so an exit code
+                    // that moved between the two runs is information the reader
+                    // needs and not a reason the case is in the bucket it is in.
+                    if r.code != f.zvcs_code {
+                        println!(
+                            "  note: zvcs exit code differed between its own two runs \
+                             (run 1={:?} run 2={:?}); not one of the surfaces the repeat judges",
+                            f.zvcs_code, r.code
+                        );
                     }
                 }
                 // Both stderrs are shown, not compared: reading them side by
@@ -382,7 +473,7 @@ pub fn emit_html(
         let _ = write!(
             cmd_rows,
             "<tr data-h=\"{h}\"><td class=\"cmd\">{c}</td><td>{tot}</td><td>{m}</td>\
-             <td>{o}</td><td>{e}</td><td>{s}</td><td class=\"{cls}\">{p}</td></tr>",
+             <td>{o}</td><td>{e}</td><td>{s}</td><td>{f}</td><td class=\"{cls}\">{p}</td></tr>",
             h = esc(cmd),
             c = esc(cmd),
             tot = t.scored(),
@@ -390,6 +481,10 @@ pub fn emit_html(
             o = t.stdout_diff,
             e = t.exit_diff,
             s = t.state_diff,
+            // Its own column rather than folded into the diff columns: a row whose
+            // gap between `cases` and `match` is explained by nothing else visible
+            // sends a reader looking for a bug that is not there.
+            f = t.zvcs_nondeterministic,
             cls = cls,
             p = pct_str(t.matched, t.scored()),
         );
@@ -495,7 +590,7 @@ pub fn emit_html(
     // Per-command parity table (HUD .file-table).
     let _ = write!(html, "<h3 class=\"section-h\">Per-command parity — {corpus_cmds} commands with corpus cases</h3>\n");
     html.push_str("<div class=\"controls\"><input id=\"q\" type=\"search\" placeholder=\"// filter commands…\" autocomplete=\"off\" spellcheck=\"false\"><span id=\"cnt\"></span></div>\n");
-    html.push_str("<table class=\"file-table\" id=\"tbl\"><thead><tr><th>command</th><th>cases</th><th>match</th><th>out&ne;</th><th>exit&ne;</th><th>state&ne;</th><th>parity</th></tr></thead><tbody>\n");
+    html.push_str("<table class=\"file-table\" id=\"tbl\"><thead><tr><th>command</th><th>cases</th><th>match</th><th>out&ne;</th><th>exit&ne;</th><th>state&ne;</th><th title=\"zvcs did not reproduce its own output or post-state on a second run; counted as failures\">flaky</th><th>parity</th></tr></thead><tbody>\n");
     html.push_str(&cmd_rows);
     html.push_str("</tbody></table>\n");
 
@@ -1006,3 +1101,97 @@ const REPORT_JS: &str = r#"
  bindDetails('q3','cnt3','cfgmatrix');
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::Tally;
+    use crate::runner::Verdict;
+
+    /// Where each verdict lands in the two numbers that matter: the numerator
+    /// (`matched`) and the denominator (`scored`).
+    ///
+    /// The zvcs flake is the one this pins down. It has to be *inside* the
+    /// denominator — an exclusion the binary under test can trigger itself would
+    /// pay a randomly-wrong port in removed cases — and it must never be inside
+    /// the numerator. The two stock-side buckets stay outside both, and outside
+    /// is only defensible because nothing zvcs does can reach them.
+    #[test]
+    fn a_flake_is_counted_as_a_failure_and_never_as_a_match() {
+        let mut t = Tally::default();
+        for v in [
+            Verdict::Match,
+            Verdict::StdoutDiff,
+            Verdict::ZvcsNondeterministic,
+            Verdict::Nondeterministic,
+            Verdict::StockTimeout,
+        ] {
+            t.record(v);
+        }
+        assert_eq!(t.matched, 1);
+        assert_eq!(t.zvcs_nondeterministic, 1);
+        // match + stdout-diff + flake; the two stock-side buckets are excluded.
+        assert_eq!(t.scored(), 3);
+        // …but every case run is still visible in the total, so an exclusion can
+        // never make a case disappear from the report.
+        assert_eq!(t.total(), 5);
+        assert!((t.pct() - 100.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// A run that is all flake reports 0% parity, not 100% of an empty
+    /// denominator — the shape of hole an exclusion would open.
+    #[test]
+    fn an_all_flake_command_scores_zero_not_a_vacuous_hundred() {
+        let mut t = Tally::default();
+        t.record(Verdict::ZvcsNondeterministic);
+        t.record(Verdict::ZvcsNondeterministic);
+        assert_eq!(t.scored(), 2);
+        assert_eq!(t.pct(), 0.0);
+    }
+
+    /// The denominator and the "nothing could be measured" predicate must agree,
+    /// verdict for verdict. They are written in two different files — `scored()`
+    /// sums fields here, `is_unmeasurable` names verdicts there — and a new
+    /// verdict added to one and forgotten in the other silently moves the parity
+    /// number without anybody choosing to.
+    ///
+    /// The `match` is what keeps the list below honest: it is exhaustive, so a
+    /// new variant fails to compile until it is listed here too.
+    #[test]
+    fn the_denominator_and_the_unmeasurable_predicate_agree() {
+        let every = [
+            Verdict::Match,
+            Verdict::Unsupported,
+            Verdict::StdoutDiff,
+            Verdict::ExitDiff,
+            Verdict::StateDiff,
+            Verdict::StderrDiff,
+            Verdict::Crash,
+            Verdict::Hang,
+            Verdict::ZvcsNondeterministic,
+            Verdict::Nondeterministic,
+            Verdict::StockTimeout,
+        ];
+        for v in every {
+            match v {
+                Verdict::Match
+                | Verdict::Unsupported
+                | Verdict::StdoutDiff
+                | Verdict::ExitDiff
+                | Verdict::StateDiff
+                | Verdict::StderrDiff
+                | Verdict::Crash
+                | Verdict::Hang
+                | Verdict::ZvcsNondeterministic
+                | Verdict::Nondeterministic
+                | Verdict::StockTimeout => {}
+            }
+            let mut t = Tally::default();
+            t.record(v);
+            assert_eq!(t.scored(), usize::from(!v.is_unmeasurable()), "{}", v.label());
+            // Whatever the bucket, the case is still visible in the total.
+            assert_eq!(t.total(), 1, "{}", v.label());
+            // And only an actual match may reach the numerator.
+            assert_eq!(t.matched, usize::from(v.is_match()), "{}", v.label());
+        }
+    }
+}

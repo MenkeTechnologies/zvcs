@@ -356,6 +356,98 @@ pub fn cases() -> Vec<Case> {
     shape_reach::cases(&mut c);
     transport_local::cases(&mut c);
     worktree_index::cases(&mut c);
+    config_and_globals(&mut c);
+
+    // ---- format-patch: the three ways of naming where the series goes ----
+    //
+    // `-o`/`--output-directory` is not an `OPT_STRING` — it is a callback that
+    // refuses to overwrite a value it already holds
+    // (`output_directory_callback()`, builtin/log.c:1593-1603), so a second one
+    // is `fatal: two output directories?` (128) rather than "last one wins".
+    // Every case below was exit 0 here until that callback was ported, which is
+    // the shape of failure the corpus is least likely to catch by accident:
+    // `-o` alone already had a case, and it passed.
+    //
+    // The die fires inside `parse_options()`, which walks the whole argv before
+    // `setup_revisions()` runs, so it preempts what comes after it on the line —
+    // hence the trailing revision-shaped junk on one of them.
+    for shape in [Shape::Branched, Shape::Dirty] {
+        // The reported fuzz case, plus the same duplicate in each of the four
+        // spellings the option has. All four reach the one callback, so a port
+        // that guards only the separate-argument form still fails here.
+        c.push(Case::new("format-patch", &["format-patch", "-o", "patches", "-o", "patches"], shape));
+        c.push(Case::new(
+            "format-patch",
+            &["format-patch", "-o", "patches", "--indent-heuristic", "-o", "patches"],
+            shape,
+        ));
+        c.push(Case::new(
+            "format-patch",
+            &["format-patch", "--output-directory=patches", "-o", "other", "-1"],
+            shape,
+        ));
+        c.push(Case::new("format-patch", &["format-patch", "-opatches", "-oother", "-1"], shape));
+        // `*dir` is a pointer test, so the empty string is a directory too.
+        c.push(Case::new("format-patch", &["format-patch", "-o", "", "-o", "patches", "-1"], shape));
+        // Preemption: the second `-o` is reached during option parsing, before
+        // the revision `nosuchrev` is resolved.
+        c.push(Case::new(
+            "format-patch",
+            &["format-patch", "-o", "patches", "-o", "other", "nosuchrev"],
+            shape,
+        ));
+        // …and before the `--stdout` incompatibility check, which runs after
+        // `parse_options()` returns (builtin/log.c:2250-2251).
+        c.push(Case::new(
+            "format-patch",
+            &["format-patch", "--stdout", "-o", "patches", "-o", "other", "-1"],
+            shape,
+        ));
+
+        // `die_for_incompatible_opt3(use_stdout, "--stdout", close_file,
+        // "--output", !!output_directory, "--output-directory")` — the wording
+        // depends on how many of the three were named
+        // (`die_for_incompatible_opt4()`, parse-options.c:1528-1558), and
+        // `--output` with `--output-directory` was not being caught at all.
+        c.push(Case::new(
+            "format-patch",
+            &["format-patch", "--stdout", "--output", "s.patch", "--output-directory", "d", "-1"],
+            shape,
+        ));
+        c.push(Case::new(
+            "format-patch",
+            &["format-patch", "--output", "s.patch", "--output-directory", "d", "-1"],
+            shape,
+        ));
+        c.push(Case::new(
+            "format-patch",
+            &["format-patch", "--stdout", "--output-directory", "d", "-1"],
+            shape,
+        ));
+
+        // The two that must still be accepted, so the guard cannot be "refuse
+        // `-o`": one `-o`, and `format.outputDirectory` beside it. The config is
+        // a *different* variable (`cfg.config_output_directory`, builtin/log.c:895)
+        // merged in only at builtin/log.c:2261-2262 — after both checks above —
+        // so it is neither a second output directory nor a reason to refuse
+        // `--stdout`.
+        c.push(Case::new("format-patch", &["format-patch", "-o", "patches", "-1"], shape));
+        c.push(Case::new(
+            "format-patch",
+            &["-c", "format.outputDirectory=cfgdir", "format-patch", "-o", "patches", "-1"],
+            shape,
+        ));
+        c.push(Case::new(
+            "format-patch",
+            &["-c", "format.outputDirectory=cfgdir", "format-patch", "--stdout", "-1"],
+            shape,
+        ));
+        c.push(Case::new(
+            "format-patch",
+            &["-c", "format.outputDirectory=cfgdir", "format-patch", "-1"],
+            shape,
+        ));
+    }
 
     c
 }
@@ -573,4 +665,155 @@ fn stdin_driven(c: &mut Vec<Case>) {
     si("fmt-merge-msg", &["fmt-merge-msg"], Shape::Branched,
        b"0000000000000000000000000000000000000000\t\tbranch 'feature' of ../upstream\n", c);
     si("fmt-merge-msg", &["fmt-merge-msg"], Shape::Branched, b"not a fetch-head line\n", c);
+}
+
+// ---------------------------------------------------------------------------
+// Configuration and global options
+// ---------------------------------------------------------------------------
+//
+// `-c key=value` and the options `git.c:handle_options` parses before the verb
+// are sampled across every grammar by the fuzzer, which is breadth. This is the
+// floor underneath it: a handful of settings and options whose effect on stdout
+// is unmistakable, on shapes chosen so the effect has something to act on.
+//
+// The point of curating them as well as sampling them is that a port which
+// ignores `-c` outright, or which never reaches `handle_options` at all, fails
+// here on a named case in every run — instead of failing on whichever sampled
+// combination happens to be drawn under this seed.
+
+/// One case per (config, argv, shape) triple.
+fn cfg(
+    cmd: &'static str,
+    config: &[(&str, &str)],
+    args: &[&str],
+    shape: Shape,
+    out: &mut Vec<Case>,
+) {
+    out.push(Case::new(cmd, args, shape).with_config(config));
+}
+
+/// One case per (global options, argv, shape) triple.
+fn glob(
+    cmd: &'static str,
+    globals: &[&[&str]],
+    args: &[&str],
+    shape: Shape,
+    out: &mut Vec<Case>,
+) {
+    out.push(Case::new(cmd, args, shape).with_globals(globals));
+}
+
+/// Configuration keys and global options whose effect is visible on stdout.
+fn config_and_globals(out: &mut Vec<Case>) {
+    // ---- core.abbrev: the width of every id git prints ----
+    // Two widths, so a port that hard-codes 7 fails one of them whichever it
+    // picked, and `40`/`no` which ask for no abbreviation at all.
+    cfg("log", &[("core.abbrev", "12")], &["log", "--oneline", "-1"], Shape::Branched, out);
+    cfg("log", &[("core.abbrev", "4")], &["log", "--oneline", "-1"], Shape::Branched, out);
+    cfg("rev-parse", &[("core.abbrev", "16")], &["rev-parse", "--short", "HEAD"], Shape::Linear, out);
+    cfg("rev-parse", &[("core.abbrev", "no")], &["rev-parse", "--short", "HEAD"], Shape::Linear, out);
+    cfg("ls-tree", &[("core.abbrev", "10")], &["ls-tree", "--abbrev", "HEAD"], Shape::Linear, out);
+
+    // ---- diff.renames: whether a rename is a rename ----
+    // On the one shape that contains renames, so the setting decides between
+    // `R100 orig/alpha.txt moved/alpha.txt` and a delete plus an add.
+    for value in ["true", "false", "copies"] {
+        cfg(
+            "diff",
+            &[("diff.renames", value)],
+            &["diff", "--name-status", "HEAD~2", "HEAD"],
+            Shape::Renamed,
+            out,
+        );
+    }
+    // A limit of one pair, which git reports by refusing to detect at all.
+    cfg(
+        "diff",
+        &[("diff.renames", "true"), ("diff.renameLimit", "1")],
+        &["diff", "--name-status", "HEAD~2", "HEAD"],
+        Shape::Renamed,
+        out,
+    );
+
+    // ---- diff hunk shape ----
+    cfg("diff", &[("diff.context", "1")], &["diff", "HEAD~1", "HEAD"], Shape::Renamed, out);
+    cfg("diff", &[("diff.noprefix", "true")], &["diff", "HEAD~1", "HEAD"], Shape::Renamed, out);
+    cfg("diff", &[("diff.mnemonicPrefix", "true")], &["diff", "HEAD"], Shape::Dirty, out);
+    for algo in ["patience", "histogram", "minimal"] {
+        cfg("diff", &[("diff.algorithm", algo)], &["diff", "HEAD~1", "HEAD"], Shape::Whitespace, out);
+    }
+
+    // ---- status: what the most-read porcelain decides to print ----
+    for value in ["no", "normal", "all"] {
+        cfg("status", &[("status.showUntrackedFiles", value)], &["status", "--porcelain"], Shape::Dirty, out);
+    }
+    cfg("status", &[("status.short", "true")], &["status"], Shape::Dirty, out);
+    cfg("status", &[("status.short", "true"), ("status.branch", "true")], &["status"], Shape::Dirty, out);
+    cfg("status", &[("status.relativePaths", "false")], &["status"], Shape::Dirty, out);
+    // Colour is otherwise unreachable: `env::harden` sets `NO_COLOR` and pins
+    // `TERM=dumb`, so `color.ui=always` is the only way a case asks for escape
+    // sequences — and it is the one value that overrides both.
+    cfg("status", &[("color.ui", "always")], &["status", "--short"], Shape::Dirty, out);
+
+    // ---- log: the defaults every walk inherits ----
+    cfg("log", &[("log.abbrevCommit", "true")], &["log", "-1"], Shape::Branched, out);
+    cfg("log", &[("log.decorate", "full")], &["log", "--oneline", "-2"], Shape::Branched, out);
+    cfg("log", &[("log.decorate", "no")], &["log", "--oneline", "-2"], Shape::Branched, out);
+    for value in ["iso", "short", "raw", "unix"] {
+        cfg("log", &[("log.date", value)], &["log", "-1", "--pretty=%ad"], Shape::Branched, out);
+    }
+    // `pretty.<name>` defines a format that `--pretty=<name>` then resolves, so
+    // one key reaches the whole placeholder language from the config side.
+    cfg("log", &[("pretty.custom", "%H %s")], &["log", "-1", "--pretty=custom"], Shape::Branched, out);
+
+    // ---- path quoting, on the shape whose paths need quoting ----
+    for value in ["true", "false"] {
+        cfg("ls-files", &[("core.quotePath", value)], &["ls-files"], Shape::AwkwardPaths, out);
+        cfg("status", &[("core.quotePath", value)], &["status", "--porcelain"], Shape::AwkwardPaths, out);
+    }
+
+    // ---- ref ordering ----
+    cfg("tag", &[("tag.sort", "-refname")], &["tag", "--list"], Shape::Branched, out);
+    cfg("branch", &[("branch.sort", "-refname")], &["branch", "--list"], Shape::Branched, out);
+
+    // ---- merge conflict rendering ----
+    for style in ["merge", "diff3", "zdiff3"] {
+        cfg("diff", &[("merge.conflictStyle", style)], &["diff"], Shape::Conflicted, out);
+    }
+
+    // ---- global options: the half of argv that precedes the subcommand ----
+    glob("log", &[&["--no-pager"]], &["log", "--oneline", "-1"], Shape::Branched, out);
+    glob("log", &[&["-P"]], &["log", "--oneline", "-1"], Shape::Branched, out);
+    glob("status", &[&["--no-optional-locks"]], &["status", "--porcelain"], Shape::Dirty, out);
+    glob("log", &[&["--no-replace-objects"]], &["log", "--oneline", "-1"], Shape::Linear, out);
+    glob("status", &[&["--no-advice"]], &["status"], Shape::Conflicted, out);
+
+    // `-C` moves before anything else happens, so `--show-prefix` reports where
+    // it landed — the one query that separates "changed directory" from
+    // "accepted the option and ignored it".
+    glob("rev-parse", &[&["-C", "src"]], &["rev-parse", "--show-prefix"], Shape::Linear, out);
+    glob("rev-parse", &[&["-C", "src"]], &["rev-parse", "--show-cdup"], Shape::Linear, out);
+    glob("status", &[&["-C", "src"]], &["status", "--porcelain"], Shape::Dirty, out);
+    // `--git-dir` and `--work-tree` after a `-C`, which is where their relative
+    // resolution is decided.
+    glob("rev-parse", &[&["-C", "src"], &["--git-dir=../.git"]], &["rev-parse", "--git-dir"], Shape::Linear, out);
+    glob("rev-parse", &[&["--git-dir=.git"], &["--work-tree=."]], &["rev-parse", "--show-toplevel"], Shape::Linear, out);
+
+    // Pathspec magic supplied globally rather than per pathspec. `*.md` is a
+    // glob to `--glob-pathspecs`, a literal filename to `--literal-pathspecs`,
+    // and neither to `--noglob-pathspecs`.
+    for opt in ["--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs"] {
+        glob("ls-files", &[&[opt]], &["ls-files", "--", "*.md"], Shape::Linear, out);
+    }
+    glob("ls-files", &[&["--icase-pathspecs"]], &["ls-files", "--", "README.MD"], Shape::Linear, out);
+
+    // A ref namespace, which relocates every ref read and written.
+    glob("for-each-ref", &[&["--namespace=ns"]], &["for-each-ref"], Shape::Branched, out);
+    glob("rev-parse", &[&["--namespace=ns"]], &["rev-parse", "--git-dir"], Shape::Branched, out);
+    glob("show-ref", &[&["--namespace=ns"]], &["show-ref"], Shape::Branched, out);
+
+    // Attributes read from a tree instead of from the worktree, on the shape
+    // that has a `.gitattributes` with rules in it.
+    glob("check-attr", &[&["--attr-source=HEAD"]], &["check-attr", "-a", "README.md"], Shape::Attributes, out);
+    glob("check-attr", &[&["--attr-source=does-not-exist"]], &["check-attr", "-a", "README.md"], Shape::Attributes, out);
 }

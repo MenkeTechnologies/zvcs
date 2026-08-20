@@ -734,7 +734,13 @@ fn checkout_and_report(ctx: &Ctx, target: &str) -> Result<()> {
         return Ok(());
     }
 
-    super::checkout::checkout(&["-q".to_string(), target.to_string()])?;
+    // git runs the checkout through `run_command()`, so its output is flushed
+    // by the child's `exit()` before anything printed after it here; see
+    // `crate::cstdio::run_command`.
+    {
+        let _child = crate::cstdio::run_command();
+        super::checkout::checkout(&["-q".to_string(), target.to_string()])?;
+    }
 
     if was_detached {
         if let Some(id) = old_id {
@@ -1360,6 +1366,8 @@ fn take_step(
     if no_checkout {
         write_ref(&ctx.file("BISECT_HEAD"), best)?;
     } else {
+        // Through `run_command()` in git; see `crate::cstdio::run_command`.
+        let _child = crate::cstdio::run_command();
         super::checkout::checkout(&["-q".to_string(), hex.clone()])?;
     }
     println!("[{hex}] {}", subject(&ctx.repo, best)?);
@@ -1408,6 +1416,8 @@ fn check_merge_bases(
         if no_checkout {
             write_ref(&ctx.file("BISECT_HEAD"), mb)?;
         } else {
+            // Through `run_command()` in git; see `crate::cstdio::run_command`.
+            let _child = crate::cstdio::run_command();
             super::checkout::checkout(&["-q".to_string(), hex.clone()])?;
         }
         println!("[{hex}] {}", subject(&ctx.repo, mb)?);

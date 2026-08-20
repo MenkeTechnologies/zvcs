@@ -1746,7 +1746,15 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let b_commit = parents[0];
 
     // `git checkout -b <branch> <b_commit>`; only apply if the checkout succeeds.
-    super::checkout::checkout(&["-b".to_string(), branch, b_commit.to_string()])?;
+    // git spawns it (`run_command()` in `branch_stash()`), so its
+    // `show_local_changes()` block is flushed by that child's `exit()` and lands
+    // ahead of the `Already up to date.`/status output below however stdout is
+    // captured. Running it in process would otherwise leave the block sitting in
+    // the buffer until the dispatcher flushed it, at the very end.
+    {
+        let _child = crate::cstdio::run_command();
+        super::checkout::checkout(&["-b".to_string(), branch, b_commit.to_string()])?;
+    }
 
     // The checkout moved HEAD/worktree on disk; re-open so the restore sees it.
     // `branch_stash` calls `do_apply_stash(..., 1, ...)`: the index is always

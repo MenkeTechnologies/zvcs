@@ -288,3 +288,54 @@ fn buffered_stdout_still_reaches_a_separate_capture() {
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
+
+/// `git stash branch` runs the checkout through `run_command()` (builtin/stash.c),
+/// so the child's `exit()` flushes its `show_local_changes()` block before the
+/// parent prints anything else — the two `M<TAB>` lines lead, whatever stdout is.
+///
+/// Calling that subcommand in process instead collapses the two stdio buffers
+/// into one, and the block ends up after the apply and the closing `status`. The
+/// parity corpus caught exactly that; this pins it.
+#[test]
+fn stash_branch_flushes_the_checkout_before_the_apply() {
+    let Some(git) = stock_git() else {
+        eprintln!("no stock git available; skipping");
+        return;
+    };
+    // `c.txt` is what the stash holds, `b.txt` is what HEAD moved past the stash's
+    // base (so the checkout has files to rewrite), and `a.txt` is an uncommitted
+    // edit the checkout has to carry — the one thing the listing can name.
+    let build = |tag: &str| {
+        let (repo, home, sink) = work_area(tag);
+        run(&git, &repo, &home, &["init", "-q", "-b", "main", "."]);
+        run(&git, &repo, &home, &["config", "user.name", "A U Thor"]);
+        run(&git, &repo, &home, &["config", "user.email", "author@example.com"]);
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(repo.join(f), "1\n").unwrap();
+        }
+        run(&git, &repo, &home, &["add", "."]);
+        run(&git, &repo, &home, &["commit", "-q", "-m", "c1"]);
+        std::fs::write(repo.join("c.txt"), "stashed\n").unwrap();
+        run(&git, &repo, &home, &["stash", "-q"]);
+        std::fs::write(repo.join("b.txt"), "moved on\n").unwrap();
+        run(&git, &repo, &home, &["add", "b.txt"]);
+        run(&git, &repo, &home, &["commit", "-q", "-m", "c2"]);
+        std::fs::write(repo.join("a.txt"), "local\n").unwrap();
+        (repo, home, sink)
+    };
+    let (zrepo, zhome, zsink) = build("z-stashbranch");
+    let (grepo, ghome, gsink) = build("g-stashbranch");
+    let args = ["stash", "branch", "off-stash", "stash@{0}"];
+    let z = merged(BIN, &zrepo, &zhome, &zsink, &args);
+    let g = merged(&git, &grepo, &ghome, &gsink, &args);
+
+    assert_eq!(g, z, "`git stash branch` capture differs from stock");
+    assert!(
+        line_at(&z, "M\t") < line_at(&z, "On branch off-stash"),
+        "the checkout's listing is flushed by that child's exit(), so it leads the \
+         apply and the closing status:\n{z}"
+    );
+
+    let _ = std::fs::remove_dir_all(zrepo.parent().unwrap());
+    let _ = std::fs::remove_dir_all(grepo.parent().unwrap());
+}

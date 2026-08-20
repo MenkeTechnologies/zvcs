@@ -159,6 +159,57 @@ pub fn before_spawn() {
     flush();
 }
 
+/// The whole of `run_command()` for a git subcommand this port runs **in
+/// process** where stock git forks one.
+///
+/// git reaches several subcommands through `run_command()` rather than by
+/// calling their `cmd_*` directly — `branch_stash()` runs `git checkout -b
+/// <branch> <b_commit>` that way (builtin/stash.c), and `bisect` moves the
+/// worktree with the same kind of call. A real child has its own stdio, so the
+/// sequence around it is fixed: `fflush(NULL)` before the `fork()`
+/// (run-command.c:743), then the child's own `exit()` flushes *its* buffer
+/// before the parent resumes. Both flushes land before the next thing the parent
+/// prints, which is why stock's
+///
+/// ```text
+/// $ git stash branch off-stash stash@{1} 2>&1 | cat
+/// M       counter.txt          <- the checkout child, flushed by its exit()
+/// M       notes.txt
+/// Already up to date.          <- the parent, afterwards
+/// ```
+///
+/// keeps that order however stdout is captured.
+///
+/// Calling such a subcommand as a plain function collapses those two processes
+/// into one, so the callee's [`defer`] leaks into the caller and its output sits
+/// in the buffer until the dispatcher's flush — which moved the two `M` lines
+/// above to the very end of the command. This guard restores the boundary:
+/// flush on entry, and on drop flush again and hand the caller back the
+/// buffering state it had, exactly as a `fork`/`exit` pair would.
+#[must_use = "the boundary is restored when the guard is dropped"]
+pub struct RunCommand {
+    parent_deferred: bool,
+}
+
+/// Enter a [`RunCommand`] boundary around an in-process subcommand call.
+pub fn run_command() -> RunCommand {
+    // `fflush(NULL)` before the `fork()`.
+    flush();
+    RunCommand {
+        // A child starts with its own, unarmed buffer; whether *this* command
+        // buffers is the parent's business and is restored on drop.
+        parent_deferred: DEFERRED.swap(false, Ordering::Relaxed),
+    }
+}
+
+impl Drop for RunCommand {
+    fn drop(&mut self) {
+        // The child's `exit()` flushing its own buffer.
+        flush();
+        DEFERRED.store(self.parent_deferred, Ordering::Relaxed);
+    }
+}
+
 /// Formatting entry point for the [`print`] / [`println`] macros.
 pub fn write_args(args: std::fmt::Arguments<'_>) {
     match args.as_str() {

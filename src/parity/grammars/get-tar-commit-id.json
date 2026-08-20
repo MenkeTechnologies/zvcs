@@ -1,0 +1,7 @@
+{
+  "command": "get-tar-commit-id",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

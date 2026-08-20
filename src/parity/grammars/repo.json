@@ -31,6 +31,12 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "packed",
+    "worktree",
+    "behind-remote",
+    "sparse",
+    "stashed",
+    "octopus"
   ]
 }

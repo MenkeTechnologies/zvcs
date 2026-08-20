@@ -1,7 +1,9 @@
 {
   "command": "var",
   "mutating": false,
-  "flags": ["-l"],
+  "flags": [
+    "-l"
+  ],
   "positionals": [
     "",
     "GIT_AUTHOR_IDENT",
@@ -20,5 +22,12 @@
     "git_editor",
     "-l"
   ],
-  "shapes": ["linear", "detached", "submodule"]
+  "shapes": [
+    "linear",
+    "detached",
+    "submodule",
+    "worktree",
+    "behind-remote",
+    "sparse"
+  ]
 }

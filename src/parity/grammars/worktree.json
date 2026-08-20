@@ -18,7 +18,10 @@
     "list",
     "",
     "does-not-exist",
-    "--bogus-option"
+    "--bogus-option",
+    "wt",
+    "wt/README.md",
+    "linked"
   ],
   "shapes": [
     "linear",
@@ -28,6 +31,12 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "worktree",
+    "behind-remote",
+    "sparse",
+    "packed",
+    "stashed",
+    "octopus"
   ]
 }

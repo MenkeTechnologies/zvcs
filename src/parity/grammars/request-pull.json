@@ -1,7 +1,9 @@
 {
   "command": "request-pull",
   "mutating": false,
-  "flags": ["-p"],
+  "flags": [
+    "-p"
+  ],
   "positionals": [
     "v0.1.0 .",
     "v0.1.0 . HEAD",
@@ -15,7 +17,24 @@
     "does-not-exist . HEAD",
     "v0.1.0 . does-not-exist",
     "v0.1.0",
-    ""
+    "",
+    "origin",
+    "origin/main",
+    "origin/div",
+    "div",
+    "FETCH_HEAD",
+    "refs/remotes/origin/main",
+    "./.remote.git"
   ],
-  "shapes": ["linear", "branched", "merged", "dirty", "detached"]
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "behind-remote",
+    "octopus",
+    "renamed",
+    "packed"
+  ]
 }

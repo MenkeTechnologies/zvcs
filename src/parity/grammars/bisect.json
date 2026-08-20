@@ -44,6 +44,11 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "octopus",
+    "packed",
+    "worktree",
+    "behind-remote",
+    "renamed"
   ]
 }

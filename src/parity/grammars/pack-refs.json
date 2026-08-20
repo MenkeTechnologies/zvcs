@@ -28,6 +28,11 @@
     "branched",
     "merged",
     "detached",
-    "submodule"
+    "submodule",
+    "packed",
+    "behind-remote",
+    "worktree",
+    "stashed",
+    "octopus"
   ]
 }

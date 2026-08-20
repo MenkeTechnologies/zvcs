@@ -30,6 +30,9 @@
     "branched",
     "merged",
     "detached",
-    "dirty"
+    "dirty",
+    "octopus",
+    "packed",
+    "renamed"
   ]
 }

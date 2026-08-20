@@ -1,0 +1,7 @@
+{
+  "command": "instaweb",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

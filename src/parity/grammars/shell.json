@@ -1,0 +1,7 @@
+{
+  "command": "shell",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

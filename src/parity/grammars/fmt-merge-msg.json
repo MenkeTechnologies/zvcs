@@ -30,6 +30,10 @@
     "linear",
     "branched",
     "merged",
-    "detached"
+    "detached",
+    "behind-remote",
+    "octopus",
+    "mergeable-dirty",
+    "mergeable-staged"
   ]
 }

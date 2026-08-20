@@ -37,12 +37,29 @@
     "../outside.txt",
     "/absolute/path",
     "*.log",
-    "sub/../README.md"
+    "sub/../README.md",
+    ".gitattributes",
+    ".mailmap",
+    "src/tabs.rs",
+    "docs/manual.md",
+    "vendor/generated.js",
+    "logs/keep.log",
+    "assets/logo.bin",
+    "sub/nested.txt",
+    "build/output.o",
+    "important.log",
+    "notes.tmp",
+    "é.txt",
+    "é-new.txt"
   ],
   "shapes": [
     "linear",
     "dirty",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "attributes",
+    "sparse",
+    "stashed",
+    "decomposed-paths"
   ]
 }

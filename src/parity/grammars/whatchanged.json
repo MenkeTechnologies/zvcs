@@ -158,7 +158,26 @@
     ":!README.md",
     "does-not-exist",
     "no/such/path.txt",
-    "refs/heads/nope"
+    "refs/heads/nope",
+    "orig/alpha.txt",
+    "orig/beta.txt",
+    "orig/gamma.txt",
+    "orig/delta.txt",
+    "moved/alpha.txt",
+    "moved/beta.txt",
+    "copies/gamma.txt",
+    "orig",
+    "moved",
+    "ws/indent.c",
+    "ws/eol.txt",
+    "ws",
+    "oct-a",
+    "oct-b",
+    "oct-c",
+    "oct-side",
+    "HEAD^2",
+    "HEAD^3",
+    "HEAD^4"
   ],
   "shapes": [
     "linear",
@@ -168,6 +187,13 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "renamed",
+    "whitespace",
+    "octopus",
+    "attributes",
+    "packed",
+    "sparse",
+    "decomposed-paths"
   ]
 }

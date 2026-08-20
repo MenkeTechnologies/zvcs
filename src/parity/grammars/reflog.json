@@ -144,7 +144,17 @@
     "exists refs/heads/does-not-exist",
     "exists main",
     "exists does-not-exist",
-    "bogus-subcommand"
+    "bogus-subcommand",
+    "refs/stash",
+    "stash@{0}",
+    "stash@{1}",
+    "origin",
+    "origin/main",
+    "origin/div",
+    "div",
+    "FETCH_HEAD",
+    "refs/remotes/origin/main",
+    "./.remote.git"
   ],
   "shapes": [
     "linear",
@@ -154,6 +164,11 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "stashed",
+    "behind-remote",
+    "worktree",
+    "octopus",
+    "packed"
   ]
 }

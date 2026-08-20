@@ -1,0 +1,40 @@
+{
+  "command": "mailinfo",
+  "mutating": true,
+  "flags": [
+    "-k",
+    "-b",
+    "-m",
+    "--message-id",
+    "--no-message-id",
+    "-u",
+    "-n",
+    "--encoding=UTF-8",
+    "--encoding=ISO-8859-1",
+    "--encoding=bogus",
+    "--scissors",
+    "--no-scissors",
+    "--quoted-cr=nowarn",
+    "--quoted-cr=warn",
+    "--quoted-cr=strip",
+    "--quoted-cr=bogus"
+  ],
+  "positionals": [
+    ".git/parity-msg",
+    ".git/parity-patch",
+    "/dev/null",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "patches",
+    "whitespace",
+    "attributes"
+  ]
+}

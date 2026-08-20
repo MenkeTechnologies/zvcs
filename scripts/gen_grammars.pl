@@ -35,14 +35,28 @@ die "no grammar JSON files in $dir\n" unless @files;
 # Only the shapes fixture.rs actually builds. An unknown shape is a typo, not a
 # new fixture, so it is rejected loudly rather than silently dropped.
 my %SHAPE = (
-    'linear'        => 'Shape::Linear',
-    'branched'      => 'Shape::Branched',
-    'merged'        => 'Shape::Merged',
-    'dirty'         => 'Shape::Dirty',
-    'conflicted'    => 'Shape::Conflicted',
-    'detached'      => 'Shape::Detached',
-    'awkward-paths' => 'Shape::AwkwardPaths',
-    'submodule'     => 'Shape::Submodule',
+    'linear'           => 'Shape::Linear',
+    'branched'         => 'Shape::Branched',
+    'merged'           => 'Shape::Merged',
+    'dirty'            => 'Shape::Dirty',
+    'conflicted'       => 'Shape::Conflicted',
+    'detached'         => 'Shape::Detached',
+    'awkward-paths'    => 'Shape::AwkwardPaths',
+    'submodule'        => 'Shape::Submodule',
+    'attributes'       => 'Shape::Attributes',
+    'renamed'          => 'Shape::Renamed',
+    'whitespace'       => 'Shape::Whitespace',
+    'packed'           => 'Shape::Packed',
+    'patches'          => 'Shape::Patches',
+    'sparse'           => 'Shape::Sparse',
+    'mergeable-dirty'  => 'Shape::MergeableDirty',
+    'mergeable-staged' => 'Shape::MergeableStaged',
+    'stashed'          => 'Shape::Stashed',
+    'behind-remote'    => 'Shape::BehindRemote',
+    'worktree'         => 'Shape::Worktree',
+    'octopus'          => 'Shape::Octopus',
+    'no-index-trees'   => 'Shape::NoIndexTrees',
+    'decomposed-paths' => 'Shape::DecomposedPaths',
 );
 
 sub rs_str {

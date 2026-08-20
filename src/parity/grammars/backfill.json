@@ -40,6 +40,10 @@
     "dirty",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "packed",
+    "behind-remote",
+    "worktree",
+    "sparse"
   ]
 }

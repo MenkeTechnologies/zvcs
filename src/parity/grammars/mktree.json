@@ -1,7 +1,26 @@
 {
   "command": "mktree",
   "mutating": true,
-  "flags": ["-z", "--missing", "--batch"],
-  "positionals": ["", "does-not-exist"],
-  "shapes": ["linear", "branched", "merged", "dirty", "detached", "awkward-paths", "submodule"]
+  "flags": [
+    "-z",
+    "--missing",
+    "--batch"
+  ],
+  "positionals": [
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "renamed",
+    "octopus",
+    "sparse",
+    "decomposed-paths"
+  ]
 }

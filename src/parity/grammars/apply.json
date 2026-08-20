@@ -56,7 +56,18 @@
     "/dev/null",
     "README.md",
     "src/lib.rs",
-    "does-not-exist"
+    "does-not-exist",
+    "patches/valid.patch",
+    "patches/corrupt.patch",
+    "patches/context-only.patch",
+    "patches/whitespace.patch",
+    "patches/offset.patch",
+    "patches/binary.patch",
+    "mail/series.mbox",
+    "mail/one.eml",
+    "quilt/series",
+    "quilt/0001-first.patch",
+    "quilt/0002-second.patch"
   ],
   "shapes": [
     "linear",
@@ -66,6 +77,14 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "patches",
+    "whitespace",
+    "renamed",
+    "attributes",
+    "sparse",
+    "mergeable-dirty",
+    "mergeable-staged",
+    "decomposed-paths"
   ]
 }

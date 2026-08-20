@@ -80,6 +80,13 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "renamed",
+    "whitespace",
+    "attributes",
+    "octopus",
+    "packed",
+    "behind-remote",
+    "decomposed-paths"
   ]
 }

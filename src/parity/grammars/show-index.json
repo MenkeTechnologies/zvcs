@@ -12,7 +12,11 @@
     "",
     "does-not-exist",
     "README.md",
-    "HEAD"
+    "HEAD",
+    "packs/sample.pack",
+    "packs/sample.idx",
+    "packs/unindexed.pack",
+    "big.txt"
   ],
   "shapes": [
     "linear",
@@ -21,6 +25,8 @@
     "dirty",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "packed",
+    "octopus"
   ]
 }

@@ -1,0 +1,41 @@
+{
+  "command": "format-rev",
+  "mutating": false,
+  "flags": [
+    "--stdin-mode=revs",
+    "--stdin-mode=rev",
+    "--stdin-mode=text",
+    "--stdin-mode=bogus",
+    "--no-stdin-mode",
+    "--format=%H",
+    "--format=%s",
+    "--format=oneline",
+    "--format=medium",
+    "--format=bogus",
+    "--no-format",
+    "--notes=refs/notes/commits",
+    "--notes=does-not-exist",
+    "--no-notes",
+    "-z",
+    "--null",
+    "--null-input",
+    "--no-null-input",
+    "--null-output",
+    "--no-null-output"
+  ],
+  "positionals": [],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "octopus",
+    "packed",
+    "behind-remote",
+    "renamed"
+  ]
+}

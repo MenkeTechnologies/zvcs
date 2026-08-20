@@ -1,0 +1,15 @@
+{
+  "command": "checkout--worker",
+  "mutating": true,
+  "flags": [
+    "--prefix=parity/",
+    "--prefix=",
+    "--no-prefix"
+  ],
+  "positionals": [],
+  "shapes": [
+    "linear",
+    "dirty",
+    "sparse"
+  ]
+}

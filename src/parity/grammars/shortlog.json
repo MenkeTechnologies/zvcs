@@ -137,7 +137,14 @@
     "HEAD README.md",
     "refs/heads/does-not-exist",
     "does-not-exist",
-    "does-not-exist..HEAD"
+    "does-not-exist..HEAD",
+    "oct-a",
+    "oct-b",
+    "oct-c",
+    "oct-side",
+    "HEAD^2",
+    "HEAD^3",
+    "HEAD^4"
   ],
   "shapes": [
     "linear",
@@ -147,6 +154,10 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "attributes",
+    "octopus",
+    "renamed",
+    "behind-remote"
   ]
 }

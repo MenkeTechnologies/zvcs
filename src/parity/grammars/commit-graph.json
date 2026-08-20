@@ -35,6 +35,10 @@
     "detached",
     "dirty",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "packed",
+    "octopus",
+    "worktree",
+    "behind-remote"
   ]
 }

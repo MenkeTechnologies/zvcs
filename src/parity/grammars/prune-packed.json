@@ -1,7 +1,27 @@
 {
   "command": "prune-packed",
   "mutating": true,
-  "flags": ["-n", "--dry-run", "--no-dry-run", "-q", "--quiet", "--no-quiet"],
-  "positionals": ["", "does-not-exist"],
-  "shapes": ["linear", "branched", "merged", "dirty", "detached"]
+  "flags": [
+    "-n",
+    "--dry-run",
+    "--no-dry-run",
+    "-q",
+    "--quiet",
+    "--no-quiet"
+  ],
+  "positionals": [
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "packed",
+    "worktree",
+    "stashed",
+    "octopus"
+  ]
 }

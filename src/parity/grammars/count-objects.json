@@ -14,6 +14,24 @@
     "--verbose --no-human-readable",
     "--human-readable --no-verbose"
   ],
-  "positionals": ["", "does-not-exist", "HEAD"],
-  "shapes": ["linear", "branched", "merged", "dirty", "conflicted", "detached", "awkward-paths", "submodule"]
+  "positionals": [
+    "",
+    "does-not-exist",
+    "HEAD"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "packed",
+    "stashed",
+    "worktree",
+    "behind-remote",
+    "octopus"
+  ]
 }

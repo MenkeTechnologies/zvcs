@@ -20,13 +20,21 @@
     "src/lib.rs",
     ".git/objects/pack",
     "does-not-exist.idx",
-    "does-not-exist"
+    "does-not-exist",
+    "packs/sample.pack",
+    "packs/sample.idx",
+    "packs/unindexed.pack",
+    "big.txt"
   ],
   "shapes": [
     "linear",
     "branched",
     "merged",
     "detached",
-    "submodule"
+    "submodule",
+    "packed",
+    "octopus",
+    "behind-remote",
+    "worktree"
   ]
 }

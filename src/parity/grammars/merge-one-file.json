@@ -1,0 +1,29 @@
+{
+  "command": "merge-one-file",
+  "mutating": true,
+  "flags": [],
+  "positionals": [
+    "",
+    "100644",
+    "100755",
+    "040000",
+    "README.md",
+    "src/lib.rs",
+    "conflict.txt",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "mergeable-dirty",
+    "mergeable-staged",
+    "attributes",
+    "decomposed-paths"
+  ]
+}

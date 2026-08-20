@@ -1,0 +1,34 @@
+{
+  "command": "jump",
+  "mutating": false,
+  "flags": [
+    "--stdout"
+  ],
+  "positionals": [
+    "diff",
+    "merge",
+    "grep",
+    "ws",
+    "auto",
+    "fn",
+    "TODO",
+    "README.md",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "whitespace",
+    "renamed",
+    "attributes",
+    "sparse",
+    "mergeable-dirty"
+  ]
+}

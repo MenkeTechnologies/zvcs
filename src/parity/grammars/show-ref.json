@@ -39,7 +39,16 @@
     "mymain",
     "does-not-exist",
     "refs/heads/does-not-exist",
-    "refs/tags/does-not-exist"
+    "refs/tags/does-not-exist",
+    "oct-a",
+    "oct-b",
+    "oct-c",
+    "oct-side",
+    "HEAD^2",
+    "HEAD^3",
+    "HEAD^4",
+    "refs/stash",
+    "refs/remotes/origin/main"
   ],
   "shapes": [
     "linear",
@@ -47,6 +56,11 @@
     "merged",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "behind-remote",
+    "worktree",
+    "stashed",
+    "octopus",
+    "packed"
   ]
 }

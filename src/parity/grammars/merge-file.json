@@ -30,7 +30,18 @@
     "README.md",
     "src/lib.rs",
     "does-not-exist",
-    ""
+    "",
+    "ni/a.txt",
+    "ni/b.txt",
+    "ni/da",
+    "ni/db",
+    "ni/addonly_a",
+    "ni/addonly_b",
+    "ni/delonly_a",
+    "ni/delonly_b",
+    "ws/indent.c",
+    "ws/eol.txt",
+    "ws"
   ],
   "shapes": [
     "linear",
@@ -38,6 +49,11 @@
     "merged",
     "dirty",
     "conflicted",
-    "awkward-paths"
+    "awkward-paths",
+    "whitespace",
+    "attributes",
+    "renamed",
+    "no-index-trees",
+    "decomposed-paths"
   ]
 }

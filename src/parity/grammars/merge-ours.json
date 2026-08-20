@@ -1,0 +1,37 @@
+{
+  "command": "merge-ours",
+  "mutating": true,
+  "flags": [],
+  "positionals": [
+    "HEAD",
+    "main",
+    "feature",
+    "--",
+    "ff-cold",
+    "div-cold",
+    "div-hot",
+    "oct-a",
+    "oct-b",
+    "theirs",
+    "side",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "mergeable-dirty",
+    "mergeable-staged",
+    "octopus",
+    "renamed",
+    "whitespace",
+    "attributes",
+    "decomposed-paths"
+  ]
+}

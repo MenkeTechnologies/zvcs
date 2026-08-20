@@ -156,7 +156,28 @@
     ":(icase)readme.md",
     "does-not-exist",
     "src/does-not-exist.rs",
-    "-not-a-flag"
+    "-not-a-flag",
+    "orig/alpha.txt",
+    "orig/beta.txt",
+    "orig/gamma.txt",
+    "orig/delta.txt",
+    "moved/alpha.txt",
+    "moved/beta.txt",
+    "copies/gamma.txt",
+    "orig",
+    "moved",
+    "ws/indent.c",
+    "ws/eol.txt",
+    "ws",
+    "inside",
+    "inside/keep.txt",
+    "inside/nested/also.txt",
+    "outside",
+    "outside/drop.txt",
+    "outside/stray.txt",
+    "root.txt",
+    "é.txt",
+    "é-new.txt"
   ],
   "shapes": [
     "linear",
@@ -166,6 +187,14 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "renamed",
+    "whitespace",
+    "attributes",
+    "sparse",
+    "stashed",
+    "mergeable-dirty",
+    "mergeable-staged",
+    "decomposed-paths"
   ]
 }

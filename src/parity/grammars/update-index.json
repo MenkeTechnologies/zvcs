@@ -61,7 +61,28 @@
     "src/",
     "does-not-exist",
     "src/does-not-exist.rs",
-    "-not-a-flag"
+    "-not-a-flag",
+    "inside",
+    "inside/keep.txt",
+    "inside/nested/also.txt",
+    "outside",
+    "outside/drop.txt",
+    "outside/stray.txt",
+    "root.txt",
+    ".gitattributes",
+    ".gitignore",
+    ".mailmap",
+    "src/tabs.rs",
+    "docs/manual.md",
+    "vendor/generated.js",
+    "logs/keep.log",
+    "assets/logo.bin",
+    "sub/nested.txt",
+    "build/output.o",
+    "important.log",
+    "notes.tmp",
+    "é.txt",
+    "é-new.txt"
   ],
   "shapes": [
     "linear",
@@ -71,6 +92,14 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "sparse",
+    "attributes",
+    "renamed",
+    "whitespace",
+    "stashed",
+    "worktree",
+    "patches",
+    "decomposed-paths"
   ]
 }

@@ -1,0 +1,40 @@
+{
+  "command": "mailsplit",
+  "mutating": true,
+  "flags": [
+    "-o.git/parity-mailsplit",
+    "-o.",
+    "-odoes-not-exist",
+    "-b",
+    "-d4",
+    "-d2",
+    "-d0",
+    "-f0",
+    "-f3",
+    "--keep-cr",
+    "--mboxrd"
+  ],
+  "positionals": [
+    "patches/valid.patch",
+    "patches/corrupt.patch",
+    "patches/context-only.patch",
+    "patches/whitespace.patch",
+    "patches/binary.patch",
+    "mail/series.mbox",
+    "mail/one.eml",
+    "quilt/series",
+    "does-not-exist",
+    "--",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "patches",
+    "whitespace"
+  ]
+}

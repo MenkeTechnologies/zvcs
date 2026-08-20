@@ -1,0 +1,42 @@
+{
+  "command": "filter-branch",
+  "mutating": true,
+  "flags": [
+    "--setup=true",
+    "--subdirectory-filter=src",
+    "--subdirectory-filter=does-not-exist",
+    "--env-filter=true",
+    "--tree-filter=true",
+    "--index-filter=true",
+    "--parent-filter=cat",
+    "--msg-filter=cat",
+    "--commit-filter=git commit-tree \"$@\"",
+    "--tag-name-filter=cat",
+    "--original=refs/parity-original",
+    "--prune-empty",
+    "-f",
+    "--force"
+  ],
+  "positionals": [
+    "HEAD",
+    "main",
+    "--all",
+    "main..HEAD",
+    "HEAD~1..HEAD",
+    "--",
+    "README.md",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "renamed",
+    "whitespace",
+    "decomposed-paths"
+  ]
+}

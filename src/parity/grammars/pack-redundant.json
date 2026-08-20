@@ -1,0 +1,26 @@
+{
+  "command": "pack-redundant",
+  "mutating": false,
+  "flags": [
+    "--i-still-use-this",
+    "--verbose",
+    "--alt-odb",
+    "--all"
+  ],
+  "positionals": [
+    "packs/sample.pack",
+    "packs/unindexed.pack",
+    ".git/objects/pack",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "packed",
+    "submodule",
+    "octopus"
+  ]
+}

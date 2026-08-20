@@ -105,7 +105,21 @@
     "src/lib.rs",
     "does-not-exist",
     "does-not-exist...feature",
-    "main...does-not-exist"
+    "main...does-not-exist",
+    "oct-a",
+    "oct-b",
+    "oct-c",
+    "oct-side",
+    "HEAD^2",
+    "HEAD^3",
+    "HEAD^4",
+    "origin",
+    "origin/main",
+    "origin/div",
+    "div",
+    "FETCH_HEAD",
+    "refs/remotes/origin/main",
+    "./.remote.git"
   ],
   "shapes": [
     "linear",
@@ -113,6 +127,11 @@
     "merged",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "renamed",
+    "whitespace",
+    "octopus",
+    "behind-remote",
+    "patches"
   ]
 }

@@ -34,7 +34,14 @@
     "disable",
     "does-not-exist",
     "src",
-    "README.md"
+    "README.md",
+    "inside",
+    "inside/keep.txt",
+    "inside/nested/also.txt",
+    "outside",
+    "outside/drop.txt",
+    "outside/stray.txt",
+    "root.txt"
   ],
   "shapes": [
     "linear",
@@ -44,6 +51,11 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "sparse",
+    "attributes",
+    "worktree",
+    "mergeable-dirty",
+    "decomposed-paths"
   ]
 }

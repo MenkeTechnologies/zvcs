@@ -1,0 +1,31 @@
+{
+  "command": "for-each-repo",
+  "mutating": true,
+  "flags": [
+    "--config=maintenance.repo",
+    "--config=parity.repo",
+    "--config=",
+    "--config=bogus",
+    "--no-config",
+    "--keep-going",
+    "--no-keep-going"
+  ],
+  "positionals": [
+    "--",
+    "status",
+    "rev-parse",
+    "--git-dir",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "submodule",
+    "worktree",
+    "behind-remote"
+  ]
+}

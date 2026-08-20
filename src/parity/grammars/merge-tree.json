@@ -51,7 +51,25 @@
     "main^{tree}",
     "feature^{tree}",
     "does-not-exist",
-    ""
+    "",
+    "ff-cold",
+    "ff-hot",
+    "ff-squat",
+    "div-cold",
+    "div-hot",
+    "div-squat",
+    "div-other",
+    "keep.txt",
+    "hot.txt",
+    "cold.txt",
+    "squat.txt",
+    "oct-a",
+    "oct-b",
+    "oct-c",
+    "oct-side",
+    "HEAD^2",
+    "HEAD^3",
+    "HEAD^4"
   ],
   "shapes": [
     "linear",
@@ -61,6 +79,13 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "mergeable-dirty",
+    "mergeable-staged",
+    "octopus",
+    "renamed",
+    "whitespace",
+    "attributes",
+    "decomposed-paths"
   ]
 }

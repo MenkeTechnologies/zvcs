@@ -1,0 +1,51 @@
+{
+  "command": "mv",
+  "mutating": true,
+  "flags": [
+    "-v",
+    "--verbose",
+    "--no-verbose",
+    "-n",
+    "--dry-run",
+    "--no-dry-run",
+    "-f",
+    "--force",
+    "--no-force",
+    "-k",
+    "--sparse",
+    "--no-sparse"
+  ],
+  "positionals": [
+    "README.md",
+    "src/lib.rs",
+    "src",
+    "moved.md",
+    "src/moved.rs",
+    "nested",
+    "orig/alpha.txt",
+    "moved",
+    "inside/keep.txt",
+    "outside/drop.txt",
+    "é.txt",
+    "é-new.txt",
+    "with space.txt",
+    "does-not-exist",
+    "--",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "sparse",
+    "renamed",
+    "attributes",
+    "stashed",
+    "decomposed-paths"
+  ]
+}

@@ -29,13 +29,32 @@
     "main~1 feature",
     "does-not-exist",
     "main does-not-exist",
-    "README.md"
+    "README.md",
+    "origin",
+    "origin/main",
+    "origin/div",
+    "div",
+    "FETCH_HEAD",
+    "refs/remotes/origin/main",
+    "./.remote.git",
+    "oct-a",
+    "oct-b",
+    "oct-c",
+    "oct-side",
+    "HEAD^2",
+    "HEAD^3",
+    "HEAD^4"
   ],
   "shapes": [
     "linear",
     "branched",
     "merged",
     "detached",
-    "dirty"
+    "dirty",
+    "behind-remote",
+    "octopus",
+    "renamed",
+    "packed",
+    "mergeable-dirty"
   ]
 }

@@ -1,0 +1,13 @@
+{
+  "command": "version",
+  "mutating": false,
+  "flags": [
+    "--build-options",
+    "--no-build-options"
+  ],
+  "positionals": [],
+  "shapes": [
+    "linear",
+    "detached"
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "command": "history",
+  "mutating": true,
+  "flags": [
+    "-n",
+    "--dry-run",
+    "--no-dry-run",
+    "--update-refs=branches",
+    "--update-refs=head",
+    "--update-refs=bogus",
+    "--reedit-message",
+    "--no-reedit-message",
+    "--empty=drop",
+    "--empty=keep",
+    "--empty=abort",
+    "--empty=bogus"
+  ],
+  "positionals": [
+    "fixup",
+    "reword",
+    "split",
+    "HEAD",
+    "HEAD~1",
+    "HEAD~2",
+    "main",
+    "does-not-exist",
+    "--",
+    "README.md",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "renamed",
+    "whitespace",
+    "octopus",
+    "mergeable-dirty",
+    "mergeable-staged",
+    "packed"
+  ]
+}

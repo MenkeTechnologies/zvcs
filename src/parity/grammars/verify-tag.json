@@ -31,6 +31,8 @@
     "merged",
     "dirty",
     "detached",
-    "submodule"
+    "submodule",
+    "octopus",
+    "packed"
   ]
 }

@@ -36,6 +36,9 @@
     "dirty",
     "conflicted",
     "detached",
-    "submodule"
+    "submodule",
+    "worktree",
+    "behind-remote",
+    "octopus"
   ]
 }

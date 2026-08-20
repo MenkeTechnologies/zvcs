@@ -29,6 +29,11 @@
     "merged",
     "dirty",
     "detached",
-    "submodule"
+    "submodule",
+    "packed",
+    "stashed",
+    "worktree",
+    "behind-remote",
+    "octopus"
   ]
 }

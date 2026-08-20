@@ -17,7 +17,11 @@
     "Committer Name <committer@example.com>",
     "Bad <unclosed",
     "does-not-exist",
-    ""
+    "",
+    "Old Name <old@example.invalid>",
+    "Alias Name <alias@example.invalid>",
+    "Typo Name <typo@example.invalid>",
+    "Solo Name <solo@example.invalid>"
   ],
   "shapes": [
     "linear",
@@ -26,6 +30,8 @@
     "dirty",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "attributes",
+    "octopus"
   ]
 }

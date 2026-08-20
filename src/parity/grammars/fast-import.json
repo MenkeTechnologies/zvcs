@@ -40,6 +40,20 @@
     "--rewrite-submodules-to=sub:to.marks",
     "--no-such-flag"
   ],
-  "positionals": ["", "does-not-exist"],
-  "shapes": ["linear", "branched", "merged", "dirty", "detached", "awkward-paths", "submodule"]
+  "positionals": [
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "packed",
+    "octopus",
+    "decomposed-paths"
+  ]
 }

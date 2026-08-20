@@ -1,0 +1,47 @@
+{
+  "command": "submodule--helper",
+  "mutating": true,
+  "flags": [
+    "--prefix=sub",
+    "--prefix=",
+    "-q",
+    "--quiet",
+    "-n",
+    "--dry-run",
+    "-f",
+    "--force",
+    "--create-reflog",
+    "-t",
+    "--track",
+    "--name=sub",
+    "--depth=1",
+    "--single-branch",
+    "--filter=blob:none",
+    "--url=./.remote.git",
+    "--path=sub"
+  ],
+  "positionals": [
+    "gitdir",
+    "clone",
+    "create-branch",
+    "get-default-remote",
+    "absorbgitdirs",
+    "push-check",
+    "sub",
+    "main",
+    "HEAD",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "submodule",
+    "behind-remote",
+    "worktree",
+    "sparse"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "command": "sh-i18n--envsubst",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

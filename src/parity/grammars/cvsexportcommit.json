@@ -1,0 +1,7 @@
+{
+  "command": "cvsexportcommit",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

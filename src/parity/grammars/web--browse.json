@@ -1,0 +1,7 @@
+{
+  "command": "web--browse",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

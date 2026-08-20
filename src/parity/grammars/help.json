@@ -1,0 +1,43 @@
+{
+  "command": "help",
+  "mutating": false,
+  "flags": [
+    "-a",
+    "--all",
+    "--external-commands",
+    "--no-external-commands",
+    "--aliases",
+    "--no-aliases",
+    "-v",
+    "--verbose",
+    "--no-verbose",
+    "-g",
+    "--guides",
+    "-c",
+    "--config",
+    "--user-interfaces",
+    "--developer-interfaces",
+    "-m",
+    "--man",
+    "--no-man",
+    "--no-web",
+    "--no-info"
+  ],
+  "positionals": [
+    "log",
+    "status",
+    "commit",
+    "revisions",
+    "everyday",
+    "attributes",
+    "git",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "detached",
+    "submodule"
+  ]
+}

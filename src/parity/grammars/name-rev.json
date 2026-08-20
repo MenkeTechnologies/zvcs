@@ -33,7 +33,21 @@
     "main feature",
     "HEAD main v0.1.0",
     "does-not-exist",
-    "0000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000",
+    "oct-a",
+    "oct-b",
+    "oct-c",
+    "oct-side",
+    "HEAD^2",
+    "HEAD^3",
+    "HEAD^4",
+    "origin",
+    "origin/main",
+    "origin/div",
+    "div",
+    "FETCH_HEAD",
+    "refs/remotes/origin/main",
+    "./.remote.git"
   ],
   "shapes": [
     "linear",
@@ -41,6 +55,10 @@
     "merged",
     "dirty",
     "detached",
-    "submodule"
+    "submodule",
+    "octopus",
+    "behind-remote",
+    "packed",
+    "worktree"
   ]
 }

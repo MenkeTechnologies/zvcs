@@ -21,6 +21,12 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "sparse",
+    "attributes",
+    "renamed",
+    "stashed",
+    "mergeable-staged",
+    "decomposed-paths"
   ]
 }

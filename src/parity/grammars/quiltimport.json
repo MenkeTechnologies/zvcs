@@ -1,0 +1,33 @@
+{
+  "command": "quiltimport",
+  "mutating": true,
+  "flags": [
+    "-n",
+    "--dry-run",
+    "--no-dry-run",
+    "--author=Someone <someone@example.invalid>",
+    "--author=",
+    "--no-author",
+    "--patches=quilt",
+    "--patches=patches",
+    "--patches=does-not-exist",
+    "--no-patches",
+    "--series=quilt/series",
+    "--series=does-not-exist",
+    "--no-series",
+    "--keep-non-patch",
+    "--no-keep-non-patch"
+  ],
+  "positionals": [],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "patches",
+    "whitespace",
+    "renamed"
+  ]
+}

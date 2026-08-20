@@ -1,0 +1,35 @@
+{
+  "command": "url-parse",
+  "mutating": false,
+  "flags": [
+    "-chost",
+    "--component=scheme",
+    "--component=user",
+    "--component=password",
+    "--component=host",
+    "--component=port",
+    "--component=path",
+    "--component=bogus",
+    "--component=",
+    "--no-component"
+  ],
+  "positionals": [
+    "https://example.invalid/user/repo",
+    "https://user:pw@example.invalid:8443/repo.git",
+    "example.invalid:~user/repo",
+    "example.invalid:user/repo",
+    "ssh://git@example.invalid/repo",
+    "file:///tmp/repo",
+    "./.remote.git",
+    "git://example.invalid/repo",
+    "not a url",
+    "--",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "detached",
+    "behind-remote",
+    "submodule"
+  ]
+}

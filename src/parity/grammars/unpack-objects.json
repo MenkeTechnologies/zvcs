@@ -26,6 +26,8 @@
     "linear",
     "branched",
     "merged",
-    "detached"
+    "detached",
+    "packed",
+    "octopus"
   ]
 }

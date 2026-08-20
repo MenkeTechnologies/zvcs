@@ -48,6 +48,10 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "octopus",
+    "packed",
+    "renamed",
+    "decomposed-paths"
   ]
 }

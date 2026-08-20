@@ -72,6 +72,10 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "packed",
+    "octopus",
+    "renamed",
+    "behind-remote"
   ]
 }

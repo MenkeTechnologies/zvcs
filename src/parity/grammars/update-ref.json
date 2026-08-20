@@ -30,13 +30,26 @@
     "0000000000000000000000000000000000000000",
     "refs/heads/does-not-exist",
     "refs/heads/bad..name",
-    "does-not-exist"
+    "does-not-exist",
+    "origin",
+    "origin/main",
+    "origin/div",
+    "div",
+    "FETCH_HEAD",
+    "refs/remotes/origin/main",
+    "./.remote.git",
+    "refs/stash"
   ],
   "shapes": [
     "linear",
     "branched",
     "merged",
     "dirty",
-    "detached"
+    "detached",
+    "behind-remote",
+    "worktree",
+    "stashed",
+    "octopus",
+    "packed"
   ]
 }

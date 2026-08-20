@@ -1,7 +1,20 @@
 {
   "command": "mktag",
   "mutating": true,
-  "flags": ["--strict", "--no-strict"],
-  "positionals": ["", "does-not-exist"],
-  "shapes": ["linear", "branched", "merged", "detached"]
+  "flags": [
+    "--strict",
+    "--no-strict"
+  ],
+  "positionals": [
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "octopus",
+    "packed"
+  ]
 }

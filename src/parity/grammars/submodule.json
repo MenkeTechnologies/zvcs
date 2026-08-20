@@ -1,7 +1,32 @@
 {
   "command": "submodule",
   "mutating": false,
-  "flags": ["--quiet", "-q", "--cached"],
-  "positionals": ["status", "summary", "foreach", "--cached", "--recursive", "README.md", "does-not-exist", ""],
-  "shapes": ["linear", "branched", "merged", "dirty", "detached", "submodule"]
+  "flags": [
+    "--quiet",
+    "-q",
+    "--cached"
+  ],
+  "positionals": [
+    "status",
+    "summary",
+    "foreach",
+    "--cached",
+    "--recursive",
+    "README.md",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "submodule",
+    "behind-remote",
+    "worktree",
+    "sparse",
+    "packed",
+    "decomposed-paths"
+  ]
 }

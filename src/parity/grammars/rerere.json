@@ -28,6 +28,10 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "mergeable-dirty",
+    "mergeable-staged",
+    "whitespace",
+    "octopus"
   ]
 }

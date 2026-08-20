@@ -1,0 +1,29 @@
+{
+  "command": "diagnose",
+  "mutating": true,
+  "flags": [
+    "-o.git/parity-diagnose",
+    "--output-directory=.git/parity-diagnose",
+    "--output-directory=does-not-exist",
+    "--no-output-directory",
+    "-sparity",
+    "--suffix=parity",
+    "--no-suffix",
+    "--mode=stats",
+    "--mode=all",
+    "--mode=bogus"
+  ],
+  "positionals": [],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "submodule",
+    "packed",
+    "worktree",
+    "behind-remote",
+    "sparse"
+  ]
+}

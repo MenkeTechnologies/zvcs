@@ -27,12 +27,19 @@
     ".git/objects/pack/pack-does-not-exist.pack",
     "README.md",
     "does-not-exist.pack",
-    "does-not-exist"
+    "does-not-exist",
+    "packs/sample.pack",
+    "packs/sample.idx",
+    "packs/unindexed.pack",
+    "big.txt"
   ],
   "shapes": [
     "linear",
     "branched",
     "merged",
-    "detached"
+    "detached",
+    "packed",
+    "octopus",
+    "behind-remote"
   ]
 }

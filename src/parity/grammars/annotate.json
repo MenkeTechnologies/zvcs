@@ -62,7 +62,21 @@
     "does-not-exist",
     "HEAD -- does-not-exist",
     "does-not-exist -- README.md",
-    ""
+    "",
+    "orig/alpha.txt",
+    "orig/beta.txt",
+    "orig/gamma.txt",
+    "orig/delta.txt",
+    "moved/alpha.txt",
+    "moved/beta.txt",
+    "copies/gamma.txt",
+    "orig",
+    "moved",
+    "ws/indent.c",
+    "ws/eol.txt",
+    "ws",
+    "é.txt",
+    "é-new.txt"
   ],
   "shapes": [
     "linear",
@@ -72,6 +86,12 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "renamed",
+    "whitespace",
+    "attributes",
+    "packed",
+    "octopus",
+    "decomposed-paths"
   ]
 }

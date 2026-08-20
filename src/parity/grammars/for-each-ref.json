@@ -98,7 +98,11 @@
     "REFS/HEADS/MAIN",
     "refs/does-not-exist/*",
     "does-not-exist",
-    "refs/heads/* refs/tags/*"
+    "refs/heads/* refs/tags/*",
+    "refs/remotes/*",
+    "refs/stash",
+    "refs/worktree/*",
+    "refs/heads/oct-*"
   ],
   "shapes": [
     "linear",
@@ -108,6 +112,12 @@
     "conflicted",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "behind-remote",
+    "worktree",
+    "stashed",
+    "octopus",
+    "packed",
+    "attributes"
   ]
 }

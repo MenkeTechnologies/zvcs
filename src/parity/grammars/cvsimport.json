@@ -1,0 +1,7 @@
+{
+  "command": "cvsimport",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

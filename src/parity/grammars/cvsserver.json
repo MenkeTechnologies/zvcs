@@ -1,0 +1,7 @@
+{
+  "command": "cvsserver",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

@@ -1,0 +1,45 @@
+{
+  "command": "hook",
+  "mutating": true,
+  "flags": [
+    "--allow-unknown-hook-name",
+    "--no-allow-unknown-hook-name",
+    "--ignore-missing",
+    "--no-ignore-missing",
+    "--to-stdin=README.md",
+    "--to-stdin=does-not-exist",
+    "--no-to-stdin",
+    "-j1",
+    "--jobs=2",
+    "--jobs=-1",
+    "--no-jobs",
+    "-z",
+    "--show-scope",
+    "--no-show-scope"
+  ],
+  "positionals": [
+    "run",
+    "list",
+    "pre-commit",
+    "post-commit",
+    "pre-push",
+    "parity-unknown-hook",
+    "does-not-exist",
+    "--",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule",
+    "packed",
+    "worktree",
+    "behind-remote",
+    "sparse"
+  ]
+}

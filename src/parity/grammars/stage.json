@@ -40,7 +40,28 @@
     ":(exclude)README.md",
     ":!src/lib.rs",
     "does-not-exist",
-    "src/does-not-exist.rs"
+    "src/does-not-exist.rs",
+    "inside",
+    "inside/keep.txt",
+    "inside/nested/also.txt",
+    "outside",
+    "outside/drop.txt",
+    "outside/stray.txt",
+    "root.txt",
+    ".gitattributes",
+    ".gitignore",
+    ".mailmap",
+    "src/tabs.rs",
+    "docs/manual.md",
+    "vendor/generated.js",
+    "logs/keep.log",
+    "assets/logo.bin",
+    "sub/nested.txt",
+    "build/output.o",
+    "important.log",
+    "notes.tmp",
+    "é.txt",
+    "é-new.txt"
   ],
   "shapes": [
     "linear",
@@ -50,6 +71,13 @@
     "merged",
     "detached",
     "awkward-paths",
-    "submodule"
+    "submodule",
+    "sparse",
+    "attributes",
+    "renamed",
+    "whitespace",
+    "stashed",
+    "patches",
+    "decomposed-paths"
   ]
 }

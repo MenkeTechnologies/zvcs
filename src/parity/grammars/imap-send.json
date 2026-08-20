@@ -1,0 +1,7 @@
+{
+  "command": "imap-send",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

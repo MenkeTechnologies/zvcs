@@ -73,13 +73,58 @@ pub(crate) fn query_refupdates(
         .map_err(Into::into)
 }
 
+/// The effective ref namespace to install on the ref store at open time.
+///
+/// # Why `GIT_NAMESPACE` is deliberately excluded here
+///
+/// `gitoxide.core.refsNamespace` declares `.with_environment_override("GIT_NAMESPACE")`
+/// (`config/tree/sections/gitoxide.rs`), so `apply_environment_overrides()` folds the
+/// environment variable into the merged config under `Source::EnvOverride`. Honouring
+/// that value here would namespace the *entire* repository — every `find_reference`,
+/// every ref iteration, every ref transaction — for any process that merely has
+/// `GIT_NAMESPACE` set.
+///
+/// Git does not work that way, and the difference is not cosmetic: it is the whole
+/// semantic of the feature. In git, `GIT_NAMESPACE` is read exclusively by the code
+/// that serves refs *over the wire*, and by nothing else:
+///
+///   * `upload-pack.c:892` `for_each_namespaced_ref_1()` sets
+///     `opts.namespace = get_git_namespace()` for its own iteration only, and
+///     `upload-pack.c:1200,1220` push every advertised name back through
+///     `strip_namespace()`. `upload-pack.c:1090-1107` resolve HEAD via
+///     `refs_head_ref_namespaced()`.
+///   * `receive-pack.c` `update()` builds `namespaced_name = get_git_namespace() + name`
+///     for the ref transaction, and advertises `strip_namespace(ref->name)`.
+///   * `http-backend.c:523,569,591,604` do the same for the dumb ref routes.
+///
+/// Every other builtin ignores it entirely. That is verifiable as a negative: the
+/// string "namespace" does not occur even once in `builtin/for-each-ref.c`,
+/// `builtin/show-ref.c`, `builtin/rev-parse.c`, `builtin/branch.c`,
+/// `builtin/update-ref.c` or `builtin/ls-remote.c`. `refs.c` likewise applies no
+/// prefix in the generic `refs_for_each_ref()` / `refs_resolve_ref_unsafe()` paths —
+/// only the explicitly named `refs_head_ref_namespaced()` (`refs.c:1053`) does.
+///
+/// The observable consequence, and the reason this is worth a paragraph: with
+/// `GIT_NAMESPACE=ns` set, `git for-each-ref` lists the ordinary `refs/heads/*` and
+/// `refs/tags/*`, *and* lists any `refs/namespaces/ns/*` refs under their full
+/// unstripped names, because to that builtin they are just refs like any other.
+/// Namespacing the store globally instead makes it list the namespace contents with
+/// the prefix stripped — and, when the namespace holds no refs at all, makes it list
+/// nothing and fail HEAD resolution with "The reference 'HEAD' did not exist".
+///
+/// So the environment override is filtered out and the namespace is applied
+/// explicitly, at the two-and-a-half call sites that git applies it at, via
+/// `Repository::set_namespace()`. A `gitoxide.core.refsNamespace` set in an actual
+/// config *file* still takes effect: that key is gitoxide's own API surface, has no
+/// git counterpart to diverge from, and is not something a git user's environment can
+/// switch on by accident.
 pub(crate) fn query_refs_namespace(
     config: &gix_config::File,
     lenient_config: bool,
 ) -> Result<Option<gix_ref::Namespace>, config::refs_namespace::Error> {
     let key = "gitoxide.core.refsNamespace";
     config
-        .string(key)
+        .string_filter(key, |meta| meta.source != gix_config::Source::EnvOverride)
         .map(|ns| gitoxide::Core::REFS_NAMESPACE.try_into_refs_namespace(ns))
         .transpose()
         .with_leniency(lenient_config)

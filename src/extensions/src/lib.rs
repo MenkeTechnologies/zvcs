@@ -31,6 +31,7 @@ pub mod merge_apply;
 pub mod merge_guard;
 pub mod merge_msg;
 pub mod merge_ws;
+pub mod namespace;
 pub mod objname;
 pub mod objpath;
 pub mod optint;

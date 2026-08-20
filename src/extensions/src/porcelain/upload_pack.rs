@@ -338,10 +338,27 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
         .into_iter()
         .find_map(|c| gix::open_opts(c, options.clone()).ok());
 
-    let Some(repo) = repo else {
+    let Some(mut repo) = repo else {
         eprintln!("fatal: '{directory}' does not appear to be a git repository");
         return Ok(ExitCode::from(128));
     };
+
+    // `GIT_NAMESPACE` applies here and at almost nowhere else — upload-pack is one
+    // of the three programs git namespaces (see [`crate::namespace`]). Installing
+    // it on the ref store reproduces all of git's namespace behaviour in this
+    // command at once: `for_each_namespaced_ref_1()`'s
+    // `opts.namespace = get_git_namespace()` restricts `advertisement()`'s
+    // iteration to the namespace (`upload-pack.c:892`), `strip_namespace()` takes
+    // the prefix back off each advertised name (`upload-pack.c:1200,1220`), and
+    // `refs_head_ref_namespaced()` makes `repo.head()` resolve
+    // `refs/namespaces/<ns>/HEAD` (`upload-pack.c:1090-1107`, `refs.c:1053`).
+    //
+    // Refs outside the namespace disappear from the advertisement as a direct
+    // consequence, which is the point: "git-upload-pack and git-receive-pack will
+    // ignore all references outside the specified namespace"
+    // (`Documentation/gitnamespaces.adoc`).
+    crate::namespace::apply(&mut repo)?;
+    let repo = repo;
 
     // `--advertise-refs`/`--http-backend-info-refs` write the advertisement and exit
     // (the smart-HTTP info/refs half); the bidirectional local/ssh path negotiates.

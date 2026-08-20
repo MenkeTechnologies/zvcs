@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,7 +34,6 @@ use std::process::ExitCode;
 ///     The vendored gitoxide has no server side at all — `gix-protocol` ships
 ///     only `fetch`/`handshake`/`ls_refs` clients — so there is nothing to port
 ///     onto, and shelling out to stock git would defeat the purpose.
-///   * `GIT_NAMESPACE` (git's `strip_namespace` over the ref listing).
 ///   * A `~user` project root (git's `interpolate_path` in `enter_repo`).
 ///
 /// Known, documented deviations: the repository-ownership check that stock
@@ -89,7 +88,7 @@ pub fn http_backend(_args: &[String]) -> Result<ExitCode> {
             &format!("Repository not exported: '{repo_path}'"),
         ));
     }
-    let repo = match gix::open(&git_dir) {
+    let mut repo = match gix::open(&git_dir) {
         Ok(r) => r,
         Err(_) => {
             return Ok(not_found(
@@ -98,6 +97,15 @@ pub fn http_backend(_args: &[String]) -> Result<ExitCode> {
             ))
         }
     };
+    // The dumb ref routes are namespaced in git, unlike the ref-listing builtins:
+    // `http-backend.c:569` iterates with `.namespace = get_git_namespace()`,
+    // `:523` writes each name through `strip_namespace(ref->name)`, and `:604`
+    // resolves HEAD via `refs_head_ref_namespaced()` with `:591` stripping the
+    // symref target. Installing the namespace on the ref store gives all three,
+    // since `gix-ref` prefixes on lookup and strips on the way out. The object and
+    // pack routes are plain file serving and are unaffected either way.
+    crate::namespace::apply(&mut repo)?;
+    let repo = repo;
     let cfg = HttpConfig::read(&repo);
 
     match cmd.imp {
@@ -501,22 +509,12 @@ fn select_service(
 // Route handlers
 // ---------------------------------------------------------------------------
 
-/// git's ref-listing routes run through `strip_namespace`, which this port does
-/// not implement; refuse rather than serve an unfiltered listing.
-fn reject_namespace() -> Result<()> {
-    if env("GIT_NAMESPACE").is_some() {
-        bail!("GIT_NAMESPACE is not supported");
-    }
-    Ok(())
-}
-
 /// `get_head`: `ref: <fully resolved name>` for a symbolic HEAD that resolves,
 /// the raw object id for a detached one, and an empty body for an unborn one.
 fn get_head(hdr: &mut Headers, repo: &gix::Repository, cfg: &HttpConfig) -> Result<ExitCode> {
     if let Err(code) = select_getanyfile(hdr, cfg) {
         return Ok(code);
     }
-    reject_namespace()?;
     let mut body = String::new();
     if let Ok(head) = repo.find_reference("HEAD") {
         match head.target() {
@@ -570,7 +568,6 @@ fn get_info_refs(hdr: &mut Headers, repo: &gix::Repository, cfg: &HttpConfig) ->
     if let Err(code) = select_getanyfile(hdr, cfg) {
         return Ok(code);
     }
-    reject_namespace()?;
 
     use gix::bstr::ByteSlice;
     let mut names: Vec<String> = Vec::new();

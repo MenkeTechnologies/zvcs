@@ -154,9 +154,15 @@
 //!      the pushed history onto the receiving repository's shallow boundary is
 //!      not implemented.
 //!
-//! `GIT_NAMESPACE` (git advertises namespaced names) and object alternates (git
-//! appends one `<oid> .have` line per alternate ref) also bail rather than
-//! producing a short advertisement.
+//! Object alternates (git appends one `<oid> .have` line per alternate ref) bail
+//! rather than producing a short advertisement.
+//!
+//! `GIT_NAMESPACE` **is** honoured: receive-pack is one of the three programs git
+//! namespaces. The advertisement reports `strip_namespace(ref->name)` and hides
+//! refs outside the namespace, and `update()`'s
+//! `namespaced_name = get_git_namespace() + name` means a pushed `refs/heads/x`
+//! is written to `refs/namespaces/<ns>/refs/heads/x`. See [`crate::namespace`]
+//! for why almost every *other* command must ignore the variable.
 //!
 //! `-q`/`--quiet` is accepted and parsed: it only suppresses progress reporting,
 //! which this port does not emit, so it has no observable effect.
@@ -255,6 +261,26 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
         );
         return Ok(ExitCode::from(128));
     };
+
+    // receive-pack is the second of the three programs git namespaces (see
+    // [`crate::namespace`]). One `set_namespace()` covers both halves, because
+    // git namespaces reads *and* writes here:
+    //
+    //   * the advertisement reports `strip_namespace(ref->name)`, and refs
+    //     outside the namespace are not advertised at all;
+    //   * `update()` builds `namespaced_name = get_git_namespace() + name` and
+    //     hands *that* to the ref transaction, so a push of `refs/heads/x` lands
+    //     at `refs/namespaces/<ns>/refs/heads/x`.
+    //
+    // `gix-ref` carries the store's namespace into transactions
+    // (`store/file/transaction/prepare.rs:541`), so the write half follows from
+    // the read half rather than needing its own prefixing pass.
+    //
+    // Applied out here rather than inside `open_repo()` so that a malformed
+    // namespace surfaces as git's `bad git namespace path "<raw>"` — folding it
+    // into the `Option` that function returns would report it as the unrelated
+    // "does not appear to be a git repository".
+    crate::namespace::apply(&mut repo)?;
 
     reject_unportable_advertisement(&repo)?;
 
@@ -421,9 +447,6 @@ fn open_repo(dir: &str) -> Option<gix::Repository> {
 /// Bail on repository state that changes the advertisement in a way this port
 /// does not reproduce, rather than emitting a silently wrong ref list.
 fn reject_unportable_advertisement(repo: &gix::Repository) -> Result<()> {
-    if std::env::var_os("GIT_NAMESPACE").is_some() {
-        bail!("GIT_NAMESPACE is not supported (git advertises namespaced ref names)");
-    }
     let alternates = repo.common_dir().join("objects").join("info").join("alternates");
     if alternates.is_file() || std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES").is_some() {
         bail!("object alternates are not supported (git advertises one '<oid> .have' line per alternate ref)");

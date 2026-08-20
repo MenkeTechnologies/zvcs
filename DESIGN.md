@@ -94,6 +94,24 @@ Two locks sit underneath, with distinct jobs:
   a 32-way `commit` fanout with no daemon: 11–12 of these per run, each formerly a
   hard exit-1 that lost the commit.
 
+- **Stream interleaving (`src/extensions/src/cstdio.rs`).** git orders its two
+  streams through C stdio, not explicitly: `stderr` is unbuffered, `stdout` is
+  line buffered on a terminal and **fully** buffered anywhere else, and
+  `start_command()` flushes with `fflush(NULL)` before every `fork()`
+  (run-command.c:743). So `git checkout <branch> 2>&1 | cat` prints `Switched to
+  branch …` (stderr) *before* the `show_local_changes()` listing (stdout), while
+  the same command on a tty prints them the other way round. Rust's `println!` is
+  a `LineWriter` whatever fd 1 is and can only produce the second order, so the
+  commands whose output has to match stock byte-for-byte when both streams are
+  captured — `checkout`, `switch`, `merge` — route their stdout through this
+  module and arm it with `cstdio::defer()` on entry; the dispatcher flushes after
+  the command, and `cstdio::before_spawn()` stands in for the pre-`fork` flush.
+  Arming is per command, so a shared helper (`merge_apply`, `diff_index`,
+  `merge-index`, `merge-one-file`, `read-tree`, `rerere`) can be routed through
+  the buffer without changing any command that has not opted in. **The fix for a
+  stream-order mismatch is never to move a line to the other stream** — the
+  stream assignment is git's and is already right; the ordering is buffering.
+
 ### Layer 2 — `z*` superset verbs + singleton daemon
 
 The novel coordination layer stock git cannot have. Verbs live under a `z`

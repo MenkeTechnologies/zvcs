@@ -221,6 +221,7 @@ enum Mode {
     GetAll,
     GetRegexp,
     GetUrlMatch,
+    GetColor,
     GetColorBool,
     List,
     Add,
@@ -242,6 +243,7 @@ impl Mode {
             Mode::GetAll => "--get-all",
             Mode::GetRegexp => "--get-regexp",
             Mode::GetUrlMatch => "--get-urlmatch",
+            Mode::GetColor => "--get-color",
             Mode::GetColorBool => "--get-colorbool",
             Mode::ReplaceAll => "--replace-all",
             Mode::RenameSection => "--rename-section",
@@ -292,13 +294,18 @@ fn usage_error(msg: &str) -> Result<ExitCode> {
 /// How a read prints each `(key, value)` pair: git's `--show-origin` /
 /// `--show-scope` prefixes, the `--null` record separator, and the `--type`
 /// canonicalization applied to the value.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct Display {
     show_origin: bool,
     show_scope: bool,
     null: bool,
     name_only: bool,
     ty: Option<ValueType>,
+    /// `--default=<value>` (`display_opts.default_value`, builtin/config.c:127):
+    /// the value a `--get` that finds nothing formats and prints instead. It goes
+    /// through the *same* `format_config()` the real values do, so `--type` applies
+    /// to it and a default the type rejects is a fatal error.
+    default_value: Option<String>,
 }
 
 /// `--type=<t>` and its legacy spellings (`--bool`, `--int`, `--bool-or-int`,
@@ -614,6 +621,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "--get-all" => Some(Mode::GetAll),
             "--get-regexp" => Some(Mode::GetRegexp),
             "--get-urlmatch" => Some(Mode::GetUrlMatch),
+            "--get-color" => Some(Mode::GetColor),
             "--get-colorbool" => Some(Mode::GetColorBool),
             "--replace-all" => Some(Mode::ReplaceAll),
             "--rename-section" => Some(Mode::RenameSection),
@@ -686,6 +694,11 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        if let Some(v) = a.strip_prefix("--default=") {
+            d.default_value = Some(v.to_string());
+            continue;
+        }
+
         // `--type=<t>` and its legacy spellings canonicalize the value on the way
         // out; see [`select_type`] for the two refusals it owns.
         // `-t<type>` is parse-options' sticky short form; `--type` never matches
@@ -720,6 +733,15 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                     return Ok(code);
                 }
             }
+            // `OPT_STRING(0, "default", …)`: an attached `--default=<v>` is handled
+            // with the other `=`-carrying options above; this is the separated form.
+            "--default" => {
+                let Some(v) = args.get(i) else {
+                    return Ok(super::missing_option_value(a));
+                };
+                i += 1;
+                d.default_value = Some(v.clone());
+            }
             "-t" | "--type" => {
                 let Some(v) = args.get(i) else {
                     // `get_arg()`'s PARSE_OPT_ERROR: no usage block, and the
@@ -750,10 +772,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 scope = Scope::Default;
             }
             "--no-worktree" | "--no-blob" => {}
-            // `--no-default` and `--no-comment` NULL an `OPT_STRING` that this
-            // port never reads, and `--no-fixed-value` clears a bit it never
-            // sets; the unset sense is the behaviour already in place.
-            "--no-default" | "--no-comment" | "--no-fixed-value" => {}
+            // `--no-default` NULLs the `OPT_STRING` behind `--default`; the other
+            // two clear slots this port does not read.
+            "--no-default" => d.default_value = None,
+            "--no-comment" | "--no-fixed-value" => {}
             "--worktree" => bail!(
                 "--worktree scope is not supported: it reads and writes \
                  $GIT_COMMON_DIR/worktrees/<id>/config.worktree behind the \
@@ -773,7 +795,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // (builtin/config.c:1407-1410) runs before every other check, including the
     // actionless one, and exits 129 through `error()` + `exit()` rather than
     // through `usage_with_options()`, so it carries no usage block.
-    if mode == Mode::GetColorBool && ty_name.is_some() {
+    if matches!(mode, Mode::GetColor | Mode::GetColorBool) && ty_name.is_some() {
         return usage_error("--get-color and variable type are incoherent");
     }
     //
@@ -787,11 +809,30 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     if name_only && !matches!(mode, Mode::List | Mode::GetRegexp) {
         return usage_error("--name-only is only applicable to --list or --get-regexp");
     }
+    // ```c
+    // if (display_opts.default_value && !(actions & ACTION_GET)) {
+    //         error(_("--default is only applicable to --get"));
+    //         exit(129);
+    // }
+    // ```
+    // (`builtin/config.c:1440-1443`.) It runs *after* the implicit action is
+    // resolved (`case 1: actions = ACTION_GET`), so the bare one-operand read —
+    // `git config --default=x some.missing` — is a `--get` by then and is allowed.
+    if d.default_value.is_some()
+        && !(mode == Mode::Get || (mode == Mode::Auto && positional.len() == 1))
+    {
+        return usage_error("--default is only applicable to --get");
+    }
     match mode {
         Mode::List if !positional.is_empty() => {
             return usage_error("wrong number of arguments, should be 0");
         }
         Mode::Get | Mode::GetAll | Mode::GetRegexp if !(1..=2).contains(&positional.len()) => {
+            return usage_error("wrong number of arguments, should be from 1 to 2");
+        }
+        // `check_argc(argc, 1, 2)` (builtin/config.c:1607) — the same window and
+        // the same wording as the get forms.
+        Mode::GetColor if !(1..=2).contains(&positional.len()) => {
             return usage_error("wrong number of arguments, should be from 1 to 2");
         }
         _ => {}
@@ -831,6 +872,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         | Mode::GetAll
         | Mode::GetRegexp
         | Mode::GetUrlMatch
+        | Mode::GetColor
         | Mode::GetColorBool => true,
         Mode::Auto => positional.len() == 1,
         Mode::Add
@@ -933,6 +975,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             get_regexp(file, positional[0], positional.get(1).copied(), &d)
         }
         Mode::GetUrlMatch => get_urlmatch(file, &positional, &d),
+        Mode::GetColor => get_color(file, positional[0], positional.get(1).copied()),
         Mode::GetColorBool => get_colorbool(file, &positional),
         Mode::Edit => edit_config(&write_target()?),
         Mode::RenameSection => rename_section(&write_target()?, &positional),
@@ -1070,8 +1113,44 @@ fn get(
         }
         Ok(())
     })?;
+    // ```c
+    // if (!values.nr && display_opts->default_value) {
+    //         struct key_value_info kvi = KVI_INIT;
+    //         kvi_from_param(&kvi);
+    //         …
+    //         status = format_config(display_opts, item, key_, display_opts->default_value, &kvi, 0);
+    //         if (status < 0)
+    //                 die(_("failed to format default config value: %s"), display_opts->default_value);
+    // ```
+    //
+    // (`builtin/config.c:608-628`.) The default is formatted by the same
+    // `format_config()` the stored values go through, so `--type` applies to it —
+    // and `kvi_from_param()` gives it no file of origin, which is what shortens the
+    // diagnostic when the type rejects it. Only a `--get` that found *nothing* uses
+    // it; a key that exists but was filtered out by a value-pattern still exits 1.
     if selected.is_empty() {
-        return Ok(ExitCode::from(1));
+        let Some(default) = d.default_value.as_deref() else {
+            return Ok(ExitCode::from(1));
+        };
+        let formatted = match d.ty {
+            None => Ok(default.as_bytes().to_vec()),
+            Some(t) => t.canonicalize(name, default.as_bytes()),
+        };
+        return match formatted {
+            Ok(value) => {
+                emit_kv(&mut out, d, name, &value, &param_metadata(), b'\n', false)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            // A `format_config()` that returns < 0 is the `die()` above rather than
+            // the callback's usual `bad config line` follow-up, because the default
+            // came from the command line and has no config line behind it.
+            Err(TypeError::Callback(message)) => {
+                eprintln!("{message}");
+                eprintln!("fatal: failed to format default config value: {default}");
+                Ok(ExitCode::from(128))
+            }
+            Err(err) => Ok(report_type_error(err, name, default.as_bytes(), None)),
+        };
     }
 
     // git canonicalizes in file order and dies on the first value that does not
@@ -1651,42 +1730,272 @@ fn edit_config(target: &WriteTarget) -> Result<ExitCode> {
     })
 }
 
-/// `git config --get-colorbool <name> [<stdout-is-tty>]` — resolve a color
-/// setting to `true`/`false`, printing it and exiting 0 when color is on, 1 when
-/// off (git inverts the usual convention here so shell `if` reads naturally).
+/// `kvi_from_param()` (`config.c`): the origin a value typed on the command line
+/// carries — no file, no line number. `--show-origin` renders it as `command line:`
+/// and the type diagnostics take their short form.
+fn param_metadata() -> gix::config::file::Metadata {
+    gix::config::file::Metadata::from(Source::Cli)
+}
+
+/// ```c
+/// static int git_get_color_config(const char *var, const char *value,
+///                                 const struct config_context *ctx UNUSED, void *cb)
+/// {
+///         struct get_color_config_data *data = cb;
 ///
-/// `auto` (and an unset key) depend on whether stdout is a terminal: the caller
-/// may state that as the optional second operand, otherwise it is probed.
+///         if (!strcmp(var, data->get_color_slot)) {
+///                 if (!value)
+///                         config_error_nonbool(var);
+///                 if (color_parse(value, data->parsed_color) < 0)
+///                         return -1;
+///                 data->get_color_found = 1;
+///         }
+///         return 0;
+/// }
+///
+/// static int get_color(const struct config_location_options *opts,
+///                       const char *var, const char *def_color)
+/// {
+///         …
+///         config_with_options(git_get_color_config, &data, …);
+///
+///         if (!data.get_color_found && def_color) {
+///                 if (color_parse(def_color, data.parsed_color) < 0) {
+///                         ret = error(_("unable to parse default color value"));
+///                         goto out;
+///                 }
+///         }
+///         ret = 0;
+/// out:
+///         fputs(data.parsed_color, stdout);
+///         return ret;
+/// }
+/// ```
+///
+/// (`builtin/config.c:712-753`.) Four things the shape of that function decides:
+///
+/// * the output is `fputs` of the escape sequence with **no newline**, and an unset
+///   slot with no default prints nothing at all and still exits 0.
+/// * every occurrence of the slot is parsed as the callback walks the file, so a
+///   value the parser rejects is fatal even when a later one would have won — and
+///   it fails as a config-callback error, `fatal: bad config line <n> in file <f>`.
+/// * the *last* occurrence is the one that survives into `parsed_color`.
+/// * a `<default>` the parser rejects is a plain `error()` return, not a `die()`:
+///   `unable to parse default color value` and `main()`'s `-1`, which the shell
+///   sees as 255.
+fn get_color(file: &gix::config::File, slot: &str, def_color: Option<&str>) -> Result<ExitCode> {
+    let key = parse_key(slot)?;
+    let wanted = key_of(&key);
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    let mut parsed: Option<String> = None;
+    let mut failure: Option<(Vec<u8>, Option<std::path::PathBuf>)> = None;
+    for_each_entry(file, |k, value, meta| {
+        if k != wanted || failure.is_some() {
+            return Ok(());
+        }
+        match super::color::parse_color_spec(&String::from_utf8_lossy(value)) {
+            Some(sgr) => parsed = Some(sgr),
+            None => failure = Some((value.to_vec(), meta.path.as_deref().map(ToOwned::to_owned))),
+        }
+        Ok(())
+    })?;
+    if let Some((value, origin)) = failure {
+        let text = String::from_utf8_lossy(&value).into_owned();
+        return Ok(report_type_error(
+            TypeError::Callback(format!("error: invalid color value: {text}")),
+            slot,
+            &value,
+            origin.as_deref(),
+        ));
+    }
+
+    if parsed.is_none() {
+        if let Some(def) = def_color {
+            match super::color::parse_color_spec(def) {
+                Some(sgr) => parsed = Some(sgr),
+                None => {
+                    eprintln!("error: invalid color value: {def}");
+                    eprintln!("error: unable to parse default color value");
+                    // `main()` hands the shell `-1`, which is 255.
+                    return Ok(ExitCode::from(255));
+                }
+            }
+        }
+    }
+    out.write_all(parsed.unwrap_or_default().as_bytes())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// ```c
+/// static int git_get_colorbool_config(const char *var, const char *value,
+///                                     const struct config_context *ctx UNUSED, void *cb)
+/// {
+///         struct get_colorbool_config_data *data = cb;
+///
+///         if (!strcmp(var, data->get_colorbool_slot))
+///                 data->get_colorbool_found = git_config_colorbool(var, value);
+///         else if (!strcmp(var, "diff.color"))
+///                 data->get_diff_color_found = git_config_colorbool(var, value);
+///         else if (!strcmp(var, "color.ui"))
+///                 data->get_color_ui_found = git_config_colorbool(var, value);
+///         return 0;
+/// }
+///
+/// static int get_colorbool(const struct config_location_options *opts,
+///                          const char *var, int print)
+/// {
+///         …
+///         if (data.get_colorbool_found == GIT_COLOR_UNKNOWN) {
+///                 if (!strcmp(data.get_colorbool_slot, "color.diff"))
+///                         data.get_colorbool_found = data.get_diff_color_found;
+///                 if (data.get_colorbool_found == GIT_COLOR_UNKNOWN)
+///                         data.get_colorbool_found = data.get_color_ui_found;
+///         }
+///
+///         if (data.get_colorbool_found == GIT_COLOR_UNKNOWN)
+///                 /* default value if none found in config */
+///                 data.get_colorbool_found = GIT_COLOR_AUTO;
+///
+///         result = want_color(data.get_colorbool_found);
+///
+///         if (print) {
+///                 printf("%s\n", result ? "true" : "false");
+///                 return 0;
+///         } else
+///                 return result ? 0 : 1;
+/// }
+/// ```
+///
+/// (`builtin/config.c:762-810`.) The fallback chain is the whole point of the
+/// option: an unset slot inherits `diff.color` (only for the slot literally named
+/// `color.diff`, git's historical spelling) and then `color.ui`, and only a slot
+/// that none of the three set falls through to `auto`. `never`/`always` are
+/// answers in their own right, so `color.ui = never` makes every unset slot false
+/// even on a terminal.
+///
+/// The exit code is inverted from the usual convention so a shell `if` reads
+/// naturally: 0 when color is on, 1 when it is off. The value is *printed* only
+/// when the caller states whether stdout is a terminal, which is git's `print`
+/// argument (`argc == 2`).
 fn get_colorbool(file: &gix::config::File, positional: &[&str]) -> Result<ExitCode> {
     let Some(name) = positional.first() else {
         return usage_error("wrong number of arguments, should be from 1 to 2");
     };
-    // git prints the resolved value only when the caller SAYS whether stdout is
-    // a tty; with the argument omitted it answers through the exit code alone.
+    if positional.len() > 2 {
+        return usage_error("wrong number of arguments, should be from 1 to 2");
+    }
+    // `color_stdout_is_tty = git_config_bool("command line", argv[1])` — the caller
+    // overrides the `isatty()` probe, and a word that is not a boolean is
+    // `git_config_bool()`'s `die()`, naming `command line` as the origin.
     let stated = positional.get(1);
     let tty = match stated {
-        Some(v) => optint::maybe_bool(v).unwrap_or(false),
+        Some(v) => match optint::maybe_bool(v) {
+            Some(b) => b,
+            None => {
+                eprintln!("fatal: bad boolean config value '{v}' for 'command line'");
+                return Ok(ExitCode::from(128));
+            }
+        },
         None => std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
 
     let key = parse_key(name)?;
-    let raw = file
-        .raw_value_filter_by(key.section_name, key.subsection_name, key.value_name, |m| {
-            !is_synthetic(m.source)
-        })
-        .ok()
-        .map(|v| String::from_utf8_lossy(&v).trim().to_string());
+    let wanted = key_of(&key);
+    let (mut slot, mut diff_color, mut color_ui) = (None, None, None);
+    // The value that is not one of the three words and not a boolean either —
+    // `color.diff = red`, say — is `git_config_bool()`'s `die()`, and it fires
+    // while the config is being walked rather than at the end.
+    let mut bad: Option<(String, String)> = None;
+    for_each_entry(file, |k, value, _| {
+        if k != wanted && k != "diff.color" && k != "color.ui" {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(value).trim().to_string();
+        let Some(decided) = colorbool_of(&text) else {
+            if bad.is_none() {
+                bad = Some((k.to_string(), text));
+            }
+            return Ok(());
+        };
+        if k == wanted {
+            slot = Some(decided);
+        } else if k == "diff.color" {
+            diff_color = Some(decided);
+        } else {
+            color_ui = Some(decided);
+        }
+        Ok(())
+    })?;
+    if let Some((key, value)) = bad {
+        eprintln!("fatal: bad boolean config value '{value}' for '{key}'");
+        return Ok(ExitCode::from(128));
+    }
 
-    // git: an explicit boolean wins; `auto` and "unset" both defer to the tty.
-    let on = match raw.as_deref() {
-        Some("auto") | None => tty,
-        Some(v) => optint::maybe_bool(v).unwrap_or(true), // a color NAME means "on"
+    let found = slot
+        .or_else(|| if wanted == "color.diff" { diff_color } else { None })
+        .or(color_ui)
+        // `GIT_COLOR_AUTO` is the default when nothing in the config decided.
+        .unwrap_or(ColorBool::Auto);
+    // `want_color()`: `ALWAYS` and `NEVER` answer outright, `AUTO` asks the terminal.
+    let on = match found {
+        ColorBool::Always => true,
+        ColorBool::Never => false,
+        ColorBool::Auto => tty,
     };
     if stated.is_some() {
         println!("{on}");
         return Ok(ExitCode::SUCCESS);
     }
     Ok(if on { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+/// `enum git_colorbool`, minus the `GIT_COLOR_UNKNOWN` that `Option::None` carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorBool {
+    Always,
+    Never,
+    Auto,
+}
+
+/// ```c
+/// enum git_colorbool git_config_colorbool(const char *var, const char *value)
+/// {
+///         if (value) {
+///                 if (!strcasecmp(value, "never"))  return GIT_COLOR_NEVER;
+///                 if (!strcasecmp(value, "always")) return GIT_COLOR_ALWAYS;
+///                 if (!strcasecmp(value, "auto"))   return GIT_COLOR_AUTO;
+///         }
+///         if (!var) return GIT_COLOR_UNKNOWN;
+///         /* Missing or explicit false to turn off colorization */
+///         if (!git_config_bool(var, value)) return GIT_COLOR_NEVER;
+///         /* any normal truth value defaults to 'auto' */
+///         return GIT_COLOR_AUTO;
+/// }
+/// ```
+///
+/// (`color.c:382-403`.) Anything that is not one of the three words goes through
+/// `git_config_bool()`, which `die()`s on a value that is not a boolean at all —
+/// so `color.diff = red` is `fatal: bad boolean config value 'red' for 'color.diff'`
+/// rather than a colorized `auto`. `None` reports that failure to the caller. A
+/// false boolean is `never`; a true one is `auto`, not `always`, because the slot
+/// still has to agree with the terminal.
+fn colorbool_of(value: &str) -> Option<ColorBool> {
+    if value.eq_ignore_ascii_case("never") {
+        return Some(ColorBool::Never);
+    }
+    if value.eq_ignore_ascii_case("always") {
+        return Some(ColorBool::Always);
+    }
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(ColorBool::Auto);
+    }
+    match optint::maybe_bool(value)? {
+        false => Some(ColorBool::Never),
+        true => Some(ColorBool::Auto),
+    }
 }
 
 /// `git config --rename-section <old> <new>` — rewrite the section header in

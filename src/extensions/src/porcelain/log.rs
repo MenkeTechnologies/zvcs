@@ -926,6 +926,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut show_root = cfg_show_root;
     let mut color = ColorWhen::Auto;
     let mut order = Order::Default;
+    // `git_log_output_encoding` (environment.c:51), set by `--encoding=<enc>`.
+    let mut log_encoding: Option<String> = None;
+    // `diff_options.anchors` — the repeatable `--anchored=<text>` list.
+    let mut anchors: Vec<String> = Vec::new();
     let mut revs: Vec<String> = Vec::new();
     // Parallel to `revs`: whether a `--not` was in force when it was read, which
     // reverses the sense the `^` prefix would otherwise give it.
@@ -1635,6 +1639,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             order = Order::Date;
         } else if a == "--topo-order" {
             order = Order::Topo;
+        // ```c
+        // } else if (!strcmp(arg, "--author-date-order")) {
+        //         revs->sort_order = REV_SORT_BY_AUTHOR_DATE;
+        //         revs->topo_order = 1;
+        // ```
+        // (`revision.c:2456-2458`.) Like `--date-order` it turns the topological
+        // sort on; only the tie-break differs.
+        } else if a == "--author-date-order" {
+            order = Order::AuthorDate;
         } else if let Some(v) = a.strip_prefix("--grep=") {
             grep_pats.push(v.to_string());
         } else if a == "--grep" {
@@ -1890,24 +1903,26 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             }
+        // ```c
+        // } else if ((argcount = parse_long_opt("encoding", argv, &optarg))) {
+        //         free(git_log_output_encoding);
+        //         if (strcmp(optarg, "none"))
+        //                 git_log_output_encoding = xstrdup(optarg);
+        //         else
+        //                 git_log_output_encoding = xstrdup("");
+        //         return argcount;
+        // ```
+        //
+        // (`revision.c:2701-2707`.) `none` is stored as the *empty* string, which
+        // `repo_logmsg_reencode()` reads as "hand the message back untouched" — it is
+        // not the same as asking for UTF-8, which drops the `encoding` header.
+        // `parse_long_opt()` takes both the attached and the separated spelling.
         } else if a == "--encoding" {
-            // `--encoding=<enc>`: the encoding commit messages are re-coded into. This
-            // port writes them as stored, which is what `utf-8` and `none` ask for.
             i += 1;
             let v = args.get(i).cloned().unwrap_or_default();
-            if !super::blame::encoding_is_passthrough(&v) {
-                bail!(
-                    "unsupported flag \"--encoding={v}\" (only utf-8 and none are ported; \
-                     re-coding commit messages is not)"
-                );
-            }
+            log_encoding = Some(if v == "none" { String::new() } else { v });
         } else if let Some(v) = a.strip_prefix("--encoding=") {
-            if !super::blame::encoding_is_passthrough(v) {
-                bail!(
-                    "unsupported flag \"{a}\" (only utf-8 and none are ported; re-coding \
-                     commit messages is not)"
-                );
-            }
+            log_encoding = Some(if v == "none" { String::new() } else { v.to_string() });
         } else if a == "-z" {
             z = true;
         } else if a == "-w" || a == "--ignore-all-space" {
@@ -1929,6 +1944,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             patch_opts.algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal);
         } else if a == "--patience" {
             patch_opts.algorithm = Some(gix::diff::blob::Algorithm::Patience);
+            // `diff_opt_patience()` frees every anchor named before it (`diff.c:5845-5853`).
+            anchors.clear();
+        // `--anchored=<text>` (`diff_opt_anchored()`, diff.c:5544-5556): repeatable, and
+        // each occurrence re-pins the algorithm to patience. `setup_revisions()` hands
+        // every unrecognised token to `diff_opt_parse()`, so `git log -p` takes it too.
+        } else if let Some(v) = a.strip_prefix("--anchored=") {
+            patch_opts.algorithm = Some(gix::diff::blob::Algorithm::Patience);
+            anchors.push(v.to_string());
+        } else if a == "--anchored" {
+            i += 1;
+            let Some(v) = args.get(i).cloned() else {
+                eprintln!("error: option `anchored' requires a value");
+                return Ok(ExitCode::from(129));
+            };
+            patch_opts.algorithm = Some(gix::diff::blob::Algorithm::Patience);
+            anchors.push(v);
         } else if a == "--histogram" {
             patch_opts.algorithm = Some(gix::diff::blob::Algorithm::Histogram);
         } else if let Some(v) = a.strip_prefix("--diff-algorithm=") {
@@ -2723,7 +2754,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `init_topo_walk()` — so `--topo-order`/`--date-order` are silently inert
     // there, and the pending order (or its date sort) stands.
     if effective_order != Order::Default && no_walk.is_none() {
-        nodes = topo_sort(nodes, effective_order == Order::Date);
+        nodes = topo_sort_ordered(&repo, nodes, effective_order);
     }
 
     // `-L`: carry the tracked ranges backward through the history, keeping only the
@@ -3633,6 +3664,49 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // them is the whole cost of a format like `--oneline` or `%s`. The window
     // renders a batch of records at a time across the thread pool; the loop below
     // still writes them one after another, in walk order.
+    // ```c
+    // const char *get_log_output_encoding(void)
+    // {
+    //         return git_log_output_encoding ? git_log_output_encoding
+    //                 : get_commit_output_encoding();
+    // }
+    // const char *get_commit_output_encoding(void)
+    // {
+    //         return git_commit_encoding ? git_commit_encoding : "UTF-8";
+    // }
+    // ```
+    //
+    // (`environment.c:189-198`.) `--encoding=` wins, then `i18n.logOutputEncoding`,
+    // then `i18n.commitEncoding`, and UTF-8 when none of them is set. The two config
+    // keys write the *same* two slots the option does, so `--encoding=none` (the
+    // empty string) still beats a configured `i18n.logOutputEncoding`.
+    let output_encoding = match log_encoding {
+        Some(v) => v,
+        None => {
+            let cfg = repo.config_snapshot();
+            cfg.string("i18n.logOutputEncoding")
+                .or_else(|| cfg.string("i18n.commitEncoding"))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "UTF-8".to_string())
+        }
+    };
+    // `reencode_string_len()` delegates to `iconv(3)`; this port's stand-in is
+    // `encoding_rs`, which has no UTF-16/UTF-32 *encoder* — see
+    // `crate::porcelain::mailinfo::encode_to`. git's own UTF-16 output is
+    // platform-dependent there too (`ICONV_OMITS_BOM` decides whether it writes the
+    // byte-order mark itself), so rather than emit bytes that are neither, the
+    // request is refused outright.
+    if super::mailinfo::is_utf16_or_32_name(&output_encoding) {
+        bail!(
+            "unsupported flag \"--encoding={output_encoding}\" (the UTF-16 and UTF-32 \
+             families are not ported; every other charset is)"
+        );
+    }
+
+    // The anchor list is final once the option scan is; it reaches the blob differ
+    // through the process-wide slot. See [`super::diff_pairs::set_anchor_texts`].
+    super::diff_pairs::set_anchor_texts(anchors);
+
     let mut entries = EntryWindow::new(EntryParams {
         abbrev_commit,
         show_signature,
@@ -3662,6 +3736,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             subject_prefix: &cfg_subject_prefix,
             encode_headers: encode_email_headers,
         },
+        output_encoding: &output_encoding,
     });
     // `do_remerge_diff()` (log-tree.c:1029-1090) re-runs the merge into a temporary
     // object directory and diffs its tree against the recorded one. This port has
@@ -4939,6 +5014,13 @@ pub(super) enum Order {
     Date,
     /// `--topo-order`: topological, following the graph rather than the clock.
     Topo,
+    /// `--author-date-order`: topological, breaking ties by *author* date.
+    ///
+    /// `REV_SORT_BY_AUTHOR_DATE` (revision.c:2456-2458). The commit date a walk
+    /// normally orders by is the one a rebase or an amend rewrites; the author date
+    /// survives both, so this is the order that keeps a rewritten history in the
+    /// sequence its patches were written in.
+    AuthorDate,
 }
 
 /// `--no-walk[=(sorted|unsorted)]` (`revision.c`'s `no_walk` field).
@@ -4995,6 +5077,10 @@ struct EntryParams<'a> {
     date_explicit: bool,
     /// See [`RenderCtx::email`].
     email: EmailStyle<'a>,
+    /// `get_log_output_encoding()` (`environment.c:189-193`): the charset commit
+    /// messages are re-coded into before they are rendered. Empty means
+    /// `--encoding=none` — hand the stored bytes back untouched.
+    output_encoding: &'a str,
 }
 
 /// A look-ahead buffer of rendered commit records.
@@ -5125,7 +5211,24 @@ fn entry_block_from(
     abbrev: &std::cell::RefCell<AbbrevCache>,
     from: Option<ObjectId>,
 ) -> Result<Vec<u8>> {
-    let commit = repo.find_object(node.id)?.try_into_commit()?;
+    let mut commit = repo.find_object(node.id)?.try_into_commit()?;
+    // `show_log()` renders from `repo_logmsg_reencode(commit, NULL, encoding)`
+    // (`pretty.c:2315-2316`) rather than from the stored buffer, so the whole
+    // object — headers included — is re-coded before anything reads it.
+    //
+    // A *user* format takes the other road. `pretty_print_commit()` hands
+    // `CMIT_FMT_USERFORMAT` straight to `repo_format_commit_message()`
+    // (`pretty.c:2318-2322`), which re-codes the commit to **UTF-8** whatever
+    // `--encoding` said (`pretty.c:1734`), expands the format against those bytes,
+    // and only then converts the finished record out of UTF-8 into the requested
+    // encoding (`pretty.c:2026-2046`). The observable difference is
+    // `--encoding=none`: the built-in formats print the stored bytes untouched,
+    // while a user format still prints UTF-8.
+    // `reference` is not a format of its own in git: `get_commit_format()` sets
+    // `CMIT_FMT_USERFORMAT` and saves `%C(auto)%h (%s, %ad)` as the user format
+    // (pretty.c`s `setup_commit_format`), so it takes the user-format road too.
+    let user_format = matches!(p.pretty, Pretty::User(_) | Pretty::Reference);
+    logmsg_reencode(&mut commit.data, if user_format { "UTF-8" } else { p.output_encoding });
     // `--parents` then `--children` decorate the header with ids, in that order
     // (`show_log` prints `print_parents` before `children`). A child list is what
     // the walk saw, so it names only commits this run reached.
@@ -5190,6 +5293,31 @@ fn entry_block_from(
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
+    // ```c
+    // if (output_enc) {
+    //         if (same_encoding(utf8, output_enc))
+    //                 output_enc = NULL;
+    // } …
+    // if (output_enc) {
+    //         char *out = reencode_string_len(sb->buf, sb->len, output_enc, utf8, &outsz);
+    //         if (out)
+    //                 strbuf_attach(sb, out, outsz, outsz + 1);
+    // }
+    // ```
+    //
+    // (`pretty.c:2026-2046`.) The conversion is of the *rendered record*, and a
+    // conversion that cannot be done leaves the UTF-8 bytes in place. An empty
+    // output encoding — `--encoding=none` — reaches `iconv_open("", "UTF-8")`,
+    // which is the locale's own charset and changes nothing here.
+    if user_format && !p.output_encoding.is_empty() {
+        if !super::mailinfo::same_encoding("UTF-8", p.output_encoding) {
+            if let Some(out) =
+                super::mailinfo::reencode(&block, "UTF-8", p.output_encoding)
+            {
+                block = out;
+            }
+        }
+    }
     // A `tformat:` record is terminated by a newline. git still terminates a
     // record whose expansion happened to be empty (so `%d` prints one line per
     // commit); only the genuinely empty user format emits no terminator.
@@ -6387,6 +6515,69 @@ pub(super) fn walk(
 /// set, drained through a queue that is date-ordered for `--date-order` and a
 /// LIFO stack for `--topo-order`.
 pub(crate) fn topo_sort(nodes: Vec<Node>, by_date: bool) -> Vec<Node> {
+    let keys = by_date.then(|| nodes.iter().map(|n| (n.id, n.time)).collect());
+    topo_sort_keyed(nodes, keys.as_ref())
+}
+
+/// [`topo_sort`] driven by an [`Order`] rather than a bool, which is what
+/// `sort_in_topological_order(&revs->commits, revs->sort_order)` takes.
+///
+/// ```c
+/// switch (sort_order) {
+/// default: /* REV_SORT_IN_GRAPH_ORDER */ queue.compare = NULL; break;
+/// case REV_SORT_BY_COMMIT_DATE: queue.compare = compare_commits_by_commit_date; break;
+/// case REV_SORT_BY_AUTHOR_DATE:
+///         init_author_date_slab(&author_date);
+///         queue.compare = compare_commits_by_author_date;
+///         queue.cb_data = &author_date;
+///         break;
+/// }
+/// …
+/// for (next = orig; next; next = next->next) {
+///         …
+///         if (sort_order == REV_SORT_BY_AUTHOR_DATE)
+///                 record_author_date(&author_date, commit);
+/// }
+/// ```
+///
+/// (`commit.c:961-982`.) `record_author_date()` reads the `author` header of each
+/// listed commit up front and stores its timestamp in a slab; a commit with no
+/// author line, or one whose date does not parse, keeps the slab's zero — so it
+/// sorts as the epoch rather than being dropped.
+pub(crate) fn topo_sort_ordered(
+    repo: &gix::Repository,
+    nodes: Vec<Node>,
+    order: Order,
+) -> Vec<Node> {
+    let keys: Option<std::collections::HashMap<ObjectId, i64>> = match order {
+        Order::Default | Order::Topo => None,
+        Order::Date => Some(nodes.iter().map(|n| (n.id, n.time)).collect()),
+        Order::AuthorDate => Some(
+            nodes
+                .iter()
+                .map(|n| (n.id, author_date_of(repo, n.id).unwrap_or(0)))
+                .collect(),
+        ),
+    };
+    topo_sort_keyed(nodes, keys.as_ref())
+}
+
+/// `record_author_date()` (`commit.c:866-891`): the `author` header's timestamp, or
+/// `None` when the commit has no author line or its date is malformed.
+fn author_date_of(repo: &gix::Repository, id: ObjectId) -> Option<i64> {
+    let commit = repo.find_object(id).ok()?.try_into_commit().ok()?;
+    Some(commit.author().ok()?.time().ok()?.seconds)
+}
+
+/// The shared drain: `keys` is the priority the frontier is ordered by (highest
+/// first, earliest-queued breaking ties), or `None` for the LIFO stack that keeps
+/// `--topo-order`'s graph order.
+fn topo_sort_keyed(
+    nodes: Vec<Node>,
+    keys: Option<&std::collections::HashMap<ObjectId, i64>>,
+) -> Vec<Node> {
+    let by_date = keys.is_some();
+    let key_of = |id: &ObjectId| keys.and_then(|k| k.get(id)).copied().unwrap_or(0);
     let mut indegree: std::collections::HashMap<ObjectId, usize> =
         nodes.iter().map(|n| (n.id, 1usize)).collect();
     for node in &nodes {
@@ -6412,10 +6603,10 @@ pub(crate) fn topo_sort(nodes: Vec<Node>, by_date: bool) -> Vec<Node> {
     let mut out: Vec<usize> = Vec::with_capacity(nodes.len());
     while !queue.is_empty() {
         let at = if by_date {
-            // Highest commit date wins; the earliest-queued entry breaks ties.
+            // Highest key wins; the earliest-queued entry breaks ties.
             let mut best = 0usize;
             for (k, &i) in queue.iter().enumerate() {
-                if nodes[i].time > nodes[queue[best]].time {
+                if key_of(&nodes[i].id) > key_of(&nodes[queue[best]].id) {
                     best = k;
                 }
             }
@@ -7437,6 +7628,12 @@ enum DecoKind {
     RemoteBranch,
     /// The single `refs/stash` ref (bold magenta).
     Stash,
+    /// `DECORATION_GRAFTED` — not a ref at all but the pseudo-decoration
+    /// `add_graft_decoration()` (log-tree.c:211-219) hangs on every commit the
+    /// graft table names, rendered as the literal word `grafted`. A `--depth`
+    /// clone registers its boundary commits as grafts, which is the form this
+    /// port reaches; `refs/replace/*`'s `replaced` entry shares the slot.
+    Grafted,
     /// Any other ref, reachable only once the default namespace filter is
     /// relaxed by `--clear-decorations` / `log.initialDecorationSet=all`.
     /// git's `DECORATION_NONE`, whose color slot is a bare reset.
@@ -7685,6 +7882,19 @@ pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilte
         }
     }
 
+    // `for_each_commit_graft(add_graft_decoration, NULL)` (log-tree.c:242): every
+    // commit the graft table names gets the literal `grafted` decoration, and it
+    // is added last so it renders first. The table is `.git/shallow` plus
+    // `.git/info/grafts`; this port carries the shallow half, which is the one a
+    // `clone --depth`/`fetch --depth` leaves behind. No `ref_filter_match()` runs
+    // over these — they are not refs, so `--decorate-refs` cannot exclude them.
+    for id in repo.shallow_commits().ok().flatten().iter().flat_map(|c| c.iter()) {
+        map.entry(*id).or_default().push(Deco {
+            kind: DecoKind::Grafted,
+            full: "grafted".to_string(),
+        });
+    }
+
     Ok(Decorations { map, head_branch })
 }
 
@@ -7735,14 +7945,14 @@ pub(crate) fn format_decorations(
         return;
     }
 
-    const RESET: &str = "\x1b[m";
-    let paint = |text: &str, code: &str| -> String {
-        if code.is_empty() {
-            text.to_string()
-        } else {
-            format!("{code}{text}{RESET}")
-        }
-    };
+    // `format_decorations()` (log-tree.c:399-401, :387-391) writes the slot color,
+    // the text, then `color_reset` — **unconditionally**, never conditioned on the
+    // slot having produced a sequence. `color_reset` is
+    // `decorate_get_color(use_color, DECORATION_NONE)`, i.e. `\e[m` while coloring
+    // is on and `""` while it is off, which is exactly `colors.none`. Skipping the
+    // reset for an empty slot dropped a byte stock emits: `color.decorate.branch =
+    // normal` parses to an empty sequence but still closes with `\e[m`.
+    let paint = |text: &str, code: &str| -> String { format!("{code}{text}{}", colors.none) };
     // git's slot defaults: HEAD bold cyan, local branch bold green, remote bold
     // red, tag bold yellow, stash bold magenta, anything else a bare reset. The
     // punctuation between and around the entries takes `color.diff.commit`, the
@@ -7754,6 +7964,7 @@ pub(crate) fn format_decorations(
         DecoKind::RemoteBranch => colors.remote_branch.as_str(),
         DecoKind::Tag => colors.tag.as_str(),
         DecoKind::Stash => colors.stash.as_str(),
+        DecoKind::Grafted => colors.grafted.as_str(),
         DecoKind::Other => colors.none.as_str(),
     };
     let show = |d: &Deco| -> String {
@@ -7785,7 +7996,12 @@ pub(crate) fn format_decorations(
         .iter()
         .filter(|d| folded.is_none_or(|f| !std::ptr::eq(*d, f)))
         .collect();
-    ordered.sort_by_key(|d| (d.kind != DecoKind::Head, std::cmp::Reverse(d.full.clone())));
+    // `for_each_commit_graft(add_graft_decoration)` runs *after* the ref walk and
+    // after `HEAD` (log-tree.c:221-243), and `add_name_decoration` prepends, so a
+    // graft decoration renders ahead of even `HEAD`.
+    ordered.sort_by_key(|d| {
+        (d.kind != DecoKind::Grafted, d.kind != DecoKind::Head, std::cmp::Reverse(d.full.clone()))
+    });
 
     let mut entries: Vec<String> = Vec::new();
     for d in ordered {
@@ -8868,6 +9084,21 @@ fn render_entry(
             }
             write_raw_ident(out, b"author", &author)?;
             write_raw_ident(out, b"committer", &committer)?;
+            // ```c
+            // if (pp->fmt == CMIT_FMT_RAW) {
+            //         strbuf_add(sb, line, linelen);
+            //         continue;
+            // }
+            // ```
+            //
+            // (`pp_header()`, pretty.c.) `raw` copies **every** header line of the
+            // commit through, so the ones this port does not reconstruct by name —
+            // `encoding`, `gpgsig`, `mergetag` — still have to be written. They come
+            // out in the order they are stored, which is behind the four above.
+            for line in extra_headers(commit.data.as_slice()) {
+                out.extend_from_slice(line);
+                out.push(b'\n');
+            }
             out.push(b'\n');
             // `raw` prints the message as stored: its table entry has no tab width.
             indent_message(out, commit.message_raw()?, ctx.expand_tabs.unwrap_or(0));
@@ -11928,4 +12159,167 @@ mod tests {
         // A path outside every positive spec is still not selected.
         assert!(!set(&["src", ":!src/gen"], b"docs/guide.md"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// `repo_logmsg_reencode()` (pretty.c:708-775)
+// ---------------------------------------------------------------------------
+
+/// ```c
+/// const char *repo_logmsg_reencode(struct repository *r, const struct commit *commit,
+///                                  char **commit_encoding, const char *output_encoding)
+/// {
+///         static const char *utf8 = "UTF-8";
+///         const char *msg = repo_get_commit_buffer(r, commit, NULL);
+///
+///         if (!output_encoding || !*output_encoding) {
+///                 if (commit_encoding)
+///                         *commit_encoding = get_header(msg, "encoding");
+///                 return msg;
+///         }
+///         encoding = get_header(msg, "encoding");
+///         use_encoding = encoding ? encoding : utf8;
+///         if (same_encoding(use_encoding, output_encoding)) {
+///                 if (!encoding)
+///                         return msg;
+///                 out = …msg…;
+///         } else {
+///                 out = reencode_string(msg, output_encoding, use_encoding);
+///         }
+///         if (out)
+///                 out = replace_encoding_header(out, output_encoding);
+///         return out ? out : msg;
+/// }
+/// ```
+///
+/// (`pretty.c:708-775`.) Four behaviours fall out of that shape and each one is
+/// observable:
+///
+/// * `--encoding=none` stores the *empty* string, which is the early return: the
+///   commit is rendered exactly as it is stored, `encoding` header and all.
+/// * a commit with no `encoding` header is assumed to be UTF-8, so
+///   `--encoding=ISO-8859-1` re-codes it even though nothing says it is UTF-8.
+/// * the header is rewritten to name the encoding the message is now in, and
+///   *dropped* when that is UTF-8 — so `git log --encoding=UTF-8 --pretty=raw` shows
+///   no `encoding` line even for a commit that carries one.
+/// * a conversion `iconv(3)` cannot do — an unknown charset name, or a character
+///   the target cannot represent — is not an error: `reencode_string()` returns
+///   NULL and the stored bytes are printed unchanged.
+///
+/// The buffer is rewritten in place, which is where `show_log()` reads it from.
+pub(crate) fn logmsg_reencode(data: &mut Vec<u8>, output_encoding: &str) {
+    if output_encoding.is_empty() {
+        return;
+    }
+    let header = commit_header(data, b"encoding");
+    let use_encoding = header.clone().unwrap_or_else(|| "UTF-8".to_string());
+    if super::mailinfo::same_encoding(&use_encoding, output_encoding) {
+        // Nothing to convert; only the header still has to be brought in line, and
+        // a commit that has none needs even that.
+        if header.is_none() {
+            return;
+        }
+    } else {
+        let Some(out) = super::mailinfo::reencode(data, &use_encoding, output_encoding) else {
+            return;
+        };
+        *data = out;
+    }
+    replace_encoding_header(data, output_encoding);
+}
+
+/// `get_header(msg, key)` → `find_commit_header()`: the value of a header line in
+/// the commit's header block, which ends at the first empty line.
+fn commit_header(data: &[u8], key: &[u8]) -> Option<String> {
+    for line in data.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            return None;
+        }
+        if let Some(rest) = line.strip_prefix(key) {
+            if let Some(value) = rest.strip_prefix(b" ") {
+                return Some(String::from_utf8_lossy(value).into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// ```c
+/// static char *replace_encoding_header(char *buf, const char *encoding)
+/// {
+///         /* guess if there is an encoding header before a \n\n */
+///         while (!starts_with(cp, "encoding ")) {
+///                 cp = strchr(cp, '\n');
+///                 if (!cp || *++cp == '\n')
+///                         return buf;
+///         }
+///         start = cp - buf;
+///         cp = strchr(cp, '\n');
+///         if (!cp)
+///                 return buf; /* should not happen but be defensive */
+///         len = cp + 1 - (buf + start);
+///
+///         if (is_encoding_utf8(encoding)) {
+///                 /* we have re-coded to UTF-8; drop the header */
+///                 strbuf_remove(&tmp, start, len);
+///         } else {
+///                 /* just replaces XXXX in 'encoding XXXX\n' */
+///                 strbuf_splice(&tmp, start + strlen("encoding "),
+///                               len - strlen("encoding \n"), encoding, strlen(encoding));
+///         }
+/// }
+/// ```
+///
+/// (`pretty.c:677-707`.) The scan stops at the blank line that ends the header
+/// block, so a body line beginning `encoding ` is never mistaken for the header.
+fn replace_encoding_header(data: &mut Vec<u8>, encoding: &str) {
+    let mut at = 0usize;
+    let start = loop {
+        if data[at..].starts_with(b"encoding ") {
+            break at;
+        }
+        let Some(nl) = data[at..].iter().position(|b| *b == b'\n') else { return };
+        at += nl + 1;
+        // `*++cp == '\n'`: the blank line that ends the header block.
+        if data.get(at) == Some(&b'\n') || at >= data.len() {
+            return;
+        }
+    };
+    let Some(nl) = data[start..].iter().position(|b| *b == b'\n') else { return };
+    let end = start + nl + 1;
+    if super::mailinfo::is_utf8_name(encoding) {
+        data.drain(start..end);
+    } else {
+        let value_at = start + b"encoding ".len();
+        data.splice(value_at..end - 1, encoding.bytes());
+    }
+}
+
+/// The header lines of a commit that [`Pretty::Raw`] does not reconstruct from the
+/// parsed object: everything that is not `tree`, `parent`, `author` or `committer`,
+/// continuation lines (a leading space, as `gpgsig` uses) included.
+///
+/// The scan stops at the blank line that ends the header block, so a body line
+/// starting with one of those words is never mistaken for a header.
+fn extra_headers(data: &[u8]) -> Vec<&[u8]> {
+    const RECONSTRUCTED: [&[u8]; 4] = [b"tree ", b"parent ", b"author ", b"committer "];
+    let mut out = Vec::new();
+    let mut in_reconstructed = false;
+    for line in data.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            break;
+        }
+        // A continuation line belongs to whatever header opened it.
+        if line.starts_with(b" ") {
+            if !in_reconstructed {
+                out.push(line);
+            }
+            continue;
+        }
+        in_reconstructed = RECONSTRUCTED.iter().any(|k| line.starts_with(k));
+        if !in_reconstructed {
+            out.push(line);
+        }
+    }
+    out
 }

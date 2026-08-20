@@ -52,6 +52,13 @@
 //!     3005 loose objects but 7 in `objects/17`, git 2.55.0 declines to run at
 //!     the default `gc.auto=6700` (7 > 27 is false) and runs at `gc.auto=1`;
 //!     with 2 packs it runs at `gc.autoPackLimit=1` and declines at 2.
+//!   * **Reporting a previous failure**, as [`report_last_gc_error`]: a
+//!     non-empty `$GIT_DIR/gc.log` that has not aged past `gc.logExpiry`
+//!     (default `1.day.ago`) is printed and the whole run abandoned, exit 0.
+//!     Reached only on git's detaching path — `--detach`, or `--auto` with
+//!     `gc.autoDetach` — and only after the `--auto` threshold gate. The key
+//!     itself is validated at config-read time by `repo_config_get_expiry()`'s
+//!     "must resolve to the past" rule; see [`log_expiry`].
 //!   * **`pack-refs --all --prune`**, delegated to [`super::pack_refs::pack_refs`],
 //!     which is a real port. This is what moves `refs/heads/*` and `refs/tags/*`
 //!     into `packed-refs`.
@@ -129,8 +136,27 @@
 //!      git's own `--aggressive` pushes, so no delta is kept from an existing
 //!      pack.
 //!
-//! `--detach` is accepted and always ignored: this port runs synchronously, so
-//! the work is complete by the time `gc` returns rather than shortly after.
+//!   3. **`gc.repackFilter` / `gc.repackFilterTo`.** git forwards these to its
+//!      `repack` child as `--filter=` / `--filter-to=`, which makes it write a
+//!      *second* pack holding the filtered-out objects. [`repack_all`] has no
+//!      counterpart for that split — it partitions the store into reachable and
+//!      unreachable and writes one pack for each — so a valid filter is read and
+//!      then not applied. What *is* reproduced is the pair of refusals the child
+//!      raises for a spec it cannot parse and for `--filter-to` without
+//!      `--filter`; see [`check_repack_filter`], which explains why the split is
+//!      not simply bolted on.
+//!   4. **Writing `gc.log`.** A failure is reported on stderr here rather than
+//!      captured to a file, there being no detached child whose output would
+//!      otherwise be lost, and the file is not removed after a successful run
+//!      either (`builtin/gc.c:99-101`). Reading one *is* done — see
+//!      [`report_last_gc_error`] — because a `gc.log` stock git left in a shared
+//!      repository has to stop this `gc` for as long as it stops that one.
+//!
+//! `--detach` does not run the work in the background: this port is synchronous,
+//! so the work is complete by the time `gc` returns rather than shortly after.
+//! The flag is still *read*, because git gates `report_last_gc_error()` on
+//! `opts.detach > 0` — so it, and `gc.autoDetach` under `--auto`, decide whether
+//! a previous failure's `gc.log` is reported and this run abandoned.
 //! `--quiet` suppresses the progress meters the pack write reports, which git
 //! writes to stderr and only on a terminal; see [`crate::progress`].
 //!
@@ -300,6 +326,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // default only when the command line was silent. git 2.37 made cruft packs
     // the default when neither says otherwise.
     let mut cruft: Option<bool> = None;
+    // git's `opts.detach`, which starts at `-1` ("not asked either way"). `None`
+    // here is that `-1`: it is distinct from `Some(false)`, because only the
+    // unasked state lets `gc.autoDetach` fill it in under `--auto`.
+    let mut detach: Option<bool> = None;
 
     let mut end_of_opts = false;
     let mut i = 0;
@@ -343,7 +373,14 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             // as listed in USAGE. `--keep-largest-pack` selects which packs to
             // rewrite, which this port does not vary; `--detach` is covered in
             // the module docs.
-            "--detach" | "--no-detach" | "--force" | "--no-force"
+            // `--detach` no longer runs the work in the background here — this
+            // port is synchronous — but git gates `report_last_gc_error()` on
+            // `opts.detach > 0` (builtin/gc.c:962), so the flag still decides
+            // whether a previous failure's `gc.log` is reported. See
+            // [`report_last_gc_error`].
+            "--detach" => detach = Some(true),
+            "--no-detach" => detach = Some(false),
+            "--force" | "--no-force"
             | "--keep-largest-pack"
             // `--no-expire-to` is a valid negation (USAGE spells it `--[no-]expire-to`);
             // `--max-cruft-size` has no `--no-` form, so one is left to error out.
@@ -435,6 +472,34 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `gc.logExpiry`, read by `gc_config()` right after `gc.maxCruftSize`
+    // (builtin/gc.c:211). git 2.55.0 reports the cruft size first when both are
+    // unreadable, in either `-c` order, which is why this sits below that block.
+    let gc_log_expire = match log_expiry(&repo) {
+        Ok(value) => value,
+        Err(rejection) => {
+            eprintln!("fatal: {}", rejection.into_fatal());
+            return Ok(ExitCode::from(128));
+        }
+    };
+
+    // `gc.repackFilter` / `gc.repackFilterTo`, read by `gc_config()` immediately
+    // after `gc.logExpiry` (builtin/gc.c:222-230) and forwarded verbatim to the
+    // `repack` child as `--filter=<v>` / `--filter-to=<v>` (:653-656), each only
+    // when it is set *and* non-empty. Nothing is validated at this point; the
+    // child's own parse-options does that, which is why the check below sits
+    // beside the repack rather than here.
+    let snap = repo.config_snapshot();
+    let repack_filter = snap
+        .string("gc.repackFilter")
+        .map(|v| v.to_string())
+        .filter(|v| !v.is_empty());
+    let repack_filter_to = snap
+        .string("gc.repackFilterTo")
+        .map(|v| v.to_string())
+        .filter(|v| !v.is_empty());
+    drop(snap);
+
     // `cmd_gc()`: `if (prune_expire_arg && parse_expiry_date(prune_expire_arg, &dummy))
     // die(_("failed to parse prune expiry value %s"), prune_expire_arg)`. It runs
     // after `parse_options()` and after the stray-positional usage error, and it
@@ -462,6 +527,28 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // anything, so nothing below this point may run either.
     if auto && !gc_needed(&repo) {
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // `cmd_gc()`: `if (cfg.detach_auto && opts.detach < 0) opts.detach = 1;`
+    // inside the `--auto` branch (builtin/gc.c:930-931), so only `--auto` lets
+    // `gc.autoDetach` (default true) turn detaching on. Without `--auto` the
+    // flag stays at `-1` unless it was given, and `-1` is not `> 0`.
+    let detach_positive = match detach {
+        Some(explicit) => explicit,
+        None => auto && repo.config_snapshot().boolean("gc.autoDetach").unwrap_or(true),
+    };
+
+    // `if (opts.detach > 0) { ret = report_last_gc_error(); … }`
+    // (builtin/gc.c:962-972). A previous failure that is still within
+    // `gc.logExpiry` is reported and this run is abandoned, with an exit of 0
+    // — `ret = 1` is folded back to 0 at :966 so an auto-gc never fails a
+    // command that only invoked it as housekeeping.
+    if detach_positive {
+        match report_last_gc_error(&repo, &gc_log_expire) {
+            LastGcError::None => {}
+            LastGcError::Reported => return Ok(ExitCode::SUCCESS),
+            LastGcError::Unreadable(code) => return Ok(code),
+        }
     }
 
     // git prints this from the repack itself, not from option parsing, so it is
@@ -520,6 +607,41 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // git's `cfg->prune_reflogs` gate.
     if reflog_expire_enabled(&repo) {
         expire_reflogs(&repo)?;
+    }
+
+    // The `repack` child's own argument diagnostics, which `gc` reaches here —
+    // after `pack-refs` and `reflog expire` have already run, and after the
+    // `--auto` gate, so a below-threshold `gc --auto` never sees them. git
+    // reports the child's `die()` and then `run_command`'s own line, and hands
+    // the 128 back:
+    //
+    // ```text
+    // $ git -c gc.repackFilter=bogusfilter gc
+    // fatal: invalid filter-spec 'bogusfilter'
+    // fatal: failed to run repack
+    // ```
+    //
+    // A bad spec is rejected while parse-options is still running
+    // (`builtin/repack.c`'s `OPT_PARSE_LIST_OBJECTS_FILTER`), so it beats the
+    // `--filter-to` pairing check at `builtin/repack.c:407-408`.
+    if let Some(code) = check_repack_filter(repack_filter.as_deref(), repack_filter_to.as_deref()) {
+        return Ok(code);
+    }
+
+    // `git_pack_config()`'s `pack.useBitmaps` and `pack.allowPackReuse`, which
+    // git reaches through the `pack-objects` grandchild its `repack` child
+    // starts. That is why `gc -h` prints usage under a bad value and a real `gc`
+    // dies: the read belongs to the packing, not to the option parsing. This
+    // port packs inline, so it is arranged here, immediately before
+    // [`repack_all`]. See [`super::pack_objects::PackConfig`].
+    match crate::repo_settings::RepoSettings::load(&repo)
+        .and_then(|settings| super::pack_objects::PackConfig::load(&repo, &settings))
+    {
+        Ok(_) => {}
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
     }
 
     repack_all(
@@ -1200,6 +1322,218 @@ pub(super) fn too_many_packs(repo: &gix::Repository) -> bool {
 // only the main ref store's `logs/` are processed (git's `--all` also visits
 // each linked worktree's ref store, which `prune` already declines to support).
 
+/// The `repack` child's diagnostics for the two arguments `gc` forwards from
+/// `gc.repackFilter` and `gc.repackFilterTo`, or `None` when it would have
+/// started.
+///
+/// # What this does and does not do
+///
+/// The *diagnostics* are ported; the object split they gate is not. git's
+/// `--filter` makes `repack` write a **second** pack holding what the old packs
+/// held and the new one does not, built by a `pack-objects --stdin-packs` pass
+/// that [`repack_all`] has no counterpart for — it partitions the store into
+/// reachable and unreachable and writes one pack for each, with no third set and
+/// no `^`-excluded input. Splitting the reachable half here instead would also
+/// have to decide what happens to a filtered-out object that was only ever
+/// loose, which git leaves alone because `--stdin-packs` never enumerates it,
+/// and getting that wrong deletes objects. So a *valid* filter is read and then
+/// not applied, and this is listed with the other "Not performed" steps in the
+/// module docs.
+///
+/// What is reproduced is the pair of refusals, which are reachable from
+/// configuration alone and stop the `gc` in git exactly as they stop it here.
+fn check_repack_filter(filter: Option<&str>, filter_to: Option<&str>) -> Option<ExitCode> {
+    let failed = |message: &str| {
+        eprintln!("fatal: {message}");
+        eprintln!("fatal: failed to run repack");
+        Some(ExitCode::from(128))
+    };
+    if let Some(spec) = filter {
+        if let Err(message) = super::pack_objects::gently_parse_filter(spec.as_bytes()) {
+            return failed(&message);
+        }
+    } else if filter_to.is_some() {
+        return failed("option '--filter-to' can only be used along with '--filter'");
+    }
+    None
+}
+
+/// How git refuses a `gc.logExpiry` it will not accept: `git_die_config()`
+/// prints an `error:` line naming the key and its value, then a `fatal:` line
+/// naming where the value came from.
+struct LogExpiryRejection {
+    /// The offending value, as written.
+    value: String,
+    /// The `fatal:` clause: `unable to parse '<var>' from command-line config`
+    /// for `-c`/environment, `bad config variable '<var>' in file '<path>'`
+    /// otherwise.
+    origin: String,
+}
+
+impl LogExpiryRejection {
+    /// Print the `error:` line and return the message to die with.
+    ///
+    /// git's file-backed clause also names the line the variable sits on
+    /// (`… in file '.git/config' at line 9`); gitoxide's config metadata carries
+    /// the source path but not the line, so that clause is dropped — the same
+    /// limitation, and the same wording, as [`crate::default_config`]'s port of
+    /// the sibling `config_error_nonbool` diagnostic.
+    fn into_fatal(self) -> String {
+        eprintln!("error: Invalid gc.logexpiry: '{}'", self.value);
+        self.origin
+    }
+}
+
+/// `repo_config_get_expiry(r, "gc.logexpiry", &out)` (config.c:2468-2481), whose
+/// validation is *not* `parse_expiry_date`:
+///
+/// ```c
+/// int ret = repo_config_get_string(r, key, output);
+/// if (ret) return ret;
+/// if (strcmp(*output, "now")) {
+///         timestamp_t now = approxidate("now");
+///         if (approxidate(*output) >= now)
+///                 git_die_config(r, key, _("Invalid %s: '%s'"), key, *output);
+/// }
+/// ```
+///
+/// So the literal `now` is let through as a special case, and everything else
+/// has to resolve to a moment strictly in the past. That is a wider net than
+/// "unparseable": `approxidate()` answers *now* for anything it cannot read, so
+/// `bogus`, an empty value, `false` and `all` are all rejected while `never`,
+/// `1.day.ago` and `2 weeks ago` are accepted — each verified against git
+/// 2.55.0.
+///
+/// The returned string is `cfg.gc_log_expire`, defaulting to git's
+/// `"1.day.ago"` (builtin/gc.c:160).
+fn log_expiry(repo: &gix::Repository) -> Result<String, LogExpiryRejection> {
+    let Some((value, origin)) = last_value_with_source(repo, "gc.logExpiry") else {
+        return Ok("1.day.ago".to_string());
+    };
+    if value != "now" && crate::date::approxidate(&value) >= crate::date::now_seconds() {
+        return Err(LogExpiryRejection { value, origin });
+    }
+    Ok(value)
+}
+
+/// The last value configured for `key` plus the `git_die_config()` clause naming
+/// where it came from.
+///
+/// `crate::config::last_value_with_origin` reports the origin as the numeric
+/// diagnostic's ` in file <path>` suffix, which is a different sentence from the
+/// one `git_die_config` builds; this walks the same merged config and builds
+/// that one instead, distinguishing a `-c`/environment value from a file.
+fn last_value_with_source(repo: &gix::Repository, key: &str) -> Option<(String, String)> {
+    use gix::config::Source;
+
+    let (section_name, name) = key.split_once('.')?;
+    let var = key.to_lowercase();
+    let config = repo.config_snapshot().plumbing().clone();
+    let mut found: Option<(String, gix::config::file::Metadata)> = None;
+    for section in config.sections() {
+        let header = section.header();
+        if header.subsection_name().is_some()
+            || !header.name().to_string().eq_ignore_ascii_case(section_name)
+        {
+            continue;
+        }
+        for value in section.body().values(name) {
+            found = Some((value.to_str_lossy().into_owned(), section.meta().clone()));
+        }
+    }
+    let (raw, meta) = found?;
+    let origin = match meta.source {
+        Source::Cli | Source::Env => format!("unable to parse '{var}' from command-line config"),
+        _ => match &meta.path {
+            Some(path) => {
+                let shown = path.to_string_lossy();
+                let shown = shown.strip_prefix("./").unwrap_or(&shown);
+                format!("bad config variable '{var}' in file '{shown}'")
+            }
+            None => format!("bad config variable '{var}'"),
+        },
+    };
+    Some((raw, origin))
+}
+
+/// What [`report_last_gc_error`] found.
+enum LastGcError {
+    /// No `gc.log`, or one that has aged past `gc.logExpiry`, or an empty one:
+    /// the run continues.
+    None,
+    /// A non-empty `gc.log` inside the expiry. git warns and abandons the run
+    /// with an exit of 0.
+    Reported,
+    /// `gc.log` could not be stat'd or read for a reason other than its absence;
+    /// git has already printed `die_message_errno()`'s line and returns 128.
+    Unreadable(ExitCode),
+}
+
+/// Port of `report_last_gc_error()` (builtin/gc.c:791-831).
+///
+/// A `gc` that fails while detached writes its diagnostics to `$GIT_DIR/gc.log`
+/// (builtin/gc.c:1003-1010). The next detaching `gc` reads that file back and,
+/// if it is still recent enough to matter, prints it and does nothing —
+/// "a previous gc failed … it is likely to fail in the same way".
+///
+/// `gc.logExpiry` is what "recent enough" means: the file is skipped once its
+/// mtime is older than `parse_expiry_date(gc.logExpiry)`, so the default
+/// `1.day.ago` makes a stale failure stop blocking auto-gc after a day. The
+/// caller has already checked git's `opts.detach > 0` gate.
+///
+/// This port never *writes* `gc.log` — it runs synchronously, so a failure is
+/// reported on stderr where the user is already looking, and there is no
+/// detached child whose output would otherwise be lost. Reading one is still
+/// right: stock git and this binary share a repository, so a `gc.log` stock git
+/// left behind must stop this `gc` for exactly as long as it stops that one.
+fn report_last_gc_error(repo: &gix::Repository, gc_log_expire: &str) -> LastGcError {
+    let gc_log_path = repo.git_dir().join("gc.log");
+    let metadata = match std::fs::metadata(&gc_log_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LastGcError::None,
+        Err(e) => {
+            eprintln!("fatal: cannot stat '{}': {e}", gc_log_path.display());
+            return LastGcError::Unreadable(ExitCode::from(128));
+        }
+    };
+
+    // `if (st.st_mtime < gc_log_expire_time) goto done;` — an unreadable
+    // `gc.logExpiry` never reaches here (it is fatal above), and
+    // `parse_expiry_date` folds `never` to 0, which no mtime is below.
+    let expire_time = crate::date::parse_expiry_date(gc_log_expire).unwrap_or(0);
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if mtime < expire_time {
+        return LastGcError::None;
+    }
+
+    let contents = match std::fs::read_to_string(&gc_log_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fatal: cannot read '{}': {e}", gc_log_path.display());
+            return LastGcError::Unreadable(ExitCode::from(128));
+        }
+    };
+    // `else if (len > 0)`: an empty log is not a failure report.
+    if contents.is_empty() {
+        return LastGcError::None;
+    }
+
+    eprintln!(
+        "warning: The last gc run reported the following. Please correct the root cause\n\
+         and remove {}\n\
+         Automatic cleanup will not be performed until the file is removed.\n\
+         \n\
+         {contents}",
+        gc_log_path.display()
+    );
+    LastGcError::Reported
+}
+
 /// git gc's `cfg->prune_reflogs`: `reflog expire --all` runs unless BOTH
 /// `gc.reflogExpire` and `gc.reflogExpireUnreachable` are configured to a value
 /// that resolves to the `never` sentinel (`0`). An unset value is not `never`,
@@ -1240,16 +1574,46 @@ pub(super) struct ReflogExpireConfig {
 }
 
 impl ReflogExpireConfig {
-    /// `reflog_expire_options_set_refname()`: the first pattern that matches
-    /// wins, `refs/stash` never expires when unconfigured, otherwise the
-    /// defaults apply. `gc` sets no explicit expiry, so the config always drives.
+    /// `reflog_expire_options_set_refname()` (`reflog.c:99-133`): the first
+    /// pattern that matches wins, `refs/stash` never expires when unconfigured,
+    /// otherwise the defaults apply. `gc` sets no explicit expiry, so the config
+    /// always drives.
+    ///
+    /// A matching entry supplies **both** cutoffs, and the one it does not
+    /// configure is `0` — the `never` sentinel — not the global default:
+    ///
+    /// ```c
+    /// if (!wildmatch(ent->pattern, ref, 0)) {
+    ///         if (!(cb->explicit_expiry & REFLOG_EXPIRE_TOTAL))
+    ///                 cb->expire_total = ent->expire_total;
+    ///         if (!(cb->explicit_expiry & REFLOG_EXPIRE_UNREACH))
+    ///                 cb->expire_unreachable = ent->expire_unreachable;
+    ///         return;
+    /// }
+    /// ```
+    ///
+    /// `ent` comes from `find_cfg_ent()`, which allocates it with
+    /// `FLEX_ALLOC_MEM` — a zeroing allocation — so an unconfigured slot holds
+    /// `0`, and `0` is what `should_expire_reflog_ent()` reads as "never
+    /// expire". Configuring one half of a pattern therefore switches the *other*
+    /// half off, which is not what the documentation suggests and is easy to get
+    /// wrong: this returned `self.default_*` for the unset half until a
+    /// differential run caught it. Verified against git 2.55.0 on a branch whose
+    /// three reflog entries are all 400 days old, one tip reachable:
+    ///
+    /// | configuration                                     | entries kept |
+    /// |---------------------------------------------------|--------------|
+    /// | (none)                                            | 0            |
+    /// | `gc.reflogExpireUnreachable=never`                | 0            |
+    /// | `gc.<refs/heads/*>.reflogExpireUnreachable=never` | 3            |
+    /// | `gc.<refs/heads/*>.reflogExpire=never`            | 3            |
+    /// | `gc.<refs/heads/*>.reflogExpireUnreachable=now`   | 1            |
+    /// | `gc.<refs/heads/*>.reflogExpire=now`              | 0            |
+    /// | `gc.<refs/tags/*>.reflogExpireUnreachable=never`  | 0            |
     pub(super) fn resolve(&self, refname: &str) -> (i64, i64) {
         for ent in &self.entries {
             if wildmatch0(ent.pattern.as_bytes(), refname.as_bytes()) {
-                return (
-                    ent.total.unwrap_or(self.default_total),
-                    ent.unreach.unwrap_or(self.default_unreach),
-                );
+                return (ent.total.unwrap_or(0), ent.unreach.unwrap_or(0));
             }
         }
         if refname == "refs/stash" {

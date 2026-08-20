@@ -173,6 +173,9 @@ pub fn run(
             Stdio::null()
         });
 
+    // `start_command()`'s `fflush(NULL)` (run-command.c:743) — a hook's output
+    // must not overtake the buffered output of the command that ran it.
+    crate::cstdio::before_spawn();
     let mut child = cmd.spawn()?;
     if let Some(data) = stdin {
         if let Some(mut sink) = child.stdin.take() {

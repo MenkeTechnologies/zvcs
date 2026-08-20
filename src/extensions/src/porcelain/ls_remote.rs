@@ -253,6 +253,12 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     // `prefix_from_spec_as_filter_on_remote` must be off: ls-remote lists every
     // advertised ref, not just the ones the remote's refspecs would fetch.
     let remote_name = remote.name().map(|n| n.as_bstr().to_string());
+    // `remote.<name>.vcs` routes the whole connection through `git-remote-<vcs>`
+    // rather than the URL's own transport, which this port cannot drive — see
+    // [`super::fetch::foreign_vcs`].
+    if let Some(code) = super::fetch::reject_foreign_vcs(&repo, remote_name.as_deref()) {
+        return Ok(code);
+    }
     let connect_options = gix::remote::connect::Options {
         upload_pack: super::fetch::local_service_program(
             remote.url(gix::remote::Direction::Fetch),

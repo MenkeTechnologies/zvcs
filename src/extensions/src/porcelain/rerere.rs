@@ -18,6 +18,11 @@
 //! behind every other three-way merge in this build (see `merge_apply.rs`), so
 //! a replay lands exactly where `git merge` would have left the file.
 
+// `print!`/`println!` here go through git's stdout buffer. `merge` reaches this
+// module in-process and arms that buffer (see `crate::cstdio`), so both halves of
+// its output have to be buffered or they interleave against each other; run as
+// its own command nothing arms it and these are unbuffered writes as before.
+use crate::cstdio::print;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::Write;
@@ -221,7 +226,7 @@ fn cmd_status(repo: &gix::Repository) -> Result<ExitCode> {
         out.extend_from_slice(&e.path);
         out.push(b'\n');
     }
-    std::io::stdout().write_all(&out)?;
+    crate::cstdio::write_bytes_io(&out)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -255,7 +260,7 @@ fn cmd_remaining(repo: &gix::Repository) -> Result<ExitCode> {
             out.push(b'\n');
         }
     }
-    std::io::stdout().write_all(&out)?;
+    crate::cstdio::write_bytes_io(&out)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -291,7 +296,7 @@ fn cmd_diff(repo: &gix::Repository) -> Result<ExitCode> {
         UnifiedDiff::new(&diff, &input, HunkWriter { out: &mut out }, ContextSize::symmetrical(3))
             .consume()?;
     }
-    std::io::stdout().write_all(&out)?;
+    crate::cstdio::write_bytes_io(&out)?;
     Ok(ExitCode::SUCCESS)
 }
 

@@ -56,7 +56,9 @@
 //!     / `--do-walk`, and `--reverse`. `cmd_format_patch` emits its `list[]`
 //!     backwards, so each of them comes out as the reverse of what `git log`
 //!     would print and `--reverse` cancels that flip rather than adding to it.
-//!   * flags — `--stdout`, `-o`/`--output-directory`, `-<n>`/`--max-count`,
+//!   * flags — `--stdout`, `-o`/`--output-directory` (a callback, so a second one
+//!     is `fatal: two output directories?` rather than "last wins" — see
+//!     [`set_outdir`]), `-<n>`/`--max-count`,
 //!     `--skip`, `--reverse`, `--min-parents`/`--max-parents`/`--no-merges`,
 //!     `-n`/`--numbered`, `-N`/`--no-numbered`, `--start-number`,
 //!     `--numbered-files`, `--suffix`, `--subject-prefix`, `--rfc`,
@@ -590,6 +592,21 @@ struct Opts {
     // Output shape.
     to_stdout: bool,
     outdir: Option<String>,
+    /// Whether `-o`/`--output-directory` was given on the command line, as
+    /// opposed to [`Opts::outdir`] having been seeded from
+    /// `format.outputDirectory`.
+    ///
+    /// git keeps the two apart: the option writes the file-scope
+    /// `output_directory` (builtin/log.c:1137) and the config writes
+    /// `cfg.config_output_directory` (builtin/log.c:895), and the config value is
+    /// only folded in at builtin/log.c:2261-2262 — *after* both the
+    /// `two output directories?` check in `output_directory_callback()`
+    /// (builtin/log.c:1598-1599) and the `--stdout`/`--output`/`--output-directory`
+    /// incompatibility check (builtin/log.c:2250-2251). Folding them into one
+    /// field here made `format.outputDirectory` behave as if `-o` had been typed,
+    /// which refuses `--stdout` in a repository that merely configures an output
+    /// directory. This flag is what those two checks read.
+    outdir_cli: bool,
     numbered: Option<bool>,
     start_number: usize,
     numbered_files: bool,
@@ -927,17 +944,45 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         Parsed::Exit(code) => return Ok(code),
     };
 
-    // `cmd_format_patch`: `--output` cannot share a command line with `--stdout`. The
-    // file itself was already created while the option parsed, as git's `OPT_FILENAME`
-    // does, so it is left behind either way.
-    if opts.output.is_some() && opts.to_stdout {
-        return Ok(fatal("options '--stdout' and '--output' cannot be used together"));
-    }
-
-    // `-o`/`--output-directory` is the same story, and git checks it whichever
-    // order the two were given in.
-    if opts.outdir.is_some() && opts.to_stdout {
-        return Ok(fatal("options '--stdout' and '--output-directory' cannot be used together"));
+    // Port of `cmd_format_patch`'s
+    //
+    //     die_for_incompatible_opt3(use_stdout, "--stdout",
+    //                               rev.diffopt.close_file, "--output",
+    //                               !!output_directory, "--output-directory");
+    //
+    // (builtin/log.c:2250-2251). The three ways of naming a destination are
+    // mutually exclusive, and `die_for_incompatible_opt4()`
+    // (parse-options.c:1528-1558, which the `opt3` form forwards to with a zeroed
+    // fourth slot) picks its wording from how many of them were given: three
+    // spelled options get the Oxford-comma message, two get the pair message
+    // naming them in table order. Checking the pairs separately — which is what
+    // this did — printed the pair message for a command line that named all
+    // three, and never noticed `--output` together with `--output-directory` at
+    // all.
+    //
+    // The file named by `--output` was already created while the option parsed,
+    // as git's `OPT_FILENAME` does, so it is left behind either way.
+    //
+    // `output_directory` here is the *option's* variable: `format.outputDirectory`
+    // is only merged in eleven lines further down (builtin/log.c:2261-2262), so a
+    // configured output directory does not make `--stdout` illegal. See
+    // [`Opts::outdir_cli`].
+    let named: Vec<&str> = [
+        (opts.to_stdout, "--stdout"),
+        (opts.output.is_some(), "--output"),
+        (opts.outdir_cli, "--output-directory"),
+    ]
+    .into_iter()
+    .filter_map(|(given, name)| given.then_some(name))
+    .collect();
+    match named.as_slice() {
+        [a, b, c] => {
+            return Ok(fatal(&format!(
+                "options '{a}', '{b}', and '{c}' cannot be used together"
+            )))
+        }
+        [a, b] => return Ok(fatal(&format!("options '{a}' and '{b}' cannot be used together"))),
+        _ => {}
     }
 
     // `--ignore-if-in-upstream` compares the series against the other side of a
@@ -1752,6 +1797,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     let mut o = Opts {
         to_stdout: false,
         outdir: cfg_str("format.outputDirectory"),
+        outdir_cli: false,
         numbered: snap.boolean("format.numbered"),
         start_number: 1,
         numbered_files: false,
@@ -2003,7 +2049,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--stdout" => o.to_stdout = true,
             "-o" | "--output-directory" => {
                 i += 1;
-                o.outdir = Some(value_at(args, i, a)?);
+                let dir = value_at(args, i, a)?;
+                if let Err(code) = set_outdir(&mut o, dir) {
+                    return Ok(Parsed::Exit(code));
+                }
             }
             "-n" | "--numbered" => o.numbered = Some(true),
             "-N" | "--no-numbered" => o.numbered = Some(false),
@@ -2274,7 +2323,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--histogram" => o.algorithm = Algorithm::Histogram,
             "-a" | "--text" => o.text = true,
             s if s.starts_with("--output-directory=") => {
-                o.outdir = Some(s["--output-directory=".len()..].to_owned());
+                let dir = s["--output-directory=".len()..].to_owned();
+                if let Err(code) = set_outdir(&mut o, dir) {
+                    return Ok(Parsed::Exit(code));
+                }
             }
             s if s.starts_with("--start-number=") => {
                 match parse_start_number(&s["--start-number=".len()..]) {
@@ -2715,7 +2767,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     return Ok(Parsed::Exit(code));
                 }
             }
-            s if s.len() > 2 && s.starts_with("-o") => o.outdir = Some(s[2..].to_owned()),
+            s if s.len() > 2 && s.starts_with("-o") => {
+                let dir = s[2..].to_owned();
+                if let Err(code) = set_outdir(&mut o, dir) {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
             // `OPT_STRING('v', "reroll-count", …)`: git stores the value verbatim
             // and never checks it is a number — `-vabc` names the series `vabc`,
             // and only `diff_title()` later asks whether it parses as an integer.
@@ -4021,6 +4078,47 @@ fn upstream_endpoints(repo: &gix::Repository, opts: &Opts) -> Result<Endpoints> 
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
+}
+
+/// Port of `output_directory_callback()` (builtin/log.c:1593-1603).
+///
+/// `-o`/`--output-directory` is `OPT_CALLBACK_F(…, PARSE_OPT_NONEG,
+/// output_directory_callback)` (builtin/log.c:2041-2043) rather than an
+/// `OPT_STRING`, and the callback refuses to overwrite a value it already holds:
+///
+/// ```text
+/// const char **dir = (const char **)opt->value;
+/// BUG_ON_OPT_NEG(unset);
+/// if (*dir)
+///         die(_("two output directories?"));
+/// *dir = arg;
+/// ```
+///
+/// So the last `-o` does **not** win the way a repeated `--signature` or
+/// `--subject-prefix` does — a second one is fatal (exit 128), in every spelling
+/// the option has (`-o <dir>`, `-o<dir>`, `--output-directory <dir>`,
+/// `--output-directory=<dir>`) and in any mixture of them, since all four reach
+/// the one callback. `*dir` is a pointer test, so even `-o '' -o x` is two
+/// directories. `PARSE_OPT_NONEG` means there is no `--no-output-directory` that
+/// could clear it back to `NULL`.
+///
+/// The `die()` fires inside `parse_options()`, which walks the whole argv before
+/// `setup_revisions()` runs, so it preempts an unresolvable revision later on
+/// the line — which is why this is checked here in the option loop rather than
+/// recorded positionally like the `diff_opt_parse()` value errors are.
+///
+/// `format.outputDirectory` is a different variable
+/// (`cfg.config_output_directory`, builtin/log.c:895) merged in only at
+/// builtin/log.c:2261-2262, i.e. after this check, so config plus one `-o` is
+/// not "two output directories" — hence the flag rather than a test on
+/// [`Opts::outdir`], which carries the config seed.
+fn set_outdir(o: &mut Opts, dir: String) -> Result<(), ExitCode> {
+    if o.outdir_cli {
+        return Err(fatal("two output directories?"));
+    }
+    o.outdir = Some(dir);
+    o.outdir_cli = true;
+    Ok(())
 }
 
 /// The author timestamp `--author-date-order` sorts on, which is git's

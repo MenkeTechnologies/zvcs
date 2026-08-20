@@ -43,9 +43,11 @@
 //! The same machinery serves a **built-in** tool whose `mergetools/<tool>`
 //! backend is ported: [`builtin_merge_cmd`] produces the shell line that backend
 //! would run, which then goes through the identical `( eval $cmd )` path. So far
-//! that is `meld` — including `check_meld_for_features`, i.e.
+//! those are `meld` — including `check_meld_for_features`, i.e.
 //! `mergetool.meld.hasOutput` and `mergetool.meld.useAutoMerge` (both falling
-//! back to probing `meld --help`, as the shell backend does).
+//! back to probing `meld --help`, as the shell backend does) and `vimdiff`,
+//! whose `mergetool.<variant>.layout` grammar is compiled into vim's `-c` script
+//! by [`gen_cmd`].
 //!
 //! What still bails, rather than fake a run:
 //!   * every other **built-in** tool (no `.cmd`, no ported backend): its
@@ -734,7 +736,9 @@ fn wait_status(status: std::process::ExitStatus) -> i32 {
 /// `$merge_tool_path` in scope — the same contract a user-defined
 /// `mergetool.<tool>.cmd` has, so the two share one execution path.
 ///
-/// Only `mergetools/meld` is ported. Every other backend returns `None`, which
+/// Two backends are ported: `mergetools/vimdiff` (the whole `[g|n]vimdiff[1-3]`
+/// family, layout grammar included — see [`vimdiff_merge_cmd`]) and
+/// `mergetools/meld`. Every other backend returns `None`, which
 /// leaves the run bailing on [`SUBSTRATE`] rather than inventing a command line.
 ///
 /// The `Err` case is git's `die "unknown mergetool.meld.useAutoMerge: …"`.
@@ -742,6 +746,9 @@ fn builtin_merge_cmd(
     tool: &str,
     snapshot: &gix::config::Snapshot<'_>,
 ) -> Result<Option<String>, String> {
+    if is_vimdiff_variant(tool) {
+        return Ok(Some(vimdiff_merge_cmd(tool, snapshot)));
+    }
     if tool != "meld" {
         return Ok(None);
     }
@@ -755,6 +762,192 @@ fn builtin_merge_cmd(
     } else {
         format!("\"$merge_tool_path\"{option_auto_merge} \"$LOCAL\" \"$MERGED\" \"$REMOTE\"")
     }))
+}
+
+/// Whether `tool` is one of the nine names `mergetools/vimdiff` serves:
+/// `[g|n]vimdiff` and its `1`/`2`/`3` layout variants.
+fn is_vimdiff_variant(tool: &str) -> bool {
+    let stem = tool.strip_suffix(['1', '2', '3']).unwrap_or(tool);
+    VIM_FAMILY.contains(&stem)
+}
+
+/// `merge_cmd()` (`mergetools/vimdiff:375-425`): resolve the layout, compile it
+/// into vim's `-c` script and build the command line.
+///
+/// **`mergetool.<variant>.layout`** is read here, with the fallback chain the
+/// script spells out. `mergetool.vimdiff.layout` is consulted for *every*
+/// variant — `gvimdiff`, `nvimdiff2`, all nine of them — because the key
+/// predates the per-variant one and the script keeps honouring it
+/// ("backward compatibility", vimdiff:380). The numbered variants then discard
+/// whatever was configured: `vimdiff1`/`2`/`3` *are* fixed layouts, so
+/// configuring `mergetool.vimdiff2.layout` has no effect, exactly as in the
+/// script, and only the unnumbered names fall back to git's four-window default.
+///
+/// One branch of the script is unreachable here. It rewrites the buffer numbers
+/// (`2b`→`quit`, `3b`→`2b`, `4b`→`3b`) and drops `$BASE` from the command line
+/// when the conflict has no merge base. This port always materializes all four
+/// temp files — `checkout_staged_file()` writes an empty file for a stage the
+/// index does not carry — so vim always opens four buffers and the numbering
+/// never shifts.
+fn vimdiff_merge_cmd(tool: &str, snapshot: &gix::config::Snapshot<'_>) -> String {
+    let configured = |key: String| {
+        snapshot.string(&key).map(|v| v.to_str_lossy().into_owned()).filter(|v| !v.is_empty())
+    };
+    let layout = configured(format!("mergetool.{tool}.layout"))
+        .or_else(|| configured("mergetool.vimdiff.layout".to_string()));
+
+    let layout = match tool {
+        t if t.ends_with('1') => "@LOCAL,REMOTE".to_string(),
+        t if t.ends_with('2') => "LOCAL,MERGED,REMOTE".to_string(),
+        t if t.ends_with('3') => "MERGED".to_string(),
+        _ => layout.unwrap_or_else(|| "(LOCAL,BASE,REMOTE)/MERGED".to_string()),
+    };
+
+    let (final_cmd, final_target) = gen_cmd(&layout);
+    let run = format!(
+        "\"$merge_tool_path\" -f {final_cmd} \"$LOCAL\" \"$BASE\" \"$REMOTE\" \"$MERGED\""
+    );
+    // The tail of `merge_cmd`: a layout that marked one file with `@` writes
+    // *that* file back over `$MERGED` when vim exits cleanly, and the tool's own
+    // exit status is still what the caller judges.
+    match final_target {
+        "MERGED" => run,
+        target => format!(
+            "{run}; ret=$?; if test \"$ret\" -eq 0; then cp \"${target}\" \"$MERGED\"; fi; exit \"$ret\""
+        ),
+    }
+}
+
+/// `gen_cmd()` (`mergetools/vimdiff:266-343`): compile a layout definition into
+/// the `-c` argument vim is started with, and report which file the layout
+/// marked with `@`.
+///
+/// The grammar is three operators over the four buffer names `LOCAL`, `BASE`,
+/// `REMOTE` and `MERGED`: `+` opens a new tab, `/` splits horizontally, `,`
+/// splits vertically, and parentheses group. `@` in front of a name marks the
+/// file the result is saved to, defaulting to `MERGED`.
+///
+/// The emitted script is a chain of vim commands separated by `|`, opened with
+/// `set hidden diffopt-=hiddenoff` so buffers survive being hidden, and closed
+/// with `tabdo windo diffthis` + `tabfirst` so every window diffs and the first
+/// tab is the one shown.
+fn gen_cmd(layout: &str) -> (String, &'static str) {
+    let final_target = if layout.contains("@LOCAL") {
+        "LOCAL"
+    } else if layout.contains("@BASE") {
+        "BASE"
+    } else if layout.contains("@REMOTE") {
+        "REMOTE"
+    } else {
+        "MERGED"
+    };
+
+    let mut cmd = String::new();
+    for tab in layout.split('+') {
+        if cmd.is_empty() {
+            // vim's "nop" operator: the chain has to start with a command.
+            cmd.push_str("echo");
+        } else {
+            cmd.push_str(" | tabnew");
+        }
+        // A tab with no split shows every buffer in one window, so it needs an
+        // explicit `bufdo diffthis` — `tabdo windo diffthis` below only reaches
+        // the buffer each window is displaying.
+        if !tab.contains(',') && !tab.contains('/') {
+            cmd.push_str(" | silent execute 'bufdo diffthis'");
+        }
+        gen_cmd_aux(tab, &mut cmd);
+    }
+    cmd.push_str(" | execute 'tabdo windo diffthis'");
+
+    (format!("-c \"set hidden diffopt-=hiddenoff | {cmd} | tabfirst\""), final_target)
+}
+
+/// `gen_cmd_aux()` (`mergetools/vimdiff:58-263`): the recursive half of
+/// [`gen_cmd`], appending one layout expression's window commands to `cmd`.
+///
+/// Three steps, in the script's order: strip the parentheses that wrap the whole
+/// expression, find the first *top-level* separator, and recurse into the two
+/// halves around it. Horizontal (`/`) binds tighter than vertical (`,`) — the
+/// script tests it first — and reaching a leaf means the expression names one
+/// buffer, which becomes vim's `1b`..`4b` in `$LOCAL $BASE $REMOTE $MERGED`
+/// order.
+fn gen_cmd_aux(layout: &str, cmd: &mut String) {
+    let bytes = layout.as_bytes();
+    let mut start = 0usize;
+    let mut end = bytes.len();
+
+    // Step 1: how deep is the *shallowest* buffer name? That many parenthesis
+    // pairs wrap the whole expression and can be dropped.
+    let mut nested = 0i32;
+    let mut nested_min = 100i32;
+    for &c in bytes {
+        match c {
+            b' ' => continue,
+            b'(' => nested += 1,
+            b')' => nested -= 1,
+            _ => nested_min = nested_min.min(nested),
+        }
+    }
+    while nested_min > 0 {
+        start += 1;
+        end = end.saturating_sub(1);
+        while start < bytes.len() && bytes[start - 1] != b'(' {
+            start += 1;
+        }
+        while end > 0 && bytes.get(end) != Some(&b')') {
+            end -= 1;
+        }
+        nested_min -= 1;
+    }
+    if start > end || end > bytes.len() {
+        return;
+    }
+
+    // Step 2: the first `/` and the first `,` outside any parentheses.
+    let mut horizontal = None;
+    let mut vertical = None;
+    let mut nested = 0i32;
+    for (offset, &c) in bytes[start..end].iter().enumerate() {
+        let i = start + offset;
+        match c {
+            b' ' => continue,
+            b'(' => nested += 1,
+            b')' => nested -= 1,
+            b'/' if nested == 0 && horizontal.is_none() => horizontal = Some(i),
+            b',' if nested == 0 && vertical.is_none() => vertical = Some(i),
+            _ => {}
+        }
+    }
+
+    // Step 3: split at the higher-precedence separator, left half first.
+    let split = horizontal
+        .map(|i| (i, "leftabove split", "wincmd j"))
+        .or_else(|| vertical.map(|i| (i, "leftabove vertical split", "wincmd l")));
+    if let Some((index, before, after)) = split {
+        cmd.push_str(" | ");
+        cmd.push_str(before);
+        gen_cmd_aux(&layout[start..index], cmd);
+        cmd.push_str(" | ");
+        cmd.push_str(after);
+        // The right half runs to the end of the *whole* expression, closing
+        // parentheses included; the recursive call strips them again.
+        gen_cmd_aux(&layout[index + 1..], cmd);
+        return;
+    }
+
+    // Step 4: a leaf — one buffer name, once the decoration is stripped.
+    let target: String =
+        layout[start..end].chars().filter(|c| !" @();|-".contains(*c)).collect();
+    cmd.push_str(match target.as_str() {
+        "LOCAL" => " | 1b",
+        "BASE" => " | 2b",
+        "REMOTE" => " | 3b",
+        "MERGED" => " | 4b",
+        // The script emits this literally rather than failing, so a typo in a
+        // layout surfaces as vim complaining about the command.
+        other => return cmd.push_str(&format!(" | ERROR: >{other}<")),
+    });
 }
 
 /// Port of `check_meld_for_features` (`mergetools/meld`): decide whether this

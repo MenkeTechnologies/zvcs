@@ -28,6 +28,11 @@
 //! `-X` that fails is one git itself rejects.
 
 use anyhow::{anyhow, Result};
+// The `Auto-merging` / `CONFLICT (…)` lines below go through git's stdout
+// buffer, so a caller that armed it (`merge`) keeps them in step with its own
+// stdout. A caller that has not (`stash apply`, `am`, `pull`, `merge-octopus`)
+// never buffers, and these stay unbuffered writes exactly as before.
+use crate::cstdio::println;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 

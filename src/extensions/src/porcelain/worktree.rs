@@ -1720,6 +1720,9 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // `--track` / `--no-track`; `None` when neither was given.
     let mut opt_track: Option<bool> = None;
     let mut orphan = false;
+    // `worktree.guessRemote`, which `--[no-]guess-remote` then overrides
+    // (worktree.c:131, :138-139, :823).
+    let mut guess_remote: Option<bool> = None;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut i = 0;
@@ -1768,10 +1771,15 @@ fn add(args: &[String]) -> Result<ExitCode> {
             // `--track` first (worktree.c:839-841) and reports the *combination*,
             // so the refusal for `--orphan` alone has to wait until both are known.
             "--orphan" => orphan = true,
-            // Refused rather than approximated: both need remote-tracking DWIM
-            // this port does not have.
-            "--guess-remote" | "--no-guess-remote" | "--relative-paths"
-            | "--no-relative-paths" => {
+            // `OPT_BOOL(0, "guess-remote", &guess_remote, …)` (worktree.c:823)
+            // writes the same variable `worktree.guessRemote` initialised, so
+            // the command line is simply the last word.
+            "--guess-remote" => guess_remote = Some(true),
+            "--no-guess-remote" => guess_remote = Some(false),
+            // Refused rather than approximated: relative worktree links need the
+            // `extensions.relativeWorktrees` writer this port only has for
+            // `worktree repair`.
+            "--relative-paths" | "--no-relative-paths" => {
                 bail!("`worktree add {a}` is not ported")
             }
             // Named as parse-options names it: a long one keeps whatever
@@ -1828,7 +1836,54 @@ fn add(args: &[String]) -> Result<ExitCode> {
     }
     crate::objname::warn_ambiguous_refname(&repo, branch_arg);
 
-    let start = resolve_start(&repo, new_branch.as_deref(), force_branch, detach, commit_ish, &dwim_name)?;
+    // `dwim_branch()` (worktree.c:767-789), the `ac < 2` arm's guess. With no
+    // `<commit-ish>`, no `-b` and no `--detach`, git names the new branch after
+    // the directory — and if **`worktree.guessRemote`** (or `--guess-remote`) is
+    // on and no local branch of that name exists, it starts that branch from the
+    // one remote-tracking branch whose name matches, making it the upstream:
+    //
+    // ```c
+    // *new_branch = branchname;
+    // if (guess_remote) {
+    //         char *remote = unique_tracking_name(*new_branch, &oid, NULL);
+    //         return remote;
+    // }
+    // ```
+    //
+    // The setting only reaches this one decision. It cannot move an explicit
+    // `<commit-ish>` (worktree.c:900-912 DWIMs that one unconditionally) and it
+    // cannot apply once `-b` named the branch.
+    let guess_remote = guess_remote.unwrap_or_else(|| {
+        repo.config_snapshot().boolean("worktree.guessRemote").unwrap_or(false)
+    });
+    let guessed_start = (guess_remote
+        && commit_ish.is_none()
+        && new_branch.is_none()
+        && !detach
+        && !dwim_name.is_empty()
+        && repo.try_find_reference(format!("refs/heads/{dwim_name}").as_str())?.is_none())
+    .then(|| unique_tracking_name(&repo, &dwim_name))
+    .flatten();
+
+    // worktree.c:919-930, the floor every `add` passes through before anything is
+    // created: `if (!opts.orphan && !lookup_commit_reference_by_name(branch))` is
+    // `die(_("invalid reference: %s"), branch)`, and `attempt_hint = !opts.quiet &&
+    // (ac < 2)` decides whether the `advice.worktreeAddOrphan` hint is offered
+    // first. The hint is for the DWIM forms only: with an explicit `<commit-ish>`
+    // that does not resolve, the user named something that does not exist rather
+    // than reaching for an unborn branch.
+    let start = match resolve_start(&repo, new_branch.as_deref(), force_branch, detach, commit_ish, &dwim_name, guessed_start.as_deref()) {
+        Ok(start) => start,
+        Err(e) => {
+            match invalid_reference(&repo, branch_arg, path_arg, new_branch.as_deref(), quiet, commit_ish.is_none())? {
+                Some(code) => return Ok(code),
+                // `dwim_orphan()` inferred `--orphan` instead of dying, which is
+                // the unborn-worktree floor this port does not build; let the
+                // resolver's own failure stand.
+                None => return Err(e),
+            }
+        }
+    };
 
     // `print_preparing_worktree_line()` looks a name up only on the two arms that
     // need an id for the message — `-B` (the branch being reset) and the detached
@@ -2031,7 +2086,154 @@ fn add(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// worktree.c:919-930 — the report for a `<commit-ish>` (or a `HEAD`) that names
+/// no commit, and the `advice.worktreeAddOrphan` hint that precedes it.
+///
+/// `ac_lt_2` is git's `ac < 2`: no `<commit-ish>` was given, so `branch` is the
+/// literal `HEAD` and the add is one of the DWIM forms. Those are the only forms
+/// that reach `dwim_orphan()` (worktree.c:888-899), and therefore the only ones
+/// where "there is nothing to start from" can mean the user wanted an unborn
+/// branch. `attempt_hint` is that condition ANDed with `!opts.quiet`, and
+/// `used_new_branch_options` (`new_branch || new_branch_force`) picks between the
+/// two hint texts so the suggested command keeps the `-b <name>` the user typed.
+///
+/// Returns `Ok(None)` when git would not have died here at all: `dwim_orphan()`
+/// infers `--orphan` when the repository has no local refs whatsoever, so
+/// worktree.c:919 is never reached and neither the warning nor the hint is
+/// printed. That unborn-worktree floor is not built here, so the caller reports
+/// the resolver's own failure rather than inventing output stock never emits.
+fn invalid_reference(
+    repo: &gix::Repository,
+    branch: &str,
+    path: &str,
+    new_branch: Option<&str>,
+    quiet: bool,
+    ac_lt_2: bool,
+) -> Result<Option<ExitCode>> {
+    // `can_use_local_refs()` (worktree.c:691-701) runs on every `ac < 2` arm —
+    // through `dwim_orphan()` for the two DWIM branches and directly for
+    // `--detach` — so its warning belongs to all of them and to none of the
+    // `ac == 2` ones.
+    if ac_lt_2 && !can_use_local_refs(repo, quiet)? {
+        return Ok(None);
+    }
+    if !quiet && ac_lt_2 {
+        // Both texts end in a newline, so `vadvise()` emits a blank `hint:` line
+        // between the block and its `Disable this message with …` trailer.
+        match new_branch {
+            Some(name) => crate::advice::Advice::WorktreeAddOrphan.advise_in(
+                repo,
+                &format!(
+                    "If you meant to create a worktree containing a new unborn branch\n\
+                     (branch with no commits) for this repository, you can do so\n\
+                     using the --orphan flag:\n\
+                     \n\
+                     \x20   git worktree add --orphan -b {name} {path}\n"
+                ),
+            ),
+            None => crate::advice::Advice::WorktreeAddOrphan.advise_in(
+                repo,
+                &format!(
+                    "If you meant to create a worktree containing a new unborn branch\n\
+                     (branch with no commits) for this repository, you can do so\n\
+                     using the --orphan flag:\n\
+                     \n\
+                     \x20   git worktree add --orphan {path}\n"
+                ),
+            ),
+        };
+    }
+    eprintln!("fatal: invalid reference: {branch}");
+    Ok(Some(ExitCode::from(128)))
+}
+
+/// Port of `can_use_local_refs()` (worktree.c:691-701): whether the repository
+/// has anything a worktree could be started from. `HEAD` resolving is enough;
+/// otherwise any `refs/heads/*` that resolves counts, and git warns that `HEAD`
+/// is pointing somewhere it should not be. Only when neither holds does
+/// `dwim_orphan()` conclude that an unborn branch is the only possibility.
+///
+/// The warning's message ends in a newline of its own, so `warning()` prints it
+/// followed by a blank line — which is why stock's output has one before the
+/// hint block.
+fn can_use_local_refs(repo: &gix::Repository, quiet: bool) -> Result<bool> {
+    if repo.head_id().is_ok() {
+        return Ok(true);
+    }
+    let any_branch = repo
+        .references()?
+        .prefixed("refs/heads/")?
+        .filter_map(std::result::Result::ok)
+        .any(|mut r| r.peel_to_id_in_place().is_ok());
+    if any_branch {
+        if !quiet {
+            eprintln!("warning: HEAD points to an invalid (or orphaned) reference.\n");
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Which of `<commit-ish>`, `-b`/`-B` and the DWIM branch this add starts from.
+/// `unique_tracking_name()` (remote.c): the one remote-tracking ref that
+/// `refs/heads/<name>` would be fetched into, or `None` when no remote or more
+/// than one remote offers it.
+///
+/// git runs each remote's *fetch refspecs* over `refs/heads/<name>`
+/// (`check_tracking_name()` → `refspec_find_match()`) and keeps the destination
+/// only if that ref exists, so the answer follows a rewritten refspec rather
+/// than assuming `refs/remotes/<remote>/<name>`. The same src-side match is done
+/// here, mirroring the dst-side one [`super::branch`] already uses: a `*` in the
+/// source matches by prefix and suffix, and whatever it captured is substituted
+/// into the destination's `*`.
+///
+/// Ambiguity is a decline, not an error — two remotes carrying the branch leaves
+/// `worktree add` starting from `HEAD`, which is what git does with the `NULL`
+/// this returns.
+fn unique_tracking_name(repo: &gix::Repository, name: &str) -> Option<String> {
+    let src_ref = format!("refs/heads/{name}");
+    let mut found: Option<String> = None;
+    for remote_name in repo.remote_names() {
+        let Ok(remote) = repo.find_remote(&*remote_name) else { continue };
+        for spec in remote.refspecs(gix::remote::Direction::Fetch) {
+            let gix::refspec::Instruction::Fetch(gix::refspec::instruction::Fetch::AndUpdate {
+                src,
+                dst,
+                ..
+            }) = spec.to_ref().instruction()
+            else {
+                continue;
+            };
+            let (src, dst) = (src.to_str_lossy().into_owned(), dst.to_str_lossy().into_owned());
+            let candidate = match src.split_once('*') {
+                Some((prefix, suffix)) => {
+                    let matched = src_ref
+                        .strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_suffix(suffix))
+                        .filter(|_| src_ref.len() >= prefix.len() + suffix.len())?;
+                    match dst.split_once('*') {
+                        Some((dp, ds)) => format!("{dp}{matched}{ds}"),
+                        None => dst.clone(),
+                    }
+                }
+                None if src == src_ref => dst.clone(),
+                None => continue,
+            };
+            if repo.try_find_reference(candidate.as_str()).ok().flatten().is_none() {
+                continue;
+            }
+            match &found {
+                // A second remote offering the same branch is ambiguous, and
+                // git's DWIM gives up rather than choosing.
+                Some(existing) if *existing != candidate => return None,
+                Some(_) => {}
+                None => found = Some(candidate),
+            }
+        }
+    }
+    found
+}
+
 fn resolve_start(
     repo: &gix::Repository,
     new_branch: Option<&str>,
@@ -2039,6 +2241,7 @@ fn resolve_start(
     detach: bool,
     commit_ish: Option<&str>,
     dwim_name: &str,
+    guessed_start: Option<&str>,
 ) -> Result<Start> {
     let peel = |spec: &str| -> Result<ObjectId> {
         let id = repo
@@ -2077,7 +2280,12 @@ fn resolve_start(
         }
         // No commit-ish: `-b $(basename <path>)` off HEAD, or a detached HEAD.
         None => {
-            let oid = peel("HEAD")?;
+            // `dwim_branch()`'s remote guess, when `worktree.guessRemote` found
+            // exactly one remote-tracking branch of that name: the *start point*
+            // becomes that ref, so the new branch begins at the remote's tip and
+            // the `git branch` below records it as the upstream.
+            let from = guessed_start.unwrap_or("HEAD");
+            let oid = peel(from)?;
             if detach {
                 Ok(Start::Detached(oid))
             } else {
@@ -2085,7 +2293,7 @@ fn resolve_start(
                     name: FullName::try_from(format!("refs/heads/{dwim_name}"))?,
                     oid,
                     force: false,
-                    from: "HEAD".to_string(),
+                    from: from.to_string(),
                 })
             }
         }

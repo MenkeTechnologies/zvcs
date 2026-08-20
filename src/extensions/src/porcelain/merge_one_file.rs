@@ -52,6 +52,11 @@
 //! merge itself is whatever the ported `merge-file` produces, carrying that
 //! module's documented deviations from `xdl_merge`.
 
+// `print!`/`println!` here go through git's stdout buffer. `merge` reaches this
+// module in-process and arms that buffer (see `crate::cstdio`), so both halves of
+// its output have to be buffered or they interleave against each other; run as
+// its own command nothing arms it and these are unbuffered writes as before.
+use crate::cstdio::println;
 use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};

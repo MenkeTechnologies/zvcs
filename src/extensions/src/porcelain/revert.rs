@@ -1092,64 +1092,8 @@ fn revert_one(
     // The tree — conflict markers and all — is written before anything is checked
     // out, so the object exists even when a checkout below is refused.
     let merged_tree = merge.tree.write()?.detach();
-    // `merge_switch_to_result()` (merge-ort.c) records every result it checks
-    // out as `AUTO_MERGE`, clean or conflicted and whether or not a commit
-    // follows — which is why stock leaves `.git/AUTO_MERGE` behind after a
-    // *successful* `git revert`. A revert always takes the in-process merge
-    // (`do_pick_commit` routes `TODO_REVERT` there regardless of `--strategy`),
-    // so there is no strategy-child exception here.
-    std::fs::write(
-        repo.git_dir().join("AUTO_MERGE"),
-        format!("{merged_tree}\n"),
-    )?;
     let merged = flatten(repo, merged_tree)?;
     let ours = flatten(repo, ours_tree)?;
-
-    // git's merge-ort emits an `Auto-merging` line for every path it ran a blob
-    // merge on, then a `CONFLICT (...)` line for the ones left unresolved; a path
-    // both sides changed identically resolves trivially and is reported by
-    // neither, which is why reverting an already-reverted change stays silent.
-    let unresolved = gix::merge::tree::TreatAsUnresolved::git();
-    let mut conflicted: Vec<BString> = Vec::new();
-    for conflict in &merge.conflicts {
-        let path = conflict.changes_in_resolution().0.location().to_owned();
-        if conflict.content_merge().is_some() {
-            println!("Auto-merging {path}");
-        }
-        if !conflict.is_unresolved(unresolved) {
-            continue;
-        }
-        // merge-ort reports a path one side modified and the other deleted with
-        // its own message naming both operands, not the generic content notice.
-        // Reverting a root commit hits this for every file the commit added:
-        // "theirs" is the empty tree, so each one is deleted there and modified
-        // in HEAD. The modified side is the one whose tree still carries `path`.
-        if matches!(
-            conflict.resolution,
-            Err(gix::merge::tree::ResolutionFailure::OursModifiedTheirsDeleted)
-        ) {
-            let (modify, delete) = if ours.contains_key(&path) {
-                ("HEAD", other_label.as_str())
-            } else {
-                (other_label.as_str(), "HEAD")
-            };
-            println!(
-                "CONFLICT (modify/delete): {path} deleted in {delete} and modified in {modify}.  \
-                 Version {modify} of {path} left in tree."
-            );
-            conflicted.push(path);
-            continue;
-        }
-        // merge-ort's `filemask == 6`: no ancestor stage means both sides added
-        // the path, reported as `add/add` rather than `content`.
-        let kind = if conflict.entries()[0].is_none() {
-            "add/add"
-        } else {
-            "content"
-        };
-        println!("CONFLICT ({kind}): Merge conflict in {path}");
-        conflicted.push(path);
-    }
 
     // --- refuse to clobber ------------------------------------------------
     let changed: Vec<BString> = ours
@@ -1200,6 +1144,71 @@ fn revert_one(
         eprintln!("fatal: revert failed");
         return Ok(Step::Failed(ExitCode::from(128)));
     }
+
+    // `merge_switch_to_result()`'s `write_auto_merge` region (merge-ort.c:4959-4971):
+    // it records every result it checked out as `AUTO_MERGE`, clean or conflicted
+    // and whether or not a commit follows, which is why stock leaves
+    // `.git/AUTO_MERGE` behind after a *successful* `git revert`. A revert always
+    // takes the in-process merge (`do_pick_commit` routes `TODO_REVERT` there
+    // regardless of `--strategy`), so there is no strategy-child exception here.
+    //
+    // **After the two refusals above, not before.** They stand in for
+    // `checkout(opt, head, result->tree)` (merge-ort.c:4936), whose failure sets
+    // `result->clean = -1` and `return`s from merge_switch_to_result — past the
+    // `record_conflicted_index_entries()` call and past this write. Writing first
+    // left a `.git/AUTO_MERGE` stock never creates, and every later `git status`
+    // and `git diff AUTO_MERGE` read it as a merge in progress.
+    crate::merge_apply::write_auto_merge(repo, merged_tree)?;
+
+    // `merge_display_update_messages()` (merge-ort.c:4973-4974), the call after
+    // the write above and therefore also after the refusals: merge-ort emits an
+    // `Auto-merging` line for every path it ran a blob merge on, then a
+    // `CONFLICT (...)` line for the ones left unresolved. A path both sides
+    // changed identically resolves trivially and is reported by neither, which is
+    // why reverting an already-reverted change stays silent — and a refused
+    // checkout reports none of them at all.
+    let unresolved = gix::merge::tree::TreatAsUnresolved::git();
+    let mut conflicted: Vec<BString> = Vec::new();
+    for conflict in &merge.conflicts {
+        let path = conflict.changes_in_resolution().0.location().to_owned();
+        if conflict.content_merge().is_some() {
+            println!("Auto-merging {path}");
+        }
+        if !conflict.is_unresolved(unresolved) {
+            continue;
+        }
+        // merge-ort reports a path one side modified and the other deleted with
+        // its own message naming both operands, not the generic content notice.
+        // Reverting a root commit hits this for every file the commit added:
+        // "theirs" is the empty tree, so each one is deleted there and modified
+        // in HEAD. The modified side is the one whose tree still carries `path`.
+        if matches!(
+            conflict.resolution,
+            Err(gix::merge::tree::ResolutionFailure::OursModifiedTheirsDeleted)
+        ) {
+            let (modify, delete) = if ours.contains_key(&path) {
+                ("HEAD", other_label.as_str())
+            } else {
+                (other_label.as_str(), "HEAD")
+            };
+            println!(
+                "CONFLICT (modify/delete): {path} deleted in {delete} and modified in {modify}.  \
+                 Version {modify} of {path} left in tree."
+            );
+            conflicted.push(path);
+            continue;
+        }
+        // merge-ort's `filemask == 6`: no ancestor stage means both sides added
+        // the path, reported as `add/add` rather than `content`.
+        let kind = if conflict.entries()[0].is_none() {
+            "add/add"
+        } else {
+            "content"
+        };
+        println!("CONFLICT ({kind}): Merge conflict in {path}");
+        conflicted.push(path);
+    }
+
     // --- message ----------------------------------------------------------
     let committer = repo
         .committer()

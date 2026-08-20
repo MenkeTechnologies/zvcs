@@ -100,18 +100,21 @@ const ERROR_REFS: u8 = 8;
 ///
 /// ### Known divergences from stock git — read before trusting a clean result
 ///
-/// 1. **The fsck message layer does not cover every message id.** git lints
-///    object *contents* on top of the connectivity walk and exits 1 when an
-///    error-severity message fires; that layer is ported below (see [`MSGS`]),
-///    including `fsck.<msg-id>` severities, `--strict` promotion,
-///    `fsck.skipList`, the `.gitmodules`/`.gitattributes` blob lint and
-///    `fsck_finish()`'s sweep over the paths the trees named. What is *not*
-///    covered is listed id by id in [`UNPORTED_MSG_IDS`], and a repository whose
-///    only defect is one of those is reported clean here while stock git reports
-///    it. `--full` verifies pack *integrity* (checksums, per-object hash/CRC)
-///    via the gix pack verifier; the message layer runs over packed objects too,
-///    since the object-directory scan below iterates the whole odb rather than
-///    only its loose half.
+/// 1. **The fsck message layer covers every message id's *configuration*, but
+///    not every message id's *check*.** git lints object *contents* on top of
+///    the connectivity walk and exits 1 when an error-severity message fires;
+///    that layer is ported below (see [`MSGS`]), including `fsck.<msg-id>`
+///    severities, `--strict` promotion, `fsck.skipList`, the
+///    `.gitmodules`/`.gitattributes` blob lint and `fsck_finish()`'s sweep over
+///    the paths the trees named. [`MSGS`] holds a row for all 76 ids of
+///    `FOREACH_FSCK_MSG_ID`, so every `fsck.<msg-id>` parses, validates and
+///    round-trips as git's does. The rows built with `msg_config_only!` are the
+///    ones whose *check* is not performed — each says why in its own doc, and
+///    all but `badReftableTableName` name a finding that is unreachable in stock
+///    git too. `--full` verifies pack *integrity* (checksums, per-object
+///    hash/CRC) via the gix pack verifier; the message layer runs over packed
+///    objects too, since the object-directory scan below iterates the whole odb
+///    rather than only its loose half.
 /// 2. **The reference-database check runs in-process.** git checks the
 ///    reference database by default (`--references`) by *running* `git refs
 ///    verify` as a child; [`fsck_refs`] is that check, called directly instead.
@@ -140,10 +143,13 @@ const ERROR_REFS: u8 = 8;
 ///    `HAS_OBJ`, so it draws no `unreachable`/`dangling` line and something
 ///    reachable that names it draws a `missing` one. Two details are not
 ///    reproduced: git's `error_errno()` line after an empty object file carries
-///    a stale errno from an unrelated syscall, and a blob larger than
-///    `core.bigFileThreshold` is checked by git in streaming form, which only
-///    changes which message precedes the identical `object corrupt or missing`
-///    line. The neighbouring case — an object that reads fine but that
+///    a stale errno from an unrelated syscall, and a *corrupt* blob larger than
+///    `core.bigFileThreshold` is verified by git with `check_stream_oid()`
+///    rather than `unpack_loose_rest()`, which only changes which message
+///    precedes the identical `object corrupt or missing` line. The threshold's
+///    other consequence — that an intact blob over it reaches `fsck_blob()` with
+///    no buffer, which is what reports `gitmodulesLarge` — *is* reproduced; see
+///    [`blob_buffer`]. The neighbouring case — an object that reads fine but that
 ///    `parse_object_buffer()` rejects — is ported too: the `error: <oid>: object
 ///    could not be parsed: <path>` line, the `error:` diagnostic
 ///    `parse_commit_buffer()`/`parse_tag_buffer()` prints ahead of it,
@@ -2007,6 +2013,13 @@ fn lint_special_blobs(
     msg_lines: &mut Vec<(Slot, ObjectId, String)>,
 ) -> u8 {
     let mut errors = 0u8;
+    // `read_loose_object()` is the only reader on this path that streams past
+    // `core.bigFileThreshold`; a packed object reaches `fsck_obj_buffer()` with a
+    // real buffer no matter how big it is. Confirmed against git 2.55.0: the same
+    // 501-byte `.gitmodules` at `core.bigFileThreshold=100` reports
+    // `gitmodulesLarge` while loose and reports nothing once `git repack -ad` has
+    // packed it.
+    let threshold = big_file_threshold(repo);
     let mut candidates: Vec<ObjectId> =
         gitmodules_found.keys().chain(gitattributes_found.keys()).copied().collect();
     candidates.sort();
@@ -2070,7 +2083,23 @@ fn lint_special_blobs(
             std::cmp::Ordering::Less => Slot::Scan(id.as_bytes()[0]),
             _ => finish_slot,
         };
-        for finding in check_blob(&data, as_modules, as_attrs) {
+        // Only the *scan* slot can see a streamed blob, and only for a loose one.
+        // `fsck_loose()` is where `read_loose_object()` hands `fsck_object()` a
+        // null buffer for a blob over `core.bigFileThreshold`
+        // (`object-file.c:1645`); `fsck_finish()`'s sweep reaches the same blob
+        // through `fsck_blobs()`, which always calls `odb_read_object()`
+        // (`fsck.c:1337`) and so always has the whole thing. A packed object
+        // never streams here either — `verify_packfile()` decodes it in full.
+        //
+        // So `gitmodulesLarge` is scan-order dependent in git itself, and
+        // observably so. Confirmed against git 2.55.0 at
+        // `core.bigFileThreshold=100` with a 501-byte `.gitmodules`: with the
+        // naming tree in fanout `94` and the blob in `b6` the id is reported,
+        // and with the blob in `b5` and the tree in `d2` — the blob scanned
+        // first, so linted by `fsck_finish()` — it is not.
+        let streamed = matches!(slot, Slot::Scan(_)) && is_loose(repo, id);
+        let buffer = if streamed { blob_buffer(&data, threshold) } else { Some(&data[..]) };
+        for finding in check_blob(buffer, as_modules, as_attrs) {
             errors |= emit_blob_finding(msg_config, &finding, id, Kind::Blob, slot, msg_lines);
         }
     }
@@ -2513,10 +2542,13 @@ fn slot(id: &ObjectId, size: usize) -> usize {
 // warning to an error, and `fsck.skipList` / `receive.fsck.skipList` name a
 // file of object ids whose messages are dropped wholesale.
 //
-// Which ids are here is decided by one rule: a row exists only when this port
-// actually performs the check *and* the check can fire on both the `git fsck`
-// and the `receive-pack` path. That excludes every id git reports from a place
-// this port has no equivalent of — see [`UNPORTED_MSG_IDS`].
+// The table below carries a row for every id in `FOREACH_FSCK_MSG_ID`, because
+// git's three config callbacks accept every id in every family and diagnose a bad
+// value for any of them — an id missing from the table would silently accept a
+// severity git rejects, and would reject a severity git accepts. What separates
+// the rows is which macro built them: `msg!`, `msg_mktag!` and `msg_refs!` mark a
+// check this port performs (and say where it can fire), while `msg_config_only!`
+// marks one it does not, with the reason spelled out in the row's own doc.
 
 /// `fsck.h`'s `enum fsck_msg_type`. `Ignore`, `Warn` and `Error` are the three
 /// values a `fsck.<msg-id>` variable can name; `Info` is a default only.
@@ -2539,168 +2571,296 @@ pub enum Severity {
 }
 
 /// One row of `fsck.h`'s `FOREACH_FSCK_MSG_ID` table.
+///
+/// Every row carries all three variable spellings because git reads all three,
+/// unconditionally and for every id in the table. `git_fsck_config()`
+/// (`fsck.c:1461`) matches `fsck.<anything>` and hands it to
+/// `fsck_set_msg_type()`; `receive-pack`'s `receive_pack_config()`
+/// (`builtin/receive-pack.c:186`) and `fetch_pack_fsck_config()`
+/// (`fetch-pack.c:1971`) match `receive.fsck.<anything>` / `fetch.fsck.<anything>`
+/// and hand it to `is_valid_msg_type()`. None of the three consults the check's
+/// reachability, so all three diagnose a bad value — which is why every row here
+/// spells out its own three keys instead of leaving a family unread.
+///
+/// The three families are independent: `git help config` is explicit that "the
+/// `receive.fsck.<msg-id>` and `fetch.fsck.<msg-id>` variables will not fall back
+/// on the `fsck.<msg-id>` configuration if they aren't set", so [`MsgConfig`]
+/// reads exactly one of the three per [`MsgSource`] and never merges them.
 pub struct Msg {
     /// The `<msg-id>` git prints in front of the message text.
     pub id: &'static str,
-    /// The variable `git fsck` reads for this check's severity.
+    /// The variable `git fsck` reads for this check's severity — `fsck.c:1461`.
     pub fsck_key: &'static str,
-    /// The variable `git receive-pack` reads for it. git deliberately does
-    /// *not* let this fall back to `fsck_key` (`git help config`: "the
-    /// receive.fsck.<msg-id> … variables will not fall back on the
-    /// fsck.<msg-id> configuration").
-    ///
-    /// `None` for a row only `git mktag` can report. git accepts the
-    /// `receive.fsck.<msg-id>` spelling of every id in the table and forwards
-    /// it, but a transfer can never reach these checks: `index-pack` and
-    /// `unpack-objects` both run `parse_object_buffer()` before
-    /// `fsck_object()` and `die("invalid <type>")` when it fails, and the
-    /// pusher could not have built the object into a pack anyway —
-    /// `git update-ref` refuses to point a reference at an object that does
-    /// not parse. Reading the key would be claiming a check that cannot run.
-    pub receive_key: Option<&'static str>,
+    /// The variable `git receive-pack` reads for it —
+    /// `builtin/receive-pack.c:186`, which forwards it to the
+    /// `index-pack`/`unpack-objects` child as `--strict=<id>=<severity>`.
+    pub receive_key: &'static str,
+    /// The variable `git fetch`/`git fetch-pack` reads for it —
+    /// `fetch-pack.c:1971`, which forwards it to `index-pack` the same way.
+    pub fetch_key: &'static str,
     /// `fsck.h`'s severity for the id when nothing configures it.
     pub default: Severity,
 }
 
-/// Build one table row; the two config keys are always `fsck.<id>` and
-/// `receive.fsck.<id>`, spelled out so both are greppable literals.
+/// Build one table row for a check this port performs on the object paths — the
+/// `git fsck` object walk, `index-pack`/`unpack-objects`, the `receive-pack`
+/// transfer check and the `fetch` transfer check alike. All three config keys are
+/// spelled out rather than `concat!`ed so each one is a greppable literal.
 macro_rules! msg {
-    ($konst:ident, $id:literal, $fsck:literal, $receive:literal, $sev:ident) => {
+    ($konst:ident, $id:literal, $fsck:literal, $receive:literal, $fetch:literal, $sev:ident) => {
         #[doc = concat!("`", $id, "`, whose severity comes from `", $fsck, "` under ")]
-        #[doc = concat!("`git fsck` and from `", $receive, "` under `git receive-pack`.")]
+        #[doc = concat!("`git fsck`, `", $receive, "` under `git receive-pack` and `")]
+        #[doc = concat!($fetch, "` under `git fetch`. The check is performed.")]
         pub const $konst: Msg = Msg {
             id: $id,
             fsck_key: $fsck,
-            receive_key: Some($receive),
+            receive_key: $receive,
+            fetch_key: $fetch,
             default: Severity::$sev,
         };
     };
 }
 
-/// Build one row for a check only `git mktag` reaches, so only `fsck.<id>`
-/// exists for it. See [`Msg::receive_key`].
+/// Build one row for a check this port performs, but that only `git mktag`
+/// reaches.
+///
+/// `index-pack`, `unpack-objects` and the `git fsck` object walk all run
+/// `parse_object_buffer()` before `fsck_object()` and give up when it fails
+/// (`builtin/index-pack.c:953`'s `die("invalid %s")`), so a tag broken enough to
+/// trip one of these ids never survives to be reported by them. `git mktag` is
+/// the one entry point that fscks a raw tag buffer first. The
+/// `receive.fsck.<id>` / `fetch.fsck.<id>` spellings are still read, because git
+/// reads and validates them there whether or not the check can fire; they simply
+/// never select a severity that anything on those paths consults.
 macro_rules! msg_mktag {
-    ($konst:ident, $id:literal, $fsck:literal, $sev:ident) => {
+    ($konst:ident, $id:literal, $fsck:literal, $receive:literal, $fetch:literal, $sev:ident) => {
         #[doc = concat!("`", $id, "`, whose severity comes from `", $fsck, "`. Only ")]
         #[doc = "`git mktag` reports it: it is the one entry point that fscks a raw tag"]
-        #[doc = "buffer without `parse_tag_buffer()` rejecting it first."]
+        #[doc = concat!("buffer without `parse_tag_buffer()` rejecting it first. `", $receive)]
+        #[doc = concat!("` and `", $fetch, "` are read and validated, as git does, but the")]
+        #[doc = "check cannot fire on a transfer."]
         pub const $konst: Msg = Msg {
             id: $id,
             fsck_key: $fsck,
-            receive_key: None,
+            receive_key: $receive,
+            fetch_key: $fetch,
             default: Severity::$sev,
         };
     };
 }
 
-/// Build one row for a check only the reference-database walk reaches, so only
-/// `fsck.<id>` exists for it. See [`Msg::receive_key`].
+/// Build one row for a check this port performs, but that only the
+/// reference-database walk reaches — `git refs verify`, which `git fsck` runs for
+/// `--references`.
+///
+/// A transfer never reaches these: `receive-pack` and `fetch-pack` fsck the
+/// objects that came over the wire, not the local repository's ref files. The
+/// `receive.fsck.<id>` / `fetch.fsck.<id>` spellings are still read, because git
+/// reads and validates them there regardless.
 macro_rules! msg_refs {
-    ($konst:ident, $id:literal, $fsck:literal, $sev:ident) => {
+    ($konst:ident, $id:literal, $fsck:literal, $receive:literal, $fetch:literal, $sev:ident) => {
         #[doc = concat!("`", $id, "`, whose severity comes from `", $fsck, "`. Only ")]
         #[doc = "the reference-database check reports it — `git refs verify`, which"]
-        #[doc = "`git fsck` runs for `--references`. A transfer never reaches it:"]
-        #[doc = "`receive-pack` fscks the objects the pusher sent, not the receiving"]
-        #[doc = "repository's ref files, so reading a `receive.fsck.<id>` spelling"]
-        #[doc = "would be claiming a check that cannot run."]
+        #[doc = concat!("`git fsck` runs for `--references`. `", $receive, "` and `", $fetch)]
+        #[doc = "` are read and validated, as git does, but the check cannot fire on a"]
+        #[doc = "transfer."]
         pub const $konst: Msg = Msg {
             id: $id,
             fsck_key: $fsck,
-            receive_key: None,
+            receive_key: $receive,
+            fetch_key: $fetch,
+            default: Severity::$sev,
+        };
+    };
+}
+
+/// Build one row whose check this port does **not** perform.
+///
+/// The row exists so that all three variables parse, validate and round-trip
+/// exactly as git's do — a severity git rejects is the same `fatal:` here, a
+/// misspelled id next to it is the same `Unhandled message id`, and a severity
+/// git accepts is accepted and stored. What the row does *not* do is report
+/// anything: no code path constructs a [`Finding`] naming it. `$why` records the
+/// reason, which is the only honest claim available for these ids.
+///
+/// Leaving the id out of the table entirely would be worse in both directions:
+/// `fsck.<id> = bogus` would be silently accepted where git dies, and
+/// `fsck.<id> = warn` would be diagnosed as an unknown id where git accepts it.
+macro_rules! msg_config_only {
+    ($konst:ident, $id:literal, $fsck:literal, $receive:literal, $fetch:literal, $sev:ident,
+     $why:literal) => {
+        #[doc = concat!("`", $id, "`. **The check is not performed by this port.** ", $why)]
+        #[doc = ""]
+        #[doc = concat!("`", $fsck, "`, `", $receive, "` and `", $fetch, "` are still read,")]
+        #[doc = "validated and stored, so a bad severity or a neighbouring misspelled id"]
+        #[doc = "fails exactly as git fails — but no finding ever names this row."]
+        pub const $konst: Msg = Msg {
+            id: $id,
+            fsck_key: $fsck,
+            receive_key: $receive,
+            fetch_key: $fetch,
             default: Severity::$sev,
         };
     };
 }
 
 // --- commit header checks (`verify_headers`, `fsck_commit`, `fsck_ident`) ---
-msg!(BAD_PARENT_SHA1, "badParentSha1", "fsck.badParentSha1", "receive.fsck.badParentSha1", Error);
-msg!(MISSING_AUTHOR, "missingAuthor", "fsck.missingAuthor", "receive.fsck.missingAuthor", Error);
-msg!(MULTIPLE_AUTHORS, "multipleAuthors", "fsck.multipleAuthors", "receive.fsck.multipleAuthors", Error);
-msg!(MISSING_COMMITTER, "missingCommitter", "fsck.missingCommitter", "receive.fsck.missingCommitter", Error);
-msg!(MISSING_NAME_BEFORE_EMAIL, "missingNameBeforeEmail", "fsck.missingNameBeforeEmail", "receive.fsck.missingNameBeforeEmail", Error);
-msg!(BAD_NAME, "badName", "fsck.badName", "receive.fsck.badName", Error);
-msg!(BAD_EMAIL, "badEmail", "fsck.badEmail", "receive.fsck.badEmail", Error);
-msg!(MISSING_EMAIL, "missingEmail", "fsck.missingEmail", "receive.fsck.missingEmail", Error);
-msg!(MISSING_SPACE_BEFORE_EMAIL, "missingSpaceBeforeEmail", "fsck.missingSpaceBeforeEmail", "receive.fsck.missingSpaceBeforeEmail", Error);
-msg!(MISSING_SPACE_BEFORE_DATE, "missingSpaceBeforeDate", "fsck.missingSpaceBeforeDate", "receive.fsck.missingSpaceBeforeDate", Error);
-msg!(ZERO_PADDED_DATE, "zeroPaddedDate", "fsck.zeroPaddedDate", "receive.fsck.zeroPaddedDate", Error);
-msg!(BAD_DATE_OVERFLOW, "badDateOverflow", "fsck.badDateOverflow", "receive.fsck.badDateOverflow", Error);
-msg!(BAD_DATE, "badDate", "fsck.badDate", "receive.fsck.badDate", Error);
-msg!(BAD_TIMEZONE, "badTimezone", "fsck.badTimezone", "receive.fsck.badTimezone", Error);
-msg!(NUL_IN_COMMIT, "nulInCommit", "fsck.nulInCommit", "receive.fsck.nulInCommit", Warn);
-msg!(UNTERMINATED_HEADER, "unterminatedHeader", "fsck.unterminatedHeader", "receive.fsck.unterminatedHeader", Fatal);
-msg!(NUL_IN_HEADER, "nulInHeader", "fsck.nulInHeader", "receive.fsck.nulInHeader", Fatal);
+msg!(BAD_PARENT_SHA1, "badParentSha1", "fsck.badParentSha1", "receive.fsck.badParentSha1", "fetch.fsck.badParentSha1", Error);
+msg!(MISSING_AUTHOR, "missingAuthor", "fsck.missingAuthor", "receive.fsck.missingAuthor", "fetch.fsck.missingAuthor", Error);
+msg!(MULTIPLE_AUTHORS, "multipleAuthors", "fsck.multipleAuthors", "receive.fsck.multipleAuthors", "fetch.fsck.multipleAuthors", Error);
+msg!(MISSING_COMMITTER, "missingCommitter", "fsck.missingCommitter", "receive.fsck.missingCommitter", "fetch.fsck.missingCommitter", Error);
+msg!(MISSING_NAME_BEFORE_EMAIL, "missingNameBeforeEmail", "fsck.missingNameBeforeEmail", "receive.fsck.missingNameBeforeEmail", "fetch.fsck.missingNameBeforeEmail", Error);
+msg!(BAD_NAME, "badName", "fsck.badName", "receive.fsck.badName", "fetch.fsck.badName", Error);
+msg!(BAD_EMAIL, "badEmail", "fsck.badEmail", "receive.fsck.badEmail", "fetch.fsck.badEmail", Error);
+msg!(MISSING_EMAIL, "missingEmail", "fsck.missingEmail", "receive.fsck.missingEmail", "fetch.fsck.missingEmail", Error);
+msg!(MISSING_SPACE_BEFORE_EMAIL, "missingSpaceBeforeEmail", "fsck.missingSpaceBeforeEmail", "receive.fsck.missingSpaceBeforeEmail", "fetch.fsck.missingSpaceBeforeEmail", Error);
+msg!(MISSING_SPACE_BEFORE_DATE, "missingSpaceBeforeDate", "fsck.missingSpaceBeforeDate", "receive.fsck.missingSpaceBeforeDate", "fetch.fsck.missingSpaceBeforeDate", Error);
+msg!(ZERO_PADDED_DATE, "zeroPaddedDate", "fsck.zeroPaddedDate", "receive.fsck.zeroPaddedDate", "fetch.fsck.zeroPaddedDate", Error);
+msg!(BAD_DATE_OVERFLOW, "badDateOverflow", "fsck.badDateOverflow", "receive.fsck.badDateOverflow", "fetch.fsck.badDateOverflow", Error);
+msg!(BAD_DATE, "badDate", "fsck.badDate", "receive.fsck.badDate", "fetch.fsck.badDate", Error);
+msg!(BAD_TIMEZONE, "badTimezone", "fsck.badTimezone", "receive.fsck.badTimezone", "fetch.fsck.badTimezone", Error);
+msg!(NUL_IN_COMMIT, "nulInCommit", "fsck.nulInCommit", "receive.fsck.nulInCommit", "fetch.fsck.nulInCommit", Warn);
+msg!(UNTERMINATED_HEADER, "unterminatedHeader", "fsck.unterminatedHeader", "receive.fsck.unterminatedHeader", "fetch.fsck.unterminatedHeader", Fatal);
+msg!(NUL_IN_HEADER, "nulInHeader", "fsck.nulInHeader", "receive.fsck.nulInHeader", "fetch.fsck.nulInHeader", Fatal);
+// `fsck_commit()`'s two `tree` header ids (`fsck.c:970` and `fsck.c:972`). Both
+// sit behind a `parse_commit_buffer()` that has already rejected the same
+// buffer, on every path that could reach them, so neither is reportable — see
+// the `msg_config_only!` rows below for the evidence.
+msg_config_only!(MISSING_TREE, "missingTree", "fsck.missingTree", "receive.fsck.missingTree", "fetch.fsck.missingTree", Error,
+    "`fsck_commit()` reports it at `fsck.c:970` for a commit whose first header \
+     is not `tree `, but every entry point parses the commit first and gives up: \
+     `builtin/fsck.c:754` calls `parse_object_buffer()` and prints `object could \
+     not be parsed`, and `builtin/index-pack.c:950` does the same and dies \
+     `invalid commit`. Confirmed against git 2.55.0: a commit object with no \
+     `tree` line yields `error: bogus commit object <oid>` from `git fsck`, from \
+     `git index-pack --strict` and from `git unpack-objects --strict` — never \
+     `missingTree`. No command hands a raw *commit* buffer to `fsck_buffer()` \
+     the way `git mktag` does for tags.");
+msg_config_only!(BAD_TREE_SHA1, "badTreeSha1", "fsck.badTreeSha1", "receive.fsck.badTreeSha1", "fetch.fsck.badTreeSha1", Error,
+    "`fsck_commit()` reports it at `fsck.c:972` for a `tree` line whose hex is \
+     not a well-formed object id. Unreachable for the same reason as \
+     `missingTree`: `parse_commit_buffer()` rejects the buffer first everywhere.");
 
 // --- tree checks (`fsck_tree`) ---------------------------------------------
-msg!(NULL_SHA1, "nullSha1", "fsck.nullSha1", "receive.fsck.nullSha1", Warn);
-msg!(FULL_PATHNAME, "fullPathname", "fsck.fullPathname", "receive.fsck.fullPathname", Warn);
-msg!(HAS_DOT, "hasDot", "fsck.hasDot", "receive.fsck.hasDot", Warn);
-msg!(HAS_DOTDOT, "hasDotdot", "fsck.hasDotdot", "receive.fsck.hasDotdot", Warn);
-msg!(HAS_DOTGIT, "hasDotgit", "fsck.hasDotgit", "receive.fsck.hasDotgit", Warn);
-msg!(ZERO_PADDED_FILEMODE, "zeroPaddedFilemode", "fsck.zeroPaddedFilemode", "receive.fsck.zeroPaddedFilemode", Warn);
-msg!(BAD_FILEMODE, "badFilemode", "fsck.badFilemode", "receive.fsck.badFilemode", Info);
-msg!(DUPLICATE_ENTRIES, "duplicateEntries", "fsck.duplicateEntries", "receive.fsck.duplicateEntries", Error);
-msg!(TREE_NOT_SORTED, "treeNotSorted", "fsck.treeNotSorted", "receive.fsck.treeNotSorted", Error);
-msg!(LARGE_PATHNAME, "largePathname", "fsck.largePathname", "receive.fsck.largePathname", Warn);
+msg!(NULL_SHA1, "nullSha1", "fsck.nullSha1", "receive.fsck.nullSha1", "fetch.fsck.nullSha1", Warn);
+msg!(FULL_PATHNAME, "fullPathname", "fsck.fullPathname", "receive.fsck.fullPathname", "fetch.fsck.fullPathname", Warn);
+msg!(HAS_DOT, "hasDot", "fsck.hasDot", "receive.fsck.hasDot", "fetch.fsck.hasDot", Warn);
+msg!(HAS_DOTDOT, "hasDotdot", "fsck.hasDotdot", "receive.fsck.hasDotdot", "fetch.fsck.hasDotdot", Warn);
+msg!(HAS_DOTGIT, "hasDotgit", "fsck.hasDotgit", "receive.fsck.hasDotgit", "fetch.fsck.hasDotgit", Warn);
+msg!(ZERO_PADDED_FILEMODE, "zeroPaddedFilemode", "fsck.zeroPaddedFilemode", "receive.fsck.zeroPaddedFilemode", "fetch.fsck.zeroPaddedFilemode", Warn);
+msg!(BAD_FILEMODE, "badFilemode", "fsck.badFilemode", "receive.fsck.badFilemode", "fetch.fsck.badFilemode", Info);
+msg!(DUPLICATE_ENTRIES, "duplicateEntries", "fsck.duplicateEntries", "receive.fsck.duplicateEntries", "fetch.fsck.duplicateEntries", Error);
+msg!(TREE_NOT_SORTED, "treeNotSorted", "fsck.treeNotSorted", "receive.fsck.treeNotSorted", "fetch.fsck.treeNotSorted", Error);
+msg!(LARGE_PATHNAME, "largePathname", "fsck.largePathname", "receive.fsck.largePathname", "fetch.fsck.largePathname", Warn);
+msg_config_only!(EMPTY_NAME, "emptyName", "fsck.emptyName", "receive.fsck.emptyName", "fetch.fsck.emptyName", Warn,
+    "`fsck_tree()` accumulates `has_empty_name |= !*name` at `fsck.c:657` and \
+     reports it at `fsck.c:773`, but the flag is computed from an entry \
+     `init_tree_desc_gently()`/`decode_tree_entry()` has already accepted, and \
+     that rejects an empty filename outright. A tree holding a zero-length entry \
+     name therefore fails to parse and is reported as `badTree` instead. \
+     Confirmed against git 2.55.0: a hand-built tree whose single entry is \
+     `100644 \\0<oid>` yields `error: empty filename in tree entry` followed by \
+     `error in tree <oid>: badTree: cannot be parsed as a tree`, with no \
+     `emptyName` line. The id is dead in git itself, not merely unported.");
 
 // --- tag checks (`fsck_tag`) -----------------------------------------------
 //
 // The first seven are the header walk `parse_tag_buffer()` shadows everywhere
 // but in `git mktag`; see [`Msg::receive_key`] and [`super::mktag`].
-msg_mktag!(MISSING_OBJECT, "missingObject", "fsck.missingObject", Error);
-msg_mktag!(BAD_OBJECT_SHA1, "badObjectSha1", "fsck.badObjectSha1", Error);
-msg_mktag!(MISSING_TYPE_ENTRY, "missingTypeEntry", "fsck.missingTypeEntry", Error);
-msg_mktag!(MISSING_TYPE, "missingType", "fsck.missingType", Error);
-msg_mktag!(BAD_TYPE, "badType", "fsck.badType", Error);
-msg_mktag!(MISSING_TAG_ENTRY, "missingTagEntry", "fsck.missingTagEntry", Error);
-msg_mktag!(MISSING_TAG, "missingTag", "fsck.missingTag", Error);
-msg!(MISSING_TAGGER_ENTRY, "missingTaggerEntry", "fsck.missingTaggerEntry", "receive.fsck.missingTaggerEntry", Info);
-msg!(BAD_TAG_NAME, "badTagName", "fsck.badTagName", "receive.fsck.badTagName", Info);
-msg!(EXTRA_HEADER_ENTRY, "extraHeaderEntry", "fsck.extraHeaderEntry", "receive.fsck.extraHeaderEntry", Ignore);
-msg!(BAD_TREE, "badTree", "fsck.badTree", "receive.fsck.badTree", Error);
+msg_mktag!(MISSING_OBJECT, "missingObject", "fsck.missingObject", "receive.fsck.missingObject", "fetch.fsck.missingObject", Error);
+msg_mktag!(BAD_OBJECT_SHA1, "badObjectSha1", "fsck.badObjectSha1", "receive.fsck.badObjectSha1", "fetch.fsck.badObjectSha1", Error);
+msg_mktag!(MISSING_TYPE_ENTRY, "missingTypeEntry", "fsck.missingTypeEntry", "receive.fsck.missingTypeEntry", "fetch.fsck.missingTypeEntry", Error);
+msg_mktag!(MISSING_TYPE, "missingType", "fsck.missingType", "receive.fsck.missingType", "fetch.fsck.missingType", Error);
+msg_mktag!(BAD_TYPE, "badType", "fsck.badType", "receive.fsck.badType", "fetch.fsck.badType", Error);
+msg_mktag!(MISSING_TAG_ENTRY, "missingTagEntry", "fsck.missingTagEntry", "receive.fsck.missingTagEntry", "fetch.fsck.missingTagEntry", Error);
+msg_mktag!(MISSING_TAG, "missingTag", "fsck.missingTag", "receive.fsck.missingTag", "fetch.fsck.missingTag", Error);
+msg!(MISSING_TAGGER_ENTRY, "missingTaggerEntry", "fsck.missingTaggerEntry", "receive.fsck.missingTaggerEntry", "fetch.fsck.missingTaggerEntry", Info);
+msg!(BAD_TAG_NAME, "badTagName", "fsck.badTagName", "receive.fsck.badTagName", "fetch.fsck.badTagName", Info);
+msg!(EXTRA_HEADER_ENTRY, "extraHeaderEntry", "fsck.extraHeaderEntry", "receive.fsck.extraHeaderEntry", "fetch.fsck.extraHeaderEntry", Ignore);
+msg!(BAD_TREE, "badTree", "fsck.badTree", "receive.fsck.badTree", "fetch.fsck.badTree", Error);
+// `fsck_tag()`'s `gpgsig`/`gpgsig-sha256` continuation walk (`fsck.c:1097`).
+msg_config_only!(BAD_GPGSIG, "badGpgsig", "fsck.badGpgsig", "receive.fsck.badGpgsig", "fetch.fsck.badGpgsig", Error,
+    "`fsck_tag()` reports it at `fsck.c:1100` when a `gpgsig ` header runs to the \
+     end of the buffer with no newline. Reaching that line needs \
+     `verify_headers()` (`fsck.c:829`) to have returned 0 first, and it only does \
+     so when the buffer contains a `\\n\\n` or ends in `\\n` — either of which \
+     gives the `gpgsig` line the newline whose absence is the whole finding. A \
+     buffer with neither is reported as `unterminatedHeader`, which is \
+     `FSCK_FATAL` and so cannot be demoted out of the way \
+     (`fsck.c:176`: `Cannot demote unterminatedHeader to <x>`). Confirmed against \
+     git 2.55.0 by construction, including via `git mktag`, which is the only \
+     caller that fscks a raw tag buffer.");
+msg_config_only!(BAD_HEADER_CONTINUATION, "badHeaderContinuation", "fsck.badHeaderContinuation", "receive.fsck.badHeaderContinuation", "fetch.fsck.badHeaderContinuation", Error,
+    "`fsck_tag()` reports it at `fsck.c:1108` for a ` `-indented `gpgsig` \
+     continuation line that runs to the end of the buffer with no newline. \
+     Unreachable for exactly the reason `badGpgsig` is: `verify_headers()` has \
+     already turned a buffer with no terminating newline into a `FSCK_FATAL` \
+     `unterminatedHeader`.");
+// `fsck_buffer()`'s fallthrough for an object that is none of the four types
+// (`fsck.c:1276`).
+msg_config_only!(UNKNOWN_TYPE, "unknownType", "fsck.unknownType", "receive.fsck.unknownType", "fetch.fsck.unknownType", Error,
+    "`fsck_buffer()` reports it at `fsck.c:1276` — `unknown type '%d' (internal \
+     fsck error)` — for a type that is not blob, tree, commit or tag. No object \
+     database can hand one over: `type_from_string_gently()` refuses to write a \
+     fifth type in the first place. Confirmed against git 2.55.0: \
+     `git hash-object -t frobnicate --literally` fails with \
+     `fatal: invalid object type \"frobnicate\"` before an object exists at all. \
+     The message text calls itself an internal error, which is what it is.");
 
 // --- the four special paths, reported against the *tree* that names them
 // (`fsck_tree`'s per-entry block) ------------------------------------------
-msg!(GITMODULES_SYMLINK, "gitmodulesSymlink", "fsck.gitmodulesSymlink", "receive.fsck.gitmodulesSymlink", Error);
-msg!(GITATTRIBUTES_SYMLINK, "gitattributesSymlink", "fsck.gitattributesSymlink", "receive.fsck.gitattributesSymlink", Info);
-msg!(GITIGNORE_SYMLINK, "gitignoreSymlink", "fsck.gitignoreSymlink", "receive.fsck.gitignoreSymlink", Info);
-msg!(MAILMAP_SYMLINK, "mailmapSymlink", "fsck.mailmapSymlink", "receive.fsck.mailmapSymlink", Info);
+msg!(GITMODULES_SYMLINK, "gitmodulesSymlink", "fsck.gitmodulesSymlink", "receive.fsck.gitmodulesSymlink", "fetch.fsck.gitmodulesSymlink", Error);
+msg!(GITATTRIBUTES_SYMLINK, "gitattributesSymlink", "fsck.gitattributesSymlink", "receive.fsck.gitattributesSymlink", "fetch.fsck.gitattributesSymlink", Info);
+msg!(GITIGNORE_SYMLINK, "gitignoreSymlink", "fsck.gitignoreSymlink", "receive.fsck.gitignoreSymlink", "fetch.fsck.gitignoreSymlink", Info);
+msg!(MAILMAP_SYMLINK, "mailmapSymlink", "fsck.mailmapSymlink", "receive.fsck.mailmapSymlink", "fetch.fsck.mailmapSymlink", Info);
 
 // --- blob-content checks, reported against the *blob* (`fsck_blob`) --------
-msg!(GITMODULES_PARSE, "gitmodulesParse", "fsck.gitmodulesParse", "receive.fsck.gitmodulesParse", Info);
-msg!(GITMODULES_NAME, "gitmodulesName", "fsck.gitmodulesName", "receive.fsck.gitmodulesName", Error);
-msg!(GITMODULES_URL, "gitmodulesUrl", "fsck.gitmodulesUrl", "receive.fsck.gitmodulesUrl", Error);
-msg!(GITMODULES_PATH, "gitmodulesPath", "fsck.gitmodulesPath", "receive.fsck.gitmodulesPath", Error);
-msg!(GITMODULES_UPDATE, "gitmodulesUpdate", "fsck.gitmodulesUpdate", "receive.fsck.gitmodulesUpdate", Error);
-msg!(GITATTRIBUTES_LARGE, "gitattributesLarge", "fsck.gitattributesLarge", "receive.fsck.gitattributesLarge", Error);
-msg!(GITATTRIBUTES_LINE_LENGTH, "gitattributesLineLength", "fsck.gitattributesLineLength", "receive.fsck.gitattributesLineLength", Error);
+msg!(GITMODULES_PARSE, "gitmodulesParse", "fsck.gitmodulesParse", "receive.fsck.gitmodulesParse", "fetch.fsck.gitmodulesParse", Info);
+msg!(GITMODULES_NAME, "gitmodulesName", "fsck.gitmodulesName", "receive.fsck.gitmodulesName", "fetch.fsck.gitmodulesName", Error);
+msg!(GITMODULES_URL, "gitmodulesUrl", "fsck.gitmodulesUrl", "receive.fsck.gitmodulesUrl", "fetch.fsck.gitmodulesUrl", Error);
+msg!(GITMODULES_PATH, "gitmodulesPath", "fsck.gitmodulesPath", "receive.fsck.gitmodulesPath", "fetch.fsck.gitmodulesPath", Error);
+msg!(GITMODULES_UPDATE, "gitmodulesUpdate", "fsck.gitmodulesUpdate", "receive.fsck.gitmodulesUpdate", "fetch.fsck.gitmodulesUpdate", Error);
+msg!(GITATTRIBUTES_LARGE, "gitattributesLarge", "fsck.gitattributesLarge", "receive.fsck.gitattributesLarge", "fetch.fsck.gitattributesLarge", Error);
+// `fsck_blob()`'s `!buf` half (`fsck.c:1198`): the caller found the blob too big
+// to hold in memory and passed a null buffer, so there is nothing to parse. Which
+// blobs those are is `core.bigFileThreshold`'s decision — see [`streamed_blob`].
+msg!(GITMODULES_LARGE, "gitmodulesLarge", "fsck.gitmodulesLarge", "receive.fsck.gitmodulesLarge", "fetch.fsck.gitmodulesLarge", Error);
+msg!(GITATTRIBUTES_LINE_LENGTH, "gitattributesLineLength", "fsck.gitattributesLineLength", "receive.fsck.gitattributesLineLength", "fetch.fsck.gitattributesLineLength", Error);
 
 // --- `fsck_finish()`'s two sweeps over the collected paths (`fsck_blobs`) --
-msg!(GITMODULES_MISSING, "gitmodulesMissing", "fsck.gitmodulesMissing", "receive.fsck.gitmodulesMissing", Error);
-msg!(GITMODULES_BLOB, "gitmodulesBlob", "fsck.gitmodulesBlob", "receive.fsck.gitmodulesBlob", Error);
-msg!(GITATTRIBUTES_MISSING, "gitattributesMissing", "fsck.gitattributesMissing", "receive.fsck.gitattributesMissing", Error);
-msg!(GITATTRIBUTES_BLOB, "gitattributesBlob", "fsck.gitattributesBlob", "receive.fsck.gitattributesBlob", Error);
+msg!(GITMODULES_MISSING, "gitmodulesMissing", "fsck.gitmodulesMissing", "receive.fsck.gitmodulesMissing", "fetch.fsck.gitmodulesMissing", Error);
+msg!(GITMODULES_BLOB, "gitmodulesBlob", "fsck.gitmodulesBlob", "receive.fsck.gitmodulesBlob", "fetch.fsck.gitmodulesBlob", Error);
+msg!(GITATTRIBUTES_MISSING, "gitattributesMissing", "fsck.gitattributesMissing", "receive.fsck.gitattributesMissing", "fetch.fsck.gitattributesMissing", Error);
+msg!(GITATTRIBUTES_BLOB, "gitattributesBlob", "fsck.gitattributesBlob", "receive.fsck.gitattributesBlob", "fetch.fsck.gitattributesBlob", Error);
 
 // --- the reference database (`refs_fsck`, `files_fsck`, `packed_fsck`) ------
 //
 // Reported against a *path* rather than an object id: a refname
 // (`refs/heads/x`, `worktrees/wt/HEAD`), or one of `packed-refs`,
 // `packed-refs.header`, `packed-refs line <n>`. See [`fsck_refs`].
-msg_refs!(BAD_REF_NAME, "badRefName", "fsck.badRefName", Error);
-msg_refs!(BAD_REF_FILETYPE, "badRefFiletype", "fsck.badRefFiletype", Error);
-msg_refs!(BAD_REF_CONTENT, "badRefContent", "fsck.badRefContent", Error);
-msg_refs!(BAD_REF_OID, "badRefOid", "fsck.badRefOid", Error);
-msg_refs!(BAD_HEAD_TARGET, "badHeadTarget", "fsck.badHeadTarget", Error);
-msg_refs!(BAD_REFERENT_NAME, "badReferentName", "fsck.badReferentName", Error);
-msg_refs!(REF_MISSING_NEWLINE, "refMissingNewline", "fsck.refMissingNewline", Info);
-msg_refs!(TRAILING_REF_CONTENT, "trailingRefContent", "fsck.trailingRefContent", Info);
-msg_refs!(SYMLINK_REF, "symlinkRef", "fsck.symlinkRef", Info);
-msg_refs!(SYMREF_TARGET_IS_NOT_A_REF, "symrefTargetIsNotARef", "fsck.symrefTargetIsNotARef", Info);
-msg_refs!(BAD_PACKED_REF_HEADER, "badPackedRefHeader", "fsck.badPackedRefHeader", Error);
-msg_refs!(BAD_PACKED_REF_ENTRY, "badPackedRefEntry", "fsck.badPackedRefEntry", Error);
-msg_refs!(PACKED_REF_ENTRY_NOT_TERMINATED, "packedRefEntryNotTerminated", "fsck.packedRefEntryNotTerminated", Error);
-msg_refs!(PACKED_REF_UNSORTED, "packedRefUnsorted", "fsck.packedRefUnsorted", Error);
-msg_refs!(EMPTY_PACKED_REFS_FILE, "emptyPackedRefsFile", "fsck.emptyPackedRefsFile", Info);
+msg_refs!(BAD_REF_NAME, "badRefName", "fsck.badRefName", "receive.fsck.badRefName", "fetch.fsck.badRefName", Error);
+msg_refs!(BAD_REF_FILETYPE, "badRefFiletype", "fsck.badRefFiletype", "receive.fsck.badRefFiletype", "fetch.fsck.badRefFiletype", Error);
+msg_refs!(BAD_REF_CONTENT, "badRefContent", "fsck.badRefContent", "receive.fsck.badRefContent", "fetch.fsck.badRefContent", Error);
+msg_refs!(BAD_REF_OID, "badRefOid", "fsck.badRefOid", "receive.fsck.badRefOid", "fetch.fsck.badRefOid", Error);
+msg_refs!(BAD_HEAD_TARGET, "badHeadTarget", "fsck.badHeadTarget", "receive.fsck.badHeadTarget", "fetch.fsck.badHeadTarget", Error);
+msg_refs!(BAD_REFERENT_NAME, "badReferentName", "fsck.badReferentName", "receive.fsck.badReferentName", "fetch.fsck.badReferentName", Error);
+msg_refs!(REF_MISSING_NEWLINE, "refMissingNewline", "fsck.refMissingNewline", "receive.fsck.refMissingNewline", "fetch.fsck.refMissingNewline", Info);
+msg_refs!(TRAILING_REF_CONTENT, "trailingRefContent", "fsck.trailingRefContent", "receive.fsck.trailingRefContent", "fetch.fsck.trailingRefContent", Info);
+msg_refs!(SYMLINK_REF, "symlinkRef", "fsck.symlinkRef", "receive.fsck.symlinkRef", "fetch.fsck.symlinkRef", Info);
+msg_refs!(SYMREF_TARGET_IS_NOT_A_REF, "symrefTargetIsNotARef", "fsck.symrefTargetIsNotARef", "receive.fsck.symrefTargetIsNotARef", "fetch.fsck.symrefTargetIsNotARef", Info);
+msg_refs!(BAD_PACKED_REF_HEADER, "badPackedRefHeader", "fsck.badPackedRefHeader", "receive.fsck.badPackedRefHeader", "fetch.fsck.badPackedRefHeader", Error);
+msg_refs!(BAD_PACKED_REF_ENTRY, "badPackedRefEntry", "fsck.badPackedRefEntry", "receive.fsck.badPackedRefEntry", "fetch.fsck.badPackedRefEntry", Error);
+msg_refs!(PACKED_REF_ENTRY_NOT_TERMINATED, "packedRefEntryNotTerminated", "fsck.packedRefEntryNotTerminated", "receive.fsck.packedRefEntryNotTerminated", "fetch.fsck.packedRefEntryNotTerminated", Error);
+msg_refs!(PACKED_REF_UNSORTED, "packedRefUnsorted", "fsck.packedRefUnsorted", "receive.fsck.packedRefUnsorted", "fetch.fsck.packedRefUnsorted", Error);
+msg_refs!(EMPTY_PACKED_REFS_FILE, "emptyPackedRefsFile", "fsck.emptyPackedRefsFile", "receive.fsck.emptyPackedRefsFile", "fetch.fsck.emptyPackedRefsFile", Info);
+msg_config_only!(BAD_REFTABLE_TABLE_NAME, "badReftableTableName", "fsck.badReftableTableName", "receive.fsck.badReftableTableName", "fetch.fsck.badReftableTableName", Warn,
+    "`refs/reftable-backend.c::reftable_fsck_error_handler` raises it for a table \
+     file inside `reftable/` whose name does not match the \
+     `0x%012<PRIx64>-0x%012<PRIx64>-%08x.ref` form the backend writes. The \
+     vendored `gix-ref` has no reftable backend at all — only the `files` backend \
+     with its `packed-refs` — so a reftable repository cannot even be opened here, \
+     let alone have its table names walked. Porting the id would mean porting the \
+     backend.");
 
 /// Every row this port implements, for severity resolution and for telling a
 /// misspelled `fsck.<x>` key from a real one.
@@ -2722,6 +2882,8 @@ pub const MSGS: &[Msg] = &[
     NUL_IN_COMMIT,
     UNTERMINATED_HEADER,
     NUL_IN_HEADER,
+    MISSING_TREE,
+    BAD_TREE_SHA1,
     NULL_SHA1,
     FULL_PATHNAME,
     HAS_DOT,
@@ -2732,6 +2894,7 @@ pub const MSGS: &[Msg] = &[
     DUPLICATE_ENTRIES,
     TREE_NOT_SORTED,
     LARGE_PATHNAME,
+    EMPTY_NAME,
     MISSING_OBJECT,
     BAD_OBJECT_SHA1,
     MISSING_TYPE_ENTRY,
@@ -2743,6 +2906,9 @@ pub const MSGS: &[Msg] = &[
     BAD_TAG_NAME,
     EXTRA_HEADER_ENTRY,
     BAD_TREE,
+    BAD_GPGSIG,
+    BAD_HEADER_CONTINUATION,
+    UNKNOWN_TYPE,
     GITMODULES_SYMLINK,
     GITATTRIBUTES_SYMLINK,
     GITIGNORE_SYMLINK,
@@ -2754,6 +2920,7 @@ pub const MSGS: &[Msg] = &[
     GITMODULES_UPDATE,
     GITATTRIBUTES_LARGE,
     GITATTRIBUTES_LINE_LENGTH,
+    GITMODULES_LARGE,
     GITMODULES_MISSING,
     GITMODULES_BLOB,
     GITATTRIBUTES_MISSING,
@@ -2773,56 +2940,9 @@ pub const MSGS: &[Msg] = &[
     PACKED_REF_ENTRY_NOT_TERMINATED,
     PACKED_REF_UNSORTED,
     EMPTY_PACKED_REFS_FILE,
+    BAD_REFTABLE_TABLE_NAME,
 ];
 
-/// The rest of `FOREACH_FSCK_MSG_ID`: ids git knows and this port never
-/// reports. They are listed by bare id and not by variable name on purpose —
-/// nothing reads a `fsck.<one-of-these>` variable, so naming one would claim
-/// support that does not exist. Configuring one is accepted (git would too)
-/// and changes nothing, which is the honest outcome for a check that is not
-/// performed. Four groups:
-///
-///   * **one reference-database id.** `badHeadTarget`, `badPackedRefEntry`,
-///     `badPackedRefHeader`, `badRefContent`, `badReferentName`,
-///     `badRefFiletype`, `badRefName`, `badRefOid`, `emptyPackedRefsFile`,
-///     `packedRefEntryNotTerminated`, `packedRefUnsorted`, `refMissingNewline`,
-///     `symlinkRef`, `symrefTargetIsNotARef` and `trailingRefContent` are now
-///     checked by [`fsck_refs`] below. What remains from that family is
-///     `badReftableTableName`, which
-///     `refs/reftable-backend.c::reftable_fsck_error_handler` raises: the
-///     vendored `gix-ref` has no reftable backend at all, so a reftable
-///     repository cannot be opened here, let alone have its table names
-///     checked;
-///   * **the two commit ids no entry point can reach.** `missingTree` and
-///     `badTreeSha1` are reported by `fsck_commit()` for a `tree` header that
-///     `parse_commit_buffer()` has already rejected (`bogus commit object` /
-///     `bad tree pointer in commit`), and no command hands a raw commit buffer
-///     to `fsck_buffer()` — `git mktag` only takes tags. Their tag-side
-///     counterparts *are* ported, through `git mktag`; see [`MISSING_OBJECT`];
-///   * **four ids that are dead in git itself.** `emptyName` cannot be set:
-///     `fsck_tree()`'s `has_empty_name` is computed from an entry
-///     `decode_tree_entry()` has already accepted, and that rejects an empty
-///     filename first, so the tree is reported as `badTree` instead.
-///     `badGpgsig` and `badHeaderContinuation` both need a `gpgsig` value that
-///     runs to the end of the buffer with no newline, which `verify_headers()`
-///     already rejects as `unterminatedHeader` — and that id is `FSCK_FATAL`,
-///     so no configuration can demote it out of the way. `unknownType` is
-///     `fsck_buffer()`'s fallthrough for a type that is not one of the four,
-///     which no object database yields;
-///   * **`gitmodulesLarge`**, which git only reports when `read_loose_object()`
-///     streamed the blob past `core.bigFileThreshold` instead of loading it.
-///     This port always loads the blob, so the `NULL` buffer that triggers the
-///     id never arises.
-const UNPORTED_MSG_IDS: &[&str] = &[
-    "badGpgsig",
-    "badHeaderContinuation",
-    "badReftableTableName",
-    "badTreeSha1",
-    "emptyName",
-    "gitmodulesLarge",
-    "missingTree",
-    "unknownType",
-];
 
 /// One reported defect: the table row that names it plus the rendered text.
 pub struct Finding {
@@ -2833,17 +2953,35 @@ pub struct Finding {
     pub text: String,
 }
 
-/// Whether the caller is `git fsck` or `git receive-pack`, which picks the
-/// variable family and the `--strict` behaviour.
+/// Which of the three variable families the caller reads, which also picks the
+/// `--strict` behaviour and where each configuration failure surfaces.
+///
+/// The three never fall back on one another. `git help config`, under
+/// `fsck.<msg-id>`: "the `receive.fsck.<msg-id>` and `fetch.fsck.<msg-id>`
+/// variables will not fall back on the `fsck.<msg-id>` configuration if they
+/// aren't set. To uniformly configure the same fsck settings in different
+/// circumstances, all three of them must be set to the same values."
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MsgSource {
-    /// `fsck.<msg-id>` / `fsck.skipList`, with `--strict` honoured.
+    /// `fsck.<msg-id>` / `fsck.skipList`, read by `git_fsck_config()`
+    /// (`fsck.c:1440`) with `--strict` honoured.
     Fsck { strict: bool },
-    /// `receive.fsck.<msg-id>` / `receive.fsck.skipList`. The transfer check
-    /// always runs `index-pack`/`unpack-objects` with `--strict`, so a
+    /// `receive.fsck.<msg-id>` / `receive.fsck.skipList`, read by
+    /// `receive_pack_config()` (`builtin/receive-pack.c:174`). The transfer
+    /// check always runs `index-pack`/`unpack-objects` with `--strict`, so a
     /// defaulted warning is an error here even though the same object only
     /// warns under a plain `git fsck`.
     Receive,
+    /// `fetch.fsck.<msg-id>` / `fetch.fsck.skipList`, read by
+    /// `fetch_pack_fsck_config()` (`fetch-pack.c:1954`). Identical to
+    /// [`MsgSource::Receive`] in every respect but the variable names and the
+    /// capital `S` in its unknown-id warning — `fetch-pack.c:1978` spells it
+    /// `Skipping unknown msg id '%s'`, `builtin/receive-pack.c:193` spells it
+    /// `skipping unknown msg id '%s'`. `index-pack` gets the list as
+    /// `--strict<list>` (`fetch-pack.c:1061`) and its options carry
+    /// `.strict = 1` (`fsck.c:1403`, the `FSCK_OPTIONS_MISSING_GITMODULES` row),
+    /// hence the same warning promotion.
+    Fetch,
 }
 
 /// The resolved severity of every message id plus the skipped-object set —
@@ -2854,10 +2992,24 @@ pub struct MsgConfig {
     /// Object ids the skip list names; every message about them is dropped.
     skip: HashSet<ObjectId>,
     /// A `die()` that `git fsck` reaches while reading its own configuration,
-    /// but `receive-pack` only reaches inside the `index-pack`/`unpack-objects`
-    /// child it hands `--strict=<types>` to — so the pusher sees it on the
-    /// side band and the push fails with that child's abnormal exit rather
-    /// than the session dying before the advertisement.
+    /// but `receive-pack` and `fetch-pack` only reach inside the
+    /// `index-pack`/`unpack-objects` child they hand `--strict=<types>` to — so
+    /// the failure arrives with that child's abnormal exit rather than the
+    /// session dying before the advertisement (`receive-pack`) or before the
+    /// negotiation (`fetch`).
+    ///
+    /// Which failures those are follows from *where* git runs each check.
+    /// `is_valid_msg_type()` — all `receive.fsck.`/`fetch.fsck.` variables go
+    /// through it — calls `parse_msg_id()` then `parse_msg_type()`, so a bad
+    /// *value* dies in the parent. The demote rule (`fsck.c:176`) and
+    /// `oidset_parse_file()` (`fsck.c:207`) live in `fsck_set_msg_type()` /
+    /// `fsck_set_msg_types()`, which the parent never calls: it only appends the
+    /// token to the `--strict` list. Both therefore die in the child. Confirmed
+    /// against git 2.55.0: with `fetch.fsckObjects` unset,
+    /// `fetch.fsck.nulInHeader=warn` and `fetch.fsck.skipList=/nope` fetch
+    /// cleanly, and with it set they die `Cannot demote nulinheader to warn` /
+    /// `could not open object name list: /nope`, each followed by
+    /// `fatal: index-pack failed`.
     pub deferred_fatal: Option<String>,
 }
 
@@ -2867,31 +3019,39 @@ impl MsgConfig {
     /// Returns the message git dies with — without its `fatal: ` prefix — for
     /// a bad value (`Unknown fsck message type`) or, under `git fsck` only, a
     /// misspelled id (`Unhandled message id`). The two failures the transfer
-    /// side only reaches inside its child land in [`Self::deferred_fatal`].
+    /// sides only reach inside their child land in [`Self::deferred_fatal`].
     pub fn new(repo: &gix::Repository, source: MsgSource) -> Result<Self, String> {
         let config = repo.config_snapshot();
-        let strict = matches!(source, MsgSource::Fsck { strict: true } | MsgSource::Receive);
+        // `fsck_options_init()` gives both transfer paths a `strict` option set
+        // (`fsck.c:1403`, the `FSCK_OPTIONS_MISSING_GITMODULES` row every
+        // `index-pack`/`unpack-objects` uses), so every *defaulted* warning is an
+        // error there.
+        let strict = matches!(
+            source,
+            MsgSource::Fsck { strict: true } | MsgSource::Receive | MsgSource::Fetch
+        );
         let mut deferred_fatal: Option<String> = None;
         let mut levels = HashMap::with_capacity(MSGS.len());
         for m in MSGS {
-            // A `receive_key`-less row has no `receive-pack` spelling to read,
-            // so on that path it keeps its default (promoted, since the
-            // transfer side always checks strictly).
+            // Every row has all three spellings: git's three config callbacks
+            // each match their whole family without consulting the id.
             let key = match source {
-                MsgSource::Fsck { .. } => Some(m.fsck_key),
+                MsgSource::Fsck { .. } => m.fsck_key,
                 MsgSource::Receive => m.receive_key,
+                MsgSource::Fetch => m.fetch_key,
             };
-            let level = match key.and_then(|key| config.string(key)) {
+            let level = match config.string(key) {
                 Some(v) => {
                     let value = v.to_string();
-                    // `is_valid_msg_type()` runs in receive-pack's own config
-                    // callback, so an unknown *value* is fatal on both paths.
+                    // `is_valid_msg_type()` runs in the transfer paths' own
+                    // config callbacks, so an unknown *value* is fatal on all
+                    // three.
                     let level = parse_severity(&value)?;
                     if m.default == Severity::Fatal && level != Severity::Error {
                         let text = format!("Cannot demote {} to {value}", m.id.to_lowercase());
                         match source {
                             MsgSource::Fsck { .. } => return Err(text),
-                            MsgSource::Receive => {
+                            MsgSource::Receive | MsgSource::Fetch => {
                                 deferred_fatal.get_or_insert(text);
                             }
                         }
@@ -2907,42 +3067,46 @@ impl MsgConfig {
             levels.insert(m.id, level);
         }
 
-        // git validates *every* variable in the family, including the ids this
-        // port does not check, and dies on one it does not know at all.
+        // git validates *every* variable in the family, including the ids whose
+        // check this port does not perform, and diagnoses one it does not know
+        // at all.
         let (section, subsection) = match source {
             MsgSource::Fsck { .. } => ("fsck", None),
             MsgSource::Receive => ("receive", Some("fsck")),
+            MsgSource::Fetch => ("fetch", Some("fsck")),
         };
         for name in value_names(&config, section, subsection) {
             let lower = name.to_lowercase();
             if lower == "skiplist" {
                 continue;
             }
-            let known = MSGS.iter().any(|m| m.id.eq_ignore_ascii_case(&name))
-                || UNPORTED_MSG_IDS.iter().any(|id| id.eq_ignore_ascii_case(&name));
+            let known = MSGS.iter().any(|m| m.id.eq_ignore_ascii_case(&name));
             if known {
                 continue;
             }
             // `git help config`: an unknown `fsck.<msg-id>` kills fsck, while
-            // the same under `receive.fsck.` is only a warning.
+            // the same under `receive.fsck.`/`fetch.fsck.` is only a warning.
+            // The two warnings differ in one byte — see [`MsgSource::Fetch`].
             match source {
                 MsgSource::Fsck { .. } => return Err(format!("Unhandled message id: {lower}")),
                 MsgSource::Receive => eprintln!("warning: skipping unknown msg id '{lower}'"),
+                MsgSource::Fetch => eprintln!("warning: Skipping unknown msg id '{lower}'"),
             }
         }
 
         let skip_key = match source {
             MsgSource::Fsck { .. } => "fsck.skipList",
             MsgSource::Receive => "receive.fsck.skipList",
+            MsgSource::Fetch => "fetch.fsck.skipList",
         };
         let skip = match config.string(skip_key) {
             Some(path) => match read_skip_list(&path.to_string()) {
                 Ok(skip) => skip,
-                // `init_skiplist()` runs where the checking runs, so the
-                // transfer side hits this inside its child.
+                // `oidset_parse_file()` runs where the checking runs, so the
+                // transfer sides hit this inside their child.
                 Err(text) => match source {
                     MsgSource::Fsck { .. } => return Err(text),
-                    MsgSource::Receive => {
+                    MsgSource::Receive | MsgSource::Fetch => {
                         deferred_fatal.get_or_insert(text);
                         HashSet::new()
                     }
@@ -3007,17 +3171,32 @@ fn parse_severity(value: &str) -> Result<Severity, String> {
     }
 }
 
-/// `fsck.c::init_skiplist` plus `oidset_parse_file_carefully`: one object id
-/// per line, with `#` comments, blank lines and surrounding whitespace ignored.
+/// `oidset.c::oidset_parse_file_carefully` (`oidset.c:73`), which
+/// `fsck_set_msg_types()` reaches for `skiplist=<path>`: one object id per line.
+///
+/// Its own comment: "Allow trailing comments, leading whitespace (including
+/// before commits), and empty or whitespace only lines." The order matters and is
+/// reproduced here — the line is first truncated at its *first* `#`, wherever it
+/// sits, and only then trimmed. A `<oid>   # note` line therefore names the oid,
+/// which trimming first and testing `starts_with('#')` would have rejected.
+///
+/// Both failures are `die()`s, and the caller decides whether they surface here
+/// or inside a transfer's child; see [`MsgConfig::deferred_fatal`].
 fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|_| format!("could not open object name list: {path}"))?;
     let mut out = HashSet::new();
     for line in text.lines() {
+        let line = match line.find('#') {
+            Some(hash) => &line[..hash],
+            None => line,
+        };
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
             continue;
         }
+        // `parse_oid_hex_algop(...) || *p != '\0'`: the whole remainder of the
+        // line has to be one full-length id.
         let id = ObjectId::from_hex(line.as_bytes())
             .map_err(|_| format!("invalid object name: {line}"))?;
         out.insert(id);
@@ -3053,7 +3232,7 @@ fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
 // object checks. `--strict` is accepted and changes nothing here: it only
 // promotes a *defaulted* `Warn`, and every ported reference id defaults to
 // `Error` or `Info`. The one id of this family that is not ported is
-// `badReftableTableName`; see [`UNPORTED_MSG_IDS`].
+// `badReftableTableName`; see [`BAD_REFTABLE_TABLE_NAME`].
 //
 // ### Known divergences
 //
@@ -4484,14 +4663,31 @@ const ATTR_MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
 /// `fsck.c::fsck_blob`: lint a blob some tree named `.gitmodules` and/or
 /// `.gitattributes`. `as_modules`/`as_attrs` are the two `oidset_contains()`
 /// tests; a blob no tree singled out has nothing checked at all.
-pub fn check_blob(data: &[u8], as_modules: bool, as_attrs: bool) -> Vec<Finding> {
+///
+/// `data` is `None` for git's `!buf` case — the caller found the blob too big to
+/// hold in memory and streamed it instead, which is [`streamed_blob`]'s decision.
+/// git's comment at `fsck.c:1199` ("Let's just consider that an error") is the
+/// whole rationale: with no buffer there is nothing to parse, so the blob is
+/// reported rather than skipped. Note the `return` at `fsck.c:1204`: a blob named
+/// as *both* `.gitmodules` and `.gitattributes` reports only `gitmodulesLarge`,
+/// because the `.gitmodules` half leaves the function before the
+/// `.gitattributes` half runs.
+pub fn check_blob(data: Option<&[u8]>, as_modules: bool, as_attrs: bool) -> Vec<Finding> {
     let mut out = Vec::new();
     if as_modules {
+        let Some(data) = data else {
+            report(&mut out, &GITMODULES_LARGE, ".gitmodules too large to parse");
+            return out;
+        };
         check_gitmodules_blob(data, &mut out);
     }
     if as_attrs {
-        // git's `!buf` half of this test is the streamed-blob case
-        // (`gitmodulesLarge`'s sibling) which this port cannot reach.
+        // `!buf || size > ATTR_MAX_FILE_SIZE` — the streamed blob and the merely
+        // huge one report the same id.
+        let Some(data) = data else {
+            report(&mut out, &GITATTRIBUTES_LARGE, ".gitattributes too large to parse");
+            return out;
+        };
         if data.len() > ATTR_MAX_FILE_SIZE {
             report(&mut out, &GITATTRIBUTES_LARGE, ".gitattributes too large to parse");
             return out;
@@ -4514,6 +4710,38 @@ pub fn check_blob(data: &[u8], as_modules: bool, as_attrs: bool) -> Vec<Finding>
         }
     }
     out
+}
+
+/// `core.bigFileThreshold` — git's `repo_settings_get_big_file_threshold()`
+/// (`repo-settings.c:167`), whose default is `512 * 1024 * 1024`.
+///
+/// It is the only reason `fsck_blob()` ever sees a null buffer, and hence the
+/// only way `gitmodulesLarge` can fire. A configured `0` makes every non-empty
+/// blob "big": `repo_cfg_ulong()` stores the parsed value verbatim and the test
+/// is a plain `size > threshold`.
+///
+/// One divergence: git's `git_config_ulong()` dies `bad numeric config value` on
+/// a value it cannot parse, while a value this port cannot parse falls back to
+/// the default. That belongs to `core.bigFileThreshold`'s own port, not to fsck.
+pub fn big_file_threshold(repo: &gix::Repository) -> u64 {
+    repo.config_snapshot()
+        .string("core.bigFileThreshold")
+        .and_then(|v| crate::config::parse_config_ulong(&v.to_string()).ok())
+        .unwrap_or(512 * 1024 * 1024)
+}
+
+/// The buffer `fsck_blob()` is handed for a blob whose contents are `data`:
+/// `None` once it is over `threshold`, which is what git passes after
+/// `read_loose_object()` (`object-file.c:1645`) or `index-pack`'s `unpack_entry`
+/// (`builtin/index-pack.c:488`) streamed it into a fixed-size scratch buffer
+/// instead of allocating for it.
+///
+/// Both tests are `type == OBJ_BLOB && size > threshold`, strictly greater.
+/// Confirmed against git 2.55.0 on a 501-byte `.gitmodules`:
+/// `core.bigFileThreshold=501` reports nothing, `=500` reports
+/// `gitmodulesLarge`.
+pub fn blob_buffer(data: &[u8], threshold: u64) -> Option<&[u8]> {
+    (data.len() as u64 <= threshold).then_some(data)
 }
 
 /// `fsck.c::fsck_gitmodules_fn` run over every `submodule.<name>.<key>` the

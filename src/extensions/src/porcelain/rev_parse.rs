@@ -40,6 +40,17 @@
 //! `--remotes[=<glob>]`, `--glob=<glob>`, `--exclude=<pattern>`, plus revision
 //! and path arguments.
 //!
+//! Also implemented, and none of them a revision query: the whole `--parseopt`
+//! mode (with `--keep-dashdash`, `--stop-at-non-option` and `--stuck-long`) over a
+//! port of `parse-options.c`, `--sq-quote`, `--local-env-vars`,
+//! `--resolve-git-dir <path>`, `--git-path <name>`, `--shared-index-path`,
+//! `--path-format=(absolute|relative)`, `--disambiguate=<prefix>` and the four
+//! date rewrites `--since=`/`--after=`/`--before=`/`--until=`.
+//!
+//! `--path-format=` is scan state like every display option, so it governs only the
+//! path queries written *after* it; the rendering it selects is
+//! [`print_path`], a port of `builtin/rev-parse.c:656-703`.
+//!
 //! The ref-set family goes through the same
 //! [`crate::porcelain::log::RefSelection`] the revision walkers use, which is
 //! `refs_for_each_ref_ext()`'s rule: the pattern is matched against the *whole*
@@ -49,9 +60,10 @@
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
 //! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
-//! `--is-shallow-repository`, `--disambiguate=<prefix>` and `--sq-quote`.
-//! Options git does *not* recognize are echoed, which is what git itself does
-//! with them.
+//! `--is-shallow-repository`, `--show-superproject-working-tree`, `--bisect`,
+//! `--default`, `--prefix`, `--revs-only`/`--no-revs`/`--flags`/`--no-flags`,
+//! `--end-of-options`, `--all-objects` and `--exclude-hidden=`. Options git does
+//! *not* recognize are echoed, which is what git itself does with them.
 
 use anyhow::Result;
 use std::io::Write;
@@ -111,6 +123,10 @@ struct Opts {
     echo_flags: bool,
     /// git's `DO_NONFLAGS`: echo path arguments. Cleared by `--verify`/`--short`.
     echo_paths: bool,
+    /// `--path-format=(absolute|relative)`, git's `enum format_type format`
+    /// (`builtin/rev-parse.c:721`). It is plain scan state, so it governs only the
+    /// path-printing options that come *after* it on the command line.
+    format: Format,
 }
 
 impl Default for Opts {
@@ -124,6 +140,7 @@ impl Default for Opts {
             abbrev_ref_strict: None,
             echo_flags: true,
             echo_paths: true,
+            format: Format::Default,
         }
     }
 }
@@ -134,11 +151,6 @@ impl Default for Opts {
 const UNIMPLEMENTED_EXACT: &[&str] = &[
     "-h",
     "--help",
-    "--parseopt",
-    "--sq-quote",
-    "--keep-dashdash",
-    "--stop-at-non-option",
-    "--stuck-long",
     "--sq",
     "--not",
     "--default",
@@ -147,11 +159,7 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--no-revs",
     "--flags",
     "--no-flags",
-    "--local-env-vars",
     "--output-object-format",
-    "--resolve-git-dir",
-    "--git-path",
-    "--shared-index-path",
     "--is-shallow-repository",
     "--show-superproject-working-tree",
     "--bisect",
@@ -160,16 +168,9 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
 ];
 
 const UNIMPLEMENTED_PREFIX: &[&str] = &[
-    "--path-format=",
-    "--disambiguate=",
     "--exclude-hidden=",
-    "--since=",
-    "--after=",
-    "--until=",
-    "--before=",
     "--default=",
     "--prefix=",
-    "--git-path=",
 ];
 
 pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
@@ -180,6 +181,74 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // falls through to the ordinary argument handling.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
+    }
+
+    // ```c
+    // if (argc > 1 && !strcmp("--parseopt", argv[1]))
+    //         return cmd_parseopt(argc - 1, argv + 1, prefix);
+    //
+    // if (argc > 1 && !strcmp("--sq-quote", argv[1]))
+    //         return cmd_sq_quote(argc - 2, argv + 2);
+    // ```
+    //
+    // (`builtin/rev-parse.c:725-729`.) Both are whole *modes*, recognized only in
+    // the first argument slot and never entered from anywhere else in the scan:
+    // `git rev-parse HEAD --sq-quote` echoes the flag instead. Neither opens a
+    // repository.
+    match args.first().map(String::as_str) {
+        Some("--parseopt") => return parseopt(&args[1..]),
+        Some("--sq-quote") => {
+            let mut buf = Vec::new();
+            sq_quote_argv(&mut buf, &args[1..]);
+            buf.push(b'\n');
+            std::io::stdout().write_all(&buf)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        _ => {}
+    }
+
+    // ```c
+    // if (!seen_end_of_options) {
+    //         if (!strcmp(arg, "--local-env-vars")) { … continue; }
+    //         if (!strcmp(arg, "--resolve-git-dir")) { … continue; }
+    // }
+    //
+    // /* The rest of the options require a git repository. */
+    // if (!did_repo_setup) {
+    //         prefix = setup_git_directory(the_repository);
+    // ```
+    //
+    // (`builtin/rev-parse.c:757-780`.) Repository setup is lazy and happens on the
+    // first argument that is *not* one of those two, so a command made only of them
+    // answers outside a repository. This port opens the repository up front, so the
+    // leading run of pre-setup options is drained here first; any later occurrence
+    // is answered by the scan below, where the repository is already open — which is
+    // the same order git prints them in.
+    let mut start = 0usize;
+    while start < args.len() {
+        match args[start].as_str() {
+            "--local-env-vars" => {
+                print_local_env_vars(&mut std::io::stdout())?;
+                start += 1;
+            }
+            "--resolve-git-dir" => {
+                let Some(dir) = args.get(start + 1) else {
+                    eprintln!("fatal: --resolve-git-dir requires an argument");
+                    return Ok(ExitCode::from(128));
+                };
+                if !print_resolved_git_dir(&mut std::io::stdout(), dir)? {
+                    return Ok(ExitCode::from(128));
+                }
+                start += 2;
+            }
+            _ => break,
+        }
+    }
+    let args = &args[start..];
+    // With nothing left, `did_repo_setup` never becomes 1 and no repository is ever
+    // opened — which is what lets `git rev-parse --local-env-vars` answer outside one.
+    if args.is_empty() {
+        return Ok(ExitCode::SUCCESS);
     }
 
     // `setup_git_directory()` looks at `$GIT_DIR` before it walks upwards, so
@@ -194,6 +263,9 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+
+    // Everything `print_path()` needs out of a setup this port does not perform.
+    let paths = PathCtx::new(&repo);
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -229,7 +301,13 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // separator is echoed and then diagnosed as a path.
     let has_dashdash = args.iter().any(|a| a == "--");
 
-    for arg in args {
+    // An index loop rather than a `for`: `--resolve-git-dir` and `--git-path` take
+    // the *next* argv entry as their value (`argv[++i]`), which the scan has to be
+    // able to skip.
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+        i += 1;
         // After an explicit `--`, everything is a pathspec: echo it (when paths
         // are being echoed) and move on. No existence check, no flag parsing.
         if dashdash {
@@ -250,11 +328,30 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // The options that print at their position and need more than the option
+        // table: the two pre-setup ones (reached here when they were not part of the
+        // leading run), the two that consume `argv[++i]`, and the ones that read the
+        // repository or the clock.
+        if !as_is && arg.starts_with('-') && arg.len() > 1 {
+            match positional_option(&mut out, &repo, &paths, &mut o, arg, args.get(i))? {
+                Positional::NotMine => {}
+                Positional::Consumed => continue,
+                Positional::ConsumedValue => {
+                    i += 1;
+                    continue;
+                }
+                Positional::Fatal => {
+                    out.flush()?;
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+
         if !as_is && arg.len() > 1 && arg.starts_with('-') {
             match option(&mut o, arg)? {
                 Opt::Consumed => {}
                 Opt::Query(q) => {
-                    if let Some(code) = query(&mut out, &repo, q)? {
+                    if let Some(code) = query(&mut out, &repo, &paths, &o, q)? {
                         out.flush()?;
                         return Ok(code);
                     }
@@ -870,7 +967,39 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
 
 /// Repository queries that print at their position in the scan. Returns an exit
 /// code when the query cannot be answered the way git would answer it.
-fn query(out: &mut impl Write, repo: &gix::Repository, q: Query) -> Result<Option<ExitCode>> {
+fn query(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    paths: &PathCtx,
+    o: &Opts,
+    q: Query,
+) -> Result<Option<ExitCode>> {
+    // `--path-format=` overrides the `default_type` each of these options would
+    // otherwise print with, and it is scan state — so it only reaches the queries
+    // written after it on the command line. Under `FORMAT_DEFAULT` the existing
+    // per-query rendering below is what git's `DEFAULT_*` arms already produce.
+    if o.format != Format::Default {
+        if let Some(path) = match q {
+            Query::GitDir | Query::AbsoluteGitDir => Some(gitdir_string(repo, paths)),
+            Query::GitCommonDir => Some(gitdir_common_string(repo, paths)),
+            Query::ShowToplevel => match toplevel(repo) {
+                Some(top) => Some(top),
+                None => {
+                    out.flush()?;
+                    eprintln!("fatal: this operation must be run in a work tree");
+                    return Ok(Some(ExitCode::from(128)));
+                }
+            },
+            _ => None,
+        } {
+            // `--absolute-git-dir` pins `wanted = FORMAT_CANONICAL` regardless
+            // (`builtin/rev-parse.c:1053`).
+            let format =
+                if matches!(q, Query::AbsoluteGitDir) { Format::Canonical } else { o.format };
+            print_path(out, paths, &path, format, DefaultType::Unmodified)?;
+            return Ok(None);
+        }
+    }
     match q {
         Query::GitDir => {
             // git prints `$GIT_DIR` verbatim when set. Otherwise the value is whatever
@@ -886,20 +1015,14 @@ fn query(out: &mut impl Write, repo: &gix::Repository, q: Query) -> Result<Optio
         }
         Query::AbsoluteGitDir => emit(out, absolute(repo.git_dir()).as_os_str().as_encoded_bytes())?,
         Query::GitCommonDir => {
-            // `print_path(…, DEFAULT_RELATIVE_IF_SHARED)`: relative to the prefix when there is
-            // one, and otherwise the stored value as-is — which is the same string `--git-dir`
-            // prints whenever there is no separate common directory.
-            let common = absolute(repo.common_dir());
-            match prefix(repo) {
-                Some(pfx) => {
-                    let up: std::path::PathBuf = pfx.components().map(|_| "..").collect();
-                    emit(out, up.join(&common).as_os_str().as_encoded_bytes())?;
-                }
-                None if common == absolute(repo.git_dir()) => {
-                    emit(out, git_dir_display(repo).as_os_str().as_encoded_bytes())?;
-                }
-                None => emit(out, common.as_os_str().as_encoded_bytes())?,
-            }
+            // `print_path(repo_get_common_dir(the_repository), prefix, format,
+            //  DEFAULT_RELATIVE_IF_SHARED)` (`builtin/rev-parse.c:1073`): the stored
+            // string, made relative to the directory the command was run in when the
+            // two share a root. A `.git` one directory down is `../.git`; an absolute
+            // one (a linked worktree's common directory) shares no root with the
+            // relative prefix and is printed whole.
+            let common = gitdir_common_string(repo, paths);
+            print_path(out, paths, &common, o.format, DefaultType::RelativeIfShared)?;
         }
         Query::ShowToplevel => match toplevel(repo) {
             Some(top) => emit(out, top.as_os_str().as_encoded_bytes())?,
@@ -1565,4 +1688,1776 @@ fn ref_target(repo: &gix::Repository, reference: &gix::Reference<'_>) -> Option<
 fn emit(out: &mut impl Write, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     out.write_all(bytes.as_ref())?;
     out.write_all(b"\n")
+}
+
+// ---------------------------------------------------------------------------
+// Options that print at their position (builtin/rev-parse.c:757-1122)
+// ---------------------------------------------------------------------------
+
+/// What [`positional_option`] made of an argument.
+enum Positional {
+    /// Not one of the options this function answers; the option table gets it.
+    NotMine,
+    /// Answered; the scan moves to the next argument.
+    Consumed,
+    /// Answered, and the option also ate `argv[++i]`.
+    ConsumedValue,
+    /// git `die()`d; the message is on stderr and the scan stops at 128.
+    Fatal,
+}
+
+/// The `builtin/rev-parse.c` options that print (or die) at their position and
+/// need more than the flag table to do it: the two that run before repository
+/// setup, the two that consume `argv[++i]`, `--path-format=`, `--disambiguate=`,
+/// the four date rewrites, and `--shared-index-path`.
+fn positional_option(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    paths: &PathCtx,
+    o: &mut Opts,
+    arg: &str,
+    next: Option<&String>,
+) -> Result<Positional> {
+    // ```c
+    // if (!strcmp(arg, "--local-env-vars")) {
+    //         int i;
+    //         for (i = 0; local_repo_env[i]; i++)
+    //                 printf("%s\n", local_repo_env[i]);
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:758-763`.)
+    if arg == "--local-env-vars" {
+        print_local_env_vars(out)?;
+        return Ok(Positional::Consumed);
+    }
+    // ```c
+    // if (!strcmp(arg, "--resolve-git-dir")) {
+    //         const char *gitdir = argv[++i];
+    //         if (!gitdir)
+    //                 die(_("--resolve-git-dir requires an argument"));
+    //         gitdir = resolve_gitdir(gitdir);
+    //         if (!gitdir)
+    //                 die(_("not a gitdir '%s'"), argv[i]);
+    //         puts(gitdir);
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:764-773`.)
+    if arg == "--resolve-git-dir" {
+        let Some(dir) = next else {
+            out.flush()?;
+            eprintln!("fatal: --resolve-git-dir requires an argument");
+            return Ok(Positional::Fatal);
+        };
+        out.flush()?;
+        if !print_resolved_git_dir(out, dir)? {
+            return Ok(Positional::Fatal);
+        }
+        return Ok(Positional::ConsumedValue);
+    }
+    // ```c
+    // if (!strcmp(arg, "--git-path")) {
+    //         if (!argv[i + 1])
+    //                 die(_("--git-path requires an argument"));
+    //         print_path(repo_git_path_replace(the_repository, &buf, "%s", argv[i + 1]),
+    //                    prefix, format, DEFAULT_RELATIVE_IF_SHARED);
+    //         i++;
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:796-805`.) `--git-path=<name>` is *not* this option —
+    // the test is a whole-string compare — so it falls through and is echoed.
+    if arg == "--git-path" {
+        let Some(name) = next else {
+            out.flush()?;
+            eprintln!("fatal: --git-path requires an argument");
+            return Ok(Positional::Fatal);
+        };
+        let path = git_path(repo, paths, name);
+        print_path(out, paths, &path, o.format, DefaultType::RelativeIfShared)?;
+        return Ok(Positional::ConsumedValue);
+    }
+    // ```c
+    // if (opt_with_value(arg, "--path-format", &arg)) {
+    //         if (!arg)
+    //                 die(_("--path-format requires an argument"));
+    //         if (!strcmp(arg, "absolute")) {
+    //                 format = FORMAT_CANONICAL;
+    //         } else if (!strcmp(arg, "relative")) {
+    //                 format = FORMAT_RELATIVE;
+    //         } else {
+    //                 die(_("unknown argument to --path-format: %s"), arg);
+    //         }
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:820-831`.) `opt_with_value()` accepts the bare spelling
+    // with a NULL value, which is the `requires an argument` arm; `--path-format=`
+    // with an empty value is the `unknown argument` one.
+    if arg == "--path-format" {
+        out.flush()?;
+        eprintln!("fatal: --path-format requires an argument");
+        return Ok(Positional::Fatal);
+    }
+    if let Some(mode) = arg.strip_prefix("--path-format=") {
+        o.format = match mode {
+            "absolute" => Format::Canonical,
+            "relative" => Format::Relative,
+            _ => {
+                out.flush()?;
+                eprintln!("fatal: unknown argument to --path-format: {mode}");
+                return Ok(Positional::Fatal);
+            }
+        };
+        return Ok(Positional::Consumed);
+    }
+    // ```c
+    // if (skip_prefix(arg, "--disambiguate=", &arg)) {
+    //         repo_for_each_abbrev(the_repository, arg, the_hash_algo, show_abbrev, NULL);
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:938-942`.) `show_abbrev()` is `show_rev(NORMAL, oid, NULL)`,
+    // so the listing obeys whatever display options are in effect at this position —
+    // and `--verify` counts every match as a revision, which is what makes
+    // `git rev-parse --short --disambiguate=<prefix>` print one and then die.
+    if let Some(prefix) = arg.strip_prefix("--disambiguate=") {
+        for id in for_each_abbrev(repo, prefix) {
+            show_rev(out, repo, o, &id, None, None, false)?;
+        }
+        return Ok(Positional::Consumed);
+    }
+    // ```c
+    // if (!strcmp(arg, "--shared-index-path")) {
+    //         if (repo_read_index(the_repository) < 0)
+    //                 die(_("Could not read the index"));
+    //         if (the_repository->index->split_index) {
+    //                 const struct object_id *oid = &the_repository->index->split_index->base_oid;
+    //                 const char *path = repo_git_path_replace(the_repository, &buf,
+    //                                                          "sharedindex.%s", oid_to_hex(oid));
+    //                 print_path(path, prefix, format, DEFAULT_RELATIVE);
+    //         }
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:1097-1106`.) An index that is not a split index prints
+    // *nothing at all* — not an empty line — and still exits 0.
+    if arg == "--shared-index-path" {
+        if let Some(base) = shared_index_base(repo) {
+            let path = git_path(repo, paths, &format!("sharedindex.{base}"));
+            print_path(out, paths, &path, o.format, DefaultType::Relative)?;
+        }
+        return Ok(Positional::Consumed);
+    }
+    // ```c
+    // if (skip_prefix(arg, "--since=", &arg)) { show_datestring("--max-age=", arg); continue; }
+    // if (skip_prefix(arg, "--after=", &arg)) { show_datestring("--max-age=", arg); continue; }
+    // if (skip_prefix(arg, "--before=", &arg)) { show_datestring("--min-age=", arg); continue; }
+    // if (skip_prefix(arg, "--until=", &arg)) { show_datestring("--min-age=", arg); continue; }
+    // ```
+    // (`builtin/rev-parse.c:1107-1122`.)
+    for (opt, flag) in [
+        ("--since=", "--max-age="),
+        ("--after=", "--max-age="),
+        ("--before=", "--min-age="),
+        ("--until=", "--min-age="),
+    ] {
+        if let Some(value) = arg.strip_prefix(opt) {
+            show_datestring(out, o, flag, value)?;
+            return Ok(Positional::Consumed);
+        }
+    }
+    Ok(Positional::NotMine)
+}
+
+/// ```c
+/// static void show_datestring(const char *flag, const char *datestr)
+/// {
+///         char *buffer;
+///
+///         /* date handling requires both flags and revs */
+///         if ((filter & (DO_FLAGS | DO_REVS)) != (DO_FLAGS | DO_REVS))
+///                 return;
+///         buffer = xstrfmt("%s%"PRItime, flag, approxidate(datestr));
+///         show(buffer);
+///         free(buffer);
+/// }
+/// ```
+///
+/// (`builtin/rev-parse.c:241-251`.) `approxidate()` — not `approxidate_careful()` —
+/// so a string it cannot read is silently "now" rather than an error:
+/// `--since=bogusdate` prints the current epoch second. `DO_REVS` is only ever
+/// cleared by `--no-revs`, which this port still refuses, so the gate reduces to
+/// `DO_FLAGS`: `--verify` and `--short` clear it and the rewrite disappears.
+fn show_datestring(out: &mut impl Write, o: &Opts, flag: &str, datestr: &str) -> Result<()> {
+    if !o.echo_flags {
+        return Ok(());
+    }
+    let when = crate::date::approxidate(datestr);
+    emit(out, format!("{flag}{when}").as_bytes())?;
+    Ok(())
+}
+
+/// `local_repo_env[]` (`environment.c:101-118`) — the repository-local environment
+/// variables `git` clears before it recurses into a submodule, printed one per line.
+/// The order is the array's, not alphabetical.
+fn print_local_env_vars(out: &mut impl Write) -> Result<()> {
+    const LOCAL_REPO_ENV: &[&str] = &[
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ];
+    for name in LOCAL_REPO_ENV {
+        writeln!(out, "{name}")?;
+    }
+    Ok(())
+}
+
+/// ```c
+/// const char *resolve_gitdir_gently(const char *suspect, int *return_error_code)
+/// {
+///         if (is_git_directory(suspect))
+///                 return suspect;
+///         return read_gitfile_gently(suspect, return_error_code);
+/// }
+/// ```
+///
+/// (`setup.c:2169-2174`.) A real git directory answers with the string it was
+/// *given*, unchanged — no realpath, no absolutization. A `.git` file answers with
+/// the `gitdir: <path>` it points at. Anything else is
+/// `fatal: not a gitdir '<path>'`; the `bool` is `false` there.
+fn print_resolved_git_dir(out: &mut impl Write, suspect: &str) -> Result<bool> {
+    let path = std::path::Path::new(suspect);
+    if is_git_directory(path) {
+        writeln!(out, "{suspect}")?;
+        return Ok(true);
+    }
+    match read_gitfile(path) {
+        Some(target) => {
+            out.write_all(target.as_os_str().as_encoded_bytes())?;
+            out.write_all(b"\n")?;
+            Ok(true)
+        }
+        None => {
+            out.flush()?;
+            eprintln!("fatal: not a gitdir '{suspect}'");
+            Ok(false)
+        }
+    }
+}
+
+/// ```c
+/// int is_git_directory(const char *suspect)
+/// {
+///         /* Check worktree-related signatures */
+///         … "%s/HEAD" …
+///         if (validate_headref(path.buf))
+///                 goto done;
+///
+///         strbuf_reset(&path);
+///         get_common_dir(&path, suspect);
+///         len = path.len;
+///
+///         /* Check non-worktree-related signatures */
+///         if (getenv(DB_ENVIRONMENT)) {
+///                 if (access(getenv(DB_ENVIRONMENT), X_OK)) goto done;
+///         } else {
+///                 strbuf_setlen(&path, len);
+///                 strbuf_addstr(&path, "/objects");
+///                 if (access(path.buf, X_OK)) goto done;
+///         }
+///
+///         strbuf_setlen(&path, len);
+///         strbuf_addstr(&path, "/refs");
+///         if (access(path.buf, X_OK)) goto done;
+///
+///         ret = 1;
+/// ```
+///
+/// (`setup.c:415-453`.) `HEAD` is looked for in `suspect` itself, but `objects` and
+/// `refs` in the *common* directory — which is what makes a linked worktree's
+/// private administrative directory (`.git/worktrees/<id>`, which has neither) a
+/// git directory all the same.
+fn is_git_directory(dir: &std::path::Path) -> bool {
+    if !validate_headref(&dir.join("HEAD")) {
+        return false;
+    }
+    let common = get_common_dir(dir);
+    let objects = match std::env::var_os("GIT_OBJECT_DIRECTORY") {
+        Some(v) => std::path::PathBuf::from(v),
+        None => common.join("objects"),
+    };
+    objects.is_dir() && common.join("refs").is_dir()
+}
+
+/// ```c
+/// int get_common_dir_noenv(struct strbuf *sb, const char *gitdir)
+/// {
+///         strbuf_addf(&path, "%s/commondir", gitdir);
+///         if (file_exists(path.buf)) {
+///                 … read it, strip trailing CR/LF …
+///                 if (!is_absolute_path(data.buf))
+///                         strbuf_addf(&path, "%s/", gitdir);
+///                 strbuf_addbuf(&path, &data);
+///                 strbuf_add_real_path(sb, path.buf);
+///         } else {
+///                 strbuf_addstr(sb, gitdir);
+///         }
+/// }
+/// ```
+///
+/// (`setup.c:312-350`.) `$GIT_COMMON_DIR` wins outright when it is set.
+fn get_common_dir(gitdir: &std::path::Path) -> std::path::PathBuf {
+    if let Some(v) = std::env::var_os("GIT_COMMON_DIR") {
+        return std::path::PathBuf::from(v);
+    }
+    let Ok(text) = std::fs::read_to_string(gitdir.join("commondir")) else {
+        return gitdir.to_path_buf();
+    };
+    let target = text.trim_end_matches(['\n', '\r']);
+    let path = std::path::Path::new(target);
+    let joined = if path.is_absolute() { path.to_path_buf() } else { gitdir.join(path) };
+    std::fs::canonicalize(&joined).unwrap_or(joined)
+}
+
+/// `validate_headref()` (`setup.c:352-402`): a `refs/…` symlink, a file whose text
+/// is `ref: refs/…`, or a file holding a bare object name.
+fn validate_headref(path: &std::path::Path) -> bool {
+    if let Ok(target) = std::fs::read_link(path) {
+        return target.to_string_lossy().starts_with("refs/");
+    }
+    let Ok(data) = std::fs::read(path) else { return false };
+    // `read_in_full(fd, buffer, sizeof(buffer)-1)` with a 256-byte buffer.
+    let text = String::from_utf8_lossy(&data[..data.len().min(255)]).into_owned();
+    if let Some(refname) = text.strip_prefix("ref:") {
+        if refname.trim_start().starts_with("refs/") {
+            return true;
+        }
+    }
+    // `get_oid_hex_any()`: any of the hash algorithms git knows, so SHA-1's 40 and
+    // SHA-256's 64 hex characters both answer.
+    let head = text.trim_end_matches(['\n', '\r']);
+    matches!(head.len(), 40 | 64) && head.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// ```c
+/// if (!starts_with(buf, "gitdir: "))
+///         error_code = READ_GITFILE_ERR_INVALID_FORMAT;
+/// …
+/// if (!is_absolute_path(dir) && (slash = strrchr(path, '/')))
+///         dir = xstrfmt("%.*s%.*s", …);   /* relative to the gitfile's directory */
+/// if (!is_git_directory(dir))
+///         error_code = READ_GITFILE_ERR_NOT_A_REPO;
+/// strbuf_realpath(&realpath, dir, 1);
+/// ```
+///
+/// (`setup.c:956-1035`.) The prefix is `gitdir: ` *with* the space, the target is
+/// resolved against the gitfile's own directory when it is relative, and the answer
+/// is the symlink-resolved absolute path rather than the stored text.
+fn read_gitfile(file: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !file.symlink_metadata().ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(file).ok()?;
+    let target = text.strip_prefix("gitdir: ")?.trim_end_matches(['\n', '\r']);
+    if target.is_empty() {
+        return None;
+    }
+    let mut path = std::path::PathBuf::from(target);
+    if path.is_relative() {
+        path = file.parent()?.join(path);
+    }
+    is_git_directory(&path).then(|| std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+// ---------------------------------------------------------------------------
+// `repo_git_path()` (path.c:418-465) and `print_path()` (builtin/rev-parse.c:656)
+// ---------------------------------------------------------------------------
+
+/// git's `enum format_type` (`builtin/rev-parse.c:636-643`), set by `--path-format`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// `FORMAT_DEFAULT`: whatever the individual option's `default_type` asks for.
+    Default,
+    /// `FORMAT_RELATIVE`: relative to the directory the command was run in.
+    Relative,
+    /// `FORMAT_CANONICAL`: symlink-resolved and absolute.
+    Canonical,
+}
+
+/// git's `enum default_type` (`builtin/rev-parse.c:645-654`): what an option asks
+/// for when `--path-format` has not overridden it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefaultType {
+    /// `DEFAULT_RELATIVE`.
+    Relative,
+    /// `DEFAULT_RELATIVE_IF_SHARED`: relative only when the two paths share a root,
+    /// which for a *relative* stored path means "print it as it stands".
+    RelativeIfShared,
+    /// `DEFAULT_CANONICAL`. Reached in git only from `--git-dir`'s "build
+    /// `<cwd>/.git` and canonicalize it" fallback, which [`git_dir_display`]
+    /// answers directly — so no caller here selects it.
+    #[allow(dead_code)]
+    Canonical,
+    /// `DEFAULT_UNMODIFIED`: `puts(path)`.
+    Unmodified,
+}
+
+/// git's `prefix` and the directory it is measured from: everything `print_path()`
+/// reads out of the setup that this port does not perform.
+///
+/// git has chdir'd to [`PathCtx::root`] by the time any of these options print, and
+/// `prefix` is the slash-terminated path from there back down to the directory the
+/// user typed the command in — `NULL` when those are the same directory. A relative
+/// path (`.git`, `.git/HEAD`) is therefore resolved against `root`, never against
+/// the process's own working directory.
+struct PathCtx {
+    /// git's working directory after `setup_git_directory()`: the top of the work
+    /// tree, or the git directory itself when there is no work tree to stand in.
+    root: std::path::PathBuf,
+    /// git's `prefix`, slash-terminated, or `None` when the command was already run
+    /// at `root`.
+    prefix: Option<String>,
+}
+
+impl PathCtx {
+    fn new(repo: &gix::Repository) -> PathCtx {
+        // `setup_git_directory()` only climbs to the top of the work tree when the
+        // cwd is *inside* it; standing in the git directory of a non-bare repository
+        // leaves it there, which is why `--git-dir` answers `.` from inside `.git`.
+        let root = match repo.workdir() {
+            Some(wd) if !is_inside_git_dir(repo) => absolute(wd),
+            _ => absolute(repo.git_dir()),
+        };
+        let prefix = std::env::current_dir()
+            .ok()
+            .and_then(|c| std::fs::canonicalize(c).ok())
+            .and_then(|cwd| cwd.strip_prefix(&root).ok().map(std::path::Path::to_path_buf))
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .map(|rel| format!("{}/", rel.display()));
+        PathCtx { root, prefix }
+    }
+
+    /// `strbuf_realpath_forgiving()`: resolve as much of `path` as exists and keep
+    /// the rest verbatim. A relative path is joined onto [`PathCtx::root`] first,
+    /// which is git's cwd.
+    fn realpath(&self, path: &std::path::Path) -> std::path::PathBuf {
+        let absolute =
+            if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
+        if let Ok(p) = std::fs::canonicalize(&absolute) {
+            return p;
+        }
+        // Peel components off the tail until something resolves, then put them back.
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut head = absolute.clone();
+        while let Some(parent) = head.parent().map(std::path::Path::to_path_buf) {
+            let Some(name) = head.file_name().map(std::ffi::OsString::from) else { break };
+            head = parent;
+            tail.push(name);
+            if let Ok(resolved) = std::fs::canonicalize(&head) {
+                let mut out = resolved;
+                for name in tail.iter().rev() {
+                    out.push(name);
+                }
+                return out;
+            }
+        }
+        absolute
+    }
+}
+
+/// ```c
+/// static void print_path(const char *path, const char *prefix, enum format_type format, enum default_type def)
+/// {
+///         char *cwd = NULL;
+///         if (!prefix && (format != FORMAT_DEFAULT || def != DEFAULT_RELATIVE_IF_SHARED))
+///                 prefix = cwd = xgetcwd();
+///         if (format == FORMAT_DEFAULT && def == DEFAULT_UNMODIFIED) {
+///                 puts(path);
+///         } else if (format == FORMAT_RELATIVE ||
+///                   (format == FORMAT_DEFAULT && def == DEFAULT_RELATIVE)) {
+///                 /* both sides are made absolute first */
+///                 puts(relative_path(path, prefix, &buf));
+///         } else if (format == FORMAT_DEFAULT && def == DEFAULT_RELATIVE_IF_SHARED) {
+///                 puts(relative_path(path, prefix, &buf));
+///         } else {
+///                 strbuf_realpath_forgiving(&buf, path, 1);
+///                 puts(buf.buf);
+///         }
+/// }
+/// ```
+///
+/// (`builtin/rev-parse.c:656-703`.) The `RELATIVE_IF_SHARED` arm is the only one
+/// that can see a NULL `prefix`, and there a NULL prefix makes `relative_path()`
+/// return its input unchanged — which is how a stored `.git` prints as `.git`.
+fn print_path(
+    out: &mut impl Write,
+    ctx: &PathCtx,
+    path: &std::path::Path,
+    format: Format,
+    def: DefaultType,
+) -> Result<()> {
+    let text = path.as_os_str().as_encoded_bytes().to_vec();
+    let shared_default = format == Format::Default && def == DefaultType::RelativeIfShared;
+
+    let rendered: Vec<u8> = if format == Format::Default && def == DefaultType::Unmodified {
+        text
+    } else if format == Format::Relative
+        || (format == Format::Default && def == DefaultType::Relative)
+    {
+        // `relative_path()` compares text, so both sides are absolutized first or a
+        // relative path measured against an absolute one is simply handed back.
+        let abs = ctx.realpath(path);
+        let base = ctx.realpath(std::path::Path::new(ctx.prefix.as_deref().unwrap_or("")));
+        relative_path(
+            abs.as_os_str().as_encoded_bytes(),
+            Some(base.as_os_str().as_encoded_bytes()),
+        )
+    } else if shared_default {
+        // git compares the *stored* strings here: a relative `prefix` against a
+        // relative git-directory path is what turns `.git/HEAD` into `../.git/HEAD`
+        // one directory down, and an absolute git directory (a linked worktree)
+        // shares no root with it and is printed whole.
+        relative_path(&text, ctx.prefix.as_deref().map(str::as_bytes))
+    } else {
+        ctx.realpath(path).as_os_str().as_encoded_bytes().to_vec()
+    };
+    out.write_all(&rendered)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+/// ```c
+/// const char *relative_path(const char *in, const char *prefix, struct strbuf *sb)
+/// ```
+///
+/// (`path.c:942-1037`), byte for byte: an empty `in` is `./`, an empty (or NULL)
+/// `prefix` returns `in` unchanged, and paths that do not share a root are also
+/// returned unchanged. Otherwise the shared directory components are dropped and one
+/// `../` is emitted per component of `prefix` that is left over.
+fn relative_path(input: &[u8], prefix: Option<&[u8]>) -> Vec<u8> {
+    let is_sep = |b: u8| b == b'/';
+    let in_len = input.len();
+    let prefix = prefix.unwrap_or(b"");
+    let prefix_len = prefix.len();
+    if in_len == 0 {
+        return b"./".to_vec();
+    }
+    if prefix_len == 0 {
+        return input.to_vec();
+    }
+    // `have_same_root()`: on a POSIX filesystem that is "both absolute or both
+    // relative", since there is no drive prefix to compare.
+    if input.starts_with(b"/") != prefix.starts_with(b"/") {
+        return input.to_vec();
+    }
+
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut prefix_off, mut in_off) = (0usize, 0usize);
+    while i < prefix_len && j < in_len && prefix[i] == input[j] {
+        if is_sep(prefix[i]) {
+            while i < prefix_len && is_sep(prefix[i]) {
+                i += 1;
+            }
+            while j < in_len && is_sep(input[j]) {
+                j += 1;
+            }
+            prefix_off = i;
+            in_off = j;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+
+    if i >= prefix_len && prefix_off < prefix_len {
+        if j >= in_len {
+            in_off = in_len;
+        } else if is_sep(input[j]) {
+            while j < in_len && is_sep(input[j]) {
+                j += 1;
+            }
+            in_off = j;
+        } else {
+            i = prefix_off;
+        }
+    } else if j >= in_len && in_off < in_len && i < prefix_len && is_sep(prefix[i]) {
+        while i < prefix_len && is_sep(prefix[i]) {
+            i += 1;
+        }
+        in_off = in_len;
+    }
+
+    let rest = &input[in_off..];
+    if i >= prefix_len {
+        return if rest.is_empty() { b"./".to_vec() } else { rest.to_vec() };
+    }
+
+    let mut sb: Vec<u8> = Vec::with_capacity(rest.len());
+    while i < prefix_len {
+        if is_sep(prefix[i]) {
+            sb.extend_from_slice(b"../");
+            while i < prefix_len && is_sep(prefix[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    if !is_sep(prefix[prefix_len - 1]) {
+        sb.extend_from_slice(b"../");
+    }
+    sb.extend_from_slice(rest);
+    sb
+}
+
+/// ```c
+/// static void repo_git_pathv(struct repository *repo, const struct worktree *wt,
+///                            struct strbuf *buf, const char *fmt, va_list args)
+/// {
+///         int gitdir_len;
+///         strbuf_worktree_gitdir(buf, repo, wt);
+///         if (buf->len && !is_dir_sep(buf->buf[buf->len - 1]))
+///                 strbuf_addch(buf, '/');
+///         gitdir_len = buf->len;
+///         strbuf_vaddf(buf, fmt, args);
+///         if (!wt)
+///                 adjust_git_path(repo, buf, gitdir_len);
+///         strbuf_cleanup_path(buf);
+/// }
+/// ```
+///
+/// (`path.c:418-431`.) The base is `repo->gitdir` — the *string* setup left there,
+/// not a canonical path, which is why `--git-path HEAD` answers `.git/HEAD` in a
+/// plain checkout, `HEAD` in a bare repository (where the gitdir is `.` and
+/// `cleanup_path()` strips the `./`), and an absolute path in a linked worktree.
+fn git_path(repo: &gix::Repository, ctx: &PathCtx, name: &str) -> std::path::PathBuf {
+    let gitdir = gitdir_string(repo, ctx);
+    let mut buf = format!("{}", gitdir.display());
+    if !buf.is_empty() && !buf.ends_with('/') {
+        buf.push('/');
+    }
+    let gitdir_len = buf.len();
+    buf.push_str(name);
+    adjust_git_path(repo, ctx, &mut buf, gitdir_len);
+    // `cleanup_path()` (path.c:42-50): a leading `./` and the slashes right behind
+    // it are dropped, which is what turns the bare repository's `./HEAD` into `HEAD`.
+    if let Some(rest) = buf.strip_prefix("./") {
+        buf = rest.trim_start_matches('/').to_string();
+    }
+    std::path::PathBuf::from(buf)
+}
+
+/// The string `setup_git_directory()` leaves in `repo->gitdir`: `$GIT_DIR` verbatim
+/// when it was given, `.` when git's own working directory *is* the git directory,
+/// `.git` for a plain checkout, and the absolute path in every other case (a linked
+/// worktree, a submodule, a `--git-dir` elsewhere).
+fn gitdir_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("GIT_DIR") {
+        return dir.into();
+    }
+    let git_dir = absolute(repo.git_dir());
+    if git_dir == ctx.root {
+        return ".".into();
+    }
+    if git_dir == ctx.root.join(".git") {
+        return ".git".into();
+    }
+    git_dir
+}
+
+/// ```c
+/// static void adjust_git_path(struct repository *repo, struct strbuf *buf, int git_dir_len)
+/// {
+///         const char *base = buf->buf + git_dir_len;
+///
+///         if (is_dir_file(base, "info", "grafts"))
+///                 strbuf_splice(buf, 0, buf->len, repo->graft_file, strlen(repo->graft_file));
+///         else if (!strcmp(base, "index"))
+///                 strbuf_splice(buf, 0, buf->len, repo->index_file, strlen(repo->index_file));
+///         else if (dir_prefix(base, "objects"))
+///                 replace_dir(buf, git_dir_len + 7, repo->objects->sources->path);
+///         else if (repo_settings_get_hooks_path(repo) && dir_prefix(base, "hooks"))
+///                 replace_dir(buf, git_dir_len + 5, repo_settings_get_hooks_path(repo));
+///         else if (repo->different_commondir)
+///                 update_common_dir(buf, git_dir_len, repo->commondir);
+/// }
+/// ```
+///
+/// (`path.c:387-404`.) The four relocations are `$GIT_GRAFT_FILE`, `$GIT_INDEX_FILE`,
+/// `$GIT_OBJECT_DIRECTORY` and `core.hooksPath`; the fifth arm sends the paths a
+/// linked worktree *shares* with the main checkout back to the common directory.
+fn adjust_git_path(repo: &gix::Repository, ctx: &PathCtx, buf: &mut String, git_dir_len: usize) {
+    let base = buf[git_dir_len..].to_string();
+    let replace_whole = |buf: &mut String, with: std::ffi::OsString| {
+        *buf = std::path::PathBuf::from(with).display().to_string();
+    };
+    if base == "info/grafts" {
+        if let Some(v) = std::env::var_os("GIT_GRAFT_FILE") {
+            replace_whole(buf, v);
+        }
+        return;
+    }
+    if base == "index" {
+        if let Some(v) = std::env::var_os("GIT_INDEX_FILE") {
+            replace_whole(buf, v);
+        }
+        return;
+    }
+    // `dir_prefix(base, "objects")`: the name itself or anything under it.
+    if base == "objects" || base.starts_with("objects/") {
+        if let Some(v) = std::env::var_os("GIT_OBJECT_DIRECTORY") {
+            let rest = &base["objects".len()..];
+            *buf = format!("{}{}", std::path::PathBuf::from(v).display(), rest);
+        }
+        return;
+    }
+    if base == "hooks" || base.starts_with("hooks/") {
+        if let Ok(Some(hooks)) = repo.config_snapshot().trusted_path("core.hooksPath") {
+            let rest = &base["hooks".len()..];
+            *buf = format!("{}{}", hooks.display(), rest);
+            return;
+        }
+    }
+    // `repo->different_commondir`: only a linked worktree has one.
+    let common = absolute(repo.common_dir());
+    if common != absolute(repo.git_dir()) && is_common_path(&base) {
+        let common = gitdir_common_string(repo, ctx);
+        let mut replaced = format!("{}", common.display());
+        if !replaced.is_empty() && !replaced.ends_with('/') {
+            replaced.push('/');
+        }
+        replaced.push_str(&base);
+        *buf = replaced;
+    }
+}
+
+/// The string git holds in `repo->commondir`, mirroring [`gitdir_string`]: `.git`
+/// for the main checkout of a plain repository, otherwise the absolute path.
+fn gitdir_common_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
+    let common = absolute(repo.common_dir());
+    if common == ctx.root {
+        return ".".into();
+    }
+    if common == ctx.root.join(".git") {
+        return ".git".into();
+    }
+    common
+}
+
+/// `common_list[]` (`path.c:98-124`) through `check_common()`: whether a path below
+/// the git directory belongs to the *common* directory a linked worktree shares with
+/// the main checkout, rather than to the worktree's own private directory.
+///
+/// ```c
+/// static struct common_dir common_list[] = {
+///         { 0, 1, 1, "branches" },
+///         { 0, 1, 1, "common" },
+///         { 0, 1, 1, "hooks" },
+///         { 0, 1, 1, "info" },
+///         { 0, 0, 0, "info/sparse-checkout" },
+///         { 1, 1, 1, "logs" },
+///         { 1, 0, 0, "logs/HEAD" },
+///         { 0, 1, 0, "logs/refs/bisect" },
+///         { 0, 1, 0, "logs/refs/rewritten" },
+///         { 0, 1, 0, "logs/refs/worktree" },
+///         { 0, 1, 1, "lost-found" },
+///         { 0, 1, 1, "objects" },
+///         { 0, 1, 1, "refs" },
+///         { 0, 1, 0, "refs/bisect" },
+///         { 0, 1, 0, "refs/rewritten" },
+///         { 0, 1, 0, "refs/worktree" },
+///         { 0, 1, 1, "remotes" },
+///         { 0, 1, 1, "worktrees" },
+///         { 0, 1, 1, "rr-cache" },
+///         { 0, 1, 1, "svn" },
+///         { 0, 0, 1, "config" },
+///         { 1, 0, 1, "gc.pid" },
+///         { 0, 0, 1, "packed-refs" },
+///         { 0, 0, 1, "shallow" },
+///         { 0, 0, 0, NULL }
+/// };
+/// ```
+///
+/// The trie matches the *longest* entry that is a path prefix of the query, and the
+/// third column (`is_common`) then decides. A directory entry matches the name
+/// itself or anything under it; a file entry only the exact name. The `.lock`
+/// suffix is stripped before the lookup and put back afterwards
+/// (`update_common_dir()`, `path.c:351-363`).
+fn is_common_path(path: &str) -> bool {
+    // (path, is_dir, is_common)
+    const COMMON_LIST: &[(&str, bool, bool)] = &[
+        ("branches", true, true),
+        ("common", true, true),
+        ("hooks", true, true),
+        ("info", true, true),
+        ("info/sparse-checkout", false, false),
+        ("logs", true, true),
+        ("logs/HEAD", false, false),
+        ("logs/refs/bisect", true, false),
+        ("logs/refs/rewritten", true, false),
+        ("logs/refs/worktree", true, false),
+        ("lost-found", true, true),
+        ("objects", true, true),
+        ("refs", true, true),
+        ("refs/bisect", true, false),
+        ("refs/rewritten", true, false),
+        ("refs/worktree", true, false),
+        ("remotes", true, true),
+        ("worktrees", true, true),
+        ("rr-cache", true, true),
+        ("svn", true, true),
+        ("config", false, true),
+        ("gc.pid", false, true),
+        ("packed-refs", false, true),
+        ("shallow", false, true),
+    ];
+    let path = path.strip_suffix(".lock").unwrap_or(path);
+    let mut best: Option<(usize, bool)> = None;
+    for (name, is_dir, is_common) in COMMON_LIST {
+        let matches = if *is_dir {
+            path == *name || path.strip_prefix(name).is_some_and(|r| r.starts_with('/'))
+        } else {
+            path == *name
+        };
+        if matches && best.is_none_or(|(len, _)| name.len() > len) {
+            best = Some((name.len(), *is_common));
+        }
+    }
+    best.is_some_and(|(_, is_common)| is_common)
+}
+
+/// `repo_for_each_abbrev()` (`object-name.c:548-567`): every object whose name
+/// starts with `prefix`, in ascending object-id order and without repeats.
+///
+/// A prefix shorter than two hex characters selects nothing — the object database
+/// is enumerated through the two-character fanout of the loose object directories
+/// and of the pack index, so there is no bucket to open — and a prefix carrying a
+/// non-hex character is `parse_oid_prefix()`'s `-1`, which is also nothing. Both
+/// were verified against stock 2.55.0 on a loose and on a packed repository.
+fn for_each_abbrev(repo: &gix::Repository, prefix: &str) -> Vec<ObjectId> {
+    if prefix.len() < 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Vec::new();
+    }
+    let hex_len = prefix.len().min(repo.object_hash().len_in_hex());
+    // `from_hex_nonempty()` rather than `from_hex()`: the latter refuses anything
+    // shorter than `MIN_HEX_LEN`, and git's own minimum here is the two-character
+    // fanout the guard above already applies.
+    let Ok(prefix) = gix::hash::Prefix::from_hex_nonempty(&prefix[..hex_len]) else {
+        return Vec::new();
+    };
+    let mut found: Vec<ObjectId> = Vec::new();
+    let Ok(iter) = repo.objects.iter() else { return found };
+    for id in iter.flatten() {
+        if prefix.cmp_oid(&id) == std::cmp::Ordering::Equal {
+            found.push(id);
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// `the_repository->index->split_index->base_oid`: the shared index a split index
+/// points at, read out of the `link` extension of `$GIT_DIR/index`. `None` when the
+/// index is an ordinary one, which is what makes `--shared-index-path` print nothing.
+fn shared_index_base(repo: &gix::Repository) -> Option<ObjectId> {
+    let path = match std::env::var_os("GIT_INDEX_FILE") {
+        Some(v) => std::path::PathBuf::from(v),
+        None => repo.git_dir().join("index"),
+    };
+    let data = std::fs::read(path).ok()?;
+    let (state, _) = gix::index::State::from_bytes(
+        &data,
+        std::time::SystemTime::UNIX_EPOCH.into(),
+        repo.object_hash(),
+        gix::index::decode::Options::default(),
+    )
+    .ok()?;
+    state.shared_index_checksum()
+}
+
+// ---------------------------------------------------------------------------
+// `--sq-quote` (builtin/rev-parse.c:569-579) and `sq_quote_buf` (quote.c:28-48)
+// ---------------------------------------------------------------------------
+
+/// ```c
+/// void sq_quote_buf(struct strbuf *dst, const char *src)
+/// {
+///         strbuf_addch(dst, '\'');
+///         while (*src) {
+///                 size_t len = strcspn(src, "'!");
+///                 strbuf_add(dst, src, len);
+///                 src += len;
+///                 while (need_bs_quote(*src)) {
+///                         strbuf_addstr(dst, "'\\");
+///                         strbuf_addch(dst, *src++);
+///                         strbuf_addch(dst, '\'');
+///                 }
+///         }
+///         strbuf_addch(dst, '\'');
+/// }
+/// ```
+///
+/// (`quote.c:28-48`.) The whole string is wrapped in single quotes and the two
+/// characters `need_bs_quote()` names — `'` and `!` — leave the quotes, are
+/// backslash-escaped, and the quotes reopen: `a'b` becomes `'a'\''b'`.
+pub(crate) fn sq_quote_buf(dst: &mut Vec<u8>, src: &[u8]) {
+    dst.push(b'\'');
+    for &byte in src {
+        if byte == b'\'' || byte == b'!' {
+            dst.extend_from_slice(b"'\\");
+            dst.push(byte);
+            dst.push(b'\'');
+        } else {
+            dst.push(byte);
+        }
+    }
+    dst.push(b'\'');
+}
+
+/// ```c
+/// void sq_quote_argv(struct strbuf *dst, const char **argv)
+/// {
+///         for (i = 0; argv[i]; ++i) {
+///                 strbuf_addch(dst, ' ');
+///                 sq_quote_buf(dst, argv[i]);
+///         }
+/// }
+/// ```
+///
+/// (`quote.c:85-95`.) Every element is preceded by a space, including the first —
+/// which is why `git rev-parse --sq-quote a b` prints a leading blank, and an empty
+/// argument list prints nothing but the newline `cmd_sq_quote()` adds.
+pub(crate) fn sq_quote_argv(dst: &mut Vec<u8>, argv: &[String]) {
+    for arg in argv {
+        dst.push(b' ');
+        sq_quote_buf(dst, arg.as_bytes());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `--parseopt` (builtin/rev-parse.c:395-567) over a port of parse-options.c
+// ---------------------------------------------------------------------------
+
+/// `PARSE_OPT_NOARG`.
+const PO_NOARG: u32 = 1 << 0;
+/// `PARSE_OPT_OPTARG`.
+const PO_OPTARG: u32 = 1 << 1;
+/// `PARSE_OPT_NONEG`.
+const PO_NONEG: u32 = 1 << 2;
+/// `PARSE_OPT_HIDDEN`.
+const PO_HIDDEN: u32 = 1 << 3;
+
+/// `PARSE_OPT_KEEP_DASHDASH`.
+const CTX_KEEP_DASHDASH: u32 = 1 << 0;
+/// `PARSE_OPT_STOP_AT_NON_OPTION`.
+const CTX_STOP_AT_NON_OPTION: u32 = 1 << 1;
+/// `PARSE_OPT_SHELL_EVAL`: wrap `-h` output in a `cat <<\EOF` heredoc so the caller
+/// can `eval` it.
+const CTX_SHELL_EVAL: u32 = 1 << 2;
+
+/// One entry of the `struct option options[]` `cmd_parseopt()` builds out of the
+/// spec on stdin, plus the `OPTION_GROUP` headers it also puts in that array.
+#[derive(Clone)]
+struct PoOption {
+    /// `OPTION_GROUP` rather than `OPTION_CALLBACK`: a heading, never matched.
+    group: bool,
+    short_name: Option<char>,
+    long_name: Option<String>,
+    /// The `<arghint>` after the flag characters, if the spec line gave one.
+    argh: Option<String>,
+    help: String,
+    flags: u32,
+}
+
+impl PoOption {
+    fn allow_unset(&self) -> bool {
+        self.flags & PO_NONEG == 0
+    }
+}
+
+/// `struct parse_opt_ctx_t`, reduced to the fields `cmd_parseopt()`'s two
+/// `parse_options()` calls actually read.
+struct PoCtx {
+    argv: Vec<String>,
+    /// Index of the argument being looked at; `argc` in the C is `argv.len() - at`.
+    at: usize,
+    /// `p->opt`: the not-yet-consumed tail of a short-option cluster, or the text
+    /// after a long option's `=`.
+    opt: Option<String>,
+    /// `ctx->out`: the non-option arguments, in order.
+    out: Vec<String>,
+    /// `ctx->total`: how many arguments the parse started with.
+    total: usize,
+    flags: u32,
+}
+
+/// `enum parse_opt_result`, minus the values `cmd_parseopt()` cannot see.
+enum PoResult {
+    Done,
+    NonOption,
+    Unknown,
+    Error,
+    Help,
+}
+
+/// `git rev-parse --parseopt` — read an option spec on stdin, parse the arguments
+/// after `--` against it, and print the `set --` line a shell function evaluates.
+///
+/// ```c
+/// static int cmd_parseopt(int argc, const char **argv, const char *prefix)
+/// {
+///         int keep_dashdash = 0, stop_at_non_option = 0;
+///         …
+///         strbuf_addstr(&parsed, "set --");
+///         argc = parse_options(argc, argv, prefix, parseopt_opts, parseopt_usage,
+///                              PARSE_OPT_KEEP_DASHDASH);
+///         if (argc < 1 || strcmp(argv[0], "--"))
+///                 usage_with_options(parseopt_usage, parseopt_opts);
+/// ```
+///
+/// (`builtin/rev-parse.c:429-456`.) `args` is everything after the `--parseopt`
+/// token itself, matching the C's `argv + 1`.
+fn parseopt(args: &[String]) -> Result<ExitCode> {
+    let usage = vec!["git rev-parse --parseopt [<options>] -- [<args>...]".to_string()];
+    let mut own = vec![
+        po_bool("keep-dashdash", "keep the `--` passed as an arg"),
+        po_bool("stop-at-non-option", "stop parsing after the first non-option argument"),
+        po_bool("stuck-long", "output in stuck long form"),
+    ];
+    let mut selected = [false; 3];
+
+    let mut ctx = PoCtx {
+        argv: args.to_vec(),
+        at: 0,
+        opt: None,
+        out: Vec::new(),
+        total: args.len(),
+        flags: CTX_KEEP_DASHDASH,
+    };
+    let mut dump = Vec::new();
+    match parse_options_step(&mut ctx, &own, &mut |idx, _arg, unset| {
+        selected[idx] = !unset;
+        Ok(())
+    }) {
+        // The first `parse_options()` runs with no `PARSE_OPT_SHELL_EVAL`, so its
+        // `-h` block is the bare usage on stdout — no `cat <<\EOF` wrapper.
+        PoResult::Help => {
+            render_usage(&mut std::io::stdout(), &usage, &own, 0)?;
+            return Ok(ExitCode::from(129));
+        }
+        PoResult::Error => return Ok(ExitCode::from(129)),
+        PoResult::Unknown => {
+            eprintln!("error: {}", unknown_name(&ctx));
+            render_usage(&mut std::io::stderr(), &usage, &own, 0)?;
+            return Ok(ExitCode::from(129));
+        }
+        PoResult::Done | PoResult::NonOption => {}
+    }
+    let rest = parse_options_end(ctx);
+    let (keep_dashdash, stop_at_non_option, stuck_long) = (selected[0], selected[1], selected[2]);
+
+    if rest.first().map(String::as_str) != Some("--") {
+        render_usage(&mut std::io::stderr(), &usage, &own, 0)?;
+        return Ok(ExitCode::from(129));
+    }
+    own.clear();
+
+    // ```c
+    // /* get the usage up to the first line with a -- on it */
+    // for (;;) {
+    //         if (strbuf_getline(&sb, stdin) == EOF)
+    //                 die(_("premature end of input"));
+    //         if (!strcmp("--", sb.buf)) {
+    //                 if (!usage.nr)
+    //                         die(_("no usage string given before the `--' separator"));
+    //                 break;
+    //         }
+    //         strvec_push(&usage, sb.buf);
+    // }
+    // ```
+    // (`builtin/rev-parse.c:458-470`.)
+    let spec = std::io::read_to_string(std::io::stdin())?;
+    let mut lines = spec.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    let mut spec_usage: Vec<String> = Vec::new();
+    loop {
+        let Some(line) = lines.next() else {
+            eprintln!("fatal: premature end of input");
+            return Ok(ExitCode::from(128));
+        };
+        if line == "--" {
+            if spec_usage.is_empty() {
+                eprintln!("fatal: no usage string given before the `--' separator");
+                return Ok(ExitCode::from(128));
+            }
+            break;
+        }
+        spec_usage.push(line.to_string());
+    }
+
+    let opts = match parse_spec_lines(lines) {
+        Ok(opts) => opts,
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+
+    // ```c
+    // argc = parse_options(argc, argv, prefix, opts, usage.v,
+    //                 (keep_dashdash ? PARSE_OPT_KEEP_DASHDASH : 0) |
+    //                 (stop_at_non_option ? PARSE_OPT_STOP_AT_NON_OPTION : 0) |
+    //                 PARSE_OPT_SHELL_EVAL);
+    // ```
+    // (`builtin/rev-parse.c:548-551`.) `argv[0]` is still the `--`, and the flag
+    // decides whether it survives into the output.
+    let mut flags = CTX_SHELL_EVAL;
+    if keep_dashdash {
+        flags |= CTX_KEEP_DASHDASH;
+    }
+    if stop_at_non_option {
+        flags |= CTX_STOP_AT_NON_OPTION;
+    }
+    // `parse_options_start_1()` (`parse-options.c:746-757`) drops `argv[0]` before it
+    // parses anything — the slot a normal command's program name sits in. Here that
+    // slot holds the `--` separator the check above just verified, so the scan starts
+    // at index 1 and `total` counts what is left. `total` is what decides whether a
+    // `-h` is *lone*, so it has to be that reduced count.
+    let mut ctx = PoCtx { argv: rest, at: 1, opt: None, out: Vec::new(), total: 0, flags };
+    ctx.total = ctx.argv.len().saturating_sub(1);
+    let step = parse_options_step(&mut ctx, &opts, &mut |idx, arg, unset| {
+        parseopt_dump(&mut dump, &opts[idx], arg, unset, stuck_long);
+        Ok(())
+    });
+    match step {
+        PoResult::Help => {
+            render_usage(&mut std::io::stdout(), &spec_usage, &opts, CTX_SHELL_EVAL)?;
+            return Ok(ExitCode::from(129));
+        }
+        PoResult::Error => return Ok(ExitCode::from(129)),
+        PoResult::Unknown => {
+            eprintln!("error: {}", unknown_name(&ctx));
+            render_usage(&mut std::io::stderr(), &spec_usage, &opts, 0)?;
+            return Ok(ExitCode::from(129));
+        }
+        PoResult::Done | PoResult::NonOption => {}
+    }
+    let rest = parse_options_end(ctx);
+
+    // `strbuf_addstr(&parsed, " --"); sq_quote_argv(&parsed, argv); puts(parsed.buf);`
+    let mut line = b"set --".to_vec();
+    line.extend_from_slice(&dump);
+    line.extend_from_slice(b" --");
+    sq_quote_argv(&mut line, &rest);
+    line.push(b'\n');
+    std::io::stdout().write_all(&line)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `OPT_BOOL(0, name, …)`, the shape all three of `--parseopt`'s own options have.
+fn po_bool(name: &str, help: &str) -> PoOption {
+    PoOption {
+        group: false,
+        short_name: None,
+        long_name: Some(name.to_string()),
+        argh: None,
+        help: help.to_string(),
+        flags: PO_NOARG,
+    }
+}
+
+/// ```c
+/// static int parseopt_dump(const struct option *o, const char *arg, int unset)
+/// {
+///         struct strbuf *parsed = o->value;
+///         if (unset)
+///                 strbuf_addf(parsed, " --no-%s", o->long_name);
+///         else if (o->short_name && (o->long_name == NULL || !stuck_long))
+///                 strbuf_addf(parsed, " -%c", o->short_name);
+///         else
+///                 strbuf_addf(parsed, " --%s", o->long_name);
+///         if (arg) {
+///                 if (!stuck_long)
+///                         strbuf_addch(parsed, ' ');
+///                 else if (o->long_name)
+///                         strbuf_addch(parsed, '=');
+///                 sq_quote_buf(parsed, arg);
+///         }
+///         return 0;
+/// }
+/// ```
+///
+/// (`builtin/rev-parse.c:395-412`.)
+fn parseopt_dump(dst: &mut Vec<u8>, o: &PoOption, arg: Option<&str>, unset: bool, stuck_long: bool) {
+    if unset {
+        dst.extend_from_slice(format!(" --no-{}", o.long_name.as_deref().unwrap_or("")).as_bytes());
+    } else if o.short_name.is_some() && (o.long_name.is_none() || !stuck_long) {
+        dst.extend_from_slice(format!(" -{}", o.short_name.expect("checked")).as_bytes());
+    } else {
+        dst.extend_from_slice(format!(" --{}", o.long_name.as_deref().unwrap_or("")).as_bytes());
+    }
+    if let Some(arg) = arg {
+        if !stuck_long {
+            dst.push(b' ');
+        } else if o.long_name.is_some() {
+            dst.push(b'=');
+        }
+        sq_quote_buf(dst, arg.as_bytes());
+    }
+}
+
+/// ```c
+/// /* parse: (<short>|<short>,<long>|<long>)[*=?!]*<arghint>? SP+ <help> */
+/// ```
+///
+/// (`builtin/rev-parse.c:472-542`.) An empty line is skipped. A line with no
+/// whitespace in it, or whose first character is whitespace, is an `OPTION_GROUP`
+/// heading. Otherwise the text up to the first whitespace run is the name plus its
+/// flag characters plus an optional argument hint, and the rest — leading whitespace
+/// stripped — is the help.
+fn parse_spec_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> std::result::Result<Vec<PoOption>, String> {
+    let mut opts: Vec<PoOption> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(space) = line.find(char::is_whitespace) else {
+            opts.push(PoOption {
+                group: true,
+                short_name: None,
+                long_name: None,
+                argh: None,
+                help: line.trim_start().to_string(),
+                flags: 0,
+            });
+            continue;
+        };
+        if space == 0 {
+            opts.push(PoOption {
+                group: true,
+                short_name: None,
+                long_name: None,
+                argh: None,
+                help: line.trim_start().to_string(),
+                flags: 0,
+            });
+            continue;
+        }
+        let (spec, help) = line.split_at(space);
+        let help = help[1..].trim_start().to_string();
+        let mut o = PoOption {
+            group: false,
+            short_name: None,
+            long_name: None,
+            argh: None,
+            help,
+            flags: PO_NOARG,
+        };
+
+        // `s = strpbrk(sb.buf, "*=?!")` — the first flag character, or the end of
+        // the name when there is none.
+        let bytes = spec.as_bytes();
+        let flag_at = bytes.iter().position(|b| b"*=?!".contains(b)).unwrap_or(bytes.len());
+        if flag_at == 0 {
+            return Err("missing opt-spec before option flags".to_string());
+        }
+        let names = &spec[..flag_at];
+        if flag_at == 1 {
+            o.short_name = names.chars().next();
+        } else if bytes[1] != b',' {
+            o.long_name = Some(names.to_string());
+        } else {
+            o.short_name = names.chars().next();
+            o.long_name = Some(names[2..].to_string());
+        }
+
+        let mut i = flag_at;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'=' => o.flags &= !PO_NOARG,
+                b'?' => {
+                    o.flags &= !PO_NOARG;
+                    o.flags |= PO_OPTARG;
+                }
+                b'!' => o.flags |= PO_NONEG,
+                b'*' => o.flags |= PO_HIDDEN,
+                _ => break,
+            }
+            i += 1;
+        }
+        if i < bytes.len() {
+            o.argh = Some(spec[i..].to_string());
+        }
+        opts.push(o);
+    }
+    Ok(opts)
+}
+
+/// `error(_("unknown option `%s'"))` / `error(_("unknown switch `%c'"))`
+/// (`parse-options.c:1214-1222`), rendered from whatever the scan stopped on.
+fn unknown_name(ctx: &PoCtx) -> String {
+    let arg = ctx.argv.get(ctx.at).cloned().unwrap_or_default();
+    if arg.starts_with("--") {
+        format!("unknown option `{}'", &arg[2..])
+    } else {
+        match ctx.opt.as_deref().and_then(|s| s.chars().next()) {
+            Some(c) if c.is_ascii() => format!("unknown switch `{c}'"),
+            _ => format!("unknown non-ascii option in string: `{arg}'"),
+        }
+    }
+}
+
+/// `parse_options_end()` (`parse-options.c:1040-1048`): the collected non-options
+/// followed by everything the scan stopped before.
+fn parse_options_end(ctx: PoCtx) -> Vec<String> {
+    let mut out = ctx.out;
+    out.extend_from_slice(&ctx.argv[ctx.at.min(ctx.argv.len())..]);
+    out
+}
+
+/// `parse_options_step()` (`parse-options.c:995-1080`), for the option shapes
+/// `cmd_parseopt()` can build: `OPTION_GROUP` headings and `OPTION_CALLBACK`
+/// entries. `hit` is the callback, called with the option's index in `options`.
+fn parse_options_step(
+    ctx: &mut PoCtx,
+    options: &[PoOption],
+    hit: &mut dyn FnMut(usize, Option<&str>, bool) -> Result<()>,
+) -> PoResult {
+    ctx.opt = None;
+    while ctx.at < ctx.argv.len() {
+        let arg = ctx.argv[ctx.at].clone();
+
+        // `if (*arg != '-' || !arg[1])`: a bare `-` and anything not starting with
+        // one are non-options.
+        if !arg.starts_with('-') || arg.len() == 1 {
+            if ctx.flags & CTX_STOP_AT_NON_OPTION != 0 {
+                return PoResult::NonOption;
+            }
+            ctx.out.push(arg);
+            ctx.at += 1;
+            continue;
+        }
+
+        // `if (internal_help && ctx->total == 1 && !strcmp(arg + 1, "h"))`: a *lone*
+        // `-h` is help even when the spec declares an `h` of its own.
+        if ctx.total == 1 && arg == "-h" {
+            return PoResult::Help;
+        }
+
+        if !arg.starts_with("--") {
+            ctx.opt = Some(arg[1..].to_string());
+            loop {
+                match parse_short_opt(ctx, options, hit) {
+                    ShortResult::Error => return PoResult::Error,
+                    ShortResult::Unknown => {
+                        if ctx.opt.as_deref().is_some_and(|s| s.starts_with('h')) {
+                            return PoResult::Help;
+                        }
+                        return PoResult::Unknown;
+                    }
+                    ShortResult::Done => {}
+                }
+                if ctx.opt.is_none() {
+                    break;
+                }
+            }
+            ctx.at += 1;
+            continue;
+        }
+
+        if arg == "--" {
+            if ctx.flags & CTX_KEEP_DASHDASH == 0 {
+                ctx.at += 1;
+            }
+            break;
+        }
+        if arg == "--help-all" || arg == "--help" {
+            return PoResult::Help;
+        }
+
+        match parse_long_opt(ctx, &arg[2..], options, hit) {
+            LongResult::Error => return PoResult::Error,
+            LongResult::Help => return PoResult::Help,
+            LongResult::Unknown => return PoResult::Unknown,
+            LongResult::Done => {}
+        }
+        ctx.at += 1;
+    }
+    PoResult::Done
+}
+
+enum ShortResult {
+    Done,
+    Unknown,
+    Error,
+}
+
+enum LongResult {
+    Done,
+    Unknown,
+    Error,
+    Help,
+}
+
+/// `parse_short_opt()` (`parse-options.c:426-461`): the first character of
+/// `ctx->opt` names the option, and whatever follows it stays for the next round —
+/// which is how `-abc` and `-Cvalue` are both read.
+fn parse_short_opt(
+    ctx: &mut PoCtx,
+    options: &[PoOption],
+    hit: &mut dyn FnMut(usize, Option<&str>, bool) -> Result<()>,
+) -> ShortResult {
+    let Some(rest) = ctx.opt.clone() else { return ShortResult::Unknown };
+    let Some(c) = rest.chars().next() else { return ShortResult::Unknown };
+    for (idx, o) in options.iter().enumerate() {
+        if o.group || o.short_name != Some(c) {
+            continue;
+        }
+        let tail = &rest[c.len_utf8()..];
+        ctx.opt = (!tail.is_empty()).then(|| tail.to_string());
+        return get_value(ctx, options, idx, false, hit);
+    }
+    ShortResult::Unknown
+}
+
+/// `parse_long_opt()` (`parse-options.c:519-594`): exact match first, then the
+/// unique abbreviation, with `no-` handled on both the typed name and the table's.
+fn parse_long_opt(
+    ctx: &mut PoCtx,
+    arg: &str,
+    options: &[PoOption],
+    hit: &mut dyn FnMut(usize, Option<&str>, bool) -> Result<()>,
+) -> LongResult {
+    // `arg_end = strchrnul(arg, '=')` and `arg_start = arg`: the *whole* token, value
+    // included, is what the exact match is tried against — which is how `--bar=b`
+    // leaves `=b` in `rest` and lands the value in `p->opt`. Only the abbreviation
+    // compare is cut at the `=`.
+    let eq = arg.find('=').unwrap_or(arg.len());
+    let mut off = 0usize;
+    let mut unset = false;
+    let mut no_no = false;
+    if arg[off..].starts_with("no-") {
+        off += 3;
+        if arg[off..].starts_with("no-") {
+            off += 3;
+            no_no = true;
+        } else {
+            unset = true;
+        }
+    }
+    let start = &arg[off..];
+    // `arg_end - arg_start`, which can be zero once the `no-` prefixes are off.
+    let cmp_len = eq.saturating_sub(off);
+
+    let mut abbrev: Option<(usize, bool)> = None;
+    let mut ambiguous: Option<(usize, bool)> = None;
+    for (idx, o) in options.iter().enumerate() {
+        if o.group {
+            continue;
+        }
+        let Some(full) = o.long_name.as_deref() else { continue };
+        let (long_name, opt_unset) = match full.strip_prefix("no-") {
+            Some(stem) => (stem, true),
+            None if no_no => continue,
+            None => (full, false),
+        };
+        let sense = unset != opt_unset;
+        if sense && !o.allow_unset() {
+            continue;
+        }
+
+        if let Some(rest) = start.strip_prefix(long_name) {
+            if let Some(value) = rest.strip_prefix('=') {
+                ctx.opt = Some(value.to_string());
+            } else if !rest.is_empty() {
+                continue;
+            }
+            return get_value_long(ctx, options, idx, sense, hit);
+        }
+
+        let register = |cand: (usize, bool), abbrev: &mut Option<(usize, bool)>, ambiguous: &mut Option<(usize, bool)>| {
+            if let Some(prev) = *abbrev {
+                if prev != cand {
+                    *ambiguous = Some(prev);
+                }
+            }
+            *abbrev = Some(cand);
+        };
+        // `!strncmp(long_name, arg_start, arg_end - arg_start)`.
+        if long_name.len() >= cmp_len && long_name.as_bytes()[..cmp_len] == start.as_bytes()[..cmp_len]
+        {
+            register((idx, sense), &mut abbrev, &mut ambiguous);
+        }
+        // `starts_with("no-", arg)`: whether the typed text is a prefix of `no-`,
+        // which is what makes `--n` name every negatable option at once.
+        if o.allow_unset() && "no-".starts_with(arg) {
+            register((idx, !opt_unset), &mut abbrev, &mut ambiguous);
+        }
+    }
+
+    if let (Some((ai, aunset)), Some((bi, bunset))) = (ambiguous, abbrev) {
+        eprintln!(
+            "error: ambiguous option: {arg} (could be --{}{} or --{}{})",
+            if aunset { "no-" } else { "" },
+            options[ai].long_name.as_deref().unwrap_or(""),
+            if bunset { "no-" } else { "" },
+            options[bi].long_name.as_deref().unwrap_or(""),
+        );
+        return LongResult::Help;
+    }
+    if let Some((idx, sense)) = abbrev {
+        // `if (*arg_end) p->opt = arg_end + 1;`
+        if eq < arg.len() {
+            ctx.opt = Some(arg[eq + 1..].to_string());
+        }
+        return get_value_long(ctx, options, idx, sense, hit);
+    }
+    LongResult::Unknown
+}
+
+fn get_value_long(
+    ctx: &mut PoCtx,
+    options: &[PoOption],
+    idx: usize,
+    unset: bool,
+    hit: &mut dyn FnMut(usize, Option<&str>, bool) -> Result<()>,
+) -> LongResult {
+    match get_value(ctx, options, idx, unset, hit) {
+        ShortResult::Done => LongResult::Done,
+        ShortResult::Error => LongResult::Error,
+        ShortResult::Unknown => LongResult::Unknown,
+    }
+}
+
+/// `get_value()`'s `OPTION_CALLBACK` arm (`parse-options.c:236-259`) — the only one
+/// `cmd_parseopt()` builds:
+///
+/// ```c
+/// if (unset)                                        p_unset = 1;
+/// else if (opt->flags & PARSE_OPT_NOARG)            p_unset = 0;
+/// else if (opt->flags & PARSE_OPT_OPTARG && !p->opt) p_unset = 0;
+/// else if (get_arg(p, opt, flags, &arg))            return -1;
+/// else { p_unset = 0; p_arg = arg; }
+/// ```
+fn get_value(
+    ctx: &mut PoCtx,
+    options: &[PoOption],
+    idx: usize,
+    unset: bool,
+    hit: &mut dyn FnMut(usize, Option<&str>, bool) -> Result<()>,
+) -> ShortResult {
+    let o = &options[idx];
+    let (arg, p_unset) = if unset {
+        (None, true)
+    } else if o.flags & PO_NOARG != 0 {
+        (None, false)
+    } else if o.flags & PO_OPTARG != 0 && ctx.opt.is_none() {
+        (None, false)
+    } else {
+        // `get_arg()` (`parse-options.c:47-62`): the attached value, else the next
+        // argument, else `%s requires a value`.
+        match ctx.opt.take() {
+            Some(v) => (Some(v), false),
+            None => {
+                if ctx.at + 1 < ctx.argv.len() {
+                    ctx.at += 1;
+                    (Some(ctx.argv[ctx.at].clone()), false)
+                } else {
+                    eprintln!("error: {} requires a value", optname(o, unset));
+                    return ShortResult::Error;
+                }
+            }
+        }
+    };
+    if hit(idx, arg.as_deref(), p_unset).is_err() {
+        return ShortResult::Error;
+    }
+    ShortResult::Done
+}
+
+/// `optname()` (`parse-options.c:30-45`).
+fn optname(o: &PoOption, unset: bool) -> String {
+    match (&o.long_name, o.short_name) {
+        (None, Some(c)) => format!("switch `{c}'"),
+        (Some(name), _) if unset => format!("option `no-{name}'"),
+        (Some(name), _) => format!("option `{name}'"),
+        (None, None) => String::new(),
+    }
+}
+
+/// `usage_with_options_internal()` (`parse-options.c:1312-1479`): the usage lines,
+/// then one padded row per option, then a trailing blank line. `ctx_flags` carries
+/// `PARSE_OPT_SHELL_EVAL`, which wraps the whole block in a `cat <<\EOF` heredoc —
+/// and only ever on the stdout (`-h`) path, never on the stderr (error) one.
+fn render_usage(
+    out: &mut impl Write,
+    usage: &[String],
+    opts: &[PoOption],
+    ctx_flags: u32,
+) -> Result<()> {
+    const USAGE_OPTS_WIDTH: usize = 26;
+    let shell_eval = ctx_flags & CTX_SHELL_EVAL != 0;
+    if shell_eval {
+        write!(out, "cat <<\\EOF\n")?;
+    }
+
+    let mut prefix = "usage: ";
+    let mut saw_empty_line = false;
+    for entry in usage {
+        if !saw_empty_line && entry.is_empty() {
+            saw_empty_line = true;
+        }
+        for (j, line) in entry.split('\n').enumerate() {
+            if saw_empty_line && !line.is_empty() {
+                writeln!(out, "    {line}")?;
+            } else if saw_empty_line {
+                writeln!(out)?;
+            } else if j == 0 {
+                writeln!(out, "{prefix}{line}")?;
+            } else {
+                writeln!(out, "{:width$}{line}", "", width = "usage: ".len())?;
+            }
+        }
+        prefix = "   or: ";
+    }
+
+    let mut need_newline = true;
+    for o in opts {
+        if o.group {
+            writeln!(out)?;
+            need_newline = false;
+            if !o.help.is_empty() {
+                writeln!(out, "{}", o.help)?;
+            }
+            continue;
+        }
+        if o.flags & PO_HIDDEN != 0 {
+            continue;
+        }
+        if need_newline {
+            writeln!(out)?;
+            need_newline = false;
+        }
+
+        let mut row = String::from("    ");
+        if let Some(c) = o.short_name {
+            row.push('-');
+            row.push(c);
+        }
+        if o.long_name.is_some() && o.short_name.is_some() {
+            row.push_str(", ");
+        }
+        let mut positive_name: Option<&str> = None;
+        if let Some(name) = o.long_name.as_deref() {
+            if o.flags & PO_NONEG != 0 {
+                row.push_str(&format!("--{name}"));
+            } else if let Some(stem) = name.strip_prefix("no-") {
+                positive_name = Some(stem);
+                row.push_str(&format!("--{name}"));
+            } else {
+                row.push_str(&format!("--[no-]{name}"));
+            }
+        }
+        if o.flags & PO_NOARG == 0 {
+            row.push_str(&usage_argh(o));
+        }
+        write!(out, "{row}")?;
+
+        let mut pos = display_width(&row);
+        let help = if o.help.is_empty() { "" } else { o.help.as_str() };
+        let mut rest = help;
+        loop {
+            let (chunk, tail) = match rest.find('\n') {
+                Some(at) => (&rest[..=at], &rest[at + 1..]),
+                None => (rest, ""),
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            usage_padding(out, pos)?;
+            out.write_all(chunk.as_bytes())?;
+            pos = 0;
+            if tail.is_empty() {
+                break;
+            }
+            rest = tail;
+        }
+        writeln!(out)?;
+
+        // `if (positive_name) { if (find_option_by_long_name(...)) continue; … }`
+        if let Some(stem) = positive_name {
+            if opts.iter().any(|c| c.long_name.as_deref() == Some(stem)) {
+                continue;
+            }
+            let row = format!("    --{stem}");
+            write!(out, "{row}")?;
+            usage_padding(out, display_width(&row))?;
+            writeln!(out, "opposite of --no-{stem}")?;
+        }
+    }
+    writeln!(out)?;
+    if shell_eval {
+        write!(out, "EOF\n")?;
+    }
+    let _ = USAGE_OPTS_WIDTH;
+    Ok(())
+}
+
+/// `usage_padding()` (`parse-options.c:1296-1302`): pad to column 26, or wrap onto
+/// a fresh line indented to it when the option row is already at least that wide.
+fn usage_padding(out: &mut impl Write, pos: usize) -> Result<()> {
+    const USAGE_OPTS_WIDTH: usize = 26;
+    if pos < USAGE_OPTS_WIDTH {
+        write!(out, "{:width$}", "", width = USAGE_OPTS_WIDTH - pos)?;
+    } else {
+        write!(out, "\n{:width$}", "", width = USAGE_OPTS_WIDTH)?;
+    }
+    Ok(())
+}
+
+/// `usage_argh()` (`parse-options.c:1237-1286`). The `<>` decoration is dropped
+/// when the hint is already punctuated — or missing, in which case the hint itself
+/// is the literal `...`.
+fn usage_argh(o: &PoOption) -> String {
+    let literal = o.argh.as_deref().is_none_or(|a| a.contains(['(', ')', '<', '>', '[', ']', '|']));
+    let argh = o.argh.as_deref().unwrap_or("...");
+    if o.flags & PO_OPTARG != 0 {
+        if o.long_name.is_some() {
+            if literal {
+                format!("[={argh}]")
+            } else {
+                format!("[=<{argh}>]")
+            }
+        } else if literal {
+            format!("[{argh}]")
+        } else {
+            format!("[<{argh}>]")
+        }
+    } else if literal {
+        format!(" {argh}")
+    } else {
+        format!(" <{argh}>")
+    }
+}
+
+/// `utf8_fprintf()`'s return value: the *column* count of what was printed, which
+/// is what the padding is measured against.
+fn display_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
 }

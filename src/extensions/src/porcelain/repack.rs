@@ -203,6 +203,19 @@
 //!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
 //!     of it depends on resolving and parsing the named blob;
 //!   * `combine:` sub-specs are not percent-decoded.
+//!   * `repack.midxSplitFactor` and `repack.midxNewLayerThreshold` size the
+//!     geometric merge of incremental MIDX layers, which `--write-midx=incremental`
+//!     refuses above — but git range-checks both *unconditionally*
+//!     (`builtin/repack.c:291-296`), so the refusals are reproduced and the
+//!     values themselves steer nothing. `repack.midxMustContainCruft` *is*
+//!     honoured: it decides whether the `multi-pack-index` covers the cruft
+//!     packs, through [`resolve_midx_cruft`].
+//!   * `pack.useBitmaps` and `pack.allowPackReuse` are read where git's
+//!     `pack-objects` child would have read them — in [`execute`], so `repack -h`
+//!     still prints usage — and validated, but neither bitmap-accelerated
+//!     counting nor verbatim pack reuse exists here. The four `pack.*` booleans
+//!     `prepare_repo_settings()` owns are handled the same way, one layer up in
+//!     [`crate::repo_settings`].
 //! ```
 
 use anyhow::{bail, Context, Result};
@@ -465,15 +478,28 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
     // git reads the pack config before parse-options here too, so an unreadable
     // `pack.packSizeLimit` is fatal ahead of every parse diagnostic — verified
     // against git 2.55.0, where `repack -h` under a bad value reports the number
-    // rather than printing usage.
+    // rather than printing usage. The same is true of the three `repack.midx*`
+    // keys `repack_config()` reads (`builtin/repack.c:97-110`), which is why they
+    // are loaded here rather than next to the MIDX write they steer.
+    let mut midx_cfg = MidxConfig::DEFAULT;
     let pack_size_limit_cfg = match gix::discover(".") {
-        Ok(repo) => match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
-            Ok(limit) => limit,
-            Err(message) => {
-                eprintln!("fatal: {message}");
-                return Ok(ExitCode::from(128));
-            }
-        },
+        Ok(repo) => {
+            let limit = match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
+                Ok(limit) => limit,
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            };
+            midx_cfg = match MidxConfig::load(&repo) {
+                Ok(cfg) => cfg,
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            };
+            limit
+        }
         Err(_) => None,
     };
 
@@ -482,7 +508,7 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         Parsed::Ok(state) => state,
     };
 
-    if let Some(code) = preflight(&state) {
+    if let Some(code) = preflight(&state, &midx_cfg) {
         return Ok(code);
     }
 
@@ -505,24 +531,103 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         eprintln!("warning: minimum pack size limit is 1 MiB");
     }
 
-    execute(&state)
+    execute(&state, &midx_cfg)
 }
 
 /// git's 1 MiB floor for `pack_size_limit`: any smaller non-zero limit warns and
 /// is then raised to this.
 const MIN_PACK_SIZE_LIMIT: u64 = 1024 * 1024;
 
+/// The three `repack.midx*` keys `repack_config()` reads
+/// (`builtin/repack.c:97-110`), with their defaults from
+/// `DEFAULT_MIDX_SPLIT_FACTOR` / `DEFAULT_MIDX_NEW_LAYER_THRESHOLD`
+/// (`builtin/repack.c:242-243`).
+///
+/// # Where each is honoured
+///
+/// * `midx_must_contain_cruft` reaches [`execute`], which drops cruft packs from
+///   the `multi-pack-index` when it is false. That is the same set
+///   `repack-midx.c:199-235` computes.
+/// * `split_factor` and `new_layer_threshold` steer the geometric merge of
+///   *incremental* MIDX layers (`--write-midx=incremental`), which this port
+///   refuses outright — see the module docs. Their range checks are still
+///   reproduced, because git runs them unconditionally at
+///   `builtin/repack.c:291-296` whether or not a MIDX is being written at all.
+///
+/// # One deviation, in the diagnostics' order
+///
+/// git reads these through a `repo_config` *callback*, so when two of them hold
+/// unreadable values the one that appears first in the configuration is the one
+/// named. This port reads key by key in a fixed order (`repack.midxSplitFactor`,
+/// then `repack.midxNewLayerThreshold`, then `repack.midxMustContainCruft`, all
+/// after `pack.packSizeLimit`), so it names the first of those instead. Each key
+/// on its own is byte-identical; only the pairing differs.
+#[derive(Copy, Clone, Debug)]
+struct MidxConfig {
+    /// `repack.midxSplitFactor`, git's `git_config_int`. Checked against its
+    /// floor of 2 later, in [`preflight`].
+    split_factor: i64,
+    /// `repack.midxNewLayerThreshold`, floor 1.
+    new_layer_threshold: i64,
+    /// `repack.midxMustContainCruft`, git's `git_config_bool`, default true.
+    must_contain_cruft: bool,
+}
+
+impl MidxConfig {
+    /// `builtin/repack.c:242-243`, the values `repack_config()` starts from.
+    const DEFAULT: Self = MidxConfig {
+        split_factor: 2,
+        new_layer_threshold: 8,
+        must_contain_cruft: true,
+    };
+
+    /// Read the three keys, `Err` carrying git's `die()` line minus `fatal: `.
+    fn load(repo: &gix::Repository) -> Result<Self, String> {
+        let mut cfg = Self::DEFAULT;
+        if let Some(v) = crate::config::config_int(repo, "repack.midxsplitfactor")? {
+            cfg.split_factor = v;
+        }
+        if let Some(v) = crate::config::config_int(repo, "repack.midxnewlayerthreshold")? {
+            cfg.new_layer_threshold = v;
+        }
+        if let Some(v) = crate::repo_settings::config_bool_strict(repo, "repack.midxmustcontaincruft")? {
+            cfg.must_contain_cruft = v;
+        }
+        Ok(cfg)
+    }
+}
+
 /// Do the repacking, for a repository discovered from the current directory.
 ///
 /// git reaches the object database only after every check above, so this is also
 /// where "not a git repository" is diagnosed.
-fn execute(st: &State) -> Result<ExitCode> {
+fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     let Ok(repo) = gix::discover(".") else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };
     let objdir = repo.objects.store_ref().path().to_path_buf();
     let pack_dir = objdir.join("pack");
+
+    // `git_pack_config()`'s two remaining keys. git reaches them in the
+    // `pack-objects` child this port packs inline instead, so an unreadable
+    // value is fatal for a real run and *not* for `repack -h` — which is what
+    // git 2.55.0 does: `-c pack.allowPackReuse=bogus repack -h` prints the usage
+    // block, while the same config on `repack -a -d` dies. See
+    // [`super::pack_objects::PackConfig`] for what each would have steered.
+    match crate::repo_settings::RepoSettings::load(&repo)
+        .and_then(|settings| super::pack_objects::PackConfig::load(&repo, &settings))
+    {
+        Ok(_) => {}
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    }
+
+    // `existing->midx_packs`, read before `-d` can delete a pack out from under
+    // the MIDX; see [`resolve_midx_cruft`].
+    let existing_midx_packs = super::multi_pack_index::midx_pack_names(&pack_dir);
     // git's `packdir` *string*, which is the only thing the locality rule looks
     // at; see [`git_packdir`].
     let packdir = git_packdir(&repo, &objdir);
@@ -789,7 +894,11 @@ fn execute(st: &State) -> Result<ExitCode> {
         );
     }
     if st.write_midx {
-        super::multi_pack_index::write_midx(&pack_dir, repo.object_hash())?;
+        if resolve_midx_cruft(midx.must_contain_cruft, &new_packs, existing_midx_packs.as_deref(), &pack_dir) {
+            super::multi_pack_index::write_midx(&pack_dir, repo.object_hash())?;
+        } else {
+            super::multi_pack_index::write_midx_without_cruft(&pack_dir, repo.object_hash())?;
+        }
     }
 
     if run_server_info {
@@ -797,6 +906,53 @@ fn execute(st: &State) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether the `multi-pack-index` about to be written must include the cruft
+/// packs — `repack.midxMustContainCruft` after the two overrides git applies.
+///
+/// The key is a *permission to omit*, not an instruction to omit, and git takes
+/// that permission away twice:
+///
+/// 1. `builtin/repack.c:460-478`. When the run wrote no new pack, the surviving
+///    non-cruft packs may still reference objects that only the cruft pack now
+///    holds, so the MIDX has to cover them — unless a MIDX already exists, in
+///    which case the next rule decides instead.
+/// 2. `repack-midx.c:199-200`, `midx_has_unknown_packs()`. If the *existing*
+///    MIDX names a pack the new one would not, that pack may be part of a
+///    bitmap's reachability closure, and the cruft packs are kept for the same
+///    reason. In git a pack from the old MIDX counts as known when it is in the
+///    include list, or (with `--geometric`) below the split line, or in
+///    `non_kept_packs` and not marked for deletion. This port has no geometric
+///    split and no deletion marks — the packs still on disk at this point *are*
+///    the survivors, and `write_midx_without_cruft` includes exactly the
+///    non-cruft ones — so "known" collapses to "still in the new include set".
+fn resolve_midx_cruft(
+    must_contain_cruft: bool,
+    new_packs: &[(String, usize)],
+    existing_midx_packs: Option<&[String]>,
+    pack_dir: &Path,
+) -> bool {
+    if must_contain_cruft {
+        return true;
+    }
+    if new_packs.is_empty() && existing_midx_packs.is_none() {
+        return true;
+    }
+    let Some(existing) = existing_midx_packs else {
+        return false;
+    };
+    // The include set the new MIDX would carry: every non-cruft `.idx` left in
+    // the directory.
+    let include: std::collections::HashSet<String> = fs::read_dir(pack_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".idx"))
+        .filter(|name| !pack_dir.join(name).with_extension("mtimes").is_file())
+        .collect();
+    existing.iter().any(|name| !include.contains(name))
 }
 
 /// Encode `ids` as a pack, install it in `pack_dir` as `pack-<checksum>.pack`,
@@ -1698,7 +1854,7 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
 
 /// The option conflicts stock git rejects before it does any work, in git's own
 /// order. Each prints `fatal: <msg>` on stderr and exits 128.
-fn preflight(st: &State) -> Option<ExitCode> {
+fn preflight(st: &State, midx: &MidxConfig) -> Option<ExitCode> {
     // die_for_incompatible_opt3(-A, -k/--keep-unreachable, --cruft)
     let triad = [
         (st.loosen_unreachable, "-A"),
@@ -1727,6 +1883,29 @@ fn preflight(st: &State) -> Option<ExitCode> {
             "Incremental repacks are incompatible with bitmap indexes.  Use\n\
              --no-write-bitmap-index or disable the pack.writeBitmaps configuration.",
         ));
+    }
+
+    // `builtin/repack.c:291-296`, which sits between the bitmap-conflict die
+    // above (:274) and the `--filter-to` die below (:407-408) — pinned against
+    // git 2.55.0 by running each pair: `-c repack.midxSplitFactor=1 repack -b`
+    // reports the bitmap conflict, `… repack --filter-to=x` reports the split
+    // factor. git names the *option* both keys shadow, not the config key, and
+    // prints the value as the `int` it read.
+    //
+    // The check is unconditional in git: it fires with no `--write-midx` on the
+    // line and with nothing to pack, which is why it is here rather than beside
+    // the MIDX write.
+    if midx.split_factor < 2 {
+        return Some(fatal(&format!(
+            "invalid value for --midx-split-factor: {}",
+            midx.split_factor
+        )));
+    }
+    if midx.new_layer_threshold < 1 {
+        return Some(fatal(&format!(
+            "invalid value for --midx-new-layer-threshold: {}",
+            midx.new_layer_threshold
+        )));
     }
 
     if st.filter_to && !st.filter {

@@ -62,6 +62,9 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+// Every `print!`/`println!` below goes through git's stdout buffer; see
+// `crate::cstdio` and the `defer()` call in `switch()`.
+use crate::cstdio::{print, println};
 use std::io::Write as _;
 use std::process::ExitCode;
 
@@ -399,6 +402,10 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
 }
 
 pub fn switch(args: &[String]) -> Result<ExitCode> {
+    // Same split as `checkout`: the worktree-change listing is stdout, the
+    // `Switched to …` line is stderr, and stdio's buffering of the first is what
+    // orders them for a caller capturing both. See `crate::cstdio`.
+    crate::cstdio::defer();
     // `-h` as any argument prints usage on stdout and exits 129.
     //
     // `--help-all` prints the same block. parse_options_step() tests it with a

@@ -73,6 +73,17 @@
 //!     error here. An error fails the whole push with
 //!     `fatal: fsck error in packed object` from the per-object pass, or
 //!     `fatal: fsck error in pack objects` from the `fsck_finish()` sweep.
+//!     `receive.fsck.<msg-id>` is read for *every* id in
+//!     [`super::fsck::MSGS`] — git's config callback validates whatever follows
+//!     `receive.fsck.` without asking whether the check can fire, so a value it
+//!     rejects is `fatal: Unknown fsck message type: '<v>'` before the
+//!     advertisement, and an id it does not know is only
+//!     `warning: skipping unknown msg id '<id>'`. The family never falls back on
+//!     `fsck.<msg-id>`.
+//!   * **`core.bigFileThreshold`** decides which blobs `index-pack` would have
+//!     streamed rather than held, which is the only way `gitmodulesLarge` is
+//!     ever reported — and therefore only on the `index-pack` branch, since
+//!     `unpack-objects` has no per-object blob check at all.
 //!   * **`receive.denyCurrentBranch`, `receive.denyDeleteCurrent`,
 //!     `receive.denyDeletes`, `receive.denyNonFastForwards`** are checked per
 //!     command in `update()`'s order, each producing git's own band-2 message
@@ -253,8 +264,10 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
     // push-certificate nonce's HMAC key.
     let config = match Config::read(&repo, &opts.dir) {
         Ok(config) => config,
+        // `is_valid_msg_type()` reaches `parse_msg_type()`'s `die()`
+        // (`fsck.c:127`), which prefixes `fatal: ` like every other one.
         Err(fatal) => {
-            eprintln!("{fatal}");
+            eprintln!("fatal: {fatal}");
             return Ok(ExitCode::from(128));
         }
     };
@@ -1616,7 +1629,7 @@ fn ingest_pack(
         }
     };
     if config.fsck_objects {
-        if let Err(message) = fsck_received(repo, &received, config, band) {
+        if let Err(message) = fsck_received(repo, &received, config, band, to_loose) {
             band.fatal(&message);
             return Err(child);
         }
@@ -1663,12 +1676,21 @@ impl<R: Read> Read for Counted<R> {
 }
 
 /// Every object id an index file lists, in pack order.
+///
+/// The index itself is sorted by object id; `index-pack` and `unpack-objects`
+/// both see the objects in the order the *pack* holds them, which is what
+/// decides whether a `.gitmodules` blob is linted by the per-object pass or by
+/// `fsck_finish()` — see [`fsck_received`]. So the entries are re-sorted on their
+/// pack offset here rather than taken as the index lists them.
 fn pack_object_ids(
     index_path: &std::path::Path,
     object_hash: gix::hash::Kind,
 ) -> Result<Vec<gix::ObjectId>> {
     let index = gix::odb::pack::index::File::at(index_path, object_hash)?;
-    Ok(index.iter().map(|e| e.oid).collect())
+    let mut entries: Vec<(u64, gix::ObjectId)> =
+        index.iter().map(|e| (e.pack_offset, e.oid)).collect();
+    entries.sort_unstable();
+    Ok(entries.into_iter().map(|(_, oid)| oid).collect())
 }
 
 /// `fsck_objects`: run the object-content message layer over everything the
@@ -1680,6 +1702,7 @@ fn fsck_received(
     received: &[gix::ObjectId],
     config: &Config,
     band: &mut Band,
+    to_loose: bool,
 ) -> Result<(), String> {
     // Which of `unpack-objects`/`index-pack`'s two `die()`s the caller gets:
     // the per-object pass says `fsck error in packed object`, `fsck_finish()`
@@ -1690,6 +1713,15 @@ fn fsck_received(
     // drained by `fsck_finish()` below.
     let mut gitmodules: HashSet<gix::ObjectId> = HashSet::new();
     let mut gitattributes: HashSet<gix::ObjectId> = HashSet::new();
+    // `gitmodules_done`/`gitattributes_done`: a blob the per-object pass already
+    // linted, which `fsck_blobs()` skips (`fsck.c:1334`).
+    let mut done: HashSet<gix::ObjectId> = HashSet::new();
+    // `parse_pack_objects()`'s delay list: the blobs `unpack_entry_data()` could
+    // not hand over, drained after the whole pack has been read.
+    let mut delayed: Vec<gix::ObjectId> = Vec::new();
+    // `core.bigFileThreshold`, which decides whether the per-object pass sees a
+    // blob's contents at all — and so whether `gitmodulesLarge` can fire.
+    let threshold = super::fsck::big_file_threshold(repo);
     /// One finding at its resolved severity, in `index-pack`/`unpack-objects`'
     /// spelling — which names the object rather than its type.
     fn report(
@@ -1713,6 +1745,48 @@ fn fsck_received(
 
     for id in received {
         let Ok(object) = repo.find_object(*id) else { continue };
+        // `parse_pack_objects()` (`builtin/index-pack.c:1284`) hands every
+        // non-delta object to `sha1_object()` as it comes off the wire, so a blob
+        // some *earlier* object in the pack already named is linted right here
+        // rather than in `fsck_finish()`.
+        //
+        // A blob over `core.bigFileThreshold` is the exception, and the reason
+        // this matters at all: `unpack_entry_data()`
+        // (`builtin/index-pack.c:488`) inflates it into a fixed scratch buffer
+        // and returns `NULL`, and `parse_pack_objects()` puts every such object
+        // on a *delay* list (`builtin/index-pack.c:1279`) that is drained only
+        // once the whole pack has been read (`builtin/index-pack.c:1308`). By
+        // then every tree in the pack has contributed to `gitmodules_found`, so a
+        // streamed blob is checked against the complete set no matter where it
+        // sat in the pack — which is why it, and only it, can report
+        // `gitmodulesLarge`. Confirmed against git 2.55.0 at
+        // `core.bigFileThreshold=100` on a pack built blob-first:
+        // `index-pack --strict` still reports the id.
+        //
+        // `unpack-objects` has no per-object blob pass at all — `write_object()`
+        // (`builtin/unpack-objects.c:281`) writes a blob and flags it without
+        // fscking it, and a blob over the threshold goes through `stream_blob()`
+        // (`builtin/unpack-objects.c:559`) — so a small push, which git unpacks
+        // loose, can never report `gitmodulesLarge`. Confirmed on the same pack:
+        // `unpack-objects --strict` is silent.
+        if object.kind == gix::object::Kind::Blob {
+            if to_loose {
+                continue;
+            }
+            if object.data.len() as u64 > threshold {
+                delayed.push(*id);
+                continue;
+            }
+            let as_modules = gitmodules.contains(id);
+            let as_attrs = gitattributes.contains(id);
+            if as_modules || as_attrs {
+                done.insert(*id);
+                for finding in check_blob(Some(&object.data), as_modules, as_attrs) {
+                    report(config, band, &finding, id, &mut failed);
+                }
+            }
+            continue;
+        }
         let checked = check_object(object.kind, &object.data, true, repo.object_hash().len_in_hex());
         // The tree-entry decoder's own `error:` lines, already prefixed.
         for line in &checked.raw {
@@ -1725,18 +1799,35 @@ fn fsck_received(
         }
     }
 
+    // `parse_pack_objects()`'s delayed sweep (`builtin/index-pack.c:1308`): the
+    // streamed blobs, now that every tree in the pack has named what it names.
+    // They are still part of the per-object pass, so a finding here is
+    // `fsck error in packed object`.
+    for id in &delayed {
+        let as_modules = gitmodules.contains(id);
+        let as_attrs = gitattributes.contains(id);
+        if !as_modules && !as_attrs {
+            continue;
+        }
+        done.insert(*id);
+        for finding in check_blob(None, as_modules, as_attrs) {
+            report(config, band, &finding, id, &mut failed);
+        }
+    }
+
     // `fsck_finish()`: every blob the trees pointed at, whether or not the pack
     // carried it. Pack order first so the report is reproducible; anything the
     // pack did not carry follows in id order.
     let mut queue: Vec<gix::ObjectId> = received
         .iter()
         .copied()
+        .filter(|id| !done.contains(id))
         .filter(|id| gitmodules.contains(id) || gitattributes.contains(id))
         .collect();
     let mut rest: Vec<gix::ObjectId> = gitmodules
         .union(&gitattributes)
         .copied()
-        .filter(|id| !queue.contains(id))
+        .filter(|id| !done.contains(id) && !queue.contains(id))
         .collect();
     rest.sort();
     queue.append(&mut rest);
@@ -1749,7 +1840,10 @@ fn fsck_received(
         // some other type, once per sweep that named it.
         let (missing, non_blob) = match repo.find_object(id) {
             Ok(object) if object.kind == gix::object::Kind::Blob => {
-                for finding in check_blob(&object.data, as_modules, as_attrs) {
+                // `fsck_blobs()` always reads the whole object
+                // (`fsck.c:1337`'s `odb_read_object()`), so nothing is streamed
+                // here however large it is.
+                for finding in check_blob(Some(&object.data), as_modules, as_attrs) {
                     report(config, band, &finding, &id, &mut failed);
                 }
                 continue;

@@ -388,6 +388,50 @@ pub fn last_value_with_origin(repo: &gix::Repository, key: &str) -> Option<(Stri
     Some((raw, origin))
 }
 
+/// The last value configured for the dotted `<section>.<key>`, distinguishing a
+/// key gitoxide reports as having **no** value from one whose value is empty.
+///
+/// `None` for a key that is not set anywhere, `Some(None)` for the valueless form,
+/// `Some(Some(v))` for a value. [`last_value_with_origin`] flattens the first two
+/// together, which is right for the numeric readers (they treat both as
+/// unreadable) and wrong for a reader that has to tell git's `NULL` value from
+/// git's `""` — `git_config_bool(var, NULL)` is *true* (`parse.c:168-169`) while
+/// `git_config_bool(var, "")` is false, and `git_config_string(var, NULL)` is
+/// `config_error_nonbool` while `""` is an empty string.
+///
+/// # How the distinction survives the parser
+///
+/// gitoxide's parser emits an empty `Event::Value` for a key with no `=`
+/// (`gix-config/src/parse/from_bytes/mod.rs:294-303`), so the raw event stream
+/// looks the same for both spellings — but it is the event's *position* that
+/// carries the difference, and `key_and_value_range_by_in`
+/// (`gix-config/src/file/section/body.rs:182-217`) reads it: a `Value` sitting
+/// directly after the name event is the valueless form and reports no value at
+/// all. That is what `value_implicit()` returns and what this function forwards.
+/// The plainer `values()` accessor does not — it renders the same occurrence as
+/// an empty string — so a reader that needs the distinction has to come through
+/// here.
+///
+/// Only the **last** occurrence of a name within one section is classified this
+/// way; earlier repeats of the same name are only reachable through `values()`.
+pub fn last_value_implicit(repo: &gix::Repository, key: &str) -> Option<Option<String>> {
+    use gix::bstr::ByteSlice as _;
+
+    let (section, name) = key.split_once('.')?;
+    let config = repo.config_snapshot().plumbing().clone();
+    let mut found: Option<Option<String>> = None;
+    for sec in config.sections() {
+        let header = sec.header();
+        if header.subsection_name().is_some() || !header.name().to_string().eq_ignore_ascii_case(section) {
+            continue;
+        }
+        if let Some(v) = sec.body().value_implicit(name) {
+            found = Some(v.map(|raw| raw.to_str_lossy().into_owned()));
+        }
+    }
+    found
+}
+
 /// git's `git_config_ulong` for the dotted `key`: `Ok(None)` when unset,
 /// `Ok(Some(v))` for a value git can read, and `Err(<message>)` carrying the exact
 /// `fatal:` line git dies with otherwise — `bad numeric config value '<raw>' for
@@ -408,12 +452,37 @@ pub fn config_ulong(repo: &gix::Repository, key: &str) -> Result<Option<u64>, St
 /// git's `git_config_int` for the dotted `key`, the signed counterpart of
 /// [`config_ulong`] with the same `Err` contract.
 pub fn config_int(repo: &gix::Repository, key: &str) -> Result<Option<i64>, String> {
+    config_int_named(repo, key, &key.to_lowercase())
+}
+
+/// [`config_int`] for the callers whose diagnostic does **not** lower-case the key.
+///
+/// `die_bad_number()` prints whatever string its caller passed as the variable
+/// name, and that string is a literal in the C source rather than the normalised
+/// key the parser produced. Most of them are written lowercase, so lower-casing is
+/// the right default — but not all: `parallel-checkout.c:60,65` spell
+/// `checkout.workers` and `checkout.thresholdForParallelism` in camelCase, and git
+/// 2.55.0 reports them that way verbatim:
+///
+/// ```text
+/// fatal: bad numeric config value 'bogus' for 'checkout.thresholdForParallelism': invalid unit
+/// ```
+///
+/// `key` is what is looked up (case-insensitively, as always); `reported_as` is
+/// what the message says.
+pub fn config_int_named(
+    repo: &gix::Repository,
+    key: &str,
+    reported_as: &str,
+) -> Result<Option<i64>, String> {
     let Some((raw, origin)) = last_value_with_origin(repo, key) else {
         return Ok(None);
     };
     match parse_config_int(&raw) {
         Ok(v) => Ok(Some(v)),
-        Err(reason) => Err(bad_number(&raw, key, &origin, reason)),
+        Err(reason) => Err(format!(
+            "bad numeric config value '{raw}' for '{reported_as}'{origin}: {reason}"
+        )),
     }
 }
 
@@ -438,7 +507,12 @@ fn bad_number(raw: &str, key: &str, origin: &str, reason: &str) -> String {
 ///   `1`/`false`: `index.threads` of `0`, `true`, `2` and `4` each produce an
 ///   `EOIE`, while `1`, `false` and an unset value do not.
 /// * `index.skipHash` — whether to zero the index's trailing checksum instead of
-///   computing it.
+///   computing it. Its *default* is not a constant: `feature.manyFiles=true`
+///   flips it on (`repo-settings.c:59-63`, then `:79`, which passes the cascaded
+///   value in as this key's fallback), so the trailer of an index written under
+///   `feature.manyFiles` is twenty zero bytes with no `index.skipHash` set
+///   anywhere. That cascade is resolved by [`crate::repo_settings::RepoSettings`],
+///   which also validates the two `feature.*` booleans the way git does.
 ///
 /// Note that `EOIE` is only ever appended when some *other* extension was
 /// written, since it exists to record where the extensions begin; an index
@@ -469,7 +543,14 @@ pub fn index_write_options(repo: &gix::Repository) -> gix::index::write::Options
             tree_cache: true,
             end_of_index_entry,
         },
-        skip_hash: snap.boolean("index.skipHash").unwrap_or(false),
+        // `index.skipHash` over the `feature.manyFiles` cascade. A repository whose
+        // settings block cannot be resolved has already been refused by the
+        // dispatcher's gate for every verb that writes an index, so an `Err` here
+        // can only come from a verb outside that list; fall back to git's
+        // unconfigured default rather than fail an index write over it.
+        skip_hash: crate::repo_settings::RepoSettings::load(repo)
+            .map(|s| s.index_skip_hash)
+            .unwrap_or(false),
     }
 }
 

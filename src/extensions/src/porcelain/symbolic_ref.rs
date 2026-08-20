@@ -156,10 +156,20 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
+    // `core.preferSymlinkRefs` is read when the files ref store is created
+    // (refs/files-backend.c:129), which every form of this command does — so an
+    // unreadable value refuses the read form as much as the write form, and
+    // refuses before any update is applied.
+    let prefer_symlink =
+        match crate::repo_settings::config_bool_strict(&repo, "core.prefersymlinkrefs") {
+            Ok(v) => v.unwrap_or(false),
+            Err(msg) => return fatal(&msg),
+        };
+
     if opts.delete {
         delete_symref(&repo, positional[0])
     } else if positional.len() == 2 {
-        set_symref(&repo, positional[0], positional[1], opts.message.as_deref())
+        set_symref(&repo, positional[0], positional[1], opts.message.as_deref(), prefer_symlink)
     } else {
         read_symref(&repo, positional[0], &opts)
     }
@@ -194,6 +204,7 @@ fn set_symref(
     name: &str,
     target: &str,
     message: Option<&str>,
+    prefer_symlink: bool,
 ) -> Result<ExitCode> {
     if name == "HEAD" && !target.starts_with("refs/") {
         return fatal("Refusing to point HEAD outside of refs/");
@@ -233,6 +244,10 @@ fn set_symref(
         deref: false,
     })?;
 
+    if prefer_symlink {
+        write_ref_symlink(repo, name_full.as_ref(), target);
+    }
+
     // gitoxide deliberately writes no reflog for symbolic-target updates, so the
     // entry git would have produced is appended here.
     if let Some(new) = new {
@@ -245,6 +260,75 @@ fn set_symref(
         )?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The deprecation notice `create_ref_symlink()` prints the first time it runs
+/// (refs/files-backend.c:2108-2118), byte for byte. Only the first line carries
+/// git's `warning: ` prefix; the rest spell their own `hint: `, and the line that
+/// shows the fix is separated from it by a **tab**.
+const SYMLINK_REFS_DEPRECATION: &str = "\
+warning: 'core.preferSymlinkRefs=true' is nominated for removal.
+hint: The use of symbolic links for symbolic refs is deprecated
+hint: and will be removed in Git 3.0. The configuration that
+hint: tells Git to use them is thus going away. You can unset
+hint: it with:
+hint:
+hint:\tgit config unset core.preferSymlinkRefs
+hint:
+hint: Git will then use the textual symref format instead.";
+
+/// `core.preferSymlinkRefs=true`: store the symbolic reference as a **symbolic
+/// link** to its target instead of as a `ref: <name>` file.
+///
+/// Port of `create_ref_symlink()` (refs/files-backend.c:2094-2119):
+///
+/// ```c
+/// ref_path = get_locked_file_path(&lock->lk);
+/// unlink(ref_path);
+/// ret = symlink(target, ref_path);
+/// …
+/// if (ret)
+///         fprintf(stderr, "no symlink - falling back to symbolic ref\n");
+/// ```
+///
+/// Note `get_locked_file_path` strips the `.lock` suffix, so git unlinks and
+/// re-creates the *live* reference rather than swapping a lock file into place —
+/// this write is not atomic upstream either. Here the textual form has already
+/// been written by the transaction above, so it is read back first and restored if
+/// the `symlink(2)` fails, which is the state git's fall-through leaves behind.
+///
+/// The deprecation warning is printed whether or not the link could be created,
+/// exactly as upstream prints it after the `if (ret)` fallback message.
+///
+/// Reading such a reference back is handled in the vendored `gix-ref`
+/// (`store/file/find.rs`'s `symlink_ref_contents`), so a repository written this
+/// way — by this port or by stock git — resolves identically either side.
+fn write_ref_symlink(repo: &gix::Repository, name: &FullNameRef, target: &str) {
+    // `HEAD` lives in the per-worktree git dir, `refs/…` in the common dir; take
+    // whichever one the transaction just wrote to.
+    let relative = gix::path::from_byte_slice(name.as_bstr());
+    let candidates = [repo.git_dir().join(relative), repo.common_dir().join(relative)];
+    let Some(ref_path) = candidates.into_iter().find(|p| p.symlink_metadata().is_ok()) else {
+        eprintln!("{SYMLINK_REFS_DEPRECATION}");
+        eprintln!("no symlink - falling back to symbolic ref");
+        return;
+    };
+
+    let textual = std::fs::read(&ref_path).ok();
+    let _ = std::fs::remove_file(&ref_path);
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(target, &ref_path);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(target, &ref_path);
+    if let Err(_err) = linked {
+        // Restore what the transaction wrote; git reaches the same state by
+        // letting the textual write proceed after the failed `symlink()`.
+        if let Some(textual) = textual {
+            let _ = std::fs::write(&ref_path, textual);
+        }
+        eprintln!("no symlink - falling back to symbolic ref");
+    }
+    eprintln!("{SYMLINK_REFS_DEPRECATION}");
 }
 
 /// `--delete` form. Refuses `HEAD`, and anything that is not a symbolic ref —

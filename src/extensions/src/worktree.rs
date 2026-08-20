@@ -6,6 +6,63 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+/// `DEFAULT_NUM_WORKERS` (`parallel-checkout.c:41`).
+const DEFAULT_NUM_WORKERS: i64 = 1;
+/// `DEFAULT_THRESHOLD_FOR_PARALLELISM` (`parallel-checkout.c:40`).
+const DEFAULT_THRESHOLD_FOR_PARALLELISM: i64 = 100;
+
+/// Port of `get_parallel_checkout_configs()` (`parallel-checkout.c:44-67`):
+///
+/// ```c
+/// if (repo_config_get_int(the_repository, "checkout.workers", num_workers))
+///         *num_workers = DEFAULT_NUM_WORKERS;
+/// else if (*num_workers < 1)
+///         *num_workers = online_cpus();
+///
+/// if (repo_config_get_int(the_repository, "checkout.thresholdForParallelism", threshold))
+///         *threshold = DEFAULT_THRESHOLD_FOR_PARALLELISM;
+/// ```
+///
+/// Returns `(workers, threshold)`, or the `fatal:` line git dies with when either
+/// value is unreadable. Both are `git_config_int`, so a bad value is
+/// `bad numeric config value …` — and note that the *worker count* is read first,
+/// so with both keys broken it is `checkout.workers` that reports.
+///
+/// # What is honored
+///
+/// The threshold decides how many entries a checkout must have before git hands
+/// them to `checkout--worker` processes instead of writing them inline
+/// (`unpack-trees.c:482` calls this from `check_updates()`, then
+/// `run_parallel_checkout(&state, pc_workers, pc_threshold, …)` at `:504`). This
+/// port writes every entry inline — `checkout_subset` below is a single-threaded
+/// `gix_worktree_state::checkout`, and `porcelain::checkout__worker` implements
+/// the helper's command line and pkt-line framing but not the item protocol — so
+/// no value of either key changes which files appear or what is in them. What is
+/// reproduced is the read itself and its rejection, which is observable: git
+/// refuses the command outright, before any file is touched.
+///
+/// `GIT_TEST_CHECKOUT_WORKERS`, the environment escape hatch that short-circuits
+/// both reads (`parallel-checkout.c:46-58`), is deliberately not honored: it exists
+/// to force git's own test suite onto the parallel path this port does not have.
+pub fn parallel_checkout_configs(repo: &gix::Repository) -> Result<(i64, i64), String> {
+    let workers = match crate::config::config_int_named(repo, "checkout.workers", "checkout.workers")? {
+        // `online_cpus()` for a count below one, which is how `checkout.workers=0`
+        // asks for "one per core".
+        Some(n) if n < 1 => {
+            i64::try_from(std::thread::available_parallelism().map_or(1, |n| n.get())).unwrap_or(1)
+        }
+        Some(n) => n,
+        None => DEFAULT_NUM_WORKERS,
+    };
+    let threshold = crate::config::config_int_named(
+        repo,
+        "checkout.thresholdForParallelism",
+        "checkout.thresholdForParallelism",
+    )?
+    .unwrap_or(DEFAULT_THRESHOLD_FOR_PARALLELISM);
+    Ok((workers, threshold))
+}
+
 /// Check out `index` into `dir`, skipping the call entirely when the index has
 /// no entries.
 ///

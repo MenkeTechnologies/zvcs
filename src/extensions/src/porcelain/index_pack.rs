@@ -845,7 +845,15 @@ fn index_empty_from_stdin(
 /// can fail:
 ///
 /// * `fsck_object()` from `sha1_object()`, on every object the pack holds →
-///   `fsck error in packed object`.
+///   `fsck error in packed object`. A *blob* is only checked if some object
+///   already in `gitmodules_found`/`gitattributes_found` named it, which for a
+///   blob under `core.bigFileThreshold` means the naming tree came earlier in the
+///   pack. A blob over the threshold is different: `unpack_entry_data()`
+///   (`builtin/index-pack.c:488`) hands over `NULL` for it, and
+///   `parse_pack_objects()` (`builtin/index-pack.c:1279`) puts it on a delay list
+///   drained once the whole pack has been read, so it is always checked against
+///   the complete set — and that null buffer is the only thing that ever reports
+///   `gitmodulesLarge`.
 /// * `fsck_walk()` plus `check_objects()`, under `--strict` only: every object a
 ///   packed object links to must be in the pack or already in the object
 ///   database, with the type the link implies → `did not receive expected
@@ -882,11 +890,73 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
     let mut queued: Vec<(ObjectId, bool, bool)> = Vec::new();
     let mut links: Vec<(ObjectId, ObjKind)> = Vec::new();
     let mut object_error = false;
+    // `options->gitmodules_found` / `gitattributes_found` as they stand *while*
+    // the pack is being walked, so the per-object pass below can tell a blob some
+    // earlier object already named from one nothing has named yet.
+    let mut modules_found: std::collections::HashSet<ObjectId> = Default::default();
+    let mut attrs_found: std::collections::HashSet<ObjectId> = Default::default();
+    // `options->gitmodules_done` / `gitattributes_done`: what `fsck_finish()`
+    // skips (`fsck.c:1334`).
+    let mut done_early: std::collections::HashSet<ObjectId> = Default::default();
+    // `parse_pack_objects()`'s delay list: the blobs `unpack_entry_data()` could
+    // not hand over, drained after the whole pack has been read.
+    let mut delayed: Vec<ObjectId> = Vec::new();
+    /// One blob finding from the per-object pass, at `index-pack`'s always-strict
+    /// severity and in its spelling — which names the object, not its type.
+    fn report_blob_finding(
+        finding: &super::fsck::Finding,
+        id: &ObjectId,
+        object_error: &mut bool,
+    ) {
+        match strict_severity(finding.msg) {
+            Severity::Ignore => {}
+            Severity::Info | Severity::Warn => {
+                eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
+            }
+            Severity::Error | Severity::Fatal => {
+                eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
+                *object_error = true;
+            }
+        }
+    }
+    // `repo_settings_get_big_file_threshold()`. `index-pack` can run outside a
+    // repository, where git falls back to the same built-in default.
+    let threshold = gix::discover(".")
+        .map(|repo| super::fsck::big_file_threshold(&repo))
+        .unwrap_or(512 * 1024 * 1024);
 
     for (_, index) in &order {
         let id = bundle.index.oid_at_index(*index).to_owned();
         let (object, _) = bundle.get_object_by_index(*index, &mut buf, &mut inflate, &mut cache)?;
         let (kind, data) = (object.kind, object.data.to_vec());
+
+        // `parse_pack_objects()` (`builtin/index-pack.c:1284`) fscks every
+        // non-delta object as it is unpacked, so a blob an earlier object in the
+        // pack already named is linted here rather than in `fsck_finish()`.
+        //
+        // A blob over `core.bigFileThreshold` goes on the *delay* list instead
+        // (`builtin/index-pack.c:1279`): `unpack_entry_data()`
+        // (`builtin/index-pack.c:488`) inflated it into a fixed scratch buffer
+        // and returned `NULL`, so it is re-visited once the whole pack has been
+        // read (`builtin/index-pack.c:1308`) — by which point every tree has
+        // named what it names. That null buffer is the only thing that ever
+        // reports `gitmodulesLarge`: `fsck_blobs()` reads the whole object
+        // (`fsck.c:1337`), so the finish pass never can.
+        if kind == ObjKind::Blob {
+            if data.len() as u64 > threshold {
+                delayed.push(id);
+                continue;
+            }
+            let as_modules = modules_found.contains(&id);
+            let as_attrs = attrs_found.contains(&id);
+            if as_modules || as_attrs {
+                done_early.insert(id);
+                for finding in check_blob(Some(&data), as_modules, as_attrs) {
+                    report_blob_finding(&finding, &id, &mut object_error);
+                }
+            }
+            continue;
+        }
 
         let checked = check_object(kind, &data, true, hash.len_in_hex());
         // `init_tree_desc_gently()` and `update_tree_entry_gently()` call
@@ -909,14 +979,32 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
         }
         for blob in &checked.gitmodules {
             queued.push((*blob, true, false));
+            modules_found.insert(*blob);
         }
         for blob in &checked.gitattributes {
             queued.push((*blob, false, true));
+            attrs_found.insert(*blob);
         }
         if strict {
             collect_links(kind, &data, &mut links, hash);
         }
     }
+    // `parse_pack_objects()`'s delayed sweep (`builtin/index-pack.c:1308`): the
+    // streamed blobs, now that every tree in the pack has named what it names.
+    // Still part of the per-object pass, so a finding here is
+    // `fsck error in packed object`.
+    for id in &delayed {
+        let as_modules = modules_found.contains(id);
+        let as_attrs = attrs_found.contains(id);
+        if !as_modules && !as_attrs {
+            continue;
+        }
+        done_early.insert(*id);
+        for finding in check_blob(None, as_modules, as_attrs) {
+            report_blob_finding(&finding, id, &mut object_error);
+        }
+    }
+
     if object_error {
         crate::git_fatal!("fsck error in packed object");
     }
@@ -951,7 +1039,8 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
         let mut finish_error = false;
         let mut done: Vec<ObjectId> = Vec::new();
         for (id, as_modules, as_attrs) in &queued {
-            if done.contains(id) {
+            // `fsck_blobs()` skips whatever the per-object pass already linted.
+            if done.contains(id) || done_early.contains(id) {
                 continue;
             }
             done.push(*id);
@@ -982,7 +1071,13 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
                 finish_error = true;
                 continue;
             }
-            for finding in check_blob(&data, *as_modules, *as_attrs) {
+            // `fsck_finish()` reaches a queued blob through `fsck_blobs()`, which
+            // always reads the whole object (`fsck.c:1337`), so no blob is
+            // streamed here however big it is. The streamed case belongs to the
+            // per-object pass above, where `unpack_entry_data()` returns `NULL`
+            // for a blob over `core.bigFileThreshold`
+            // (`builtin/index-pack.c:488`) — see [`fsck_pack_blob_buffer`].
+            for finding in check_blob(Some(&data), *as_modules, *as_attrs) {
                 match strict_severity(finding.msg) {
                     Severity::Ignore => {}
                     Severity::Info | Severity::Warn => {
@@ -1229,35 +1324,26 @@ fn parse_index_version(rest: &str) -> Option<(u64, Option<u64>)> {
     }
 }
 
-/// Every fsck message id git recognises, each the enum name from
-/// `FOREACH_FSCK_MSG_ID` (fsck.h) lowercased with underscores removed — the
-/// exact string `parse_msg_id()` compares a lowercased user token against.
-const FSCK_MSG_IDS: &[&str] = &[
-    "nulinheader", "unterminatedheader", "badheadercontinuation", "baddate",
-    "baddateoverflow", "bademail", "badgpgsig", "badheadtarget", "badname",
-    "badobjectsha1", "badpackedrefentry", "badpackedrefheader", "badparentsha1",
-    "badreferentname", "badrefcontent", "badreffiletype", "badrefname",
-    "badrefoid", "badtimezone", "badtree", "badtreesha1", "badtype",
-    "duplicateentries", "gitattributesblob", "gitattributeslarge",
-    "gitattributeslinelength", "gitattributesmissing", "gitmodulesblob",
-    "gitmoduleslarge", "gitmodulesmissing", "gitmodulesname", "gitmodulespath",
-    "gitmodulessymlink", "gitmodulesupdate", "gitmodulesurl", "missingauthor",
-    "missingcommitter", "missingemail", "missingnamebeforeemail", "missingobject",
-    "missingspacebeforedate", "missingspacebeforeemail", "missingtag",
-    "missingtagentry", "missingtree", "missingtype", "missingtypeentry",
-    "multipleauthors", "packedrefentrynotterminated", "packedrefunsorted",
-    "treenotsorted", "unknowntype", "zeropaddeddate", "badreftabletablename",
-    "emptyname", "fullpathname", "hasdot", "hasdotdot", "hasdotgit",
-    "largepathname", "nullsha1", "nulincommit", "zeropaddedfilemode",
-    "badfilemode", "badtagname", "emptypackedrefsfile", "gitattributessymlink",
-    "gitignoresymlink", "gitmodulesparse", "mailmapsymlink", "missingtaggerentry",
-    "refmissingnewline", "symlinkref", "symreftargetisnotaref",
-    "trailingrefcontent", "extraheaderentry",
-];
+/// Whether `id` — already lowercased by the caller, as `fsck_set_msg_types()`
+/// lowercases the token — names a message `parse_msg_id()` knows.
+///
+/// `prepare_msg_ids()` (`fsck.c:42`) builds its comparison key by lowercasing the
+/// `FOREACH_FSCK_MSG_ID` enum name and dropping the underscores, which is exactly
+/// the ASCII-lowercase of the camel-cased id [`super::fsck::MSGS`] already
+/// carries: `BAD_TREE_SHA1` → `badtreesha1` → `badTreeSha1`. So the table is the
+/// single source for both, rather than a second hand-maintained list that can
+/// drift from it.
+fn is_fsck_msg_id(id: &str) -> bool {
+    super::fsck::MSGS.iter().any(|m| m.id.to_ascii_lowercase() == id)
+}
 
-/// The fsck message ids whose default severity is `FSCK_FATAL`; git refuses to
-/// demote these to anything other than `error`.
-const FSCK_FATAL_IDS: &[&str] = &["nulinheader", "unterminatedheader"];
+/// Whether `id` names a message whose default severity is `FSCK_FATAL`; git
+/// refuses to demote one of those to anything other than `error` (`fsck.c:176`).
+fn is_fsck_fatal_id(id: &str) -> bool {
+    super::fsck::MSGS
+        .iter()
+        .any(|m| m.default == super::fsck::Severity::Fatal && m.id.to_ascii_lowercase() == id)
+}
 
 /// Validate a `--strict=<v>` / `--fsck-objects=<v>` message-type list exactly as
 /// git's `fsck_set_msg_types()` → `fsck_set_msg_type()` do, dying (fatal, exit
@@ -1284,13 +1370,13 @@ fn validate_fsck_msg_types(values: &str) -> std::result::Result<(), ExitCode> {
         };
         let id = token[..eq].to_ascii_lowercase();
         let severity = &token[eq + 1..];
-        if !FSCK_MSG_IDS.contains(&id.as_str()) {
+        if !is_fsck_msg_id(&id) {
             return Err(fatal(format!("Unhandled message id: {id}")));
         }
         if !matches!(severity, "error" | "warn" | "ignore") {
             return Err(fatal(format!("Unknown fsck message type: '{severity}'")));
         }
-        if severity != "error" && FSCK_FATAL_IDS.contains(&id.as_str()) {
+        if severity != "error" && is_fsck_fatal_id(&id) {
             return Err(fatal(format!("Cannot demote {id} to {severity}")));
         }
     }

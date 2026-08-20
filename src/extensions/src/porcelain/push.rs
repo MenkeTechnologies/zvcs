@@ -1337,7 +1337,10 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
     let colors = super::color::PushColors::resolve(gix::discover(".").ok().as_ref());
     let mut any_failed = outcome.unpack.is_err();
     if let Err(reason) = &outcome.unpack {
-        eprintln!("error: unpack failed: {reason}");
+        // `receive_status()` (`send-pack.c:160`): `error(_("remote unpack failed:
+        // %s"), reader->line)`. The `remote ` is part of the sentence — the
+        // status line came off the wire, not from anything local.
+        eprintln!("error: remote unpack failed: {reason}");
     }
 
     // Refs rejected while matching against the advertisement — `--delete` of a

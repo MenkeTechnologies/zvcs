@@ -223,6 +223,9 @@
 //! (a gitlink whose submodule is already checked out passes under git too).
 
 use anyhow::Result;
+// Every `print!`/`println!` below goes through git's stdout buffer; see
+// `crate::cstdio` and the `defer()` call in `merge()`.
+use crate::cstdio::{print, println};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -550,20 +553,51 @@ impl Opts {
     }
 
     /// `use_strategies` after `if (!use_strategies)` has filled in a default
-    /// (builtin/merge.c:1599-1606). The default is chosen by the *head count*
+    /// (builtin/merge.c:1601-1608). The default is chosen by the *head count*
     /// and only when no `-s` was given: `add_strategies(pull_twohead,
     /// DEFAULT_TWOHEAD)` for one head, `add_strategies(pull_octopus,
-    /// DEFAULT_OCTOPUS)` for several. With `merge.twohead`/`merge.octopus`
-    /// unset, `add_strategies()` falls through to the `all_strategy[]` entries
-    /// carrying the attribute, i.e. `ort` and `octopus`.
-    fn picks(&self, head_count: usize) -> Vec<Pick> {
+    /// DEFAULT_OCTOPUS)` for several.
+    ///
+    /// **`pull.twohead` and `pull.octopus`** are those two strings, read by
+    /// `git_merge_config()` (builtin/merge.c:708-713). The keys are spelled
+    /// `pull.*` and live in *this* command, not in `pull`: `git pull` never
+    /// looks at them, it forwards its heads to `merge`, so the two settings
+    /// govern `git merge` just as much as a pull. Set, the value is a
+    /// *space-separated list* of strategies (`add_strategies()`,
+    /// builtin/merge.c:872-889) that is tried in order until one succeeds, and
+    /// it replaces the built-in default rather than adding to it. Unset,
+    /// `add_strategies()` falls through to the `all_strategy[]` entries carrying
+    /// the attribute — `ort` for two heads, `octopus` for more.
+    ///
+    /// An unknown name in the list is `get_strategy()`'s error, so a typo in
+    /// `pull.twohead` fails the merge with the same two lines a bad `-s` does.
+    fn picks(
+        &self,
+        head_count: usize,
+        config: &StrategyConfig,
+    ) -> std::result::Result<Vec<Pick>, ExitCode> {
         if !self.strategies.is_empty() {
-            return self.strategies.clone();
+            return Ok(self.strategies.clone());
         }
-        match head_count > 1 {
-            true => vec![Pick::new(Strategy::Octopus, "octopus")],
-            false => vec![Pick::new(Strategy::Ort, "ort")],
+        let (configured, fallback) = match head_count > 1 {
+            true => (config.octopus.as_deref(), Strategy::Octopus),
+            false => (config.twohead.as_deref(), Strategy::Ort),
+        };
+        let Some(configured) = configured else {
+            let name = match fallback {
+                Strategy::Octopus => "octopus",
+                _ => "ort",
+            };
+            return Ok(vec![Pick::new(fallback, name)]);
+        };
+        let mut picks = Vec::new();
+        // `string_list_split(&list, string, " ", -1)` keeps empty fields, so a
+        // value of `" "` really does ask for two nameless strategies and dies on
+        // the first.
+        for name in configured.split(char::from(32)) {
+            picks.push(Pick::new(resolve_strategy(name)?, name));
         }
+        Ok(picks)
     }
 
     /// `option_commit`: `--no-commit` clears it, and so does `--squash`
@@ -575,7 +609,74 @@ impl Opts {
     }
 }
 
+/// The two default-strategy strings `git_merge_config()` keeps
+/// (builtin/merge.c:110, :708-713): `pull.octopus` for a merge with more than
+/// one head, `pull.twohead` for the ordinary one-head case.
+///
+/// An **empty** value counts as configured, not as unset. `git_config_string()`
+/// stores `""`, `add_strategies()` sees a non-NULL string and splits it, and the
+/// one empty field it yields reaches `get_strategy("")` — which names no
+/// strategy, so stock dies:
+///
+/// ```text
+/// $ git -c pull.twohead= merge side
+/// Could not find merge strategy ''.
+/// Available strategies are: octopus ours recursive resolve subtree.
+/// ```
+///
+/// Treating it as unset here would silently merge with `ort` instead.
+#[derive(Default)]
+struct StrategyConfig {
+    twohead: Option<String>,
+    octopus: Option<String>,
+}
+
+/// Read [`StrategyConfig`] from the repository configuration.
+fn strategy_config(repo: &gix::Repository) -> StrategyConfig {
+    let snapshot = repo.config_snapshot();
+    let string = |key: &str| snapshot.string(key).map(|v| v.to_str_lossy().into_owned());
+    StrategyConfig { twohead: string("pull.twohead"), octopus: string("pull.octopus") }
+}
+
+/// `git_merge_config()`'s `branch.<current>.mergeoptions` capture
+/// (builtin/merge.c:667-674) split the way `parse_branch_merge_options()`
+/// (builtin/merge.c:641-659) splits it.
+///
+/// `branch` is `refs_resolve_refdup(…, "HEAD", 0, …)` with `refs/heads/` stripped
+/// (builtin/merge.c:1393-1397). The `0` flags matter: the ref is resolved without
+/// `RESOLVE_REF_READING`, so an *unborn* branch still yields its own name, and a
+/// detached HEAD yields the literal `HEAD` — which is why
+/// `branch.HEAD.mergeoptions` is a real (if odd) setting.
+///
+/// The error text is git's, down to the lowercase `mergeoptions` spelling the
+/// `die()` format string hard-codes regardless of how the key was written in the
+/// file.
+fn branch_merge_options() -> std::result::Result<Vec<String>, String> {
+    let Ok(repo) = gix::discover(".") else {
+        return Ok(Vec::new());
+    };
+    let branch = match repo.head_ref() {
+        Ok(Some(r)) => r.name().shorten().to_string(),
+        // `git symbolic-ref HEAD` failing is a detached HEAD, where
+        // `resolve_refdup` hands back the unresolved `HEAD` itself.
+        _ => "HEAD".to_string(),
+    };
+    let Some(raw) = repo.config_snapshot().string(&format!("branch.{branch}.mergeoptions")) else {
+        return Ok(Vec::new());
+    };
+    let raw = raw.to_string();
+    match crate::alias::split_cmdline(&raw) {
+        Ok(words) => Ok(words),
+        Err(e) => Err(format!("Bad branch.{branch}.mergeoptions string: {e}")),
+    }
+}
+
 pub fn merge(args: &[String]) -> Result<ExitCode> {
+    // `Updating <a>..<b>`, `Fast-forward` and the diffstat are stdout
+    // (builtin/merge.c); a refused checkout's `error: …`/`Aborting` is stderr.
+    // stdio holds the stdout half off a terminal, which is why stock prints the
+    // refusal first into a pipe. See `crate::cstdio`.
+    crate::cstdio::defer();
     let mut op = Op::Merge;
     let mut opts = Opts::default();
     let mut refs: Vec<String> = Vec::new();
@@ -619,6 +720,33 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+
+    // `parse_branch_merge_options()` (builtin/merge.c:641-659), driven from
+    // :1407-1408. `branch.<current>.mergeoptions` is not a set of typed knobs but
+    // a *command line*: git splits it with `split_cmdline()` and runs the whole
+    // `builtin_merge_options` table over it, with `argv[0]` faked as
+    // `branch.*.mergeoptions`, **before** `parse_options()` sees the real argv.
+    // Both writes land in the same variables, so anything the user typed
+    // afterwards wins — `branch.main.mergeoptions = --no-ff` plus a command-line
+    // `--ff` fast-forwards.
+    //
+    // Splicing the words in front of `args` reproduces that ordering exactly,
+    // because this loop is the same table applied left to right. The one thing
+    // that must not carry over is a *non-option* word: `parse_options()` leaves
+    // those in its own argv and `parse_branch_merge_options()` throws that argv
+    // away, so `--no-ff zzjunk` merges without fast-forwarding and never treats
+    // `zzjunk` as a head. `config_argc` below is the boundary that drops them.
+    let (args, config_argc) = match branch_merge_options() {
+        Ok(words) => {
+            let n = words.len();
+            (words.into_iter().chain(args.iter().cloned()).collect::<Vec<String>>(), n)
+        }
+        Err(msg) => {
+            eprintln!("fatal: {msg}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+    let args: &[String] = &args;
 
     let mut i = 0;
     while i < args.len() {
@@ -886,7 +1014,14 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             _ if a.len() > 1 && a.starts_with('-') => {
                 anyhow::bail!("unsupported flag {a}")
             }
-            _ => refs.push(a.to_string()),
+            // A head to merge — unless it came out of `branch.<n>.mergeoptions`,
+            // whose leftover non-options `parse_branch_merge_options()` discards
+            // along with the argv it parsed them into.
+            _ => {
+                if i >= config_argc {
+                    refs.push(a.to_string());
+                }
+            }
         }
         i += 1;
     }
@@ -1003,6 +1138,11 @@ fn restore_state(head: ObjectId, snapshot: Option<ObjectId>) -> Result<()> {
     let apply = ["apply", "--index", "--quiet", &commit.to_string()].map(str::to_string);
     // "It is OK to ignore error here, for example when there was nothing to
     // restore." (builtin/merge.c:415-418)
+    // git applies a merge autostash by spawning `git stash apply`
+    // (`apply_autostash_oid()`), so `start_command()`'s `fflush(NULL)`
+    // (run-command.c:743) puts everything buffered so far out ahead of it. This
+    // port runs `stash` in-process; the flush is what keeps the order the same.
+    crate::cstdio::before_spawn();
     let _ = super::stash::stash(&apply);
     Ok(())
 }
@@ -1164,6 +1304,9 @@ fn merge_with_strategies(
     // bracket the whole loop, not each attempt: one snapshot is what every
     // `restore_state()` below rewinds to.
     let stash = begin_autostash(repo, opts)?;
+    // Same `fflush(NULL)` as above: git reaches `stash create` through
+    // `run_command()` too.
+    crate::cstdio::before_spawn();
     let snapshot = super::stash::create_snapshot(repo)?;
 
     let mut best: Option<usize> = None;
@@ -1720,7 +1863,10 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // (builtin/merge.c:1599-1606). Everything below reads this list rather than
     // any single `-s`: the attribute union that decides `fast_forward` and
     // `allow_trivial`, and the loop that tries each in turn.
-    let picks = opts.picks(targets.len());
+    let picks = match opts.picks(targets.len(), &strategy_config(&repo)) {
+        Ok(picks) => picks,
+        Err(code) => return Ok(code),
+    };
 
     // More than one head. `add_strategies(pull_octopus, DEFAULT_OCTOPUS)`
     // (builtin/merge.c:1605) only picks the octopus when no `-s` was given; a
@@ -3411,6 +3557,9 @@ fn launch_editor(repo: &gix::Repository, path: &Path) -> Result<bool> {
     if editor == ":" {
         return Ok(true);
     }
+    // `start_command()`'s `fflush(NULL)` (run-command.c:743): the editor takes
+    // over the terminal, so nothing may still be sitting in the buffer.
+    crate::cstdio::before_spawn();
     let status = crate::external::prepare_shell_cmd_str(&editor, [path]).status();
     match status {
         Ok(status) if status.success() => Ok(true),

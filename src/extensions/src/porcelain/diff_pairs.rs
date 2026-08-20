@@ -149,10 +149,10 @@
 //!   supported`, exit 128 — this matches stock git's `builtin/diff-pairs.c`, which dies
 //!   with the same message rather than recursing.
 //! * `--anchored=<text>`: git runs it as a patience diff carrying anchor prefixes
-//!   (`xpp->anchors`). The vendored `gix-imara-diff` has the patience algorithm itself
-//!   (`patience.rs`, a port of `xdiff/xpatience.c`, reached by `--patience` below), but
-//!   no way to pass anchors in — `is_anchor()` is constantly false there — so this bails
-//!   rather than silently dropping the anchors.
+//!   (`xpp->anchors`). The vendored `gix-imara-diff` takes them now
+//!   (`Diff::compute_with_anchors`, reached through [`set_anchor_texts`]), and
+//!   `git diff` / `git log -p` publish them — but *this* verb still does not parse the
+//!   flag, so it bails rather than silently dropping the anchors.
 //! * `--find-copies-harder` is parsed and fed to `diffcore_rename`, but a `diff-pairs`
 //!   batch only ever contains the pairs stdin listed: git supplies the unmodified pairs
 //!   the option needs from a tree walk, and there is none here, so it behaves as plain
@@ -4499,7 +4499,34 @@ pub(crate) fn compute_compacted(
 ) -> gix::diff::blob::Diff {
     use gix::diff::blob::{compact, IndentHeuristic, IndentLevel, SliderHeuristic, Token};
 
-    let mut diff = gix::diff::blob::Diff::compute(algorithm, input);
+    // ```c
+    // static int diff_opt_anchored(const struct option *opt, const char *arg, int unset)
+    // {
+    //         options->xdl_opts = DIFF_WITH_ALG(options, PATIENCE_DIFF);
+    //         ALLOC_GROW(options->anchors, options->anchors_nr + 1, options->anchors_alloc);
+    //         options->anchors[options->anchors_nr++] = xstrdup(arg);
+    //         return 0;
+    // }
+    // ```
+    //
+    // (`diff.c:5544-5556`.) The anchors ride into `xdl_diff()` on `xpp->anchors`
+    // (`diff.c:4056-4057`) and are read by `xdl_do_patience_diff()` alone, so they are
+    // inert under any other algorithm — which is what makes a later
+    // `--diff-algorithm=histogram` silently drop them. `is_anchor()` matches the *raw*
+    // record text, before any whitespace normalization, so the flags are decided from
+    // `after` rather than from the interned tokens.
+    let anchors = anchor_texts();
+    let mut diff = if algorithm == gix::diff::blob::Algorithm::Patience && !anchors.is_empty() {
+        let flags: Vec<bool> = after
+            .iter()
+            .map(|line| anchors.iter().any(|a| line.starts_with(a.as_bytes())))
+            .collect();
+        let mut diff = gix::diff::blob::Diff::default();
+        diff.compute_with_anchors(&input.before, &input.after, &flags);
+        diff
+    } else {
+        gix::diff::blob::Diff::compute(algorithm, input)
+    };
     if algorithm == gix::diff::blob::Algorithm::Histogram {
         // Histogram is the one algorithm whose `xdl_change_compact()` does more than slide:
         // a group that grew by merging during the slide can hold lines that match in both
@@ -5742,4 +5769,24 @@ fn def_ff(rec: &[u8]) -> Option<&[u8]> {
         len -= 1;
     }
     Some(&rec[..len])
+}
+
+/// git's `diff_options.anchors` — the repeatable `--anchored=<text>` list.
+///
+/// One `diff_options` per command in git, and this port's blob-diff entry point
+/// ([`compute_compacted`]) is reached from a dozen call sites that thread no diff
+/// options of their own, so the list lives here for the process the way
+/// [`crate::quote`] holds `quote_path_fully`. It is written once, while the command
+/// line is being parsed, and only read afterwards.
+static ANCHORS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Publish the `--anchored=<text>` list for the rest of this command. The first call
+/// wins, matching git's single option parse.
+pub(crate) fn set_anchor_texts(anchors: Vec<String>) {
+    let _ = ANCHORS.set(anchors);
+}
+
+/// The published anchors, empty when `--anchored` was not given.
+fn anchor_texts() -> &'static [String] {
+    ANCHORS.get().map_or(&[], Vec::as_slice)
 }

@@ -134,6 +134,26 @@
 //!     component is in the set, its `.idx`/`.rev`/`.mtimes` when `pack-metadata`
 //!     is. `core.fsyncObjectFiles` is read for its deprecation warning and its
 //!     effect on the `loose-object` component.
+//!   * `pack.usePathWalk` — the default for `--path-walk`, resolved by
+//!     [`resolve_path_walk`] exactly as `builtin/pack-objects.c:5188-5197` does.
+//!     The walk itself is not implemented, but the *diagnostics* the flag gates
+//!     are: `--path-walk` (however it was turned on) together with
+//!     `--delta-islands`, or with a `--filter` carrying a non-zero `tree:<n>`,
+//!     warns `cannot use <option> with --path-walk` and switches the walk back
+//!     off — see [`path_walk_filter_compatible`].
+//!   * `pack.useSparse`, `pack.readReverseIndex`,
+//!     `pack.useBitmapBoundaryTraversal` — read through
+//!     [`crate::repo_settings::RepoSettings`], which git resolves in
+//!     `prepare_repo_settings()` before `git_pack_config()` and therefore before
+//!     parse-options; a value that is not a boolean is fatal here just as it is
+//!     in git, `-h` included. None of the three steers anything in this port;
+//!     each field on `RepoSettings` says what it would have steered.
+//!   * `pack.useBitmaps`, `pack.allowPackReuse` — read in
+//!     [`PackConfig::load`], git's `git_pack_config()`. Neither reading an
+//!     existing `.bitmap` nor verbatim pack reuse exists here, so both are
+//!     validated and reported and then unused; `pack.allowPackReuse` has its own
+//!     tri-state grammar and its own `fatal:`, which is why it is not a plain
+//!     boolean.
 
 use anyhow::Result;
 use gix::hash::ObjectId;
@@ -481,6 +501,17 @@ struct State {
     write_bitmap_index: bool,
     /// `--delta-islands`: honour `pack.island` in the delta search.
     delta_islands: bool,
+    /// `--sparse` / `--no-sparse`. `None` leaves git's `sparse` at the value
+    /// `prepare_repo_settings()` seeded it with (`pack.useSparse`, default on).
+    sparse: Option<bool>,
+    /// `--path-walk` / `--no-path-walk`. `None` is git's `path_walk = -1`, which
+    /// [`resolve_path_walk`] then resolves against `pack.usePathWalk`.
+    path_walk: Option<bool>,
+    /// `--use-bitmap-index` / `--no-use-bitmap-index`. `None` is git's
+    /// `use_bitmap_index = -1`; `pack.useBitmaps` only fills it in much later
+    /// (`builtin/pack-objects.c:5334`), which is why the `--path-walk` default
+    /// at :5189 sees the flag alone.
+    use_bitmap_index: Option<bool>,
     /// Whether the phase meters and the end-of-run summary go to stderr. Seeded
     /// from `isatty(2)` in [`parse`], then `-q` and `--progress` (and
     /// `--all-progress`) override it, last one wins.
@@ -509,6 +540,188 @@ enum Parsed {
     Exit(ExitCode),
 }
 
+/// `enum pack_reuse` (`builtin/pack-objects.c:246-251`): how much of an existing
+/// pack `pack-objects` may copy verbatim into the new one.
+///
+/// Nothing here reuses pack bytes — every entry is re-encoded from the object it
+/// names — so the value only ever records what git *would* have done. It exists
+/// as its own type rather than a boolean because `pack.allowPackReuse` is a
+/// tri-state whose invalid values get their own diagnostic.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum PackReuse {
+    /// `NO_PACK_REUSE` — the value a false boolean selects.
+    None,
+    /// `SINGLE_PACK_REUSE` — git's default, and what a true boolean selects.
+    Single,
+    /// `MULTI_PACK_REUSE` — `multi`, or `feature.experimental` by way of
+    /// `r->settings.pack_use_multi_pack_reuse`.
+    Multi,
+}
+
+/// The `git_pack_config()` keys this port reads that are not already resolved
+/// elsewhere — `pack.useBitmaps` and `pack.allowPackReuse`.
+///
+/// git reads them in `repo_config(the_repository, git_pack_config, NULL)`
+/// (`builtin/pack-objects.c:5173`), which runs *before* `parse_options`, so a
+/// value git cannot read is fatal ahead of every parse diagnostic including
+/// `-h`. Verified against git 2.55.0 inside a repository:
+///
+/// ```text
+/// $ git -c pack.useBitmaps=bogus pack-objects -h
+/// fatal: bad boolean config value 'bogus' for 'pack.usebitmaps'
+/// $ git -c pack.allowPackReuse=bogus pack-objects -h
+/// fatal: invalid pack.allowPackReuse value: 'bogus'
+/// ```
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct PackConfig {
+    /// `use_bitmap_index_default` (`builtin/pack-objects.c:244`, set at :3709),
+    /// the fallback for `--use-bitmap-index`. On in git.
+    ///
+    /// It only ever decides whether an existing `.bitmap` is *read* to shortcut
+    /// counting; `gix-pack` has no bitmap reader, so the object list is walked
+    /// either way and the pack is the same either way.
+    pub(crate) use_bitmap_index_default: bool,
+    /// `allow_pack_reuse` (`builtin/pack-objects.c:251`), seeded from
+    /// `r->settings.pack_use_multi_pack_reuse` at :5167 and then overridden by
+    /// `pack.allowPackReuse` at :3729-3743.
+    pub(crate) allow_pack_reuse: PackReuse,
+}
+
+impl PackConfig {
+    /// `git_pack_config()` for the two keys above, with `settings` supplying the
+    /// `MULTI_PACK_REUSE` seed `prepare_repo_settings()` already resolved.
+    ///
+    /// `Err` carries the exact line git's `die()` prints, minus the `fatal: `
+    /// prefix.
+    pub(crate) fn load(
+        repo: &gix::Repository,
+        settings: &crate::repo_settings::RepoSettings,
+    ) -> Result<Self, String> {
+        // builtin/pack-objects.c:5167-5168, which runs before git_pack_config
+        // and is therefore the value the config overrides rather than the other
+        // way round.
+        let mut allow_pack_reuse = if settings.pack_use_multi_pack_reuse {
+            PackReuse::Multi
+        } else {
+            PackReuse::Single
+        };
+
+        // builtin/pack-objects.c:3729-3743. The boolean half is
+        // `git_parse_maybe_bool_text`, the *word*-only grammar — not
+        // `git_parse_maybe_bool` — so `true`/`yes`/`on`/`false`/`no`/`off` and
+        // the empty string are booleans while the digits are not: git 2.55.0
+        // rejects `pack.allowPackReuse=1` and `=0` with this key's own `die()`,
+        // which is neither a `bad boolean config value` nor a numeric
+        // diagnostic. The two mode words are compared with `strcasecmp`.
+        match crate::config::last_value_implicit(repo, "pack.allowpackreuse") {
+            None => {}
+            // A key written with no `=` at all: `git_parse_maybe_bool_text(NULL)`
+            // answers 1 before it looks at any text, so it is `SINGLE_PACK_REUSE`.
+            Some(None) => allow_pack_reuse = PackReuse::Single,
+            Some(Some(raw)) => {
+                allow_pack_reuse = match crate::optint::maybe_bool_text(&raw) {
+                    Some(true) => PackReuse::Single,
+                    Some(false) => PackReuse::None,
+                    None if raw.eq_ignore_ascii_case("single") => PackReuse::Single,
+                    None if raw.eq_ignore_ascii_case("multi") => PackReuse::Multi,
+                    // The one diagnostic here that names the key in git's
+                    // camelCase: it is a `die()` with a literal
+                    // `pack.allowPackReuse` in the format string, not the
+                    // lowercased `var` the config reader hands the callback.
+                    None => return Err(format!("invalid pack.allowPackReuse value: '{raw}'")),
+                };
+            }
+        }
+
+        // builtin/pack-objects.c:3725-3728, a plain `git_config_bool`.
+        let use_bitmap_index_default =
+            crate::repo_settings::config_bool_strict(repo, "pack.usebitmaps")?.unwrap_or(true);
+
+        Ok(PackConfig {
+            use_bitmap_index_default,
+            allow_pack_reuse,
+        })
+    }
+}
+
+/// `path_walk_filter_compatible()` (`path-walk.c:686-689`), which is
+/// `prepare_filters(NULL, options)` — the `info == NULL` half of
+/// `prepare_filters_one()`.
+///
+/// With no `path_walk_info` to fill in, every filter form returns 1 except a
+/// `tree:<depth>` with a non-zero depth, which `error()`s first and then returns
+/// 0; `combine:` recurses and fails on the first sub-filter that does. So the
+/// answer is "does this spec contain a non-zero `tree:<n>` anywhere", and the
+/// depth that answer found is the one git names.
+///
+/// `Err(depth)` is git's 0 return, carrying the number for the
+/// `error: tree:<n> filter not supported by the path-walk API` line the caller
+/// prints. Verified against git 2.55.0: `--filter=tree:0` is compatible,
+/// `--filter=tree:1` and `--filter=combine:blob:none+tree:2` are not.
+fn path_walk_filter_compatible(spec: &[u8]) -> Result<(), u64> {
+    if let Some(rest) = spec.strip_prefix(b"tree:".as_slice()) {
+        // The spec reached here only after `gently_parse_filter` accepted it, so
+        // the magnitude parses; a `None` cannot occur and is treated as the
+        // compatible depth zero rather than invented into a diagnostic.
+        let depth = git_parse_ulong(rest).unwrap_or(0);
+        if depth != 0 {
+            return Err(depth);
+        }
+        return Ok(());
+    }
+    if let Some(body) = spec.strip_prefix(b"combine:".as_slice()) {
+        // `parse_combine_filter`'s split, minus the validation it already did:
+        // percent-decode each segment and recurse, skipping the empty segments a
+        // leading or trailing `+` leaves behind.
+        for segment in body.split(|&c| c == b'+') {
+            if segment.is_empty() {
+                continue;
+            }
+            path_walk_filter_compatible(&url_percent_decode(segment))?;
+        }
+    }
+    Ok(())
+}
+
+/// `builtin/pack-objects.c:5188-5197`: the `--path-walk` default, resolved
+/// immediately after the no-output usage check and before any of the post-parse
+/// `die()`s.
+///
+/// ```c
+/// if (path_walk < 0) {
+///         if (use_bitmap_index > 0 || !use_internal_rev_list)
+///                 path_walk = 0;
+///         else if (the_repository->gitdir &&
+///                  the_repository->settings.pack_use_path_walk)
+///                 path_walk = 1;
+///         else
+///                 path_walk = git_env_bool("GIT_TEST_PACK_PATH_WALK", 0);
+/// }
+/// ```
+///
+/// `use_bitmap_index` is still `-1` here unless `--use-bitmap-index` was given
+/// explicitly — `pack.useBitmaps` is not folded in until line 5334 — so the
+/// first arm reads the *flag*, not the config. `GIT_TEST_PACK_PATH_WALK` is
+/// git's own test hook and is honoured for the same reason the other
+/// `GIT_TEST_*` hooks are.
+fn resolve_path_walk(st: &State, settings: Option<&crate::repo_settings::RepoSettings>) -> bool {
+    if let Some(explicit) = st.path_walk {
+        return explicit;
+    }
+    if st.use_bitmap_index == Some(true) || !st.internal_rev_list {
+        return false;
+    }
+    match settings {
+        Some(s) if s.pack_use_path_walk => true,
+        // `the_repository->gitdir` is false outside a repository, which is the
+        // `None` case here; both fall through to the environment hook.
+        _ => std::env::var("GIT_TEST_PACK_PATH_WALK")
+            .ok()
+            .and_then(|v| crate::optint::maybe_bool(&v))
+            .unwrap_or(false),
+    }
+}
+
 /// `git pack-objects` — argument validation, pre-flight checks, and the empty
 /// pack; a pack with entries in it is not ported.
 ///
@@ -527,20 +740,55 @@ pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    // git calls `git_config(git_pack_config, ...)` *before* `parse_options`, so a
-    // `pack.packSizeLimit` it cannot read is fatal ahead of every parse
-    // diagnostic — even ahead of `-h`. Verified against git 2.55.0: inside a repo
-    // both `pack-objects -h` and `pack-objects --nosuch` report the bad number
-    // instead. Outside a repository git never gets that far ("not a git
-    // repository" wins), which is why the read is skipped when discovery fails.
+    // `cmd_pack_objects()` reads configuration twice before `parse_options`, and
+    // both reads can be fatal ahead of every parse diagnostic — `-h` included.
+    // Verified against git 2.55.0 inside a repo: `pack-objects -h` reports the
+    // bad value instead of the usage block for each key below. Outside a
+    // repository git never gets that far ("not a git repository" wins), which is
+    // why both reads are skipped when discovery fails.
+    //
+    //   1. `prepare_repo_settings(the_repository)` (:5164) — the `feature.*`
+    //      macros, `core.packedGit*`, and the four `pack.*` booleans in
+    //      [`crate::repo_settings::RepoSettings`].
+    //   2. `repo_config(the_repository, git_pack_config, NULL)` (:5173) —
+    //      `pack.packSizeLimit` and [`PackConfig`]'s two keys.
+    //
+    // The order matters: `pack.useSparse=bogus pack.packSizeLimit=bogus` reports
+    // the boolean, because settings are prepared first.
+    let mut settings = None;
     let pack_size_limit_cfg = match gix::discover(".") {
-        Ok(repo) => match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
-            Ok(limit) => limit,
-            Err(message) => {
-                eprintln!("fatal: {message}");
-                return Ok(ExitCode::from(128));
+        Ok(repo) => {
+            let loaded = match crate::repo_settings::RepoSettings::load(&repo) {
+                Ok(s) => s,
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            };
+            let limit = match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
+                Ok(limit) => limit,
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            };
+            match PackConfig::load(&repo, &loaded) {
+                Ok(PackConfig { use_bitmap_index_default, allow_pack_reuse }) => {
+                    // git carries these to `:5334` (whether an existing
+                    // `.bitmap` shortcuts the object count) and `:4708` (how
+                    // much of an existing pack is copied verbatim). Neither
+                    // reader nor copier exists here, so the resolved values are
+                    // dropped rather than pretended into an effect.
+                    let _ = (use_bitmap_index_default, allow_pack_reuse);
+                }
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
             }
-        },
+            settings = Some(loaded);
+            limit
+        }
         Err(_) => None,
     };
 
@@ -549,7 +797,7 @@ pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
         Parsed::Ok(state) => state,
     };
 
-    if let Some(code) = preflight(&state) {
+    if let Some(code) = preflight(&state, settings.as_ref()) {
         return Ok(code);
     }
 
@@ -3745,7 +3993,7 @@ fn check_filter_spec(spec: &str) -> Option<ExitCode> {
 /// filter forms, in git's declaration order (which decides which diagnostic a
 /// near-miss like `blob:` or `object:` gets). `Err(msg)` carries the exact text
 /// git puts after `fatal: `.
-fn gently_parse_filter(arg: &[u8]) -> Result<(), String> {
+pub(super) fn gently_parse_filter(arg: &[u8]) -> Result<(), String> {
     // pack-objects does not set `allow_auto_filter`, so `auto` is always refused.
     if arg == b"auto" {
         return Err("'auto' filter not supported by this command".to_string());
@@ -4031,6 +4279,11 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         // this port emits neither warning.
         "write-bitmap-index" | "write-bitmap-index-quiet" => st.write_bitmap_index = on,
         "delta-islands" => st.delta_islands = on,
+        // The three `OPT_BOOL`s whose "unset" state the post-parse defaults read
+        // apart from their false state, so each is recorded as a tri-state.
+        "sparse" => st.sparse = Some(on),
+        "path-walk" => st.path_walk = Some(on),
+        "use-bitmap-index" => st.use_bitmap_index = Some(on),
         "quiet" => st.progress = !on,
         "progress" | "all-progress" => st.progress = on,
         "exclude-promisor-objects" => st.exclude_promisor = on,
@@ -4153,13 +4406,53 @@ fn to_number(v: &str) -> Option<i64> {
 ///
 /// The first check prints the bare usage block on stderr and exits 129; the rest
 /// are `die()`s and exit 128.
-fn preflight(st: &State) -> Option<ExitCode> {
+fn preflight(st: &State, settings: Option<&crate::repo_settings::RepoSettings>) -> Option<ExitCode> {
     // `pack_to_stdout != !base_name`, plus git's rejection of a second
     // positional. Beats every `fatal:` below: `--compression=99` on its own
     // reports usage, not a bad compression level.
     if st.stdout == (st.positionals.len() == 1) || st.positionals.len() > 1 {
         eprint!("{USAGE}");
         return Some(ExitCode::from(129));
+    }
+
+    // `builtin/pack-objects.c:5216-5228`, which sits between the usage check
+    // above (:5185) and the `bad pack compression level` die below (:5284):
+    //
+    // ```c
+    // if (path_walk) {
+    //         const char *option = NULL;
+    //         if (!path_walk_filter_compatible(&filter_options))
+    //                 option = "--filter";
+    //         else if (use_delta_islands)
+    //                 option = "--delta-islands";
+    //         if (option) {
+    //                 warning(_("cannot use %s with %s"), option, "--path-walk");
+    //                 path_walk = 0;
+    //         }
+    // }
+    // ```
+    //
+    // The walk itself is one of this module's stated gaps, so turning it back
+    // off changes nothing here — but the warning does not depend on the walk,
+    // and it is reachable from `pack.usePathWalk` alone, which is what makes
+    // that key honoured rather than merely validated. `--filter` wins over
+    // `--delta-islands` when both would fire, and the filter's own
+    // `error: tree:<n> filter not supported by the path-walk API` is printed
+    // first, from inside the compatibility check.
+    if resolve_path_walk(st, settings) {
+        let incompatible = match st.filter.as_deref() {
+            Some(spec) => match path_walk_filter_compatible(spec.as_bytes()) {
+                Err(depth) => {
+                    eprintln!("error: tree:{depth} filter not supported by the path-walk API");
+                    Some("--filter")
+                }
+                Ok(()) => st.delta_islands.then_some("--delta-islands"),
+            },
+            None => st.delta_islands.then_some("--delta-islands"),
+        };
+        if let Some(option) = incompatible {
+            eprintln!("warning: cannot use {option} with --path-walk");
+        }
     }
 
     // Beats `--thin`: `pack-objects base --thin --compression=99` reports the

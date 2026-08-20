@@ -187,12 +187,13 @@
 //!   `diff-pairs` do honour them — see [`super::diff_pairs`] for the port.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
 //!   filtering is supported.
-//! * `--anchored=<text>` is rejected. It is the one `xdiff` input with no equivalent
-//!   in the ported blob-diff crate: git threads the anchor prefixes through
-//!   `xpp->anchors` into `xdl_do_patience_diff()`'s `is_anchor()` (xdiff/xpatience.c:74-75),
-//!   and `gix-imara-diff` has no way to pass them in at all — see the note at
-//!   `src/ported/gix-imara-diff/src/patience.rs:20-22`. Accepting it would silently
-//!   produce the unanchored patience diff, so it is refused instead.
+//! * `--anchored=<text>` is implemented: the anchor prefixes reach
+//!   `xdl_do_patience_diff()`'s `is_anchor()` (xdiff/xpatience.c:71-79) through
+//!   `gix_imara_diff::Diff::compute_with_anchors`, which the ported
+//!   `src/ported/gix-imara-diff/src/patience.rs` grew for it. Like git's, the option
+//!   pins the algorithm to patience and is repeatable, and a later `--patience`
+//!   discards every anchor named before it. The plumbing verbs (`diff-files`,
+//!   `diff-index`, `diff-tree`) still refuse it.
 //! * `git diff` on an unmerged path renders the combined (`--cc`) patch, and only that —
 //!   the duplicate stage-2-vs-worktree pair the raw/name/stat formats also report is not
 //!   given a `diff --git` section. `--cached` renders git's `* Unmerged path` line.
@@ -700,6 +701,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut dirstat = super::diff_files::DirStat::default();
     let mut diff_filter: Option<Vec<u8>> = None;
     let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
+    // `diff_options.anchors` — the repeatable `--anchored=<text>` list.
+    let mut anchors: Vec<String> = Vec::new();
     // `options->objfind`, the one oidset every `--find-object=<id>` inserts into.
     // Empty means the objfind pickaxe was never requested.
     let mut find_object_ids: Vec<ObjectId> = Vec::new();
@@ -964,6 +967,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             } else if flag == "-O" {
                 order_file = Some(a.clone());
+            } else if flag == "--anchored" {
+                // `OPT_CALLBACK_F(0, "anchored", options, N_("<text>"), …, PARSE_OPT_NONEG,
+                // diff_opt_anchored)` (diff.c:6228-6230): the separated form of a
+                // required-argument callback, so this entry is the anchor text.
+                algorithm = Some(gix::diff::blob::Algorithm::Patience);
+                anchors.push(a.clone());
             } else if flag == "--diff-algorithm" {
                 // The separated form of an `OPT_CALLBACK_F` with a required argument:
                 // parse-options has already taken this entry as the value, so it reaches
@@ -1044,7 +1053,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         if diff_color::needs_separate_value(a)
             || indicator_slot(a).is_some()
             || a == "--diff-merges"
-            || matches!(a.as_str(), "--diff-algorithm" | "--find-object" | "-S" | "-G")
+            || matches!(
+                a.as_str(),
+                "--diff-algorithm" | "--find-object" | "-S" | "-G" | "--anchored"
+            )
         {
             pending_value = Some(a.clone());
             continue;
@@ -1180,8 +1192,29 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
             "--myers" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
             "--histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
-            // `--patience` aliases `--diff-algorithm=patience`.
-            "--patience" => algorithm = Some(gix::diff::blob::Algorithm::Patience),
+            // ```c
+            // static int diff_opt_patience(const struct option *opt, const char *arg, int unset)
+            // {
+            //         /*
+            //          * Both --patience and --anchored use PATIENCE_DIFF
+            //          * internally, so remove any anchors previously
+            //          * specified.
+            //          */
+            //         for (i = 0; i < options->anchors_nr; i++)
+            //                 free(options->anchors[i]);
+            //         options->anchors_nr = 0;
+            //         options->ignore_driver_algorithm = 1;
+            //         return set_diff_algorithm(options, "patience");
+            // }
+            // ```
+            //
+            // (`diff.c:5839-5858`.) `--patience` is not just an alias: it *drops* every
+            // anchor named before it, so `--anchored=x --patience` is a plain patience
+            // diff while `--patience --anchored=x` is anchored.
+            "--patience" => {
+                algorithm = Some(gix::diff::blob::Algorithm::Patience);
+                anchors.clear();
+            }
             // Accepted here rather than implemented.
             //
             // Rename detection is *not* in this list any more — `-M`, `-C`,
@@ -1411,6 +1444,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // port, which is why `--diff-algorithm=MYERS` is Myers and not a fatal.
             s if s.starts_with("--diff-algorithm=") => {
                 algorithm = super::diff_optval::parse_algorithm_value(&s["--diff-algorithm=".len()..]);
+            }
+            // `--anchored=<text>`, the attached form of the same callback. Every
+            // occurrence appends, and each one re-pins the algorithm to patience — so a
+            // `--histogram` in between is undone by the next `--anchored`.
+            s if s.starts_with("--anchored=") => {
+                algorithm = Some(gix::diff::blob::Algorithm::Patience);
+                anchors.push(s["--anchored=".len()..].to_string());
             }
             // `diff_opt_find_object()`: each occurrence inserts into one `objfind`
             // oidset, resolved through [`crate::objname::find_object`] at the flag's own
@@ -1699,6 +1739,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    // The anchor list is final once the scan is: `--patience` may have cleared it and
+    // a later `--anchored` may have refilled it. It reaches the blob differ through
+    // the process-wide slot rather than through a parameter — see
+    // [`super::diff_pairs::set_anchor_texts`].
+    super::diff_pairs::set_anchor_texts(anchors);
+
     // A value-taking option left at the end of the command line never reaches its
     // callback: parse-options reports it and exits 129 before any revision or
     // pathspec is looked at.

@@ -591,6 +591,7 @@ mod merge_recursive_theirs;
 mod merge_resolve;
 mod merge_subtree;
 mod merge_tree;
+mod man_viewer;
 mod mergetool;
 mod mktag;
 mod mktree;

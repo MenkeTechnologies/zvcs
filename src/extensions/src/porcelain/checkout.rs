@@ -107,6 +107,9 @@
 //! ```
 
 use anyhow::{anyhow, bail, Result};
+// Every `print!`/`println!` below goes through git's stdout buffer; see
+// `crate::cstdio` and the `defer()` call in `checkout()`.
+use crate::cstdio::{print, println};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU8;
 use std::process::ExitCode;
@@ -206,6 +209,11 @@ pub(super) const LONG_OPTS: &[super::LongOpt] = {
 };
 
 pub fn checkout(args: &[String]) -> Result<ExitCode> {
+    // git writes `show_local_changes()` / `report_tracking()` to stdout and
+    // `Switched to branch '<b>'` to stderr (builtin/checkout.c). Off a terminal
+    // stdio holds the stdout half until `exit()`, so a caller capturing both
+    // sees the stderr line first; see `crate::cstdio`.
+    crate::cstdio::defer();
     // Every ref this moves carries a reflog line, and git writes those with an
     // identity it synthesizes from the OS when `user.*` is unset — only a
     // `commit` with nothing determinable is refused. Without this a bare runner,
@@ -1132,6 +1140,8 @@ pub(super) fn maybe_recurse_submodules(
             cmd.arg("-q");
         }
         cmd.arg(target.to_string());
+        // `start_command()`'s `fflush(NULL)` (run-command.c:743).
+        crate::cstdio::before_spawn();
         let _ = cmd.status();
     }
     Ok(())

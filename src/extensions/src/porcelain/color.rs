@@ -521,6 +521,12 @@ pub(crate) struct DecorateColors {
     pub(crate) tag: String,
     /// `stash` — the `refs/stash` entry. Default bold magenta.
     pub(crate) stash: String,
+    /// `grafted` — the pseudo-decoration `load_ref_decorations()` hangs on every
+    /// commit the graft table names (`log-tree.c:211-219`, `add_graft_decoration`),
+    /// which is where a shallow clone's boundary commits show up as `grafted`.
+    /// git paints `refs/replace/*`'s `replaced` entry from the same slot
+    /// (`log-tree.c:174`). Default bold blue.
+    pub(crate) grafted: String,
     /// git's `DECORATION_NONE`, the bare reset any other ref is shown in. It has
     /// no config key of its own; it is empty here only when coloring is off.
     pub(crate) none: String,
@@ -539,6 +545,7 @@ impl DecorateColors {
             remote_branch: slot(&snapshot, "color.decorate.remoteBranch", "bold red"),
             tag: slot(&snapshot, "color.decorate.tag", "bold yellow"),
             stash: slot(&snapshot, "color.decorate.stash", "bold magenta"),
+            grafted: slot(&snapshot, "color.decorate.grafted", "bold blue"),
             none: RESET.to_string(),
             commit: slot(&snapshot, "color.diff.commit", "yellow"),
         }
@@ -553,6 +560,7 @@ impl DecorateColors {
             remote_branch: String::new(),
             tag: String::new(),
             stash: String::new(),
+            grafted: String::new(),
             none: String::new(),
             commit: String::new(),
         }
@@ -607,47 +615,101 @@ impl PushColors {
 // ---------------------------------------------------------------------------
 
 /// Parse a git color spec (`"green"`, `"bold red"`, `"brightblue"`, `"#ff0000"`,
-/// `"216"`, `"ul"`, `"no-bold"`, …) into the SGR sequence git's `color_output`
-/// would emit, or `None` for a spec git rejects. An empty / `"normal"` spec that
-/// selects no color and no attributes yields `Some("")` — the caller renders that
-/// as "leave text unpainted", matching git.
+/// `"216"`, `"ul"`, `"no-bold"`, `"reset green"`, …) into the SGR sequence git's
+/// `color_output()` would emit, or `None` for a spec git rejects. An empty /
+/// `"normal"` spec that selects no color and no attributes yields `Some("")` — the
+/// caller renders that as "leave text unpainted", matching git.
+///
+/// ```c
+/// /* [reset] [fg [bg]] [attr]... */
+/// while (len > 0) {
+///         …
+///         if (match_word(word, wordlen, "reset")) { has_reset = 1; continue; }
+///         if (!parse_color(&c, word, wordlen)) {
+///                 if (fg.type == COLOR_UNSPECIFIED) { fg = c; continue; }
+///                 if (bg.type == COLOR_UNSPECIFIED) { bg = c; continue; }
+///                 goto bad;
+///         }
+///         val = parse_attr(word, wordlen);
+///         if (0 <= val) attr |= (1 << val); else goto bad;
+/// }
+///
+/// if (has_reset || attr || !color_empty(&fg) || !color_empty(&bg)) {
+///         int sep = 0;
+///         OUT('\033'); OUT('[');
+///         if (has_reset) sep++;
+///         for (i = 0; attr; i++) {
+///                 unsigned bit = (1 << i);
+///                 if (!(attr & bit)) continue;
+///                 attr &= ~bit;
+///                 if (sep++) OUT(';');
+///                 dst += xsnprintf(dst, end - dst, "%d", i);
+///         }
+///         if (!color_empty(&fg)) { if (sep++) OUT(';'); dst = color_output(dst, …, &fg, 0); }
+///         if (!color_empty(&bg)) { if (sep++) OUT(';'); dst = color_output(dst, …, &bg, 1); }
+///         OUT('m');
+/// }
+/// ```
+///
+/// (`color.c:275-365`.) Three details of that loop decide the bytes:
+///
+/// * attributes are collected into a *bitmask* and written out in ascending code
+///   order, not in the order they were typed — `ul bold` is `\033[1;4m`.
+/// * `reset` writes no code of its own; it only pre-increments `sep`, so the first
+///   real code is preceded by a `;` and a lone `reset` is the bare `\033[m`.
+/// * a color is tried before an attribute, which is what lets `-1` be `normal`
+///   rather than an unknown attribute name.
 pub(crate) fn parse_color_spec(spec: &str) -> Option<String> {
-    let mut attrs: Vec<String> = Vec::new();
+    let mut has_reset = false;
+    // `unsigned int attr`, one bit per SGR code, so duplicates collapse and the
+    // emission order is numeric.
+    let mut attr: u32 = 0;
     let mut fg: Option<Color> = None;
     let mut bg: Option<Color> = None;
 
     for word in spec.split_whitespace() {
-        if let Some(code) = parse_attr(word) {
-            attrs.push(code);
+        // `match_word()` is `strncasecmp`, so `RESET` counts too.
+        if word.eq_ignore_ascii_case("reset") {
+            has_reset = true;
             continue;
         }
-        let color = parse_color(word)?;
-        if fg.is_none() {
-            fg = Some(color);
-        } else if bg.is_none() {
-            bg = Some(color);
-        } else {
-            // A third color is a spec error, exactly as git's parser reports.
-            return None;
+        if let Some(color) = parse_color(word) {
+            if fg.is_none() {
+                fg = Some(color);
+            } else if bg.is_none() {
+                bg = Some(color);
+            } else {
+                // A third color is a spec error, exactly as git's parser reports.
+                return None;
+            }
+            continue;
         }
+        // `parse_attr()` compares with `memcmp`, so attribute names are
+        // case-SENSITIVE where color names are not: `Bold` is a spec error.
+        attr |= 1u32 << parse_attr(word)?;
     }
 
-    let mut codes = attrs;
-    if let Some(c) = fg {
-        if let Some(code) = c.sgr(false) {
-            codes.push(code);
+    let ground = |c: &Option<Color>, bg: bool| c.as_ref().and_then(|c| c.sgr(bg));
+    let fg_code = ground(&fg, false);
+    let bg_code = ground(&bg, true);
+    if !has_reset && attr == 0 && fg_code.is_none() && bg_code.is_none() {
+        return Some(String::new());
+    }
+
+    // `has_reset` contributes an empty slot, which is what puts the leading `;`
+    // in front of whatever follows it — and nothing at all when it is alone.
+    let mut codes: Vec<String> = Vec::new();
+    if has_reset {
+        codes.push(String::new());
+    }
+    for bit in 0..32u32 {
+        if attr & (1 << bit) != 0 {
+            codes.push(bit.to_string());
         }
     }
-    if let Some(c) = bg {
-        if let Some(code) = c.sgr(true) {
-            codes.push(code);
-        }
-    }
-    if codes.is_empty() {
-        Some(String::new())
-    } else {
-        Some(format!("\x1b[{}m", codes.join(";")))
-    }
+    codes.extend(fg_code);
+    codes.extend(bg_code);
+    Some(format!("\x1b[{}m", codes.join(";")))
 }
 
 /// A parsed color: `Normal` selects no code for its ground; the rest map to the
@@ -692,13 +754,24 @@ fn parse_color(word: &str) -> Option<Color> {
         "default" => return Some(Color::Default),
         _ => {}
     }
-    // A `#rrggbb` 24-bit color.
-    if let Some(hex) = lower.strip_prefix('#') {
-        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-            return Some(Color::Rgb(r, g, b));
+    // ```c
+    // if ((len == 7 || len == 4) && name[0] == '#') {
+    //         int width_per_color = (len == 7) ? 2 : 1;
+    // ```
+    // (`color.c:191-201`.) The 12-bit form doubles each nibble — `#f00` is
+    // `#ff0000` — because `get_hex_color()` reads `in[0]` and `in[width-1]`, which
+    // are the same character when the width is one. A `#` that is neither length
+    // falls through to the name and number arms rather than failing outright.
+    if lower.starts_with('#') && (lower.len() == 7 || lower.len() == 4) {
+        let width = if lower.len() == 7 { 2 } else { 1 };
+        let hex = &lower[1..];
+        if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let nibble = |c: u8| (c as char).to_digit(16).expect("checked") as u8;
+            let byte = |i: usize| {
+                let s = hex.as_bytes();
+                (nibble(s[i * width]) << 4) | nibble(s[i * width + width - 1])
+            };
+            return Some(Color::Rgb(byte(0), byte(1), byte(2)));
         }
         return None;
     }
@@ -710,9 +783,22 @@ fn parse_color(word: &str) -> Option<Color> {
     if let Some(idx) = basic_color_index(&lower) {
         return Some(Color::Ansi(idx));
     }
-    // A bare palette index: 0..=7 basic, 8..=15 bright, 16..=255 the 256-palette.
-    if let Ok(n) = lower.parse::<u16>() {
+    // ```c
+    // val = strtol(name, &end, 10);
+    // if (end - name == len) {
+    //         if (val < -1)          ; /* fall through to error */
+    //         else if (val < 0)      { out->type = COLOR_NORMAL; return 0; }
+    //         else if (val < 8)      { out->type = COLOR_ANSI;  out->value = val + 30; return 0; }
+    //         else if (val < 16)     { out->type = COLOR_ANSI;  out->value = val - 8 + 90; return 0; }
+    //         else if (val < 256)    { out->type = COLOR_256;   out->value = val; return 0; }
+    // }
+    // ```
+    // (`color.c:203-227`.) `-1` is git's documented alias for `normal`; every other
+    // negative number is a spec error.
+    if let Ok(n) = lower.parse::<i64>() {
         return match n {
+            i64::MIN..=-2 => None,
+            -1 => Some(Color::Normal),
             0..=7 => Some(Color::Ansi(n as u8)),
             8..=15 => Some(Color::Bright(n as u8)),
             16..=255 => Some(Color::C256(n as u8)),
@@ -737,38 +823,46 @@ fn basic_color_index(name: &str) -> Option<u8> {
     })
 }
 
-/// git's `parse_attr`: an attribute name (`bold`, `dim`, `italic`, `ul`, `blink`,
-/// `reverse`, `strike`), `reset`, or a `no`/`no-` negation, returning the SGR code.
-/// `None` for a word that is not an attribute (the caller then tries a color).
-fn parse_attr(word: &str) -> Option<String> {
-    let lower = word.to_ascii_lowercase();
-    if lower == "reset" {
-        return Some("0".to_string());
-    }
-    // A `no`/`no-` prefix turns the attribute off with git's reset code.
-    let (name, negate) = match lower.strip_prefix("no-").or_else(|| lower.strip_prefix("no")) {
-        Some(rest) => (rest, true),
-        None => (lower.as_str(), false),
+/// ```c
+/// static int parse_attr(const char *name, size_t len)
+/// {
+///         static const struct { const char *name; size_t len; int val, neg; } attrs[] = {
+///                 ATTR("bold", 1, 22), ATTR("dim", 2, 22), ATTR("italic", 3, 23),
+///                 ATTR("ul", 4, 24), ATTR("blink", 5, 25), ATTR("reverse", 7, 27),
+///                 ATTR("strike", 9, 29)
+///         };
+///         int negate = 0;
+///         if (skip_prefix_mem(name, len, "no", &name, &len)) {
+///                 skip_prefix_mem(name, len, "-", &name, &len);
+///                 negate = 1;
+///         }
+///         for (i = 0; i < ARRAY_SIZE(attrs); i++)
+///                 if (attrs[i].len == len && !memcmp(attrs[i].name, name, len))
+///                         return negate ? attrs[i].neg : attrs[i].val;
+///         return -1;
+/// }
+/// ```
+///
+/// (`color.c:229-260`.) The comparison is `memcmp`, so this is the one part of a
+/// color spec that is case-sensitive — `Bold` is not `bold`. `reset` is not in
+/// this table; `color_parse_mem_1()` handles it before either parser runs.
+fn parse_attr(word: &str) -> Option<u32> {
+    let (name, negate) = match word.strip_prefix("no") {
+        Some(rest) => (rest.strip_prefix('-').unwrap_or(rest), true),
+        None => (word, false),
     };
-    let on = match name {
-        "bold" => 1,
-        "dim" => 2,
-        "italic" => 3,
-        "ul" => 4,
-        "blink" => 5,
-        "reverse" => 7,
-        "strike" => 9,
-        _ => return None,
-    };
-    let code = if negate {
-        // git's off codes: bold and dim share 22, the rest are value + 20.
-        if on == 1 || on == 2 {
-            22
-        } else {
-            on + 20
-        }
-    } else {
-        on
-    };
-    Some(code.to_string())
+    // (name, value, negation)
+    const ATTRS: &[(&str, u32, u32)] = &[
+        ("bold", 1, 22),
+        ("dim", 2, 22),
+        ("italic", 3, 23),
+        ("ul", 4, 24),
+        ("blink", 5, 25),
+        ("reverse", 7, 27),
+        ("strike", 9, 29),
+    ];
+    ATTRS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, on, off)| if negate { *off } else { *on })
 }

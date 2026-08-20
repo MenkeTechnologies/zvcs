@@ -1392,7 +1392,7 @@ fn decode_b_segment(seg: &[u8]) -> Vec<u8> {
 
 /// `same_utf_encoding()` folded into `same_encoding()`: `UTF-16BE` and
 /// `UTF16BE` name the same encoding, and otherwise names compare case-blind.
-fn same_encoding(src: &str, dst: &str) -> bool {
+pub(crate) fn same_encoding(src: &str, dst: &str) -> bool {
     // A named fn, not a closure: closure inference ties the input and output
     // lifetimes to one inference variable, which cannot outlive the call.
     fn variant(s: &str) -> Option<&str> {
@@ -1412,7 +1412,7 @@ fn same_encoding(src: &str, dst: &str) -> bool {
 }
 
 /// Whether `name` spells UTF-8.
-fn is_utf8_name(name: &str) -> bool {
+pub(crate) fn is_utf8_name(name: &str) -> bool {
     same_encoding("UTF-8", name)
 }
 
@@ -1440,7 +1440,7 @@ fn is_latin1_name(name: &str) -> bool {
 /// ISO-8859-1 as true Latin-1 where those are C1 controls. Mail in the wild
 /// declares `iso-8859-1` constantly, so taking the WHATWG reading would corrupt
 /// exactly the common case.
-fn reencode(data: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
+pub(crate) fn reencode(data: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
     let text = decode_from(data, from)?;
     encode_to(&text, to)
 }
@@ -1448,7 +1448,7 @@ fn reencode(data: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
 /// The decode half. US-ASCII and Latin-1 are done here (see [`reencode`]); UTF-8
 /// is a validity check, since iconv rejects malformed input rather than
 /// substituting.
-fn decode_from(data: &[u8], from: &str) -> Option<String> {
+pub(crate) fn decode_from(data: &[u8], from: &str) -> Option<String> {
     if is_ascii_name(from) {
         return data
             .iter()
@@ -1469,7 +1469,7 @@ fn decode_from(data: &[u8], from: &str) -> Option<String> {
 }
 
 /// The encode half, mirroring [`decode_from`].
-fn encode_to(text: &str, to: &str) -> Option<Vec<u8>> {
+pub(crate) fn encode_to(text: &str, to: &str) -> Option<Vec<u8>> {
     if is_utf8_name(to) {
         return Some(text.as_bytes().to_vec());
     }
@@ -1481,6 +1481,14 @@ fn encode_to(text: &str, to: &str) -> Option<Vec<u8>> {
             .chars()
             .map(|c| u8::try_from(c as u32).ok())
             .collect::<Option<Vec<u8>>>();
+    }
+    // `encoding_rs` has no UTF-16/UTF-32 *encoder*: `Encoding::output_encoding()`
+    // maps `UTF_16LE`/`UTF_16BE` (and `replacement`) to UTF-8, so `encode()` would
+    // hand back UTF-8 bytes under a UTF-16 label — a wrong answer rather than a
+    // refusal. Report the conversion as impossible instead; the callers treat that
+    // the way they treat `iconv_open()` failing.
+    if is_utf16_or_32_name(to) {
+        return None;
     }
     let enc = encoding_rs::Encoding::for_label_no_replacement(to.as_bytes())?;
     let (out, _, had_errors) = enc.encode(text);
@@ -1718,4 +1726,15 @@ fn perror(e: &std::io::Error) -> String {
         Some(at) if text.ends_with(')') => text[..at].to_string(),
         _ => text,
     }
+}
+
+/// Whether `name` spells one of the UTF-16 / UTF-32 family, which `encoding_rs`
+/// cannot *produce*. See the guard in [`encode_to`].
+pub(crate) fn is_utf16_or_32_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let rest = match lower.strip_prefix("utf") {
+        Some(rest) => rest.strip_prefix('-').unwrap_or(rest),
+        None => return false,
+    };
+    rest.starts_with("16") || rest.starts_with("32")
 }

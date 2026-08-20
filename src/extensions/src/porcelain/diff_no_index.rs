@@ -509,6 +509,11 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // `git diff` takes is taken here too. `None` leaves the `diff.algorithm`
     // default resolved below.
     let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
+    // `diff_options.anchors` — the repeatable `--anchored=<text>` list, which pins the
+    // algorithm to patience and which a later `--patience` clears (`diff.c:5544-5556`
+    // and `diff.c:5839-5858`).
+    let mut anchors: Vec<String> = Vec::new();
+    let mut want_anchor_value = false;
     // `--diff-algorithm` is an `OPT_CALLBACK_F` without `PARSE_OPT_OPTARG`, so
     // parse-options consumes the next argv entry as its value before that entry is
     // examined for anything else — a `--`, an operand, or another option.
@@ -550,6 +555,15 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         }
         if matches!(a.as_str(), "--skip-to" | "--rotate-to" | "--output" | "--inter-hunk-context") {
             pending = Some(a.clone());
+            continue;
+        }
+        if std::mem::take(&mut want_anchor_value) {
+            algorithm = Some(gix::diff::blob::Algorithm::Patience);
+            anchors.push(a.clone());
+            continue;
+        }
+        if a == "--anchored" {
+            want_anchor_value = true;
             continue;
         }
         if std::mem::take(&mut want_algorithm_value) {
@@ -638,8 +652,16 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             // `xdl_opts` word, so the last one on the line wins.
             "--minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
             "--myers" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
-            "--patience" => algorithm = Some(gix::diff::blob::Algorithm::Patience),
+            "--patience" => {
+                algorithm = Some(gix::diff::blob::Algorithm::Patience);
+                // `diff_opt_patience()` frees every anchor named before it.
+                anchors.clear();
+            }
             "--histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
+            s if s.starts_with("--anchored=") => {
+                algorithm = Some(gix::diff::blob::Algorithm::Patience);
+                anchors.push(s["--anchored=".len()..].to_string());
+            }
             // `diff_opt_diff_algorithm()`'s glued form, matched case-insensitively
             // by `parse_algorithm_value()`'s `strcasecmp` — so `--diff-algorithm=MYERS`
             // is Myers and not the `error()` below.
@@ -777,6 +799,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         eprintln!("error: option `diff-algorithm' requires a value");
         return Ok(ExitCode::from(129));
     }
+    if want_anchor_value {
+        eprintln!("error: option `anchored' requires a value");
+        return Ok(ExitCode::from(129));
+    }
+    // The anchor list is final: `--patience` may have cleared it and a later
+    // `--anchored` refilled it. See [`super::diff_pairs::set_anchor_texts`].
+    super::diff_pairs::set_anchor_texts(anchors);
     // The same for the other value-taking options: parse-options reports the missing
     // value and exits 129 before the operand count is looked at.
     if let Some(flag) = pending {

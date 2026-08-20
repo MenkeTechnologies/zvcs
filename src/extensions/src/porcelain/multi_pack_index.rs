@@ -636,6 +636,41 @@ pub(crate) fn write_midx(pack_dir: &Path, object_hash: gix::hash::Kind) -> Resul
     write_midx_from(pack_dir, object_hash, pack_indices(pack_dir))
 }
 
+/// [`write_midx`] over the non-cruft packs only — the set `repack-midx.c:199-235`
+/// builds when `repack.midxMustContainCruft` is false and the pre-existing MIDX
+/// held no pack the new one would drop.
+///
+/// A cruft pack is one carrying a `.mtimes` sidecar; that is exactly what
+/// `packed_git.is_cruft` records (`packfile.c`, set from the `.mtimes` the pack
+/// was opened with), and it is the same test `existing_packs_populate()` uses to
+/// sort a pack into `cruft_packs` rather than `non_kept_packs`.
+pub(crate) fn write_midx_without_cruft(
+    pack_dir: &Path,
+    object_hash: gix::hash::Kind,
+) -> Result<bool> {
+    write_midx_from(pack_dir, object_hash, non_cruft_pack_indices(pack_dir))
+}
+
+/// [`pack_indices`] minus every pack with a `.mtimes` beside it.
+fn non_cruft_pack_indices(dir: &Path) -> Vec<PathBuf> {
+    pack_indices(dir)
+        .into_iter()
+        .filter(|idx| !idx.with_extension("mtimes").is_file())
+        .collect()
+}
+
+/// The `.idx` names an already-written `<pack_dir>/multi-pack-index` lists, or
+/// `None` when there is no readable MIDX there.
+///
+/// This is git's `existing->midx_packs`, which `midx_has_unknown_packs()`
+/// (`repack-midx.c`) walks to decide whether the MIDX about to be written may
+/// safely drop the cruft packs. Callers must read it *before* the repack removes
+/// superseded packs, since `drop_stale_midx()` may delete the file on the way.
+pub(crate) fn midx_pack_names(pack_dir: &Path) -> Option<Vec<String>> {
+    let file = multi_index::File::at(pack_dir.join("multi-pack-index"), None).ok()?;
+    Some(file.index_names().iter().map(|n| n.to_string_lossy().into_owned()).collect())
+}
+
 /// Write `<pack_dir>/multi-pack-index` from an explicit index-path set (used by
 /// `--stdin-packs`, which indexes only the packs named on stdin); otherwise
 /// identical to [`write_midx`].

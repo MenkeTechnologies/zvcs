@@ -255,6 +255,201 @@ const NEED_WORK_TREE: &[&str] = &[
     "switch",
 ];
 
+/// The verbs that put this repository through `prepare_repo_settings()` before
+/// they do anything else (`crate::repo_settings`).
+///
+/// git has no flag for this the way it has `NEED_WORK_TREE`: the settings block
+/// is built lazily, the first time some code path asks for one of its members, so
+/// which commands reach it is a property of the call graph rather than of the
+/// command table. The three doors that matter are `repo_read_index()` /
+/// `do_write_index()` (`read-cache.c:2191`, `:2323`, `:2830`),
+/// `repo_settings_get_warn_ambiguous_refs()` (`repo-settings.c:182`, reached by
+/// every revision-name lookup) and pack access (`packfile.c:736`, `:1797`) — which
+/// between them cover almost everything that reads a repository.
+///
+/// Rather than guess at that call graph, this list was measured: every entry was
+/// run under git 2.55.0 with `-c core.packedGitLimit=bogus` and answered
+/// `fatal: bad numeric config value …` — several of them in more than one form
+/// (`stash list` and `stash show`, `reset --soft` and `reset --hard`,
+/// `sparse-checkout list` and `sparse-checkout disable`, `rev-parse --git-dir` and
+/// `rev-parse --show-toplevel`, …), so the verb as a whole behaves this way and
+/// not just one of its modes.
+///
+/// Deliberately absent, because git reaches the settings block for *some* of their
+/// modes only and a per-verb gate would validate too early for the rest:
+/// `for-each-ref` (`--format=%(refname)` never peels an object and never dies),
+/// `commit-graph` and `multi-pack-index` (`write` dies, `verify` does not),
+/// `notes` (`add` dies, `list` does not) and `bisect` (`start` dies, `log` does
+/// not). Also absent: the verbs that never reach it at all under any form tried —
+/// `branch`, `tag`, `remote`, `symbolic-ref`, `update-ref`, `count-objects`,
+/// `config`, `var`, `hash-object`, `bundle`, `replace`, `verify-pack`, `cherry`,
+/// `push`, `ls-remote`, `mktag`, `merge-file`, `merge-index`,
+/// `interpret-trailers`, `stripspace`, `patch-id`, `show-index`, `rerere`.
+const REPO_SETTINGS_VERBS: &[&str] = &[
+    "add",
+    "am",
+    "annotate",
+    "apply",
+    "archive",
+    "backfill",
+    "blame",
+    "cat-file",
+    "check-attr",
+    "check-ignore",
+    "checkout",
+    "checkout-index",
+    "cherry-pick",
+    "clean",
+    "commit",
+    "commit-tree",
+    "describe",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "fast-export",
+    "fetch",
+    "format-patch",
+    "fsck",
+    "gc",
+    "grep",
+    "last-modified",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "maintenance",
+    "merge",
+    "merge-base",
+    "merge-tree",
+    "mktree",
+    "mv",
+    "name-rev",
+    "pack-refs",
+    "prune",
+    "prune-packed",
+    "pull",
+    "range-diff",
+    "read-tree",
+    "rebase",
+    "reflog",
+    "repack",
+    "reset",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "revert",
+    "rm",
+    "shortlog",
+    "show",
+    "show-ref",
+    "sparse-checkout",
+    "stage",
+    "stash",
+    "status",
+    "submodule",
+    "switch",
+    "unpack-file",
+    "update-index",
+    "update-server-info",
+    "verify-commit",
+    "verify-tag",
+    "whatchanged",
+    "worktree",
+    "write-tree",
+];
+
+/// The verbs that run git's `git_default_config()` callback (`crate::default_config`)
+/// but never reach the settings block, on top of every entry in
+/// [`REPO_SETTINGS_VERBS`], which reaches both.
+///
+/// git's real rule is "any command that parses the configuration at all", which is
+/// nearly everything; it is spelled as an inclusion list here for the same reason
+/// as above — every entry was measured under git 2.55.0 with
+/// `-c core.createObject=bogus` and with
+/// `-c sparse.expectFilesOutsideOfPatterns=bogus`, and both refused it. Commands
+/// left out because they were measured *not* to refuse: `remote`, `ls-remote`,
+/// `cherry`, `bundle`, `column`, `stripspace` (without `--strip-comments`),
+/// `check-ref-format`, `config`, `version`, `sh-i18n--envsubst`. Commands left out
+/// because their behavior varies by mode — `bisect` refuses `reset` but not
+/// `start`, `stripspace` refuses `-s` but not a bare run — are absent rather than
+/// guessed at, so this gate under-matches git rather than refusing something git
+/// would run.
+const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
+    "branch",
+    "check-mailmap",
+    "clone",
+    "commit-graph",
+    "count-objects",
+    "credential",
+    "difftool",
+    "for-each-ref",
+    "hash-object",
+    "hook",
+    "index-pack",
+    "init",
+    "interpret-trailers",
+    "mailinfo",
+    "mktag",
+    "multi-pack-index",
+    "notes",
+    "patch-id",
+    "push",
+    "replace",
+    "rerere",
+    "symbolic-ref",
+    "tag",
+    "update-ref",
+    "var",
+    "verify-pack",
+];
+
+/// Whether this command line reaches `check_updates()` (`unpack-trees.c:404`) and
+/// therefore `get_parallel_checkout_configs()` at `:482` — the read of
+/// `checkout.workers` and `checkout.thresholdForParallelism`
+/// ([`crate::worktree::parallel_checkout_configs`]).
+///
+/// The call is unconditional inside `check_updates()`, so it happens even when
+/// there is nothing to update (`git checkout main` while already on `main` still
+/// refuses a bad value), but only for the modes that go through the worktree
+/// update at all. Measured against git 2.55.0 with
+/// `-c checkout.thresholdForParallelism=bogus` — refused / not refused:
+///
+/// ```text
+/// checkout main          refused    reset --soft HEAD    not refused
+/// checkout b2            refused    reset --mixed HEAD   not refused
+/// checkout -- f          refused    reset                not refused
+/// switch main            refused    reset --hard HEAD    refused
+/// restore f              refused    reset --merge HEAD   refused
+/// restore --worktree f   refused    reset --keep HEAD    refused
+/// restore --staged f     not ref.   read-tree HEAD       not refused
+/// restore --staged
+///         --worktree f   refused    read-tree -m HEAD    not refused
+/// checkout-index -a      refused    read-tree -m -u HEAD refused
+/// ```
+///
+/// `merge`, `rebase`, `cherry-pick`, `revert`, `stash` and `clone` reach
+/// `check_updates()` too, but only on the paths where they actually rewrite the
+/// worktree, which is not decidable from the command line; they are left out so
+/// this never refuses something git would have run.
+fn updates_worktree(sub: &str, args: &[String]) -> bool {
+    let has = |names: &[&str]| {
+        args.iter()
+            .any(|a| names.iter().any(|n| a == n || a.starts_with(&format!("{n}="))))
+    };
+    match sub {
+        "checkout" | "switch" | "checkout-index" => true,
+        // `restore` writes the worktree unless `--staged` was given alone;
+        // `--staged --worktree` writes both (builtin/checkout.c's `opts->checkout_worktree`).
+        "restore" => !has(&["--staged", "-S"]) || has(&["--worktree", "-W"]),
+        // `reset`'s three worktree-touching modes (builtin/reset.c's `reset_type`).
+        "reset" => has(&["--hard", "--merge", "--keep"]),
+        // `read-tree -u` only means anything with `-m`/`--reset`/`--prefix`, which
+        // is exactly when it updates.
+        "read-tree" => has(&["-u", "--update"]),
+        _ => false,
+    }
+}
+
 /// Whether `sub` names a verb [`run`] dispatches — a superset verb or a ported
 /// porcelain command. Alias expansion uses this to stop at a real command
 /// (builtins win over an `alias.<cmd>` of the same name, exactly as git does)
@@ -525,6 +720,56 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
             // configured and for one it cannot `chdir()` into (setup.c:503-505).
             if !repo.workdir().is_some_and(|wt| wt.is_dir()) {
                 return Err(crate::fatal::need_work_tree());
+            }
+        }
+    }
+
+    // `prepare_repo_settings()` (repo-settings.c:30) — the per-repository settings
+    // block git resolves before the command runs. It is a *gate* here because the
+    // keys it reads are read through `repo_config_get_bool`/`_ulong`, which die on
+    // a value they cannot parse, and it runs early enough that nothing else is
+    // printed first. See `crate::repo_settings` for what is honored and what is
+    // only validated.
+    //
+    // `rev-parse --parseopt` / `--sq-quote` are the one documented mode of a
+    // listed verb that runs without repository setup at all (builtin/rev-parse.c
+    // handles both before `setup_git_directory()`), so they skip the gate the way
+    // git skips the settings block for them.
+    let rev_parse_no_setup = sub == "rev-parse"
+        && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote");
+    let in_repo_settings = !help_only && !rev_parse_no_setup && REPO_SETTINGS_VERBS.contains(&sub);
+    // `git_default_config()`'s own two keys (`crate::default_config`) are checked
+    // while the config is *parsed*, so they refuse a much wider set of commands
+    // than the settings block does — `branch` and `hash-object` die for them and
+    // not for `core.packedGitLimit`.
+    let in_default_config =
+        !help_only && (in_repo_settings || DEFAULT_CONFIG_EXTRA_VERBS.contains(&sub));
+    let in_parallel_checkout = !help_only && updates_worktree(sub, args);
+    if in_repo_settings || in_default_config || in_parallel_checkout {
+        if let Ok(repo) = gix::discover(".") {
+            // Settings block first, because that is the order the two diagnostics
+            // come out of stock git for a command that reaches both: with
+            // `-c core.createObject=bogus -c core.packedGitLimit=bogus`, git 2.55.0's
+            // `status` reports `core.packedgitlimit`. The settings block is read by
+            // targeted `repo_config_get_*` lookups that skip the default callback,
+            // and `read_index()` asks for it before the command gets as far as
+            // calling `git_config()`.
+            if in_repo_settings {
+                if let Err(msg) = crate::repo_settings::RepoSettings::load(&repo) {
+                    return Err(crate::fatal::die(msg));
+                }
+            }
+            if in_default_config {
+                if let Err(rejection) = crate::default_config::validate(&repo) {
+                    return Err(crate::fatal::die(rejection.into_fatal()));
+                }
+            }
+            // `check_updates()` reads the parallel-checkout pair after the config
+            // has been parsed, so it reports last of the three.
+            if in_parallel_checkout {
+                if let Err(msg) = crate::worktree::parallel_checkout_configs(&repo) {
+                    return Err(crate::fatal::die(msg));
+                }
             }
         }
     }

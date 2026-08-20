@@ -52,11 +52,12 @@
 //!     "doesn't take any non-option arguments" errors, with git's exact text,
 //!     stream and exit code 129.
 //!
-//! Faithfully unsupported — `bail!`s rather than emitting divergent output: a
-//! configured `man.viewer` other than plain `man`.
+//! The man viewer itself is [`super::man_viewer`]: `man.viewer`, `man.<tool>.cmd`
+//! and `man.<tool>.path`, walked as the fall-through chain `show_man_page()`
+//! walks.
 
 use super::column;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1896,7 +1897,7 @@ fn list_commands_in_dir(dir: &Path) -> BTreeSet<String> {
 /// installation ships and whose names `git help -a` already prints under a
 /// category, so listing them a second time as "external" would contradict the
 /// table printed directly above.
-fn load_command_list() -> (BTreeSet<String>, BTreeSet<String>) {
+pub(crate) fn load_command_list() -> (BTreeSet<String>, BTreeSet<String>) {
     let exec_dir = PathBuf::from(crate::exec_path());
 
     let mut main_cmds: BTreeSet<String> = crate::dispatch::PORCELAIN_VERBS
@@ -1997,7 +1998,7 @@ pub struct Topic {
 
 /// The heading [`GUIDES`] entries are filed under. The block's own first line is
 /// a sentence rather than a category name, so this names the section instead.
-const GUIDES_SECTION: &str = "Git concept guides";
+pub(crate) const GUIDES_SECTION: &str = "Git concept guides";
 
 /// Every topic git documents, parsed out of the [`ALL_COMMANDS`] and [`GUIDES`]
 /// blocks this module already prints — the command list is not restated
@@ -2075,6 +2076,100 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+/// The alias *names* alone, in **configuration order** — `list_aliases()`
+/// (alias.c), which is what `git --list-cmds=alias` prints.
+///
+/// Not the sorted, last-wins view [`alias_list`] builds. `list_aliases()` is a
+/// config callback that appends every `alias.<name>` it is handed, so the
+/// listing follows the files (system, then global, then repository, then `-c`)
+/// and repeats a name that is defined twice. Stock, verified:
+///
+/// ```text
+/// $ git -c alias.zz=status -c alias.aa=log -c alias.zz=diff --list-cmds=alias
+/// … zz aa zz
+/// ```
+///
+/// The expansion is carried as the string list's `util` there and never
+/// printed, so it is dropped here too.
+pub(crate) fn alias_names() -> Vec<String> {
+    let repo = gix::discover(".").ok();
+    let snapshot = repo.as_ref().map(|r| r.config_snapshot());
+    let globals;
+    let file = match snapshot.as_ref() {
+        Some(s) => s.plumbing(),
+        None => match gix::config::File::from_globals() {
+            Ok(f) => {
+                globals = f;
+                &globals
+            }
+            Err(_) => return Vec::new(),
+        },
+    };
+    let Some(sections) = file.sections_by_name("alias") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for section in sections {
+        for (name, _) in section.body() {
+            // git's config parser lower-cases value names before its alias
+            // listing sees them, so `[alias] Foo` lists as `foo`.
+            out.push(name.to_string().to_lowercase());
+        }
+    }
+    out
+}
+
+/// `completion.commands`, the edit script `--list-cmds=config` applies
+/// (`list_cmds_by_config()`, help.c:418-441). Read from the same configuration
+/// the alias listing uses, so it is honoured inside a repository and from the
+/// global files outside one — git reaches it after
+/// `setup_git_directory_gently()` for exactly that reason (git.c:83-87).
+pub(crate) fn completion_commands() -> Option<String> {
+    let repo = gix::discover(".").ok();
+    let snapshot = repo.as_ref().map(|r| r.config_snapshot());
+    let globals;
+    let file = match snapshot.as_ref() {
+        Some(s) => s.plumbing(),
+        None => match gix::config::File::from_globals() {
+            Ok(f) => {
+                globals = f;
+                &globals
+            }
+            Err(_) => return None,
+        },
+    };
+    file.string("completion.commands")
+        .map(|v| String::from_utf8_lossy(&v).into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// The members of one `git help` common-command group — the five
+/// `common_categories[]` attributes (help.c:34-44) whose only listing is the
+/// grouped table `git help` prints with no options. `None` when `section` is
+/// not one of that block's headings, which is the caller's cue to look for a
+/// `git help -a` category instead.
+pub(crate) fn common_group(section: &str) -> Option<Vec<String>> {
+    let mut current: Option<&str> = None;
+    let mut out = Vec::new();
+    for line in COMMON_CMDS.lines() {
+        match line.strip_prefix("   ") {
+            // A body line belongs to the heading last seen.
+            Some(entry) => {
+                if current == Some(section) {
+                    if let Some(name) = entry.split_whitespace().next() {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+            // The block opens with a sentence and separates groups with blank
+            // lines; everything else is a heading.
+            None if line.is_empty() || line.starts_with("These are") => {}
+            None => current = Some(line),
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Every `alias.<name>` in the effective configuration, sorted by name, the
 /// last definition winning as git's config resolution does. Outside a
 /// repository only the global files are consulted, which is where git looks
@@ -2118,32 +2213,31 @@ fn show_help_for(topic: &str) -> Result<ExitCode> {
     // so generate theirs on demand and open it with `man -M`. Done before the
     // alias check for git's "a real command wins over an alias" precedence.
     if crate::dispatch::SUPERSET_VERBS.contains(&topic) {
-        reject_unsupported_viewer_config()?;
         if let Some(root) = crate::superset::manpage::ensure_page(topic)
             .map_err(|e| anyhow::anyhow!("failed to write man page: {e}"))?
         {
-            std::io::stdout().flush().ok();
-            let status = Command::new("man")
-                .arg("-M")
-                .arg(&root)
-                .arg(format!("git-{topic}"))
-                .status()
-                .map_err(|e| anyhow::anyhow!("failed to run man: {e}"))?;
-            return Ok(ExitCode::from(exit_status_code(status)));
+            return super::man_viewer::show_man_page(
+                &viewer_config(),
+                &format!("git-{topic}"),
+                Some(&root),
+            );
         }
     }
 
     let Some(page) = resolve_page(topic)? else {
         return Ok(ExitCode::SUCCESS);
     };
-    reject_unsupported_viewer_config()?;
+    super::man_viewer::show_man_page(&viewer_config(), &page, None)
+}
 
-    std::io::stdout().flush().ok();
-    let status = Command::new("man")
-        .arg(&page)
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run man: {e}"))?;
-    Ok(ExitCode::from(exit_status_code(status)))
+/// The configuration the man viewer chain is read from — `git_help_config()`
+/// runs after `setup_git_directory_gently()`, so the global files apply outside
+/// a repository just as [`help_config`] resolves them.
+fn viewer_config() -> gix::config::File {
+    match gix::discover(".") {
+        Ok(repo) => repo.config_snapshot().plumbing().clone(),
+        Err(_) => gix::config::File::from_globals().unwrap_or_default(),
+    }
 }
 
 /// `cmd_help`'s alias check followed by `check_git_cmd()` + `cmd_to_page()`,
@@ -2328,26 +2422,8 @@ fn die(msg: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// git's `man.viewer` names a program to hand the page to (`konqueror`, `woman`,
-/// a `man.<tool>.cmd`). This port only drives plain `man`, so a different viewer
-/// is rejected instead of silently ignored. `help.format` needs no gate: all
-/// three of git's formats are implemented, and [`parse_help_format`] rejects the
-/// rest with git's own message.
-fn reject_unsupported_viewer_config() -> Result<()> {
-    let Ok(repo) = gix::discover(".") else {
-        return Ok(());
-    };
-    let config = repo.config_snapshot();
-    if let Some(viewer) = config.string("man.viewer") {
-        if viewer != "man" {
-            bail!("man.viewer={viewer} is not supported: only the plain `man` viewer is");
-        }
-    }
-    Ok(())
-}
-
 /// A child's exit status as git reports it: its exit code, or 128 + signal.
-fn exit_status_code(status: ExitStatus) -> u8 {
+pub(crate) fn exit_status_code(status: ExitStatus) -> u8 {
     if let Some(code) = status.code() {
         return code as u8;
     }

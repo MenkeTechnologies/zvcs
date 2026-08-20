@@ -220,8 +220,10 @@
 //!   here, so those invocations are declined rather than answered with a two-way patch.
 //!   Under `--cached` the same guard means the mode only turns the patch format on,
 //!   which *is* reproduced.
-//! * `--anchored=<text>`: nothing in this tree implements the anchored patience
-//!   variant, so the flag is recorded and refused for any content format.
+//! * `--anchored=<text>`: the anchored patience variant *is* implemented — see
+//!   [`super::diff_pairs::set_anchor_texts`] and `gix-imara-diff`'s `patience.rs` — but
+//!   this verb does not parse the flag onto it, so it is recorded and refused for any
+//!   content format rather than silently ignored.
 //! * `-G`/`-I`/`-S --pickaxe-regex` compile with the `regex` crate, not the platform's
 //!   POSIX engine, so a pattern the two engines disagree about (rare metacharacter edge
 //!   cases) can match differently, and an *invalid* pattern's fatal carries a different
@@ -2228,7 +2230,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             rest = prefix_lines(&rest, &opts.line_prefix);
         }
         out.extend_from_slice(&rest);
-        std::io::stdout().lock().write_all(&out)?;
+        // Through git's stdout buffer, not straight at fd 1: `show_local_changes()`
+        // reaches this from inside `checkout`/`switch`, where stock's block sits in
+        // the stdio buffer while `Switched to branch …` goes out on stderr. Run as
+        // `git diff-index` nothing arms the buffer and this is an unbuffered write
+        // as before, `EPIPE` and all.
+        crate::cstdio::write_bytes_io(&out)?;
     }
 
     // `diff_result_code()`: bit 0 is `--exit-code` with something to report, bit 1 is

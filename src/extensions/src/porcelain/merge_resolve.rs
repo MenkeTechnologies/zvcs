@@ -68,6 +68,11 @@
 //! * An unborn `HEAD` and an already-unmerged index, both of which the
 //!   `diff-index` pre-flight would have to diagnose in git's own words.
 
+// `print!`/`println!` here go through git's stdout buffer. `merge` reaches this
+// module in-process and arms that buffer (see `crate::cstdio`), so both halves of
+// its output have to be buffered or they interleave against each other; run as
+// its own command nothing arms it and these are unbuffered writes as before.
+use crate::cstdio::{print, println};
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
 use std::process::ExitCode;

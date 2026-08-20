@@ -263,6 +263,10 @@ fn merge_entry(ctx: &mut Ctx, rows: &[Row], start: usize, path: &BStr) -> Result
         cmd.env("PATH", p);
     }
 
+    // `start_command()`'s `fflush(NULL)` (run-command.c:743): the child writes
+    // straight at the inherited fd, so anything already buffered has to be out
+    // first or its `Auto-merging <path>` line jumps ahead of the strategy's.
+    crate::cstdio::before_spawn();
     let ok = match cmd.status() {
         Ok(status) => status.success(),
         Err(e) => {

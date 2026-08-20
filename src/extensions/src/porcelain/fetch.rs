@@ -68,6 +68,17 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `remote.<name>.serverOption` → default set of `-o`/`--server-option` values
 ///   * `remote.<name>.negotiationInclude` → default set of `--negotiation-include` tips
 ///
+/// The transfer-side object check, which has no flag at all
+/// (`fetch_pack_fsck_config()`, `fetch-pack.c:1954`, and [`fsck_fetched`]):
+///   * `fetch.fsckObjects`, falling back to `transfer.fsckObjects` → lint every
+///     object the pack delivered before a ref moves, killing the fetch on the
+///     first error with `index-pack`'s own two `fatal:` lines
+///   * `fetch.fsck.<msg-id>`      → that message's severity for this fetch only;
+///     it never falls back on `fsck.<msg-id>`
+///   * `fetch.fsck.skipList`      → object ids whose messages are dropped
+///   * `core.bigFileThreshold`    → which blobs the check sees as streamed, and
+///     so whether `gitmodulesLarge` can fire
+///
 /// Command-line refspecs go through git's two-stage match (`get_ref_map` in
 /// `builtin/fetch.c`): the refspecs on the command line select the refs, and
 /// the remote's configured refspecs — or `--refmap` — then map *only those*
@@ -1470,6 +1481,59 @@ fn refspec_globs_agree(spec: &str) -> bool {
     true
 }
 
+/// `remote.<name>.vcs` — the foreign-SCM helper a remote is reached through.
+///
+/// `remote_get_1()` records it as `remote->foreign_vcs` (remote.c:571-573), and
+/// `transport_get()` (transport.c:1239, :1251-1253) then hands the *whole*
+/// connection to `git-remote-<vcs>` instead of looking at the URL's scheme:
+///
+/// ```c
+/// helper = remote->foreign_vcs;
+/// …
+/// if (helper) {
+///         transport_helper_init(ret, helper);
+/// ```
+///
+/// The helper speaks the remote-helper protocol (`capabilities`, `list`,
+/// `import`/`export`) over its own stdio, and this port has no
+/// `transport-helper.c` — its `remote-ext`/`remote-fd`/`remote-http` verbs are
+/// individual helpers, not the machinery that drives one. So the setting is
+/// read and the command *refuses*, rather than ignoring it and connecting to
+/// the URL directly with the git protocol: for a `[remote "hg"] vcs = hg`
+/// remote that URL is not a git repository at all, and the git-protocol attempt
+/// would fail somewhere further along with a diagnostic about the wrong thing.
+///
+/// Returns the configured helper name, or `None` when the key is unset.
+///
+/// An **empty** value counts as set: `git_config_string()` stores `""`, so
+/// `transport_get()`'s `if (helper)` is still true and stock reaches for
+/// `git-remote-` — `git: 'remote-' is not a git command.` followed by
+/// `fatal: remote helper '' aborted session`, exit 128. Treating it as unset
+/// here would connect over the git protocol instead, which is the silent wrong
+/// thing this gate exists to prevent.
+pub(super) fn foreign_vcs(repo: &gix::Repository, remote_name: Option<&str>) -> Option<String> {
+    let name = remote_name?;
+    repo.config_snapshot()
+        .plumbing()
+        .string_by("remote", Some(gix::bstr::BStr::new(name.as_bytes())), "vcs")
+        .map(|v| v.to_string())
+}
+
+/// [`foreign_vcs`] as a gate: `Some(code)` is the exit status the caller must
+/// return, after the refusal has been reported.
+pub(super) fn reject_foreign_vcs(
+    repo: &gix::Repository,
+    remote_name: Option<&str>,
+) -> Option<ExitCode> {
+    let vcs = foreign_vcs(repo, remote_name)?;
+    let name = remote_name.unwrap_or_default();
+    eprintln!(
+        "fatal: remote.{name}.vcs={vcs} needs the git-remote-{vcs} helper protocol, \
+         which is not ported"
+    );
+    Some(ExitCode::from(128))
+}
+
 /// The program to run instead of `git-upload-pack` on the other end.
 ///
 /// `--upload-pack` wins over `remote.<name>.uploadpack`, which git reads in `get_upload_pack()`.
@@ -1948,6 +2012,16 @@ fn fetch_one(
         ..Default::default()
     };
 
+    // `remote.<name>.vcs` routes the whole connection through `git-remote-<vcs>`
+    // rather than the URL's own transport, which this port cannot drive — see
+    // [`foreign_vcs`]. Refused here, before the URL is displayed, so nothing
+    // claims to be fetching from a repository that was never going to be read
+    // with the git protocol.
+    if foreign_vcs(repo, remote_name.as_deref()).is_some() {
+        let _ = reject_foreign_vcs(repo, remote_name.as_deref());
+        return Ok(Verdict::Fatal);
+    }
+
     let raw_url = remote
         .url(gix::remote::Direction::Fetch)
         .map(ToString::to_string)
@@ -2035,6 +2109,35 @@ fn fetch_one(
         return Ok(Verdict::Fatal);
     }
 
+    // `fetch_pack_config()` (`fetch-pack.c:1995`) reads `fetch.fsck.<msg-id>`,
+    // `fetch.fsck.skipList`, `fetch.fsckObjects` and `transfer.fsckObjects` from
+    // inside `fetch_pack()` — after the ref map is in hand, so it is diagnosed
+    // *after* `couldn't find remote ref` and *before* any object moves.
+    // Confirmed against git 2.55.0: `-c fetch.fsck.badTree=bogus` next to a
+    // refspec the remote does not have reports only `couldn't find remote ref`,
+    // while the same against a ref that exists — even one already up to date —
+    // reports `fatal: Unknown fsck message type: 'bogus'`.
+    //
+    // The value is validated whether or not the check will run, because
+    // `fetch_pack_fsck_config()` calls `is_valid_msg_type()` on every
+    // `fetch.fsck.` variable it sees (`fetch-pack.c:1974`).
+    let fsck_msgs = match super::fsck::MsgConfig::new(repo, super::fsck::MsgSource::Fetch) {
+        Ok(config) => config,
+        Err(text) => {
+            eprintln!("fatal: {text}");
+            return Ok(Verdict::Fatal);
+        }
+    };
+    // `fetch_pack_fsck_objects()` (`fetch-pack.c:2158`): `fetch.fsckObjects`
+    // first, `transfer.fsckObjects` as the fallback, off when neither is set.
+    let fsck_objects = {
+        let snapshot = repo.config_snapshot();
+        snapshot
+            .boolean("fetch.fsckObjects")
+            .or_else(|| snapshot.boolean("transfer.fsckObjects"))
+            .unwrap_or(false)
+    };
+
     let outcome = prepared
         .with_dry_run(opts.dry_run)
         .with_shallow(opts.shallow.clone().unwrap_or_default())
@@ -2084,10 +2187,29 @@ fn fetch_one(
         eprintln!("warning: rejected {name} because shallow roots are not allowed to be updated");
     }
 
+    // `fetch.fsckObjects` / `transfer.fsckObjects`: every object the pack
+    // delivered is linted before a single ref moves, and the first error kills
+    // the fetch. This runs before [`explode_small_pack`] because with the check
+    // on `fetch_pack()` always picks `index-pack` — `do_keep || from_promisor ||
+    // index_pack_args || fsck_objects` at `fetch-pack.c:1007` — so the loose
+    // shortcut is not taken at all, and `index-pack` is also the name in the
+    // `%s failed` that follows the child's own diagnostic.
+    if let Status::Change { write_pack_bundle, .. } = &outcome.status {
+        if fsck_objects {
+            if let Err(message) = fsck_fetched(repo, write_pack_bundle, &fsck_msgs) {
+                eprintln!("fatal: {message}");
+                eprintln!("fatal: index-pack failed");
+                return Ok(Verdict::Fatal);
+            }
+        }
+    }
+
     // `fetch_pack()` chooses `unpack-objects` over `index-pack` for a small pack, so a
     // fetch of a handful of objects leaves them loose rather than packed.
     if let Status::Change { write_pack_bundle, .. } = &outcome.status {
-        explode_small_pack(repo, write_pack_bundle)?;
+        if !fsck_objects {
+            explode_small_pack(repo, write_pack_bundle)?;
+        }
     }
 
     // Both status variants carry the ref-update outcome; the ref_map ties each
@@ -2859,6 +2981,197 @@ mod tests {
             format!("{}\tnot-for-merge\t/tmp/o", id.to_hex())
         );
     }
+}
+
+/// `fetch.fsckObjects`: run the object-content message layer over everything the
+/// fetch delivered, at the severities `fetch.fsck.<msg-id>` selects.
+///
+/// git does this inside the `index-pack --strict<list>` child `fetch_pack()`
+/// starts (`fetch-pack.c:1061`), so the message text is `index-pack`'s spelling —
+/// it names the object, not its type — and a failure kills the fetch before a
+/// single ref moves. The child dies before renaming its temporary into
+/// `objects/pack`, so nothing of the pack survives; gitoxide has already written
+/// the pack by the time we get here, so it is removed on the way out. Confirmed
+/// against git 2.55.0: a fetch that fails this check leaves an empty
+/// `for-each-ref` and no `.pack`/`.idx` behind.
+///
+/// The two-phase structure and its two `die()`s are `index-pack`'s: the
+/// per-object pass says `fsck error in packed object`, `fsck_finish()` says
+/// `fsck error in pack objects`, and git dies at the first of the two it reaches.
+/// See [`super::receive_pack`] for the same shape on the push side, including why
+/// a `.gitmodules` blob's position in the pack decides which pass lints it.
+fn fsck_fetched(
+    repo: &gix::Repository,
+    bundle: &gix::odb::pack::bundle::write::Outcome,
+    msgs: &super::fsck::MsgConfig,
+) -> std::result::Result<(), String> {
+    use super::fsck::{big_file_threshold, check_blob, check_object, Severity};
+
+    let discard = || {
+        for path in [bundle.data_path.clone(), bundle.index_path.clone(), bundle.keep_path.clone()] {
+            if let Some(path) = path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    };
+
+    // `--strict=<list>`'s own `die()`s: the demote rule and an unreadable
+    // skip list are both reached inside the child, not while `fetch` read its
+    // configuration. See `MsgConfig::deferred_fatal`.
+    if let Some(text) = &msgs.deferred_fatal {
+        discard();
+        return Err(text.clone());
+    }
+
+    let (Some(index_path), Some(_)) = (&bundle.index_path, &bundle.data_path) else {
+        return Ok(());
+    };
+    let index = match gix::odb::pack::index::File::at(index_path, repo.object_hash()) {
+        Ok(index) => index,
+        Err(e) => {
+            discard();
+            return Err(e.to_string());
+        }
+    };
+    // Pack order, not index order: which pass lints a named blob depends on
+    // whether the naming tree came earlier *in the pack*.
+    let mut entries: Vec<(u64, gix::ObjectId)> =
+        index.iter().map(|e| (e.pack_offset, e.oid)).collect();
+    entries.sort_unstable();
+
+    let threshold = big_file_threshold(repo);
+    let mut failed = false;
+    let mut gitmodules: std::collections::HashSet<gix::ObjectId> = Default::default();
+    let mut gitattributes: std::collections::HashSet<gix::ObjectId> = Default::default();
+    let mut done: std::collections::HashSet<gix::ObjectId> = Default::default();
+    let mut report = |finding: &super::fsck::Finding, id: &gix::ObjectId, failed: &mut bool| {
+        match msgs.severity(finding, id) {
+            Severity::Ignore => {}
+            Severity::Info | Severity::Warn => {
+                eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
+            }
+            Severity::Error | Severity::Fatal => {
+                eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
+                *failed = true;
+            }
+        }
+    };
+
+    // `parse_pack_objects()`'s delay list (`builtin/index-pack.c:1279`): a blob
+    // over `core.bigFileThreshold` is inflated into a fixed scratch buffer and
+    // handed to `fsck_object()` as `NULL` only after the whole pack has been read
+    // (`builtin/index-pack.c:1308`), so it is checked against the complete
+    // `gitmodules_found` set no matter where it sat in the pack. That null buffer
+    // is the only thing that ever reports `gitmodulesLarge`.
+    let mut delayed: Vec<gix::ObjectId> = Vec::new();
+    for (_, id) in &entries {
+        let Ok(object) = repo.find_object(*id) else { continue };
+        if object.kind == gix::object::Kind::Blob {
+            if object.data.len() as u64 > threshold {
+                delayed.push(*id);
+                continue;
+            }
+            let as_modules = gitmodules.contains(id);
+            let as_attrs = gitattributes.contains(id);
+            if as_modules || as_attrs {
+                done.insert(*id);
+                for finding in check_blob(Some(&object.data), as_modules, as_attrs) {
+                    report(&finding, id, &mut failed);
+                }
+            }
+            continue;
+        }
+        let checked = check_object(object.kind, &object.data, true, repo.object_hash().len_in_hex());
+        for line in &checked.raw {
+            eprintln!("{line}");
+        }
+        gitmodules.extend(checked.gitmodules);
+        gitattributes.extend(checked.gitattributes);
+        for finding in &checked.findings {
+            report(finding, id, &mut failed);
+        }
+    }
+    for id in &delayed {
+        let as_modules = gitmodules.contains(id);
+        let as_attrs = gitattributes.contains(id);
+        if !as_modules && !as_attrs {
+            continue;
+        }
+        done.insert(*id);
+        for finding in check_blob(None, as_modules, as_attrs) {
+            report(&finding, id, &mut failed);
+        }
+    }
+
+    // `fsck_finish()`: every blob the trees named that the per-object pass did
+    // not already lint, whether or not the pack carried it.
+    let failed_before_finish = failed;
+    let mut queue: Vec<gix::ObjectId> = entries
+        .iter()
+        .map(|(_, id)| *id)
+        .filter(|id| !done.contains(id))
+        .filter(|id| gitmodules.contains(id) || gitattributes.contains(id))
+        .collect();
+    let mut rest: Vec<gix::ObjectId> = gitmodules
+        .union(&gitattributes)
+        .copied()
+        .filter(|id| !done.contains(id) && !queue.contains(id))
+        .collect();
+    rest.sort();
+    queue.append(&mut rest);
+
+    for id in queue {
+        let as_modules = gitmodules.contains(&id);
+        let as_attrs = gitattributes.contains(&id);
+        // `fsck_blobs()` reads the whole object (`fsck.c:1337`), so no blob is
+        // streamed here; it reports an unreadable or non-blob object once per
+        // sweep that named it.
+        let (missing, non_blob) = match repo.find_object(id) {
+            Ok(object) if object.kind == gix::object::Kind::Blob => {
+                for finding in check_blob(Some(&object.data), as_modules, as_attrs) {
+                    report(&finding, &id, &mut failed);
+                }
+                continue;
+            }
+            Ok(_) => (false, true),
+            Err(_) => (true, false),
+        };
+        for (present, missing_msg, blob_msg, label) in [
+            (
+                as_modules,
+                &super::fsck::GITMODULES_MISSING,
+                &super::fsck::GITMODULES_BLOB,
+                ".gitmodules",
+            ),
+            (
+                as_attrs,
+                &super::fsck::GITATTRIBUTES_MISSING,
+                &super::fsck::GITATTRIBUTES_BLOB,
+                ".gitattributes",
+            ),
+        ] {
+            if !present {
+                continue;
+            }
+            let finding = if missing {
+                super::fsck::Finding { msg: missing_msg, text: format!("unable to read {label} blob") }
+            } else {
+                debug_assert!(non_blob);
+                super::fsck::Finding { msg: blob_msg, text: format!("non-blob found at {label}") }
+            };
+            report(&finding, &id, &mut failed);
+        }
+    }
+
+    if failed {
+        discard();
+        return Err(if failed_before_finish {
+            "fsck error in packed object".into()
+        } else {
+            "fsck error in pack objects".into()
+        });
+    }
+    Ok(())
 }
 
 /// `fetch_pack()`'s `unpack-objects` path: a pack carrying fewer objects than

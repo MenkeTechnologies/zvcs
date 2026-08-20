@@ -1620,17 +1620,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // In pathspec-limited ("only") mode the tree comes from HEAD's tree with only
     // the listed paths swapped for their worktree content instead — see
     // `build_only_mode_tree`, which also stages those paths into the real index.
-    let (tree_id, new_entries): (ObjectId, Vec<(BString, EntryMode, ObjectId)>) = if only_mode {
+    let tree_id: ObjectId = if only_mode {
         build_only_mode_tree(&repo, &pathspecs)?
     } else {
         let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
-        // Snapshot (path, mode, id) per staged file for the summary/short-stat below.
-        let mut new_entries: Vec<(BString, EntryMode, ObjectId)> = Vec::new();
         if let Some(index) = &index {
-            let backing = index.path_backing();
-            new_entries.reserve(index.entries().len());
             for entry in index.entries() {
-                let path = entry.path_in(backing);
+                let path = entry.path_in(index.path_backing());
                 let mode = entry.mode.to_tree_entry_mode().ok_or_else(|| {
                     anyhow::anyhow!("index entry `{path}` has an unrepresentable mode")
                 })?;
@@ -1639,11 +1635,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     mode.kind(),
                     entry.id,
                 )?;
-                new_entries.push((path.to_owned(), mode, entry.id));
             }
         }
-        let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
-        (tree_id, new_entries)
+        editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?
     };
 
     // --- parents ---------------------------------------------------------
@@ -2327,121 +2321,46 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         println!(" Date: {dt}");
     }
 
-    // --- short-stat + create/delete/mode-change summary ------------------
+    // --- short-stat + summary --------------------------------------------
     // `log_tree_diff()` bails out on a commit with more than one parent unless a
     // combined-diff mode is asked for, which `print_commit_summary()` never does,
     // so a merge prints its headline and nothing else.
     if is_merge_commit {
         break 'summary;
     }
-    // Old file set (path -> mode, id) flattened from the parent tree; empty for
-    // the root commit.
-    let mut old_entries: HashMap<BString, (EntryMode, ObjectId)> = HashMap::new();
-    if let Some(pt) = parent_tree_id {
-        let old_index = repo.index_from_tree(&pt)?;
-        let old_backing = old_index.path_backing();
-        for e in old_index.entries() {
-            if let Some(m) = e.mode.to_tree_entry_mode() {
-                old_entries.insert(e.path_in(old_backing).to_owned(), (m, e.id));
-            }
-        }
-    }
-    let new_paths: HashSet<&BString> = new_entries.iter().map(|(p, _, _)| p).collect();
-
-    // File-level change count (git's "N files changed"), including binaries and
-    // pure mode changes; renames are counted as a delete plus a create.
-    let mut files_changed: u64 = 0;
-    let mut summary: Vec<(BString, String)> = Vec::new();
-    for (path, mode, id) in &new_entries {
-        match old_entries.get(path) {
-            None => {
-                files_changed += 1;
-                summary.push((path.clone(), format!("create mode {} {path}", octal(*mode))));
-            }
-            Some((old_mode, old_id)) => {
-                if old_id != id || old_mode != mode {
-                    files_changed += 1;
-                }
-                if old_mode != mode {
-                    summary.push((
-                        path.clone(),
-                        format!("mode change {} => {} {path}", octal(*old_mode), octal(*mode)),
-                    ));
-                }
-            }
-        }
-    }
-    for (path, (mode, _)) in &old_entries {
-        if !new_paths.contains(path) {
-            files_changed += 1;
-            summary.push((path.clone(), format!("delete mode {} {path}", octal(*mode))));
-        }
-    }
-
-    // Line counts from a real tree-to-tree blob diff (rename detection off, to
-    // keep the file accounting consistent with the count above).
-    let new_tree = repo.find_tree(tree_id)?;
-    let old_tree = match parent_tree_id {
-        Some(pt) => repo.find_tree(pt)?,
-        None => repo.empty_tree(),
-    };
-    let mut platform = old_tree.changes()?;
-    platform.options(|opts| {
-        opts.track_rewrites(None);
-    });
-    let stats = platform.stats(&new_tree)?;
-
-    // A gitlink has no blob to diff, so the tree-diff stats above score it zero —
-    // but git renders a submodule as the one-line `Subproject commit <oid>`, making
-    // a pointer move one insertion plus one deletion, a new submodule one insertion
-    // and a removed one, one deletion.
-    let mut ins = stats.lines_added;
-    let mut del = stats.lines_removed;
-    let is_gitlink = |m: &EntryMode| m.kind() == gix::object::tree::EntryKind::Commit;
-    for (path, mode, id) in &new_entries {
-        match old_entries.get(path) {
-            None => {
-                if is_gitlink(mode) {
-                    ins += 1;
-                }
-            }
-            Some((old_mode, old_id)) => {
-                if old_id == id && old_mode == mode {
-                    continue;
-                }
-                if is_gitlink(mode) {
-                    ins += 1;
-                }
-                if is_gitlink(old_mode) {
-                    del += 1;
-                }
-            }
-        }
-    }
-    for (path, (mode, _)) in &old_entries {
-        if !new_paths.contains(path) && is_gitlink(mode) {
-            del += 1;
-        }
-    }
-
-    // git prints the diff block only when something actually changed.
-    if files_changed > 0 {
-        let mut line = format!(" {files_changed} file{} changed", plural(files_changed));
-        // git shows the insertion clause unless there are only deletions, and the
-        // deletion clause unless there are only insertions.
-        if ins > 0 || del == 0 {
-            line.push_str(&format!(", {ins} insertion{}(+)", plural(ins)));
-        }
-        if del > 0 || ins == 0 {
-            line.push_str(&format!(", {del} deletion{}(-)", plural(del)));
-        }
-        println!("{line}");
-
-        summary.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_, l) in &summary {
-            println!(" {l}");
-        }
-    }
+    // `print_commit_summary()` does not count tree entries: it hands the commit to
+    // the ordinary revision/diff machinery (sequencer.c:1462-1474) with
+    // `DIFF_FORMAT_SHORTSTAT | DIFF_FORMAT_SUMMARY`, `show_root_diff = 1`, and
+    // `rev.diffopt.detect_rename = DIFF_DETECT_RENAME` (sequencer.c:1473), then
+    // lets `log_tree_commit()` diff the commit against its **first parent** — or
+    // against the empty tree when it has none, which is what `show_root_diff`
+    // buys. So the block below is produced by this port's own `diff-tree`, the
+    // engine `git diff --shortstat --summary -M` already agrees with stock on,
+    // rather than by a walk written a second time here. Two things that walk got
+    // wrong, both of them silent:
+    //
+    //   * With rename detection off it reported `git mv old new` as
+    //     ` 2 files changed, 20 insertions(+), 20 deletions(-)` plus a
+    //     create/delete pair, where stock prints ` 1 file changed, 0 insertions(+),
+    //     0 deletions(-)` and ` rename old.txt => new.txt (100%)`.
+    //   * Its line counts came from `gix`'s tree-diff statistics, which run both
+    //     blobs through the `Mode::ToGit` conversion pipeline before diffing them.
+    //     A commit that rewrites `a\nb\n` as `a\r\nb\r\nc\r\n` scored
+    //     ` 1 insertion(+)` there — the CRLF was normalized away on both sides —
+    //     against stock's ` 3 insertions(+), 2 deletions(-)`.
+    //
+    // `-r` is `log_tree_diff()`'s recursion, without which a change under `src/`
+    // would be charged to the `src` tree object; the operands are the two trees
+    // rather than the two commits so that `diff-tree` prints no commit-id header.
+    let left = parent_tree_id.unwrap_or_else(|| gix::ObjectId::empty_tree(hash));
+    super::diff_tree::diff_tree(&[
+        "-r".to_string(),
+        "-M".to_string(),
+        "--shortstat".to_string(),
+        "--summary".to_string(),
+        left.to_string(),
+        tree_id.to_string(),
+    ])?;
     } // 'summary
 
     // The merge is concluded, so the worktree `merge --autostash` put aside comes
@@ -3270,18 +3189,12 @@ pub(crate) fn write_commit_object(
 /// HEAD version — so any staged (index) changes to *other* paths are disregarded.
 /// After the tree is built the same matched paths are staged into the real
 /// on-disk index (leaving unrelated index entries untouched) so later commits see
-/// them. Returns `(tree_id, new_entries)` for the caller's summary/short-stat.
+/// them. Returns the tree id the commit is written against.
 ///
 /// A pathspec matches a path when the path equals it or lives under `<spec>/`;
 /// literal files and directory prefixes are supported, as are the worktree globs
 /// the dirwalk resolves. Blob hashing and mode detection mirror `git add`.
-/// A staged-entry snapshot for the commit summary: (repo-relative path, mode, id).
-type StagedEntry = (BString, EntryMode, ObjectId);
-
-fn build_only_mode_tree(
-    repo: &gix::Repository,
-    pathspecs: &[String],
-) -> Result<(ObjectId, Vec<StagedEntry>)> {
+fn build_only_mode_tree(repo: &gix::Repository, pathspecs: &[String]) -> Result<ObjectId> {
     // The commit tree comes from git's "false index" — HEAD's tree with only the
     // matched paths taken from the worktree. The same staged set is then applied
     // to the real index, so the worktree is walked and hashed exactly once.
@@ -3289,10 +3202,8 @@ fn build_only_mode_tree(
 
     let hash = repo.object_hash();
     let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
-    let mut new_entries: Vec<(BString, EntryMode, ObjectId)> = Vec::new();
     {
         let backing = temp.path_backing();
-        new_entries.reserve(temp.entries().len());
         for entry in temp.entries() {
             let path = entry.path_in(backing);
             let mode = entry
@@ -3304,7 +3215,6 @@ fn build_only_mode_tree(
                 mode.kind(),
                 entry.id,
             )?;
-            new_entries.push((path.to_owned(), mode, entry.id));
         }
     }
     let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
@@ -3316,7 +3226,7 @@ fn build_only_mode_tree(
     staged.apply_to(&mut real);
     real.write(gix::index::write::Options::default())?;
 
-    Ok((tree_id, new_entries))
+    Ok(tree_id)
 }
 
 /// `-i`/`--include <paths>`: refresh the *index-known* paths from the worktree,
@@ -3710,21 +3620,6 @@ fn collect_tracked_changes(
     }
 
     Ok(StagedSet { staged, deletions })
-}
-
-/// The git-internal octal representation of a tree entry mode, e.g. `100644`.
-fn octal(mode: EntryMode) -> String {
-    let mut buf = [0u8; 6];
-    mode.as_bytes(&mut buf).to_string()
-}
-
-/// `""` for a count of 1, `"s"` otherwise — for git's `file`/`files` etc.
-fn plural(n: u64) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
 }
 
 /// git's editor path for `git commit` without `-m`: build a template from

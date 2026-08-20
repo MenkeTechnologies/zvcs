@@ -302,6 +302,9 @@ impl file::Store {
         self.check_windows_device_name(name)?;
         let (base, relative_path) = self.reference_path_with_base(name);
         let ref_path = base.join(&relative_path);
+        if let Some(symref) = symlink_ref_contents(&ref_path) {
+            return Ok(Some(symref));
+        }
         match std::fs::File::open(&ref_path) {
             Ok(mut file) => {
                 let mut buf = Vec::with_capacity(128);
@@ -328,6 +331,57 @@ impl file::Store {
             Err(err) => Err(err),
         }
     }
+}
+
+/// A reference stored as a *symbolic link* rather than as a `ref: <name>` file,
+/// rendered as the textual form the loose-reference decoder understands.
+///
+/// This is git's `read_ref_internal()` (refs/files-backend.c:502-538), which
+/// `lstat`s a reference before reading it and, for a symlink, follows it by hand:
+///
+/// ```c
+/// /* Follow "normalized" - ie "refs/.." symlinks by hand */
+/// if (S_ISLNK(st.st_mode)) {
+///         …
+///         if (starts_with(sb_contents.buf, "refs/") &&
+///             !check_refname_format(sb_contents.buf, 0)) {
+///                 strbuf_swap(&sb_contents, referent);
+///                 *type |= REF_ISSYMREF;
+///                 …
+///         }
+///         /*
+///          * It doesn't look like a refname; fall through to just
+///          * treating it like a non-symlink, and reading whatever it
+///          * points to.
+///          */
+/// }
+/// ```
+///
+/// So a link whose target is a valid `refs/…` name is a **symref to that name**,
+/// and any other link is followed by the filesystem as before. Both halves matter:
+/// this is how git repositories written with `core.preferSymlinkRefs=true` store
+/// `HEAD`, and reading such a link through `File::open` gets it wrong twice over —
+/// it reports the target's object id as if `HEAD` were detached, and when the
+/// target does not exist yet (an unborn branch) it reports no `HEAD` at all, which
+/// makes repository discovery fail outright.
+///
+/// `None` means "not a symlink, or not one that names a reference", i.e. read the
+/// path normally.
+fn symlink_ref_contents(ref_path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(ref_path).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let target = std::fs::read_link(ref_path).ok()?;
+    let target = gix_path::into_bstr(target);
+    if !target.starts_with(b"refs/") || gix_validate::reference::name(target.as_ref()).is_err() {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(target.len() + 6);
+    buf.extend_from_slice(b"ref: ");
+    buf.extend_from_slice(&target);
+    buf.push(b'\n');
+    Some(buf)
 }
 
 #[cfg(windows)]

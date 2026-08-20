@@ -325,6 +325,33 @@ impl Diff {
         }
     }
 
+    /// [`Diff::compute_with`] pinned to [`Algorithm::Patience`] and given git's
+    /// `--anchored` texts, already resolved to one flag per *after*-side token:
+    /// `anchors[i]` says whether the line at position `i` of `after` begins with one
+    /// of them.
+    ///
+    /// git reaches the anchored diff only through the patience algorithm
+    /// (`diff_opt_anchored()` sets `DIFF_WITH_ALG(options, PATIENCE_DIFF)`,
+    /// `diff.c:5544-5556`), and patience never trims common ends — see the comment in
+    /// [`Diff::compute_with`] — so there is no trimming to redo here.
+    pub fn compute_with_anchors(&mut self, before: &[Token], after: &[Token], anchors: &[bool]) {
+        assert!(
+            before.len() < i32::MAX as usize,
+            "imara-diff only supports up to {} tokens",
+            i32::MAX
+        );
+        assert!(
+            after.len() < i32::MAX as usize,
+            "imara-diff only supports up to {} tokens",
+            i32::MAX
+        );
+        self.removed.clear();
+        self.added.clear();
+        self.removed.resize(before.len(), false);
+        self.added.resize(after.len(), false);
+        patience::diff_anchored(before, after, &mut self.removed, &mut self.added, anchors);
+    }
+
     /// Returns the total number of tokens that were added in the second sequence.
     pub fn count_additions(&self) -> u32 {
         self.added.iter().map(|&added| u32::from(added)).sum()

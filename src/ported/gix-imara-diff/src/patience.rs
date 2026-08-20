@@ -17,9 +17,24 @@
 //!   longest-increasing-subsequence pass depends on that order, so it is preserved here
 //!   with a plain `Vec` rather than reproducing upstream's open-addressed table.
 //!
-//! `--anchored` (`xpp->anchors`) is the one upstream input with no equivalent here: this
-//! crate has no way to pass anchor prefixes in, so `is_anchor()` is constantly false and
-//! upstream's `anchor_i` stays -1. Every branch it guards is therefore dead and omitted.
+//! `--anchored` (`xpp->anchors`) arrives as the `anchors` slice: one flag per *after*-side
+//! line, already decided by the caller, which is exactly what upstream's
+//!
+//! ```c
+//! static int is_anchor(xpparam_t const *xpp, const char *line)
+//! {
+//!         for (i = 0; i < xpp->anchors_nr; i++)
+//!                 if (!strncmp(line, xpp->anchors[i], strlen(xpp->anchors[i])))
+//!                         return 1;
+//!         return 0;
+//! }
+//! ```
+//!
+//! (`xdiff/xpatience.c:71-79`) computes per record. The flag is per *line* rather than
+//! per token because upstream tests the raw record text, which under `-w`/`-b` is not
+//! the same thing as the token: two lines can intern to one token and only one of them
+//! start with the anchor. [`diff`] passes an empty slice, so `is_anchor()` is constantly
+//! false there and upstream's `anchor_i` stays -1.
 
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::HashMap;
@@ -34,7 +49,20 @@ use crate::{Algorithm, Diff};
 /// (already trimmed) sequences, which the recursion below sets for every line that is
 /// not part of a common sequence.
 pub fn diff(before: &[Token], after: &[Token], removed: &mut [bool], added: &mut [bool]) {
-    patience_diff(before, after, removed, added, 0..before.len(), 0..after.len());
+    diff_anchored(before, after, removed, added, &[]);
+}
+
+/// [`diff`] with `--anchored` in force: `anchors[i]` says whether *after*-side line `i`
+/// begins with one of the anchor texts, and a common-sequence candidate that sits on
+/// such a line can never be dropped in favour of a longer sequence.
+pub fn diff_anchored(
+    before: &[Token],
+    after: &[Token],
+    removed: &mut [bool],
+    added: &mut [bool],
+    anchors: &[bool],
+) {
+    patience_diff(before, after, removed, added, 0..before.len(), 0..after.len(), anchors);
 }
 
 /// Where the sole occurrence of a candidate line sits on the *after* side.
@@ -130,27 +158,63 @@ fn line2_of(order: &[Entry], slot: usize) -> usize {
 /// Upstream keeps one candidate per sequence *length* — the one with the smallest last
 /// `line2` — and threads the winners together through `previous`; that is patience
 /// sorting, and it is reproduced here with the same two arrays.
-fn find_longest_common_sequence(order: &[Entry]) -> Option<Vec<(usize, usize)>> {
+///
+/// ```c
+/// int anchor_i = -1;
+/// …
+///         ++i;
+///         if (i <= anchor_i)
+///                 continue;
+///         sequence[i] = entry;
+///         if (is_anchor(xpp, (const char*)recs[entry->line2 - 1].ptr)) {
+///                 anchor_i = i;
+///                 longest = anchor_i + 1;
+///         } else if (i == longest) {
+///                 longest++;
+///         }
+/// ```
+///
+/// (`xdiff/xpatience.c:200-223`.) Once a candidate on an anchored line has claimed slot
+/// `anchor_i`, nothing at or below that slot may be overwritten and the sequence is
+/// truncated to end there — which is what forces the chosen common subsequence to run
+/// *through* the anchor instead of around it.
+fn find_longest_common_sequence(order: &[Entry], anchors: &[bool]) -> Option<Vec<(usize, usize)>> {
     // `sequence[k]` is the entry ending the best sequence of length `k + 1`.
     let mut sequence: Vec<usize> = Vec::new();
     let mut previous: Vec<Option<usize>> = vec![None; order.len()];
 
+    // Upstream tracks `longest` separately from the array it fills, because an anchor
+    // shortens the sequence without shrinking the array. `-1` is "no anchor yet".
+    let mut anchor_i: isize = -1;
+    let mut longest = 0usize;
     for (slot, entry) in order.iter().enumerate() {
         let Line2::Unique(line2) = entry.line2 else {
             continue;
         };
-        let i = match sequence.last() {
-            Some(&last) if line2 <= line2_of(order, last) => binary_search(&sequence, order, line2),
-            // Extends the longest sequence found so far, so it appends.
-            _ => sequence.len() as isize - 1,
+        let i = match longest {
+            0 => -1,
+            n if line2 > line2_of(order, sequence[n - 1]) => n as isize - 1,
+            _ => binary_search(&sequence[..longest], order, line2),
         };
         previous[slot] = (i >= 0).then(|| sequence[i as usize]);
-        let i = (i + 1) as usize;
+        let i = i + 1;
+        // "Overriding entries before the anchor has no effect, so do not do that either."
+        if i <= anchor_i {
+            continue;
+        }
+        let i = i as usize;
         match i == sequence.len() {
             true => sequence.push(slot),
             false => sequence[i] = slot,
         }
+        if anchors.get(line2).copied().unwrap_or(false) {
+            anchor_i = i as isize;
+            longest = i + 1;
+        } else if i == longest {
+            longest += 1;
+        }
     }
+    sequence.truncate(longest);
 
     // Walk back from the last element, which upstream does by rewriting `next`.
     let mut slot = Some(*sequence.last()?);
@@ -173,6 +237,7 @@ fn walk_common_sequence(
     chain: &[(usize, usize)],
     r1: Range<usize>,
     r2: Range<usize>,
+    anchors: &[bool],
 ) {
     let (end1, end2) = (r1.end, r2.end);
     let (mut line1, mut line2) = (r1.start, r2.start);
@@ -199,7 +264,7 @@ fn walk_common_sequence(
             line2 += 1;
         }
         if next1 > line1 || next2 > line2 {
-            patience_diff(before, after, removed, added, line1..next1, line2..next2);
+            patience_diff(before, after, removed, added, line1..next1, line2..next2, anchors);
         }
         if chain.get(k).is_none() {
             return;
@@ -255,6 +320,7 @@ fn patience_diff(
     added: &mut [bool],
     r1: Range<usize>,
     r2: Range<usize>,
+    anchors: &[bool],
 ) {
     // Trivial case: one side is empty, so the other is wholly inserted or deleted.
     if r1.is_empty() {
@@ -274,8 +340,10 @@ fn patience_diff(
         return;
     }
 
-    match find_longest_common_sequence(&order) {
-        Some(chain) => walk_common_sequence(before, after, removed, added, &chain, r1, r2),
+    match find_longest_common_sequence(&order, anchors) {
+        Some(chain) => {
+            walk_common_sequence(before, after, removed, added, &chain, r1, r2, anchors)
+        }
         None => fall_back(before, after, removed, added, r1, r2),
     }
 }

@@ -59,7 +59,17 @@ pub(crate) fn git_with_metadata(
 
     {
         // Fast-path: avoid doing the complete search if HEAD is already not there.
-        if !dot_git.join("HEAD").exists() {
+        //
+        // `symlink_metadata` rather than `Path::exists()`, which follows links and
+        // so reports a *dangling* symlink as missing. A repository written with
+        // `core.preferSymlinkRefs=true` stores `HEAD` as a symlink to its branch
+        // (refs/files-backend.c's `create_ref_symlink`), and that link dangles for
+        // as long as the branch is unborn — which is exactly the state `git init`
+        // plus `git symbolic-ref HEAD refs/heads/<new>` leaves behind. git itself
+        // `lstat`s here (`read_ref_internal`, refs/files-backend.c:502) and finds
+        // the reference; following the link instead turned such a repository into
+        // "not a git repository (or any of the parent directories): .git".
+        if dot_git.join("HEAD").symlink_metadata().is_err() {
             return Err(crate::is_git::Error::MissingHead);
         }
         // We expect to be able to parse any ref-hash, so we shouldn't have to know the repos hash here.

@@ -39,6 +39,17 @@ impl State {
         self.object_hash
     }
 
+    /// The `link` extension's `shared_index_checksum` — the name of the shared index
+    /// a *split* index was built against — or `None` for an ordinary index.
+    ///
+    /// [`crate::File::at()`] dissolves the extension into the state it decoded and
+    /// clears this, so only a state decoded straight out of bytes still carries it.
+    /// It is what git's `the_repository->index->split_index->base_oid` holds, which
+    /// `git rev-parse --shared-index-path` renders as `sharedindex.<oid>`.
+    pub fn shared_index_checksum(&self) -> Option<gix_hash::ObjectId> {
+        self.link.as_ref().map(|link| link.shared_index_checksum)
+    }
+
     /// Return our entries
     pub fn entries(&self) -> &[Entry] {
         &self.entries

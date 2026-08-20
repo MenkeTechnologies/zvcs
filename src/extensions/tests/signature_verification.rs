@@ -198,9 +198,17 @@ fn pull_into_void_verifies_on_either_spelling() {
 }
 
 /// `%(is-base)`'s parse-time rejections are git's own `die()`s and wear git's
-/// voice; the compute path and `%(deltabase)` are gaps in this port and must not.
+/// voice; its compute path and `%(deltabase)` now render what git renders.
+///
+/// This test used to assert the opposite half: that the two compute paths were
+/// gaps, refusing at exit 1 in the port's own voice so a reader could not mistake
+/// them for git's failures. `b539da4820` ported them and left the assertion
+/// standing, so the suite has been red ever since — the value below is stock
+/// git 2.55.0's, captured from the same fixture this test builds. A test that
+/// outlives the gap it described is worse than no test: it reports a defect
+/// where the work was actually done, and it trains a reader to ignore the file.
 #[test]
-fn unported_atoms_do_not_borrow_gits_fatal() {
+fn formerly_unported_atoms_now_render_gits_values() {
     let root = scratch("atoms");
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -221,16 +229,15 @@ fn unported_atoms_do_not_borrow_gits_fatal() {
         assert_eq!(stderr(&out).trim_end(), want, "{format}");
     }
 
-    // Not git's failures. `fatal:` at 128 would claim they were.
-    for format in ["%(is-base:HEAD)", "%(deltabase)"] {
+    // The compute paths. One ref (`refs/heads/main`) at one commit, so
+    // `filter_is_base()` names it the base and `%(deltabase)` has no delta base
+    // to report — git prints the null oid rather than nothing (ref-filter.c's
+    // `oid_to_hex(&oi->delta_base_oid)` on a zeroed field).
+    for (format, want) in [("%(is-base:HEAD)", "(HEAD)\n"), ("%(deltabase)", &format!("{}\n", "0".repeat(40)))]
+    {
         let out = run(&root, &home, &["for-each-ref", &format!("--format={format}")]);
-        let err = stderr(&out);
-        assert_eq!(out.status.code(), Some(1), "{format}: {err}");
-        assert!(
-            err.starts_with("zvcs: for-each-ref: "),
-            "{format} did not speak in the port's voice: {err}"
-        );
-        assert!(!err.contains("fatal:"), "{format} borrowed git's voice: {err}");
+        assert_eq!(out.status.code(), Some(0), "{format}: {}", stderr(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), *want, "{format}");
     }
 
     let _ = std::fs::remove_dir_all(&root);

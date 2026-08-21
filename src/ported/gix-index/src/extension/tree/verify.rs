@@ -66,7 +66,9 @@ impl Tree {
             for child in children {
                 entries += child.num_entries.unwrap_or(0);
                 if let Some(prev) = prev {
-                    if prev.name.cmp(&child.name) != Ordering::Less {
+                    // Nodes are stored in git's `subtree_name_cmp` order — length first, then
+                    // `memcmp` (cache-tree.c:49-57) — not in plain lexicographic order.
+                    if super::subtree_name_cmp(&prev.name, &child.name) != Ordering::Less {
                         return Err(Error::OutOfOrder {
                             parent_id,
                             previous_path: prev.name.as_bstr().into(),
@@ -81,7 +83,7 @@ impl Tree {
                 let mut num_entries = 0;
                 for entry in tree_entries.filter_map(Result::ok).filter(|e| e.mode.is_tree()) {
                     children
-                        .binary_search_by(|e| e.name.as_bstr().cmp(entry.filename))
+                        .binary_search_by(|e| super::subtree_name_cmp(&e.name, entry.filename))
                         .map_err(|_| Error::MissingTreeDirectory {
                             parent_id,
                             entry_id: entry.oid.to_owned(),

@@ -198,8 +198,6 @@ struct Ctx {
     prefix: String,
     /// The index has entry changes that must be persisted.
     dirty: bool,
-    /// Entries were added/removed/re-flagged, so the cache-tree extension is stale.
-    tree_stale: bool,
     /// `--refresh` reported at least one path; the command exits 1.
     has_errors: bool,
     /// `--force-write-index`: persist the index even when nothing changed.
@@ -233,6 +231,25 @@ struct Ctx {
 /// Signals that git would have called `die()`: the message is already on stderr
 /// and the process must exit 128 without writing the index.
 struct Die;
+
+impl Ctx {
+    /// Record that `path`'s index entry changed: the cache-tree nodes along it can
+    /// no longer be trusted. (`dirty` — git's `cache_changed` — is set separately by
+    /// the callers, which know whether the entry really moved.)
+    ///
+    /// This is `cache_tree_invalidate_path()` (cache-tree.c:159-163), which git
+    /// calls from inside every entry-level mutation — `add_index_entry_with_check()`
+    /// (read-cache.c:1273-1274), `remove_file_from_index()` (:632),
+    /// `chmod_index_entry()` (:935) — and never from the write path, because by then
+    /// it no longer knows which paths moved.
+    ///
+    /// Only the directories above `path` lose their cached tree ids; every sibling
+    /// directory keeps its own, which is what makes `update-index` on one path in a
+    /// large tree leave a cache-tree the next `write-tree` can still mostly reuse.
+    fn invalidate(&mut self, path: &BStr) {
+        self.index.invalidate_path_in_tree(path);
+    }
+}
 
 type Step = std::result::Result<(), Die>;
 
@@ -288,7 +305,6 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         workdir,
         prefix,
         dirty: false,
-        tree_stale: false,
         has_errors: false,
         force_write: false,
         allow_add: false,
@@ -326,9 +342,11 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
                     eprintln!("fatal: Unable to write new index file");
                     return Ok(ExitCode::from(128));
                 }
-                if ctx.tree_stale {
-                    ctx.index.remove_tree();
-                }
+                // Every mutation above already invalidated the cache-tree along the
+                // path it touched (`Ctx::invalidate`), so what is written here is
+                // git's own post-`update-index` shape: the root and the changed
+                // directories marked invalid, every untouched directory still
+                // carrying its tree id.
                 ctx.index.write(crate::config::index_write_options(&ctx.repo))?;
                 // `core.fsync=index` (or an aggregate containing it) hardens the
                 // index git has just rewritten; the platform default does not.
@@ -1085,7 +1103,7 @@ fn index_info_add(
         e.stat = stat;
         e.flags = want_flags;
         ctx.dirty = true;
-        ctx.tree_stale = true;
+            ctx.invalidate(path);
         return Ok(true);
     }
 
@@ -1114,7 +1132,7 @@ fn index_info_add(
         .dangerously_push_entry(stat, oid, want_flags, mode, path);
     ctx.index.sort_entries();
     ctx.dirty = true;
-    ctx.tree_stale = true;
+    ctx.invalidate(path);
     Ok(true)
 }
 
@@ -1335,7 +1353,7 @@ fn process_directory(
                 e.mode = Mode::COMMIT;
             }
             ctx.dirty = true;
-            ctx.tree_stale = true;
+            ctx.invalidate(path.as_bstr());
             return Ok(Ok(()));
         }
         return Ok(remove_one_path(ctx, path));
@@ -1480,7 +1498,7 @@ fn add_index_entry(
         };
         if !unchanged {
             ctx.dirty = true;
-            ctx.tree_stale = true;
+            ctx.invalidate(path);
         }
         return Ok(true);
     }
@@ -1496,7 +1514,7 @@ fn add_index_entry(
     });
     if removed_conflicted {
         ctx.dirty = true;
-        ctx.tree_stale = true;
+        ctx.invalidate(owned.as_bstr());
     }
 
     if !ctx.allow_add && !removed_conflicted {
@@ -1525,14 +1543,16 @@ fn add_index_entry(
         ctx.index
             .remove_entries(|_, p, _| conflicting.iter().any(|c| c.as_bstr() == p));
         ctx.dirty = true;
-        ctx.tree_stale = true;
+        for c in &conflicting {
+            ctx.invalidate(c.as_bstr());
+        }
     }
 
     ctx.index
         .dangerously_push_entry(stat, id, want_flags, mode, path);
     ctx.index.sort_entries();
     ctx.dirty = true;
-    ctx.tree_stale = true;
+    ctx.invalidate(path);
     Ok(true)
 }
 
@@ -1557,7 +1577,7 @@ fn mark_ce_flags(ctx: &mut Ctx, path: &BString, mark: Mark) -> Step {
         normalize_extended(&mut e.flags);
     }
     ctx.dirty = true;
-    ctx.tree_stale = true;
+    ctx.invalidate(path.as_bstr());
     Ok(())
 }
 
@@ -1583,7 +1603,7 @@ fn chmod_path(ctx: &mut Ctx, flip: char, path: &BString) -> Step {
     if current != want {
         ctx.index.entries_mut()[idx].mode = want;
         ctx.dirty = true;
-        ctx.tree_stale = true;
+        ctx.invalidate(path.as_bstr());
     }
     report(ctx, format_args!("chmod {flip}x '{path}'"));
     Ok(())
@@ -1600,7 +1620,7 @@ fn remove_path_entries(ctx: &mut Ctx, path: &BStr) {
     });
     if removed {
         ctx.dirty = true;
-        ctx.tree_stale = true;
+        ctx.invalidate(owned.as_bstr());
     }
 }
 
@@ -1840,7 +1860,7 @@ fn unresolve_one(ctx: &mut Ctx, path: &BStr) -> Result<Step> {
         ctx.index
             .remove_entries(|_, p, e| p == path && e.stage_raw() == 0);
         ctx.dirty = true;
-        ctx.tree_stale = true;
+        ctx.invalidate(path);
     } else {
         let already_unmerged = {
             let backing = ctx.index.path_backing();
@@ -1865,7 +1885,7 @@ fn unresolve_one(ctx: &mut Ctx, path: &BStr) -> Result<Step> {
     if added {
         ctx.index.sort_entries();
         ctx.dirty = true;
-        ctx.tree_stale = true;
+        ctx.invalidate(path);
     }
     Ok(Ok(()))
 }

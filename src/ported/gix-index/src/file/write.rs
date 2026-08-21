@@ -17,8 +17,8 @@ impl File {
     /// to retain all information of this index.
     ///
     /// Note that the `tree` (tree-cache) extension is written as-is and is **not** recomputed or
-    /// invalidated to match the current entries; see [`File::write()`] for the implications and the
-    /// recommended workaround.
+    /// invalidated to match the current entries; see [`File::write()`] for the implications and for
+    /// the two ways to keep it honest.
     pub fn write_to(
         &self,
         mut out: impl std::io::Write,
@@ -45,23 +45,37 @@ impl File {
     ///
     /// ### The `tree` (tree-cache) extension is written as-is
     ///
-    /// The `tree` extension (tree-cache) is serialized from its current in-memory state; it is
-    /// **not** recomputed or invalidated to match the entries. So if entries were modified since the
-    /// index was read, the tree-cache is written back still marked valid even though it is now stale.
+    /// The `tree` extension (tree-cache) is serialized from its current in-memory state; this
+    /// function does **not** recompute or invalidate it to match the entries. So if entries were
+    /// modified since the index was read and nothing was done about it, the tree-cache is written
+    /// back still marked valid even though it is now stale.
     ///
     /// Git uses the tree-cache to skip unchanged directories when building a tree (on `git commit` /
     /// `git write-tree`), so a stale-but-valid tree-cache can make a later commit capture outdated
     /// subtree content; more generally, `git status` and later commits can disagree about what is
     /// staged.
     ///
-    /// Until the tree-cache is updated on write (see [issue #2421]), remove it with
-    /// [`State::remove_tree()`](crate::State::remove_tree()) before writing whenever entries were
-    /// changed:
+    /// Keeping it honest is the caller's job, and is exactly what git does at each of its own entry
+    /// mutations. Either maintain it — invalidate every path you touched, and recompute before the
+    /// write:
+    ///
+    /// ```ignore
+    /// index.invalidate_path_in_tree(path);            // cache_tree_invalidate_path()
+    /// index.cache_tree_update(&odb, Default::default())?;  // cache_tree_update()
+    /// index.write(gix_index::write::Options::default())?;
+    /// ```
+    ///
+    /// — or throw it away, which costs the next reader a recomputation and nothing else:
     ///
     /// ```ignore
     /// index.remove_tree();
     /// index.write(gix_index::write::Options::default())?;
     /// ```
+    ///
+    /// See [`State::invalidate_path_in_tree()`](crate::State::invalidate_path_in_tree()),
+    /// [`State::cache_tree_update()`](crate::State::cache_tree_update()) and
+    /// [`State::prime_cache_tree()`](crate::State::prime_cache_tree()); upstream tracks the
+    /// automatic version as [issue #2421].
     ///
     /// [issue #2421]: https://github.com/GitoxideLabs/gitoxide/issues/2421
     pub fn write(&mut self, options: write::Options) -> Result<(), Error> {

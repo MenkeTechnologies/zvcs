@@ -1520,28 +1520,19 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- build a tree object from the index ------------------------------
-    // A freshly-init'd repo has no index file yet. `open_index` errors on the
-    // missing file, so treat its absence as an empty index — git's root empty
-    // commit (`commit --allow-empty` on a fresh repo) then produces the empty tree
-    // instead of failing with "opening the index: No such file or directory".
-    // `open_index`'s Err variant is large; boxing it would churn every call site.
-    #[allow(clippy::result_large_err)]
-    let index = repo
-        .index_path()
-        .exists()
-        .then(|| repo.open_index())
-        .transpose()?;
+    // A freshly-init'd repo has no index file yet, which is an empty index — git's
+    // root empty commit (`commit --allow-empty` on a fresh repo) then produces the
+    // empty tree instead of failing to open a file that isn't there.
+    let mut index = open_or_empty_index(&repo)?;
 
     // Refuse while conflicts are staged, exactly as git does — `refresh_cache_or_die()`
     // reports every unmerged path and then `die_resolve_conflict("commit")`.
-    if let Some(index) = &index {
-        if index
-            .entries()
-            .iter()
-            .any(|e| e.stage() != gix::index::entry::Stage::Unconflicted)
-        {
-            return Ok(die_resolve_conflict(index));
-        }
+    if index
+        .entries()
+        .iter()
+        .any(|e| e.stage() != gix::index::entry::Stage::Unconflicted)
+    {
+        return Ok(die_resolve_conflict(&index));
     }
 
     // `pre-commit` runs before the commit is built; a non-zero exit aborts it
@@ -1551,12 +1542,23 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
-    // Feed every index entry into the plumbing tree editor, which builds the
-    // nested trees in canonical (git) order and writes them to the odb. The
-    // high-level `Repository::edit_tree` wrapper is gated behind the `tree-editor`
-    // feature, so the editor is constructed directly over the public object
-    // database handle instead. With no index (fresh repo) the editor stays empty
-    // and writes the empty tree.
+    // The tree a commit records *is* the index's cache-tree root:
+    // `commit_tree_extended(..., &the_repository->index->cache_tree->oid, ...)`
+    // (builtin/commit.c:1938), fed by the `cache_tree_update()` that
+    // `prepare_to_commit()` runs over the index it just read (builtin/commit.c:1111).
+    //
+    // The as-is path of `prepare_index()` (builtin/commit.c:482-491) is what decides
+    // whether the index file is rewritten: it updates the cache-tree when the index
+    // changed *or* the cache-tree is not fully valid, and `cache_tree_update()`
+    // setting `CACHE_TREE_CHANGED` is then what gets past the `SKIP_IF_UNCHANGED`
+    // guard in `write_locked_index()` (read-cache.c:3333). Everything before this
+    // point has already written whatever it staged (`-a` through
+    // `stage_tracked_changes()`, `-i` through `include_stage()`) and re-read it, so
+    // the in-memory index equals the on-disk one and git's `cache_changed` is zero:
+    // the condition reduces to "the cache-tree is not fully valid", which
+    // [`super::write_tree::refresh_cache_tree`] tests and acts on. A commit that
+    // follows a `git add` therefore rewrites the index — the `add` invalidated the
+    // root — while a second `commit --allow-empty` in a row leaves it alone.
     //
     // In pathspec-limited ("only") mode the tree comes from HEAD's tree with only
     // the listed paths swapped for their worktree content instead — see
@@ -1564,21 +1566,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let tree_id: ObjectId = if only_mode {
         build_only_mode_tree(&repo, &pathspecs)?
     } else {
-        let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
-        if let Some(index) = &index {
-            for entry in index.entries() {
-                let path = entry.path_in(index.path_backing());
-                let mode = entry.mode.to_tree_entry_mode().ok_or_else(|| {
-                    anyhow::anyhow!("index entry `{path}` has an unrepresentable mode")
-                })?;
-                editor.upsert(
-                    path.split(|&b| b == b'/').map(|c| c.as_bstr()),
-                    mode.kind(),
-                    entry.id,
-                )?;
+        match super::write_tree::refresh_cache_tree(&repo, &mut index, false)? {
+            Ok(id) => id,
+            Err(err) => {
+                // `if (cache_tree_update(the_repository->index, 0)) { error(_("Error
+                // building trees")); return 0; }` (builtin/commit.c:1111-1114), and a
+                // `prepare_to_commit()` that returns 0 makes `cmd_commit` exit 1.
+                super::write_tree::report_tree_build_failure(&err);
+                eprintln!("error: Error building trees");
+                return Ok(ExitCode::from(1));
             }
         }
-        editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?
     };
 
     // --- parents ---------------------------------------------------------
@@ -2495,6 +2493,16 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     } else if !o.pathspecs.is_empty() {
         Some(only_mode_stage(repo, &o.pathspecs)?.0)
     } else {
+        // An as-is dry run is not read-only, and that is not an accident of this
+        // port: `dry_run_commit()` calls `prepare_index(..., is_status=1)` and
+        // `is_status` only widens the refresh flags (builtin/commit.c:365-366), so
+        // the as-is branch still refreshes the index, updates its cache-tree and
+        // writes it with `COMMIT_LOCK` (builtin/commit.c:482-491). The
+        // `rollback_index_files()` that follows the report only rolls back locks
+        // that were never committed, which is why `-a` and `-i` — whose prepared
+        // index lives in a lock file — leave the real one alone while this does not.
+        let mut real = open_or_empty_index(repo)?;
+        super::write_tree::update_cache_tree_if_stale(repo, &mut real)?;
         None
     };
 
@@ -3171,10 +3179,15 @@ fn build_only_mode_tree(repo: &gix::Repository, pathspecs: &[String]) -> Result<
     // next one.
     let mut real = open_or_empty_index(repo)?;
     staged.apply_to(&mut real);
-    // Step (2)/(3) (builtin/commit.c:534-538) rewrites the real on-disk index,
+    // Step (2)/(3) (builtin/commit.c:534-539) rewrites the real on-disk index,
     // so it carries the
     // repository's index-write options like every other write does
-    // (read-cache.c:2830-2831).
+    // (read-cache.c:2830-2831). The `cache_tree_update()` that git runs between
+    // the staging and the write (builtin/commit.c:537) is what leaves the real
+    // index with a *valid* cache-tree afterwards rather than the invalidated one
+    // `apply_to` produced — the partial commit's whole point is that the next
+    // command sees a ready index.
+    super::write_tree::update_cache_tree_quietly(repo, &mut real);
     real.write(crate::config::index_write_options(repo))?;
 
     Ok(tree_id)
@@ -3259,8 +3272,12 @@ impl StagedSet {
     }
 
     /// Replace every touched path in `index` wholesale, then restore sort order.
-    /// The tree-cache extension is dropped so a later tree build cannot pick up a
-    /// stale subtree for a path that just moved.
+    ///
+    /// Each touched path is invalidated in the tree-cache, which is what git does
+    /// from inside `add_index_entry_with_check()` (read-cache.c:1273-1274) and
+    /// `remove_file_from_index()` (read-cache.c:632) for every single entry it
+    /// adds or drops. Directories no path here touches keep their cached tree ids,
+    /// so the `cache_tree_update()` that follows only re-serialises what moved.
     fn apply_to(&self, index: &mut gix::index::File) {
         let remove: HashSet<BString> = self
             .staged
@@ -3273,7 +3290,9 @@ impl StagedSet {
             index.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
         }
         index.sort_entries();
-        index.remove_tree();
+        for path in &remove {
+            index.invalidate_path_in_tree(path.as_ref());
+        }
     }
 }
 

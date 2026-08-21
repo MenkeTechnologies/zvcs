@@ -63,7 +63,7 @@ impl State {
     ///
     /// Note that the `tree` (tree-cache) extension is written as-is and is **not** recomputed or
     /// invalidated to match the entries; see [`File::write()`](crate::File::write()) for the
-    /// implications and the recommended workaround.
+    /// implications and for the two ways to keep it honest.
     pub fn write_to(
         &self,
         out: impl std::io::Write,

@@ -6,18 +6,23 @@
 //! as stock git prints it. The failure paths (unmerged index, missing object,
 //! unknown prefix, bad usage) reproduce git's stderr text and exit codes.
 //!
-//! Not covered: git additionally refreshes the index's `TREE` (cache-tree)
-//! extension on disk after a successful run. The vendored `gix-index` writer
-//! emits that extension "as-is and is **not** recomputed"
-//! (`src/ported/gix-index/src/write.rs`), so there is no substrate to rebuild
-//! it; this port leaves the index file untouched rather than writing a stale
-//! extension. Every tree object git would create is still written to the odb.
+//! The tree itself comes from the index's `TREE` (cache-tree) extension, exactly
+//! as `write_index_as_tree()` (cache-tree.c:797-831) builds it: unchanged
+//! directories are reused from the extension and only the invalidated ones are
+//! re-serialised, and the refreshed extension is written back to the index
+//! afterwards — "Not being able to write is fine -- we are only interested in
+//! updating the cache-tree part" (cache-tree.c:820-825).
+//!
+//! This module also owns the object-database glue
+//! ([`RepoOdb`], [`refresh_cache_tree`]) that the other index-writing verbs use,
+//! because it is the one whose whole job is turning an index into a tree.
 
 use anyhow::Result;
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
 use gix::index::entry::Stage;
+use gix::index::extension::tree::update as cache_tree;
 use gix::objs::tree::EntryMode;
 
 /// Stock git's `write-tree` usage block, byte-for-byte (208 bytes), including
@@ -75,6 +80,7 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut missing_ok = false;
+    let mut ignore_cache_tree = false;
     let mut prefix: Option<String> = None;
 
     let mut i = 0;
@@ -106,10 +112,11 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
             }
             // `--ignore-cache-tree` (builtin/write-tree.c:37, "only useful for
             // debugging") makes git recompute every tree instead of reusing the
-            // index's `TREE` extension. This port never reads that extension — it
-            // always walks the index and writes the trees it finds — so both senses
-            // are exact no-ops here and produce the object id stock produces.
-            "--ignore-cache-tree" | "--no-ignore-cache-tree" => {}
+            // index's `TREE` extension: `write_index_as_tree_internal()` frees the
+            // cache-tree outright and declares it invalid (cache-tree.c:751-754), so
+            // every directory is re-serialised from the entries.
+            "--ignore-cache-tree" => ignore_cache_tree = true,
+            "--no-ignore-cache-tree" => ignore_cache_tree = false,
             "--missing-ok" => missing_ok = true,
             "--no-missing-ok" => missing_ok = false,
             "--no-prefix" => prefix = None,
@@ -146,11 +153,18 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     // An absent index file is an empty index, and yields git's empty-tree id.
-    let index = repo.index_or_empty()?;
+    let mut index = open_index_for_update(&repo)?;
+    if ignore_cache_tree {
+        index.remove_tree();
+    }
 
-    let tree_id = match tree_from_index(&repo, &index, missing_ok)? {
+    let tree_id = match refresh_cache_tree(&repo, &mut index, missing_ok)? {
         Ok(id) => id,
-        Err(code) => return Ok(ExitCode::from(code)),
+        Err(err) => {
+            report_tree_build_failure(&err);
+            eprintln!("fatal: git-write-tree: error building trees");
+            return Ok(ExitCode::from(128));
+        }
     };
 
     // `--prefix` selects a sub-tree of what was just written; the trees are on
@@ -174,6 +188,191 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
 
     println!("{out_id}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The two object-database operations `cache_tree_update()` performs, bound to a
+/// repository: `odb_has_object()` (cache-tree.c:337, :445) and
+/// `odb_write_object_ext(..., OBJ_TREE, ...)` (cache-tree.c:501).
+///
+/// `gix-index` deliberately has no repository handle, so it names these as a trait
+/// and lets its caller supply them; this is that supply for every verb in this
+/// binary.
+pub(super) struct RepoOdb<'repo> {
+    /// The repository whose odb answers the presence checks and takes the trees.
+    pub(super) repo: &'repo gix::Repository,
+}
+
+impl cache_tree::Odb for RepoOdb<'_> {
+    fn has_object(&self, id: &gix::hash::oid) -> bool {
+        use gix::objs::Exists;
+        // The empty tree is present in every repository whether or not anyone ever
+        // stored it: git's object database always carries a synthetic in-memory
+        // source holding exactly that object (`odb/source-inmemory.c:18-31`), so
+        // `odb_has_object()` answers yes for it in a repository with no objects at
+        // all. gitoxide synthesises it when *reading* but not when asked whether it
+        // exists, which would otherwise make the cache-tree of an empty index
+        // permanently invalid.
+        id == gix::ObjectId::empty_tree(self.repo.object_hash()) || self.repo.objects.exists(id)
+    }
+
+    fn write_tree(
+        &self,
+        tree: &[u8],
+    ) -> std::result::Result<gix::ObjectId, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        use gix::objs::Write;
+        self.repo
+            .objects
+            .write_buf(gix::object::Kind::Tree, tree)
+            .map_err(Into::into)
+    }
+}
+
+/// Bring `index`'s cache-tree up to date with its entries and hand back the root
+/// tree id, writing the index back when — and only when — that changed something.
+///
+/// This is `write_index_as_tree()` (cache-tree.c:797-831) with the lock handling
+/// left to the caller:
+///
+/// * a cache-tree that is *fully valid* — every node has a count and its tree
+///   object is still in the odb (`cache_tree_fully_valid()`, cache-tree.c:278-292)
+///   — already names the answer, so nothing is written at all. This is what makes
+///   a second `write-tree` over an untouched index free, and why it must not
+///   rewrite the index file: `was_valid` gates the `write_locked_index()` call
+///   (cache-tree.c:818).
+/// * otherwise `cache_tree_update()` re-serialises exactly the invalidated
+///   directories, and the index is rewritten so the refreshed extension is there
+///   for the next reader — stock git included.
+///
+/// The returned `Err` is the raw failure so each verb can render git's own wording
+/// for it; see [`report_tree_build_failure`] for the `write-tree` phrasing.
+pub(super) fn refresh_cache_tree(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    missing_ok: bool,
+) -> Result<std::result::Result<gix::ObjectId, cache_tree::Error>> {
+    let odb = RepoOdb { repo };
+    if index.cache_tree_fully_valid(&odb) {
+        // `was_valid` — the id is already recorded, and the index stays untouched.
+        return Ok(Ok(index
+            .tree()
+            .expect("a fully valid cache-tree is a present cache-tree")
+            .id));
+    }
+    match index.cache_tree_update(
+        &odb,
+        cache_tree::Options {
+            missing_ok,
+            repair: false,
+        },
+    ) {
+        Ok(id) => {
+            index.write(crate::config::index_write_options(repo))?;
+            Ok(Ok(id))
+        }
+        Err(err) => Ok(Err(err)),
+    }
+}
+
+/// The as-is `prepare_index()` step (builtin/commit.c:486-491): update the
+/// cache-tree if it is not fully valid, and write the index back when that
+/// happened. The root tree id is discarded — callers that need it use
+/// [`refresh_cache_tree`], which is the same operation with the id kept.
+pub(super) fn update_cache_tree_if_stale(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
+    refresh_cache_tree(repo, index, false)?.ok();
+    Ok(())
+}
+
+/// `unpack_trees()`'s parting cache-tree refresh: recompute the extension without
+/// writing a single object, keeping only the nodes whose tree the repository
+/// already has.
+///
+/// `unpack_trees()` ends with
+/// `cache_tree_update(&o->internal.result, WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`,
+/// which is why a `read-tree -m` or a merge leaves a partly-valid cache-tree behind
+/// even though it never mints a tree object. `WRITE_TREE_REPAIR` accepts a node only
+/// after hashing what it would serialise and finding that object present
+/// (cache-tree.c:490-497), so nothing here can invent a tree id.
+///
+/// Failures — an unmerged result, most often — leave the index with no cache-tree,
+/// which is what the callers want: git ignores the return value here too.
+pub(super) fn repair_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) {
+    let odb = RepoOdb { repo };
+    let _ = index.cache_tree_update(
+        &odb,
+        cache_tree::Options {
+            missing_ok: false,
+            repair: true,
+        },
+    );
+}
+
+/// Recompute `index`'s cache-tree in place, discarding any failure — git's
+/// `cache_tree_update(the_repository->index, WRITE_TREE_SILENT);` with the return
+/// value ignored, as `prepare_index()` does before writing the real index on the
+/// partial-commit path (builtin/commit.c:537) and the as-is path
+/// (builtin/commit.c:488).
+///
+/// Ignoring the failure is safe because a failed update leaves *no* cache-tree
+/// rather than a half-built one, so the index that gets written afterwards simply
+/// has none — the same state this crate produced before cache-trees existed here.
+pub(super) fn update_cache_tree_quietly(repo: &gix::Repository, index: &mut gix::index::File) {
+    let odb = RepoOdb { repo };
+    let _ = index.cache_tree_update(&odb, cache_tree::Options::default());
+}
+
+/// Print the diagnostics stock git prints for a failed `cache_tree_update()`,
+/// leaving the verb-specific `fatal:`/`error:` summary line to the caller.
+///
+/// The unmerged report is `verify_cache()`'s (cache-tree.c:218-234): one line per
+/// conflicted entry, at most ten of them and then a bare `...`. The D/F report is
+/// the same function's second pass (cache-tree.c:240-255), with the same cap. The
+/// `invalid object` line is `update_one()`'s (cache-tree.c:450-451) and is emitted
+/// once, because git returns from the deepest level as soon as it prints it.
+pub(super) fn report_tree_build_failure(err: &cache_tree::Error) {
+    match err {
+        cache_tree::Error::Unmerged(entries) => {
+            for (n, (path, id)) in entries.iter().enumerate() {
+                if n >= MAX_UNMERGED_REPORTED {
+                    eprintln!("...");
+                    break;
+                }
+                eprintln!("{path}: unmerged ({id})");
+            }
+        }
+        cache_tree::Error::DirectoryFileConflict(pairs) => {
+            for (n, (path, conflict)) in pairs.iter().enumerate() {
+                if n >= MAX_UNMERGED_REPORTED {
+                    eprintln!("...");
+                    break;
+                }
+                eprintln!("You have both {path} and {conflict}");
+            }
+        }
+        // `error("invalid object %06o %s for '%.*s'", ...)` — the `Display` of this
+        // variant is that format string, so it is printed verbatim behind `error: `.
+        cache_tree::Error::InvalidObject { .. } => eprintln!("error: {err}"),
+        // The remaining failures are git's silent ones: `return -1` under
+        // `expected_missing` (cache-tree.c:448-449) and the `die()` for an empty
+        // sub-tree (cache-tree.c:387), plus odb write errors, which git reports
+        // through the odb layer itself.
+        cache_tree::Error::IntentToAddSubtree | cache_tree::Error::EmptySubtree => {}
+        cache_tree::Error::WriteTree(source) => eprintln!("error: {source}"),
+    }
+}
+
+/// The repository's index, or an empty in-memory one bound to `.git/index` when no
+/// index file exists yet.
+///
+/// `write_index_as_tree()` reads the index under a lock and treats a missing file
+/// as zero entries (`read_index_from()` returns 0), which is how `git write-tree`
+/// in a freshly-`init`ed repository prints the empty-tree id *and* leaves an index
+/// file behind.
+pub(super) fn open_index_for_update(repo: &gix::Repository) -> Result<gix::index::File> {
+    Ok(if repo.index_path().exists() {
+        repo.open_index()?
+    } else {
+        gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
+    })
 }
 
 /// The tree `index` names, with every tree object beneath it written into

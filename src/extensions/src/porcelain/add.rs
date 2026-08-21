@@ -1240,7 +1240,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         let chmod_errors = apply_chmod_pathspec(&mut index, chmod, include_sparse, sparsity.as_ref(), |p| {
             pathspec.is_included(p, Some(false))
         });
-        index.remove_tree();
+        invalidate_tree_cache(&mut index, &remove);
         // `do_write_index()` sets the hashfile's `skip_hash` from the repository's
         // settings block before it serialises a single entry
         // (read-cache.c:2830-2831), so `index.skipHash` — and the
@@ -1288,9 +1288,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         pathspec.is_included(p, Some(false))
     });
 
-    // The tree-cache extension is written verbatim by `File::write`; drop it after
-    // mutating entries so a later commit can't capture a stale subtree.
-    index.remove_tree();
+    invalidate_tree_cache(&mut index, &remove);
     // Same options as the intent-to-add path above: the trailer an index
     // carries is a property of the repository, not of the verb that wrote it
     // (read-cache.c:2830-2831).
@@ -1424,8 +1422,30 @@ pub(super) fn apply_chmod_pathspec(
                 entry.mode = want;
             }
         }
+        // A mode flip changes the tree entry, so `chmod_index_entry()` invalidates
+        // the cache-tree along that path just like a content change does
+        // (read-cache.c:935). Missing this would leave a cached subtree id that
+        // still describes the old mode.
+        invalidate_tree_cache(index, &wanted);
     }
     errors
+}
+
+/// Invalidate the tree-cache along every path in `paths` — git's
+/// `cache_tree_invalidate_path()` (cache-tree.c:159-163), which it calls once per
+/// entry from inside `add_index_entry_with_check()` (read-cache.c:1273-1274) and
+/// `remove_file_from_index()` (read-cache.c:632).
+///
+/// Doing it after the entries were replaced rather than during is equivalent:
+/// invalidation reads nothing from the entries, it only marks the nodes on the
+/// path — and removes the node named by the final component — as needing
+/// recomputation. What matters is that the set is complete, since a path that is
+/// changed without being invalidated leaves a cached tree id describing content
+/// that is no longer in the index.
+pub(super) fn invalidate_tree_cache(index: &mut gix::index::File, paths: &HashSet<BString>) {
+    for path in paths {
+        index.invalidate_path_in_tree(path.as_ref());
+    }
 }
 
 /// What [`renormalize_tracked_files`] reads off the command line.

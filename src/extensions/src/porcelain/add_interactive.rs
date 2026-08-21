@@ -727,6 +727,13 @@ impl State<'_> {
             }
         }
         index.sort_entries();
+        // Every entry above was replaced with `HEAD`'s version or dropped, so any
+        // cached tree id for the directories they live in now describes content the
+        // index no longer holds. git invalidates per entry from inside
+        // `add_index_entry_with_check()` (read-cache.c:1273-1274); dropping the whole
+        // extension is the conservative equivalent — it costs the next `write-tree` a
+        // recomputation and cannot leave a stale node behind.
+        index.remove_tree();
         // The interactive `revert` command writes the real index; options come
         // from the repository as they do for every writer (read-cache.c:2830-2831).
         index.write(crate::config::index_write_options(self.repo))?;

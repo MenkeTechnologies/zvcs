@@ -808,7 +808,26 @@ fn finish(o: Opts) -> Result<ExitCode> {
     if let Some(out) = &o.index_output {
         new_index.set_path(out.clone());
     }
-    new_index.remove_tree();
+    // "When reading only one tree (either the most basic form, `-m ent` or
+    // `--reset ent` form), we can obtain a fully valid cache-tree because the index
+    // must match exactly what came from the tree" (builtin/read-tree.c:281-290).
+    // That precondition holds here for the same reason it holds in git: every entry
+    // above took its id and mode from `tree_ids[0]`, and what `-m`/`--reset` carry
+    // forward from the old index is stat data and sticky flags, neither of which a
+    // tree records. A `--prefix` read is excluded because the index then holds the
+    // old entries *plus* the bound tree, which is not any single tree.
+    //
+    // Every other shape goes through `unpack_trees()`'s parting
+    // `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)` instead, which
+    // validates a node only when the tree it would serialise is already in the odb
+    // and writes nothing.
+    match (tree_ids.len(), o.prefix.as_ref()) {
+        (1, None) => new_index.prime_cache_tree(&repo.objects, &tree_ids[0])?,
+        _ => {
+            new_index.remove_tree();
+            super::write_tree::repair_cache_tree(&repo, &mut new_index);
+        }
+    }
     new_index.write(crate::config::index_write_options(&repo))?;
     // `core.fsync=index` (or an aggregate that contains it) hardens the index git
     // has just rewritten; the default set does not, so this is normally a no-op.
@@ -1081,7 +1100,12 @@ fn multi_tree_read(
     if let Some(out) = &o.index_output {
         new_index.set_path(out.clone());
     }
+    // Two or more trees never reach `prime_cache_tree()` (builtin/read-tree.c:287),
+    // so all this index gets is `unpack_trees()`'s repair pass: nodes whose tree the
+    // repository already has keep an id, everything else — including every node above
+    // an unmerged path — comes out invalid.
     new_index.remove_tree();
+    super::write_tree::repair_cache_tree(repo, &mut new_index);
     new_index.write(crate::config::index_write_options(repo))?;
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
     Ok(ExitCode::SUCCESS)

@@ -38,7 +38,10 @@ fn one_recursive(data: &[u8], hash_len: usize, alloc_limit_bytes: Option<usize>)
         data = rest;
     }
 
-    subtrees.sort_by(|a, b| a.name.cmp(&b.name));
+    // git keeps a node's subtree list in `subtree_name_cmp` order, which is length-first
+    // (cache-tree.c:49-57). Sorting into that same order both detects the duplicates checked
+    // for below and preserves the on-disk layout when this tree is written back out.
+    subtrees.sort_by(|a, b| super::subtree_name_cmp(&a.name, &b.name));
     let num_trees = subtrees.len();
     subtrees.dedup_by(|a, b| a.name == b.name);
     if num_trees != subtrees.len() {

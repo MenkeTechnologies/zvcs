@@ -23,6 +23,14 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// stdout, stderr and the exit status of one run of the shadow binary.
+///
+/// The identity and both dates are pinned. Without them the fixture's commits
+/// take the wall clock, and `s1` and `c2` land in the same second or in adjacent
+/// ones depending on machine load — which reorders the `git log` walk that
+/// range-diff pairs its two sides from, so a passing assertion about *which
+/// position each commit took* becomes a coin flip under a parallel `cargo test`.
+/// That is a defect in the fixture, not in range-diff: nothing here is testing
+/// what happens when two commits share a timestamp.
 fn run(cwd: &Path, home: &Path, args: &[&str]) -> (String, String, i32) {
     let out = Command::new(BIN)
         .args(args)
@@ -30,6 +38,13 @@ fn run(cwd: &Path, home: &Path, args: &[&str]) -> (String, String, i32) {
         .env("HOME", home)
         .env("ZVCS_HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@e.co")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@e.co")
+        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+        .env("TZ", "UTC")
         .output()
         .expect("run binary");
     (

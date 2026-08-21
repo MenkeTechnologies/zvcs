@@ -653,6 +653,12 @@ pub fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     // where the ambiguity warning belongs — not in `full_hex`, which the helpers
     // below call a second time to *diagnose* a name this has already resolved.
     warn_ambiguous_refname(repo, spec);
+    // The same argument for `read_ref_at()`'s warning, which `get_oid_basic()`
+    // raises further down the very same call (`object-name.c:787`, after the
+    // ambiguity check at `object-name.c:753-756` — hence this order).
+    if let Some(message) = read_ref_at_warning(repo, spec) {
+        eprintln!("warning: {message}");
+    }
     resolve_quiet(repo, spec)
 }
 
@@ -2304,6 +2310,49 @@ fn apply_refspecs(specs: &[String], name: &str) -> Option<String> {
 /// rule found a log, or the selector is out of range (which
 /// [`reflog_reach`] separately turns into git's `die()`).
 pub fn reflog_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    let (read, nth, at_time) = reflog_read(repo, spec)?;
+    if read.found {
+        return Some(read.oid);
+    }
+
+    // `read_ref_at()` returned 1, so `get_oid_basic()` decides what that means
+    // (`object-name.c:790-820`). Two of the three outcomes still answer; the third
+    // is the `die()` [`reflog_reach`] builds, which is this `None`.
+    if at_time != 0 {
+        // `warning(_("log for '%.*s' only goes back to %s"), …)` — the oldest
+        // entry's id is the answer and the operand resolves.
+        return Some(read.oid);
+    }
+    // `} else if (nth == co_cnt && !is_null_oid(oid)) {`: one past the end is still
+    // answerable from `read_ref_at_ent_oldest()`'s `oid`.
+    (nth == read.reccnt as i64 && !read.oid.is_null()).then_some(read.oid)
+}
+
+/// The `warning()` `read_ref_at()` raises for `spec`, ready to print, or `None`
+/// when the operand's log has nothing to complain about.
+///
+/// Kept apart from [`reflog_oid`] for the same reason
+/// [`warn_ambiguous_refname`] is kept apart from the resolver: git warns once per
+/// `get_oid_basic()` call, and a zvcs command that resolves a name twice — once to
+/// classify it, once to use it — must not say twice what stock says once. So this
+/// belongs beside [`warn_ambiguous_refname`] in [`resolve`], never in
+/// [`resolve_quiet`].
+///
+/// [`ambiguity_base`] reduces the operand to what `get_oid_basic()` is actually
+/// handed, so `HEAD@{1}^`, `HEAD@{1}^{commit}` and `HEAD@{1}:<path>` each warn
+/// once and name the reflog rather than the suffix.
+///
+/// Unlike `object-name.c`'s two other reflog diagnostics this one has no `flags`
+/// gate at all — `refs.c:1135` and `refs.c:1141` call `warning()` outright — so
+/// `git rev-parse --quiet --verify <spec>` prints it just the same.
+pub fn read_ref_at_warning(repo: &gix::Repository, spec: &str) -> Option<String> {
+    reflog_read(repo, ambiguity_base(spec))?.0.warning
+}
+
+/// `get_oid_basic()`'s reflog branch up to and including the `read_ref_at()` call
+/// (`object-name.c:742-789`), returning the walk's result together with the two
+/// selector values `object-name.c:790-820` still needs to interpret it.
+fn reflog_read(repo: &gix::Repository, spec: &str) -> Option<(ReadRefAt, i64, i64)> {
     let (base, sel) = split_reflog_selector(spec)?;
     // `repo_dwim_ref("HEAD")` reports HEAD's *target*; `repo_dwim_log` reports the
     // ref whose log was found. Either way an unborn HEAD resolves to nothing and
@@ -2330,35 +2379,174 @@ pub fn reflog_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
         (-1, t)
     };
 
+    // `repo_dwim_log()` does not merely *find* the log — it resolves the ref and
+    // hands `read_ref_at()` that value in the same `oid` out-parameter the answer
+    // comes back in (`refs.c:855-871`). Every branch of `read_ref_at_ent()` below
+    // leans on that pre-seed, so a spelling whose ref does not resolve is
+    // `refs_found == 0`, i.e. `return -1`, and the operand fails.
+    let current = resolve_ref_oid(repo, &full)?;
     // `refs_for_each_reflog_ent_reverse()`: newest entry first.
     let entries = reflog_lines(repo, &full)?;
-    if entries.is_empty() {
-        // `if (!cb.reccnt)`: `@{0}` on an empty log falls back to the ref's own
-        // value; anything else is a `die()` the caller reports.
-        return (nth == 0).then(|| resolve_ref_oid(repo, &full)).flatten();
+    Some((read_ref_at(&full, &entries, at_time, nth, current)?, nth, at_time))
+}
+
+/// `read_ref_at()` (`refs.c:1173-1218`) as a value rather than the pile of
+/// out-parameters the C fills in.
+struct ReadRefAt {
+    /// `*oid` as the function leaves it. Note that it is an *in*-parameter too:
+    /// the caller pre-seeds it with the ref's current value, and three of
+    /// `read_ref_at_ent()`'s four paths never overwrite it.
+    oid: ObjectId,
+    /// The `return` value inverted — `return 0` (an entry matched) is `true`,
+    /// `return 1` (the walk fell off the end) is `false`.
+    found: bool,
+    /// `*cutoff_cnt`, i.e. `cb.reccnt`: how many entries were consumed. The
+    /// out-of-range test in `get_oid_basic()` compares `nth` against it.
+    reccnt: usize,
+    /// The one `warning()` `read_ref_at_ent()` can raise. Held rather than printed
+    /// so the walk stays a pure function; `reflog_oid` prints it where the C does.
+    warning: Option<String>,
+}
+
+/// `read_ref_at()` (`refs.c:1173-1218`) over an already-collected, newest-first
+/// reflog.
+///
+/// The subtlety that makes this worth porting line by line is that `cb->ooid` and
+/// `cb->noid` lag the walk by one entry — `read_ref_at_ent()` inspects them
+/// *before* storing the current record:
+///
+/// ```c
+/// if (timestamp <= cb->at_time || cb->cnt == 0) {
+///         set_read_ref_cutoffs(cb, timestamp, tz, message);
+///         /*
+///          * we have not yet updated cb->[n|o]oid so they still
+///          * hold the values for the previous record.
+///          */
+///         if (!is_null_oid(&cb->ooid)) {
+///                 oidcpy(cb->oid, noid);
+///                 if (!oideq(&cb->ooid, noid))
+///                         warning(_("log for ref %s has gap after %s"),
+///                                 refname, show_date(cb->date, cb->tz, DATE_MODE(RFC2822)));
+///         }
+///         else if (cb->date == cb->at_time)
+///                 oidcpy(cb->oid, noid);
+///         else if (!oideq(noid, cb->oid))
+///                 warning(_("log for ref %s unexpectedly ended on %s"),
+///                         refname, show_date(cb->date, cb->tz, DATE_MODE(RFC2822)));
+///         cb->reccnt++;
+///         oidcpy(&cb->ooid, ooid);
+///         oidcpy(&cb->noid, noid);
+///         cb->found_it = 1;
+///         return 1;
+/// }
+/// ```
+///
+/// So `<ref>@{<n>}` is *not* "entry `n`'s new id". It is entry `n`'s new id only
+/// when entry `n-1` — the one entry *newer* — has a non-null old id. When entry
+/// `n-1` is a creation (null old id) the answer is left at the ref's current
+/// value, which is what a `git branch -m` round trip exposes: the rename pair
+/// writes a delete (`<id>` → null) and a create (null → `<id>`) into `logs/HEAD`,
+/// and `git rev-parse HEAD@{1}` then answers the current tip with
+/// `warning: log for ref HEAD unexpectedly ended on …` rather than the null id
+/// that entry actually records.
+///
+/// `n == 0` takes the same path for the same reason — there is no newer record, so
+/// `cb->ooid` is still the zeroed one `memset()` left — which is why `<ref>@{0}` is
+/// always the ref's own value and warns whenever the newest entry disagrees with
+/// it.
+///
+/// `None` is the `!cb.reccnt` arm with `cnt != 0`: an empty log, which is
+/// `die(_("log for %s is empty"))` and belongs to [`reflog_reach`].
+fn read_ref_at(
+    refname: &str,
+    entries: &[(ObjectId, ObjectId, gix::date::Time)],
+    at_time: i64,
+    cnt: i64,
+    current: ObjectId,
+) -> Option<ReadRefAt> {
+    // `memset(&cb, 0, sizeof(cb))`, so the lagged old id starts out null and
+    // `cb.oid` points at the value the caller pre-seeded.
+    let mut prev_ooid = ObjectId::null(current.kind());
+    let mut oid = current;
+    let mut reccnt = 0usize;
+    let mut cnt = cnt;
+    let mut warning = None;
+    let mut found = false;
+
+    for (ooid, noid, time) in entries {
+        // `cb->tz = tz; cb->date = timestamp;` happen for every record, matched or
+        // not, so the warnings below date the record they stopped on.
+        let (date, tz) = (time.seconds, time.offset);
+        if date <= at_time || cnt == 0 {
+            if !prev_ooid.is_null() {
+                oid = *noid;
+                if prev_ooid != *noid {
+                    warning = Some(format!(
+                        "log for ref {refname} has gap after {}",
+                        crate::porcelain::log::show_date_rfc2822(date, tz)
+                    ));
+                }
+            } else if date == at_time {
+                oid = *noid;
+            } else if *noid != oid {
+                warning = Some(format!(
+                    "log for ref {refname} unexpectedly ended on {}",
+                    crate::porcelain::log::show_date_rfc2822(date, tz)
+                ));
+            }
+            reccnt += 1;
+            found = true;
+            break;
+        }
+        reccnt += 1;
+        prev_ooid = *ooid;
+        // `if (cb->cnt > 0) cb->cnt--;` — a date selector passes `cnt == -1`, which
+        // never reaches zero, so only the timestamp test can stop that walk.
+        if cnt > 0 {
+            cnt -= 1;
+        }
     }
 
-    // `read_ref_at_ent()`: `if (timestamp <= cb->at_time || cb->cnt == 0)`, with
-    // `cnt` counting down from `nth`. The matching entry answers with its *new* id.
-    let hit = if nth >= 0 {
-        entries.get(nth as usize).map(|e| e.1)
-    } else {
-        entries.iter().find(|e| e.2 <= at_time).map(|e| e.1)
-    };
-    if let Some(id) = hit {
-        return Some(id);
+    if reccnt == 0 {
+        // ```c
+        // if (!cb.reccnt) {
+        //         if (cnt == 0) {
+        //                 set_read_ref_cutoffs(&cb, 0, 0, "empty reflog");
+        //                 return 1;
+        //         }
+        //         …
+        //         die(_("log for %s is empty"), refname);
+        // }
+        // ```
+        //
+        // `<ref>@{0}` on an empty log returns 1 with the pre-seeded value intact and
+        // `co_cnt == 0`, so `get_oid_basic()`'s `nth == co_cnt` arm accepts it in
+        // silence.
+        return (cnt == 0).then_some(ReadRefAt {
+            oid: current,
+            found: false,
+            reccnt: 0,
+            warning: None,
+        });
+    }
+    if found {
+        return Some(ReadRefAt { oid, found: true, reccnt, warning });
     }
 
-    // `read_ref_at_ent_oldest()`: nothing was old enough, so the answer is the
-    // oldest entry's *old* id — or its new id when that is the null id and a date
-    // was asked for.
+    // `refs_for_each_reflog_ent(refs, refname, read_ref_at_ent_oldest, &cb)` — the
+    // *forward* walk, stopped at its first record, so this is the oldest entry:
+    //
+    // ```c
+    // oidcpy(cb->oid, ooid);
+    // if (cb->at_time && is_null_oid(cb->oid))
+    //         oidcpy(cb->oid, noid);
+    // ```
     let oldest = entries.last()?;
-    if nth >= 0 {
-        // `} else if (nth == co_cnt && !is_null_oid(oid)) {`: one past the end is
-        // still answerable from the oldest entry's old id.
-        return (nth as usize == entries.len() && !oldest.0.is_null()).then_some(oldest.0);
+    let mut oid = oldest.0;
+    if at_time != 0 && oid.is_null() {
+        oid = oldest.1;
     }
-    Some(if at_time != 0 && oldest.0.is_null() { oldest.1 } else { oldest.0 })
+    Some(ReadRefAt { oid, found: false, reccnt, warning: None })
 }
 
 /// `repo_dwim_log()`'s `logs_found`: how many `ref_rev_parse_rules` spellings of
@@ -2384,11 +2572,15 @@ fn dwim_log_matches(repo: &gix::Repository, name: &str) -> usize {
         .count()
 }
 
-/// One ref's reflog as `(old, new, timestamp)` triples, newest entry first.
+/// One ref's reflog as `(old, new, time)` triples, newest entry first.
+///
+/// The zone offset rides along because `read_ref_at_ent()`'s warnings render the
+/// entry's own timestamp with `show_date(cb->date, cb->tz, DATE_MODE(RFC2822))`
+/// (`refs.c:1136` and `refs.c:1142`), and RFC-2822 prints local time.
 fn reflog_lines(
     repo: &gix::Repository,
     full: &str,
-) -> Option<Vec<(ObjectId, ObjectId, i64)>> {
+) -> Option<Vec<(ObjectId, ObjectId, gix::date::Time)>> {
     // The forward iterator reads the whole file into `buf`; the reverse one wants a
     // fixed-size chunk buffer and yields nothing when handed an empty slice.
     let mut buf: Vec<u8> = Vec::new();
@@ -2399,7 +2591,7 @@ fn reflog_lines(
         out.push((
             line.previous_oid(),
             line.new_oid(),
-            line.signature.time().map(|t| t.seconds).unwrap_or_default(),
+            line.signature.time().unwrap_or(gix::date::Time { seconds: 0, offset: 0 }),
         ));
     }
     // `refs_for_each_reflog_ent_reverse()`: newest entry first.

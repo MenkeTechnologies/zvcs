@@ -510,9 +510,18 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 eprintln!("fatal: {message}");
                 return Ok(ExitCode::from(128));
             }
-            if let Some((name, count)) = reflog_overflow(&repo, arg) {
+            // `read_ref_at()` has two `die()`s, not one: the ordinal past the end
+            // of the log, and `!cb.reccnt` — a log file that exists but holds no
+            // entries, which is `die(_("log for %s is empty"), refname)` naming the
+            // *full* ref rather than the operand (`refs.c:1191-1211`). Both are
+            // [`crate::objname::reflog_reach`], which is also the only one of the
+            // two implementations that knows `<ref>@{<count>}` is answerable from
+            // the oldest entry's old id rather than fatal.
+            if let Some(crate::objname::ReflogReach::Fatal(message)) =
+                crate::objname::reflog_reach(&repo, crate::objname::uninteresting_mark(arg).0)
+            {
                 out.flush()?;
-                eprintln!("fatal: log for '{name}' only has {count} entries");
+                eprintln!("fatal: {message}");
                 return Ok(ExitCode::from(128));
             }
         }
@@ -748,6 +757,14 @@ fn warn_reflog_reach(
     arg: &str,
     quiet: bool,
 ) -> std::io::Result<()> {
+    // `read_ref_at()`'s own warning comes first, because it is raised from inside
+    // the call (`refs.c:1135` and `refs.c:1141`) that `object-name.c:787` makes.
+    // It has no `flags` gate at all — neither `warning()` consults
+    // `GET_OID_QUIETLY` — so unlike everything else here it survives `--quiet`.
+    if let Some(message) = crate::objname::read_ref_at_warning(repo, arg) {
+        out.flush()?;
+        eprintln!("warning: {message}");
+    }
     if quiet {
         return Ok(());
     }
@@ -1521,35 +1538,6 @@ fn endpoint_names(spec: &str) -> (&str, &str) {
         if left.is_empty() { "HEAD" } else { left },
         if right.is_empty() { "HEAD" } else { right },
     )
-}
-
-/// `get_oid_basic()`'s reflog branch: `<ref>@{<n>}` whose `<n>` is past the end
-/// of that ref's reflog is `die("log for '%s' only has %d entries")` (exit 128),
-/// not an unknown revision — the ref resolved fine, only the ordinal did not.
-///
-/// Returns the name git puts in the message and the entry count it reports.
-/// `None` for anything that is not that shape: a non-numeric `@{...}` is a date
-/// or tracking spec, and a `<ref>` that does not exist or has no reflog falls
-/// through to the ordinary `ambiguous argument` path.
-///
-/// An empty `<ref>` (`@{2}`) means the current branch, which is why git answers
-/// `git rev-parse @{999}` with `log for 'main' …` rather than `log for '@' …`.
-fn reflog_overflow(repo: &gix::Repository, spec: &str) -> Option<(String, usize)> {
-    let rest = spec.strip_suffix('}')?;
-    let (name, ordinal) = rest.rsplit_once("@{")?;
-    if ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let nth: usize = ordinal.parse().ok()?;
-    let name = if name.is_empty() || name == "@" {
-        repo.head_name().ok()??.shorten().to_string()
-    } else {
-        name.to_string()
-    };
-    let mut reference = repo.find_reference(name.as_str()).ok()?;
-    let mut platform = reference.log_iter();
-    let count = platform.all().ok()??.count();
-    (nth >= count).then_some((name, count))
 }
 
 /// git's `dwim_ref`: resolve a bare name to the full ref it designates, then

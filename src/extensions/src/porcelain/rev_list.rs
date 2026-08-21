@@ -2635,6 +2635,15 @@ fn resolve(
     spec: &str,
     pending: &mut Vec<Pending>,
 ) -> Option<ObjectId> {
+    // `get_oid_basic()` reads a `<ref>@{…}` operand with `repo_dwim_log()` and
+    // `read_ref_at()` (`object-name.c:742-789`), never with the revspec grammar,
+    // and the two disagree: gitoxide answers with the selected entry's raw *new*
+    // id where `read_ref_at()` keeps the ref's current value — the null id after a
+    // `git branch -m` round trip. See [`crate::objname::reflog_oid`].
+    if crate::objname::is_reflog_operand(spec) {
+        return crate::objname::reflog_oid(repo, spec)
+            .and_then(|id| peel_recording_tags(repo, id, pending));
+    }
     // `at_mark()` compares with `strncasecmp`, so `main@{PUSH}` is the same
     // operand as `main@{push}`; gitoxide's parser is case-sensitive.
     let id = repo.rev_parse_single(crate::objname::canonical_spec(repo, spec).as_ref()).ok()?.detach();

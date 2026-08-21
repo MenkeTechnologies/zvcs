@@ -2625,7 +2625,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // prefix and folds the `@{u}` family before anything is looked up;
             // gitoxide's parser does neither, so `git log main:./f` and
             // `git log main@{u}` under `branch.<n>.remote = .` were refused here.
-            match repo.rev_parse_single(crate::objname::canonical_spec(&repo, spec).as_ref()) {
+            // `get_oid_basic()` resolves `<ref>@{<n>}` / `<ref>@{<date>}` itself —
+            // `repo_dwim_log()` and then `read_ref_at()` (`object-name.c:742-789`)
+            // — and gitoxide's revspec grammar does not agree with it. gitoxide
+            // hands back the selected entry's raw *new* id, where `read_ref_at()`
+            // answers with the ref's current value whenever the entry one newer is
+            // a creation; after a `git branch -m` round trip that raw id is the
+            // null id, so `git log HEAD@{1}` walked nothing at all.
+            let resolved = if crate::objname::is_reflog_operand(spec) {
+                crate::objname::reflog_oid(&repo, spec).ok_or(())
+            } else {
+                repo.rev_parse_single(crate::objname::canonical_spec(&repo, spec).as_ref())
+                    .map(|id| id.detach())
+                    .map_err(|_| ())
+            };
+            match resolved {
                 Ok(id) => {
                     // `prepare_revision_walk()`'s `handle_commit()` peels a tag
                     // and drops a tree or a blob without a word — the pending
@@ -2640,7 +2654,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     // before the walk drops the entry. So `git log <tree>` walks
                     // nothing at all rather than falling back to `revs->def`.
                     rev_input_given = true;
-                    let Some(commit) = crate::objname::walk_pending(&repo, id.detach()) else {
+                    let Some(commit) = crate::objname::walk_pending(&repo, id) else {
                         continue;
                     };
                     tips.push(commit);
@@ -6216,6 +6230,12 @@ pub(super) fn warn_operand(repo: &gix::Repository, spec: &str, ambiguity: bool) 
         // exclusion mark, so an endpoint still carrying it fails the pair.
         if range && endpoint.starts_with('^') {
             break;
+        }
+        // `read_ref_at()`'s own `warning()` (`refs.c:1135`, `refs.c:1141`) comes
+        // out of the same `get_oid_basic()` call as the one below it, just from
+        // one frame deeper, so both belong on this one pass over the endpoints.
+        if let Some(message) = crate::objname::read_ref_at_warning(repo, endpoint) {
+            eprintln!("warning: {message}");
         }
         if let Some(warning) = crate::objname::reflog_reach_warning(repo, endpoint) {
             eprint!("{warning}");

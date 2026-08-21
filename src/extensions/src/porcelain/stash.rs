@@ -2538,7 +2538,14 @@ fn write_target_index(
     }
 
     new_index.remove_tree();
-    new_index.write(gix::index::write::Options::default())?;
+    // git reaches this index through `unpack_trees()` and `write_locked_index()`,
+    // i.e. the one `do_write_index()` every other index writer goes through
+    // (`read-cache.c:2830-2831`), so `index.skipHash` — and the `feature.manyFiles`
+    // macro that defaults it — decides the trailer here too. Stock with
+    // `index.skipHash=true` leaves twenty zero bytes at the end of `.git/index`
+    // after `git stash apply`; writing the real hash instead made the next
+    // `fsck`/`git status` see a differently-shaped file than git wrote.
+    new_index.write(crate::config::index_write_options(repo))?;
     Ok(())
 }
 

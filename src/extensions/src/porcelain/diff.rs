@@ -2199,9 +2199,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         collect_tree_index(&repo, revs.first(), &mut deltas)?;
         cache = repo.diff_resource_cache_for_tree_diff()?;
     } else if revs.len() == 2 {
-        let old_tree = repo.rev_parse_single(revs[0].as_str())?.object()?.peel_to_tree()?;
+        let old_tree = rev_object(&repo, revs[0].as_str())?.peel_to_tree()?;
         old_tree_id = Some(old_tree.id);
-        let new_tree = repo.rev_parse_single(revs[1].as_str())?.object()?.peel_to_tree()?;
+        let new_tree = rev_object(&repo, revs[1].as_str())?.peel_to_tree()?;
         let changes =
             repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(gix::diff::Options::default()))?;
         for change in changes {
@@ -3327,7 +3327,7 @@ fn collect_tree_worktree(
     paths: &[String],
     deltas: &mut Vec<Delta>,
 ) -> Result<()> {
-    let tree_id = repo.rev_parse_single(spec)?.object()?.peel_to_tree()?.id;
+    let tree_id = rev_object(repo, spec)?.peel_to_tree()?.id;
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
 
     // Path -> new side and its `dirty_submodule` bits, in index order (the order
@@ -3720,11 +3720,29 @@ fn tree_entry(tree: &gix::Tree<'_>, path: &BString) -> Result<Option<(ObjectId, 
     Ok(entry.map(|e| (e.object_id(), e.mode().kind())))
 }
 
+/// One revision spec as the object `setup_revisions()` pended for it.
+///
+/// `get_oid_basic()` reads a `<ref>@{…}` operand with `repo_dwim_log()` and then
+/// `read_ref_at()` (`object-name.c:742-789`), never with the revspec grammar, and
+/// the two disagree: gitoxide answers with the selected entry's raw *new* id where
+/// `read_ref_at()` keeps the ref's current value — the null id for the record a
+/// `git branch -m` round trip leaves behind. See [`crate::objname::reflog_oid`].
+/// The operand loop resolves the same way, so this only keeps the second look-up
+/// (the one that wants a tree) in step with the first.
+fn rev_object<'r>(repo: &'r gix::Repository, spec: &str) -> Result<gix::Object<'r>> {
+    if crate::objname::is_reflog_operand(spec) {
+        if let Some(id) = crate::objname::reflog_oid(repo, spec) {
+            return Ok(repo.find_object(id)?);
+        }
+    }
+    Ok(repo.rev_parse_single(spec)?.object()?)
+}
+
 /// A single revision spec into a tree id, defaulting to `HEAD^{tree}` (or the empty
 /// tree if `HEAD` is unborn) when no spec is given.
 fn tree_id_for(repo: &gix::Repository, spec: Option<&String>) -> Result<ObjectId> {
     Ok(match spec {
-        Some(s) => repo.rev_parse_single(s.as_str())?.object()?.peel_to_tree()?.id,
+        Some(s) => rev_object(repo, s.as_str())?.peel_to_tree()?.id,
         None => repo.head_tree_id_or_empty()?.detach(),
     })
 }

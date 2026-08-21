@@ -918,6 +918,27 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // ahead of anything the checkout itself prints. `--quiet` does not
         // suppress it — stock warns under `git checkout -q` too.
         super::rev_parse::warn_ambiguous_refname(&repo, spec, false);
+        // `read_ref_at()`'s warning (`refs.c:1135`, `refs.c:1141`) rides that same
+        // `get_oid_basic()` call, and then a *second* time: `setup_branch_path()`
+        // resolves the operand again whenever it is not itself a ref name
+        //
+        // ```c
+        // if (!repo_dwim_ref(the_repository, branch->name, strlen(branch->name),
+        //                    &branch->oid, &branch->refname, 0))
+        //         repo_get_oid_committish(the_repository, branch->name, &branch->oid);
+        // ```
+        //
+        // (`builtin/checkout.c:804-806`). `<ref>@{<n>}` is never a ref name, so the
+        // fallback always fires for it and stock prints the warning twice — while
+        // an ambiguous plain name resolves at `repo_dwim_ref()` and so prints its
+        // own warning only once. Nothing here is gated: `repo_get_oid_committish()`
+        // passes `GET_OID_COMMITTISH` alone, so `git checkout -q` warns too.
+        if let Some(message) = crate::objname::read_ref_at_warning(&repo, spec) {
+            eprintln!("warning: {message}");
+            if super::rev_parse::dwim_ref_matches(&repo, spec).is_empty() {
+                eprintln!("warning: {message}");
+            }
+        }
         // A revspec like `HEAD~3` is not a valid ref *name* (`~` is rejected by
         // ref validation), so treat a lookup error as "not a branch" and let the
         // `rev_parse_single` path below resolve and detach-checkout it.

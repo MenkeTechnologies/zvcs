@@ -1526,9 +1526,22 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        let parsed = match repo.rev_parse(BStr::new(spec)) {
-            Ok(p) => p.detach(),
-            Err(_) => return Ok(bad_revision(&repo, spec, seen_dashdash)),
+        // `get_oid_basic()` reads a `<ref>@{…}` operand through `repo_dwim_log()`
+        // and `read_ref_at()` (`object-name.c:742-789`) rather than through the
+        // revspec grammar, and the two do not agree: gitoxide hands back the
+        // selected entry's raw *new* id, which is the null id for the record
+        // written by a `git branch -m` round trip, where `read_ref_at()` answers
+        // with the ref's current value. See [`crate::objname::reflog_oid`].
+        let reflog = crate::objname::is_reflog_operand(spec)
+            .then(|| crate::objname::reflog_oid(&repo, spec))
+            .flatten()
+            .map(RevSpec::Include);
+        let parsed = match reflog {
+            Some(parsed) => parsed,
+            None => match repo.rev_parse(BStr::new(spec)) {
+                Ok(p) => p.detach(),
+                Err(_) => return Ok(bad_revision(&repo, spec, seen_dashdash)),
+            },
         };
         match parsed {
             // `--not <rev>` and `^<rev>` are the same thing twice: `handle_revision_arg_1`

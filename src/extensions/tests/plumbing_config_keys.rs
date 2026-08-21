@@ -256,39 +256,62 @@ fn skip_hash_zeroes_the_index_trailer() {
     assert_ne!(index_trailer(&repo), vec![0u8; 20], "an unset skipHash must compute the trailer");
 }
 
-/// `EOIE` records where an index's extensions begin, so git only appends it when
-/// some *other* extension was written. This port writes none — it cannot
-/// recompute a tree-cache and never marks an index sparse — so the extension can
-/// never appear here regardless of `index.recordEndOfIndexEntries`.
+/// `EOIE` records where an index's extensions begin, so git appends it only when
+/// some *other* extension was written, and only when asked — the key's default is
+/// "false unless `index.threads` is enabled".
 ///
-/// That is exactly why this assertion exists: the key's default is "false unless
-/// `index.threads` is enabled", and a writer that emitted `EOIE` unconditionally
-/// (which is `gix_index::write::Extensions::All`, the default this port used
-/// before the key was read) would produce an index git 2.55.0 does not. The
-/// stock-git-seeded half of that comparison lives in the differential harness;
-/// what is pinned here is that no combination of the two keys makes this port
-/// emit an extension it has no other extension to index.
+/// This assertion used to read the other way round: it pinned that the extension
+/// could *never* appear, because the port wrote no extensions at all and so had
+/// nothing to index. That was a statement about a limitation rather than about
+/// git, and it stopped being true the moment the cache-tree landed — the port now
+/// writes `TREE`, so `EOIE` becomes reachable exactly as it is in git.
+///
+/// What is pinned now is the real rule, measured against stock git 2.55.0: with
+/// the key off there is no `EOIE`, and with it on the index carries `TREE` and
+/// then `EOIE`. Deliberately no byte count — the size is a function of how deep
+/// the fixture's tree is, so a literal here would be a number that says nothing
+/// about git and breaks the day someone adds a directory.
 #[test]
-fn end_of_index_entry_is_never_written_without_another_extension() {
+fn end_of_index_entry_follows_the_extension_it_indexes() {
     let (repo, home) = fixture("eoie");
+    let index = || std::fs::read(repo.join(".git/index")).unwrap();
+    let has = |bytes: &[u8], sig: &[u8]| bytes.windows(sig.len()).any(|w| w == sig);
 
+    // Off, and the two spellings that leave it off. `index.threads=1` is git's
+    // "one thread", which does not turn the offset table — or `EOIE` — on.
     for prefix in [
         vec![],
-        vec!["-c", "index.recordEndOfIndexEntries=true"],
         vec!["-c", "index.recordEndOfIndexEntries=false"],
-        vec!["-c", "index.threads=4"],
         vec!["-c", "index.threads=1"],
     ] {
         let mut args = prefix.clone();
         args.extend_from_slice(&["update-index", "--force-write-index"]);
         let out = run(&repo, &home, &args);
         assert!(out.status.success(), "{prefix:?}: {}", stderr(&out));
-        let bytes = std::fs::read(repo.join(".git/index")).unwrap();
-        assert!(
-            !bytes.windows(EOIE.len()).any(|w| w == EOIE),
-            "{prefix:?} wrote an EOIE with no extension to index"
-        );
+        let bytes = index();
+        assert!(!has(&bytes, EOIE), "{prefix:?} wrote an EOIE it was not asked for");
+        assert!(has(&bytes, b"TREE"), "{prefix:?} lost the cache-tree");
     }
+
+    // On: `TREE` then `EOIE`.
+    let out = run(
+        &repo,
+        &home,
+        &["-c", "index.recordEndOfIndexEntries=true", "update-index", "--force-write-index"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let bytes = index();
+    assert!(has(&bytes, b"TREE") && has(&bytes, EOIE), "asked for EOIE and did not get it");
+
+    // `index.threads=4` turns EOIE on the same way. git additionally writes the
+    // `IEOT` offset table there; this port has no writer for it, so the index is
+    // the TREE+EOIE one. Pinned so the day IEOT lands, this test says so rather
+    // than silently passing.
+    let out = run(&repo, &home, &["-c", "index.threads=4", "update-index", "--force-write-index"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let bytes = index();
+    assert!(has(&bytes, EOIE), "index.threads should have turned EOIE on");
+    assert!(!has(&bytes, b"IEOT"), "IEOT is unimplemented; update this test when it lands");
 }
 
 // ---------------------------------------------------------------------------

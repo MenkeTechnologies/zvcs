@@ -71,6 +71,16 @@ pub struct Tally {
     pub stdout_diff: usize,
     pub exit_diff: usize,
     pub state_diff: usize,
+    /// Cases that agreed on stdout, exit code and post-state, and where stock git
+    /// still read the two finished repositories differently.
+    ///
+    /// Its own field rather than a share of `state_diff` because the two say
+    /// different things: a state difference means the repository's *contents*
+    /// diverged, this one means they did not and the port nevertheless wrote a
+    /// structure git would not have. Folding it in would send a reader looking
+    /// for a content difference that is not there — which is what the whole
+    /// cache-tree afternoon was.
+    pub interop_diff: usize,
     /// Cases that agreed on stdout, exit code and state but not on the message —
     /// only reachable for the cases that opted into stderr comparison.
     pub stderr_diff: usize,
@@ -117,6 +127,7 @@ impl Tally {
             + self.stdout_diff
             + self.exit_diff
             + self.state_diff
+            + self.interop_diff
             + self.stderr_diff
             + self.crash
             + self.hang
@@ -130,6 +141,7 @@ impl Tally {
             Verdict::StdoutDiff => self.stdout_diff += 1,
             Verdict::ExitDiff => self.exit_diff += 1,
             Verdict::StateDiff => self.state_diff += 1,
+            Verdict::InteropDiff => self.interop_diff += 1,
             Verdict::StderrDiff => self.stderr_diff += 1,
             Verdict::Crash => self.crash += 1,
             Verdict::Hang => self.hang += 1,
@@ -152,20 +164,34 @@ pub struct Report {
     pub by_cmd: BTreeMap<String, Tally>,
     pub overall: Tally,
     pub failures: Vec<Outcome>,
+    /// How many cases actually paid for the interop probe, and how many were run.
+    ///
+    /// This is the price of the interop dimension, measured rather than
+    /// estimated. The whole cost argument for it is that mutating cases are a
+    /// minority and the probe only fires where the git directory changed; an
+    /// argument about a minority that nothing counts is one nobody can check, and
+    /// a percentage written into a comment goes stale the first time a corpus
+    /// entry is added. So every run prints its own.
+    pub interop_probed: usize,
+    pub interop_total: usize,
 }
 
 pub fn tally(outcomes: Vec<Outcome>) -> Report {
     let mut by_cmd: BTreeMap<String, Tally> = BTreeMap::new();
     let mut overall = Tally::default();
     let mut failures = Vec::new();
+    let mut interop_probed = 0;
+    let mut interop_total = 0;
     for o in outcomes {
         by_cmd.entry(o.case.cmd.to_string()).or_default().record(o.verdict);
         overall.record(o.verdict);
+        interop_total += 1;
+        interop_probed += usize::from(o.interop_probed);
         if !o.verdict.is_match() {
             failures.push(o);
         }
     }
-    Report { by_cmd, overall, failures }
+    Report { by_cmd, overall, failures, interop_probed, interop_total }
 }
 
 /// Render a percentage that never rounds up to a milestone it has not reached.
@@ -212,16 +238,38 @@ impl Report {
             pct_str(self.overall.matched, self.overall.scored())
         );
         println!(
-            "           unsupported={} stdout-diff={} exit-diff={} state-diff={} crash={} \
-             hang={} zvcs-flaky={}",
+            "           unsupported={} stdout-diff={} exit-diff={} state-diff={} \
+             interop-diff={} crash={} hang={} zvcs-flaky={}",
             self.overall.unsupported,
             self.overall.stdout_diff,
             self.overall.exit_diff,
             self.overall.state_diff,
+            self.overall.interop_diff,
             self.overall.crash,
             self.overall.hang,
             self.overall.zvcs_nondeterministic
         );
+        // What the interop dimension cost this run, and what it reached. Printed
+        // unconditionally, including the zero: a dimension that fired on nothing
+        // is a dimension a reader must be able to see fired on nothing, or an
+        // empty column reads as a clean bill of health rather than as an unasked
+        // question.
+        println!(
+            "interop  : {}/{} cases probed — on every case that wrote under the git directory, \
+             stock git re-read both finished repositories (`fsck --strict`, `write-tree`) \
+             and the binary under test answered the same `write-tree` about each of them. \
+             Three invocations per side where the gate opens, nothing at all where it does \
+             not",
+            self.interop_probed, self.interop_total
+        );
+        if self.overall.interop_diff > 0 {
+            println!(
+                "           interop-diff is inside the parity denominator above: stdout, exit \
+                 code and post-state all agreed and stock git still read the two finished \
+                 repositories differently — the port wrote a structure git would not have; \
+                 `--verbose` shows what the probe saw on each side"
+            );
+        }
         // Three separate lines, never one "unmeasured" total: they mean different
         // things and only one of them is counted. Reading a single number here
         // would leave a reader unable to tell an oracle that would not answer from
@@ -248,11 +296,11 @@ impl Report {
         }
 
         println!("\n--- per subcommand ---");
-        println!("{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>6} {:>7}", "cmd", "total", "match", "unsupp", "out", "exit", "state", "flaky", "parity");
+        println!("{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7} {:>6} {:>7}", "cmd", "total", "match", "unsupp", "out", "exit", "state", "interop", "flaky", "parity");
         for (cmd, t) in &self.by_cmd {
             println!(
-                "{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6.1}%",
-                cmd, t.scored(), t.matched, t.unsupported, t.stdout_diff, t.exit_diff, t.state_diff, t.zvcs_nondeterministic, t.pct()
+                "{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7} {:>6} {:>6.1}%",
+                cmd, t.scored(), t.matched, t.unsupported, t.stdout_diff, t.exit_diff, t.state_diff, t.interop_diff, t.zvcs_nondeterministic, t.pct()
             );
         }
 
@@ -344,6 +392,26 @@ impl Report {
                         println!("     zvcs | {b}");
                     }
                 }
+                // What stock git made of each side's finished repository.
+                //
+                // Printed whenever the two digests differ, not only when the
+                // verdict is `INTEROP-DIFF`: a case classified on stdout can
+                // still have left two repositories stock reads differently, and
+                // that is the more actionable half of the finding. The differing
+                // lines are the diagnosis — `stock index-repaired: no` beside
+                // `yes` is the whole cache-tree bug in one line — so only those
+                // are shown, followed by the full digest of each side, which is
+                // what "print what the probe actually saw" has to mean if a
+                // reader is to trust the classification without re-running.
+                if f.stock_interop != f.zvcs_interop {
+                    println!("  !! stock git reads the two finished repositories differently");
+                    for (a, b) in state_diff_lines(&f.stock_interop, &f.zvcs_interop).iter().take(8) {
+                        println!("     stock| {a}");
+                        println!("     zvcs | {b}");
+                    }
+                    println!("  stock interop probe:\n{}", clip(&f.stock_interop, 24));
+                    println!("  zvcs  interop probe:\n{}", clip(&f.zvcs_interop, 24));
+                }
                 // What the second zvcs run did. On a flake this is the whole
                 // finding — the report has to show what differed between the two
                 // zvcs runs, or "not reproducible" is an assertion rather than
@@ -359,6 +427,19 @@ impl Report {
                         Some(Surface::State) => {
                             println!("  !! zvcs did not reproduce its own {}", Surface::State.name());
                             for (a, b) in state_diff_lines(&f.zvcs_state, &r.state).iter().take(6) {
+                                println!("     run 1| {a}");
+                                println!("     run 2| {b}");
+                            }
+                        }
+                        // An interop difference the port does not reproduce.
+                        // Only reachable on a case that was classified
+                        // `INTEROP-DIFF`, which is the only verdict whose repeat
+                        // is asked for this digest at all — see
+                        // `runner::interop_disagreement` for why widening that
+                        // would move numbers nobody chose to move.
+                        Some(Surface::Interop) => {
+                            println!("  !! zvcs did not reproduce its own {}", Surface::Interop.name());
+                            for (a, b) in state_diff_lines(&f.zvcs_interop, &r.interop).iter().take(6) {
                                 println!("     run 1| {a}");
                                 println!("     run 2| {b}");
                             }
@@ -509,7 +590,7 @@ pub fn emit_html(
         let _ = write!(
             cmd_rows,
             "<tr data-h=\"{h}\"><td class=\"cmd\">{c}</td><td>{tot}</td><td>{m}</td>\
-             <td>{o}</td><td>{e}</td><td>{s}</td><td>{f}</td><td class=\"{cls}\">{p}</td></tr>",
+             <td>{o}</td><td>{e}</td><td>{s}</td><td>{i}</td><td>{f}</td><td class=\"{cls}\">{p}</td></tr>",
             h = esc(cmd),
             c = esc(cmd),
             tot = t.scored(),
@@ -517,6 +598,14 @@ pub fn emit_html(
             o = t.stdout_diff,
             e = t.exit_diff,
             s = t.state_diff,
+
+            // Its own column for the same reason it is its own verdict: a row
+
+            // whose gap is explained by neither stdout, exit code nor state
+
+            // sends a reader hunting for a content difference that is not there.
+
+            i = t.interop_diff,
             // Its own column rather than folded into the diff columns: a row whose
             // gap between `cases` and `match` is explained by nothing else visible
             // sends a reader looking for a bug that is not there.
@@ -606,8 +695,12 @@ pub fn emit_html(
          runs each of stock git's {stock_n} main subcommands through the binary and counts \
          the ones that don't hit the \"not yet ported\" dispatch miss. <b>Parity</b> is a \
          differential test — for {scored} curated + fuzzed cases it compares zvcs's stdout, \
-         exit code, and post-command repository state byte-for-byte against stock git, \
-         counting a case only when all three match. It does <b>not</b> assert per-command \
+         exit code, and post-command repository state byte-for-byte against stock git, and \
+         for every case that wrote to the repository it also hands both finished \
+         repositories back to stock git (<code>fsck --strict</code>, <code>write-tree</code>) \
+         and compares what stock makes of them — a port that writes what git cannot read \
+         is as broken as one that prints the wrong thing. A case counts only when all of \
+         them match. It does <b>not</b> assert per-command \
          feature completeness: a command with no corpus case is dispatched but untested, \
          listed below. A high parity over a narrow corpus is not full parity, so both \
          numbers are always shown together.</p>\n"
@@ -626,7 +719,7 @@ pub fn emit_html(
     // Per-command parity table (HUD .file-table).
     let _ = write!(html, "<h3 class=\"section-h\">Per-command parity — {corpus_cmds} commands with corpus cases</h3>\n");
     html.push_str("<div class=\"controls\"><input id=\"q\" type=\"search\" placeholder=\"// filter commands…\" autocomplete=\"off\" spellcheck=\"false\"><span id=\"cnt\"></span></div>\n");
-    html.push_str("<table class=\"file-table\" id=\"tbl\"><thead><tr><th>command</th><th>cases</th><th>match</th><th>out&ne;</th><th>exit&ne;</th><th>state&ne;</th><th title=\"zvcs did not reproduce its own output or post-state on a second run; counted as failures\">flaky</th><th>parity</th></tr></thead><tbody>\n");
+    html.push_str("<table class=\"file-table\" id=\"tbl\"><thead><tr><th>command</th><th>cases</th><th>match</th><th>out&ne;</th><th>exit&ne;</th><th>state&ne;</th><th title=\"stdout, exit code and post-state all agreed, and stock git still read the two finished repositories differently: the port wrote a structure git would not have\">interop&ne;</th><th title=\"zvcs did not reproduce its own output or post-state on a second run; counted as failures\">flaky</th><th>parity</th></tr></thead><tbody>\n");
     html.push_str(&cmd_rows);
     html.push_str("</tbody></table>\n");
 
@@ -1200,6 +1293,7 @@ mod tests {
             Verdict::StdoutDiff,
             Verdict::ExitDiff,
             Verdict::StateDiff,
+            Verdict::InteropDiff,
             Verdict::StderrDiff,
             Verdict::Crash,
             Verdict::Hang,
@@ -1214,6 +1308,7 @@ mod tests {
                 | Verdict::StdoutDiff
                 | Verdict::ExitDiff
                 | Verdict::StateDiff
+                | Verdict::InteropDiff
                 | Verdict::StderrDiff
                 | Verdict::Crash
                 | Verdict::Hang

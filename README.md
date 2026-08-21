@@ -206,6 +206,27 @@ cargo run -p zvcs-parity -- --fuzz 12 --list-cases         # print what that run
 It builds fixture repositories with stock git, runs each invocation against both
 binaries, and compares stdout, exit code, and the resulting repository state.
 
+A fourth comparison covers what the first three structurally cannot. Every state
+probe asks stock git what a repository *means* and recomputes the answer from
+scratch, so it is blind by construction to everything a repository holds beyond
+its logical content — the index cache-tree, the untracked cache, the split index,
+pack indexes, bitmaps, the multi-pack-index — because all of those are
+accelerators the logical view can rebuild without. That blindness shipped a
+defect: `zvcs add` destroyed the index cache-tree, so every stock `write-tree`,
+`commit` or `status` afterwards had to rebuild it, and the case scored a match on
+stdout, exit code, refs, objects, index entries and config alike. So for every
+case that writes under the git directory, both finished repositories are handed
+back to stock git — `fsck --strict` for validity, `write-tree` for whether stock
+can use the index as written or has to repair it first — and the same
+`write-tree` question is put to the binary under test, since a port that cannot
+read what git writes is the same class of bug as one that writes what git cannot
+read. A disagreement there is reported as its own verdict and its own column,
+because "the port wrote a structure git would not have" is a different finding
+from "the port printed the wrong thing". The probe never mutates what it
+measures: `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` redirect every write it would make into a
+scratch directory, and each run prints how many of its cases the gate opened for.
+
 Cases come in two shapes. Most are a single invocation against a pristine copy of
 a fixture. The rest are **sequences** — an ordered list of invocations against one
 repository, compared after *every* step — because git's stateful operations are
@@ -581,7 +602,9 @@ that dispatches is not thereby correct:
 
 - **Coverage** — every subcommand stock git ships is dispatched natively.
 - **Parity** — the share of harness cases whose stdout, exit code, and resulting
-  repository state match stock git exactly.
+  repository state match stock git exactly, and — for the cases that write to the
+  repository — where stock git still reads both finished repositories the same
+  way.
 
 Parity is the number that matters and it is the work that remains. Depth varies
 widely per subcommand; some are byte-faithful across their documented flag set,

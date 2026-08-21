@@ -1,7 +1,8 @@
-//! The differential runner: one case, run twice, compared four ways.
+//! The differential runner: one case, run twice, compared five ways.
 //!
-//! A case is judged on stdout bytes, exit code, and the *resulting repository
-//! state* — that last one is what makes this more than an output diff. A
+//! A case is judged on stdout bytes, exit code, the *resulting repository
+//! state*, and whether **stock git still reads the two finished repositories the
+//! same way**. The last two are what make this more than an output diff. A
 //! command can print the right thing and still corrupt the index; probing the
 //! post-state with stock git in both repos catches that.
 //!
@@ -9,6 +10,37 @@
 //! surface and zvcs is specified to be terser than git. It is still recorded so
 //! a human can read it, and whether the command *errored at all* is compared
 //! via the exit code.
+//!
+//! # A state probe re-derives; an interop probe reads
+//!
+//! Every probe in [`probe_state`] asks stock git what the repository *means* and
+//! recomputes the answer from scratch — `status` walks the worktree, `ls-files
+//! --stage` prints the entries, `cat-file --batch-all-objects` enumerates the
+//! objects. Each of those answers correctly from a repository git would never
+//! have written, because everything a repository holds beyond its logical
+//! content is an accelerator or a record the logical view can rebuild without
+//! it: the index cache-tree, the untracked cache, the split index, pack indexes,
+//! bitmaps, the multi-pack-index. A logical probe is blind to every one of them
+//! by construction, and stays blind however many more are added.
+//!
+//! That blindness shipped a defect. `zvcs add` destroyed the index cache-tree —
+//! a 168-byte index where stock writes 229 — so every stock `write-tree`,
+//! `commit` or `status` afterwards had to rebuild it. Stdout, exit code, refs,
+//! objects, index entries and config all agreed, and the case scored `Match`. It
+//! was found by hand (`30c23c0799`).
+//!
+//! [`probe_interop`] closes that class by asking stock git two questions it is
+//! never otherwise asked: *is this valid* (`fsck --strict`) and *can you use it
+//! as written, or must you repair it first* (`write-tree`, with every write
+//! redirected out of the repository). A disagreement there is
+//! [`Verdict::InteropDiff`] and gets its own column, because "the port wrote
+//! something stock reads differently" is a different finding from "the port
+//! printed the wrong thing" and from "the repository's contents differ".
+//!
+//! It costs three invocations per side — two stock git, one of the binary under
+//! test for the mirror direction — and only on a case that wrote under the git
+//! directory. See [`git_fingerprint`] for the gate and [`probe_interop`] for the
+//! full cost argument.
 //!
 //! # Both sides are asked to reproduce themselves
 //!
@@ -916,6 +948,28 @@ pub enum Verdict {
     ExitDiff,
     /// Same output, but the repository was left in a different state.
     StateDiff,
+    /// stdout, exit code and post-state all agree, and stock git still reads the
+    /// two repositories differently: [`probe_interop`] — git's own validator and
+    /// git's own use of the index — disagreed across the two sides.
+    ///
+    /// **Its own verdict because it is its own claim.** A stdout diff says the
+    /// port printed the wrong thing; a state diff says the repository means
+    /// something different; this says the repository *means the same thing* and
+    /// is nevertheless not what git would have written. The cache-tree defect
+    /// (`30c23c0799`) is the worked example: `zvcs add` stripped the `TREE`
+    /// extension stock had written, so every subsequent stock `write-tree`,
+    /// `commit` or `status` had to rebuild it. Every existing comparison passed —
+    /// identical stdout, identical exit code, identical refs, objects, index
+    /// entries and config — because the port read its own index back perfectly
+    /// and every state probe re-derives its answer from the entries rather than
+    /// from the extension. Filing that under `state-diff` would have told a
+    /// reader the repository's contents differed, which is exactly what they do
+    /// not.
+    ///
+    /// **Counted as a failure, inside the parity denominator.** An index stock
+    /// has to repair before it can use it is a defect on the machine this port
+    /// exists for, where sixteen agents and stock git share one worktree.
+    InteropDiff,
     /// stdout, exit code and state all agree, but the message on stderr does not.
     /// Only reachable for a case that opted into stderr comparison.
     StderrDiff,
@@ -1013,6 +1067,7 @@ impl Verdict {
             Verdict::StdoutDiff => "STDOUT-DIFF",
             Verdict::ExitDiff => "EXIT-DIFF",
             Verdict::StateDiff => "STATE-DIFF",
+            Verdict::InteropDiff => "INTEROP-DIFF",
             Verdict::StderrDiff => "STDERR-DIFF",
             Verdict::Crash => "CRASH",
             Verdict::Hang => "HANG",
@@ -1076,6 +1131,20 @@ pub struct Outcome {
     pub zvcs_code: Option<i32>,
     pub stock_state: String,
     pub zvcs_state: String,
+    /// What stock git — and the binary under test — made of each side's
+    /// *finished* repository; see [`probe_interop`]. Both carry the "not probed"
+    /// marker on a case that left the git directory untouched, which is how they
+    /// compare equal for free.
+    pub stock_interop: String,
+    pub zvcs_interop: String,
+    /// Whether the interop probe actually ran, as opposed to being skipped
+    /// because neither side wrote anything under the git directory.
+    ///
+    /// Reported rather than inferred: the whole cost argument for this dimension
+    /// is that mutating cases are a minority, and a claim about a minority that
+    /// nothing counts is a claim nobody can check. `report.rs` prints the
+    /// fraction beside the parity line, so every run states its own price.
+    pub interop_probed: bool,
     /// The second zvcs run, present exactly when one was taken — that is, on a
     /// case that failed and whose stock side reproduced itself.
     ///
@@ -1111,6 +1180,12 @@ pub struct Repeat {
     /// Normalized exactly like the first run's, against the repeat's own repo.
     pub stdout: String,
     pub state: String,
+    /// The interop digest of the repeat's own repository, present only when the
+    /// repeat was asked for one — that is, only on a case whose verdict was
+    /// [`Verdict::InteropDiff`]. Empty otherwise, and never compared then; see
+    /// [`interop_disagreement`] for why that restriction is load-bearing rather
+    /// than an optimization.
+    pub interop: String,
     /// Which surface this repeat disagreed with the first run on, filled in by
     /// [`judge`] — the one place that holds both runs.
     ///
@@ -1125,6 +1200,7 @@ pub struct Repeat {
 pub enum Surface {
     Stdout,
     State,
+    Interop,
 }
 
 impl Surface {
@@ -1132,6 +1208,7 @@ impl Surface {
         match self {
             Surface::Stdout => "stdout",
             Surface::State => "post-state",
+            Surface::Interop => "interop probe",
         }
     }
 }
@@ -1654,6 +1731,306 @@ fn probe_state(repo: &Path, home: &Path) -> String {
     digest
 }
 
+// ---------------------------------------------------------------------------
+// Interop: what stock git makes of the repository each side left behind
+// ---------------------------------------------------------------------------
+
+/// A cheap content-free fingerprint of the git directory, used only to decide
+/// whether a case touched the repository at all.
+///
+/// `(relative path, length, mtime)` per file, in [`walk_files`]'s sorted order.
+/// Pure `stat` calls — no child process, no file read, no hashing — because this
+/// runs for **every** case on **both** sides, twice each, and the whole cost
+/// argument for the interop dimension is that the expensive half is paid only
+/// where the repository actually changed.
+///
+/// The git directory rather than the whole fixture, and that boundary is the
+/// claim: every structure [`probe_interop`] inspects — the index and its
+/// extensions, the object store, the refs, the reflogs — lives under it, so a
+/// case that wrote nothing there cannot have written a structure for stock to
+/// misread. A command that only rewrote worktree bytes has changed nothing stock
+/// reads *as git*, and `probe_state`'s `status` probe already compares that.
+///
+/// The bounded blind spot, recorded rather than left to be discovered: a write
+/// that lands the same byte length *and* the same modification timestamp is
+/// invisible here. On APFS and ext4 the timestamp has nanosecond resolution and
+/// a rewrite always moves it, so this is a theoretical hole rather than a
+/// practical one — but it is a hole, and the safe direction is the one it errs
+/// in for everything else: [`compare_in`] opens the gate when **either** side's
+/// fingerprint moved, so a case where only the port wrote is still probed on
+/// both sides and the two digests stay comparable.
+fn git_fingerprint(repo: &Path) -> String {
+    let mut out = String::new();
+    for (rel, path) in walk_files(&git_dir(repo)) {
+        let (len, mtime) = std::fs::symlink_metadata(&path)
+            .map(|m| {
+                let t = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                (m.len(), t)
+            })
+            .unwrap_or((0, 0));
+        out.push_str(&format!("{rel} {len} {mtime}\n"));
+    }
+    out
+}
+
+/// The marker both sides carry when the gate stayed shut, so an unprobed case
+/// compares equal without either side having been asked anything.
+const INTEROP_UNPROBED: &str = "# interop\n<not probed: neither side wrote under the git directory>\n";
+
+/// Ask **stock git** whether it can still work with the repository this side left
+/// behind, report what it had to do about it, and put the same question to the
+/// binary under test so the mirror direction is measured too.
+///
+/// # The gap this closes
+///
+/// [`probe_state`] already runs stock git in both repositories, so "stock reads
+/// the port's repository" is not by itself the new thing. What every probe up
+/// there has in common is that it asks stock what the repository *means* and
+/// re-derives the answer from scratch: `status` walks the worktree, `ls-files
+/// --stage` prints the index entries, `cat-file --batch-all-objects` enumerates
+/// the object set, `for-each-ref` reads the refs. Every one of those questions
+/// can be answered correctly from a repository that git would never have
+/// written, because everything a git repository holds *beyond* its logical
+/// content is an accelerator or a record that the logical view can reconstruct
+/// without: the index cache-tree, the untracked cache, the split index, pack
+/// indexes and bitmaps, the multi-pack-index. A logical probe is blind to all of
+/// them by construction, and it stays blind however many logical probes are
+/// added.
+///
+/// That blindness was not theoretical. `zvcs add` destroyed the index
+/// cache-tree — the port wrote a 168-byte index where stock writes 229 — and
+/// every single comparison in this harness passed, because the port read its own
+/// index back perfectly and no probe above ever asked about the extension. It
+/// was found by hand (`30c23c0799`).
+///
+/// # The two questions, and why these two
+///
+/// Both are stock git, and both read a structure rather than re-deriving past
+/// it:
+///
+///  * **`fsck --strict --no-progress --no-dangling` — git's own validator.**
+///    Inflates and parses every object, checks tree entry ordering and mode
+///    bytes, checks ref names, verifies pack index integrity, and — measured,
+///    not assumed — checks the index's cache-tree: an index whose cache-tree
+///    names an object that is not there gets `error: <oid>: invalid sha1 pointer
+///    in cache-tree of .git/index` and exit 8 from stock 2.55.0, with no
+///    `--cache` needed. Exit code, stdout and stderr are all folded in, because
+///    fsck says almost everything it has to say on stderr.
+///  * **`write-tree` — git's own *use* of the index.** The tree id it prints is
+///    computed from the cache-tree where the cache-tree is valid, so a port that
+///    writes a cache-tree disagreeing with its own index entries makes stock
+///    print the wrong tree: verified by pointing an index's root cache-tree at a
+///    real-but-wrong tree object, whereupon stock 2.55.0 printed that object's id
+///    (`f741aa06…`) instead of the index's true tree (`9c05a71a…`) and `fsck`
+///    said nothing. And where the cache-tree is *absent*, stock has to rebuild it
+///    and writes the index back — which is the destroyed-cache-tree signal, and
+///    the reason the probe reports the index's byte length before and after.
+///    Verified on the worked example: stock's own index was left untouched at 261
+///    bytes, while the stripped one went 176 → 261 and came out byte-identical to
+///    stock's.
+///
+/// # Why the probe is not allowed to mutate, and how it manages that
+///
+/// `write-tree` writes: it creates tree objects and it rewrites the index it
+/// read. Running it in the repository would corrupt the very thing being
+/// measured — the object store the *next* probe reports, and, in a
+/// [`Sequence`], the premise the next *step* runs against. Copying the whole
+/// repository first would work and is what an earlier draft did; it costs a
+/// recursive tree copy per side per mutating case, and for the `Packed` shape
+/// that is real bytes.
+///
+/// So the writes are redirected instead, with git's own three variables:
+/// `GIT_INDEX_FILE` at a copy of the index, `GIT_OBJECT_DIRECTORY` at an empty
+/// scratch directory, and `GIT_ALTERNATE_OBJECT_DIRECTORIES` at the real object
+/// store so every existing object is still readable. Cost: one file copy and one
+/// `mkdir`. Verified: after the probe, nothing under the repository's `.git` had
+/// been written, and the repaired index — the whole finding — was sitting in the
+/// scratch copy where it could be compared.
+///
+/// The count of objects stock had to *create* in that scratch directory is
+/// reported too, and it is free: a non-zero count means the port's own index
+/// implies trees its own object store does not contain.
+///
+/// # What is deliberately not probed
+///
+/// Each of these was tried against stock 2.55.0 and rejected for a measured
+/// reason, recorded here so the next person does not re-derive it:
+///
+///  * **`ls-files --debug`.** Prints each index entry's `ctime`, `dev` and
+///    `ino`. Those are facts about the filesystem, not the repository, and they
+///    differ between the two sides' copies the moment either side rewrites the
+///    index — the two repos in one case were measured at `ino: 1076105459` and
+///    `1076105460` for the same path. Comparing it would report the inode
+///    allocator as a parity defect.
+///  * **`GIT_TEST_CHECK_CACHE_TREE=1`.** Present in the reference binary and it
+///    does fire — `error: cache-tree for path  does not match. Expected
+///    9c05a71a… got f741aa06…` — but only when the probing command happens to
+///    write the index back *and* has not invalidated the corrupted node first,
+///    which for a read-only probe means forcing a stat refresh by touching a
+///    worktree file. The one defect it uniquely catches is the wrong-cache-tree
+///    case, and `write-tree` already prints the wrong tree id for that with no
+///    touching and no dependence on whether an index write happened to occur.
+///  * **`count-objects -v`.** Its `size` and `size-pack` fields are pack byte
+///    counts, and the vendored gitoxide cannot reproduce git's pack bytes (see
+///    [`probe_storage`], which states the same relaxation). Every `repack` case
+///    would fail on a difference that is already known to be legitimate.
+///  * **`rev-list --all --objects`.** A full walk that `fsck` already performs,
+///    more strictly, in the same pass.
+///
+/// # The mirror: the port reading what stock wrote
+///
+/// A port that writes what git cannot read and a port that cannot read what git
+/// writes are the same class of bug, and the second one is *structurally*
+/// unmeasured by the rest of this harness. Every case starts from a stock-built
+/// fixture, so "the port reads a stock repository" is covered — for the pristine
+/// fixture, and for nothing else. A repository stock has just `gc`'d, `repack
+/// --write-midx`'d, `pack-refs`'d or `commit-graph write`'n is a repository the
+/// port has never been asked to read, and those commands are precisely the ones
+/// that produce the structures a port misreads: multi-pack indexes, bitmaps,
+/// commit-graphs, `packed-refs`, split indexes.
+///
+/// So the same `write-tree` question is put to **the binary under test** as
+/// well, about the same repository, with the same three variables redirecting
+/// its writes — verified against the port: repository byte-identical afterwards,
+/// correct tree id, scratch index rewritten. Its answer goes into the digest
+/// beside stock's, so the two sides' digests differ whenever the port reads one
+/// repository differently from the other.
+///
+/// **The bounded blind spot, stated rather than left to be found.** This is a
+/// differential comparison, so a port that misreads *both* repositories in the
+/// *same* way renders the same line on both sides and is invisible here. That is
+/// inherent to differential measurement and is already true of every other
+/// surface in this crate; what makes it tolerable is that the failures worth
+/// catching are asymmetric by construction. A structure only stock produces
+/// cannot be misread symmetrically, because the port's own repository does not
+/// contain one.
+///
+/// # Cost
+///
+/// **Three invocations per side, and only on a case that wrote under the git
+/// directory.** Two are stock git (`fsck`, `write-tree`) and the third is the
+/// binary under test answering `write-tree` about the same repository — the
+/// mirror. Everything else pays two `stat` walks of `.git` per side (see
+/// [`git_fingerprint`]) and nothing more: no child process, no copy, no
+/// comparison. A case that does mutate goes from the 18 child processes it
+/// already pays (two invocations plus two eight-probe state digests) to 24, and
+/// buys two small file copies per side.
+///
+/// The alternatives were both worse. Probing every case would spend those six
+/// processes on `log`, `diff`, `rev-parse`, `cat-file` and the rest of a corpus
+/// that is mostly read-only, for an answer that cannot differ — a repository
+/// neither side wrote to is the fixture, and the fixture is byte-identical on
+/// both sides by construction. Probing only where the *post-state digest*
+/// differed would be cheaper still and would measure nothing: this dimension
+/// exists precisely for the cases whose post-state digests agree.
+///
+/// The fraction of the corpus the gate actually opens for is printed by every
+/// run rather than estimated here, because a number in a comment goes stale the
+/// first time a case is added.
+fn probe_interop(repo: &Path, home: &Path, scratch: &Path, zvcs_bin: &Path) -> String {
+    let Ok(stock) = crate::stock::git() else {
+        return "# interop\n<no-stock-git>\n".to_string();
+    };
+    // Cleared at both ends. The tail removal is the one that keeps the worker's
+    // workdir from growing; this one is what makes `objects-written` mean
+    // anything after a run that was killed mid-probe and left a scratch behind,
+    // because a stale object counted here would be attributed to this case.
+    let _ = std::fs::remove_dir_all(scratch);
+    let mut out = String::from("# interop\n");
+
+    // 1. git's own validator, read-only, straight in the repository.
+    let mut cmd = Command::new(stock);
+    env::harden(&mut cmd, home);
+    cmd.current_dir(repo).args(["fsck", "--strict", "--no-progress", "--no-dangling"]);
+    out.push_str("## fsck --strict\n");
+    match cmd.output() {
+        Ok(o) => {
+            out.push_str(&format!("exit: {:?}\n", o.status.code()));
+            // stderr as well as stdout: fsck reports almost every finding there,
+            // and a probe that read only stdout would call a repository stock
+            // rejects outright "clean".
+            out.push_str(&String::from_utf8_lossy(&o.stdout));
+            out.push_str(&String::from_utf8_lossy(&o.stderr));
+        }
+        Err(_) => out.push_str("<spawn-failed>\n"),
+    }
+
+    // 2. git's own use of the index, and then the same question put to the
+    //    binary under test — the mirror. Both have every write redirected out of
+    //    the repository; see the header for the three variables and why.
+    out.push_str("## write-tree\n");
+    out.push_str(&write_tree_probe("stock", stock, repo, home, &scratch.join("stock")));
+    out.push_str(&write_tree_probe("zvcs", zvcs_bin, repo, home, &scratch.join("zvcs")));
+    let _ = std::fs::remove_dir_all(scratch);
+    out
+}
+
+/// Ask one binary to build a tree from this repository's index, with every write
+/// it would make redirected into `scratch`, and report both its answer and what
+/// it had to do to the index to produce it.
+///
+/// `label` names the binary in every line, so a reader of a failing digest can
+/// see at a glance whether it was git or the port that answered differently.
+/// Each fact is one line, because `report.rs` pairs the two sides' digests by
+/// line position to name whichever fact moved.
+fn write_tree_probe(
+    label: &str,
+    bin: &Path,
+    repo: &Path,
+    home: &Path,
+    scratch: &Path,
+) -> String {
+    let mut out = String::new();
+    let objects = scratch.join("objects");
+    let index_copy = scratch.join("index");
+    if std::fs::create_dir_all(&objects).is_err() {
+        return format!("{label}: <scratch-failed>\n");
+    }
+    if std::fs::copy(git_dir(repo).join("index"), &index_copy).is_err() {
+        // A repository with no index at all — an `init` before anything is
+        // staged, or a bare one. Reported as the fact it is rather than skipped,
+        // so the two sides still have a line to disagree on when only one of
+        // them has an index.
+        return format!("{label}: <no-index>\n");
+    }
+    let before = std::fs::read(&index_copy).unwrap_or_default();
+
+    let mut cmd = Command::new(bin);
+    env::harden(&mut cmd, home);
+    cmd.current_dir(repo)
+        .env("GIT_INDEX_FILE", &index_copy)
+        .env("GIT_OBJECT_DIRECTORY", &objects)
+        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", git_dir(repo).join("objects"))
+        .arg("write-tree");
+    match cmd.output() {
+        Ok(o) => {
+            out.push_str(&format!("{label} exit: {:?}\n", o.status.code()));
+            out.push_str(&format!(
+                "{label} tree: {}\n",
+                String::from_utf8_lossy(&o.stdout).trim()
+            ));
+        }
+        Err(_) => out.push_str(&format!("{label} exit: <spawn-failed>\n")),
+    }
+
+    // The finding from the worked example, as separate one-line facts.
+    let after = std::fs::read(&index_copy).unwrap_or_default();
+    out.push_str(&format!(
+        "{label} index-repaired: {}\n",
+        if before == after { "no" } else { "yes" }
+    ));
+    out.push_str(&format!("{label} index-bytes-before: {}\n", before.len()));
+    out.push_str(&format!("{label} index-bytes-after: {}\n", after.len()));
+    // Trees this binary had to create to answer: non-zero means the repository's
+    // own index implies objects its own store does not hold.
+    out.push_str(&format!("{label} objects-written: {}\n", walk_files(&objects).len()));
+    out
+}
+
 /// Root-level files and refs that record an **in-progress operation**.
 ///
 /// Enumerated from git 2.55.0 rather than globbed over `.git`, because a glob
@@ -2140,6 +2517,11 @@ pub struct Compared<'a> {
     pub stdout: &'a str,
     pub stderr: &'a str,
     pub state: &'a str,
+    /// What stock git — and the binary under test — made of the finished
+    /// repository: [`probe_interop`]'s digest, or [`INTEROP_UNPROBED`] on a case
+    /// whose gate stayed shut. The marker is identical on both sides, so an
+    /// unprobed case can never be an interop difference.
+    pub interop: &'a str,
 }
 
 /// Judge one case from the two sides' comparable projections.
@@ -2180,6 +2562,14 @@ fn classify(stock: &Compared<'_>, zvcs: &Compared<'_>, compare_stderr: bool) -> 
         Verdict::StdoutDiff
     } else if stock.state != zvcs.state {
         Verdict::StateDiff
+    // Below the state comparison and above the message one, which is where it
+    // belongs on both sides. A repository whose *contents* differ is the larger
+    // finding and the interop difference would be its consequence, so state
+    // wins; a repository stock has to repair is a larger finding than prose the
+    // harness's standing policy says is not a compatibility surface at all, so
+    // this wins over stderr.
+    } else if stock.interop != zvcs.interop {
+        Verdict::InteropDiff
     } else if compare_stderr && stock.stderr != zvcs.stderr {
         Verdict::StderrDiff
     } else {
@@ -2222,6 +2612,39 @@ fn repeat_disagreement(first_stdout: &str, first_state: &str, again: &Repeat) ->
     None
 }
 
+/// Whether a repeat run reproduced the interop digest — asked **only** of a case
+/// whose verdict is [`Verdict::InteropDiff`].
+///
+/// The restriction is the whole design, and it is not an optimization. Interop
+/// is a compared surface now, so a side that cannot reproduce it has to be
+/// reportable as a flake exactly as it is for stdout and post-state. But
+/// [`repeat_disagreement`] is consulted for the *stock* side too, and a
+/// disagreement there **excludes the case from the parity denominator**. Folding
+/// interop into it unconditionally would mean a case that fails today on stdout
+/// could leave the denominator tomorrow because stock's *interop* digest flaked
+/// — an existing, measured failure quietly reclassified as unmeasurable by a
+/// dimension that had nothing to do with it. This crate does not widen
+/// exclusions, least of all as a side effect of adding a probe.
+///
+/// Gating on the verdict makes the reachable set exactly right: the only case
+/// this can reclassify is one that is *already* an interop difference and would
+/// otherwise be reported as a defect nobody can reproduce. No pre-existing
+/// verdict can move, and no case that was in the denominator yesterday can leave
+/// it today.
+///
+/// It also means the interop probe is only paid for in a repeat when interop is
+/// the finding — [`judge`] passes the flag down to the repeat closures rather
+/// than having them guess.
+///
+/// A repeat that timed out proves nothing here for the same reason it proves
+/// nothing there: a killed run's digest is whatever it managed to produce.
+fn interop_disagreement(verdict: Verdict, first_interop: &str, again: &Repeat) -> Option<Surface> {
+    if verdict != Verdict::InteropDiff || again.timed_out {
+        return None;
+    }
+    (again.interop != first_interop).then_some(Surface::Interop)
+}
+
 /// Classify a case, then — only if it failed — ask each side to reproduce itself.
 ///
 /// The repeats are closures rather than calls so the whole decision procedure is
@@ -2234,12 +2657,17 @@ fn repeat_disagreement(first_stdout: &str, first_state: &str, again: &Repeat) ->
 /// produce — so it wins, and every case classified `Nondeterministic` before this
 /// function existed is still classified `Nondeterministic`. The zvcs repeat is
 /// not even taken in that case: its answer could not change anything.
+/// The repeat closures take one flag — *also take the interop probe* — because
+/// only [`judge`] knows the verdict, and the interop surface is judged for
+/// exactly one verdict (see [`interop_disagreement`]). Passing it down is what
+/// keeps a failing but non-interop case from paying three more invocations per
+/// side for a digest nothing would read.
 fn judge(
     compare_stderr: bool,
     stock: &Compared<'_>,
     zvcs: &Compared<'_>,
-    stock_repeat: &mut dyn FnMut() -> Result<Repeat>,
-    zvcs_repeat: &mut dyn FnMut() -> Result<Repeat>,
+    stock_repeat: &mut dyn FnMut(bool) -> Result<Repeat>,
+    zvcs_repeat: &mut dyn FnMut(bool) -> Result<Repeat>,
 ) -> Result<(Verdict, Option<Repeat>)> {
     let verdict = classify(stock, zvcs, compare_stderr);
     // Done lazily, on failure only, so the common path still costs one run per
@@ -2259,13 +2687,18 @@ fn judge(
         return Ok((verdict, None));
     }
 
-    let stock_again = stock_repeat()?;
-    if repeat_disagreement(stock.stdout, stock.state, &stock_again).is_some() {
+    let want_interop = verdict == Verdict::InteropDiff;
+
+    let stock_again = stock_repeat(want_interop)?;
+    if repeat_disagreement(stock.stdout, stock.state, &stock_again).is_some()
+        || interop_disagreement(verdict, stock.interop, &stock_again).is_some()
+    {
         return Ok((Verdict::Nondeterministic, None));
     }
 
-    let mut zvcs_again = zvcs_repeat()?;
-    zvcs_again.disagreement = repeat_disagreement(zvcs.stdout, zvcs.state, &zvcs_again);
+    let mut zvcs_again = zvcs_repeat(want_interop)?;
+    zvcs_again.disagreement = repeat_disagreement(zvcs.stdout, zvcs.state, &zvcs_again)
+        .or_else(|| interop_disagreement(verdict, zvcs.interop, &zvcs_again));
     let verdict = if zvcs_again.disagreement.is_some() {
         Verdict::ZvcsNondeterministic
     } else {
@@ -2304,10 +2737,23 @@ pub fn run_case(
         &stock_repo,
         &zvcs_repo,
         home,
-        &mut || {
-            repeat_side(crate::stock::git()?, case, templates, workdir, "stock-repeat", stock_exec)
+        &mut |interop| {
+            repeat_side(
+                crate::stock::git()?,
+                case,
+                templates,
+                workdir,
+                "stock-repeat",
+                stock_exec,
+                zvcs_bin,
+                interop,
+            )
         },
-        &mut || repeat_side(zvcs_bin, case, templates, workdir, "zvcs-repeat", zvcs_exec),
+        &mut |interop| {
+            repeat_side(
+                zvcs_bin, case, templates, workdir, "zvcs-repeat", zvcs_exec, zvcs_bin, interop,
+            )
+        },
     )
 }
 
@@ -2334,15 +2780,46 @@ fn compare_in(
     stock_repo: &Path,
     zvcs_repo: &Path,
     home: &Path,
-    stock_repeat: &mut dyn FnMut() -> Result<Repeat>,
-    zvcs_repeat: &mut dyn FnMut() -> Result<Repeat>,
+    stock_repeat: &mut dyn FnMut(bool) -> Result<Repeat>,
+    zvcs_repeat: &mut dyn FnMut(bool) -> Result<Repeat>,
 ) -> Result<Outcome> {
     let (stock_repo, zvcs_repo) = (stock_repo.to_path_buf(), zvcs_repo.to_path_buf());
+    // The gate for the interop dimension, taken before anything runs. Two `stat`
+    // walks per side and no child process; see `git_fingerprint`.
+    let stock_before = git_fingerprint(&stock_repo);
+    let zvcs_before = git_fingerprint(&zvcs_repo);
+
     let stock = run_side(crate::stock::git()?, &stock_repo, home, case)?;
     let zvcs = run_side(zvcs_bin, &zvcs_repo, home, case)?;
 
+    // Closed **before** `probe_state`, and that ordering is load-bearing rather
+    // than tidy. `probe_state` runs `status`, which refreshes the index and
+    // writes it back when the stat data it cached has gone stale — so a gate
+    // read after the state probe attributes the harness's own write to the case
+    // and opens for everything. Measured: with the reads in the wrong order,
+    // 4854 of 4861 curated cases "mutated the repository", including `log`,
+    // `rev-parse` and `cat-file`. Taken here, the number is what the case
+    // actually did.
+    //
+    // Either side writing opens the gate for **both**, so the two digests are
+    // always comparable. Gating per side would make "only the port wrote
+    // anything" show up as an interop difference between a real digest and the
+    // unprobed marker, which is a true fact reported under the wrong name — the
+    // finding there is what was written, not how stock reads it.
+    let interop_probed = stock_before != git_fingerprint(&stock_repo)
+        || zvcs_before != git_fingerprint(&zvcs_repo);
+
     let stock_state = probe_state(&stock_repo, home);
     let zvcs_state = probe_state(&zvcs_repo, home);
+
+    let (stock_interop, zvcs_interop) = if interop_probed {
+        (
+            probe_interop(&stock_repo, home, &interop_scratch(&stock_repo), zvcs_bin),
+            probe_interop(&zvcs_repo, home, &interop_scratch(&zvcs_repo), zvcs_bin),
+        )
+    } else {
+        (INTEROP_UNPROBED.to_string(), INTEROP_UNPROBED.to_string())
+    };
 
     // Asked of each binary once per run, not per case: 4000+ cases would
     // otherwise pay two extra child processes each for an answer that cannot
@@ -2356,6 +2833,10 @@ fn compare_in(
     let zvcs_stderr = normalize(&zvcs.stderr, &zvcs_repo, home, zvcs_exec);
     let stock_state_n = normalize(stock_state.as_bytes(), &stock_repo, home, stock_exec);
     let zvcs_state_n = normalize(zvcs_state.as_bytes(), &zvcs_repo, home, zvcs_exec);
+    // Normalized like every other surface: `fsck` names paths, and the two sides
+    // live at different roots.
+    let stock_interop_n = normalize(stock_interop.as_bytes(), &stock_repo, home, stock_exec);
+    let zvcs_interop_n = normalize(zvcs_interop.as_bytes(), &zvcs_repo, home, zvcs_exec);
 
     // A failing case might be one neither binary reproduces itself. Each side is
     // re-run in a fresh copy of the same shape and compared against its own first
@@ -2369,6 +2850,7 @@ fn compare_in(
             stdout: &stock_stdout,
             stderr: &stock_stderr,
             state: &stock_state_n,
+            interop: &stock_interop_n,
         },
         &Compared {
             timed_out: zvcs.timed_out,
@@ -2376,6 +2858,7 @@ fn compare_in(
             stdout: &zvcs_stdout,
             stderr: &zvcs_stderr,
             state: &zvcs_state_n,
+            interop: &zvcs_interop_n,
         },
         stock_repeat,
         zvcs_repeat,
@@ -2393,8 +2876,25 @@ fn compare_in(
         zvcs_code: zvcs.code,
         stock_state: stock_state_n,
         zvcs_state: zvcs_state_n,
+        stock_interop: stock_interop_n,
+        zvcs_interop: zvcs_interop_n,
+        interop_probed,
         zvcs_repeat,
     })
+}
+
+/// Where [`probe_interop`] parks the index copy and the redirected object
+/// directory for one repository.
+///
+/// A **sibling** of the repository, never a directory inside it. Anything under
+/// the fixture would be seen by the next `status` the case runs — in a
+/// [`Sequence`] there *is* a next step — and a probe that shows up as `?? …` in
+/// the state digest has made itself into the difference it was measuring. Named
+/// from the repository's own directory name so the four repositories a worker
+/// juggles (`stock`, `zvcs`, and the two repeats) never share one.
+fn interop_scratch(repo: &Path) -> PathBuf {
+    let name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    repo.with_file_name(format!("interop-{name}"))
 }
 
 /// Whether the sequence stops here: because this step diverged, or because it
@@ -2457,7 +2957,7 @@ pub fn run_sequence(
             &stock_repo,
             &zvcs_repo,
             home,
-            &mut || {
+            &mut |interop| {
                 repeat_sequence_side(
                     crate::stock::git()?,
                     seq,
@@ -2466,11 +2966,14 @@ pub fn run_sequence(
                     workdir,
                     "stock-repeat",
                     stock_exec,
+                    zvcs_bin,
+                    interop,
                 )
             },
-            &mut || {
+            &mut |interop| {
                 repeat_sequence_side(
-                    zvcs_bin, seq, index, templates, workdir, "zvcs-repeat", zvcs_exec,
+                    zvcs_bin, seq, index, templates, workdir, "zvcs-repeat", zvcs_exec, zvcs_bin,
+                    interop,
                 )
             },
         )?;
@@ -2499,7 +3002,11 @@ pub fn run_sequence(
 /// closure the caller supplies rather than something [`compare_in`] decides.
 ///
 /// Cost is bounded by the same rule everything else here follows: [`judge`] calls
-/// this only on a failure, and only up to the step that failed.
+/// this only on a failure, and only up to the step that failed. `interop` is
+/// [`judge`]'s answer to "is the interop digest one of the surfaces this repeat
+/// has to reproduce", which it is for exactly one verdict — see
+/// [`interop_disagreement`].
+#[allow(clippy::too_many_arguments)]
 fn repeat_sequence_side(
     bin: &Path,
     seq: &Sequence,
@@ -2508,6 +3015,8 @@ fn repeat_sequence_side(
     workdir: &Path,
     sub: &str,
     exec_dir: &Path,
+    zvcs_bin: &Path,
+    interop: bool,
 ) -> Result<Repeat> {
     let repo = workdir.join(sub);
     let _ = std::fs::remove_dir_all(&repo);
@@ -2525,8 +3034,31 @@ fn repeat_sequence_side(
         code: again.code,
         stdout: normalize(&again.stdout, &repo, home, exec_dir),
         state: normalize(probe_state(&repo, home).as_bytes(), &repo, home, exec_dir),
+        interop: repeat_interop(&repo, home, exec_dir, zvcs_bin, interop),
         disagreement: None,
     })
+}
+
+/// The interop digest of a repeat's own repository, or nothing when this repeat
+/// was not asked for one.
+///
+/// No gate here, and deliberately: the repeat only ever runs on a failing case,
+/// and it is only ever *asked* for this digest when interop is the finding —
+/// which means the first run's gate was already open. Re-deriving the gate from
+/// a second fingerprint pair would spend two more walks to answer a question
+/// [`judge`] has already answered.
+fn repeat_interop(
+    repo: &Path,
+    home: &Path,
+    exec_dir: &Path,
+    zvcs_bin: &Path,
+    wanted: bool,
+) -> String {
+    if !wanted {
+        return String::new();
+    }
+    let raw = probe_interop(repo, home, &interop_scratch(repo), zvcs_bin);
+    normalize(raw.as_bytes(), repo, home, exec_dir)
 }
 
 /// One unit of work for the runner pool: a single invocation, or a whole
@@ -2596,6 +3128,12 @@ impl Job {
 /// and the normalization is done against *that* repo's path, because a digest
 /// that still carries the repeat's own root would differ from the first run's for
 /// no reason but its location.
+///
+/// `interop` is [`judge`]'s answer to "is the interop digest one of the surfaces
+/// this repeat has to reproduce". It is true for exactly one verdict, so a
+/// failing case that is not an interop difference pays nothing for this
+/// dimension in its repeat either — see [`interop_disagreement`].
+#[allow(clippy::too_many_arguments)]
 fn repeat_side(
     bin: &Path,
     case: &Case,
@@ -2603,6 +3141,8 @@ fn repeat_side(
     workdir: &Path,
     sub: &str,
     exec_dir: &Path,
+    zvcs_bin: &Path,
+    interop: bool,
 ) -> Result<Repeat> {
     let repo = workdir.join(sub);
     let _ = std::fs::remove_dir_all(&repo);
@@ -2615,6 +3155,7 @@ fn repeat_side(
         code: again.code,
         stdout: normalize(&again.stdout, &repo, home, exec_dir),
         state: normalize(probe_state(&repo, home).as_bytes(), &repo, home, exec_dir),
+        interop: repeat_interop(&repo, home, exec_dir, zvcs_bin, interop),
         // Filled by `judge`, which is the only caller holding the first run.
         disagreement: None,
     })
@@ -2645,9 +3186,10 @@ pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        case_timeout, config_premise, git_dir, is_unsupported, judge,
-        probe_op_state, quote_config_value, render_config_entry, repeat_disagreement, scope_file,
-        split_config_key, step_is_final, Case, Compared, ConfigEntry, ConfigScope, Outcome, Repeat,
+        case_timeout, classify, config_premise, git_dir, interop_disagreement, is_unsupported,
+        judge, probe_op_state, quote_config_value, render_config_entry, repeat_disagreement,
+        scope_file, split_config_key, step_is_final, Case, Compared, ConfigEntry, ConfigScope,
+        Outcome, Repeat,
         Sequence, StepRef, Surface, Verdict, CASE_TIMEOUT, OP_STATE_DIRS, OP_STATE_FILES,
     };
     use crate::fixture::Shape;
@@ -2659,14 +3201,36 @@ mod tests {
     /// classification reads and nothing else — no binary, no repo, no clock, so
     /// these tests can never flake on the thing they exist to detect.
     fn side<'a>(code: i32, stdout: &'a str, state: &'a str) -> Compared<'a> {
-        Compared { timed_out: false, code: Some(code), stdout, stderr: "", state }
+        // Both sides carry the "gate stayed shut" marker unless a test says
+        // otherwise, which is the shape of every non-mutating case: an unprobed
+        // case can never be an interop difference.
+        Compared {
+            timed_out: false,
+            code: Some(code),
+            stdout,
+            stderr: "",
+            state,
+            interop: super::INTEROP_UNPROBED,
+        }
+    }
+
+    /// A side whose repository was probed, with `interop` as what stock made of it.
+    fn probed<'a>(code: i32, stdout: &'a str, state: &'a str, interop: &'a str) -> Compared<'a> {
+        Compared { interop, ..side(code, stdout, state) }
     }
 
     /// A side the harness killed. `stdout` is whatever it managed to write before
     /// the kill — deliberately non-empty in the tests, because the bug being
     /// guarded is a partial capture reaching the diff.
     fn killed(stdout: &str) -> Compared<'_> {
-        Compared { timed_out: true, code: None, stdout, stderr: "", state: "" }
+        Compared {
+            timed_out: true,
+            code: None,
+            stdout,
+            stderr: "",
+            state: "",
+            interop: super::INTEROP_UNPROBED,
+        }
     }
 
     fn repeat(stdout: &str, state: &str) -> Repeat {
@@ -2675,8 +3239,14 @@ mod tests {
             code: Some(0),
             stdout: stdout.to_string(),
             state: state.to_string(),
+            interop: String::new(),
             disagreement: None,
         }
+    }
+
+    /// A repeat that was asked for an interop digest, and produced this one.
+    fn repeat_interop_digest(stdout: &str, state: &str, interop: &str) -> Repeat {
+        Repeat { interop: interop.to_string(), ..repeat(stdout, state) }
     }
 
     /// A repeat the harness killed: partial stdout, nothing else.
@@ -2697,8 +3267,8 @@ mod tests {
             false,
             &side(0, "stock\n", "S"),
             &side(0, "zvcs-a\n", "S"),
-            &mut || Ok(repeat("stock\n", "S")),
-            &mut || Ok(repeat("zvcs-b\n", "S")),
+            &mut |_| Ok(repeat("stock\n", "S")),
+            &mut |_| Ok(repeat("zvcs-b\n", "S")),
         )
         .unwrap();
         assert_eq!(v, Verdict::ZvcsNondeterministic);
@@ -2709,8 +3279,8 @@ mod tests {
             false,
             &side(0, "same\n", "stock-state"),
             &side(0, "same\n", "zvcs-state-a"),
-            &mut || Ok(repeat("same\n", "stock-state")),
-            &mut || Ok(repeat("same\n", "zvcs-state-b")),
+            &mut |_| Ok(repeat("same\n", "stock-state")),
+            &mut |_| Ok(repeat("same\n", "zvcs-state-b")),
         )
         .unwrap();
         assert_eq!(v, Verdict::ZvcsNondeterministic);
@@ -2730,8 +3300,8 @@ mod tests {
                 false,
                 &stock,
                 &zvcs,
-                &mut || Ok(repeat(stock.stdout, stock.state)),
-                &mut || Ok(repeat(zvcs.stdout, zvcs.state)),
+                &mut |_| Ok(repeat(stock.stdout, stock.state)),
+                &mut |_| Ok(repeat(zvcs.stdout, zvcs.state)),
             )
             .unwrap();
             assert_eq!(v, want);
@@ -2752,8 +3322,8 @@ mod tests {
             false,
             &killed("partial"),
             &side(0, "full\n", "S"),
-            &mut || panic!("no repeat is taken for a timeout"),
-            &mut || panic!("no repeat is taken for a timeout"),
+            &mut |_| panic!("no repeat is taken for a timeout"),
+            &mut |_| panic!("no repeat is taken for a timeout"),
         )
         .unwrap();
         assert_eq!(v, Verdict::StockTimeout);
@@ -2764,8 +3334,8 @@ mod tests {
             false,
             &side(0, "full\n", "S"),
             &killed("partial"),
-            &mut || panic!("no repeat is taken for a timeout"),
-            &mut || panic!("no repeat is taken for a timeout"),
+            &mut |_| panic!("no repeat is taken for a timeout"),
+            &mut |_| panic!("no repeat is taken for a timeout"),
         )
         .unwrap();
         assert_eq!(v, Verdict::Hang);
@@ -2787,8 +3357,8 @@ mod tests {
             false,
             &side(0, "stock\n", "S"),
             &side(0, "zvcs\n", "S"),
-            &mut || Ok(killed_repeat()),
-            &mut || Ok(repeat("zvcs\n", "S")),
+            &mut |_| Ok(killed_repeat()),
+            &mut |_| Ok(repeat("zvcs\n", "S")),
         )
         .unwrap();
         assert_eq!(v, Verdict::StdoutDiff);
@@ -2798,8 +3368,8 @@ mod tests {
             false,
             &side(0, "stock\n", "S"),
             &side(0, "zvcs\n", "S"),
-            &mut || Ok(repeat("stock\n", "S")),
-            &mut || Ok(killed_repeat()),
+            &mut |_| Ok(repeat("stock\n", "S")),
+            &mut |_| Ok(killed_repeat()),
         )
         .unwrap();
         assert_eq!(v, Verdict::StdoutDiff);
@@ -2814,8 +3384,8 @@ mod tests {
             false,
             &side(0, "stock-a\n", "S"),
             &side(0, "zvcs-a\n", "S"),
-            &mut || Ok(repeat("stock-b\n", "S")),
-            &mut || panic!("the zvcs repeat must not be taken once stock has disagreed with itself"),
+            &mut |_| Ok(repeat("stock-b\n", "S")),
+            &mut |_| panic!("the zvcs repeat must not be taken once stock has disagreed with itself"),
         )
         .unwrap();
         assert_eq!(v, Verdict::Nondeterministic);
@@ -2830,12 +3400,329 @@ mod tests {
             false,
             &side(0, "same\n", "S"),
             &side(0, "same\n", "S"),
-            &mut || panic!("a match must not pay for a repeat"),
-            &mut || panic!("a match must not pay for a repeat"),
+            &mut |_| panic!("a match must not pay for a repeat"),
+            &mut |_| panic!("a match must not pay for a repeat"),
         )
         .unwrap();
         assert_eq!(v, Verdict::Match);
         assert!(r.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Interop
+    // -----------------------------------------------------------------------
+
+    /// The interop digest from the cache-tree defect, as
+    /// [`super::probe_interop`] renders it. `stock` is what stock 2.55.0 left
+    /// behind; `zvcs` is the same repository with the `TREE` extension stripped,
+    /// which is what `zvcs add` did before `30c23c0799`. Both numbers are the
+    /// measured ones.
+    fn cache_tree_digests() -> (String, String) {
+        let head = "# interop\n## fsck --strict\nexit: Some(0)\n";
+        let side = |label: &str, repaired: &str, before: usize| {
+            format!(
+                "{label} exit: Some(0)\n\
+                 {label} tree: 9c05a71a986e3294c683f3a285c8651c9ccfe16f\n\
+                 {label} index-repaired: {repaired}\n\
+                 {label} index-bytes-before: {before}\n\
+                 {label} index-bytes-after: 261\n\
+                 {label} objects-written: 0\n"
+            )
+        };
+        (
+            format!(
+                "{head}## write-tree\n{}{}",
+                side("stock", "no", 261),
+                side("zvcs", "no", 261)
+            ),
+            format!(
+                "{head}## write-tree\n{}{}",
+                side("stock", "yes", 176),
+                side("zvcs", "yes", 176)
+            ),
+        )
+    }
+
+    /// The defect this dimension exists for: identical stdout, identical exit
+    /// code, identical post-state — and stock git has to repair the port's index
+    /// before it can use it.
+    ///
+    /// Every one of the four surfaces that existed before this test was written
+    /// agrees here, which is exactly why the real bug scored `Match` and had to
+    /// be found by hand. It has to land in its own bucket rather than in
+    /// `STATE-DIFF`: the repository's *contents* are identical, and telling a
+    /// reader they diverged sends them looking for a difference that is not
+    /// there.
+    #[test]
+    fn a_destroyed_cache_tree_is_an_interop_diff_and_not_a_state_diff() {
+        let (stock, zvcs) = cache_tree_digests();
+        assert_eq!(
+            classify(
+                &probed(0, "", "same-state", &stock),
+                &probed(0, "", "same-state", &zvcs),
+                false,
+            ),
+            Verdict::InteropDiff
+        );
+        // …and it is a counted failure, never an exclusion.
+        assert!(!Verdict::InteropDiff.is_match());
+        assert!(!Verdict::InteropDiff.is_unmeasurable());
+        assert!(Verdict::InteropDiff.is_measured_failure());
+        assert_eq!(Verdict::InteropDiff.exclusion_reason(), None);
+    }
+
+    /// A case that wrote nothing under the git directory carries the same
+    /// "unprobed" marker on both sides, so it can never be an interop
+    /// difference — the property that makes the gate free rather than a source
+    /// of false findings.
+    ///
+    /// And the ordering: an interop difference never outranks a content one. A
+    /// repository whose contents differ is the larger finding and the interop
+    /// difference would be its consequence, so a case with both is reported as
+    /// the content difference it is.
+    #[test]
+    fn interop_is_judged_below_content_and_above_message() {
+        let (stock, zvcs) = cache_tree_digests();
+        // Gate shut on both sides: nothing to disagree about.
+        assert_eq!(classify(&side(0, "x\n", "S"), &side(0, "x\n", "S"), false), Verdict::Match);
+
+        // stdout, exit and state each outrank it.
+        for (a, b, want) in [
+            (probed(0, "a\n", "S", &stock), probed(0, "b\n", "S", &zvcs), Verdict::StdoutDiff),
+            (probed(0, "a\n", "S", &stock), probed(1, "a\n", "S", &zvcs), Verdict::ExitDiff),
+            (probed(0, "a\n", "S", &stock), probed(0, "a\n", "T", &zvcs), Verdict::StateDiff),
+        ] {
+            assert_eq!(classify(&a, &b, false), want);
+        }
+
+        // …and it outranks the message, which the harness's standing policy says
+        // is not a compatibility surface at all.
+        let strict_stock = Compared { stderr: "one\n", ..probed(0, "a\n", "S", &stock) };
+        let strict_zvcs = Compared { stderr: "two\n", ..probed(0, "a\n", "S", &zvcs) };
+        assert_eq!(classify(&strict_stock, &strict_zvcs, true), Verdict::InteropDiff);
+    }
+
+    /// The interop repeat is asked for by exactly one verdict, and that
+    /// restriction is what keeps this dimension from moving numbers nobody chose
+    /// to move.
+    ///
+    /// `repeat_disagreement` is consulted for the **stock** side, and a
+    /// disagreement there drops the case out of the parity denominator. If
+    /// interop were folded into it unconditionally, a case failing today on
+    /// stdout could become `Nondeterministic` tomorrow because stock's *interop*
+    /// digest flaked — an existing measured failure quietly reclassified as
+    /// unmeasurable by a probe that had nothing to do with it.
+    #[test]
+    fn the_interop_surface_is_only_judged_for_an_interop_diff() {
+        let (a, b) = ("digest-a", "digest-b");
+        // The verdict it is judged for.
+        assert_eq!(
+            interop_disagreement(
+                Verdict::InteropDiff,
+                a,
+                &repeat_interop_digest("", "", b)
+            ),
+            Some(Surface::Interop)
+        );
+        assert_eq!(
+            interop_disagreement(Verdict::InteropDiff, a, &repeat_interop_digest("", "", a)),
+            None
+        );
+        // Every other verdict: not judged, whatever the digests say. A stdout
+        // difference stays a stdout difference.
+        for v in [
+            Verdict::Match,
+            Verdict::Unsupported,
+            Verdict::StdoutDiff,
+            Verdict::ExitDiff,
+            Verdict::StateDiff,
+            Verdict::StderrDiff,
+            Verdict::Crash,
+            Verdict::Hang,
+            Verdict::ZvcsNondeterministic,
+            Verdict::Nondeterministic,
+            Verdict::StockTimeout,
+        ] {
+            assert_eq!(
+                interop_disagreement(v, a, &repeat_interop_digest("", "", b)),
+                None,
+                "{} must not be reclassified by the interop surface",
+                v.label()
+            );
+        }
+        // A killed repeat proves nothing here either: its digest is whatever it
+        // managed to produce before the kill.
+        assert_eq!(
+            interop_disagreement(Verdict::InteropDiff, a, &killed_repeat()),
+            None
+        );
+    }
+
+    /// An interop difference neither side reproduces is classified the same way
+    /// every other unreproducible difference is — and the whole point of asking
+    /// is that a *reproducible* one keeps its verdict.
+    #[test]
+    fn an_interop_flake_is_reported_as_a_flake_and_a_stable_one_as_a_defect() {
+        let (stock, zvcs) = cache_tree_digests();
+
+        // zvcs does not reproduce its own digest: a flake, counted as a failure.
+        let (v, r) = judge(
+            false,
+            &probed(0, "", "S", &stock),
+            &probed(0, "", "S", &zvcs),
+            &mut |want| {
+                assert!(want, "an interop diff must ask its repeats for the digest");
+                Ok(repeat_interop_digest("", "S", &stock))
+            },
+            &mut |_| Ok(repeat_interop_digest("", "S", "a third digest")),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::ZvcsNondeterministic);
+        assert_eq!(r.unwrap().disagreement, Some(Surface::Interop));
+
+        // Stock does not reproduce its own: nothing could match it, so the case
+        // leaves the denominator — the same rule stdout and post-state follow.
+        let (v, _) = judge(
+            false,
+            &probed(0, "", "S", &stock),
+            &probed(0, "", "S", &zvcs),
+            &mut |_| Ok(repeat_interop_digest("", "S", "something else")),
+            &mut |_| panic!("the zvcs repeat must not be taken once stock has disagreed with itself"),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::Nondeterministic);
+
+        // Both reproduce: the difference stands as the defect it is.
+        let (v, r) = judge(
+            false,
+            &probed(0, "", "S", &stock),
+            &probed(0, "", "S", &zvcs),
+            &mut |_| Ok(repeat_interop_digest("", "S", &stock)),
+            &mut |_| Ok(repeat_interop_digest("", "S", &zvcs)),
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::InteropDiff);
+        assert_eq!(r.unwrap().disagreement, None);
+    }
+
+    /// A failure that is *not* an interop difference must not pay for the
+    /// interop probe in its repeat.
+    ///
+    /// The cost argument for this whole dimension is that it fires only where it
+    /// can find something, and the repeat is the one place where that could
+    /// silently stop being true — the repeat runs on every failure, so an
+    /// unconditional digest there would be four more stock invocations on every
+    /// failing case in the corpus.
+    #[test]
+    fn a_non_interop_failure_does_not_pay_for_the_interop_probe() {
+        let (v, _) = judge(
+            false,
+            &side(0, "a\n", "S"),
+            &side(0, "b\n", "S"),
+            &mut |want| {
+                assert!(!want, "a stdout diff must not ask its repeat for an interop digest");
+                Ok(repeat("a\n", "S"))
+            },
+            &mut |want| {
+                assert!(!want, "a stdout diff must not ask its repeat for an interop digest");
+                Ok(repeat("b\n", "S"))
+            },
+        )
+        .unwrap();
+        assert_eq!(v, Verdict::StdoutDiff);
+    }
+
+    /// Every fact the probe reports occupies exactly one line, and the lines that
+    /// differ *are* the diagnosis.
+    ///
+    /// `report.rs` pairs the two digests by line position to name what moved, so
+    /// a fact that spilled across two lines would shift every following one and
+    /// print a dozen phantom differences instead of the one real one. On the real
+    /// defect the diagnosis is three lines wide and reads in English.
+    #[test]
+    fn the_interop_digest_is_one_fact_per_line() {
+        let (stock, zvcs) = cache_tree_digests();
+        let differing: Vec<(String, String)> = stock
+            .lines()
+            .zip(zvcs.lines())
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        assert_eq!(
+            differing,
+            vec![
+                ("stock index-repaired: no".into(), "stock index-repaired: yes".into()),
+                ("stock index-bytes-before: 261".into(), "stock index-bytes-before: 176".into()),
+                ("zvcs index-repaired: no".into(), "zvcs index-repaired: yes".into()),
+                ("zvcs index-bytes-before: 261".into(), "zvcs index-bytes-before: 176".into()),
+            ]
+        );
+        // The two digests have the same number of lines, which is what makes the
+        // pairing above meaningful rather than an accident of length.
+        assert_eq!(stock.lines().count(), zvcs.lines().count());
+        // Every line after the two headings carries exactly one `key: value`.
+        for line in stock.lines().filter(|l| !l.starts_with('#')) {
+            assert!(line.contains(": "), "not one fact per line: {line:?}");
+        }
+    }
+
+    /// The probe's scratch directory is a **sibling** of the repository, never
+    /// inside it, and the four repositories a worker juggles never share one.
+    ///
+    /// Anything under the fixture would be seen by the next `status` the case
+    /// runs — in a sequence there *is* a next step — and a probe that shows up as
+    /// `?? …` in the state digest has made itself into the difference it was
+    /// measuring.
+    #[test]
+    fn the_interop_scratch_never_lands_inside_the_repository() {
+        let workdir = Path::new("/w/w0");
+        let dirs: Vec<PathBuf> = ["stock", "zvcs", "stock-repeat", "zvcs-repeat"]
+            .iter()
+            .map(|s| super::interop_scratch(&workdir.join(s)))
+            .collect();
+        for (repo, scratch) in ["stock", "zvcs", "stock-repeat", "zvcs-repeat"].iter().zip(&dirs) {
+            assert!(!scratch.starts_with(workdir.join(repo)), "{scratch:?} is inside the repo");
+            assert!(scratch.starts_with(workdir), "{scratch:?} escaped the worker workdir");
+        }
+        let unique: std::collections::BTreeSet<&PathBuf> = dirs.iter().collect();
+        assert_eq!(unique.len(), dirs.len(), "two repositories share one scratch: {dirs:?}");
+    }
+
+    /// The gate reports a write and only a write.
+    ///
+    /// Reading a repository must leave the fingerprint alone, or every case in
+    /// the corpus pays the probe and the cost argument evaporates; writing must
+    /// move it, or the defect this dimension exists for goes unprobed. Both
+    /// halves are checked against a real directory, since the fingerprint is
+    /// `stat` data and nothing else.
+    #[test]
+    fn the_interop_gate_fires_on_a_write_and_not_on_a_read() {
+        let repo = scratch("interop-gate");
+        let git = repo.join(".git");
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::write(git.join("refs/heads/main"), b"0123456789abcdef0123456789abcdef01234567\n")
+            .unwrap();
+        let before = super::git_fingerprint(&repo);
+        assert!(!before.is_empty(), "the fingerprint saw nothing in a real git directory");
+
+        // Reading changes nothing.
+        let _ = std::fs::read(git.join("HEAD")).unwrap();
+        assert_eq!(super::git_fingerprint(&repo), before);
+
+        // A write of a *different length* moves it, and so does a new file.
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/other\n").unwrap();
+        let after = super::git_fingerprint(&repo);
+        assert_ne!(after, before);
+        std::fs::write(git.join("ORIG_HEAD"), b"x\n").unwrap();
+        assert_ne!(super::git_fingerprint(&repo), after);
+
+        // A file outside the git directory is deliberately not in it: every
+        // structure the probe inspects lives inside, so a worktree-only write
+        // cannot have produced one for stock to misread.
+        let worktree_only = super::git_fingerprint(&repo);
+        std::fs::write(repo.join("file.txt"), b"edited\n").unwrap();
+        assert_eq!(super::git_fingerprint(&repo), worktree_only);
     }
 
     /// The sleep allowance is additive and reaches exactly the commands whose
@@ -3373,6 +4260,7 @@ mod tests {
             Verdict::StdoutDiff,
             Verdict::ExitDiff,
             Verdict::StateDiff,
+            Verdict::InteropDiff,
             Verdict::StderrDiff,
             Verdict::Crash,
             Verdict::Hang,
@@ -3405,6 +4293,9 @@ mod tests {
             zvcs_code: Some(0),
             stock_state: String::new(),
             zvcs_state: String::new(),
+            stock_interop: String::new(),
+            zvcs_interop: String::new(),
+            interop_probed: false,
             zvcs_repeat: None,
         };
         assert_eq!(plain.id(), "dirty::status::status");

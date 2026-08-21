@@ -246,12 +246,12 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        // Separate-argument forms consume the next argument.
+        // Separate-argument forms consume the next argument — `get_arg()`,
+        // whose refusal is an `error:` line on stderr at 129 with no usage
+        // block, not this port's `zvcs: <verb>:` at exit 1.
         let value = |i: &mut usize, name: &str| -> Result<String> {
             *i += 1;
-            args.get(*i)
-                .cloned()
-                .ok_or_else(|| anyhow!("option `{name}' requires a value"))
+            Ok(crate::parseopt::value_at(args, *i, crate::parseopt::OptName::Long(name))?.to_string())
         };
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,

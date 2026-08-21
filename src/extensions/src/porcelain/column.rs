@@ -810,6 +810,17 @@ pub(crate) fn config_colopts_key(colopts: &mut u32, key: &str) -> Result<(), Str
     apply_config_keys(colopts, &[COLUMN_UI.to_string(), key.to_string()])
 }
 
+/// `column_config()` (column.c:318-326) reduced to its check: whether `value` is a
+/// token list git can read, and the `error()` text it prints first when it is not.
+///
+/// Used by the config callbacks that reach `git_column_config` before the command
+/// runs (`crate::status_config`), which need to validate a value in place and
+/// build their own origin-naming `fatal:` rather than have this module print one.
+pub(crate) fn validate_config_value(value: &str) -> Result<(), String> {
+    let mut colopts = 0u32;
+    parse_config(&mut colopts, value)
+}
+
 /// Port of `parseopt_column_callback`: apply one `--column[=<opts>]` / `--no-column`
 /// occurrence. `unset` is the `--no-column` form (git's "never"). A bad `<opts>`
 /// token yields git's `unsupported option '<tok>'` text.

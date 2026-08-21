@@ -380,19 +380,81 @@ fn set_reflog_message(args: &[String]) {
     std::env::set_var("GIT_REFLOG_ACTION", msg);
 }
 
-/// Parse a `--rebase=<value>` / `pull.rebase` / `branch.<name>.rebase` value the
-/// way git's `rebase_parse_value()` does.
-fn parse_rebase_value(v: &str) -> Result<RebaseMode> {
-    match v.to_ascii_lowercase().as_str() {
-        "" | "true" | "yes" | "on" | "1" => Ok(RebaseMode::Plain),
-        "false" | "no" | "off" | "0" => Ok(RebaseMode::Disabled),
-        "merges" => Ok(RebaseMode::Merges),
-        "interactive" => Ok(RebaseMode::Interactive),
-        "preserve" => crate::git_fatal!(
-            "preserve is no longer supported (--rebase=preserve / pull.rebase=preserve); use 'merges' instead"
-        ),
-        other => crate::git_fatal!("Invalid value for rebase: '{other}'"),
+/// `rebase_parse_value()` (rebase.c:17-37), the grammar behind `--rebase=<value>`,
+/// `pull.rebase` and `branch.<name>.rebase`:
+///
+/// ```c
+/// int v = git_parse_maybe_bool(value);
+/// if (!v)                 return REBASE_FALSE;
+/// else if (v > 0)         return REBASE_TRUE;
+/// else if (!strcmp(value, "merges") || !strcmp(value, "m"))      return REBASE_MERGES;
+/// else if (!strcmp(value, "interactive") || !strcmp(value, "i")) return REBASE_INTERACTIVE;
+/// else if (!strcmp(value, "preserve") || !strcmp(value, "p"))
+///         error(_("%s: 'preserve' superseded by 'merges'"), value);
+/// return REBASE_INVALID;
+/// ```
+///
+/// The boolean half is the *full* grammar, words and integers alike, so `2` and
+/// `0x10` select a rebase and `0` declines one. The four mode names are `strcmp`
+/// and each has a one-letter form. `preserve`/`p` prints its own `error()` line
+/// and then falls through to invalid, which is why a refusal for it is two lines.
+fn rebase_parse_value(v: &str) -> Option<RebaseMode> {
+    match crate::optint::maybe_bool(v) {
+        Some(false) => return Some(RebaseMode::Disabled),
+        Some(true) => return Some(RebaseMode::Plain),
+        None => {}
     }
+    match v {
+        "merges" | "m" => Some(RebaseMode::Merges),
+        "interactive" | "i" => Some(RebaseMode::Interactive),
+        "preserve" | "p" => {
+            eprintln!("error: {v}: 'preserve' superseded by 'merges'");
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `parse_config_rebase()` (builtin/pull.c:41-54): [`rebase_parse_value`] plus the
+/// diagnostic, which names the *key* it was reading:
+///
+/// ```text
+/// $ git -c pull.rebase=bogus pull
+/// fatal: invalid value for 'pull.rebase': 'bogus'
+/// $ git -c branch.main.rebase=bogus pull
+/// fatal: invalid value for 'branch.main.rebase': 'bogus'
+/// $ git pull --rebase=bogus
+/// error: invalid value for '--rebase': 'bogus'
+/// ```
+///
+/// `fatal` is the C's third argument: a configured value dies, while the option
+/// callback only `error()`s and lets `parse_options()` end the run — which is why
+/// the command line exits 129 and the config exits 128.
+fn parse_config_rebase(key: &str, v: &str, fatal: bool) -> Result<RebaseMode> {
+    if let Some(mode) = rebase_parse_value(v) {
+        return Ok(mode);
+    }
+    if fatal {
+        crate::git_fatal!("invalid value for '{key}': '{v}'");
+    }
+    eprintln!("error: invalid value for '{key}': '{v}'");
+    Err(anyhow::Error::new(crate::fatal::Silent(129)))
+}
+
+/// `config_get_ff()` (builtin/pull.c:171-190): `pull.ff` is a boolean or `only`,
+/// and anything else dies.
+///
+/// It runs early in `cmd_pull()` — before the "no tracking information" refusal
+/// and before `config_get_rebase()`, so a bad `pull.ff` beats a bad
+/// `pull.rebase` in either config order. Both were measured against git 2.55.0.
+fn config_get_ff(repo: &gix::Repository) -> Result<()> {
+    let Some(value) = repo.config_snapshot().string("pull.ff").map(|v| v.to_string()) else {
+        return Ok(());
+    };
+    if crate::optint::maybe_bool(&value).is_some() || value == "only" {
+        return Ok(());
+    }
+    crate::git_fatal!("invalid value for 'pull.ff': '{value}'");
 }
 
 /// Resolve the configured rebase policy: `branch.<name>.rebase` overrides
@@ -404,12 +466,18 @@ fn parse_rebase_value(v: &str) -> Result<RebaseMode> {
 /// the latter refuses to integrate a diverged branch.
 fn config_rebase(repo: &gix::Repository, branch: Option<&str>) -> Result<(RebaseMode, bool)> {
     let snap = repo.config_snapshot();
-    let raw = branch
-        .and_then(|b| snap.string(&format!("branch.{b}.rebase")))
-        .or_else(|| snap.string("pull.rebase"));
-    match raw.map(|v| v.to_string()) {
+    // The key is carried along with the value because the diagnostic names it.
+    let branch_key = branch.map(|b| format!("branch.{b}.rebase"));
+    let raw = branch_key
+        .as_ref()
+        .and_then(|k| snap.string(k).map(|v| (k.clone(), v.to_string())))
+        .or_else(|| {
+            snap.string("pull.rebase")
+                .map(|v| ("pull.rebase".to_string(), v.to_string()))
+        });
+    match raw {
         None => Ok((RebaseMode::Disabled, true)),
-        Some(v) => Ok((parse_rebase_value(&v)?, false)),
+        Some((key, v)) => Ok((parse_config_rebase(&key, &v, true)?, false)),
     }
 }
 
@@ -556,7 +624,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--rebase" => {
                 rebase_cli = Some(match inline.as_deref() {
                     None => RebaseMode::Plain,
-                    Some(v) => parse_rebase_value(v)?,
+                    Some(v) => parse_config_rebase("--rebase", v, false)?,
                 });
             }
             "--no-rebase" => rebase_cli = Some(RebaseMode::Disabled),
@@ -767,6 +835,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let repo = repo;
     let head_name = repo.head_name()?;
     let branch_short = head_name.as_ref().map(|h| h.shorten().to_string());
+
+    // `config_get_ff()` (builtin/pull.c:171-190) runs before the integration
+    // policy is resolved and before the "no tracking information" refusal, so a
+    // bad `pull.ff` is what a pull reports even when `pull.rebase` is bad too.
+    config_get_ff(&repo)?;
 
     // Resolve the integration policy git's `config_get_rebase()` computes: a CLI
     // flag wins, else branch.<name>.rebase / pull.rebase.

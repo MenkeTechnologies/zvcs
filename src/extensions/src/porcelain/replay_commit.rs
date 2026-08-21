@@ -122,3 +122,82 @@ pub(crate) fn run_git_commit(
     std::env::set_var("GIT_REFLOG_ACTION", reflog_action(action));
     super::commit::commit(&args)
 }
+
+/// `sequencer_determine_whence()` (sequencer.c:6847-6866), reduced to the answer
+/// `builtin/commit.c`'s `reflog_msg` needs.
+///
+/// ```c
+/// if (refs_ref_exists(get_main_ref_store(r), "CHERRY_PICK_HEAD")) {
+///         if (file_exists(git_path_seq_dir()))
+///                 *whence = FROM_CHERRY_PICK_MULTI;
+///         if (file_exists(rebase_path()) &&
+///             !repo_get_oid(r, "REBASE_HEAD", &rebase_head) &&
+///             !repo_get_oid(r, "CHERRY_PICK_HEAD", &cherry_pick_head) &&
+///             oideq(&rebase_head, &cherry_pick_head))
+///                 *whence = FROM_REBASE_PICK;
+///         else
+///                 *whence = FROM_CHERRY_PICK_SINGLE;
+///         return 1;
+/// }
+/// return 0;
+/// ```
+///
+/// `REVERT_HEAD` is deliberately not consulted: git looks for `CHERRY_PICK_HEAD`
+/// alone, so a stopped **revert** leaves `whence` at `FROM_COMMIT` and its
+/// concluding commit is logged as a plain `commit:` — which is exactly what
+/// stock writes (`commit: Revert "…"`, measured against 2.55.0).
+fn whence_reflog_default(git_dir: &std::path::Path) -> &'static str {
+    if !git_dir.join("CHERRY_PICK_HEAD").exists() {
+        return "commit";
+    }
+    let read = |name: &str| {
+        std::fs::read_to_string(git_dir.join(name))
+            .ok()
+            .map(|raw| raw.trim().to_string())
+    };
+    let rebase_pick = git_dir.join("rebase-merge").exists()
+        && match (read("REBASE_HEAD"), read("CHERRY_PICK_HEAD")) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+    if rebase_pick { "commit (rebase)" } else { "commit (cherry-pick)" }
+}
+
+/// The reflog action the `git commit` that `continue_single_pick()` spawns
+/// composes for itself.
+///
+/// ```c
+/// cmd.git_cmd = 1;
+/// strvec_push(&cmd.args, "commit");
+/// ...
+/// return run_command(&cmd);
+/// ```
+///
+/// (sequencer.c:5232-5257.) Unlike `run_git_commit()` two functions up, which
+/// pushes `GIT_REFLOG_ACTION=%s` onto the child's environment
+/// (sequencer.c:1141), `continue_single_pick()` pushes **nothing**: the child
+/// inherits whatever the user's environment held and otherwise falls all the way
+/// through to `reflog_msg`'s whence-derived default (builtin/commit.c:1850-1892):
+///
+/// ```c
+/// reflog_msg = getenv("GIT_REFLOG_ACTION");
+/// ...
+/// } else {
+///         if (!reflog_msg)
+///                 reflog_msg = is_from_cherry_pick(whence)
+///                                 ? "commit (cherry-pick)"
+///                                 : is_from_rebase(whence)
+///                                 ? "commit (rebase)"
+///                                 : "commit";
+/// ```
+///
+/// So a resumed cherry-pick is logged `commit (cherry-pick): <subject>` and a
+/// resumed revert `commit: <subject>` — *not* `cherry-pick:`/`revert:`, which is
+/// what the sequencer's own in-process picks write and what this port used to
+/// write here as well.
+pub(crate) fn continue_reflog_action(git_dir: &std::path::Path) -> String {
+    std::env::var("GIT_REFLOG_ACTION")
+        .ok()
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| whence_reflog_default(git_dir).to_string())
+}

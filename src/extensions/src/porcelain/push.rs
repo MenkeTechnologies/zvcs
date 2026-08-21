@@ -154,14 +154,15 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             Some((n, v)) => (n, Some(v.to_string())),
             None => (a, None),
         };
+        // `get_arg()`: the refusal is an `error:` line at 129 with no usage
+        // block, and it names the option the way it was *typed* — `git push -o`
+        // is ``switch `o'``, not ``option `-o'``.
         let mut take_value = |inline: Option<String>| -> Result<String> {
             if let Some(v) = inline {
                 return Ok(v);
             }
             i += 1;
-            args.get(i)
-                .cloned()
-                .ok_or_else(|| anyhow!("option `{name}' requires a value"))
+            Ok(super::value_at(args, i, name)?.to_string())
         };
         match name {
             "--" => end_of_options = true,
@@ -225,7 +226,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--receive-pack" | "--exec" => f.receive_pack = Some(take_value(inline)?),
             "--no-receive-pack" | "--no-exec" => f.receive_pack = None,
             "--recurse-submodules" => {
-                f.recurse = parse_recurse(&take_value(inline)?)?;
+                f.recurse = parse_recurse("recurse-submodules", &take_value(inline)?)?;
                 recurse_explicit = true;
             }
             "--no-recurse-submodules" => {
@@ -264,9 +265,49 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                     super::Resolved::Unknown
                 ) =>
             {
-                eprintln!("error: unknown option `{}'", &typed[2..]);
-                eprint!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::unknown_option(typed, USAGE));
+            }
+            // Every remaining `-<chars>` token, walked the way
+            // `parse_options_step()` walks a short cluster
+            // (parse-options.c:1061-1107): each character is its own option, `-o`
+            // swallows the rest of the token or the next argv element, and the
+            // first character the table does not claim is named on its own,
+            // against the synthetic `-<rest>` the C builds at :1095. This used to
+            // be `zvcs: push: unsupported option "-a"` at exit 1.
+            other if other.starts_with('-') && !other.starts_with("--") && other.len() > 1 => {
+                for (off, c) in other.char_indices().skip(1) {
+                    match c {
+                        'f' => f.force = true,
+                        'n' => f.dry_run = true,
+                        'd' => f.delete = true,
+                        'u' => f.set_upstream = true,
+                        'v' => f.verbose = true,
+                        'q' => f.quiet = true,
+                        // `-4`/`-6` are `OPT_SET_INT` over the transport's address
+                        // family, which this port does not select on; accepted
+                        // and inert, exactly as in the single-token arm above.
+                        '4' | '6' => {}
+                        'o' => {
+                            let rest = &other[off + c.len_utf8()..];
+                            let v = match rest.is_empty() {
+                                true => {
+                                    i += 1;
+                                    super::value_at(args, i, "-o")?.to_string()
+                                }
+                                false => rest.to_string(),
+                            };
+                            f.push_options.push(v);
+                            break;
+                        }
+                        'h' => return Ok(super::show_usage(USAGE)),
+                        _ => {
+                            return Ok(super::unknown_option(
+                                &format!("-{}", &other[off..]),
+                                USAGE,
+                            ))
+                        }
+                    }
+                }
             }
             other => bail!("unsupported option {other:?}"),
         }
@@ -302,7 +343,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         // `parse_push_recurse`, which `parse_recurse` ports). The flag overrides it.
         if !recurse_explicit {
             if let Some(v) = snap.string("push.recurseSubmodules") {
-                f.recurse = parse_recurse(&v.to_string())?;
+                f.recurse = parse_recurse("push.recursesubmodules", &v.to_string())?;
             }
         }
 
@@ -648,18 +689,31 @@ enum Recurse {
 }
 
 /// Parse a `--recurse-submodules` argument, a faithful port of git's
-/// `parse_push_recurse` (submodule-config.c): a boolean-true value is rejected
-/// (there is no plain "on" for pushing), boolean-false means `off`, and the named
-/// modes map through directly.
-fn parse_recurse(arg: &str) -> Result<Recurse> {
+/// `parse_push_recurse` (submodule-config.c:498-526): a boolean-true value is
+/// rejected (there is no plain "on" for pushing), boolean-false means `off`, and
+/// the named modes map through directly.
+///
+/// `opt` is the C's first parameter, and it is the whole reason this takes one:
+/// the refusal is `die("bad %s argument: %s", opt, arg)`, and the two callers
+/// pass different names — `option_push_parse_recurse_submodules()` passes the
+/// option's long name while `git_push_config()` (builtin/push.c:519-520) passes
+/// the *config key*. Verified against git 2.55.0:
+///
+/// ```text
+/// $ git push --recurse-submodules=bogus
+/// fatal: bad recurse-submodules argument: bogus
+/// $ git -c push.recurseSubmodules=bogus push
+/// fatal: bad push.recursesubmodules argument: bogus
+/// ```
+fn parse_recurse(opt: &str, arg: &str) -> Result<Recurse> {
     match maybe_bool(arg) {
-        Some(true) => crate::git_fatal!("bad recurse-submodules argument: {arg}"),
+        Some(true) => crate::git_fatal!("bad {opt} argument: {arg}"),
         Some(false) => Ok(Recurse::Off),
         None => match arg {
             "on-demand" => Ok(Recurse::OnDemand),
             "check" => Ok(Recurse::Check),
             "only" => Ok(Recurse::Only),
-            _ => crate::git_fatal!("bad recurse-submodules argument: {arg}"),
+            _ => crate::git_fatal!("bad {opt} argument: {arg}"),
         },
     }
 }

@@ -635,14 +635,17 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
 
 /// The value of `--opt=<v>` or, when it was written `--opt <v>`, the argument
 /// that follows — advancing the cursor past it.
+///
+/// A missing value is `get_arg()`'s refusal: ``error: option `<name>' requires a
+/// value`` on stderr and exit 129, with no usage block. It used to unwind as an
+/// ordinary error and come out as `zvcs: replay: option `--onto` requires a
+/// value` at exit 1 — the port's voice for something that is not a port gap.
 fn value_of(args: &[String], i: &mut usize, inline: Option<&str>, name: &str) -> Result<String> {
     match inline {
         Some(v) => Ok(v.to_string()),
         None => {
             *i += 1;
-            args.get(*i)
-                .cloned()
-                .ok_or_else(|| anyhow!("option `{name}` requires a value"))
+            Ok(super::value_at(args, *i, name)?.to_string())
         }
     }
 }

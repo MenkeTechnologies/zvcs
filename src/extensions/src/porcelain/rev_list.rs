@@ -898,7 +898,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--pretty=") || s.starts_with("--format=") => {
                 let spec = s.split_once('=').expect("checked above").1;
                 verbose_header = true;
-                match get_commit_format(spec) {
+                match get_commit_format(Some(&repo), spec) {
                     Ok(Some((p, _))) => pretty = Some(p),
                     // A value that names no known format and carries no `%` is
                     // what git reports as an invalid `--pretty` argument.

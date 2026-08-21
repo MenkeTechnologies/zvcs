@@ -125,9 +125,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
             "-z" => nul = true,
             "--max-depth" => {
                 i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("option `--max-depth` requires a value"))?;
+                let v = super::value_at(args, i, a)?;
                 max_depth = v
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid --max-depth value: {v}"))?;

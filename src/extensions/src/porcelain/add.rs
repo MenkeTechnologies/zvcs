@@ -241,9 +241,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // Value-taking flags: accept both `--flag=value` and `--flag value`.
             // The value is only recorded here — `OPT_STRING` does no validation —
             // so a bad one cannot outrank the fatals `cmd_add()` raises first.
+            // `unwrap_or_default()` turned a missing value into an empty one, so
+            // `git add --chmod` reported `fatal: --chmod param ''` at 128 where
+            // stock never gets that far: `get_arg()` refuses first with
+            // ``error: option `chmod' requires a value`` at 129.
             "--chmod" => {
                 i += 1;
-                chmod_arg = Some(args.get(i).cloned().unwrap_or_default());
+                chmod_arg = Some(super::value_at(args, i, a)?.to_string());
             }
             // `chmod` is an `OPT_STRING`, whose unset writes NULL over whatever an
             // earlier `--chmod=<v>` recorded (parse-options.c:200-202) — including
@@ -255,7 +259,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             }
             "--pathspec-from-file" => {
                 i += 1;
-                from_file = Some(args.get(i).cloned().unwrap_or_default());
+                from_file = Some(super::value_at(args, i, a)?.to_string());
             }
             s if s.starts_with("--pathspec-from-file=") => {
                 from_file = Some(s["--pathspec-from-file=".len()..].to_string());
@@ -301,7 +305,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            other if other.starts_with('-') => return usage_error(format!("unknown option `{}'", other.trim_start_matches('-'))),
+            other if other.starts_with('-') => return Ok(super::unknown_option(other, USAGE)),
             // A non-option argument is handed back unchanged by the resolver.
             _ => pathspecs.push(a.to_string()),
         }

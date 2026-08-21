@@ -224,21 +224,41 @@ mod filter {
         use crate::{bstr::ByteSlice, config, config::tree::core::Eol};
 
         impl Eol {
-            /// Convert `value` into the default end-of-line mode.
+            /// Convert `value` into the default end-of-line mode, or `None` for a value
+            /// git leaves unset.
             ///
-            /// ### Deviation
+            /// This is `git_default_core_config()`'s `core.eol` arm verbatim
+            /// (environment.c:413-423):
             ///
-            /// git will allow any value and silently leaves it unset, we will fail if the value is not known.
+            /// ```c
+            /// if (!strcmp(var, "core.eol")) {
+            ///         if (value && !strcasecmp(value, "lf"))          core_eol = EOL_LF;
+            ///         else if (value && !strcasecmp(value, "crlf"))   core_eol = EOL_CRLF;
+            ///         else if (value && !strcasecmp(value, "native")) core_eol = EOL_NATIVE;
+            ///         else                                           core_eol = EOL_UNSET;
+            ///         return 0;
+            /// }
+            /// ```
+            ///
+            /// The final `else` is not an error path — it is the *default* branch, and it
+            /// catches an unknown word, a valueless key and an empty value alike. So
+            /// `core.eol = bogus` leaves the mode unset and the command runs, which is what
+            /// `None` means here and what `EOL_UNSET` means there. Verified against git
+            /// 2.55.0: `git -c core.eol=bogus status --short` exits 0 and says nothing.
+            ///
+            /// The three words are compared with `strcasecmp`, so `LF` and `CRLF` are the
+            /// modes rather than unknown words.
             pub fn try_into_eol(
                 &'static self,
                 value: impl gix_utils::AsBStr,
-            ) -> Result<gix_filter::eol::Mode, config::key::GenericErrorWithValue> {
+            ) -> Result<Option<gix_filter::eol::Mode>, config::key::GenericErrorWithValue> {
                 let value = value.as_bstr();
-                Ok(match value.as_bstr().to_str_lossy().as_ref() {
-                    "lf" => gix_filter::eol::Mode::Lf,
-                    "crlf" => gix_filter::eol::Mode::CrLf,
-                    "native" => gix_filter::eol::Mode::default(),
-                    _ => return Err(config::key::GenericErrorWithValue::from_value(self, value.into())),
+                let word = value.to_str_lossy().to_ascii_lowercase();
+                Ok(match word.as_str() {
+                    "lf" => Some(gix_filter::eol::Mode::Lf),
+                    "crlf" => Some(gix_filter::eol::Mode::CrLf),
+                    "native" => Some(gix_filter::eol::Mode::default()),
+                    _ => None,
                 })
             }
         }
@@ -412,13 +432,24 @@ mod abbrev {
                             value: hex_len_str.into(),
                             max,
                         })?;
-                    if value < 4 || value as usize > object_hash.len_in_hex() {
+                    if value < 4 {
                         return Err(Error {
                             value: hex_len_str.into(),
                             max,
                         });
                     }
-                    Ok(Some(value as usize))
+                    // A length past the hash width is not an error in git: `core.abbrev`
+                    // lands in `default_abbrev` unchecked above `minimum_abbrev`
+                    // (environment.c:349-363), and `repo_find_unique_abbrev_r()`
+                    // (object-name.c) caps what it prints at `hexsz`. So the whole name
+                    // comes out rather than a fallback length. Verified against git
+                    // 2.55.0 in a 40-hex repository: `-c core.abbrev=99 log --oneline`
+                    // prints full 40-character ids, as does `-c core.abbrev=41`.
+                    //
+                    // Rejecting them here instead made the value fall back to `auto`
+                    // under a lenient config, which printed *seven* characters — shorter
+                    // than the configured length rather than longer.
+                    Ok(Some((value as usize).min(object_hash.len_in_hex())))
                 }
             }
         }

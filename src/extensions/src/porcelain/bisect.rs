@@ -1914,6 +1914,22 @@ fn diff_tree_report(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
         Some(&new_tree),
         gix::diff::Options::default(),
     )?;
+    // `gix_diff::tree_with_rewrites` recurses into subdirectories but *also*
+    // reports the containing tree entries themselves (`gix-diff/src/tree/function.rs`
+    // visits `Change::Addition`/`Change::Modification` for an entry whose mode is a
+    // tree and *then* queues it for descent). `show_diff_tree()` sets up an ordinary
+    // `rev_info` and `diff_setup_done()` turns recursion on for a stat format with
+    // no `DIFF_OPT_TREE_IN_RECURSIVE` beside it, so git's `--stat`/`--summary` only
+    // ever see blob-, symlink- and gitlink-level filepairs.
+    //
+    // Without this the first-bad-commit report listed the directories as binary
+    // blobs — `copies | Bin 0 -> 37 bytes` and `orig | Bin 74 -> 74 bytes`, those
+    // being the raw *tree object* sizes — beside the files inside them, and counted
+    // them: ` 4 files changed` where stock prints ` 2 files changed`, plus a bogus
+    // ` create mode 040000 copies` summary line. `log`'s `prepare_change` and
+    // `request-pull`'s stat builder apply the identical filter for the identical
+    // reason.
+    changes.retain(|c| !change_is_tree_entry(c));
     if changes.is_empty() {
         return Ok(Vec::new());
     }
@@ -1954,6 +1970,27 @@ fn diff_tree_report(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
     out.push(b'\n');
     out.extend_from_slice(render_stat(&files).as_bytes());
     Ok(out)
+}
+
+/// Is this change a *directory* entry that git's recursive walk would never
+/// surface as a filepair?
+///
+/// An addition or deletion of a tree is the directory itself appearing or going
+/// away; the files inside it arrive separately from the descent, and git reports
+/// only those. A modification is a directory entry only when *both* sides are
+/// trees — a path that turned from a directory into a file (or the reverse) is a
+/// real filepair git does report, so the two-sided test is what keeps it.
+fn change_is_tree_entry(change: &ChangeDetached) -> bool {
+    match change {
+        ChangeDetached::Addition { entry_mode, .. }
+        | ChangeDetached::Deletion { entry_mode, .. }
+        | ChangeDetached::Rewrite { entry_mode, .. } => entry_mode.is_tree(),
+        ChangeDetached::Modification {
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } => previous_entry_mode.is_tree() && entry_mode.is_tree(),
+    }
 }
 
 fn change_path(change: &ChangeDetached) -> &[u8] {

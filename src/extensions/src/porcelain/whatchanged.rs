@@ -843,7 +843,7 @@ fn parse_args(
         }
 
         if a.starts_with('-') && a.len() > 1 {
-            i += consume_option(args, i, &mut p, &mut st, &mut unrecognized)?;
+            i += consume_option(repo, args, i, &mut p, &mut st, &mut unrecognized)?;
             continue;
         }
 
@@ -1077,6 +1077,7 @@ fn reflog_bottom(repo: &gix::Repository, spec: &str) -> Option<String> {
 /// An unrecognised option is only *remembered*: git reports it after `setup_revisions`
 /// returns, so a bad revision later on the command line wins over it.
 fn consume_option(
+    repo: &gix::Repository,
     args: &[String],
     i: usize,
     p: &mut Parsed,
@@ -1285,11 +1286,11 @@ fn consume_option(
     // the format string the moment it is parsed (a `die()`, exit 128) — ahead of the
     // deprecation notice and of any deferred unrecognised option.
     if let Some(v) = a.strip_prefix("--pretty=") {
-        validate_pretty_format(v)?;
+        validate_pretty_format(repo, v)?;
         return Ok(1);
     }
     if let Some(v) = a.strip_prefix("--format=") {
-        validate_pretty_format(v)?;
+        validate_pretty_format(repo, v)?;
         return Ok(1);
     }
     // Numeric and enum options git rejects at parse time. The value is not implemented
@@ -1497,23 +1498,18 @@ fn validate_diff_merges(v: &str) -> Result<(), Fatal> {
     }
 }
 
-/// git's `get_commit_format`: a `--pretty`/`--format` value is valid when it is empty,
-/// carries a `format:`/`tformat:` prefix, contains a `%` placeholder, or is a
-/// case-insensitive prefix of one of the built-in format names. Anything else is
-/// `fatal: invalid --pretty format: <v>` (exit 128), reported the instant the option is
-/// parsed. The set of names is git's `builtin_formats` table in `pretty.c`.
-fn validate_pretty_format(v: &str) -> Result<(), Fatal> {
-    const NAMES: &[&str] = &[
-        "raw",
-        "medium",
-        "short",
-        "email",
-        "mboxrd",
-        "fuller",
-        "full",
-        "oneline",
-        "reference",
-    ];
+/// git's `get_commit_format` (pretty.c:190-222): a `--pretty`/`--format` value is
+/// valid when it is empty, carries a `format:`/`tformat:` prefix, contains a `%`
+/// placeholder, or names an entry in the format table — the nine `builtin_formats`
+/// plus every `pretty.<name>` the config defines, matched as a case-insensitive
+/// shortest prefix. Anything else is `fatal: invalid --pretty format: <v>`
+/// (exit 128), reported the instant the option is parsed; a `pretty.<name>` alias
+/// chain that loops is the other `die()` [`super::pretty_formats`] raises.
+///
+/// Only the accept/reject half is needed here: `whatchanged` refuses the run for
+/// its own reasons long before a format would be expanded, so the resolved format
+/// itself has nowhere to go.
+fn validate_pretty_format(repo: &gix::Repository, v: &str) -> Result<(), Fatal> {
     if v.is_empty()
         || v.starts_with("format:")
         || v.starts_with("tformat:")
@@ -1521,11 +1517,11 @@ fn validate_pretty_format(v: &str) -> Result<(), Fatal> {
     {
         return Ok(());
     }
-    let sought = v.to_ascii_lowercase();
-    if NAMES.iter().any(|n| n.starts_with(sought.as_str())) {
-        return Ok(());
+    match super::pretty_formats::resolve(Some(repo), v) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(Fatal::die(format!("invalid --pretty format: {v}"))),
+        Err(cycle) => Err(Fatal::die(cycle.message())),
     }
-    Err(Fatal::die(format!("invalid --pretty format: {v}")))
 }
 
 /// git's `--unified`/`-U` value parse: an empty value keeps the default; otherwise the

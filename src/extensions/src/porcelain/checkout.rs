@@ -328,11 +328,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             let val = match a.strip_prefix("--conflict=") {
                 Some(v) => v.to_string(),
                 None => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("option `conflict' requires a value"))?;
                     i += 1;
-                    v.clone()
+                    super::value_at(args, i, a)?.to_string()
                 }
             };
             if !matches!(val.as_str(), "merge" | "diff3" | "zdiff3") {
@@ -366,11 +363,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             let val = match a.strip_prefix("--pathspec-from-file=") {
                 Some(v) => v.to_string(),
                 None => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| anyhow!("option `pathspec-from-file' requires a value"))?;
                     i += 1;
-                    v.clone()
+                    super::value_at(args, i, a)?.to_string()
                 }
             };
             pathspec_from_file = Some(val);
@@ -391,23 +385,16 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             // Collapsing `-b`/`-B` into one slot loses that count, and `-b x -B y`
             // then silently creates `y`.
             "-b" | "-B" => {
-                let name = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow!("option '{a}' requires a value"))?;
+                let name = super::value_at(args, i + 1, a)?.to_string();
                 if a == "-B" {
-                    new_branch_force = Some(name.clone());
+                    new_branch_force = Some(name);
                 } else {
-                    new_branch_create = Some(name.clone());
+                    new_branch_create = Some(name);
                 }
                 i += 1;
             }
             "--orphan" => {
-                let Some(name) = args.get(i + 1) else {
-                    // git: `error: option `orphan' requires a value`, exit 129.
-                    eprintln!("error: option `orphan' requires a value");
-                    return Ok(ExitCode::from(129));
-                };
-                orphan = Some(name.clone());
+                orphan = Some(super::value_at(args, i + 1, a)?.to_string());
                 i += 1;
             }
             // `-d` is git's short form of `--detach` (OPT_BOOL('d', "detach")).

@@ -632,7 +632,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     // `cmd_log_init` as `cmd_log`, so the parser is `git log`'s
                     // `get_commit_format` — every format name and placeholder the
                     // one renders, the other renders identically.
-                    match super::log::get_commit_format(spec)? {
+                    match super::log::get_commit_format(None, spec)? {
                         Some((p, t)) => {
                             pretty = p;
                             terminator = t;

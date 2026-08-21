@@ -4907,12 +4907,13 @@ impl Options {
                 // and has no path through that code, so it stays refused below
                 // rather than being accepted as a no-op.
                 "--indent-heuristic" => {}
+                // `optname()` names a short option by its character, so this is
+                // ``switch `L'`` and not ``option `-L'``; the refusal is
+                // parse-options' own `error:` line at 129, never a `zvcs:` gap
+                // message at exit 1 (parse-options.c:30-45, :59-60).
                 "-L" => {
                     i += 1;
-                    let spec = args
-                        .get(i)
-                        .ok_or_else(|| anyhow!("option `-L` requires a value"))?;
-                    line_specs.push(spec.clone());
+                    line_specs.push(super::value_at(args, i, a)?.to_string());
                 }
                 // `OPT__ABBREV` is `PARSE_OPT_OPTARG`, so a bare `--abbrev` never
                 // reaches for the next argument: the callback runs with a NULL arg
@@ -4926,9 +4927,17 @@ impl Options {
                 // `blame`, so the last one wins here and errors surface there).
                 "--date" => {
                     i += 1;
-                    let v = args
-                        .get(i)
-                        .ok_or_else(|| anyhow!("option `--date` requires a value"))?;
+                    let Some(v) = args.get(i) else {
+                        // `--date` is `revision.c`'s option, not one of blame's own
+                        // `options[]`: `handle_revision_opt()` matches it by hand and
+                        // words its refusal `fatal: Option '--<name>' requires a value`
+                        // at 128 — not parse-options' `error: option `<name>'` at 129.
+                        // The two tables in [`trailing_option_missing_value`] are what
+                        // keep the halves apart, so the answer comes from there.
+                        let code = trailing_option_missing_value(a)?
+                            .expect("--date is in REV_OPT_REVISION_VALUE");
+                        return Ok(ParseOutcome::Reported(code));
+                    };
                     date_arg = Some(v.clone());
                 }
                 _ if a.starts_with("--date=") => {
@@ -4936,9 +4945,7 @@ impl Options {
                 }
                 "--diff-algorithm" => {
                     i += 1;
-                    let v = args
-                        .get(i)
-                        .ok_or_else(|| anyhow!("option `--diff-algorithm` requires a value"))?;
+                    let v = super::value_at(args, i, a)?;
                     match parse_diff_algorithm(v) {
                         Some(alg) => diff_algorithm = Some(alg),
                         None => {
@@ -4956,10 +4963,7 @@ impl Options {
                 }
                 "--contents" => {
                     i += 1;
-                    let v = args
-                        .get(i)
-                        .ok_or_else(|| anyhow!("option `--contents` requires a value"))?;
-                    contents = Some(v.clone());
+                    contents = Some(super::value_at(args, i, a)?.to_string());
                 }
                 _ if a.starts_with("--contents=") => {
                     contents = Some(a["--contents=".len()..].to_string());
@@ -4976,10 +4980,7 @@ impl Options {
                 // `--ignore-revs-file`, the entries `blame.ignoreRevsFile` put there.
                 "--ignore-rev" => {
                     i += 1;
-                    let v = args
-                        .get(i)
-                        .ok_or_else(|| anyhow!("option `--ignore-rev` requires a value"))?;
-                    ignore_rev.push(v.clone());
+                    ignore_rev.push(super::value_at(args, i, a)?.to_string());
                 }
                 _ if a.starts_with("--ignore-rev=") => {
                     ignore_rev.push(a["--ignore-rev=".len()..].to_string());
@@ -4987,10 +4988,7 @@ impl Options {
                 "--no-ignore-rev" => ignore_rev.clear(),
                 "--ignore-revs-file" => {
                     i += 1;
-                    let v = args
-                        .get(i)
-                        .ok_or_else(|| anyhow!("option `--ignore-revs-file` requires a value"))?;
-                    ignore_revs_file.push(v.clone());
+                    ignore_revs_file.push(super::value_at(args, i, a)?.to_string());
                 }
                 _ if a.starts_with("--ignore-revs-file=") => {
                     ignore_revs_file.push(a["--ignore-revs-file=".len()..].to_string());
@@ -5086,7 +5084,16 @@ impl Options {
                 _ if a.starts_with("--") && !git_knows_long_option(a) => {
                     return Ok(ParseOutcome::Unknown(unknown_option_name(args, i, pre.len())));
                 }
+                // A short option that git's *revision* parser owns and whose value
+                // is simply absent — `-S`, `-G`, `-I`, `-O`, `-n`. `get_arg()`
+                // reports it as ``switch `<c>' requires a value`` at 129 (and `-n`
+                // through `handle_revision_opt()`'s own check at 128); reaching
+                // the gap message below instead claimed the option was unported
+                // when it is merely incomplete.
                 _ if a.starts_with('-') && a.len() > 1 => {
+                    if let Some(code) = trailing_option_missing_value(a)? {
+                        return Ok(ParseOutcome::Reported(code));
+                    }
                     bail!("unsupported option: {a}")
                 }
                 _ => pre.push(a.to_string()),

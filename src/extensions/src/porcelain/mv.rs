@@ -143,9 +143,31 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             "--no-verbose" => verbose = false,
             "--sparse" => ignore_sparse = true,
             "--no-sparse" => ignore_sparse = false,
+            // A long name no entry claims is `PARSE_OPT_UNKNOWN`, named without
+            // its `--`.
+            s if s.starts_with("--") => return Ok(super::unknown_option(s, HELP)),
+            // Every remaining `-<chars>` token, walked the way
+            // `parse_options_step()` walks a short cluster
+            // (parse-options.c:1061-1107). None of `mv`'s short options takes a
+            // value, so the whole cluster is flags; what a refusal names is the
+            // character parsing stopped at, against the synthetic `-<rest>` the
+            // C builds at :1095. Reporting the whole token as one long option is
+            // what made `git mv -a` say ``unknown option `a'`` and `git mv -fa`
+            // say ``unknown option `fa'`` where stock names `a` both times.
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
-                return usage_err();
+                for (off, c) in s.char_indices().skip(1) {
+                    match c {
+                        'f' => force = true,
+                        'k' => skip = true,
+                        'n' => dry_run = true,
+                        'v' => verbose = true,
+                        'h' => {
+                            print!("{HELP}");
+                            return Ok(ExitCode::from(129));
+                        }
+                        _ => return Ok(super::unknown_option(&format!("-{}", &s[off..]), HELP)),
+                    }
+                }
             }
             // A non-option argument is handed back unchanged by the resolver.
             _ => positional.push(a),

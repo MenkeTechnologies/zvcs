@@ -195,15 +195,20 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
                 Some((n, v)) => (n, Some(v)),
                 None => (long, None),
             };
-            // Pull `--opt <value>` from the next argument when no `=` was used.
+            // Pull `--opt <value>` from the next argument when no `=` was used —
+            // git's `get_arg()`, whose refusal is an `error:` line and exit 129
+            // with no usage block, not this port's `zvcs: <verb>:` at exit 1.
             let value = |i: &mut usize| -> Result<String> {
                 match inline {
                     Some(v) => Ok(v.to_string()),
                     None => {
                         *i += 1;
-                        args.get(*i)
-                            .cloned()
-                            .ok_or_else(|| anyhow::anyhow!("option `{name}' requires a value"))
+                        Ok(crate::parseopt::value_at(
+                            args,
+                            *i,
+                            crate::parseopt::OptName::Long(name),
+                        )?
+                        .to_string())
                     }
                 }
             };

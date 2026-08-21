@@ -675,8 +675,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut relative: Option<String> = None;
     // `--check`: `DIFF_FORMAT_CHECKDIFF`.
     let mut check = false;
-    let mut src_prefix: Vec<u8> = b"a/".to_vec();
-    let mut dst_prefix: Vec<u8> = b"b/".to_vec();
+    // `options->a_prefix` / `options->b_prefix`, which `diff_setup()` leaves NULL
+    // when `diff.mnemonicPrefix` is on so that the comparison the command actually
+    // runs can name them (diff.c:5149-5153). `None` is that NULL; anything that
+    // assigns a prefix — config, a `--*-prefix` flag, or the mnemonic fill below —
+    // makes it `Some`, and `diff_set_mnemonic_prefix()` only ever fills a `None`.
+    let mut src_prefix: Option<Vec<u8>> = None;
+    let mut dst_prefix: Option<Vec<u8>> = None;
+    // `static int diff_mnemonic_prefix` (diff.c:69), read by `git_diff_ui_config()`
+    // (diff.c:406-409) — the *ui* callback, which is why the plumbing verbs
+    // (`diff-files`, `diff-index`, `diff-tree`) ignore the key entirely.
+    let mnemonic_prefix;
     // `--line-prefix=<s>`: prepended to every emitted line (`diff_line_prefix()`).
     let mut line_prefix: Vec<u8> = Vec::new();
     // `--compact-summary`: annotate `--stat` names with create/delete/mode info.
@@ -850,16 +859,43 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         if snap.boolean("diff.relative") == Some(true) {
             relative = Some(cwd_prefix(&repo));
         }
+        // `diff_setup()`'s prefix decision, which is the whole of the
+        // `diff.mnemonicPrefix` mechanism:
+        //
+        // ```c
+        // if (diff_no_prefix) {
+        //         diff_set_noprefix(options);
+        // } else if (!diff_mnemonic_prefix) {
+        //         diff_set_default_prefix(options);
+        // }
+        // ```
+        //
+        // (diff.c:5149-5153, with `diff_set_noprefix()` at 3728-3731 and
+        // `diff_set_default_prefix()` at 3733-3737.) Three consequences, each
+        // confirmed against stock git 2.55.0:
+        //
+        //   * `diff.noPrefix` wins over `diff.mnemonicPrefix` — both prefixes
+        //     become the empty string and the mnemonic fill, which only writes a
+        //     NULL slot, can no longer reach them.
+        //   * with `diff.mnemonicPrefix` on and `diff.noPrefix` off, *neither*
+        //     prefix is assigned here, so `diff.srcPrefix`/`diff.dstPrefix` are
+        //     silently ignored: `git -c diff.mnemonicPrefix=true -c
+        //     diff.srcPrefix=S/ diff` prints `i/`, not `S/`.
+        //   * without `diff.mnemonicPrefix` nothing changes — the configured
+        //     prefixes, or `a/` and `b/`, are installed up front as before.
+        mnemonic_prefix = snap.boolean("diff.mnemonicPrefix") == Some(true);
         if snap.boolean("diff.noPrefix") == Some(true) {
-            src_prefix.clear();
-            dst_prefix.clear();
-        } else {
-            if let Some(p) = snap.string("diff.srcPrefix") {
-                src_prefix = p.into();
-            }
-            if let Some(p) = snap.string("diff.dstPrefix") {
-                dst_prefix = p.into();
-            }
+            src_prefix = Some(Vec::new());
+            dst_prefix = Some(Vec::new());
+        } else if !mnemonic_prefix {
+            src_prefix = Some(
+                snap.string("diff.srcPrefix")
+                    .map_or_else(|| b"a/".to_vec(), |p| p.into()),
+            );
+            dst_prefix = Some(
+                snap.string("diff.dstPrefix")
+                    .map_or_else(|| b"b/".to_vec(), |p| p.into()),
+            );
         }
         // `diff.algorithm` names the default algorithm (`git_diff_ui_config()`, which
         // only the porcelain runs — the two plumbing verbs never read it). git
@@ -1180,13 +1216,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 raw_abbrev = Some(repo.object_hash().len_in_hex());
                 abbrev_explicit = false;
             }
+            // `diff_opt_no_prefix()` -> `diff_set_noprefix()` (diff.c:5774-5783,
+            // 3728-3731): both prefixes become the empty string. They are assigned,
+            // not cleared to NULL, so the mnemonic fill can no longer reach them —
+            // `--no-prefix` beats `diff.mnemonicPrefix`.
             "--no-prefix" => {
-                src_prefix.clear();
-                dst_prefix.clear();
+                src_prefix = Some(Vec::new());
+                dst_prefix = Some(Vec::new());
             }
+            // `diff_opt_default_prefix()` (diff.c:5785-5796) frees `diff_src_prefix`
+            // and `diff_dst_prefix` *before* calling `diff_set_default_prefix()`, so
+            // it installs the literal `a/` and `b/` even when `diff.srcPrefix` /
+            // `diff.dstPrefix` named something else.
             "--default-prefix" => {
-                src_prefix = b"a/".to_vec();
-                dst_prefix = b"b/".to_vec();
+                src_prefix = Some(b"a/".to_vec());
+                dst_prefix = Some(b"b/".to_vec());
             }
             // Diff-algorithm selection; the last flag on the command line wins.
             "--minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
@@ -1428,11 +1472,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
                 relative = Some(p);
             }
+            // `OPT_STRING_F(0, "src-prefix", &options->a_prefix, …)` (diff.c:6106-6110)
+            // writes the slot directly, so it fills one side while leaving the other
+            // for the mnemonic prefix: `-c diff.mnemonicPrefix=true diff
+            // --src-prefix=SRC/` prints `SRC/` against `w/`.
             s if s.starts_with("--src-prefix=") => {
-                src_prefix = s.as_bytes()["--src-prefix=".len()..].to_vec();
+                src_prefix = Some(s.as_bytes()["--src-prefix=".len()..].to_vec());
             }
             s if s.starts_with("--dst-prefix=") => {
-                dst_prefix = s.as_bytes()["--dst-prefix=".len()..].to_vec();
+                dst_prefix = Some(s.as_bytes()["--dst-prefix=".len()..].to_vec());
             }
             s if s.starts_with("--line-prefix=") => {
                 line_prefix = s.as_bytes()["--line-prefix=".len()..].to_vec();
@@ -1987,6 +2035,61 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     if cached && revs.len() >= 2 {
         return Ok(usage_error());
     }
+
+    // `diff_set_mnemonic_prefix()` (diff.c:3720-3726):
+    //
+    // ```c
+    // void diff_set_mnemonic_prefix(struct diff_options *options, const char *a, const char *b)
+    // {
+    //         if (!options->a_prefix)
+    //                 options->a_prefix = a;
+    //         if (!options->b_prefix)
+    //                 options->b_prefix = b;
+    // }
+    // ```
+    //
+    // Only a slot `diff_setup()` left NULL is filled, so config and the
+    // `--*-prefix` flags both win, per side. git calls it from whichever
+    // comparison the command ended up running, and the letter names that
+    // comparison's two ends:
+    //
+    //   * `run_diff_files()` — `i/` vs `w/` (diff-lib.c:121), which is bare
+    //     `git diff`: the index against the worktree.
+    //   * `run_diff_index()` — `c/` vs `i/` when `--cached`, `c/` vs `w/`
+    //     otherwise (diff-lib.c:663), which is `git diff <commit>`.
+    //   * `builtin_diff_no_index()` — `1/` vs `2/` (diff-no-index.c:425), handled
+    //     in [`super::diff_no_index`].
+    //   * `builtin_diff_b_f()` — `o/` vs `w/` (builtin/diff.c:100), a blob against
+    //     a file; this port refuses a blob operand before reaching it.
+    //
+    // A tree-against-tree comparison — `git diff <commit> <commit>`, `A...B`, and
+    // the three-or-more-revision combined form — has no such call, so it falls
+    // through to `builtin_diff()`'s own `diff_set_mnemonic_prefix(o, "a/", "b/")`
+    // (diff.c:3838) and stays `a/`/`b/` even with the key on. `--cc` output goes
+    // further and never consults the option at all: `show_combined_header()` reads
+    // `opt->a_prefix ? opt->a_prefix : "a/"` (combine-diff.c:931-932).
+    //
+    // Every letter here was read back from stock git 2.55.0 rather than inferred.
+    {
+        let (a, b): (&[u8], &[u8]) = if cached {
+            (b"c/", b"i/")
+        } else if revs.len() >= 2 {
+            // Tree vs tree: no mnemonic call, so `builtin_diff()`'s fallback.
+            (b"a/", b"b/")
+        } else if revs.len() == 1 {
+            (b"c/", b"w/")
+        } else {
+            (b"i/", b"w/")
+        };
+        // The call is unconditional in git — it is only ever a no-op because
+        // `diff_setup()` already filled both slots whenever the key is off.
+        src_prefix.get_or_insert_with(|| a.to_vec());
+        dst_prefix.get_or_insert_with(|| b.to_vec());
+    }
+    // `builtin_diff()`'s own `diff_set_mnemonic_prefix(o, "a/", "b/")` (diff.c:3838):
+    // the last resort for a slot nothing above claimed.
+    let mut src_prefix = src_prefix.unwrap_or_else(|| b"a/".to_vec());
+    let mut dst_prefix = dst_prefix.unwrap_or_else(|| b"b/".to_vec());
 
     // Three or more revisions request a dense combined ("--cc") diff of the first
     // revision against the rest, exactly like `builtin_diff_combined()`

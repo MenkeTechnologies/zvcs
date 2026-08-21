@@ -716,7 +716,14 @@ fn take_value<'a>(
         *i += 1;
         return Ok(v);
     }
-    Err(Usage::Error(format!("error: option `{}' requires a value", trim_dashes(tok))))
+    // `optname()` names a short option by its character and a long one by its
+    // name, so the token's own dashes decide the wording — trimming them and
+    // always saying `option` made `git am -C` report ``option `C'`` where stock
+    // says ``switch `C'`` (parse-options.c:30-45).
+    Err(Usage::Error(format!(
+        "error: {} requires a value",
+        crate::parseopt::OptName::typed(tok)
+    )))
 }
 
 fn no_value(tok: &str, attached: Option<&str>) -> Result<(), Usage> {
@@ -973,7 +980,10 @@ fn parse_short(
                     *i += 1;
                     v
                 } else {
-                    return Err(Usage::Error(format!("error: option `{c}' requires a value")));
+                    return Err(Usage::Error(format!(
+                        "error: {} requires a value",
+                        crate::parseopt::OptName::Short(c)
+                    )));
                 };
                 o.apply_opts.push(format!("-{c}{v}"));
             }
@@ -2820,14 +2830,54 @@ fn am_abort(repo: &gix::Repository, state_dir: &Path) -> Result<ExitCode> {
     let ctx = Ctx::new(repo, state_dir)?;
     am_rerere_clear(repo)?;
 
-    if repo.find_reference("ORIG_HEAD").is_ok() {
-        // clean_index(curr, orig) followed by `update_ref("am --abort", HEAD, orig)`
-        // — `reset --hard` performs both. The reflog line reads `reset: moving to
-        // ORIG_HEAD` rather than git's `am --abort` (a reflog-only difference).
-        if !reset_hard(&ctx, "ORIG_HEAD")? {
+    // ```c
+    // curr_branch = refs_resolve_refdup(…, "HEAD", 0, &curr_head, NULL);
+    // has_curr_head = curr_branch && !is_null_oid(&curr_head);
+    // has_orig_head = !repo_get_oid(the_repository, "ORIG_HEAD", &orig_head);
+    // if (clean_index(&curr_head, &orig_head))
+    //         die(_("failed to clean index"));
+    // if (has_orig_head)
+    //         refs_update_ref(…, "am --abort", "HEAD", &orig_head,
+    //                         has_curr_head ? &curr_head : NULL, 0,
+    //                         UPDATE_REFS_DIE_ON_ERR);
+    // ```
+    //
+    // (builtin/am.c:2185-2222.) Two things that are *not* `git reset --hard`,
+    // which is what this used to delegate to:
+    //
+    //   * the reflog line is the literal `am --abort`, on `HEAD` **and** on the
+    //     branch (`flags = 0`, so the update dereferences), not
+    //     `reset: moving to ORIG_HEAD`;
+    //   * `ORIG_HEAD` is only *read*. `reset --hard` rewrites it to the HEAD it
+    //     is leaving, so aborting an `am` that had already applied a patch left
+    //     `ORIG_HEAD` pointing at the half-applied tip instead of at the commit
+    //     the session started from — the one thing `am --abort` exists to keep.
+    //
+    // [`clean_index`] is `clean_index()`'s index+worktree half alone, which is
+    // why `--skip` already uses it.
+    let orig_head = repo.rev_parse_single("ORIG_HEAD").ok().map(|id| id.detach());
+    if let Some(orig_head) = orig_head {
+        let curr_head = repo.head_id().ok().map(|id| id.detach());
+        if !clean_index(repo, &ctx, "ORIG_HEAD")? {
             eprintln!("fatal: failed to clean index");
             return Ok(ExitCode::from(128));
         }
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "am --abort".into(),
+                },
+                expected: match curr_head {
+                    Some(old) => PreviousValue::MustExistAndMatch(Target::Object(old)),
+                    None => PreviousValue::Any,
+                },
+                new: Target::Object(orig_head),
+            },
+            name: full_name("HEAD")?,
+            deref: true,
+        })?;
     }
     // The no-ORIG_HEAD case (aborting an am started on an unborn branch) would
     // delete the current branch ref; that is left to the user rather than guessed.
@@ -3088,17 +3138,6 @@ fn clean_index(repo: &gix::Repository, ctx: &Ctx, rev: &str) -> Result<bool> {
         let _ = std::fs::remove_file(repo.git_dir().join(name));
     }
     Ok(true)
-}
-
-fn reset_hard(ctx: &Ctx, rev: &str) -> Result<bool> {
-    Ok(ctx
-        .cmd("reset")
-        .arg("--hard")
-        .arg("-q")
-        .arg(rev)
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run reset: {e}"))?
-        .success())
 }
 
 /// Run a child capturing stdout (stderr inherited), returning the trimmed output

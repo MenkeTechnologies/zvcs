@@ -178,10 +178,14 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
+        // `i` steps past this argument up front so that it is already
+        // `parse_opt_ctx_t`'s "next unread argument"; `take_value` — the shared
+        // port of `get_arg()` — then advances it over a value, and the
+        // missing-value refusal is parse-options' rather than each arm's own.
         let arg = &args[i];
+        i += 1;
         if positional_only || !arg.starts_with('-') || arg == "-" {
             positionals.push(arg.clone());
-            i += 1;
             continue;
         }
         // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
@@ -223,47 +227,23 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             "-b" | "--initial-branch" => {
-                i += 1;
-                let name = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
-                initial_branch = Some(name.clone());
+                initial_branch = Some(super::take_value(args, &mut i, arg)?.to_string())
             }
             "--no-initial-branch" => initial_branch = None,
-            "--template" => {
-                i += 1;
-                let dir = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
-                template = Some(dir.clone());
-            }
+            "--template" => template = Some(super::take_value(args, &mut i, arg)?.to_string()),
             "--no-template" => template = None,
             "--separate-git-dir" => {
-                i += 1;
-                let dir = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
-                separate_git_dir = Some(dir.clone());
+                separate_git_dir = Some(super::take_value(args, &mut i, arg)?.to_string())
             }
             "--no-separate-git-dir" => separate_git_dir = None,
             // `--object-format <hash>` / `--ref-format <format>` take a required
             // value (space or `=`), validated after the loop. Their `--no-` forms
             // unset the request, matching git's OPT_STRING negation.
             "--object-format" => {
-                i += 1;
-                let fmt = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
-                object_format = Some(fmt.clone());
+                object_format = Some(super::take_value(args, &mut i, arg)?.to_string())
             }
             "--no-object-format" => object_format = None,
-            "--ref-format" => {
-                i += 1;
-                let fmt = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
-                ref_format = Some(fmt.clone());
-            }
+            "--ref-format" => ref_format = Some(super::take_value(args, &mut i, arg)?.to_string()),
             "--no-ref-format" => ref_format = None,
             // `--shared` takes an OPTIONAL argument, attached with `=` only (git's
             // PARSE_OPT_OPTARG). `--shared group` treats `group` as a positional.
@@ -286,16 +266,41 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             _ if arg.starts_with("--ref-format=") => {
                 ref_format = Some(arg["--ref-format=".len()..].to_string());
             }
-            _ if arg.starts_with("-b") => {
-                initial_branch = Some(arg[2..].to_string());
-            }
+            // A long name no entry claims is `PARSE_OPT_UNKNOWN`: the `error:`
+            // line and the block, both on stderr, exit 129.
+            _ if arg.starts_with("--") => return Ok(super::unknown_option(arg, USAGE)),
+            // Every remaining `-<chars>` token, walked the way
+            // `parse_options_step()` walks a short cluster
+            // (parse-options.c:1061-1107). `init`'s three short options are `-q`,
+            // `-b` and the implicit `-h`, and `-b` takes its value from the rest
+            // of the cluster or the next argv element — so `git init -qb main`
+            // is `-q -b main` and `git init -qb` is ``switch `b' requires a
+            // value``. Reporting the whole token as one long option is what made
+            // `git init -a` say ``unknown option `a'`` where stock says
+            // ``unknown switch `a'``.
             _ => {
-                // `parse-options` reports a long option without its dashes.
-                let name = arg.trim_start_matches('-');
-                return Ok(usage_error(&format!("error: unknown option `{name}'")));
+                for (off, c) in arg.char_indices().skip(1) {
+                    match c {
+                        'q' => quiet = true,
+                        'b' => {
+                            let rest = &arg[off + c.len_utf8()..];
+                            initial_branch = Some(match rest.is_empty() {
+                                true => super::take_value(args, &mut i, "-b")?.to_string(),
+                                false => rest.to_string(),
+                            });
+                            break;
+                        }
+                        'h' => {
+                            print!("{USAGE}");
+                            return Ok(ExitCode::from(129));
+                        }
+                        _ => {
+                            return Ok(super::unknown_option(&format!("-{}", &arg[off..]), USAGE))
+                        }
+                    }
+                }
             }
         }
-        i += 1;
     }
 
     // Post-parse checks, in git's order — `cmd_init_db` decides these one after

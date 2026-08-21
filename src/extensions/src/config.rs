@@ -19,10 +19,23 @@
 //!
 //! The second half of this module is not about `[zvcs]` at all: it holds the
 //! readers for *git's own* configuration that more than one porcelain verb needs,
-//! so the same key is parsed and diagnosed the same way everywhere. Today that is
-//! [`parse_config_ulong`] / [`last_value_with_origin`] / [`config_ulong`] (git's
-//! `git_config_ulong` and the `bad numeric config value` diagnostic it dies with)
-//! and [`FsyncPolicy`] (`core.fsync`, `core.fsyncMethod`, `core.fsyncObjectFiles`).
+//! so the same key is parsed and diagnosed the same way everywhere:
+//!
+//! * the value parsers — [`parse_config_ulong`] / [`parse_config_int`] (git's
+//!   `git_parse_ulong`/`git_parse_int`) and [`parse_config_key`] /
+//!   [`check_config_key`] (`git_config_parse_key`);
+//! * the *lookup* readers, which keep the last value the way
+//!   `repo_config_get_*` does: [`last_value_with_origin`],
+//!   [`last_value_implicit`], [`config_ulong`], [`config_int`];
+//! * the *callback* reader, [`walk_config`], which hands back every configured
+//!   value in parse order with the origin each of git's two source-naming
+//!   diagnostics needs ([`ValueOrigin`]). That is what the ports of
+//!   `git_default_config` and the callbacks stacked on it are built from —
+//!   [`crate::default_config`], [`crate::diff_config`], [`crate::status_config`],
+//!   [`crate::log_config`], [`crate::cmd_config`];
+//! * and [`FsyncPolicy`] (`core.fsync`, `core.fsyncMethod`,
+//!   `core.fsyncObjectFiles`), which is read at the write site rather than at
+//!   parse time — see [`crate::default_config`] for why.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -865,5 +878,302 @@ mod stock_config_tests {
         assert_eq!(parse_fsync_components("all,-loose-object", 0), FSYNC_ALL & !loose);
         // An unknown component is skipped, not fatal, and the rest still applies.
         assert_eq!(parse_fsync_components("bogus,index", 0), index);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The config callback walk: every occurrence, in parse order, with its origin
+// ---------------------------------------------------------------------------
+
+/// Where one configured value came from, in the terms `git_die_config_linenr()`
+/// (config.c:2552-2559) reasons about.
+///
+/// ```c
+/// NORETURN
+/// void git_die_config_linenr(const char *key, const char *filename, int linenr)
+/// {
+///         if (!filename)
+///                 die(_("unable to parse '%s' from command-line config"), key);
+///         else
+///                 die(_("bad config variable '%s' in file '%s' at line %d"),
+///                     key, filename, linenr);
+/// }
+/// ```
+///
+/// The branch is on `kvi->filename` being `NULL`, which is exactly the
+/// `CONFIG_ORIGIN_CMDLINE` case: `-c`, `--config-env`, `GIT_CONFIG_PARAMETERS`
+/// and the `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs all arrive through
+/// `git_config_from_parameters()` with no file behind them, and all three spell
+/// themselves "command-line config" in the message no matter which one was used.
+/// Verified against git 2.55.0 for `-c core.checkstat=bogus` and for the
+/// `GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` pair — byte-identical output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueOrigin {
+    /// `kvi->filename == NULL`.
+    CommandLine,
+    /// `CONFIG_ORIGIN_FILE`, with the line the variable sits on.
+    File {
+        /// The path as git names it — `.git/config` for the repository config.
+        path: String,
+        /// 1-based line number, which is what `cs->linenr` counts.
+        line: usize,
+    },
+}
+
+impl ValueOrigin {
+    /// `git_die_config_linenr(key, …)`, minus the `fatal: ` prefix `die()` adds.
+    ///
+    /// This is the *second* line of the two-line refusal git prints when a config
+    /// callback returns negative rather than dying itself: the callback's own
+    /// `error()` text comes first, then `configset_iter()` (config.c:1654-1673)
+    /// turns the negative return into this.
+    pub fn die_linenr(&self, key: &str) -> String {
+        match self {
+            ValueOrigin::CommandLine => {
+                format!("unable to parse '{key}' from command-line config")
+            }
+            ValueOrigin::File { path, line } => {
+                format!("bad config variable '{key}' in file '{path}' at line {line}")
+            }
+        }
+    }
+
+    /// The origin clause `die_bad_number()` (config.c:1188-1223) appends instead:
+    /// ` in file <path>`, with no line number and no quotes, or nothing at all for
+    /// a command-line value. Kept in step with [`last_value_with_origin`], which
+    /// builds the same clause for the last-value-wins readers.
+    pub fn bad_number_clause(&self) -> String {
+        match self {
+            ValueOrigin::CommandLine => String::new(),
+            ValueOrigin::File { path, .. } => format!(" in file {path}"),
+        }
+    }
+}
+
+/// One `<key> <value>` pair as a config callback receives it.
+#[derive(Clone, Debug)]
+pub struct ConfigValue {
+    /// The full dotted key, normalised the way git's parser normalises it before
+    /// the callback sees it: section and variable name lower-cased, a
+    /// `[section "Sub Section"]` subsection left exactly as written.
+    pub key: String,
+    /// `None` is git's `NULL` value — the `[core]\n\tbare\n` spelling with no `=`
+    /// at all, which `git_config_bool` reads as *true* and `git_config_string`
+    /// refuses with `config_error_nonbool`. `Some("")` is the distinct
+    /// `bare =` spelling.
+    pub value: Option<String>,
+    /// Where it came from, for the two diagnostics that name their source.
+    pub origin: ValueOrigin,
+}
+
+/// Every configured `<key> <value>` pair, in the order a config callback would be
+/// handed them — git's `configset_iter()` (config.c:1654-1673).
+///
+/// # Why order, and why every occurrence
+///
+/// A callback-shaped reader is not a lookup. `repo_config(r, fn, data)` walks the
+/// configset's insertion list and calls `fn` once per *value*, so a key spelled
+/// twice is validated twice and the **first** bad spelling is the one that kills
+/// the command — even when a later line would have overridden it. That is the
+/// opposite of the targeted `repo_config_get_*` readers ([`config_ulong`],
+/// [`config_int`], [`crate::repo_settings::config_bool_strict`]), which keep the
+/// last value and never see the earlier ones. Both behaviours are real and both
+/// were measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c core.createObject=bogus -c core.createObject=rename status -s
+/// fatal: invalid mode for object creation: bogus
+/// $ git -c core.packedGitLimit=bogus -c core.packedGitLimit=1m status -s
+/// ?? b.bundle
+/// ```
+///
+/// The insertion list is built as the sources are parsed, in
+/// `do_git_config_sequence()` order (config.c:1570-1602): system, XDG, user,
+/// repository, worktree, then everything from `-c`/environment. gitoxide's
+/// snapshot presents its sections in that same order, so walking the sections and
+/// their values in order reproduces it.
+///
+/// # The valueless form
+///
+/// gitoxide's parser emits an empty `Event::Value` for a name written without `=`,
+/// so the two spellings look alike in `values()`; only `value_implicit()`
+/// distinguishes them, and only for the **last** occurrence of a name in a section
+/// (`key_and_value_range_by_in`, gix-config/src/file/section/body.rs:182-217,
+/// scans backwards). So the last occurrence is classified through
+/// `value_implicit()` and the earlier repeats are taken from `values()` — exact
+/// for a section that spells a name once, which is every real config file.
+///
+/// # Line numbers
+///
+/// The snapshot carries each section's source path but not the line any value sits
+/// on, and `bad config variable '<key>' in file '<path>' at line <n>` needs the
+/// line. So each distinct file is re-parsed once through
+/// [`gix::config::parse::Events`] to build [`FileLines`], and the walk asks it for
+/// the line of the next occurrence of a given `(section, subsection, name)`.
+pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
+    use gix::bstr::ByteSlice as _;
+    use std::collections::HashMap;
+
+    let config = repo.config_snapshot().plumbing().clone();
+    let mut lines: HashMap<PathBuf, FileLines> = HashMap::new();
+    let mut out = Vec::new();
+
+    for sec in config.sections() {
+        let header = sec.header();
+        let section = header.name().to_string().to_ascii_lowercase();
+        let subsection = header
+            .subsection_name()
+            .map(|s| s.to_str_lossy().into_owned());
+        let meta = sec.meta();
+        let path = origin_path(meta);
+        let body = sec.body();
+
+        // Positional cursors, one per distinct value name in this section, so a
+        // name repeated inside one section reads its values in order.
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for raw_name in body.value_names() {
+            let name = raw_name.to_ascii_lowercase();
+            let at = seen.entry(name.clone()).or_insert(0);
+            let index = *at;
+            *at += 1;
+
+            let all = body.values(&name);
+            let is_last = index + 1 == all.len();
+            let value = if is_last && body.value_implicit(&name) == Some(None) {
+                None
+            } else {
+                all.get(index).map(|v| v.to_str_lossy().into_owned())
+            };
+
+            let key = match &subsection {
+                Some(sub) => format!("{section}.{sub}.{name}"),
+                None => format!("{section}.{name}"),
+            };
+            let origin = match &path {
+                None => ValueOrigin::CommandLine,
+                Some(p) => {
+                    let index = lines
+                        .entry(p.clone())
+                        .or_insert_with(|| FileLines::read(p));
+                    match index.next_line(&section, subsection.as_deref(), &name) {
+                        Some(line) => ValueOrigin::File {
+                            path: shown_path(p),
+                            line,
+                        },
+                        // A file whose text could not be re-parsed leaves the
+                        // origin unknown; naming a line we did not find would be
+                        // worse than naming none, and the command-line shape is
+                        // the one git prints when it has no file to name.
+                        None => ValueOrigin::CommandLine,
+                    }
+                }
+            };
+            out.push(ConfigValue { key, value, origin });
+        }
+    }
+    out
+}
+
+/// The file behind a section, or `None` for the `-c`/environment sources git
+/// reports as command-line config.
+///
+/// `Source::Cli` and `Source::Env` are the two gitoxide assigns to values that
+/// reach the snapshot without a file, which is exactly `CONFIG_ORIGIN_CMDLINE`.
+/// A section that has neither a recognised source nor a path is treated the same
+/// way, since there is no file name to print.
+fn origin_path(meta: &gix::config::file::Metadata) -> Option<PathBuf> {
+    use gix::config::Source;
+
+    match meta.source {
+        Source::Cli | Source::Env => None,
+        _ => meta.path.clone(),
+    }
+}
+
+/// The path as git prints it: gitoxide reports the repository config as
+/// `./.git/config`, git as `.git/config`.
+fn shown_path(path: &std::path::Path) -> String {
+    let shown = path.to_string_lossy();
+    shown.strip_prefix("./").unwrap_or(&shown).to_string()
+}
+
+/// The line each variable in one config file sits on.
+///
+/// Built by re-parsing the file with gitoxide's event parser and counting the
+/// newlines that precede each `SectionValueName` event. Counting `Event::Newline`
+/// runs rather than measuring rendered spans is what makes this exact: the parser
+/// emits the line ending *inside* a `\`-continued value as its own `Newline`
+/// event too (gix-config's own doc example renders `file=a\<LF>    c` as
+/// `["file", "=", "a\\", "\n", "    c"]`), so a continuation advances the count
+/// just as `cs->linenr` advances in `get_value()`.
+struct FileLines {
+    /// `(section, subsection, name, line)` for every variable, in file order.
+    entries: Vec<(String, Option<String>, String, usize)>,
+    /// How far the walk has consumed, so repeats of one name read successive lines.
+    cursor: usize,
+}
+
+impl FileLines {
+    fn read(path: &std::path::Path) -> Self {
+        let mut entries = Vec::new();
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(events) = gix::config::parse::Events::from_bytes(&bytes, None) {
+                collect_lines(&events, &mut entries);
+            }
+        }
+        FileLines { entries, cursor: 0 }
+    }
+
+    /// The line of the next not-yet-consumed occurrence of this variable.
+    ///
+    /// The scan runs forward from the cursor and then, if that finds nothing,
+    /// from the start — so a file pulled into the snapshot twice (the same
+    /// `include.path` reached by two routes) reports its first line again rather
+    /// than nothing at all.
+    fn next_line(&mut self, section: &str, subsection: Option<&str>, name: &str) -> Option<usize> {
+        let matches = |e: &(String, Option<String>, String, usize)| {
+            e.0 == section && e.1.as_deref() == subsection && e.2 == name
+        };
+        let at = self.entries[self.cursor..]
+            .iter()
+            .position(matches)
+            .map(|i| i + self.cursor)
+            .or_else(|| self.entries.iter().position(matches))?;
+        self.cursor = at + 1;
+        Some(self.entries[at].3)
+    }
+}
+
+/// Walk one parsed file's events, tracking the current section header and the
+/// running line count, and record where each variable name appears.
+fn collect_lines(
+    events: &gix::config::parse::Events,
+    out: &mut Vec<(String, Option<String>, String, usize)>,
+) {
+    use gix::bstr::ByteSlice as _;
+    use gix::config::parse::EventRef;
+
+    let mut line = 1usize;
+    let mut section = String::new();
+    let mut subsection: Option<String> = None;
+    for event in events.iter() {
+        match event {
+            EventRef::Newline(nl) => line += nl.iter().filter(|&&b| b == b'\n').count(),
+            EventRef::SectionHeader {
+                name,
+                subsection_name,
+                ..
+            } => {
+                section = name.to_str_lossy().to_ascii_lowercase();
+                subsection = subsection_name.map(|s| s.to_str_lossy().into_owned());
+            }
+            EventRef::SectionValueName(name) => out.push((
+                section.clone(),
+                subsection.clone(),
+                name.to_str_lossy().to_ascii_lowercase(),
+                line,
+            )),
+            _ => {}
+        }
     }
 }

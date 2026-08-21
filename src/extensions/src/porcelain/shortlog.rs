@@ -603,9 +603,15 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     opts.date_format = Some(fmt.to_string());
                 }
                 ("format" | "pretty", Some(arg)) => match parse_pretty(arg) {
-                    Some(user) => opts.user_format = user,
-                    None => {
+                    Ok(Some(user)) => opts.user_format = user,
+                    Ok(None) => {
                         eprintln!("fatal: invalid --pretty format: {arg}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    // A `pretty.<name>` alias chain that loops names the format
+                    // rather than the option value (pretty.c:156-158).
+                    Err(cycle) => {
+                        eprintln!("fatal: {}", cycle.message());
                         return Ok(ExitCode::from(128));
                     }
                 },
@@ -1145,33 +1151,44 @@ fn is_known_date_format(fmt: &str) -> bool {
     )
 }
 
-/// git's `get_commit_format()`. `Some(None)` is a builtin format, which
-/// shortlog ignores; `Some(Some(f))` is a user format it expands per commit;
-/// `None` is the `invalid --pretty format` failure.
-fn parse_pretty(arg: &str) -> Option<Option<String>> {
-    const BUILTIN: [&str; 9] = [
-        "raw",
-        "medium",
-        "short",
-        "email",
-        "mboxrd",
-        "fuller",
-        "full",
-        "oneline",
-        "reference",
-    ];
-    if BUILTIN.contains(&arg) {
-        return Some(None);
+/// git's `get_commit_format()` (pretty.c:190-222). `Ok(Some(None))` is a built-in
+/// format, which shortlog ignores; `Ok(Some(Some(f)))` is a user format it expands
+/// per commit; `Ok(None)` is the `invalid --pretty format` failure; `Err` is the
+/// `pretty.<name>` alias loop.
+///
+/// The three shortcuts (`format:`, an empty value or a `tformat:` prefix, a `%`)
+/// are tried in git's order and never consult config; everything else goes to the
+/// shared format table, which is what makes `--pretty=one` `oneline`, matches a
+/// name case-blind, and picks up `pretty.<name>`.
+///
+/// `None` for the repository: shortlog parses its options before it discovers one
+/// (it can be run outside a repository entirely), so the resolver does the
+/// discovery — git reaches the same config through the lazy `setup_commit_formats()`
+/// inside `find_commit_format()`.
+fn parse_pretty(
+    arg: &str,
+) -> Result<Option<Option<String>>, super::pretty_formats::AliasCycle> {
+    if let Some(rest) = arg.strip_prefix("format:") {
+        return Ok(Some(Some(rest.to_string())));
     }
-    for prefix in ["format:", "tformat:"] {
-        if let Some(rest) = arg.strip_prefix(prefix) {
-            return Some(Some(rest.to_string()));
-        }
+    if arg.is_empty() {
+        return Ok(Some(Some(String::new())));
     }
-    if arg.is_empty() || arg.contains('%') {
-        return Some(Some(arg.to_string()));
+    if let Some(rest) = arg.strip_prefix("tformat:") {
+        return Ok(Some(Some(rest.to_string())));
     }
-    None
+    if arg.contains('%') {
+        return Ok(Some(Some(arg.to_string())));
+    }
+    Ok(match super::pretty_formats::resolve(None, arg)? {
+        None => None,
+        // Every built-in but `reference` prints through its own printer, which
+        // shortlog does not use; `reference` is a `CMIT_FMT_USERFORMAT` in git and
+        // is left with the rest here rather than being expanded, which is where
+        // this port still differs from stock.
+        Some(super::pretty_formats::Resolved::Builtin(_)) => Some(None),
+        Some(super::pretty_formats::Resolved::User { format, .. }) => Some(Some(format)),
+    })
 }
 
 // git's `approxidate()`, which `--since`/`--until` reach through the revision machinery

@@ -115,10 +115,14 @@ impl<'repo> Pipeline<'repo> {
             .transpose()
             .with_leniency(repo.config.lenient_config)?
             .unwrap_or_default();
+        // `try_into_eol` answers `None` for anything git reads as `EOL_UNSET`, so an
+        // unset key and an unrecognised value flatten to the same "unset" here — which
+        // is what `git_default_core_config()` does with them (environment.c:413-423).
         let eol = config
             .string("core.eol")
             .map(|value| Core::EOL.try_into_eol(value))
-            .transpose()?;
+            .transpose()?
+            .flatten();
         let drivers = extract_drivers(repo)?;
         Ok(gix_filter::pipeline::Options {
             drivers,

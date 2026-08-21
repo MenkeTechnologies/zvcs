@@ -1133,7 +1133,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             notes_opt.disable();
             notes_opt.given = true;
         } else if let Some(v) = a.strip_prefix("--pretty=") {
-            match get_commit_format(v)? {
+            match get_commit_format(Some(&repo), v)? {
                 Some((p, t)) => {
                     pretty = p;
                     terminator = t;
@@ -1148,7 +1148,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // `--format=<s>` is git`s alias for `--pretty=<s>` (same parser, not a
             // blind `tformat:` wrapper — `--format=abc` is rejected just like
             // `--pretty=abc`).
-            match get_commit_format(v)? {
+            match get_commit_format(Some(&repo), v)? {
                 Some((p, t)) => {
                     pretty = p;
                     terminator = t;
@@ -6884,25 +6884,52 @@ pub(super) fn email_body(
     Ok(())
 }
 
-/// git's `get_commit_format`, the shared parser behind `--pretty=` and
-/// `--format=`. Returns the format and whether it terminates (rather than
-/// separates) records:
+/// git's `get_commit_format` (pretty.c:190-222), the shared parser behind
+/// `--pretty=` and `--format=`. Returns the format and whether it terminates
+/// (rather than separates) records:
 ///   * `Ok(Some(..))` — a valid, supported format.
 ///   * `Ok(None)`     — a value git itself rejects (`fatal: invalid --pretty
 ///     format: <arg>`, exit 128): non-empty, no `%`, not a `format:`/`tformat:`
-///     prefix, and not a known format name.
-///   * `Err(..)`      — a value git accepts but this port does not yet render
-///     (an unsupported `%` placeholder), surfaced terse rather than faked.
+///     prefix, and naming no entry in the format table.
+///   * `Err(..)`      — either a value git accepts but this port does not yet
+///     render (an unsupported `%` placeholder), surfaced terse rather than faked,
+///     or the [`Fatal`](crate::fatal::Fatal) git dies with when a `pretty.<name>`
+///     alias chain loops back on itself.
+///
+/// ```c
+/// rev->use_terminator = 0;
+/// if (!arg) { rev->commit_format = CMIT_FMT_DEFAULT; return; }
+/// if (skip_prefix(arg, "format:", &arg)) { save_user_format(rev, arg, 0); return; }
+/// if (!*arg || skip_prefix(arg, "tformat:", &arg) || strchr(arg, '%')) {
+///         save_user_format(rev, arg, 1);
+///         return;
+/// }
+/// commit_format = find_commit_format(arg);
+/// if (!commit_format)
+///         die("invalid --pretty format: %s", arg);
+/// ```
+///
+/// The three shortcuts are tried in that order and never consult config; only a
+/// value that survives them reaches [`super::pretty_formats::resolve`], which is
+/// where the built-in table and the `pretty.<name>` keys both live. `repo` is
+/// git's `the_repository`, whose config the table is built from; `None` lets the
+/// resolver discover it, for the option parsers that run before their command has
+/// opened one.
 ///
 /// An empty value is git's empty user format: it renders nothing per commit and,
 /// as a terminator format, drops even the trailing newline.
-pub(crate) fn get_commit_format(spec: &str) -> Result<Option<(Pretty, bool)>> {
-    if spec.is_empty() {
-        return Ok(Some((Pretty::User(String::new()), true)));
-    }
+pub(crate) fn get_commit_format(
+    repo: Option<&gix::Repository>,
+    spec: &str,
+) -> Result<Option<(Pretty, bool)>> {
+    // `skip_prefix(arg, "format:", &arg)` comes first, so a `pretty.<name>` can
+    // never shadow the `format:` shortcut.
     if let Some(fmt) = spec.strip_prefix("format:") {
         check_format(fmt)?;
         return Ok(Some((Pretty::User(fmt.to_string()), false)));
+    }
+    if spec.is_empty() {
+        return Ok(Some((Pretty::User(String::new()), true)));
     }
     if let Some(fmt) = spec.strip_prefix("tformat:") {
         check_format(fmt)?;
@@ -6912,20 +6939,37 @@ pub(crate) fn get_commit_format(spec: &str) -> Result<Option<(Pretty, bool)>> {
         check_format(spec)?;
         return Ok(Some((Pretty::User(spec.to_string()), true)));
     }
-    match spec {
-        "oneline" => Ok(Some((Pretty::Oneline, true))),
-        "medium" => Ok(Some((Pretty::Medium, false))),
-        "short" => Ok(Some((Pretty::Short, false))),
-        "full" => Ok(Some((Pretty::Full, false))),
-        "fuller" => Ok(Some((Pretty::Fuller, false))),
-        "raw" => Ok(Some((Pretty::Raw, false))),
-        "reference" => Ok(Some((Pretty::Reference, true))),
+    match super::pretty_formats::resolve(repo, spec)? {
+        None => Ok(None),
+        Some(super::pretty_formats::Resolved::Builtin(b)) => Ok(Some(builtin_pretty(b))),
+        // `if (commit_format->format == CMIT_FMT_USERFORMAT) save_user_format(…)`
+        // (pretty.c:218-221): a `pretty.<name>` entry renders as its stored format
+        // string, with the entry's own terminator/separator answer.
+        Some(super::pretty_formats::Resolved::User { format, is_tformat }) => {
+            check_format(&format)?;
+            Ok(Some((Pretty::User(format), is_tformat)))
+        }
+    }
+}
+
+/// `rev->commit_format = commit_format->format; rev->use_terminator =
+/// commit_format->is_tformat` (pretty.c:213-214) for the nine `builtin_formats[]`
+/// entries, in this port's own `Pretty` spelling.
+pub(crate) fn builtin_pretty(b: super::pretty_formats::Builtin) -> (Pretty, bool) {
+    use super::pretty_formats::Builtin;
+    match b {
+        Builtin::Oneline => (Pretty::Oneline, true),
+        Builtin::Medium => (Pretty::Medium, false),
+        Builtin::Short => (Pretty::Short, false),
+        Builtin::Full => (Pretty::Full, false),
+        Builtin::Fuller => (Pretty::Fuller, false),
+        Builtin::Raw => (Pretty::Raw, false),
+        Builtin::Reference => (Pretty::Reference, true),
         // `cmit_fmt_is_mail()`: the two mail formats terminate rather than
         // separate their records, since `pp_title_line()` already ended the
         // header block with the blank line a reader splits on.
-        "email" => Ok(Some((Pretty::Email, false))),
-        "mboxrd" => Ok(Some((Pretty::MboxRd, false))),
-        _ => Ok(None),
+        Builtin::Email => (Pretty::Email, false),
+        Builtin::MboxRd => (Pretty::MboxRd, false),
     }
 }
 

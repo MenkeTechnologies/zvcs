@@ -137,7 +137,14 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
             "--object-format" => match it.next() {
                 Some(v) => object_format = Some(v.clone()),
                 // parse-options: a missing required value is a usage error.
-                None => return Ok(usage_error(Some("switch `object-format' requires a value"))),
+                // `optname()` names a *long* option `option `<name>'`; the
+                // `switch` wording is `OPT_SHORT`'s, and `--object-format` has no
+                // short spelling at all (parse-options.c:30-45).
+                None => {
+                    return Ok(crate::parseopt::requires_value(
+                        crate::parseopt::OptName::Long("object-format"),
+                    ))
+                }
             },
             s if s.starts_with("--object-format=") => {
                 object_format = Some(s["--object-format=".len()..].to_string());

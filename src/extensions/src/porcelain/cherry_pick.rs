@@ -196,7 +196,12 @@
 //! Repository state for a successful pick matches git: the author signature
 //! (name, email and time) is preserved from the picked commit, the committer
 //! comes from configuration, and the reflog entry is `cherry-pick: <subject>`
-//! (or `cherry-pick: fast-forward`). Mailmap is not applied to the printed
+//! (or `cherry-pick: fast-forward`) — the sequencer's own wording, from
+//! `sequencer_reflog_action()`. A pick that *stopped* and is finished by
+//! `--continue` is logged differently, `commit (cherry-pick): <subject>`,
+//! because `continue_single_pick()` hands the commit to a plain `git commit`
+//! that names itself; see [`super::replay_commit::continue_reflog_action`].
+//! Mailmap is not applied to the printed
 //! identities, so a repository that rewrites the picked author via `.mailmap`
 //! would see a different ` Author:`. The detached-HEAD status header names the
 //! current commit rather than the reflog-recorded detach point.
@@ -519,13 +524,30 @@ fn verb_conflict(new: Verb, prev: Verb) -> String {
     )
 }
 
+/// `optname()` for a long option, spelled as `builtin/revert.c`'s table spells
+/// it — the two shorthands keep the call sites below on one line each.
+fn long(name: &str) -> crate::parseopt::OptName<'_> {
+    crate::parseopt::OptName::Long(name)
+}
+
+/// `optname()` for a short option, named by the character `parse_short_opt()`
+/// matched.
+fn short(c: char) -> crate::parseopt::OptName<'static> {
+    crate::parseopt::OptName::Short(c)
+}
+
 /// An option's value: either attached (`--opt=v`, `-Xv`) or the next argument.
 /// Advances `i` when it consumes that next argument, like `parse_options` does.
+///
+/// `name` is `optname()`'s rendering, and it follows the spelling that was
+/// typed rather than the table entry: `git cherry-pick -m` is ``switch `m'``
+/// while `--mainline` is ``option `mainline'``. Passing the long name for both
+/// is what made the short forms report the wrong half.
 fn take_value<'a>(
     attached: Option<&'a str>,
     args: &'a [String],
     i: &mut usize,
-    name: &str,
+    name: crate::parseopt::OptName<'_>,
 ) -> Result<&'a str, ExitCode> {
     match attached {
         Some(v) => Ok(v),
@@ -533,7 +555,7 @@ fn take_value<'a>(
             *i += 1;
             match args.get(*i) {
                 Some(v) => Ok(v.as_str()),
-                None => Err(opt_error(&format!("option `{name}' requires a value"))),
+                None => Err(crate::parseopt::requires_value(name)),
             }
         }
     }
@@ -583,23 +605,23 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
 
             // Stored raw; the final value is validated post-parse, not here.
             "--cleanup" => {
-                o.cleanup = Some(take_value(inline, args, &mut i, "cleanup")?);
+                o.cleanup = Some(take_value(inline, args, &mut i, long("cleanup"))?);
             }
             "--no-cleanup" => o.cleanup = None,
             "--empty" => {
-                o.empty = Some(parse_empty(take_value(inline, args, &mut i, "empty")?)?);
+                o.empty = Some(parse_empty(take_value(inline, args, &mut i, long("empty"))?)?);
                 o.empty_given = true;
             }
             "--mainline" => {
-                o.mainline = Some(parse_mainline(take_value(inline, args, &mut i, "mainline")?)?);
+                o.mainline = Some(parse_mainline(take_value(inline, args, &mut i, long("mainline"))?)?);
             }
             "--no-mainline" => o.mainline = None,
             "--strategy" => {
-                o.strategy = Some(take_value(inline, args, &mut i, "strategy")?);
+                o.strategy = Some(take_value(inline, args, &mut i, long("strategy"))?);
             }
             "--no-strategy" => o.strategy = None,
             "--strategy-option" => {
-                let v = take_value(inline, args, &mut i, "strategy-option")?;
+                let v = take_value(inline, args, &mut i, long("strategy-option"))?;
                 o.xopts.push(v);
             }
             // `OPT_STRVEC`'s unset arm is `strvec_clear()`, so the negation drops
@@ -681,12 +703,12 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
                         b'r' => {}
                         b's' => o.signoff = true,
                         b'm' => {
-                            let v = take_value(attached, args, &mut i, "mainline")?;
+                            let v = take_value(attached, args, &mut i, short('m'))?;
                             o.mainline = Some(parse_mainline(v)?);
                             break;
                         }
                         b'X' => {
-                            let v = take_value(attached, args, &mut i, "strategy-option")?;
+                            let v = take_value(attached, args, &mut i, short('X'))?;
                             o.xopts.push(v);
                             break;
                         }
@@ -1354,15 +1376,6 @@ fn pick_one(
         }
     };
 
-    // The merged tree is the state of every path after the merge, conflict
-    // markers included; the diffstat and the empty-result test both read it
-    // back rather than tracking resolutions as they are made.
-    let mut resolved: Vec<(BString, EntryMode, ObjectId)> = flatten(&repo, tree_id)?
-        .into_iter()
-        .map(|(path, (mode, id))| (path, mode, id))
-        .collect();
-    resolved.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
     // --- stopped on conflict ------------------------------------------
     //
     // Checked before the empty-result guards, as git does: a conflicted pick
@@ -1549,7 +1562,7 @@ fn pick_one(
         use gix::date::time::format;
         println!(" Date: {}", author_time.format_or_unix(format::DEFAULT));
     }
-    print_diffstat(&repo, head_tree, tree_id, &resolved)?;
+    print_diffstat(head_tree, tree_id)?;
 
     state.head_id = new_id;
     Ok(PickOutcome::Done)
@@ -1946,7 +1959,13 @@ fn continue_single_pick(
         vec![head_id],
         super::commit::commit_config_signer(repo).as_ref(),
     )?;
-    let reflog = gix::reference::log::message("cherry-pick", message.as_bstr(), 1);
+    // The child here is `git commit`, not the sequencer's own `try_to_commit()`,
+    // and `continue_single_pick()` gives it no `GIT_REFLOG_ACTION` — so the
+    // wording is `builtin/commit.c`'s whence-derived default rather than the
+    // `cherry-pick:` the *unstopped* picks above write. See
+    // [`super::replay_commit::continue_reflog_action`].
+    let action = super::replay_commit::continue_reflog_action(git_dir);
+    let reflog = gix::reference::log::message(&action, message.as_bstr(), 1);
     advance_head(repo, head_id, new_id, reflog)?;
     // `sequencer_post_commit_cleanup()`, which is what the child `git commit`
     // runs on its way out: the pseudo-refs always go, the sequencer directory
@@ -1976,13 +1995,8 @@ fn continue_single_pick(
         use gix::date::time::format;
         println!(" Date: {}", author.time()?.format_or_unix(format::DEFAULT));
     }
-    let mut resolved: Vec<(BString, EntryMode, ObjectId)> = flatten(repo, tree_id)?
-        .into_iter()
-        .map(|(path, (mode, id))| (path, mode, id))
-        .collect();
-    resolved.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
-    print_diffstat(repo, head_tree, tree_id, &resolved)?;
+    print_diffstat(head_tree, tree_id)?;
     Ok(Ok(()))
 }
 
@@ -2191,73 +2205,45 @@ fn advance_head(
     Ok(())
 }
 
-/// git's short-stat plus the create/delete/mode-change block, for the diff from
-/// `old_tree` to `new_tree`. Ported from `porcelain::commit`, which derives the
-/// file count from the flattened entry sets (so a rename counts as a delete plus
-/// a create) and the line counts from a rename-free tree diff.
-fn print_diffstat(
-    repo: &gix::Repository,
-    old_tree: ObjectId,
-    new_tree: ObjectId,
-    new_entries: &[(BString, EntryMode, ObjectId)],
-) -> Result<()> {
-    let old_entries = flatten(repo, old_tree)?;
-    let new_paths: HashSet<&BString> = new_entries.iter().map(|(p, _, _)| p).collect();
-
-    let mut files_changed: u64 = 0;
-    let mut summary: Vec<(BString, String)> = Vec::new();
-    for (path, mode, id) in new_entries {
-        match old_entries.get(path) {
-            None => {
-                files_changed += 1;
-                summary.push((path.clone(), format!("create mode {} {path}", octal(*mode))));
-            }
-            Some((old_mode, old_id)) => {
-                if old_id != id || old_mode != mode {
-                    files_changed += 1;
-                }
-                if old_mode != mode {
-                    summary.push((
-                        path.clone(),
-                        format!("mode change {} => {} {path}", octal(*old_mode), octal(*mode)),
-                    ));
-                }
-            }
-        }
-    }
-    for (path, (mode, _)) in &old_entries {
-        if !new_paths.contains(path) {
-            files_changed += 1;
-            summary.push((path.clone(), format!("delete mode {} {path}", octal(*mode))));
-        }
-    }
-
-    if files_changed == 0 {
-        return Ok(());
-    }
-
-    let old = repo.find_tree(old_tree)?;
-    let new = repo.find_tree(new_tree)?;
-    let mut platform = old.changes()?;
-    platform.options(|opts| {
-        opts.track_rewrites(None);
-    });
-    let stats = platform.stats(&new)?;
-
-    let (ins, del) = (stats.lines_added, stats.lines_removed);
-    let mut line = format!(" {files_changed} file{} changed", plural(files_changed));
-    if ins > 0 || del == 0 {
-        line.push_str(&format!(", {ins} insertion{}(+)", plural(ins)));
-    }
-    if del > 0 || ins == 0 {
-        line.push_str(&format!(", {del} deletion{}(-)", plural(del)));
-    }
-    println!("{line}");
-
-    summary.sort_by(|a, b| a.0.cmp(&b.0));
-    for (_, l) in &summary {
-        println!(" {l}");
-    }
+/// The short-stat and `--summary` half of `print_commit_summary()`
+/// (sequencer.c:1413-1495) — the *same* function `git commit` prints its own
+/// summary with, which is why this is the same delegation
+/// [`super::commit`] makes:
+///
+/// ```c
+/// rev.diff = 1;
+/// rev.diffopt.output_format = DIFF_FORMAT_SHORTSTAT | DIFF_FORMAT_SUMMARY;
+/// rev.show_root_diff = 1;
+/// rev.diffopt.detect_rename = DIFF_DETECT_RENAME;
+/// ...
+/// log_tree_commit(&rev, commit);
+/// ```
+///
+/// So the block is produced by the ordinary revision/diff machinery against the
+/// commit's first parent, with rename detection **on**. The hand-rolled walk
+/// this replaces got two things wrong, both of them silently:
+///
+///   * with rename detection off it charged `git mv old new` as
+///     ` 2 files changed, 40 insertions(+), 40 deletions(-)` plus a create/delete
+///     pair, where stock prints ` 1 file changed, 0 insertions(+), 0 deletions(-)`
+///     and ` rename {orig => moved}/alpha.txt (100%)`;
+///   * its line counts came from `gix`'s tree-diff statistics, which run both
+///     blobs through the `Mode::ToGit` conversion pipeline before diffing them, so
+///     a picked commit that only rewrites CRLF as LF scored
+///     ` 1 file changed, 0 insertions(+), 0 deletions(-)` against stock's
+///     ` 3 insertions(+), 3 deletions(-)`.
+///
+/// `-r` is `log_tree_diff()`'s recursion; the operands are the two trees rather
+/// than the two commits so that `diff-tree` prints no commit-id header of its own.
+fn print_diffstat(old_tree: ObjectId, new_tree: ObjectId) -> Result<()> {
+    super::diff_tree::diff_tree(&[
+        "-r".to_string(),
+        "-M".to_string(),
+        "--shortstat".to_string(),
+        "--summary".to_string(),
+        old_tree.to_string(),
+        new_tree.to_string(),
+    ])?;
     Ok(())
 }
 
@@ -2407,21 +2393,6 @@ fn update_clean_worktree(
     new_index.remove_tree();
     new_index.write(Default::default())?;
     Ok(new_index)
-}
-
-/// The git-internal octal representation of a tree entry mode, e.g. `100644`.
-fn octal(mode: EntryMode) -> String {
-    let mut buf = [0u8; 6];
-    mode.as_bytes(&mut buf).to_string()
-}
-
-/// `""` for a count of 1, `"s"` otherwise — for git's `file`/`files` etc.
-fn plural(n: u64) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
 }
 
 #[cfg(test)]

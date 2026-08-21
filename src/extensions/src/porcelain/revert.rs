@@ -105,7 +105,10 @@
 //!     resumed sequence keeps signing. A stopped revert's `--continue` is the one
 //!     exception, and it is git's: `continue_single_pick()` spawns a plain
 //!     `git commit` with no `-S` (sequencer.c:5232-5257), so only `commit.gpgSign`
-//!     applies there.
+//!     applies there. The same spawn is why a resumed revert's reflog line reads
+//!     `commit: Revert "…"` and not `revert: …` — the child names itself, and
+//!     `sequencer_determine_whence()` does not look at `REVERT_HEAD`; see
+//!     [`super::replay_commit::continue_reflog_action`].
 
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -347,12 +350,13 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             "--no-cleanup" => o.cleanup = None,
             "--no-strategy" => o.strategy = None,
             "--no-strategy-option" => o.xopts.clear(),
+            // `optname()` follows the spelling that was typed, so `-m` is
+            // ``switch `m'`` and `--mainline` is ``option `mainline'``
+            // (parse-options.c:30-45); naming the long form for both was wrong
+            // for every short spelling here.
             "-m" | "--mainline" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
-                    eprintln!("error: option `mainline' requires a value");
-                    return Ok(ExitCode::from(129));
-                };
+                let v = super::value_at(args, i, a)?;
                 match parse_mainline(v) {
                     Some(n) => o.mainline = n,
                     None => return Ok(bad_mainline()),
@@ -360,27 +364,15 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             }
             "--cleanup" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
-                    eprintln!("error: option `cleanup' requires a value");
-                    return Ok(ExitCode::from(129));
-                };
-                o.cleanup = Some(v.clone());
+                o.cleanup = Some(super::value_at(args, i, a)?.to_string());
             }
             "--strategy" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
-                    eprintln!("error: option `strategy' requires a value");
-                    return Ok(ExitCode::from(129));
-                };
-                o.strategy = Some(v.clone());
+                o.strategy = Some(super::value_at(args, i, a)?.to_string());
             }
             "-X" | "--strategy-option" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
-                    eprintln!("error: option `strategy-option' requires a value");
-                    return Ok(ExitCode::from(129));
-                };
-                o.xopts.push(v.clone());
+                o.xopts.push(super::value_at(args, i, a)?.to_string());
             }
             "--quit" => {
                 if let Some(code) = set_mode(&mut o, Cmd::Quit) {
@@ -898,7 +890,16 @@ fn continue_single_pick(
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: format!("revert: {subject}").into(),
+                // `continue_single_pick()` hands the work to a plain `git commit`
+                // without exporting `GIT_REFLOG_ACTION` (sequencer.c:5232-5257), and
+                // `sequencer_determine_whence()` recognises `CHERRY_PICK_HEAD` alone —
+                // so a resumed *revert* logs as `commit: Revert "…"`, not `revert:`.
+                // See [`super::replay_commit::continue_reflog_action`].
+                message: format!(
+                    "{}: {subject}",
+                    super::replay_commit::continue_reflog_action(git_dir)
+                )
+                .into(),
             },
             expected: PreviousValue::MustExistAndMatch(Target::Object(head_id)),
             new: Target::Object(new_id),
@@ -1794,84 +1795,38 @@ fn print_summary(
         );
     }
 
-    let old = flatten(repo, old_tree)?;
-    let new = flatten(repo, new_tree)?;
-
-    let mut files_changed: u64 = 0;
-    let mut summary: Vec<(BString, String)> = Vec::new();
-    // A gitlink is one line of diff (`Subproject commit <oid>`) that the blob
-    // differ below cannot see at all, so it is counted here.
-    let (mut link_ins, mut link_del) = (0u64, 0u64);
-    for (path, (id, kind)) in &new {
-        match old.get(path) {
-            None => {
-                files_changed += 1;
-                if *kind == EntryKind::Commit {
-                    link_ins += 1;
-                }
-                summary.push((path.clone(), format!("create mode {} {}", octal(*kind), quote_path(path))));
-            }
-            Some((old_id, old_kind)) => {
-                if old_id != id || old_kind != kind {
-                    files_changed += 1;
-                    if *kind == EntryKind::Commit {
-                        link_ins += 1;
-                    }
-                    if *old_kind == EntryKind::Commit {
-                        link_del += 1;
-                    }
-                }
-                if old_kind != kind {
-                    summary.push((
-                        path.clone(),
-                        format!(
-                            "mode change {} => {} {}",
-                            octal(*old_kind),
-                            octal(*kind),
-                            quote_path(path)
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-    for (path, (_, kind)) in &old {
-        if !new.contains_key(path) {
-            files_changed += 1;
-            if *kind == EntryKind::Commit {
-                link_del += 1;
-            }
-            summary.push((path.clone(), format!("delete mode {} {}", octal(*kind), quote_path(path))));
-        }
-    }
-
-    // Line counts from a real blob diff; rename detection is off so the file
-    // accounting stays consistent with the counts above.
-    let old_obj = repo.find_tree(old_tree)?;
-    let new_obj = repo.find_tree(new_tree)?;
-    let mut platform = old_obj.changes()?;
-    platform.options(|o| {
-        o.track_rewrites(None);
-    });
-    let stats = platform.stats(&new_obj)?;
-
-    if files_changed > 0 {
-        let ins = stats.lines_added + link_ins;
-        let del = stats.lines_removed + link_del;
-        let mut line = format!(" {files_changed} file{} changed", plural(files_changed));
-        if ins > 0 || del == 0 {
-            line.push_str(&format!(", {ins} insertion{}(+)", plural(ins)));
-        }
-        if del > 0 || ins == 0 {
-            line.push_str(&format!(", {del} deletion{}(-)", plural(del)));
-        }
-        println!("{line}");
-
-        summary.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_, l) in &summary {
-            println!(" {l}");
-        }
-    }
+    // ```c
+    // rev.diff = 1;
+    // rev.diffopt.output_format = DIFF_FORMAT_SHORTSTAT | DIFF_FORMAT_SUMMARY;
+    // rev.show_root_diff = 1;
+    // rev.diffopt.detect_rename = DIFF_DETECT_RENAME;
+    // ...
+    // log_tree_commit(&rev, commit);
+    // ```
+    //
+    // (sequencer.c:1462-1490.) `print_commit_summary()` counts no tree entries of
+    // its own: it hands the commit to the ordinary revision/diff machinery, with
+    // rename detection **on**, and lets `log_tree_commit()` diff it against its
+    // first parent. So this delegates to the port's own `diff-tree` — the engine
+    // `git diff --shortstat --summary -M` already agrees with stock on — exactly
+    // as [`super::commit`] and [`super::cherry_pick`] do.
+    //
+    // The walk this replaces got the same two things wrong they did: it reported
+    // a rename as a create plus a delete with their full line counts, and it took
+    // its line counts from `gix`'s tree-diff statistics, which run both blobs
+    // through the `Mode::ToGit` conversion pipeline first — so a reverted CRLF/LF
+    // rewrite scored ` 1 file changed, 0 insertions(+), 0 deletions(-)` against
+    // stock's ` 3 insertions(+), 3 deletions(-)`. The gitlink hand-count that sat
+    // beside it goes too: `diff-tree` sees a `Subproject commit <oid>` line the
+    // way git does.
+    super::diff_tree::diff_tree(&[
+        "-r".to_string(),
+        "-M".to_string(),
+        "--shortstat".to_string(),
+        "--summary".to_string(),
+        old_tree.to_string(),
+        new_tree.to_string(),
+    ])?;
     Ok(())
 }
 
@@ -1884,24 +1839,4 @@ fn print_summary(
 /// space, which needs no escape, keeps the path unquoted.
 fn quote_path(path: &BString) -> String {
     crate::quote::quoted_name_string(path.as_slice())
-}
-
-/// The 6-digit octal mode git prints in create/delete/mode-change lines.
-fn octal(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Tree => "040000",
-        EntryKind::Blob => "100644",
-        EntryKind::BlobExecutable => "100755",
-        EntryKind::Link => "120000",
-        EntryKind::Commit => "160000",
-    }
-}
-
-/// `""` for a count of 1, `"s"` otherwise.
-fn plural(n: u64) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
 }

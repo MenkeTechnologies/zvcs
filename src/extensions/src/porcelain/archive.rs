@@ -299,15 +299,15 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             "--no-verbose" => opts.verbose = false,
             "--worktree-attributes" => opts.worktree_attributes = true,
             "--no-worktree-attributes" => opts.worktree_attributes = false,
-            "--format" => opts.format = Some(value_of(args, &mut i, "--format")?),
+            "--format" => opts.format = Some(value_of(args, &mut i, a)?),
             "--no-format" => opts.format = None,
-            "--prefix" => opts.prefix = Some(value_of(args, &mut i, "--prefix")?),
+            "--prefix" => opts.prefix = Some(value_of(args, &mut i, a)?),
             "--no-prefix" => opts.prefix = None,
-            "-o" | "--output" => opts.output = Some(value_of(args, &mut i, "--output")?),
+            "-o" | "--output" => opts.output = Some(value_of(args, &mut i, a)?),
             // git accepts `--no-output` but it is a no-op: `-o FILE --no-output`
             // (either order) still writes to FILE. Verified against git 2.55.0.
             "--no-output" => {}
-            "--mtime" => opts.mtime = Some(value_of(args, &mut i, "--mtime")?),
+            "--mtime" => opts.mtime = Some(value_of(args, &mut i, a)?),
             "--add-file" => {
                 let value = value_of(args, &mut i, a)?;
                 match resolve_add_file(&value) {
@@ -743,11 +743,15 @@ impl Sink {
 }
 
 /// Read the value of an option given as a separate argument (`--format tar`).
+///
+/// `i` stays *on* the value, because this command's loop advances past the
+/// current argument itself; only the shared `get_arg()` port needs the
+/// next-unread convention. `flag` is the token as typed, and that is the whole
+/// point: `optname()` names a short option by its character, so `git archive -o`
+/// is ``switch `o'`` and not the ``option `--output'`` this used to print.
 fn value_of(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
     *i += 1;
-    args.get(*i)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("option `{flag}` requires a value"))
+    Ok(super::value_at(args, *i, flag)?.to_string())
 }
 
 /// git's `add_file_cb` for `--add-virtual-file <path:content>`, which runs

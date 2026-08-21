@@ -8,15 +8,41 @@
 /// the way it was typed (`option \`depth'` for a long one, `switch \`j'` for a
 /// short one), one line on stderr, exit 129.
 ///
-/// It is here rather than in one porcelain because every command that takes an
-/// option value shares it — the message comes from `get_arg()` in
-/// parse-options.c, not from any subcommand.
+/// A thin spelling of [`crate::parseopt::requires_value`] for the call sites that
+/// hold the token rather than the table entry. The implementation lives in
+/// `parseopt` with the rest of `get_arg()`; keeping a second copy here is how the
+/// two drifted apart in the first place, with `git commit -m` reporting
+/// ``option `-m'`` while `git tag -m` reported ``switch `m'``.
 pub(crate) fn missing_option_value(key: &str) -> std::process::ExitCode {
-    match key.strip_prefix("--") {
-        Some(long) => eprintln!("error: option `{long}' requires a value"),
-        None => eprintln!("error: switch `{}' requires a value", &key[1..]),
-    }
-    std::process::ExitCode::from(129)
+    crate::parseopt::requires_value(crate::parseopt::OptName::typed(key))
+}
+
+/// `get_arg()` for a command that walks argv itself and holds the *token* rather
+/// than the table entry — which is every porcelain in this port.
+///
+/// `i` indexes the next unread argument (the caller has stepped past the option
+/// already) and is advanced past the value. `tok` is the option as typed, dashes
+/// and all: it decides nothing but the wording of the refusal, and that wording
+/// is the whole reason this exists rather than `args.get(i)`. See
+/// [`crate::parseopt::get_arg`] for the C and for why an absent value must not
+/// become an empty one.
+pub(crate) fn take_value<'a>(
+    args: &'a [String],
+    i: &mut usize,
+    tok: &str,
+) -> anyhow::Result<&'a str> {
+    crate::parseopt::get_arg(args, i, crate::parseopt::OptName::typed(tok))
+}
+
+/// [`take_value`] as a plain read at `i`, for the loops that peek at the next
+/// argument and then step onto it rather than past it. See
+/// [`crate::parseopt::value_at`].
+pub(crate) fn value_at<'a>(
+    args: &'a [String],
+    i: usize,
+    tok: &str,
+) -> anyhow::Result<&'a str> {
+    crate::parseopt::value_at(args, i, crate::parseopt::OptName::typed(tok))
 }
 
 /// `parse-options`' answer to `-h`: the command's usage block on **stdout**,
@@ -454,19 +480,11 @@ pub(crate) fn ambiguous_option(
 /// `get_arg()` returns for a missing value, and what a rejecting callback returns
 /// — prints its own line and *no* block, so a bad value for a known option looks
 /// nothing like an unknown option.
+///
+/// The rendering lives in [`crate::parseopt::unknown_option`], next to the
+/// `PARSE_OPT_ERROR` shapes it must stay distinguishable from.
 pub(crate) fn unknown_option(tok: &str, usage: &str) -> std::process::ExitCode {
-    match tok.strip_prefix("--") {
-        Some(body) => eprintln!("error: unknown option `{body}'"),
-        None => {
-            let c = tok[1..].chars().next().unwrap_or('-');
-            match c.is_ascii() {
-                true => eprintln!("error: unknown switch `{c}'"),
-                false => eprintln!("error: unknown non-ascii option in string: `{tok}'"),
-            }
-        }
-    }
-    eprint!("{usage}");
-    std::process::ExitCode::from(129)
+    crate::parseopt::unknown_option(tok, usage)
 }
 
 mod add;
@@ -498,7 +516,7 @@ mod cherry_pick;
 mod clean;
 mod clone;
 pub(crate) mod color;
-mod column;
+pub(crate) mod column;
 mod commit;
 mod commit_graph;
 mod commit_tree;
@@ -649,6 +667,7 @@ mod shortlog;
 /// git's history simplification (`revision.c`); not a subcommand.
 mod simplify;
 mod convert_to_git;
+mod pretty_formats;
 mod pretty_pad;
 mod show;
 mod show_branch;

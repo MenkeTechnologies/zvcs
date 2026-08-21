@@ -451,7 +451,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "--with" => contains = Some(optarg(args, &mut i)),
             "--without" => no_contains = Some(optarg(args, &mut i)),
             "-s" | "--sign" => sign = Some(true),
-            "-u" | "--local-user" => keyid = Some(take_value(args, &mut i, a)?.to_string()),
+            "-u" | "--local-user" => keyid = Some(super::take_value(args, &mut i, a)?.to_string()),
             "-e" | "--edit" => edit_flag = true,
             "-n" => lines = Some(1),
             "--points-at" => points_at = Some(optarg(args, &mut i)),
@@ -463,15 +463,15 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 if let Some(rest) = a.strip_prefix("--sort=") {
                     sorts.push(rest.to_string());
                 } else if a == "--sort" {
-                    sorts.push(take_value(args, &mut i, a)?.to_string());
+                    sorts.push(super::take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--format=") {
                     format = Some(rest.to_string());
                 } else if a == "--format" {
-                    format = Some(take_value(args, &mut i, a)?.to_string());
+                    format = Some(super::take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--cleanup=") {
                     cleanup = Some(rest.to_string());
                 } else if a == "--cleanup" {
-                    cleanup = Some(take_value(args, &mut i, a)?.to_string());
+                    cleanup = Some(super::take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--column=") {
                     super::column::parseopt_column(&mut colopts, Some(rest), false)
                         .map_err(|m| anyhow!("{m}"))?;
@@ -494,17 +494,17 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 } else if let Some(rest) = a.strip_prefix("--trailer=") {
                     trailers.push(rest.to_string());
                 } else if a == "--trailer" {
-                    trailers.push(take_value(args, &mut i, a)?.to_string());
+                    trailers.push(super::take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--message=") {
                     messages.push(rest.as_bytes().to_vec());
                 } else if a == "--message" || a == "-m" {
-                    messages.push(take_value(args, &mut i, a)?.as_bytes().to_vec());
+                    messages.push(super::take_value(args, &mut i, a)?.as_bytes().to_vec());
                 } else if let Some(rest) = a.strip_prefix("-m") {
                     messages.push(rest.as_bytes().to_vec());
                 } else if let Some(rest) = a.strip_prefix("--file=") {
                     message_file = Some(rest.to_string());
                 } else if a == "--file" || a == "-F" {
-                    message_file = Some(take_value(args, &mut i, a)?.to_string());
+                    message_file = Some(super::take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("-F") {
                     message_file = Some(rest.to_string());
                 // `-u<key-id>` and `--local-user=<key-id>`: an `OPT_STRING` takes
@@ -531,33 +531,42 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                     eprint!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 } else if let Some(rest) = a.strip_prefix("-n") {
-                    let n: usize = rest
-                        .parse()
-                        .map_err(|_| anyhow!("unsupported option {a:?}"))?;
-                    lines = Some(n);
-                } else if a.len() > 2
-                    && !a.starts_with("--")
-                    && a[1..2].chars().all(|c| "fadlisev".contains(c))
-                {
-                    // Bundled short flags, e.g. `-fam <msg>` = `-f -a -m <msg>`.
-                    // git's parse-options treats each char as its own option; a
-                    // value-taking one (`-m`/`-F`/`-u`/`-n`) consumes the rest of
-                    // the cluster, or the next argv element when it ends the
-                    // cluster.
-                    let cluster: Vec<char> = a[1..].chars().collect();
-                    let mut ci = 0;
-                    while ci < cluster.len() {
+                    lines = Some(tag_lines(rest)?);
+                } else if !a.starts_with("--") {
+                    // `parse_short_opt()` (parse-options.c:426-461) driven from
+                    // `parse_options_step()`'s cluster loop (:1061-1107): every
+                    // character of a `-<chars>` token is its own option, and a
+                    // value-taking one swallows the rest of the cluster — or, when
+                    // it ends the cluster, the next argv element. So `-fam <msg>`
+                    // is `-f -a -m <msg>`.
+                    //
+                    // The character parsing stops at is what a refusal names, not
+                    // the one the token began with, because the C rewrites
+                    // `argv[0]` before reporting:
+                    //
+                    // ```c
+                    //         ctx->argv[0] = xstrdup(ctx->opt - 1);
+                    //         *(char *)ctx->argv[0] = '-';
+                    //         goto unknown;
+                    // ```
+                    //
+                    // (parse-options.c:1095-1097). `git tag -aé` therefore says
+                    // ``unknown non-ascii option in string: `-é'`` and not `-aé`.
+                    // Walking `char_indices()` rather than byte slices is what
+                    // keeps a multi-byte character from splitting mid-codepoint;
+                    // the old `a[1..2]` gate panicked on exactly that input.
+                    for (off, c) in a.char_indices().skip(1) {
                         // The one-character spelling parse-options would name in a
                         // cmdmode conflict, since only the cluster knows it.
-                        let short = format!("-{}", cluster[ci]);
-                        match cluster[ci] {
+                        let short = format!("-{c}");
+                        match c {
                             'f' => force = true,
                             'a' => annotate = true,
                             'i' => ignore_case = true,
                             's' => sign = Some(true),
                             'e' => edit_flag = true,
                             'd' | 'l' | 'v' => {
-                                let mode = match cluster[ci] {
+                                let mode = match c {
                                     'd' => CmdMode::Delete,
                                     'l' => CmdMode::List,
                                     _ => CmdMode::Verify,
@@ -568,31 +577,41 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                                     return Ok(code);
                                 }
                             }
-                            c @ ('m' | 'F' | 'u' | 'n') => {
-                                let rest: String = cluster[ci + 1..].iter().collect();
-                                let val = if rest.is_empty() {
-                                    take_value(args, &mut i, &short)?.to_string()
-                                } else {
-                                    rest
+                            // `-n` is `OPTION_INTEGER` with `PARSE_OPT_OPTARG`, so
+                            // it never reaches for the next argv element: `!p->opt`
+                            // means "no attached value" and takes `defval`. That is
+                            // why `git tag -ln` lists with one line each instead of
+                            // complaining that `-n` wants a value.
+                            'n' => {
+                                lines = Some(tag_lines(&a[off + c.len_utf8()..])?);
+                                break;
+                            }
+                            c @ ('m' | 'F' | 'u') => {
+                                let rest = &a[off + c.len_utf8()..];
+                                let val = match rest.is_empty() {
+                                    true => crate::parseopt::get_arg(
+                                        args,
+                                        &mut i,
+                                        crate::parseopt::OptName::Short(c),
+                                    )?
+                                    .to_string(),
+                                    false => rest.to_string(),
                                 };
                                 match c {
                                     'm' => messages.push(val.into_bytes()),
                                     'F' => message_file = Some(val),
-                                    'u' => keyid = Some(val),
-                                    _ => {
-                                        lines = Some(if val.is_empty() {
-                                            1
-                                        } else {
-                                            val.parse()
-                                                .map_err(|_| anyhow!("unsupported option {a:?}"))?
-                                        })
-                                    }
+                                    _ => keyid = Some(val),
                                 }
                                 break; // the value flag consumed the rest of the cluster
                             }
-                            _ => bail!("unsupported option {a:?}"),
+                            // `if (internal_help && *ctx->opt == 'h') goto show_usage`
+                            // (parse-options.c:1087-1088): a cluster asks for help
+                            // exactly when the first character the table does *not*
+                            // define is `h`, so `git tag -fh` prints the block on
+                            // stdout while `git tag -Zh` reports `Z`.
+                            'h' => return Ok(super::show_usage(USAGE)),
+                            _ => return Ok(super::unknown_option(&format!("-{}", &a[off..]), USAGE)),
                         }
-                        ci += 1;
                     }
                 } else {
                     bail!("unsupported option {a:?}")
@@ -984,38 +1003,38 @@ fn verify_tags(
 /// separated argument, when present, is consumed unconditionally; otherwise the
 /// option defaults to `HEAD`.
 fn optarg(args: &[String], i: &mut usize) -> String {
-    match args.get(*i) {
-        Some(v) => {
-            *i += 1;
-            v.clone()
-        }
-        None => "HEAD".to_string(),
-    }
+    crate::parseopt::get_arg_lastarg(args, i, "HEAD").to_string()
 }
 
-/// Consume the value of a separated long/short option, or report the way
-/// `parse_options()` does when the value is missing.
+/// `-n[<num>]`'s value.
 ///
 /// ```c
-/// if (!p->argc)
-///         return error(_("%s requires a value"), optnamearg(opt, NULL, flags));
+/// { .type = OPTION_INTEGER, .short_name = 'n', .value = &filter.lines,
+///   .precision = sizeof(filter.lines), .argh = N_("n"),
+///   .help = N_("print <n> lines of each tag message"),
+///   .flags = PARSE_OPT_OPTARG, .defval = 1 },
 /// ```
-/// (parse-options.c:126-127). `optnamearg()` renders a long option as
-/// ``option `name'`` and a short one as ``switch `c'``, and the `error()` return
-/// takes `parse_options()` straight to `exit(129)` — with **no** usage block after
-/// it, unlike an unknown option. `flag` is therefore the spelling as typed, dashes
-/// and all, which is the only thing that distinguishes the two wordings.
-fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str> {
-    let Some(v) = args.get(*i) else {
-        let (kind, name) = match flag.strip_prefix("--") {
-            Some(long) => ("option", long),
-            None => ("switch", flag.trim_start_matches('-')),
-        };
-        eprintln!("error: {kind} `{name}' requires a value");
-        return Err(anyhow::Error::new(crate::fatal::Silent(129)));
-    };
-    *i += 1;
-    Ok(v.as_str())
+/// (builtin/tag.c's `options[]`). Two consequences the plain `str::parse` this
+/// replaced got wrong: an empty `rest` is `PARSE_OPT_OPTARG`'s "no attached
+/// value" and takes `defval`, so `git tag -ln` lists rather than refusing; and a
+/// value that is not a number is `git_parse_signed()`'s complaint, named for the
+/// *switch*, with no usage block behind it — not a `zvcs:` gap message at exit 1.
+///
+/// The base-0 grammar comes with it, so `-n0x2` is two lines the way stock reads
+/// it. A negative value is accepted by parse-options (it is inside an `int`'s
+/// range) and is meaningless downstream, so it clamps to zero here rather than
+/// wrapping into a huge `usize`.
+fn tag_lines(rest: &str) -> Result<usize> {
+    if rest.is_empty() {
+        return Ok(1);
+    }
+    match crate::optint::integer(&crate::optint::short_opt('n'), rest) {
+        Ok(n) => Ok(n.max(0) as usize),
+        Err(e) => {
+            eprintln!("error: {e}");
+            Err(crate::parseopt::silent(crate::parseopt::USAGE_ERROR))
+        }
+    }
 }
 
 

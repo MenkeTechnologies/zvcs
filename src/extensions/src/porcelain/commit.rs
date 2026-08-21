@@ -815,68 +815,43 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if args[i] == "--help-all" {
             return Ok(super::show_usage(USAGE_ALL));
         }
+        // `at` is this argument's own index; `i` steps past it here so that it is
+        // already `parse_opt_ctx_t`'s "next unread argument" and the shared port
+        // of `get_arg()` can advance it over a value. Every value-taking option
+        // below used to read `args.get(i)` after its own `i += 1` and word its
+        // own refusal, which is how they ended up saying ``option `-m'`` where
+        // stock says ``switch `m'``.
+        let at = i;
+        i += 1;
         // Respell a unique abbreviation as the name it resolves to, ahead of both
         // the shared value-option handler and the match below, so `--allow-empty-m`
         // reaches the same arm as `--allow-empty-message`.
         let canonical;
-        let a = match super::canonical_long(args[i].as_str(), LONG_OPTS) {
+        let a = match super::canonical_long(args[at].as_str(), LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;
                 canonical.as_ref()
             }
             super::Long::Ambiguous(first, second) => {
-                return Ok(super::ambiguous_option(&args[i], &first, &second, USAGE))
+                return Ok(super::ambiguous_option(&args[at], &first, &second, USAGE))
             }
         };
         match patch_opts.take_arg(a) {
             Err(code) => return Ok(code),
-            Ok(true) => {
-                i += 1;
-                continue;
-            }
+            Ok(true) => continue,
             Ok(false) => {}
         }
         match a {
-            "-m" | "--message" => {
-                i += 1;
-                let m = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?;
-                messages.push(m.clone());
-            }
-            "-F" | "--file" => {
-                i += 1;
-                file_args.push(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?
-                        .clone(),
-                );
-            }
+            "-m" | "--message" => messages.push(super::take_value(args, &mut i, a)?.to_string()),
+            "-F" | "--file" => file_args.push(super::take_value(args, &mut i, a)?.to_string()),
             "-C" | "--reuse-message" => {
-                i += 1;
-                reuse_arg = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?
-                        .clone(),
-                );
+                reuse_arg = Some(super::take_value(args, &mut i, a)?.to_string())
             }
             "-c" | "--reedit-message" => {
-                i += 1;
-                reuse_arg = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?
-                        .clone(),
-                );
+                reuse_arg = Some(super::take_value(args, &mut i, a)?.to_string());
                 reedit = true;
             }
-            "--date" => {
-                i += 1;
-                date_arg = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `--date` requires a value"))?
-                        .clone(),
-                );
-            }
+            "--date" => date_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
             s if s.starts_with("--file=") => file_args.push(s["--file=".len()..].to_string()),
             s if s.starts_with("--reuse-message=") => {
                 reuse_arg = Some(s["--reuse-message=".len()..].to_string())
@@ -923,22 +898,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--verify" => verify = true,
             "-s" | "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
-            "--squash" => {
-                i += 1;
-                squash_arg = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `--squash` requires a value"))?
-                        .clone(),
-                );
-            }
-            "--fixup" => {
-                i += 1;
-                fixup_arg = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `--fixup` requires a value"))?
-                        .clone(),
-                );
-            }
+            "--squash" => squash_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
+            "--fixup" => fixup_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
             s if s.starts_with("--squash=") => {
                 squash_arg = Some(s["--squash=".len()..].to_string())
             }
@@ -954,14 +915,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "-e" | "--edit" => edit_flag = Some(true),
             "--no-edit" => edit_flag = Some(false),
             "--reset-author" => reset_author = true,
-            "--author" => {
-                i += 1;
-                author_arg = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `--author` requires a value"))?
-                        .clone(),
-                );
-            }
+            "--author" => author_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
             s if s.starts_with("--author=") => {
                 author_arg = Some(s["--author=".len()..].to_string())
             }
@@ -987,7 +941,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
             "-z" | "--null" => null_term = true,
             "--no-null" => null_term = false,
-            "-b" | "--branch" => branch_header = Some(true),
+            // `--branch` has no short name in `builtin_commit_options`; `-b` used
+            // to be accepted here and silently ran the commit, where stock refuses
+            // it with ``unknown switch `b'``.
+            "--branch" => branch_header = Some(true),
             "--no-branch" => branch_header = Some(false),
             "--ahead-behind" => ahead_behind = Some(true),
             "--no-ahead-behind" => ahead_behind = Some(false),
@@ -1010,14 +967,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--interactive" => interactive = true,
             "--no-interactive" => interactive = false,
             "--pathspec-from-file" => {
-                i += 1;
-                pathspec_from_file = Some(
-                    args.get(i)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("option `--pathspec-from-file` requires a value")
-                        })?
-                        .clone(),
-                );
+                pathspec_from_file = Some(super::take_value(args, &mut i, a)?.to_string())
             }
             s if s.starts_with("--pathspec-from-file=") => {
                 pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string())
@@ -1026,38 +976,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             // --- message shaping -----------------------------------------------
-            "--cleanup" => {
-                i += 1;
-                cleanup_arg = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `--cleanup` requires a value"))?
-                        .clone(),
-                );
-            }
+            "--cleanup" => cleanup_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
             s if s.starts_with("--cleanup=") => {
                 cleanup_arg = Some(s["--cleanup=".len()..].to_string())
             }
             "--no-cleanup" => cleanup_arg = None,
-            "--trailer" => {
-                i += 1;
-                trailer_args.push(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `--trailer` requires a value"))?
-                        .clone(),
-                );
-            }
+            "--trailer" => trailer_args.push(super::take_value(args, &mut i, a)?.to_string()),
             s if s.starts_with("--trailer=") => {
                 trailer_args.push(s["--trailer=".len()..].to_string())
             }
             "--no-trailer" => trailer_args.clear(),
-            "-t" | "--template" => {
-                i += 1;
-                template_arg = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("option `--template` requires a value"))?
-                        .clone(),
-                );
-            }
+            "-t" | "--template" => template_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
             s if s.starts_with("--template=") => {
                 template_arg = Some(s["--template=".len()..].to_string())
             }
@@ -1089,7 +1018,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             // or the next argv element when the cluster ends there.
             s if s.len() > 1 && s.starts_with('-') => {
                 let cluster = &s[1..];
-                for (at, c) in cluster.char_indices() {
+                for (off, c) in cluster.char_indices() {
                     match c {
                         'a' => all = true,
                         'q' => quiet = true,
@@ -1101,11 +1030,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                         'i' => include_flag = true,
                         'p' => patch_interactive = true,
                         'z' => null_term = true,
-                        'b' => branch_header = Some(true),
                         // Optional-value short flags: bare in a cluster they take
                         // their default, an attached value ends the cluster.
                         'u' | 'S' => {
-                            let rest = &cluster[at + c.len_utf8()..];
+                            let rest = &cluster[off + c.len_utf8()..];
                             match c {
                                 'u' => {
                                     untracked_arg = Some(if rest.is_empty() {
@@ -1127,16 +1055,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                         'm' | 'F' | 'C' | 'c' | 't' => {
                             // Value-taking flags consume the rest of the cluster,
                             // else the next argv element. `-c` also sets reedit.
-                            let rest = &cluster[at + c.len_utf8()..];
-                            let val = if rest.is_empty() {
-                                i += 1;
-                                args.get(i)
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("option `-{c}` requires a value")
-                                    })?
-                                    .clone()
-                            } else {
-                                rest.to_string()
+                            let rest = &cluster[off + c.len_utf8()..];
+                            let val = match rest.is_empty() {
+                                // `optname(opt, OPT_SHORT)`: the character, not
+                                // the token — ``switch `m'``, never ``option `-m'``.
+                                true => crate::parseopt::get_arg(
+                                    args,
+                                    &mut i,
+                                    crate::parseopt::OptName::Short(c),
+                                )?
+                                .to_string(),
+                                false => rest.to_string(),
                             };
                             match c {
                                 'm' => messages.push(val),
@@ -1155,14 +1084,22 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                         // short-option loop, so `-h` answers wherever it lands
                         // in a cluster — on stdout at 129, with no `error:` line.
                         'h' => return Ok(super::show_usage(USAGE)),
-                        _ => return Err(usage_error(format!("unknown switch `{c}'"))),
+                        // `PARSE_OPT_UNKNOWN` for the character parsing stopped
+                        // at, against the synthetic `-<rest>` token the C builds
+                        // at parse-options.c:1095 — which also carries the
+                        // non-ASCII case, where git names the whole token.
+                        _ => {
+                            return Ok(super::unknown_option(
+                                &format!("-{}", &cluster[off..]),
+                                USAGE,
+                            ))
+                        }
                     }
                 }
             }
             // A bare positional argument is a pathspec (git's `--only` mode).
-            _ => pathspecs.push(args[i].clone()),
+            _ => pathspecs.push(args[at].clone()),
         }
-        i += 1;
     }
 
     // --- option validation (git's `parse_and_validate_options`) ----------

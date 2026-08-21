@@ -241,22 +241,19 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            // `optname()` follows the spelling that was typed, so the long form
+            // reports ``option `message'`` — hard-coding the short wording made
+            // `git fmt-merge-msg --message` say ``switch `m'``.
             "-m" | "--message" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
-                    return Ok(usage_error("switch `m' requires a value"));
-                };
-                message = Some(v.clone());
+                message = Some(super::value_at(args, i, a)?.to_string());
             }
             "--no-message" => message = None,
             _ if a.starts_with("--message=") => message = Some(a["--message=".len()..].into()),
             _ if a.starts_with("-m") && a.len() > 2 => message = Some(a[2..].into()),
             "--into-name" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
-                    return Ok(usage_error("option `into-name' requires a value"));
-                };
-                into_name = Some(v.clone());
+                into_name = Some(super::value_at(args, i, a)?.to_string());
             }
             "--no-into-name" => into_name = None,
             _ if a.starts_with("--into-name=") => {
@@ -264,10 +261,7 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
             }
             "-F" | "--file" => {
                 i += 1;
-                let Some(v) = args.get(i) else {
-                    return Ok(usage_error("switch `F' requires a value"));
-                };
-                inpath = Some(v.clone());
+                inpath = Some(super::value_at(args, i, a)?.to_string());
             }
             // Accepted, and deliberately inert: `OPTION_FILENAME` does not clear
             // the value on the negated form, so a preceding `--file` survives.

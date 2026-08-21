@@ -482,8 +482,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut ctx: u32 = 3;
     let mut ws = super::diff::Whitespace::Keep;
     let mut func_context = false;
-    let mut src_prefix = b"a/".to_vec();
-    let mut dst_prefix = b"b/".to_vec();
+    // `options->a_prefix` / `options->b_prefix` as the *command line* left them.
+    // git fills these in `diff_setup()` before `parse_options()` runs and the four
+    // prefix flags then overwrite them; this port parses the command line before it
+    // can read config, so the flag's opinion is kept apart here and merged over the
+    // configured value below, which restores git's precedence.
+    let mut flag_src_prefix: Option<Vec<u8>> = None;
+    let mut flag_dst_prefix: Option<Vec<u8>> = None;
     // `options->abbrev` starts at `DEFAULT_ABBREV`, which is the `core.abbrev`
     // git read at startup; `None` here stands for that deferred value, resolved
     // below once it is known whether a repository was found.
@@ -713,13 +718,19 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                     Err(code) => return Ok(code),
                 }
             }
+            // `diff_set_noprefix()` (diff.c:3728-3731): both slots become the empty
+            // string, which is an assignment — so `--no-prefix` also shuts out the
+            // mnemonic fill below.
             "--no-prefix" => {
-                src_prefix.clear();
-                dst_prefix.clear();
+                flag_src_prefix = Some(Vec::new());
+                flag_dst_prefix = Some(Vec::new());
             }
+            // `diff_opt_default_prefix()` (diff.c:5785-5796) frees the configured
+            // prefixes before installing `a/`/`b/`, so it ignores `diff.srcPrefix`
+            // and `diff.dstPrefix` as well as `diff.mnemonicPrefix`.
             "--default-prefix" => {
-                src_prefix = b"a/".to_vec();
-                dst_prefix = b"b/".to_vec();
+                flag_src_prefix = Some(b"a/".to_vec());
+                flag_dst_prefix = Some(b"b/".to_vec());
             }
             "--color" => color_when = Some(diff_color::ColorWhen::Always),
             "--no-color" => color_when = Some(diff_color::ColorWhen::Never),
@@ -732,11 +743,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                     }
                 }
             }
+            // `OPT_STRING_F(0, "src-prefix", &options->a_prefix, …)` (diff.c:6106-6110):
+            // one slot each, so the other side is still free for the mnemonic fill.
             s if s.starts_with("--src-prefix=") => {
-                src_prefix = s.as_bytes()["--src-prefix=".len()..].to_vec();
+                flag_src_prefix = Some(s.as_bytes()["--src-prefix=".len()..].to_vec());
             }
             s if s.starts_with("--dst-prefix=") => {
-                dst_prefix = s.as_bytes()["--dst-prefix=".len()..].to_vec();
+                flag_dst_prefix = Some(s.as_bytes()["--dst-prefix=".len()..].to_vec());
             }
             s if s.starts_with("-U") || s.starts_with("--unified=") => {
                 let val = s.strip_prefix("--unified=").unwrap_or(&s[2..]);
@@ -869,6 +882,57 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             let v = explicit.unwrap_or(default_abbrev);
             (v, v)
         }
+    };
+    // `diff_setup()`'s prefix decision (diff.c:5149-5153), then the command line on
+    // top of it, then `builtin_diff_no_index()`'s own
+    // `diff_set_mnemonic_prefix(&revs->diffopt, "1/", "2/")` (diff-no-index.c:425),
+    // and finally `builtin_diff()`'s `a/`/`b/` (diff.c:3838).
+    //
+    // The keys reach a no-index comparison the same way `diff.algorithm` does:
+    // `git_diff_ui_config()` has already run by the time `diff_no_index()` is
+    // called. Without a repository there is no config and the statics keep their
+    // zero values, which is the plain `a/`/`b/` pair.
+    //
+    // Read back from stock git 2.55.0 on a repository with the key set:
+    // `diff --no-index a b` is `1/a` vs `2/b`; `--src-prefix=S/` makes it `S/a` vs
+    // `2/b`; `-R` prints `2/b` against `1/a`; and `diff.noPrefix` still wins.
+    let (mut src_prefix, mut dst_prefix) = {
+        // `git_diff_ui_config()` has already run whether or not a repository was
+        // found: without one the cascade is still system + `~/.gitconfig` +
+        // `GIT_CONFIG_*`, so `git -c diff.mnemonicPrefix=true diff --no-index a b`
+        // prints `1/`/`2/` from anywhere on the filesystem.
+        let cfg: gix::config::File = match &repo {
+            Some(repo) => repo.config_snapshot().plumbing().clone(),
+            None => crate::config::global_config(),
+        };
+        let flag = |key: &str| cfg.boolean(key).ok().flatten() == Some(true);
+        let text = |key: &str| cfg.string(key).map(Vec::from);
+        let (no_prefix, mnemonic, cfg_src, cfg_dst) = (
+            flag("diff.noPrefix"),
+            flag("diff.mnemonicPrefix"),
+            text("diff.srcPrefix"),
+            text("diff.dstPrefix"),
+        );
+        let (mut a, mut b): (Option<Vec<u8>>, Option<Vec<u8>>) = if no_prefix {
+            (Some(Vec::new()), Some(Vec::new()))
+        } else if !mnemonic {
+            (
+                Some(cfg_src.unwrap_or_else(|| b"a/".to_vec())),
+                Some(cfg_dst.unwrap_or_else(|| b"b/".to_vec())),
+            )
+        } else {
+            (None, None)
+        };
+        if let Some(p) = flag_src_prefix {
+            a = Some(p);
+        }
+        if let Some(p) = flag_dst_prefix {
+            b = Some(p);
+        }
+        (
+            a.unwrap_or_else(|| b"1/".to_vec()),
+            b.unwrap_or_else(|| b"2/".to_vec()),
+        )
     };
     // `builtin_diff()`: `a_prefix = o->b_prefix; b_prefix = o->a_prefix` under
     // `-R` (diff.c:3862-3868). The exchange is of whatever the two prefixes ended

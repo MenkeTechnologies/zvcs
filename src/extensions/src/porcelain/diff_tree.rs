@@ -770,18 +770,27 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 // it is recorded like any other unsupported option.
                 _ if a.starts_with("--format=") || a.starts_with("--pretty=") => {
                     let v = a.split_once('=').map(|(_, r)| r).unwrap_or("");
-                    if !valid_pretty_format(v) {
-                        eprintln!("fatal: invalid --pretty format: {v}");
-                        return Ok(ExitCode::from(FATAL));
-                    }
                     // A name this port can render becomes the verbose header; one it
                     // only *validates* stays recorded as unsupported, so the run still
-                    // refuses rather than printing the wrong bytes.
-                    match super::log::get_commit_format(v) {
+                    // refuses rather than printing the wrong bytes. `Ok(None)` is the
+                    // name `find_commit_format()` could not place, and the `Fatal`
+                    // inside an `Err` is the `pretty.<name>` alias loop — both are
+                    // git's own `die()`, told apart from this port's "cannot render".
+                    match super::log::get_commit_format(Some(&repo), v) {
                         Ok(Some((fmt, _))) => opts.pretty = Some(std::rc::Rc::new(fmt)),
-                        _ => {
-                            unsupported.get_or_insert_with(|| a.to_string());
+                        Ok(None) => {
+                            eprintln!("fatal: invalid --pretty format: {v}");
+                            return Ok(ExitCode::from(FATAL));
                         }
+                        Err(e) => match e.downcast_ref::<crate::fatal::Fatal>() {
+                            Some(f) => {
+                                eprintln!("fatal: {}", f.0);
+                                return Ok(ExitCode::from(FATAL));
+                            }
+                            None => {
+                                unsupported.get_or_insert_with(|| a.to_string());
+                            }
+                        },
                     }
                 }
                 // git parses `--expand-tabs=<n>` at option time as a base-10 integer
@@ -1245,15 +1254,37 @@ fn emit_commit_header(
         return Ok(());
     };
     let oneline = matches!(pretty, super::log::Pretty::Oneline);
-    if !oneline {
-        out.extend_from_slice(b"commit ");
+    // ```c
+    // } else if (opt->commit_format != CMIT_FMT_USERFORMAT) {
+    //         …
+    //         if (opt->commit_format != CMIT_FMT_ONELINE)
+    //                 fputs("commit ", opt->diffopt.file);
+    //         …
+    //         fputs(repo_find_unique_abbrev(the_repository, &commit->object.oid,
+    //                                       abbrev_commit), opt->diffopt.file);
+    // ```
+    //
+    // (log-tree.c:811-820.) The object name is *inside* that branch, so a user
+    // format prints neither the `commit ` prefix nor the name — only its own
+    // expansion. `reference` is one of those: `builtin_formats[]` gives it
+    // `CMIT_FMT_USERFORMAT` with the stored format `%C(auto)%h (%s, %ad)`
+    // (pretty.c:131-132).
+    let user_format = matches!(
+        pretty,
+        super::log::Pretty::User(_) | super::log::Pretty::Reference
+    );
+    if !user_format {
+        if !oneline {
+            out.extend_from_slice(b"commit ");
+        }
+        out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
+        // git separates the object name from a oneline body with a space and from
+        // every other body with the line terminator.
+        out.push(if oneline { b' ' } else { term });
     }
-    out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
-    // git separates the object name from a oneline body with a space and from every
-    // other body with the line terminator.
-    out.push(if oneline { b' ' } else { term });
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
     let body = super::log::rev_list_pretty_body(repo, &commit, pretty)?;
+    let empty_format = user_format && body.is_empty();
     if !body.is_empty() {
         out.extend_from_slice(&body);
         // `pp_remainder()` already terminates every multi-line format's last message
@@ -1266,7 +1297,10 @@ fn emit_commit_header(
     // log-tree.c:941 — "an extra newline between the end of log and the diff/diffstat
     // output for readability", suppressed for `oneline` and for `-s`, which selects
     // `DIFF_FORMAT_NO_OUTPUT` and so leaves nothing for the blank line to separate.
-    if opts.format != Format::NoOutput && !oneline {
+    //
+    // `!commit_format_is_empty(opt->commit_format)` (log-tree.c:945) drops it for the
+    // empty user format too — `--pretty=` prints nothing at all before the raw record.
+    if opts.format != Format::NoOutput && !oneline && !empty_format {
         out.extend_from_slice(&opts.line_prefix);
         // With both a diffstat and a patch requested the separator is a `---` line
         // rather than an empty one.
@@ -1447,37 +1481,6 @@ pub(crate) fn parse_nonneg_int(s: &str) -> Option<i64> {
     }
     let val = if neg { -val } else { val };
     (val >= 0).then_some(val)
-}
-
-/// git's `get_commit_format` accept/reject decision for a `--pretty`/`--format`
-/// value. Accepted: the empty string (the default format), any custom format (a
-/// `format:`/`tformat:` prefix or a string containing `%`), and any case-insensitive
-/// prefix of a built-in format name. Everything else is what git rejects with
-/// `die("invalid --pretty format: <arg>")`; the caller reproduces that fatal.
-///
-/// The built-in names and the prefix matching were both confirmed against stock git
-/// 2.55: `--format=med` resolves (`medium`), `--format=Full` resolves case-blind,
-/// while `auto`, `default`, `onelineX` and a leading-space value are rejected.
-fn valid_pretty_format(v: &str) -> bool {
-    const PRESETS: &[&str] = &[
-        "oneline",
-        "short",
-        "medium",
-        "full",
-        "fuller",
-        "reference",
-        "email",
-        "raw",
-        "mboxrd",
-    ];
-    if v.is_empty() || v.contains('%') {
-        return true;
-    }
-    if v.starts_with("format:") || v.starts_with("tformat:") {
-        return true;
-    }
-    let lower = v.to_ascii_lowercase();
-    PRESETS.iter().any(|p| p.starts_with(&lower))
 }
 
 /// Options stock git's `diff-tree` accepts that only steer patch or stat rendering.

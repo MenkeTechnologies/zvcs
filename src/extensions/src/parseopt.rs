@@ -252,6 +252,261 @@ pub fn pathspec_tail_or_die(tail: &[String]) -> Result<Vec<String>, ExitCode> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// parse-options.c's error vocabulary
+// ---------------------------------------------------------------------------
+//
+// git has exactly four things to say about a malformed option, and it says them
+// in exactly two shapes. Which shape a command uses is not a style choice: it is
+// decided by which `enum parse_opt_result` reached `parse_options()`, and the
+// two differ in whether the usage block follows and therefore in how much a
+// caller's stderr grows.
+//
+// ```c
+//         switch (parse_options_step(&ctx, options, usagestr)) {
+//         case PARSE_OPT_HELP:
+//         case PARSE_OPT_ERROR:
+//                 exit(129);
+//         ...
+//         case PARSE_OPT_UNKNOWN:
+//                 if (ctx.argv[0][1] == '-') {
+//                         error(_("unknown option `%s'"), ctx.argv[0] + 2);
+//                 } else if (isascii(*ctx.opt)) {
+//                         error(_("unknown switch `%c'"), *ctx.opt);
+//                 } else {
+//                         error(_("unknown non-ascii option in string: `%s'"),
+//                               ctx.argv[0]);
+//                 }
+//                 usage_with_options(usagestr, options);
+//         }
+// ```
+// (parse-options.c:1198-1224)
+//
+// `PARSE_OPT_ERROR` is what `get_arg()` returns for a missing value and what a
+// rejecting callback returns. It has already printed its own `error:` line, and
+// `parse_options()` does nothing but `exit(129)` — **no usage block**.
+// `PARSE_OPT_UNKNOWN` is the other shape: `parse_options()` prints the `error:`
+// line *itself* and then calls `usage_with_options()`, which renders the block on
+// stderr and exits 129. So `git commit -m` is one line and `git commit -b` is
+// eighty, and a port that appends the block to both — or to neither — is wrong in
+// a way scripts notice.
+
+/// `optname()` (parse-options.c:30-45): how parse-options names an option inside
+/// a diagnostic.
+///
+/// ```c
+/// static const char *optname(const struct option *opt, enum opt_parsed flags)
+/// {
+///         if (flags & OPT_SHORT)
+///                 strbuf_addf(&sb, "switch `%c'", opt->short_name);
+///         else if (flags & OPT_UNSET)
+///                 strbuf_addf(&sb, "option `no-%s'", opt->long_name);
+///         else if (flags == OPT_LONG)
+///                 strbuf_addf(&sb, "option `%s'", opt->long_name);
+/// ```
+///
+/// The distinction is the *spelling the user typed*, not the option's identity:
+/// `git commit -m` says ``switch `m'`` and `git commit --message` says
+/// ``option `message'`` even though both reach the same table entry. Naming a
+/// short option by its long name (or the reverse) is the single most common way
+/// this port used to diverge, which is why the choice is a type rather than a
+/// `format!`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptName<'a> {
+    /// `OPT_SHORT`: named by the one character the table matched.
+    Short(char),
+    /// `OPT_LONG`: named by `long_name`, without the leading `--`.
+    Long(&'a str),
+    /// `OPT_UNSET`: `long_name` with git's own `no-` glued back on. git builds
+    /// this from the table's stem, so a `--no-x` spelling of a `no-x` *entry*
+    /// still reports `no-x` and not `no-no-x`.
+    Unset(&'a str),
+}
+
+impl<'a> OptName<'a> {
+    /// The name for an option as the user spelled it on the command line.
+    ///
+    /// This is the mapping every ordinary call site wants, because `optname()`'s
+    /// `flags` argument is exactly `parse_short_opt()`'s `OPT_SHORT` versus
+    /// `parse_long_opt()`'s `OPT_LONG`/`OPT_UNSET` — i.e. which of the two
+    /// parsers saw the token. A `--no-<stem>` token arrives here as
+    /// `Long("no-<stem>")`, which renders identically to `Unset("<stem>")`; the
+    /// two variants differ only for a caller that holds the table entry rather
+    /// than the token.
+    ///
+    /// `tok` is the argument with its dashes: `-m`, `--message`, `--message=x`.
+    /// A value glued on with `=` is dropped, since git names the option and not
+    /// the assignment.
+    pub fn typed(tok: &'a str) -> OptName<'a> {
+        match tok.strip_prefix("--") {
+            Some(body) => OptName::Long(body.split_once('=').map_or(body, |(n, _)| n)),
+            // A cluster (`-fam`) is named by the character parsing stopped at,
+            // so a caller that has already split one out passes `-m`; passing
+            // the whole cluster names its first character, which is what
+            // `*ctx->opt` holds when the *first* character is the unknown one.
+            None => OptName::Short(tok.trim_start_matches('-').chars().next().unwrap_or('-')),
+        }
+    }
+}
+
+impl std::fmt::Display for OptName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OptName::Short(c) => write!(f, "switch `{c}'"),
+            OptName::Long(name) => write!(f, "option `{name}'"),
+            OptName::Unset(name) => write!(f, "option `no-{name}'"),
+        }
+    }
+}
+
+/// `get_arg()`'s refusal (parse-options.c:59-60), the `PARSE_OPT_ERROR` shape:
+/// one `error:` line on stderr, **no usage block**, exit 129.
+///
+/// ```c
+///         } else
+///                 return error(_("%s requires a value"), optname(opt, flags));
+/// ```
+pub fn requires_value(name: OptName<'_>) -> ExitCode {
+    eprintln!("error: {name} requires a value");
+    ExitCode::from(USAGE_ERROR)
+}
+
+/// `do_get_value()`'s two `takes no value` refusals (parse-options.c:138-143):
+/// an `=<value>` written on the `--no-` spelling of any option, or on an option
+/// carrying `PARSE_OPT_NOARG`. Same shape as [`requires_value`].
+pub fn takes_no_value(name: OptName<'_>) -> ExitCode {
+    eprintln!("error: {name} takes no value");
+    ExitCode::from(USAGE_ERROR)
+}
+
+/// `do_get_value()`'s `PARSE_OPT_NONEG` refusal (parse-options.c:140-141), for a
+/// `--no-` spelling the table forbids. Reachable only when the caller resolves
+/// the negation itself; [`crate::porcelain::resolve_long`] normally answers such
+/// a token with `Unknown` instead, which is the *other* shape.
+pub fn isnt_available(name: OptName<'_>) -> ExitCode {
+    eprintln!("error: {name} isn't available");
+    ExitCode::from(USAGE_ERROR)
+}
+
+/// `get_arg()` (parse-options.c:47-62) for a command that walks argv itself.
+///
+/// ```c
+/// static enum parse_opt_result get_arg(struct parse_opt_ctx_t *p,
+///                                      const struct option *opt,
+///                                      enum opt_parsed flags, const char **arg)
+/// {
+///         if (p->opt) {
+///                 *arg = p->opt;
+///                 p->opt = NULL;
+///         } else if (p->argc == 1 && (opt->flags & PARSE_OPT_LASTARG_DEFAULT)) {
+///                 *arg = (const char *)opt->defval;
+///         } else if (p->argc > 1) {
+///                 p->argc--;
+///                 *arg = *++p->argv;
+///         } else
+///                 return error(_("%s requires a value"), optname(opt, flags));
+///         return 0;
+/// }
+/// ```
+///
+/// `i` is the index of the *next* unread argument, i.e. the caller has already
+/// stepped past the option token; it is advanced past the value on success. The
+/// attached forms (`--opt=v`, `-mv`) correspond to `p->opt` being non-NULL and
+/// are the caller's to peel off before getting here, because only the caller
+/// knows how many characters of the token were the option's name.
+///
+/// The whole point is the failure branch. Reading the value as
+/// `args.get(i).map(String::as_str).unwrap_or("")` — which is what several verbs
+/// in this port used to do — turns "you forgot the value" into "the value is the
+/// empty string", so `git merge --cleanup` reported an invalid cleanup mode and
+/// `git add --pathspec-from-file` tried to open `''`. Both are `error: option
+/// `<name>' requires a value` and 129 in stock git, and neither ever reaches the
+/// command's own logic.
+pub fn get_arg<'a>(
+    args: &'a [String],
+    i: &mut usize,
+    name: OptName<'_>,
+) -> Result<&'a str, anyhow::Error> {
+    let value = value_at(args, *i, name)?;
+    *i += 1;
+    Ok(value)
+}
+
+/// [`get_arg`] as a plain read, for the argv loops that *peek* at the following
+/// argument and then step onto it rather than past it.
+///
+/// The two conventions are equally common in this port and neither is wrong;
+/// what matters is that both reach the same refusal, so a verb's wording does
+/// not depend on how its loop happens to count. `i` is the index the value is
+/// expected at and nothing is advanced.
+pub fn value_at<'a>(
+    args: &'a [String],
+    i: usize,
+    name: OptName<'_>,
+) -> Result<&'a str, anyhow::Error> {
+    match args.get(i) {
+        Some(v) => Ok(v.as_str()),
+        None => {
+            let _ = requires_value(name);
+            Err(silent(USAGE_ERROR))
+        }
+    }
+}
+
+/// `PARSE_OPT_LASTARG_DEFAULT` (parse-options.c:54-55): the option's built-in
+/// default when it is the *last* argument, and the next token otherwise —
+/// consumed unconditionally, whatever it looks like. `--contains`, `--merged`
+/// and `--points-at` are the family, all defaulting to `HEAD`.
+pub fn get_arg_lastarg<'a>(args: &'a [String], i: &mut usize, defval: &'a str) -> &'a str {
+    match args.get(*i) {
+        Some(v) => {
+            *i += 1;
+            v.as_str()
+        }
+        None => defval,
+    }
+}
+
+/// `PARSE_OPT_UNKNOWN` (parse-options.c:1214-1223): the `error:` line **and** the
+/// usage block, both on stderr, exit 129.
+///
+/// A long option is named without its `--` and *with* any `=<value>` still
+/// attached (`ctx.argv[0] + 2`); a short one is named by the single character
+/// parsing stopped at, however many were clustered behind it, and a non-ASCII
+/// byte is reported as the whole token. `tok` must therefore be the token as
+/// git would hold it at the point of failure: for a cluster whose *second*
+/// character is unknown, parse-options rewrites `ctx->argv[0]` to a synthetic
+/// `-<rest>` (parse-options.c:1095-1096) before jumping to `unknown:`, so a
+/// caller that splits clusters must pass `-<c><rest>` and not the original.
+pub fn unknown_option(tok: &str, usage: &str) -> ExitCode {
+    match tok.strip_prefix("--") {
+        Some(body) => eprintln!("error: unknown option `{body}'"),
+        None => {
+            let c = tok.trim_start_matches('-').chars().next().unwrap_or('-');
+            match c.is_ascii() {
+                true => eprintln!("error: unknown switch `{c}'"),
+                false => eprintln!("error: unknown non-ascii option in string: `{tok}'"),
+            }
+        }
+    }
+    eprint!("{usage}");
+    ExitCode::from(USAGE_ERROR)
+}
+
+/// An already-printed parse-options refusal as an error to return with `?`.
+///
+/// Every helper above has written its own stderr by the time it returns, so what
+/// unwinds must carry the exit code and nothing else — `run_command()` in
+/// `lib.rs` prints `zvcs: <verb>: …` for an ordinary `anyhow` error, which would
+/// both duplicate the message and replace 129 with 1.
+///
+/// It takes the raw status rather than an [`ExitCode`] because `ExitCode` has no
+/// accessor to read one back out of; the constructors above hand back `ExitCode`
+/// for the call sites that `return Ok(…)` it directly.
+pub fn silent(code: u8) -> anyhow::Error {
+    anyhow::Error::new(crate::fatal::Silent(code))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +637,67 @@ mod tests {
 
         let err = pathspec_tail(&v(&["*", "no/such/path"])).unwrap_err();
         assert!(err.starts_with("no/such/path: no such path in the working tree."), "{err}");
+    }
+
+    /// `optname()`'s three renderings, each measured off stock git 2.55.0:
+    /// `git commit -m`, `git commit --message`, `git branch --no-color=x`.
+    #[test]
+    fn optname_renders_the_spelling_that_was_typed() {
+        assert_eq!(OptName::Short('m').to_string(), "switch `m'");
+        assert_eq!(OptName::Long("message").to_string(), "option `message'");
+        assert_eq!(OptName::Unset("color").to_string(), "option `no-color'");
+        // The token's own dashes decide, and an `=<value>` is not part of the
+        // name — `--message=` reports `option `message'`, not `message=`.
+        assert_eq!(OptName::typed("-m"), OptName::Short('m'));
+        assert_eq!(OptName::typed("--message"), OptName::Long("message"));
+        assert_eq!(OptName::typed("--message=x"), OptName::Long("message"));
+        // A `--no-` token is named with its `no-`, which is the same text
+        // `Unset` produces from the stem.
+        assert_eq!(OptName::typed("--no-color").to_string(), "option `no-color'");
+        // A cluster is named by the character parsing stopped at; a caller that
+        // has not split one yet names its first.
+        assert_eq!(OptName::typed("-fam"), OptName::Short('f'));
+    }
+
+    /// `get_arg()`'s success path advances past the value, and its failure path
+    /// is a refusal rather than an empty string — the distinction that decides
+    /// whether `git merge --cleanup` reports a missing value or an invalid mode.
+    #[test]
+    fn get_arg_consumes_the_next_token_or_refuses() {
+        let args = v(&["--cleanup", "verbatim"]);
+        let mut i = 1;
+        assert_eq!(get_arg(&args, &mut i, OptName::Long("cleanup")).unwrap(), "verbatim");
+        assert_eq!(i, 2);
+
+        // A value that looks like another option is still the value: `get_arg()`
+        // reads `*++p->argv` without inspecting it.
+        let args = v(&["-m", "--amend"]);
+        let mut i = 1;
+        assert_eq!(get_arg(&args, &mut i, OptName::Short('m')).unwrap(), "--amend");
+
+        let args = v(&["--cleanup"]);
+        let mut i = 1;
+        let err = get_arg(&args, &mut i, OptName::Long("cleanup")).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::fatal::Silent>().expect("a printed refusal").0,
+            USAGE_ERROR
+        );
+        // The index must not move: nothing was consumed.
+        assert_eq!(i, 1);
+    }
+
+    /// `PARSE_OPT_LASTARG_DEFAULT` consumes whatever follows and falls back to
+    /// the option's default only when the option ends the command line.
+    #[test]
+    fn lastarg_default_takes_the_next_token_whatever_it_is() {
+        let args = v(&["--contains", "-x"]);
+        let mut i = 1;
+        assert_eq!(get_arg_lastarg(&args, &mut i, "HEAD"), "-x");
+        assert_eq!(i, 2);
+
+        let args = v(&["--contains"]);
+        let mut i = 1;
+        assert_eq!(get_arg_lastarg(&args, &mut i, "HEAD"), "HEAD");
+        assert_eq!(i, 1);
     }
 }

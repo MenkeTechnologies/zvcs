@@ -750,16 +750,23 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
+        // `at` is this argument's own index; `i` steps past it immediately, so it
+        // is already `parse_opt_ctx_t`'s "next unread argument" and `take_value`
+        // — the shared port of `get_arg()` — can advance it over a value without
+        // a second cursor. The two used to be one, and every value-taking option
+        // hand-rolled its own missing-value message as a result.
+        let at = i;
+        i += 1;
         // Respell a unique abbreviation as the name it resolves to, so `--allow-unre`
         // reaches the same arm as `--allow-unrelated-histories`.
         let canonical;
-        let a = match super::canonical_long(args[i].as_str(), LONG_OPTS) {
+        let a = match super::canonical_long(args[at].as_str(), LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;
                 canonical.as_ref()
             }
             super::Long::Ambiguous(first, second) => {
-                return Ok(super::ambiguous_option(&args[i], &first, &second, USAGE))
+                return Ok(super::ambiguous_option(&args[at], &first, &second, USAGE))
             }
         };
         match a {
@@ -794,14 +801,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // `--into-name <name>` / `--into-name=<name>`: override the merge
             // message's destination (port of git's `into_name`).
             "--into-name" => {
-                i += 1;
-                match args.get(i) {
-                    Some(n) => opts.into_name = Some(n.clone()),
-                    None => {
-                        eprintln!("error: option `{a}' requires a value");
-                        return Ok(ExitCode::from(129));
-                    }
-                }
+                opts.into_name = Some(super::take_value(args, &mut i, a)?.to_string())
             }
             _ if a.starts_with("--into-name=") => {
                 opts.into_name = Some(a["--into-name=".len()..].to_string())
@@ -891,14 +891,15 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // (git's `option_parse_message`: `buf->len ? "\n\n" : ""`), so
             // `-m a -m b` yields the two-paragraph message `a\n\nb`.
             "-m" | "--message" => {
-                i += 1;
-                match args.get(i) {
-                    Some(m) => append_message(&mut opts.message, m),
-                    None => {
-                        eprintln!("error: option `{a}' requires a value");
-                        return Ok(ExitCode::from(129));
-                    }
-                }
+                // `OPT_CALLBACK('m', "message", …, option_parse_message)`. The
+                // callback's own `error(_("switch `m' requires a value"))`
+                // (builtin/merge.c:134) is unreachable: `OPTION_CALLBACK` runs
+                // `get_arg()` first (parse-options.c:247) and returns -1 on its
+                // failure, so the message is `optname()`'s and follows the
+                // spelling — ``switch `m'`` for `-m`, ``option `message'`` for
+                // the long form.
+                let m = super::take_value(args, &mut i, a)?.to_string();
+                append_message(&mut opts.message, &m);
             }
             // `--no-message`: clear the accumulated message (git's
             // `option_parse_message` on `unset` does `strbuf_setlen(buf, 0)`).
@@ -909,27 +910,43 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             _ if a.len() > 2 && a.starts_with("-m") && !a.starts_with("--") => {
                 append_message(&mut opts.message, &a[2..])
             }
+            // `-F`/`--file` is the one option in this table that does *not*
+            // follow `optname()`. It is an `OPTION_LOWLEVEL_CALLBACK`, which
+            // `do_get_value()` dispatches straight to without calling
+            // `get_arg()` (parse-options.c:146-147), so the callback fetches the
+            // value itself and words its own refusal:
+            //
+            // ```c
+            //         } else
+            //                 return error(_("option `%s' requires a value"),
+            //                              opt->long_name);
+            // ```
+            //
+            // (builtin/merge.c:156-157). `opt->long_name` is `file` whichever
+            // spelling was typed, so stock answers `git merge -F` with
+            // ``option `file' requires a value`` and not ``switch `F'``.
             "-F" | "--file" => {
-                i += 1;
-                match args.get(i) {
-                    Some(p) => file = Some(p.clone()),
-                    None => {
-                        eprintln!("error: option `{a}' requires a value");
-                        return Ok(ExitCode::from(129));
-                    }
-                }
+                file = Some(
+                    crate::parseopt::get_arg(args, &mut i, crate::parseopt::OptName::Long("file"))?
+                        .to_string(),
+                )
             }
             _ if a.starts_with("--file=") => file = Some(a["--file=".len()..].to_string()),
             _ if a.len() > 2 && a.starts_with("-F") && !a.starts_with("--") => {
                 file = Some(a[2..].to_string())
             }
+            // `OPT_CLEANUP` is an `OPT_STRING`, so a missing value is
+            // `get_arg()`'s refusal and never reaches `get_cleanup_mode()`.
+            // Reading it as `args.get(i).unwrap_or("")` made the absent value an
+            // empty one, which stock never sees: `git merge --cleanup` answered
+            // `fatal: Invalid cleanup mode ` at 128 instead of
+            // ``error: option `cleanup' requires a value`` at 129.
             "--cleanup" => {
-                i += 1;
-                match args.get(i).and_then(|v| parse_cleanup(v)) {
+                let mode = super::take_value(args, &mut i, a)?;
+                match parse_cleanup(mode) {
                     Some(mode) => opts.cleanup = mode,
                     None => {
-                        let bad = args.get(i).map(String::as_str).unwrap_or("");
-                        eprintln!("fatal: Invalid cleanup mode {bad}");
+                        eprintln!("fatal: Invalid cleanup mode {mode}");
                         return Ok(ExitCode::from(128));
                     }
                 }
@@ -946,16 +963,10 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // the default (`whitespace` without an editor) — our `Cleanup::Default`.
             "--no-cleanup" => opts.cleanup = Cleanup::Default,
             "-s" | "--strategy" => {
-                i += 1;
-                match args.get(i) {
-                    Some(name) => match resolve_strategy(name) {
-                        Ok(s) => opts.push_strategy(s, name),
-                        Err(code) => return Ok(code),
-                    },
-                    None => {
-                        eprintln!("error: option `{a}' requires a value");
-                        return Ok(ExitCode::from(129));
-                    }
+                let name = super::take_value(args, &mut i, a)?.to_string();
+                match resolve_strategy(&name) {
+                    Ok(s) => opts.push_strategy(s, &name),
+                    Err(code) => return Ok(code),
                 }
             }
             _ if a.starts_with("--strategy=") => {
@@ -976,19 +987,8 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // appended and applied in order. The value is only *interpreted* once
             // the `ort` strategy actually runs (see `strategy_options` above).
             "-X" | "--strategy-option" => {
-                i += 1;
-                match args.get(i) {
-                    Some(v) => opts.strategy_options.push(v.clone()),
-                    None => {
-                        // parse-options words the short and long forms differently.
-                        if a == "-X" {
-                            eprintln!("error: switch `X' requires a value");
-                        } else {
-                            eprintln!("error: option `strategy-option' requires a value");
-                        }
-                        return Ok(ExitCode::from(129));
-                    }
-                }
+                let v = super::take_value(args, &mut i, a)?.to_string();
+                opts.strategy_options.push(v);
             }
             _ if a.starts_with("--strategy-option=") => opts
                 .strategy_options
@@ -1007,23 +1007,90 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
                     super::Resolved::Unknown
                 ) =>
             {
-                eprintln!("error: unknown option `{}'", &a[2..]);
-                eprint!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::unknown_option(a, USAGE));
             }
-            _ if a.len() > 1 && a.starts_with('-') => {
-                anyhow::bail!("unsupported flag {a}")
+            // Every remaining `-<chars>` token, walked the way
+            // `parse_options_step()` walks a short cluster (parse-options.c:
+            // 1061-1107): each character is its own option, a value-taking one
+            // swallows the rest of the token or the next argv element, and the
+            // first character the table does not claim is `PARSE_OPT_UNKNOWN` —
+            // reported against the synthetic `-<rest>` the C builds at :1095, so
+            // `git merge -nZ` names `Z` and not `n`. The single-character
+            // spellings are all matched above; what reaches here is a cluster
+            // (`-nq`) or an unknown switch (`-o`), and both used to be
+            // `zvcs: merge: unsupported flag …` at exit 1.
+            _ if a.len() > 1 && a.starts_with('-') && !a.starts_with("--") => {
+                for (off, c) in a.char_indices().skip(1) {
+                    let rest = &a[off + c.len_utf8()..];
+                    match c {
+                        'n' => opts.stat = StatMode::None,
+                        'e' => opts.edit = Some(true),
+                        'q' => opts.quiet = true,
+                        'v' => opts.quiet = false,
+                        // `OPT_BOOL('S', "gpg-sign", …)` is `PARSE_OPT_OPTARG`:
+                        // an attached key is the value, nothing attached is the
+                        // default (sign with the configured key).
+                        'S' => {
+                            opts.sign = Some(rest.to_string());
+                            break;
+                        }
+                        'm' => {
+                            let m = match rest.is_empty() {
+                                true => super::take_value(args, &mut i, "-m")?.to_string(),
+                                false => rest.to_string(),
+                            };
+                            append_message(&mut opts.message, &m);
+                            break;
+                        }
+                        // Named `option \`file'` even here — see the `-F` arm.
+                        'F' => {
+                            file = Some(match rest.is_empty() {
+                                true => crate::parseopt::get_arg(
+                                    args,
+                                    &mut i,
+                                    crate::parseopt::OptName::Long("file"),
+                                )?
+                                .to_string(),
+                                false => rest.to_string(),
+                            });
+                            break;
+                        }
+                        's' => {
+                            let name = match rest.is_empty() {
+                                true => super::take_value(args, &mut i, "-s")?.to_string(),
+                                false => rest.to_string(),
+                            };
+                            match resolve_strategy(&name) {
+                                Ok(s) => opts.push_strategy(s, &name),
+                                Err(code) => return Ok(code),
+                            }
+                            break;
+                        }
+                        'X' => {
+                            let v = match rest.is_empty() {
+                                true => super::take_value(args, &mut i, "-X")?.to_string(),
+                                false => rest.to_string(),
+                            };
+                            opts.strategy_options.push(v);
+                            break;
+                        }
+                        // `internal_help`: the block on stdout at 129, reached as
+                        // soon as the first character the table does not define
+                        // is `h`.
+                        'h' => return Ok(super::show_usage(USAGE)),
+                        _ => return Ok(super::unknown_option(&format!("-{}", &a[off..]), USAGE)),
+                    }
+                }
             }
             // A head to merge — unless it came out of `branch.<n>.mergeoptions`,
             // whose leftover non-options `parse_branch_merge_options()` discards
             // along with the argv it parsed them into.
             _ => {
-                if i >= config_argc {
+                if at >= config_argc {
                     refs.push(a.to_string());
                 }
             }
         }
-        i += 1;
     }
 
     // `if (shortlog_len < 0) shortlog_len = (merge_log_config > 0) ? … : 0;` —

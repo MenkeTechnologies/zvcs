@@ -396,12 +396,169 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "push",
     "replace",
     "rerere",
+    // Measured under git 2.55.0: `show-branch` refuses `core.createObject=bogus`,
+    // `sparse.expectFilesOutsideOfPatterns=bogus`, `core.ignorecase=bogus` and
+    // `push.default=bogus`, and it is one of the verbs that also refuses
+    // `color.ui=bogus` — see `config_callback`.
+    "show-branch",
     "symbolic-ref",
     "tag",
     "update-ref",
     "var",
     "verify-pack",
 ];
+
+/// The config *callback* a verb installs, which decides how much of git's config
+/// it validates.
+///
+/// `git_default_config()` is only the innermost link of a chain: a command that
+/// produces a diff installs `git_diff_ui_config`, whose last act is to call
+/// `git_default_config`, and `status`/`commit`/`log`/`format-patch` add one more
+/// layer each on top of that (`crate::diff_config`, `crate::status_config`,
+/// `crate::log_config` document the composition and cite the C). Since
+/// `configset_iter()` runs the *whole* chain over each value in turn, a verb gets
+/// exactly one callback here rather than several stacked gates — otherwise two bad
+/// keys in one config would report in chain order instead of config order.
+///
+/// Every membership below was measured against git 2.55.0 by giving the verb a
+/// value only that layer refuses:
+///
+/// | probe | refused by |
+/// |---|---|
+/// | `-c diff.context=-1` | the UI layer and up |
+/// | `-c diff.renameLimit=bogus` | the basic layer and up |
+/// | `-c color.ui=bogus` | `git_color_config`, which the UI layer includes and the basic layer does not |
+///
+/// A verb absent from all four lists gets [`crate::default_config`] alone, which
+/// under-matches git rather than refusing something git would run.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ConfigCallback {
+    /// `git_default_config` (config.c's chain terminus).
+    Default,
+    /// `git_color_default_config`: `git_color_config` then the default.
+    Color,
+    /// `git_diff_basic_config`: the plumbing diff callback, no colour.
+    DiffBasic,
+    /// `git_diff_ui_config`: the porcelain diff callback.
+    DiffUi,
+    /// `git_log_config` (builtin/log.c:462).
+    Log,
+    /// `git_format_config` (builtin/log.c:978).
+    Format,
+    /// `git_status_config` (builtin/commit.c:1451).
+    Status,
+    /// `git_commit_config` (builtin/commit.c:1669).
+    Commit,
+    /// `grep_cmd_config` (builtin/grep.c:297).
+    Grep,
+    /// `git_blame_config` (builtin/blame.c:714).
+    Blame,
+    /// `git_fetch_config` (builtin/fetch.c:115).
+    Fetch,
+    /// `repack_config` (builtin/repack.c:55).
+    Repack,
+    /// `gc_config` (builtin/gc.c:176) — targeted lookups, then the default walk.
+    Gc,
+}
+
+/// Which callback `sub` installs.
+///
+/// `stash` is `DiffBasic` even though `git stash show` reaches the UI layer
+/// through the diff it runs: the choice here is per verb, and taking the
+/// narrower layer under-matches on that one subcommand rather than refusing
+/// `stash list` for a key git lets through.
+fn config_callback(sub: &str) -> ConfigCallback {
+    match sub {
+        "status" => ConfigCallback::Status,
+        "commit" => ConfigCallback::Commit,
+        "log" | "show" | "whatchanged" => ConfigCallback::Log,
+        "format-patch" => ConfigCallback::Format,
+        "diff" | "range-diff" => ConfigCallback::DiffUi,
+        "diff-files" | "diff-index" | "diff-tree" | "stash" | "merge-tree" | "cherry-pick"
+        | "revert" => ConfigCallback::DiffBasic,
+        "grep" => ConfigCallback::Grep,
+        "blame" | "annotate" => ConfigCallback::Blame,
+        "fetch" => ConfigCallback::Fetch,
+        "repack" => ConfigCallback::Repack,
+        "gc" | "maintenance" => ConfigCallback::Gc,
+        "add" | "stage" | "branch" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
+        _ => ConfigCallback::Default,
+    }
+}
+
+/// The verbs whose `-h` is answered *before* their config callback runs, so a
+/// value git would otherwise refuse never gets looked at.
+///
+/// git.c:474-477 demotes a lone `-h` to a gentle setup, but that only decides
+/// whether a *repository* is required — each builtin still chooses for itself
+/// whether `show_usage_with_options_if_asked()` comes before or after its
+/// `repo_config()` call, and most put the config first. Measured under git 2.55.0
+/// with `-c core.createObject=bogus <verb> -h` and `-c core.ignorecase=bogus
+/// <verb> -h`: the verbs below answer 129 with their usage block, and every other
+/// verb this dispatcher gates answers 128 with the config diagnostic.
+///
+/// `diff-files`, `diff-index` and `diff-tree` are in here for the same reason
+/// they are on the plumbing layer of `config_callback`: their `cmd_*` calls
+/// `show_usage_with_options_if_asked()` first.
+const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
+    "am",
+    "backfill",
+    "branch",
+    "checkout-index",
+    "commit",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "fsck",
+    "gc",
+    "hash-object",
+    "hook",
+    "index-pack",
+    "init",
+    "last-modified",
+    "ls-files",
+    "maintenance",
+    "merge",
+    "mktag",
+    "mktree",
+    "prune",
+    "prune-packed",
+    "rebase",
+    "reflog",
+    "rerere",
+    "rev-list",
+    "rev-parse",
+    "sparse-checkout",
+    // `git submodule -h` is a shell script and answers 0 rather than 129, so it
+    // is not a match either way; it is listed so the gate does not make it worse
+    // by refusing a value stock accepts here.
+    "submodule",
+    "status",
+    "unpack-file",
+    "update-index",
+    "var",
+];
+
+/// The four verbs whose `-h` is answered *after* `prepare_repo_settings()`, which
+/// is the reverse of the rule for every other verb.
+///
+/// Measured with `-c core.packedGitLimit=bogus <verb> -h`: `diff`, `show`, `pull`
+/// and `fetch` answer 128, and everything else answers 129 — including the verbs
+/// that *do* let their config callback beat `-h`, so the two gates genuinely
+/// disagree and cannot share one flag.
+const SETTINGS_BEFORE_HELP_VERBS: &[&str] =
+    &["checkout", "diff", "fetch", "pull", "restore", "show", "switch"];
+
+/// The verbs that run a *second* config pass over `grep_config` alone, because
+/// `repo_init_revisions()` installs it for `--grep`/`-S` after the command's own
+/// callback has already run. See `crate::cmd_config` for the measurement that
+/// fixes the order.
+///
+/// `git grep` is absent because it reaches the same keys through its own
+/// callback, in one chain; `rev-list`, `shortlog`, `diff-tree`, `diff` and
+/// `status` are absent because they were measured not to reach them at all.
+const GREP_REVISION_VERBS: &[&str] =
+    &["log", "show", "whatchanged", "format-patch", "range-diff"];
 
 /// Whether this command line reaches `check_updates()` (`unpack-trees.c:404`) and
 /// therefore `get_parallel_checkout_configs()` at `:482` — the read of
@@ -737,13 +894,19 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // git skips the settings block for them.
     let rev_parse_no_setup = sub == "rev-parse"
         && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote");
-    let in_repo_settings = !help_only && !rev_parse_no_setup && REPO_SETTINGS_VERBS.contains(&sub);
+    // Each gate has its own answer to "does `-h` come first?", and the two do not
+    // agree — see [`HELP_BEFORE_CONFIG_VERBS`] and [`SETTINGS_BEFORE_HELP_VERBS`].
+    let settings_help_skip = help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub);
+    let config_help_skip = help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub);
+    let in_repo_settings =
+        !settings_help_skip && !rev_parse_no_setup && REPO_SETTINGS_VERBS.contains(&sub);
     // `git_default_config()`'s own two keys (`crate::default_config`) are checked
     // while the config is *parsed*, so they refuse a much wider set of commands
     // than the settings block does — `branch` and `hash-object` die for them and
     // not for `core.packedGitLimit`.
-    let in_default_config =
-        !help_only && (in_repo_settings || DEFAULT_CONFIG_EXTRA_VERBS.contains(&sub));
+    let in_default_config = !config_help_skip
+        && (REPO_SETTINGS_VERBS.contains(&sub) || DEFAULT_CONFIG_EXTRA_VERBS.contains(&sub))
+        && !rev_parse_no_setup;
     let in_parallel_checkout = !help_only && updates_worktree(sub, args);
     if in_repo_settings || in_default_config || in_parallel_checkout {
         if let Ok(repo) = gix::discover(".") {
@@ -760,8 +923,41 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                 }
             }
             if in_default_config {
-                if let Err(rejection) = crate::default_config::validate(&repo) {
-                    return Err(crate::fatal::die(rejection.into_fatal()));
+                // `porcelain::diff` reads `diff.submodule` for itself and prints
+                // git's unknown-format warning at that point, so the gate must
+                // not print a second one. Claiming it here leaves that verb with
+                // exactly the one warning git emits; every other verb has no
+                // second reader and takes the gate's.
+                // See `crate::diff_config::claim_submodule_warning`.
+                if sub == "diff" {
+                    crate::diff_config::claim_submodule_warning();
+                }
+                let outcome = match config_callback(sub) {
+                    ConfigCallback::Default => {
+                        crate::default_config::validate(&repo).map(|_| ())
+                    }
+                    ConfigCallback::Color => crate::diff_config::validate_color(&repo),
+                    ConfigCallback::DiffBasic => crate::diff_config::validate_basic(&repo),
+                    ConfigCallback::DiffUi => crate::diff_config::validate_ui(&repo),
+                    ConfigCallback::Log => crate::log_config::validate_log(&repo),
+                    ConfigCallback::Format => crate::log_config::validate_format(&repo),
+                    ConfigCallback::Status => crate::status_config::validate_status(&repo),
+                    ConfigCallback::Commit => crate::status_config::validate_commit(&repo),
+                    ConfigCallback::Grep => crate::cmd_config::validate_grep(&repo),
+                    ConfigCallback::Blame => crate::cmd_config::validate_blame(&repo),
+                    ConfigCallback::Fetch => crate::cmd_config::validate_fetch(&repo),
+                    ConfigCallback::Repack => crate::cmd_config::validate_repack(&repo),
+                    ConfigCallback::Gc => crate::cmd_config::validate_gc(&repo),
+                };
+                if let Err(rejection) = outcome {
+                    return Err(rejection.into_error());
+                }
+                // `repo_init_revisions()`'s own pass, which runs after the
+                // command's callback has finished.
+                if GREP_REVISION_VERBS.contains(&sub) {
+                    if let Err(rejection) = crate::cmd_config::validate_grep_only(&repo) {
+                        return Err(rejection.into_error());
+                    }
                 }
             }
             // `check_updates()` reads the parallel-checkout pair after the config

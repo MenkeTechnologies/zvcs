@@ -3447,6 +3447,30 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
     // conflicted (stage 1/2/3 entries), so it would leave markers in place.
     restore_worktree_to_tree(repo, &old_index, orig_tree, &should_interrupt)?;
 
+    // ```c
+    // strbuf_addf(&head_msg, "%s (abort): returning to %s",
+    //             options.reflog_action,
+    //             options.head_name ? options.head_name
+    //                               : oid_to_hex(&options.orig_head->object.oid));
+    // ropts.head_msg = head_msg.buf;
+    // ropts.branch = options.head_name;
+    // ```
+    //
+    // (builtin/rebase.c:1395-1416.) `head_name` is the **fully qualified** ref
+    // read back from `$state_dir/head-name`, so the line reads `rebase (abort):
+    // returning to refs/heads/main` — the ref is part of the message, and
+    // `@{n}`/`git reflog grep` consumers read it out of there. A detached rebase
+    // has no `head_name` and names the object id instead.
+    //
+    // `reset_head()` is given no `branch_msg`, and `update_refs()` falls back to
+    // `reflog_branch ? reflog_branch : reflog_head` (reset.c:72-75) — so the
+    // branch update carries the *same* string as the `HEAD` update rather than a
+    // wording of its own.
+    let head_msg = format!(
+        "{} (abort): returning to {}",
+        reflog_action(),
+        if st.head_name == "detached HEAD" { st.orig_head.to_string() } else { st.head_name.clone() }
+    );
     if st.head_name != "detached HEAD" {
         let name = full_name(&st.head_name)?;
         repo.edit_reference(RefEdit {
@@ -3454,7 +3478,7 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
                 log: LogChange {
                     mode: RefLog::AndReference,
                     force_create_reflog: false,
-                    message: format!("{} (abort): updating HEAD", reflog_action()).into(),
+                    message: head_msg.clone().into(),
                 },
                 expected: PreviousValue::Any,
                 new: Target::Object(st.orig_head),
@@ -3462,9 +3486,9 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
             name: name.clone(),
             deref: false,
         })?;
-        set_head(repo, Target::Symbolic(name), &format!("{} (abort): returning", reflog_action()))?;
+        set_head(repo, Target::Symbolic(name), &head_msg)?;
     } else {
-        set_head(repo, Target::Object(st.orig_head), &format!("{} (abort)", reflog_action()))?;
+        set_head(repo, Target::Object(st.orig_head), &head_msg)?;
     }
     // `remove_branch_state(the_repository, 0)` (builtin/rebase.c's `ACTION_ABORT`),
     // which is `remove_merge_branch_state()` plus `SQUASH_MSG` (branch.c:803-818),
@@ -4474,7 +4498,18 @@ impl Sequencer<'_> {
         args.push("--allow-empty".into());
         // The author of the commit being replayed, saved by `write_author_script`
         // when the instruction started, survives the interruption.
-        let env = self.author_env();
+        let mut env = self.author_env();
+        // `const char *reflog_action = reflog_message(opts, "continue", NULL);`
+        // (sequencer.c:5267), handed to `run_git_commit(…, reflog_action, …)`
+        // (sequencer.c:5429-5430) which exports it as `GIT_REFLOG_ACTION`
+        // (sequencer.c:1141). `reflog_message()` composes
+        // `<sequencer_reflog_action()> (continue)` (sequencer.c:2243-2261), so the
+        // resumed commit is logged `rebase (continue): <subject>` — and
+        // `zzz (continue): …` when the caller named the action.
+        env.push((
+            "GIT_REFLOG_ACTION".to_string(),
+            format!("{} (continue)", reflog_action()),
+        ));
         let code = self.run_commit(&args, env)?;
         if code != 0 {
             return Ok(Some(ExitCode::from(code as u8)));

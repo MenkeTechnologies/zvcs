@@ -1072,7 +1072,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
             "--pretty" => opts.out = OutFmt::Builtin(Builtin::Medium),
             s if s.starts_with("--pretty=") || s.starts_with("--format=") => {
                 let v = s.split_once('=').expect("checked for `=` above").1;
-                match classify_pretty(v) {
+                match classify_pretty(repo, v) {
                     Pretty::Oneline => opts.out = OutFmt::Oneline,
                     Pretty::Builtin(b) => opts.out = OutFmt::Builtin(b),
                     Pretty::Custom(f) => match unsupported_placeholder(&f) {
@@ -1084,6 +1084,12 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
                     Pretty::Unimplemented => note_first(&mut unimplemented, s.to_owned()),
                     Pretty::Invalid => {
                         eprintln!("fatal: invalid --pretty format: {v}");
+                        return Ok(128);
+                    }
+                    // A `pretty.<name>` alias chain that loops names the format
+                    // rather than the option value (pretty.c:156-158).
+                    Pretty::Cycle(msg) => {
+                        eprintln!("fatal: {msg}");
                         return Ok(128);
                     }
                 }
@@ -2480,28 +2486,48 @@ enum Pretty {
     Custom(String),
     Unimplemented,
     Invalid,
+    /// The `die()` message for a `pretty.<name>` alias chain that loops.
+    Cycle(String),
 }
 
-/// Classify a `--pretty=`/`--format=` value the way git's `get_commit_format()` does.
-fn classify_pretty(value: &str) -> Pretty {
-    if let Some(rest) = value
-        .strip_prefix("format:")
-        .or_else(|| value.strip_prefix("tformat:"))
-    {
+/// Classify a `--pretty=`/`--format=` value the way git's `get_commit_format()`
+/// does (pretty.c:190-222).
+///
+/// The three shortcuts — a `format:` prefix, then an empty value or a `tformat:`
+/// prefix or a `%` anywhere — are tried in git's order and never consult config.
+/// Everything else goes to the shared format table, so a name resolves as a
+/// case-insensitive shortest prefix (`--pretty=one` is `oneline`) and a
+/// `pretty.<name>` key is picked up along with the built-ins.
+fn classify_pretty(repo: &gix::Repository, value: &str) -> Pretty {
+    use super::pretty_formats::{Builtin as B, Resolved};
+
+    if let Some(rest) = value.strip_prefix("format:") {
         return Pretty::Custom(rest.to_owned());
     }
-    match value {
-        "oneline" => Pretty::Oneline,
-        "medium" => Pretty::Builtin(Builtin::Medium),
-        "short" => Pretty::Builtin(Builtin::Short),
-        "full" => Pretty::Builtin(Builtin::Full),
-        "fuller" => Pretty::Builtin(Builtin::Fuller),
-        "raw" => Pretty::Builtin(Builtin::Raw),
-        "reference" => Pretty::Builtin(Builtin::Reference),
-        // The mbox/patch formats need git's whole email driver; still deferred.
-        "email" | "mboxrd" => Pretty::Unimplemented,
-        v if v.is_empty() || v.contains('%') => Pretty::Custom(v.to_owned()),
-        _ => Pretty::Invalid,
+    if value.is_empty() {
+        return Pretty::Custom(String::new());
+    }
+    if let Some(rest) = value.strip_prefix("tformat:") {
+        return Pretty::Custom(rest.to_owned());
+    }
+    if value.contains('%') {
+        return Pretty::Custom(value.to_owned());
+    }
+    match super::pretty_formats::resolve(Some(repo), value) {
+        Err(cycle) => Pretty::Cycle(cycle.message()),
+        Ok(None) => Pretty::Invalid,
+        Ok(Some(Resolved::Builtin(b))) => match b {
+            B::Oneline => Pretty::Oneline,
+            B::Medium => Pretty::Builtin(Builtin::Medium),
+            B::Short => Pretty::Builtin(Builtin::Short),
+            B::Full => Pretty::Builtin(Builtin::Full),
+            B::Fuller => Pretty::Builtin(Builtin::Fuller),
+            B::Raw => Pretty::Builtin(Builtin::Raw),
+            B::Reference => Pretty::Builtin(Builtin::Reference),
+            // The mbox/patch formats need git's whole email driver; still deferred.
+            B::Email | B::MboxRd => Pretty::Unimplemented,
+        },
+        Ok(Some(Resolved::User { format, .. })) => Pretty::Custom(format),
     }
 }
 

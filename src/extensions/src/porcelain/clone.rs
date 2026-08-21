@@ -380,18 +380,17 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         // Fetch the value for a value-taking option (inline `=v` or next arg).
         // Kept as a plain expression (not a closure) so the `i` cursor stays
         // freely borrowable in the other match arms.
+        // The option is named the way it was *typed*, because `optname()` is
+        // (parse-options.c:30-45): `git clone -o` is ``switch `o'`` and
+        // `--origin` is ``option `origin'``. Passing the long name for both is
+        // what made every short spelling here report the wrong half — and the
+        // whole message the wrong shape, since `zvcs: clone: --origin requires a
+        // value` at exit 1 is neither git's text nor git's 129.
         macro_rules! take_value {
-            ($name:literal) => {
+            () => {
                 match inline_val.clone() {
                     Some(v) => v,
-                    None => {
-                        let v = args
-                            .get(i)
-                            .cloned()
-                            .ok_or_else(|| anyhow::anyhow!(concat!($name, " requires a value")))?;
-                        i += 1;
-                        v
-                    }
+                    None => super::take_value(args, &mut i, key)?.to_string(),
                 }
             };
         }
@@ -422,24 +421,24 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // a worktree (leaves an empty index, exactly like git).
             "-n" | "--no-checkout" => no_checkout = true,
             "--checkout" => no_checkout = false,
-            "-o" | "--origin" => origin = Some(take_value!("--origin")),
+            "-o" | "--origin" => origin = Some(take_value!()),
             "--no-origin" => origin = None,
-            "-b" | "--branch" => branch = Some(take_value!("--branch")),
+            "-b" | "--branch" => branch = Some(take_value!()),
             "--no-branch" => branch = None,
             "-c" | "--config" => {
-                let raw = take_value!("--config");
+                let raw = take_value!();
                 config_pairs.push(parse_config_pair(&raw)?);
             }
             "--no-tags" => tags = Some(Tags::None),
             // `--tags` resets to git's default (all tags fetched).
             "--tags" => tags = None,
             // `-u`/`--upload-pack <path>`: the program to run in place of `git-upload-pack`.
-            "-u" | "--upload-pack" => upload_pack = Some(take_value!("--upload-pack")),
+            "-u" | "--upload-pack" => upload_pack = Some(take_value!()),
             "--no-upload-pack" => upload_pack = None,
             // Protocol-v2 server options, repeatable. `-o` is `--origin` for clone, so only the long form.
-            "--server-option" => server_options.push(take_value!("--server-option").into()),
+            "--server-option" => server_options.push(take_value!().into()),
             "--no-server-option" => server_options.clear(),
-            "-j" | "--jobs" => jobs = Some(take_value!("--jobs")),
+            "-j" | "--jobs" => jobs = Some(take_value!()),
             other if other.starts_with("-j") && other.len() > 2 => {
                 jobs = Some(other[2..].to_string())
             }
@@ -450,25 +449,39 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-reject-shallow" => reject_shallow = Some(false),
             "--single-branch" => single_branch = Some(true),
             "--no-single-branch" => single_branch = Some(false),
-            "--template" => template = Some(take_value!("--template")),
+            "--template" => template = Some(take_value!()),
             "--no-template" => template = None,
-            "--separate-git-dir" => separate_git_dir = Some(take_value!("--separate-git-dir")),
+            "--separate-git-dir" => separate_git_dir = Some(take_value!()),
             "--no-separate-git-dir" => separate_git_dir = None,
-            "--ref-format" => ref_format = Some(take_value!("--ref-format")),
+            "--ref-format" => ref_format = Some(take_value!()),
             "--no-ref-format" => ref_format = None,
-            "--reference" => references.push((take_value!("--reference"), false)),
-            "--reference-if-able" => references.push((take_value!("--reference-if-able"), true)),
+            "--reference" => references.push((take_value!(), false)),
+            "--reference-if-able" => references.push((take_value!(), true)),
             "-s" | "--shared" => shared = true,
             "--no-shared" => shared = false,
             "--dissociate" => dissociate = true,
             "--no-dissociate" => dissociate = false,
             "--sparse" => sparse = true,
             "--no-sparse" => sparse = false,
+            // `--revision` is an `OPT_STRING` in `builtin_clone_options[]`, so
+            // parse-options fetches its value before `cmd_clone()` ever runs: a
+            // missing one is ``option `revision' requires a value`` at 129 and
+            // never reaches the command. Cloning at a bare revision is not
+            // ported, and *that* refusal is this port's own — which is why the
+            // value is taken first and the gap reported second.
+            "--revision" => {
+                let _ = take_value!();
+                bail!(
+                    "unsupported option \"--revision\" (cloning at a bare revision needs the \
+                     unborn-HEAD handshake, which is not ported)"
+                );
+            }
+            "--no-revision" => {}
             // `--filter=<spec>`: ask the remote to withhold the objects `<spec>` selects against.
             // git parses the spec in `cmd_clone`'s option table, so an invalid one never reaches the
             // network; `Filter::from_str` reproduces both the grammar and the messages.
             "--filter" => {
-                let raw = take_value!("--filter");
+                let raw = take_value!();
                 filter = Some(raw.parse().map_err(|e| anyhow::anyhow!("{e}"))?);
             }
             "--no-filter" => filter = None,
@@ -476,10 +489,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // into (git's `option_also_filter_submodules`).
             "--also-filter-submodules" => also_filter_submodules = Some(true),
             "--no-also-filter-submodules" => also_filter_submodules = Some(false),
-            "--bundle-uri" => bundle_uri = Some(take_value!("--bundle-uri")),
+            "--bundle-uri" => bundle_uri = Some(take_value!()),
             "--no-bundle-uri" => bundle_uri = None,
             "--depth" => {
-                let v = take_value!("--depth");
+                let v = take_value!();
                 let n: u32 = v
                     .parse()
                     .map_err(|_| anyhow::anyhow!("depth {v:?} is not a positive number"))?;
@@ -492,12 +505,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // the value through `approxidate()`, which never fails — an unreadable date is the
             // current time, not an error.
             "--shallow-since" => {
-                let v = take_value!("--shallow-since");
+                let v = take_value!();
                 shallow_since = Some(gix::date::Time::new(crate::date::approxidate(&v), 0));
             }
             // Exclude history reachable from a ref (git's repeatable `deepen_not`).
             "--shallow-exclude" => {
-                let v = take_value!("--shallow-exclude");
+                let v = take_value!();
                 let name = gix::refs::PartialName::try_from(v.as_str())
                     .map_err(|_| anyhow::anyhow!("--shallow-exclude expects a valid ref, got {v:?}"))?;
                 shallow_exclude.push(name);
@@ -554,8 +567,59 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 // go back to the token.
                 return Ok(super::unknown_option(typed, USAGE));
             }
-            other if other.starts_with('-') && other.len() > 1 => {
-                bail!("unsupported option {other:?}");
+            // Every remaining `-<chars>` token, walked the way
+            // `parse_options_step()` walks a short cluster
+            // (parse-options.c:1061-1107): each character is its own option, a
+            // value-taking one swallows the rest of the token or the next argv
+            // element, and the first character the table does not claim is named
+            // on its own — against the synthetic `-<rest>` the C builds at :1095,
+            // so `git clone -qZ` reports `Z` and not `q`. This whole arm used to
+            // be `zvcs: clone: unsupported option "-a"` at exit 1.
+            other if other.starts_with('-') && !other.starts_with("--") && other.len() > 1 => {
+                for (off, c) in other.char_indices().skip(1) {
+                    let rest = &other[off + c.len_utf8()..];
+                    match c {
+                        'q' => quiet = true,
+                        'v' => {}
+                        'l' => no_local = false,
+                        'n' => no_checkout = true,
+                        's' => shared = true,
+                        '4' => {
+                            address_family =
+                                Some(gix::protocol::transport::AddressFamily::V4)
+                        }
+                        '6' => {
+                            address_family =
+                                Some(gix::protocol::transport::AddressFamily::V6)
+                        }
+                        'o' | 'b' | 'u' | 'c' | 'j' => {
+                            let v = match rest.is_empty() {
+                                true => super::take_value(
+                                    args,
+                                    &mut i,
+                                    &format!("-{c}"),
+                                )?
+                                .to_string(),
+                                false => rest.to_string(),
+                            };
+                            match c {
+                                'o' => origin = Some(v),
+                                'b' => branch = Some(v),
+                                'u' => upload_pack = Some(v),
+                                'c' => config_pairs.push(parse_config_pair(&v)?),
+                                _ => jobs = Some(v),
+                            }
+                            break;
+                        }
+                        'h' => return Ok(super::show_usage(USAGE)),
+                        _ => {
+                            return Ok(super::unknown_option(
+                                &format!("-{}", &other[off..]),
+                                USAGE,
+                            ))
+                        }
+                    }
+                }
             }
             // A non-option argument is handed back unchanged by the resolver, so the
             // argv slice itself is pushed and the operand keeps `args`' lifetime.

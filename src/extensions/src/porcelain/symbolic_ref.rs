@@ -131,15 +131,39 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
             "--no-delete" => opts.delete = false,
             "-m" => {
                 i += 1;
-                let Some(reason) = args.get(i) else {
-                    return usage_error(Some("switch `m' requires a value"));
-                };
-                opts.message = Some(reason.clone());
+                opts.message = Some(super::value_at(args, i, a)?.to_string());
             }
             _ if a.starts_with("-m") => opts.message = Some(a[2..].to_string()),
+            // A long name no entry claims is `PARSE_OPT_UNKNOWN`.
+            _ if a.starts_with("--") => return Ok(super::unknown_option(a, USAGE)),
+            // Every remaining `-<chars>` token, walked the way
+            // `parse_options_step()` walks a short cluster
+            // (parse-options.c:1061-1107): each character is its own option, `-m`
+            // swallows the rest of the cluster or the next argv element, and the
+            // first character the table does not claim is named on its own —
+            // against the synthetic `-<rest>` the C builds at :1095. `git
+            // symbolic-ref -qa` therefore reports `a`, where this used to report
+            // the whole `qa` as a long option's name.
             _ => {
-                let name = a.trim_start_matches('-');
-                return usage_error(Some(format!("unknown option `{name}'").as_str()));
+                for (off, c) in a.char_indices().skip(1) {
+                    match c {
+                        'q' => opts.quiet = true,
+                        'd' => opts.delete = true,
+                        'm' => {
+                            let rest = &a[off + c.len_utf8()..];
+                            opts.message = Some(match rest.is_empty() {
+                                true => {
+                                    i += 1;
+                                    super::value_at(args, i, "-m")?.to_string()
+                                }
+                                false => rest.to_string(),
+                            });
+                            break;
+                        }
+                        'h' => return Ok(super::show_usage(USAGE)),
+                        _ => return Ok(super::unknown_option(&format!("-{}", &a[off..]), USAGE)),
+                    }
+                }
             }
         }
         i += 1;

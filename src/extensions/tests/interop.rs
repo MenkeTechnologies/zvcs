@@ -17,9 +17,33 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 /// Probe with `zjobs` (a zvcs-only verb): stock git rejects it (non-zero) and,
 /// unlike `zdaemon`, git's autocorrect won't map it to a real blocking command
 /// (`zdaemon` → `daemon`, which hangs). zvcs runs it (zero).
+/// A real git, or `None` when this machine has none to compare against.
+///
+/// The probe asks a candidate to run a superset verb: zvcs serves `zjobs`
+/// itself, a real git does not. That test is only sound with `PATH` **emptied**.
+/// git's `execv_dashed_external()` resolves an unknown verb to a `git-<verb>` on
+/// `PATH`, and zvcs's own installation puts `~/.zvcs/bin/git-zjobs` there as a
+/// symlink to the shadow binary — so with the ambient `PATH` every stock git on
+/// this machine answers `zjobs` successfully:
+///
+/// ```text
+/// /usr/bin/git zjobs            rc=0     <- looks like zvcs
+/// /opt/homebrew/bin/git zjobs   rc=0     <- looks like zvcs
+/// PATH= /usr/bin/git zjobs      rc=1     <- the truth
+/// ```
+///
+/// Without the `PATH=""`, every candidate was misread as zvcs, `stock_git()`
+/// answered `None`, and every test in this file returned early — the file
+/// reported "3 passed" while running none of its comparisons. A skip that
+/// announces itself as a pass is worse than a failure, so the candidate is
+/// resolved to an absolute path first (`PATH=""` would otherwise make a bare
+/// `git` unspawnable) and the bare name is dropped rather than guessed at.
 fn stock_git() -> Option<String> {
-    for cand in ["/usr/bin/git", "git"] {
-        match Command::new(cand).args(["zjobs"]).output() {
+    for cand in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"] {
+        if !Path::new(cand).exists() {
+            continue;
+        }
+        match Command::new(cand).args(["zjobs"]).env("PATH", "").output() {
             Ok(out) if !out.status.success() => return Some(cand.to_string()),
             _ => continue,
         }

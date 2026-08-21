@@ -664,3 +664,365 @@ fn the_happy_path_survives_the_rewritten_walks() {
     assert_eq!(r.code, 0);
     assert!(r.stdout.starts_with("100755 "), "--chmod +x did not stage the mode: {}", r.stdout);
 }
+
+// ---------------------------------------------------------------------------
+// usage() vs usage_with_options(): the block with no error line in front of it
+// ---------------------------------------------------------------------------
+
+/// `usage(<usagestr>)` — the block on stderr, exit 129, and **no `error:` line**.
+///
+/// This is the third shape, and the one `assert_unknown` would happily accept if
+/// it only checked that a usage block appeared. `usage_with_options()` prints
+/// `error: unknown option `<name>'` first; plain `usage()` does not print
+/// anything before the block, which is what `cmd_diff_tree` calls
+/// (builtin/diff-tree.c:163). Asserting the *absence* of the error line is the
+/// whole assertion.
+fn assert_bare_usage(f: &Fixture, args: &[&str], usage_head: &str) {
+    let r = f.run(args);
+    assert_eq!(r.code, 129, "`git {args:?}` exit code (stderr: {})", r.stderr);
+    assert_eq!(r.stdout, "", "`git {args:?}` stdout");
+    assert_eq!(
+        r.stderr.lines().next(),
+        Some(usage_head),
+        "`git {args:?}` first stderr line"
+    );
+    assert!(
+        !r.stderr.starts_with("error:"),
+        "`git {args:?}` printed an error line ahead of a plain usage() block: {}",
+        r.stderr
+    );
+}
+
+/// The first line of `diff_tree_usage` (builtin/diff-tree.c:83).
+const DIFF_TREE_USAGE_HEAD: &str =
+    "usage: git diff-tree [--stdin] [-m] [-s] [-v] [--no-commit-id] [--pretty]";
+
+/// The first line of `replay_usage` (builtin/replay.c:85-89).
+const REPLAY_USAGE_HEAD: &str = "usage: (EXPERIMENTAL!) git replay ([--contained] \
+                                 --onto=<newbase> | --advance=<branch> | --revert=<branch>)";
+
+// ---------------------------------------------------------------------------
+// format-patch: every option in builtin_format_patch_options[]
+// ---------------------------------------------------------------------------
+
+/// `cmd_format_patch` runs `parse_options()` over its own table
+/// (builtin/log.c:2006-2095) to completion before `setup_revisions()` reads a
+/// single argument, so a missing value for any of these is `get_arg()`'s
+/// `PARSE_OPT_ERROR`: one `error:` line, no usage block, exit 129.
+///
+/// Every long spelling in that table that takes a value is listed, because the
+/// port routes all of them through one helper and a helper is exactly the thing
+/// that can be right for the option it was written against and wrong for the
+/// other eighteen. `-o` and `-v` are here too: they reach the same helper and
+/// must come back out as ``switch `o'`` / ``switch `v'``, not as their long
+/// names.
+#[test]
+fn format_patchs_own_table_reports_a_missing_value_in_gits_words() {
+    let f = Fixture::new("fpvalue");
+    for (args, line) in [
+        (&["format-patch", "--add-header"][..], "error: option `add-header' requires a value"),
+        (&["format-patch", "--base"], "error: option `base' requires a value"),
+        (&["format-patch", "--cc"], "error: option `cc' requires a value"),
+        (
+            &["format-patch", "--commit-list-format"],
+            "error: option `commit-list-format' requires a value",
+        ),
+        (
+            &["format-patch", "--cover-from-description"],
+            "error: option `cover-from-description' requires a value",
+        ),
+        (
+            &["format-patch", "--creation-factor"],
+            "error: option `creation-factor' requires a value",
+        ),
+        (
+            &["format-patch", "--description-file"],
+            "error: option `description-file' requires a value",
+        ),
+        (
+            &["format-patch", "--filename-max-length"],
+            "error: option `filename-max-length' requires a value",
+        ),
+        (&["format-patch", "--in-reply-to"], "error: option `in-reply-to' requires a value"),
+        (&["format-patch", "--interdiff"], "error: option `interdiff' requires a value"),
+        (
+            &["format-patch", "--output-directory"],
+            "error: option `output-directory' requires a value",
+        ),
+        (&["format-patch", "--range-diff"], "error: option `range-diff' requires a value"),
+        (&["format-patch", "--reroll-count"], "error: option `reroll-count' requires a value"),
+        (&["format-patch", "--signature"], "error: option `signature' requires a value"),
+        (&["format-patch", "--signature-file"], "error: option `signature-file' requires a value"),
+        (&["format-patch", "--start-number"], "error: option `start-number' requires a value"),
+        (&["format-patch", "--subject-prefix"], "error: option `subject-prefix' requires a value"),
+        (&["format-patch", "--suffix"], "error: option `suffix' requires a value"),
+        (&["format-patch", "--to"], "error: option `to' requires a value"),
+        (&["format-patch", "-o"], "error: switch `o' requires a value"),
+        (&["format-patch", "-v"], "error: switch `v' requires a value"),
+    ] {
+        assert_value_error(&f, args, line);
+    }
+}
+
+/// Stage 1 outranks stage 2 whatever the argv order: a revision that does not
+/// resolve is `setup_revisions()`' to complain about, and `setup_revisions()`
+/// does not run until `parse_options()` has swept the whole line
+/// (builtin/log.c:2196). So the missing value wins even written last.
+#[test]
+fn format_patchs_missing_value_outranks_a_bad_revision_written_first() {
+    let f = Fixture::new("fporder");
+    assert_value_error(
+        &f,
+        &["format-patch", "zznosuchrev", "--subject-prefix"],
+        "error: option `subject-prefix' requires a value",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// fast-export: every option in cmd_fast_export's table
+// ---------------------------------------------------------------------------
+
+/// The same shape for `cmd_fast_export`'s table
+/// (builtin/fast-export.c:1323-1367). Every entry there is long-only, so
+/// `optname()` never produces the `switch` wording for this verb.
+///
+/// This verb used to answer all ten with its *leftover-argument* usage block
+/// instead — `usage_with_options(fast_export_usage, options)` at
+/// builtin/fast-export.c:1384 — because the separated `--<opt> <value>` spelling
+/// was not recognised at all and fell through `PARSE_OPT_KEEP_UNKNOWN_OPT`'s
+/// bucket into `setup_revisions()`. Asserting the whole of stderr is what tells
+/// the two apart.
+#[test]
+fn fast_exports_own_table_reports_a_missing_value_in_gits_words() {
+    let f = Fixture::new("fevalue");
+    for (args, line) in [
+        (&["fast-export", "--anonymize-map"][..], "error: option `anonymize-map' requires a value"),
+        (&["fast-export", "--export-marks"], "error: option `export-marks' requires a value"),
+        (&["fast-export", "--import-marks"], "error: option `import-marks' requires a value"),
+        (
+            &["fast-export", "--import-marks-if-exists"],
+            "error: option `import-marks-if-exists' requires a value",
+        ),
+        (&["fast-export", "--progress"], "error: option `progress' requires a value"),
+        (&["fast-export", "--reencode"], "error: option `reencode' requires a value"),
+        (&["fast-export", "--refspec"], "error: option `refspec' requires a value"),
+        (&["fast-export", "--signed-commits"], "error: option `signed-commits' requires a value"),
+        (&["fast-export", "--signed-tags"], "error: option `signed-tags' requires a value"),
+        (
+            &["fast-export", "--tag-of-filtered-object"],
+            "error: option `tag-of-filtered-object' requires a value",
+        ),
+    ] {
+        assert_value_error(&f, args, line);
+    }
+}
+
+/// The half of `get_arg()` that is not an error: `*arg = *++p->argv` reads the
+/// next argv slot whatever it contains, so the separated spelling has to work
+/// for all ten — and its value must not be left behind to be misread as a
+/// revision.
+///
+/// Before the walk was rewritten `git fast-export --progress 1 HEAD` died
+/// `fatal: ambiguous argument '1'` and `--export-marks <file> HEAD` died
+/// `fatal: HEAD: no such path in the working tree.`, because the option token
+/// went into the unknown bucket and its value became an operand.
+#[test]
+fn fast_export_takes_a_separated_value_for_every_option_that_has_one() {
+    let f = Fixture::new("fesep");
+    let marks = f.work.join("marks.txt");
+    let marks = marks.to_str().unwrap();
+
+    let r = f.run(&[
+        "fast-export",
+        "--progress",
+        "1",
+        "--reencode",
+        "yes",
+        "--signed-tags",
+        "strip",
+        "--signed-commits",
+        "strip",
+        "--tag-of-filtered-object",
+        "drop",
+        "--refspec",
+        "refs/heads/main:refs/heads/main",
+        "--export-marks",
+        marks,
+        "HEAD",
+    ]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(
+        r.stdout.contains("commit refs/heads/main\n"),
+        "no commit stanza in the stream: {}",
+        r.stdout
+    );
+    let written = std::fs::read_to_string(marks).expect("--export-marks wrote no marks file");
+    assert!(written.contains(':'), "marks file has no mark lines: {written}");
+
+    // The marks just written import again, through the other two spellings.
+    let r = f.run(&["fast-export", "--import-marks", marks, "HEAD"]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let r = f.run(&["fast-export", "--import-marks-if-exists", marks, "HEAD"]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+}
+
+/// `OPT_INTEGER(0, "progress", …)` has three distinguishable rejections
+/// (parse-options.c:260-288) and the port used to give the third wording for all
+/// of them. Each is `opterror()`'s single `error:` line and exit 129 — no usage
+/// block — in both spellings, since `p->opt` and `*++p->argv` reach the same
+/// check.
+#[test]
+fn fast_exports_progress_reports_gits_three_integer_rejections() {
+    let f = Fixture::new("feint");
+    assert_value_error(
+        &f,
+        &["fast-export", "--progress=", "HEAD"],
+        "error: option `progress' expects a numerical value",
+    );
+    assert_value_error(
+        &f,
+        &["fast-export", "--progress", "", "HEAD"],
+        "error: option `progress' expects a numerical value",
+    );
+    assert_value_error(
+        &f,
+        &["fast-export", "--progress=bogus", "HEAD"],
+        "error: option `progress' expects an integer value with an optional k/m/g suffix",
+    );
+    assert_value_error(
+        &f,
+        &["fast-export", "--progress=2147483648", "HEAD"],
+        "error: value 2147483648 for option `progress' not in range [-2147483648,2147483647]",
+    );
+    // The grammar itself is `git_parse_signed()`'s: base 0, so `0x10` is
+    // sixteen and `010` is eight, and a k/m/g suffix scales by 1024.
+    for v in ["0x10", "010", "1k", "+7", "-2147483648", "2147483647"] {
+        let r = f.run(&["fast-export", &format!("--progress={v}"), "HEAD"]);
+        assert_eq!(r.code, 0, "`--progress={v}` was rejected: {}", r.stderr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// diff-tree: the leftover loop, which calls usage() and not usage_with_options()
+// ---------------------------------------------------------------------------
+
+/// `cmd_diff_tree` has no option table of its own: `setup_revisions()` takes
+/// what it recognises and everything else survives into
+///
+/// ```c
+///         while (--argc > 0) {
+///                 const char *arg = *++argv;
+///
+///                 if (!strcmp(arg, "--stdin")) { read_stdin = 1; continue; }
+///                 if (!strcmp(arg, "--merge-base")) { merge_base = 1; continue; }
+///                 usage(diff_tree_usage);
+///         }
+/// ```
+/// (builtin/diff-tree.c:152-164)
+///
+/// `usage()` is not `usage_with_options()`: there is no `error: unknown option`
+/// line, only the block, and the status is 129 rather than the `die()` 128 this
+/// port used to give. A `-h` that had company is the same argument by the same
+/// route.
+#[test]
+fn diff_tree_answers_an_unknown_argument_with_the_bare_usage_block() {
+    let f = Fixture::new("dtunknown");
+    for args in [
+        &["diff-tree", "--zzbogus"][..],
+        &["diff-tree", "-Z"],
+        &["diff-tree", "--zzbogus", "HEAD"],
+        &["diff-tree", "HEAD", "--zzbogus"],
+        &["diff-tree", "-h", "HEAD"],
+    ] {
+        assert_bare_usage(&f, args, DIFF_TREE_USAGE_HEAD);
+    }
+}
+
+/// The leftover loop runs *after* `setup_revisions()`, so an operand that does
+/// not resolve is diagnosed first however the two are ordered — and *before* the
+/// two `die()`s underneath it, so an unknown argument outranks both the
+/// `--stdin`/`--merge-base` incompatibility (builtin/diff-tree.c:166-167) and
+/// the merge-base operand count (:168-169).
+#[test]
+fn diff_tree_resolves_revisions_before_it_rejects_an_unknown_argument() {
+    let f = Fixture::new("dtorder");
+    for args in [
+        &["diff-tree", "--zzbogus", "zznosuchrev"][..],
+        &["diff-tree", "zznosuchrev", "--zzbogus"],
+        &["diff-tree", "-h", "zznosuchrev"],
+    ] {
+        let r = f.run(args);
+        assert_eq!(r.code, 128, "`git {args:?}` exit code (stderr: {})", r.stderr);
+        assert_eq!(
+            r.stderr.lines().next(),
+            Some(
+                "fatal: ambiguous argument 'zznosuchrev': unknown revision or path \
+                 not in the working tree."
+            ),
+            "`git {args:?}` stderr"
+        );
+    }
+    for args in [
+        &["diff-tree", "--stdin", "--merge-base", "--zzbogus"][..],
+        &["diff-tree", "--merge-base", "HEAD", "--zzbogus"],
+    ] {
+        assert_bare_usage(&f, args, DIFF_TREE_USAGE_HEAD);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// replay: PARSE_OPT_KEEP_UNKNOWN_OPT means the operand check comes first
+// ---------------------------------------------------------------------------
+
+/// `cmd_replay` passes `PARSE_OPT_KEEP_UNKNOWN_OPT` (builtin/replay.c:117-118),
+/// so an option outside its table is not rejected by `parse_options()` at all —
+/// it is copied through for the `setup_revisions()` call at :163. The mode
+/// requirement at :121 sits between the two:
+///
+/// ```c
+///         if (!opts.onto && !opts.advance && !opts.revert) {
+///                 error(_("exactly one of --onto, --advance, or --revert is required"));
+///                 usage_with_options(replay_usage, replay_options);
+///         }
+/// ```
+///
+/// So `git replay --zzbogus` is answered by the *missing mode*, with the option
+/// never reported at all. This port used to raise its own unported-flag refusal
+/// during the sweep, which put it in front — the one thing
+/// `PARSE_OPT_KEEP_UNKNOWN_OPT` guarantees cannot happen.
+#[test]
+fn replay_requires_a_mode_before_it_looks_at_an_unknown_option() {
+    let f = Fixture::new("replayorder");
+    for args in [
+        &["replay"][..],
+        &["replay", "--zzbogus"],
+        &["replay", "--contained", "--zzbogus"],
+        &["replay", "--"],
+        &["replay", "--max-count=1", "HEAD"],
+    ] {
+        assert_unknown(
+            &f,
+            args,
+            "error: exactly one of --onto, --advance, or --revert is required",
+            REPLAY_USAGE_HEAD,
+        );
+    }
+}
+
+/// The checks git runs between the mode requirement and `setup_revisions()` keep
+/// their place too: `die_for_incompatible_opt3` (builtin/replay.c:126-128) and
+/// `get_ref_action_mode` (:137) both come first, and both `die()` at 128.
+#[test]
+fn replays_incompatible_modes_and_ref_action_still_precede_the_walk() {
+    let f = Fixture::new("replaymode");
+    let r = f.run(&["replay", "--advance", "main", "--revert", "main", "--zzbogus"]);
+    assert_eq!(r.code, 128, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stderr,
+        "fatal: options '--advance' and '--revert' cannot be used together\n"
+    );
+
+    let r = f.run(&["replay", "--onto", "main", "--ref-action=bogus", "--zzbogus"]);
+    assert_eq!(r.code, 128, "stderr: {}", r.stderr);
+    assert_eq!(r.stderr, "fatal: invalid --ref-action value: 'bogus'\n");
+}

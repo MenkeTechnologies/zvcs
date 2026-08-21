@@ -696,8 +696,24 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
 
     if do_fetch {
-        eprintln!("Updating {name}");
-        if super::fetch::fetch(&[name.to_string()]).is_err() {
+        // `Updating %s` is `printf`, not `fprintf(stderr, …)`
+        // (builtin/remote.c's `add` arm), like the `Fetching %s` that
+        // `remote update` prints from the same file.
+        println!("Updating {name}");
+        // git branches on `cmd_fetch()`'s int: anything but 0 is
+        // `error: Could not fetch <name>` and exit 1.
+        //
+        // `fetch()` reports a failed fetch as `Ok(ExitCode::from(128))`, not as
+        // `Err` — `Err` is reserved for the paths that die. Testing only
+        // `is_err()` therefore missed every ordinary failure, so
+        // `git remote add -f origin <missing repo>` printed the transport's
+        // `ERROR: Repository not found.` and then exited **0**, telling a script
+        // that checks `$?` the fetch had succeeded.
+        let failed = match super::fetch::fetch(&[name.to_string()]) {
+            Ok(code) => code != ExitCode::SUCCESS,
+            Err(_) => true,
+        };
+        if failed {
             eprintln!("error: Could not fetch {name}");
             return Ok(ExitCode::from(1));
         }
@@ -2217,7 +2233,14 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         if announce {
             println!("Fetching {name}");
         }
-        if super::fetch::fetch(std::slice::from_ref(name)).is_err() {
+        // Same as the `add -f` arm above: an ordinary fetch failure comes back
+        // as `Ok(ExitCode::from(128))`, so `is_err()` alone let
+        // `git remote update` walk on to the next remote and exit 0.
+        let failed = match super::fetch::fetch(std::slice::from_ref(name)) {
+            Ok(code) => code != ExitCode::SUCCESS,
+            Err(_) => true,
+        };
+        if failed {
             eprintln!("error: Could not fetch {name}");
             return Ok(ExitCode::from(1));
         }

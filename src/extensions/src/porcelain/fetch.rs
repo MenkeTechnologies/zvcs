@@ -1386,13 +1386,47 @@ const REFCOL_WIDTH: usize = 10;
 /// The URL as `git fetch` shows it in the `From …` header and in every
 /// FETCH_HEAD row: trailing slashes are dropped, and a trailing `.git` with it
 /// (`store_updated_refs` computes `url_len` exactly this way).
-fn display_url(url: &str) -> &str {
+fn display_url(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
-    match trimmed.strip_suffix(".git") {
+    let trimmed = match trimmed.strip_suffix(".git") {
         // git requires more than four characters before the suffix, so a bare
         // `.git` (or `x.git`) keeps its name.
         Some(head) if head.len() > 1 => head,
         _ => trimmed,
+    };
+    strip_userinfo(trimmed)
+}
+
+/// Drop the `user@` / `user:password@` from a URL's authority, which is what
+/// makes `git fetch` over ssh say `From github.com:owner/repo` rather than
+/// `From git@github.com:owner/repo`.
+///
+/// Measured against stock git 2.55.0 rather than inferred, because the scp-like
+/// spelling and the URL spelling delimit the authority differently:
+///
+/// ```text
+/// git@github.com:owner/repo.git        -> github.com:owner/repo
+/// ssh://git@github.com/owner/repo.git  -> ssh://github.com/owner/repo
+/// https://github.com/owner/repo.git    -> https://github.com/owner/repo
+/// ```
+///
+/// The scheme survives; only the userinfo goes. The authority ends at the first
+/// `/` in the URL form and at the first `:` in the scp-like one, so the `@` is
+/// only honoured before that — otherwise a path that happens to contain `@`
+/// (`host:mail@archive`) would lose its leading component.
+fn strip_userinfo(url: &str) -> String {
+    let (scheme, rest) = match url.find("://") {
+        Some(i) => url.split_at(i + 3),
+        None => ("", url),
+    };
+    let authority_end = if scheme.is_empty() {
+        rest.find(':').unwrap_or(rest.len())
+    } else {
+        rest.find('/').unwrap_or(rest.len())
+    };
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}{}", &rest[at + 1..]),
+        None => format!("{scheme}{rest}"),
     }
 }
 
@@ -2936,6 +2970,33 @@ fn fetch_submodules(repo: &gix::Repository, opts: &FetchOpts) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `From <url>` line drops the userinfo, keeps the scheme, and loses the
+    /// trailing `.git` — every row measured against stock git 2.55.0 rather than
+    /// inferred, because the scp-like and URL spellings delimit the authority
+    /// differently and only the measurement says where the `@` stops counting.
+    #[test]
+    fn the_from_line_url_drops_userinfo_and_keeps_the_scheme() {
+        for (raw, want) in [
+            // Measured: `git fetch` over each of these against a real remote.
+            ("git@github.com:owner/repo.git", "github.com:owner/repo"),
+            ("ssh://git@github.com/owner/repo.git", "ssh://github.com/owner/repo"),
+            ("https://github.com/owner/repo.git", "https://github.com/owner/repo"),
+            // A password is userinfo too, and must not reach the terminal.
+            ("https://user:pw@example.com/x.git", "https://example.com/x"),
+            // No userinfo: unchanged apart from the suffix rules.
+            ("https://example.com/x/", "https://example.com/x"),
+            ("/srv/local/repo.git", "/srv/local/repo"),
+            // `.git` needs more than one character ahead of it to be a suffix.
+            ("x.git", "x.git"),
+            // An `@` in the PATH is not userinfo: the authority ended at the
+            // first `:` (scp-like) or `/` (URL), so the path keeps its component.
+            ("host:mail@archive", "host:mail@archive"),
+            ("https://example.com/mail@archive", "https://example.com/mail@archive"),
+        ] {
+            assert_eq!(display_url(raw), want, "{raw}");
+        }
+    }
 
     /// git's prefetch filter moves the destination under `refs/prefetch/`,
     /// forces it, and drops the tag refspec entirely.

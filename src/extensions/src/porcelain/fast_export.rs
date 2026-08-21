@@ -230,6 +230,55 @@ fn usage_error(msg: &str) -> ExitCode {
     ExitCode::from(129)
 }
 
+/// The value of one of fast-export's ten value-taking options, in either of the
+/// two spellings `parse_long_opt()` accepts.
+///
+/// ```c
+/// static enum parse_opt_result get_arg(struct parse_opt_ctx_t *p, ...)
+/// {
+///         if (p->opt) {
+///                 *arg = p->opt;
+///                 p->opt = NULL;
+///         } ...
+///         } else if (p->argc > 1) {
+///                 p->argc--;
+///                 *arg = *++p->argv;
+///         } else
+///                 return error(_("%s requires a value"), optname(opt, flags));
+/// ```
+/// (parse-options.c:47-62)
+///
+/// `glued` is `p->opt`, the tail of a `--<name>=<value>` token, and is used
+/// as-is when present — including when it is empty, since `p->opt` is a non-NULL
+/// pointer to a `\0` there. Otherwise the next argv slot is the value, whatever
+/// it looks like: `get_arg()` reads `*++p->argv` without inspecting it, so
+/// `--export-marks --anonymize` writes marks to a file called `--anonymize`.
+///
+/// Only when there is no next slot is this an error, and it is
+/// `PARSE_OPT_ERROR`: one `error: option `<name>' requires a value` line on
+/// stderr, **no usage block**, exit 129. Every entry in `cmd_fast_export`'s table
+/// (builtin/fast-export.c:1323-1367) is long-only, so `optname()` always renders
+/// the `option `<name>'` form and never `switch `<c>'`.
+///
+/// Before this existed the separated spelling was not recognised at all: the
+/// option token fell through to `PARSE_OPT_KEEP_UNKNOWN_OPT`'s bucket and its
+/// value became a revision argument, so `fast-export --progress 1 HEAD` died
+/// `fatal: ambiguous argument '1'` where stock exported the history, and the
+/// missing-value case surfaced as the leftover-argument usage block instead of
+/// the `error:` line.
+fn option_value(
+    args: &[String],
+    i: &mut usize,
+    glued: Option<&str>,
+    name: &str,
+) -> Result<String> {
+    match glued {
+        Some(v) => Ok(v.to_string()),
+        None => crate::parseopt::get_arg(args, i, crate::parseopt::OptName::Long(name))
+            .map(str::to_string),
+    }
+}
+
 /// git's `die()`: `fatal: <msg>` on stderr, exit 128.
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
@@ -400,12 +449,24 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // The `-h` test lives inside that same loop, which is why a `-h` behind the
     // separator is not a help request either.
     let mut rest: Vec<&str> = Vec::new();
-    let mut argv = args.iter();
-    while let Some(a) = argv.next() {
-        let s = a.as_str();
-        match s {
+    let mut ai = 0usize;
+    while ai < args.len() {
+        let s = args[ai].as_str();
+        // `parse_long_opt()` (parse-options.c:462-560) splits the token at the
+        // first `=` and matches only the part in front of it, leaving the tail in
+        // `p->opt` for `get_arg()`. Everything this table does not own is copied
+        // through *verbatim*, `=<value>` included, so `name` is only ever used to
+        // match — never to rebuild an argument for stage 2.
+        let (name, glued) = match s.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+            _ => (s, None),
+        };
+        // Step past the option token first, the way `parse_options_step()` does,
+        // so `option_value()` reads the argument after it.
+        ai += 1;
+        match name {
             "--" => {
-                rest.extend(argv.map(String::as_str));
+                rest.extend(args[ai..].iter().map(String::as_str));
                 break;
             }
 
@@ -425,56 +486,58 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             "--anonymize" => opts.anonymize = true,
             "--reference-excluded-parents" => opts.reference_excluded_parents = true,
 
-            _ if s.starts_with("--progress=") => {
-                // git's `--progress` is a parse-options `OPTION_INTEGER`: base-0
-                // magnitude, an optional k/m/g suffix, a signed C-int range. A
-                // value outside that is `opterror()`'s single `error:` line and
-                // exit 129, with no option list behind it.
-                let v = &s["--progress=".len()..];
-                match parse_progress_int(v) {
-                    Some(n) => opts.progress = Some(n),
-                    None => {
-                        return Ok(usage_error(
-                            "option `progress' expects an integer value with an optional k/m/g suffix",
-                        ))
-                    }
+            "--progress" => {
+                // `OPT_INTEGER(0, "progress", &progress, …)`
+                // (builtin/fast-export.c:1324) is an `OPTION_INTEGER` over a C
+                // `int`, so `do_get_value()` rejects a bad value in three
+                // distinguishable ways (parse-options.c:260-288): an empty value
+                // "expects a numerical value", an out-of-range one names the
+                // value and the bounds, and anything else "expects an integer
+                // value with an optional k/m/g suffix". Each is `opterror()`'s
+                // single `error:` line and exit 129, with no option list behind
+                // it. Collapsing the three into the last wording — which this
+                // arm used to do — got `--progress=` and `--progress=2147483648`
+                // wrong.
+                let v = option_value(args, &mut ai, glued, "progress")?;
+                match crate::optint::integer(&crate::optint::long_opt("progress"), &v) {
+                    Ok(n) => opts.progress = Some(n),
+                    Err(e) => return Ok(usage_error(e.message())),
                 }
             }
-            _ if s.starts_with("--export-marks=") => {
-                opts.export_marks = Some(s["--export-marks=".len()..].to_string());
+            "--export-marks" => {
+                opts.export_marks = Some(option_value(args, &mut ai, glued, "export-marks")?);
             }
-            _ if s.starts_with("--import-marks=") => {
-                import_marks = Some((s["--import-marks=".len()..].to_string(), false));
+            "--import-marks" => {
+                import_marks = Some((option_value(args, &mut ai, glued, "import-marks")?, false));
             }
-            _ if s.starts_with("--import-marks-if-exists=") => {
-                import_marks = Some((s["--import-marks-if-exists=".len()..].to_string(), true));
+            "--import-marks-if-exists" => {
+                let v = option_value(args, &mut ai, glued, "import-marks-if-exists")?;
+                import_marks = Some((v, true));
             }
-            _ if s.starts_with("--refspec=") => {
-                refspecs.push(s["--refspec=".len()..].to_string());
-            }
-            _ if s.starts_with("--anonymize-map=") => {
-                anonymize_map.push(s["--anonymize-map=".len()..].to_string());
+            "--refspec" => refspecs.push(option_value(args, &mut ai, glued, "refspec")?),
+            "--anonymize-map" => {
+                anonymize_map.push(option_value(args, &mut ai, glued, "anonymize-map")?);
             }
             // git's `parse_opt_sign_mode` names the failing option through
             // `opt->long_name`, so the two sign-mode options share one message
             // shape and differ only in that name.
-            _ if s.starts_with("--signed-tags=") => {
-                let v = &s["--signed-tags=".len()..];
-                match SignedMode::parse(v) {
+            "--signed-tags" => {
+                let v = option_value(args, &mut ai, glued, "signed-tags")?;
+                match SignedMode::parse(&v) {
                     Some(m) => opts.signed_tags = m,
                     None => return Ok(usage_error(&format!("unknown signed-tags mode: {v}"))),
                 }
             }
-            _ if s.starts_with("--signed-commits=") => {
-                let v = &s["--signed-commits=".len()..];
-                match SignedMode::parse(v) {
+            "--signed-commits" => {
+                let v = option_value(args, &mut ai, glued, "signed-commits")?;
+                match SignedMode::parse(&v) {
                     Some(m) => opts.signed_commits = m,
                     None => return Ok(usage_error(&format!("unknown signed-commits mode: {v}"))),
                 }
             }
-            _ if s.starts_with("--tag-of-filtered-object=") => {
-                let v = &s["--tag-of-filtered-object=".len()..];
-                opts.filtered_tag = match v {
+            "--tag-of-filtered-object" => {
+                let v = option_value(args, &mut ai, glued, "tag-of-filtered-object")?;
+                opts.filtered_tag = match v.as_str() {
                     "abort" => FilteredTagMode::Abort,
                     "drop" => FilteredTagMode::Drop,
                     "rewrite" => FilteredTagMode::Rewrite,
@@ -482,12 +545,12 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
                     _ => return Ok(usage_error(&format!("unknown tag-of-filtered mode: {v}"))),
                 };
             }
-            _ if s.starts_with("--reencode=") => {
+            "--reencode" => {
                 // git's `parse_opt_reencode_mode`: a `git_parse_maybe_bool` value
                 // (so `yes`/`true`/`on`/`1`/any non-zero int → yes, `no`/`false`/
                 // `off`/`0`/empty → no), else a case-insensitive `abort`.
-                let v = &s["--reencode=".len()..];
-                match parse_reencode(v) {
+                let v = option_value(args, &mut ai, glued, "reencode")?;
+                match parse_reencode(&v) {
                     Some(m) => opts.reencode = m,
                     None => return Ok(usage_error(&format!("unknown reencoding mode: {v}"))),
                 }

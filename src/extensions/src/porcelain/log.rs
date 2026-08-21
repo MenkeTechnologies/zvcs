@@ -1045,6 +1045,52 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         if a == "--help-all" {
             return Ok(super::show_usage(USAGE_ALL));
         }
+        // A short option that spends the *next* argv slot on its value, standing
+        // last on the line: `get_arg()` (parse-options.c:59-60) — or, for `-n`,
+        // `handle_revision_opt()`'s own `argc <= 1` check (revision.c) — refuses it
+        // before the option's arm ever runs, so this has to come ahead of every
+        // other decision about the argument.
+        //
+        // Each arm below reads its value as `args.get(i).unwrap_or_default()`,
+        // which turns "you forgot the pattern" into "the pattern is the empty
+        // string": `git log -S` searched for `""`, matched every commit and exited
+        // 0 where git exits 129. The two tables that decide *which* refusal and
+        // *which* status live in [`super::blame::trailing_option_missing_value`],
+        // which is asked here rather than restated — `-S`, `-G`, `-I`, `-O` and
+        // `-l` are parse-options' ``switch `<c>' requires a value`` at 129 while
+        // `-n` is `revision.c`'s `error: -n requires an argument` at 128.
+        //
+        // Only short options are routed here. A long one is spelled `--name=<v>`
+        // or takes the next slot too, and its arms are answered elsewhere; a
+        // cluster (`-Sfoo`) already carries its value and the table declines it.
+        //
+        // A `--` in the value slot is not a value. `setup_revisions()` cuts the
+        // option region at the separator before it parses a single option:
+        //
+        // ```c
+        // /* First, search for "--" */
+        // ...
+        //         for (i = 1; i < argc; i++) {
+        //                 const char *arg = argv[i];
+        //                 if (strcmp(arg, "--"))
+        //                         continue;
+        //                 ...
+        //                 argv[i] = NULL;
+        //                 argc = i;
+        // ```
+        //
+        // (`revision.c`.) So `git log -S --` is a missing value, not a search for
+        // the string `--`. That cut is also exactly what separates these options
+        // from `-L`: `-L` is `builtin_log_options`' own entry and is read in stage
+        // 1, where the separator is still an ordinary argv slot — `git log -L --`
+        // really does hand `--` to the range parser, and dies at 128 for a
+        // malformed range rather than 129 for a missing value.
+        let value_slot_empty = i + 1 == args.len() || args[i + 1] == "--";
+        if value_slot_empty && a.starts_with('-') && !a.starts_with("--") {
+            if let Some(code) = super::blame::trailing_option_missing_value(a)? {
+                return Ok(code);
+            }
+        }
         // The value checks `diff_opt_parse`'s callbacks run as each option is seen.
         // `cmd_log` hands the whole argument list to `setup_revisions`, so a diff
         // option's value is validated here whether or not this command renders it.
@@ -5931,6 +5977,47 @@ impl Eq for Node {}
 /// decoding every abbreviation the machine has ever computed — which is what
 /// reading them out of the SQLite ledger cost, hex-parsing each id on the way in.
 struct AbbrevCache {
+    /// The width `gix::Id::shorten_or_id()` will start disambiguating from for
+    /// this repository, which is the half of the key that is not the object id.
+    ///
+    /// It has to be the *resolved* width and not the raw `core.abbrev` text,
+    /// because `core.abbrev` is three different things (`git_default_core_config()`,
+    /// environment.c):
+    ///
+    /// ```c
+    /// if (!strcmp(var, "core.abbrev")) {
+    ///         if (!value)
+    ///                 return config_error_nonbool(var);
+    ///         if (!strcasecmp(value, "auto"))
+    ///                 default_abbrev = -1;
+    ///         else if (!git_parse_maybe_bool_text(value))
+    ///                 default_abbrev = GIT_MAX_HEXSZ;
+    ///         else {
+    ///                 int abbrev = git_config_int(var, value, ctx->kvi);
+    ///                 if (abbrev < minimum_abbrev)
+    ///                         return error(_("abbrev length out of range: %d"), abbrev);
+    ///                 default_abbrev = abbrev;
+    ///         }
+    ///         return 0;
+    /// }
+    /// ```
+    ///
+    /// `auto` is a *derived* width and a false-y word (`no`, `off`, `false`, the
+    /// empty value) is the **whole** hash — two answers that are never the same
+    /// and must never share a key. Reading the key with `.integer("core.abbrev")`
+    /// did share it: no integer parses out of `no`, so it and `auto` both landed
+    /// on `0`. One `git -c core.abbrev=no log --oneline` then wrote every id it
+    /// touched into `~/.zvcs/cache/abbrev` at 40 characters under the key `auto`
+    /// reads, and every later `git log --oneline` in any clone on that machine
+    /// served the full hash back — a persistent, machine-wide corruption from a
+    /// single invocation, not per-process state.
+    ///
+    /// Resolving `auto` to its concrete width fixes a second, quieter version of
+    /// the same hole: at `0` every `auto` repository shared one key, so an
+    /// abbreviation computed while a repository was small stayed cached after it
+    /// grew enough to need a longer prefix. [`crate::abbrev::configured_abbrev`]
+    /// is the port of the C above and is shared with every other verb that has to
+    /// agree on this width.
     hex_len: usize,
     /// Abbreviations computed by THIS cache. Anything else is one lookup away in
     /// the shared image, so only what the image lacks is held here.
@@ -5941,12 +6028,9 @@ struct AbbrevCache {
 
 impl AbbrevCache {
     fn new(repo: &gix::Repository) -> Self {
-        // The repo-wide length: `core.abbrev` when set, else gix's auto rule.
-        let hex_len = repo
-            .config_snapshot()
-            .integer("core.abbrev")
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(0);
+        // See [`AbbrevCache::hex_len`]: the resolved width, never the raw config
+        // text, because `no`/`off`/`false` and `auto` are different answers.
+        let hex_len = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
         AbbrevCache { hex_len, local: Default::default(), fresh: Vec::new() }
     }
 

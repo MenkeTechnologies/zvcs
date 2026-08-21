@@ -70,8 +70,17 @@
 //! Unlike zshrs' script cache, the header pins no crate version. Entries are keyed
 //! by content, not by the binary that produced them, so they stay correct across
 //! releases — pinning would discard the whole warm cache on every version bump.
-//! [`FORMAT_VERSION`] covers the only thing that can actually invalidate an image:
-//! a change to this file's layout or hash.
+//! [`FORMAT_VERSION`] covers a change to this file's layout or hash, which is the
+//! only thing that can invalidate an *image*.
+//!
+//! What it does not cover is a change to what a key **means**, because it is
+//! checked against the base image's header and the journal has none: a
+//! `FORMAT_VERSION` bump discards `<name>.rkyv` and then merges every stale row of
+//! `<name>.log` straight back in. A key whose meaning changed is retired by
+//! versioning the key itself instead, so the old byte string can never be looked
+//! up again — see [`ABBREV_KEY_VERSION`], which exists because one
+//! `git -c core.abbrev=no log` used to poison every later `git log --oneline` on
+//! the machine.
 
 use memmap2::Mmap;
 use rkyv::{Archive, Serialize};
@@ -357,28 +366,72 @@ pub fn treediff_load(old_tree: &str, new_tree: &str, counts: bool) -> Option<&'s
     std::str::from_utf8(v).ok()
 }
 
-/// Raw object id bytes followed by the hex length, written into `buf`.
+/// What an abbrev key's `hex_len` byte means, appended so a change to that
+/// meaning retires every row written under the old one.
+///
+/// [`FORMAT_VERSION`] cannot do this job. It guards the *layout* of the base
+/// image and is checked when that image is mapped, so a bump discards
+/// `abbrev.rkyv` — but not `abbrev.log`, which carries no header and is merged
+/// into every read regardless. It is also shared with the tree-diff and blame
+/// caches, whose (much larger) rows have nothing wrong with them.
+///
+/// Versioning the key instead retires exactly the rows whose meaning changed:
+/// a key written at another version is a different byte string, so it can never
+/// be found again by any lookup. The retired rows stay in the image until it is
+/// next rewritten and cost a lookup nothing — the index is binary-searched, not
+/// scanned — which is the price of not deleting a file that concurrent readers
+/// may have mapped.
+///
+/// * `1` — `hex_len` was `core.abbrev` read as an integer, so `auto`, `no`,
+///   `off`, `false` and every unparsable value all keyed as `0`. `no` and its
+///   spellings mean the *full* hash while `auto` means a derived width, so one
+///   `git -c core.abbrev=no log` poisoned `auto` for every later command on the
+///   machine. `AbbrevCache::hex_len` in `porcelain::log` carries the C.
+/// * `2` — `hex_len` is the resolved width from
+///   [`crate::abbrev::configured_abbrev`]: `auto`'s derived number, or the hash's
+///   own hex width for the false-y words.
+///
+/// The one-shot import out of the old SQLite ledger ([`crate::db`]) stamps the
+/// current version onto rows the ledger stored under the version-1 meaning. That
+/// is safe rather than a second poisoning: a numeric `core.abbrev` meant the same
+/// number under both, and the `0` rows — the poisoned ones — become keys nothing
+/// asks for, because every reader now resolves to at least
+/// [`crate::abbrev::MINIMUM_ABBREV`] and git itself refuses `core.abbrev = 0`
+/// with `abbrev length out of range: 0` before any command runs.
+pub const ABBREV_KEY_VERSION: u8 = 2;
+
+/// Bytes an abbrev key can take: the largest hash gix supports (32) plus the hex
+/// length and [`ABBREV_KEY_VERSION`].
+pub const ABBREV_KEY_MAX: usize = 34;
+
+/// Raw object id bytes, the hex length, then [`ABBREV_KEY_VERSION`], written into
+/// `buf`.
 ///
 /// The key is the id's bytes rather than its hex text because `log --oneline`
 /// looks up every commit and every parent: formatting a 40-byte string per lookup
-/// just to hash it was most of what abbreviation cost. The largest hash gix
-/// supports is 32 bytes, so the buffer covers any of them plus the length byte.
+/// just to hash it was most of what abbreviation cost.
 ///
 /// The hex length is part of the key because the correct abbreviation grows with
 /// the repository — a prefix that was unique when it was computed must not be
-/// served once the repo needs a longer one.
-pub fn abbrev_key_into(buf: &mut [u8; 33], oid: &[u8], hex_len: usize) -> Option<usize> {
+/// served once the repo needs a longer one — and because two different
+/// `core.abbrev` settings must not answer for each other.
+pub fn abbrev_key_into(
+    buf: &mut [u8; ABBREV_KEY_MAX],
+    oid: &[u8],
+    hex_len: usize,
+) -> Option<usize> {
     if oid.len() > 32 || hex_len > u8::MAX as usize {
         return None;
     }
     buf[..oid.len()].copy_from_slice(oid);
     buf[oid.len()] = hex_len as u8;
-    Some(oid.len() + 1)
+    buf[oid.len() + 1] = ABBREV_KEY_VERSION;
+    Some(oid.len() + 2)
 }
 
 /// The abbreviation cached for an object id at `hex_len`.
 pub fn abbrev_load(oid: &[u8], hex_len: usize) -> Option<&'static str> {
-    let mut buf = [0u8; 33];
+    let mut buf = [0u8; ABBREV_KEY_MAX];
     let n = abbrev_key_into(&mut buf, oid, hex_len)?;
     let v = abbrev().get(&buf[..n])?;
     std::str::from_utf8(v).ok()
@@ -447,7 +500,7 @@ impl CacheWrite {
             CacheWrite::Abbrev { hex_len, rows } => rows
                 .into_iter()
                 .filter_map(|(oid, short)| {
-                    let mut buf = [0u8; 33];
+                    let mut buf = [0u8; ABBREV_KEY_MAX];
                     let n = abbrev_key_into(&mut buf, &oid, hex_len)?;
                     Some((buf[..n].to_vec(), short.into_bytes()))
                 })
@@ -964,10 +1017,37 @@ mod tests {
         assert_ne!(treediff_key("ab", "cd", false), treediff_key("abc", "d", false));
         assert_ne!(treediff_key("ab", "cd", false), treediff_key("ab", "cd", true));
         assert_ne!(blame_key("a", "b/c", "x"), blame_key("a/b", "c", "x"));
-        let mut one = [0u8; 33];
-        let mut two = [0u8; 33];
+        let mut one = [0u8; ABBREV_KEY_MAX];
+        let mut two = [0u8; ABBREV_KEY_MAX];
         let n1 = abbrev_key_into(&mut one, &[0xaa; 20], 7).unwrap();
         let n2 = abbrev_key_into(&mut two, &[0xaa; 20], 8).unwrap();
         assert_ne!(one[..n1], two[..n2], "hex length must be part of the key");
+    }
+
+    /// A key carries [`ABBREV_KEY_VERSION`], so a row written under the previous
+    /// meaning of `hex_len` cannot be found by a lookup made under this one. That
+    /// is what makes an already-poisoned `abbrev` cache recover rather than keep
+    /// serving 40 characters where `auto` asked for seven.
+    #[test]
+    fn an_abbrev_key_from_the_retired_scheme_can_never_be_found_again() {
+        let oid = [0xbb; 20];
+        let mut buf = [0u8; ABBREV_KEY_MAX];
+        let n = abbrev_key_into(&mut buf, &oid, 7).unwrap();
+        assert_eq!(n, oid.len() + 2, "id, hex length, key version");
+        assert_eq!(buf[n - 1], ABBREV_KEY_VERSION);
+
+        // Version 1's key was the id and the length byte, and nothing else.
+        let mut retired = oid.to_vec();
+        retired.push(7);
+        assert_ne!(&buf[..n], retired.as_slice(), "a v1 key must not still match");
+
+        // The collision the version retires: `auto` and `core.abbrev=no` both keyed
+        // as 0 under v1, so one wrote the other's answer. Under v2 they resolve to
+        // different widths and therefore to different keys.
+        let mut auto = [0u8; ABBREV_KEY_MAX];
+        let mut full = [0u8; ABBREV_KEY_MAX];
+        let a = abbrev_key_into(&mut auto, &oid, 7).unwrap();
+        let f = abbrev_key_into(&mut full, &oid, 40).unwrap();
+        assert_ne!(auto[..a], full[..f]);
     }
 }

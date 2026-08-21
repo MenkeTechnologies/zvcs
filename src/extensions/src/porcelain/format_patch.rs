@@ -3927,10 +3927,23 @@ fn parse_start_number(value: &str) -> std::result::Result<usize, ExitCode> {
 }
 
 /// The value slot of a two-token option, e.g. the `<dir>` in `-o <dir>`.
-fn value_at(args: &[String], i: usize, name: &str) -> Result<String> {
-    args.get(i)
-        .cloned()
-        .ok_or_else(|| anyhow!("option `{name}` requires a value"))
+///
+/// Every option this is called for is an entry in `builtin_format_patch_options`
+/// (builtin/log.c:2006-2095), so a missing value is `get_arg()`'s
+/// `PARSE_OPT_ERROR` (parse-options.c:59-60) and not this port's own diagnostic:
+/// one `error: <optname> requires a value` line on stderr, **no usage block**,
+/// exit 129. `cmd_format_patch` runs that `parse_options()` sweep to completion
+/// before `setup_revisions()` looks at a single argument (builtin/log.c:2196),
+/// which is why the refusal is immediate here and outranks a bad revision
+/// written earlier on the command line.
+///
+/// `tok` is the option as the user spelled it, so [`crate::parseopt::OptName::typed`] gives
+/// `optname()`'s two renderings from the one call site: `git format-patch -o`
+/// is ``switch `o'`` and `git format-patch --output-directory` is
+/// ``option `output-directory'``.
+fn value_at(args: &[String], i: usize, tok: &str) -> Result<String> {
+    crate::parseopt::value_at(args, i, crate::parseopt::OptName::typed(tok))
+        .map(str::to_string)
 }
 
 /// Port of `clean_message_id()` (builtin/log.c): skip leading whitespace and

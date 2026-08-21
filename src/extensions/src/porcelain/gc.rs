@@ -648,6 +648,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         &repo,
         unreachable,
         delta_options(&repo, aggressive, crate::progress::enabled(quiet)),
+        quiet,
     )?;
 
     // `repack` has already removed every unreachable object under `Drop`, so the
@@ -793,6 +794,7 @@ fn repack_all(
     repo: &gix::Repository,
     unreachable: Unreachable,
     delta: super::pack_objects::WriteOptions,
+    quiet: bool,
 ) -> Result<()> {
     let hash = repo.object_hash();
     let objdir = repo.objects.store_ref().path().to_path_buf();
@@ -822,6 +824,17 @@ fn repack_all(
     existing.sort_unstable();
     existing.dedup();
     if existing.is_empty() {
+        // `gc` reaches its repacking through a `repack -d -l` child
+        // (`builtin/gc.c:897`, with `-a`/`-A`/`--cruft` appended by
+        // `add_repack_all_option()` and `-q` by `builtin/gc.c:926-927`), so
+        // `repack`'s own `if (!names.nr) printf_ln(_("Nothing new to pack."))`
+        // (`builtin/repack.c:460-462`) lands on `gc`'s stdout. An empty object
+        // store is exactly the case that leaves `pack-objects` with nothing to
+        // write, so `git init --bare b && git -C b gc` says so; this port packs
+        // inline, so the notice is emitted here, on the same terms.
+        if !quiet {
+            println!("Nothing new to pack.");
+        }
         return Ok(());
     }
 

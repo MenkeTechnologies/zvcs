@@ -3082,7 +3082,12 @@ fn parse_count(arg: &str) -> Result<i32, String> {
 /// [`rev_opt_value_refusal`], which the callers run first because a value that is
 /// present and wrong is rejected wherever the option stands, while "requires a
 /// value" is only reachable at the end of the line.
-fn trailing_option_missing_value(arg: &str) -> Result<Option<ExitCode>> {
+///
+/// Shared with `log`, `show` and the other `setup_revisions()` verbs rather than
+/// copied into each: the split between the two tables — parse-options' `error:`
+/// at 129 and `revision.c`'s `die()` at 128 — is the whole content of this
+/// function, and a second copy is a second chance to get that split wrong.
+pub(super) fn trailing_option_missing_value(arg: &str) -> Result<Option<ExitCode>> {
     let mut err = std::io::stderr().lock();
     if let Some(body) = arg.strip_prefix("--") {
         // `--name=<value>` carries its value with it, so it is never missing one.

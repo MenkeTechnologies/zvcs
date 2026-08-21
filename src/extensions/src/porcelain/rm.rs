@@ -646,7 +646,11 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     // The cache-tree extension is written as-is, so drop it after mutating
     // entries or a later commit could capture a stale subtree.
     index.remove_tree();
-    index.write(gix::index::write::Options::default())?;
+    // git's `rm` finishes with `write_locked_index()` (builtin/rm.c:442), whose
+    // `do_write_index()` reads `skip_hash` out of the settings block
+    // (read-cache.c:2830-2831) — so this index gets the same trailer any other
+    // verb would have written in this repository.
+    index.write(crate::config::index_write_options(&repo))?;
 
     Ok(ret)
 }

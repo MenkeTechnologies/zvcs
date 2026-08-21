@@ -1829,6 +1829,17 @@ fn fetch_one(
         return Ok(Verdict::Fatal);
     }
 
+    // `transport_check_allowed()`, which `git_connect()` reaches for every scheme
+    // it opens itself and `transport_helper_init()` for the rest. It matters most
+    // here: a fetch is what a submodule update runs, and git clears
+    // `$GIT_PROTOCOL_FROM_USER` around exactly that, so a `.gitmodules` URL naming
+    // a local path or an `ext::` command is refused where a typed one is not.
+    if let Some(remote_url) = remote.url(gix::remote::Direction::Fetch) {
+        if crate::setup::check_url_allowed(remote_url).is_some() {
+            return Ok(Verdict::Fatal);
+        }
+    }
+
     // The configured fetch refspecs, captured before command-line refspecs replace them: with explicit
     // refspecs they become git's *opportunistic* second stage, mapping the refs the command line selected onto
     // the tracking refs they would normally land in (`get_ref_map` in `builtin/fetch.c`).

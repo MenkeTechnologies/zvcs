@@ -2171,19 +2171,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // git writes ORIG_HEAD only once it commits to actually rebasing. It is a
     // pseudo-ref, so no reflog is created for it (gix applies git's own
     // `should_autocreate_reflog` rule).
-    repo.edit_reference(RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::AndReference,
-                force_create_reflog: false,
-                message: "rebase".into(),
-            },
-            expected: PreviousValue::Any,
-            new: Target::Object(head_oid),
-        },
-        name: full_name("ORIG_HEAD")?,
-        deref: false,
-    })?;
+    write_orig_head(&repo, head_oid)?;
 
     // The sequencer detaches HEAD at <onto> first, ...
     set_head(
@@ -4335,15 +4323,50 @@ fn checkout_onto(repo: &gix::Repository, start: &SequencerStart<'_>) -> Result<(
 }
 
 /// git writes `ORIG_HEAD` only once it commits to actually rebasing. It is a
-/// pseudo-ref, so no reflog is created for it (gix applies git's own
-/// `should_autocreate_reflog` rule).
+/// pseudo-ref, so no reflog is created for it under the default
+/// `core.logAllRefUpdates` (gix applies git's own `should_autocreate_reflog`
+/// rule); `core.logAllRefUpdates=always` is what makes the entry appear, and
+/// therefore what makes its message observable.
+///
+/// The message is *not* the bare action name. Both start paths reach
+/// `reset_working_tree()` with `RESET_WORKING_TREE_UPDATE_ORIG_HEAD` set and no
+/// `orig_head_msg` of their own — `sequencer.c:4936-4946` for the merge backend
+/// (`checkout_onto()`, which passes only `.head_msg` and
+/// `.default_reflog_action`) and `builtin/rebase.c:1882-1889` for the apply
+/// backend. `reset.c` then builds the message itself:
+///
+/// ```c
+/// if ((update_orig_head && !reflog_orig_head) || !reflog_head) {
+///         if (!default_reflog_action)
+///                 BUG("default_reflog_action must be given when reflog messages are omitted");
+///         reflog_action = getenv(GIT_REFLOG_ACTION_ENVIRONMENT);
+///         strbuf_addf(&msg, "%s: ", reflog_action ? reflog_action :
+///                                                   default_reflog_action);
+/// }
+/// prefix_len = msg.len;
+///
+/// if (update_orig_head) {
+///         ...
+///                 if (!reflog_orig_head) {
+///                         strbuf_addstr(&msg, "updating ORIG_HEAD");
+///                         reflog_orig_head = msg.buf;
+///                 }
+/// ```
+/// (`reset.c:34-50`)
+///
+/// So the entry reads `<action>: updating ORIG_HEAD`, where `<action>` is
+/// `$GIT_REFLOG_ACTION` when set and `rebase` otherwise — exactly
+/// [`reflog_action`]. Only the two start sites update `ORIG_HEAD`;
+/// `--continue`/`--skip`/`--abort` pass `RESET_WORKING_TREE_UPDATE_HEAD` without
+/// `…_UPDATE_ORIG_HEAD` (`builtin/rebase.c:1390-1391`, `1416-1417`) and so leave
+/// it alone.
 fn write_orig_head(repo: &gix::Repository, head: ObjectId) -> Result<()> {
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: "rebase".into(),
+                message: format!("{}: updating ORIG_HEAD", reflog_action()).into(),
             },
             expected: PreviousValue::Any,
             new: Target::Object(head),

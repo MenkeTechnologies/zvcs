@@ -217,6 +217,39 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // `git-submodule.sh:23` calls `require_work_tree`, the `git-sh-setup.sh`
+    // helper, before it parses a single argument of its own:
+    //
+    //     require_work_tree () {
+    //         test "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true || {
+    //             program_name=$0
+    //             die "$(eval_gettext "fatal: \$program_name cannot be used without a working tree.")"
+    //         }
+    //     }
+    //
+    // (`git-sh-setup.sh:186-191`.) So every subcommand — `status` included, and
+    // the bare form that defaults to it — refuses outside a work tree with one
+    // line on stderr and exit 1, not the 128 a C builtin's `die()` would give:
+    // `die` is `die_with_status 1` (`git-sh-setup.sh:49-57`), and the `fatal: `
+    // prefix is part of the message text rather than something `die` adds.
+    //
+    // `$program_name` is `$0`, the path `git.c` execs the script under, which is
+    // `<exec-path>/git-submodule`. The shadow serves every `git-*` helper out of
+    // its own bin directory, so [`crate::exec_path`] is the honest analogue —
+    // and a `git-submodule` link really does live there, so the path names a
+    // file exactly as stock's does.
+    //
+    // `git submodule--helper` is a C builtin that never sources `git-sh-setup`,
+    // which is why it is [`subcommand`] that is entered directly and why the
+    // gate sits here rather than there.
+    if outside_work_tree() {
+        eprintln!(
+            "fatal: {}/git-submodule cannot be used without a working tree.",
+            crate::exec_path()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
     // `git-submodule.sh:29`: "Tell the rest of git that any URLs we get don't
     // come directly from the user, so it can apply policy as appropriate." Every
     // url this porcelain dials comes out of `.gitmodules`, so `protocol.<x>.allow
@@ -229,6 +262,23 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
     std::env::set_var("GIT_PROTOCOL_FROM_USER", "0");
 
     subcommand(args)
+}
+
+/// `require_work_tree`'s test, negated: `git rev-parse --is-inside-work-tree`
+/// did not answer `true`.
+///
+/// The shell writes it as `test "$(...2>/dev/null)" = true || die`, so *any*
+/// answer other than the word `true` refuses — including the failure that
+/// standing outside a repository altogether produces. That case never reaches
+/// this gate in practice: `. git-sh-setup` runs first and dies with git's own
+/// `not a git repository` (exit 128), which is what the subcommands below
+/// reproduce when discovery fails, so discovery failing here stands down and
+/// lets them do it.
+fn outside_work_tree() -> bool {
+    match gix::discover(".") {
+        Ok(repo) => !crate::setup::is_inside_work_tree(&repo),
+        Err(_) => false,
+    }
 }
 
 /// The subcommand table `git submodule` and `git submodule--helper` share.
@@ -366,7 +416,7 @@ fn status_repo(
     cached: bool,
     recursive: bool,
 ) -> Result<u8> {
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
     let entries = match module_list(repo, &index, patterns)? {
         Ok(entries) => entries,
         // Unmatched pathspecs: git reports each one and exits 1.
@@ -506,7 +556,7 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
 /// against the repository it opened, mirroring git's `module_update` calling the
 /// init pass before `update_submodules`.
 fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Result<u8> {
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
 
     let mut entries = match module_list(repo, &index, patterns)? {
         Ok(entries) => entries,
@@ -727,7 +777,7 @@ fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
 
     // `module_summary()` resolves the `[commit]` slot before it looks at
     // `--files`, so a leading revision is consumed either way — `--files` then
@@ -1309,7 +1359,7 @@ fn foreach_repo(
     super_prefix: Option<&str>,
     prefix: Option<&BString>,
 ) -> Result<u8> {
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
     let entries = match module_list(repo, &index, &[])? {
         Ok(entries) => entries,
         Err(code) => return Ok(code),
@@ -1519,7 +1569,7 @@ fn sync_repo(
     super_prefix: Option<&str>,
     prefix: Option<&BString>,
 ) -> Result<u8> {
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
     let entries = match module_list(repo, &index, patterns)? {
         Ok(entries) => entries,
         Err(code) => return Ok(code),
@@ -1777,7 +1827,7 @@ fn set_url(args: &[String], mut quiet: bool) -> Result<ExitCode> {
 
     // `repo_read_gitmodules(the_repository, 0)` then `sync_submodule(sub->path,
     // prefix, NULL, ...)`: the sync must see the url just written.
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
     let display = display_path(path.as_bstr(), prefix.as_ref());
     let modules = read_gitmodules(&repo);
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -1864,7 +1914,7 @@ fn deinit(args: &[String], mut quiet: bool) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
     let prefix = repo_prefix(&repo)?;
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
     let entries = match module_list(&repo, &index, &patterns)? {
         Ok(entries) => entries,
         Err(code) => return Ok(ExitCode::from(code)),
@@ -2086,7 +2136,7 @@ fn absorb_repo(
     patterns: &[BString],
     super_prefix: Option<&str>,
 ) -> Result<u8> {
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
     let entries = match module_list(repo, &index, patterns)? {
         Ok(entries) => entries,
         Err(code) => return Ok(code),
@@ -2447,7 +2497,7 @@ fn update_repo(
         repo
     };
 
-    let index = repo.open_index()?;
+    let index = repo.index_or_empty()?;
     let entries = match module_list(&repo, &index, patterns)? {
         Ok(entries) => entries,
         Err(code) => return Ok(code),

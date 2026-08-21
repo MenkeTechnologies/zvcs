@@ -1512,7 +1512,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if include_flag {
         let mut index = open_or_empty_index(&repo)?;
         include_stage(&repo, &pathspecs, &index)?.apply_to(&mut index);
-        index.write(gix::index::write::Options::default())?;
+        // `-i` writes the real index through `write_locked_index()`
+        // (builtin/commit.c:454-465), so the repository's index-write settings apply:
+        // `do_write_index()` takes `skip_hash` from the settings block for every
+        // index it serialises (read-cache.c:2830-2831).
+        index.write(crate::config::index_write_options(&repo))?;
     }
 
     // --- build a tree object from the index ------------------------------
@@ -2799,7 +2803,13 @@ impl IndexSwap {
             guard.backup = Some(backup);
         }
         let mut bytes = Vec::new();
-        prepared.write_to(&mut bytes, gix::index::write::Options::default())?;
+        // The dry-run swap stands in for git's partial-commit `false_lock`
+        // (`next-index-<pid>`, builtin/commit.c:541-550), which is written by the
+        // same `write_locked_index()` -> `do_write_index()` pair as the real
+        // index — `skip_hash` and all (read-cache.c:2830-2831). A hook that reads
+        // this index through `GIT_INDEX_FILE` therefore sees the trailer the
+        // repository asked for, not the one this code path felt like writing.
+        prepared.write_to(&mut bytes, crate::config::index_write_options(repo))?;
         std::fs::write(&guard.index, &bytes)?;
         Ok(guard)
     }
@@ -3161,7 +3171,11 @@ fn build_only_mode_tree(repo: &gix::Repository, pathspecs: &[String]) -> Result<
     // next one.
     let mut real = open_or_empty_index(repo)?;
     staged.apply_to(&mut real);
-    real.write(gix::index::write::Options::default())?;
+    // Step (2)/(3) (builtin/commit.c:534-538) rewrites the real on-disk index,
+    // so it carries the
+    // repository's index-write options like every other write does
+    // (read-cache.c:2830-2831).
+    real.write(crate::config::index_write_options(repo))?;
 
     Ok(tree_id)
 }
@@ -3463,7 +3477,10 @@ fn stage_tracked_changes(repo: &gix::Repository) -> Result<()> {
         return Ok(());
     }
     staged.apply_to(&mut index);
-    index.write(gix::index::write::Options::default())?;
+    // `add_files_to_cache()` + `write_locked_index()` (builtin/commit.c:454-465):
+    // an ordinary index write, with the repository's options
+    // (read-cache.c:2830-2831).
+    index.write(crate::config::index_write_options(repo))?;
     Ok(())
 }
 

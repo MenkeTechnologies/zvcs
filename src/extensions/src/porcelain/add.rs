@@ -1241,7 +1241,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             pathspec.is_included(p, Some(false))
         });
         index.remove_tree();
-        index.write(gix::index::write::Options::default())?;
+        // `do_write_index()` sets the hashfile's `skip_hash` from the repository's
+        // settings block before it serialises a single entry
+        // (read-cache.c:2830-2831), so `index.skipHash` — and the
+        // `feature.manyFiles` macro that defaults it (repo-settings.c:59-63, then
+        // `:81`) — governs every index git writes, whichever verb wrote it.
+        // Going through the shared reader is what keeps the trailer this leaves
+        // behind identical to the one `update-index` would have left.
+        index.write(crate::config::index_write_options(&repo))?;
         record_stage_event(&repo, staged.len() + deletions.len());
 
         if verbose {
@@ -1284,7 +1291,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // The tree-cache extension is written verbatim by `File::write`; drop it after
     // mutating entries so a later commit can't capture a stale subtree.
     index.remove_tree();
-    index.write(gix::index::write::Options::default())?;
+    // Same options as the intent-to-add path above: the trailer an index
+    // carries is a property of the repository, not of the verb that wrote it
+    // (read-cache.c:2830-2831).
+    index.write(crate::config::index_write_options(&repo))?;
     record_stage_event(&repo, staged.len() + deletions.len());
 
     if verbose {

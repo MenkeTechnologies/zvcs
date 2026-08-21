@@ -251,38 +251,40 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
 
     // Default target is HEAD; otherwise each positional commit-ish, in order.
     // git dies on the first one it cannot handle, so a failure stops the loop.
-    if revs.is_empty() {
-        let commit = repo.head_commit()?;
-        if let Some(code) = describe_one(&repo, &commit, &opts, &filter)? {
-            return Ok(code);
-        }
-    } else {
-        for rev in &revs {
-            // `repo_get_oid` takes a full-length hex name as the id without
-            // consulting the odb, so an absent-but-well-formed id is *not* an
-            // invalid object name here; it fails below, where neither
-            // `lookup_commit_reference_gently` nor `odb_read_object_info` can
-            // produce anything for it.
-            let Some(id) = crate::objname::resolve(&repo, rev) else {
-                return fatal(format!("Not a valid object name {rev}"));
-            };
-            // git names a commit (tags peel through) directly; a blob is routed to
-            // the tree-path search; anything else is fatal (`builtin/describe.c`).
-            match repo.find_object(id).ok().and_then(|obj| obj.peel_to_commit().ok()) {
-                Some(commit) => {
-                    if let Some(code) = describe_one(&repo, &commit, &opts, &filter)? {
-                        return Ok(code);
-                    }
+    //
+    // The default is spelled as the literal argument it is: `cmd_describe()` ends
+    // in `describe("HEAD", 1)` (`builtin/describe.c:784`), the very function the
+    // positional loop calls (`:790`), so the bare form takes the same
+    // `repo_get_oid()` route and the same diagnostics. That matters on an unborn
+    // `HEAD`, where `repo_get_oid()` fails and `describe()` dies with
+    // `Not a valid object name HEAD` (`builtin/describe.c:571`, exit 128).
+    // Peeling `HEAD` separately reported gitoxide's "does not have any commits"
+    // instead, which is neither git's wording nor git's exit code.
+    let targets: Vec<&str> = if revs.is_empty() { vec!["HEAD"] } else { revs.to_vec() };
+    for rev in &targets {
+        // `repo_get_oid` takes a full-length hex name as the id without
+        // consulting the odb, so an absent-but-well-formed id is *not* an
+        // invalid object name here; it fails below, where neither
+        // `lookup_commit_reference_gently` nor `odb_read_object_info` can
+        // produce anything for it.
+        let Some(id) = crate::objname::resolve(&repo, rev) else {
+            return fatal(format!("Not a valid object name {rev}"));
+        };
+        // git names a commit (tags peel through) directly; a blob is routed to
+        // the tree-path search; anything else is fatal (`builtin/describe.c`).
+        match repo.find_object(id).ok().and_then(|obj| obj.peel_to_commit().ok()) {
+            Some(commit) => {
+                if let Some(code) = describe_one(&repo, &commit, &opts, &filter)? {
+                    return Ok(code);
                 }
-                None => {
-                    let blob =
-                        repo.find_object(id).ok().filter(|o| o.kind == gix::object::Kind::Blob);
-                    let Some(obj) = blob else {
-                        return fatal(format!("{rev} is neither a commit nor blob"));
-                    };
-                    if let Some(code) = describe_blob(&repo, obj.id, &opts, &filter)? {
-                        return Ok(code);
-                    }
+            }
+            None => {
+                let blob = repo.find_object(id).ok().filter(|o| o.kind == gix::object::Kind::Blob);
+                let Some(obj) = blob else {
+                    return fatal(format!("{rev} is neither a commit nor blob"));
+                };
+                if let Some(code) = describe_blob(&repo, obj.id, &opts, &filter)? {
+                    return Ok(code);
                 }
             }
         }

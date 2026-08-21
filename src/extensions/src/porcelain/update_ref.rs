@@ -699,6 +699,80 @@ fn categorize(cmd: &str) -> Option<Cat> {
     })
 }
 
+/// `builtin/update-ref.c:679-693`'s `command[]`, reduced to what the dispatch
+/// loop reads off it: the prefix, and whether the entry declares arguments.
+const COMMANDS: &[(&str, bool)] = &[
+    ("update", true),
+    ("create", true),
+    ("delete", true),
+    ("verify", true),
+    ("symref-update", true),
+    ("symref-create", true),
+    ("symref-delete", true),
+    ("symref-verify", true),
+    ("option", true),
+    ("start", false),
+    ("prepare", false),
+    ("abort", false),
+    ("commit", false),
+];
+
+/// `builtin/update-ref.c:720-738` — pick the command out of one whole input line.
+///
+/// ```c
+/// for (i = 0; i < ARRAY_SIZE(command); i++) {
+///         const char *prefix = command[i].prefix;
+///         char c;
+///
+///         if (!starts_with(input.buf, prefix))
+///                 continue;
+///
+///         /*
+///          * If the command has arguments, verify that it's
+///          * followed by a space. Otherwise, it shall be followed
+///          * by a line terminator.
+///          */
+///         c = command[i].args ? ' ' : line_termination;
+///         if (input.buf[strlen(prefix)] != c)
+///                 continue;
+///
+///         cmd = &command[i];
+///         break;
+/// }
+/// ```
+///
+/// The byte after the prefix has to be exactly right, which is why `commit foo`
+/// and `option` are *unknown commands* rather than a mis-argued `commit` and a
+/// mis-argued `option`, and why a final line with no terminator at all is one
+/// too: `input.buf[strlen("start")]` is then the string's NUL, not `'\n'`.
+///
+/// `line` carries its terminator, so the `-z` case where that NUL *is* the
+/// terminator falls out of the same test.
+fn match_command(line: &str, terminator: char) -> Option<&'static str> {
+    COMMANDS.iter().find_map(|&(prefix, takes_args)| {
+        let rest = line.strip_prefix(prefix)?;
+        let want = if takes_args { ' ' } else { terminator };
+        rest.starts_with(want).then_some(prefix)
+    })
+}
+
+/// C's `isspace()` over the ASCII range: space, `\t`, `\n`, `\v`, `\f`, `\r`.
+/// Rust's `is_ascii_whitespace()` omits the vertical tab.
+fn is_c_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
+/// What C's `%s` prints for `input.buf`: everything up to the first NUL.
+///
+/// The whole line is interpolated, terminator included — `strbuf_getwholeline()`
+/// keeps it — so `die("unknown command: %s", input.buf)` emits `bogus line\n`
+/// and `die()` then adds its own newline, giving a stderr that ends `\n\n`. In
+/// `-z` mode the terminator *is* the NUL, so `%s` stops before it and only
+/// `die()`'s newline shows.
+fn c_string(s: &str) -> &str {
+    s.split('\0').next().unwrap_or(s)
+}
+
 /// git's `prepare`: acquire the locks the staged batch needs and validate its
 /// preconditions, then roll everything back. gitoxide's prepared transaction is
 /// perfectly rolled back when dropped, so this catches a doomed batch at
@@ -746,28 +820,51 @@ fn run_stdin(
     // The transaction state machine; starts in the implicit open transaction.
     let mut state = TxnState::Open;
 
-    let records = if nul {
-        split_nul_records(&input)?
+    // git's loop is `while (!strbuf_getwholeline(&input, stdin, line_termination))`,
+    // so what it dispatches on — and interpolates into every diagnostic — is one
+    // whole terminator-carrying chunk of the input. Both splitters hand that
+    // chunk back verbatim; `-z` additionally pre-collects the NUL-separated
+    // value slots that belong to it, which the line form takes from the chunk
+    // itself.
+    let terminator = if nul { '\0' } else { '\n' };
+    let records: Vec<(String, Option<Vec<String>>)> = if nul {
+        split_nul_records(&input).into_iter().map(|(raw, f)| (raw, Some(f))).collect()
     } else {
-        split_line_records(&input)?
+        split_line_records(&input).into_iter().map(|raw| (raw, None)).collect()
     };
 
-    for fields in records {
-        let Some(cmd) = fields.first().map(String::as_str) else {
-            continue;
-        };
-        let args = &fields[1..];
+    for (raw, staged) in records {
+        // `builtin/update-ref.c:715-718`, both checked on the raw line and both
+        // ahead of the command table:
+        //
+        //     if (*input.buf == line_termination)
+        //             die("empty command in input");
+        //     else if (isspace(*input.buf))
+        //             die("whitespace before command: %s", input.buf);
+        if raw.starts_with(terminator) {
+            return fatal(anyhow!("empty command in input"));
+        }
+        if raw.starts_with(is_c_space) {
+            return fatal(anyhow!("whitespace before command: {}", c_string(&raw)));
+        }
 
         // git recognises the command before consulting the state machine, so an
         // unknown command is reported even from a closed/prepared transaction.
-        let Some(cat) = categorize(cmd) else {
-            return fatal(anyhow!("unknown command: {}", fields.join(" ")));
+        // The whole line is the `%s`, terminator and all.
+        let Some(cmd) = match_command(&raw, terminator) else {
+            return fatal(anyhow!("unknown command: {}", c_string(&raw)));
         };
-        // The transaction controls take no arguments; git treats `commit foo` as
-        // an unknown command rather than silently committing.
-        if cat != Cat::Edit && !args.is_empty() {
-            return fatal(anyhow!("unknown command: {}", fields.join(" ")));
-        }
+        let cat = categorize(cmd).expect("the command table and the classifier list the same names");
+
+        // `parse_cmd_*` reads its arguments off the same line. Splitting it here
+        // rather than up front keeps a malformed *later* line from pre-empting
+        // the output of the commands ahead of it, which is what git's
+        // line-at-a-time loop gives.
+        let fields = match staged {
+            Some(fields) => fields,
+            None => tokenize(raw.strip_suffix(terminator).unwrap_or(&raw))?,
+        };
+        let args = &fields[1..];
 
         // State guard, matching git's per-state restrictions. Each violation is a
         // fatal error exiting 128.
@@ -1107,7 +1204,14 @@ fn stage_symref_command(
 /// The first field of each record is `<command> SP <ref>` (or a bare command),
 /// and every following NUL-separated field up to the record's argument count is
 /// a value slot. The per-command field counts come straight from the man page.
-fn split_nul_records(input: &str) -> Result<Vec<Vec<String>>> {
+///
+/// Each record is returned with the head as `strbuf_getwholeline(&input, stdin,
+/// '\0')` produced it — its NUL terminator restored — beside the fields, so the
+/// caller's diagnostics can interpolate the same `input.buf` git's do. An
+/// unrecognised head is not rejected here: git meets it in the dispatch loop,
+/// after the commands ahead of it have already run, so it is passed through with
+/// no value slots for the loop to refuse.
+fn split_nul_records(input: &str) -> Vec<(String, Vec<String>)> {
     let mut fields: Vec<&str> = input.split('\0').collect();
     // A well-formed stream ends with a trailing NUL, producing one empty tail.
     if fields.last().is_some_and(|f| f.is_empty()) {
@@ -1130,8 +1234,7 @@ fn split_nul_records(input: &str) -> Result<Vec<Vec<String>>> {
             "symref-update" => 3,
             "symref-create" => 1,
             "symref-delete" | "symref-verify" => 1,
-            "option" | "start" | "prepare" | "commit" | "abort" => 0,
-            _ => crate::git_fatal!("unknown command: {head}"),
+            _ => 0,
         };
         let mut record = vec![cmd];
         if let Some(f) = first {
@@ -1147,22 +1250,22 @@ fn split_nul_records(input: &str) -> Result<Vec<Vec<String>>> {
                 None => break,
             }
         }
-        records.push(record);
+        records.push((format!("{head}\0"), record));
     }
-    Ok(records)
+    records
 }
 
-/// Split newline-terminated `--stdin` input into space-separated, optionally
-/// C-quoted fields.
-fn split_line_records(input: &str) -> Result<Vec<Vec<String>>> {
-    let mut records = Vec::new();
-    for line in input.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        records.push(tokenize(line)?);
-    }
-    Ok(records)
+/// Split newline-terminated `--stdin` input into the lines
+/// `strbuf_getwholeline(&input, stdin, '\n')` would hand back one at a time.
+///
+/// Terminators are kept and empty lines are kept: both are things git's dispatch
+/// loop looks at. `str::lines()` did neither, which turned `\n` on its own into
+/// a skipped record where git says `empty command in input`, dropped the `\r` of
+/// a CRLF line git keeps, and cost every diagnostic the trailing newline git
+/// interpolates. A final line with no terminator is handed back as it arrived,
+/// which is what makes it an unknown command in [`match_command`].
+fn split_line_records(input: &str) -> Vec<String> {
+    input.split_inclusive('\n').map(str::to_string).collect()
 }
 
 /// Split one instruction line into fields, honouring C-style quoting.

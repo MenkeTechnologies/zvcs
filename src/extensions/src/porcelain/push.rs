@@ -460,6 +460,18 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // `transport_check_allowed()` for the push direction. git reaches it from the
+    // same `git_connect()`, so `protocol.<name>.allow` gates a push exactly as it
+    // gates a fetch.
+    if let Some(remote_url) = remote
+        .url(gix::remote::Direction::Push)
+        .or_else(|| remote.url(gix::remote::Direction::Fetch))
+    {
+        if let Some(code) = crate::setup::check_url_allowed(remote_url) {
+            return Ok(code);
+        }
+    }
+
     // Build the concrete updates, plus the (local-branch, remote-ref) pairs that
     // `--set-upstream` records after a successful push.
     let (mut requests, upstreams) = build_requests(&repo, &f, &specs)?;

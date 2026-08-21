@@ -789,8 +789,10 @@ fn update_paths(repo: &gix::Repository, update: &[BString]) -> Result<()> {
 
     index.sort_entries();
     index.remove_tree();
+    // Staging a previous resolution rewrites the real index, so it carries the
+    // repository's index-write options (read-cache.c:2830-2831).
     index
-        .write(gix::index::write::Options::default())
+        .write(crate::config::index_write_options(repo))
         .context("unable to write new index file")?;
     Ok(())
 }

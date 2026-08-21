@@ -329,7 +329,10 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     if modified {
         index.sort_entries();
         index.remove_tree();
-        index.write(gix::index::write::Options::default())?;
+        // `write_locked_index()` at the end of `cmd_mv()` (builtin/mv.c:634); the
+        // options come from the repository, not from this call site
+        // (read-cache.c:2830-2831).
+        index.write(crate::config::index_write_options(&repo))?;
     }
 
     Ok(ExitCode::SUCCESS)

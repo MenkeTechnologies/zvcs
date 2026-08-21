@@ -80,7 +80,11 @@
 //! * `create` — build the `I`/`W` commit graph and print the `W` id without
 //!   storing it or touching the worktree (`do_create_stash`).
 //! * `store` — point `refs/stash` at an existing stash-like commit, appending
-//!   the reflog entry (`do_store_stash`).
+//!   the reflog entry (`do_store_stash`). "Stash-like" is checked, not assumed:
+//!   `do_store_stash()` runs `assert_stash_like()` on the hex spelling of the
+//!   commit first (`builtin/stash.c:1132-1134`), so an ordinary commit — `git
+//!   stash store -m x HEAD` — is `fatal: '<oid>' is not a stash-like commit`
+//!   and exit 128, with no ref written. See [`store_assert_stash_like`].
 //! * `show` — diff the stash base tree against its worktree tree, formatted per
 //!   the diff options / `stash.showStat`+`stash.showPatch` config; rendering is
 //!   delegated to the `diff` porcelain (git's own `diff_tree_oid` machinery).
@@ -1524,17 +1528,88 @@ pub(crate) fn store_commit(repo: &gix::Repository, oid: ObjectId, message: &str)
     Ok(())
 }
 
-fn store_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
-    let (message, quiet, commit) = parse_store_options(args)?;
-    let oid = match repo.rev_parse_single(commit.as_str()) {
-        Ok(id) => id.detach(),
+/// `assert_stash_like()` (`builtin/stash.c:216-223`), as `do_store_stash()` calls
+/// it on the hex spelling of the commit it is about to point `refs/stash` at
+/// (`builtin/stash.c:1132-1134`):
+///
+/// ```c
+/// static void assert_stash_like(struct stash_info *info, const char *revision)
+/// {
+///         if (get_oidf(&info->b_commit, "%s^1", revision) ||
+///             get_oidf(&info->w_tree, "%s:", revision) ||
+///             get_oidf(&info->b_tree, "%s^1:", revision) ||
+///             get_oidf(&info->i_tree, "%s^2:", revision))
+///                 die(_("'%s' is not a stash-like commit"), revision);
+/// }
+/// ```
+///
+/// Four resolutions, so four requirements: the object is a commit (`%s:` wants a
+/// tree out of it), it has a second parent (`%s^2:`), and both of the first two
+/// parents can be read for their trees (`%s^1:`, `%s^2:`). That is the shape
+/// `git stash create` writes and nothing else — a plain commit fails on `^2`.
+///
+/// `%s^1` runs through `lookup_commit_reference()`, which reports a non-commit
+/// on stderr before the `die` and is why stock prints two lines for a tree or a
+/// blob. Both go to stderr, and `-q` suppresses neither: `store_stash()` gates
+/// only its own `Cannot update` line on quiet, and this is a `die`.
+///
+/// Returns the `fatal:` body, or `None` when the commit is stash-like.
+fn store_assert_stash_like(repo: &gix::Repository, oid: ObjectId) -> Option<String> {
+    let not_stash_like = format!("'{oid}' is not a stash-like commit");
+    // A full-length hex name resolves to an id without an odb lookup, so the
+    // object may simply not be there; `lookup_commit_reference()` is silent
+    // about that one and only the `die` is printed.
+    let Ok(object) = repo.find_object(oid) else {
+        return Some(not_stash_like);
+    };
+    // `lookup_commit_reference()` peels tags before it decides, and names the
+    // kind it arrived at — so a tag over a tree is reported as the tree.
+    let Ok(object) = object.peel_tags_to_end() else {
+        return Some(not_stash_like);
+    };
+    let kind = object.kind;
+    let commit = match object.peel_to_commit() {
+        Ok(commit) => commit,
         Err(_) => {
-            if !quiet {
-                eprintln!("Cannot update refs/stash with {commit}");
-            }
-            return Ok(ExitCode::FAILURE);
+            // `lookup_commit_reference()`'s own diagnostic, ahead of the `die`.
+            eprintln!("error: object {oid} is a {kind}, not a commit");
+            return Some(not_stash_like);
         }
     };
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    // `%s^2:` needs a second parent, and both parents have to be readable
+    // commits for `%s^1:` and `%s^2:` to name their trees.
+    if parents.len() < 2 {
+        return Some(not_stash_like);
+    }
+    if parents[..2].iter().any(|id| repo.find_commit(*id).is_err()) {
+        return Some(not_stash_like);
+    }
+    None
+}
+
+fn store_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    let (message, quiet, commit) = parse_store_options(args)?;
+    // `repo_get_oid_with_flags(the_repository, argv[0], &obj, ...)`
+    // (`builtin/stash.c:1177-1185`) — the same resolution every other command
+    // uses, which takes a full-length hex name as the id without consulting the
+    // odb. So `git stash store <40 hex that names nothing>` gets past this and
+    // fails the stash-like assertion below, where stock fails it too; rejecting
+    // it here reported `Cannot update` and exit 1 instead of the fatal and 128.
+    let Some(oid) = crate::objname::resolve(repo, &commit) else {
+        if !quiet {
+            eprintln!("Cannot update refs/stash with {commit}");
+        }
+        return Ok(ExitCode::FAILURE);
+    };
+    // `do_store_stash()` asserts before it writes. Without this, `git stash
+    // store -m x HEAD` silently pointed `refs/stash` at an ordinary commit —
+    // and, for a tree or a blob argument, at an object `git stash list` cannot
+    // even walk.
+    if let Some(message) = store_assert_stash_like(repo, oid) {
+        eprintln!("fatal: {message}");
+        return Ok(ExitCode::from(128));
+    }
     let stash_msg = message.unwrap_or_else(|| "Created via \"git stash store\".".to_string());
     repo.edit_reference(RefEdit {
         change: Change::Update {

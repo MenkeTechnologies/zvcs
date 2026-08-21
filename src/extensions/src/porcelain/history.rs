@@ -541,7 +541,11 @@ pub(super) fn write_ondisk_index(
     index.set_path(path);
     // A stale file from an interrupted run would otherwise block the lock.
     let _ = std::fs::remove_file(path);
-    index.write(gix::index::write::Options::default())?;
+    // A scratch index at `path` rather than `.git/index`, but git writes those
+    // through the same `write_locked_index()` -> `do_write_index()` pair, which
+    // reads `skip_hash` off the repository regardless of where the file lands
+    // (read-cache.c:2830-2831).
+    index.write(crate::config::index_write_options(repo))?;
     Ok(())
 }
 

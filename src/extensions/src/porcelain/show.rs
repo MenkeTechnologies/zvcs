@@ -365,7 +365,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // formats on git's `expand_tabs_in_log_default` of 8.
     let mut expand_tabs: Option<usize> = None;
 
-    for a in args {
+    for (idx, a) in args.iter().enumerate() {
         let s = a.as_str();
         // parse_options_step()'s `internal_help`. `git show` is `builtin/log.c`,
         // so the block it prints is `git log`'s — on stdout at 129.
@@ -382,6 +382,29 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         if after_dashdash {
             pathspecs.push(a.as_bytes().to_vec());
             continue;
+        }
+        // A short option that spends the *next* argv slot on its value, with no
+        // slot left to spend: `get_arg()` (parse-options.c:59-60) — or, for `-n`,
+        // `handle_revision_opt()`'s own `argc <= 1` check (revision.c) — refuses it
+        // ahead of the option's own arm, so `git show -S` is a usage error and not
+        // a search for the empty string.
+        //
+        // `--` in the value slot is not a value: `setup_revisions()` cuts the
+        // option region at the separator (`argv[i] = NULL; argc = i;`,
+        // `revision.c`) before it parses anything, which is why `git show -S --`
+        // is the same refusal. `-L` is exempt because it is `builtin_log_options`'
+        // own entry, read in stage 1 where the separator is still an ordinary
+        // slot — and the table below declines it for exactly that reason.
+        //
+        // The two tables that decide which refusal and which status live in
+        // [`super::blame::trailing_option_missing_value`]: `-S`, `-G`, `-I`, `-O`
+        // and `-l` are parse-options' ``switch `<c>' requires a value`` at 129,
+        // `-n` is `revision.c`'s `error: -n requires an argument` at 128.
+        let value_slot_empty = idx + 1 == args.len() || args[idx + 1] == "--";
+        if value_slot_empty && s.starts_with('-') && !s.starts_with("--") {
+            if let Some(code) = super::blame::trailing_option_missing_value(s)? {
+                return Ok(code);
+            }
         }
         if let Some(kind) = pending_pickaxe.take() {
             match kind {

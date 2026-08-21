@@ -853,16 +853,22 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     //   * Default → the repo's fully-merged snapshot inside one, else the
     //     global+system+env cascade git falls back to.
     //   * Local   → the repository-local file alone (requires a repo).
-    //   * Global  → the XDG + `~/.gitconfig` pair, merged (last wins).
-    //   * System  → `$(prefix)/etc/gitconfig` alone.
+    //   * Global  → the ONE file `git_global_config()` names; see [`global_config_file`].
+    //   * System  → `$GIT_CONFIG_SYSTEM`, else `$(prefix)/etc/gitconfig`, alone.
     //   * File    → the named file alone, includes not followed.
     let snapshot = repo.as_ref().map(gix::Repository::config_snapshot);
     let default_global;
     let scoped;
-    // Set when a `--file` target could not be read. git only makes that fatal
-    // for `--list`; the get forms treat it as "key not found" (exit 1), so the
-    // error is carried to the dispatch below rather than raised here.
+    let scope_file;
+    // Set when a scope that names a single file could not read it. git only makes
+    // that fatal for `--list`; the get forms treat it as "key not found" (exit 1),
+    // so the error is carried to the dispatch below rather than raised here.
     let mut unreadable: Option<std::io::Error> = None;
+    // git's `location_opts.source.file` — the single file the scope resolved to, or
+    // `None` for the scopes that read a cascade. `cmd_config_list()` names it in the
+    // fatal it dies with (builtin/config.c:1063-1065), so the two have to travel
+    // together.
+    let mut source_file: Option<&std::path::Path> = None;
     // A pure write skips the read side entirely: the write path re-reads its
     // target under the lock, and reading here as well would repeat git's
     // `warning: unable to access …` diagnostic for an unreadable file.
@@ -899,22 +905,42 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             scoped = load_or_empty(&path, Source::Local)?;
             &scoped
         }
+        // `location_options_init()` (builtin/config.c:959-972): a scope flag does
+        // not select a *cascade*, it selects one file — `git_global_config()` for
+        // `--global`, `git_system_config()` for `--system` — and everything after
+        // reads that file alone. Reading the pair merged made `--global --list`
+        // print the XDG file's entries alongside `~/.gitconfig`'s, where git prints
+        // only the one it picked, and made a `$GIT_CONFIG_GLOBAL` that names
+        // nothing look like an empty configuration instead of a fatal.
         Scope::Global => {
-            scoped = read_scope(&[Source::Git, Source::User]);
+            let Some(path) = global_config_file() else {
+                // `if (!opts->source.file) die(_("$HOME not set"))`: with no `$HOME`
+                // it is unknown whether `~/.gitconfig` exists, so git will not guess
+                // at the XDG location even when `$XDG_CONFIG_HOME` is set.
+                return Err(crate::fatal::Fatal("$HOME not set".to_owned()).into());
+            };
+            scope_file = path;
+            source_file = Some(&scope_file);
+            scoped = read_single_scope_file(&scope_file, Source::User, reads_config, &mut unreadable)?;
             &scoped
         }
         Scope::System => {
-            scoped = read_scope(&[Source::System]);
+            scope_file = system_config_file();
+            source_file = Some(&scope_file);
+            scoped =
+                read_single_scope_file(&scope_file, Source::System, reads_config, &mut unreadable)?;
             &scoped
         }
         // `--file` is git's `CONFIG_SCOPE_COMMAND`, hence `Source::Cli`. Read
         // through `fs::read` so a missing or unreadable path surfaces as a
         // plain `io::Error` whose errno git reports verbatim.
         Scope::File(path) if !reads_config => {
+            source_file = Some(path);
             scoped = empty_config(path, Source::Cli);
             &scoped
         }
         Scope::File(path) => {
+            source_file = Some(path);
             scoped = match read_config_bytes(path) {
                 Ok(bytes) => {
                     let mut f = parse_config(&bytes, path, Source::Cli)?;
@@ -954,10 +980,13 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     let write_target = || resolve_write_target(&scope, repo.as_ref());
 
     match mode {
-        // Unlike the get forms, `--list` reports an unreadable `--file` as a
-        // fatal error rather than as an empty result.
-        Mode::List => match (&scope, &unreadable) {
-            (Scope::File(path), Some(err)) => {
+        // Unlike the get forms, `--list` reports an unreadable scope file as a
+        // fatal error rather than as an empty result — `cmd_config_list()`
+        // (builtin/config.c:1060-1068) dies whenever `config_with_options()`
+        // failed and a file was named, which covers `--file`, `--global` and
+        // `--system` alike.
+        Mode::List => match (source_file, &unreadable) {
+            (Some(path), Some(err)) => {
                 eprintln!(
                     "fatal: unable to read config file '{}': {}",
                     path.display(),
@@ -2185,6 +2214,108 @@ fn load_for_write(path: &std::path::Path, source: Source) -> Result<Option<Confi
         Err(_) => {
             eprintln!("error: invalid config file {}", path.display());
             Ok(None)
+        }
+    }
+}
+
+/// `git_global_config()` (config.c:1505-1523): the ONE file `--global` reads and
+/// writes.
+///
+/// ```c
+/// git_global_config_paths(&user_config, &xdg_config);
+/// if (!user_config) { free(xdg_config); return NULL; }
+///
+/// if (access_or_warn(user_config, R_OK, 0) && xdg_config &&
+///     !access_or_warn(xdg_config, R_OK, 0)) {
+///         free(user_config);
+///         return xdg_config;
+/// } else {
+///         free(xdg_config);
+///         return user_config;
+/// }
+/// ```
+///
+/// with `git_global_config_paths()` (config.c:1525-1537) above it:
+///
+/// ```c
+/// char *user_config = xstrdup_or_null(getenv("GIT_CONFIG_GLOBAL"));
+/// char *xdg_config = NULL;
+///
+/// if (!user_config) {
+///         user_config = interpolate_path("~/.gitconfig", 0);
+///         xdg_config = xdg_config_home("config");
+/// }
+/// ```
+///
+/// Two things fall out of that shape and both are observable:
+///
+/// * **`$GIT_CONFIG_GLOBAL` suppresses the XDG file entirely** — it is only
+///   computed on the branch where the variable is unset. So a `$GIT_CONFIG_GLOBAL`
+///   naming a file that is not there is not "fall back to XDG", it is the file
+///   `--list` then fails to read.
+/// * **The XDG file is a fallback, not a peer.** `~/.gitconfig` wins whenever it
+///   is readable, and the XDG file is used only when it is not — never both. This
+///   port used to merge the pair, which showed entries under `--global --list`
+///   that stock git does not show.
+///
+/// `None` is git's `NULL`, which the caller turns into `die(_("$HOME not set"))`.
+fn global_config_file() -> Option<std::path::PathBuf> {
+    if let Some(configured) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+        return Some(std::path::PathBuf::from(configured));
+    }
+    // `interpolate_path("~/.gitconfig", 0)` is NULL without `$HOME`.
+    let user = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".gitconfig");
+    let xdg = gix::path::env::xdg_config("config", &mut gix::path::env::var);
+    // `access_or_warn(…, R_OK, 0)`: readable wins, and only the *unreadable*
+    // `~/.gitconfig` hands over to a readable XDG file.
+    match xdg {
+        Some(xdg) if !readable(&user) && readable(&xdg) => Some(xdg),
+        _ => Some(user),
+    }
+}
+
+/// `git_system_config()` (config.c:1496-1503): `$GIT_CONFIG_SYSTEM`, else the
+/// installed `$(prefix)/etc/gitconfig`.
+///
+/// `GIT_CONFIG_NOSYSTEM` is deliberately absent: it is checked by
+/// `git_config_system()` in the *cascade* (config.c:1540-1542), not here, so
+/// `git config --system --list` reads the file even under it — verified against
+/// git 2.55.0.
+fn system_config_file() -> std::path::PathBuf {
+    if let Some(configured) = std::env::var_os("GIT_CONFIG_SYSTEM") {
+        return std::path::PathBuf::from(configured);
+    }
+    Source::System
+        .storage_location(&mut gix::path::env::var)
+        .map_or_else(|| std::path::PathBuf::from("/etc/gitconfig"), |p| p)
+}
+
+/// `access(path, R_OK)` as `access_or_warn()` tests it.
+fn readable(path: &std::path::Path) -> bool {
+    std::fs::File::open(path).is_ok()
+}
+
+/// The one file a `--global`/`--system` scope reads, loaded the way `--file`
+/// loads its own: through `fs::read`, so a missing or unreadable path is carried
+/// as an `io::Error` whose errno git reports verbatim rather than being silently
+/// treated as an empty configuration.
+///
+/// A pure write reads nothing, matching the `--file` arm — the write path re-reads
+/// its target under the lock and would otherwise repeat the access warning.
+fn read_single_scope_file(
+    path: &std::path::Path,
+    source: Source,
+    reads_config: bool,
+    unreadable: &mut Option<std::io::Error>,
+) -> Result<ConfigFile> {
+    if !reads_config {
+        return Ok(empty_config(path, source));
+    }
+    match read_config_bytes(path) {
+        Ok(bytes) => parse_config(&bytes, path, source),
+        Err(err) => {
+            *unreadable = Some(err);
+            Ok(empty_config(path, source))
         }
     }
 }

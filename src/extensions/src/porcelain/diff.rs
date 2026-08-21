@@ -754,9 +754,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--color[=<when>]` / `--no-color`. `None` leaves the decision to
     // `color.diff` / `diff.color` / `color.ui` and the terminal test.
     let mut color_when: Option<diff_color::ColorWhen> = None;
-    // `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight` (default
-    // `WSEH_NEW`) once the repository's config is readable, below.
-    let mut ws_error_highlight: u32;
+    // `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight` once the
+    // repository's config is readable, below. git's own starting value is
+    // `ws_error_highlight_default = WSEH_NEW` (diff.c), which is what an absent —
+    // or, at this point, unreachable — config leaves standing.
+    let mut ws_error_highlight: u32 = diff_color::WSEH_NEW;
     // `--color-moved*` / `--word-diff*` / `--color-words`, layered over
     // `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` below.
     let mut move_word = diff_color::MoveWordOpts::default();
@@ -898,12 +900,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             );
         }
         // `diff.algorithm` names the default algorithm (`git_diff_ui_config()`, which
-        // only the porcelain runs — the two plumbing verbs never read it). git
-        // validates it while loading config, so an unknown name is a hard error
-        // (exit 128) even when a CLI flag would have overridden it, which is why this
-        // is classified eagerly rather than lazily.
+        // only the porcelain runs — the two plumbing verbs never read it).
+        //
+        // Only the *value* is read here. An unknown name never reaches this point:
+        // git rejects it while loading config, and this port does the same in
+        // `crate::diff_config`'s `diff.algorithm` arm, which `dispatch.rs` runs
+        // for `diff` before the verb is called — and only ever gets that far when
+        // `gix::discover()` succeeded, which is the same condition this block is
+        // under. Refusing again here printed the wrong text anyway: it named the
+        // *option* (`diff algorithm "bogus" is not available`) where the config
+        // reader says `unknown value for config 'diff.algorithm': bogus` followed
+        // by a `fatal:` naming the file and line. The no-repository route
+        // (`--no-index`, which the gate cannot cover) keeps its own copy of the
+        // refusal in [`super::diff_no_index`].
         if let Some(name) = snap.string("diff.algorithm") {
-            config_algorithm = Some(parse_config_algorithm(name.as_ref())?);
+            config_algorithm = super::diff_optval::parse_algorithm_value(&name.to_str_lossy());
         }
         // `diff.indentHeuristic` (`git_diff_basic_config()`): the default landing spot
         // for a slidable hunk. A command-line `--[no-]indent-heuristic` overrides it.
@@ -954,14 +965,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    // `diff.wsErrorHighlight` (`git_diff_basic_config()`): a value git rejects is
-    // a fatal config error, reported before any diff is computed.
-    match diff_color::ws_error_highlight_default(&repo) {
-        Ok(v) => ws_error_highlight = v,
-        Err(bad) => {
-            eprintln!("error: unknown value for config 'diff.wserrorhighlight': {bad}");
-            return Ok(ExitCode::from(128));
-        }
+    // `diff.wsErrorHighlight` (`git_diff_basic_config()`). A value git rejects is
+    // a fatal config error, but it is not reported here: `crate::diff_config`'s
+    // `diff.wserrorhighlight` arm refuses it in `dispatch.rs`, before this verb
+    // runs, with the `error:` line *and* the `fatal: bad config variable …` line
+    // that names the file — the second of which this site never printed. So an
+    // unparsable value cannot arrive, and the default stands for the `None` that
+    // an absent one gives. Same shape as `diff-index`, `diff-files` and `log`.
+    if let Ok(v) = diff_color::ws_error_highlight_default(&repo) {
+        ws_error_highlight = v;
     }
 
     let mut revs: Vec<String> = Vec::new();
@@ -982,6 +994,30 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
 
     for a in args {
         if let Some(flag) = pending_value.take() {
+            // `--` is not a value. `setup_revisions()` cuts the option region at
+            // the separator before it parses a single option:
+            //
+            // ```c
+            // /* First, search for "--" */
+            // ...
+            //         for (i = 1; i < argc; i++) {
+            //                 const char *arg = argv[i];
+            //                 if (strcmp(arg, "--"))
+            //                         continue;
+            //                 ...
+            //                 argv[i] = NULL;
+            //                 argc = i;
+            // ```
+            //
+            // (`revision.c`.) So the option ahead of it has no slot left to spend
+            // and `get_arg()` refuses (parse-options.c:59-60) — `git diff -S --`
+            // is a missing value, not a search for the string `--`, and
+            // `git diff --output --` never opens a file called `--`. Every other
+            // token, an option-looking one included, *is* taken: `git diff -S -p`
+            // searches for `-p`.
+            if a == "--" {
+                return Ok(missing_value_refusal(&flag));
+            }
             if flag == "--ws-error-highlight" {
                 match diff_color::parse_ws_error_highlight(a) {
                     Ok(v) => ws_error_highlight = v,
@@ -1003,6 +1039,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             } else if flag == "-O" {
                 order_file = Some(a.clone());
+            } else if flag == "-l" {
+                match parse_rename_limit(a) {
+                    Ok(n) => ro.rename_limit = n,
+                    Err(code) => return Ok(code),
+                }
+            } else if flag == "-n" {
+                if let Err(code) = check_max_count(a) {
+                    return Ok(code);
+                }
             } else if flag == "--anchored" {
                 // `OPT_CALLBACK_F(0, "anchored", options, N_("<text>"), …, PARSE_OPT_NONEG,
                 // diff_opt_anchored)` (diff.c:6228-6230): the separated form of a
@@ -1086,6 +1131,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // so a bare one takes the next entry too. Treating it as an *empty* pattern
         // instead left the real pattern behind to be read as a revision, which is why
         // `git diff -S dd HEAD~1` died with `fatal: ambiguous argument 'dd'`.
+        //
+        // Behind a `--` none of that applies: `setup_revisions()` has already
+        // moved everything after the separator into `prune_data` (`revision.c`),
+        // so the token is a pathspec and not an option at all. `git diff -- -S`
+        // limits the diff to a path called `-S`, and claiming it here made that a
+        // usage error — which is why the pathspec test comes first.
+        if after_dashdash {
+            trailing_paths.push(a.clone());
+            continue;
+        }
         if diff_color::needs_separate_value(a)
             || indicator_slot(a).is_some()
             || a == "--diff-merges"
@@ -1095,10 +1150,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             )
         {
             pending_value = Some(a.clone());
-            continue;
-        }
-        if after_dashdash {
-            trailing_paths.push(a.clone());
             continue;
         }
         // The value checks `diff_opt_parse`'s callbacks run as each option is seen,
@@ -1591,17 +1642,33 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             }
             // `-l<n>`: `OPT_INTEGER('l', NULL, &options->rename_limit, ...)`.
-            "-l" => {
-                eprintln!("error: switch `l' requires a value");
-                return Ok(ExitCode::from(129));
-            }
+            //
+            // `OPT_INTEGER` carries no `PARSE_OPT_OPTARG`, so parse-options takes
+            // the *next* argv entry when nothing is glued on — `git diff -l 5` is
+            // `git diff -l5`. Refusing the bare token outright instead made every
+            // separated spelling a usage error, and it hid the value's own
+            // diagnostic: `git diff -l foo` is ``switch `l' expects an integer
+            // value with an optional k/m/g suffix``, which only [`crate::optint`]
+            // below can word.
+            "-l" => pending_value = Some(a.to_string()),
             s if s.starts_with("-l") && s.len() > 2 => {
-                match crate::optint::integer(&crate::optint::short_opt('l'), &s[2..]) {
+                match parse_rename_limit(&s[2..]) {
                     Ok(n) => ro.rename_limit = n,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return Ok(ExitCode::from(129));
-                    }
+                    Err(code) => return Ok(code),
+                }
+            }
+            // `-n<count>` / `-n <count>`: `handle_revision_opt()`'s short spelling
+            // of `--max-count` (`revision.c`), which every `setup_revisions()`
+            // caller accepts whether or not it walks. `cmd_diff()` does not — it
+            // diffs the trees `setup_revisions()` left pending — so the count has
+            // no effect and `git diff -n 1` prints the whole diff. What it does
+            // have is a value parser, and `git diff -n foo` is
+            // `fatal: 'foo': not an integer` at 128 exactly as `git log -n foo` is,
+            // so the value is checked here and then dropped.
+            "-n" => pending_value = Some(a.to_string()),
+            s if s.starts_with("-n") && s.len() > 2 => {
+                if let Err(code) = check_max_count(&s[2..]) {
+                    return Ok(code);
                 }
             }
             // `-U` / `--unified[=<n>]`: git's `diff_opt_unified()` enables patch
@@ -1797,16 +1864,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // callback: parse-options reports it and exits 129 before any revision or
     // pathspec is looked at.
     if let Some(flag) = pending_value {
-        // `--diff-merges` is not a parse-options entry at all: `parse_long_opt()`
-        // (revision.c) reads it, and its missing-value complaint is
-        // `die("Option '--%s' requires a value", ...)` — a fatal at 128 rather than
-        // the `error:` line parse-options writes at 129.
-        if flag == "--diff-merges" {
-            eprintln!("fatal: Option '--diff-merges' requires a value");
-            return Ok(ExitCode::from(128));
-        }
-        eprintln!("error: {}", diff_color::missing_value(&flag));
-        return Ok(ExitCode::from(129));
+        return Ok(missing_value_refusal(&flag));
     }
     // `diff_setup_done()`'s two pickaxe `die()`s, in git's order. They close
     // `setup_revisions()`, so they run once the whole option scan and every
@@ -3903,6 +3961,66 @@ fn invalid_option(arg: &str, have_revision: bool) -> ExitCode {
         eprintln!("error: invalid option: {arg}");
     }
     usage_error()
+}
+
+/// What `git diff` says about a value-taking option whose value slot is empty —
+/// because the option stood last on the line, or because the next slot held the
+/// `--` that `setup_revisions()` cuts the option region at.
+///
+/// Three parsers own these options and each words the refusal its own way, which
+/// is why this is one function rather than an `eprintln!` at each site:
+///
+///   * parse-options' `get_arg()` (parse-options.c:59-60) — ``error: <name>
+///     requires a value``, no usage block, exit **129**. That covers everything
+///     in `diff_opt_parse()`'s table, short (`-S`, `-l`, `-O`) and long alike;
+///     `optname()` decides between ``switch `<c>'`` and ``option `<name>'`` from
+///     the spelling, which is what [`diff_color::missing_value`] renders.
+///   * `parse_long_opt()` (`revision.c`) for `--diff-merges`, whose
+///     `die("Option '--%s' requires a value", ...)` is a `fatal:` at exit **128**.
+///   * `handle_revision_opt()`'s own `-n` check (`revision.c`), which is neither:
+///     ``error: -n requires an argument`` — an `error:` line at exit **128**.
+///
+/// All three are the observed stderr and status of git 2.55.0.
+///
+/// `-l`'s and `-n`'s value, wherever it was written: glued on (`-l5`, `-n5`) or in
+/// the next argv slot (`-l 5`, `-n 5`). Both spellings reach the same parser, so
+/// both reach the same refusal.
+///
+/// `-l` is `OPT_INTEGER('l', NULL, &options->rename_limit, ...)`, so the
+/// diagnostic is parse-options' integer wording at 129 — ``switch `l' expects an
+/// integer value with an optional k/m/g suffix``.
+fn parse_rename_limit(value: &str) -> Result<i64, ExitCode> {
+    crate::optint::integer(&crate::optint::short_opt('l'), value).map_err(|e| {
+        eprintln!("error: {e}");
+        ExitCode::from(129)
+    })
+}
+
+/// `-n`'s value through `parse_count()` (`revision.c`), whose `die()` is
+/// `fatal: '<value>': not an integer` at 128. The parsed count is discarded:
+/// `cmd_diff()` diffs the pending trees rather than walking, so `--max-count`
+/// changes nothing it prints.
+fn check_max_count(value: &str) -> Result<(), ExitCode> {
+    match super::log::parse_max_count(value) {
+        Ok(_) => Ok(()),
+        Err(()) => {
+            eprintln!("fatal: '{value}': not an integer");
+            Err(ExitCode::from(128))
+        }
+    }
+}
+
+fn missing_value_refusal(flag: &str) -> ExitCode {
+    if flag == "--diff-merges" {
+        eprintln!("fatal: Option '--diff-merges' requires a value");
+        return ExitCode::from(128);
+    }
+    if flag == "-n" {
+        eprintln!("error: -n requires an argument");
+        return ExitCode::from(128);
+    }
+    eprintln!("error: {}", diff_color::missing_value(flag));
+    ExitCode::from(129)
 }
 
 /// `git_xmerge_config()`'s `diff.algorithm` arm:

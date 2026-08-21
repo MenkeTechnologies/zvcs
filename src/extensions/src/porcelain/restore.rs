@@ -296,7 +296,11 @@ fn restore_submodule_worktree(
         }
     }
     target_index.remove_tree();
-    target_index.write(gix::index::write::Options::default())?;
+    // The *submodule's* index, so the submodule repository's settings decide the
+    // trailer — which is what git gets too, since it moves a submodule HEAD by
+    // running the plumbing inside the submodule and the command-line `-c`
+    // overrides reach that child through the environment.
+    target_index.write(crate::config::index_write_options(sm_repo))?;
 
     // Detach the submodule HEAD at the restored commit (git detaches here).
     sm_repo.edit_reference(RefEdit {
@@ -1020,7 +1024,10 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             }
         }
         cur.remove_tree();
-        cur.write(gix::index::write::Options::default())?;
+        // `do_write_index()` takes `skip_hash` from the settings block for every
+        // index it writes (read-cache.c:2830-2831), so a `--staged` restore leaves
+        // the same trailer an `add` or an `update-index` would have.
+        cur.write(crate::config::index_write_options(&repo))?;
     }
 
     Ok(ExitCode::SUCCESS)

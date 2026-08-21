@@ -727,7 +727,9 @@ impl State<'_> {
             }
         }
         index.sort_entries();
-        index.write(gix::index::write::Options::default())?;
+        // The interactive `revert` command writes the real index; options come
+        // from the repository as they do for every writer (read-cache.c:2830-2831).
+        index.write(crate::config::index_write_options(self.repo))?;
         Ok(())
     }
 

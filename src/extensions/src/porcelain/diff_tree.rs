@@ -471,6 +471,26 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     // The first option git accepts but this port cannot honour. Kept until we know
     // whether the invocation produces output at all; see the module documentation.
     let mut unsupported: Option<String> = None;
+    // An argument that survives `setup_revisions()` and is not `--stdin` or
+    // `--merge-base`, i.e. `cmd_diff_tree`'s leftover loop:
+    //
+    // ```c
+    //         while (--argc > 0) {
+    //                 const char *arg = *++argv;
+    //
+    //                 if (!strcmp(arg, "--stdin")) { read_stdin = 1; continue; }
+    //                 if (!strcmp(arg, "--merge-base")) { merge_base = 1; continue; }
+    //                 usage(diff_tree_usage);
+    //         }
+    // ```
+    // (builtin/diff-tree.c:152-164)
+    //
+    // That loop runs *after* `setup_revisions()` has resolved every operand, so
+    // it is recorded here rather than reported: `git diff-tree --zzbogus
+    // nosuchrev` dies on the revision, and only `git diff-tree --zzbogus HEAD`
+    // reaches the usage block. `usage()` — not `usage_with_options()` — is what
+    // git calls, so there is no `error: unknown option` line in front of it.
+    let mut leftover = false;
     // `--merge-base` is validated after revision resolution: git requires exactly two
     // commits and dies fatally (not a usage error) otherwise, even with zero revs.
     let mut merge_base = false;
@@ -705,12 +725,11 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 }
                 // The lone-`-h` help is answered before discovery. Reaching
                 // here means `-h` had company, which `cmd_diff_tree` treats as
-                // any other unhandled argument: `usage(diff_tree_usage)`, so the
-                // same block but on stderr.
-                "-h" => {
-                    eprint!("{USAGE}");
-                    return Ok(ExitCode::from(USAGE_ERROR));
-                }
+                // any other unhandled argument: it is unknown to
+                // `setup_revisions()`, survives into the leftover loop and is
+                // answered there by `usage(diff_tree_usage)` — the same block
+                // but on stderr, and only once every operand has resolved.
+                "-h" => leftover = true,
                 // `cmd_diff_tree` starts from `opt->abbrev = 0` (full object names) and
                 // `--no-abbrev` puts it back there, so it is the standing default here.
                 "--no-abbrev" => {
@@ -834,10 +853,15 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 _ if is_known_unsupported(a) => {
                     unsupported.get_or_insert_with(|| a.to_string());
                 }
-                // Not one of git's diff-tree options as far as this port knows; git
-                // would answer with its usage text and 129, but guessing that here
-                // would hide a genuinely missing option, so fail loudly instead.
-                _ => crate::git_fatal!("unrecognized option {a:?}"),
+                // Not one of git's diff-tree options as far as this port knows.
+                // git's `setup_revisions()` does not recognise it either — that
+                // is the same test — so it lands in the leftover loop and is
+                // answered by `usage(diff_tree_usage)` once the operands have
+                // resolved. The tables above are what keeps an option git *does*
+                // support out of this arm: an unported one is recognised by
+                // [`is_known_unsupported`] and bails loudly at the point output
+                // would be produced.
+                _ => leftover = true,
             }
             i += 1;
             continue;
@@ -1010,6 +1034,16 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         );
         return Ok(ExitCode::from(FATAL));
     }
+    // `cmd_diff_tree`'s leftover loop (builtin/diff-tree.c:152-164) sits between
+    // `setup_revisions()` and every `die()` below it, so an unrecognised argument
+    // outranks both the `--stdin`/`--merge-base` incompatibility and the
+    // merge-base operand count, and is outranked in turn by a revision that did
+    // not resolve.
+    if leftover {
+        eprint!("{USAGE}");
+        return Ok(ExitCode::from(USAGE_ERROR));
+    }
+
     // git checks the `--merge-base` operand count after resolving revisions but before
     // the missing-<tree-ish> usage error, so zero revs here is the fatal merge-base
     // message, not the usage text.

@@ -74,8 +74,15 @@
 //!     already have exploded the objects that preceded the corruption: this
 //!     port validates the whole pack before writing anything. The exit code
 //!     agrees; the set of salvaged loose objects can differ.
-//!   * the `fatal:` text for a malformed pack is `gix-pack`'s diagnostic rather
-//!     than git's (`early EOF` and friends). The exit code is 128 either way.
+//!   * the `fatal:` text for a malformed pack is git's only where the error
+//!     chain says which of git's fatals it is — `early EOF`, `bad pack file`
+//!     and `unknown pack file version <n>`; see [`pack_fatal`]. Everything else
+//!     keeps `gix-pack`'s own diagnostic. The exit code is 128 either way.
+//!   * a pack whose declared object count is zero and whose trailing hash is
+//!     missing is accepted here and exits 0; git reads the trailer through the
+//!     same `fill()` and answers `early EOF`. The pack writer verifies the
+//!     trailer it is given rather than insisting one arrive, so there is no
+//!     short-read to catch. Real packs always carry it.
 
 use anyhow::Result;
 use std::collections::HashSet;
@@ -355,7 +362,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     let outcome = match written {
         Ok(outcome) => outcome,
         Err(e) => {
-            eprintln!("fatal: {e}");
+            eprintln!("fatal: {}", pack_fatal(&e));
             return Ok(ExitCode::from(128));
         }
     };
@@ -378,7 +385,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     let bundle = match bundle {
         Ok(bundle) => bundle,
         Err(e) => {
-            eprintln!("fatal: {e}");
+            eprintln!("fatal: {}", pack_fatal(&e));
             return Ok(ExitCode::from(128));
         }
     };
@@ -394,7 +401,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
             let object = match bundle.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache) {
                 Ok((object, _location)) => object,
                 Err(e) => {
-                    eprintln!("fatal: {e}");
+                    eprintln!("fatal: {}", pack_fatal(&e));
                     return Ok(ExitCode::from(128));
                 }
             };
@@ -425,7 +432,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         let object = match bundle.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache) {
             Ok((object, _location)) => object,
             Err(e) => {
-                eprintln!("fatal: {e}");
+                eprintln!("fatal: {}", pack_fatal(&e));
                 return Ok(ExitCode::from(128));
             }
         };
@@ -470,7 +477,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         let object = match bundle.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache) {
             Ok((object, _location)) => object,
             Err(e) => {
-                eprintln!("fatal: {e}");
+                eprintln!("fatal: {}", pack_fatal(&e));
                 return Ok(ExitCode::from(128));
             }
         };
@@ -603,6 +610,86 @@ fn parse_magnitude(s: &str) -> u64 {
     }
     // Out of range saturates the way `strtoumax` does, at the maximum.
     digits.parse().unwrap_or(u64::MAX)
+}
+
+/// Restate a `gix-pack` failure in the words `unpack-objects` would `die()` with.
+///
+/// Three of git's fatals are decidable from the error, and they are the three a
+/// caller is most likely to meet:
+///
+/// * **`early EOF`** — `fill()` (`builtin/unpack-objects.c:78-84`) dies with it
+///   the moment `xread()` returns 0 with the request unsatisfied, which covers
+///   an empty stdin, a short pack header and a truncated entry alike. `gix-pack`
+///   reaches all of those through `read_exact`, so an `UnexpectedEof` is that
+///   same condition.
+/// * **`bad pack file`** — `unpack_all()`'s signature check
+///   (`builtin/unpack-objects.c:587-588`), which is `data::header::decode()`'s
+///   only `Corrupt` (`gix-pack/src/data/header.rs:9`).
+/// * **`unknown pack file version %u`** — the version check right below it
+///   (`:590-592`), which is that decoder's `UnsupportedVersion`.
+///
+/// Anything else keeps gitoxide's own wording; the exit code is 128 either way.
+///
+/// The nesting is descended by hand rather than through `Error::source()`.
+/// Several of these wrappers are `#[error(transparent)]`, and thiserror
+/// implements that by forwarding `source()` to the *wrapped* error's `source()`
+/// — so the wrapped error is never yielded as a link. Walking `source()` from a
+/// `bundle::write::Error::PackIter` therefore skips straight past the
+/// `input::Error` and the `gix_hash::io::Error` under it and never sees the
+/// `io::Error` at all, which is how a truncated pack kept reporting
+/// "An IO operation failed while streaming an entry".
+fn pack_fatal(err: &(dyn std::error::Error + 'static)) -> String {
+    classify_pack_error(err).unwrap_or_else(|| err.to_string())
+}
+
+/// One node of the descent [`pack_fatal`] documents: recognise the wrapper,
+/// step into the error it holds, and stop at the first thing git has a word for.
+fn classify_pack_error(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    use gix::hash::io::Error as HashIoError;
+    use gix::odb::pack::bundle::write::Error as BundleError;
+    use gix::odb::pack::data::header::decode::Error as HeaderError;
+    use gix::odb::pack::data::input::Error as InputError;
+    use gix::odb::pack::index::write::Error as IndexError;
+
+    if let Some(e) = err.downcast_ref::<io::Error>() {
+        return (e.kind() == io::ErrorKind::UnexpectedEof).then(|| "early EOF".to_string());
+    }
+    if let Some(e) = err.downcast_ref::<HeaderError>() {
+        return match e {
+            HeaderError::Corrupt(_) => Some("bad pack file".to_string()),
+            HeaderError::UnsupportedVersion(v) => Some(format!("unknown pack file version {v}")),
+            HeaderError::Io { source, .. } => classify_pack_error(source),
+        };
+    }
+    if let Some(e) = err.downcast_ref::<HashIoError>() {
+        return match e {
+            HashIoError::Io(e) => classify_pack_error(e),
+            HashIoError::Hasher(_) => None,
+        };
+    }
+    if let Some(e) = err.downcast_ref::<InputError>() {
+        return match e {
+            InputError::Io(e) => classify_pack_error(e),
+            InputError::PackParse(e) => classify_pack_error(e),
+            _ => None,
+        };
+    }
+    if let Some(e) = err.downcast_ref::<IndexError>() {
+        return match e {
+            IndexError::Io(e) => classify_pack_error(e),
+            IndexError::PackEntryDecode(e) => classify_pack_error(e),
+            _ => None,
+        };
+    }
+    if let Some(e) = err.downcast_ref::<BundleError>() {
+        return match e {
+            BundleError::Io(e) => classify_pack_error(e),
+            BundleError::PackIter(e) => classify_pack_error(e),
+            BundleError::IndexWrite(e) => classify_pack_error(e),
+            BundleError::Persist(_) => None,
+        };
+    }
+    None
 }
 
 /// Take the 12-byte pack header off `stream`, returning the bytes read so they

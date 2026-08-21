@@ -711,11 +711,36 @@ fn run_command(argv: &[String]) -> ExitCode {
     let mut rest = rest;
     precompose::argv(&mut rest);
 
-    // git's repository setup runs next, and its one refusal that is pure policy —
-    // `safe.bareRepository` — has to happen before the verb touches the repository.
+    // git's repository setup runs next. Its refusals fire in the order
+    // `setup_git_directory_gently_1()` reaches them, which is observable whenever
+    // two of them apply at once — see the section header in `setup.rs`.
+    //
+    // Discovery first: `$GIT_OBJECT_DIRECTORY` is part of the test that decides
+    // whether a directory is a repository at all, and it runs before any
+    // configuration has been read, so it beats even a malformed command-line
+    // override.
+    if let Some(code) = setup::object_directory_gate(&sub) {
+        return code;
+    }
+    // Then the first read of configuration, which `get_allowed_bare_repo()` and
+    // `ensure_valid_ownership()` both make: a bad `-c` / `GIT_CONFIG_COUNT` triple
+    // is reported before either policy refusal below.
+    if let Some(code) = setup::command_line_config_gate(&sub, &rest) {
+        return code;
+    }
+    // `safe.bareRepository` (setup.c:1676-1678), one line ahead of ownership.
     if let Some(code) = disallowed_bare_repository(&sub) {
         return code;
     }
+    // `safe.directory` (setup.c:1651-1656): the gate that stops git operating on a
+    // repository someone else owns, whose hooks and configuration would otherwise
+    // run as us.
+    if let Some(code) = setup::dubious_ownership(&sub) {
+        return code;
+    }
+    // Not a refusal: the object database names each alternate that has gone
+    // missing and the command carries on.
+    setup::report_missing_alternates(&sub);
 
     // Install the pager (over stdout, and stderr when it is a tty) before the
     // command runs, so its output — and any error below — flows through it. Torn
@@ -792,7 +817,7 @@ fn dashed_subcommand(arg0: &str) -> Option<String> {
 /// minus the handful (`grep`, `rev-parse`, `archive`) that call
 /// `setup_git_directory()` themselves and therefore *do* die. Everything else
 /// needs a repository, which is what makes `safe.bareRepository` refuse it.
-const NO_SETUP_VERBS: &[&str] = &[
+pub(crate) const NO_SETUP_VERBS: &[&str] = &[
     "apply",
     "bugreport",
     "bundle",

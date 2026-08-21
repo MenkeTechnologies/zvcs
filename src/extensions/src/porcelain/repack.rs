@@ -74,7 +74,12 @@
 //!     suppresses just that notice. That notice does not end the run: `-d` still
 //!     prunes and `--write-midx` still writes, exactly as `if (!names.nr)` in
 //!     `cmd_repack()` only reports and falls through. With `-a` the whole set is
-//!     repacked regardless.
+//!     repacked regardless — but `-a` is not an exemption from the notice:
+//!     `builtin/repack.c:460-462` gates it on `!names.nr` alone, and an *empty*
+//!     object store gives `pack-objects` nothing to write however total the
+//!     `-a` is. `git init --bare b && git -C b repack -ad` prints it, which is
+//!     also where `git gc`'s copy comes from (`builtin/gc.c:897` runs
+//!     `repack -d -l`, `-a`/`-A` appended by `add_repack_all_option()`).
 //!   * **`.idx` and `.rev`** are written straight from the pack writer's own
 //!     record of where each object landed, the `.rev` unless
 //!     `pack.writeReverseIndex` is false. The pack is named after its trailing
@@ -682,14 +687,21 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // The pack's entry order is ours to choose; sorting makes a run reproducible.
     to_pack.sort();
 
-    // `if (!names.nr)`: git says so and carries on, and it says so about the
-    // *first* `pack-objects` alone — the notice sits between that child and the
-    // cruft and filtered packs, so a run that goes on to write a filtered pack
-    // still prints it. Everything after the pack write still runs too — in
-    // particular `-d`'s `prune_packed_objects()`, which is what drops the loose
-    // copies of objects an *existing* pack already holds, and `--write-midx`.
-    // Returning here instead left those loose objects behind.
-    if to_pack.is_empty() && !st.all_into_one && !st.quiet {
+    // `if (!names.nr)` (`builtin/repack.c:460-462`): git says so and carries on,
+    // and it says so about the *first* `pack-objects` alone — the notice sits
+    // between that child and the cruft and filtered packs, so a run that goes on
+    // to write a filtered pack still prints it. Everything after the pack write
+    // still runs too — in particular `-d`'s `prune_packed_objects()`, which is
+    // what drops the loose copies of objects an *existing* pack already holds,
+    // and `--write-midx`. Returning here instead left those loose objects behind.
+    //
+    // The gate is `!names.nr && !po_args.quiet` and nothing else: `-a` does not
+    // exempt a run from it. `-a` normally has something to pack, so the two
+    // conditions coincide almost everywhere — but an empty object store leaves
+    // `pack-objects` with nothing to write whatever the mode, and stock prints
+    // the notice there. Testing `all_into_one` here made
+    // `git init --bare b && git -C b repack -ad` silent where stock says so.
+    if to_pack.is_empty() && !st.quiet {
         println!("Nothing new to pack.");
     }
 

@@ -236,6 +236,17 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // `transport_check_allowed()` — the connection is about to be opened, and
+    // `protocol.<name>.allow` / `$GIT_ALLOW_PROTOCOL` / `$GIT_PROTOCOL_FROM_USER`
+    // decide whether this scheme may be reached at all. Ahead of the `From` header
+    // because git prints no header for a refused transport, and after `--get-url`
+    // because that form never connects.
+    if let Some(remote_url) = remote.url(gix::remote::Direction::Fetch) {
+        if let Some(code) = crate::setup::check_url_allowed(remote_url) {
+            return Ok(code);
+        }
+    }
+
     // git prints the header only when `<repository>` was left off the command line.
     if repository.is_none() && !opts.quiet {
         eprintln!("From {url}");

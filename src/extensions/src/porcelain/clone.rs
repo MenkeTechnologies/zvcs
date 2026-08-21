@@ -700,6 +700,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // Parse the URL up front so a malformed one is reported before touching disk.
     let url = gix::url::parse(url_str.into())?;
 
+    // `transport_check_allowed()`. git reaches it only once the transport is being
+    // opened, which is after the `Cloning into '<dir>'…` banner — reproduced by
+    // deferring the check to the banner site below rather than refusing here.
+
     // Resolve the shallow-boundary selectors into a single `Shallow` value. The
     // exclude form supersedes a lone `--shallow-since`, which supersedes
     // `--depth`, matching git's treatment of them as one deepen group.
@@ -771,6 +775,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         } else {
             eprintln!("Cloning into '{dir}'...");
         }
+    }
+
+    // `transport_check_allowed()`, here rather than at the top of the command
+    // because git reaches it inside `transport_get()`/`git_connect()` — after the
+    // banner. `git clone <path>` under `$GIT_PROTOCOL_FROM_USER=0` therefore
+    // prints `Cloning into '<dir>'...` and only then refuses, which is what a
+    // caller reading the two streams together sees.
+    if let Some(code) = crate::setup::check_url_allowed(&url) {
+        return Ok(code);
     }
 
     // `cmd_clone`'s local-clone block: when the source is a *path* on this

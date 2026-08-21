@@ -729,10 +729,27 @@ fn checkout_and_report(ctx: &Ctx, target: &str) -> Result<()> {
         Ok(Some(_))
     );
 
-    if !was_detached && target_is_branch && old_branch.as_deref() == Some(target) {
-        eprintln!("Already on '{target}'");
-        return Ok(());
-    }
+    // Already sitting on the branch bisect started from — the overwhelmingly
+    // common shape, since `bisect start` records the branch it was invoked on
+    // and `bisect reset` is usually run after a `bisect good`/`bad` that landed
+    // back there. git has *no* short-circuit for it: `bisect_reset()` spawns the
+    // checkout whenever a target was resolved and `BISECT_HEAD` is absent,
+    //
+    // ```c
+    // if (branch.len && !refs_ref_exists(get_main_ref_store(the_repository), "BISECT_HEAD")) {
+    //         struct child_process cmd = CHILD_PROCESS_INIT;
+    //
+    //         cmd.git_cmd = 1;
+    //         strvec_pushl(&cmd.args, "checkout", "--ignore-other-worktrees", NULL);
+    // ```
+    // (`builtin/bisect.c:261-265`)
+    //
+    // and `git checkout <current branch>` still moves HEAD through
+    // `update_refs_for_switch()`, which writes `checkout: moving from X to X`
+    // unconditionally. Returning early here dropped that entry, which silently
+    // renumbered every older `HEAD@{n}` for anything reading the reflog
+    // afterwards. So run the checkout either way and only vary the message.
+    let already_on = !was_detached && target_is_branch && old_branch.as_deref() == Some(target);
 
     // git runs the checkout through `run_command()`, so its output is flushed
     // by the child's `exit()` before anything printed after it here; see
@@ -747,7 +764,9 @@ fn checkout_and_report(ctx: &Ctx, target: &str) -> Result<()> {
             eprintln!("Previous HEAD position was {}", describe(&ctx.repo, id)?);
         }
     }
-    if target_is_branch {
+    if already_on {
+        eprintln!("Already on '{target}'");
+    } else if target_is_branch {
         eprintln!("Switched to branch '{target}'");
     } else {
         let id = ctx.repo.head_id()?.detach();

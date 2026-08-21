@@ -246,6 +246,10 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
     let mut ref_name: Option<String> = None;
     let mut ref_action: Option<String> = None;
     let mut rev_exprs: Vec<String> = Vec::new();
+    // The first argument `parse_options()` kept for `setup_revisions()` that this
+    // port cannot hand on. Recorded rather than raised, because `parse_options()`
+    // is not where git looks at it; see the arm that fills it in.
+    let mut unported: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -268,14 +272,31 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
-            "--" => bail!(
-                "unsupported flag \"--\" (pathspec-limited replay is not ported; \
-                 ported: --contained, --onto, --advance, --revert, --ref, --ref-action)"
-            ),
-            s if s.starts_with('-') && s.len() > 1 => bail!(
-                "unsupported flag {s:?} (rev-list commit-limiting options are not ported; \
-                 ported: --contained, --onto, --advance, --revert, --ref, --ref-action)"
-            ),
+            // `cmd_replay` passes `PARSE_OPT_KEEP_UNKNOWN_OPT` and no
+            // `PARSE_OPT_KEEP_DASHDASH` (builtin/replay.c:117-118), so neither of
+            // these is rejected by `parse_options()` at all: the separator ends
+            // the sweep and everything it did not own is copied through for
+            // `setup_revisions()`, which does not run until line 163 — *after*
+            // the mode check at :121. Recording the refusal instead of raising it
+            // here is what puts `error: exactly one of --onto, --advance, or
+            // --revert is required` in front of it, which is what stock prints
+            // for a bare `git replay --zzbogus`.
+            "--" => {
+                unported.get_or_insert_with(|| {
+                    "unsupported flag \"--\" (pathspec-limited replay is not ported; \
+                     ported: --contained, --onto, --advance, --revert, --ref, --ref-action)"
+                        .to_string()
+                });
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                unported.get_or_insert_with(|| {
+                    format!(
+                        "unsupported flag {s:?} (rev-list commit-limiting options are not \
+                         ported; ported: --contained, --onto, --advance, --revert, --ref, \
+                         --ref-action)"
+                    )
+                });
+            }
             s => rev_exprs.push(s.to_string()),
         }
         i += 1;
@@ -335,6 +356,18 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
     } else {
         Mode::Pick
     };
+
+    // Everything `parse_options()` kept reaches `setup_revisions()` at
+    // builtin/replay.c:163, which is where an argument this port cannot hand on
+    // stops the command — behind the mode requirement, the three
+    // `die_for_incompatible_opt*` checks and `get_ref_action_mode()`, all of
+    // which git runs first. The refusal itself stays this port's own: git accepts
+    // the rev-list commit-limiting options here and applying them wrongly would
+    // change which commits get replayed, so saying so is honest where echoing
+    // git's `unrecognized argument` would not be.
+    if let Some(msg) = unported {
+        bail!(msg);
+    }
 
     // The replay writes objects and (in update mode) references; hold the
     // coordinator lock across the whole read-modify-write, like `cherry-pick`.

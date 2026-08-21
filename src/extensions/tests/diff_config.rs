@@ -107,16 +107,45 @@ fn diff_algorithm_default_matches_flag_and_is_overridden() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
+/// An unreadable `diff.algorithm` is refused while the configuration is being
+/// *parsed*, by `git_diff_ui_config` (diff.c:462-470), not by the diff machinery
+/// later:
+///
+/// ```c
+/// if (!strcmp(var, "diff.algorithm")) {
+///         if (!value) return config_error_nonbool(var);
+///         diff_algorithm = parse_algorithm_value(value);
+///         if (diff_algorithm < 0)
+///                 return error(_("unknown value for config '%s': %s"), var, value);
+///         return 0;
+/// }
+/// ```
+///
+/// `return error(...)` means `configset_iter()` follows it with
+/// `git_die_config_linenr()`, so the second line names the file and the line the
+/// variable sits on. Both lines are what git 2.55.0 printed for this exact
+/// fixture; they are asserted verbatim because the earlier port produced a
+/// different message of its own invention (`diff algorithm "bogus" is not
+/// available`, which is the `--diff-algorithm` *option*'s text) with no second
+/// line at all.
 #[test]
 fn diff_algorithm_invalid_value_errors() {
     let (repo, home) = fixture("algobad");
     git(&repo, &["config", "diff.algorithm", "bogus"]);
+    let line = std::fs::read_to_string(repo.join(".git/config"))
+        .unwrap()
+        .lines()
+        .position(|l| l.trim() == "algorithm = bogus")
+        .expect("the value git config wrote is there")
+        + 1;
     let o = diff(&repo, &home, &[]);
-    assert!(!o.status.success(), "invalid diff.algorithm must fail");
-    let err = String::from_utf8_lossy(&o.stderr);
-    assert!(
-        err.contains("diff algorithm \"bogus\" is not available"),
-        "stderr: {err}"
+    assert_eq!(o.status.code(), Some(128), "invalid diff.algorithm must be fatal");
+    assert_eq!(
+        String::from_utf8_lossy(&o.stderr),
+        format!(
+            "error: unknown value for config 'diff.algorithm': bogus\n\
+             fatal: bad config variable 'diff.algorithm' in file '.git/config' at line {line}\n"
+        )
     );
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }

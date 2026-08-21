@@ -156,17 +156,25 @@ fn log_expiry_accepts_now_never_and_any_past_moment() {
 
 #[test]
 fn log_expiry_from_a_file_names_the_file_and_h_still_wins() {
-    // `git_die_config()`'s clause depends on where the value came from. git 2.55.0
-    // also names the line (`… at line 9`); gitoxide's config metadata carries the
-    // path but not the line, the same documented gap as `crate::default_config`'s
-    // port of the sibling diagnostic, so the assertion stops at the file.
+    // `git_die_config()`'s clause depends on where the value came from, and for a
+    // file it names the line as well as the path — which
+    // `crate::config::walk_config` supplies by re-parsing the file, since
+    // gitoxide's config metadata carries the path but not the line.
     let (repo, home) = fixture("file");
     ok(&repo, &home, &["config", "gc.logExpiry", "bogus"]);
+    let line = std::fs::read_to_string(repo.join(".git/config"))
+        .unwrap()
+        .lines()
+        .position(|l| l.trim().to_ascii_lowercase().starts_with("logexpiry"))
+        .expect("the value git config wrote is there")
+        + 1;
     let out = run(&repo, &home, &["gc", "-q"]);
     assert_eq!(
         stderr(&out),
-        "error: Invalid gc.logexpiry: 'bogus'\n\
-         fatal: bad config variable 'gc.logexpiry' in file '.git/config'\n"
+        format!(
+            "error: Invalid gc.logexpiry: 'bogus'\n\
+             fatal: bad config variable 'gc.logexpiry' in file '.git/config' at line {line}\n"
+        )
     );
     assert_eq!(code(&out), 128);
 

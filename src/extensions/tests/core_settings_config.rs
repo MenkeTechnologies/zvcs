@@ -318,8 +318,9 @@ fn create_object_without_a_value_is_config_error_nonbool() {
     //     error: missing value for 'core.createobject'
     //     fatal: bad config variable 'core.createobject' in file '.git/config' at line 9
     //
-    // The ` at line 9` clause is the one part not reproduced — gitoxide's config
-    // metadata carries the source path but not the line.
+    // The ` at line 9` clause is reproduced too: gitoxide's config metadata
+    // carries the source path but not the line, so `crate::config::walk_config`
+    // re-parses the file to find it.
     let (repo, home) = fixture("create-object-nonbool");
     let cfg = repo.join(".git/config");
     let mut text = std::fs::read_to_string(&cfg).unwrap();
@@ -328,10 +329,18 @@ fn create_object_without_a_value_is_config_error_nonbool() {
 
     let out = run(&repo, &home, &["branch"]);
     assert_eq!(code(&out), FATAL);
+    let line = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .lines()
+        .position(|l| l.trim() == "createObject")
+        .expect("the appended line is there")
+        + 1;
     assert_eq!(
         stderr(&out),
-        "error: missing value for 'core.createobject'\n\
-         fatal: bad config variable 'core.createobject' in file '.git/config'\n"
+        format!(
+            "error: missing value for 'core.createobject'\n\
+             fatal: bad config variable 'core.createobject' in file '.git/config' at line {line}\n"
+        )
     );
 
     // An empty value is a different thing: it reaches the mode comparison and

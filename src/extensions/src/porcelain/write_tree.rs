@@ -227,6 +227,80 @@ impl cache_tree::Odb for RepoOdb<'_> {
     }
 }
 
+/// `index.threads` as `repo_config_get_index_threads()` resolves it (config.c:2533-2552):
+/// the `GIT_TEST_INDEX_THREADS` override first, then the key read as bool-or-int, where
+/// `true` is `0` ("one thread per core"), `false` is `1`, and a number is itself. `None`
+/// is git's "not configured", which every caller turns into one thread.
+fn index_threads(repo: &gix::Repository) -> Option<u32> {
+    // `val = git_env_ulong("GIT_TEST_INDEX_THREADS", 0); if (val) ...` — a zero or unparsable
+    // value falls through to the config, which is what `git_env_ulong`'s default does.
+    if let Some(val) = std::env::var("GIT_TEST_INDEX_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v != 0)
+    {
+        return Some(val);
+    }
+    let snap = repo.config_snapshot();
+    let raw = snap.string("index.threads")?;
+    let raw = raw.to_str().ok()?.trim().to_owned();
+    Some(match raw.to_ascii_lowercase().as_str() {
+        // `git_parse_maybe_bool_text()` (parse.c:166-181), which compares with
+        // `strcasecmp` and returns *false* for an empty value (`if (!*value) return 0`).
+        // A bare `[index] threads` with no value at all is git's `true`, but gix reports
+        // no string for such a key, so it arrives here as "unset" — one thread instead of
+        // one per core. The two only differ above 20 000 entries, below which the
+        // per-core path produces no offset table either (`cache_nr / THREAD_COST`).
+        "" | "false" | "no" | "off" => 1,
+        "true" | "yes" | "on" => 0,
+        other => other.parse::<u32>().ok()?,
+    })
+}
+
+/// How many threads the next index write should size its `IEOT` extension for, or `None` when
+/// git would write none at all.
+///
+/// This is `do_write_index()`'s gate, which needs the repository and so cannot live in
+/// `gix-index`:
+///
+/// ```text
+/// if (!HAVE_THREADS || repo_config_get_index_threads(the_repository, &nr_threads))
+///         nr_threads = 1;
+///
+/// if (nr_threads != 1 && record_ieot()) {
+/// ```
+/// (read-cache.c:2874-2877), with `record_ieot()` (read-cache.c:2788-2801) being
+/// `index.recordOffsetTable` when it is set, and otherwise "written by default if the user
+/// explicitly requested threaded index reads" — i.e. `index.threads` set to anything but one
+/// thread.
+///
+/// Both halves have to hold, which is why `index.recordOffsetTable=true` on its own writes no
+/// offset table: `nr_threads` is still 1 there. Verified against stock git 2.55.0, which leaves
+/// such an index at `TREE` alone.
+///
+/// The block count, and whether there are enough blocks to be worth writing at all, is decided
+/// by `gix-index` at write time — see
+/// [`gix::index::extension::index_entry_offset_table::entries_per_block()`].
+pub(crate) fn offset_table_threads(repo: &gix::Repository) -> Option<u32> {
+    let nr_threads = index_threads(repo).unwrap_or(1);
+    if nr_threads == 1 {
+        return None;
+    }
+    let record = repo
+        .config_snapshot()
+        .boolean("index.recordOffsetTable")
+        // Unset: the default is "threading was asked for", which `nr_threads != 1` already is.
+        .unwrap_or(true);
+    record.then_some(nr_threads)
+}
+
+/// Attach the `IEOT` decision to `index` so its next write carries the extension exactly when
+/// stock git's would — the one line every `do_write_index()` caller gets for free in C, because
+/// there the decision is made inside the writer.
+pub(crate) fn prepare_offset_table(repo: &gix::Repository, index: &mut gix::index::File) {
+    index.set_offset_table_threads(offset_table_threads(repo));
+}
+
 /// Bring `index`'s cache-tree up to date with its entries and hand back the root
 /// tree id, writing the index back when — and only when — that changed something.
 ///
@@ -266,6 +340,7 @@ pub(super) fn refresh_cache_tree(
         },
     ) {
         Ok(id) => {
+            prepare_offset_table(repo, index);
             index.write(crate::config::index_write_options(repo))?;
             Ok(Ok(id))
         }
@@ -295,7 +370,101 @@ pub(super) fn update_cache_tree_if_stale(repo: &gix::Repository, index: &mut gix
 ///
 /// Failures — an unmerged result, most often — leave the index with no cache-tree,
 /// which is what the callers want: git ignores the return value here too.
-pub(super) fn repair_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) {
+/// What every `unpack_trees()`-shaped verb must do to an index between "the entries are final"
+/// and `write_locked_index()`: replace the cache-tree with one recomputed from the entries in
+/// `WRITE_TREE_REPAIR` mode, and settle the `IEOT` decision.
+///
+/// This is the shared route for the whole class of verbs that arrive at an index by *reading a
+/// tree* — checkout, switch, reset, restore, merge and its strategies, cherry-pick, revert,
+/// rebase, stash, sparse-checkout, `read-tree`, `apply --index`. In git they all funnel through
+/// `unpack_trees()`, which never discards the extension: it carries the source index's over with
+/// `move_index_extensions()` and ends with
+/// `cache_tree_update(&o->internal.result, WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+/// (unpack-trees.c:2079-2093). An index this port writes without that step has no `TREE` at all,
+/// which costs stock git a full rebuild — and a rewrite of the index file — on its next
+/// `write-tree`, `commit` or `status`.
+///
+/// **The [`remove_tree()`](gix::index::File::remove_tree()) is not optional.** git can afford to
+/// keep the old nodes because every entry it moves is invalidated as it moves
+/// (`invalidate_ce_path()`, unpack-trees.c:2298-2304); the verbs routed here mutate entries
+/// without doing that, so a surviving node could still be marked valid while the entries below
+/// it have changed — and `update_one()` reuses exactly such a node without looking
+/// (cache-tree.c:336-339). Dropping first costs a recomputation of directories git would have
+/// skipped and buys the guarantee that no node can outlive the entries it describes.
+///
+/// Verbs that mutate *entries* rather than read a tree — `add`, `rm`, `mv`, `update-index` — must
+/// **not** come here: git invalidates their paths and leaves the extension partly invalid, so
+/// repairing it instead would write a fully valid cache-tree where stock wrote a stale-marked
+/// one. Use [`gix::index::State::invalidate_path_in_tree()`] per touched path there.
+/// Carry `old`'s cache-tree onto `new` and invalidate exactly the paths whose entry changed —
+/// the shape a **`MIXED` reset** leaves behind, and the one thing that is *not* an
+/// `unpack_trees()` repair.
+///
+/// `cmd_reset()` sends every `--mixed` through `read_from_tree()` (builtin/reset.c:494), not
+/// through `reset_index()`: it diffs the index against the target tree with `oneway_diff()` and
+/// stages the differences one entry at a time, so each one goes through
+/// `add_index_entry_with_check()` (read-cache.c:1273-1274) or `remove_file_from_index()`
+/// (read-cache.c:632) and invalidates only its own path. Nothing repairs the result afterwards,
+/// which is why stock's index after `git reset` still shows the root invalid while the
+/// directories the reset did not reach keep their ids.
+///
+/// `git stash push` inherits this exactly, because it performs its reset by running `git reset`
+/// (builtin/stash.c's `do_push_stash`), and so does the autostash snapshot.
+///
+/// Repairing instead would produce a *fully valid* cache-tree where stock leaves a partly
+/// invalid one — not unsafe, but a structure git would not have written, and one that costs the
+/// next `write-tree` nothing while making the index file 19 bytes longer than git's.
+///
+/// A path counts as changed when its blob id, mode or stage differs, or when it exists on only
+/// one side; comparing the two sorted entry lists in one pass is the same set `oneway_diff()`
+/// would have produced.
+pub(crate) fn carry_cache_tree_invalidating_changes(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    new: &mut gix::index::File,
+) {
+    use gix::bstr::BString;
+    use std::collections::HashMap;
+
+    let Some(tree) = old.tree().cloned() else {
+        // No cache-tree to carry: git would have had one to invalidate into, this index
+        // simply has nothing, and the next reader rebuilds. Never repair here — that would
+        // mint the fully valid extension this function exists to avoid.
+        prepare_offset_table(repo, new);
+        return;
+    };
+    let key = |index: &gix::index::File| -> HashMap<BString, (gix::ObjectId, u32, u32)> {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode.bits(), e.stage_raw())))
+            .collect()
+    };
+    let before = key(old);
+    let after = key(new);
+
+    new.set_tree(Some(tree));
+    for (path, state) in &after {
+        if before.get(path) != Some(state) {
+            new.invalidate_path_in_tree(path.as_ref());
+        }
+    }
+    for path in before.keys() {
+        if !after.contains_key(path) {
+            new.invalidate_path_in_tree(path.as_ref());
+        }
+    }
+    prepare_offset_table(repo, new);
+}
+
+pub(crate) fn rebuild_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) {
+    index.remove_tree();
+    repair_cache_tree(repo, index);
+    prepare_offset_table(repo, index);
+}
+
+pub(crate) fn repair_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) {
     let odb = RepoOdb { repo };
     let _ = index.cache_tree_update(
         &odb,

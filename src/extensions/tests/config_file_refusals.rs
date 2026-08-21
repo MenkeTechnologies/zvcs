@@ -26,6 +26,11 @@
 //! Every expectation below was captured from stock git 2.55.0 on the same input
 //! and is asserted as a literal, so these run headless with nothing on `PATH` but
 //! the binary under test.
+//!
+//! One test here is not about a message at all. Because the early gate runs on
+//! *every* invocation, anything it does is done by every child process too — so
+//! it must not be able to start one. See
+//! [`the_early_gate_terminates_with_a_git_shim_on_path`].
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -430,4 +435,94 @@ fn command_line_overrides_are_untouched() {
         stderr(&out),
         format!("fatal: bad config line {line} in file .git/config\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// The gate must not be able to spawn a process
+// ---------------------------------------------------------------------------
+
+/// The early gate runs before any argument is looked at, on every invocation.
+/// If it starts a `git`, and that `git` is this binary, the child runs the gate
+/// and starts another: an unbounded fan-out across processes that never
+/// terminates.
+///
+/// That is not hypothetical. `Source::GitInstallation.storage_location()` locates
+/// its file by running `git config -lz --show-origin --name-only`, and zvcs's
+/// shipped installation model is a `git` on `PATH` that *is* zvcs — so building
+/// the candidate list through that source hung `git init -q --bare` outright.
+/// A per-process memo does not help, because each generation is a fresh process.
+/// The fix was to derive the system path the way `git_system_config()`
+/// (config.c:1499-1506) derives it and to drop the installation scope, which
+/// `do_git_config_sequence()` (config.c:1547-1613) does not have; this test pins
+/// the property that broke rather than the implementation that broke it.
+///
+/// The shim layout — `git`, `git-upload-pack` and `git-receive-pack` all pointing
+/// at the binary under test, first on `PATH` — is the one `push_mirror_prune.rs`
+/// builds, which is how the hang was first seen.
+#[test]
+fn the_early_gate_terminates_with_a_git_shim_on_path() {
+    let root = scratch("shim");
+    let (home, bin) = (root.join("home"), root.join("bin"));
+    std::fs::create_dir_all(&bin).expect("mkdir bin");
+
+    // A `git` on PATH that is this binary, exactly as `~/.zvcs/bin/git` is.
+    #[cfg(unix)]
+    for name in ["git", "git-upload-pack", "git-receive-pack"] {
+        std::os::unix::fs::symlink(BIN, bin.join(name)).expect("symlink shim");
+    }
+    #[cfg(not(unix))]
+    for name in ["git.exe", "git-upload-pack.exe", "git-receive-pack.exe"] {
+        std::fs::copy(BIN, bin.join(name)).expect("copy shim");
+    }
+
+    let path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut dirs = vec![bin.clone()];
+            dirs.extend(std::env::split_paths(&existing));
+            std::env::join_paths(dirs).expect("join PATH")
+        }
+        None => bin.clone().into_os_string(),
+    };
+
+    // `init --bare` reaches the gate and then opens nothing else, so a hang here
+    // is the gate and not the command. Deliberately *without*
+    // `GIT_CONFIG_NOSYSTEM`, since suppressing the system scope is what used to
+    // hide the recursion.
+    let target = root.join("bare.git");
+    let mut child = Command::new(BIN)
+        .args(["init", "-q", "--bare"])
+        .arg(&target)
+        .current_dir(&root)
+        .env("HOME", &home)
+        .env("ZVCS_HOME", &home)
+        .env("PATH", &path)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("LC_ALL", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_CONFIG_NOSYSTEM")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("XDG_CONFIG_HOME")
+        .spawn()
+        .expect("spawn zvcs git");
+
+    // Generous next to the ~0.1s this takes, tight next to "forever".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("wait on child") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`git init -q --bare` did not terminate within 30s with a git shim on PATH: \
+                     the early config gate is spawning a process again"
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+
+    assert!(status.success(), "exit {:?}", status.code());
+    assert!(target.join("HEAD").is_file(), "the bare repository was created");
 }

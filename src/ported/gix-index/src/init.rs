@@ -37,10 +37,12 @@ pub mod from_tree {
                 is_sparse: false,
                 tree: None,
                 link: None,
+                link_at_decode_time: false,
                 resolve_undo: None,
                 untracked: None,
                 fs_monitor: None,
                 offset_table_at_decode_time: false,
+                offset_table_threads: None,
                 end_of_index_at_decode_time: false,
             }
         }
@@ -104,10 +106,12 @@ pub mod from_tree {
                 is_sparse: false,
                 tree: None,
                 link: None,
+                link_at_decode_time: false,
                 resolve_undo: None,
                 untracked: None,
                 fs_monitor: None,
                 offset_table_at_decode_time: false,
+                offset_table_threads: None,
                 end_of_index_at_decode_time: false,
             })
         }

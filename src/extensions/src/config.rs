@@ -1491,25 +1491,30 @@ fn included_paths(events: &gix::config::parse::Events, from: &std::path::Path) -
 
 /// The files `do_git_config_sequence()` would open for `scopes`, in its order.
 ///
-/// The global half is delegated to gitoxide's `Source::storage_location()`, which
-/// already implements git's environment rules for these scopes —
-/// `GIT_CONFIG_NOSYSTEM` suppressing the system file, `GIT_CONFIG_SYSTEM` and
-/// `GIT_CONFIG_GLOBAL` replacing a scope outright, `XDG_CONFIG_HOME` falling back
-/// to `$HOME/.config`. Duplicates are possible (`GIT_CONFIG_GLOBAL` answers for
-/// both the XDG and the user scope) and are dropped by the visited set in
-/// [`check_config_file`].
+/// The two *global* scopes are delegated to gitoxide's
+/// `Source::storage_location()`, which already implements git's environment rules
+/// for them — `GIT_CONFIG_GLOBAL` replacing a scope outright, `XDG_CONFIG_HOME`
+/// falling back to `$HOME/.config` — and reads nothing but the environment to do
+/// it. Duplicates are possible (`GIT_CONFIG_GLOBAL` answers for both the XDG and
+/// the user scope) and are dropped by the visited set in [`check_config_file`].
+///
+/// The *system* scope is not, and `Source::GitInstallation` is absent entirely:
+/// both can start a `git` subprocess, and this list is built on every invocation.
+/// See [`system_config_path`] for the whole of that reasoning — it is the reason
+/// this function must not grow a `storage_location()` call for either scope.
 fn config_file_sequence(scopes: ConfigScopes, naming: GitDirNaming) -> Vec<ConfigCandidate> {
     use gix::config::Source;
 
     let mut out = Vec::new();
     if scopes == ConfigScopes::EarlyGlobal {
         let mut env = |name: &str| std::env::var_os(name);
-        for source in [
-            Source::GitInstallation,
-            Source::System,
-            Source::Git,
-            Source::User,
-        ] {
+        if let Some(path) = system_config_path(&mut env) {
+            let shown = path.to_string_lossy().into_owned();
+            out.push(ConfigCandidate { path, shown });
+        }
+        // The two global scopes, in `do_git_config_sequence()` order — XDG
+        // before user. Neither reads anything but the environment.
+        for source in [Source::Git, Source::User] {
             if let Some(path) = source.storage_location(&mut env) {
                 let shown = path.to_string_lossy().into_owned();
                 out.push(ConfigCandidate { path, shown });
@@ -1529,6 +1534,110 @@ fn config_file_sequence(scopes: ConfigScopes, naming: GitDirNaming) -> Vec<Confi
         out.push(dirs.candidate(&dirs.git_dir, "config.worktree", naming));
     }
     out
+}
+
+/// git's `git_system_config()` (config.c:1499-1506) — the *only* system-scope
+/// file `do_git_config_sequence()` reads.
+///
+/// ```c
+/// char *git_system_config(void)
+/// {
+///         char *system_config = xstrdup_or_null(getenv("GIT_CONFIG_SYSTEM"));
+///         if (!system_config)
+///                 system_config = system_path(ETC_GITCONFIG);
+///         normalize_path_copy(system_config, system_config);
+///         return system_config;
+/// }
+/// ```
+///
+/// # Why this is hand-rolled instead of `Source::storage_location()`
+///
+/// **It must not be able to spawn a process, and `storage_location()` can.**
+///
+/// The gate this feeds runs on *every* invocation, before any argument is looked
+/// at. `Source::GitInstallation.storage_location()` calls
+/// `gix_path::env::installation_config()`, which locates the file by running
+/// `git config -lz --show-origin --name-only` (gix-path/src/env/git/mod.rs:181)
+/// — its own documentation says "both may spawn git once". zvcs's shipped
+/// installation model is a `git` on `PATH` that *is* zvcs
+/// (`~/.zvcs/bin/git` shadows git), so that child runs the gate, which spawns
+/// another child, which runs the gate: an unbounded process fan-out that never
+/// terminates. It was reproduced as `git init -q --bare` hanging with a `git`
+/// shim first on `PATH`, and disappearing under `GIT_CONFIG_NOSYSTEM=1` —
+/// exactly the variable `installation_config()` honours.
+/// `Source::System.storage_location()` has the same hazard on Windows, where it
+/// falls back to `system_prefix()` → `core_dir()` → `git --exec-path`.
+///
+/// Of the ways to break that loop, this is the one the C source settles:
+///
+/// * **Memoising the probe does not work.** The recursion is *across* processes.
+///   Each child is a fresh process with a fresh `LazyLock`, so a per-process
+///   cache still leaves one spawn per generation and the fan-out is unchanged.
+/// * **Resolving the installation config without a subprocess is not possible**
+///   off Windows. The value is *defined* as "ask the `git` in `PATH` where its
+///   configuration is", and for zvcs that `git` is zvcs.
+/// * **`installation_config_unsuppressed()` answers a different question** ("where
+///   is git installed", for `etc/gitattributes` and friends) and spawns just the
+///   same, so it is no use here either.
+/// * **Dropping the scope is correct on its own terms.** `do_git_config_sequence()`
+///   (config.c:1547-1613) reads `git_system_config()`, then `xdg_config`, then
+///   `user_config`, then the repository pair, then the command line — and nothing
+///   else. There is no installation-config scope anywhere in git. It is a
+///   gitoxide concept for behaving like the git that is installed *alongside* it,
+///   which is not a relationship zvcs has with itself. Naming such a file in
+///   `bad config line <n> in file <path>` would be inventing a diagnostic git
+///   cannot produce.
+///
+/// So the scope is gone from the sequence and the system path is derived the way
+/// `git_system_config()` derives it, from the environment and a compiled-in
+/// default. Nothing on this path starts a process.
+///
+/// `GIT_CONFIG_NOSYSTEM` is honoured because `git_config_system()`
+/// (config.c:1542-1545) — `return !git_env_bool("GIT_CONFIG_NOSYSTEM", 0);` —
+/// gates the whole system read on it in `do_git_config_sequence()` (config.c:1574).
+///
+/// The truthiness test is gitoxide's, kept exactly as the `storage_location()`
+/// call it replaces had it, so this is not a behaviour change: a value neither
+/// side can parse leaves the scope enabled. git is stricter and dies with
+/// `bad boolean environment value '<v>' for 'GIT_CONFIG_NOSYSTEM'`, which this
+/// port does not do anywhere — measured with a *valid* system config, where this
+/// gate cannot fire at all, and the divergence is the same. Validating git's
+/// environment booleans is its own piece of work.
+fn system_config_path(env: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let nosystem = env("GIT_CONFIG_NOSYSTEM")
+        .map(gix::config::Boolean::try_from)
+        .transpose()
+        .ok()
+        .flatten()
+        .is_some_and(|b| b.0);
+    if nosystem {
+        return None;
+    }
+    if let Some(path) = env("GIT_CONFIG_SYSTEM") {
+        return Some(PathBuf::from(path));
+    }
+    system_path_etc_gitconfig()
+}
+
+/// `system_path(ETC_GITCONFIG)` for this build.
+///
+/// On a Unix build `ETC_GITCONFIG` is absolute and `system_path()` returns it
+/// unchanged, which is the same answer gitoxide reaches through
+/// `system_prefix()` — that function is a constant `/` off Windows
+/// (gix-path/src/env/mod.rs:230-240), so there is no difference to preserve and
+/// no reason to call it.
+///
+/// On Windows the prefix is discovered by running `git --exec-path`, which is the
+/// spawn this whole function exists to avoid. The scope is skipped there rather
+/// than probed: the gate then names no file, the command falls back to the port's
+/// own diagnostic, and nothing recurses. Naming nothing is a degradation; a
+/// process fan-out is a hang.
+fn system_path_etc_gitconfig() -> Option<PathBuf> {
+    if cfg!(windows) {
+        None
+    } else {
+        Some(PathBuf::from("/etc/gitconfig"))
+    }
 }
 
 /// The `$GIT_DIR` and `$GIT_COMMON_DIR` of the repository the current directory

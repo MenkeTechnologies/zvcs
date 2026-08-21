@@ -835,7 +835,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // ---- 3. Path form: reset the named index entries only; no HEAD move. ----
     if with_paths {
         let mut index = pathspec_index(&repo, &old_index, target_tree, &paths, intent_to_add)?;
-        finish_mixed(&repo, &mut index, quiet, refresh)?;
+        finish_mixed(&repo, &old_index, &mut index, quiet, refresh)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -915,7 +915,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         ResetMode::Soft => {}
         ResetMode::Mixed => {
             let mut index = reset_index_to_tree(&repo, &old_index, target_tree, intent_to_add)?;
-            finish_mixed(&repo, &mut index, quiet, refresh)?;
+            finish_mixed(&repo, &old_index, &mut index, quiet, refresh)?;
         }
         ResetMode::Hard => {
             let should_interrupt = AtomicBool::new(false);
@@ -1011,6 +1011,7 @@ const REFRESH_INDEX_DELAY_WARNING_IN_MS: u64 = 2 * 1000;
 /// the refresh, exactly as `cmd_reset()` does.
 fn finish_mixed(
     repo: &gix::Repository,
+    old_index: &gix::index::File,
     index: &mut gix::index::File,
     quiet: bool,
     refresh: bool,
@@ -1034,9 +1035,11 @@ fn finish_mixed(
             );
         }
     }
-    // Drop the stale cache-tree extension before persisting (see gix File::write).
-    index.remove_tree();
-    index.write(Default::default())?;
+    // A `--mixed` reset never repairs: `cmd_reset()` routes it through
+    // `read_from_tree()` (builtin/reset.c:494), which stages the differences entry by
+    // entry and so invalidates only the paths that actually moved.
+    super::write_tree::carry_cache_tree_invalidating_changes(repo, old_index, index);
+    index.write(crate::config::index_write_options(repo))?;
     Ok(())
 }
 
@@ -1260,8 +1263,12 @@ fn reset_worktree_hard(
         }
     }
 
-    new_index.remove_tree();
-    new_index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+
+    super::write_tree::rebuild_cache_tree(repo, &mut new_index);
+    new_index.write(crate::config::index_write_options(repo))?;
     Ok(())
 }
 
@@ -1486,8 +1493,12 @@ fn reset_two_tree(
         }
     }
 
-    new_index.remove_tree();
-    new_index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+
+    super::write_tree::rebuild_cache_tree(repo, &mut new_index);
+    new_index.write(crate::config::index_write_options(repo))?;
     Ok(true)
 }
 

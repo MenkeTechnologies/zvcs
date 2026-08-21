@@ -707,7 +707,7 @@ mod web__browse;
 mod whatchanged;
 mod worktree;
 pub(crate) mod worktree_filespec;
-mod write_tree;
+pub(crate) mod write_tree;
 
 pub use add::add;
 pub use am::am;

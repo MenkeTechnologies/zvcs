@@ -324,14 +324,16 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     }
 
     // 8. Persist once. `dangerously_push_entry` appends out of order, so restore
-    //    the sort invariant before writing, and drop the stale tree-cache so a
-    //    later commit doesn't capture a subtree that no longer exists.
+    //    the sort invariant before writing. The tree-cache was invalidated along
+    //    both ends of every rename as the entries moved (see `apply_remaps`), so
+    //    what is written back describes only the directories the move left alone.
     if modified {
         index.sort_entries();
-        index.remove_tree();
         // `write_locked_index()` at the end of `cmd_mv()` (builtin/mv.c:634); the
-        // options come from the repository, not from this call site
-        // (read-cache.c:2830-2831).
+        // options — the trailer's `skip_hash` and the `IEOT` offset table alike —
+        // come from the repository, not from this call site
+        // (read-cache.c:2830-2831, :2874-2904).
+        super::write_tree::prepare_offset_table(&repo, &mut index);
         index.write(crate::config::index_write_options(&repo))?;
     }
 
@@ -597,6 +599,9 @@ fn stage_gitmodules(
     let path = workdir.join(".gitmodules");
     let content = std::fs::read(&path)?;
     let id = repo.write_blob(&content)?.detach();
+    // Restaging goes through `add_file_to_index()` in git, so the path is
+    // invalidated like any other staged one (read-cache.c:1273-1274).
+    index.invalidate_path_in_tree(BStr::new(b".gitmodules"));
     let stat = gix::index::fs::Metadata::from_path_no_follow(&path)
         .ok()
         .and_then(|md| Stat::from_fs(&md).ok())
@@ -626,6 +631,17 @@ fn stage_gitmodules(
 /// (the force-overwrite case), then re-append the entries at their new paths.
 /// A `sort_entries()` by the caller restores lookup invariants afterward.
 fn apply_remaps(index: &mut gix::index::File, remaps: &[(String, String)]) {
+    // `cmd_mv()` moves each entry with `rename_index_entry_at()`
+    // (builtin/mv.c:615), which invalidates the cache-tree along the *old* name
+    // (read-cache.c:169) and then re-adds the entry under the new one, where
+    // `add_index_entry_with_check()` invalidates along the *new* name
+    // (read-cache.c:1273-1274). Both ends, per rename — a directory neither the
+    // source nor the destination passes through keeps its cached tree id.
+    for (old, new) in remaps {
+        index.invalidate_path_in_tree(BStr::new(old.as_bytes()));
+        index.invalidate_path_in_tree(BStr::new(new.as_bytes()));
+    }
+
     // Capture (new_path, fields) for each source entry before mutating.
     let mut pushes: Vec<(Stat, ObjectId, Flags, Mode, String)> = Vec::with_capacity(remaps.len());
     {

@@ -1480,7 +1480,7 @@ fn pull_into_void(
         }
     };
     let mut new_index = applied.index;
-    new_index.write(Default::default())?;
+    new_index.write(crate::config::index_write_options(repo))?;
 
     repo.edit_reference(RefEdit {
         change: Change::Update {

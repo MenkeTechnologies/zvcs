@@ -65,28 +65,88 @@ pub(crate) fn decode(data: &[u8], object_hash: gix_hash::Kind) -> Result<Link, d
     })
 }
 
+/// Where a `sharedindex.<id>` file may live, in the order git looks
+/// (read-cache.c:1888-1906).
+///
+/// `read_index_from()` builds `"%s/sharedindex.%s"` from the *git directory* it
+/// was handed (read-cache.c:1893) and only if that file is missing does it retry
+/// against the directory the index itself is in:
+///
+/// ```text
+/// base_path2 = xstrfmt("%s/sharedindex.%s", dirname(path_copy), base_oid_hex);
+/// ```
+/// (read-cache.c:1901-1902)
+///
+/// The distinction only shows up when the two directories differ, which is
+/// exactly what `GIT_INDEX_FILE` pointing outside `$GIT_DIR` does — and what a
+/// worktree's `$GIT_DIR/worktrees/<name>/index` does. Resolving only against the
+/// index's own directory makes every such repository unreadable, so both are
+/// tried here, in git's order.
+fn shared_index_candidates(
+    index_path: &std::path::Path,
+    git_dir: Option<&std::path::Path>,
+    checksum: gix_hash::ObjectId,
+) -> Vec<std::path::PathBuf> {
+    let file_name = format!("sharedindex.{checksum}");
+    let mut out = Vec::with_capacity(2);
+    if let Some(git_dir) = git_dir {
+        out.push(git_dir.join(&file_name));
+    }
+    if let Some(dir) = index_path.parent() {
+        let fallback = dir.join(&file_name);
+        if !out.contains(&fallback) {
+            out.push(fallback);
+        }
+    }
+    out
+}
+
 impl Link {
     pub(crate) fn dissolve_into(
         self,
         split_index: &mut crate::File,
+        git_dir: Option<&std::path::Path>,
         object_hash: gix_hash::Kind,
         skip_hash: bool,
         options: crate::decode::Options,
     ) -> Result<(), crate::file::init::Error> {
-        let shared_index_path = split_index
-            .path
-            .parent()
-            .expect("split index file in .git folder")
-            .join(format!("sharedindex.{}", self.shared_index_checksum));
-        let mut shared_index = crate::File::at(
-            shared_index_path,
-            object_hash,
-            skip_hash,
-            crate::decode::Options {
-                expected_checksum: self.shared_index_checksum.into(),
-                ..options
-            },
-        )?;
+        let options = crate::decode::Options {
+            expected_checksum: self.shared_index_checksum.into(),
+            ..options
+        };
+        let candidates = shared_index_candidates(&split_index.path, git_dir, self.shared_index_checksum);
+        let mut shared_index = None;
+        let mut last_err = None;
+        for candidate in &candidates {
+            match crate::File::at(candidate, object_hash, skip_hash, options) {
+                Ok(file) => {
+                    shared_index = Some(file);
+                    break;
+                }
+                // Only a missing file moves on to the next candidate; a shared index
+                // that exists but does not decode is an error about *that* file, and
+                // git reports it rather than silently looking elsewhere.
+                Err(crate::file::init::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    last_err = Some(crate::file::init::Error::Io(err));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let mut shared_index = match shared_index {
+            Some(file) => file,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    crate::file::init::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "Could not find shared index 'sharedindex.{}' referenced by the split index at '{}'",
+                            self.shared_index_checksum,
+                            split_index.path.display()
+                        ),
+                    ))
+                }));
+            }
+        };
 
         if let Some(bitmaps) = self.bitmaps {
             let mut split_entry_index = 0;
@@ -178,4 +238,28 @@ impl Link {
 
         Ok(())
     }
+}
+
+/// Serialize `link` to `out` including the extension's signature and size header,
+/// git's `write_link_extension()` (split-index.c:83-91).
+///
+/// The order is the one `read_link_extension()` (read-cache.c:1830-1861) parses:
+/// the shared index's checksum, then the delete bitmap, then the replace bitmap.
+/// Both bitmaps are optional as a pair — git writes them only
+/// `if (!si->base || is_null_oid(&si->base_oid))` is false and the bitmaps exist,
+/// and its reader returns successfully the moment the size is exhausted after the
+/// object id (`if (!sz) return 0;`).
+pub fn write_to(link: &Link, mut out: impl std::io::Write) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(link.shared_index_checksum.as_slice());
+    if let Some(bitmaps) = &link.bitmaps {
+        bitmaps.delete.write_to(&mut body)?;
+        bitmaps.replace.write_to(&mut body)?;
+    }
+
+    out.write_all(&SIGNATURE)?;
+    let size = u32::try_from(body.len())
+        .map_err(|_| std::io::Error::other("link extension exceeds 4 gigabytes"))?;
+    out.write_all(&size.to_be_bytes())?;
+    out.write_all(&body)
 }

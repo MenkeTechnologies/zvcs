@@ -3555,8 +3555,12 @@ fn restore_worktree_to_tree(
         }
     }
 
-    new_index.remove_tree();
-    new_index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+
+    super::write_tree::rebuild_cache_tree(repo, &mut new_index);
+    new_index.write(crate::config::index_write_options(repo))?;
     Ok(())
 }
 
@@ -5007,7 +5011,7 @@ impl<'r> Sequencer<'r> {
             }
         }
         self.index = applied.index;
-        self.index.write(Default::default())?;
+        self.index.write(crate::config::index_write_options(repo))?;
 
         if !applied.conflicts.is_empty() {
             // `merge_switch_to_result()` records the merged tree as `AUTO_MERGE`
@@ -5415,7 +5419,7 @@ impl<'r> Sequencer<'r> {
             }
         }
         self.index = applied.index;
-        self.index.write(Default::default())?;
+        self.index.write(crate::config::index_write_options(repo))?;
 
         let commit = repo.find_commit(original)?;
         let message: BString = commit.message_raw()?.to_owned();
@@ -6459,8 +6463,10 @@ fn update_clean_worktree(
     }
 
     // Drop any stale cache-tree extension before persisting.
-    new_index.remove_tree();
-    new_index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::rebuild_cache_tree(repo, &mut new_index);
+    new_index.write(crate::config::index_write_options(repo))?;
 
     Ok(())
 }

@@ -415,6 +415,18 @@ fn merge_and_apply(
             gix::merge::tree::apply_index_entries::RemovalMode::Prune,
         );
     }
+    // Every merge-shaped verb — `merge` and its strategies, `pull`, `am`, `rebase`,
+    // `cherry-pick`, `revert`, `stash apply`, `checkout`'s autostash — reaches its
+    // finished index through this one function and then writes it, so this is where
+    // git's parting `cache_tree_update(&o->internal.result, WRITE_TREE_SILENT |
+    // WRITE_TREE_REPAIR)` belongs (unpack-trees.c:2088-2092). Doing it here rather
+    // than at each writer is what keeps the twelve of them from drifting apart.
+    //
+    // It runs *after* the conflict entries are applied, because a conflicted index
+    // has no tree at all: `verify_cache()` refuses an unmerged entry
+    // (cache-tree.c:218-234) and the update leaves the extension off, which is the
+    // right answer for an index that cannot be turned into a tree.
+    crate::porcelain::write_tree::rebuild_cache_tree(repo, &mut index);
 
     Ok(Merged::Applied(Applied {
         tree_id,

@@ -615,13 +615,23 @@ impl State {
     /// them when [writing the index](Self::write_to()).
     pub fn remove_entries(&mut self, mut should_remove: impl FnMut(usize, &BStr, &mut Entry) -> bool) {
         let mut index = 0;
+        // `remove_index_entry_at()` opens with `record_resolve_undo(istate, ce)`
+        // (read-cache.c:1370-1371), so every unmerged entry leaves its stage behind
+        // in the `REUC` extension on the way out — which is the only moment that
+        // information still exists. Merged entries are offered and ignored, exactly
+        // as `record_resolve_undo()`'s own `if (!stage) return;` ignores them.
+        let mut resolve_undo = self.resolve_undo.take();
         let paths = &self.path_backing;
         self.entries.retain_mut(|e| {
             let path = e.path_in(paths);
             let res = !should_remove(index, path, e);
             index += 1;
+            if !res {
+                extension::resolve_undo::record_entry(&mut resolve_undo, path, e);
+            }
             res
         });
+        self.resolve_undo = resolve_undo;
     }
 
     /// Physically remove the entry at `index`, or panic if the entry didn't exist.
@@ -631,7 +641,13 @@ impl State {
     /// Note that the memory used for the removed entries paths is not freed, as it's append-only, and
     /// that some extensions might refer to paths which are now deleted.
     pub fn remove_entry_at_index(&mut self, index: usize) -> Entry {
-        self.entries.remove(index)
+        let entry = self.entries.remove(index);
+        // The other half of `remove_index_entry_at()` (read-cache.c:1370-1371); see
+        // [`remove_entries()`](Self::remove_entries()).
+        let mut resolve_undo = self.resolve_undo.take();
+        extension::resolve_undo::record_entry(&mut resolve_undo, entry.path_in(&self.path_backing), &entry);
+        self.resolve_undo = resolve_undo;
+        entry
     }
 }
 
@@ -649,6 +665,16 @@ impl State {
     pub fn link(&self) -> Option<&extension::Link> {
         self.link.as_ref()
     }
+    /// Return `true` if the file this state was decoded from was a *split* index.
+    ///
+    /// [`link()`](Self::link()) cannot answer this: reading a split index dissolves
+    /// the extension into the entries it refers to, leaving `link` as `None` on a
+    /// state that very much came from a split index. git keeps the same distinction
+    /// in `istate->split_index`, which is what `--no-split-index` tests before it
+    /// bothers to rewrite anything (builtin/update-index.c:1188-1194).
+    pub fn had_link(&self) -> bool {
+        self.link_at_decode_time
+    }
     /// Obtain the resolve-undo extension.
     pub fn resolve_undo(&self) -> Option<&extension::resolve_undo::Paths> {
         self.resolve_undo.as_ref()
@@ -656,6 +682,35 @@ impl State {
     /// Remove the resolve-undo extension.
     pub fn remove_resolve_undo(&mut self) -> Option<extension::resolve_undo::Paths> {
         self.resolve_undo.take()
+    }
+    /// Forget the resolve-undo record for `path`, returning whether there was one.
+    ///
+    /// git's `unmerge_index_entry()` ends with
+    /// `string_list_remove(istate->resolve_undo, ce->name, 1)` (resolve-undo.c:151-152):
+    /// once the recorded stages are back in the index the conflict is no longer
+    /// undone, so the record that described it must go.
+    pub fn remove_resolve_undo_path(&mut self, path: &BStr) -> bool {
+        let Some(paths) = self.resolve_undo.as_mut() else {
+            return false;
+        };
+        let removed = extension::resolve_undo::remove(paths, path);
+        if paths.is_empty() {
+            self.resolve_undo = None;
+        }
+        removed
+    }
+    /// Replace the `link` (split-index) extension, or remove it with `None`.
+    ///
+    /// A `Some` here is what makes the next write a *split* index: the entries that
+    /// remain in this state are the split half, and `link` names the
+    /// `sharedindex.<id>` file holding the rest. Reading an index dissolves the
+    /// extension into the entries it refers to
+    /// ([`File::at()`](crate::File::at())), so this is always `None` on a
+    /// freshly-read index and setting it is a deliberate act — as it is in git,
+    /// where `add_split_index()` / `remove_split_index()` (split-index.c:356-393)
+    /// are the only two ways in and out.
+    pub fn set_link(&mut self, link: Option<extension::Link>) {
+        self.link = link;
     }
     /// Obtain the untracked extension.
     pub fn untracked(&self) -> Option<&extension::UntrackedCache> {
@@ -672,6 +727,59 @@ impl State {
     /// Return `true` if the offset-table extension was present when decoding this index.
     pub fn had_offset_table(&self) -> bool {
         self.offset_table_at_decode_time
+    }
+
+    /// Install `tree` as this index's cache-tree, replacing whatever was there.
+    ///
+    /// The counterpart of [`remove_tree()`](Self::remove_tree()), and the way to move a
+    /// cache-tree from one index to another — which is what git's `move_index_extensions()`
+    /// does when `unpack_trees()` hands its result over (unpack-trees.c:2079), and what a
+    /// caller that rebuilt the entry list in a fresh index has to do by hand to keep the
+    /// directories it did not touch.
+    ///
+    /// **The caller owns the invariant.** Nothing here checks that the nodes describe these
+    /// entries; a node that survives a change to the entries below it is exactly the stale
+    /// cache-tree that makes a later `write-tree` hand back the wrong id. Follow this with
+    /// [`invalidate_path_in_tree()`](Self::invalidate_path_in_tree()) for every path whose
+    /// entry differs, as git does at each mutation.
+    pub fn set_tree(&mut self, tree: Option<extension::Tree>) {
+        self.tree = tree;
+    }
+
+    /// Ask the next write to emit the `IEOT` (index entry offset table) extension, sized for
+    /// `threads` readers — `Some(0)` for git's "one per core", `Some(n)` for a literal count,
+    /// and `None` (the default) to emit none.
+    ///
+    /// This is the half of `do_write_index()`'s `IEOT` decision that needs a repository:
+    ///
+    /// ```text
+    /// if (!HAVE_THREADS || repo_config_get_index_threads(the_repository, &nr_threads))
+    ///         nr_threads = 1;
+    ///
+    /// if (nr_threads != 1 && record_ieot()) {
+    /// ```
+    /// (read-cache.c:2874-2877)
+    ///
+    /// A caller passes `Some(nr_threads)` only when both of those conditions hold — `index.threads`
+    /// resolves to something other than one thread, *and* `record_ieot()` (read-cache.c:2788-2801)
+    /// says yes, which means `index.recordOffsetTable` is set true, or is unset and threading was
+    /// asked for. Everything downstream of that gate — how many blocks there are, and whether
+    /// there are enough of them to be worth writing — is
+    /// [`entries_per_block()`](crate::extension::index_entry_offset_table::entries_per_block()),
+    /// which this crate applies at write time.
+    ///
+    /// The setting is a property of the *write*, not of the index: it is not preserved across a
+    /// decode (see [`had_offset_table()`](Self::had_offset_table()) for what the file carried)
+    /// and it does not survive being read back, exactly as in git, where nothing but the
+    /// configuration decides.
+    pub fn set_offset_table_threads(&mut self, threads: Option<u32>) {
+        self.offset_table_threads = threads;
+    }
+
+    /// Return the `index.threads` value the next write will size its `IEOT` extension for; see
+    /// [`set_offset_table_threads()`](Self::set_offset_table_threads()).
+    pub fn offset_table_threads(&self) -> Option<u32> {
+        self.offset_table_threads
     }
 }
 

@@ -292,7 +292,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
                 &should_interrupt,
             )?;
             cur_index = applied.index;
-            cur_index.write(Default::default())?;
+            cur_index.write(crate::config::index_write_options(&repo))?;
             // `MRC=$SHA1 MRT=$(git write-tree)`
             mrc = vec![sha1_commit];
             mrc_text = vec![sha1.clone()];
@@ -362,7 +362,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
             &should_interrupt,
         )?;
         cur_index = applied.index;
-        cur_index.write(Default::default())?;
+        cur_index.write(crate::config::index_write_options(&repo))?;
         if !applied.conflicts.is_empty() {
             // `git-merge-one-file` left conflict markers → `OCTOPUS_FAILURE=1`.
             // The last head may fail (loop ends, exit 1); an earlier one makes the

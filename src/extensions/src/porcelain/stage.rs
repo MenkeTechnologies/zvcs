@@ -1147,7 +1147,7 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 entry.stat = *stat;
             }
         }
-        index.write(gix::index::write::Options::default())?;
+        index.write(crate::config::index_write_options(repo))?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1919,10 +1919,18 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         })
     };
 
-    // The tree-cache extension is written verbatim by `File::write`; drop it after
-    // mutating entries so a later commit can't capture a stale subtree.
-    index.remove_tree();
-    index.write(gix::index::write::Options::default())?;
+    // `git stage` is registered as `cmd_add` itself, so its cache-tree handling is
+    // `add`'s: `add_index_entry_with_check()` invalidates each path it stages
+    // (read-cache.c:1273-1274) and `remove_file_from_index()` each path it drops
+    // (read-cache.c:632), leaving every untouched directory at its cached tree id.
+    // Dropping the whole extension instead — which this did — is why `stage` was
+    // the one `add` spelling that came out of a staging run with no `TREE` at all.
+    // (`apply_chmod_pathspec` above invalidates the paths it flips on its own.)
+    super::add::invalidate_tree_cache(&mut index, &remove);
+    for s in &staged {
+        index.invalidate_path_in_tree(s.path.as_ref());
+    }
+    index.write(crate::config::index_write_options(repo))?;
     super::add::record_stage_event(repo, staged.len() + deletions.len());
 
     if o.verbose {

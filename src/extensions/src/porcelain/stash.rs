@@ -851,7 +851,17 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     let should_interrupt = AtomicBool::new(false);
     let fresh = sync_worktree(&scratch, worktree_target, &affected, &target_map, &should_interrupt)?;
     let old_index = repo.open_index()?;
-    write_target_index(repo, index_target, &old_index, &fresh)?;
+    // Which reset `do_push_stash` runs decides the extension it leaves behind. The plain
+    // push shells out to `git reset --hard -q` (builtin/stash.c:1820), and a `--hard` reset
+    // ends in `prime_cache_tree()` (builtin/reset.c:126) — fully valid. `--keep-index` and a
+    // pathspec push instead reset with `git reset -q --refresh -- <paths>`
+    // (builtin/stash.c:1883), which is `--mixed` and therefore invalidates per changed path.
+    let cache_tree = if keep_index || !opts.pathspecs.is_empty() {
+        CacheTree::LikeMixedReset
+    } else {
+        CacheTree::LikeUnpackTrees
+    };
+    write_target_index(repo, index_target, &old_index, &fresh, cache_tree)?;
 
     // The untracked files now live in the stash's third parent, so git removes
     // them from the worktree — with `git clean --force --quiet -d`, whose `-d`
@@ -2074,7 +2084,7 @@ fn restore_stash_commit(
         // git leaves the conflicted worktree in place and fails the apply; the
         // caller keeps the stash and reports it.
         if let Some(applied) = applied.as_mut() {
-            applied.index.write(Default::default())?;
+            applied.index.write(crate::config::index_write_options(repo))?;
         }
         if restore_index {
             eprintln!("Index was not unstashed.");
@@ -2106,7 +2116,7 @@ fn restore_stash_commit(
         } else {
             unstage_changes_unless_new(repo, c_tree, applied.tree_id)?
         };
-        write_target_index(repo, index_tree, &old_index, &fresh)?;
+        write_target_index(repo, index_tree, &old_index, &fresh, CacheTree::LikeUnpackTrees)?;
     }
 
     // Untracked files come back last and stay untracked — their stats are
@@ -2176,7 +2186,7 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
     let should_interrupt = AtomicBool::new(false);
     let fresh = sync_worktree(repo, head_tree_id, &affected, &head_map, &should_interrupt)?;
     let old_index = repo.open_index()?;
-    write_target_index(repo, head_tree_id, &old_index, &fresh)?;
+    write_target_index(repo, head_tree_id, &old_index, &fresh, CacheTree::LikeMixedReset)?;
     Ok(w_commit)
 }
 
@@ -2235,7 +2245,11 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         // changes stay UNSTAGED: reset the index to HEAD rather than persisting the
         // merged index, leaving worktree-vs-index as the user's local changes.
         let mut head_index = repo.index_from_tree(&ours)?;
-        head_index.write(Default::default())?;
+        // Built straight from a tree, so it is exactly what `reset_tree()` would have
+        // unpacked — and `unpack_trees()` leaves a repaired cache-tree behind
+        // (unpack-trees.c:2088-2092).
+        super::write_tree::rebuild_cache_tree(repo, &mut head_index);
+        head_index.write(crate::config::index_write_options(repo))?;
         if !quiet {
             // `apply_save_autostash_oid()` reports this on **stderr**, alongside
             // every other line the autostash machinery prints.
@@ -2245,7 +2259,7 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         // Keep the conflicted index (stages 1/2/3) so the user can resolve, exactly
         // as a conflicting `git stash apply` leaves it.
         let mut index = applied.index;
-        index.write(Default::default())?;
+        index.write(crate::config::index_write_options(repo))?;
         if !quiet {
             // git keeps the changes recoverable in the stash on a conflicting apply.
             eprintln!("Applying autostash resulted in conflicts.");
@@ -2491,6 +2505,24 @@ fn revert_paths_in_tree(
     Ok(editor.write()?.detach())
 }
 
+/// Which shape of cache-tree the index this verb is about to write should carry.
+///
+/// `stash` reaches an index two different ways and git leaves a different extension behind for
+/// each, so this has to be a decision the caller makes rather than one this function guesses.
+enum CacheTree {
+    /// `reset_tree()` (builtin/stash.c:334-374), i.e. `unpack_trees()` with `oneway_merge`,
+    /// whose parting `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    /// (unpack-trees.c:2088-2092) leaves every node it can prove — which, for an index that
+    /// is an exact expansion of a tree the repository has, is all of them. This is
+    /// `stash apply --index` restoring the stashed index state.
+    LikeUnpackTrees,
+    /// The reset `do_push_stash` performs by running `git reset` itself, which is a `--mixed`
+    /// reset and therefore invalidates per changed path without repairing anything
+    /// (builtin/reset.c:494 → `read_from_tree()`). This is `stash push` and the autostash
+    /// snapshot, and stock's index after them still shows the root invalid.
+    LikeMixedReset,
+}
+
 /// Write the on-disk index to the state of `tree_id`, reusing `fresh` stats for
 /// just-written files and the previous index stats for entries that didn't move,
 /// so the next status check stays cheap.
@@ -2499,6 +2531,7 @@ fn write_target_index(
     tree_id: ObjectId,
     old_index: &gix::index::File,
     fresh: &HashMap<BString, Stat>,
+    cache_tree: CacheTree,
 ) -> Result<()> {
     let mut new_index = repo.index_from_tree(&tree_id)?;
 
@@ -2537,9 +2570,30 @@ fn write_target_index(
         }
     }
 
-    new_index.remove_tree();
-    // git reaches this index through `unpack_trees()` and `write_locked_index()`,
-    // i.e. the one `do_write_index()` every other index writer goes through
+    // git reaches this index through `reset_tree()` (builtin/stash.c:334-374),
+    // i.e. `unpack_trees()` with `oneway_merge`, and `unpack_trees()` neither
+    // primes nor discards the cache-tree: it carries the source index's
+    // extension over with `move_index_extensions()` and then, unless the result
+    // is already fully valid, finishes with
+    // `cache_tree_update(&o->internal.result, WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2079-2093).
+    //
+    // `WRITE_TREE_REPAIR` writes no object: it hashes what each level *would*
+    // serialise and keeps the id only when that tree is already in the odb
+    // (cache-tree.c:490-497). Here every level is: the index above was expanded
+    // from `tree_id`, which is a tree the repository already has, so each node's
+    // serialisation is one of its subtrees and the whole cache-tree comes out
+    // valid — the same extension stock git leaves behind, without minting a
+    // single object. An index that for any reason does not match gets the nodes
+    // it can prove and nothing more.
+    match cache_tree {
+        CacheTree::LikeUnpackTrees => super::write_tree::rebuild_cache_tree(repo, &mut new_index),
+        CacheTree::LikeMixedReset => {
+            super::write_tree::carry_cache_tree_invalidating_changes(repo, old_index, &mut new_index);
+        }
+    }
+    // The `write_locked_index()` that ends `reset_tree()` is the one
+    // `do_write_index()` every other index writer goes through
     // (`read-cache.c:2830-2831`), so `index.skipHash` — and the `feature.manyFiles`
     // macro that defaults it — decides the trailer here too. Stock with
     // `index.skipHash=true` leaves twenty zero bytes at the end of `.git/index`

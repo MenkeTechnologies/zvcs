@@ -84,11 +84,12 @@
 //!   directory/file-conflict detection — git substitutes `o->df_conflict_entry`
 //!   for a slot whose path is a directory in that tree — and sparse-directory
 //!   handling. A path that is a file in one tree and a directory in another is
-//!   therefore merged as if the directory side were absent.
+//!   therefore merged as if the directory side were absent. Because no sparse
+//!   directory entry is ever built here, the index this verb writes is never
+//!   sparse, so `prime_cache_tree()`'s sparse-directory branch
+//!   (cache-tree.c:872-891) cannot be reached through `read-tree`.
 //! * The `-u` untracked-collision check rejects any existing file at a path the read
 //!   adds; git additionally permits it when the file is `.gitignore`d.
-//! * The cache-tree (`TREE`) extension is dropped on write, as everywhere else in
-//!   zvcs, because gitoxide cannot recompute it (`gix_index::File::write`).
 //! * `--sparse-checkout` is accepted but never applies a sparse filter, and
 //!   `--recurse-submodules` never descends into submodules — both need substrate
 //!   this port does not have, so they behave as their `--no-` counterparts.
@@ -822,11 +823,11 @@ fn finish(o: Opts) -> Result<ExitCode> {
     // validates a node only when the tree it would serialise is already in the odb
     // and writes nothing.
     match (tree_ids.len(), o.prefix.as_ref()) {
-        (1, None) => new_index.prime_cache_tree(&repo.objects, &tree_ids[0])?,
-        _ => {
-            new_index.remove_tree();
-            super::write_tree::repair_cache_tree(&repo, &mut new_index);
+        (1, None) => {
+            new_index.prime_cache_tree(&repo.objects, &tree_ids[0])?;
+            super::write_tree::prepare_offset_table(&repo, &mut new_index);
         }
+        _ => super::write_tree::rebuild_cache_tree(&repo, &mut new_index),
     }
     new_index.write(crate::config::index_write_options(&repo))?;
     // `core.fsync=index` (or an aggregate that contains it) hardens the index git
@@ -1104,8 +1105,7 @@ fn multi_tree_read(
     // so all this index gets is `unpack_trees()`'s repair pass: nodes whose tree the
     // repository already has keep an id, everything else — including every node above
     // an unmerged path — comes out invalid.
-    new_index.remove_tree();
-    super::write_tree::repair_cache_tree(repo, &mut new_index);
+    super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     new_index.write(crate::config::index_write_options(repo))?;
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
     Ok(ExitCode::SUCCESS)

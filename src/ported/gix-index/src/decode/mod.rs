@@ -272,7 +272,9 @@ impl State {
 
                 end_of_index_at_decode_time: end_of_index,
                 offset_table_at_decode_time: offset_table,
+                offset_table_threads: None,
                 tree,
+                link_at_decode_time: link.is_some(),
                 link,
                 resolve_undo,
                 untracked,

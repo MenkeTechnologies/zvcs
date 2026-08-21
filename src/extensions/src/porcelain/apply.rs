@@ -1720,9 +1720,15 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         }
         index.sort_entries();
-        // Drop the cached tree so a later commit cannot capture a stale subtree.
-        index.remove_tree();
-        index.write(gix::index::write::Options::default())?;
+        // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+        // (unpack-trees.c:2088-2092); a conflicted result simply has no node it can prove.
+        super::write_tree::rebuild_cache_tree(
+            idx_repo.as_ref().expect("repo present when update_index"),
+            index,
+        );
+        index.write(crate::config::index_write_options(
+            idx_repo.as_ref().expect("repo present when update_index"),
+        ))?;
     }
 
     // `write_out_results()`: the conflicted paths are named once every write is

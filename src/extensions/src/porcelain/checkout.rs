@@ -2171,8 +2171,10 @@ fn restore_from_index(
             }
         }
     }
-    index.remove_tree();
-    index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::rebuild_cache_tree(repo, &mut index);
+    index.write(crate::config::index_write_options(repo))?;
 
     if bare && !quiet {
         eprintln!(
@@ -2329,8 +2331,10 @@ fn restore_from_tree(
     if pushed {
         index.sort_entries();
     }
-    index.remove_tree();
-    index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::rebuild_cache_tree(repo, &mut index);
+    index.write(crate::config::index_write_options(repo))?;
 
     if bare && !quiet {
         eprintln!(
@@ -2581,7 +2585,7 @@ pub(super) fn apply_switch_autostash(
         eprintln!("Applied autostash.");
     } else {
         let mut index = applied.index;
-        index.write(Default::default())?;
+        index.write(crate::config::index_write_options(repo))?;
         super::stash::store_commit(
             repo,
             stash,
@@ -2698,8 +2702,10 @@ pub(super) fn update_worktree_to_tree(
         }
     }
     index.sort_entries();
-    index.remove_tree();
-    index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::rebuild_cache_tree(repo, &mut index);
+    index.write(crate::config::index_write_options(repo))?;
     Ok(())
 }
 
@@ -2802,8 +2808,10 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
             }
         }
     }
-    new_index.remove_tree();
-    new_index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::rebuild_cache_tree(repo, &mut new_index);
+    new_index.write(crate::config::index_write_options(repo))?;
     // `remove_branch_state()`: a forced switch abandons any in-progress merge,
     // cherry-pick or revert, exactly as git's `switch_branches` does after the
     // worktree is reconciled.

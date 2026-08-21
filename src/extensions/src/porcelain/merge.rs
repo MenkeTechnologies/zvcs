@@ -2436,7 +2436,7 @@ fn ort_attempt(
         }
     };
     let mut index = applied.index;
-    index.write(Default::default())?;
+    index.write(crate::config::index_write_options(repo))?;
     // `merge_switch_to_result()`'s `write_auto_merge` region: the strategy ran
     // and its result is on disk, so the merged tree is recorded. A commit
     // removes it again; `--no-commit`, `--squash` and a conflict all stop first
@@ -2922,7 +2922,7 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
             }
         };
         cur_index = applied.index;
-        cur_index.write(Default::default())?;
+        cur_index.write(crate::config::index_write_options(repo))?;
 
         if !applied.conflicts.is_empty() {
             // Octopus aborts on the first conflicting head, leaving the
@@ -4586,8 +4586,10 @@ fn update_worktree(
     }
 
     // Drop any stale cache-tree extension before persisting.
-    new_index.remove_tree();
-    new_index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::rebuild_cache_tree(repo, &mut new_index);
+    new_index.write(crate::config::index_write_options(repo))?;
 
     Ok(())
 }

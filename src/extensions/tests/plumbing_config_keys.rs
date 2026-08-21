@@ -13,6 +13,8 @@
 //!     hardening policy and its three diagnostics.
 //!   * `index.skipHash` and `index.recordEndOfIndexEntries` (with its
 //!     `index.threads` default) — the index write options.
+//!   * `index.recordOffsetTable` (with the same `index.threads` default) — the
+//!     `IEOT` offset table.
 //!   * `pack.packSizeLimit` — `pack-objects` / `repack`'s 1 MiB floor warning and
 //!     its validation ahead of parse-options.
 //!   * `gc.recentObjectsHook` — extra "recent" traversal tips for `prune`.
@@ -303,15 +305,158 @@ fn end_of_index_entry_follows_the_extension_it_indexes() {
     let bytes = index();
     assert!(has(&bytes, b"TREE") && has(&bytes, EOIE), "asked for EOIE and did not get it");
 
-    // `index.threads=4` turns EOIE on the same way. git additionally writes the
-    // `IEOT` offset table there; this port has no writer for it, so the index is
-    // the TREE+EOIE one. Pinned so the day IEOT lands, this test says so rather
-    // than silently passing.
+    // `index.threads=4` turns EOIE on the same way, and adds the `IEOT` offset
+    // table ahead of it — see `offset_table_appears_exactly_when_git_writes_one`
+    // for the table's own rules.
     let out = run(&repo, &home, &["-c", "index.threads=4", "update-index", "--force-write-index"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let bytes = index();
     assert!(has(&bytes, EOIE), "index.threads should have turned EOIE on");
-    assert!(!has(&bytes, b"IEOT"), "IEOT is unimplemented; update this test when it lands");
+    assert!(has(&bytes, b"IEOT"), "index.threads should have turned the offset table on");
+    assert!(
+        bytes.windows(4).position(|w| w == b"IEOT") < bytes.windows(4).position(|w| w == b"TREE"),
+        "IEOT is written first so a reader finds it without scanning (read-cache.c:2975-2980)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// index.recordOffsetTable / index.threads — the IEOT extension
+// ---------------------------------------------------------------------------
+
+/// The extensions of an index file, in file order, as `(signature, body)` pairs.
+///
+/// Only index versions 2 and 3 are parsed; nothing in this binary writes the
+/// path-compressed version 4.
+fn extensions(index: &Path) -> Vec<([u8; 4], Vec<u8>)> {
+    let data = std::fs::read(index).unwrap();
+    assert_eq!(&data[..4], b"DIRC");
+    let version = u32::from_be_bytes(data[4..8].try_into().unwrap());
+    assert!(version <= 3, "index version {version} is path-compressed");
+    let count = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+
+    let mut off = 12;
+    for _ in 0..count {
+        let start = off;
+        let flags = u16::from_be_bytes(data[off + 60..off + 62].try_into().unwrap());
+        off += 62;
+        if version >= 3 && flags & 0x4000 != 0 {
+            off += 2;
+        }
+        off += data[off..].iter().position(|&b| b == 0).unwrap();
+        off += 8 - ((off - start) % 8);
+    }
+
+    let mut out = Vec::new();
+    while off + 8 <= data.len() - 20 {
+        let sig: [u8; 4] = data[off..off + 4].try_into().unwrap();
+        let size = u32::from_be_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
+        out.push((sig, data[off + 8..off + 8 + size].to_vec()));
+        off += 8 + size;
+    }
+    out
+}
+
+/// The `IEOT` blocks of an index as `(offset, entry_count)` pairs, or `None` when
+/// the index carries no offset table.
+///
+/// The body is a version word followed by one `(offset, count)` pair per block,
+/// all big-endian, with no count of its own — `read_ieot_extension()` derives the
+/// block count from the extension size (read-cache.c:3694-3695).
+fn offset_table(index: &Path) -> Option<Vec<(u32, u32)>> {
+    let body = extensions(index).into_iter().find(|(sig, _)| sig == b"IEOT")?.1;
+    assert_eq!(
+        u32::from_be_bytes(body[..4].try_into().unwrap()),
+        1,
+        "IEOT_VERSION is 1; stock rejects anything else (read-cache.c:3686-3690)"
+    );
+    assert_eq!((body.len() - 4) % 8, 0, "the body is whole (offset, count) pairs");
+    Some(
+        body[4..]
+            .chunks_exact(8)
+            .map(|c| {
+                (
+                    u32::from_be_bytes(c[..4].try_into().unwrap()),
+                    u32::from_be_bytes(c[4..].try_into().unwrap()),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// `IEOT` appears exactly where stock git 2.55.0 puts it, and describes the same
+/// blocks.
+///
+/// The gate is a conjunction that is easy to get wrong in either direction
+/// (read-cache.c:2874-2877):
+///
+/// ```text
+/// if (!HAVE_THREADS || repo_config_get_index_threads(the_repository, &nr_threads))
+///         nr_threads = 1;
+///
+/// if (nr_threads != 1 && record_ieot()) {
+/// ```
+///
+/// so `index.recordOffsetTable=true` **on its own writes nothing** — `nr_threads`
+/// is still one — and `index.threads=4 index.recordOffsetTable=false` writes
+/// nothing either. Both were confirmed against stock git 2.55.0 on this fixture,
+/// which leaves `TREE` alone in the first case and `TREE`+`EOIE` in the second.
+///
+/// This fixture has two entries, so `index.threads=N` gives
+/// `ieot_blocks = min(N, 2)` and `ieot_entries = DIV_ROUND_UP(2, blocks)`
+/// (read-cache.c:2885-2904): one block per entry at `N >= 2`, and at `N == 1` no
+/// extension at all because "no reason to write out the IEOT extension if we
+/// don't have enough blocks to utilize multi-threading".
+#[test]
+fn offset_table_appears_exactly_when_git_writes_one() {
+    let (repo, home) = fixture("ieot");
+    let index = repo.join(".git/index");
+
+    for prefix in [
+        vec![],
+        vec!["-c", "index.threads=1"],
+        // The key alone cannot turn it on: `record_ieot()` is only consulted once
+        // `nr_threads != 1` already holds.
+        vec!["-c", "index.recordOffsetTable=true"],
+        // And it can turn it off while threading is on.
+        vec!["-c", "index.threads=4", "-c", "index.recordOffsetTable=false"],
+    ] {
+        let mut args = prefix.clone();
+        args.extend_from_slice(&["update-index", "--force-write-index"]);
+        let out = run(&repo, &home, &args);
+        assert!(out.status.success(), "{prefix:?}: {}", stderr(&out));
+        assert_eq!(offset_table(&index), None, "{prefix:?} wrote an IEOT it was not asked for");
+    }
+
+    // Two threads, two entries: one block each. The first block starts at the
+    // first entry, which is the 12-byte header (`offset = hashfile_total(f)`
+    // right after the header, read-cache.c:2906).
+    for prefix in [
+        vec!["-c", "index.threads=2"],
+        vec!["-c", "index.threads=4"],
+        vec!["-c", "index.threads=4", "-c", "index.recordOffsetTable=true"],
+    ] {
+        let mut args = prefix.clone();
+        args.extend_from_slice(&["update-index", "--force-write-index"]);
+        let out = run(&repo, &home, &args);
+        assert!(out.status.success(), "{prefix:?}: {}", stderr(&out));
+        let blocks = offset_table(&index).unwrap_or_else(|| panic!("{prefix:?} wrote no IEOT"));
+        assert_eq!(blocks.len(), 2, "{prefix:?}: two entries cannot fill more than two blocks");
+        assert_eq!(blocks[0].0, 12, "{prefix:?}: the first block starts right after the header");
+        assert_eq!(
+            blocks.iter().map(|(_, n)| n).sum::<u32>(),
+            2,
+            "{prefix:?}: every entry belongs to exactly one block"
+        );
+        assert!(
+            blocks[1].0 > blocks[0].0,
+            "{prefix:?}: blocks are written in file order, got {blocks:?}"
+        );
+        // Each offset must land on an entry boundary: entries are 8-byte aligned
+        // from the start of the file, and a reader seeks straight to them.
+        for (offset, _) in &blocks {
+            assert_eq!(offset % 8, 4, "{prefix:?}: {offset} is not an entry start");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

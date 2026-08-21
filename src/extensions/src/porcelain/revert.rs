@@ -1245,7 +1245,7 @@ fn revert_one(
             unresolved,
             gix::merge::tree::apply_index_entries::RemovalMode::Prune,
         );
-        new_index.write(Default::default())?;
+        new_index.write(crate::config::index_write_options(repo))?;
 
         let git_dir = repo.git_dir();
         std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
@@ -1632,8 +1632,10 @@ fn apply(
         }
     }
     index.sort_entries();
-    index.remove_tree();
-    index.write(Default::default())?;
+    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::rebuild_cache_tree(repo, &mut index);
+    index.write(crate::config::index_write_options(repo))?;
     Ok(index)
 }
 

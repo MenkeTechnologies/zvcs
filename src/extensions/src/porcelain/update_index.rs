@@ -21,7 +21,8 @@
 //!   * `--clear-resolve-undo`, `--force-write-index`
 //!   * `--index-version <n>` / `--show-index-version` (one shared variable in
 //!     git, so a trailing `--show-index-version` cancels a bad `--index-version`)
-//!   * `--split-index`, `--untracked-cache` and friends, `--fsmonitor`
+//!   * `--split-index` / `--no-split-index`, `--untracked-cache` and friends,
+//!     `--fsmonitor`
 //!   * `--index-info` (its three stdin line grammars, including the `-z` and
 //!     C-quoted path forms and mode-0 removal)
 //!   * `--verbose`, `--`, and `<file>...`
@@ -48,6 +49,32 @@
 //! `core.fsync` / `core.fsyncMethod`; `core.fsyncObjectFiles` is read for its
 //! deprecation warning.
 //!
+//! `--split-index` really splits. The entries are written to
+//! `$GIT_DIR/sharedindex.<id>` and `$GIT_DIR/index` keeps the tree-cache plus a
+//! `link` extension naming it, which is exactly what stock git then reads
+//! (`write_shared_index()` / `write_split_index()`, read-cache.c:2338-2382).
+//! `--no-split-index` writes one whole index again: reading a split index has
+//! already dissolved its `link` into the entries, so the ordinary write *is* the
+//! un-split. Both spellings emit git's `core.splitIndex` disagreement warning.
+//!
+//! What is not reproduced is git's per-entry replace bookkeeping. git leaves an
+//! empty-path stand-in entry in the split half for every shared entry it has
+//! touched, with the matching bit set in the replace bitmap
+//! (split-index.c:223-309); that needs the `CE_UPDATE_IN_BASE` / `CE_MATCHED`
+//! per-entry provenance this index model does not carry. The split half written
+//! here holds no entries and two empty bitmaps — a smaller file that decodes to
+//! the same index, and one stock git reads without reporting a repair.
+//! `core.splitIndex`, `splitIndex.maxPercentChange` and
+//! `splitIndex.sharedIndexExpire` remain unimplemented: a split happens when this
+//! flag asks for one and at no other time, and no shared index is ever expired.
+//!
+//! `--unresolve` restores the conflict stages recorded in the index's `REUC`
+//! extension exactly as git does — dropping the stage-0 entry, re-adding stages
+//! 1/2/3, and then forgetting the record it consumed (`string_list_remove()`,
+//! resolve-undo.c:151-152). The extension itself is now serialised by `gix_index`,
+//! so a conflict resolved through this port stays recoverable by stock git's
+//! `git checkout --merge`.
+//!
 //! Accepted but not represented on disk, because the vendored `gix_index` writes
 //! neither the extension nor a pinned header version. Each is invisible to
 //! `git status` / `git ls-files`, so behaviour observable through git itself is
@@ -55,15 +82,8 @@
 //!   * `--index-version <n>`: the range check and the resulting index write are
 //!     performed, but `gix_index` derives V2/V3 from the entry flags and cannot
 //!     emit V4 or be pinned.
-//!   * `--split-index`, `--untracked-cache`, `--fsmonitor`: the `link`, `UNTR`
-//!     and `FSMN` extensions are not writable through the vendored crates.
-//!   * `--unresolve` restores the conflict stages recorded in the index's `REUC`
-//!     extension exactly as git does (dropping the stage-0 entry and re-adding
-//!     stages 1/2/3), but the resolve-undo extension itself is not re-emitted:
-//!     `gix_index` decodes `REUC` yet its writer only serialises the tree-cache
-//!     and sparse extensions. This matches every other index-mutating command in
-//!     this port, which likewise cannot persist `REUC`; the restored index
-//!     entries — all that `git status` / `git ls-files` observe — are identical.
+//!   * `--untracked-cache`, `--fsmonitor`: the `UNTR` and `FSMN` extensions are
+//!     not writable through the vendored crates.
 //!
 //! Also note that content filters (`.gitattributes` clean/smudge, `autocrlf`)
 //! are not applied when hashing worktree files, matching this port's `git add`.
@@ -202,6 +222,11 @@ struct Ctx {
     has_errors: bool,
     /// `--force-write-index`: persist the index even when nothing changed.
     force_write: bool,
+    /// git's `split_index`, a tri-state initialised to -1 and acted on once, at
+    /// the end (builtin/update-index.c:1177-1195): `None` leaves the index's shape
+    /// as it was, `Some(true)` splits it into `$GIT_DIR/sharedindex.<id>` plus a
+    /// `link`-carrying index, `Some(false)` writes one whole index again.
+    split_index: Option<bool>,
 
     allow_add: bool,
     allow_remove: bool,
@@ -307,6 +332,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         dirty: false,
         has_errors: false,
         force_write: false,
+        split_index: None,
         allow_add: false,
         allow_remove: false,
         allow_replace: false,
@@ -347,7 +373,20 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
                 // git's own post-`update-index` shape: the root and the changed
                 // directories marked invalid, every untouched directory still
                 // carrying its tree id.
-                ctx.index.write(crate::config::index_write_options(&ctx.repo))?;
+                super::write_tree::prepare_offset_table(&ctx.repo, &mut ctx.index);
+                let write_options = crate::config::index_write_options(&ctx.repo);
+                if ctx.split_index == Some(true) {
+                    // `write_shared_index()` then `write_split_index()`
+                    // (read-cache.c:2358-2382). Everything the index holds moves into
+                    // `$GIT_DIR/sharedindex.<id>`; what stays behind is the tree-cache
+                    // and the `link` extension naming it.
+                    let git_dir = ctx.repo.git_dir().to_owned();
+                    ctx.index.write_split(&git_dir, write_options)?;
+                } else {
+                    // A split index that was read has already been dissolved into its
+                    // entries, so the ordinary write is also git's un-split.
+                    ctx.index.write(write_options)?;
+                }
                 // `core.fsync=index` (or an aggregate containing it) hardens the
                 // index git has just rewritten; the platform default does not.
                 fsync.harden_path(crate::config::FsyncComponent::Index, ctx.index.path());
@@ -648,10 +687,24 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                     ctx.dirty = true;
                 }
 
-                // The extensions below are not writable through the vendored
-                // crates; see the module documentation. Accepting them keeps
-                // exit codes and everything observable through git in step.
-                "split-index" | "no-split-index" => {}
+                // `cmd_update_index`'s `OPT_BOOL(0, "split-index", &split_index, ...)`
+                // is a tri-state: unset leaves the index's shape alone, `1` splits
+                // it, `0` un-splits it (builtin/update-index.c:1177-1195). Reading a
+                // split index already dissolved its `link` extension into the
+                // entries, so "un-split" is simply the ordinary full write.
+                "split-index" => {
+                    ctx.split_index = Some(true);
+                    ctx.dirty = true;
+                }
+                "no-split-index" => {
+                    ctx.split_index = Some(false);
+                    // `if (the_repository->index->split_index) { ... }`
+                    // (builtin/update-index.c:1188-1194): un-splitting an index that
+                    // was never split changes nothing, and git does not rewrite it.
+                    if ctx.index.had_link() {
+                        ctx.dirty = true;
+                    }
+                }
                 // git's `fsmonitor` is a tri-state that only the tail acts on, so
                 // the warning fires once however many times the flag was given.
                 "fsmonitor" => fsmonitor = Some(true),
@@ -756,6 +809,25 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                 .unwrap_or_else(|| "(null)".to_owned());
             report(&format!("Untracked cache enabled for '{tree}'"));
         }
+    }
+
+    // `if (split_index > 0) { if (git_config_get_split_index() == 0) warning(...) }`
+    // and its mirror for `--no-split-index` (builtin/update-index.c:1177-1195).
+    // git warns about the *configuration* disagreeing with the flag and then does
+    // what the flag said regardless; the write itself happens in `cmd_update_index`'s
+    // caller, which is this port's `execute()`.
+    match ctx.split_index {
+        Some(true) if ctx.repo.config_snapshot().boolean("core.splitIndex") == Some(false) => {
+            eprintln!(
+                "warning: core.splitIndex is set to false; remove or change it, if you really want to enable split index"
+            );
+        }
+        Some(false) if ctx.repo.config_snapshot().boolean("core.splitIndex") == Some(true) => {
+            eprintln!(
+                "warning: core.splitIndex is set to true; remove or change it, if you really want to disable split index"
+            );
+        }
+        _ => {}
     }
 
     match fsmonitor {
@@ -1884,6 +1956,11 @@ fn unresolve_one(ctx: &mut Ctx, path: &BStr) -> Result<Step> {
     }
     if added {
         ctx.index.sort_entries();
+        // `string_list_remove(istate->resolve_undo, ce->name, 1)`
+        // (resolve-undo.c:151-152): the conflict is back, so the record of it
+        // having been undone is not. Stock git's `ls-files --resolve-undo` prints
+        // nothing after an `--unresolve`, and now so does this.
+        ctx.index.remove_resolve_undo_path(path);
         ctx.dirty = true;
         ctx.invalidate(path);
     }

@@ -155,8 +155,19 @@ pub struct State {
     // Extensions
     end_of_index_at_decode_time: bool,
     offset_table_at_decode_time: bool,
+    /// `index.threads` as the next write should see it, or `None` to write no `IEOT` at all.
+    ///
+    /// `do_write_index()` reads `index.threads` and `index.recordOffsetTable` from the
+    /// repository itself (read-cache.c:2874-2877); this crate has no repository to read, so the
+    /// decision is carried here instead. See
+    /// [`State::set_offset_table_threads()`](State::set_offset_table_threads()).
+    offset_table_threads: Option<u32>,
     tree: Option<extension::Tree>,
     link: Option<extension::Link>,
+    /// Whether the file this state was decoded from carried a `link` extension,
+    /// i.e. was a split index. `link` itself is dissolved into the entries at
+    /// decode time, so this is the only thing left saying it was ever there.
+    link_at_decode_time: bool,
     resolve_undo: Option<extension::resolve_undo::Paths>,
     untracked: Option<extension::UntrackedCache>,
     fs_monitor: Option<extension::FsMonitor>,

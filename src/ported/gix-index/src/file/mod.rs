@@ -132,6 +132,8 @@ mod mutation {
 ///
 pub mod init;
 ///
+pub mod split;
+///
 pub mod verify;
 ///
 pub mod write;

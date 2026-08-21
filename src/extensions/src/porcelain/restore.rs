@@ -295,7 +295,8 @@ fn restore_submodule_worktree(
             }
         }
     }
-    target_index.remove_tree();
+    // `unpack_trees()` leaves a repaired cache-tree behind (unpack-trees.c:2088-2092).
+    super::write_tree::rebuild_cache_tree(sm_repo, &mut target_index);
     // The *submodule's* index, so the submodule repository's settings decide the
     // trailer — which is what git gets too, since it moves a submodule HEAD by
     // running the plumbing inside the submodule and the command-line `-c`
@@ -1023,7 +1024,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        cur.remove_tree();
+        // `unpack_trees()` leaves a repaired cache-tree behind (unpack-trees.c:2088-2092).
+        super::write_tree::rebuild_cache_tree(&repo, &mut cur);
         // `do_write_index()` takes `skip_hash` from the settings block for every
         // index it writes (read-cache.c:2830-2831), so a `--staged` restore leaves
         // the same trailer an `add` or an `update-index` would have.

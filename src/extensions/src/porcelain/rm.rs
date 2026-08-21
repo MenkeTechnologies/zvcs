@@ -631,8 +631,23 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
 
     // 13. Drop every selected path (all stages) from the owned index, apply any
     //     `.gitmodules` restage, and persist.
+    //
+    //     `cmd_rm()` drops each path with `remove_file_from_index()`
+    //     (builtin/rm.c:398), and that function's *first* act is
+    //     `cache_tree_invalidate_path(istate, path)` (read-cache.c:627-637) — the
+    //     only cache-tree work `rm` does. Invalidating per path rather than
+    //     dropping the whole extension is what keeps every directory the removal
+    //     never touched at its cached tree id, and what lets a cache-tree stock
+    //     git wrote survive a `zvcs rm` instead of being thrown away wholesale.
+    for path in &selected_paths {
+        index.invalidate_path_in_tree(path.as_bstr());
+    }
     index.remove_entries(|_, path, _| selected_paths.contains(&path.to_owned()));
     if let Some((id, stat)) = gitmodules_update {
+        // `stage_updated_gitmodules()` restages the rewritten file through
+        // `add_file_to_index()`, whose `add_index_entry_with_check()` invalidates
+        // the path it adds (read-cache.c:1273-1274).
+        index.invalidate_path_in_tree(b".gitmodules".as_bstr());
         index.remove_entries(|_, path, _| path == b".gitmodules".as_bstr());
         index.dangerously_push_entry(
             stat,
@@ -643,13 +658,13 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         );
         index.sort_entries();
     }
-    // The cache-tree extension is written as-is, so drop it after mutating
-    // entries or a later commit could capture a stale subtree.
-    index.remove_tree();
     // git's `rm` finishes with `write_locked_index()` (builtin/rm.c:442), whose
     // `do_write_index()` reads `skip_hash` out of the settings block
-    // (read-cache.c:2830-2831) — so this index gets the same trailer any other
-    // verb would have written in this repository.
+    // (read-cache.c:2830-2831) and decides the `IEOT` offset table from
+    // `index.threads` / `index.recordOffsetTable` (read-cache.c:2874-2904) — so
+    // this index gets the same trailer and the same extensions any other verb
+    // would have written in this repository.
+    super::write_tree::prepare_offset_table(&repo, &mut index);
     index.write(crate::config::index_write_options(&repo))?;
 
     Ok(ret)

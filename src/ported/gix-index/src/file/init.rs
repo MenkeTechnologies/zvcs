@@ -34,8 +34,21 @@ impl File {
         skip_hash: bool,
         options: decode::Options,
     ) -> Result<Self, Error> {
+        Self::at_or_default_with_git_dir(path, None, object_hash, skip_hash, options)
+    }
+
+    /// Like [`at_or_default()`](Self::at_or_default()), but able to resolve a split
+    /// index's shared half against `git_dir`; see
+    /// [`at_with_git_dir()`](Self::at_with_git_dir()).
+    pub fn at_or_default_with_git_dir(
+        path: impl Into<PathBuf>,
+        git_dir: Option<&Path>,
+        object_hash: gix_hash::Kind,
+        skip_hash: bool,
+        options: decode::Options,
+    ) -> Result<Self, Error> {
         let path = path.into();
-        Ok(match Self::at(&path, object_hash, skip_hash, options) {
+        Ok(match Self::at_with_git_dir(&path, git_dir, object_hash, skip_hash, options) {
             Ok(f) => f,
             Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 File::from_state(State::new(object_hash), path)
@@ -52,6 +65,26 @@ impl File {
     /// before it is read. That way, invalid files would see a more descriptive error message as we try to parse them.
     pub fn at(
         path: impl Into<PathBuf>,
+        object_hash: gix_hash::Kind,
+        skip_hash: bool,
+        options: decode::Options,
+    ) -> Result<Self, Error> {
+        Self::at_with_git_dir(path, None, object_hash, skip_hash, options)
+    }
+
+    /// Like [`at()`](Self::at()), but told which directory is `$GIT_DIR` so that a
+    /// *split* index can find its `sharedindex.<id>` companion.
+    ///
+    /// git resolves that name against the git directory first and only then against
+    /// the directory the index file itself lives in (read-cache.c:1893 and
+    /// :1901-1902). Those are the same directory for `$GIT_DIR/index` and different
+    /// for everything else — `GIT_INDEX_FILE` pointing elsewhere, a temporary index
+    /// built next to the worktree — so without `git_dir` a split repository is
+    /// simply unreadable. Passing `None` keeps the old, index-relative-only
+    /// behaviour.
+    pub fn at_with_git_dir(
+        path: impl Into<PathBuf>,
+        git_dir: Option<&Path>,
         object_hash: gix_hash::Kind,
         skip_hash: bool,
         options: decode::Options,
@@ -97,7 +130,7 @@ impl File {
         let (state, checksum) = State::from_bytes(&data, mtime, object_hash, options)?;
         let mut file = File { state, path, checksum };
         if let Some(mut link) = file.link.take() {
-            link.dissolve_into(&mut file, object_hash, skip_hash, options)?;
+            link.dissolve_into(&mut file, git_dir, object_hash, skip_hash, options)?;
         }
 
         Ok(file)

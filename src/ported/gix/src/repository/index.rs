@@ -35,8 +35,13 @@ impl crate::Repository {
             .with_lenient_default(self.config.lenient_config)?
             .unwrap_or_default();
 
-        let index = gix_index::File::at(
+        // The git directory is what git resolves a split index's `sharedindex.<id>`
+        // against (read-cache.c:1893); the index file's own directory is only the
+        // fallback (read-cache.c:1901-1902) and is a different place whenever
+        // `GIT_INDEX_FILE` points outside `$GIT_DIR`.
+        let index = gix_index::File::at_with_git_dir(
             self.index_path(),
+            Some(self.git_dir()),
             self.object_hash(),
             skip_hash,
             gix_index::decode::Options {

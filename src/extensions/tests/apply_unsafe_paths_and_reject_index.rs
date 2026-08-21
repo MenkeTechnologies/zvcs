@@ -585,9 +585,21 @@ fn a_directory_that_climbs_above_the_root_is_a_usage_error() {
     assert_eq!((code, err.as_str()), (0, ""));
     assert_eq!(f.read("f.txt"), "l1\nl2\nl3\nl4\nL5\nl6\nl7\nl8\nl9\n");
 
-    // An absolute root is normalised fine and then refused by name, per patch.
+    // An absolute root normalises fine, and what happens next depends on whether
+    // the patch has a preimage to read. This case asserted the creation outcome
+    // while handing `apply` a *modification*, so it demanded of zvcs something
+    // stock git does not do — verified against git 2.55.0 in the same fixture.
+    //
+    // A modification reads the preimage first (`load_preimage()` ->
+    // `read_old_data()`), so it never reaches the name check and reports the open
+    // failure at 1.
     let f = Fixture::new("dirabs");
     let (code, _, err) = f.apply(&["--directory=/tmp"], CLEAN);
-    assert_eq!(code, 128);
-    assert_eq!(err, "error: invalid path '/tmp/f.txt'\n");
+    assert_eq!((code, err.as_str()), (1, "error: /tmp/f.txt: No such file or directory\n"));
+
+    // A creation has nothing to read, so `verify_path()` refuses the absolute
+    // name — which is the behaviour this case was written to pin.
+    let f = Fixture::new("dirabsnew");
+    let (code, _, err) = f.apply(&["--directory=/tmp"], CREATE);
+    assert_eq!((code, err.as_str()), (128, "error: invalid path '/tmp/new.txt'\n"));
 }

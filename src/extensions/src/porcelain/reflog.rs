@@ -1424,6 +1424,51 @@ fn render(
             SelectorKind::Index => None,
         };
         for (n, entry) in section.entries.iter().enumerate().skip(section.start) {
+            // `git reflog` is `git log --walk-reflogs`, and that walk hands out
+            // *commits*, not reflog lines. `next_reflog_entry()` only ever returns
+            // what `next_reflog_commit()` found, and that function steps the cursor
+            // past every entry whose **new** object is not a commit:
+            //
+            // ```c
+            // for (; log->recno >= 0; log->recno--) {
+            //         struct reflog_info *entry = &log->reflogs->items[log->recno];
+            //         struct object *obj = parse_object(the_repository,
+            //                                           &entry->noid);
+            //
+            //         if (obj && obj->type == OBJ_COMMIT)
+            //                 return (struct commit *)obj;
+            // }
+            // return NULL;
+            // ```
+            // (`reflog-walk.c:341-352`)
+            //
+            // The test is `parse_object()` **plus** `type == OBJ_COMMIT`, not "the
+            // id is null". Three unrelated shapes fail it for the same reason: the
+            // zero id a deletion records (nothing to parse), an id whose object the
+            // repository no longer holds (pruned, or a shallow/partial clone), and
+            // an id that parses to the wrong type because the ref pointed at a tag,
+            // a tree or a blob. `parse_object` does not peel, so an annotated tag is
+            // dropped as surely as a missing object.
+            //
+            // `branch -m` is the everyday source of these: a rename logs the old
+            // name's *deletion* into HEAD's log (`<commit> -> 0{40}`) next to the new
+            // name's creation, so every rename leaves one unwalkable entry behind.
+            //
+            // A dropped entry still spends its `@{…}` number. The selector is
+            // computed from the array slot the survivor occupies —
+            // `strbuf_addf(sb, "%d", commit_reflog->reflogs->nr - 2 - commit_reflog->recno)`
+            // (`reflog-walk.c:266-267`), against a `recno` that `next_reflog_entry()`
+            // already decremented past the returned entry (`reflog-walk.c:379`), so
+            // it reads back as `nr - 1 - <array index>`. Two renames therefore print
+            // `@{0}`, `@{2}`, `@{4}` rather than a renumbered `@{0}`, `@{1}`, `@{2}`.
+            // That is why this is a `continue` that leaves `n` untouched, and not a
+            // filtering pass over `section.entries`.
+            if !matches!(
+                repo.find_header(entry.oid).map(|h| h.kind()),
+                Ok(gix::objs::Kind::Commit)
+            ) {
+                continue;
+            }
             if let Some(want_merge) = opts.merges {
                 if is_merge(repo, entry.oid) != want_merge {
                     continue;

@@ -30,9 +30,13 @@
 //!
 //! ### Honest limitations
 //!
-//! * The `fatal:` lines omit the trailing `: <strerror>` that `die_errno()`
-//!   appends. In the EOF case git reports a stale, meaningless `errno` there
-//!   (no syscall failed), so the suffix is not reproducible across platforms.
+//! * The `fatal:` lines carry the `: <strerror(errno)>` tail `die_errno()`
+//!   appends, read from the live `errno` exactly as `fmt_with_err()`
+//!   (`usage.c:215-237`) does. On the EOF path no syscall failed, so both git and
+//!   this port report whatever their own startup left in `errno` — a value that
+//!   depends on the platform, the working directory and the configuration read,
+//!   and that the two binaries have no reason to agree on. The tail is present
+//!   and correctly formed; it is not guaranteed to be the same word stock prints.
 //! * C's `strtol` runs off the end of the 512-byte content record when that
 //!   record contains no NUL byte, and C's final `write` can read past the
 //!   1024-byte buffer when a pathological digit run pushes the payload beyond
@@ -74,11 +78,32 @@ pub fn get_tar_commit_id(args: &[String]) -> Result<ExitCode> {
     let mut buffer = [0u8; HEADERSIZE];
     match read_in_full(&mut buffer) {
         Err(e) => {
-            eprintln!("fatal: git get-tar-commit-id: read error: {e}");
+            eprintln!(
+                "fatal: git get-tar-commit-id: read error: {}",
+                crate::external::strerror(&e)
+            );
             return Ok(ExitCode::from(128));
         }
+        // `if (n != HEADERSIZE) die_errno(…)` (`builtin/get-tar-commit-id.c:38-39`).
+        //
+        // `die_errno` is not `die`: it appends the live `errno` unconditionally —
+        // `snprintf(buf, n, "%s: %s", fmt, str_error)` over `err = strerror(errno)`
+        // (`usage.c:220,235`). Nothing on this path sets `errno`: a clean EOF makes
+        // `read_in_full()` return a short count from a `read(2)` that *succeeded*,
+        // so what git reports is whatever its own startup happened to leave behind.
+        // Observed on git 2.55: `No such file or directory` from a failed `open()`
+        // during config or repository discovery, and `Result too large` (`ERANGE`)
+        // whenever the working directory is long enough that `strbuf_getcwd()`'s
+        // first `getcwd(3)` had to grow its buffer. The message is therefore
+        // context-dependent by construction and not a fixed string.
+        //
+        // Reproducing it means doing the same thing: read `errno` at the point of
+        // the failure and render it exactly as `strerror` would, with none of the
+        // ` (os error N)` tail Rust's own `Display` adds. It is captured before any
+        // other call so nothing between here and the read can overwrite it.
         Ok(n) if n != HEADERSIZE => {
-            eprintln!("fatal: git get-tar-commit-id: EOF before reading tar header");
+            let errno = crate::external::strerror(&std::io::Error::last_os_error());
+            eprintln!("fatal: git get-tar-commit-id: EOF before reading tar header: {errno}");
             return Ok(ExitCode::from(128));
         }
         Ok(_) => {}
@@ -95,7 +120,10 @@ pub fn get_tar_commit_id(args: &[String]) -> Result<ExitCode> {
 
     let payload = &content[comment_offset..comment_offset + payload_len];
     if let Err(e) = std::io::stdout().write_all(payload) {
-        eprintln!("fatal: git get-tar-commit-id: write error: {e}");
+        eprintln!(
+            "fatal: git get-tar-commit-id: write error: {}",
+            crate::external::strerror(&e)
+        );
         return Ok(ExitCode::from(128));
     }
     Ok(ExitCode::SUCCESS)

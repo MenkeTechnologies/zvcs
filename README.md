@@ -200,6 +200,7 @@ Run the harness to see current depth per subcommand:
 cargo run -p zvcs-parity                 # curated corpus
 cargo run -p zvcs-parity -- --fuzz 12    # plus generated flag combinations and workflows
 cargo run -p zvcs-parity -- --fuzz 12 --fuzz-sequences 0   # flag combinations only
+cargo run -p zvcs-parity -- --fuzz 12 --list-cases         # print what that run would execute
 ```
 
 It builds fixture repositories with stock git, runs each invocation against both
@@ -228,6 +229,22 @@ the illegal transitions (`rebase --continue` with a cherry-pick in progress); ru
 a mutating invocation and then the readers whose answer it should have changed;
 run an operation and then its inverse, where the end state must equal the start.
 Every draw is a pure function of the seed, so a reported step replays exactly.
+
+Configuration is sampled as two dimensions, not one. Git's behaviour is a
+function of its configuration at least as much as of its argv, and it reads that
+configuration from a *sequence* of sources — `/etc`-style system, global,
+`.git/config`, `.git/config.worktree`, `.gitmodules`, `GIT_CONFIG_KEY_<n>`, and
+`-c` — each a different parser with a defined precedence between them. A draw
+picks a **set of keys that interact** (`core.autocrlf` with `core.eol` and
+`core.safecrlf`; `diff.noprefix` with `diff.srcPrefix` and `diff.mnemonicPrefix`;
+`feature.manyFiles` with `index.skipHash`; `push.default` with
+`branch.<name>.merge`) and then a **scope for each one**, so one key set twice in
+one file is the last-value-wins rule and one key set in two scopes is precedence
+— neither of which a `-c`-only harness can express. The file scopes also carry
+malformed content, which is where git's line-numbered
+`bad config line 12 in file .git/config` lives; `-c` has no line to number. Each
+case id names the scope every setting came from, so a failure is reconstructed by
+hand from the id alone.
 
 A case that fails is then re-run on **both** sides, because a byte comparison is
 only meaningful between values each binary can produce twice. A case stock git

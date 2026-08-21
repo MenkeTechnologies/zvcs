@@ -11,7 +11,9 @@
 //! Usage:
 //!   zvcs-parity                      # curated corpus
 //!   zvcs-parity --fuzz 40            # corpus + 40 generated cases per command
+//!                                    #   and 40 generated sequences per entry point
 //!   zvcs-parity --fuzz 40 --seed 7   # reproduce a specific fuzz run
+//!   zvcs-parity --fuzz 40 --fuzz-sequences 0   # argv sweep only, no sequences
 //!   zvcs-parity --only status,log    # restrict to some subcommands
 //!   zvcs-parity --verbose            # print every failure in detail
 //!   zvcs-parity --bin path/to/git    # explicit binary under test
@@ -33,6 +35,16 @@ use std::process::ExitCode;
 
 struct Args {
     fuzz_per_cmd: usize,
+    /// `--fuzz-sequences <n>`: generated multi-step workflows per entry point.
+    ///
+    /// `None` means "follow `--fuzz`", which is the one-knob default. It is a
+    /// knob of its own because the two generated corpora have very different
+    /// unit prices — a case is one invocation and one state probe per side, a
+    /// sequence is five or six of each — so a caller who wants a deep argv sweep
+    /// would otherwise be made to buy a proportionally larger sequence bill to
+    /// get it, and a caller chasing one stateful defect would be made to buy the
+    /// argv sweep. `0` turns the family off.
+    fuzz_sequences: Option<usize>,
     seed: u64,
     only: Vec<String>,
     verbose: bool,
@@ -47,6 +59,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut a = Args {
         fuzz_per_cmd: 0,
+        fuzz_sequences: None,
         // Fixed default so an unseeded run is still reproducible; override to explore.
         seed: 0x5A5A_C0DE,
         only: Vec::new(),
@@ -65,6 +78,11 @@ fn parse_args() -> Result<Args> {
         match argv[i].as_str() {
             "--fuzz" => {
                 a.fuzz_per_cmd = next(i)?.parse().context("--fuzz needs a number")?;
+                i += 2;
+            }
+            "--fuzz-sequences" => {
+                a.fuzz_sequences =
+                    Some(next(i)?.parse().context("--fuzz-sequences needs a number")?);
                 i += 2;
             }
             "--seed" => {
@@ -130,9 +148,22 @@ fn real_main() -> Result<ExitCode> {
     // machinery. `Job::cmd` is what `--only` filters on either way.
     let mut cases: Vec<Job> = corpus::cases().into_iter().map(Job::Single).collect();
     cases.extend(corpus::sequences().into_iter().map(Job::Sequence));
+    // `--fuzz-sequences` defaults to `--fuzz`, so one knob deepens both generated
+    // corpora; see `Args::fuzz_sequences` for why it is separable at all.
+    let fuzz_sequences = args.fuzz_sequences.unwrap_or(args.fuzz_per_cmd);
     if args.fuzz_per_cmd > 0 {
         eprintln!("fuzzing  : {} cases/cmd, seed {}", args.fuzz_per_cmd, args.seed);
         cases.extend(fuzz::generate(args.seed, args.fuzz_per_cmd).into_iter().map(Job::Single));
+    }
+    let mut generated_sequences = 0;
+    if fuzz_sequences > 0 {
+        let generated = fuzz::generate_sequences(args.seed, fuzz_sequences);
+        generated_sequences = generated.len();
+        eprintln!(
+            "workflows: {fuzz_sequences} sequences/entry-point, seed {} ({generated_sequences} generated)",
+            args.seed
+        );
+        cases.extend(generated.into_iter().map(Job::Sequence));
     }
     if !args.only.is_empty() {
         cases.retain(|c| args.only.iter().any(|o| o == c.cmd()));
@@ -141,10 +172,18 @@ fn real_main() -> Result<ExitCode> {
     // the multi-step corpus is stated rather than left to be inferred from a
     // wall clock: one sequence of seven steps is one case in the parity
     // denominator and seven child processes per side.
+    //
+    // The generated share is printed beside the total because the two are priced
+    // and produced differently — curated sequences are a fixed cost every run
+    // pays, generated ones scale with a knob — and a single number would leave a
+    // reader unable to tell which one just got more expensive. It is counted
+    // before `--only` is applied and the total after, so a filtered run shows the
+    // filtered price.
     let sequences = cases.iter().filter(|j| matches!(j, Job::Sequence(_))).count();
     let invocations: usize = cases.iter().map(Job::invocations).sum();
     eprintln!(
-        "cases    : {} ({sequences} sequences; {invocations} invocations per side)",
+        "cases    : {} ({sequences} sequences, {generated_sequences} of them generated before \
+         --only; {invocations} invocations per side)",
         cases.len()
     );
 

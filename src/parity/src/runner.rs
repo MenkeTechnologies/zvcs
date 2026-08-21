@@ -467,9 +467,18 @@ impl Step {
 /// A `cherry-pick --continue` that fails because the preceding `add` staged the
 /// wrong thing is reported as the `add`, which is where the bug is.
 pub struct Sequence {
-    /// Short stable slug naming the workflow, rendered into every step id. It is
-    /// how a reader finds the sequence in `corpus/sequences.rs` again.
-    pub name: &'static str,
+    /// Short stable slug naming the workflow, rendered into every step id. For a
+    /// curated sequence it is how a reader finds it in `corpus/sequences.rs`
+    /// again; for a generated one it names the family and the draw that produced
+    /// it, so a reader can tell the two apart at a glance in a failure header.
+    ///
+    /// Owned rather than `&'static str`, which is what it was while every
+    /// sequence in the harness was a literal. [`crate::fuzz::generate_sequences`]
+    /// composes a name from a family slug and a draw index at run time, and there
+    /// is nothing `'static` for it to borrow. Curated call sites are unaffected:
+    /// [`Sequence::new`] takes anything that converts, so `"conflict-abort"`
+    /// still works and no existing step id changes by a byte.
+    pub name: String,
     /// Everything a step does not carry. See the type docs for the split.
     pub envelope: Case,
     pub steps: Vec<Step>,
@@ -484,20 +493,30 @@ impl Sequence {
     /// sequence under one command is what puts it in that command's brief in
     /// `scripts/split_failures.pl`, which is where somebody fixing `stash` will
     /// look for it.
-    pub fn new(cmd: &'static str, name: &'static str, shape: Shape) -> Self {
-        Self { name, envelope: Case::new(cmd, &[], shape), steps: Vec::new() }
+    pub fn new(cmd: &'static str, name: impl Into<String>, shape: Shape) -> Self {
+        Self { name: name.into(), envelope: Case::new(cmd, &[], shape), steps: Vec::new() }
     }
 
     /// Append a step.
-    pub fn step(mut self, args: &[&str]) -> Self {
-        self.steps.push(Step { args: args.iter().map(|s| s.to_string()).collect(), stdin: None });
-        self
+    pub fn step(self, args: &[&str]) -> Self {
+        self.step_argv(args.iter().map(|s| s.to_string()).collect(), None)
     }
 
     /// Append a step fed `stdin`, byte-identically to both sides.
-    pub fn step_stdin(mut self, args: &[&str], stdin: &'static [u8]) -> Self {
-        self.steps
-            .push(Step { args: args.iter().map(|s| s.to_string()).collect(), stdin: Some(stdin) });
+    pub fn step_stdin(self, args: &[&str], stdin: &'static [u8]) -> Self {
+        self.step_argv(args.iter().map(|s| s.to_string()).collect(), Some(stdin))
+    }
+
+    /// Append a step whose argv was built at run time.
+    ///
+    /// The one push site the other two delegate to, and the only one a generated
+    /// sequence can use: [`crate::fuzz::generate_sequences`] draws a step's
+    /// tokens out of a [`crate::fuzz::Grammar`] and owns the `String`s it
+    /// produced, so there is no `&[&str]` for it to hand over. Kept as a single
+    /// push rather than three so a field added to [`Step`] cannot be filled in
+    /// two places and forgotten in the third.
+    pub fn step_argv(mut self, args: Vec<String>, stdin: Option<&'static [u8]>) -> Self {
+        self.steps.push(Step { args, stdin });
         self
     }
 

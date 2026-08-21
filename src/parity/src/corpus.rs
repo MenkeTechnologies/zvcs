@@ -540,7 +540,13 @@ const BROKEN_PATCH: &[u8] = b"diff --git a/README.md b/README.md\n\
  nothing like the real file\n";
 
 /// A single-patch mbox with fixed headers, so `am` produces a fixed commit id.
-const MBOX: &[u8] = b"From 1234567890abcdef1234567890abcdef12345678 Mon Sep 17 00:00:00 2001\n\
+///
+/// `pub(crate)` because [`crate::fuzz`] feeds it to the generated `am` walks as
+/// well: applying it twice is the cheapest way to park a repository in
+/// `.git/rebase-apply/` with no corrupt input to manufacture, and a second
+/// mailbox literal written beside this one would be two things to keep in step
+/// for no gain.
+pub(crate) const MBOX: &[u8] = b"From 1234567890abcdef1234567890abcdef12345678 Mon Sep 17 00:00:00 2001\n\
 From: Example Author <author@example.invalid>\n\
 Date: Tue, 14 Nov 2023 22:13:20 +0000\n\
 Subject: [PATCH] add a line to README\n\

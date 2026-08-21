@@ -198,7 +198,8 @@ Run the harness to see current depth per subcommand:
 
 ```sh
 cargo run -p zvcs-parity                 # curated corpus
-cargo run -p zvcs-parity -- --fuzz 12    # plus generated flag combinations
+cargo run -p zvcs-parity -- --fuzz 12    # plus generated flag combinations and workflows
+cargo run -p zvcs-parity -- --fuzz 12 --fuzz-sequences 0   # flag combinations only
 ```
 
 It builds fixture repositories with stock git, runs each invocation against both
@@ -215,6 +216,18 @@ step's own argv, so a conflicted `cherry-pick` whose `--continue` writes the wro
 reflog message is named as step 6 of 7 rather than as a difference that appeared
 somewhere in a workflow. Every step after the first therefore runs on a premise
 already proven identical on both sides.
+
+Both shapes are also **generated**. `--fuzz <n>` draws `n` invocations per
+subcommand from grammars extracted from git's own documentation; the same flag
+draws `n` workflows per entry point, and `--fuzz-sequences <n>` sets that count
+on its own because a sequence costs several invocations where a case costs one.
+A generated workflow is not a random chain of commands — that would be two
+independent cases sharing a directory. Each one encodes a dependency: park the
+repository in an interrupted operation and walk the resumption verbs including
+the illegal transitions (`rebase --continue` with a cherry-pick in progress); run
+a mutating invocation and then the readers whose answer it should have changed;
+run an operation and then its inverse, where the end state must equal the start.
+Every draw is a pure function of the seed, so a reported step replays exactly.
 
 A case that fails is then re-run on **both** sides, because a byte comparison is
 only meaningful between values each binary can produce twice. A case stock git
@@ -721,9 +734,11 @@ writes off the caller's critical path:
   than a fixed slice, because one commit that rewrites a large file outweighs a
   hundred that touch a line each. `ZVCS_THREADS=1` forces the sequential path and
   produces byte-identical output.
-- **A cache that remembers.** An abbreviation is fixed once the object exists,
-  and a tree pair's change list and per-file line tallies are a pure function of
-  two immutable trees. None of it can go stale, so it is computed once and read
+- **A cache that remembers.** An abbreviation is fixed once the object and the
+  width `core.abbrev` resolves to are both known — which is why the width is part
+  of the key, not an assumption — and a tree pair's change list and per-file line
+  tallies are a pure function of two immutable trees. None of it can go stale, so
+  it is computed once and read
   back forever after — which is what `log --stat` and `blame` are reading instead
   of the object store. The answers live in memory-mapped rkyv images under
   `~/.zvcs/cache/`, so a hit is a binary search and a slice into the mapping:

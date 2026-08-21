@@ -2640,8 +2640,11 @@ fn resolve(
     // and the two disagree: gitoxide answers with the selected entry's raw *new*
     // id where `read_ref_at()` keeps the ref's current value — the null id after a
     // `git branch -m` round trip. See [`crate::objname::reflog_oid`].
-    if crate::objname::is_reflog_operand(spec) {
-        return crate::objname::reflog_oid(repo, spec)
+    // The test is on the *reduced* name: a `^{…}`, `~<n>` or `:<path>` suffix is
+    // applied to what the reader answered, never folded into the selector. See
+    // [`crate::objname::reflog_spec_oid`].
+    if crate::objname::resolves_through_reflog(spec) {
+        return crate::objname::reflog_spec_oid(repo, spec)
             .and_then(|id| peel_recording_tags(repo, id, pending));
     }
     // `at_mark()` compares with `strncasecmp`, so `main@{PUSH}` is the same

@@ -67,6 +67,7 @@
 
 use anyhow::Result;
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::process::ExitCode;
 
 use crate::advice::Advice;
@@ -428,13 +429,21 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             match crate::objname::split_range(arg) {
                 Some(range) => {
                     warn_ambiguous_refname(&repo, range.a, o.quiet);
-                    warn_reflog_reach(&mut out, &repo, range.a, o.quiet)?;
+                    if let ControlFlow::Break(code) =
+                        warn_reflog_reach(&mut out, &repo, range.a, o.quiet)?
+                    {
+                        return Ok(code);
+                    }
                     // The endpoint has already been warned about on the line
                     // above; this is the same resolution, not a second operand.
                     let a_resolved = crate::objname::resolve_quiet(&repo, range.a).is_some();
                     if a_resolved {
                         warn_ambiguous_refname(&repo, range.b, o.quiet);
-                        warn_reflog_reach(&mut out, &repo, range.b, o.quiet)?;
+                        if let ControlFlow::Break(code) =
+                            warn_reflog_reach(&mut out, &repo, range.b, o.quiet)?
+                        {
+                            return Ok(code);
+                        }
                     }
                 }
                 None => {
@@ -464,7 +473,11 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                         return Ok(ExitCode::from(128));
                     }
                     warn_ambiguous_refname(&repo, name, o.quiet);
-                    warn_reflog_reach(&mut out, &repo, name, o.quiet)?;
+                    if let ControlFlow::Break(code) =
+                        warn_reflog_reach(&mut out, &repo, name, o.quiet)?
+                    {
+                        return Ok(code);
+                    }
                 }
             }
             // A full-length hex name *is* the object id and short-circuits ahead
@@ -474,8 +487,11 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // `get_oid_basic()` resolves `<ref>@{<n>}` itself, through
                 // `repo_dwim_log()` rather than gitoxide's ref lookup — which
                 // answers for names git rejects and rejects names git answers.
-                if crate::objname::is_reflog_operand(arg) {
-                    crate::objname::reflog_oid(&repo, arg)
+                // The test is on the *reduced* name, not on the operand: a
+                // `^{…}`, `~<n>` or `:<path>` suffix is applied to whatever the
+                // reader answered, never folded into the selector.
+                if crate::objname::resolves_through_reflog(arg) {
+                    crate::objname::reflog_spec_oid(&repo, arg)
                 } else if carries_walk_mark(arg) {
                     None
                 } else {
@@ -510,20 +526,13 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 eprintln!("fatal: {message}");
                 return Ok(ExitCode::from(128));
             }
-            // `read_ref_at()` has two `die()`s, not one: the ordinal past the end
-            // of the log, and `!cb.reccnt` — a log file that exists but holds no
-            // entries, which is `die(_("log for %s is empty"), refname)` naming the
-            // *full* ref rather than the operand (`refs.c:1191-1211`). Both are
-            // [`crate::objname::reflog_reach`], which is also the only one of the
-            // two implementations that knows `<ref>@{<count>}` is answerable from
-            // the oldest entry's old id rather than fatal.
-            if let Some(crate::objname::ReflogReach::Fatal(message)) =
-                crate::objname::reflog_reach(&repo, crate::objname::uninteresting_mark(arg).0)
-            {
-                out.flush()?;
-                eprintln!("fatal: {message}");
-                return Ok(ExitCode::from(128));
-            }
+            // `read_ref_at()`'s two `die()`s — the ordinal past the end of the log
+            // and `!cb.reccnt`, a log file that exists but holds no entries — are
+            // *not* raised here. They fire inside `get_oid_basic()`, i.e. during
+            // the resolution, which is `warn_reflog_reach()` above: raising them
+            // from this block instead let `HEAD@{99}^{commit}` resolve through
+            // `get_oid_1()`'s fallback first and answer where stock dies, and put
+            // the operand on stdout via `show_file()` before the message.
         }
 
         match resolved {
@@ -545,8 +554,14 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // own refusal — from `get_oid_basic()`'s `repo_dwim_log()` branch
                 // above. Re-asking gitoxide's full grammar would resolve names git
                 // rejects (`HEAD@{0}` off a stale log under an unborn HEAD).
+                //
+                // A range endpoint is resolved the same way and so is subject to
+                // the same rule: `try_difference()` calls
+                // `repo_get_oid_committish()` on each side, never the range
+                // grammar, so `HEAD@{1}..HEAD` is two ordinary resolutions and
+                // gitoxide must not be asked about either of them.
                 let parsed = if arg.is_empty()
-                    || crate::objname::is_reflog_operand(arg)
+                    || reflog_operand_anywhere(arg)
                     || carries_walk_mark(arg)
                 {
                     None
@@ -576,7 +591,9 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // a revspec built out of a full-length hex naming an object that is
                 // not present fails to parse at all. git reaches the same specs
                 // through `get_oid()`, which takes full hex at face value.
-                let parsed = parsed.or_else(|| full_hex_spec(&repo, arg));
+                let parsed = parsed
+                    .or_else(|| reflog_range(&repo, arg))
+                    .or_else(|| full_hex_spec(&repo, arg));
                 match parsed {
                     Some(Parsed::Range(range)) => {
                         emit_range(&mut out, &repo, &o, range, arg)?;
@@ -635,6 +652,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // the operand gets one more resolution, with
                     // `GET_OID_ONLY_TO_DIE`, and a `<rev>:<path>` / `:<n>:<path>`
                     // failure has a message of its own there.
+                    warn_reflog_reach_again(&repo, arg);
                     if let Some(message) = crate::objname::peel_type_error(&repo, arg) {
                         eprintln!("error: {message}");
                     }
@@ -742,37 +760,173 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
     found
 }
 
-/// `get_oid_basic`'s *other* warning, a little further down the same function
-/// (`object-name.c:1006-1011`): a `<ref>@{<date>}` operand whose date is older
-/// than every entry in that ref's log resolves to the oldest entry and says so.
+/// Everything `get_oid_basic()`'s reflog branch has to say about one operand
+/// (`object-name.c:787-820`), for the one command that holds its `flags`.
 ///
-/// It shares `--quiet`'s `GET_OID_QUIETLY` gate with the ambiguity warning, and
-/// nothing else — in particular `core.warnAmbiguousRefs` does not silence it. The
-/// message itself is [`crate::objname::reflog_reach_warning`]'s, so this is only
-/// the placement: stdout is flushed first, because the operands before this one
-/// have already printed and git's warning lands after them.
+/// `builtin/rev-parse.c:862-863` is the only place that sets `GET_OID_QUIETLY`
+/// from the command line:
+///
+/// ```c
+/// quiet = 1;
+/// flags |= GET_OID_QUIETLY;
+/// ```
+///
+/// so this is the only caller that cannot go through
+/// [`crate::objname::resolve`], which is `repo_get_oid()` with git's defaults.
+///
+/// Three diagnostics, three different gates:
+///
+/// * `read_ref_at()`'s own `warning()` has **no** gate — `refs.c:1135` and
+///   `refs.c:1141` call `warning()` outright — so `--quiet` does not silence it;
+/// * `warning: log for '<ref>' only goes back to …` is gated by
+///   `GET_OID_QUIETLY`;
+/// * the `die()` is gated by it too, but only for the *message*:
+///   `if (flags & GET_OID_QUIETLY) exit(128); else die(…)` — stock
+///   `git rev-parse --quiet 'HEAD@{99}'` still exits 128, in silence.
+///
+/// And the gate is not simply `--quiet`, because `get_parent()` and
+/// `get_nth_ancestor()` hand the recursion a literal `GET_OID_COMMITTISH` and so
+/// drop the flag before `get_oid_basic()` is reached — see
+/// [`crate::objname::quiet_lost_in_navigation`]. Stock
+/// `git rev-parse --quiet --verify 'HEAD@{99}^'` therefore dies with the message
+/// and exit 128 where `… --quiet --verify 'HEAD@{99}'` exits 128 saying nothing.
+///
+/// The `die()` fires *inside* the resolution, so it is raised here rather than
+/// from the failed-operand block below: stdout is still empty at this point,
+/// which is what keeps `show_file()` from echoing the operand first.
 fn warn_reflog_reach(
     out: &mut impl Write,
     repo: &gix::Repository,
     arg: &str,
     quiet: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<ControlFlow<ExitCode>> {
     // `read_ref_at()`'s own warning comes first, because it is raised from inside
     // the call (`refs.c:1135` and `refs.c:1141`) that `object-name.c:787` makes.
-    // It has no `flags` gate at all — neither `warning()` consults
-    // `GET_OID_QUIETLY` — so unlike everything else here it survives `--quiet`.
     if let Some(message) = crate::objname::read_ref_at_warning(repo, arg) {
         out.flush()?;
         eprintln!("warning: {message}");
     }
-    if quiet {
-        return Ok(());
+    let quiet = quiet && !crate::objname::quiet_lost_in_navigation(arg);
+    match crate::objname::reflog_reach(repo, arg) {
+        Some(crate::objname::ReflogReach::Warning(message)) if !quiet => {
+            out.flush()?;
+            eprintln!("warning: {message}");
+        }
+        Some(crate::objname::ReflogReach::Fatal(message)) => {
+            out.flush()?;
+            if !quiet {
+                eprintln!("fatal: {message}");
+            }
+            return Ok(ControlFlow::Break(ExitCode::from(128)));
+        }
+        _ => {}
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// Whether [`crate::objname::resolves_through_reflog`] claims `arg` or, when
+/// `arg` is a range, either of its endpoints.
+///
+/// `try_difference()` (`builtin/rev-parse.c:269-326`) never resolves the range as
+/// a unit — it cuts at the `..` and calls `repo_get_oid_committish()` on each
+/// side — so an endpoint the reflog reader owns makes the whole spelling
+/// gitoxide's parser's business no longer.
+fn reflog_operand_anywhere(arg: &str) -> bool {
+    match crate::objname::split_range(arg) {
+        Some(range) => {
+            crate::objname::resolves_through_reflog(range.a)
+                || crate::objname::resolves_through_reflog(range.b)
+        }
+        None => crate::objname::resolves_through_reflog(arg),
+    }
+}
+
+/// `try_difference()` for a range [`reflog_operand_anywhere`] took away from
+/// gitoxide: both endpoints through the shared resolver, joined by `&&`.
+///
+/// ```c
+/// if (!repo_get_oid_committish(the_repository, this, &start_oid) &&
+///     !repo_get_oid_committish(the_repository, next, &end_oid)) {
+/// ```
+///
+/// Without this a `git branch -m` round trip made `git rev-parse 'HEAD@{1}..HEAD'`
+/// print `^0000000000000000000000000000000000000000` — gitoxide's range grammar
+/// resolves `<ref>@{<n>}` with its own reflog reader, which hands back the
+/// selected entry's raw new id where `read_ref_at()` answers with the ref's own
+/// value.
+///
+/// The endpoints have already been warned about above, so this is
+/// `resolve_quiet`: the same resolution, not a second pair of operands.
+fn reflog_range(repo: &gix::Repository, arg: &str) -> Option<Parsed> {
+    let range = crate::objname::split_range(arg)?;
+    if !crate::objname::resolves_through_reflog(range.a)
+        && !crate::objname::resolves_through_reflog(range.b)
+    {
+        return None;
+    }
+    let from = crate::objname::resolve_quiet(repo, range.a)?;
+    let to = crate::objname::resolve_quiet(repo, range.b)?;
+    Some(Parsed::Range(if range.symmetric {
+        RangeSpec::Merge { theirs: from, ours: to }
+    } else {
+        RangeSpec::Range { from, to }
+    }))
+}
+
+/// [`warn_reflog_reach`] for the *second* resolution — the one
+/// `die_verify_filename()` performs before it dies.
+///
+/// ```c
+/// void maybe_die_on_misspelt_object_name(struct repository *r,
+///                                        const char *name,
+///                                        const char *prefix)
+/// {
+///         struct object_context oc;
+///         struct object_id oid;
+///         get_oid_with_context_1(r, name, GET_OID_ONLY_TO_DIE | GET_OID_QUIETLY,
+///                                prefix, &oid, &oc);
+///         object_context_release(&oc);
+/// }
+/// ```
+///
+/// (`object-name.c:1880-1889`.) So `get_oid_basic()` is reached a second time for
+/// every operand that failed and is then diagnosed, and everything it is not
+/// gated out of saying it says again — which is why stock 2.55.0 prints
+///
+/// ```text
+/// warning: log for ref HEAD unexpectedly ended on Thu, 7 Apr 2005 22:13:13 +0200
+/// warning: log for ref HEAD unexpectedly ended on Thu, 7 Apr 2005 22:13:13 +0200
+/// fatal: ambiguous argument 'HEAD@{1}~99': ...
+/// ```
+///
+/// `GET_OID_QUIETLY` is set here whatever the command line said, so the second
+/// pass is quiet by default — and the exception is the same one as everywhere
+/// else: `get_parent()`/`get_nth_ancestor()` drop the flag, so
+/// `HEAD@{<old date>}^` and `HEAD@{<old date>}~99` print `only goes back to`
+/// twice while `HEAD@{<old date>}:nosuch` prints it once.
+///
+/// The name is `arg`, not the caret-stripped `name`: `die_verify_filename()` is
+/// handed `builtin/rev-parse.c`'s `arg` and passes it straight through.
+///
+/// No `die()` can come out of this pass — an out-of-range selector ended the
+/// command during the first resolution — so there is nothing to propagate.
+fn warn_reflog_reach_again(repo: &gix::Repository, arg: &str) {
+    // `get_oid_basic()` says all of this in one call, and in this order: the
+    // full-hex ambiguity warning, then the plain-name one, then `read_ref_at()`'s.
+    // `GET_OID_QUIETLY` gates the middle one and the reflog reach warning below;
+    // the full-hex one answers to `GET_OID_SKIP_AMBIGUITY_CHECK` instead and so
+    // comes out on both passes regardless — stock 2.55.0 prints
+    // `refname '<40-hex>' is ambiguous.` twice for `<40-hex-ref>:nosuch`.
+    warn_ambiguous_refname(repo, arg, true);
+    if let Some(message) = crate::objname::read_ref_at_warning(repo, arg) {
+        eprintln!("warning: {message}");
+    }
+    if !crate::objname::quiet_lost_in_navigation(arg) {
+        return;
     }
     if let Some(warning) = crate::objname::reflog_reach_warning(repo, arg) {
-        out.flush()?;
         eprint!("{warning}");
     }
-    Ok(())
 }
 
 /// `get_oid_basic`'s ambiguity warning (`object-name.c`): once a plain name has
@@ -787,11 +941,21 @@ fn warn_reflog_reach(
 /// second copy of the rule here would be a second thing to keep in step. `quiet`
 /// is the only thing rev-parse adds: it is the one builtin with a `--quiet` that
 /// reaches `get_oid()` with `GET_OID_QUIETLY`.
+///
+/// `quiet` is `--quiet`'s `GET_OID_QUIETLY` *as `get_oid_basic()` finally sees
+/// it*, so the caller has to account for the reduction dropping it — see
+/// [`crate::objname::quiet_lost_in_navigation`]. Stock
+/// `git rev-parse --quiet --verify 'dup~99'` prints `refname 'dup' is
+/// ambiguous.` although `--quiet` was given, because `get_nth_ancestor()` handed
+/// the recursion a bare `GET_OID_COMMITTISH`.
 pub(crate) fn warn_ambiguous_refname(repo: &gix::Repository, arg: &str, quiet: bool) {
     crate::objname::warn_ambiguous_operand(
         repo,
         arg,
-        crate::objname::OidFlags { quiet, ..Default::default() },
+        crate::objname::OidFlags {
+            quiet: quiet && !crate::objname::quiet_lost_in_navigation(arg),
+            ..Default::default()
+        },
     );
 }
 

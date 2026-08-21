@@ -2632,8 +2632,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // answers with the ref's current value whenever the entry one newer is
             // a creation; after a `git branch -m` round trip that raw id is the
             // null id, so `git log HEAD@{1}` walked nothing at all.
-            let resolved = if crate::objname::is_reflog_operand(spec) {
-                crate::objname::reflog_oid(&repo, spec).ok_or(())
+            // The test is on the *reduced* name: `HEAD@{<n>}~1` reaches
+            // `get_oid_basic()` as `HEAD@{<n>}` and walks from what came back.
+            // See [`crate::objname::reflog_spec_oid`].
+            let resolved = if crate::objname::resolves_through_reflog(spec) {
+                crate::objname::reflog_spec_oid(&repo, spec).ok_or(())
             } else {
                 repo.rev_parse_single(crate::objname::canonical_spec(&repo, spec).as_ref())
                     .map(|id| id.detach())

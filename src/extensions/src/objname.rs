@@ -43,6 +43,18 @@
 //! — the two hand-written copies this module replaced had already drifted apart
 //! in the order they tried the two resolvers.
 //!
+//! The same argument settles where a diagnostic belongs. `get_oid_basic()` warns
+//! and dies *while resolving*, below the only return path `repo_get_oid()` has,
+//! so no caller can hear one without the other and none can decline either.
+//! [`resolve`] is this port's `repo_get_oid()`; [`reflog_diagnostics`] is
+//! therefore the whole of `get_oid_basic()`'s reflog branch, raised there and
+//! nowhere else, and the two commands that hold git's own `flags` —
+//! `builtin/rev-parse.c` with `GET_OID_QUIETLY`, and the revision walk, which
+//! diagnoses an endpoint before it resolves — reach [`reflog_reach`] and
+//! [`read_ref_at_warning`] directly instead. A verb list is the one thing this
+//! must not be: git's set is "every command that resolves an argv operand", and
+//! that set is not enumerable by hand.
+//!
 //! `get_oid_hex()` accepts either case, because `hexval()` reads `A`-`F` as well
 //! as `a`-`f`. So does `ObjectId::from_hex` as it stands — it decodes through
 //! `faster_hex::hex_decode`, which is `hex_decode_with_case(…, CheckCase::None)`
@@ -469,14 +481,19 @@ fn short_oid_unambiguous(repo: &gix::Repository, name: &str) -> bool {
 ///
 /// A walker therefore does the strip itself, at the point where the C does, and
 /// asks about what is left — [`uninteresting_mark`] is that strip.
+///
+/// The `<rev>:<path>` cut is [`object_part`]'s bracket-aware one and **not** a
+/// plain `strchr(name, ':')`, because that is the only scan `repo_get_oid()` ever
+/// runs: `get_oid_with_context_1()` counts `@{`/`^{` groups so a colon inside one
+/// is part of the group, not the path separator (`object-name.c:1821-1830`). A
+/// plain `strchr` cut `HEAD@{2005-01-01T00:00:00+0000}` at the first colon of the
+/// clock time and handed the reflog readers `HEAD@{2005-01-01T00` — no trailing
+/// `}`, so not a reflog operand at all, so silent where stock 2.55.0 warns
+/// `log for 'HEAD' only goes back to …`. Every `@{<date>}` spelling carrying a
+/// time was affected, and so was `<40-hex-ref>^{/a:b}`, which stock warns about
+/// twice and this said nothing about.
 fn ambiguity_base(spec: &str) -> &str {
-    // `cp = strchr(name, ':')`, with the empty left side left alone — `:/text`
-    // and `:<path>` are their own forms and never reach `get_oid_basic()`.
-    let base = match spec.find(':').filter(|at| *at > 0) {
-        Some(at) => &spec[..at],
-        None => spec,
-    };
-    strip_navigation(base)
+    strip_navigation(object_part(spec))
 }
 
 /// The suffix reduction `get_oid_1()` and `peel_onion()` run between them, taken
@@ -495,7 +512,45 @@ fn ambiguity_base(spec: &str) -> &str {
 /// `<40-hex>^{{commit}}` are measured at their full length, miss the full-hex
 /// branch and are silent in stock 2.55.0. Cutting the group unconditionally made
 /// them warn.
-fn strip_navigation(mut base: &str) -> &str {
+fn strip_navigation(base: &str) -> &str {
+    navigation(base).0
+}
+
+/// [`strip_navigation`] together with the one thing the reduction's *shape*
+/// decides: whether it went through `get_parent()`/`get_nth_ancestor()`.
+///
+/// Those two are the only steps that do not pass `lookup_flags` down —
+/// they hand the recursion a literal `GET_OID_COMMITTISH`:
+///
+/// ```c
+/// static enum get_oid_result get_parent(struct repository *r,
+///                                       const char *name, int len,
+///                                       struct object_id *result, int idx)
+/// {
+///         struct object_id oid;
+///         enum get_oid_result ret = get_oid_1(r, name, len, &oid,
+///                                             GET_OID_COMMITTISH);
+/// ```
+///
+/// (`object-name.c:828-834`, and `get_nth_ancestor()` at `object-name.c:858-867`
+/// does the same.) `peel_onion()` keeps the caller's flags — it only clears
+/// `GET_OID_DISAMBIGUATORS` — and `get_oid_with_context_1()`'s `<rev>:<path>`
+/// arm keeps them too, so a `~<n>`/`^<n>` anywhere in the reduction is what
+/// **loses `GET_OID_QUIETLY`** before `get_oid_basic()` is reached.
+///
+/// That is directly observable, and it cuts both ways:
+///
+/// * `git rev-parse --quiet --verify 'HEAD@{<old date>}^'` prints
+///   `warning: log for 'HEAD' only goes back to …` in stock 2.55.0 although
+///   `--quiet` set `GET_OID_QUIETLY`, because `get_parent()` dropped it;
+/// * `git rev-parse --quiet --verify 'HEAD@{<old date>}'` is silent, because
+///   nothing dropped it;
+/// * on the failure path, where `die_verify_filename()` resolves a second time
+///   with `GET_OID_ONLY_TO_DIE | GET_OID_QUIETLY`, the warning comes out twice
+///   for `HEAD@{<old date>}^` and `HEAD@{<old date>}~99` and once for
+///   `HEAD@{<old date>}:nosuch`.
+fn navigation(mut base: &str) -> (&str, bool) {
+    let mut drops_quiet = false;
     loop {
         // `peel_onion()`: at least four characters, ending in `}`, and the
         // *rightmost* `{` whose predecessor is `^` opens the type name.
@@ -511,10 +566,22 @@ fn strip_navigation(mut base: &str) -> &str {
         // what precedes it.
         let head = base.trim_end_matches(|c: char| c.is_ascii_digit());
         match head.strip_suffix(['~', '^']).filter(|rest| !rest.is_empty()) {
-            Some(rest) => base = rest,
-            None => return base,
+            Some(rest) => {
+                base = rest;
+                drops_quiet = true;
+            }
+            None => return (base, drops_quiet),
         }
     }
+}
+
+/// Whether resolving `spec` reaches `get_oid_basic()` with `GET_OID_QUIETLY`
+/// cleared even when the caller set it — see [`navigation`].
+///
+/// The `<rev>:<path>` cut runs first and keeps the flag, so this asks
+/// [`navigation`] about the object half only.
+pub fn quiet_lost_in_navigation(spec: &str) -> bool {
+    navigation(object_part(spec)).1
 }
 
 /// `peel_onion()`'s type-name table (`object-name.c:936-951`), asked of the text
@@ -656,10 +723,71 @@ pub fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     // The same argument for `read_ref_at()`'s warning, which `get_oid_basic()`
     // raises further down the very same call (`object-name.c:787`, after the
     // ambiguity check at `object-name.c:753-756` — hence this order).
+    reflog_diagnostics(repo, spec);
+    resolve_quiet(repo, spec)
+}
+
+/// Everything `get_oid_basic()`'s reflog branch says about one operand
+/// (`object-name.c:787-820`), printed where the C prints it — including the
+/// `die()`, which ends the process here exactly as it ends it there.
+///
+/// **This is the routing point.** git raises all three of these from inside
+/// `get_oid_basic()`, so every command that resolves an argv operand through
+/// `repo_get_oid()` gets them, and every command that does not resolve one stays
+/// silent. [`resolve`] is this port's `repo_get_oid()`, which is why they belong
+/// here rather than in a list of verbs: bolting the warning onto `rev-parse` and
+/// `log` left `cat-file` (argv and `--batch`), `merge-base`,
+/// `merge-base --is-ancestor`, `branch --contains`, `branch --merged`,
+/// `tag --contains`, `for-each-ref --contains`, `diff`, `name-rev`,
+/// `describe --always`, `ls-tree`, `archive`, `grep`, `blame`, `commit-tree`,
+/// `ls-files --with-tree`, `read-tree`, `show-branch`, `cherry`, `bundle`,
+/// `notes`, `verify-tag` and `tag <name> <rev>` silent where stock 2.55.0
+/// speaks — every one of them measured, and a list nobody would have finished by
+/// hand.
+///
+/// The verbs that still do not hear it are exactly the ones that do not come
+/// through here: `diff-tree`, `update-ref` and `merge-tree` resolve their
+/// operands themselves, and `checkout`/`switch` reach `resolve()` for only one of
+/// the two resolutions stock performs.
+///
+/// The `die()` is not a value some caller might forget to render:
+///
+/// ```c
+/// if (flags & GET_OID_QUIETLY)
+///         exit(128);
+/// else
+///         die(_("log for %s is empty"), refname);
+/// ```
+///
+/// (`refs.c:1207-1210`, and `object-name.c:810-815` for the sibling `only has %d
+/// entries`.) It fires below `repo_get_oid()`'s only return path, so a caller
+/// cannot see it and cannot decline it — `git cat-file -t HEAD@{1}` and `git
+/// merge-base HEAD@{1} HEAD` on an empty log both end at `fatal: log for HEAD is
+/// empty`, not at each verb's own "not a valid object name". Reproducing that
+/// with a return value would mean teaching all 66 call sites the same lesson;
+/// exiting here is what the C does and is the only spelling that cannot drift.
+///
+/// The two commands that hold `get_oid_basic()`'s `flags` themselves —
+/// `builtin/rev-parse.c`, which passes `GET_OID_QUIETLY` for `--quiet`, and the
+/// revision walk, which diagnoses an endpoint before it resolves — do not come
+/// through here; they reach [`reflog_reach`] and [`read_ref_at_warning`]
+/// directly, with the gate they are entitled to.
+fn reflog_diagnostics(repo: &gix::Repository, spec: &str) {
+    // `read_ref_at()`'s own `warning()` comes from one frame deeper than the
+    // block below it, so it is printed first (`refs.c:1135`, `refs.c:1141`).
     if let Some(message) = read_ref_at_warning(repo, spec) {
         eprintln!("warning: {message}");
     }
-    resolve_quiet(repo, spec)
+    match reflog_reach(repo, spec) {
+        Some(ReflogReach::Warning(message)) => eprintln!("warning: {message}"),
+        Some(ReflogReach::Fatal(message)) => {
+            eprintln!("fatal: {message}");
+            // `die()` leaves through `exit()`, which flushes the stdio buffer —
+            // `cstdio`'s `atexit` handler is registered for exactly this.
+            std::process::exit(crate::fatal::EXIT_FATAL as i32);
+        }
+        None => {}
+    }
 }
 
 /// [`resolve`] without `get_oid_basic()`'s ambiguity warning, for the callers
@@ -715,10 +843,64 @@ pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     // gitoxide's rev-spec parser. That matters in both directions: gitoxide gives
     // up on an ambiguous `dup@{0}` that git answers, and it answers `HEAD@{0}` off
     // a stale `logs/HEAD` that git refuses because `HEAD` resolves to nothing.
+    if resolves_through_reflog(spec) {
+        return reflog_spec_oid(repo, spec);
+    }
+    repo.rev_parse_single(canonical_spec(repo, spec).as_ref()).ok().map(|id| id.detach())
+}
+
+/// Whether the reduction `repo_get_oid()` performs lands `get_oid_basic()` on a
+/// reflog operand, so that [`reflog_spec_oid`] and not gitoxide's revspec grammar
+/// is what answers for `spec`.
+///
+/// Two tests, because `get_oid_1()` asks twice: [`ambiguity_base`] is the name the
+/// reduction ends at, and the whole `spec` is what `get_oid_1()` falls back to
+/// once `peel_onion()` has given up (`object-name.c:1128-1132`).
+pub fn resolves_through_reflog(spec: &str) -> bool {
+    is_reflog_operand(spec) || is_reflog_operand(ambiguity_base(spec))
+}
+
+/// [`reflog_oid`] reached the way `repo_get_oid()` reaches it: through the
+/// reduction, not off the operand as typed.
+///
+/// The reduction runs *before* `get_oid_basic()` ever sees the name, and the
+/// suffix then works on the object that came back — `peel_onion()` resolves
+/// `sp - name - 2` characters and peels the result (`object-name.c:959-962`),
+/// `get_parent()` and `get_nth_ancestor()` resolve `len1` and walk from there
+/// (`object-name.c:828-834` and `object-name.c:858-867`), and `get_oid_with_context_1()`'s `<rev>:<path>`
+/// arm resolves the left half and looks the path up in that tree
+/// (`object-name.c:1833-1841`). So a reflog operand carrying a suffix is *not* a
+/// reflog operand to `get_oid_basic()`: [`ambiguity_base`] is the name it is
+/// finally handed, and only that name goes to the reader.
+///
+/// Substituting the resolved id back into the operand is what keeps the three
+/// suffix families on one path rather than on three special cases. Gating on the
+/// whole spec instead routed `HEAD@{<n>}^{commit}` and `HEAD@{<n>}^{tree}` into
+/// the reader with `<n>}^{commit` as the *selector* — which
+/// `approxidate_careful()` reads as a date rather than rejecting, so both
+/// answered the newest entry instead of peeling — and it left
+/// `HEAD@{<n>}~<n>` and `HEAD@{<n>}:<path>`, neither of which ends in `}`, to
+/// gitoxide's own reflog reader, which has no [`read_ref_at`] and so failed
+/// outright on the operands a `git branch -m` round trip produces.
+///
+/// The whole-spec attempt comes *last* for the same reason: `get_oid_1()` only
+/// falls back to `get_oid_basic()` on the full name once `peel_onion()` has
+/// returned -1, which is how stock answers `HEAD@{<old date>}^{blob}` at all
+/// despite the peel being impossible.
+pub fn reflog_spec_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    let base = ambiguity_base(spec);
+    if base.len() < spec.len() && is_reflog_operand(base) {
+        if let Some(id) = reflog_oid(repo, base) {
+            let rewritten = format!("{}{}", id.to_hex(), &spec[base.len()..]);
+            if let Some(id) = resolve_quiet(repo, &rewritten) {
+                return Some(id);
+            }
+        }
+    }
     if is_reflog_operand(spec) {
         return reflog_oid(repo, spec);
     }
-    repo.rev_parse_single(canonical_spec(repo, spec).as_ref()).ok().map(|id| id.detach())
+    None
 }
 
 /// The operand as gitoxide's revspec parser needs to see it: `@{u}`-family marks
@@ -1813,8 +1995,18 @@ fn split_reflog_selector(spec: &str) -> Option<(&str, &str)> {
 /// `None` means git has nothing to say: the name is not a reflog operand, the ref
 /// has no log at all (`repo_dwim_log()` finds nothing, and the operand then fails
 /// to resolve exactly as it does today), or the selector is in range.
+///
+/// `spec` is the operand as written. [`ambiguity_base`] reduces it to the name
+/// `get_oid_basic()` is actually handed, which is where the diagnosis belongs:
+/// `HEAD@{99}^`, `HEAD@{99}~1`, `HEAD@{99}^{commit}` and `HEAD@{99}:f` all die
+/// with `log for 'HEAD' only has 4 entries` in stock 2.55.0, because
+/// `get_parent()`, `get_nth_ancestor()`, `peel_onion()` and
+/// `get_oid_with_context_1()`'s path arm each resolve the base *first* and never
+/// get to apply their suffix. Asking about the operand as typed found no `@{…}`
+/// at the end of three of those four and reported the generic
+/// `ambiguous argument` instead.
 pub fn reflog_reach(repo: &gix::Repository, spec: &str) -> Option<ReflogReach> {
-    let (base, sel) = split_reflog_selector(spec)?;
+    let (base, sel) = split_reflog_selector(ambiguity_base(spec))?;
     // `repo_dwim_log()`: which ref's log this is. Nothing found is `refs_found ==
     // 0`, i.e. `return -1` — the operand does not resolve, and the caller's
     // existing "unknown revision" message is git's.
@@ -1932,7 +2124,7 @@ pub fn reflog_reach(repo: &gix::Repository, spec: &str) -> Option<ReflogReach> {
 /// `HEAD@{<date>}^{commit}` and `HEAD@{<date>}:<path>` each warn once, naming the
 /// reflog and not the suffix.
 pub fn reflog_reach_warning(repo: &gix::Repository, spec: &str) -> Option<String> {
-    match reflog_reach(repo, ambiguity_base(spec))? {
+    match reflog_reach(repo, spec)? {
         ReflogReach::Warning(message) => Some(format!("warning: {message}\n")),
         // `read_ref_at()`'s other outcome is a `die()`, and printing it here would
         // duplicate the fatal its caller is already building.

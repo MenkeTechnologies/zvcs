@@ -1532,8 +1532,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // selected entry's raw *new* id, which is the null id for the record
         // written by a `git branch -m` round trip, where `read_ref_at()` answers
         // with the ref's current value. See [`crate::objname::reflog_oid`].
-        let reflog = crate::objname::is_reflog_operand(spec)
-            .then(|| crate::objname::reflog_oid(&repo, spec))
+        // The test is on the *reduced* name: `HEAD@{<n>}^{commit}` reaches
+        // `get_oid_basic()` as `HEAD@{<n>}`, and the peel then works on the object
+        // the reader answered with. See [`crate::objname::reflog_spec_oid`].
+        let reflog = crate::objname::resolves_through_reflog(spec)
+            .then(|| crate::objname::reflog_spec_oid(&repo, spec))
             .flatten()
             .map(RevSpec::Include);
         let parsed = match reflog {

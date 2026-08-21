@@ -1674,13 +1674,15 @@ fn process_request(
     // `warn_on_object_refname_ambiguity` bracket — held around this whole loop —
     // takes the full-hex one out; the plain-name one has no such gate, and stock
     // `printf dup | git cat-file --batch-check` prints it.
-    if let Ok(spec) = std::str::from_utf8(name) {
-        crate::objname::warn_ambiguous_refname(repo, spec);
-    }
-    let oid = std::str::from_utf8(name)
-        .ok()
-        .and_then(|s| repo.rev_parse_single(s).ok())
-        .map(|id| id.detach());
+    //
+    // And it reaches `get_oid_with_context()`, not gitoxide's revspec parser, so
+    // the rest of that call comes with it: `read_ref_at()`'s warnings, the reach
+    // warning, the `die()` for a selector past the end of the log — stock
+    // `printf 'HEAD@{99}\n' | git cat-file --batch-check` ends the whole batch at
+    // `fatal: log for 'HEAD' only has 3 entries` rather than reporting one
+    // `missing` line — and `get_oid_1()`'s narrower grammar, which has no case for
+    // `HEAD^!` and reports it `missing` where gitoxide resolved it.
+    let oid = std::str::from_utf8(name).ok().and_then(|s| crate::objname::resolve(repo, s));
 
     let Some(oid) = oid else {
         out.write_all(name)?;

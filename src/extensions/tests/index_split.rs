@@ -167,7 +167,10 @@ fn zvcs_writes_a_split_index_stock_git_can_use() {
 
     // The load-bearing check: stock git answers the same tree, and answering it
     // does not make stock rewrite the index — i.e. it accepted the structure as
-    // written rather than repairing it.
+    // written rather than repairing it. This is the assertion that caught the
+    // difference between "decodes to the same index" and "is the file git would
+    // have written": a split half with no stand-in entries reads fine everywhere
+    // and is still rewritten on sight by git 2.50.
     let index_before = std::fs::read(git_dir.join("index")).unwrap();
     assert_eq!(
         ok(&git, &repo, &["write-tree"]),
@@ -181,6 +184,71 @@ fn zvcs_writes_a_split_index_stock_git_can_use() {
     );
 
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Splitting the *same* index with each binary must produce the same two files.
+///
+/// Both halves are fully determined by the entries — the shared one is a plain
+/// index of them, the split one a stand-in per entry plus the bitmaps — so given
+/// one starting repository there is exactly one right answer, and the shared
+/// index's name is its own checksum, so a content difference shows up as a name
+/// difference too. Copying a finished repository and splitting each copy holds the
+/// stat data fixed, which is the only part that could differ for uninteresting
+/// reasons.
+#[test]
+fn splitting_the_same_index_gives_the_same_bytes_as_stock_git() {
+    let Some(git) = stock_git() else {
+        eprintln!("no stock git found — skipping split-index byte comparison");
+        return;
+    };
+
+    let root = tmp("bytes");
+    let source = root.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    populated(&git, &source);
+
+    let (stock_repo, zvcs_repo) = (root.join("stock"), root.join("zvcs"));
+    for dest in [&stock_repo, &zvcs_repo] {
+        copy_tree(&source, dest);
+    }
+    ok(&git, &stock_repo, &["update-index", "--split-index"]);
+    ok(BIN, &zvcs_repo, &["update-index", "--split-index"]);
+
+    let stock_shared = shared_index(&stock_repo.join(".git")).expect("stock git wrote a shared index");
+    let zvcs_shared = shared_index(&zvcs_repo.join(".git")).expect("zvcs wrote a shared index");
+    assert_eq!(
+        zvcs_shared.file_name(),
+        stock_shared.file_name(),
+        "the shared index is named by its checksum, so the names agree only if the bytes do"
+    );
+    assert_eq!(
+        std::fs::read(&zvcs_shared).unwrap(),
+        std::fs::read(&stock_shared).unwrap(),
+        "the shared half must be byte-for-byte stock git's"
+    );
+    assert_eq!(
+        std::fs::read(zvcs_repo.join(".git/index")).unwrap(),
+        std::fs::read(stock_repo.join(".git/index")).unwrap(),
+        "the split half must be byte-for-byte stock git's"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Recursively copy `from` to `to`, preserving nothing but the bytes — enough for
+/// a git directory, whose only mode that matters is the executable bit no fixture
+/// here uses.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+        }
+    }
 }
 
 /// `--no-split-index` puts it back together.

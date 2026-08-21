@@ -1447,6 +1447,20 @@ fn reset_two_tree(
     }
     new_index.sort_entries();
 
+    // `--merge` and `--keep` are both `unpack_trees()` in git, and it opens with
+    // `resolve_undo_clear_index()` (unpack-trees.c) — a two-tree reset discards
+    // the resolve-undo record rather than adding to it.
+    //
+    // This port reaches the same result by *mutating* the old index, and the
+    // mutation runs through `remove_entries()`, which is exactly where git
+    // *records* resolve-undo from (`remove_index_entry_at()`,
+    // read-cache.c:1370-1371). So the shapes collide: at index level a
+    // conflict-resolving `add` and a two-tree reset do the same thing, and only
+    // the caller knows which one it is. Clearing here is that knowledge — without
+    // it `git reset --merge` after a resolved conflict writes a REUC stock git
+    // does not have (measured: stock 0 records, this port 3).
+    new_index.remove_resolve_undo();
+
     // Write the changed files to the worktree by checking out a filtered copy that
     // holds only the updated entries — kept files (with their local changes) are
     // never touched.

@@ -8,15 +8,19 @@
 //! shared half plus the `link` extension naming it, and keeps the tree-cache and
 //! everything else the index had.
 //!
-//! What this writes is the shape `prepare_to_write_split_index()` produces when
-//! nothing has diverged from the shared half yet: every entry moves across, the
-//! split half is left empty, and both bitmaps are empty. git can and does write a
-//! denser variant — an entry whose path is empty standing in for a shared entry
-//! whose stat data was refreshed, with the corresponding bit set in the replace
-//! bitmap (split-index.c:223-309) — and reading that back is what
-//! [`Link::dissolve_into()`](crate::extension::Link) has always handled. Both
-//! decode to exactly the same set of entries; this one simply never claims a
-//! replacement it did not make.
+//! The split half is not empty, and that matters. `prepare_to_write_split_index()`
+//! leaves a *stand-in* entry there for every base entry it is replacing — same
+//! stat data, same id, same mode, but with the name stripped (`CE_STRIP_NAME`, so
+//! the path is empty and the name length is zero) — and sets that base entry's bit
+//! in the replace bitmap (split-index.c:223-309). On the split that creates the
+//! shared half, every entry has just been written into the base, so every one of
+//! them gets a stand-in and a replace bit; the delete bitmap stays empty.
+//!
+//! An index that instead carried no entries and empty bitmaps decodes to the same
+//! thing and git 2.55 reads it unchanged, but git 2.50 does not consider it a
+//! fixed point: the first command that touches the index rewrites it into the shape
+//! above. Writing that shape directly is what makes the file stock git would have
+//! written, on every version.
 
 use std::path::{Path, PathBuf};
 
@@ -36,17 +40,18 @@ pub enum Error {
 
 impl File {
     /// Write this index split in two under `git_dir`: a `sharedindex.<id>` file
-    /// holding every entry, and this index — emptied of entries and carrying a
-    /// `link` extension that names it — at its own path.
+    /// holding every entry by name, and this index — reduced to one name-stripped
+    /// stand-in per entry plus the `link` extension naming the shared half — at its
+    /// own path.
     ///
     /// Returns the id of the shared index, which is its trailing checksum and the
     /// name it is stored under, exactly as git's `si->base_oid` is
     /// `si->base->oid` (read-cache.c:2371).
     ///
-    /// The in-memory state is left holding the `link` extension and no entries,
-    /// which is what was written; re-reading the file through
-    /// [`File::at_with_git_dir()`](File::at_with_git_dir()) dissolves it back into
-    /// the full entry list.
+    /// The in-memory state is left holding exactly what was written, stand-ins and
+    /// all, so it no longer answers questions about paths; re-reading the file
+    /// through [`File::at_with_git_dir()`](File::at_with_git_dir()) dissolves it
+    /// back into the full entry list.
     ///
     /// ### The shared half is never written with `index.skipHash`
     ///
@@ -57,20 +62,40 @@ impl File {
     /// unconditionally to get a name for.
     pub fn write_split(&mut self, git_dir: &Path, options: write::Options) -> Result<gix_hash::ObjectId, Error> {
         // `move_cache_to_base_index()` (split-index.c:102-132): the entries become
-        // the shared index's, and the split index starts out with none of its own.
+        // the shared index's, and the split index keeps only stand-ins for them.
         let shared_id = write_shared(self, git_dir)?;
 
-        let mut entries = Vec::new();
-        std::mem::swap(&mut self.state.entries, &mut entries);
+        let entries = std::mem::take(&mut self.state.entries);
+        let path_backing = std::mem::take(&mut self.state.path_backing);
+
+        // One stand-in per entry the shared half actually received — the writer
+        // drops `CE_REMOVE` entries (read-cache.c:2915-2916), so those must not
+        // consume a bitmap position either, or every later bit would point at the
+        // wrong base entry.
+        for entry in entries.iter().filter(|e| !e.flags.contains(crate::entry::Flags::REMOVE)) {
+            self.state.dangerously_push_entry(
+                entry.stat,
+                entry.id,
+                entry.flags,
+                entry.mode,
+                // `CE_STRIP_NAME`: the name lives in the base entry this stands in
+                // for, and the entry writer derives the stored name length from the
+                // path, so an empty path is a zero name length.
+                bstr::BStr::new(b""),
+            );
+        }
+        let replace_bits = vec![true; self.state.entries.len()];
+
         // `si->delete_bitmap = ewah_new(); si->replace_bitmap = ewah_new();`
-        // (split-index.c:220-221) — present and empty, as git writes them whenever
-        // there is a base to point at.
-        let empty = gix_bitmap::ewah::Vec::from_bits(&[]).expect("an empty bitmap always fits");
+        // (split-index.c:220-221), then a `ewah_set(si->replace_bitmap, i)` for each
+        // base entry a stand-in replaces. Nothing is deleted from a base that was
+        // built from these very entries, so the delete bitmap stays empty.
         self.state.set_link(Some(extension::Link {
             shared_index_checksum: shared_id,
             bitmaps: Some(extension::link::Bitmaps {
-                delete: empty.clone(),
-                replace: empty,
+                delete: gix_bitmap::ewah::Vec::from_bits(&[]).expect("an empty bitmap always fits"),
+                replace: gix_bitmap::ewah::Vec::from_bits(&replace_bits)
+                    .expect("far fewer than 4 billion entries"),
             }),
         }));
 
@@ -79,6 +104,7 @@ impl File {
             // Put the entries back so the caller's state still describes the
             // repository if the split half could not be committed.
             self.state.entries = entries;
+            self.state.path_backing = path_backing;
             self.state.set_link(None);
         }
         result?;

@@ -57,16 +57,17 @@
 //! already dissolved its `link` into the entries, so the ordinary write *is* the
 //! un-split. Both spellings emit git's `core.splitIndex` disagreement warning.
 //!
-//! What is not reproduced is git's per-entry replace bookkeeping. git leaves an
-//! empty-path stand-in entry in the split half for every shared entry it has
-//! touched, with the matching bit set in the replace bitmap
-//! (split-index.c:223-309); that needs the `CE_UPDATE_IN_BASE` / `CE_MATCHED`
-//! per-entry provenance this index model does not carry. The split half written
-//! here holds no entries and two empty bitmaps — a smaller file that decodes to
-//! the same index, and one stock git reads without reporting a repair.
+//! Both halves come out byte-for-byte what stock git writes from the same index,
+//! down to the name-stripped stand-in entry the split half keeps for every entry
+//! that moved into the shared one and the replace bitmap that points at them
+//! (split-index.c:223-309) — the shared index is therefore stored under the same
+//! name, since that name is its own checksum.
+//!
 //! `core.splitIndex`, `splitIndex.maxPercentChange` and
 //! `splitIndex.sharedIndexExpire` remain unimplemented: a split happens when this
-//! flag asks for one and at no other time, and no shared index is ever expired.
+//! flag asks for one and at no other time, no *subsequent* write keeps the index
+//! split (the next command reads it, dissolves the `link`, and writes one whole
+//! index again), and no shared index is ever expired.
 //!
 //! `--unresolve` restores the conflict stages recorded in the index's `REUC`
 //! extension exactly as git does — dropping the stage-0 entry, re-adding stages

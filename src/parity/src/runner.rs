@@ -586,6 +586,21 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(20);
 /// that completes inside the budget is compared exactly as before.
 const SLEEP_ALLOWANCE: &[(&str, u64)] = &[("filter-branch", 10)];
 
+/// Ceiling on *draining* a finished child's pipes — a separate budget from
+/// [`CASE_TIMEOUT`], because it bounds a different failure.
+///
+/// The case ceiling bounds how long a command may *run*. This one bounds how
+/// long the harness will wait for EOF **after** that command is gone, which is
+/// not the same event: `kill()` reaps the child but never its grandchildren, so
+/// a detached process holding the inherited write end keeps the pipe open
+/// indefinitely. Without this, the case timeout fires exactly as designed and
+/// the run still deadlocks one line later, in a read nobody thought could block.
+///
+/// Short on purpose. The bytes are already written by the time the child exits;
+/// this is waiting on a file descriptor to close, not on work to finish, so a
+/// wait this long means a live holder that is never going away.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The wall-clock ceiling for one invocation of `case`: the base ceiling plus
 /// whatever [`SLEEP_ALLOWANCE`] documents for its subcommand.
 fn case_timeout(case: &Case) -> Duration {
@@ -689,16 +704,58 @@ fn run_side(bin: &Path, repo: &Path, home: &Path, case: &Case) -> Result<Side> {
         let _ = w.join();
     }
 
-    // Pipes are drained after exit; every fixture case produces bounded output,
-    // so this cannot deadlock on a full pipe buffer in practice.
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut h) = child.stdout.take() {
-        let _ = h.read_to_end(&mut stdout);
-    }
-    if let Some(mut h) = child.stderr.take() {
-        let _ = h.read_to_end(&mut stderr);
-    }
+    // Drain the pipes with a deadline of their own.
+    //
+    // The child has exited, but that does **not** guarantee EOF on its pipes:
+    // `child.kill()` kills the child, never its grandchildren, and any process
+    // the child spawned that inherited the write end keeps the pipe open after
+    // the child is gone. `read_to_end` then blocks forever waiting for an EOF
+    // nobody will send — the whole harness deadlocks in a *drain*, after the
+    // case timeout has already done its job. That is not hypothetical: it hung a
+    // full corpus run for as long as it was left alone, with the case timeout
+    // working perfectly and this read below it never returning.
+    //
+    // So each pipe is drained on its own thread and abandoned if it outlives the
+    // budget. Bytes already buffered are kept (the same "half an answer" the
+    // kill path preserves for a human to read), and `timed_out` still keeps them
+    // out of every comparison. An abandoned thread leaks one blocked reader for
+    // the life of the process, which is the correct trade: a leaked thread costs
+    // a stack, a blocked drain costs the entire run.
+    let drain = |h: Option<std::process::ChildStdout>,
+                 e: Option<std::process::ChildStderr>|
+     -> (Vec<u8>, Vec<u8>) {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let (tx2, rx2) = (tx.clone(), rx);
+        if let Some(mut h) = h {
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = h.read_to_end(&mut b);
+                let _ = tx.send((0u8, b));
+            });
+        } else {
+            let _ = tx.send((0u8, Vec::new()));
+        }
+        if let Some(mut e) = e {
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = e.read_to_end(&mut b);
+                let _ = tx2.send((1u8, b));
+            });
+        } else {
+            let _ = tx2.send((1u8, Vec::new()));
+        }
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            match rx2.recv_timeout(DRAIN_TIMEOUT) {
+                Ok((0, b)) => out = b,
+                Ok((_, b)) => err = b,
+                Err(_) => break, // deadline hit: keep what arrived, abandon the rest
+            }
+        }
+        (out, err)
+    };
+    let (stdout, stderr) = drain(child.stdout.take(), child.stderr.take());
 
     // A killed child's pipes still hold whatever it managed to write. Those bytes
     // are kept for a human to read, and `timed_out` is the flag that keeps them

@@ -1177,3 +1177,655 @@ fn collect_lines(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The config *file* reader's own refusals
+// ---------------------------------------------------------------------------
+//
+// Everything above this line is about the *values* a config file holds. This
+// section is about the file itself failing to parse, and about the repository
+// format the file declares — two diagnostics that only a file can reach, and
+// that `-c` therefore cannot be used to test.
+//
+// git's parser dies where it stands. `git_parse_source()` (config.c:1141-1170)
+// builds the message from the source it was reading,
+//
+// ```c
+// case CONFIG_ORIGIN_FILE:
+//         error_msg = xstrfmt(_("bad config line %d in file %s"),
+//                               cs->linenr, cs->name);
+//         break;
+// ```
+//
+// and then (config.c:1171-1185) picks what to do with it:
+//
+// ```c
+// switch (opts && opts->error_action ?
+//         opts->error_action :
+//         cs->default_error_action) {
+// case CONFIG_ERROR_DIE:
+//         die("%s", error_msg);
+// ```
+//
+// `do_config_from_file()` (config.c:1394) sets `top.default_error_action =
+// CONFIG_ERROR_DIE`, and `do_git_config_sequence()` passes a literal `NULL` for
+// `opts` to every one of its five `git_config_from_file_with_options()` calls, so
+// every on-disk config file in the sequence dies. That is why the refusal is
+// `fatal:` at exit 128 rather than an ordinary error — and why it comes out of
+// the *reader*, before any command has run.
+
+/// The two moments git reads configuration from a file, which decide *when* a
+/// malformed one is fatal and therefore which files a given check may name.
+///
+/// * [`ConfigScopes::EarlyGlobal`] is `read_very_early_config()`, reached from
+///   `tr2_sysenv_load()` inside `trace2_initialize()` — which `init_git()`
+///   (common-init.c:77) runs *before* `cmd_main()`. It reads system, XDG and
+///   user configuration and nothing else, so a malformed one of those kills
+///   every invocation, `git --version` and `git --exec-path` included, before a
+///   single argument has been looked at. Measured against git 2.55.0: with `[]`
+///   in `~/.gitconfig`, all of `--version`, `--exec-path`, `--html-path`,
+///   `--man-path`, `--help`, `version`, `help`, `stripspace` and an unknown verb
+///   exit 128 with `fatal: bad config line 1 in file <path>`.
+/// * [`ConfigScopes::Repository`] is the repository half of
+///   `do_git_config_sequence()` — `$GIT_COMMON_DIR/config` and, when
+///   `extensions.worktreeConfig` is on, `$GIT_DIR/config.worktree`. git reaches
+///   it from `run_builtin()` (git.c:479-491): `setup_git_directory()` and then
+///   `check_pager_config()`, both before the builtin's own `fn` is called. So it
+///   applies to every `RUN_SETUP`/`RUN_SETUP_GENTLY` entry of the `commands[]`
+///   table and to none of the others. Measured with `[]` in `.git/config`:
+///   `status -h`, `commit -h`, `merge-index`, `hash-object -`, `column`,
+///   `patch-id`, `shortlog`, `http-backend` and an unknown verb all exit 128,
+///   while `version`, `help`, `stripspace`, `credential-cache exit` and
+///   `url-parse` — none of which take repository setup — exit 0.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScopes {
+    /// System, XDG and `~/.gitconfig`: what `read_very_early_config()` covers.
+    EarlyGlobal,
+    /// `$GIT_COMMON_DIR/config` and `$GIT_DIR/config.worktree`.
+    Repository,
+}
+
+/// `fatal: bad config line <n> in file <path>` for the first file in `scopes`
+/// that git's parser would refuse, or `None` when they all parse.
+///
+/// The returned string is the message without the `fatal: ` prefix, so it can be
+/// handed to [`crate::fatal::die`] or printed by a gate that already knows it is
+/// leaving with 128.
+pub fn bad_config_line(scopes: ConfigScopes, naming: GitDirNaming) -> Option<String> {
+    let (path, line) = first_unparsable_config_file(scopes, naming)?;
+    Some(format!("bad config line {line} in file {path}"))
+}
+
+/// How the message spells `$GIT_DIR`, which is not a constant: git prints what
+/// setup left in `$GIT_DIR`, and not every command gets there the same way.
+///
+/// `setup_git_directory()` chdirs to the top of the work tree and keeps the
+/// relative `.git` the discovery walk found, so every `RUN_SETUP` verb names
+/// `.git/config` from anywhere inside the work tree. `cmd_init_db()` does not use
+/// that setup at all — it resolves the directory itself and calls
+/// `set_git_dir(real_path(...))` — so `git init` in a repository whose config is
+/// malformed names the *absolute* path. Both measured against git 2.55.0 in the
+/// same repository:
+///
+/// ```text
+/// $ git status
+/// fatal: bad config line 8 in file .git/config
+/// $ git init
+/// fatal: bad config line 8 in file /tmp/rr/.git/config
+/// ```
+///
+/// Ignored by [`ConfigScopes::EarlyGlobal`], whose files are named by absolute
+/// path in every case.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GitDirNaming {
+    /// `.git/config` — what `setup_git_directory()` leaves behind.
+    AsDiscovered,
+    /// The resolved path, as `cmd_init_db()`'s `real_path()` produces.
+    Absolute,
+}
+
+/// The first config file in `scopes` that will not parse, as
+/// `(path as git would print it, 1-based line)`.
+///
+/// The walk has to be its own thing rather than a question asked of a loaded
+/// snapshot: by the time gitoxide reports the failure the file is gone from the
+/// error — `gix_config::file::init::Error::Parse` carries only
+/// `gix_config::parse::Error`, which knows the line but not the path. So the
+/// candidates are re-derived in `do_git_config_sequence()` order (config.c:
+/// system, XDG, user, repository, worktree) and each is parsed on its own; the
+/// first refusal is the one git would have died on, because git aborts the whole
+/// sequence at that same point.
+///
+/// `include.path` is followed depth-first after its including file parses, which
+/// is where git resolves it — an included file that will not parse is named by
+/// its own path, not the includer's. Conditional `includeIf` sections are not
+/// followed; naming no file at all is better than naming the wrong one, and the
+/// caller falls back to its own voice when this returns `None`.
+pub fn first_unparsable_config_file(
+    scopes: ConfigScopes,
+    naming: GitDirNaming,
+) -> Option<(String, usize)> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for candidate in config_file_sequence(scopes, naming) {
+        if let Some(found) = check_config_file(&candidate, &mut seen) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// One file of the config sequence: where it lives, and how git names it.
+struct ConfigCandidate {
+    /// The path to open.
+    path: PathBuf,
+    /// The path as git's message spells it — the string git passed to
+    /// `git_config_from_file()`, which is absolute for the global scopes and
+    /// `$GIT_DIR`-relative for a discovered repository.
+    shown: String,
+}
+
+/// Parse `candidate`, and on success follow its unconditional includes. Returns
+/// the first `(shown path, line)` that will not parse.
+fn check_config_file(
+    candidate: &ConfigCandidate,
+    seen: &mut Vec<PathBuf>,
+) -> Option<(String, usize)> {
+    // git's own `include.c` guards against an include cycle with a depth limit;
+    // a visited set is the same guarantee and cheaper to state.
+    if seen.contains(&candidate.path) {
+        return None;
+    }
+    seen.push(candidate.path.clone());
+    let Ok(bytes) = std::fs::read(&candidate.path) else {
+        // `git_config_from_file_with_options()` opens with `fopen_or_warn()` and
+        // simply returns -1 when that fails, so an unreadable file is not this
+        // diagnostic.
+        return None;
+    };
+    let events = match gix::config::parse::Events::from_bytes(&bytes, None) {
+        Ok(events) => events,
+        Err(err) => return Some((candidate.shown.clone(), err.line_number())),
+    };
+    if let Some(line) = unterminated_valueless_key(&events) {
+        return Some((candidate.shown.clone(), line));
+    }
+    for included in included_paths(&events, &candidate.path) {
+        let shown = included.to_string_lossy().into_owned();
+        let next = ConfigCandidate {
+            path: included,
+            shown,
+        };
+        if let Some(found) = check_config_file(&next, seen) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The line of the first valueless key that is not the last thing on its line,
+/// which git's `get_value()` refuses and gitoxide's parser accepts.
+///
+/// git reads the name, skips spaces and tabs, and then allows exactly two
+/// continuations — end of line, or `=` and a value (config.c, `get_value()`):
+///
+/// ```c
+/// while (c == ' ' || c == '\t')
+///         c = get_next_char(cs);
+///
+/// value = NULL;
+/// if (c != '\n') {
+///         if (c != '=')
+///                 return -1;
+///         value = parse_value(cs);
+///         if (!value)
+///                 return -1;
+/// }
+/// ```
+///
+/// `return -1` is what `git_parse_source()` turns into `bad config line %d in
+/// file %s`. gitoxide's parser instead ends the implicit-boolean form wherever it
+/// stands and carries on, so `garbage line` becomes the two valueless names
+/// `garbage` and `line` rather than a refusal, and `b ; c` becomes a valueless
+/// `b` followed by a comment. Measured against git 2.55.0, with the file as the
+/// global config and `git config --list` reading it:
+///
+/// ```text
+/// [a]\nb\n          rc=0, lists `a.b`      [a]\nb ; c\n   fatal: bad config line 2
+/// [a]\nb   \n       rc=0, lists `a.b`      [a]\nb # c\n   fatal: bad config line 2
+/// [a]\nb            rc=0, lists `a.b`      [a]\nb;c\n     fatal: bad config line 2
+/// [a]\nb\t\n        rc=0, lists `a.b`      [a]\nb c\n     fatal: bad config line 2
+/// ```
+///
+/// This is a check over the event stream gitoxide already produced rather than a
+/// second parser: a valueless key is a `Value` event sitting directly after its
+/// name (with only `Whitespace` between), and git's rule is that the next event
+/// must be the line ending or the end of the file.
+fn unterminated_valueless_key(events: &gix::config::parse::Events) -> Option<usize> {
+    use gix::config::parse::EventRef;
+
+    let mut line = 1usize;
+    // Whether the last significant event was a name, and then whether the value
+    // that followed it was the implicit (valueless) one.
+    let mut after_name = false;
+    let mut after_implicit_value = false;
+    for event in events.iter() {
+        match event {
+            EventRef::Whitespace(_) => continue,
+            EventRef::Newline(nl) => {
+                line += nl.iter().filter(|&&b| b == b'\n').count();
+                after_name = false;
+                after_implicit_value = false;
+            }
+            EventRef::SectionValueName(_) => {
+                if after_implicit_value {
+                    return Some(line);
+                }
+                after_name = true;
+                after_implicit_value = false;
+            }
+            EventRef::Value(_) if after_name => {
+                after_name = false;
+                after_implicit_value = true;
+            }
+            other => {
+                if after_implicit_value && matches!(other, EventRef::Comment { .. }) {
+                    return Some(line);
+                }
+                after_name = false;
+                after_implicit_value = false;
+            }
+        }
+    }
+    None
+}
+
+/// The `include.path` targets of one parsed file, resolved the way
+/// `expand_include_path()` (config.c) resolves them: `~` against `$HOME`, and a
+/// relative path against the *including file's* directory.
+///
+/// `includeIf.<condition>.path` is deliberately left out — evaluating the
+/// condition here would be a second implementation of `include_condition_is_true()`
+/// and getting it wrong would name a file git never opened.
+fn included_paths(events: &gix::config::parse::Events, from: &std::path::Path) -> Vec<PathBuf> {
+    use gix::bstr::ByteSlice as _;
+    use gix::config::parse::EventRef;
+
+    let mut out = Vec::new();
+    let mut in_include = false;
+    let mut at_path = false;
+    for event in events.iter() {
+        match event {
+            EventRef::SectionHeader {
+                name,
+                subsection_name,
+                ..
+            } => {
+                in_include = subsection_name.is_none()
+                    && name.to_str_lossy().eq_ignore_ascii_case("include");
+                at_path = false;
+            }
+            EventRef::SectionValueName(name) => {
+                at_path = in_include && name.to_str_lossy().eq_ignore_ascii_case("path");
+            }
+            EventRef::Value(raw) if at_path => {
+                at_path = false;
+                let text = raw.to_str_lossy().into_owned();
+                if text.is_empty() {
+                    continue;
+                }
+                let expanded = expand_tilde(&text);
+                out.push(if expanded.is_absolute() {
+                    expanded
+                } else {
+                    match from.parent() {
+                        Some(dir) => dir.join(expanded),
+                        None => expanded,
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The files `do_git_config_sequence()` would open for `scopes`, in its order.
+///
+/// The global half is delegated to gitoxide's `Source::storage_location()`, which
+/// already implements git's environment rules for these scopes —
+/// `GIT_CONFIG_NOSYSTEM` suppressing the system file, `GIT_CONFIG_SYSTEM` and
+/// `GIT_CONFIG_GLOBAL` replacing a scope outright, `XDG_CONFIG_HOME` falling back
+/// to `$HOME/.config`. Duplicates are possible (`GIT_CONFIG_GLOBAL` answers for
+/// both the XDG and the user scope) and are dropped by the visited set in
+/// [`check_config_file`].
+fn config_file_sequence(scopes: ConfigScopes, naming: GitDirNaming) -> Vec<ConfigCandidate> {
+    use gix::config::Source;
+
+    let mut out = Vec::new();
+    if scopes == ConfigScopes::EarlyGlobal {
+        let mut env = |name: &str| std::env::var_os(name);
+        for source in [
+            Source::GitInstallation,
+            Source::System,
+            Source::Git,
+            Source::User,
+        ] {
+            if let Some(path) = source.storage_location(&mut env) {
+                let shown = path.to_string_lossy().into_owned();
+                out.push(ConfigCandidate { path, shown });
+            }
+        }
+        return out;
+    }
+
+    let Some(dirs) = repository_directories() else {
+        return out;
+    };
+    // `opts.commondir` is what the repository config is read from, so a linked
+    // worktree reads the main repository's `config` and only `config.worktree`
+    // is its own (config.c:1590-1600).
+    out.push(dirs.candidate(&dirs.common_dir, "config", naming));
+    if worktree_config_enabled(&dirs.common_dir.join("config")) {
+        out.push(dirs.candidate(&dirs.git_dir, "config.worktree", naming));
+    }
+    out
+}
+
+/// The `$GIT_DIR` and `$GIT_COMMON_DIR` of the repository the current directory
+/// is in, plus what setup would have made `$GIT_DIR` *look* like.
+struct RepositoryDirs {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    /// `Some(top)` for a repository with a work tree, used to decide whether
+    /// git's message would say the bare `.git`.
+    work_tree: Option<PathBuf>,
+    /// `$GIT_DIR` named the repository outright, which is git's
+    /// `GIT_DIR_EXPLICIT`: `setup_explicit_git_dir()` installs the variable's
+    /// own spelling and never chdirs, so the message repeats it verbatim —
+    /// `GIT_DIR=.git` gives `.git/config` and an absolute one gives an absolute
+    /// path. Both measured against git 2.55.0.
+    explicit: bool,
+}
+
+impl RepositoryDirs {
+    /// One candidate under `dir`, named the way git's message names it.
+    ///
+    /// `setup_git_directory()` chdirs to the top of the work tree and leaves
+    /// `$GIT_DIR` as the relative `.git` it discovered, which is why git prints
+    /// `.git/config` from anywhere inside the work tree and an absolute path for
+    /// an explicit `$GIT_DIR` or a `--separate-git-dir` repository. Both were
+    /// measured against git 2.55.0.
+    fn candidate(&self, dir: &std::path::Path, file: &str, naming: GitDirNaming) -> ConfigCandidate {
+        let shown_dir = match &self.work_tree {
+            _ if naming == GitDirNaming::Absolute => crate::setup::realpath(dir),
+            _ if self.explicit => dir.to_path_buf(),
+            Some(top)
+                if crate::setup::realpath(dir) == crate::setup::realpath(&top.join(".git")) =>
+            {
+                std::path::Path::new(".git").to_path_buf()
+            }
+            _ => dir.to_path_buf(),
+        };
+        let shown = shown_dir.join(file).to_string_lossy().into_owned();
+        ConfigCandidate {
+            path: dir.join(file),
+            shown,
+        }
+    }
+}
+
+/// Locate the repository without opening it — opening is what fails when the
+/// config will not parse, so the location has to come from the discovery walk
+/// alone.
+fn repository_directories() -> Option<RepositoryDirs> {
+    // `setup_git_directory_gently_1()` reads `$GIT_DIR` before it walks anywhere
+    // and returns `GIT_DIR_EXPLICIT` when it is set, so the variable short-circuits
+    // discovery entirely.
+    let (git_dir, work_tree, explicit) = match std::env::var_os("GIT_DIR") {
+        Some(dir) => {
+            let git_dir = PathBuf::from(dir);
+            if !git_dir.is_dir() {
+                return None;
+            }
+            let work_tree = std::env::var_os("GIT_WORK_TREE").map(PathBuf::from);
+            (git_dir, work_tree, true)
+        }
+        None => {
+            let (path, _trust) = gix::discover::upwards(std::path::Path::new(".")).ok()?;
+            let (git_dir, work_tree) = path.into_repository_and_work_tree_directories();
+            (git_dir, work_tree, false)
+        }
+    };
+    // `get_common_dir()`: `$GIT_COMMON_DIR`, else a `commondir` file inside
+    // `$GIT_DIR` redirecting the shared half of the repository elsewhere, which is
+    // how a linked worktree is wired up. The file's content is a path, relative to
+    // `$GIT_DIR` unless absolute; git's message shows it resolved, so a
+    // `worktrees/<name>/../..` round trip is normalised away rather than printed.
+    let common_dir = match std::env::var_os("GIT_COMMON_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::fs::read_to_string(git_dir.join("commondir")) {
+            Ok(text) => {
+                let trimmed = text.trim_end_matches(['\n', '\r']);
+                let candidate = PathBuf::from(trimmed);
+                if trimmed.is_empty() {
+                    git_dir.clone()
+                } else if candidate.is_absolute() {
+                    candidate
+                } else {
+                    normalize_lexically(&git_dir.join(candidate))
+                }
+            }
+            Err(_) => git_dir.clone(),
+        },
+    };
+    Some(RepositoryDirs {
+        git_dir,
+        common_dir,
+        work_tree,
+        explicit,
+    })
+}
+
+/// Collapse `.` and `x/..` in a path without touching the filesystem, the way
+/// `strbuf_normalize_path()` does — a linked worktree's `commondir` says `../..`
+/// and git prints the collapsed result, not the round trip.
+fn normalize_lexically(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Only a real directory name may be popped; `../..` at the front
+                // of a relative path has to stay.
+                if out.components().next_back().is_some_and(|c| matches!(c, Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `extensions.worktreeConfig` is on, read straight out of the
+/// repository config file.
+///
+/// It has to be read from the file rather than from a snapshot for the same
+/// reason the rest of this section exists: the snapshot is what failed. The read
+/// is deliberately forgiving — a file that will not parse never gets here,
+/// because the caller checks it first.
+fn worktree_config_enabled(config_path: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(config_path) else {
+        return false;
+    };
+    let Ok(file) = gix::config::File::from_bytes_no_includes(
+        &bytes,
+        gix::config::file::Metadata::from(gix::config::Source::Local),
+        Default::default(),
+    ) else {
+        return false;
+    };
+    matches!(file.boolean("extensions.worktreeConfig"), Ok(Some(true)))
+}
+
+/// How git's setup would have reported a repository this port could not open
+/// because of its *configuration*, or `None` when the failure is not one of the
+/// three that reach a user in git's own words.
+///
+/// The three are all raised by `read_and_verify_repository_format()`
+/// (setup.c:751-816) reading `$GIT_COMMON_DIR/config` and handing the result to
+/// `verify_repository_format()` (setup.c:888-925):
+///
+/// ```c
+/// if (GIT_REPO_VERSION_READ < format->version) {
+///         strbuf_addf(err, _("Expected git repo version <= %d, found %d"),
+///                     GIT_REPO_VERSION_READ, format->version);
+///         return -1;
+/// }
+/// ...
+/// if (format->version == 0 && format->v1_only_extensions.nr) {
+///         strbuf_addstr(err,
+///                       Q_("repo version is 0, but v1-only extension found:",
+///                          "repo version is 0, but v1-only extensions found:",
+///                          format->v1_only_extensions.nr));
+///
+///         for (i = 0; i < format->v1_only_extensions.nr; i++)
+///                 strbuf_addf(err, "\n\t%s",
+///                             format->v1_only_extensions.items[i].string);
+///         return -1;
+/// }
+/// ```
+///
+/// Each offender is appended as `"\n\t%s"`, so the message is two lines, and
+/// `read_repository_format()` (setup.c:866-876) reads **only that one file** —
+/// which is why `-c extensions.objectFormat=sha256` is accepted by both git and
+/// this port while the same key in `.git/config` is refused by both. Measured
+/// against git 2.55.0.
+pub fn repository_format_message(err: &gix::config::Error) -> Option<String> {
+    use gix::config::Error as E;
+    match err {
+        // `handle_extension()` (setup.c:653-716) classifies `objectformat` as
+        // v1-only, and `check_repo_format()` (setup.c:718-749) appends the
+        // extension's *suffix* — already lower-cased by the config parser — to
+        // `v1_only_extensions`.
+        E::ObjectFormatRequiresV1 => {
+            Some("repo version is 0, but v1-only extension found:\n\tobjectformat".to_owned())
+        }
+        // `GIT_REPO_VERSION_READ` is 1.
+        E::UnsupportedRepositoryFormatVersion { version } => {
+            Some(format!("Expected git repo version <= 1, found {version}"))
+        }
+        _ => None,
+    }
+}
+
+/// The `fatal:` line git would have printed for a repository this port failed to
+/// open, searched for anywhere in an `anyhow` chain.
+///
+/// Two failures reach here and neither is this port's to describe in its own
+/// voice: a configuration file that will not parse (which git reports from the
+/// reader, [`bad_config_line`]) and a repository format the build cannot honour
+/// ([`repository_format_message`]). Everything else keeps the `zvcs: <verb>: …`
+/// prefix that marks it as this binary speaking for itself.
+pub fn setup_fatal(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(|cause| {
+        if let Some(open) = cause.downcast_ref::<gix::open::Error>() {
+            return open_error_message(open);
+        }
+        if let Some(discover) = cause.downcast_ref::<gix::discover::Error>() {
+            return match discover {
+                gix::discover::Error::Open(open) => open_error_message(open),
+                gix::discover::Error::Discover(_) => None,
+            };
+        }
+        if is_gitmodules_failure(cause) {
+            return gitmodules_message();
+        }
+        cause.downcast_ref::<gix::config::Error>().and_then(config_error_message)
+    })
+}
+
+/// `bad config line <n> in file <path>` for the worktree's `.gitmodules`.
+///
+/// `config_from_gitmodules()` (submodule-config.c:784-814) reads the on-disk file
+/// through `git_config_from_file_with_options(fn, config_source->file, data,
+/// scope, NULL)` — `NULL` options, so the per-source `CONFIG_ERROR_DIE` applies
+/// and a malformed `.gitmodules` is as fatal as a malformed `.git/config`. The
+/// only tolerance in that file is `repo_read_gitmodules()`'s unmerged-index guard
+/// (submodule-config.c:840); the `CONFIG_ERROR_SILENT` that does swallow a parse
+/// failure lives in `fsck_blob()` (fsck.c:1212), which reports
+/// `gitmodulesParse` itself instead. So the file is tolerated only by *not being
+/// read* — see [`gix::status::index_worktree::BuiltinSubmoduleStatus`].
+///
+/// The path is absolute because `repo_worktree_path(repo, GITMODULES_FILE)`
+/// builds it from the worktree root. Measured against git 2.55.0.
+/// Whether this link in the chain is one of the errors that can only come from
+/// reading `.gitmodules`.
+///
+/// The types below are the *outermost* wrappers, and they have to be, because
+/// everything under them is `#[error(transparent)]` — and `transparent` forwards
+/// `source()` as well as `Display`, so each inner layer is skipped entirely and
+/// the `gix_config::parse::Error` at the bottom never appears in the chain at
+/// all. `gix::submodule::modules::Error` is what `Repository::submodules()`
+/// returns, and `gix_status::index_as_worktree::Error::SubmoduleStatus` is the
+/// (non-transparent) wrapper the index-versus-worktree walk puts around it.
+fn is_gitmodules_failure(cause: &(dyn std::error::Error + 'static)) -> bool {
+    if cause.downcast_ref::<gix::submodule::modules::Error>().is_some()
+        || cause.downcast_ref::<gix::submodule::open_modules_file::Error>().is_some()
+    {
+        return true;
+    }
+    // The index-versus-worktree walk boxes the submodule error and every layer
+    // above it is transparent, so this is the one nameable type left in the chain
+    // that says the failure came from reading `.gitmodules`.
+    matches!(
+        cause.downcast_ref::<gix::status::index_worktree::submodule_status::Error>(),
+        Some(gix::status::index_worktree::submodule_status::Error::Modules(_))
+    )
+}
+
+/// `bad config line <n> in file <path>` for the worktree's `.gitmodules`, or
+/// `None` when that file parses after all.
+///
+/// The file is re-read rather than described from the error, for the same reason
+/// as [`first_unparsable_config_file`]: the surviving error carries a line but
+/// not a path, and re-parsing gives both from the one file git would have named.
+fn gitmodules_message() -> Option<String> {
+    let dirs = repository_directories()?;
+    let path = crate::setup::realpath(&dirs.work_tree?).join(".gitmodules");
+    let bytes = std::fs::read(&path).ok()?;
+    let err = gix::config::parse::Events::from_bytes(&bytes, None).err()?;
+    Some(format!(
+        "bad config line {} in file {}",
+        err.line_number(),
+        path.display()
+    ))
+}
+
+/// [`setup_fatal`] for one `gix::open::Error`.
+fn open_error_message(err: &gix::open::Error) -> Option<String> {
+    match err {
+        gix::open::Error::Config(config) => config_error_message(config),
+        _ => None,
+    }
+}
+
+/// [`setup_fatal`] for one `gix::config::Error`.
+///
+/// A parse failure arrives here with no file attached, so the file is found by
+/// re-walking the sequence. Both scopes are searched, global first, because that
+/// is the order git reads them in and therefore the order it would have died in.
+fn config_error_message(err: &gix::config::Error) -> Option<String> {
+    use gix::config::Error as E;
+    match err {
+        E::Init(_) | E::ResolveIncludes(_) | E::Span(_) | E::ConfigValue(_) => {
+            bad_config_line(ConfigScopes::EarlyGlobal, GitDirNaming::AsDiscovered)
+                .or_else(|| bad_config_line(ConfigScopes::Repository, GitDirNaming::AsDiscovered))
+        }
+        other => repository_format_message(other),
+    }
+}

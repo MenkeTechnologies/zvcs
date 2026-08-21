@@ -374,6 +374,28 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
 /// `start`, `stripspace` refuses `-s` but not a bare run — are absent rather than
 /// guessed at, so this gate under-matches git rather than refusing something git
 /// would run.
+/// The entries of [`REPO_SETTINGS_VERBS`] that reach the settings block and
+/// **not** `git_default_config()`.
+///
+/// The two gates are usually reached together, which is why one list drives
+/// both — but not always. `prune`, `prune-packed` and `mktree` are `RUN_SETUP`
+/// entries whose builtins contain no `git_config()` call at all: the setup they
+/// get reads the repository format and the index (which is where the settings
+/// block comes from), and nothing ever runs the default callback. Measured
+/// against git 2.55.0 in a repository with one commit:
+///
+/// ```text
+/// $ git -c core.abbrev=bogus prune-packed          rc=0
+/// $ git -c core.createObject=bogus prune-packed    rc=0
+/// $ git -c core.checkstat=bogus prune-packed       rc=0
+/// $ git -c index.version=bogus prune-packed        fatal: bad numeric config value 'bogus' …
+/// ```
+///
+/// The same three answers hold for `prune` and `mktree`. Before this list, a
+/// valueless `[core]` / `abbrev` in a system config file made `git prune-packed`
+/// die at 128 where git prunes and exits 0 — the port refusing work git performs.
+const SETTINGS_ONLY_VERBS: &[&str] = &["mktree", "prune", "prune-packed"];
+
 const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "branch",
     "check-mailmap",
@@ -387,6 +409,16 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "hook",
     "index-pack",
     "init",
+    // `init-db` is `init` under its historical name and runs the same
+    // `cmd_init_db()`, so it reads the same configuration. Measured against git
+    // 2.55.0 in an existing repository: `git -c core.abbrev=bogus init-db`,
+    // `-c core.createObject=bogus` and `-c core.checkstat=bogus` each refuse it
+    // at 128, and a valueless `[core]` / `abbrev` in a config *file* gives
+    // `error: missing value for 'core.abbrev'` followed by
+    // `fatal: bad config variable 'core.abbrev' in file '<f>' at line 2`.
+    // Without this the port re-initialised the repository — a mutation git
+    // refuses to make.
+    "init-db",
     "interpret-trailers",
     "mailinfo",
     "mktag",
@@ -803,6 +835,124 @@ fn queueing_would_swallow_work() -> bool {
     superset::zppid::git_ancestor().unwrap_or(true)
 }
 
+/// The verbs that keep running with a `.git/config` git's parser would refuse.
+///
+/// git's repository config is read by the dispatcher, not the builtin, so the
+/// list is not "which commands call `git_config()`" but "which `commands[]`
+/// entries have neither `RUN_SETUP` nor `RUN_SETUP_GENTLY` *and* never reach a
+/// config read on their own". Measured against git 2.55.0 in a repository whose
+/// `.git/config` ends in `[]` — these exit 0, everything else measured exits 128
+/// with `fatal: bad config line 8 in file .git/config`:
+///
+/// ```text
+/// version   stripspace   url-parse http://x   credential-cache exit   mailsplit -o.
+/// ```
+///
+/// A second group belongs here for a different reason: `check-ref-format`,
+/// `clone`, `get-tar-commit-id`, `remote-ext`, `remote-fd` and `verify-pack` do
+/// read configuration, but they read it *themselves*, after their own usage
+/// check — so bare they answer 129 (or their own fatal) where a `RUN_SETUP` verb
+/// would already have died at 128, and given real arguments they die at 128
+/// after their command has started. `git clone . dest` prints `Cloning into
+/// '…'` first and only then the config refusal. Gating them in the dispatcher
+/// would move the diagnostic ahead of output git puts before it; they reach the
+/// same message through the error path in `lib.rs` instead.
+///
+/// `help` is handled separately below, because it splits on its arguments.
+const CONFIG_GATE_EXEMPT_VERBS: &[&str] = &[
+    "check-ref-format",
+    "clone",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
+    "get-tar-commit-id",
+    "mailsplit",
+    "remote-ext",
+    "remote-fd",
+    "stripspace",
+    "url-parse",
+    "verify-pack",
+    "version",
+];
+
+/// `git help` reads configuration only for the forms that consult the command
+/// tables or a manual page. Measured against git 2.55.0 under the same malformed
+/// `.git/config`: bare `git help` and `git help -g` exit 0, while `git help -a`,
+/// `git help --all` and `git help <verb>` exit 128 — and `git <verb> --help` is
+/// rewritten to the last of those, so it dies too.
+fn help_reads_config(args: &[String]) -> bool {
+    !(args.is_empty() || args == ["-g"] || args == ["--guides"])
+}
+
+/// The verbs that answer without ever opening the repository through the path
+/// that would surface a repository-format refusal, and therefore need
+/// `read_and_verify_repository_format()` reproduced for them explicitly.
+///
+/// Every other verb opens the repository and gets the same message through the
+/// error path in `lib.rs` — `gix` raises `ObjectFormatRequiresV1` and
+/// `UnsupportedRepositoryFormatVersion` from its own open, which
+/// [`crate::config::repository_format_message`] renders in git's words. These
+/// three do not: `init`/`init-db` create rather than open, and `rev-parse`
+/// answers `--git-dir` and friends off the discovery walk alone. git checks the
+/// format for all of them — `cmd_init_db()` through its own
+/// `check_and_apply_repository_format()`, `rev-parse` through
+/// `setup_git_directory()` — so the check has to happen before they run.
+/// Measured against git 2.55.0 with `extensions.objectFormat = sha256` at
+/// `core.repositoryFormatVersion = 0`: all three exit 128 with
+/// `fatal: repo version is 0, but v1-only extension found:\n\tobjectformat`.
+const REPO_FORMAT_GATE_VERBS: &[&str] = &["init", "init-db", "rev-parse"];
+
+/// `read_and_verify_repository_format()` for the handful of verbs that would
+/// otherwise never reach it, or `None` to carry on.
+///
+/// The verdict is `gix`'s own — the same open that every other verb performs —
+/// so this adds no refusal that was not already reachable; it only moves the one
+/// that exists to the moment git makes it. `rev-parse --parseopt` and
+/// `--sq-quote` are handled before `setup_git_directory()` in
+/// `builtin/rev-parse.c` and so skip it, exactly as they skip the settings block.
+fn repository_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
+    if !REPO_FORMAT_GATE_VERBS.contains(&sub) {
+        return None;
+    }
+    if sub == "rev-parse" && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote") {
+        return None;
+    }
+    let err = gix::discover(".").err()?;
+    let gix::discover::Error::Open(gix::open::Error::Config(config)) = &err else {
+        return None;
+    };
+    let msg = crate::config::repository_format_message(config)?;
+    crate::trace2::error(&msg);
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
+/// `fatal: bad config line <n> in file <path>` for the repository's own config
+/// files, or `None` to carry on.
+///
+/// Returns the exit code to leave with. The diagnostic is written here rather
+/// than returned as an error because it is not the command's — `run_builtin()`
+/// dies with it before the command exists.
+fn config_file_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
+    if CONFIG_GATE_EXEMPT_VERBS.contains(&sub) {
+        return None;
+    }
+    if sub == "help" && !help_reads_config(args) {
+        return None;
+    }
+    // `cmd_init_db()` resolves the directory for itself and calls
+    // `set_git_dir(real_path(…))` instead of using the setup that leaves the
+    // relative `.git` behind, so its message names the absolute path.
+    let naming = match sub {
+        "init" | "init-db" => crate::config::GitDirNaming::Absolute,
+        _ => crate::config::GitDirNaming::AsDiscovered,
+    };
+    let msg = crate::config::bad_config_line(crate::config::ConfigScopes::Repository, naming)?;
+    crate::trace2::error(&msg);
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // Fleet command log: record this invocation when `git zcommands` has turned
     // logging on. A single `stat` (no work) when it is off, so the hot path pays
@@ -833,6 +983,27 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // including the before-only case, whose advice has already run by then.
     if let Some(result) = superset::intercepts::maybe_intercept(sub, args) {
         return result;
+    }
+
+    // The repository half of `do_git_config_sequence()`. `run_builtin()`
+    // (git.c:479-491) runs `setup_git_directory()` and then `check_pager_config()`
+    // — which is `read_early_config()`, the whole system→XDG→user→repo→worktree
+    // sequence — *before* it calls the builtin's own `fn`. So a `.git/config` that
+    // will not parse refuses the command in the dispatcher, ahead of its
+    // parse-options usage error, ahead of `-h`, and ahead of the work-tree gate
+    // below. That ordering is the whole of defect (2): `git merge-index` with a
+    // malformed config must die at 128 rather than print its usage at 129, and
+    // `cmd_merge_index()` (builtin/merge-index.c:81-131) contains no config call
+    // at all — the read is entirely the dispatcher's.
+    //
+    // The global scopes were already checked before any argument was looked at
+    // (see `run_command` in `lib.rs`); this is only the two files that need a
+    // repository to name.
+    if let Some(code) = config_file_gate(sub, args) {
+        return Ok(code);
+    }
+    if let Some(code) = repository_format_gate(sub, args) {
+        return Ok(code);
     }
 
     // `handle_builtin()` (git.c): `git <cmd> --help` is rewritten to
@@ -906,6 +1077,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // not for `core.packedGitLimit`.
     let in_default_config = !config_help_skip
         && (REPO_SETTINGS_VERBS.contains(&sub) || DEFAULT_CONFIG_EXTRA_VERBS.contains(&sub))
+        && !SETTINGS_ONLY_VERBS.contains(&sub)
         && !rev_parse_no_setup;
     let in_parallel_checkout = !help_only && updates_worktree(sub, args);
     if in_repo_settings || in_default_config || in_parallel_checkout {

@@ -207,11 +207,25 @@ pub struct BuiltinSubmoduleStatus {
     repo: crate::ThreadSafeRepository,
     #[cfg(not(feature = "parallel"))]
     git_dir: std::path::PathBuf,
-    submodule_paths: Vec<BString>,
+    /// The submodule paths `.gitmodules` declares, read on first use.
+    ///
+    /// `None` means "not read yet", which is git's state until something asks.
+    /// `repo_read_gitmodules()` (submodule-config.c:830-844) is called lazily
+    /// from the submodule lookups, and in the index-versus-worktree walk the only
+    /// caller is `is_submodule_ignored()` on a **gitlink** entry
+    /// (`diff_queue_change()` / `diff_queue_addremove()`). A tree with no gitlink
+    /// therefore never opens `.gitmodules` at all — which is why a malformed one
+    /// is invisible to `git diff-files` and `git status` in a repository with no
+    /// submodules, and fatal in one that has them. Both measured against git
+    /// 2.55.0 with `[core "a" b]` as the whole of `.gitmodules`: `diff-files`,
+    /// `status`, `diff` and `submodule status` exit 0 with no submodule in the
+    /// index, and exit 128 with `fatal: bad config line 1 in file
+    /// <abs>/.gitmodules` once one is added.
+    submodule_paths: Option<Vec<BString>>,
 }
 
 ///
-mod submodule_status {
+pub mod submodule_status {
     use crate::config::cache::util::ApplyLeniency;
     use crate::{
         bstr,
@@ -222,27 +236,25 @@ mod submodule_status {
 
     impl BuiltinSubmoduleStatus {
         /// Create a new instance from a `repo` and a `mode` to control how the submodule status will be obtained.
+        ///
+        /// `.gitmodules` is *not* read here: git reaches it only from a gitlink
+        /// entry, so the read is deferred to the first [`status()`][Self::status]
+        /// call. Reading it up front made a malformed `.gitmodules` abort every
+        /// command that walks the index — `git diff-files` in a repository with
+        /// no submodules at all — where git never opens the file.
         pub fn new(
             repo: crate::ThreadSafeRepository,
             mode: Submodule,
         ) -> Result<Self, crate::submodule::modules::Error> {
+            #[cfg(not(feature = "parallel"))]
             let local_repo = repo.to_thread_local();
-            let submodule_paths = match local_repo.submodules() {
-                Ok(Some(sm)) => {
-                    let mut v: Vec<_> = sm.filter_map(|sm| sm.path().ok()).collect();
-                    v.sort();
-                    v
-                }
-                Ok(None) => Vec::new(),
-                Err(err) => return Err(err),
-            };
             Ok(Self {
                 mode,
                 #[cfg(feature = "parallel")]
                 repo,
                 #[cfg(not(feature = "parallel"))]
                 git_dir: local_repo.git_dir().to_owned(),
-                submodule_paths,
+                submodule_paths: None,
             })
         }
     }
@@ -250,12 +262,19 @@ mod submodule_status {
     /// The error returned submodule status checks.
     #[derive(Debug, thiserror::Error)]
     pub enum Error {
+        /// The submodule's own worktree status could not be computed.
         #[error(transparent)]
         SubmoduleStatus(#[from] crate::submodule::status::Error),
+        /// The submodule's `ignore` setting could not be read.
         #[error(transparent)]
         IgnoreConfig(#[from] crate::submodule::config::Error),
+        /// `diff.ignoreSubmodules` could not be read.
         #[error(transparent)]
         DiffSubmoduleIgnoreConfig(#[from] config::key::GenericErrorWithValue),
+        /// `.gitmodules` could not be read or parsed, raised at the first gitlink
+        /// entry rather than up front — see [`BuiltinSubmoduleStatus::new()`].
+        #[error(transparent)]
+        Modules(#[from] crate::submodule::modules::Error),
     }
 
     impl gix_status::index_as_worktree::traits::SubmoduleStatus for BuiltinSubmoduleStatus {
@@ -264,19 +283,29 @@ mod submodule_status {
 
         fn status(&mut self, _entry: &gix_index::Entry, rela_path: &BStr) -> Result<Option<Self::Output>, Self::Error> {
             use bstr::ByteSlice;
-            if self
-                .submodule_paths
-                .binary_search_by(|path| path.as_bstr().cmp(rela_path))
-                .is_err()
-            {
-                return Ok(None);
-            }
             #[cfg(feature = "parallel")]
             let repo = self.repo.to_thread_local();
             #[cfg(not(feature = "parallel"))]
             let Ok(repo) = crate::open(&self.git_dir) else {
                 return Ok(None);
             };
+            // The lazy `repo_read_gitmodules()`: this is the first gitlink the
+            // walk has reached, which is the only thing that makes git open the
+            // file, and a parse failure here is the caller's to report.
+            let known = match &mut self.submodule_paths {
+                Some(paths) => paths,
+                slot => slot.insert(match repo.submodules()? {
+                    Some(sm) => {
+                        let mut v: Vec<_> = sm.filter_map(|sm| sm.path().ok()).collect();
+                        v.sort();
+                        v
+                    }
+                    None => Vec::new(),
+                }),
+            };
+            if known.binary_search_by(|path| path.as_bstr().cmp(rela_path)).is_err() {
+                return Ok(None);
+            }
             let Ok(Some(mut submodules)) = repo.submodules() else {
                 return Ok(None);
             };

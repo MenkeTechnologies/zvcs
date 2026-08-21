@@ -3826,11 +3826,33 @@ fn persist(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
 
 /// Every submodule declared in `.gitmodules`, or an empty list when the file is
 /// absent (git treats that as "no mappings", then dies per gitlink entry).
+///
+/// A superproject whose index holds no gitlink does not read the file at all.
+/// `repo_read_gitmodules()` (submodule-config.c:830-844) is lazy, and everything
+/// that triggers it here — `module_list_compute()`'s loop body,
+/// `submodule_from_path()` — runs once per gitlink, so with no gitlink there is
+/// nothing to look up and the file is never opened. That is observable, because
+/// reading it is fatal when it will not parse: measured against git 2.55.0 with
+/// `[core "a" b]` as the whole of `.gitmodules`, `git submodule status` exits 0
+/// in a superproject with no gitlink in its index and exits 128 with
+/// `fatal: bad config line 1 in file <abs>/.gitmodules` once one is added.
 fn submodules(repo: &gix::Repository) -> Result<Vec<gix::Submodule<'_>>> {
+    if !index_holds_a_gitlink(repo) {
+        return Ok(Vec::new());
+    }
     Ok(match repo.submodules()? {
         Some(iter) => iter.collect(),
         None => Vec::new(),
     })
+}
+
+/// Whether the index holds any gitlink entry — the condition under which git
+/// ever looks a submodule up by path, and therefore ever opens `.gitmodules`.
+fn index_holds_a_gitlink(repo: &gix::Repository) -> bool {
+    let Ok(index) = repo.index_or_empty() else {
+        return false;
+    };
+    index.entries().iter().any(|e| e.mode.is_submodule())
 }
 
 /// The declaration whose `path` field names `path`, if any.

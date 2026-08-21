@@ -533,6 +533,24 @@ pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Optio
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
 /// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
 fn run_command(argv: &[String]) -> ExitCode {
+    // `init_git()` (common-init.c:53-83) runs before `cmd_main()` ever sees the
+    // command line, and one of the things it runs is `trace2_initialize()`, whose
+    // `tr2_sysenv_load()` calls `read_very_early_config()`. That reads the system,
+    // XDG and user config files — with `CONFIG_ERROR_DIE` per file, like the whole
+    // sequence — so a malformed one of *those* three kills the invocation before a
+    // single argument has been looked at. Measured against git 2.55.0 with `[]` in
+    // `~/.gitconfig`: `git --version`, `git --exec-path`, `git --html-path`,
+    // `git --man-path`, `git --help`, `git version`, `git help`, `git stripspace`
+    // and an unknown verb all print `fatal: bad config line 1 in file <path>` and
+    // exit 128. So this precedes `handle_options`, exactly as `init_git` precedes
+    // `cmd_main`. The repository half of the sequence is a separate, later gate —
+    // see `dispatch::run` and `config::ConfigScopes`.
+    if let Some(msg) = config::bad_config_line(config::ConfigScopes::EarlyGlobal, config::GitDirNaming::AsDiscovered) {
+        trace2::error(&msg);
+        eprintln!("fatal: {msg}");
+        return ExitCode::from(fatal::EXIT_FATAL);
+    }
+
     // Dashed invocation: run as `git-<verb>` (a symlink in `~/.zvcs/bin`, or any
     // `git-*` on PATH) and git dispatches `<verb>` — git.c strips the `git-` prefix
     // from argv[0]. We fold it in by prepending the verb to the argument list;
@@ -777,6 +795,19 @@ fn run_command(argv: &[String]) -> ExitCode {
         // `archive --remote`, and `rev-parse --parseopt` never ask.
         Err(e) if fatal::discovery_fatal(&e).is_some() => {
             let msg = fatal::discovery_fatal(&e).expect("checked");
+            trace2::error(&msg);
+            eprintln!("fatal: {msg}");
+            ExitCode::from(fatal::EXIT_FATAL)
+        }
+        // The other half of setup: the repository was found but its configuration
+        // could not be used. git raises these from the config reader and from
+        // `read_and_verify_repository_format()` (setup.c:751-816), both of which
+        // `die()`, so they are git's words at 128 and not this port's at 1. The
+        // gates above catch them before the command runs for the verbs that git
+        // gates; this arm is what covers a command that opens a *second*
+        // repository — a submodule, a worktree, a clone source — mid-run.
+        Err(e) if config::setup_fatal(&e).is_some() => {
+            let msg = config::setup_fatal(&e).expect("checked");
             trace2::error(&msg);
             eprintln!("fatal: {msg}");
             ExitCode::from(fatal::EXIT_FATAL)

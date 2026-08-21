@@ -7,9 +7,48 @@
 //! Determinism is a hard requirement — a parity failure nobody can reproduce is
 //! not actionable. Every case is a pure function of `(seed, index)`, so a failing
 //! run replays exactly from the seed printed in its report.
+//!
+//! # What a configuration draw costs
+//!
+//! Configuration used to be one dimension with one delivery mechanism: a key, a
+//! value, and `-c`. It is now two — *which keys* and *which scope each one comes
+//! from* — and the scope half means some draws write files into the fixture. That
+//! is the only new cost in this file, and it is worth stating what it is before
+//! reading the sampler that spends it.
+//!
+//! **The price.** A draw that lands on a file scope costs one `open`/`write`/
+//! `close` of a few hundred bytes, per side, per case, into a directory tree the
+//! runner has just created and deletes when the case ends. At most five such
+//! writes — one per file scope — and none at all for a draw that stays on `-c`
+//! or on `GIT_CONFIG_KEY_<n>`, which is most of them. No extra child process, no
+//! extra fixture template, no extra comparison, and not one more case in the
+//! parity denominator: a scoped case is the same single invocation it was, read
+//! under a premise that was put in place before it ran.
+//!
+//! **Why this is the cheap shape.** The two alternatives are both more
+//! expensive, and the first is also wrong:
+//!
+//!  * *Install each key by running `git config --file …` first.* One child
+//!    process per key per side, and on the zvcs side it is the **implementation
+//!    under test** writing the premise. A port with a broken config writer would
+//!    corrupt its own premise, and the case would then be measuring the writer
+//!    twice instead of measuring the key once — which is the one thing a
+//!    differential harness must never do. Writing the bytes from Rust means both
+//!    sides start from a file this crate produced, byte for byte.
+//!  * *A fixture template per scope.* Twenty-two shapes crossed with the scope
+//!    combinations, built at start-up and hashed, so that a four-line text file
+//!    could exist. The premise is smaller than the machinery.
+//!
+//! The two sides live at different roots, which is the problem [`Case::cwd`] and
+//! [`crate::runner::REPO_PLACEHOLDER`] already solve for directories and
+//! environment values; the file scopes solve it the same way, by naming a path
+//! *relative to the side's own fixture root* and letting the runner resolve it
+//! per side ([`crate::runner::scope_file`]). A case names a scope and never a
+//! path, which is also what keeps the two synthetic scopes compatible with the
+//! hardened environment — see [`crate::runner::ConfigScope`].
 
 use crate::fixture::Shape;
-use crate::runner::{Case, Sequence};
+use crate::runner::{Case, ConfigEntry, ConfigScope, Sequence};
 
 /// xorshift64*. Chosen for being reproducible and dependency-free rather than
 /// statistically excellent — case selection does not need cryptographic quality.
@@ -205,6 +244,568 @@ const CONFIG_EDGE_VALUES: &[&str] = &[
     "", " ", "auto", "abc", "-1", "0", "1", "999999999", "99999999999999999999999999",
     "true", "false", "yes", "no", "on", "off", "none", "\t", "=", "%H",
 ];
+
+// ---------------------------------------------------------------------------
+// Configuration: interacting key sets
+// ---------------------------------------------------------------------------
+
+/// Shared value pools for the key sets below, so a key that takes a colour and
+/// a key that takes an expiry do not both end up drawing from one generic list.
+///
+/// Each is spelled with the forms git's own parser distinguishes rather than
+/// with representatives: `never`/`always`/`auto` are three *different* branches
+/// of `git_config_colorbool`, and a pool holding only `true`/`false` would
+/// measure the bool branch three times and the colour branches never.
+const COLORBOOL: &[&str] = &["auto", "always", "never", "true", "false", "no", "bogus", ""];
+/// Colour specifications, including the ones that are not.
+const COLOR: &[&str] =
+    &["red", "bold blue", "normal", "reverse", "black green", "#ff0000", "12", "256", "bogus", ""];
+/// Integers, including the two that are not integers and the one that overflows.
+const INT: &[&str] =
+    &["0", "1", "2", "3", "-1", "7", "40", "1000", "99999999999999999999999999", "abc", ""];
+/// Expiry dates. `never` and `now` are special-cased before `approxidate` runs,
+/// and `all`/`false`/`bogus` are rejected — three different outcomes from one
+/// parser.
+const EXPIRY: &[&str] =
+    &["never", "now", "2.weeks.ago", "1.day.ago", "all", "bogus", "", "false", "3.months.ago"];
+/// Byte sizes, which git parses with a `k`/`m`/`g` suffix.
+const SIZE: &[&str] = &["0", "1", "16k", "2m", "1g", "512", "-1", "bogus", ""];
+
+/// A set of configuration keys that only matter **together**.
+///
+/// The single-key sampler could never reach an interaction, and interactions are
+/// where a port's configuration handling actually breaks: reading `diff.renames`
+/// correctly and ignoring `diff.renameLimit` produces the right answer on every
+/// case that sets one of them. Each group below is a set of keys that one
+/// decision reads, so drawing two or three of them at once is what puts the
+/// decision under test rather than the parse.
+///
+/// Two sources fed this table, and both are cited per group: git's own
+/// documented interactions, and — more usefully — which keys each config
+/// callback in `src/extensions/src/{default_config,diff_config,status_config,
+/// log_config,cmd_config}.rs` reads *in one arm or under one guard*. The second
+/// source names interactions no documentation states: `status_config.rs:208-225`
+/// parses `diff.renameLimit` only while `st.rename_limit` is still `-1`, so a
+/// preceding `status.renameLimit` makes a later garbage `diff.renameLimit`
+/// silently acceptable — a two-key fact that no one-key draw can express.
+struct ConfigGroup {
+    /// Slug for the test that asserts the table is well formed. Not rendered
+    /// into a case id: the id names the keys that were actually drawn, which is
+    /// what a reader needs, and a group name would be one more token that does
+    /// not narrow anything — which is also why the field is read only by
+    /// `cargo test`, and says so rather than being silently warned about.
+    #[allow(dead_code)]
+    name: &'static str,
+    keys: &'static [(&'static str, &'static [&'static str])],
+}
+
+/// The interacting sets.
+///
+/// A key may appear in more than one group; that is not duplication, it is the
+/// point. `core.abbrev` interacts with `log.abbrevCommit` in one decision and
+/// with `core.disambiguate` in another, and a table that listed it once would
+/// have to pick which of the two interactions to leave unmeasured.
+const CONFIG_GROUPS: &[ConfigGroup] = &[
+    // `core.eol` is only consulted for a file `core.autocrlf` did not already
+    // decide, and `core.safecrlf` decides whether an irreversible conversion is
+    // a warning or a refusal — three keys, one conversion. The port validates
+    // all three independently and leaves `core.eol`'s arm empty
+    // (`default_config.rs:350`, `:355`, `:364`), so any disagreement here is a
+    // disagreement about the conversion rather than about the parse.
+    ConfigGroup {
+        name: "crlf",
+        keys: &[
+            ("core.autocrlf", &["true", "false", "input"]),
+            ("core.eol", &["lf", "crlf", "native", "bogus"]),
+            ("core.safecrlf", &["true", "false", "warn"]),
+            ("core.checkRoundtripEncoding", &["SHIFT-JIS", "UTF-16", "bogus", ""]),
+            ("core.filemode", BOOLS),
+        ],
+    },
+    // The four prefix keys are read as four independent strings/bools
+    // (`diff_config.rs:189-201`) and resolved against each other only when a
+    // diff is actually rendered: `diff.noprefix` wins over an explicit
+    // `diff.srcPrefix`, and `diff.mnemonicPrefix` replaces both with a letter
+    // that depends on which side of the comparison a file is. `format.noprefix`
+    // is the fifth, with its own refusal path (`log_config.rs:164-173`).
+    ConfigGroup {
+        name: "diff-prefix",
+        keys: &[
+            ("diff.noprefix", BOOLS),
+            ("diff.srcPrefix", &["a/", "src/", "", "x", "a b/"]),
+            ("diff.dstPrefix", &["b/", "dst/", "", "y", "c d/"]),
+            ("diff.mnemonicPrefix", BOOLS),
+            ("format.noprefix", BOOLS),
+            ("diff.relative", &["true", "false", "src/", "no/such/"]),
+        ],
+    },
+    // `color.ui` decides whether the per-command keys are consulted at all, and
+    // a per-command key decides whether its slots are. The slot tables return
+    // *before* the value is parsed for a slot they do not know
+    // (`diff_config.rs:283-289`, `status_config.rs:229-235`), so a bad colour is
+    // only reachable by pairing a real slot with it — and `color.grep`'s table is
+    // the exception that rejects the unknown slot itself
+    // (`cmd_config.rs:183-189`). Both halves need two keys to reach.
+    ConfigGroup {
+        name: "color-cascade",
+        keys: &[
+            ("color.ui", COLORBOOL),
+            ("color.diff", COLORBOOL),
+            ("diff.color", COLORBOOL),
+            ("color.status", COLORBOOL),
+            ("color.branch", COLORBOOL),
+            ("color.grep", COLORBOOL),
+            ("color.diff.meta", COLOR),
+            ("color.diff.frag", COLOR),
+            ("color.diff.whitespace", COLOR),
+            ("color.status.header", COLOR),
+            ("color.status.bogusSlot", COLOR),
+            ("color.grep.filename", COLOR),
+            ("color.grep.bogusSlot", COLOR),
+            ("color.decorate.branch", COLOR),
+            ("color.advice.hint", COLOR),
+        ],
+    },
+    // `--short` output has no branch header unless `status.branch` asks for one,
+    // and `status.aheadBehind` decides whether that header costs a revision walk.
+    // The port reads all four out of one bool arm (`status_config.rs:166-173`),
+    // which is exactly why a one-key draw cannot tell a port that honours the
+    // combination from one that honours each key alone.
+    ConfigGroup {
+        name: "status-render",
+        keys: &[
+            ("status.short", BOOLS),
+            ("status.branch", BOOLS),
+            ("status.aheadBehind", BOOLS),
+            ("status.showStash", BOOLS),
+            ("status.showUntrackedFiles", &["no", "normal", "all", "1", "off", "bogus"]),
+            ("status.relativePaths", BOOLS),
+            ("status.displayCommentPrefix", BOOLS),
+            ("status.submoduleSummary", &["true", "false", "0", "5", "bogus"]),
+        ],
+    },
+    // The `-1` guards: `diff.renames` and `diff.renameLimit` are read only while
+    // the status defaults are still unset, so a `status.*` spelling drawn first
+    // changes what a later `diff.*` spelling does — including making an
+    // otherwise-fatal value silently acceptable (`status_config.rs:208-225`).
+    ConfigGroup {
+        name: "rename-detection",
+        keys: &[
+            ("diff.renames", &["true", "false", "copies", "copy", ""]),
+            ("status.renames", &["true", "false", "copies", "copy", ""]),
+            ("diff.renameLimit", INT),
+            ("status.renameLimit", INT),
+            ("merge.renames", BOOLS),
+            ("merge.renameLimit", INT),
+        ],
+    },
+    // `push.default=simple`/`upstream` are *defined* in terms of
+    // `branch.<name>.merge` and `branch.<name>.remote`, and `remote.pushDefault`
+    // overrides the branch's own remote. `push.default` alone can only ever be
+    // measured against a branch with no upstream configured.
+    ConfigGroup {
+        name: "push-upstream",
+        keys: &[
+            (
+                "push.default",
+                &["nothing", "matching", "simple", "upstream", "current", "tracking", "bogus"],
+            ),
+            ("branch.main.merge", &["refs/heads/main", "refs/heads/other", "main", ""]),
+            ("branch.main.remote", &["origin", "gen", ".", ""]),
+            ("branch.main.pushRemote", &["origin", "gen", ""]),
+            ("remote.pushDefault", &["origin", "gen", ""]),
+            ("push.autoSetupRemote", BOOLS),
+            ("branch.autoSetupMerge", &["true", "false", "always", "inherit", "simple"]),
+        ],
+    },
+    // `feature.manyFiles` is not a setting, it is a *bundle*: it turns on
+    // `index.skipHash`, `index.version=4` and `core.untrackedCache`, and an
+    // explicit key must beat the bundle. That is only observable when both are
+    // set, and the direction it must win in is the whole content of the feature.
+    ConfigGroup {
+        name: "index-features",
+        keys: &[
+            ("feature.manyFiles", BOOLS),
+            ("feature.experimental", BOOLS),
+            ("index.skipHash", BOOLS),
+            ("index.version", &["2", "3", "4", "0", "5", "bogus"]),
+            ("index.recordEndOfIndexEntries", BOOLS),
+            ("index.recordOffsetTable", BOOLS),
+            ("core.untrackedCache", &["true", "false", "keep", "bogus"]),
+            ("core.fsmonitor", BOOLS),
+        ],
+    },
+    // `gc.auto` decides whether the automatic run happens at all;
+    // `gc.autoPackLimit` decides what it does when it does; `gc.autoDetach`
+    // decides whether the caller waits for it. The port reads them as one flat
+    // sequence (`cmd_config.rs:458-472`) with no key gating another, which is
+    // itself worth comparing against git, where `gc.auto=0` makes the rest inert.
+    ConfigGroup {
+        name: "gc-auto",
+        keys: &[
+            ("gc.auto", INT),
+            ("gc.autoPackLimit", INT),
+            ("gc.autoDetach", BOOLS),
+            ("gc.bigPackThreshold", SIZE),
+            ("gc.cruftPacks", BOOLS),
+            ("gc.maxCruftSize", SIZE),
+            ("gc.aggressiveWindow", INT),
+            ("gc.aggressiveDepth", INT),
+            ("gc.packRefs", &["true", "false", "notbare", "bogus"]),
+        ],
+    },
+    // Two expiry vocabularies in one command. `gc.reflogExpireUnreachable` is
+    // only consulted once `gc.reflogExpire` has resolved
+    // (`cmd_config.rs:453-455`), and the prune trio uses a *different* rule from
+    // the reflog pair — `approxidate` strictly in the past
+    // (`cmd_config.rs:479-482`, `:555-564`) — so `all` is legal to one and
+    // rejected by the other.
+    ConfigGroup {
+        name: "gc-expiry",
+        keys: &[
+            ("gc.reflogExpire", EXPIRY),
+            ("gc.reflogExpireUnreachable", EXPIRY),
+            ("gc.pruneExpire", EXPIRY),
+            ("gc.worktreePruneExpire", EXPIRY),
+            ("gc.logExpiry", EXPIRY),
+        ],
+    },
+    // `branch.<name>.rebase` overrides `pull.rebase` for one branch, and
+    // `pull.ff=only` contradicts both. A single key can only ever measure the
+    // fallback.
+    ConfigGroup {
+        name: "pull-rebase",
+        keys: &[
+            ("pull.rebase", &["true", "false", "merges", "interactive", "bogus"]),
+            ("branch.main.rebase", &["true", "false", "merges", "interactive", "bogus"]),
+            ("pull.ff", &["true", "false", "only", "bogus"]),
+            ("merge.ff", &["true", "false", "only", "bogus"]),
+            ("pull.twohead", &["ort", "recursive", "bogus"]),
+            ("rebase.autoStash", BOOLS),
+            ("merge.autoStash", BOOLS),
+        ],
+    },
+    // `rerere.enabled` decides whether a conflict is *recorded*, and
+    // `merge.conflictStyle` decides what the recorded markers look like, so the
+    // two together decide what `.git/rr-cache` ends up containing — which
+    // `runner::probe_rr_cache` compares. `rerere.autoUpdate` then decides whether
+    // the resolution is staged, which changes the index the next step reads.
+    ConfigGroup {
+        name: "merge-conflict",
+        keys: &[
+            ("merge.conflictStyle", &["merge", "diff3", "zdiff3", "bogus"]),
+            ("rerere.enabled", BOOLS),
+            ("rerere.autoUpdate", BOOLS),
+            ("merge.ff", &["true", "false", "only", "bogus"]),
+            ("merge.verbosity", INT),
+            ("merge.log", &["true", "false", "20", "bogus"]),
+            ("merge.branchdesc", BOOLS),
+        ],
+    },
+    // Every id in a `log` line is abbreviated to the same width, and the width is
+    // `core.abbrev` — but only when `log.abbrevCommit` asked for abbreviation at
+    // all. `log.decorate` and `log.date` then decide what else is on the line.
+    // The port validates `log.decorate` nowhere (`log_config.rs:209`, an empty
+    // arm) and `log.date` as a bare string (`:203`), so both are only measurable
+    // through what the command prints.
+    ConfigGroup {
+        name: "log-render",
+        keys: &[
+            ("log.abbrevCommit", BOOLS),
+            ("core.abbrev", &["4", "7", "12", "40", "auto", "no", "0", "1", "64"]),
+            ("log.decorate", &["short", "full", "auto", "no", "true", "false", "bogus"]),
+            (
+                "log.date",
+                &["relative", "local", "iso", "iso-strict", "short", "raw", "human", "unix",
+                  "default", "format:%Y-%m-%d", "bogus"],
+            ),
+            ("log.follow", BOOLS),
+            ("log.showRoot", BOOLS),
+            ("log.mailmap", BOOLS),
+            (
+                "log.diffMerges",
+                &["off", "none", "on", "first-parent", "separate", "combined", "dense-combined",
+                  "remerge", "bogus"],
+            ),
+        ],
+    },
+    // One shared range check with three entry points (`default_config.rs:559-566`):
+    // `-1` is exempt, `0..=9` is legal, everything else is fatal — and the message
+    // names whichever key was written, so a port that normalises them to one key
+    // reports the wrong one.
+    ConfigGroup {
+        name: "zlib-levels",
+        keys: &[
+            ("core.compression", &["-1", "0", "1", "9", "10", "-2", "bogus", ""]),
+            ("core.looseCompression", &["-1", "0", "1", "9", "10", "-2", "bogus", ""]),
+            ("pack.compression", &["-1", "0", "1", "9", "10", "-2", "bogus", ""]),
+        ],
+    },
+    // `diff.colorMoved` accepts the whole boolean grammar before its seven mode
+    // names (`diff_config.rs:405-423`), and `diff.colorMovedWS`'s second error
+    // fires only when `allow-indentation-change` co-occurs with a whitespace
+    // token (`:464-470`) — a combination no single token can reach.
+    ConfigGroup {
+        name: "diff-moved",
+        keys: &[
+            (
+                "diff.colorMoved",
+                &["no", "plain", "blocks", "zebra", "default", "dimmed-zebra", "true", "false",
+                  "bogus"],
+            ),
+            (
+                "diff.colorMovedWS",
+                &["no", "ignore-space-change", "ignore-space-at-eol", "ignore-all-space",
+                  "allow-indentation-change", "allow-indentation-change,ignore-all-space", ""],
+            ),
+            (
+                "diff.wsErrorHighlight",
+                &["none", "default", "all", "new", "old", "context", "new,old", "bogus"],
+            ),
+            ("diff.indentHeuristic", BOOLS),
+            ("diff.algorithm", &["myers", "minimal", "patience", "histogram", "default", "bogus"]),
+            ("diff.context", &["0", "1", "3", "10", "-1"]),
+            ("diff.interHunkContext", &["0", "1", "3", "-1"]),
+        ],
+    },
+    // `core.whitespace` is one key whose *tokens* contradict each other — only
+    // the `tab-in-indent` + `indent-with-non-tab` pair is fatal
+    // (`default_config.rs:475-491`) — and `apply.whitespace` decides what `apply`
+    // does about the rules `core.whitespace` set.
+    ConfigGroup {
+        name: "whitespace-rules",
+        keys: &[
+            (
+                "core.whitespace",
+                &["trailing-space", "space-before-tab", "indent-with-non-tab", "tab-in-indent",
+                  "tab-in-indent,indent-with-non-tab", "tabwidth=4", "tabwidth=0", "tabwidth=99",
+                  "-trailing-space", "blank-at-eof", "bogus"],
+            ),
+            ("apply.whitespace", &["nowarn", "warn", "fix", "error", "error-all", "bogus"]),
+            ("apply.ignoreWhitespace", &["no", "change", "bogus"]),
+            ("core.autocrlf", &["true", "false", "input"]),
+        ],
+    },
+    // `submodule.active` is a pathspec and `submodule.<name>.active` is a bool
+    // that overrides it for one submodule; `.gitmodules` supplies `path` and
+    // `url` and `.git/config` overrides both. This is the group the
+    // [`ConfigScope::Modules`] scope exists for — every key here is one git will
+    // read out of `.gitmodules`, and no other key is.
+    ConfigGroup {
+        name: "submodule",
+        keys: &[
+            ("submodule.sub.path", &["sub", "other", "", "sub/"]),
+            ("submodule.sub.url", &["./sub", "../sub", "", "https://example.invalid/x"]),
+            ("submodule.sub.active", BOOLS),
+            ("submodule.sub.ignore", &["all", "dirty", "untracked", "none", "bogus"]),
+            ("submodule.sub.update", &["checkout", "rebase", "merge", "none", "bogus"]),
+            ("submodule.sub.branch", &["main", ".", "", "bogus"]),
+            ("submodule.active", &["sub", ":(glob)**", ".", "", "no/such"]),
+            ("submodule.recurse", BOOLS),
+            ("submodule.fetchJobs", INT),
+        ],
+    },
+    // `diff.submodule` and `status.submoduleSummary` decide how a submodule's
+    // change is *rendered*, and `diff.ignoreSubmodules` decides whether it is
+    // rendered at all. The port dies on a bad `diff.ignoreSubmodules` and only
+    // warns on a bad `diff.submodule` (`diff_config.rs:223-240`), and the warning
+    // is latched process-wide (`:105-116`), so the pair's outcome depends on
+    // which one the command reads first.
+    ConfigGroup {
+        name: "submodule-render",
+        keys: &[
+            ("diff.ignoreSubmodules", &["all", "untracked", "dirty", "none", "bogus"]),
+            ("diff.submodule", &["log", "short", "diff", "bogus"]),
+            ("status.submoduleSummary", &["true", "false", "0", "5", "bogus"]),
+            ("submodule.recurse", BOOLS),
+            ("fetch.recurseSubmodules", &["true", "false", "on-demand", "bogus"]),
+        ],
+    },
+    // `fetch.prune` and `fetch.pruneTags` are separate switches over one refspec
+    // walk, and `fetch.parallel`/`fetch.recurseSubmodules` decide how many
+    // processes do it. `fetch.output` then decides whether any of it is printed.
+    ConfigGroup {
+        name: "fetch",
+        keys: &[
+            ("fetch.all", BOOLS),
+            ("fetch.prune", BOOLS),
+            ("fetch.pruneTags", BOOLS),
+            ("fetch.showForcedUpdates", BOOLS),
+            ("fetch.recurseSubmodules", &["true", "false", "on-demand", "bogus"]),
+            ("fetch.parallel", INT),
+            ("fetch.output", &["full", "compact", "bogus"]),
+            ("remote.origin.prune", BOOLS),
+            ("remote.origin.tagOpt", &["--tags", "--no-tags", "bogus"]),
+        ],
+    },
+    // `grep.patternType` and `grep.extendedRegexp` are two spellings of one
+    // choice with a documented precedence between them, and the rest decide what
+    // a matching line looks like.
+    ConfigGroup {
+        name: "grep",
+        keys: &[
+            ("grep.patternType", &["default", "basic", "extended", "fixed", "perl", "bogus"]),
+            ("grep.extendedRegexp", BOOLS),
+            ("grep.lineNumber", BOOLS),
+            ("grep.column", BOOLS),
+            ("grep.fullName", BOOLS),
+            ("grep.threads", INT),
+            ("grep.fallbackToNoIndex", BOOLS),
+        ],
+    },
+    // `core.abbrev` sets the width and `core.disambiguate` decides which objects
+    // a short id is allowed to name, so the two together decide whether a given
+    // prefix resolves at all. `core.checkStat` is in the same callback and shares
+    // its fall-through (`default_config.rs:284-292`).
+    ConfigGroup {
+        name: "abbrev-disambiguate",
+        keys: &[
+            ("core.abbrev", &["4", "7", "12", "40", "auto", "no", "false", "0", "1", "64", "true"]),
+            (
+                "core.disambiguate",
+                &["none", "commit", "committish", "tree", "treeish", "blob", "bogus"],
+            ),
+            ("log.abbrevCommit", BOOLS),
+            ("core.checkStat", &["default", "minimal", "bogus"]),
+        ],
+    },
+    // Path interpretation: whether a name is folded, decomposed, quoted or
+    // refused. `core.precomposeUnicode` and `core.protectHFS` disagree about the
+    // same byte sequences, and `core.quotePath` decides whether the disagreement
+    // is even visible in the output.
+    ConfigGroup {
+        name: "path-handling",
+        keys: &[
+            ("core.ignoreCase", BOOLS),
+            ("core.precomposeUnicode", BOOLS),
+            ("core.protectHFS", BOOLS),
+            ("core.protectNTFS", BOOLS),
+            ("core.quotePath", BOOLS),
+            ("core.symlinks", BOOLS),
+            ("core.fileMode", BOOLS),
+        ],
+    },
+    // Two spellings of one setting, each in its own arm. A port that normalises
+    // them to one key reports the wrong name in the error, and a port that
+    // implements only one silently ignores the other — neither is visible unless
+    // both spellings are drawn.
+    ConfigGroup {
+        name: "alias-spellings",
+        keys: &[
+            ("diff.suppressBlankEmpty", BOOLS),
+            ("diff.suppress-blank-empty", BOOLS),
+            ("pager.color", BOOLS),
+            ("color.pager", BOOLS),
+            ("core.commentChar", &["#", ";", "auto", "", "ab", "\n"]),
+            ("core.commentString", &["#", ";", "auto", "", "--"]),
+            ("repack.writeBitmaps", BOOLS),
+            ("pack.writeBitmaps", BOOLS),
+            ("diff.color", COLORBOOL),
+            ("color.diff", COLORBOOL),
+        ],
+    },
+    // The repository's own format, which decides whether the rest of the
+    // configuration is even read: an unknown `extensions.*` at format version 1
+    // makes git refuse the repository outright, and `core.bare` over a worktree
+    // is a refusal `setup.c` takes before any command runs.
+    ConfigGroup {
+        name: "repo-format",
+        keys: &[
+            ("core.repositoryFormatVersion", &["0", "1", "2", "bogus", ""]),
+            ("extensions.worktreeConfig", BOOLS),
+            ("extensions.objectFormat", &["sha1", "sha256", "bogus"]),
+            ("extensions.refStorage", &["files", "reftable", "bogus"]),
+            ("extensions.noSuchExtension", BOOLS),
+            ("core.bare", BOOLS),
+            ("core.logAllRefUpdates", &["true", "false", "always"]),
+        ],
+    },
+    // Ref ordering and the `versionsort.suffix` list `version:` sorting consults,
+    // which is inert unless a `version:` sort is actually asked for.
+    ConfigGroup {
+        name: "ref-ordering",
+        keys: &[
+            ("tag.sort", &["refname", "-refname", "version:refname", "taggerdate", "bogus"]),
+            ("branch.sort", &["refname", "-refname", "committerdate", "bogus"]),
+            ("versionsort.suffix", &["-pre", "-rc", "", "-"]),
+            ("versionsort.prereleaseSuffix", &["-pre", "-rc", ""]),
+            ("column.ui", &["never", "always", "auto", "column", "row", "plain", "bogus"]),
+            ("column.branch", &["never", "always", "auto", "bogus"]),
+            ("column.tag", &["never", "always", "auto", "bogus"]),
+        ],
+    },
+];
+
+/// Lines written verbatim into a scope's file that git's parser **rejects**,
+/// each verified against stock 2.55.0 to produce
+/// `fatal: bad config line <n> in file <path>`.
+///
+/// Unreachable any other way. `-c` is handed a key and a value that have already
+/// been split, so no `-c` can express a section header that never closes, a
+/// value whose quote never closes, or a `]` with nothing in front of it — and
+/// none of those produce a *line number*, which is the diagnostic a file has and
+/// a command line does not.
+///
+/// The bad-escape entry carries its own `[core]` header because a `\q` is only a
+/// bad escape once the line is being read as a value; appended to a file with no
+/// section it would fail earlier, with a different message, and the case would
+/// be measuring a different refusal than the one it names.
+const CONFIG_BAD_LINES: &[&str] = &[
+    "garbage line",
+    "[core",
+    "[bad section]",
+    "]",
+    "[]",
+    "[core]]",
+    "= 1",
+    "x = \"unterminated",
+    "[core \"a\" b]",
+    "[core]\n\tabbrev = \"bad\\qescape\"",
+];
+
+/// Lines that are *legal* and that `-c` still cannot produce.
+///
+/// The malformed pool above measures the refusal; this one measures the parser
+/// on inputs it accepts and that no other scope can deliver: a key with no value
+/// at all (which is boolean **true**, while `-c key=` is the empty string — the
+/// asymmetry `default_config.rs:823-830` implements), a trailing comment, a
+/// backslash continuation that joins two lines into one value, a section and a
+/// key on one line, and case folding of both the section and the key.
+///
+/// Each was checked against stock 2.55.0: the continuation yields `45` from
+/// `4\`+`5`, the folded spelling yields `4`, and the valueless key yields the
+/// empty rendering `--get` gives a true boolean.
+const CONFIG_ODD_LINES: &[&str] = &[
+    "[core]\n\tabbrev",
+    "[core]\n\tabbrev = 4 # comment",
+    "[core]\n\tabbrev = 4 ; comment",
+    "# comment only",
+    "; comment only",
+    "[core]\n\tabbrev = 4\\\n5",
+    "[CORE]\n\tABBREV = 4",
+    "[core] abbrev = 4",
+    "[branch \"a.b\"]\n\tmerge = refs/heads/main",
+    "\n",
+];
+
+/// The scopes a given key may be delivered from.
+///
+/// `.gitmodules` is not a general configuration file: `submodule-config.c` reads
+/// `submodule.*` out of it and nothing else, so putting `core.abbrev` there
+/// would write a file git parses and then discards — a case that looks like it
+/// set a key and set nothing. Every other key is deliverable from every scope,
+/// which is what makes the scope the variable under test rather than a property
+/// of the key.
+fn scopes_for(key: &str) -> &'static [ConfigScope] {
+    if key.starts_with("submodule.") {
+        ConfigScope::ALL
+    } else {
+        // Every scope git layers, which for a key that is not a submodule key is
+        // every scope there is: `ConfigScope::ALL` differs from this only by
+        // `Modules`, which is the one this branch exists to exclude.
+        ConfigScope::ORDERED
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -622,31 +1223,97 @@ fn mutate_value(rng: &mut Rng, flag: &str) -> String {
     }
 }
 
-/// Draw `-c key=value` overrides.
+/// Draw the scope one entry is delivered from.
+///
+/// `primary` is the scope the draw as a whole leans toward, and the two thirds
+/// bias toward it is the difference between measuring two things:
+///
+///  * **Same scope, twice.** Two entries for one key in one *file* is the
+///    last-value-wins rule, which every scope implements separately — the file
+///    parser by overwriting as it reads, `-c` by appending to a parameter list
+///    that is walked in order. Without the bias, a two-entry draw would land in
+///    one file only about a sixth of the time and the rule would be measured a
+///    sixth as often as it is worth measuring.
+///  * **Different scopes.** One key in two scopes is *precedence*, which is the
+///    single thing a `-c`-only harness could never see at all. The remaining
+///    third is what produces it.
+///
+/// Both are wanted, so neither is chosen: the bias buys the first without
+/// closing off the second.
+fn sample_scope(rng: &mut Rng, key: &str, primary: ConfigScope) -> ConfigScope {
+    let allowed = scopes_for(key);
+    // The `chance` roll is taken before the membership test, so the RNG consumes
+    // the same amount whether or not `primary` is admissible for this key — a
+    // draw whose stream position depended on the key would make an id
+    // irreproducible from its seed.
+    let take_primary = rng.chance(2, 3);
+    if take_primary && allowed.contains(&primary) {
+        primary
+    } else {
+        *rng.pick(allowed)
+    }
+}
+
+/// Draw the configuration one case runs under: which keys, which values, and
+/// **which scope each one is delivered from**.
 ///
 /// Most cases get none: configuration is a second axis, and crossing it into
 /// every case would leave the argv axis measured only under a perturbed git.
-/// When it fires, one to three keys are drawn, which is enough for two settings
-/// to interact (`diff.renames` with `diff.renameLimit`, `status.short` with
-/// `status.branch`) without the shrinker having five to peel off.
-fn sample_config(rng: &mut Rng) -> Vec<(String, String)> {
+///
+/// When it fires, two thirds of the draws take their keys from one
+/// [`CONFIG_GROUPS`] entry rather than independently from [`CONFIG_KEYS`]. That
+/// is the whole point of the group table: two keys drawn independently out of a
+/// forty-key pool are almost never the two that interact, so a sampler that only
+/// ever did that would spend its whole budget proving that unrelated settings do
+/// not interfere. The remaining third keeps drawing independently, because the
+/// flat pool is wider than the groups and a key that belongs to no group would
+/// otherwise become unreachable.
+///
+/// One to three keys, as before, and **repetition is allowed**: the same key
+/// drawn twice with two values is the last-wins premise, and it is only a
+/// duplicate when the scope, the key *and* the value all repeat, which measures
+/// nothing the first one did not.
+///
+/// A raw line is appended on a minority of draws, always into a file scope,
+/// because a line is a thing only a file has — half of them malformed (the
+/// line-numbered refusal that `-c` cannot produce) and half legal-but-
+/// unreachable (a valueless key, a continuation, a trailing comment).
+///
+/// It goes *after* the settings rather than being shuffled among them, and the
+/// reason is the legal half rather than the malformed half. A legal file-only
+/// line is a setting like any other, so putting it last is what makes it the one
+/// that wins when it names a key an earlier stanza also named — the same
+/// last-wins question, asked of the form only a file can express. The malformed
+/// half aborts the whole read wherever it sits, so its position is not a choice
+/// anybody has.
+fn sample_config(rng: &mut Rng) -> Vec<ConfigEntry> {
     if !rng.chance(1, 3) {
         return Vec::new();
     }
-    let mut out: Vec<(String, String)> = Vec::new();
+    let primary = *rng.pick(ConfigScope::ALL);
+    let group = if rng.chance(2, 3) { Some(rng.pick(CONFIG_GROUPS)) } else { None };
+
+    let mut out: Vec<ConfigEntry> = Vec::new();
     for _ in 0..=rng.below(3) {
-        let (key, own) = *rng.pick(CONFIG_KEYS);
+        let (key, own) = match group {
+            Some(g) => *rng.pick(g.keys),
+            None => *rng.pick(CONFIG_KEYS),
+        };
         // Two thirds from the key's own values, one third from the generic edge
         // pool: the first measures what the setting *does*, the second measures
         // what happens when it cannot be parsed.
         let value = if rng.chance(2, 3) { *rng.pick(own) } else { *rng.pick(CONFIG_EDGE_VALUES) };
-        // A repeated key is not a duplicate — git applies `-c` in order and the
-        // last one wins, which is its own parse path — but a repeated *pair* is,
-        // so only exact repeats are skipped.
-        let pair = (key.to_string(), value.to_string());
-        if !out.contains(&pair) {
-            out.push(pair);
+        let scope = sample_scope(rng, key, primary);
+        let entry = ConfigEntry::set(scope, key, value);
+        if !out.contains(&entry) {
+            out.push(entry);
         }
+    }
+
+    if rng.chance(1, 5) {
+        let scope = *rng.pick(ConfigScope::FILES);
+        let pool = if rng.chance(1, 2) { CONFIG_BAD_LINES } else { CONFIG_ODD_LINES };
+        out.push(ConfigEntry::raw(scope, *rng.pick(pool)));
     }
     out
 }
@@ -1517,13 +2184,7 @@ fn grammar_for<'a>(grammars: &'a [Grammar], cmd: &str) -> Option<&'a Grammar> {
 fn envelope_dims(rng: &mut Rng, seq: Sequence, shape: Shape) -> Sequence {
     let config = sample_config(rng);
     let cwd = sample_cwd(rng, shape);
-    let seq = if config.is_empty() {
-        seq
-    } else {
-        let borrowed: Vec<(&str, &str)> =
-            config.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        seq.with_config(&borrowed)
-    };
+    let seq = if config.is_empty() { seq } else { seq.with_scoped_config(config) };
     match cwd {
         Some(dir) => seq.in_dir(dir),
         None => seq,
@@ -1711,6 +2372,7 @@ fn round_trip(rng: &mut Rng, rt: &RoundTrip, n: usize) -> Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::split_config_key;
 
     /// The sampled environment may only *add* variables, never re-point one of
     /// `env::harden`'s pins. The runner asserts this per case, which catches it
@@ -1721,6 +2383,14 @@ mod tests {
         for (key, values) in ENV_VARS {
             assert!(!crate::env::is_pinned(key), "{key} is pinned by env::harden");
             assert!(!values.is_empty(), "{key} has no values to draw from");
+            // `ConfigScope::Env` writes `GIT_CONFIG_COUNT`/`KEY_<n>`/`VALUE_<n>`
+            // onto the same child, so a variable in that family drawn here would
+            // be silently overwritten — and `run_side` asserts on the collision,
+            // which would abort a whole sweep on whichever case drew both.
+            assert!(
+                !key.starts_with("GIT_CONFIG_"),
+                "{key} collides with the config env scope; deliver it as a ConfigEntry instead"
+            );
             for value in *values {
                 // The two sides run against copies at different roots, so a
                 // literal absolute path would name one side's repository to both.
@@ -1735,13 +2405,203 @@ mod tests {
     /// Every config key has values, and no value is an absolute path — config
     /// goes into argv unsubstituted, so a literal root would name one side's
     /// copy to both.
+    ///
+    /// The grouped pool is held to the same rules as the flat one, and to one
+    /// more: a group with a single key is not a group. The whole reason
+    /// [`CONFIG_GROUPS`] exists is that two keys can be drawn together, and a
+    /// one-key entry would spend a two-thirds share of the budget doing what the
+    /// flat pool already does.
     #[test]
     fn config_pool_is_well_formed() {
+        let well_formed = |key: &str, values: &[&str], whose: &str| {
+            assert!(key.contains('.'), "{whose}: {key} is not a section.key");
+            assert!(!values.is_empty(), "{whose}: {key} has no values to draw from");
+            assert!(
+                values.iter().all(|v| !v.starts_with('/')),
+                "{whose}: {key} names an absolute path"
+            );
+            assert!(
+                split_config_key(key).is_some(),
+                "{whose}: {key} cannot be written as a config file stanza"
+            );
+        };
         for (key, values) in CONFIG_KEYS {
-            assert!(key.contains('.'), "{key} is not a section.key");
-            assert!(!values.is_empty(), "{key} has no values to draw from");
-            assert!(values.iter().all(|v| !v.starts_with('/')), "{key} names an absolute path");
+            well_formed(key, values, "CONFIG_KEYS");
         }
+        for group in CONFIG_GROUPS {
+            assert!(group.keys.len() > 1, "group {} has nothing to interact with", group.name);
+            for (key, values) in group.keys {
+                well_formed(key, values, group.name);
+            }
+        }
+    }
+
+    /// `.gitmodules` is only read for `submodule.*`, so a key that is not one
+    /// must never be routed there: git would parse the file and discard the
+    /// stanza, and the case would look like it set a key while setting nothing.
+    /// Every other key must reach every other scope, or the scope dimension
+    /// silently collapses back to the `-c` it replaced.
+    #[test]
+    fn only_submodule_keys_reach_the_gitmodules_scope() {
+        let every_key = CONFIG_KEYS
+            .iter()
+            .chain(CONFIG_GROUPS.iter().flat_map(|g| g.keys.iter()))
+            .map(|(k, _)| *k);
+        let (mut submodule_keys, mut other_keys) = (0, 0);
+        for key in every_key {
+            let scopes = scopes_for(key);
+            if key.starts_with("submodule.") {
+                submodule_keys += 1;
+                assert!(scopes.contains(&ConfigScope::Modules), "{key} cannot reach .gitmodules");
+            } else {
+                other_keys += 1;
+                assert!(!scopes.contains(&ConfigScope::Modules), "{key} would be discarded there");
+            }
+            for scope in ConfigScope::ALL {
+                if *scope != ConfigScope::Modules {
+                    assert!(scopes.contains(scope), "{key} cannot reach {}", scope.name());
+                }
+            }
+        }
+        assert!(submodule_keys > 0, "no key can reach the .gitmodules scope at all");
+        assert!(other_keys > 0, "every key is a submodule key");
+    }
+
+    /// Every scope is actually drawn. A scope that silently rounded to zero —
+    /// because a probability was wrong, or because `scopes_for` excluded it —
+    /// would leave the whole point of the widening unmeasured while every number
+    /// in the report stayed exactly as plausible as before.
+    #[test]
+    fn every_config_scope_is_drawn() {
+        let cases = generate(20250821, 6);
+        for scope in ConfigScope::ALL {
+            assert!(
+                cases.iter().any(|c| c.config.iter().any(|e| e.scope == *scope)),
+                "no case delivered a setting from the {} scope",
+                scope.name()
+            );
+        }
+    }
+
+    /// The two shapes a scope dimension exists to reach, neither of which a
+    /// one-key `-c` sampler can produce:
+    ///
+    ///  * one key set **twice in one file**, which is last-value-wins;
+    ///  * one key set **in two scopes**, which is precedence.
+    ///
+    /// Asserted together because the bias in [`sample_scope`] trades them off
+    /// against each other: a bias of 1 would give only the first, a bias of 0
+    /// only rarely the first, and either mistake leaves half of what the scope
+    /// dimension is for unmeasured while the case count stays the same.
+    #[test]
+    fn config_draws_reach_last_wins_and_precedence() {
+        let cases = generate(0xC0FFEE, 6);
+        let mut repeated_in_one_file = 0;
+        let mut same_key_two_scopes = 0;
+        for case in &cases {
+            for (i, a) in case.config.iter().enumerate() {
+                for b in case.config.iter().skip(i + 1) {
+                    if a.key.is_none() || a.key != b.key {
+                        continue;
+                    }
+                    if a.scope == b.scope && a.scope.is_file() {
+                        repeated_in_one_file += 1;
+                    } else if a.scope != b.scope {
+                        same_key_two_scopes += 1;
+                    }
+                }
+            }
+        }
+        assert!(repeated_in_one_file > 0, "no draw ever set one key twice in one file");
+        assert!(same_key_two_scopes > 0, "no draw ever set one key in two scopes");
+    }
+
+    /// A raw line is a thing only a file has, so it may only be drawn for a file
+    /// scope — a raw entry on `-c` or in `GIT_CONFIG_KEY_<n>` would be silently
+    /// dropped by [`crate::runner::install_config`], and a case id would then
+    /// name a premise that never reached either side.
+    ///
+    /// Both pools have to be reached as well: the malformed one measures the
+    /// line-numbered refusal, the legal one measures the parser on inputs `-c`
+    /// cannot express, and they are drawn on one coin flip that a wrong constant
+    /// could send entirely one way.
+    #[test]
+    fn raw_config_lines_only_land_in_file_scopes() {
+        let cases = generate(31337, 8);
+        let raws: Vec<&ConfigEntry> =
+            cases.iter().flat_map(|c| c.config.iter()).filter(|e| e.is_raw()).collect();
+        assert!(!raws.is_empty(), "no case ever drew a raw config line");
+        for entry in &raws {
+            assert!(
+                entry.scope.is_file(),
+                "raw line delivered to the non-file scope {}",
+                entry.scope.name()
+            );
+        }
+        assert!(
+            raws.iter().any(|e| CONFIG_BAD_LINES.contains(&e.value.as_str())),
+            "no case ever drew a malformed config line"
+        );
+        assert!(
+            raws.iter().any(|e| CONFIG_ODD_LINES.contains(&e.value.as_str())),
+            "no case ever drew a legal file-only config line"
+        );
+    }
+
+    /// The `::config[…]` segment names the scope of every entry it carries, and
+    /// carries every non-command-line entry. This is the property that makes a
+    /// scoped failure reproducible by hand: without the scope the reader knows a
+    /// key and a value and not which of six places to put them, and the case
+    /// they reconstruct is a different case.
+    #[test]
+    fn case_ids_name_the_scope_of_every_scoped_entry() {
+        let mut checked = 0;
+        for case in generate(777, 6) {
+            let scoped: Vec<&ConfigEntry> =
+                case.config.iter().filter(|e| e.scope != ConfigScope::CommandLine).collect();
+            if scoped.is_empty() {
+                assert!(!case.id().contains("::config["), "empty config segment in {}", case.id());
+                continue;
+            }
+            let id = case.id();
+            let segment = id
+                .split("::config[")
+                .nth(1)
+                .and_then(|s| s.split(']').next())
+                .expect("a config segment");
+            for entry in scoped {
+                assert!(
+                    segment.contains(&format!("{}:", entry.scope.name())),
+                    "{} does not name the {} scope",
+                    id,
+                    entry.scope.name()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no generated case carried a scoped config entry");
+    }
+
+    /// The group table is what makes an *interaction* reachable, so it has to
+    /// actually fire: a group draw must put two keys of one group into one case
+    /// often enough to be worth the two-thirds share it costs.
+    #[test]
+    fn grouped_draws_put_interacting_keys_in_one_case() {
+        let cases = generate(2468, 6);
+        let mut hits = 0;
+        for case in &cases {
+            let keys: Vec<&str> =
+                case.config.iter().filter_map(|e| e.key.as_deref()).collect();
+            if keys.len() < 2 {
+                continue;
+            }
+            if CONFIG_GROUPS.iter().any(|g| {
+                keys.iter().filter(|k| g.keys.iter().any(|(gk, _)| gk == *k)).count() >= 2
+            }) {
+                hits += 1;
+            }
+        }
+        assert!(hits > 0, "no case ever drew two keys from one interacting group");
     }
 
     /// A payload is only attached where the invocation asks for it, by one of
@@ -1791,9 +2651,24 @@ mod tests {
         assert!(cases.iter().any(|c| c.cwd.is_some()), "no case sampled a working directory");
         assert!(cases.iter().any(|c| c.stdin.is_some()), "no case sampled a stdin payload");
 
-        // Rendered, not merely stored.
-        let with_config = cases.iter().find(|c| !c.config.is_empty()).unwrap();
-        assert!(with_config.id().contains("-c "), "config missing from {}", with_config.id());
+        // Rendered, not merely stored — and rendered in the right place for the
+        // scope: a command-line entry belongs in the argv segment, everything
+        // else in the `::config[…]` segment, because a reader reproducing the
+        // case types the first and writes the second into a file.
+        let with_cmdline = cases
+            .iter()
+            .find(|c| c.config.iter().any(|e| e.scope == ConfigScope::CommandLine))
+            .expect("no case sampled a command-line config key");
+        assert!(with_cmdline.id().contains("-c "), "config missing from {}", with_cmdline.id());
+        let with_scoped = cases
+            .iter()
+            .find(|c| c.config.iter().any(|e| e.scope != ConfigScope::CommandLine))
+            .expect("no case sampled a scoped config key");
+        assert!(
+            with_scoped.id().contains("::config["),
+            "scoped config missing from {}",
+            with_scoped.id()
+        );
         let with_cwd = cases.iter().find(|c| c.cwd.is_some()).unwrap();
         assert!(with_cwd.id().contains("::cwd["), "cwd missing from {}", with_cwd.id());
         let with_env = cases.iter().find(|c| !c.env.is_empty()).unwrap();
@@ -1828,10 +2703,13 @@ mod tests {
         let case = Case { stdin: Some(P_PATHS), ..case };
 
         let minimal = shrink(&case, &mut |c| {
-            c.config.iter().any(|(k, _)| k == "status.short")
+            c.config.iter().any(|e| e.key.as_deref() == Some("status.short"))
         });
 
-        assert_eq!(minimal.config, vec![("status.short".to_string(), "true".to_string())]);
+        assert_eq!(
+            minimal.config,
+            vec![ConfigEntry::set(ConfigScope::CommandLine, "status.short", "true")]
+        );
         assert!(minimal.globals.is_empty());
         assert!(minimal.env.is_empty());
         assert_eq!(minimal.cwd, None);

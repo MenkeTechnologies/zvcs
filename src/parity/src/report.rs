@@ -11,7 +11,7 @@
 //! together and `Unsupported` counts as a failure rather than a skip.
 
 use crate::env;
-use crate::runner::{Outcome, Surface, Verdict};
+use crate::runner::{config_premise, Outcome, Surface, Verdict};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -308,6 +308,23 @@ impl Report {
                         s.total - s.index
                     );
                     for line in &s.script {
+                        println!("    {line}");
+                    }
+                }
+                // The configuration that was installed into both fixtures
+                // before the invocation ran.
+                //
+                // The id already carries every entry, and that is what makes the
+                // failure reproducible. This is what makes it *readable*: a
+                // reader looking at `repo:core.abbrev=4 repo:core.abbrev=12` has
+                // to assemble two stanzas in their head to see which one wins,
+                // and a reader looking at a raw line has to un-escape it. The
+                // rendered file says both. Printed only when there is something
+                // to print, so a case whose whole configuration is `-c` — which
+                // the argv line above already shows — costs no extra lines.
+                for (place, text) in config_premise(&f.case.config) {
+                    println!("  config premise ({place}):");
+                    for line in text.lines() {
                         println!("    {line}");
                     }
                 }

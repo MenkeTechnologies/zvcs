@@ -57,8 +57,8 @@ pub struct Case {
     pub cmd: &'static str,
     /// Full argv after the binary name, including the subcommand.
     pub args: Vec<String>,
-    /// `-c key=value` overrides, rendered ahead of the subcommand and applied
-    /// identically to both sides.
+    /// Configuration the case runs under, each entry naming the **scope** it is
+    /// delivered from, applied identically to both sides.
     ///
     /// The largest surface the harness could not reach. Git's behaviour is a
     /// function of its configuration at least as much as of its argv —
@@ -68,10 +68,19 @@ pub struct Case {
     /// those defaults was the only value ever measured. A port that ignores a
     /// setting entirely scored exactly the same as one that honours it.
     ///
-    /// `-c` rather than writing `.git/config`: a case is one invocation against
-    /// a pristine copy and cannot write a file first, and the command line is
-    /// the one config source that needs no prior state. It also keeps the
-    /// setting visible in [`Case::id`], so a failure names the key.
+    /// **The scope used to be fixed at `-c`, and that was half a measurement.**
+    /// The reasoning was that a case is one invocation against a pristine copy
+    /// and cannot write a file first, so the command line is the one source
+    /// needing no prior state. The premise was wrong: the runner *builds* the
+    /// pristine copy, so it can put a file in it before the invocation runs, and
+    /// [`install_config`] now does — see [`ConfigScope`] for the three classes of
+    /// behaviour that only a non-`-c` scope can reach (precedence, file parsing,
+    /// and the sources that are gated on another key).
+    ///
+    /// Order is significant and preserved. Two entries naming the same key in
+    /// the same file scope are written as two stanzas, in this order, which is
+    /// how "the last value in a file wins" becomes observable; two entries in
+    /// different scopes are how precedence between scopes becomes observable.
     ///
     /// A key that makes stock git **die** is kept, not filtered. Agreeing on the
     /// refusal is parity; excluding it would be measuring only the values git
@@ -80,7 +89,7 @@ pub struct Case {
     /// Values are literal, like every other argv token — nothing here is
     /// substituted, so a value must not name an absolute path for the same
     /// reason [`Case::env`] values may not.
-    pub config: Vec<(String, String)>,
+    pub config: Vec<ConfigEntry>,
     /// Global options that precede the subcommand — `--no-pager`, `-C <dir>`,
     /// `--namespace=<n>`, `--literal-pathspecs`, and the rest of the set git
     /// parses in `git.c:handle_options` before it dispatches a verb.
@@ -172,6 +181,199 @@ pub struct Case {
 /// values, so one literal can name both copies.
 pub const REPO_PLACEHOLDER: &str = "{repo}";
 
+// ---------------------------------------------------------------------------
+// Configuration scopes
+// ---------------------------------------------------------------------------
+
+/// Where a configuration setting is delivered from.
+///
+/// Git does not have *a* configuration; it has a sequence of sources read in a
+/// fixed order (`config.c:do_git_config_sequence`), and each one is a different
+/// parser reached by a different code path. Until this enum existed every case
+/// delivered every key through `-c`, which is the *last* source in that sequence
+/// and the only one that is not a file. Three classes of behaviour were
+/// therefore structurally unmeasurable, and none of them is exotic:
+///
+///  * **Precedence.** A port that reads a key correctly from `-c` and never
+///    looks in `.git/config` scores exactly the same as one that reads both, and
+///    a port that has the order backwards — repository beating the command
+///    line — scores the same again. Precedence is only observable when one key
+///    is set twice, in two scopes, to two values.
+///  * **File parsing.** `-c` hands the parser an already-split `key=value`. A
+///    file has section headers, subsections, comments, quoting, escapes and
+///    continuation, and it can be malformed in ways no command line can express.
+///    `fatal: bad config line 12 in file .git/config` names a line number, and a
+///    line number is a fact only a file has. It also has *order*: two settings of
+///    one key in one file is the last-value-wins rule, which `-c` has its own
+///    separate implementation of.
+///  * **The gated sources.** `.git/config.worktree` is not read at all unless
+///    `extensions.worktreeConfig` is true in `.git/config`, and `.gitmodules` is
+///    read for `submodule.*` and nothing else. Reaching either means writing two
+///    files, which no single `-c` can do.
+///
+/// # What is *not* here, and why
+///
+/// `$HOME/.gitconfig` and `/etc/gitconfig` — the paths a human means by "global"
+/// and "system" — stay unreachable on purpose. [`env::harden`] pins
+/// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` to `/dev/null` and sets
+/// `GIT_CONFIG_NOSYSTEM`, precisely so the machine's own files cannot leak into
+/// the comparison, and [`env::is_pinned`] forbids a *case* from re-pointing them
+/// for the reason `corpus/shape_reach.rs` states: a case that could aim
+/// `GIT_CONFIG_GLOBAL` anywhere could aim it at the user's real file.
+///
+/// [`ConfigScope::Global`] and [`ConfigScope::System`] therefore mean "a file at
+/// that *position in the precedence order*", delivered by the runner re-pointing
+/// the variable at a path it computed itself from the side's own fixture root
+/// ([`scope_file`]). The case never names the path and cannot; the file lives
+/// inside a copy that is deleted when the case ends; and the pin is left at
+/// `/dev/null` for every case that does not draw the scope, so no existing case
+/// changes by a byte. What is measured is the layering, which is the part a port
+/// gets wrong — not the filesystem location, which is the part `harden` exists to
+/// keep out.
+///
+/// # Order
+///
+/// The variants are declared **lowest precedence first**, and
+/// [`config_scope_declaration_order_is_gits_precedence_order`] pins that against
+/// the order measured from stock git 2.55.0 rather than against this comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConfigScope {
+    /// `.gitmodules` in the worktree root.
+    ///
+    /// Outside the layered sequence rather than at the bottom of it:
+    /// `submodule-config.c` reads this file on its own, for `submodule.*` keys
+    /// only, and `.git/config` overrides it whatever the rest of the order says.
+    /// It is declared first because "not in the order" has to sit somewhere and
+    /// the bottom is the least misleading place for it.
+    Modules,
+    /// `$GIT_CONFIG_SYSTEM`, pointed at a file inside this side's own fixture.
+    /// Drawing it also clears `GIT_CONFIG_NOSYSTEM`, which otherwise suppresses
+    /// the whole scope — verified against stock 2.55.0, which reads the file only
+    /// once the variable is gone.
+    System,
+    /// `$GIT_CONFIG_GLOBAL`, pointed at a file inside this side's own fixture.
+    Global,
+    /// `.git/config`.
+    Repo,
+    /// `.git/config.worktree`, inert until `extensions.worktreeConfig` is set —
+    /// so drawing this scope writes *two* files, and a port that honours the
+    /// file without checking the gate diverges on a case that writes only one.
+    Worktree,
+    /// `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`.
+    Env,
+    /// `-c key=value`: the original scope, and until now the only one.
+    CommandLine,
+}
+
+impl ConfigScope {
+    /// The scopes git layers in a defined order, lowest first. `Modules` is
+    /// absent because it is not part of that sequence; see the variant.
+    pub const ORDERED: &'static [ConfigScope] = &[
+        ConfigScope::System,
+        ConfigScope::Global,
+        ConfigScope::Repo,
+        ConfigScope::Worktree,
+        ConfigScope::Env,
+        ConfigScope::CommandLine,
+    ];
+
+    /// Every scope, for a sampler that wants to draw one.
+    pub const ALL: &'static [ConfigScope] = &[
+        ConfigScope::Modules,
+        ConfigScope::System,
+        ConfigScope::Global,
+        ConfigScope::Repo,
+        ConfigScope::Worktree,
+        ConfigScope::Env,
+        ConfigScope::CommandLine,
+    ];
+
+    /// The scopes delivered by writing a file into the fixture. The rest are
+    /// delivered on the command line or through the environment and cost no I/O.
+    pub const FILES: &'static [ConfigScope] = &[
+        ConfigScope::Modules,
+        ConfigScope::System,
+        ConfigScope::Global,
+        ConfigScope::Repo,
+        ConfigScope::Worktree,
+    ];
+
+    /// Short slug rendered into [`Case::id`]. Lower-case and free of spaces, so
+    /// the id stays one whitespace-delimited token per entry.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConfigScope::Modules => "modules",
+            ConfigScope::System => "system",
+            ConfigScope::Global => "global",
+            ConfigScope::Repo => "repo",
+            ConfigScope::Worktree => "worktree",
+            ConfigScope::Env => "env",
+            ConfigScope::CommandLine => "cmdline",
+        }
+    }
+
+    /// Whether this scope is delivered by writing a file.
+    pub fn is_file(self) -> bool {
+        Self::FILES.contains(&self)
+    }
+}
+
+/// One configuration fact a case carries: a setting, or a raw line in a file.
+///
+/// Raw lines are the whole reason this is not a `(scope, key, value)` triple.
+/// A file scope can hold content that is not a setting at all — a missing
+/// section header, an unterminated quote, a stray `]`, a key with no value — and
+/// that content is exactly what produces git's line-numbered
+/// `bad config line %d in file %s`, a diagnostic `-c` has no way to reach.
+/// Modelling it as a setting with a funny value would not work: the malformed
+/// part is the *line*, not the value, and half of these forms have no key to
+/// hang a value on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigEntry {
+    pub scope: ConfigScope,
+    /// The `section.key` this entry sets, or `None` when the entry is a raw line
+    /// written verbatim into the scope's file.
+    pub key: Option<String>,
+    /// The value for a keyed entry; the whole line, newlines and all, for a raw
+    /// one.
+    pub value: String,
+}
+
+impl ConfigEntry {
+    /// `key = value`, delivered through `scope`.
+    pub fn set(scope: ConfigScope, key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { scope, key: Some(key.into()), value: value.into() }
+    }
+
+    /// A line written verbatim into `scope`'s file. Only meaningful for a file
+    /// scope — a command line and an environment pair have no lines — and
+    /// [`install_config`] is the only thing that reads it, so a raw entry in a
+    /// non-file scope is silently inert rather than an error the sampler has to
+    /// avoid at run time. [`crate::fuzz`] asserts it never produces one.
+    pub fn raw(scope: ConfigScope, line: impl Into<String>) -> Self {
+        Self { scope, key: None, value: line.into() }
+    }
+
+    /// True when this entry is a raw file line rather than a setting.
+    pub fn is_raw(&self) -> bool {
+        self.key.is_none()
+    }
+
+    /// How the entry reads in [`Case::id`]: `<scope>:<key>=<value>` for a
+    /// setting, `<scope>:~<escaped line>` for a raw one.
+    ///
+    /// The raw form is escaped because a line can carry a newline or a tab, and
+    /// an id with a newline in it stops being one line of a report. `~` marks it
+    /// as a line rather than a setting so a reader who copies it back knows to
+    /// paste it rather than to run `git config`.
+    pub fn render(&self) -> String {
+        match &self.key {
+            Some(k) => format!("{}:{k}={}", self.scope.name(), self.value),
+            None => format!("{}:~{}", self.scope.name(), self.value.escape_default()),
+        }
+    }
+}
+
 impl Case {
     pub fn new(cmd: &'static str, args: &[&str], shape: Shape) -> Self {
         Self {
@@ -218,11 +420,28 @@ impl Case {
     }
 
     /// Run this case with `-c key=value` in front of the subcommand.
+    ///
+    /// Still spelled as bare pairs, and still command-line scoped, because that
+    /// is what every curated call site means when it writes one: the setting is
+    /// part of the invocation being described. A case that wants a scope says so
+    /// with [`Case::with_scoped_config`]. Keeping this signature is also what
+    /// makes the scope widening free of a corpus rewrite — no existing case's
+    /// [`Case::id`] moves by a byte, so no existing failure is renamed.
     pub fn with_config(self, config: &[(&str, &str)]) -> Self {
         Self {
-            config: config.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            config: config
+                .iter()
+                .map(|(k, v)| ConfigEntry::set(ConfigScope::CommandLine, *k, *v))
+                .collect(),
             ..self
         }
+    }
+
+    /// Run this case with configuration delivered from the scopes each entry
+    /// names. Order is preserved: within one file scope it is the order the
+    /// stanzas are written in, which is what decides the last-wins outcome.
+    pub fn with_scoped_config(self, config: Vec<ConfigEntry>) -> Self {
+        Self { config, ..self }
     }
 
     /// Run this case with global options in front of the subcommand. Each inner
@@ -253,9 +472,18 @@ impl Case {
     /// do if they were already spliced into `args` as loose tokens.
     pub fn argv(&self) -> Vec<String> {
         let mut argv = Vec::with_capacity(self.config.len() * 2 + self.globals.len() + self.args.len());
-        for (key, value) in &self.config {
-            argv.push("-c".to_string());
-            argv.push(format!("{key}={value}"));
+        // Only the command-line scope renders here. Everything else is a file
+        // written into the fixture or a variable set on the child, and rendering
+        // it as `-c` would deliver the setting through the one scope the entry
+        // said it was not using — which is the whole thing being measured.
+        for entry in &self.config {
+            if entry.scope != ConfigScope::CommandLine {
+                continue;
+            }
+            if let Some(key) = &entry.key {
+                argv.push("-c".to_string());
+                argv.push(format!("{key}={}", entry.value));
+            }
         }
         for global in &self.globals {
             argv.extend(global.iter().cloned());
@@ -298,7 +526,7 @@ impl Case {
     /// the invocation back. A case that sets neither keeps byte-for-byte the id
     /// it had before those fields existed, so no existing failure is renamed.
     ///
-    /// The grammar `[!]<shape>::<cmd>::<argv>[::cwd[…]][::env[…]][::stdin[…]]`
+    /// The grammar `[!]<shape>::<cmd>::<argv>[::config[…]][::cwd[…]][::env[…]][::stdin[…]]`
     /// is load-bearing: `scripts/split_failures.pl` matches `<shape>::<cmd>::`
     /// off the front of a failure header to file the block under a subcommand,
     /// so the two leading segments must stay first and must stay free of spaces.
@@ -326,6 +554,21 @@ impl Case {
     /// are what a reader needs to see beside "step 3 of 7".
     fn id_tail(&self) -> String {
         let mut id = self.argv().join(" ");
+        // Everything the argv segment could not show: a setting that came from a
+        // file or from the environment is invisible on the command line, and an
+        // id that showed only the `-c` half would name a case a reader could not
+        // reproduce. Rendered as `<scope>:<key>=<value>` per entry, in delivery
+        // order, so the segment is a recipe — write these lines into that scope's
+        // file, in this order, and the case is back.
+        let scoped: Vec<String> = self
+            .config
+            .iter()
+            .filter(|e| e.scope != ConfigScope::CommandLine)
+            .map(ConfigEntry::render)
+            .collect();
+        if !scoped.is_empty() {
+            id.push_str(&format!("::config[{}]", scoped.join(" ")));
+        }
         if let Some(cwd) = self.cwd {
             id.push_str(&format!("::cwd[{cwd}]"));
         }
@@ -541,6 +784,19 @@ impl Sequence {
         self.map_envelope(|c| c.with_config(config))
     }
 
+    /// Run every step under configuration delivered from the scopes each entry
+    /// names.
+    ///
+    /// The file-scoped half is installed **once**, into each side's copy, before
+    /// the first step — see [`run_sequence`]. It is deliberately not re-written
+    /// between steps: a workflow whose own steps edit `.git/config` (and several
+    /// do) would otherwise have its edit silently reverted before the step that
+    /// was supposed to read it, and the sequence would be measuring the harness
+    /// rather than the port.
+    pub fn with_scoped_config(self, config: Vec<ConfigEntry>) -> Self {
+        self.map_envelope(|c| c.with_scoped_config(config))
+    }
+
     /// Run every step with these global options in front of its subcommand.
     pub fn with_globals(self, globals: &[&[&str]]) -> Self {
         self.map_envelope(|c| c.with_globals(globals))
@@ -594,7 +850,7 @@ impl Sequence {
     /// competing with it:
     ///
     /// ```text
-    /// [!]<shape>::<cmd>::seq[<name>]::step<i>/<n>::<argv>[::cwd[…]][::env[…]][::stdin[…]]::script[<argv1> | <argv2> | …]
+    /// [!]<shape>::<cmd>::seq[<name>]::step<i>/<n>::<argv>[::config[…]][::cwd[…]][::env[…]][::stdin[…]]::script[<argv1> | <argv2> | …]
     /// ```
     ///
     /// Three properties are deliberate.
@@ -965,6 +1221,300 @@ fn apply_case_env(cmd: &mut Command, repo: &Path, extra: &[(String, String)]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Installing a case's configuration into a fixture copy
+// ---------------------------------------------------------------------------
+
+/// This side's git directory: `.git` when it is one, the fixture root otherwise.
+///
+/// Every shape `fixture::build` produces has a real `.git` directory at its
+/// root, so the fallback is defensive rather than load-bearing — but a shape
+/// added tomorrow that is bare at the root would otherwise write its
+/// configuration into a directory git never reads, and a premise git never read
+/// is a case that measures nothing while looking like it measured something.
+pub(crate) fn git_dir(repo: &Path) -> PathBuf {
+    let dot = repo.join(".git");
+    if dot.is_dir() {
+        dot
+    } else {
+        repo.to_path_buf()
+    }
+}
+
+/// The file a file-backed scope is delivered through, always inside `repo`.
+///
+/// The paths are computed from the side's own fixture root and from nothing
+/// else. That is the property that keeps [`ConfigScope::Global`] and
+/// [`ConfigScope::System`] compatible with [`env::harden`]'s pins: a case says
+/// only *which scope*, never *which file*, so there is no way for a case to aim
+/// either variable at the machine's real configuration —
+/// [`scope_files_stay_inside_the_fixture`] asserts it.
+///
+/// The two synthetic files live under the git directory rather than beside the
+/// worktree on purpose. A file in the worktree would show up as `?? …` in every
+/// `status` the case runs and in the state probe, which is a difference the case
+/// did not ask for and which would drown the setting it did ask for.
+pub(crate) fn scope_file(repo: &Path, scope: ConfigScope) -> Option<PathBuf> {
+    let git = git_dir(repo);
+    Some(match scope {
+        ConfigScope::Repo => git.join("config"),
+        ConfigScope::Worktree => git.join("config.worktree"),
+        ConfigScope::Global => git.join("parity-global.config"),
+        ConfigScope::System => git.join("parity-system.config"),
+        ConfigScope::Modules => repo.join(".gitmodules"),
+        ConfigScope::Env | ConfigScope::CommandLine => return None,
+    })
+}
+
+/// Split `section.key` / `section.subsection.key` the way git's own config
+/// writer does: the section is everything up to the first dot, the key is
+/// everything after the last, and whatever is between them is the subsection.
+///
+/// A subsection may itself contain dots (`branch.feature.x.merge` is branch
+/// `feature.x`), which is exactly why the split is first-dot/last-dot and not
+/// a three-way `split('.')`.
+pub(crate) fn split_config_key(key: &str) -> Option<(&str, Option<&str>, &str)> {
+    let (section, rest) = key.split_once('.')?;
+    if section.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some(match rest.rsplit_once('.') {
+        Some((sub, name)) => (section, Some(sub), name),
+        None => (section, None, rest),
+    })
+}
+
+/// Quote a value so the file delivers **the same string** `-c` would.
+///
+/// Unquoted, git's config reader strips surrounding whitespace, stops at a `#`
+/// or `;`, and treats an absent value as boolean true. Every one of those would
+/// silently change the value under test, so the scope — the one variable — would
+/// no longer be the only difference from the `-c` case. Quoting removes all
+/// three: inside quotes whitespace and comment characters are literal, and `""`
+/// is the empty string rather than an implicit true.
+///
+/// The escapes are exactly the five `config.c:parse_value` accepts
+/// (`\"`, `\\`, `\n`, `\t`, `\b`); anything else after a backslash is a parse
+/// error, which is why a literal backslash has to become `\\` rather than being
+/// passed through. Reaching that parse error is a job for a raw line, where it
+/// is deliberate and visible in the id.
+pub(crate) fn quote_config_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The bytes one entry contributes to its scope's file.
+///
+/// One `[section]` header per setting, even when consecutive settings share a
+/// section. Git accepts a section repeated any number of times, and repeating it
+/// is what keeps a *repeated key* readable as two independent stanzas — the
+/// last-value-wins premise this whole ordering exists to test. Merging them into
+/// one header would work too and would be one line shorter to read; it would also
+/// make a two-entry draw and a one-entry draw look the same in the file, which is
+/// the distinction the case is about.
+///
+/// A key that is not `section.key` at all cannot be written as a stanza, so it is
+/// emitted as a bare line — which is what git would make of it anyway, and which
+/// its own parser then rejects with the diagnostic that is the point.
+pub(crate) fn render_config_entry(entry: &ConfigEntry) -> String {
+    let Some(key) = &entry.key else {
+        return format!("{}\n", entry.value);
+    };
+    match split_config_key(key) {
+        Some((section, sub, name)) => {
+            let header = match sub {
+                Some(sub) => format!("[{section} \"{}\"]", sub.replace('\\', "\\\\").replace('"', "\\\"")),
+                None => format!("[{section}]"),
+            };
+            format!("{header}\n\t{name} = {}\n", quote_config_value(&entry.value))
+        }
+        None => format!("{key} = {}\n", quote_config_value(&entry.value)),
+    }
+}
+
+/// Append `text` to `path`, creating it if it does not exist.
+fn append_file(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {} to install case configuration", path.display()))?;
+    f.write_all(text.as_bytes())
+        .with_context(|| format!("writing case configuration to {}", path.display()))
+}
+
+/// Write a case's file-scoped configuration into one already-instantiated
+/// fixture copy.
+///
+/// # Cost, and why this is the cheap shape
+///
+/// One `open`/`write`/`close` per **file scope actually drawn**, per side, per
+/// case — at most five small appends into a directory tree the runner has just
+/// created and will delete when the case ends. No extra child process, no extra
+/// fixture template, no extra comparison, and nothing at all for the cases that
+/// draw no file scope, which is most of them.
+///
+/// The two obvious alternatives are both far more expensive, and the first is
+/// also *wrong*:
+///
+///  * **Run `git config --file …` to install each key.** That is one child
+///    process per key per side, doubling the process count of a config-heavy
+///    case — and on the zvcs side it would be the *implementation under test*
+///    writing the premise. A port with a broken config writer would corrupt its
+///    own premise and the case would then measure the writer twice instead of
+///    measuring the key once, which is the one thing a differential harness must
+///    never do. Writing the bytes here means both sides start from a file this
+///    crate produced, byte for byte.
+///  * **A fixture template per scope.** Twenty-two shapes times the scope
+///    combinations, built at start-up, for a premise that is four lines of text.
+///
+/// Ordering inside a file is the entry order in `config`, filtered to that
+/// scope — that is what makes "the last value wins" observable.
+///
+/// [`ConfigScope::Worktree`] writes twice: the gate
+/// (`extensions.worktreeConfig = true` in `.git/config`) and then the file
+/// itself. Without the gate git ignores `.git/config.worktree` entirely, so a
+/// case that drew the scope would have measured nothing while looking like it
+/// measured a setting. Verified against stock 2.55.0, which reads the file with
+/// the gate set and `core.repositoryFormatVersion` still 0 — the extension is
+/// honoured regardless of the format version, so no version bump is done here and
+/// the shape stays the shape every other case sees.
+pub fn install_config(repo: &Path, entries: &[ConfigEntry]) -> Result<()> {
+    if !entries.iter().any(|e| e.scope.is_file()) {
+        return Ok(());
+    }
+    if entries.iter().any(|e| e.scope == ConfigScope::Worktree) {
+        append_file(&git_dir(repo).join("config"), "[extensions]\n\tworktreeConfig = true\n")?;
+    }
+    for scope in ConfigScope::FILES {
+        let text: String = entries
+            .iter()
+            .filter(|e| e.scope == *scope)
+            .map(render_config_entry)
+            .collect();
+        if text.is_empty() {
+            continue;
+        }
+        let path = scope_file(repo, *scope).expect("a file scope has a file");
+        append_file(&path, &text)?;
+    }
+    Ok(())
+}
+
+/// What a case's non-command-line configuration looks like on disk and in the
+/// environment, as `(where, what)` pairs for the failure block.
+///
+/// The id already carries every entry, and that is what makes a failure
+/// *reproducible*; this is what makes it *readable*. A reader looking at
+/// `repo:core.abbrev=4 repo:core.abbrev=auto` has to reconstruct two stanzas in
+/// their head to see that the second one wins, while the rendered file says it.
+/// Paths are relative to the fixture root, because the absolute one names a
+/// temporary directory that no longer exists by the time anybody reads the
+/// report.
+pub fn config_premise(entries: &[ConfigEntry]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if entries.iter().any(|e| e.scope == ConfigScope::Worktree) {
+        out.push((".git/config".to_string(), "[extensions]\n\tworktreeConfig = true\n".to_string()));
+    }
+    for scope in ConfigScope::FILES {
+        let text: String = entries
+            .iter()
+            .filter(|e| e.scope == *scope)
+            .map(render_config_entry)
+            .collect();
+        if text.is_empty() {
+            continue;
+        }
+        let where_ = match scope {
+            ConfigScope::Repo => ".git/config",
+            ConfigScope::Worktree => ".git/config.worktree",
+            ConfigScope::Global => "$GIT_CONFIG_GLOBAL → .git/parity-global.config",
+            ConfigScope::System => "$GIT_CONFIG_SYSTEM → .git/parity-system.config",
+            ConfigScope::Modules => ".gitmodules",
+            _ => unreachable!("ConfigScope::FILES holds only file scopes"),
+        };
+        out.push((where_.to_string(), text));
+    }
+    let env: Vec<&ConfigEntry> =
+        entries.iter().filter(|e| e.scope == ConfigScope::Env && !e.is_raw()).collect();
+    if !env.is_empty() {
+        let mut text = format!("GIT_CONFIG_COUNT={}\n", env.len());
+        for (i, e) in env.iter().enumerate() {
+            text.push_str(&format!(
+                "GIT_CONFIG_KEY_{i}={}\nGIT_CONFIG_VALUE_{i}={}\n",
+                e.key.as_deref().unwrap_or_default(),
+                e.value
+            ));
+        }
+        out.push(("environment".to_string(), text));
+    }
+    out
+}
+
+/// Apply the environment half of a case's configuration: the two synthetic file
+/// pins and the `GIT_CONFIG_KEY_<n>` pairs.
+///
+/// Split from [`apply_case_env`] because the two have opposite rules. A case's
+/// *own* environment may only add variables `harden` left unset, and
+/// [`env::is_pinned`] enforces that against the case. This function is the
+/// **runner** re-pointing two of `harden`'s pins at paths it computed itself from
+/// the fixture root — see [`ConfigScope`] for why that is not the leak
+/// `is_pinned` exists to stop, and note that the re-point happens only for a case
+/// that drew the scope, so every other case keeps `/dev/null` exactly as before.
+///
+/// `GIT_CONFIG_NOSYSTEM` is *removed* rather than set to `0`: git checks only
+/// whether the variable exists (`config.c:git_config_system`), so `0` would
+/// suppress the system scope just as `1` does, and the case would have written a
+/// file nothing reads.
+fn apply_config_env(cmd: &mut Command, repo: &Path, case: &Case) {
+    let entries = &case.config;
+    if entries.iter().any(|e| e.scope == ConfigScope::Global) {
+        cmd.env("GIT_CONFIG_GLOBAL", scope_file(repo, ConfigScope::Global).expect("file scope"));
+    }
+    if entries.iter().any(|e| e.scope == ConfigScope::System) {
+        cmd.env("GIT_CONFIG_SYSTEM", scope_file(repo, ConfigScope::System).expect("file scope"));
+        cmd.env_remove("GIT_CONFIG_NOSYSTEM");
+    }
+
+    let env: Vec<&ConfigEntry> =
+        entries.iter().filter(|e| e.scope == ConfigScope::Env && !e.is_raw()).collect();
+    if env.is_empty() {
+        return;
+    }
+    // A case that sets the same variables through `Case::env` — the curated
+    // discovery cases do, and they predate this scope — would have its pairs
+    // silently overwritten here, so the case would run under a configuration its
+    // own id does not describe. Asserted rather than merged: merging would need
+    // this function to parse the case's environment back into pairs, and a
+    // corpus entry that wants both is a corpus bug with one obvious fix, which
+    // `no_case_sets_the_env_config_scope_twice` catches at `cargo test` time.
+    assert!(
+        !case.env.iter().any(|(k, _)| k.starts_with("GIT_CONFIG_")),
+        "case sets GIT_CONFIG_* through Case::env and through ConfigScope::Env at once"
+    );
+    cmd.env("GIT_CONFIG_COUNT", env.len().to_string());
+    for (i, e) in env.iter().enumerate() {
+        cmd.env(format!("GIT_CONFIG_KEY_{i}"), e.key.as_deref().unwrap_or_default());
+        cmd.env(format!("GIT_CONFIG_VALUE_{i}"), &e.value);
+    }
+}
+
 /// Run one side of a case.
 ///
 /// Takes the whole [`Case`] rather than a parameter per dimension: every
@@ -977,6 +1527,10 @@ fn run_side(bin: &Path, repo: &Path, home: &Path, case: &Case) -> Result<Side> {
     let mut cmd = Command::new(bin);
     env::harden(&mut cmd, home);
     apply_case_env(&mut cmd, repo, &case.env);
+    // After the case's own environment, because it re-points two of `harden`'s
+    // pins and the case is not allowed to have touched them — see
+    // `apply_config_env` for why the runner may and a case may not.
+    apply_config_env(&mut cmd, repo, case);
     cmd.current_dir(&dir)
         .args(case.argv())
         // Closed stdin stays the default. A command that reads input it was not
@@ -1733,6 +2287,13 @@ pub fn run_case(
     let _ = std::fs::remove_dir_all(&zvcs_repo);
     templates.instantiate(case.shape, &stock_repo)?;
     templates.instantiate(case.shape, &zvcs_repo)?;
+    // The file-scoped half of the configuration is part of the *premise*, so it
+    // is written once into each pristine copy before anything runs — never
+    // re-written between steps, which would clobber whatever the invocation
+    // itself wrote to `.git/config`. Identical bytes on both sides, produced
+    // here rather than by either binary; see `install_config`.
+    install_config(&stock_repo, &case.config)?;
+    install_config(&zvcs_repo, &case.config)?;
 
     let home = &templates.home;
     let stock_exec = stock_exec_dir(home);
@@ -1881,6 +2442,8 @@ pub fn run_sequence(
     let _ = std::fs::remove_dir_all(&zvcs_repo);
     templates.instantiate(seq.envelope.shape, &stock_repo)?;
     templates.instantiate(seq.envelope.shape, &zvcs_repo)?;
+    install_config(&stock_repo, &seq.envelope.config)?;
+    install_config(&zvcs_repo, &seq.envelope.config)?;
 
     let home = &templates.home;
     let stock_exec = stock_exec_dir(home);
@@ -1949,6 +2512,7 @@ fn repeat_sequence_side(
     let repo = workdir.join(sub);
     let _ = std::fs::remove_dir_all(&repo);
     templates.instantiate(seq.envelope.shape, &repo)?;
+    install_config(&repo, &seq.envelope.config)?;
     let home = &templates.home;
 
     let mut again = None;
@@ -2043,6 +2607,7 @@ fn repeat_side(
     let repo = workdir.join(sub);
     let _ = std::fs::remove_dir_all(&repo);
     templates.instantiate(case.shape, &repo)?;
+    install_config(&repo, &case.config)?;
     let home = &templates.home;
     let again = run_side(bin, &repo, home, case)?;
     Ok(Repeat {
@@ -2080,11 +2645,13 @@ pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        case_timeout, is_unsupported, judge, probe_op_state, repeat_disagreement, step_is_final,
-        Case, Compared, Outcome, Repeat, Sequence, StepRef, Surface, Verdict, CASE_TIMEOUT,
-        OP_STATE_DIRS, OP_STATE_FILES,
+        case_timeout, config_premise, git_dir, is_unsupported, judge,
+        probe_op_state, quote_config_value, render_config_entry, repeat_disagreement, scope_file,
+        split_config_key, step_is_final, Case, Compared, ConfigEntry, ConfigScope, Outcome, Repeat,
+        Sequence, StepRef, Surface, Verdict, CASE_TIMEOUT, OP_STATE_DIRS, OP_STATE_FILES,
     };
     use crate::fixture::Shape;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -2502,7 +3069,7 @@ mod tests {
             assert_eq!(case.env, vec![("GIT_DIR".to_string(), "{repo}/.git".to_string())]);
             assert_eq!(
                 case.config,
-                vec![("rerere.enabled".to_string(), "true".to_string())]
+                vec![ConfigEntry::set(ConfigScope::CommandLine, "rerere.enabled", "true")]
             );
             assert_eq!(case.globals, vec![vec!["--no-advice".to_string()]]);
             // The envelope's own argv and payload are never executed: the step's
@@ -2516,6 +3083,270 @@ mod tests {
             seq.step_case(0).argv(),
             vec!["-c", "rerere.enabled=true", "--no-advice", "cherry-pick", "theirs"]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration scopes
+    // -----------------------------------------------------------------------
+
+    /// The declaration order of [`ConfigScope`] is git's precedence order,
+    /// lowest first — the fact every scoped case is read against.
+    ///
+    /// Written out as a literal expectation rather than derived from the enum,
+    /// because the enum is what is under test: a variant inserted in the wrong
+    /// place would still compile, would still run, and would quietly make
+    /// [`ConfigScope::ORDERED`] a lie that the module documentation repeats.
+    /// The sequence is the one measured from stock git 2.55.0 with
+    /// `config --show-origin --get-all`, where a key set in all of them resolves
+    /// to the command-line value and lists in this order.
+    #[test]
+    fn config_scope_declaration_order_is_gits_precedence_order() {
+        assert_eq!(
+            ConfigScope::ORDERED,
+            &[
+                ConfigScope::System,
+                ConfigScope::Global,
+                ConfigScope::Repo,
+                ConfigScope::Worktree,
+                ConfigScope::Env,
+                ConfigScope::CommandLine,
+            ]
+        );
+        // …and the declaration order agrees with it, which is what `Ord` means
+        // for this type and what a reader comparing two scopes will assume.
+        let mut sorted = ConfigScope::ORDERED.to_vec();
+        sorted.sort();
+        assert_eq!(sorted, ConfigScope::ORDERED.to_vec());
+        // `Modules` is outside the sequence and must not be in it.
+        assert!(!ConfigScope::ORDERED.contains(&ConfigScope::Modules));
+        assert_eq!(ConfigScope::ALL.len(), ConfigScope::ORDERED.len() + 1);
+        // Exactly the file-backed scopes have a file, and no other scope does.
+        for scope in ConfigScope::ALL {
+            assert_eq!(
+                scope.is_file(),
+                scope_file(Path::new("/tmp/x"), *scope).is_some(),
+                "{} disagrees with itself about having a file",
+                scope.name()
+            );
+        }
+    }
+
+    /// Every file a scope is delivered through lives **inside that side's own
+    /// fixture copy**, and the two synthetic ones live inside its git directory.
+    ///
+    /// This is the invariant that lets [`ConfigScope::Global`] and
+    /// [`ConfigScope::System`] re-point two of `env::harden`'s pins without
+    /// reopening the leak those pins close: the path is a function of the repo
+    /// root and nothing else, so no case can aim either variable at the
+    /// machine's real `~/.gitconfig` or `/etc/gitconfig`. The git-directory part
+    /// matters too — a synthetic file in the worktree would show up as `??` in
+    /// every `status` the case runs and in the state probe, which is a difference
+    /// the case never asked for.
+    #[test]
+    fn scope_files_stay_inside_the_fixture() {
+        let repo = Path::new("/nowhere/fixture");
+        for scope in ConfigScope::FILES {
+            let path = scope_file(repo, *scope).expect("a file scope has a file");
+            assert!(path.starts_with(repo), "{} escapes the fixture: {:?}", scope.name(), path);
+        }
+        for scope in [ConfigScope::Global, ConfigScope::System] {
+            let path = scope_file(repo, scope).unwrap();
+            assert!(
+                path.starts_with(git_dir(repo)),
+                "{} is visible to the worktree: {:?}",
+                scope.name(),
+                path
+            );
+        }
+        assert_eq!(scope_file(repo, ConfigScope::Env), None);
+        assert_eq!(scope_file(repo, ConfigScope::CommandLine), None);
+    }
+
+    /// `section.key` and `section.subsection.key` split the way git's own writer
+    /// splits them: first dot, last dot, and everything between is one
+    /// subsection — dots included, which is why `branch.a.b.merge` is branch
+    /// `a.b` and not a three-level key.
+    #[test]
+    fn split_config_key_finds_the_subsection() {
+        assert_eq!(split_config_key("core.abbrev"), Some(("core", None, "abbrev")));
+        assert_eq!(
+            split_config_key("branch.main.merge"),
+            Some(("branch", Some("main"), "merge"))
+        );
+        assert_eq!(
+            split_config_key("branch.a.b.merge"),
+            Some(("branch", Some("a.b"), "merge"))
+        );
+        // Not a key at all: written as a bare line, which git then rejects — the
+        // refusal is the measurement, so it must not be silently repaired.
+        assert_eq!(split_config_key("nosection"), None);
+        assert_eq!(split_config_key(".key"), None);
+        assert_eq!(split_config_key("section."), None);
+    }
+
+    /// A value written into a file delivers **the same string** `-c` would.
+    ///
+    /// Unquoted, git's reader strips surrounding whitespace, stops at `#`, and
+    /// reads an absent value as boolean true — three silent rewrites that would
+    /// make the scope stop being the only difference between a file case and its
+    /// `-c` twin. Every value here is one the fuzz pools actually draw.
+    #[test]
+    fn file_values_are_quoted_so_the_scope_is_the_only_variable() {
+        assert_eq!(quote_config_value("4"), "\"4\"");
+        // The empty value: `""` is the empty string, while a bare `key` with
+        // nothing after it is boolean true. `-c key=` means the former.
+        assert_eq!(quote_config_value(""), "\"\"");
+        // Whitespace and comment characters survive verbatim inside quotes.
+        assert_eq!(quote_config_value(" "), "\" \"");
+        assert_eq!(quote_config_value("# not a comment"), "\"# not a comment\"");
+        assert_eq!(quote_config_value("a; b"), "\"a; b\"");
+        // The five escapes `config.c:parse_value` accepts, and nothing else —
+        // a raw backslash would start an escape git does not know and turn a
+        // value into a parse error the case did not ask for.
+        assert_eq!(quote_config_value("\t"), "\"\\t\"");
+        assert_eq!(quote_config_value("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote_config_value("a\\b"), "\"a\\\\b\"");
+        assert_eq!(quote_config_value("a\nb"), "\"a\\nb\"");
+    }
+
+    /// A setting becomes one stanza, a subsection is quoted into its header, and
+    /// a raw line is written through untouched.
+    ///
+    /// One header per setting even when two settings share a section: a repeated
+    /// section is legal git, and repeating it is what keeps two draws of one key
+    /// legible as two stanzas — which is the last-value-wins premise the ordering
+    /// exists to test.
+    #[test]
+    fn a_setting_becomes_one_stanza_and_a_raw_line_stays_a_line() {
+        assert_eq!(
+            render_config_entry(&ConfigEntry::set(ConfigScope::Repo, "core.abbrev", "4")),
+            "[core]\n\tabbrev = \"4\"\n"
+        );
+        assert_eq!(
+            render_config_entry(&ConfigEntry::set(
+                ConfigScope::Repo,
+                "branch.main.merge",
+                "refs/heads/main"
+            )),
+            "[branch \"main\"]\n\tmerge = \"refs/heads/main\"\n"
+        );
+        assert_eq!(
+            render_config_entry(&ConfigEntry::raw(ConfigScope::Repo, "[core")),
+            "[core\n"
+        );
+        // A key that is not a `section.key` is emitted as the bare line it is,
+        // because git's refusal of it is the thing being compared.
+        assert_eq!(
+            render_config_entry(&ConfigEntry::set(ConfigScope::Repo, "nosection", "1")),
+            "nosection = \"1\"\n"
+        );
+    }
+
+    /// The premise a failure block prints: one entry per file, in draw order,
+    /// plus the gate the worktree scope needs and the environment pairs.
+    ///
+    /// Order inside a file is the whole content of a last-wins case, so it is
+    /// asserted rather than assumed — a renderer that grouped by key, or that
+    /// sorted, would turn `4` then `12` into a case whose printed premise says
+    /// the opposite of what ran.
+    #[test]
+    fn the_config_premise_is_rendered_per_file_in_draw_order() {
+        let entries = vec![
+            ConfigEntry::set(ConfigScope::Repo, "core.abbrev", "4"),
+            ConfigEntry::set(ConfigScope::Repo, "core.abbrev", "12"),
+            ConfigEntry::set(ConfigScope::Worktree, "core.abbrev", "40"),
+            ConfigEntry::set(ConfigScope::Env, "diff.renames", "copies"),
+            ConfigEntry::set(ConfigScope::CommandLine, "status.short", "true"),
+        ];
+        let premise = config_premise(&entries);
+        let by_place = |name: &str| -> String {
+            premise
+                .iter()
+                .find(|(w, _)| w == name)
+                .unwrap_or_else(|| panic!("{name} missing from {premise:?}"))
+                .1
+                .clone()
+        };
+        // The gate is written before the file it gates, and into `.git/config`.
+        assert_eq!(premise[0].0, ".git/config");
+        assert_eq!(premise[0].1, "[extensions]\n\tworktreeConfig = true\n");
+        assert_eq!(
+            by_place(".git/config.worktree"),
+            "[core]\n\tabbrev = \"40\"\n"
+        );
+        // Two stanzas for one key, in the order drawn: the second wins, and the
+        // printed premise has to show why.
+        let repo = premise
+            .iter()
+            .filter(|(w, _)| w == ".git/config")
+            .map(|(_, t)| t.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(repo.len(), 2, "the gate and the settings are separate stanzas");
+        assert_eq!(repo[1], "[core]\n\tabbrev = \"4\"\n[core]\n\tabbrev = \"12\"\n");
+        assert_eq!(
+            by_place("environment"),
+            "GIT_CONFIG_COUNT=1\nGIT_CONFIG_KEY_0=diff.renames\nGIT_CONFIG_VALUE_0=copies\n"
+        );
+        // The command-line entry is not a premise: it is in the argv, and the
+        // block that prints this one already prints the argv.
+        assert!(!premise.iter().any(|(_, t)| t.contains("status.short")));
+    }
+
+    /// Only the command-line scope reaches argv, and only the non-command-line
+    /// scopes reach the `::config[…]` segment.
+    ///
+    /// Both halves matter. Rendering a file-scoped entry as `-c` would deliver
+    /// the setting through the one scope the entry said it was *not* using,
+    /// which is the entire thing being measured; leaving it out of the id would
+    /// make the case unreproducible, since nothing else in the id says a file
+    /// was written.
+    #[test]
+    fn each_scope_is_rendered_exactly_once_and_in_the_right_place() {
+        let case = Case::new("status", &["status"], Shape::Linear).with_scoped_config(vec![
+            ConfigEntry::set(ConfigScope::CommandLine, "core.abbrev", "4"),
+            ConfigEntry::set(ConfigScope::Repo, "core.abbrev", "12"),
+            ConfigEntry::set(ConfigScope::Global, "diff.renames", "copies"),
+            ConfigEntry::raw(ConfigScope::Worktree, "[core"),
+        ]);
+        assert_eq!(case.argv(), vec!["-c", "core.abbrev=4", "status"]);
+        assert_eq!(
+            case.id(),
+            "linear::status::-c core.abbrev=4 status\
+             ::config[repo:core.abbrev=12 global:diff.renames=copies worktree:~[core]"
+        );
+        // Dropping one entry drops exactly one fact from the id, which is what
+        // makes `fuzz::shrink`'s walk over `config` mean anything.
+        assert_eq!(case.size(), 4);
+    }
+
+    /// A case may not carry `GIT_CONFIG_*` in its own environment *and* use
+    /// [`ConfigScope::Env`], because the runner would overwrite the case's pairs
+    /// and the case would run under a configuration its own id does not
+    /// describe.
+    ///
+    /// Checked against the real corpus rather than in the abstract: the curated
+    /// discovery cases set `GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0` directly and
+    /// predate the scope, so this is the one place the two mechanisms could
+    /// actually collide. `run_side` asserts it again per case; this catches it
+    /// at `cargo test` time, before a corpus entry that would abort a sweep is
+    /// committed.
+    #[test]
+    fn no_case_mixes_the_env_config_scope_with_its_own_environment() {
+        let mut checked = 0;
+        let envelopes = crate::corpus::sequences().into_iter().map(|s| s.envelope);
+        for case in crate::corpus::cases().into_iter().chain(envelopes) {
+            let hand_written = case.env.iter().any(|(k, _)| k.starts_with("GIT_CONFIG_"));
+            let scoped = case.config.iter().any(|e| e.scope == ConfigScope::Env);
+            assert!(
+                !(hand_written && scoped),
+                "{} sets GIT_CONFIG_* twice, by two mechanisms",
+                case.id()
+            );
+            if hand_written {
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no corpus case sets GIT_CONFIG_* by hand any more — drop the guard");
     }
 
     /// A sequence reports the *first* step that diverged, and otherwise its

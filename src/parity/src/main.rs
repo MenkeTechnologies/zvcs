@@ -14,6 +14,7 @@
 //!                                    #   and 40 generated sequences per entry point
 //!   zvcs-parity --fuzz 40 --seed 7   # reproduce a specific fuzz run
 //!   zvcs-parity --fuzz 40 --fuzz-sequences 0   # argv sweep only, no sequences
+//!   zvcs-parity --fuzz 40 --list-cases         # what that run would execute
 //!   zvcs-parity --only status,log    # restrict to some subcommands
 //!   zvcs-parity --verbose            # print every failure in detail
 //!   zvcs-parity --bin path/to/git    # explicit binary under test
@@ -54,6 +55,18 @@ struct Args {
     /// `--html <path>`: also write the HTML port report to this path from the
     /// run's real coverage + parity numbers (regenerates `docs/port_report.html`).
     html: Option<String>,
+    /// `--list-cases`: print the id of every case the run *would* execute, then
+    /// exit without running anything.
+    ///
+    /// A case id is this harness's reproduction recipe — it carries the shape,
+    /// the argv, the configuration and the scope each setting came from, the
+    /// working directory, the environment and the stdin digest — and until this
+    /// flag existed the only way to see one was to make it fail. That is a poor
+    /// trade for the question it answers most often, which is "what does seed N
+    /// actually generate", and it is the question a reader asks before trusting
+    /// that a sampled dimension fires at all. Costs nothing: generation is pure,
+    /// so no fixture is built and no child process is spawned.
+    list_cases: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -68,6 +81,7 @@ fn parse_args() -> Result<Args> {
         keep: false,
         shrink: false,
         html: None,
+        list_cases: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -113,6 +127,10 @@ fn parse_args() -> Result<Args> {
                 a.html = Some(next(i)?);
                 i += 2;
             }
+            "--list-cases" => {
+                a.list_cases = true;
+                i += 1;
+            }
             other => anyhow::bail!("unknown argument {other:?}"),
         }
     }
@@ -129,8 +147,47 @@ fn main() -> ExitCode {
     }
 }
 
+/// Print what a run would execute, without executing it.
+///
+/// Deliberately the *same* assembly the real run does — the curated corpus, then
+/// the generated cases, then the sequences, then `--only` — rather than a second
+/// path that lists the corpus it thinks exists. A listing that could disagree
+/// with the run is worse than no listing, because it would be believed.
+///
+/// Sequences print one line per step, under the same id `report` prints for a
+/// failure at that step, so a step id copied out of a listing and a step id
+/// copied out of a failure are the same string.
+fn list_cases(args: &Args) -> Result<ExitCode> {
+    let fuzz_sequences = args.fuzz_sequences.unwrap_or(args.fuzz_per_cmd);
+    let mut jobs: Vec<Job> = corpus::cases().into_iter().map(Job::Single).collect();
+    jobs.extend(corpus::sequences().into_iter().map(Job::Sequence));
+    if args.fuzz_per_cmd > 0 {
+        jobs.extend(fuzz::generate(args.seed, args.fuzz_per_cmd).into_iter().map(Job::Single));
+    }
+    if fuzz_sequences > 0 {
+        jobs.extend(fuzz::generate_sequences(args.seed, fuzz_sequences).into_iter().map(Job::Sequence));
+    }
+    if !args.only.is_empty() {
+        jobs.retain(|j| args.only.iter().any(|o| o == j.cmd()));
+    }
+    for job in &jobs {
+        match job {
+            Job::Single(c) => println!("{}", c.id()),
+            Job::Sequence(s) => {
+                for i in 0..s.len() {
+                    println!("{}", s.step_id(i));
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn real_main() -> Result<ExitCode> {
     let args = parse_args()?;
+    if args.list_cases {
+        return list_cases(&args);
+    }
     let zvcs_bin = runner::locate_zvcs_bin(args.bin.as_deref())?;
 
     // Everything lands under one root so a run leaves nothing behind.

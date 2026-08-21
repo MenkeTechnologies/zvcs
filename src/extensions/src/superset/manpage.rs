@@ -49,7 +49,7 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zdaemon <start|stop|restart|reload|status|info|ping|log>",
         desc: &[
             "Controls the one machine-wide daemon (state under ~/.zvcs, socket ~/.zvcs/zvcs.sock) that replaces git's index.lock with a fair per-repo queue and hosts the async job queue, the SQLite ledger, and reactive autonomy.",
-            "start/stop bring it up and down; restart and reload respawn it, re-reading config; status and info report liveness and pid/socket/paths/config; ping is a scriptable liveness check; log [-n N] [-f] shows or tails ~/.zvcs/zvcs.log.",
+            "start/stop bring it up and down; restart and reload respawn it, re-reading config; status and info report liveness and pid/socket/paths/config; ping is a scriptable liveness check; log [-n N] [-f] shows or tails ~/.zvcs/zvcs.log, whose every line opens with a local RFC-3339 stamp (2026-08-20T14:03:11-07:00) ahead of its [zvcs ...] tag.",
         ],
     },
     Doc {

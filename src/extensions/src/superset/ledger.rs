@@ -68,7 +68,12 @@ pub fn zrepos(args: &[String]) -> Result<ExitCode> {
 /// is piped or redirected (a script), it runs **inline** so `indexed N, pruned M`
 /// stays on stdout and the index is populated before the next command. `--sync`
 /// forces inline, `--async` forces detached; either overrides the tty default.
+/// Set on the detached `zreindex --sync` child so it knows its stdout is the
+/// singleton log; internal, never a documented switch.
+const DETACHED_ENV: &str = "ZVCS_REINDEX_DETACHED";
+
 pub fn zreindex(args: &[String]) -> Result<ExitCode> {
+
     let mut forced: Option<bool> = None; // Some(true)=sync, Some(false)=async
     let mut roots_args: Vec<String> = Vec::new();
     for a in args {
@@ -84,7 +89,7 @@ pub fn zreindex(args: &[String]) -> Result<ExitCode> {
     if !sync {
         let mut child: Vec<&str> = vec!["zreindex", "--sync"];
         child.extend(roots_args.iter().map(String::as_str));
-        crate::autostart::spawn_detached_self(&child);
+        crate::autostart::spawn_detached_self(&child, &[(DETACHED_ENV, "1")]);
         eprintln!("zvcs: reindex crawling in background — watch with `git zdaemon log -f`");
         return Ok(ExitCode::SUCCESS);
     }
@@ -95,7 +100,14 @@ pub fn zreindex(args: &[String]) -> Result<ExitCode> {
         roots_args.iter().map(std::path::PathBuf::from).collect()
     };
     let (n, pruned) = crate::crawler::crawl_into_db(&roots)?;
-    println!("indexed {n} repo(s), pruned {pruned}");
+    // The async form re-execs this same `--sync` command with stdout pointed at
+    // `zvcs.log`; there the result is a log record and goes through the stamped,
+    // tagged writer. A real `--sync` (piped or asked for) still prints to stdout.
+    if std::env::var_os(DETACHED_ENV).is_some() {
+        crate::superset::zdaemon::log_line(&format!("[zvcs crawl] indexed {n} repo(s), pruned {pruned}"));
+    } else {
+        println!("indexed {n} repo(s), pruned {pruned}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

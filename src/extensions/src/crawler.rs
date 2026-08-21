@@ -87,12 +87,13 @@ fn open_log() -> Option<File> {
         .ok()
 }
 
-/// Append one progress line to the shared log handle, if the log opened. Holding
-/// the mutex over the write keeps concurrent walk threads' lines from interleaving.
+/// Append one stamped progress line to the shared log handle, if the log opened.
+/// Holding the mutex over the write keeps concurrent walk threads' lines from
+/// interleaving; the stamp is taken inside the lock so the file stays ordered.
 fn log_progress(log: &Mutex<Option<File>>, msg: &str) {
     if let Ok(mut guard) = log.lock() {
         if let Some(f) = guard.as_mut() {
-            let _ = writeln!(f, "{msg}");
+            let _ = writeln!(f, "{} {msg}", crate::superset::zdaemon::log_stamp());
         }
     }
 }
@@ -272,11 +273,9 @@ fn recrawl_if_changed(git_dir: &Path, last_roots: &mut Option<Vec<PathBuf>>) {
 /// runs on a detached thread, so its result must never touch the terminal — a
 /// foreground daemon still inherits stdout. Writing the log directly (rather than
 /// `println!`) keeps this chatter log-only no matter how the daemon was launched.
+/// One writer for the whole file, so every line carries the same stamp.
 fn log_line(msg: &str) {
-    let path = crate::superset::zdaemon::zvcs_home().join("zvcs.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{msg}");
-    }
+    crate::superset::zdaemon::log_line(msg);
 }
 
 /// The configured crawl roots: `[zvcs] crawlroots` (whitespace/comma separated),

@@ -225,7 +225,7 @@
         <h3><span class="doc-sigil">git</span> zdaemon <span class="doc-summary">control the singleton machine-wide coordinator</span></h3>
         <pre class="doc-synopsis"><code>git zdaemon &lt;start|stop|restart|reload|status|info|ping|log&gt;</code></pre>
         <p>Controls the one machine-wide daemon (state under ~/.zvcs, socket ~/.zvcs/zvcs.sock) that replaces git's index.lock with a fair per-repo queue and hosts the async job queue, the SQLite ledger, and reactive autonomy.</p>
-        <p>start/stop bring it up and down; restart and reload respawn it, re-reading config; status and info report liveness and pid/socket/paths/config; ping is a scriptable liveness check; log [-n N] [-f] shows or tails ~/.zvcs/zvcs.log.</p>
+        <p>start/stop bring it up and down; restart and reload respawn it, re-reading config; status and info report liveness and pid/socket/paths/config; ping is a scriptable liveness check; log [-n N] [-f] shows or tails ~/.zvcs/zvcs.log, whose every line opens with a local RFC-3339 stamp (2026-08-20T14:03:11-07:00) ahead of its [zvcs ...] tag.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>
       <article class="doc-entry" id="zconfig">

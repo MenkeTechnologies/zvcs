@@ -68,13 +68,17 @@ pub fn spawn_detached(workdir: &Path) {
 /// Re-exec this binary with `args`, fully detached (own process group, stdio →
 /// the singleton log), inheriting the caller's cwd. Turns a foreground command
 /// into a background one so the prompt returns at once — e.g. `zreindex` handing
-/// a whole-device crawl to a child. Fire-and-forget; output lands in `zvcs.log`.
-pub fn spawn_detached_self(args: &[&str]) {
+/// a whole-device crawl to a child. `env` is set on the child only — used to
+/// tell it that its stdout IS the log. Fire-and-forget; output lands in `zvcs.log`.
+pub fn spawn_detached_self(args: &[&str], env: &[(&str, &str)]) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     route_stdio_to_log(&mut cmd);
     cmd.process_group(0);
     let _ = cmd.spawn();

@@ -250,7 +250,9 @@ zdaemon <start|stop|status>` controls the singleton coordinator (below). `git
 zdaemon <start|stop|restart|reload|status|info|ping|log>` is the full daemon
 control surface — `restart`/`reload` respawn it (re-reading config), `ping` is a
 scriptable liveness check, `info` prints pid/socket/paths/config, and `log [-n
-N] [-f]` shows/tails `~/.zvcs/zvcs.log`. `git
+N] [-f]` shows/tails `~/.zvcs/zvcs.log` — every line there opens with a local
+RFC-3339 stamp (`2026-08-20T14:03:11-07:00`) ahead of its `[zvcs ...]` tag, so a
+day's activity is a plain `grep` and a stall is visible in the tail. `git
 zup` brings the whole tree — the top-level repo **and** every nested submodule —
 to latest `origin/main` (fetch + fast-forward, attached; dirty/diverged skipped).
 

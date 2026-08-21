@@ -29,6 +29,18 @@ use std::time::{Duration, Instant};
 
 use crate::config::ZvcsConfig;
 
+/// Every line the watcher emits ends up in `zvcs.log` — a detached daemon has the
+/// log as its stdout — so it opens with the same stamp [`log_line`] writes. Going
+/// through `println!` (not the log file directly) keeps a foreground
+/// `zdaemon start --foreground` showing the same lines on the terminal.
+///
+/// [`log_line`]: crate::superset::zdaemon::log_line
+macro_rules! note {
+    ($($arg:tt)*) => {
+        println!("{} {}", crate::superset::zdaemon::log_stamp(), format_args!($($arg)*))
+    };
+}
+
 /// A watched repository: its git directory and working directory (passed to
 /// hooks).
 struct Target {
@@ -111,14 +123,14 @@ fn run(cfg: ZvcsConfig) {
     }) {
         Ok(w) => w,
         Err(e) => {
-            println!("[zvcs watch] cannot create watcher: {e}");
+            note!("[zvcs watch] cannot create watcher: {e}");
             return;
         }
     };
 
     let mut registered: HashSet<PathBuf> = HashSet::new();
     let (watched, armed_n) = register(&mut watcher, &targets, &mut registered);
-    println!(
+    note!(
         "[zvcs watch] watching {} path(s) ({watched} tree(s), {armed_n} whole-dir), hooks={}",
         targets.len(),
         cfg.hooks_enabled(),
@@ -243,7 +255,7 @@ fn run(cfg: ZvcsConfig) {
                 if let Ok(repo) = gix::open(&t.git_dir) {
                     for (wd, status) in crate::superset::sync_dups(&repo, false) {
                         if status.starts_with("synced") || status.starts_with("forced") {
-                            println!("[zvcs autodups] {wd}: {status}");
+                            note!("[zvcs autodups] {wd}: {status}");
                         }
                     }
                 }
@@ -321,7 +333,7 @@ fn rescan(
     *targets = rebuilt;
     let (added, armed) = register(watcher, targets, registered);
     if added > 0 {
-        println!(
+        note!(
             "[zvcs watch] picked up {added} new path(s) ({armed} whole-dir); now watching {} repo(s)",
             targets.len()
         );
@@ -436,7 +448,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                         .unwrap_or_else(|| PathBuf::from(&r.git_dir));
                     add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false, None, 0);
                     if targets.len() >= MAX_WATCHED {
-                        println!(
+                        note!(
                             "[zvcs watch] capped at {MAX_WATCHED} watched repos; \
                              narrow `zvcs.crawlroots` to watch fewer"
                         );
@@ -542,7 +554,7 @@ fn react(cfg: &ZvcsConfig) {
         match crate::superset::reconcile_repo_local(&repo) {
             Ok(msg) => record_reconcile_event(&repo, &msg),
             Err(e) => {
-                println!("[zvcs reconcile] (top): error: {e:#}");
+                note!("[zvcs reconcile] (top): error: {e:#}");
                 let _ = crate::db::record_failure(repo.git_dir(), "reconcile", &format!("{e:#}"));
             }
         }
@@ -553,7 +565,7 @@ fn react(cfg: &ZvcsConfig) {
                         Ok(msg) => record_reconcile_event(&sub, &msg),
                         Err(e) => {
                             let path = sm.path().map(|p| p.to_string()).unwrap_or_default();
-                            println!("[zvcs reconcile] {path}: error: {e:#}");
+                            note!("[zvcs reconcile] {path}: error: {e:#}");
                             let _ = crate::db::record_failure(
                                 sub.git_dir(),
                                 "reconcile",
@@ -578,7 +590,7 @@ fn react(cfg: &ZvcsConfig) {
                 }
             }
             Err(e) => {
-                println!("[zvcs autobump] error: {e:#}");
+                note!("[zvcs autobump] error: {e:#}");
                 let _ = crate::db::record_failure(repo.git_dir(), "autobump", &format!("{e:#}"));
             }
         }

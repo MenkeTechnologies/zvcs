@@ -118,14 +118,29 @@ pub fn zvcs_home() -> PathBuf {
     dir
 }
 
-/// Append one line to the singleton daemon log (`$ZVCS_HOME/zvcs.log`) so daemon
-/// activity — job queue/exec lifecycle included — is grep-able alongside the
-/// `[zvcs watch]`/`[zvcs crawl]` lines. Best-effort: a log that cannot be opened
-/// silently no-ops and never fails the caller.
+/// The wall-clock stamp every `zvcs.log` line opens with: RFC-3339 in the
+/// process's own zone (`2026-08-20T14:03:11-07:00`), rendered by the ported
+/// `show_date()` so the daemon log and `git log --date=iso-strict-local` agree
+/// on one spelling. Sorts lexicographically within a zone, and the leading
+/// `YYYY-MM-DD` makes a day's activity a plain `grep`.
+pub(crate) fn log_stamp() -> String {
+    let now = crate::superset::zsince::now_secs();
+    let mode = crate::showdate::DateMode {
+        kind: crate::showdate::DateType::Iso8601Strict,
+        local: true,
+        strftime_fmt: None,
+    };
+    crate::showdate::show_date(now, 0, &mode, now)
+}
+
+/// Append one stamped line to the singleton daemon log (`$ZVCS_HOME/zvcs.log`)
+/// so daemon activity — job queue/exec lifecycle included — is grep-able
+/// alongside the `[zvcs watch]`/`[zvcs crawl]` lines. Best-effort: a log that
+/// cannot be opened silently no-ops and never fails the caller.
 pub(crate) fn log_line(msg: &str) {
     let path = zvcs_home().join("zvcs.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{msg}");
+        let _ = writeln!(f, "{} {msg}", log_stamp());
     }
 }
 

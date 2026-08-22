@@ -150,11 +150,27 @@ impl<'repo> Commit<'repo> {
     /// assert_eq!(parent_ids, vec![repo.rev_parse_single("HEAD~1")?]);
     /// # Ok(()) }
     /// ```
+    /// ### Grafts
+    ///
+    /// A commit named by the repository's [graft table](crate::graft) reports the
+    /// parents that table gives it, not the ones its `parent` headers record — git's
+    /// `parse_commit_buffer()` substituting `commit->parents` (commit.c:554-590).
+    /// The object itself is untouched, so [`decode()`](Self::decode()) and
+    /// [`iter()`](Self::iter()) still show the recorded parents, exactly as
+    /// `git cat-file -p` does over a grafted commit.
     pub fn parent_ids(&self) -> impl Iterator<Item = crate::Id<'repo>> + '_ {
         use crate::ext::ObjectIdExt;
         let repo = self.repo;
-        gix_object::CommitRefIter::from_bytes(&self.data, self.id.kind())
-            .parent_ids()
+        // Exactly one of the two is `Some`: a graft replaces the whole parent list,
+        // and without one the headers stand.
+        let grafted = repo.commit_grafts().parents_of(&self.id).map(<[_]>::to_vec);
+        let recorded = grafted
+            .is_none()
+            .then(|| gix_object::CommitRefIter::from_bytes(&self.data, self.id.kind()).parent_ids());
+        grafted
+            .into_iter()
+            .flatten()
+            .chain(recorded.into_iter().flatten())
             .map(move |id| id.attach(repo))
     }
 

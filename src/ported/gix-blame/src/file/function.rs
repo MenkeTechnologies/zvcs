@@ -235,7 +235,15 @@ pub fn file(
         let parent_ids: ParentIds = match &options.children {
             Some(children) => collect_children(children, &commit_id, &odb, cache.as_ref(), &mut buf2)?,
             None => {
-                let mut ids = collect_parents(commit, &odb, cache.as_ref(), &mut buf2)?;
+                // `first_scapegoat()` reads `commit->parents`, which
+                // `parse_commit_buffer()` already replaced from the graft table
+                // (commit.c:554-590) — so the substitution belongs before the
+                // `--first-parent` truncation, exactly as it does in git.
+                let grafted = options.grafts.as_ref().and_then(|g| g.parents_of(&commit_id));
+                let mut ids = match grafted {
+                    Some(grafted) => parent_ids_with_times(grafted, &odb, &mut buf2),
+                    None => collect_parents(commit, &odb, cache.as_ref(), &mut buf2)?,
+                };
                 if options.first_parent {
                     ids.truncate(1);
                 }
@@ -1267,6 +1275,24 @@ fn find_path_entry_in_commit(
 }
 
 type ParentIds = SmallVec<[(gix_hash::ObjectId, i64); 2]>;
+
+/// Pair each id with the commit time the blame queue orders by, the way
+/// [`collect_parents`] does for a commit read from the object database.
+///
+/// A parent that cannot be read gets time 0 — the same fallback, which matters
+/// because a graft may well name a commit this repository does not have.
+fn parent_ids_with_times(ids: &[gix_hash::ObjectId], odb: &impl gix_object::Find, buf: &mut Vec<u8>) -> ParentIds {
+    ids.iter()
+        .map(|id| {
+            let time = odb
+                .find_commit_iter(id.as_ref(), buf)
+                .ok()
+                .and_then(|parent| parent.committer().ok().map(|committer| committer.seconds()))
+                .unwrap_or_default();
+            (*id, time)
+        })
+        .collect()
+}
 
 fn collect_parents(
     commit: gix_traverse::commit::Either<'_, '_>,

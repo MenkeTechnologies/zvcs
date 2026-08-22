@@ -422,11 +422,16 @@ fn merge_and_apply(
     // WRITE_TREE_REPAIR)` belongs (unpack-trees.c:2088-2092). Doing it here rather
     // than at each writer is what keeps the twelve of them from drifting apart.
     //
-    // It runs *after* the conflict entries are applied, because a conflicted index
-    // has no tree at all: `verify_cache()` refuses an unmerged entry
-    // (cache-tree.c:218-234) and the update leaves the extension off, which is the
-    // right answer for an index that cannot be turned into a tree.
-    crate::porcelain::write_tree::rebuild_cache_tree(repo, &mut index);
+    // It runs *after* the conflict entries are applied, because what the extension
+    // ends up looking like depends on them: `verify_cache()` refuses an unmerged
+    // entry (cache-tree.c:218-234) and `cache_tree_update()` returns before it has
+    // touched `istate->cache_tree`, so a conflicted result keeps the cache-tree
+    // `unpack_trees()` carried over from the pre-merge index — with the paths the
+    // merge touched invalidated and the rest still naming their trees. Carrying
+    // and invalidating rather than dropping is what reproduces that: stock's index
+    // after a conflicting merge still has `TREE`, and an index with none is 34-42
+    // bytes shorter than the one git wrote.
+    crate::porcelain::write_tree::carry_and_repair_cache_tree(repo, old_index, &mut index);
 
     Ok(Merged::Applied(Applied {
         tree_id,

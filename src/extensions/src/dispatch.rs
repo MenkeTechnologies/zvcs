@@ -902,29 +902,136 @@ fn help_reads_config(args: &[String]) -> bool {
 /// `fatal: repo version is 0, but v1-only extension found:\n\tobjectformat`.
 const REPO_FORMAT_GATE_VERBS: &[&str] = &["init", "init-db", "rev-parse"];
 
-/// `read_and_verify_repository_format()` for the handful of verbs that would
-/// otherwise never reach it, or `None` to carry on.
+/// The verbs `check_repository_format_gently()` is called for with a non-`NULL`
+/// `nongit_ok`, which turns its refusal into a warning and lets the command run
+/// **outside** the repository:
 ///
-/// The verdict is `gix`'s own — the same open that every other verb performs —
-/// so this adds no refusal that was not already reachable; it only moves the one
-/// that exists to the moment git makes it. `rev-parse --parseopt` and
-/// `--sq-quote` are handled before `setup_git_directory()` in
-/// `builtin/rev-parse.c` and so skip it, exactly as they skip the settings block.
+/// ```c
+/// if (verify_repository_format(candidate, &err) < 0) {
+///         if (nongit_ok) {
+///                 warning("%s", err.buf);
+///                 *nongit_ok = -1;
+///                 return -1;
+///         }
+///         die("%s", err.buf);
+/// }
+/// ```
+///
+/// That is git.c's `RUN_SETUP_GENTLY` class plus the entries with no setup flag
+/// whose builtins call `setup_git_directory_gently()` for themselves. Everything
+/// *not* listed here reaches the `die()` arm, which is what
+/// [`repository_format_gate`] reproduces.
+///
+/// `rev-parse` is deliberately absent even though its `commands[]` entry carries
+/// no flag: `cmd_rev_parse()` calls the ungentle `setup_git_directory()` for
+/// every mode but `--parseopt`/`--sq-quote`, and dies. `grep` and `archive` are
+/// present for the opposite reason — they are `RUN_SETUP_GENTLY` entries that
+/// [`crate::NO_SETUP_VERBS`] excludes, because the question that list answers
+/// ("what still works with no repository at all") is not this one.
+///
+/// The warning half is **not** ported. Reproducing it means running these verbs
+/// with the repository suppressed — `discover_git_directory_reason()`
+/// (setup.c:1700-1750) emits a second `warning: ignoring git dir '<dir>': …` and
+/// the command then behaves as though it were outside a repository — which is a
+/// restructuring of discovery, not a diagnostic. Listing them here keeps this
+/// gate from inventing a `fatal:` git does not raise; they carry on as before.
+const FORMAT_GENTLE_VERBS: &[&str] = &[
+    "apply",
+    "archive",
+    "bugreport",
+    "bundle",
+    "check-ref-format",
+    "clone",
+    "column",
+    "config",
+    "credential",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
+    "diagnose",
+    "diff",
+    "difftool",
+    "for-each-repo",
+    "get-tar-commit-id",
+    "grep",
+    "hash-object",
+    "help",
+    "hook",
+    "index-pack",
+    "interpret-trailers",
+    "ls-remote",
+    "mailinfo",
+    "mailsplit",
+    "merge-file",
+    "mergetool",
+    "patch-id",
+    "receive-pack",
+    "remote-ext",
+    "remote-fd",
+    "shortlog",
+    "show-index",
+    "stripspace",
+    "upload-archive",
+    "upload-archive--writer",
+    "upload-pack",
+    "url-parse",
+    "var",
+    "verify-pack",
+    "version",
+];
+
+/// `read_and_verify_repository_format()` (setup.c:753-777) for the verb about to
+/// run, or `None` to carry on.
+///
+/// Two readings of the repository's format meet here and they answer different
+/// questions:
+///
+/// * **`gix`'s own**, for [`REPO_FORMAT_GATE_VERBS`] — the verbs that would never
+///   open the repository and so would never surface `gix`'s error at all. It
+///   covers what `gix` itself refuses (`ObjectFormatRequiresV1`,
+///   `UnsupportedRepositoryFormatVersion`) and nothing more.
+/// * **The port of `verify_repository_format()`**
+///   ([`crate::config::repository_format_refusal`]), which covers the arms `gix`
+///   has no error for at all. The one that matters is
+///   `unknown repository extension found:` — an `extensions.<anything>` git does
+///   not know, at `core.repositoryFormatVersion = 1`. `gix` reads such a
+///   repository happily, so every verb ran and exited 0 where stock git exits
+///   128. It also reaches `noop-v1` and the other v1-only extensions at version
+///   0, which `gix` only diagnoses for `objectformat`.
+///
+/// The second check runs for every verb outside [`FORMAT_GENTLE_VERBS`], which is
+/// exactly the set git calls `check_repository_format_gently()` for with a
+/// `NULL` `nongit_ok` and therefore dies for. It is ordered after the `gix`
+/// reading so the verbs in both keep the message they already produced.
+///
+/// `rev-parse --parseopt` and `--sq-quote` are handled before
+/// `setup_git_directory()` in `builtin/rev-parse.c` and so skip both, exactly as
+/// they skip the settings block.
 fn repository_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
-    if !REPO_FORMAT_GATE_VERBS.contains(&sub) {
-        return None;
-    }
     if sub == "rev-parse" && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote") {
         return None;
     }
-    let err = gix::discover(".").err()?;
-    let gix::discover::Error::Open(gix::open::Error::Config(config)) = &err else {
-        return None;
-    };
-    let msg = crate::config::repository_format_message(config)?;
+    let msg = format_refusal(sub)?;
     crate::trace2::error(&msg);
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
+/// The `err.buf` half of [`repository_format_gate`], split out so the two
+/// readings read as the two questions they are.
+fn format_refusal(sub: &str) -> Option<String> {
+    if REPO_FORMAT_GATE_VERBS.contains(&sub) {
+        let discovered = gix::discover(".").err();
+        if let Some(gix::discover::Error::Open(gix::open::Error::Config(config))) = &discovered {
+            if let Some(msg) = crate::config::repository_format_message(config) {
+                return Some(msg);
+            }
+        }
+    }
+    if FORMAT_GENTLE_VERBS.contains(&sub) {
+        return None;
+    }
+    crate::config::repository_format_refusal()
 }
 
 /// `fatal: bad config line <n> in file <path>` for the repository's own config

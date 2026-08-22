@@ -364,11 +364,48 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
 /// The name in the message is `peel_onion()`'s whole `name`/`len`, i.e. the
 /// operand *including* its `^{…}` suffix, not the base.
 ///
-/// Callers emit this once per failed resolution. git resolves a failing operand
-/// twice on the commands that end in `die_verify_filename()`, which is why stock
-/// `git rev-parse main^{blob}` prints the line twice while `git cat-file -t
-/// main^{blob}` — no `verify_filename()` — prints it once.
+/// Callers emit this once per resolution — *not* once per failed resolution.
+/// `error()` is raised while `get_oid_1()` is still running, and `get_oid_1()`
+/// carries on afterwards: it falls back to `get_oid_basic()` on the whole name
+/// (`object-name.c:1128-1132`), which for a reflog operand can still answer. So
+/// stock `git rev-parse 'HEAD@{<old date>}^{blob}'` prints the `error:` line and
+/// then exits 0 with an id on stdout. [`resolve`] is where the emission belongs
+/// for the same reason the reflog diagnostics belong there.
+///
+/// git resolves a *failing* operand twice on the commands that end in
+/// `die_verify_filename()`, which is why stock `git rev-parse main^{blob}` prints
+/// the line twice while `git cat-file -t main^{blob}` — no `verify_filename()` —
+/// prints it once.
+///
+/// `name` is the operand as written, because the frame that reports is not
+/// generally the operand's own: `peel_onion()` runs at every step of the
+/// reduction that has a `^{<type>}` to cut, and the suffixes above it are cut
+/// first. Stock 2.55.0 answers `HEAD^{blob}^`, `HEAD^{blob}~1` and
+/// `HEAD^{blob}:f` with `error: HEAD^{blob}: …` — the *reduced* name — so the
+/// walk below is `object_part()` followed by [`navigation_step`], asking
+/// [`peel_onion_error`] at each frame and taking the first answer.
+///
+/// Outside-in is the right order even though the C recurses inside-out: an outer
+/// frame whose inner peel failed cannot report, because `get_oid_1()` returned
+/// non-zero and `peel_onion()` bails at `object-name.c:959-960` before
+/// `repo_peel_to_type()`. Measured both ways round against stock 2.55.0 —
+/// `HEAD^{tree}^{blob}` reports the whole operand, `HEAD^{blob}^{tree}` reports
+/// only `HEAD^{blob}`.
 pub fn peel_type_error(repo: &gix::Repository, name: &str) -> Option<String> {
+    // `get_oid_with_context_1()` cuts the path arm before `get_oid_1()` is
+    // entered at all, so a `<rev>:<path>` never reaches `peel_onion()` whole.
+    let mut base = object_part(name);
+    loop {
+        if let Some(message) = peel_onion_error(repo, base) {
+            return Some(message);
+        }
+        base = navigation_step(base)?.0;
+    }
+}
+
+/// [`peel_type_error`] for one `peel_onion()` frame: the `error()` it raises for
+/// the name it was handed, with no reduction of its own.
+fn peel_onion_error(repo: &gix::Repository, name: &str) -> Option<String> {
     // `if (len < 4 || name[len-1] != '}') return -1;`
     if name.len() < 4 || !name.ends_with('}') {
         return None;
@@ -551,28 +588,37 @@ fn strip_navigation(base: &str) -> &str {
 ///   `HEAD@{<old date>}:nosuch`.
 fn navigation(mut base: &str) -> (&str, bool) {
     let mut drops_quiet = false;
-    loop {
-        // `peel_onion()`: at least four characters, ending in `}`, and the
-        // *rightmost* `{` whose predecessor is `^` opens the type name.
-        if base.len() >= 4 && base.ends_with('}') {
-            if let Some(at) =
-                base.rfind("^{").filter(|at| *at > 0 && peel_onion_type(&base[at + 2..]))
-            {
-                base = &base[..at];
-                continue;
-            }
-        }
-        // `get_oid_1()`: trailing digits, then one `~` or `^`, then recurse on
-        // what precedes it.
-        let head = base.trim_end_matches(|c: char| c.is_ascii_digit());
-        match head.strip_suffix(['~', '^']).filter(|rest| !rest.is_empty()) {
-            Some(rest) => {
-                base = rest;
-                drops_quiet = true;
-            }
-            None => return (base, drops_quiet),
+    while let Some((rest, dropped)) = navigation_step(base) {
+        base = rest;
+        drops_quiet |= dropped;
+    }
+    (base, drops_quiet)
+}
+
+/// One turn of [`navigation`]'s loop: the name the *next* `get_oid_1()` frame is
+/// handed, and whether that frame is one of the two that drop `GET_OID_QUIETLY`.
+///
+/// `None` is the fixed point — neither `peel_onion()` nor `get_oid_1()`'s
+/// `~<n>`/`^<n>` block has anything left to cut, so `get_oid_basic()` is next.
+///
+/// Split out of [`navigation`] because the reduction is not only a way of
+/// arriving at a name: `peel_onion()` runs, and can `error()`, at *every* step
+/// that has a `^{<type>}` to cut. [`peel_type_error`] walks the same chain to
+/// find the one frame that reports.
+fn navigation_step(base: &str) -> Option<(&str, bool)> {
+    // `peel_onion()`: at least four characters, ending in `}`, and the
+    // *rightmost* `{` whose predecessor is `^` opens the type name.
+    if base.len() >= 4 && base.ends_with('}') {
+        if let Some(at) =
+            base.rfind("^{").filter(|at| *at > 0 && peel_onion_type(&base[at + 2..]))
+        {
+            return Some((&base[..at], false));
         }
     }
+    // `get_oid_1()`: trailing digits, then one `~` or `^`, then recurse on
+    // what precedes it.
+    let head = base.trim_end_matches(|c: char| c.is_ascii_digit());
+    head.strip_suffix(['~', '^']).filter(|rest| !rest.is_empty()).map(|rest| (rest, true))
 }
 
 /// Whether resolving `spec` reaches `get_oid_basic()` with `GET_OID_QUIETLY`
@@ -716,14 +762,60 @@ pub fn has_walk_mark(spec: &str) -> bool {
 /// an object the repository does not have returns `Some` here, leaving the
 /// caller free to produce whatever git produces for a missing object.
 pub fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    resolve_with_flags(repo, spec, OidFlags::default())
+}
+
+/// [`resolve`] for the one command that reaches `repo_get_oid_with_flags()` with
+/// a bit set: `builtin/update-ref.c`, which passes `GET_OID_SKIP_AMBIGUITY_CHECK`
+/// for both of its value slots.
+///
+/// Only the two ambiguity warnings answer to `flags` here. `GET_OID_QUIETLY` is
+/// deliberately not among them: the sole caller that sets it is
+/// `builtin/rev-parse.c`, which does not come through this function at all — it
+/// holds git's `flags` itself and reaches [`warn_ambiguous_operand`],
+/// [`reflog_reach`] and [`read_ref_at_warning`] directly, because `--quiet`
+/// changes not only what it prints but which of the two `die()` spellings it
+/// ends on.
+pub fn resolve_with_flags(
+    repo: &gix::Repository,
+    spec: &str,
+    flags: OidFlags,
+) -> Option<ObjectId> {
+    // `repo_dwim_ref()` calls `substitute_branch_name()` before it expands
+    // anything (`refs.c:795-803`), and `interpret_branch_mark()`'s `die()` fires
+    // from in there — so an `@{u}`/`@{push}` mark that names no upstream ends the
+    // command *inside* `get_oid_basic()` (`object-name.c:748`), ahead of the
+    // ambiguity warning below it and ahead of every caller's own "not a valid
+    // object name". Bolting it onto `rev-parse` and `log` alone left `cat-file`
+    // (argv and `--batch`), `merge-base`, `branch --contains`, `diff`, `ls-tree`
+    // and the rest answering `missing`/`Not a valid object name` where stock
+    // 2.55.0 dies.
+    if let Some(message) = upstream_mark_fatal(repo, spec) {
+        eprintln!("fatal: {message}");
+        std::process::exit(crate::fatal::EXIT_FATAL as i32);
+    }
     // `repo_get_oid()` reaches `get_oid_basic()` once per operand, so this is
     // where the ambiguity warning belongs — not in `full_hex`, which the helpers
     // below call a second time to *diagnose* a name this has already resolved.
-    warn_ambiguous_refname(repo, spec);
+    warn_ambiguous_operand(repo, spec, flags);
     // The same argument for `read_ref_at()`'s warning, which `get_oid_basic()`
     // raises further down the very same call (`object-name.c:787`, after the
     // ambiguity check at `object-name.c:753-756` — hence this order).
-    reflog_diagnostics(repo, spec);
+    reflog_diagnostics(repo, ambiguity_base(spec));
+    // `peel_onion()`'s `error()` (`object-name.c:897-903`), raised from inside
+    // `get_oid_1()` and therefore before `get_oid_basic()` ever answers.
+    if let Some(message) = peel_type_error(repo, spec) {
+        eprintln!("error: {message}");
+        // `peel_onion()` returned -1, so `get_oid_1()` hands `get_oid_basic()`
+        // the **whole** name (`object-name.c:1128-1132`) — a second, differently
+        // spelled trip through the reflog branch. `approxidate_careful()` does
+        // not reject `2005-01-01}^{blob` as a selector (it sets `*error_ret`
+        // only when nothing in the string was `isdigit()` or `isalpha()`,
+        // `date.c:1409-1410`), which is how stock 2.55.0 prints
+        // `log for 'HEAD' only goes back to …` twice for
+        // `HEAD@{<old date>}^{blob}` and answers with the oldest entry.
+        reflog_diagnostics(repo, spec);
+    }
     resolve_quiet(repo, spec)
 }
 
@@ -745,10 +837,22 @@ pub fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// speaks — every one of them measured, and a list nobody would have finished by
 /// hand.
 ///
-/// The verbs that still do not hear it are exactly the ones that do not come
-/// through here: `diff-tree`, `update-ref` and `merge-tree` resolve their
-/// operands themselves, and `checkout`/`switch` reach `resolve()` for only one of
-/// the two resolutions stock performs.
+/// The four verbs that used to resolve their operands themselves now come
+/// through here too — `diff-tree` at its positional classifier, `update-ref` at
+/// each value slot (through [`resolve_with_flags`], for its
+/// `GET_OID_SKIP_AMBIGUITY_CHECK`), `merge-tree` at all three of
+/// `get_merge_parent()`/`repo_get_oid_treeish()`/`get_tree_descriptor()` — and
+/// `checkout`/`switch` reach it *twice*, because
+/// `setup_new_branch_info_and_source_tree()` resolves the operand again through
+/// `setup_branch_path()` (`builtin/checkout.c:804-806,1311,1476`).
+///
+/// `range-diff` is the one that still hears less than stock: it resolves each
+/// positional once where `cmd_range_diff()` resolves `argv[0]` twice (a guard at
+/// `builtin/range-diff.c:106-109` and a validation at
+/// `builtin/range-diff.c:112-120`) and then walks the two `<argv0>..<argvN>`
+/// ranges it builds, so stock 2.55.0 prints the reach warning three times for
+/// `git range-diff 'HEAD@{<old date>}' HEAD~1 HEAD` and twice for the one- and
+/// two-argument spellings, against one and none here.
 ///
 /// The `die()` is not a value some caller might forget to render:
 ///
@@ -772,13 +876,18 @@ pub fn resolve(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// revision walk, which diagnoses an endpoint before it resolves — do not come
 /// through here; they reach [`reflog_reach`] and [`read_ref_at_warning`]
 /// directly, with the gate they are entitled to.
-fn reflog_diagnostics(repo: &gix::Repository, spec: &str) {
+fn reflog_diagnostics(repo: &gix::Repository, name: &str) {
+    // `name` is what `get_oid_basic()` was handed, not the operand: the caller
+    // reduces. [`resolve_with_flags`] calls this twice for one operand because
+    // `get_oid_1()` calls `get_oid_basic()` twice when `peel_onion()` fails, and
+    // the two calls do not agree on the name.
+    //
     // `read_ref_at()`'s own `warning()` comes from one frame deeper than the
     // block below it, so it is printed first (`refs.c:1135`, `refs.c:1141`).
-    if let Some(message) = read_ref_at_warning(repo, spec) {
+    if let Some(message) = read_ref_at_warning_of(repo, name) {
         eprintln!("warning: {message}");
     }
-    match reflog_reach(repo, spec) {
+    match reflog_reach_of(repo, name) {
         Some(ReflogReach::Warning(message)) => eprintln!("warning: {message}"),
         Some(ReflogReach::Fatal(message)) => {
             eprintln!("fatal: {message}");
@@ -2006,7 +2115,19 @@ fn split_reflog_selector(spec: &str) -> Option<(&str, &str)> {
 /// at the end of three of those four and reported the generic
 /// `ambiguous argument` instead.
 pub fn reflog_reach(repo: &gix::Repository, spec: &str) -> Option<ReflogReach> {
-    let (base, sel) = split_reflog_selector(ambiguity_base(spec))?;
+    reflog_reach_of(repo, ambiguity_base(spec))
+}
+
+/// [`reflog_reach`] for one `get_oid_basic()` call, over the name that call was
+/// handed rather than over the operand.
+///
+/// `get_oid_1()` reaches `get_oid_basic()` twice for an operand whose
+/// `peel_onion()` failed (`object-name.c:1128-1132`), and the second time it
+/// passes the name **whole** — so the two calls do not agree on where the reflog
+/// selector ends, and a single reduction cannot stand in for both. See
+/// [`resolve_with_flags`].
+pub fn reflog_reach_of(repo: &gix::Repository, name: &str) -> Option<ReflogReach> {
+    let (base, sel) = split_reflog_selector(name)?;
     // `repo_dwim_log()`: which ref's log this is. Nothing found is `refs_found ==
     // 0`, i.e. `return -1` — the operand does not resolve, and the caller's
     // existing "unknown revision" message is git's.
@@ -2538,7 +2659,17 @@ pub fn reflog_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// gate at all — `refs.c:1135` and `refs.c:1141` call `warning()` outright — so
 /// `git rev-parse --quiet --verify <spec>` prints it just the same.
 pub fn read_ref_at_warning(repo: &gix::Repository, spec: &str) -> Option<String> {
-    reflog_read(repo, ambiguity_base(spec))?.0.warning
+    read_ref_at_warning_of(repo, ambiguity_base(spec))
+}
+
+/// [`read_ref_at_warning`] for one `get_oid_basic()` call, over the name that
+/// call was handed rather than over the operand.
+///
+/// The pair to [`reflog_reach_of`], and needed for the same reason: `get_oid_1()`
+/// reaches `get_oid_basic()` a second time, with the name **whole**, once
+/// `peel_onion()` has returned -1 (`object-name.c:1128-1132`).
+pub fn read_ref_at_warning_of(repo: &gix::Repository, name: &str) -> Option<String> {
+    reflog_read(repo, name)?.0.warning
 }
 
 /// `get_oid_basic()`'s reflog branch up to and including the `read_ref_at()` call

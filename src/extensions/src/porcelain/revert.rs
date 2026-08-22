@@ -1245,6 +1245,28 @@ fn revert_one(
             unresolved,
             gix::merge::tree::apply_index_entries::RemovalMode::Prune,
         );
+        // Every unresolved path just had its stage-0 entry replaced by stages 1/2/3. In git
+        // that happens through `add_index_entry()`, which invalidates the path in the
+        // cache-tree (read-cache.c:1273-1274) — and the repair inside `apply()` validated
+        // those nodes against the *merged* entries, which no longer exist. Marking them
+        // invalid again is not optional: `write-tree` reuses a valid node without looking at
+        // the entries under it (cache-tree.c:336-339), so stock git reading this index would
+        // answer with a tree for an index it must refuse. Nothing re-validates them
+        // afterwards, because `cache_tree_update()` returns at `verify_cache()` on an
+        // unmerged index before touching the extension (cache-tree.c:218-234, :523-526) —
+        // which is why stock's index here still carries `TREE` with the touched nodes at -1.
+        let conflicted_paths: Vec<gix::bstr::BString> = {
+            let backing = new_index.path_backing();
+            new_index
+                .entries()
+                .iter()
+                .filter(|e| e.stage_raw() != 0)
+                .map(|e| e.path_in(backing).to_owned())
+                .collect()
+        };
+        for path in &conflicted_paths {
+            new_index.invalidate_path_in_tree(path.as_ref());
+        }
         new_index.write(crate::config::index_write_options(repo))?;
 
         let git_dir = repo.git_dir();
@@ -1624,7 +1646,8 @@ fn apply(
 
     // Restage: drop every changed path from the current index, then push back
     // the ones the merged tree still has. Untouched entries keep their stats.
-    let mut index = repo.index_or_load_from_head()?.into_owned();
+    let before = repo.index_or_load_from_head()?.into_owned();
+    let mut index = before.clone();
     index.remove_entries(|_, path, _| changed.contains(&path.to_owned()));
     for path in changed {
         if let Some((id, mode, flags, stat)) = fresh.get(path) {
@@ -1632,9 +1655,11 @@ fn apply(
         }
     }
     index.sort_entries();
-    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
-    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
-    super::write_tree::rebuild_cache_tree(repo, &mut index);
+    // `unpack_trees()` carries the source index's cache-tree over, invalidated at every path
+    // it moved, and then repairs it (unpack-trees.c:2085-2093) — so the index git leaves here
+    // carries one. The caller may still add conflict stages on top; it invalidates those paths
+    // itself, because a node validated here would otherwise outlive the entries it describes.
+    super::write_tree::carry_and_repair_cache_tree(repo, &before, &mut index);
     index.write(crate::config::index_write_options(repo))?;
     Ok(index)
 }

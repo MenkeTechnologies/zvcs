@@ -868,10 +868,24 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         }
 
         // A positional. It is a `<tree-ish>` exactly when it resolves as a revision.
-        // `handle_revision_arg()` gets it first either way, so `get_oid_basic()`'s
-        // ambiguity warning belongs here — once per positional, ahead of the
+        // `handle_revision_arg()` gets it first either way, so *everything*
+        // `get_oid_basic()` says belongs here — once per positional, ahead of the
         // several times this spec is resolved again further down.
-        crate::objname::warn_ambiguous_refname(&repo, a);
+        //
+        // [`crate::objname::resolve`] and not the ambiguity warning alone: the
+        // warning is only one of the four things git raises from inside that call,
+        // and `diff-tree` was hearing that one and none of the rest. Stock 2.55.0
+        // answers `git diff-tree --name-only 'HEAD@{99}' HEAD` with
+        // `fatal: log for 'HEAD' only has 3 entries` and
+        // `git diff-tree --name-only 'HEAD@{<old date>}' HEAD` with
+        // `warning: log for 'HEAD' only goes back to …`; this port reported its own
+        // `ambiguous argument` for the first and said nothing for the second.
+        //
+        // The id is deliberately dropped. Classification stays `rev_parse_single`'s
+        // because the two disagree on an absent full-length hex — git decodes it
+        // and then reports `bad object` a few lines below, which is the branch
+        // under `revs.push()`.
+        crate::objname::resolve(&repo, a);
         if repo.rev_parse_single(a).is_ok() {
             revs.push(a.to_string());
             i += 1;

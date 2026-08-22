@@ -125,6 +125,20 @@ impl<'cache, T> Graph<'_, 'cache, T> {
         self.map.clear();
     }
 
+    /// The parents `id` must be walked with when a graft covers it, or `None` when
+    /// the commit's own `parent` headers stand — `lookup_commit_graft()`
+    /// (commit.c:332-340), read through the table installed by
+    /// [`with_grafts()`](Self::with_grafts()).
+    ///
+    /// The list is copied because the caller goes on to borrow the graph mutably in
+    /// order to read the commit itself.
+    fn grafted_parents(&self, id: &gix_hash::oid) -> Option<SmallVec<[gix_hash::ObjectId; 2]>> {
+        self.grafts
+            .as_ref()?
+            .parents_of(id)
+            .map(|parents| parents.iter().copied().collect())
+    }
+
     /// Insert the parents of commit named `id` to the graph and associate new parents with data
     /// by calling `new_parent_data(parent_id, committer_timestamp)`, or update existing parents
     /// data with `update_existing(parent_id, &mut existing_data)`.
@@ -136,8 +150,15 @@ impl<'cache, T> Graph<'_, 'cache, T> {
         update_existing: &mut dyn FnMut(gix_hash::ObjectId, &mut T),
         first_parent: bool,
     ) -> Result<(), insert_parents::Error> {
+        // `parse_commit_buffer()` looks the graft up before it reads the first
+        // `parent` header (commit.c:554) but still requires the commit itself to
+        // have been read, so the lookup stays and only the parent list is replaced.
+        let grafted = self.grafted_parents(id);
         let commit = self.lookup(id)?;
-        let parents: SmallVec<[_; 2]> = commit.iter_parents().collect();
+        let parents: SmallVec<[_; 2]> = match grafted {
+            Some(grafted) => grafted.into_iter().map(Ok).collect(),
+            None => commit.iter_parents().collect(),
+        };
         for parent_id in parents {
             let parent_id = parent_id?;
             match self.map.entry(parent_id) {
@@ -177,8 +198,14 @@ impl<'cache, T> Graph<'_, 'cache, T> {
             + From<gix_object::decode::Error>
             + From<commit::iter_parents::Error>,
     {
+        // See [`Self::insert_parents`]: the graft replaces the parent list only,
+        // after the commit itself was read (commit.c:554).
+        let grafted = self.grafted_parents(id);
         let commit = self.lookup(id).map_err(E::from)?;
-        let parents: SmallVec<[_; 2]> = commit.iter_parents().collect();
+        let parents: SmallVec<[_; 2]> = match grafted {
+            Some(grafted) => grafted.into_iter().map(Ok).collect(),
+            None => commit.iter_parents().collect(),
+        };
         for parent_id in parents {
             let parent_id = parent_id.map_err(E::from)?;
             let parent = match try_lookup(&parent_id, &*self.find, self.cache, &mut self.parent_buf).map_err(E::from)? {
@@ -221,7 +248,23 @@ impl<'find, 'cache, T> Graph<'find, 'cache, T> {
             map: gix_hashtable::HashMap::default(),
             buf: Vec::new(),
             parent_buf: Vec::new(),
+            grafts: None,
         }
+    }
+
+    /// Substitute parent lists through `grafts` for every commit this graph materializes.
+    ///
+    /// This is git's `parse_commit_buffer()` consulting `lookup_commit_graft()`
+    /// (commit.c:554-590): the commit objects themselves stay untouched, but every
+    /// parent list handed out — and therefore every walk built on this graph, which
+    /// is `merge_base()`, `describe()` and the hidden-frontier painting — sees the
+    /// grafted parents.
+    ///
+    /// Pass `None` to leave the graph reading the recorded parents, which is what a
+    /// repository without `info/grafts` and without `shallow` does.
+    pub fn with_grafts(mut self, grafts: Option<std::sync::Arc<crate::graft::Table>>) -> Self {
+        self.grafts = grafts.filter(|table| !table.is_empty());
+        self
     }
 }
 
@@ -246,6 +289,9 @@ impl<T> Graph<'_, '_, Commit<T>> {
                     Some(commit) => commit,
                 };
                 let mut commit = commit.to_owned(new_data)?;
+                if let Some(grafts) = &self.grafts {
+                    grafts.substitute(&id, &mut commit.parents);
+                }
                 update_data(&mut commit.data);
                 entry.insert(commit);
             }
@@ -297,6 +343,9 @@ impl<T: Default> Graph<'_, '_, Commit<T>> {
                     Some(commit) => commit,
                 };
                 let mut commit = commit.to_owned(T::default)?;
+                if let Some(grafts) = &self.grafts {
+                    grafts.substitute(&id, &mut commit.parents);
+                }
                 update_commit(&mut commit);
                 entry.insert(commit);
             }

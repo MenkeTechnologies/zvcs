@@ -36,10 +36,17 @@ pub struct Graph<'find, 'cache, T> {
     buf: Vec<u8>,
     /// Another buffer we typically use to store parents.
     parent_buf: Vec<u8>,
+    /// The [graft table](graft::Table), consulted for every parent list this graph
+    /// materializes — git's `lookup_commit_graft()` inside `parse_commit_buffer()`
+    /// (commit.c:554). `None` is the ordinary repository with no
+    /// `<GIT_DIR>/info/grafts` and no `<GIT_DIR>/shallow`.
+    grafts: Option<std::sync::Arc<graft::Table>>,
 }
 
 ///
 pub mod graph;
+
+pub mod graft;
 
 /// A utility type implementing a queue which can be used to automatically sort data by its time in ascending order.
 ///

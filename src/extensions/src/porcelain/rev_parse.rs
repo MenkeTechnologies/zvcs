@@ -426,6 +426,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             // each endpoint with `repo_get_oid_committish()`, joined by `&&` — so
             // a range warns once per endpoint, and not at all for the second one
             // when the first failed to resolve.
+            let ranged = crate::objname::split_range(arg).is_some();
             match crate::objname::split_range(arg) {
                 Some(range) => {
                     warn_ambiguous_refname(&repo, range.a, o.quiet);
@@ -478,48 +479,65 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     {
                         return Ok(code);
                     }
+                    if let ControlFlow::Break(code) =
+                        warn_peel_type(&mut out, &repo, name, o.quiet)?
+                    {
+                        return Ok(code);
+                    }
                 }
             }
+            // `name`, not `arg`. `cmd_rev_parse()` advances past the exclusion
+            // mark and hands `repo_get_oid_with_flags()` what is left
+            // (`builtin/rev-parse.c:1163-1169`), so every rule below this point —
+            // the full-hex short circuit, `repo_dwim_log()`'s reflog branch and
+            // the revspec grammar alike — is applied to the caret-stripped name.
+            // Resolving `arg` instead left `git rev-parse '^HEAD@{1}'` to
+            // `repo_dwim_log("^HEAD")`, which cannot match because
+            // `check_refname_format()` bans `^`, so stock's `^<oid>` came back as
+            // `fatal: ambiguous argument`. A range keeps its caret: it was
+            // claimed by `try_difference()` two lines above the strip.
+            let name = match ranged {
+                true => arg.as_str(),
+                false => crate::objname::uninteresting_mark(arg).0,
+            };
             // A full-length hex name *is* the object id and short-circuits ahead
             // of every database lookup, so it answers even for an object that is
             // not present — see [`crate::objname::full_hex`].
-            crate::objname::full_hex(&repo, arg).or_else(|| {
+            crate::objname::full_hex(&repo, name).or_else(|| {
                 // `get_oid_basic()` resolves `<ref>@{<n>}` itself, through
                 // `repo_dwim_log()` rather than gitoxide's ref lookup — which
                 // answers for names git rejects and rejects names git answers.
                 // The test is on the *reduced* name, not on the operand: a
                 // `^{…}`, `~<n>` or `:<path>` suffix is applied to whatever the
                 // reader answered, never folded into the selector.
-                if crate::objname::resolves_through_reflog(arg) {
-                    crate::objname::reflog_spec_oid(&repo, arg)
-                } else if carries_walk_mark(arg) {
+                if crate::objname::resolves_through_reflog(name) {
+                    crate::objname::reflog_spec_oid(&repo, name)
+                } else if carries_walk_mark(name) {
                     None
                 } else {
                     repo
-                        .rev_parse_single(crate::objname::canonical_spec(&repo, arg).as_ref())
+                        .rev_parse_single(crate::objname::canonical_spec(&repo, name).as_ref())
                         .ok()
                         .map(|id| id.detach())
                 }
             })
+            // `show_rev(type, &oid, name)` (`builtin/rev-parse.c:1177`): the mark
+            // decides the `^` prefix and the echoed name is the stripped one.
+            .map(|id| (id, name, !ranged && name.len() < arg.len()))
         };
 
         // A reflog ordinal past the end of an existing ref's log is its own
         // `die()` inside `get_oid()`, ahead of any path interpretation — nothing
         // has been echoed yet at this point, which is what keeps stdout empty.
         if resolved.is_none() {
-            // `peel_onion()` reports a type it cannot reach through `error()`, not
-            // through the caller's `die()`, so the line comes out once per
-            // resolution attempt — here for the one that just failed, and again
-            // below if `die_verify_filename()` resolves the operand a second time.
-            // The name is measured after the exclusion mark, matching
-            // `cmd_rev_parse()`'s `if (*arg == '^') name++;`.
-            if let Some(message) =
-                crate::objname::peel_type_error(&repo, crate::objname::uninteresting_mark(arg).0)
-            {
-                out.flush()?;
-                eprintln!("error: {message}");
-            }
-            // Same class: `prefix_path()` dies while `get_oid_with_context_1()` is
+            // `peel_onion()`'s `error()` is *not* raised here. It comes out of the
+            // resolution itself — [`warn_peel_type`] above — because `get_oid_1()`
+            // carries on after it and the operand may still answer, which is how
+            // stock prints the line and then exits 0 for
+            // `HEAD@{<old date>}^{blob}`. `die_verify_filename()`'s second
+            // resolution repeats it further down.
+            //
+            // `prefix_path()` dies while `get_oid_with_context_1()` is
             // still rewriting the path arm, so nothing has been echoed yet.
             if let Some(message) = crate::objpath::relative_path_fatal(&repo, arg) {
                 out.flush()?;
@@ -536,12 +554,23 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         }
 
         match resolved {
-            Some(id) => {
+            // `show_rev(type, &oid, name)` (`builtin/rev-parse.c:1177`): `type` is
+            // `REVERSED` when the operand opened with `^`, and the name echoed by
+            // `--symbolic`/`--abbrev-ref` is the one the caret was taken off.
+            Some((id, name, reversed)) => {
                 if o.verify {
                     revs += 1;
-                    held = Some((id, BString::from(arg.as_bytes()), false));
+                    held = Some((id, BString::from(name.as_bytes()), reversed));
                 } else {
-                    show_rev(&mut out, &repo, &o, &id, Some(arg.as_bytes().as_bstr()), None, false)?;
+                    show_rev(
+                        &mut out,
+                        &repo,
+                        &o,
+                        &id,
+                        Some(name.as_bytes().as_bstr()),
+                        None,
+                        reversed,
+                    )?;
                 }
             }
             None => {
@@ -814,6 +843,63 @@ fn warn_reflog_reach(
         }
         Some(crate::objname::ReflogReach::Fatal(message)) => {
             out.flush()?;
+            if !quiet {
+                eprintln!("fatal: {message}");
+            }
+            return Ok(ControlFlow::Break(ExitCode::from(128)));
+        }
+        _ => {}
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// `peel_onion()`'s `error()` (`object-name.c:897-903`) and the second
+/// `get_oid_basic()` call that follows it, for the one command that holds git's
+/// `flags`.
+///
+/// ```c
+/// ret = peel_onion(r, name, len, oid, lookup_flags);
+/// if (!ret)
+///         return FOUND;
+///
+/// ret = get_oid_basic(r, name, len, oid, lookup_flags);
+/// ```
+///
+/// (`object-name.c:1128-1132`.) The `error()` is raised while `get_oid_1()` is
+/// still running, so it comes out whether or not the operand goes on to resolve:
+/// stock `git rev-parse 'HEAD@{<old date>}^{blob}'` prints it and *then* exits 0
+/// with an id on stdout, because the fallback below it read the reflog again —
+/// this time with the whole operand as the name, so the selector is
+/// `<old date>}^{blob`, which `approxidate_careful()` accepts (`date.c:1409-1410`
+/// sets `*error_ret` only when nothing in the string was `isdigit()` or
+/// `isalpha()`). That is why the reach warning comes out **twice** there and once
+/// for every `^{…}` spelling that peels.
+///
+/// `error()` itself has no `flags` gate; the second reflog diagnosis carries the
+/// same gates as the first, and `peel_onion()` passes `lookup_flags` down
+/// untouched apart from `GET_OID_DISAMBIGUATORS`, so `--quiet` still reaches it.
+fn warn_peel_type(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    name: &str,
+    quiet: bool,
+) -> std::io::Result<ControlFlow<ExitCode>> {
+    let Some(message) = crate::objname::peel_type_error(repo, name) else {
+        return Ok(ControlFlow::Continue(()));
+    };
+    out.flush()?;
+    eprintln!("error: {message}");
+    // `get_oid_basic()` a second time, on the **whole** name — so the reduction
+    // that produced the reflog diagnosis above does not apply here.
+    if let Some(message) = crate::objname::read_ref_at_warning_of(repo, name) {
+        eprintln!("warning: {message}");
+    }
+    let quiet = quiet && !crate::objname::quiet_lost_in_navigation(name);
+    match crate::objname::reflog_reach_of(repo, name) {
+        Some(crate::objname::ReflogReach::Warning(message)) if !quiet => {
+            eprintln!("warning: {message}");
+        }
+        Some(crate::objname::ReflogReach::Fatal(message)) => {
             if !quiet {
                 eprintln!("fatal: {message}");
             }

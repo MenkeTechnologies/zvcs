@@ -958,17 +958,13 @@ fn exit_code(conflicted: bool) -> ExitCode {
 /// `None` when git would say it could not parse it as a tree.
 fn peel_tree(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     // One `repo_get_oid_treeish()` per operand, so one trip through
-    // `get_oid_basic()` and one chance to warn about a 40-hex refname.
-    crate::objname::warn_ambiguous_refname(repo, spec);
-    Some(
-        repo.rev_parse_single(spec)
-            .ok()?
-            .object()
-            .ok()?
-            .peel_to_tree()
-            .ok()?
-            .id,
-    )
+    // `get_oid_basic()` and one chance at everything it raises — the 40-hex
+    // ambiguity warning, `read_ref_at()`'s two, `interpret_branch_mark()`'s
+    // `die()` and `peel_onion()`'s `error()`. Reaching only the first left stock's
+    // `warning: log for 'HEAD' only goes back to …` unsaid for
+    // `git merge-tree 'HEAD@{<old date>}' HEAD`.
+    let id = crate::objname::resolve(repo, spec)?;
+    Some(repo.find_object(id).ok()?.peel_to_tree().ok()?.id)
 }
 
 /// Resolve `spec` to a commit id, or `None` when it is not something git would
@@ -983,9 +979,10 @@ fn peel_tree(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// at the end of the tag chain rather than `tag`.
 fn peel_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     // `get_merge_parent()` is one `repo_get_oid()` (`commit.c:1881`) ahead of the
-    // peel, which is where the ambiguity warning comes from.
-    crate::objname::warn_ambiguous_refname(repo, spec);
-    let object = repo.rev_parse_single(spec).ok()?.object().ok()?;
+    // peel, which is where every one of `get_oid_basic()`'s diagnostics comes
+    // from — not the ambiguity warning alone.
+    let id = crate::objname::resolve(repo, spec)?;
+    let object = repo.find_object(id).ok()?;
     let object = object.peel_tags_to_end().ok()?;
     if object.kind == gix::object::Kind::Commit {
         return Some(object.id);
@@ -1013,13 +1010,14 @@ enum TreeResolution {
 /// fatal conditions it distinguishes before it begins the three-tree walk.
 fn resolve_tree(repo: &gix::Repository, spec: &str) -> TreeResolution {
     // `get_tree_descriptor()`'s `repo_get_oid(r, rev, &oid)`
-    // (`builtin/merge-tree.c:379`), one per operand.
-    crate::objname::warn_ambiguous_refname(repo, spec);
-    let id = match repo.rev_parse_single(spec) {
-        Ok(id) => id,
-        Err(_) => return TreeResolution::UnknownRev,
+    // (`builtin/merge-tree.c:379`), one per operand — and therefore one trip
+    // through `get_oid_basic()`, which says more than the ambiguity warning this
+    // used to be.
+    let id = match crate::objname::resolve(repo, spec) {
+        Some(id) => id,
+        None => return TreeResolution::UnknownRev,
     };
-    let object = match id.object() {
+    let object = match repo.find_object(id) {
         Ok(object) => object,
         Err(_) => return TreeResolution::UnknownRev,
     };

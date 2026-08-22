@@ -211,7 +211,7 @@ pub(crate) fn ws_error_highlight_default(repo: &gix::Repository) -> Result<u32, 
 
 /// `ws_blank_line()`: a line made only of whitespace (C `isspace`, so the
 /// vertical tab and form feed count too).
-fn ws_blank_line(line: &[u8]) -> bool {
+pub(crate) fn ws_blank_line(line: &[u8]) -> bool {
     line.iter()
         .all(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
 }
@@ -280,11 +280,15 @@ pub(crate) fn check_blank_at_eof(old: &[u8], new: &[u8]) -> (usize, usize) {
 // the color.diff.<slot> table (diff.c `diff_colors[]` / `color_diff_slots[]`)
 // ---------------------------------------------------------------------------
 
-/// git's `enum color_diff`, restricted to the slots the diff commands can reach.
-/// The dual-color slots (`contextDimmed`, `contextBold`, `oldDimmed`, `newDimmed`,
-/// `oldBold`, `newBold`) are only consulted under `o->flags.dual_color_diffed_diffs`,
-/// which `range-diff --dual-color` alone sets (range-diff.c:524), so nothing these
-/// commands emit can reach them and they are deliberately absent.
+/// git's `enum color_diff` (diff.h:452-476), in its own order.
+///
+/// The last six slots — `contextDimmed`, `oldDimmed`, `newDimmed`, `contextBold`,
+/// `oldBold`, `newBold` — are only consulted under
+/// `o->flags.dual_color_diffed_diffs`, which `range-diff`'s `output()` alone sets
+/// (range-diff.c:524-525). They are the *inner* diff's colors: a diff-of-diffs line
+/// is painted twice over, once for the outer sign that `set_sign` carries and once
+/// for the inner marker the content starts with, and the bold/dimmed pair is what
+/// keeps the two legible against each other (diff.c:1483-1497, :1528-1541).
 #[derive(Clone, Copy)]
 pub(crate) enum DiffSlot {
     /// `context` (also spelled `plain`) — unchanged lines. No color by default.
@@ -320,10 +324,23 @@ pub(crate) enum DiffSlot {
     NewMovedDim,
     /// `newMovedAlternativeDimmed` — the alternate block interior. Faint italic.
     NewMovedAltDim,
+    /// `contextDimmed` — a diff-of-diffs line the outer diff removes whose inner
+    /// marker is neither `+`, `-` nor `@`. Faint.
+    ContextDim,
+    /// `oldDimmed` — an outer-removed line whose inner marker is `-`. Faint red.
+    OldDim,
+    /// `newDimmed` — an outer-removed line whose inner marker is `+`. Faint green.
+    NewDim,
+    /// `contextBold` — an outer-added line whose inner marker is none of the three. Bold.
+    ContextBold,
+    /// `oldBold` — an outer-added line whose inner marker is `-`. Bold red.
+    OldBold,
+    /// `newBold` — an outer-added line whose inner marker is `+`. Bold green.
+    NewBold,
 }
 
 /// The number of slots in [`DiffSlot`].
-const NSLOTS: usize = 16;
+const NSLOTS: usize = 22;
 
 /// One row of the slot table: the `color.diff.` and `diff.color.` spellings git
 /// accepts for the slot, and its built-in default spec.
@@ -390,6 +407,33 @@ const SLOT_DEFS: [SlotDef; NSLOTS] = [
             "diff.color.newMovedAlternativeDimmed",
         ],
         default_spec: "dim italic",
+    },
+    // The dual-color pairs (diff.c:99-104): `GIT_COLOR_FAINT`, `GIT_COLOR_FAINT_RED`,
+    // `GIT_COLOR_FAINT_GREEN`, `GIT_COLOR_BOLD`, `GIT_COLOR_BOLD_RED`,
+    // `GIT_COLOR_BOLD_GREEN`.
+    SlotDef {
+        names: &["color.diff.contextDimmed", "diff.color.contextDimmed"],
+        default_spec: "dim",
+    },
+    SlotDef {
+        names: &["color.diff.oldDimmed", "diff.color.oldDimmed"],
+        default_spec: "dim red",
+    },
+    SlotDef {
+        names: &["color.diff.newDimmed", "diff.color.newDimmed"],
+        default_spec: "dim green",
+    },
+    SlotDef {
+        names: &["color.diff.contextBold", "diff.color.contextBold"],
+        default_spec: "bold",
+    },
+    SlotDef {
+        names: &["color.diff.oldBold", "diff.color.oldBold"],
+        default_spec: "bold red",
+    },
+    SlotDef {
+        names: &["color.diff.newBold", "diff.color.newBold"],
+        default_spec: "bold green",
     },
 ];
 
@@ -1458,7 +1502,6 @@ fn emit_syms(syms: &[Sym], colors: &DiffColors) -> Vec<u8> {
     let context = colors.get(DiffSlot::Context);
     let frag = colors.get(DiffSlot::Frag);
     let func = colors.get(DiffSlot::Func);
-    let ws_color = colors.get(DiffSlot::Whitespace);
 
     let mut out: Vec<u8> = Vec::with_capacity(syms.len() * 48);
     for s in syms {
@@ -1466,13 +1509,21 @@ fn emit_syms(syms: &[Sym], colors: &DiffColors) -> Vec<u8> {
             Kind::Meta => emit_header_line(&mut out, &s.line, meta, reset),
             Kind::Frag => emit_hunk_header(&mut out, on, &s.line, frag, context, func, reset),
             Kind::Plus | Kind::Minus | Kind::Context => {
-                let set = colors.get(content_slot(s.kind, s.flags));
-                emit_content(
+                let ck = match s.kind {
+                    Kind::Plus => ContentKind::Plus,
+                    Kind::Minus => ContentKind::Minus,
+                    _ => ContentKind::Context,
+                };
+                // `dual` is false for every command that reaches this re-emitter:
+                // `o->flags.dual_color_diffed_diffs` is set in exactly one place,
+                // range-diff's `output()` (range-diff.c:524-525), and range-diff
+                // paints its diff-of-diffs line by line rather than through here.
+                emit_content_symbol(
                     &mut out,
-                    on,
-                    set,
-                    reset,
-                    ws_color,
+                    colors,
+                    false,
+                    ck,
+                    s.flags,
                     s.sign,
                     &s.line,
                     s.ws_rule,
@@ -1481,7 +1532,10 @@ fn emit_syms(syms: &[Sym], colors: &DiffColors) -> Vec<u8> {
                 );
             }
             Kind::Incomplete => {
-                let set = if s.highlight { ws_color } else { context };
+                let set = match s.highlight {
+                    true => colors.get(DiffSlot::Whitespace),
+                    false => context,
+                };
                 emit_line(&mut out, on, set, reset, &s.line);
             }
             Kind::Raw | Kind::WordRaw => out.extend_from_slice(&s.line),
@@ -1498,20 +1552,20 @@ fn emit_syms(syms: &[Sym], colors: &DiffColors) -> Vec<u8> {
 
 /// The `DIFF_SYMBOL_PLUS` / `DIFF_SYMBOL_MINUS` color switch (diff.c:1459, 1504),
 /// keyed on the three move flags. Context lines never carry them.
-fn content_slot(kind: Kind, flags: u32) -> DiffSlot {
+fn content_slot(kind: ContentKind, flags: u32) -> DiffSlot {
     let mv = flags & (MOVED_LINE | MOVED_LINE_ALT | MOVED_LINE_UNINTERESTING);
     let alt = MOVED_LINE | MOVED_LINE_ALT;
     let alt_dim = alt | MOVED_LINE_UNINTERESTING;
     let dim = MOVED_LINE | MOVED_LINE_UNINTERESTING;
     match kind {
-        Kind::Plus => match mv {
+        ContentKind::Plus => match mv {
             m if m == alt_dim => DiffSlot::NewMovedAltDim,
             m if m == alt => DiffSlot::NewMovedAlt,
             m if m == dim => DiffSlot::NewMovedDim,
             m if m == MOVED_LINE => DiffSlot::NewMoved,
             _ => DiffSlot::New,
         },
-        Kind::Minus => match mv {
+        ContentKind::Minus => match mv {
             m if m == alt_dim => DiffSlot::OldMovedAltDim,
             m if m == alt => DiffSlot::OldMovedAlt,
             m if m == dim => DiffSlot::OldMovedDim,
@@ -2112,8 +2166,13 @@ fn new_blank_line_at_eof(cur: &FilePaint, lno_pre: usize, lno_post: usize, line:
     ws_blank_line(line)
 }
 
-/// `emit_line_ws_markup()`: one `+`/`-`/context line, choosing between the plain
-/// single-span emission and the three-way whitespace-marked one.
+/// `emit_line_ws_markup()` (diff.c:1362-1396): one `+`/`-`/context line, choosing
+/// between the plain single-span emission and the three-way whitespace-marked one.
+///
+/// `set_sign` is `None` for every ordinary diff. Only the dual-color diff-of-diffs
+/// fills it in, and when it does the sign column is additionally reversed —
+/// `emit_line_0(o, set_sign, set, !!set_sign, …)` (diff.c:1385, :1391) — which is
+/// what makes the outer `+`/`-` stand out from the inner one it precedes.
 ///
 /// An empty context line under `diff.suppressBlankEmpty` loses its sign in git;
 /// the callers of this module apply that rewrite as a separate whole-buffer pass
@@ -2122,6 +2181,7 @@ fn new_blank_line_at_eof(cur: &FilePaint, lno_pre: usize, lno_post: usize, line:
 fn emit_content(
     out: &mut Vec<u8>,
     on: bool,
+    set_sign: Option<&str>,
     set: &str,
     reset: &str,
     ws_color: &str,
@@ -2137,15 +2197,114 @@ fn emit_content(
         None
     };
     match ws {
-        None => emit_line_0(out, on, Some(set), None, false, reset, sign, line),
+        // `if (!ws && !set_sign)` — the whole line in one color, applied before
+        // the sign so the sign is painted too.
+        None if set_sign.is_none() => emit_line_0(out, on, Some(set), None, false, reset, sign, line),
+        // `else if (!ws)` — sign color, then content color, with the reverse video
+        // `!!set_sign` asks for.
+        None => emit_line_0(out, on, set_sign, Some(set), true, reset, sign, line),
         Some(ws) if blank_at_eof => {
             emit_line_0(out, on, Some(ws), None, false, reset, sign, line)
         }
         Some(ws) => {
-            emit_line_0(out, on, Some(set), None, false, reset, sign, b"");
+            // `emit_line_0(o, set_sign ? set_sign : set, NULL, !!set_sign, …, "", 0)`.
+            let head = set_sign.unwrap_or(set);
+            emit_line_0(out, on, Some(head), None, set_sign.is_some(), reset, sign, b"");
             ws_check_emit(out, line, ws_rule, set, reset, ws);
         }
     }
+}
+
+/// The three content symbols `emit_diff_symbol_from_struct()` colors by hand:
+/// `DIFF_SYMBOL_CONTEXT`, `DIFF_SYMBOL_PLUS` and `DIFF_SYMBOL_MINUS`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentKind {
+    Context,
+    Plus,
+    Minus,
+}
+
+/// `emit_diff_symbol_from_struct()`'s `DIFF_SYMBOL_CONTEXT` / `_PLUS` / `_MINUS`
+/// arms (diff.c:1441-1546), colors chosen and the line handed to
+/// [`emit_content`].
+///
+/// `move_flags` carries the `DIFF_SYMBOL_MOVED_LINE*` bits that pick the moved-line
+/// palette; `dual` is `o->flags.dual_color_diffed_diffs`.
+///
+/// With `dual` on, `set` — whatever the move switch just chose — becomes `set_sign`
+/// and `set` is re-picked from the *inner* diff's marker, the first byte of the
+/// content. That second lookup is the whole of "dual color": the outer diff's sign
+/// keeps its own red/green while the inner diff's `+`/`-`/`@` re-tints the rest of
+/// the line, bold under an outer `+` and dimmed under an outer `-`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_content_symbol(
+    out: &mut Vec<u8>,
+    colors: &DiffColors,
+    dual: bool,
+    kind: ContentKind,
+    move_flags: u32,
+    sign: u8,
+    line: &[u8],
+    ws_rule: u32,
+    mut highlight: bool,
+    blank_at_eof: bool,
+) {
+    let base = colors.get(content_slot(kind, move_flags));
+    // `char c = !len ? 0 : line[0];` — the inner diff's own marker.
+    let c = line.first().copied().unwrap_or(0);
+    let mut set_sign: Option<&str> = None;
+    let mut set = base;
+    if dual {
+        match kind {
+            // diff.c:1445-1454: no `set_sign`, so the outer context sign simply
+            // takes the inner marker's own color.
+            ContentKind::Context => {
+                set = match c {
+                    b'+' => colors.get(DiffSlot::New),
+                    b'@' => colors.get(DiffSlot::Frag),
+                    b'-' => colors.get(DiffSlot::Old),
+                    _ => set,
+                };
+            }
+            // diff.c:1485-1497. The `flags &= ~DIFF_SYMBOL_CONTENT_WS_MASK` at
+            // :1497 clears the `WSEH_*` side bit along with the rule bits, so an
+            // outer-added line never takes the whitespace-marked path here.
+            ContentKind::Plus => {
+                set_sign = Some(base);
+                set = match c {
+                    b'-' => colors.get(DiffSlot::OldBold),
+                    b'@' => colors.get(DiffSlot::Frag),
+                    b'+' => colors.get(DiffSlot::NewBold),
+                    _ => colors.get(DiffSlot::ContextBold),
+                };
+                highlight = false;
+            }
+            // diff.c:1530-1541 — the same switch, dimmed, and with no mask clear:
+            // an outer-removed line still honours `--ws-error-highlight=old`.
+            ContentKind::Minus => {
+                set_sign = Some(base);
+                set = match c {
+                    b'+' => colors.get(DiffSlot::NewDim),
+                    b'@' => colors.get(DiffSlot::Frag),
+                    b'-' => colors.get(DiffSlot::OldDim),
+                    _ => colors.get(DiffSlot::ContextDim),
+                };
+            }
+        }
+    }
+    emit_content(
+        out,
+        colors.enabled(),
+        set_sign,
+        set,
+        colors.reset(),
+        colors.get(DiffSlot::Whitespace),
+        sign,
+        line,
+        ws_rule,
+        highlight,
+        blank_at_eof,
+    );
 }
 
 /// `emit_hunk_header()`: the `@@ … @@` range in `frag`, the blanks that separate
@@ -2207,6 +2366,44 @@ fn emit_hunk_header(
     // `DIFF_SYMBOL_CONTEXT_FRAGINFO` is emitted with empty set and reset: the
     // buffer already carries its own sequences.
     emit_line_0(out, on, Some(""), None, false, "", 0, &msg);
+}
+
+/// `emit_hunk_header()` under `o->flags.suppress_hunk_header_line_count`
+/// (diff.c:1733-1798), the only shape `range-diff` ever prints: a bare `@@` where
+/// the line counts would be (diff.c:1764-1765), then the section name the
+/// `section_headers` userdiff driver found.
+///
+/// `dual` is `o->flags.dual_color_diffed_diffs`, which prefixes `GIT_COLOR_REVERSE`
+/// (diff.c:1761-1762). It is a separate entry point from [`emit_hunk_header`]
+/// because the two flags always travel together: `output()` sets
+/// `dual_color_diffed_diffs` and `suppress_hunk_header_line_count` in the same
+/// breath (range-diff.c:524-526), and nothing else sets either.
+///
+/// `func_line` is the section name with no separator; xdiff writes exactly one
+/// space between the closing `@@` and the name, which is the `cp`..`ep` run
+/// diff.c:1778-1785 paints in the context color.
+pub(crate) fn emit_hunk_header_suppressed(
+    out: &mut Vec<u8>,
+    colors: &DiffColors,
+    dual: bool,
+    func_line: &[u8],
+) {
+    let reset = colors.reset();
+    if dual && colors.enabled() {
+        out.extend_from_slice(REVERSE.as_bytes());
+    }
+    out.extend_from_slice(colors.get(DiffSlot::Frag).as_bytes());
+    out.extend_from_slice(b"@@");
+    out.extend_from_slice(reset.as_bytes());
+    if !func_line.is_empty() {
+        out.extend_from_slice(colors.get(DiffSlot::Context).as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(reset.as_bytes());
+        out.extend_from_slice(colors.get(DiffSlot::Func).as_bytes());
+        out.extend_from_slice(func_line);
+        out.extend_from_slice(reset.as_bytes());
+    }
+    out.push(b'\n');
 }
 
 /// A file-header line: the metainfo color, or verbatim for the lines git emits

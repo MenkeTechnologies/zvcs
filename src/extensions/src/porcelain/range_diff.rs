@@ -52,11 +52,24 @@
 //!   magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec stops rather than
 //!   match with different semantics.
 //! * `--creation-factor=<n>` (and its `--creation-factor <n>` /
-//!   `--no-creation-factor` spellings), `--left-only`, `--right-only`,
-//!   `--no-dual-color`, `--no-color`, `--color=never`, `--color=auto`, `-p` /
-//!   `-u` / `--patch`, and `--ws-error-highlight=<kind>` (a no-op with color
-//!   off, which is the only mode this port emits). Dual and simple coloring are
-//!   byte-identical once color is off.
+//!   `--no-creation-factor` spellings), `--left-only`, `--right-only` and `-p` /
+//!   `-u` / `--patch`.
+//! * Color in every form: `--color[=<when>]`, `--no-color`, `color.ui` /
+//!   `color.diff`, the whole `color.diff.<slot>` palette, and both
+//!   `--dual-color` (the default, which also *forces* color on and so overrides
+//!   `--no-color`) and `--no-dual-color`. The diff-of-diffs body carries git's
+//!   dual-color markup: each line's outer sign is reversed and painted from
+//!   `old`/`new`, while the content is re-painted from the *inner* diff's own
+//!   marker through `contextBold`/`oldBold`/`newBold` under an outer `+` and
+//!   `contextDimmed`/`oldDimmed`/`newDimmed` under an outer `-`
+//!   (diff.c:1441-1546). Dual and simple coloring are byte-identical once color
+//!   is off, which is why `format-patch --range-diff` is unaffected by either.
+//! * `--ws-error-highlight=<kind>` and `diff.wsErrorHighlight`, plus
+//!   `core.whitespace`: with color on, an outer `+`/`-`/context line whose side is
+//!   selected has its whitespace errors painted with `color.diff.whitespace`,
+//!   through the same `ws_check_emit()` split `git diff` uses. The dual `+` arm
+//!   clears the whole whitespace mask (diff.c:1497), so only the `-` and context
+//!   sides can show it in a dual-color run.
 //! * `--notes[=<ref>]` / `--no-notes`, upstream's `notes_callback()` reproduced
 //!   through [`super::notes::DisplayOpt`]: notes are on by default (the inner
 //!   `git log` uses a built-in pretty format, so `cmd_log_init_finish()` enables
@@ -212,8 +225,6 @@
 //!
 //! ### Not covered — these stop rather than emit output that would diverge
 //!
-//! * Color in any form: `--color`, `--color=always`, and `--dual-color` (which
-//!   upstream uses to *force* color on). The dual-color markup is not ported.
 //! * The output formats that replace the patch body — `--stat` and its width
 //!   options, `--compact-summary`, `--numstat`, `--shortstat`, `--dirstat`,
 //!   `--summary`, `--raw`, `--name-only`, `--name-status`, `--check` — none of
@@ -889,10 +900,24 @@ struct Opts {
     /// The first option this port recognises as real but does not implement,
     /// held until the run is about to produce output. See the module docs.
     deferred: Option<String>,
-    /// `diff_get_color_opt()`'s palette for the pair header, empty strings when
-    /// `diffopt.use_color` is off — which is the default, since output is not a
-    /// terminal. `--dual-color` and `--color=always` turn it on.
+    /// `diff_get_color_opt()`'s palette for the pair header and the diff-of-diffs
+    /// body, empty strings when `diffopt.use_color` is off — which is the default,
+    /// since output is not a terminal. `--dual-color` and `--color=always` turn it on.
     colors: diff_color::DiffColors,
+    /// `opts.flags.dual_color_diffed_diffs`, which `output()` fills from
+    /// `range_diff_opts->dual_color` (range-diff.c:524-525) and
+    /// `builtin/range-diff.c:186` computes as `simple_color < 1` — so it is on
+    /// unless `--no-dual-color` was given. With color off it changes nothing:
+    /// every sequence the dual arms select is the empty string and
+    /// `GIT_COLOR_REVERSE` is gated on `want_color()` (diff.c:776).
+    dual: bool,
+    /// `whitespace_rule()` for the diff-of-diffs' two synthetic blobs, which comes
+    /// entirely from `core.whitespace`: the filespecs are named `a` and `b`
+    /// (range-diff.c:495), and this port reads no `whitespace` gitattribute.
+    ws_rule: u32,
+    /// `o->ws_error_highlight`: `--ws-error-highlight=<kind>`, else
+    /// `diff.wsErrorHighlight`, else `WSEH_NEW`.
+    ws_error_highlight: u32,
 }
 
 impl Opts {
@@ -924,7 +949,12 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         abbrev: Abbrev::Default,
         deferred: None,
         colors: diff_color::DiffColors::disabled(),
+        dual: true,
+        ws_rule: diff_color::WS_DEFAULT_RULE,
+        ws_error_highlight: diff_color::WSEH_NEW,
     };
+    // `--ws-error-highlight=<kind>`, held until the config default can be read.
+    let mut ws_error_highlight: Option<u32> = None;
     // `simple_color` is upstream's tri-state: -1 until `--dual-color` sets it to 0 or
     // `--no-dual-color` sets it to 1 (builtin/range-diff.c:49). Only the 0 case forces
     // color, and it does so after `diff_setup_done()` — which is why `--dual-color
@@ -1360,13 +1390,24 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // — leaving the pair headers, which this port renders. So it is
             // implemented here, not deferred.
             "-s" | "--no-patch" => output_format = FMT_NO_OUTPUT,
-            // `--ws-error-highlight=<kind>` only tints whitespace errors when
-            // color is on. This port always emits with color off, so it is a
-            // byte-for-byte no-op; accept it and consume a detached value so the
-            // value is not mistaken for a revision.
+            // `--ws-error-highlight=<kind>` (`diff_opt_ws_error_highlight()`),
+            // which `emit_line_ws_markup()` reads when it decides whether a line's
+            // whitespace errors are painted. A value the parser rejects is an
+            // `error:` at parse time, 129, ahead of everything the run would
+            // otherwise check.
             "--ws-error-highlight" => {
-                if inline.is_none() {
-                    i += 1;
+                let raw = match required_value(args, &mut i, name, inline) {
+                    Ok(v) => v,
+                    Err(code) => return Ok(code),
+                };
+                match diff_color::parse_ws_error_highlight(&raw) {
+                    Ok(v) => ws_error_highlight = Some(v),
+                    Err(accepted) => {
+                        return Ok(option_error(&format!(
+                            "unknown value after ws-error-highlight={}",
+                            &raw[..accepted]
+                        )))
+                    }
                 }
             }
             // Upstream parses `--inter-hunk-context` as `OPTION_UNSIGNED` at
@@ -1588,13 +1629,17 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // which resolves to off whenever stdout is not a terminal.
     let want_color = simple_color == 0 || diff_color::resolve_color(&repo, color_when);
     opts.colors = diff_color::DiffColors::resolve(&repo, want_color);
-    // The pair headers are colored below, but the diff-of-diffs body carries the
-    // dual-color markup (`contextDimmed`/`oldBold`/… under
-    // `o->flags.dual_color_diffed_diffs`) that this port does not render. Refuse a run
-    // that would print one rather than emit a plainly-colored approximation of it.
-    if want_color && !opts.no_patch {
-        opts.defer("colored diff-of-diffs body is not ported".to_string());
-    }
+    // `range_diff_opts.dual_color = simple_color < 1` (builtin/range-diff.c:186):
+    // dual unless `--no-dual-color` was spelled out, which is why the *default*
+    // colored range-diff is the dual one.
+    opts.dual = simple_color < 1;
+    // `whitespace_rule()` and `o->ws_error_highlight`, both read only by
+    // `emit_line_ws_markup()` and so both invisible until color is on.
+    opts.ws_rule = diff_color::whitespace_rule_cfg(&repo);
+    opts.ws_error_highlight = match ws_error_highlight {
+        Some(v) => v,
+        None => diff_color::ws_error_highlight_default(&repo).unwrap_or(diff_color::WSEH_NEW),
+    };
 
     // Upstream's order: the argument shape is checked first (a bad shape is 129
     // even when `--left-only --right-only` were also given), and the two-range
@@ -1796,6 +1841,12 @@ pub(super) fn show_range_diff(
         // `format-patch --range-diff` embeds the range-diff in a patch, which is never
         // colored.
         colors: diff_color::DiffColors::disabled(),
+        // `log-tree.c:717` asks for `.dual_color = 1`; with the palette disabled it
+        // selects the same (empty) sequences the simple arms would, so the bytes are
+        // the same either way.
+        dual: true,
+        ws_rule: diff_color::WS_DEFAULT_RULE,
+        ws_error_highlight: diff_color::WSEH_NEW,
     };
     let ends1 = match endpoints(repo, range1) {
         Ok(e) => walkable(repo, e),
@@ -3852,8 +3903,9 @@ fn decimal_width(mut number: u64) -> usize {
 /// of `@@` plus the section name the `section_headers` driver finds.
 ///
 /// Unlike [`diffsize`], this is the diff the user's `diff_options` configure —
-/// `--diff-algorithm`, `--no-indent-heuristic`, `-U<n>` and the three
-/// `--output-indicator-*` markers all land here and nowhere else.
+/// `--diff-algorithm`, `--no-indent-heuristic`, `-U<n>`, the three
+/// `--output-indicator-*` markers and the whole colour palette all land here and
+/// nowhere else.
 fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> {
     let input = InternedInput::new(a, b);
     let diff = match opts.indent_heuristic {
@@ -3866,12 +3918,27 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> 
     };
     let before: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
 
+    // `builtin_diff()`'s pre-pass (diff.c:1920-1927): the two patch texts are this
+    // filepair's pre- and post-images, and the check is skipped outright — leaving
+    // both counters at zero, which disables it — unless the rule is on.
+    let blank_at_eof = match opts.ws_rule & diff_color::WS_BLANK_AT_EOF != 0 {
+        true => diff_color::check_blank_at_eof(a, b),
+        false => (0, 0),
+    };
+
     let writer = OuterHunks {
         out,
         before,
         indicators: opts.indicators,
         func_line: Vec::new(),
         funclineprev: -1,
+        colors: &opts.colors,
+        dual: opts.dual,
+        ws_rule: opts.ws_rule,
+        ws_error_highlight: opts.ws_error_highlight,
+        blank_at_eof,
+        lno_pre: 0,
+        lno_post: 0,
     };
     UnifiedDiff::new(
         &diff,
@@ -3884,7 +3951,8 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> 
 }
 
 /// Writes the outer hunks, carrying `func_line` and `funclineprev` across hunks
-/// the way `xdl_emit_diff()` does.
+/// the way `xdl_emit_diff()` does, and colouring each line the way
+/// `fn_out_consume()` → `emit_diff_symbol()` does.
 struct OuterHunks<'a> {
     out: &'a mut Vec<u8>,
     before: Vec<&'a [u8]>,
@@ -3896,6 +3964,35 @@ struct OuterHunks<'a> {
     func_line: Vec<u8>,
     /// The `s1 - 1` of the previous hunk, the exclusive limit of the search.
     funclineprev: i64,
+    /// `diff_get_color_opt()`'s table, all empty strings with colour off.
+    colors: &'a diff_color::DiffColors,
+    /// `o->flags.dual_color_diffed_diffs`.
+    dual: bool,
+    /// `ecbdata->ws_rule`.
+    ws_rule: u32,
+    /// `o->ws_error_highlight`.
+    ws_error_highlight: u32,
+    /// `ecbdata->blank_at_eof_in_preimage` / `_postimage`.
+    blank_at_eof: (usize, usize),
+    /// `ecbdata->lno_in_preimage` / `_postimage`, reset from each hunk header by
+    /// `find_lno()` (diff.c:2424-2437) and stepped per emitted line.
+    lno_pre: usize,
+    lno_post: usize,
+}
+
+impl OuterHunks<'_> {
+    /// `new_blank_line_at_eof()` (diff.c:1685-1694), against the line counters as
+    /// they stand after this line's increment.
+    fn new_blank_line_at_eof(&self, line: &[u8]) -> bool {
+        let (pre, post) = self.blank_at_eof;
+        if self.ws_rule & diff_color::WS_BLANK_AT_EOF == 0 || pre == 0 || post == 0 {
+            return false;
+        }
+        if pre > self.lno_pre || post > self.lno_post {
+            return false;
+        }
+        diff_color::ws_blank_line(line)
+    }
 }
 
 impl ConsumeHunk for OuterHunks<'_> {
@@ -3912,32 +4009,70 @@ impl ConsumeHunk for OuterHunks<'_> {
         }
         self.funclineprev = s1 - 1;
 
-        self.out.extend_from_slice(INDENT);
-        self.out.extend_from_slice(b"@@");
-        if !self.func_line.is_empty() {
-            self.out.push(b' ');
-            self.out.extend_from_slice(&self.func_line);
-        }
-        self.out.push(b'\n');
+        // `find_lno()` reads the two numbers back out of the header xdiff just
+        // wrote, and `xdl_emit_hunk_hdr()` writes `s - 1` for an empty side — so a
+        // zero-length side starts one lower than the struct's 1-based field.
+        let start = |begin: u32, len: u32| match len {
+            0 => begin.saturating_sub(1) as usize,
+            _ => begin as usize,
+        };
+        self.lno_pre = start(header.before_hunk_start, header.before_hunk_len);
+        self.lno_post = start(header.after_hunk_start, header.after_hunk_len);
 
-        // `emit_line_0()` writes the prefix, the sign, then the record verbatim
-        // — the patch text always ends its lines, so nothing is appended. A NUL
-        // sign (the empty `--output-indicator-*` value) writes no column at all:
-        // `if (first) fputc(first, file)` (diff.c:786-787).
+        // `diff_line_prefix()` first, then the header the `fraginfo` palette
+        // paints. Lent out and handed straight back so the buffer keeps carrying
+        // the last matched section name across hunks.
+        self.out.extend_from_slice(INDENT);
+        let func_line = std::mem::take(&mut self.func_line);
+        diff_color::emit_hunk_header_suppressed(self.out, self.colors, self.dual, &func_line);
+        self.func_line = func_line;
+
+        // `emit_line_0()` writes the prefix, then the sign, then the record — with
+        // the line terminator held back past the closing reset (diff.c:801-807). A
+        // NUL sign (the empty `--output-indicator-*` value) writes no column at
+        // all: `if (first) fputc(first, file)` (diff.c:786-787).
         for &(kind, content) in lines {
+            // `fn_out_consume()`'s three cases, each stepping the line counters
+            // before it emits (diff.c:2499-2512).
+            let (ck, ind, side) = match kind {
+                DiffLineKind::Context => {
+                    self.lno_pre += 1;
+                    self.lno_post += 1;
+                    (diff_color::ContentKind::Context, IND_CONTEXT, diff_color::WSEH_CONTEXT)
+                }
+                DiffLineKind::Add => {
+                    self.lno_post += 1;
+                    (diff_color::ContentKind::Plus, IND_NEW, diff_color::WSEH_NEW)
+                }
+                DiffLineKind::Remove => {
+                    self.lno_pre += 1;
+                    (diff_color::ContentKind::Minus, IND_OLD, diff_color::WSEH_OLD)
+                }
+            };
+            // The record as xdiff hands it over. A patch text always ends its
+            // lines, so only a truncated final record can lack the terminator.
+            let terminated: Vec<u8>;
+            let line: &[u8] = if content.ends_with(b"\n") {
+                content
+            } else {
+                terminated = [content, b"\n"].concat();
+                &terminated
+            };
+            let blank_at_eof =
+                ck == diff_color::ContentKind::Plus && self.new_blank_line_at_eof(line);
             self.out.extend_from_slice(INDENT);
-            let sign = self.indicators[match kind {
-                DiffLineKind::Context => IND_CONTEXT,
-                DiffLineKind::Add => IND_NEW,
-                DiffLineKind::Remove => IND_OLD,
-            }];
-            if sign != 0 {
-                self.out.push(sign);
-            }
-            self.out.extend_from_slice(content);
-            if !content.ends_with(b"\n") {
-                self.out.push(b'\n');
-            }
+            diff_color::emit_content_symbol(
+                self.out,
+                self.colors,
+                self.dual,
+                ck,
+                0,
+                self.indicators[ind],
+                line,
+                self.ws_rule,
+                self.ws_error_highlight & side != 0,
+                blank_at_eof,
+            );
         }
         Ok(())
     }

@@ -27,6 +27,9 @@ impl crate::Repository {
             shallow_commits,
             #[cfg(feature = "attributes")]
             modules,
+            // `prepare_commit_graft()` is lazy in git too — nothing is read until the
+            // first commit is parsed.
+            grafts: Default::default(),
         };
         // A partial clone is only usable if reading an object it skipped goes back to the remote, so the
         // object database learns how to do that as soon as the repository that configures it exists.

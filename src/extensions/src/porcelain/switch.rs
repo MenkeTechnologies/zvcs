@@ -903,6 +903,23 @@ fn switch_detach(
             let Some(id) = crate::objname::resolve(repo, s) else {
                 return fatal(format!("invalid reference: {s}"));
             };
+            // `setup_new_branch_info_and_source_tree()` (`builtin/checkout.c:1311`)
+            // resolves the operand a second time through `setup_branch_path()`:
+            //
+            // ```c
+            // if (!repo_dwim_ref(the_repository, branch->name, strlen(branch->name),
+            //                    &branch->oid, &branch->refname, 0))
+            //         repo_get_oid_committish(the_repository, branch->name, &branch->oid);
+            // ```
+            //
+            // (`builtin/checkout.c:804-806`.) `<ref>@{<n>}` is never a ref name, so
+            // the fallback always fires for it and stock 2.55.0 prints
+            // `warning: log for 'HEAD' only goes back to …` twice for
+            // `git switch --detach 'HEAD@{<old date>}'`, where a plain branch name
+            // stops at `repo_dwim_ref()` and warns once.
+            if super::rev_parse::dwim_ref_matches(repo, s).is_empty() {
+                crate::objname::resolve(repo, s);
+            }
             match super::checkout::classify_tree_ish(repo, id)? {
                 TreeIsh::Commit(commit) => commit.id,
                 TreeIsh::Tree(_) => {

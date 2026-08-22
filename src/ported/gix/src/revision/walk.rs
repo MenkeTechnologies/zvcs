@@ -286,44 +286,30 @@ impl<'repo> Platform<'repo> {
         Ok(revision::Walk {
             repo,
             inner: Box::new(
-                gix_traverse::commit::Simple::filtered(tips, &repo.objects, {
-                    // Note that specific shallow handling for commit-graphs isn't needed as these contain
-                    // all information there is, and exclude shallow parents to be structurally consistent.
-                    let shallow_commits = repo.shallow_commits()?;
-                    let mut grafted_parents_to_skip = Vec::new();
-                    let mut buf = Vec::new();
-                    move |id| {
-                        if !filter(id) {
-                            return false;
-                        }
-                        let id = id.to_owned();
-                        if boundary.binary_search(&id).is_ok() {
-                            return false;
-                        }
-                        match shallow_commits.as_ref() {
-                            Some(commits) => {
-                                if let Ok(idx) = grafted_parents_to_skip.binary_search(&id) {
-                                    grafted_parents_to_skip.remove(idx);
-                                    return false;
-                                }
-                                if commits.binary_search(&id).is_ok() {
-                                    if let Ok(commit) = repo.objects.find_commit_iter(&id, &mut buf) {
-                                        grafted_parents_to_skip.extend(commit.parent_ids());
-                                        grafted_parents_to_skip.sort();
-                                    }
-                                }
-                                true
-                            }
-                            None => true,
-                        }
+                gix_traverse::commit::Simple::filtered(tips, &repo.objects, move |id| {
+                    if !filter(id) {
+                        return false;
                     }
+                    boundary.binary_search(&id.to_owned()).is_err()
                 })
                 .sorting(sorting.into_simple().expect("for now there is nothing else"))?
                 .parents(parents)
+                // The predicate above no longer has to fake a graft: `.git/shallow` and
+                // `info/grafts` both feed the [table](crate::graft), and the walk reads
+                // the substituted parent list directly — git's `parse_commit_buffer()`
+                // (commit.c:554-590) rather than a skip list. A skip predicate could
+                // only ever *drop* a parent, which is wrong for a graft line that names
+                // different parents, and wrong even for a shallow boundary as soon as
+                // one of the skipped parents is reachable from somewhere else.
+                //
+                // Note that `commit_graph()` below returns nothing while a graft table
+                // is in effect (`commit_graph_compatible()`, commit-graph.c:223-242), so
+                // the two can never disagree.
+                .grafts(Some(repo.commit_grafts().clone()))
                 .commit_graph(
                     commit_graph.or(use_commit_graph
-                        .map_or_else(|| self.repo.config.may_use_commit_graph(), Ok)?
-                        .then(|| self.repo.commit_graph().ok())
+                        .map_or_else(|| repo.config.may_use_commit_graph(), Ok)?
+                        .then(|| repo.commit_graph().ok())
                         .flatten()),
                 )
                 .hide(hidden)?

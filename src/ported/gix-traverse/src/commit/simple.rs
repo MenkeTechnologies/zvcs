@@ -189,9 +189,12 @@ fn compute_hidden_frontier(
     hidden_tips: &[ObjectId],
     objects: &impl gix_object::Find,
     cache: Option<&gix_commitgraph::Graph>,
+    grafts: Option<std::sync::Arc<gix_revwalk::graft::Table>>,
     predicate: &mut impl FnMut(&gix_hash::oid) -> bool,
 ) -> Result<gix_revwalk::graph::IdMap<()>, Error> {
-    let mut graph = gix_revwalk::Graph::<gix_revwalk::graph::Commit<PaintFlags>>::new(objects, cache);
+    // The painting has to see the same parents the visible walk will, or it paints
+    // a frontier the walk can never reach.
+    let mut graph = gix_revwalk::Graph::<gix_revwalk::graph::Commit<PaintFlags>>::new(objects, cache).with_grafts(grafts);
     // The queue value carries whether the entry was still visible-only when it was queued, so the
     // loop below can test "is any visible commit still pending" in constant time instead of
     // scanning the whole queue on every iteration. A commit that gains `HIDDEN` after it was
@@ -407,6 +410,23 @@ mod init {
             self
         }
 
+        /// Substitute the parents of every commit named by `grafts`, which is git's
+        /// `parse_commit_buffer()` consulting `lookup_commit_graft()` (commit.c:554-590).
+        ///
+        /// Both files that feed the table are covered: an `info/grafts` line replaces
+        /// the parent list outright, and a `<GIT_DIR>/shallow` entry makes the commit
+        /// parentless so the walk stops at the clone's boundary instead of reading
+        /// parent objects that are not there.
+        ///
+        /// Note that git refuses to open a commit-graph while a graft table is in
+        /// effect (`commit_graph_compatible()`, commit-graph.c:223-242), because a
+        /// graph is written from the recorded parents; callers that set both should
+        /// resolve that the same way.
+        pub fn grafts(mut self, grafts: Option<std::sync::Arc<gix_revwalk::graft::Table>>) -> Self {
+            self.grafts = grafts.filter(|table| !table.is_empty());
+            self
+        }
+
         fn queue_to_vecdeque(&mut self) {
             let state = &mut self.state;
             state.next.extend(
@@ -443,6 +463,7 @@ mod init {
                 &hidden_tips,
                 &self.objects,
                 self.cache.as_ref(),
+                self.grafts.clone(),
                 &mut self.predicate,
             )?;
             self.state.next.retain(|id| !self.state.hidden.contains_key(id));
@@ -529,6 +550,7 @@ mod init {
                 state,
                 parents: Default::default(),
                 sorting: Default::default(),
+                grafts: None,
             }
         }
     }
@@ -594,6 +616,42 @@ mod init {
                     continue;
                 }
                 let mut parents: ParentIds = Default::default();
+
+                // `parse_commit_buffer()` still reads the commit — only its parent list
+                // is replaced (commit.c:554-590) — so the graft is applied after the
+                // lookup, and a grafted commit that is missing still errors as before.
+                if let Some(grafted) = self.grafts.as_ref().and_then(|g| g.parents_of(&oid)).map(<[_]>::to_vec) {
+                    if let Err(err) = super::super::find(self.cache.as_ref(), &self.objects, &oid, &mut state.buf) {
+                        return Some(Err(err.into()));
+                    }
+                    for id in grafted {
+                        parents.push(id);
+                        if follow_first_parent_only && parents.len() > 1 {
+                            continue;
+                        }
+                        insert_into_seen_and_queue(
+                            &mut state.seen,
+                            &state.hidden,
+                            id,
+                            &mut self.predicate,
+                            next,
+                            order,
+                            cutoff,
+                            || {
+                                self.objects
+                                    .find_commit_iter(id.as_ref(), &mut state.parents_buf)
+                                    .ok()
+                                    .and_then(|parent| parent.committer().ok().map(|committer| committer.seconds()))
+                                    .unwrap_or_default()
+                            },
+                        );
+                    }
+                    return Some(Ok(Info {
+                        id: oid,
+                        parent_ids: parents,
+                        commit_time: Some(commit_time),
+                    }));
+                }
 
                 match super::super::find(self.cache.as_ref(), &self.objects, &oid, &mut state.buf) {
                     Ok(Either::CachedCommit(commit)) => {
@@ -681,6 +739,26 @@ mod init {
                     continue;
                 }
                 let mut parents: ParentIds = Default::default();
+
+                // See the same block in `next_by_commit_date()`: the commit is still
+                // read, only its parent list comes from the graft table.
+                if let Some(grafted) = self.grafts.as_ref().and_then(|g| g.parents_of(&oid)).map(<[_]>::to_vec) {
+                    if let Err(err) = super::super::find(self.cache.as_ref(), &self.objects, &oid, &mut state.buf) {
+                        return Some(Err(err.into()));
+                    }
+                    for pid in grafted {
+                        parents.push(pid);
+                        if follow_first_parent_only && parents.len() > 1 {
+                            continue;
+                        }
+                        insert_into_seen_and_next(&mut state.seen, &state.hidden, pid, &mut self.predicate, next);
+                    }
+                    return Some(Ok(Info {
+                        id: oid,
+                        parent_ids: parents,
+                        commit_time: None,
+                    }));
+                }
 
                 match super::super::find(self.cache.as_ref(), &self.objects, &oid, &mut state.buf) {
                     Ok(Either::CachedCommit(commit)) => {

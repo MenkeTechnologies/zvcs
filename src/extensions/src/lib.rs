@@ -533,6 +533,25 @@ pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Optio
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
 /// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
 fn run_command(argv: &[String]) -> ExitCode {
+    // The very first thing any git process does with the environment:
+    // `read_very_early_config()` opens the sequence with
+    // `git_config_system()` (config.c:1541), which is
+    // `return !git_env_bool("GIT_CONFIG_NOSYSTEM", 0);`. `git_env_bool()` dies on
+    // a value that is not a boolean, so `GIT_CONFIG_NOSYSTEM=bogus` refuses
+    // *every* invocation — measured against git 2.55.0, `git --version`,
+    // `git --exec-path`, `git init`, `git config --list` and `git status` all
+    // print `fatal: bad boolean environment value 'bogus' for
+    // 'GIT_CONFIG_NOSYSTEM'` and exit 128, inside a repository and outside one
+    // alike. It also *outranks* a malformed `~/.gitconfig`: the system gate is
+    // consulted before the user file is opened, so with both wrong git reports
+    // the environment value and never mentions the file.
+    //
+    // Hence this line, ahead of the early-config gate below and ahead of
+    // `handle_options`. [`setup::git_env_bool`] carries the grammar and the
+    // standing warning against extending this to variables git does not
+    // validate.
+    let _ = setup::git_env_bool("GIT_CONFIG_NOSYSTEM", false);
+
     // `init_git()` (common-init.c:53-83) runs before `cmd_main()` ever sees the
     // command line, and one of the things it runs is `trace2_initialize()`, whose
     // `tr2_sysenv_load()` calls `read_very_early_config()`. That reads the system,
@@ -733,6 +752,10 @@ fn run_command(argv: &[String]) -> ExitCode {
     // `setup_git_directory_gently_1()` reaches them, which is observable whenever
     // two of them apply at once — see the section header in `setup.rs`.
     //
+    // The discovery loop's own first line, `GIT_DISCOVERY_ACROSS_FILESYSTEM`
+    // (setup.c:1597), which is read before the walk begins and so beats every
+    // refusal below it.
+    setup::discovery_environment_gate(&sub);
     // Discovery first: `$GIT_OBJECT_DIRECTORY` is part of the test that decides
     // whether a directory is a repository at all, and it runs before any
     // configuration has been read, so it beats even a malformed command-line
@@ -756,6 +779,10 @@ fn run_command(argv: &[String]) -> ExitCode {
     if let Some(code) = setup::dubious_ownership(&sub) {
         return code;
     }
+    // The repository survived the walk, so `setup_git_env_internal()` runs and
+    // with it `GIT_NO_LAZY_FETCH` (setup.c:1066) — after the two policy gates
+    // above, which is the order git reaches them in.
+    setup::no_lazy_fetch_environment_gate(&sub);
     // Not a refusal: the object database names each alternate that has gone
     // missing and the command carries on.
     setup::report_missing_alternates(&sub);

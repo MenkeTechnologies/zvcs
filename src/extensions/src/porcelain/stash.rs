@@ -1037,6 +1037,20 @@ fn build_stash_commit(
     message: Option<&str>,
     opts: &PushOpts,
 ) -> Result<StashBuild> {
+    // `do_create_stash()` obtains the index tree `I` with
+    // `write_index_as_tree(&info->i_tree, the_repository->index,
+    // repo_get_index_file(), 0, NULL)` (builtin/stash.c), and that call is not a read.
+    // `write_index_as_tree()` holds the index lock, and when the cache-tree is not already
+    // fully valid it runs `cache_tree_update()` and writes the index back — "Not being able
+    // to write is fine -- we are only interested in updating the cache-tree part"
+    // (cache-tree.c:797-831). So `git stash` over an index whose cache-tree was stale leaves
+    // a *repaired* `.git/index` behind, and it stays repaired even when the push then fails
+    // (`-S` whose `apply -R` cannot place its patch never gets as far as the reset, yet
+    // stock's index is 19 bytes longer than it was). Without this the port left the root
+    // marked invalid where stock had recorded the tree.
+    if let Ok(mut index) = repo.open_index() {
+        super::write_tree::update_cache_tree_if_stale(repo, &mut index)?;
+    }
     let head_id = repo.head_id()?.detach();
     let head_tree_id = repo.head_tree_id()?.detach();
     let branch = match repo.head_name()? {
@@ -1999,11 +2013,26 @@ fn restore_stash_commit(
     // unrelated local work — and what makes the local-changes refusal below
     // git's own, since merge-ort ends in the same `unpack_trees` gate every
     // merge does.
-    let old_index = repo.open_index()?;
+    let mut old_index = repo.open_index()?;
     if old_index.entries().iter().any(|e| e.stage_raw() != 0) {
         crate::git_fatal!("cannot apply a stash in the middle of a merge");
     }
-    let c_tree = super::merge::index_tree(repo, &old_index)?;
+    // `do_apply_stash()` gets *ours* from
+    // `write_index_as_tree(&c_tree, the_repository->index, repo_get_index_file(), 0, NULL)`
+    // (builtin/stash.c:661-663) — the on-disk index file, by name. That function rewrites it:
+    // when the cache-tree is not already fully valid it runs `cache_tree_update()` and then
+    // `write_locked_index()` (cache-tree.c:797-831). So every `stash apply`/`pop`/`branch`
+    // leaves a repaired `.git/index` behind, including the ones that go on to refuse — which
+    // is why stock's index after a *rejected* `git stash pop` is 19 bytes longer than the one
+    // it started with. The repaired extension is also what `unpack_trees()` carries into the
+    // merge below, so this has to happen on `old_index` itself and not on a copy.
+    let c_tree = match super::write_tree::refresh_cache_tree(repo, &mut old_index, false)? {
+        Ok(id) => id,
+        // Unreachable in practice: `verify_cache()`'s unmerged pass is the check just above,
+        // and a directory/file pair cannot be in an index git wrote. The tree is still needed,
+        // so fall back to building it without going through the extension.
+        Err(_) => super::merge::index_tree(repo, &old_index)?,
+    };
 
     // `--index` replays the stash's staged state onto the current index first
     // (`apply_cached()` of the `w_commit^!` diff), and a patch that does not
@@ -2245,10 +2274,18 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         // changes stay UNSTAGED: reset the index to HEAD rather than persisting the
         // merged index, leaving worktree-vs-index as the user's local changes.
         let mut head_index = repo.index_from_tree(&ours)?;
-        // Built straight from a tree, so it is exactly what `reset_tree()` would have
-        // unpacked — and `unpack_trees()` leaves a repaired cache-tree behind
-        // (unpack-trees.c:2088-2092).
-        super::write_tree::rebuild_cache_tree(repo, &mut head_index);
+        // `apply_autostash()` re-applies with `git stash apply` and **no** `--index`, so
+        // `do_apply_stash()` finishes in `unstage_changes_unless_new(&c_tree)`
+        // (builtin/stash.c:744) — not in `reset_tree()`. That function diffs the merged
+        // index against `c_tree` and puts the pre-merge entry back for every path the merge
+        // moved, one `add_index_entry()` at a time (builtin/stash.c:615-630), then writes the
+        // index with a plain `write_locked_index()` (builtin/stash.c:637-640). Nothing
+        // repairs the cache-tree afterwards, and `add_index_entry()` invalidates the path it
+        // touches (read-cache.c:1273-1274) — so what stock leaves behind is the *merge's*
+        // cache-tree with the unstaged paths marked invalid, root included, while a directory
+        // the stash never reached still names its tree. Repairing here instead produced a
+        // fully valid extension 19 bytes longer than git's on every `pull --autostash`.
+        super::write_tree::carry_cache_tree_invalidating_changes(repo, &applied.index, &mut head_index);
         head_index.write(crate::config::index_write_options(repo))?;
         if !quiet {
             // `apply_save_autostash_oid()` reports this on **stderr**, alongside

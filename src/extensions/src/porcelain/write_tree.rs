@@ -464,6 +464,38 @@ pub(crate) fn rebuild_cache_tree(repo: &gix::Repository, index: &mut gix::index:
     prepare_offset_table(repo, index);
 }
 
+/// `unpack_trees()`'s cache-tree handling **in full**: carry the source index's extension over,
+/// invalidate every path whose entry moved, and only then repair what is left.
+///
+/// This is the three steps git actually performs, in git's order:
+///
+/// 1. `invalidate_ce_path(ce, o)` → `cache_tree_invalidate_path(o->src_index, ce->name)`
+///    (unpack-trees.c:190-197), called for every entry the merge adds, removes or replaces;
+/// 2. `move_index_extensions(&o->internal.result, o->src_index)` — the *invalidated* cache-tree
+///    is what moves onto the result;
+/// 3. `if (!o->skip_cache_tree_update && !cache_tree_fully_valid(o->internal.result.cache_tree))
+///    cache_tree_update(&o->internal.result, WRITE_TREE_SILENT | WRITE_TREE_REPAIR);`
+///    (unpack-trees.c:2085-2093).
+///
+/// [`rebuild_cache_tree`] collapses 1+2 into "drop everything", which is safe but wrong in the
+/// one case that matters: when the result is **unmerged**, step 3 fails at `verify_cache()`
+/// (cache-tree.c:218-234) *before* touching `istate->cache_tree`, so git keeps the carried,
+/// partly-invalidated structure while dropping first leaves nothing at all. Stock's index after
+/// a conflicting `merge`/`cherry-pick`/`revert`/`rebase` therefore still carries `TREE` with the
+/// touched nodes marked `-1` and the untouched ones still naming their tree; this reproduces it.
+///
+/// It is also *stricter* than dropping in the clean case rather than looser: a node survives
+/// only when no entry below it changed, which is exactly what step 1 guarantees.
+pub(crate) fn carry_and_repair_cache_tree(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    new: &mut gix::index::File,
+) {
+    carry_cache_tree_invalidating_changes(repo, old, new);
+    repair_cache_tree(repo, new);
+    prepare_offset_table(repo, new);
+}
+
 pub(crate) fn repair_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) {
     let odb = RepoOdb { repo };
     let _ = index.cache_tree_update(

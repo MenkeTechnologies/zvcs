@@ -1596,20 +1596,25 @@ fn config_file_sequence(scopes: ConfigScopes, naming: GitDirNaming) -> Vec<Confi
 /// (config.c:1542-1545) — `return !git_env_bool("GIT_CONFIG_NOSYSTEM", 0);` —
 /// gates the whole system read on it in `do_git_config_sequence()` (config.c:1574).
 ///
-/// The truthiness test is gitoxide's, kept exactly as the `storage_location()`
-/// call it replaces had it, so this is not a behaviour change: a value neither
-/// side can parse leaves the scope enabled. git is stricter and dies with
-/// `bad boolean environment value '<v>' for 'GIT_CONFIG_NOSYSTEM'`, which this
-/// port does not do anywhere — measured with a *valid* system config, where this
-/// gate cannot fire at all, and the divergence is the same. Validating git's
-/// environment booleans is its own piece of work.
+/// The truthiness test is `git_parse_maybe_bool()`'s, through
+/// [`crate::optint::maybe_bool`]: the words, the empty string for false, and any
+/// base-0 integer as its truthiness — so `0x10` and `1k` switch the scope off and
+/// `0x0` leaves it on, as they do in git. It used to be gitoxide's
+/// `config::Boolean::try_from`, which accepts a narrower grammar and *silently
+/// keeps the scope enabled* for anything it cannot read; git dies instead.
+///
+/// The refusal itself is not raised here. `git_config_system()` is reached from
+/// `read_very_early_config()`, which `init_git()` runs before `cmd_main()` sees
+/// the command line, so a malformed value refuses the invocation before any verb
+/// exists to report it against — including `git --version`. `run_command()`
+/// (lib.rs) makes that call at the top of the process for exactly that reason,
+/// and by the time this function runs the value is already known to parse. The
+/// call is kept here as well because [`crate::alias`] and the config-listing
+/// paths reach this without going through the dispatcher.
 fn system_config_path(env: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     let nosystem = env("GIT_CONFIG_NOSYSTEM")
-        .map(gix::config::Boolean::try_from)
-        .transpose()
-        .ok()
-        .flatten()
-        .is_some_and(|b| b.0);
+        .map(|raw| raw.to_string_lossy().into_owned())
+        .is_some_and(|raw| crate::setup::git_env_bool_value("GIT_CONFIG_NOSYSTEM", &raw));
     if nosystem {
         return None;
     }
@@ -1830,6 +1835,248 @@ pub fn repository_format_message(err: &gix::config::Error) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `handle_extension_v0()` (setup.c:614-634): the four extensions git honours at
+/// *any* repository version, "respected even in v0-format repositories for
+/// historical compatibility". They are consumed by that function and never reach
+/// either offender list, so they are invisible to
+/// [`verify_repository_format`] whatever the version says.
+const EXTENSIONS_V0: &[&str] = &["noop", "preciousobjects", "partialclone", "worktreeconfig"];
+
+/// `handle_extension()` (setup.c:655-716): every extension git knows about that
+/// requires repository format version 1. `check_repo_format()` (setup.c:738-741)
+/// appends each of these to `v1_only_extensions`, which
+/// [`verify_repository_format`] complains about only when the version is 0.
+///
+/// The C is a chain of `strcmp(ext, …)` and this is its exact membership, in
+/// source order. Anything absent from **both** lists lands in
+/// `unknown_extensions`, which is the other half of the same function.
+const EXTENSIONS_V1: &[&str] = &[
+    "noop-v1",
+    "objectformat",
+    "compatobjectformat",
+    "refstorage",
+    "relativeworktrees",
+    "submodulepathconfig",
+];
+
+/// `GIT_REPO_VERSION_READ` (repository.h): the highest `core.repositoryformatversion`
+/// this build will read.
+const GIT_REPO_VERSION_READ: i64 = 1;
+
+/// What `read_repository_format()` (setup.c:857-877) collected from one config
+/// file, in the shape `verify_repository_format()` consumes.
+///
+/// `version` is `-1` for a file that names no `core.repositoryformatversion` at
+/// all, which is `REPOSITORY_FORMAT_INIT`'s value and the reason
+/// `check_repository_format_gently()` (setup.c:766-769) treats a missing config
+/// as a silent success:
+///
+/// ```c
+/// /*
+///  * For historical use of check_and_apply_repository_format() in git-init,
+///  * we treat a missing config as a silent "ok", even when nongit_ok
+///  * is unset.
+///  */
+/// if (candidate->version < 0)
+///         return 0;
+/// ```
+#[derive(Default)]
+struct RepositoryFormat {
+    version: i64,
+    v1_only_extensions: Vec<String>,
+    unknown_extensions: Vec<String>,
+}
+
+/// `read_repository_format()` (setup.c:857-877) over one file: the whole of
+/// `check_repo_format()`'s classification, and nothing else.
+///
+/// ```c
+/// if (strcmp(var, "core.repositoryformatversion") == 0)
+///         data->version = git_config_int(var, value, ctx->kvi);
+/// else if (skip_prefix(var, "extensions.", &ext)) {
+///         switch (handle_extension_v0(var, value, ext, data)) { … }
+///         switch (handle_extension(var, value, ext, data)) {
+///         case EXTENSION_OK:
+///                 string_list_append(&data->v1_only_extensions, ext);
+///                 return 0;
+///         case EXTENSION_UNKNOWN:
+///                 string_list_append(&data->unknown_extensions, ext);
+///                 return 0;
+///         }
+/// }
+/// ```
+///
+/// Three details are load-bearing and each is measurable:
+///
+/// * **One file, no includes.** `read_repository_format()` calls
+///   `git_config_from_file()` directly, so an `[include]` in `.git/config` does
+///   not contribute and neither does any other scope — which is why
+///   `-c extensions.objectFormat=sha256` is accepted by git while the same key
+///   in the file is refused.
+/// * **The name is the parser's, already lower-cased.** `extensions.objectFormat`
+///   reaches the callback as `extensions.objectformat`, and that lower-cased
+///   suffix is what the message prints.
+/// * **The version is the last one seen.** The callback runs per occurrence and
+///   assigns, so a file naming the key twice keeps the second value.
+///
+/// The `EXTENSION_ERROR` arms — an `extensions.objectformat` naming a hash git
+/// does not have, a repeated `compatobjectformat` — are deliberately not
+/// reproduced: they are a different diagnostic (`error: invalid value for …`)
+/// raised from inside the config reader, and guessing at it would invent a
+/// refusal rather than port one. Such a value is classified here as the known
+/// extension it names, so this can only ever report *less* than git, never more.
+fn read_repository_format(path: &std::path::Path) -> RepositoryFormat {
+    let mut format = RepositoryFormat {
+        version: -1,
+        ..Default::default()
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return format;
+    };
+    let Ok(file) = gix::config::File::from_bytes_no_includes(
+        &bytes,
+        gix::config::file::Metadata::from(gix::config::Source::Local),
+        Default::default(),
+    ) else {
+        return format;
+    };
+    // `File::sections()` walks in file order, and `BodyRef::value_names()` yields
+    // one entry per *occurrence*, so a key written twice is seen twice — which is
+    // what `string_list_append()` per callback invocation amounts to.
+    for section in file.sections() {
+        let header = section.header();
+        let name = String::from_utf8_lossy(header.name()).to_ascii_lowercase();
+        let subsection = header
+            .subsection_name()
+            .map(|s| String::from_utf8_lossy(s).into_owned());
+        let body = section.body();
+        for key in body.value_names() {
+            let key_lower = key.to_ascii_lowercase();
+            // `git_config_parse_key()` lower-cases the section and the variable
+            // and leaves a subsection alone, so the full key is rebuilt the same
+            // way before `skip_prefix(var, "extensions.", &ext)` looks at it.
+            let full = match &subsection {
+                Some(sub) => format!("{name}.{sub}.{key_lower}"),
+                None => format!("{name}.{key_lower}"),
+            };
+            if full == "core.repositoryformatversion" {
+                // `git_config_int()`, last occurrence wins — `value()` already
+                // answers with the last one. A value git's parser would refuse is
+                // left alone here rather than guessed at; see the
+                // `EXTENSION_ERROR` note above.
+                if let Some(value) = body.value(&key) {
+                    let text = String::from_utf8_lossy(value.as_slice()).into_owned();
+                    if let Ok(v) = crate::optint::config_int(&text) {
+                        format.version = v;
+                    }
+                }
+                continue;
+            }
+            let Some(ext) = full.strip_prefix("extensions.") else {
+                continue;
+            };
+            if EXTENSIONS_V0.contains(&ext) {
+                continue;
+            }
+            if EXTENSIONS_V1.contains(&ext) {
+                format.v1_only_extensions.push(ext.to_string());
+            } else {
+                format.unknown_extensions.push(ext.to_string());
+            }
+        }
+    }
+    format
+}
+
+/// `verify_repository_format()` (setup.c:881-917), rendered as the `err` strbuf
+/// it fills — the exact text `check_repository_format_gently()` then passes to
+/// `die()`.
+///
+/// ```c
+/// if (GIT_REPO_VERSION_READ < format->version) {
+///         strbuf_addf(err, _("Expected git repo version <= %d, found %d"),
+///                     GIT_REPO_VERSION_READ, format->version);
+///         return -1;
+/// }
+///
+/// if (format->version >= 1 && format->unknown_extensions.nr) {
+///         strbuf_addstr(err, Q_("unknown repository extension found:",
+///                               "unknown repository extensions found:",
+///                               format->unknown_extensions.nr));
+///         for (i = 0; i < format->unknown_extensions.nr; i++)
+///                 strbuf_addf(err, "\n\t%s", format->unknown_extensions.items[i].string);
+///         return -1;
+/// }
+///
+/// if (format->version == 0 && format->v1_only_extensions.nr) { … }
+/// ```
+///
+/// The three arms are ordered and mutually exclusive, and the two extension arms
+/// are each other's inverse: an *unknown* extension is only ever a problem at
+/// version 1 or above, and a *known v1-only* one only at version 0. So
+/// `extensions.bogus` in a v0 repository is silently ignored by git — the port
+/// must ignore it too — while the same key at version 1 is fatal.
+///
+/// `Q_()` is the plural selector, so a second offender changes `extension` to
+/// `extensions` in the first line. Each offender then follows as its own
+/// tab-indented line.
+fn verify_repository_format(format: &RepositoryFormat) -> Option<String> {
+    if GIT_REPO_VERSION_READ < format.version {
+        return Some(format!(
+            "Expected git repo version <= {GIT_REPO_VERSION_READ}, found {}",
+            format.version
+        ));
+    }
+    if format.version >= 1 && !format.unknown_extensions.is_empty() {
+        return Some(offender_list(
+            "unknown repository extension found:",
+            "unknown repository extensions found:",
+            &format.unknown_extensions,
+        ));
+    }
+    if format.version == 0 && !format.v1_only_extensions.is_empty() {
+        return Some(offender_list(
+            "repo version is 0, but v1-only extension found:",
+            "repo version is 0, but v1-only extensions found:",
+            &format.v1_only_extensions,
+        ));
+    }
+    None
+}
+
+/// `Q_(singular, plural, n)` followed by one `"\n\t%s"` per offender.
+fn offender_list(singular: &str, plural: &str, offenders: &[String]) -> String {
+    let mut out = String::from(if offenders.len() == 1 { singular } else { plural });
+    for name in offenders {
+        out.push_str("\n\t");
+        out.push_str(name);
+    }
+    out
+}
+
+/// `read_and_verify_repository_format()` (setup.c:753-777) for the repository the
+/// current directory is in: the message git would `die()` with, or `None` when
+/// the format is one this build reads.
+///
+/// The file is `$GIT_COMMON_DIR/config`, which is what
+/// `check_repository_format_gently()` builds with `get_common_dir()` — a linked
+/// worktree shares the main repository's format, so the format of
+/// `worktrees/<name>/config` is never consulted.
+///
+/// `None` also covers "there is no repository here": with nothing found there is
+/// nothing to verify, and the caller's command carries on to fail (or not) on its
+/// own terms.
+pub fn repository_format_refusal() -> Option<String> {
+    let dirs = repository_directories()?;
+    let format = read_repository_format(&dirs.common_dir.join("config"));
+    // `if (candidate->version < 0) return 0;` — the historical silent "ok" for a
+    // repository whose config names no version at all.
+    if format.version < 0 {
+        return None;
+    }
+    verify_repository_format(&format)
 }
 
 /// The `fatal:` line git would have printed for a repository this port failed to

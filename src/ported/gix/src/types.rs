@@ -178,6 +178,12 @@ pub struct Repository {
     #[cfg(feature = "attributes")]
     pub(crate) modules: crate::submodule::ModulesFileStorage,
     pub(crate) shallow_commits: crate::shallow::CommitsStorage,
+    /// The commit graft table, read from `info/grafts` and `shallow` on first use.
+    ///
+    /// Not part of [`ThreadSafeRepository`] and not shared between clones: git's
+    /// `commit_graft_prepared` latch is per `struct repository` too, and a clone
+    /// simply reads the files again.
+    pub(crate) grafts: crate::graft::TableStorage,
 }
 
 /// An instance with access to everything a git repository entails, best imagined as container implementing `Sync + Send` for _most_

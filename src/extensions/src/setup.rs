@@ -564,19 +564,64 @@ fn ensure_valid_ownership(gitfile: Option<&Path>, worktree: Option<&Path>, gitdi
     safe_directory_allows(&path)
 }
 
-/// `git_env_bool()` (parse.c): an unset variable takes the default, and a value
-/// that is not a boolean at all is fatal rather than falling back to it.
-fn env_bool(key: &str, default: bool) -> bool {
+/// `git_env_bool()` (parse.c:193-208), the one reader every environment
+/// *boolean* in git goes through:
+///
+/// ```c
+/// int git_env_bool(const char *k, int def)
+/// {
+///         const char *v = getenv(k);
+///         int val;
+///         if (!v)
+///                 return def;
+///         val = git_parse_maybe_bool(v);
+///         if (val < 0)
+///                 die(_("bad boolean environment value '%s' for '%s'"), v, k);
+///         return val;
+/// }
+/// ```
+///
+/// Two properties are the whole point and are easy to lose separately. An unset
+/// variable takes the default — it is never "false" — and a value that is not a
+/// boolean at all is `die()`, not a fall back to the default. The grammar is
+/// `git_parse_maybe_bool()`'s, ported in [`crate::optint::maybe_bool`]: the
+/// words `true`/`yes`/`on`/`false`/`no`/`off` case-insensitively, the empty
+/// string for false, and any integer the base-0 grammar reads as its
+/// truthiness — so `0x10` and `1k` are true and a value past `int` range is not
+/// a boolean.
+///
+/// **This is not a licence to validate every `GIT_*` variable.** git validates
+/// exactly the variables it reads *through this function*, at the moment that
+/// read happens, and coerces every other one silently. `GIT_NO_REPLACE_OBJECTS`
+/// and `GIT_SKIP_HASH` are plain `getenv()` presence tests and accept
+/// `bogus` with no complaint; `GIT_DIR`, `GIT_ALLOW_PROTOCOL` and friends are
+/// not booleans at all. Adding a caller here that git does not have turns a
+/// value stock git accepts into a refusal, which is a worse divergence than the
+/// one it fixes. Every call site below cites the C line it stands in for.
+pub(crate) fn git_env_bool(key: &str, default: bool) -> bool {
     let Ok(raw) = std::env::var(key) else {
         return default;
     };
-    match crate::optint::maybe_bool(&raw) {
+    git_env_bool_value(key, &raw)
+}
+
+/// [`git_env_bool`]'s second half, for the callers that already hold the value —
+/// [`crate::config`] reads the environment through an injectable closure so a
+/// test can supply one, and would otherwise have to consult the real environment
+/// a second time to reach the same verdict.
+pub(crate) fn git_env_bool_value(key: &str, raw: &str) -> bool {
+    match crate::optint::maybe_bool(raw) {
         Some(v) => v,
         None => {
             eprintln!("fatal: bad boolean environment value '{raw}' for '{key}'");
             crate::hosted::exit(crate::fatal::EXIT_FATAL as i32);
         }
     }
+}
+
+/// The spelling the ownership checks in this module already used.
+fn env_bool(key: &str, default: bool) -> bool {
+    git_env_bool(key, default)
 }
 
 /// `sq_quote_buf_pretty()` (quote.c:50-70): shell quoting applied only when the
@@ -641,6 +686,94 @@ fn sq_quote_pretty(text: &str) -> String {
 ///   `config`, `init`, `hash-object`, `shortlog`, `patch-id`, `stripspace`,
 ///   `interpret-trailers`, `bugreport`, `column`, `diff` and `ls-remote` do not.
 ///
+/// The verbs that never call `setup_git_directory_gently_1()`, and so never read
+/// `GIT_DISCOVERY_ACROSS_FILESYSTEM` at all.
+///
+/// Not the same list as [`crate::NO_SETUP_VERBS`], which is about what happens
+/// when discovery comes up *empty*: `config`, `var`, `grep` and `hash-object`
+/// are all on that list and all still run the discovery walk, so all four die on
+/// a malformed `GIT_DISCOVERY_ACROSS_FILESYSTEM`. What is here is the narrower
+/// set that has no walk to run — `version` and `help` answer without a
+/// repository, `init`/`init-db`/`clone` create one rather than find one, and the
+/// rest either take the repository as an argument or read no configuration.
+///
+/// Measured against git 2.55.0 with `GIT_DISCOVERY_ACROSS_FILESYSTEM=bogus`:
+/// `git --version` and `git init <dir>` exit 0, while `git config --list`,
+/// `git var GIT_EDITOR`, `git hash-object --stdin`, `git status` and
+/// `git rev-parse --git-dir` all exit 128 with
+/// `fatal: bad boolean environment value 'bogus' for
+/// 'GIT_DISCOVERY_ACROSS_FILESYSTEM'` — inside a repository and outside one
+/// alike, since the variable is read before the walk that would find one.
+const NO_DISCOVERY_VERBS: &[&str] = &[
+    "check-ref-format",
+    "clone",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
+    "get-tar-commit-id",
+    "help",
+    "init",
+    "init-db",
+    "mailsplit",
+    "remote-ext",
+    "remote-fd",
+    "stripspace",
+    "upload-archive",
+    "upload-archive--writer",
+    "url-parse",
+    "verify-pack",
+    "version",
+];
+
+/// `git_env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM", 0)` (setup.c:1597), the first
+/// line of `setup_git_directory_gently_1()`'s discovery loop:
+///
+/// ```c
+/// one_filesystem = !git_env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM", 0);
+/// if (one_filesystem)
+///         current_device = get_device_or_die(dir->buf, NULL, 0);
+/// ```
+///
+/// It runs *before* the walk, so it precedes every other setup refusal —
+/// `$GIT_OBJECT_DIRECTORY`, `safe.bareRepository`, `safe.directory` — and does
+/// not need a repository to exist. Only the value is honoured here; the
+/// one-filesystem walk itself is `gix`'s, which does not cross mount points
+/// either.
+pub fn discovery_environment_gate(sub: &str) {
+    if NO_DISCOVERY_VERBS.contains(&sub) {
+        return;
+    }
+    let _ = git_env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM", false);
+}
+
+/// `git_env_bool(NO_LAZY_FETCH_ENVIRONMENT, 0)` (setup.c:1066), the last line of
+/// `setup_git_env_internal()`:
+///
+/// ```c
+/// if (git_env_bool(NO_LAZY_FETCH_ENVIRONMENT, 0))
+///         fetch_if_missing = 0;
+/// ```
+///
+/// `setup_git_env_internal()` runs when a git directory has been *established* —
+/// found by the walk, named by `$GIT_DIR`, or freshly created by `git init` — so
+/// unlike [`discovery_environment_gate`] this one is silent when there is no
+/// repository. Measured against git 2.55.0 with `GIT_NO_LAZY_FETCH=bogus`:
+/// outside a repository `git config --list`, `git var GIT_EDITOR` and
+/// `git hash-object --stdin` all exit 0, while `git init <dir>` exits 128; inside
+/// a repository every verb that reaches setup exits 128 with
+/// `fatal: bad boolean environment value 'bogus' for 'GIT_NO_LAZY_FETCH'`.
+///
+/// Placed after the ownership gates because that is the order git reaches them:
+/// the walk applies `safe.bareRepository` and `safe.directory` at setup.c:1651-1678
+/// and only the caller that accepts the result goes on to set the environment up.
+pub fn no_lazy_fetch_environment_gate(sub: &str) {
+    let creates_repository = matches!(sub, "init" | "init-db");
+    if !creates_repository && gix::discover(".").is_err() {
+        return;
+    }
+    let _ = git_env_bool("GIT_NO_LAZY_FETCH", false);
+}
+
 /// Returns the exit code to leave with, or `None` to continue.
 pub fn dubious_ownership(sub: &str) -> Option<ExitCode> {
     if crate::NO_SETUP_VERBS.contains(&sub) {

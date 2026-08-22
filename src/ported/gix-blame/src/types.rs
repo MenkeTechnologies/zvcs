@@ -255,6 +255,16 @@ pub struct Options {
     /// part in `pass_blame()`, which is why it shows up in [`Statistics`] and in the refcount graph
     /// behind [`Outcome::suspect_refcounts`].
     pub fake_commit: Option<FakeCommit>,
+    /// The repository's [graft table](gix_revwalk::graft), if it has one.
+    ///
+    /// `first_scapegoat()` reads `commit->parents`, which git has already rewritten
+    /// through `parse_commit_buffer()` (commit.c:554-590) — so a grafted commit
+    /// passes blame to the parents the table names, and a shallow boundary passes
+    /// it to nobody and keeps the lines itself.
+    ///
+    /// Ignored under [`Self::children`], where the walk runs forwards over a
+    /// caller-built children map instead of reading parents at all.
+    pub grafts: Option<std::sync::Arc<gix_revwalk::graft::Table>>,
 }
 
 /// git's `revs->children`: the commits of the walked range that have a given commit as a parent,

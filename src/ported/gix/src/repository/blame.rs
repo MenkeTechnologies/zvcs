@@ -51,6 +51,14 @@ impl Repository {
             first_parent,
             children,
             fake_commit,
+            // The graft table is the repository's, not the caller's: git rewrites
+            // `commit->parents` in `parse_commit_buffer()` (commit.c:554-590) before
+            // blame ever reads them, so a grafted parent is simply what blame sees.
+            // Taken here rather than added to `blame_file::Options` for the same
+            // reason `revision::walk` takes it from the repository at walk.rs:308 —
+            // it is a property of the repository, and a caller has no business
+            // disagreeing with it.
+            grafts: Some(self.commit_grafts().clone()),
         };
 
         let outcome = gix_blame::file(

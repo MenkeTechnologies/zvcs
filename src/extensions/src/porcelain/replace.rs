@@ -45,25 +45,23 @@
 //!   * `core.graftFile` — git 2.55 does not honour it either (only
 //!     `$GIT_GRAFT_FILE` and the default path), so neither does this.
 //!   * `GIT_REPLACE_REF_BASE` — the namespace is always `refs/replace/`.
-//!   * **Graft *registration*.** `--convert-graft-file` reads the graft file as a
-//!     list of lines; git additionally reads it as a *graft table* the first time
-//!     any commit is parsed (`prepare_commit_graft()` → `read_graft_file()`,
-//!     commit.c:287-316, reached from `parse_commit_buffer()`, commit.c:554), and
-//!     substitutes the listed parents for the commit's real ones everywhere. zvcs
-//!     has no such table: with a graft file in place, `log`, `rev-list` and every
-//!     other walker still follow the true parents. Three diagnostics ride on that
-//!     table and are therefore absent here — the
-//!     `Support for <GIT_DIR>/info/grafts is deprecated` advice (suppressed by
-//!     `--convert-graft-file`'s `no_graft_file_deprecated_advice = 1`),
-//!     `error: bad graft data: <line>` and `error: duplicate graft data: <line>`
-//!     (commit.c:249-311), plus the `error: Could not read <oid>` that
-//!     `repo_parse_commit_internal()` (commit.c:644) emits once a graft has
-//!     pre-created a commit node for an absent parent. Emitting those lines
-//!     without the substitution would report on a table that does not exist, so
-//!     they are left out rather than imitated. Applying grafts for real needs a
-//!     parent-*substitution* hook in commit parsing; gitoxide's traversal takes a
-//!     *skip* predicate (`gix::revision::walk`, used for `.git/shallow`), which
-//!     cannot express replacing a commit's parent list.
+//!   * `error: Could not read <oid>` followed by `fatal: Failed to traverse
+//!     parents of commit <oid>`, which `repo_parse_commit_internal()`
+//!     (commit.c:644) emits once a graft has named a parent the object database
+//!     does not have. The [graft table](gix::graft) substitutes such a parent, and
+//!     a walk that reaches it stops there rather than dying.
+//!
+//! Graft *registration* itself is no longer missing: `--convert-graft-file` reads
+//! the graft file as a list of lines, and [`gix::graft`] additionally reads it as
+//! the *graft table* git builds in `prepare_commit_graft()` → `read_graft_file()`
+//! (commit.c:287-330) and applies in `parse_commit_buffer()` (commit.c:554-590),
+//! so `log`, `rev-list`, `merge-base`, `describe` and `blame` all follow the
+//! substituted parents. The two diagnostics that ride on that read —
+//! `error: bad graft data: <line>` and `error: duplicate graft data: <line>`
+//! (commit.c:281, commit.c:309) — and the
+//! `Support for <GIT_DIR>/info/grafts is deprecated` advice are emitted there;
+//! this command suppresses the advice with git's
+//! `no_graft_file_deprecated_advice = 1` (builtin/replace.c:522).
 //!
 //! Exit codes follow git: 0 on success, 129 for usage errors, 1 when `-d` or
 //! `--convert-graft-file` had a failure, 128 for `die()`, and 255 for every
@@ -913,6 +911,11 @@ fn graft_file_path(repo: &gix::Repository) -> PathBuf {
 /// A missing/unreadable graft file is git's `if (!fp) return -1`, which
 /// `cmd_replace`'s `!!` collapses to exit 1 with nothing on stderr.
 fn convert_graft_file(force: bool) -> Result<ExitCode> {
+    // `no_graft_file_deprecated_advice = 1` (builtin/replace.c:522), set before the
+    // read so neither this read nor the commit parsing below re-advertises the
+    // deprecation this command exists to resolve. It must come before the first
+    // commit is looked at, because that is what triggers `prepare_commit_graft()`.
+    gix::graft::suppress_deprecation_advice();
     let repo = gix::discover(".")?;
     let graft_file = graft_file_path(&repo);
     let Ok(contents) = std::fs::read(&graft_file) else {

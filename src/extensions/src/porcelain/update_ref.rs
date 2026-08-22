@@ -508,22 +508,27 @@ fn parse_slot(
     if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
         return Ok(Val::Oid(id));
     }
-    // `GET_OID_SKIP_AMBIGUITY_CHECK` silences `get_oid_basic()`'s *first* warning
-    // and nothing else, so a plain name matching more than one ref still earns the
-    // second one: stock `git update-ref refs/heads/z dup` prints
-    // `warning: refname 'dup' is ambiguous.` once per slot it resolves.
-    crate::objname::warn_ambiguous_operand(
+    // One `repo_get_oid_with_flags()` per slot, so one trip through
+    // `get_oid_basic()` and one chance at each of the four things it raises —
+    // which is why this is [`crate::objname::resolve_with_flags`] and not the
+    // ambiguity warning on its own. `update-ref` had the warning and none of the
+    // rest, so stock's `warning: log for 'HEAD' only goes back to …` for
+    // `git update-ref refs/heads/z 'HEAD@{<old date>}'` was missing here.
+    //
+    // `GET_OID_SKIP_AMBIGUITY_CHECK` is `builtin/update-ref.c`'s alone and
+    // silences `get_oid_basic()`'s *first* warning and nothing else, so a plain
+    // name matching more than one ref still earns the second one: stock
+    // `git update-ref refs/heads/z dup` prints `warning: refname 'dup' is
+    // ambiguous.` once per slot it resolves.
+    let id = crate::objname::resolve_with_flags(
         repo,
         spec,
         crate::objname::OidFlags { skip_ambiguity_check: true, ..Default::default() },
-    );
-    let id = repo
-        .rev_parse_single(spec)
-        .map_err(|_| match slot {
-            Slot::New => anyhow!("{spec}: not a valid SHA1"),
-            Slot::Old => anyhow!("{spec}: not a valid old SHA1"),
-        })?
-        .detach();
+    )
+    .ok_or_else(|| match slot {
+        Slot::New => anyhow!("{spec}: not a valid SHA1"),
+        Slot::Old => anyhow!("{spec}: not a valid old SHA1"),
+    })?;
     Ok(Val::Oid(id))
 }
 

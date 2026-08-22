@@ -14,6 +14,8 @@ pub struct Simple<Find, Predicate> {
     state: simple::State,
     parents: Parents,
     sorting: simple::Sorting,
+    /// The graft table, if the repository has one — see [`Simple::grafts()`].
+    grafts: Option<std::sync::Arc<gix_revwalk::graft::Table>>,
 }
 
 /// Simple ancestors traversal, without the need to keep track of graph-state.

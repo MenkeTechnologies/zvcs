@@ -1126,6 +1126,19 @@ fn the_tree_reading_verbs_leave_the_cache_tree_stock_git_leaves() {
             false,
             &[&["add", "sub/a.txt"], &["stash", "push", "-q", "-k"]],
         ),
+        // A pathspec push whose path is modified in the *worktree only*, so the index
+        // entry it ends on is the one it started on. `do_push_stash()` still runs
+        // `git add -u -- <ps>` and then `git apply --index -R` over the diff of what it
+        // just staged (builtin/stash.c:1779-1815), and both stage through
+        // `add_index_entry()`, which invalidates (read-cache.c:1273-1274). So the entry
+        // comes back unchanged while the cache-tree above it does not: `sub` and the root
+        // stay marked stale. Deciding what to invalidate by comparing the before and after
+        // index cannot see that, and left a fully valid extension here.
+        (
+            "stash-push-pathspec",
+            false,
+            &[&["stash", "push", "-q", "--", "sub/a.txt"]],
+        ),
         // `git stage` is `cmd_add` itself, so it invalidates per staged path.
         ("stage", false, &[&["stage", "sub/a.txt"]]),
     ];

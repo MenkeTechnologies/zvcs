@@ -851,13 +851,28 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     let should_interrupt = AtomicBool::new(false);
     let fresh = sync_worktree(&scratch, worktree_target, &affected, &target_map, &should_interrupt)?;
     let old_index = repo.open_index()?;
-    // Which reset `do_push_stash` runs decides the extension it leaves behind. The plain
-    // push shells out to `git reset --hard -q` (builtin/stash.c:1820), and a `--hard` reset
-    // ends in `prime_cache_tree()` (builtin/reset.c:126) — fully valid. `--keep-index` and a
-    // pathspec push instead reset with `git reset -q --refresh -- <paths>`
-    // (builtin/stash.c:1883), which is `--mixed` and therefore invalidates per changed path.
-    let cache_tree = if keep_index || !opts.pathspecs.is_empty() {
-        CacheTree::LikeMixedReset
+    // Which of `do_push_stash`'s three tails ran decides the extension it leaves behind.
+    //
+    // * A plain push shells out to `git reset --hard -q --no-recurse-submodules`
+    //   (builtin/stash.c:1816-1824), and a `--hard` reset ends in `prime_cache_tree()`
+    //   (builtin/reset.c:126) — fully valid, and the index it leaves *is* `HEAD`'s tree, so
+    //   repairing it produces the same nodes.
+    // * `--keep-index` without a pathspec runs that same reset and then
+    //   `git checkout --no-overlay <i_tree> -- :/` (builtin/stash.c:1848-1862), which stages
+    //   the stashed index back over `HEAD` one `add_index_entry()` per differing path. The
+    //   entries end up unchanged, so there is nothing for a carry from the *current* index to
+    //   invalidate — the baseline has to be the reset, which is what this variant carries.
+    // * Everything else — a pathspec push (`add -u` then `apply --index -R`), `-S` and
+    //   `--patch` (`apply -R`, then `git reset -q --refresh -- <paths>` unless `--keep-index`
+    //   held it back, builtin/stash.c:1877-1889) — mutates the index git had just repaired in
+    //   `do_create_stash()`, invalidating per changed path and repairing nothing.
+    let cache_tree = if keep_index && opts.pathspecs.is_empty() && !opts.patch && !opts.staged_only {
+        CacheTree::KeepIndexOverHardReset { head_tree: head_tree_id }
+    } else if keep_index || !opts.pathspecs.is_empty() {
+        // Only the pathspec branch runs `add -u`/`apply --index -R`; `--patch` and
+        // `-S --keep-index` reach here having run no index-touching child at all.
+        let touched = if opts.pathspecs.is_empty() { HashSet::new() } else { affected.clone() };
+        CacheTree::LikeMixedReset { touched }
     } else {
         CacheTree::LikeUnpackTrees
     };
@@ -2215,7 +2230,16 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
     let should_interrupt = AtomicBool::new(false);
     let fresh = sync_worktree(repo, head_tree_id, &affected, &head_map, &should_interrupt)?;
     let old_index = repo.open_index()?;
-    write_target_index(repo, head_tree_id, &old_index, &fresh, CacheTree::LikeMixedReset)?;
+    // `create_autostash()` is `git stash create` followed by `reset_head(RESET_HEAD_HARD)`
+    // in-process (sequencer.c) — no `add`/`apply` child, so there is no path to invalidate
+    // beyond the ones whose entry actually moved.
+    write_target_index(
+        repo,
+        head_tree_id,
+        &old_index,
+        &fresh,
+        CacheTree::LikeMixedReset { touched: HashSet::new() },
+    )?;
     Ok(w_commit)
 }
 
@@ -2557,7 +2581,36 @@ enum CacheTree {
     /// reset and therefore invalidates per changed path without repairing anything
     /// (builtin/reset.c:494 → `read_from_tree()`). This is `stash push` and the autostash
     /// snapshot, and stock's index after them still shows the root invalid.
-    LikeMixedReset,
+    ///
+    /// `touched` is the paths git names to a *child command* rather than reaching by
+    /// comparing entries. A pathspec push runs `git add -u -- <ps>` and then
+    /// `git apply --index -R` over the diff of what it just staged (builtin/stash.c:1779-1815):
+    /// both stage through `add_index_entry()`, both invalidate (read-cache.c:1273-1274), and
+    /// the second undoes the first — so the entries come back to exactly what they were while
+    /// the cache-tree stays invalidated along those paths. Comparing the before and after
+    /// index cannot see that, which is why the set is passed in. Empty where git runs no such
+    /// child: `--patch` and `-S --keep-index` skip the reset entirely (builtin/stash.c:1877-1889).
+    LikeMixedReset { touched: HashSet<BString> },
+    /// `--keep-index` without a pathspec, which is **two** commands rather than a reset:
+    /// `git reset --hard -q --no-recurse-submodules` (builtin/stash.c:1816-1824) and then
+    /// `git checkout --no-overlay <i_tree> -- :/` (builtin/stash.c:1848-1862).
+    ///
+    /// The `--hard` reset ends in `prime_cache_tree()` (builtin/reset.c:126), so the
+    /// cache-tree at that point is **`HEAD`'s, fully valid** — not whatever the index carried
+    /// before, and not the repaired extension `do_create_stash()` had just written. The
+    /// checkout then stages the stash's index tree back over it, and `update_some()`
+    /// (builtin/checkout.c) leaves an entry alone when its mode and oid already match, so
+    /// only the paths where `i_tree` differs from `HEAD` go through `add_index_entry()` and
+    /// get invalidated (read-cache.c:1273-1274). Nothing repairs afterwards.
+    ///
+    /// So the answer is `HEAD` primed, with the *staged* paths — and the directories above
+    /// them — marked invalid: `""{None} "sub"{None} "sub/deeper"{valid} "other"{valid}` for a
+    /// stash that kept one staged edit under `sub/`. Carrying the current index's extension
+    /// instead cannot produce that, because `--keep-index` leaves the entries untouched and
+    /// so has nothing to invalidate against.
+    ///
+    /// `head_tree` is what the reset lands on.
+    KeepIndexOverHardReset { head_tree: ObjectId },
 }
 
 /// Write the on-disk index to the state of `tree_id`, reusing `fresh` stats for
@@ -2625,8 +2678,24 @@ fn write_target_index(
     // it can prove and nothing more.
     match cache_tree {
         CacheTree::LikeUnpackTrees => super::write_tree::rebuild_cache_tree(repo, &mut new_index),
-        CacheTree::LikeMixedReset => {
+        CacheTree::LikeMixedReset { touched } => {
             super::write_tree::carry_cache_tree_invalidating_changes(repo, old_index, &mut new_index);
+            // The paths a child command staged and then unstaged again: the entry is back to
+            // where it started, so the comparison above has nothing to report, but git's two
+            // `add_index_entry()` calls both invalidated the path on the way through.
+            for path in &touched {
+                new_index.invalidate_path_in_tree(path.as_ref());
+            }
+        }
+        // The `--hard` reset first: an index that is exactly `head_tree`, with the cache-tree
+        // `prime_cache_tree()` builds straight off that tree's objects (builtin/reset.c:126,
+        // cache-tree.c:897-911) — every node valid, none of them derived from the index the
+        // stash started with. `checkout --no-overlay <i_tree> -- :/` then stages the stashed
+        // index back over it, invalidating exactly the paths whose entry it had to replace.
+        CacheTree::KeepIndexOverHardReset { head_tree } => {
+            let mut reset_index = repo.index_from_tree(&head_tree)?;
+            reset_index.prime_cache_tree(&repo.objects, &head_tree)?;
+            super::write_tree::carry_cache_tree_invalidating_changes(repo, &reset_index, &mut new_index);
         }
     }
     // The `write_locked_index()` that ends `reset_tree()` is the one

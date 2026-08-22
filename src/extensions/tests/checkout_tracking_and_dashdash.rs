@@ -185,3 +185,45 @@ fn blame_accepts_a_utf8_encoding_request() {
         "{out:?}"
     );
 }
+
+/// `report_tracking()` runs on BOTH arms of `update_refs_for_switch()`, so
+/// checking out the branch you are already on still prints the upstream summary.
+///
+/// Reported from the field: `git checkout <current-branch>` in a repository whose
+/// branch tracks a remote printed `Already on 'dev'` and the worktree-change lines
+/// and then stopped, where git prints the tracking line under them. The already-on
+/// arm had been written as an early return, which skipped the report the real
+/// switch still made — so the two paths disagreed with each other as well as with
+/// git.
+///
+/// Both `git version 2.50.1 (Apple Git-155)` and `git version 2.55.0` were checked
+/// on this fixture and agree line for line, including the push hint.
+#[test]
+fn checking_out_the_current_branch_still_reports_tracking() {
+    let f = Fixture::new("already-on");
+    let work = f.work();
+
+    // Up to date with the upstream, and a modified file so the `M` line is in play
+    // too — it is stdout where the transition message is stderr, and the field
+    // report arrived with the two interleaved.
+    std::fs::write(work.join("f.txt"), "changed\n").unwrap();
+    let out = f.run(&work, &["checkout", "master"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "M\tf.txt\nYour branch is up to date with 'origin/master'.\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "Already on 'master'\n");
+
+    // Ahead of the upstream: the summary gains git's push hint.
+    std::fs::write(work.join("g.txt"), "b\n").unwrap();
+    f.git(&work, &["add", "g.txt"]);
+    f.git(&work, &["commit", "-q", "-m", "ahead"]);
+    let out = f.run(&work, &["checkout", "master"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "M\tf.txt\nYour branch is ahead of 'origin/master' by 1 commit.\n  (use \"git push\" to publish your local commits)\n"
+    );
+
+    // `--quiet` suppresses the whole block, message and summary alike.
+    let out = f.run(&work, &["checkout", "-q", "master"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}

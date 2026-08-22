@@ -913,14 +913,19 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // detach); fall back to a bare path restore from the index.
     if pre.len() == 1 {
         let spec = pre[0];
-        // `parse_branchname_arg()` resolves through `get_oid_mb()`, so
-        // `get_oid_basic()`'s `core.warnAmbiguousRefs` warning is emitted here,
-        // ahead of anything the checkout itself prints. `--quiet` does not
-        // suppress it — stock warns under `git checkout -q` too.
-        super::rev_parse::warn_ambiguous_refname(&repo, spec, false);
-        // `read_ref_at()`'s warning (`refs.c:1135`, `refs.c:1141`) rides that same
-        // `get_oid_basic()` call, and then a *second* time: `setup_branch_path()`
-        // resolves the operand again whenever it is not itself a ref name
+        // `parse_branchname_arg()` resolves through `get_oid_mb()`
+        // (`builtin/checkout.c:1476`), so everything `get_oid_basic()` raises is
+        // raised here, ahead of anything the checkout itself prints — the
+        // ambiguity warnings, `read_ref_at()`'s warning and its two `die()`s,
+        // `interpret_branch_mark()`'s `die()` and `peel_onion()`'s `error()`.
+        // `--quiet` suppresses none of it: `repo_get_oid_mb()` passes
+        // `GET_OID_COMMITTISH` alone, so stock warns under `git checkout -q` too.
+        // Reaching only the first two left `git checkout 'HEAD@{99}'` reporting
+        // `pathspec … did not match any file(s)` where stock dies with
+        // `log for 'HEAD' only has 3 entries`.
+        let resolved = crate::objname::resolve(&repo, spec);
+        // And then a *second* time: `setup_branch_path()` resolves the operand
+        // again whenever it is not itself a ref name
         //
         // ```c
         // if (!repo_dwim_ref(the_repository, branch->name, strlen(branch->name),
@@ -928,16 +933,17 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         //         repo_get_oid_committish(the_repository, branch->name, &branch->oid);
         // ```
         //
-        // (`builtin/checkout.c:804-806`). `<ref>@{<n>}` is never a ref name, so the
-        // fallback always fires for it and stock prints the warning twice — while
-        // an ambiguous plain name resolves at `repo_dwim_ref()` and so prints its
-        // own warning only once. Nothing here is gated: `repo_get_oid_committish()`
-        // passes `GET_OID_COMMITTISH` alone, so `git checkout -q` warns too.
-        if let Some(message) = crate::objname::read_ref_at_warning(&repo, spec) {
-            eprintln!("warning: {message}");
-            if super::rev_parse::dwim_ref_matches(&repo, spec).is_empty() {
-                eprintln!("warning: {message}");
-            }
+        // (`builtin/checkout.c:804-806`, reached from
+        // `setup_new_branch_info_and_source_tree()` at `builtin/checkout.c:1311`).
+        // `<ref>@{<n>}` is never a ref name, so the fallback always fires for it
+        // and stock prints the warning twice — while an ambiguous plain name
+        // resolves at `repo_dwim_ref()` and so prints its own warning only once.
+        // It is reached only when the first resolution answered:
+        // `parse_branchname_arg()` returns at `builtin/checkout.c:1518` otherwise,
+        // which is why `git checkout 'HEAD^{blob}'` prints `error: …` once and not
+        // twice.
+        if resolved.is_some() && super::rev_parse::dwim_ref_matches(&repo, spec).is_empty() {
+            crate::objname::resolve(&repo, spec);
         }
         // A revspec like `HEAD~3` is not a valid ref *name* (`~` is rejected by
         // ref validation), so treat a lookup error as "not a branch" and let the
@@ -973,7 +979,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // that resolution's result being used, not a second visit to
         // `get_oid_basic()` — warning again made `git checkout --detach <ambiguous>`
         // print two `refname … is ambiguous` lines where git prints one.
-        if let Some(id) = crate::objname::resolve_quiet(&repo, spec) {
+        if let Some(id) = resolved {
             let commit = match classify_tree_ish(&repo, id)? {
                 TreeIsh::Commit(commit) => commit,
                 // A tree is a legitimate `source_tree`, so `parse_branchname_arg()`
@@ -1237,6 +1243,14 @@ pub(crate) fn switch_to_branch_opts(
             )?;
             if !quiet {
                 eprintln!("Already on '{spec}'");
+                // `report_tracking()` runs after the message on BOTH arms of
+                // `update_refs_for_switch()` (builtin/checkout.c) — the
+                // already-on arm is not an early return in git, it just skips
+                // the ref update. Returning before it meant
+                // `git checkout <current-branch>` lost the
+                // `Your branch is up to date with '<upstream>'.` line that both
+                // git 2.50.1 and 2.55.0 print, while a real switch kept it.
+                print_tracking_status(repo);
             }
             return Ok(ExitCode::SUCCESS);
         }

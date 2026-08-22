@@ -1248,6 +1248,17 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // `:81`) — governs every index git writes, whichever verb wrote it.
         // Going through the shared reader is what keeps the trailer this leaves
         // behind identical to the one `update-index` would have left.
+        //
+        // `IEOT` is the same kind of repository-wide decision and is made in the
+        // same function, one block earlier: `if (nr_threads != 1 &&
+        // record_ieot())` (read-cache.c:2877-2904) is evaluated before any entry
+        // is written, and the extension goes out ahead of every other one
+        // (`:2983-2993`). In C that reaches `cmd_add` for free because it writes
+        // through `write_locked_index()` (read-cache.c:3323) like everything else;
+        // here the decision lives outside the writer, so each caller has to attach
+        // it — and without this line `add` was the verb that dropped `IEOT`, and
+        // with it `EOIE`, which gix only emits alongside another extension.
+        super::write_tree::prepare_offset_table(&repo, &mut index);
         index.write(crate::config::index_write_options(&repo))?;
         record_stage_event(&repo, staged.len() + deletions.len());
 
@@ -1289,9 +1300,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     });
 
     invalidate_tree_cache(&mut index, &remove);
-    // Same options as the intent-to-add path above: the trailer an index
-    // carries is a property of the repository, not of the verb that wrote it
-    // (read-cache.c:2830-2831).
+    // Same options — and the same `IEOT` decision — as the intent-to-add path
+    // above: what an index carries beyond its entries is a property of the
+    // repository, not of the verb that wrote it (read-cache.c:2830-2831 for the
+    // trailer, `:2877-2904` for the offset table).
+    super::write_tree::prepare_offset_table(&repo, &mut index);
     index.write(crate::config::index_write_options(&repo))?;
     record_stage_event(&repo, staged.len() + deletions.len());
 

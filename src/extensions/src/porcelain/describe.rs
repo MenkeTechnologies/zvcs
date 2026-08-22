@@ -34,9 +34,12 @@ const LONG_OPTS: &[LongOpt] = &[
 
 /// `git describe` — name a commit from the tags (or refs) in its past.
 ///
-/// Backed by gitoxide's `commit().describe()` platform (`gix_revision::describe`),
-/// which implements git's candidate-walk algorithm. Output matches stock
-/// `git describe`: a bare `<tag>` on an exact match, otherwise
+/// Backed by gitoxide's `gix_revision::describe()` primitive, which implements
+/// git's candidate-walk algorithm; the candidate map and the traversal graph are
+/// built here rather than by gix's `commit().describe()` platform, because both
+/// have to be reachable — the map for `--match`/`--exclude`, the graph for the
+/// walk's own error reporting (see [`ReportUnreadableParents`]). Output matches
+/// stock `git describe`: a bare `<tag>` on an exact match, otherwise
 /// `<tag>-<depth>-g<shorthash>`, with an optional `-dirty` suffix.
 ///
 /// Supported forms:
@@ -64,9 +67,9 @@ const LONG_OPTS: &[LongOpt] = &[
 /// ```
 ///
 /// `--match`/`--exclude` are ports of `builtin/describe.c:get_name()`: the candidate
-/// `name_by_oid` map is built here from the repo's refs filtered by `wildmatch`, then
-/// handed to the low-level `gix_revision::describe()` primitive directly (the higher
-/// `SelectRef` platform builds the map itself and cannot be filtered). `--contains`
+/// `name_by_oid` map is built here from the repo's refs filtered by `wildmatch`
+/// ([`build_names`], which stands in for the platform's own `SelectRef::names()`
+/// whether or not a glob is in play). `--contains`
 /// is a port of `builtin/name-rev.c` (git delegates `describe --contains` to
 /// `name-rev --peel-tag --name-only --no-undefined`). The `<blob>` form ports
 /// `describe_blob()`'s `--objects --in-commit-order --reverse` walk.
@@ -355,6 +358,15 @@ impl Filter {
         !self.match_pats.is_empty() || !self.exclude_pats.is_empty()
     }
 
+    /// Whether the candidate map may keep `full`, for a filter that may not be
+    /// active. With no `--match`/`--exclude` git never reaches its accept test at
+    /// all, so an inactive filter admits everything the `SelectRef` selected —
+    /// which is what makes [`build_names`] a stand-in for gix's own
+    /// `SelectRef::names()` in both cases.
+    fn admits(&self, full: &BStr) -> bool {
+        !self.is_active() || self.accepts(full)
+    }
+
     /// git's `get_name()` accept test, keyed on a full ref name. Only meaningful
     /// while `is_active()`; `path_to_match` is the ref's short form (`refs/tags/`,
     /// or under `--all` `refs/heads/`/`refs/remotes/`, stripped) exactly as git's
@@ -432,21 +444,21 @@ fn describe_commit_to_string(
     let id = commit.id();
     let commit_oid = commit.id;
 
-    // With a glob filter active the higher SelectRef platform can't be used (it
-    // builds its own unfiltered name map); resolve through the low-level primitive
-    // with a hand-built, filtered map instead. Otherwise use the platform as before.
-    let outcome = if filter.is_active() {
-        resolve_filtered(repo, &commit_oid, opts.select, filter, opts.max_candidates, fallback, opts.first_parent)?
-    } else {
-        commit
-            .describe()
-            .names(opts.select)
-            .traverse_first_parent(opts.first_parent)
-            .max_candidates(opts.max_candidates)
-            .id_as_fallback(fallback)
-            .try_resolve()?
-            .map(|r| r.outcome)
-    };
+    // Always the low-level primitive: the higher `SelectRef` platform builds its
+    // own name map (so a glob filter cannot reach it) *and* its own graph (so the
+    // parent-lookup reporting `describe_commit()` gets from `repo_parse_commit()`
+    // cannot reach it either). [`build_names`] covers both selector cases, and
+    // [`resolve`] owns the graph.
+    let outcome = resolve(
+        repo,
+        &commit_oid,
+        opts.select,
+        filter,
+        opts.max_candidates,
+        fallback,
+        opts.first_parent,
+        Reporting::On,
+    )?;
 
     let outcome = match outcome {
         Some(o) => o,
@@ -458,27 +470,23 @@ fn describe_commit_to_string(
             // is nothing reachable at all" the way git does: re-run the same walk
             // with unannotated tags admitted (still honoring the glob filter) and
             // see whether that finds a name.
+            //
+            // git counts `unannotated_cnt` inside the single walk it already ran,
+            // so this second one is the port's own bookkeeping and must stay
+            // silent: reporting from it would print the walk's `error:` lines
+            // twice for one `git describe`.
             let unannotated_would_help = opts.select == SelectRef::AnnotatedTags && {
-                let alt = if filter.is_active() {
-                    resolve_filtered(
-                        repo,
-                        &commit_oid,
-                        SelectRef::AllTags,
-                        filter,
-                        opts.max_candidates,
-                        false,
-                        opts.first_parent,
-                    )?
-                } else {
-                    commit
-                        .describe()
-                        .names(SelectRef::AllTags)
-                        .traverse_first_parent(opts.first_parent)
-                        .max_candidates(opts.max_candidates)
-                        .try_resolve()?
-                        .map(|r| r.outcome)
-                };
-                alt.is_some()
+                resolve(
+                    repo,
+                    &commit_oid,
+                    SelectRef::AllTags,
+                    filter,
+                    opts.max_candidates,
+                    false,
+                    opts.first_parent,
+                    Reporting::Off,
+                )?
+                .is_some()
             };
             let code = if unannotated_would_help {
                 fatal(format!(
@@ -496,10 +504,71 @@ fn describe_commit_to_string(
     Ok(Ok(format_outcome(repo, outcome, &id, opts)?))
 }
 
+/// Whether this walk is the one whose object lookups git would have reported on.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Reporting {
+    On,
+    Off,
+}
+
+/// `repo_parse_commit()`'s reporting, attached to the object lookup the walk was
+/// going to make anyway.
+///
+/// `describe_commit()` calls `repo_parse_commit(the_repository, p)` on every parent
+/// of every commit it pops and **ignores the return** (builtin/describe.c:279 and
+/// `:429`):
+///
+/// ```c
+/// while (parents) {
+///         struct commit *p = parents->item;
+///         repo_parse_commit(the_repository, p);
+/// ```
+///
+/// So the walk does not stop for a parent it cannot read — but
+/// `parse_commit_gently()` has already spoken on the way past: `error("Could not
+/// read %s")` when the object is absent, `error("Object %s not a commit")` when it
+/// is present and is something else. Both are stderr side effects with no bearing
+/// on the exit code, which is decided later by whether a candidate was found. A
+/// graft naming a parent the repository does not have is the everyday way to see
+/// one.
+///
+/// gix's traversal has the same non-fatal shape — `Graph::insert_parents()` skips
+/// a parent `try_lookup()` cannot resolve — but it is silent, and it lives in
+/// `gix-revwalk`, below this crate. So the reporting is spliced in at the one
+/// place the walk asks the object database: the `gix_object::Find` the graph is
+/// built on. Nothing about what the traversal *does* with the answer changes,
+/// which is exactly what separates this from the aborting lookups `log`,
+/// `rev-list` and `merge-base` need — those must fail on a missing object, this
+/// one must not.
+struct ReportUnreadableParents<'a> {
+    repo: &'a gix::Repository,
+}
+
+impl gix::objs::Find for ReportUnreadableParents<'_> {
+    fn try_find<'a>(
+        &self,
+        id: &gix::hash::oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> std::result::Result<Option<gix::objs::Data<'a>>, gix::objs::find::Error> {
+        let found = gix::objs::Find::try_find(self.repo, id, buffer)?;
+        match &found {
+            None => eprintln!("error: Could not read {id}"),
+            Some(data) if data.kind != gix::object::Kind::Commit => {
+                eprintln!("error: Object {id} not a commit");
+            }
+            Some(_) => {}
+        }
+        Ok(found)
+    }
+}
+
 /// Resolve a commit through the low-level `gix_revision::describe()` primitive with
 /// a caller-built candidate map, so `--match`/`--exclude` filtering can be applied
-/// before the walk (the `SelectRef` platform builds the map internally, unfiltered).
-fn resolve_filtered(
+/// before the walk (the `SelectRef` platform builds the map internally, unfiltered)
+/// and so the walk's parent lookups can be reported on — see
+/// [`ReportUnreadableParents`] for why that has to happen here.
+#[expect(clippy::too_many_arguments)]
+fn resolve(
     repo: &gix::Repository,
     commit_oid: &ObjectId,
     select: SelectRef,
@@ -507,21 +576,31 @@ fn resolve_filtered(
     max_candidates: usize,
     fallback: bool,
     first_parent: bool,
+    reporting: Reporting,
 ) -> Result<Option<Outcome<'static>>> {
     let name_by_oid = build_names(repo, select, filter)?;
     let cache = repo.commit_graph_if_enabled()?;
-    let mut graph =
-        repo.revision_graph::<gix::revision::plumbing::describe::Flags>(cache.as_ref());
-    let outcome = gix::revision::plumbing::describe(
-        commit_oid,
-        &mut graph,
-        DescribeOptions {
-            name_by_oid,
-            max_candidates,
-            fallback_to_oid: fallback,
-            first_parent,
-        },
-    )
+    let options = DescribeOptions {
+        name_by_oid,
+        max_candidates,
+        fallback_to_oid: fallback,
+        first_parent,
+    };
+    // The reporting graph is `Repository::revision_graph()` with the object
+    // lookups wrapped; the graft table has to come along either way, or the walk
+    // would follow the recorded parents instead of the grafted ones.
+    let outcome = match reporting {
+        Reporting::On => {
+            let mut graph = gix::revwalk::Graph::new(ReportUnreadableParents { repo }, cache.as_ref())
+                .with_grafts(Some(repo.commit_grafts().clone()));
+            gix::revision::plumbing::describe(commit_oid, &mut graph, options)
+        }
+        Reporting::Off => {
+            let mut graph =
+                repo.revision_graph::<gix::revision::plumbing::describe::Flags>(cache.as_ref());
+            gix::revision::plumbing::describe(commit_oid, &mut graph, options)
+        }
+    }
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(outcome)
 }
@@ -544,7 +623,7 @@ fn build_names(
                 .tags()?
                 .filter_map(Result::ok)
                 .filter_map(|r| {
-                    if !filter.accepts(r.name().as_bstr()) {
+                    if !filter.admits(r.name().as_bstr()) {
                         return None;
                     }
                     let tag = r.try_id()?.object().ok()?.try_into_tag().ok()?;
@@ -568,7 +647,7 @@ fn build_names(
             }
             .filter_map(Result::ok)
             .filter_map(|mut r| {
-                if !filter.accepts(r.name().as_bstr()) {
+                if !filter.admits(r.name().as_bstr()) {
                     return None;
                 }
                 let target_id = r.target().try_id().map(ToOwned::to_owned);

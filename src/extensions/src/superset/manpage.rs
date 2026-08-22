@@ -198,6 +198,7 @@ pub const DOCS: &[Doc] = &[
         desc: &[
             "add <name> provisions a complete, object-sharing, isolated worktree of the repository plus all nested submodules (each on a zwt/<name> branch) at ~/.zvcs/worktrees/<name>/, so each agent gets a private tree that cannot collide with any other \\(em no re-clone.",
             "list and remove <name> manage them.",
+            "remove tears down the worktree tree and, in each repository, the linked-worktree metadata it provisioned \\(em identified by the round trip between the worktree's .git pointer and that metadata's own gitdir file. A pointer that is unreadable, malformed, symlinked, or names anything else is refused by name on stderr and left on disk, and the command exits non-zero rather than deleting a path it cannot prove it wrote.",
         ],
     },
     Doc {

@@ -1147,6 +1147,11 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 entry.stat = *stat;
             }
         }
+        // `refresh_index()` writes back through the same `write_locked_index()`
+        // (read-cache.c:3323) as a real staging run, so the refreshed index is not
+        // allowed to come out with fewer extensions than a staged one — same
+        // `IEOT` decision, same place in the write.
+        super::write_tree::prepare_offset_table(repo, &mut index);
         index.write(crate::config::index_write_options(repo))?;
     }
     Ok(ExitCode::SUCCESS)
@@ -1930,6 +1935,13 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     for s in &staged {
         index.invalidate_path_in_tree(s.path.as_ref());
     }
+    // And its `IEOT` handling is `add`'s for the same reason: `do_write_index()`
+    // decides the offset table from `index.threads`/`index.recordOffsetTable`
+    // alone (`if (nr_threads != 1 && record_ieot())`, read-cache.c:2877-2904) and
+    // writes it ahead of every other extension (`:2983-2993`), so it belongs to
+    // the repository rather than to the verb. See [`super::add`]'s write for the
+    // full note.
+    super::write_tree::prepare_offset_table(repo, &mut index);
     index.write(crate::config::index_write_options(repo))?;
     super::add::record_stage_event(repo, staged.len() + deletions.len());
 

@@ -71,7 +71,7 @@ fn remove_redundant(
                         walk_start.push((parent_id, GenThenTime::from(&*parent)));
                     }
                 })
-                .map_err(|_| Simple("could not insert parent commit into graph"))?;
+                .map_err(|_| Simple::Graph("could not insert parent commit into graph"))?;
         }
     }
     walk_start.sort_by_key(|a| a.0);
@@ -124,7 +124,7 @@ fn remove_redundant(
                             stack.push((*parent_id, GenThenTime::from(&*parent)));
                         }
                     })
-                    .map_err(|_| Simple("could not insert parent commit into graph"))?
+                    .map_err(|_| Simple::Graph("could not insert parent commit into graph"))?
                     .is_some()
                 {
                     break;
@@ -159,7 +159,7 @@ fn paint_down_to_common(
             commit.data |= Flags::COMMIT1;
             queue.insert(GenThenTime::from(&*commit), first);
         })
-        .map_err(|_| Simple("could not insert commit into graph"))?;
+        .map_err(|_| Simple::Graph("could not insert commit into graph"))?;
 
     for other in others {
         graph
@@ -167,7 +167,7 @@ fn paint_down_to_common(
                 commit.data |= Flags::COMMIT2;
                 queue.insert(GenThenTime::from(&*commit), *other);
             })
-            .map_err(|_| Simple("could not insert commit into graph"))?;
+            .map_err(|_| Simple::Graph("could not insert commit into graph"))?;
     }
 
     let mut out = Vec::new();
@@ -187,14 +187,24 @@ fn paint_down_to_common(
         }
 
         for parent_id in commit.parents.clone() {
-            graph
+            // `if (repo_parse_commit(r, p))` (commit-reach.c:171-186): git parses
+            // every parent it is about to queue and gives up on the whole
+            // computation when one cannot be read — it does not treat the parent as
+            // a boundary. A vacant entry here is exactly that failure: the object was
+            // never read, so it cannot be a node git's `lookup_commit()` had already
+            // parsed, and git's guard above the parse (`(p->object.flags & flags) ==
+            // flags`) can only skip a node that *is* in the graph already.
+            let queued = graph
                 .get_or_insert_full_commit(parent_id, |parent| {
                     if (parent.data & flags_without_result) != flags_without_result {
                         parent.data |= flags_without_result;
                         queue.insert(GenThenTime::from(&*parent), parent_id);
                     }
                 })
-                .map_err(|_| Simple("could not insert parent commit into graph"))?;
+                .map_err(|_| Simple::Graph("could not insert parent commit into graph"))?;
+            if queued.is_none() {
+                return Err(Simple::UnparsableCommit(parent_id));
+            }
         }
     }
 

@@ -17,13 +17,33 @@ bitflags::bitflags! {
 /// The error returned by the [`merge_base()`][function::merge_base()] function.
 pub type Error = Simple;
 
-/// A simple error type for merge base operations.
+/// What can stop a merge-base computation.
 #[derive(Debug)]
-pub struct Simple(pub &'static str);
+pub enum Simple {
+    /// A commit could not be put into the graph — a decode failure, or an object
+    /// database that could not answer.
+    Graph(&'static str),
+    /// `error(_("could not parse commit %s"))` (commit-reach.c:184-185).
+    ///
+    /// `paint_down_to_common()` parses every parent it is about to queue
+    /// (commit-reach.c:171-186) and *aborts the whole computation* when one cannot
+    /// be read, rather than treating it as a boundary. The commit named is the
+    /// parent, and git's `repo_parse_commit()` has already printed its own
+    /// `error("Could not read %s")` (commit.c:641-645) for the same object by the
+    /// time this is returned.
+    ///
+    /// A graft line naming an object this repository does not have reaches it
+    /// without a damaged object database: `lookup_commit_graft()` (commit.c:332-340)
+    /// substitutes whatever the file said.
+    UnparsableCommit(gix_hash::ObjectId),
+}
 
 impl std::fmt::Display for Simple {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        match self {
+            Simple::Graph(message) => f.write_str(message),
+            Simple::UnparsableCommit(id) => write!(f, "could not parse commit {id}"),
+        }
     }
 }
 

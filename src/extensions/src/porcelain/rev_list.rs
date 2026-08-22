@@ -1110,6 +1110,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // 1. Full commit list in date order — the input every later stage refines.
     let mut commits: Vec<ObjectId> = Vec::new();
     let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    // The read failure that ended the walk, if one did — raised where git's own
+    // `die()` fires, which is after the commits it had already streamed. See
+    // [`super::log::WalkAbort`].
+    let mut abort: Option<super::log::WalkAbort> = None;
     if no_walk {
         // `prepare_revision_walk` returns before `limit_list` under `--no-walk`,
         // so the list is exactly the pending commits, deduplicated by the SEEN
@@ -1149,7 +1153,22 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             platform = platform.with_hidden(hidden.clone());
         }
         for info in platform.all()? {
-            let info = info?;
+            let info = match info {
+                Ok(info) => info,
+                // `process_parents()` (revision.c:1189-1194) parses every parent of
+                // the commit it just popped, so a parent the odb cannot produce ends
+                // the walk one commit *earlier* than this iterator notices it — the
+                // iterator queues parent ids unread and only trips when one is
+                // popped. `locate` puts the abort back where git has it.
+                Err(err) => match super::log::WalkAbort::locate(&repo, &commits, &parents_of) {
+                    Some((at, found)) => {
+                        commits.truncate(at);
+                        abort = Some(found);
+                        break;
+                    }
+                    None => return Err(err.into()),
+                },
+            };
             parents_of.insert(info.id, info.parent_ids.to_vec());
             commits.push(info.id);
         }
@@ -1260,6 +1279,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `init_topo_walk()` — so `--topo-order` and `--date-order` are silently inert
     // under `--no-walk`, and the pending order (or its date sort) stands.
     if order != Order::Date && !no_walk {
+        // `--topo-order`/`--date-order` make `prepare_revision_walk()` run
+        // `limit_list()` and `sort_in_topological_order()` before it returns
+        // (revision.c:4033-4039), so the failure is a setup failure and
+        // `cmd_rev_list()` prints nothing at all.
+        if let Some(abort) = abort {
+            return Ok(abort.die_setup());
+        }
         let dates: Option<HashMap<ObjectId, i64>> = (order == Order::DateTopo).then(|| {
             commits
                 .iter()
@@ -1377,6 +1403,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     }
 
     if let Some(max) = max_count {
+        // `cmd_rev_list()` stops calling `get_revision()` once the cap is spent, so
+        // a walk whose remaining commits were all going to be dropped by the cap
+        // never reaches the parent it cannot read: `git rev-list -n 1` over a
+        // history whose second commit is grafted to a missing parent exits 0.
+        if commits.len() >= max {
+            abort = None;
+        }
         commits.truncate(max);
     }
 
@@ -1621,7 +1654,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if objects && !in_commit_order {
+    // `traverse_commit_list()` (list-objects.c) drains `get_revision()` first and
+    // only then calls `traverse_non_commits()`, so a walk that died never reaches
+    // the object listing at all. `--in-commit-order` is the exception: it emits a
+    // commit's objects inside the loop, alongside the commit, and those stand.
+    if objects && !in_commit_order && abort.is_none() {
         for id in &commits {
             if let Err(code) = collect_commit_objects(
                 &repo,
@@ -1652,6 +1689,26 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     let stdout = std::io::stdout();
     let mut sink = stdout.lock();
+    // Everything below the walk is a *summary* rather than a stream: a count, a
+    // disk-usage total, a `--reverse`d listing. git computes those inside the
+    // `while ((commit = get_revision(revs)))` loop and prints them once it ends,
+    // so a walk that died never reaches the print — only the plain listing, which
+    // git emits commit by commit, keeps the prefix it managed to produce.
+    if let Some(abort) = abort {
+        // A pathspec puts `try_to_simplify_commit()` (revision.c:1182) ahead of
+        // `process_parents()`'s parent loop, and its tree diff hits the unreadable
+        // parent first — see [`super::log::WalkAbort::die_simplify`].
+        let die = match pathspecs.is_empty() {
+            true => super::log::WalkAbort::die_traverse,
+            false => super::log::WalkAbort::die_simplify,
+        };
+        if count_only || quiet || disk_usage || reverse {
+            return Ok(die(abort));
+        }
+        sink.write_all(&out)?;
+        sink.flush()?;
+        return Ok(die(abort));
+    }
     if count_only {
         if left_right && cherry_mark {
             writeln!(sink, "{count_left}\t{count_right}\t{count_same}")?;

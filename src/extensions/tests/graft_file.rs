@@ -395,18 +395,36 @@ fn the_shallow_file_feeds_the_same_table() {
     );
 }
 
+/// The object id no line of this fixture's history carries, used as a graft's
+/// parent so the walk is sent at something the repository does not have.
+const ABSENT: &str = "0123456789012345678901234567890123456789";
+
+/// `error("Could not read %s")` (commit.c:641-645) followed by
+/// `die("Failed to traverse parents of commit %s")` (revision.c:4467-4471).
+///
+/// Two ids, and they are different ones: the first names the parent that could
+/// not be read, the second the commit whose parent list named it.
+fn traverse_failure() -> String {
+    format!("error: Could not read {ABSENT}\nfatal: Failed to traverse parents of commit {C3}\n")
+}
+
 /// A graft that names a parent this repository does not have.
 ///
-/// git's `lookup_commit()` pre-creates the node and the walk then dies with
-/// `error: Could not read <oid>` / `fatal: Failed to traverse parents of commit
-/// <oid>` (commit.c:644). zvcs stops the walk at the missing parent instead of
-/// dying; what must not happen either way is following the *real* parent, which
-/// would silently show history the graft removed.
+/// `lookup_commit_graft()` (commit.c:332-340) substitutes whatever the file said
+/// without checking it, so `process_parents()` (revision.c:1189-1194) reaches a
+/// parent `repo_parse_commit_gently(r, p, 0)` cannot read. That prints
+/// `error("Could not read %s")` (commit.c:641-645) and returns -1, which
+/// `get_revision_1()` turns into `die("Failed to traverse parents of commit %s")`
+/// (revision.c:4467-4471) naming the *commit*, not the parent.
+///
+/// The walk streams, so every commit popped before the failure has already been
+/// printed: `git log --oneline` shows `c4` and only then dies. What must not
+/// happen is following the *real* parent, which would silently show history the
+/// graft removed.
 #[test]
 fn a_graft_to_a_missing_parent_does_not_fall_back_to_the_real_one() {
     let f = Fixture::new("missing");
-    let absent = "0123456789012345678901234567890123456789";
-    f.write_grafts(&format!("{C3} {absent}\n"));
+    f.write_grafts(&format!("{C3} {ABSENT}\n"));
 
     let out = f.quiet(&["log", "--oneline"]);
     assert!(
@@ -419,4 +437,162 @@ fn a_graft_to_a_missing_parent_does_not_fall_back_to_the_real_one() {
         "the walk still starts at HEAD; got:\n{}",
         out.stdout
     );
+    assert_eq!(out.stdout, "2a07f7aa50 c4\n", "and stops before the grafted commit");
+    assert_eq!(out.stderr, traverse_failure());
+    assert_eq!(out.code, 128);
+}
+
+/// `--max-count` spends itself before the walk reaches the unreadable parent, so
+/// `get_revision()` is never asked for the commit that would have died on it.
+///
+/// This is the one shape of the failure that is not a failure at all: git exits 0
+/// with no diagnostic, because `cmd_log_walk()`'s loop ended on the cap.
+#[test]
+fn a_cap_reached_before_the_missing_parent_is_not_an_error() {
+    let f = Fixture::new("missing-capped");
+    f.write_grafts(&format!("{C3} {ABSENT}\n"));
+
+    for args in [
+        &["log", "--oneline", "-n", "1"][..],
+        &["rev-list", "--max-count=1", "HEAD"][..],
+    ] {
+        let out = f.quiet(args);
+        assert_eq!(out.code, 0, "{args:?} stderr: {}", out.stderr);
+        assert_eq!(out.stderr, "", "{args:?}");
+    }
+
+    // One more than the cap does reach it.
+    let out = f.quiet(&["log", "--oneline", "-n", "2"]);
+    assert_eq!(out.stdout, "2a07f7aa50 c4\n");
+    assert_eq!(out.stderr, traverse_failure());
+    assert_eq!(out.code, 128);
+}
+
+/// Every verb that shares `get_revision()` dies the same way over the same
+/// repository, and the ones that summarise rather than stream print nothing.
+///
+/// `cmd_rev_list()` prints each commit inside the walk loop, so its prefix stands;
+/// `--count`, `--quiet` and `cmd_shortlog()` only print once the loop ends, which
+/// a `die()` inside the loop never lets happen.
+#[test]
+fn every_verb_over_the_same_walk_dies_the_same_way() {
+    let f = Fixture::new("missing-siblings");
+    f.write_grafts(&format!("{C3} {ABSENT}\n"));
+
+    // Streaming: the commits popped before the failure are already out.
+    for (args, stdout) in [
+        (&["rev-list", "HEAD"][..], format!("{C4}\n")),
+        (&["rev-list", "--parents", "HEAD"][..], format!("{C4} {C3}\n")),
+        (&["rev-list", "--all"][..], format!("{C4}\n{C1}\n")),
+        (&["log", "--oneline", "--all"][..], "2a07f7aa50 c4\n8beb863f66 c1\n".to_string()),
+    ] {
+        let out = f.quiet(args);
+        assert_eq!(out.stdout, stdout, "{args:?}");
+        assert_eq!(out.stderr, traverse_failure(), "{args:?}");
+        assert_eq!(out.code, 128, "{args:?}");
+    }
+
+    // Summarising: nothing is printed at all.
+    for args in [
+        &["rev-list", "--count", "HEAD"][..],
+        &["rev-list", "--quiet", "HEAD"][..],
+        &["rev-list", "--reverse", "HEAD"][..],
+        &["shortlog", "HEAD"][..],
+        &["log", "--oneline", "--reverse"][..],
+    ] {
+        let out = f.quiet(args);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(out.stderr, traverse_failure(), "{args:?}");
+        assert_eq!(out.code, 128, "{args:?}");
+    }
+}
+
+/// An order that has to see the whole history first fails during *setup*.
+///
+/// `--topo-order`, `--date-order` and `--graph` (which implies the first) make
+/// `prepare_revision_walk()` run `limit_list()`/`sort_in_topological_order()`
+/// before it returns (revision.c:4033-4039), so the read failure happens before
+/// the first commit is printed and `builtin/log.c`'s `die(_("revision walk setup
+/// failed"))` is what the user sees.
+#[test]
+fn a_whole_history_order_fails_during_setup_instead() {
+    let f = Fixture::new("missing-ordered");
+    f.write_grafts(&format!("{C3} {ABSENT}\n"));
+
+    let expected = format!("error: Could not read {ABSENT}\nfatal: revision walk setup failed\n");
+    for args in [
+        &["log", "--graph", "--oneline"][..],
+        &["log", "--oneline", "--topo-order"][..],
+        &["log", "--oneline", "--date-order"][..],
+        &["rev-list", "--topo-order", "HEAD"][..],
+        &["rev-list", "--date-order", "HEAD"][..],
+    ] {
+        let out = f.quiet(args);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(out.stderr, expected, "{args:?}");
+        assert_eq!(out.code, 128, "{args:?}");
+    }
+}
+
+/// `merge-base` does not stream, and it does not stop at the parent either.
+///
+/// `paint_down_to_common()` parses every parent it is about to queue and returns
+/// `error(_("could not parse commit %s"))` when one cannot be read
+/// (commit-reach.c:171-186), on top of the `error("Could not read %s")` the parse
+/// itself printed. Neither is a `die()`, so the exit code is whatever the mode's
+/// handler returns — and the five modes disagree: the default one propagates
+/// `show_merge_base()`'s -1 (255), `--octopus`, `--is-ancestor` and
+/// `--fork-point` end at 128, and `--independent` reaches its ordinary "nothing
+/// to show" 1 because `reduce_heads_replace()` discards the failure.
+#[test]
+fn merge_base_reports_the_parent_it_could_not_read() {
+    let f = Fixture::new("missing-mergebase");
+    f.write_grafts(&format!("{C3} {ABSENT}\n"));
+
+    let expected =
+        format!("error: Could not read {ABSENT}\nerror: could not parse commit {ABSENT}\n");
+    for (args, code) in [
+        (&["merge-base", "HEAD", "side"][..], 255),
+        (&["merge-base", "main", "main~1"][..], 255),
+        (&["merge-base", "--octopus", "HEAD", "side"][..], 128),
+        (&["merge-base", "--is-ancestor", "side", "HEAD"][..], 128),
+        (&["merge-base", "--fork-point", "side", "main"][..], 128),
+        (&["merge-base", "--independent", "main", "side"][..], 1),
+    ] {
+        let out = f.quiet(args);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(out.stderr, expected, "{args:?}");
+        assert_eq!(out.code, code, "{args:?}");
+    }
+
+    // `merge_bases_many()` short-circuits when an operand *is* the other
+    // (commit-reach.c:206-215), so the walk never starts and nothing is reported.
+    let out = f.quiet(&["merge-base", "main", "main"]);
+    assert_eq!(out.stdout, format!("{C4}\n"));
+    assert_eq!(out.stderr, "");
+    assert_eq!(out.code, 0);
+}
+
+/// A pathspec puts `try_to_simplify_commit()` (revision.c:1182) ahead of the
+/// parent loop, and its tree diff hits the unreadable parent first — so the
+/// ending is `die("cannot simplify commit %s (because of %s)")`
+/// (revision.c:1034-1037), which names both ids in one line.
+#[test]
+fn a_pathspec_dies_in_the_simplification_instead() {
+    let f = Fixture::new("missing-pathspec");
+    f.write_grafts(&format!("{C3} {ABSENT}\n"));
+
+    let expected = format!(
+        "error: Could not read {ABSENT}\nfatal: cannot simplify commit {C3} (because of {ABSENT})\n"
+    );
+    for (args, stdout) in [
+        (&["log", "--oneline", "--", "f"][..], "2a07f7aa50 c4\n"),
+        (&["rev-list", "HEAD", "--", "f"][..], "2a07f7aa502f1ce3b0084b7f36bbc92431ffe179\n"),
+        (&["shortlog", "HEAD", "--", "f"][..], ""),
+    ] {
+        let out = f.quiet(args);
+        assert_eq!(out.stdout, stdout, "{args:?}");
+        assert_eq!(out.stderr, expected, "{args:?}");
+        assert_eq!(out.code, 128, "{args:?}");
+    }
 }

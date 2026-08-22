@@ -20,6 +20,13 @@
 //! false), 128 for a bad object name or a mode/`--all` conflict, 129 for a
 //! usage error (unknown option, wrong argument count, conflicting modes).
 //!
+//! A commit `paint_down_to_common()` cannot read is its own ending, and each mode
+//! spells it differently: the default mode exits **255** (`show_merge_base()`
+//! returns -1 and `cmd_merge_base()` propagates it), `--octopus`,
+//! `--is-ancestor` and `--fork-point` exit 128, and `--independent` exits 1
+//! because `reduce_heads_replace()` discards the failure. All five print the same
+//! two `error:` lines — see [`report_unparsable`].
+//!
 //! Option abbreviation (`--oct` for `--octopus`) resolves the way `parse_long_opt()`
 //! resolves it, against [`LONG_OPTS`].
 
@@ -163,10 +170,15 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
                 Ok(id) => id,
                 Err(code) => return Ok(code),
             };
-            Ok(if is_ancestor(&repo, one, two)? {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
+            Ok(match is_ancestor(&repo, one, two)? {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::from(1),
+                // `ret = repo_in_merge_bases(...); if (ret < 0) exit(128);`
+                // (builtin/merge-base.c:119-121).
+                Err(id) => {
+                    report_unparsable(id);
+                    ExitCode::from(128)
+                }
             })
         }
         Mode::ForkPoint => {
@@ -185,7 +197,18 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
                 Ok(commits) => commits,
                 Err(code) => return Ok(code),
             };
-            let heads = reduce_heads(&repo, &commits)?;
+            // `reduce_heads_replace()` (builtin/merge-base.c:68) ignores what
+            // `get_independent()` returned, so a failed computation leaves `revs`
+            // empty and `handle_independent()` falls into its `return 1` — the two
+            // error lines are printed, but the exit code is the ordinary "nothing
+            // to show" one.
+            let heads = match reduce_heads(&repo, &commits)? {
+                Ok(heads) => heads,
+                Err(id) => {
+                    report_unparsable(id);
+                    return Ok(ExitCode::from(1));
+                }
+            };
             if heads.is_empty() {
                 return Ok(ExitCode::from(1));
             }
@@ -199,10 +222,23 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
                 Ok(commits) => commits,
                 Err(code) => return Ok(code),
             };
-            let Some(bases) = octopus_bases(&repo, &commits)? else {
-                return Ok(ExitCode::from(1));
+            // `if (get_octopus_merge_bases(revs, &result) < 0) ... return 128;`
+            // (builtin/merge-base.c:89-92).
+            let bases = match octopus_bases(&repo, &commits)? {
+                Ok(Some(bases)) => bases,
+                Ok(None) => return Ok(ExitCode::from(1)),
+                Err(id) => {
+                    report_unparsable(id);
+                    return Ok(ExitCode::from(128));
+                }
             };
-            let heads = reduce_heads(&repo, &bases)?;
+            let heads = match reduce_heads(&repo, &bases)? {
+                Ok(heads) => heads,
+                Err(id) => {
+                    report_unparsable(id);
+                    return Ok(ExitCode::from(1));
+                }
+            };
             if heads.is_empty() {
                 return Ok(ExitCode::from(1));
             }
@@ -218,11 +254,16 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
                 Ok(commits) => commits,
                 Err(code) => return Ok(code),
             };
-            let bases: Vec<ObjectId> = repo
-                .merge_bases_many(commits[0], &commits[1..])?
-                .into_iter()
-                .map(|id| id.detach())
-                .collect();
+            // `show_merge_base()` returns -1 (builtin/merge-base.c:17-22) and
+            // `cmd_merge_base()` hands that straight back, so the process exits with
+            // 255 rather than one of git's usual codes.
+            let bases = match merge_bases(&repo, commits[0], &commits[1..])? {
+                Ok(bases) => bases,
+                Err(id) => {
+                    report_unparsable(id);
+                    return Ok(ExitCode::from(255));
+                }
+            };
             if bases.is_empty() {
                 return Ok(ExitCode::from(1));
             }
@@ -357,44 +398,90 @@ fn print_bases(bases: &[ObjectId], show_all: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `repo_get_merge_bases_many()` with git's one *reported* failure separated out.
+///
+/// `paint_down_to_common()` parses every parent it is about to queue and returns
+/// `error(_("could not parse commit %s"))` when one cannot be read
+/// (commit-reach.c:171-186) — it does not stop at the parent and carry on. Each
+/// of `merge-base`'s five modes then ends differently for it (`show_merge_base()`
+/// returns -1 and `cmd_merge_base()` propagates it, `handle_octopus()` returns
+/// 128, `handle_is_ancestor()` and `get_fork_point()` call `exit(128)`,
+/// `reduce_heads_replace()` swallows it and leaves an empty list), so the id is
+/// handed back rather than turned into an exit code here.
+///
+/// `Ok(Err(id))` is that failure; `Err(..)` is everything else, which stays an
+/// ordinary error.
+fn merge_bases(
+    repo: &Repository,
+    one: ObjectId,
+    others: &[ObjectId],
+) -> Result<std::result::Result<Vec<ObjectId>, ObjectId>> {
+    use gix::revision::plumbing::merge_base::Simple;
+    match repo.merge_bases_many(one, others) {
+        Ok(bases) => Ok(Ok(bases.into_iter().map(|id| id.detach()).collect())),
+        Err(gix::repository::merge_bases_many::Error::MergeBase(Simple::UnparsableCommit(id))) => {
+            Ok(Err(id))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The two lines git has already written by the time a mode handler sees the
+/// failure, in order: `error("Could not read %s")` from the parse itself
+/// (commit.c:641-645), then `error(_("could not parse commit %s"))` from
+/// `paint_down_to_common()` (commit-reach.c:184-185).
+///
+/// Both name the same object, and neither is a `die()` — the exit code is
+/// whatever the mode's handler goes on to return.
+fn report_unparsable(id: ObjectId) {
+    eprintln!("error: Could not read {id}");
+    eprintln!("error: could not parse commit {id}");
+}
+
 /// git's `in_merge_bases`: is `one` reachable from `two`? True exactly when
 /// `one` is itself a merge base of the two.
-fn is_ancestor(repo: &Repository, one: ObjectId, two: ObjectId) -> Result<bool> {
-    Ok(repo
-        .merge_bases_many(one, &[two])?
-        .into_iter()
-        .any(|id| id.detach() == one))
+fn is_ancestor(
+    repo: &Repository,
+    one: ObjectId,
+    two: ObjectId,
+) -> Result<std::result::Result<bool, ObjectId>> {
+    Ok(merge_bases(repo, one, &[two])?.map(|bases| bases.into_iter().any(|id| id == one)))
 }
 
 /// git's `get_octopus_merge_bases`: fold the commit list into the accumulated
 /// bases, taking every pairwise merge base at each step. `None` when the
 /// commits don't all share history (git returns an empty list there).
-fn octopus_bases(repo: &Repository, commits: &[ObjectId]) -> Result<Option<Vec<ObjectId>>> {
+fn octopus_bases(
+    repo: &Repository,
+    commits: &[ObjectId],
+) -> Result<std::result::Result<Option<Vec<ObjectId>>, ObjectId>> {
     let Some((first, rest)) = commits.split_first() else {
-        return Ok(None);
+        return Ok(Ok(None));
     };
     let mut acc = vec![*first];
     for commit in rest {
         let mut next = Vec::new();
         for base in &acc {
-            next.extend(
-                repo.merge_bases_many(*commit, std::slice::from_ref(base))?
-                    .into_iter()
-                    .map(|id| id.detach()),
-            );
+            match merge_bases(repo, *commit, std::slice::from_ref(base))? {
+                Ok(bases) => next.extend(bases),
+                Err(id) => return Ok(Err(id)),
+            }
         }
         if next.is_empty() {
-            return Ok(None);
+            return Ok(Ok(None));
         }
         acc = next;
     }
-    Ok(Some(acc))
+    Ok(Ok(Some(acc)))
 }
 
 /// git's `reduce_heads`: de-duplicate `commits` (keeping first occurrence, so
 /// input order is preserved) and drop every commit that is reachable from
 /// another one in the list.
-fn reduce_heads(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
+fn reduce_heads(
+    repo: &Repository,
+    commits: &[ObjectId],
+) -> Result<std::result::Result<Vec<ObjectId>, ObjectId>> {
     let mut unique: Vec<ObjectId> = Vec::with_capacity(commits.len());
     for id in commits {
         if !unique.contains(id) {
@@ -406,16 +493,22 @@ fn reduce_heads(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>
     for (i, candidate) in unique.iter().enumerate() {
         let mut redundant = false;
         for (j, other) in unique.iter().enumerate() {
-            if i != j && is_ancestor(repo, *candidate, *other)? {
-                redundant = true;
-                break;
+            if i != j {
+                match is_ancestor(repo, *candidate, *other)? {
+                    Ok(true) => {
+                        redundant = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(id) => return Ok(Err(id)),
+                }
             }
         }
         if !redundant {
             out.push(*candidate);
         }
     }
-    Ok(out)
+    Ok(Ok(out))
 }
 
 /// git's `handle_fork_point`: find where the history leading to `commitname`
@@ -564,11 +657,14 @@ fn fork_point(repo: &Repository, refname: &str, commitname: &str) -> Result<Exit
         }
     }
 
-    let bases: Vec<ObjectId> = repo
-        .merge_bases_many(derived, &candidates)?
-        .into_iter()
-        .map(|id| id.detach())
-        .collect();
+    // `if (repo_get_merge_bases_many(...) < 0) exit(128);` (commit.c:1117-1119).
+    let bases = match merge_bases(repo, derived, &candidates)? {
+        Ok(bases) => bases,
+        Err(id) => {
+            report_unparsable(id);
+            return Ok(ExitCode::from(128));
+        }
+    };
 
     // Exactly one base, and it has to be one of the reflog entries.
     if bases.len() != 1 || !candidates.contains(&bases[0]) {

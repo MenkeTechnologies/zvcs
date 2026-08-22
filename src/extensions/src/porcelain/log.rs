@@ -2801,10 +2801,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // frontier, so the list is the reflog entries themselves rather than anything
     // reachable from a tip. Each entry keeps the commit's *real* parents, which is
     // what the pruning and the diffs below then use.
-    let mut nodes = if walk_reflogs {
-        reflog_walk(&repo, &tip_names)?
+    // `get_revision_1()` streams, so a parent it cannot read ends the command
+    // *after* everything already popped has been printed. `abort` carries that
+    // ending; which of git's three messages it becomes is decided below, once the
+    // effective order is known, and it is raised at the point in this function
+    // where git's own `die()` would have fired.
+    let (mut nodes, abort) = if walk_reflogs {
+        (reflog_walk(&repo, &tip_names)?, None)
     } else {
-        walk(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?
+        walk_reporting(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?
     };
     // `-L` sets `revs->topo_order = 1` without touching `sort_order`, so it walks
     // topologically unless `--date-order` asked for the date-ordered variant.
@@ -2817,7 +2822,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `init_topo_walk()` — so `--topo-order`/`--date-order` are silently inert
     // there, and the pending order (or its date sort) stands.
     if effective_order != Order::Default && no_walk.is_none() {
+        // `prepare_revision_walk()` runs `limit_list()` before it returns whenever
+        // the order needs the whole history first (revision.c:4033-4039), so the
+        // read failure happens during setup and `cmd_log()` never reaches
+        // `cmd_log_walk()`: nothing is printed and the message is the generic one.
+        if let Some(abort) = abort {
+            return Ok(abort.die_setup());
+        }
         nodes = topo_sort_ordered(&repo, nodes, effective_order);
+    }
+    // `--reverse` makes `cmd_log_walk()` buffer every commit and print them only
+    // after `get_revision()` runs dry (`revision.c`'s `revs->reverse` handling in
+    // `get_revision()`), so a walk that dies never prints its prefix.
+    if reverse {
+        if let Some(abort) = abort {
+            return Ok(abort.die_traverse());
+        }
     }
 
     // `-L`: carry the tracked ranges backward through the history, keeping only the
@@ -4586,6 +4606,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `diff_warn_rename_limit()` flushes stdout before it warns — so this lands
         // after the last record (builtin/log.c:443, diff.c:7038-7040).
         rename_warn.emit("diff.renameLimit");
+        // The walk died after the records above were streamed. git's `die()` runs
+        // between two `get_revision()` calls, so the prefix stands and the exit
+        // code is 128 rather than `diff_result_code()`'s.
+        if let Some(abort) = abort {
+            // With a pathspec, `process_parents()` reaches `try_to_simplify_commit()`
+            // (revision.c:1182) before its parent loop, and that diffs the commit
+            // against each parent's tree — so the unreadable parent is hit there and
+            // `die("cannot simplify commit %s (because of %s)")` (revision.c:1034-1037)
+            // is the message, not the traversal one.
+            return Ok(match pathspecs.is_empty() {
+                true => abort.die_traverse(),
+                false => abort.die_simplify(),
+            });
+        }
         rc
     }
 }
@@ -6525,6 +6559,106 @@ fn insert_by_date(list: &mut Vec<Node>, node: Node) {
     list.insert(pos, node);
 }
 
+/// The read failure that ends a walk: git's `error("Could not read %s")` plus the
+/// commit whose parent list named the object.
+///
+/// `repo_parse_commit_internal()` (commit.c:641-645) reports the *object it could
+/// not read*; `get_revision_1()` (revision.c:4466-4471) then dies naming the
+/// commit whose parents it was traversing, so the two lines carry two different
+/// ids. Keeping both is the whole reason this type exists rather than a bare
+/// `ObjectId`.
+///
+/// The pair is reachable without a damaged object database: an `info/grafts` line
+/// may name a parent this repository does not have, and `lookup_commit_graft()`
+/// (commit.c:332-340) substitutes it unconditionally.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct WalkAbort {
+    /// The object `error("Could not read %s")` names — the parent that is absent.
+    pub(super) missing: ObjectId,
+    /// The commit whose parent list named [`missing`](Self::missing), which is what
+    /// every one of git's follow-up messages names.
+    pub(super) child: ObjectId,
+}
+
+impl WalkAbort {
+    /// Recover the abort point from a walk that reported the read failure late.
+    ///
+    /// `gix-traverse`'s `Simple` queues a parent id without reading it and only
+    /// fails when that id is popped, so a caller built on it has already collected
+    /// the commit whose parent list git would have died on. git's own order is the
+    /// one in [`walk_reporting`]: the *first* commit whose parent list names an
+    /// unreadable object is where `process_parents()` returns -1, and that commit
+    /// is not emitted. This finds it in the collected order and reports both its
+    /// index — everything from there on was never printed by git — and the pair of
+    /// ids the messages need.
+    ///
+    /// `None` means the walk failed for some other reason, which the caller should
+    /// keep reporting the way it did before.
+    pub(super) fn locate(
+        repo: &gix::Repository,
+        walked: &[ObjectId],
+        parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
+    ) -> Option<(usize, WalkAbort)> {
+        for (at, id) in walked.iter().enumerate() {
+            for parent in parents_of.get(id).into_iter().flatten() {
+                if repo.find_object(*parent).is_err() {
+                    return Some((at, WalkAbort { missing: *parent, child: *id }));
+                }
+            }
+        }
+        None
+    }
+
+    /// `error("Could not read %s", oid_to_hex(&item->object.oid))` (commit.c:641-645).
+    ///
+    /// Every one of git's endings for this failure opens with this line, because it
+    /// is printed by the parse itself rather than by whoever asked for the parse.
+    pub(super) fn report(self) {
+        eprintln!("error: Could not read {}", self.missing);
+    }
+
+    /// `die("Failed to traverse parents of commit %s")` (revision.c:4467-4471 for
+    /// the streaming walk, revision.c:3953-3956 for the topological one).
+    ///
+    /// This is the ending for a walk that had already started handing commits to
+    /// its caller, so anything printed before the abort stands.
+    pub(super) fn die_traverse(self) -> ExitCode {
+        self.report();
+        eprintln!("fatal: Failed to traverse parents of commit {}", self.child);
+        ExitCode::from(128)
+    }
+
+    /// `die(_("revision walk setup failed"))` — `builtin/log.c`'s and
+    /// `builtin/rev-list.c`'s reaction to `prepare_revision_walk()` returning
+    /// non-zero.
+    ///
+    /// An order that has to see the whole history before it can emit anything
+    /// (`--topo-order`, `--date-order`, and `--graph`, which implies the first)
+    /// runs `limit_list()`/`sort_in_topological_order()` inside
+    /// `prepare_revision_walk()` (revision.c:4033-4039), so the failure happens
+    /// before the first commit is printed and the message is the generic one.
+    pub(super) fn die_setup(self) -> ExitCode {
+        self.report();
+        eprintln!("fatal: revision walk setup failed");
+        ExitCode::from(128)
+    }
+
+    /// `die("cannot simplify commit %s (because of %s)")` (revision.c:1034-1037).
+    ///
+    /// With a pathspec, `process_parents()` calls `try_to_simplify_commit()` before
+    /// it walks the parent list, and that has to diff the commit against each
+    /// parent's tree — so the unreadable parent is hit by
+    /// `repo_parse_commit(the_repository, p)` there first and this message wins.
+    pub(super) fn die_simplify(self) -> ExitCode {
+        self.report();
+        eprintln!(
+            "fatal: cannot simplify commit {} (because of {})",
+            self.child, self.missing
+        );
+        ExitCode::from(128)
+    }
+}
+
 /// Breadth-first walk over the reachable history, newest commit first. With
 /// `first_parent`, only the first parent of each commit is followed — git's
 /// `--first-parent`.
@@ -6537,6 +6671,44 @@ pub(super) fn walk(
     budget: Option<usize>,
     no_walk: Option<NoWalk>,
 ) -> Result<Vec<Node>> {
+    let (nodes, abort) = walk_reporting(repo, tips, tip_sources, first_parent, hidden, budget, no_walk)?;
+    match abort {
+        // A caller that has nowhere to stream a partial history to sees the read
+        // failure as an ordinary error, which is what it was before the walk
+        // learned to report it.
+        Some(abort) => Err(anyhow!(
+            "An object with id {} could not be found",
+            abort.missing
+        )),
+        None => Ok(nodes),
+    }
+}
+
+/// [`walk`], but handing back the commits it managed to walk alongside the read
+/// failure that stopped it, so a caller can stream the prefix git streams.
+///
+/// git never collects a history before printing it: `get_revision_1()`
+/// (revision.c:4416-4491) pops one commit, calls `process_parents()` on it, and
+/// only then returns it to `cmd_log_walk()`. `process_parents()`
+/// (revision.c:1189-1194) parses every parent of the popped commit through
+/// `repo_parse_commit_gently(revs->repo, p, 0)`, and a parent the object
+/// database does not have makes that print `error("Could not read %s")`
+/// (commit.c:641-645) and return -1, which is `die("Failed to traverse parents
+/// of commit %s")` (revision.c:4467-4471) naming the *popped* commit rather than
+/// the parent. Everything popped before it has already been printed.
+///
+/// So the abort point is "after the previous commit was emitted, before this one
+/// is" — exactly where this loop stops, since it reads a node's parents before
+/// pushing the node onto `out`.
+pub(super) fn walk_reporting(
+    repo: &gix::Repository,
+    tips: &[ObjectId],
+    tip_sources: &[String],
+    first_parent: bool,
+    hidden: &HashSet<ObjectId>,
+    budget: Option<usize>,
+    no_walk: Option<NoWalk>,
+) -> Result<(Vec<Node>, Option<WalkAbort>)> {
     // Shallow commits (from `.git/shallow`, as a `--depth` clone leaves) are grafted
     // to have no parents: the walk must stop at them, not try to read their absent
     // parent objects (which is git's `is_repository_shallow` / grafting behaviour).
@@ -6583,7 +6755,7 @@ pub(super) fn walk(
         if mode == NoWalk::Unsorted {
             out.sort_by_key(|n| n.seq);
         }
-        return Ok(out);
+        return Ok((out, None));
     }
 
     let mut out: Vec<Node> = Vec::new();
@@ -6604,7 +6776,15 @@ pub(super) fn walk(
         };
         for parent in parents {
             if seen.insert(*parent) {
-                let mut pnode = reader.read(repo, *parent)?;
+                // `repo_parse_commit_gently(revs->repo, p, 0)` inside
+                // `process_parents()` (revision.c:1194): a parent that cannot be
+                // read stops the walk here, with `node` never emitted. A graft
+                // line naming an object this repository does not have is the way
+                // to reach it without a corrupt odb — `lookup_commit_graft()`
+                // (commit.c:332-340) hands back whatever the file said.
+                let Ok(mut pnode) = reader.read(repo, *parent) else {
+                    return Ok((out, Some(WalkAbort { missing: *parent, child: node.id })));
+                };
                 // git's `add_parents_to_list`: a parent inherits the source of the
                 // commit that first reaches it (an empty-string clone when off).
                 pnode.source = node.source.clone();
@@ -6615,7 +6795,7 @@ pub(super) fn walk(
         }
         out.push(node);
     }
-    Ok(out)
+    Ok((out, None))
 }
 
 /// git's `sort_in_topological_order`: an indegree count over the already-walked

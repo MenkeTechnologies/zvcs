@@ -961,7 +961,19 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             Some(super::log::PathspecMatcher::new(repo, &pathspecs)?)
         };
 
-        let items = walk(repo, &tips, &hidden, &filters)?;
+        // `cmd_shortlog()` drains `get_revision()` into its author table and prints
+        // nothing until the walk ends, so a parent it cannot read leaves no output
+        // at all — only the two lines and 128. See [`super::log::WalkAbort`].
+        let (items, abort) = walk(repo, &tips, &hidden, &filters)?;
+        if let Some(abort) = abort {
+            // A pathspec puts `try_to_simplify_commit()` (revision.c:1182) ahead of
+            // `process_parents()`'s parent loop, and its tree diff hits the
+            // unreadable parent first — see [`super::log::WalkAbort::die_simplify`].
+            return Ok(match pathspecs.is_empty() {
+                true => abort.die_traverse(),
+                false => abort.die_simplify(),
+            });
+        }
         let items = if filters.ancestry_path {
             keep_ancestry_path(items, &hidden)
         } else {
@@ -1375,8 +1387,9 @@ fn walk(
     tips: &[ObjectId],
     hidden: &[ObjectId],
     filters: &Filters,
-) -> Result<Vec<WalkItem>> {
+) -> Result<(Vec<WalkItem>, Option<super::log::WalkAbort>)> {
     let mut items = Vec::new();
+    let mut abort: Option<super::log::WalkAbort> = None;
     match filters.order {
         Order::Default | Order::AuthorDate => {
             let mut platform = repo
@@ -1389,7 +1402,20 @@ fn walk(
                 platform = platform.with_hidden(hidden.to_vec());
             }
             for info in platform.all()? {
-                let info = info?;
+                let info = match info {
+                    Ok(info) => info,
+                    // See the same interception in `rev_list`: the iterator notices
+                    // the unreadable parent one commit later than `process_parents()`
+                    // does, so the abort is put back where git has it.
+                    Err(err) => match locate_abort(repo, &items) {
+                        Some((at, found)) => {
+                            items.truncate(at);
+                            abort = Some(found);
+                            break;
+                        }
+                        None => return Err(err.into()),
+                    },
+                };
                 items.push(WalkItem {
                     id: info.id,
                     parents: info.parent_ids.iter().map(|id| id.to_owned()).collect(),
@@ -1442,7 +1468,20 @@ fn walk(
             .filter_map(|id| by_id.remove(&id))
             .collect();
     }
-    Ok(items)
+    Ok((items, abort))
+}
+
+/// [`super::log::WalkAbort::locate`] over this walk's item list.
+fn locate_abort(
+    repo: &gix::Repository,
+    items: &[WalkItem],
+) -> Option<(usize, super::log::WalkAbort)> {
+    let walked: Vec<ObjectId> = items.iter().map(|item| item.id).collect();
+    let parents_of: std::collections::HashMap<ObjectId, Vec<ObjectId>> = items
+        .iter()
+        .map(|item| (item.id, item.parents.clone()))
+        .collect();
+    super::log::WalkAbort::locate(repo, &walked, &parents_of)
 }
 
 /// The author timestamp `--author-date-order` ranks a commit by, which is git's

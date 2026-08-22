@@ -73,6 +73,90 @@
 //! counter and its own column, and it stays inside the parity denominator as a
 //! failure — see [`Verdict::ZvcsNondeterministic`] for why excluding it would be
 //! the one kind of exclusion this harness must never have.
+//!
+//! # A second oracle: telling a port defect from a version difference
+//!
+//! Everything above compares the port with **one** git and treats that git's
+//! answer as the answer. That is a real limit, not a simplification. On a machine
+//! with `/usr/bin/git` at 2.50.1 and `/opt/homebrew/bin/git` at 2.55.0 the harness
+//! picks the newer one and never asks the other, so a difference between the port
+//! and 2.55.0 is reported identically whether the port is wrong or whether *git*
+//! changed between the two releases and the port reproduces the older behaviour.
+//! Both read as `stdout-diff` with a specific diff attached, and one of them is
+//! an afternoon spent making code match a behaviour upstream deliberately moved.
+//!
+//! So when [`crate::stock::alt_git`] finds a second real git, a failing case is
+//! run against it too and the three answers are classified together
+//! ([`adjudicate`]):
+//!
+//!   * **the two gits agree, the port differs** — the strongest signal this
+//!     harness can produce. Not one git's opinion: two independent releases say
+//!     the port is wrong. The verdict it already earned stands, and the report
+//!     says it was corroborated.
+//!   * **the two gits disagree with each other, and the port reproduces the
+//!     second one** — [`Verdict::VersionSkew`]. The port is not producing a wrong
+//!     answer, it is producing an *older git's* answer, and naming that is the
+//!     entire point of the dimension.
+//!   * **the two gits disagree and the port matches neither** — the verdict
+//!     stands, because no choice of target version makes the port right here. The
+//!     disagreement is still recorded and listed, because it says the *expected
+//!     value* on this case is version-dependent — which is exactly the shape of a
+//!     curated expectation that was captured against the wrong git.
+//!   * **the second oracle would not reproduce itself, or was killed by the case
+//!     timeout** — inconclusive, and said so. A disagreement is corroborated by a
+//!     second run of the second oracle before it is believed, because some values
+//!     are re-rolled every run and two samples can agree by luck: the first
+//!     version of this dimension reported `filter-branch`'s
+//!     `(N seconds passed, remaining M predicted)` progress line as a version
+//!     difference between 2.55.0 and 2.50.1. A dimension whose headline finding is
+//!     manufactured by machine load is worse than no dimension. See
+//!     [`alt_reproduced`].
+//!
+//! ## What it does to the denominator
+//!
+//! [`Verdict::VersionSkew`] is **inside** the parity denominator, counted as a
+//! failure, exactly like [`Verdict::ZvcsNondeterministic`] and for the same
+//! reason. The two alternatives are both worse:
+//!
+//! *Excluding it* — dropping the case from `Tally::scored` the way stock
+//! non-determinism is dropped — would be an exclusion **the binary under test can
+//! trigger**. Stock's exclusion is safe only because no port behaviour can reach
+//! it; this one is reached by the port emitting a particular string, so a port
+//! that reproduced 2.50 behaviour on its hardest cases would shrink its own
+//! denominator and outscore a port that tried to reproduce 2.55 and missed. That
+//! is the self-serving exclusion this crate exists to refuse.
+//!
+//! *Counting it as a match* would be worse still: the number would then mean "the
+//! port agrees with some git somewhere", which is not a claim anybody wants and
+//! degrades as the number of installed gits grows.
+//!
+//! So the headline number keeps its single meaning — *matches the git this port
+//! targets*, the version `stock::git` already refuses to measure below — and the
+//! version difference is made visible instead of being paid for: its own verdict,
+//! its own counter, its own column, its own report line, and a listing of every
+//! case where the two gits disagreed at all. A reader who wants the other number
+//! is given it explicitly on a second line rather than having it folded silently
+//! into the first.
+//!
+//! The consequence, stated rather than hidden: `parity` is *bit-identical* with
+//! and without a second oracle. The dimension can move a case from one failure
+//! bucket to another and can never move one into or out of the numerator or the
+//! denominator. That is a property, not an accident — see
+//! [`the_second_oracle_cannot_move_the_parity_number`].
+//!
+//! ## What it costs
+//!
+//! One extra invocation and one extra state probe, **only** on a case that
+//! already failed against the primary oracle and whose verdict is one the second
+//! oracle can speak to ([`alt_speaks_to`]) — plus a second one on the far smaller
+//! set where the two gits actually disagreed and the disagreement has to be
+//! corroborated ([`alt_reproduced`]). A run in which everything matches pays
+//! nothing at all, which is the same gate the repeat uses and for the same
+//! reason: runtime is not neutral, a harness people run less often measures less.
+//! `--alt-git-every-case` lifts the gate, at one extra invocation per case, and
+//! buys the one thing the gate cannot see — a case where the port matches 2.55.0
+//! and 2.50.1 would have said something else. Every run prints which of the two
+//! it paid for and what it cost.
 
 use crate::env;
 use crate::fixture::{Shape, Templates};
@@ -1009,6 +1093,33 @@ pub enum Verdict {
     /// the stock repeat already tests and this one deliberately does not
     /// duplicate.
     ZvcsNondeterministic,
+    /// The two stock gits do not agree with each other on this invocation, and
+    /// the port reproduces the **second** one — the one the report is not
+    /// measured against. Only reachable when a second oracle was resolved; see
+    /// [`crate::stock::alt_git`] and [`adjudicate`].
+    ///
+    /// **Its own verdict because it is its own claim.** Every other failure
+    /// bucket says the port produced something no git produced. This one says
+    /// the port produced something a real git produces, and that git is not the
+    /// one this port targets. The two are different findings and cost different
+    /// afternoons: the first is a bug to fix, the second is a decision about
+    /// which release to track, and a reader who cannot tell them apart will
+    /// "fix" code to match behaviour upstream changed on purpose.
+    ///
+    /// **Counted as a failure, inside the parity denominator, never excluded.**
+    /// The argument is [`Verdict::ZvcsNondeterministic`]'s, and it is the reason
+    /// this is not the exclusion it superficially looks like it should be: the
+    /// condition is half a property of the oracles (they disagree) and half a
+    /// property of the binary under test (it matched the older one), and the
+    /// *conjunction* is therefore something the port can trigger. An exclusion a
+    /// port can trigger pays a port for triggering it — reproduce 2.50 on the
+    /// hard cases and the denominator shrinks. The number stays defined as
+    /// "matches the git this port targets", which is the version
+    /// [`crate::stock::git`] already refuses to measure below.
+    ///
+    /// The report prints the forgiving number too, on a line of its own, so
+    /// nothing is hidden by the choice — only kept out of the headline.
+    VersionSkew,
     /// Stock git does not agree with *itself* on this invocation, so byte
     /// comparison cannot measure anything. Established by re-running the stock
     /// side in a second pristine repo and diffing the two stock outputs — never
@@ -1072,6 +1183,7 @@ impl Verdict {
             Verdict::Crash => "CRASH",
             Verdict::Hang => "HANG",
             Verdict::ZvcsNondeterministic => "ZVCS-NONDETERMINISTIC",
+            Verdict::VersionSkew => "VERSION-SKEW",
             Verdict::Nondeterministic => "NONDETERMINISTIC",
             Verdict::StockTimeout => "STOCK-TIMEOUT",
         }
@@ -1095,6 +1207,12 @@ impl Verdict {
                 "zvcs did not reproduce its own stdout or post-state while stock did; \
                  counted as a failure, not excluded",
             ),
+            // `VersionSkew` is deliberately **not** here. This listing is headed
+            // "unmeasurable + flaky", and a bucket that is neither would be
+            // filed under a heading that misdescribes it — the exact error the
+            // separate verdict exists to avoid. It gets its own section, printed
+            // only by a run that had a second oracle, which is also what keeps a
+            // one-git machine's report byte-identical to what it was.
             _ => None,
         }
     }
@@ -1152,6 +1270,15 @@ pub struct Outcome {
     /// reproduced" is the fact a reader most wants attached to a failure they
     /// are about to spend an afternoon on, and it has already been paid for.
     pub zvcs_repeat: Option<Repeat>,
+    /// What the **second** oracle said, present exactly when one was resolved and
+    /// asked — a failing case whose verdict [`alt_speaks_to`], or any case at all
+    /// under `--alt-git-every-case`.
+    ///
+    /// `None` covers both "the machine has one git" and "this case did not need a
+    /// second opinion", and the report distinguishes them from the run-level
+    /// counts rather than from this field: a per-case `None` cannot say which,
+    /// and the difference matters only in aggregate.
+    pub alt: Option<AltRun>,
 }
 
 impl Outcome {
@@ -1211,6 +1338,119 @@ impl Surface {
             Surface::Interop => "interop probe",
         }
     }
+}
+
+/// The surface two *oracles* differed on.
+///
+/// A separate enum from [`Surface`] rather than two more variants on it, and the
+/// difference is the point: [`Surface`] is the set of things a side is asked to
+/// reproduce about *itself*, where exit code is deliberately excluded (widening
+/// it would widen an exclusion — see [`repeat_disagreement`]). This is the set of
+/// things two gits are compared on, where the exit code is a first-class answer
+/// and the message is one too for a case that opted in. Sharing one enum would
+/// have made "add a variant here" silently mean "widen an exclusion there".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OracleSurface {
+    Exit,
+    Stdout,
+    State,
+    Stderr,
+}
+
+impl OracleSurface {
+    pub fn name(self) -> &'static str {
+        match self {
+            OracleSurface::Exit => "exit code",
+            OracleSurface::Stdout => "stdout",
+            OracleSurface::State => "post-state",
+            OracleSurface::Stderr => "stderr",
+        }
+    }
+}
+
+/// What the second oracle turned a failing case into, once its answer has been
+/// compared with both the primary oracle's and the port's.
+///
+/// Four states, and none of them collapses into another. In particular
+/// [`AltFinding::Inconclusive`] is not folded into [`AltFinding::GitsAgree`]:
+/// "the second git was killed before it answered" would then read as "the second
+/// git corroborates the defect", which is a claim nothing measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltFinding {
+    /// The two gits produced the same answer. The port's difference is the
+    /// port's — corroborated by an independent release, which is the strongest
+    /// statement this harness can make about a defect.
+    GitsAgree,
+    /// The two gits produced different answers and the port reproduced the
+    /// second one's. The port is tracking that git's behaviour, not producing a
+    /// wrong one. Becomes [`Verdict::VersionSkew`].
+    PortTracksAlt,
+    /// The two gits produced different answers and the port reproduced neither.
+    /// The verdict stands — no choice of target version makes the port right —
+    /// but the case is one where "parity" has no single answer, so it is listed.
+    GitsDisagree,
+    /// Nothing could be concluded: the second oracle hit the case timeout, or it
+    /// reported a disagreement it then failed to reproduce.
+    ///
+    /// One bucket for both because they are one claim — *this sample is not
+    /// evidence* — and splitting it would invite a reader to treat one of them as
+    /// a weak finding. A killed run's partial output differs from a complete one
+    /// every time; an unreproducible one differs from itself. See
+    /// [`alt_reproduced`] for the `filter-branch` wall-clock line that put the
+    /// second case here.
+    Inconclusive,
+}
+
+impl AltFinding {
+    /// Whether the two gits disagreed with each other at all — the listing this
+    /// dimension exists to produce, independent of what the port did.
+    pub fn gits_disagreed(self) -> bool {
+        matches!(self, AltFinding::PortTracksAlt | AltFinding::GitsDisagree)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AltFinding::GitsAgree => "gits-agree",
+            AltFinding::PortTracksAlt => "port-tracks-alt",
+            AltFinding::GitsDisagree => "gits-disagree",
+            AltFinding::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+/// One run of the **second** oracle, reduced to the surfaces the three-way
+/// comparison reads, plus what that comparison concluded.
+///
+/// stderr is captured here though the primary comparison does not byte-compare
+/// it, because a case that *opted into* stderr comparison can fail on it, and a
+/// second oracle that could not speak to the surface the verdict was about would
+/// have to be skipped for exactly the cases where prose is being compared. The
+/// interop digest is **not** captured, deliberately: it would cost three more
+/// invocations per adjudicated case, and it is produced by asking the *primary*
+/// stock git to read a finished repository — pointing an older git at it answers
+/// a question about the reader, not about what the port wrote. So
+/// [`Verdict::InteropDiff`] is simply not a verdict the second oracle is asked
+/// about; see [`alt_speaks_to`].
+#[derive(Clone, Debug)]
+pub struct AltRun {
+    /// Which git this was, so every printed line can name it. Carried per
+    /// outcome rather than looked up at print time so a report can never
+    /// attribute one git's bytes to the other's version.
+    pub version: (u32, u32, u32),
+    pub timed_out: bool,
+    pub code: Option<i32>,
+    /// Normalized exactly like the other two sides', against this run's own repo.
+    pub stdout: String,
+    pub stderr: String,
+    pub state: String,
+    pub finding: AltFinding,
+    /// The first surface the two gits differed on, `None` when they agreed (or
+    /// when nothing could be concluded). Recorded rather than recomputed by the
+    /// report for the same reason [`Repeat::disagreement`] is: the verdict and
+    /// the printed explanation have to come from one comparison, or a report can
+    /// say "the two gits differ on stdout" about a case classified on its exit
+    /// code.
+    pub surface: Option<OracleSurface>,
 }
 
 /// Ceiling on a single invocation. Fuzzing reaches commands that wait on input
@@ -2429,6 +2669,40 @@ fn stock_exec_dir(home: &Path) -> &'static Path {
     })
 }
 
+/// The second oracle's exec-path, resolved once for the whole run.
+///
+/// Its own resolution rather than reusing the primary's, and that is load-bearing
+/// rather than tidy: the two gits are installed in different trees
+/// (`/Library/Developer/CommandLineTools/usr/libexec/git-core` against
+/// `/opt/homebrew/libexec/git-core`), and several commands print their exec-path.
+/// Normalizing the second oracle's output against the *first* oracle's exec-path
+/// would leave that string unmasked in exactly one of the three answers, and the
+/// harness would report an install-location difference as a version difference on
+/// every case that mentions it.
+fn alt_exec_dir(bin: &Path, home: &Path) -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| exec_path_of(bin, home))
+}
+
+/// Whether `--alt-git-every-case` was given: ask the second oracle about every
+/// case, not only the ones that already failed.
+///
+/// A process-wide flag rather than another argument threaded through six call
+/// sites, for the same reason the exec-paths above are: it is fixed before the
+/// first case runs and read identically by every worker. `set_alt_every_case` is
+/// called once from `main`; a second call is ignored, because this is a knob and
+/// aborting a five-minute sweep over a duplicated setter trades a real
+/// measurement for a tidy one.
+static ALT_EVERY_CASE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn set_alt_every_case(on: bool) {
+    let _ = ALT_EVERY_CASE.set(on);
+}
+
+fn alt_every_case() -> bool {
+    *ALT_EVERY_CASE.get().unwrap_or(&false)
+}
+
 /// The binary-under-test's exec-path, resolved once for the whole run.
 fn zvcs_exec_dir(bin: &Path, home: &Path) -> &'static Path {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -2575,6 +2849,178 @@ fn classify(stock: &Compared<'_>, zvcs: &Compared<'_>, compare_stderr: bool) -> 
     } else {
         Verdict::Match
     }
+}
+
+/// Whether a second oracle has anything to say about this verdict.
+///
+/// The gate on the whole dimension, and it is about *meaning* before it is about
+/// cost. A second git can only adjudicate a finding it produced a comparable
+/// answer for, so the set is exactly the content differences:
+///
+///   * [`Verdict::ExitDiff`], [`Verdict::StdoutDiff`], [`Verdict::StateDiff`],
+///     [`Verdict::StderrDiff`] — the port said something, the oracle said
+///     something else, and a second oracle's answer settles which of the two the
+///     rest of the world says. Included.
+///   * [`Verdict::Unsupported`] — the port refused. It matched no git by
+///     construction, so no three-way outcome can change the verdict; the second
+///     oracle could only add to the disagreement listing, and buying an
+///     invocation per unported command for that is the wrong trade.
+///   * [`Verdict::Crash`], [`Verdict::Hang`] — the port crashed or never
+///     answered. No git's behaviour exculpates that.
+///   * [`Verdict::InteropDiff`] — the finding lives in a digest [`AltRun`] does
+///     not carry, and could not sensibly carry: see its doc.
+///   * [`Verdict::Nondeterministic`], [`Verdict::StockTimeout`] — there is no
+///     stable primary answer to be a second opinion *about*.
+///   * [`Verdict::ZvcsNondeterministic`] — the port does not agree with itself,
+///     so which of its two answers would a third binary be compared against?
+///   * [`Verdict::VersionSkew`] — already adjudicated; it is this function's own
+///     output.
+///   * [`Verdict::Match`] — the port matched the primary oracle, so nothing is in
+///     dispute. `--alt-git-every-case` overrides this one and only this one,
+///     because it buys the single thing the gate cannot see: a case where the
+///     port matches 2.55.0 and the older git would have said something else.
+///     That is a fact about *the corpus*, not about the port — it marks the cases
+///     whose expected value is version-dependent — so it is worth paying for
+///     deliberately and not worth paying for by default.
+fn alt_speaks_to(v: Verdict) -> bool {
+    matches!(
+        v,
+        Verdict::ExitDiff | Verdict::StdoutDiff | Verdict::StateDiff | Verdict::StderrDiff
+    )
+}
+
+/// The first surface on which the second oracle differs from some other answer,
+/// in the same precedence order [`classify`] uses.
+///
+/// Same order deliberately: a reader comparing "the two gits differ on their exit
+/// code" against a verdict of `stdout-diff` needs the two sentences to have been
+/// produced by one rule, or they are two rules that will drift.
+///
+/// stderr participates only for a case that opted into stderr comparison, which
+/// is the standing policy everywhere else in this crate — error prose is not a
+/// compatibility surface, and two gits phrasing one error differently is not a
+/// version difference anybody wants listed as one.
+fn oracle_diff(
+    alt: &AltRun,
+    code: Option<i32>,
+    stdout: &str,
+    state: &str,
+    stderr: &str,
+    compare_stderr: bool,
+) -> Option<OracleSurface> {
+    if alt.code != code {
+        Some(OracleSurface::Exit)
+    } else if alt.stdout != stdout {
+        Some(OracleSurface::Stdout)
+    } else if alt.state != state {
+        Some(OracleSurface::State)
+    } else if compare_stderr && alt.stderr != stderr {
+        Some(OracleSurface::Stderr)
+    } else {
+        None
+    }
+}
+
+/// Whether the second oracle reproduced its own answer, so a disagreement it
+/// reported can be believed.
+///
+/// The third binary is held to exactly the standard the other two are held to,
+/// and it has to be. `judge` establishes that stock and zvcs each reproduce
+/// themselves, but that is not enough to make a *third* sample's disagreement
+/// mean "the versions differ": some values are re-rolled every run and two
+/// samples can agree by luck. `filter-branch` prints
+/// `(N seconds passed, remaining M predicted)` from the wall clock, and the first
+/// run of this dimension duly reported
+/// `branched::filter-branch::filter-branch -f --tree-filter true HEAD` as a
+/// version difference between 2.55.0 and 2.50.1 — the two gits had printed
+/// `(0 seconds passed)` and `(1 seconds passed)`, and the port happened to land on
+/// the second. A dimension whose headline finding is manufactured by machine load
+/// is worse than no dimension, because its output still reads like evidence.
+///
+/// So a disagreement is corroborated by a second run of the second oracle before
+/// it is believed, and a second oracle that will not reproduce itself yields
+/// [`AltFinding::Inconclusive`] — the same "nothing follows from this" treatment a
+/// timeout gets, and for the same reason.
+///
+/// **Only a disagreement is corroborated, never an agreement.** Two gits agreeing
+/// by luck on an unstable value produces [`AltFinding::GitsAgree`], which does not
+/// excuse the port of anything — it corroborates a defect the case already had.
+/// Erring toward the port being asked to be right is this crate's standing
+/// direction, and it keeps the common path at one extra invocation.
+///
+/// **A repeat that timed out proves nothing**, so the finding stands rather than
+/// being dissolved: identical to [`repeat_disagreement`], and load must not be
+/// able to erase a real version difference any more than it may invent one.
+///
+/// **What this does not close, recorded rather than hidden.** Re-running is
+/// evidence, not proof. A value drawn from the wall clock can come out the same
+/// twice — both of the second oracle's runs finishing inside the same second —
+/// while the primary oracle's two runs land on a different one, and the case is
+/// then labelled a version difference on a command where no version changed.
+/// Measured: over `--only filter-branch --alt-git-every-case`, corroboration
+/// moved one such case to [`AltFinding::Inconclusive`] and two survived it. Three
+/// facts make that the acceptable error rather than a reason to widen the rule
+/// further:
+///
+///  * It is bounded to the commands whose output embeds a clock, and every one of
+///    them is named in the listing with both gits' bytes printed, so the reader
+///    sees `(0 seconds passed)` against `(1 seconds passed)` and stops.
+///  * It can only move a case **between two failure buckets**. `VersionSkew` and
+///    the content diff it replaced are worth the same to both the numerator and
+///    the denominator, so no number moves in either direction.
+///  * This crate already accepts exactly this imprecision one bucket over:
+///    [`Verdict::ZvcsNondeterministic`]'s doc names this same `filter-branch`
+///    progress line as a case counted against the port that nothing could pass.
+///    Trading it for a wider exclusion is the trade this harness does not make.
+fn alt_reproduced(first: &AltRun, again: &AltRun, compare_stderr: bool) -> bool {
+    if again.timed_out {
+        return true;
+    }
+    oracle_diff(again, first.code, &first.stdout, &first.state, &first.stderr, compare_stderr)
+        .is_none()
+}
+
+/// Classify one case three ways, and say whether the verdict changes.
+///
+/// Pure, and separate from [`judge`] for the same reason [`classify`] is separate
+/// from the running: this is the rule that decides whether a difference gets
+/// filed as a defect or as a version difference, and a rule nothing can test
+/// without a machine that happens to have two gits on it is a rule that drifts.
+///
+/// **Only one verdict is reachable from here, and only in one direction.**
+/// [`Verdict::VersionSkew`] replaces a content difference; nothing else moves.
+/// The numerator cannot be reached at all: a case whose verdict is
+/// [`Verdict::Match`] has the port and the primary oracle agreeing on every
+/// surface [`oracle_diff`] reads, so the two comparisons below are the same
+/// comparison and [`AltFinding::PortTracksAlt`] is unreachable for it — which is
+/// what makes `--alt-git-every-case` safe to run over a passing corpus. The
+/// [`alt_speaks_to`] guard on the rewrite says the same thing structurally, so
+/// the property does not depend on that argument staying true.
+fn adjudicate(
+    verdict: Verdict,
+    compare_stderr: bool,
+    stock: &Compared<'_>,
+    zvcs: &Compared<'_>,
+    alt: &AltRun,
+) -> (Verdict, AltFinding, Option<OracleSurface>) {
+    // A killed second oracle proves nothing in either direction, exactly as a
+    // killed repeat does. Concluding "the gits agree" from it would corroborate a
+    // defect with a run that never finished; concluding "they disagree" would
+    // manufacture a version difference out of machine load.
+    if alt.timed_out {
+        return (verdict, AltFinding::Inconclusive, None);
+    }
+    let vs_primary =
+        oracle_diff(alt, stock.code, stock.stdout, stock.state, stock.stderr, compare_stderr);
+    let Some(surface) = vs_primary else {
+        return (verdict, AltFinding::GitsAgree, None);
+    };
+    let vs_port =
+        oracle_diff(alt, zvcs.code, zvcs.stdout, zvcs.state, zvcs.stderr, compare_stderr);
+    if vs_port.is_none() && alt_speaks_to(verdict) {
+        return (Verdict::VersionSkew, AltFinding::PortTracksAlt, Some(surface));
+    }
+    (verdict, AltFinding::GitsDisagree, Some(surface))
 }
 
 /// Whether a repeat run disagrees with the first run, and on which surface.
@@ -2754,6 +3200,18 @@ pub fn run_case(
                 zvcs_bin, case, templates, workdir, "zvcs-repeat", zvcs_exec, zvcs_bin, interop,
             )
         },
+        &mut || match crate::stock::alt_git() {
+            None => Ok(None),
+            Some((bin, version)) => alt_side(
+                bin,
+                version,
+                case,
+                templates,
+                workdir,
+                alt_exec_dir(bin, home),
+            )
+            .map(Some),
+        },
     )
 }
 
@@ -2773,6 +3231,13 @@ pub fn run_case(
 /// differs: a case re-runs one argv in a fresh copy, a step has to replay its
 /// whole prefix (see [`repeat_sequence_side`]). [`judge`] calls them only on a
 /// failure, so neither is paid for on the common path.
+///
+/// `alt_side_run` is a third closure for the same reason and with the same
+/// discipline: it answers "run this invocation against the second oracle", which
+/// for a step means replaying the prefix, and it returns `None` on a machine with
+/// only one git so this function never has to know how an oracle is resolved. It
+/// is called last, only for the verdicts [`alt_speaks_to`] admits, and only after
+/// [`judge`] has established the difference is reproducible.
 #[allow(clippy::too_many_arguments)]
 fn compare_in(
     case: &Case,
@@ -2782,6 +3247,7 @@ fn compare_in(
     home: &Path,
     stock_repeat: &mut dyn FnMut(bool) -> Result<Repeat>,
     zvcs_repeat: &mut dyn FnMut(bool) -> Result<Repeat>,
+    alt_side_run: &mut dyn FnMut() -> Result<Option<AltRun>>,
 ) -> Result<Outcome> {
     let (stock_repo, zvcs_repo) = (stock_repo.to_path_buf(), zvcs_repo.to_path_buf());
     // The gate for the interop dimension, taken before anything runs. Two `stat`
@@ -2842,27 +3308,66 @@ fn compare_in(
     // re-run in a fresh copy of the same shape and compared against its own first
     // answer; only a disagreement there reclassifies. Both repeats are lazy — the
     // closures are called by `judge` only when the case failed.
-    let (verdict, zvcs_repeat) = judge(
-        case.compare_stderr,
-        &Compared {
-            timed_out: stock.timed_out,
-            code: stock.code,
-            stdout: &stock_stdout,
-            stderr: &stock_stderr,
-            state: &stock_state_n,
-            interop: &stock_interop_n,
-        },
-        &Compared {
-            timed_out: zvcs.timed_out,
-            code: zvcs.code,
-            stdout: &zvcs_stdout,
-            stderr: &zvcs_stderr,
-            state: &zvcs_state_n,
-            interop: &zvcs_interop_n,
-        },
-        stock_repeat,
-        zvcs_repeat,
-    )?;
+    let stock_view = Compared {
+        timed_out: stock.timed_out,
+        code: stock.code,
+        stdout: &stock_stdout,
+        stderr: &stock_stderr,
+        state: &stock_state_n,
+        interop: &stock_interop_n,
+    };
+    let zvcs_view = Compared {
+        timed_out: zvcs.timed_out,
+        code: zvcs.code,
+        stdout: &zvcs_stdout,
+        stderr: &zvcs_stderr,
+        state: &zvcs_state_n,
+        interop: &zvcs_interop_n,
+    };
+    let (verdict, zvcs_repeat) =
+        judge(case.compare_stderr, &stock_view, &zvcs_view, stock_repeat, zvcs_repeat)?;
+
+    // The second oracle, asked last and only when it has something to say.
+    //
+    // After `judge` rather than inside it, and that ordering is the whole cost
+    // argument. `judge` has already established that the difference is
+    // reproducible on both sides — a case that turned out to be a flake never
+    // reaches here, so a loaded machine cannot buy a third invocation per flake,
+    // and a version difference can never be claimed about an answer neither
+    // binary produces twice.
+    //
+    // `alt_every_case` lifts the failure gate and nothing else: `alt_speaks_to`
+    // still decides which *verdicts* can be adjudicated, so an ungated run pays
+    // for matching cases (the ones it exists to examine) and still does not pay
+    // for crashes, hangs, gaps or unmeasurable cases.
+    let mut verdict = verdict;
+    let mut alt = None;
+    if alt_speaks_to(verdict) || (alt_every_case() && verdict.is_match()) {
+        if let Some(mut run) = alt_side_run()? {
+            let (mut v, mut finding, mut surface) =
+                adjudicate(verdict, case.compare_stderr, &stock_view, &zvcs_view, &run);
+            // A disagreement between two gits is corroborated before it is
+            // believed; see `alt_reproduced` for the `filter-branch` clock line
+            // that made this necessary. Paid for only when there is a
+            // disagreement to corroborate, which on this corpus is a handful of
+            // cases in five thousand.
+            if finding.gits_disagreed() {
+                let again = alt_side_run()?;
+                let stable = again
+                    .as_ref()
+                    .is_some_and(|a| alt_reproduced(&run, a, case.compare_stderr));
+                if !stable {
+                    v = verdict;
+                    finding = AltFinding::Inconclusive;
+                    surface = None;
+                }
+            }
+            run.finding = finding;
+            run.surface = surface;
+            verdict = v;
+            alt = Some(run);
+        }
+    }
 
     Ok(Outcome {
         case: case.clone(),
@@ -2880,6 +3385,7 @@ fn compare_in(
         zvcs_interop: zvcs_interop_n,
         interop_probed,
         zvcs_repeat,
+        alt,
     })
 }
 
@@ -2975,6 +3481,19 @@ pub fn run_sequence(
                     zvcs_bin, seq, index, templates, workdir, "zvcs-repeat", zvcs_exec, zvcs_bin,
                     interop,
                 )
+            },
+            &mut || match crate::stock::alt_git() {
+                None => Ok(None),
+                Some((bin, version)) => alt_sequence_side(
+                    bin,
+                    version,
+                    seq,
+                    index,
+                    templates,
+                    workdir,
+                    alt_exec_dir(bin, home),
+                )
+                .map(Some),
             },
         )?;
         if step_is_final(outcome.verdict, index, seq.steps.len()) {
@@ -3161,6 +3680,93 @@ fn repeat_side(
     })
 }
 
+/// Run one case against the **second** oracle, in a fresh copy of the same
+/// shape, and reduce it to the surfaces the three-way comparison reads.
+///
+/// A sibling of [`repeat_side`] and shaped like it on purpose — same fresh
+/// instantiation, same config installed from the same premise, same
+/// normalization against its own root — because the second oracle has to be
+/// asked *the identical question* the first two were asked. Any difference in
+/// how the repository is prepared shows up as a version difference that is
+/// really a harness difference, which is the one kind of finding this dimension
+/// must never produce: it would exculpate the port for free.
+///
+/// The post-state is probed the way every other side's is, which means it is read
+/// by the **primary** stock git (see [`probe_state`]). That is deliberate and not
+/// an oversight. The question here is *what did the second oracle write*, not
+/// *how does the second oracle read*; using one reader for all three sides keeps
+/// the digests comparable and stops a difference in the reader from being
+/// reported as a difference in the writer.
+///
+/// `finding` and `surface` are left for [`adjudicate`], the only place holding
+/// all three answers.
+fn alt_side(
+    bin: &Path,
+    version: (u32, u32, u32),
+    case: &Case,
+    templates: &Templates,
+    workdir: &Path,
+    exec_dir: &Path,
+) -> Result<AltRun> {
+    let repo = workdir.join("alt");
+    let _ = std::fs::remove_dir_all(&repo);
+    templates.instantiate(case.shape, &repo)?;
+    install_config(&repo, &case.config)?;
+    let home = &templates.home;
+    let run = run_side(bin, &repo, home, case)?;
+    Ok(AltRun {
+        version,
+        timed_out: run.timed_out,
+        code: run.code,
+        stdout: normalize(&run.stdout, &repo, home, exec_dir),
+        stderr: normalize(&run.stderr, &repo, home, exec_dir),
+        state: normalize(probe_state(&repo, home).as_bytes(), &repo, home, exec_dir),
+        finding: AltFinding::Inconclusive,
+        surface: None,
+    })
+}
+
+/// Run a sequence's first `index + 1` steps against the second oracle and report
+/// what the last of them produced.
+///
+/// The prefix is replayed for the reason [`repeat_sequence_side`] replays it: a
+/// step's answer is a function of the state the steps before it built, and asking
+/// the second oracle to run `cherry-pick --continue` in a pristine copy would
+/// have it answer "no cherry-pick in progress" — a difference from both other
+/// sides that says nothing about either git's behaviour and would be filed as a
+/// version difference.
+fn alt_sequence_side(
+    bin: &Path,
+    version: (u32, u32, u32),
+    seq: &Sequence,
+    index: usize,
+    templates: &Templates,
+    workdir: &Path,
+    exec_dir: &Path,
+) -> Result<AltRun> {
+    let repo = workdir.join("alt");
+    let _ = std::fs::remove_dir_all(&repo);
+    templates.instantiate(seq.envelope.shape, &repo)?;
+    install_config(&repo, &seq.envelope.config)?;
+    let home = &templates.home;
+
+    let mut run = None;
+    for i in 0..=index {
+        run = Some(run_side(bin, &repo, home, &seq.step_case(i))?);
+    }
+    let run = run.expect("the loop runs at least once");
+    Ok(AltRun {
+        version,
+        timed_out: run.timed_out,
+        code: run.code,
+        stdout: normalize(&run.stdout, &repo, home, exec_dir),
+        stderr: normalize(&run.stderr, &repo, home, exec_dir),
+        state: normalize(probe_state(&repo, home).as_bytes(), &repo, home, exec_dir),
+        finding: AltFinding::Inconclusive,
+        surface: None,
+    })
+}
+
 /// Locate the zvcs `git` binary. Explicit override wins; otherwise the usual
 /// cargo output paths, debug first to match the project's local-dev rule.
 pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
@@ -3186,9 +3792,11 @@ pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        case_timeout, classify, config_premise, git_dir, interop_disagreement, is_unsupported,
-        judge, probe_op_state, quote_config_value, render_config_entry, repeat_disagreement,
-        scope_file, split_config_key, step_is_final, Case, Compared, ConfigEntry, ConfigScope,
+        adjudicate, alt_reproduced, alt_speaks_to, case_timeout, classify, config_premise, git_dir,
+        interop_disagreement, is_unsupported, judge, oracle_diff, probe_op_state,
+        quote_config_value, render_config_entry, repeat_disagreement,
+        scope_file, split_config_key, step_is_final, AltFinding, AltRun, Case, Compared,
+        ConfigEntry, ConfigScope, OracleSurface,
         Outcome, Repeat,
         Sequence, StepRef, Surface, Verdict, CASE_TIMEOUT, OP_STATE_DIRS, OP_STATE_FILES,
     };
@@ -3406,6 +4014,325 @@ mod tests {
         .unwrap();
         assert_eq!(v, Verdict::Match);
         assert!(r.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // The second oracle
+    // -----------------------------------------------------------------------
+
+    /// A second oracle's answer. Version is the older git this machine has, so
+    /// the assertions below read the way a real finding would.
+    fn alt(code: i32, stdout: &str, state: &str) -> AltRun {
+        AltRun {
+            version: (2, 50, 1),
+            timed_out: false,
+            code: Some(code),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            state: state.to_string(),
+            // Both are what `adjudicate` fills in; a fixture that pre-filled
+            // them could pass a test by agreeing with itself.
+            finding: AltFinding::Inconclusive,
+            surface: None,
+        }
+    }
+
+    /// A second oracle the harness killed.
+    fn killed_alt() -> AltRun {
+        AltRun { timed_out: true, code: None, stdout: "half".into(), ..alt(0, "", "") }
+    }
+
+    /// Two independent git releases giving the same answer is the strongest
+    /// statement this harness can make about a defect, and it must not change the
+    /// verdict the case already earned — corroboration is a fact about the
+    /// finding, not a different finding.
+    #[test]
+    fn two_gits_that_agree_corroborate_the_defect_and_move_nothing() {
+        let (v, finding, surface) = adjudicate(
+            Verdict::StdoutDiff,
+            false,
+            &side(0, "git\n", "S"),
+            &side(0, "port\n", "S"),
+            &alt(0, "git\n", "S"),
+        );
+        assert_eq!(v, Verdict::StdoutDiff);
+        assert_eq!(finding, AltFinding::GitsAgree);
+        // Nothing to name: there is no surface on which the two gits differ.
+        assert_eq!(surface, None);
+    }
+
+    /// The finding the whole dimension exists for: the two gits disagree and the
+    /// port reproduces the second one. That is not a wrong answer, it is an
+    /// *older git's* answer, and it gets a verdict of its own so nobody spends an
+    /// afternoon making code match a behaviour upstream changed on purpose.
+    ///
+    /// Checked on every surface the two oracles are compared on, because a
+    /// version difference in an exit code is as real as one in stdout and a rule
+    /// that only fired for stdout would file the others as defects.
+    #[test]
+    fn a_port_that_reproduces_the_other_git_is_a_version_difference() {
+        // stdout
+        let (v, finding, surface) = adjudicate(
+            Verdict::StdoutDiff,
+            false,
+            &side(0, "new\n", "S"),
+            &side(0, "old\n", "S"),
+            &alt(0, "old\n", "S"),
+        );
+        assert_eq!(v, Verdict::VersionSkew);
+        assert_eq!(finding, AltFinding::PortTracksAlt);
+        assert_eq!(surface, Some(OracleSurface::Stdout));
+
+        // exit code
+        let (v, _, surface) = adjudicate(
+            Verdict::ExitDiff,
+            false,
+            &side(0, "same\n", "S"),
+            &side(1, "same\n", "S"),
+            &alt(1, "same\n", "S"),
+        );
+        assert_eq!(v, Verdict::VersionSkew);
+        assert_eq!(surface, Some(OracleSurface::Exit));
+
+        // post-state
+        let (v, _, surface) = adjudicate(
+            Verdict::StateDiff,
+            false,
+            &side(0, "same\n", "new-state"),
+            &side(0, "same\n", "old-state"),
+            &alt(0, "same\n", "old-state"),
+        );
+        assert_eq!(v, Verdict::VersionSkew);
+        assert_eq!(surface, Some(OracleSurface::State));
+    }
+
+    /// Two gits disagreeing does **not** excuse a port that matches neither.
+    ///
+    /// No choice of target version makes such a case a pass, so the verdict it
+    /// earned stands. The disagreement is still reported — it says the expected
+    /// value here is version-dependent, which is exactly the shape of a curated
+    /// expectation captured against the wrong git — but "the oracles differ" is
+    /// not on its own a reason to stop counting a difference.
+    #[test]
+    fn a_disagreement_between_gits_does_not_excuse_a_port_that_matches_neither() {
+        let (v, finding, surface) = adjudicate(
+            Verdict::StdoutDiff,
+            false,
+            &side(0, "new\n", "S"),
+            &side(0, "port\n", "S"),
+            &alt(0, "old\n", "S"),
+        );
+        assert_eq!(v, Verdict::StdoutDiff);
+        assert_eq!(finding, AltFinding::GitsDisagree);
+        assert_eq!(surface, Some(OracleSurface::Stdout));
+        assert!(finding.gits_disagreed(), "it still belongs in the disagreement listing");
+    }
+
+    /// A killed second oracle proves nothing in either direction, exactly as a
+    /// killed repeat does.
+    ///
+    /// Its partial stdout differs from a complete run's every time. Read as
+    /// agreement it would corroborate a defect with a run that never finished;
+    /// read as disagreement it would manufacture a version difference out of
+    /// machine load — and that one is the dangerous direction, because it flatters.
+    #[test]
+    fn a_second_oracle_that_timed_out_concludes_nothing() {
+        let (v, finding, surface) = adjudicate(
+            Verdict::StdoutDiff,
+            false,
+            &side(0, "git\n", "S"),
+            &side(0, "port\n", "S"),
+            &killed_alt(),
+        );
+        assert_eq!(v, Verdict::StdoutDiff);
+        assert_eq!(finding, AltFinding::Inconclusive);
+        assert_eq!(surface, None);
+        assert!(!finding.gits_disagreed());
+    }
+
+    /// The property the module header claims: **the second oracle can never move
+    /// the parity number.** It may move a case from one failure bucket to
+    /// another; it may not put one into the numerator or take one out of the
+    /// denominator.
+    ///
+    /// Two independent reasons, and both are checked because either alone would
+    /// be a coincidence somebody could break. First, a matching case has the port
+    /// and the primary oracle agreeing on every surface `oracle_diff` reads, so
+    /// "the port matches the second oracle" and "the two gits agree" are the same
+    /// comparison and `PortTracksAlt` is unreachable. Second, `alt_speaks_to`
+    /// gates the rewrite, so even an impossible input cannot produce it.
+    #[test]
+    fn the_second_oracle_cannot_move_the_parity_number() {
+        // A passing case the older git would have answered differently: reported,
+        // never rescored. This is what `--alt-git-every-case` exists to find.
+        let (v, finding, surface) = adjudicate(
+            Verdict::Match,
+            false,
+            &side(0, "new\n", "S"),
+            &side(0, "new\n", "S"),
+            &alt(0, "old\n", "S"),
+        );
+        assert_eq!(v, Verdict::Match);
+        assert_eq!(finding, AltFinding::GitsDisagree);
+        assert_eq!(surface, Some(OracleSurface::Stdout));
+
+        // The structural guard, exercised with an input the runner cannot
+        // produce: port and second oracle identical while the verdict says
+        // `Match`. The rewrite still does not fire, so the property does not
+        // depend on the argument above staying true.
+        let (v, _, _) = adjudicate(
+            Verdict::Match,
+            false,
+            &side(0, "new\n", "S"),
+            &side(0, "old\n", "S"),
+            &alt(0, "old\n", "S"),
+        );
+        assert_eq!(v, Verdict::Match);
+
+        // And no verdict outside the content differences may be rewritten, so a
+        // crash, a hang or a gap can never be reclassified as a version
+        // difference by a second git that happens to match the port.
+        for unrewritable in [
+            Verdict::Unsupported,
+            Verdict::Crash,
+            Verdict::Hang,
+            Verdict::InteropDiff,
+            Verdict::ZvcsNondeterministic,
+            Verdict::Nondeterministic,
+            Verdict::StockTimeout,
+        ] {
+            let (v, _, _) = adjudicate(
+                unrewritable,
+                false,
+                &side(0, "new\n", "S"),
+                &side(0, "old\n", "S"),
+                &alt(0, "old\n", "S"),
+            );
+            assert_eq!(v, unrewritable, "{}", unrewritable.label());
+        }
+    }
+
+    /// A disagreement the second oracle will not reproduce is not a version
+    /// difference, and this is the rule that says so.
+    ///
+    /// Not hypothetical, and not a corner: the first version of this dimension
+    /// filed `filter-branch -f --tree-filter true HEAD` as a `VERSION-SKEW`
+    /// between 2.55.0 and 2.50.1. The two gits had printed
+    /// `(0 seconds passed, remaining 0 predicted)` and
+    /// `(1 seconds passed, remaining 1 predicted)` from the wall clock, and the
+    /// port happened to land on the second. Nothing about git's behaviour changed
+    /// between those releases; the machine was busy. The values below are that
+    /// case's, verbatim.
+    #[test]
+    fn a_disagreement_the_second_oracle_will_not_reproduce_is_not_a_version_difference() {
+        let first = alt(0, "Rewrite abc (1/2) (1 seconds passed, remaining 1 predicted)\n", "S");
+        let again = alt(0, "Rewrite abc (1/2) (0 seconds passed, remaining 0 predicted)\n", "S");
+        assert!(!alt_reproduced(&first, &again, false));
+
+        // The same answer twice is corroboration, and the finding stands.
+        assert!(alt_reproduced(&first, &first.clone(), false));
+    }
+
+    /// A repeat of the second oracle that timed out proves nothing, so it may not
+    /// dissolve a disagreement either.
+    ///
+    /// The symmetric error to the one above, and the more dangerous direction is
+    /// this one: if a killed repeat counted as "did not reproduce", a loaded
+    /// machine could erase a real version difference and hand the case back as an
+    /// ordinary port defect. Same rule as `repeat_disagreement`.
+    #[test]
+    fn a_second_oracle_repeat_that_timed_out_may_not_dissolve_a_disagreement() {
+        let first = alt(0, "old\n", "S");
+        assert!(alt_reproduced(&first, &killed_alt(), false));
+    }
+
+    /// The corroborating run compares the same surfaces the two oracles are
+    /// compared on, stderr included only for a case that opted in — so a
+    /// disagreement found on stderr is corroborated on stderr, and a case that
+    /// never compares prose is not asked to reproduce it.
+    #[test]
+    fn the_corroborating_run_compares_what_the_oracles_were_compared_on() {
+        let first = AltRun { stderr: "one".into(), ..alt(0, "same\n", "S") };
+        let again = AltRun { stderr: "two".into(), ..alt(0, "same\n", "S") };
+        assert!(!alt_reproduced(&first, &again, true));
+        assert!(alt_reproduced(&first, &again, false));
+    }
+
+    /// Which verdicts a second git is asked about at all.
+    ///
+    /// The `match` is exhaustive so a new verdict cannot be added without a
+    /// decision being made here: the default of "ask about it" would spend an
+    /// invocation per case on a question the second oracle has no answer for, and
+    /// the default of "do not" would silently shrink the dimension.
+    #[test]
+    fn only_a_content_difference_is_worth_a_second_opinion() {
+        let every = [
+            Verdict::Match,
+            Verdict::Unsupported,
+            Verdict::StdoutDiff,
+            Verdict::ExitDiff,
+            Verdict::StateDiff,
+            Verdict::InteropDiff,
+            Verdict::StderrDiff,
+            Verdict::Crash,
+            Verdict::Hang,
+            Verdict::ZvcsNondeterministic,
+            Verdict::VersionSkew,
+            Verdict::Nondeterministic,
+            Verdict::StockTimeout,
+        ];
+        for v in every {
+            let want = match v {
+                Verdict::StdoutDiff
+                | Verdict::ExitDiff
+                | Verdict::StateDiff
+                | Verdict::StderrDiff => true,
+                Verdict::Match
+                | Verdict::Unsupported
+                | Verdict::InteropDiff
+                | Verdict::Crash
+                | Verdict::Hang
+                | Verdict::ZvcsNondeterministic
+                | Verdict::VersionSkew
+                | Verdict::Nondeterministic
+                | Verdict::StockTimeout => false,
+            };
+            assert_eq!(alt_speaks_to(v), want, "{}", v.label());
+        }
+    }
+
+    /// The two oracles are compared in `classify`'s own precedence order, and
+    /// stderr participates only for a case that opted into it.
+    ///
+    /// Both halves matter. The order is what lets a reader read "the two gits
+    /// differ on their exit code" beside a verdict of `exit-diff` without holding
+    /// two rules in their head. The stderr gate is this crate's standing policy:
+    /// error prose is not a compatibility surface, and two gits phrasing one
+    /// message differently is not a version difference anybody wants listed.
+    #[test]
+    fn the_two_gits_are_compared_in_the_classifier_s_own_order() {
+        // Everything differs at once: the exit code is named, being first.
+        let a = AltRun { stderr: "alt-msg".into(), ..alt(1, "alt\n", "alt-state") };
+        assert_eq!(
+            oracle_diff(&a, Some(0), "primary\n", "primary-state", "primary-msg", true),
+            Some(OracleSurface::Exit)
+        );
+        // Same code: stdout is next.
+        assert_eq!(
+            oracle_diff(&a, Some(1), "primary\n", "primary-state", "primary-msg", true),
+            Some(OracleSurface::Stdout)
+        );
+        // Same code and stdout: the post-state.
+        assert_eq!(
+            oracle_diff(&a, Some(1), "alt\n", "primary-state", "primary-msg", true),
+            Some(OracleSurface::State)
+        );
+        // Only the message left, and it counts only when the case opted in.
+        assert_eq!(
+            oracle_diff(&a, Some(1), "alt\n", "alt-state", "primary-msg", true),
+            Some(OracleSurface::Stderr)
+        );
+        assert_eq!(oracle_diff(&a, Some(1), "alt\n", "alt-state", "primary-msg", false), None);
     }
 
     // -----------------------------------------------------------------------
@@ -4297,6 +5224,7 @@ mod tests {
             zvcs_interop: String::new(),
             interop_probed: false,
             zvcs_repeat: None,
+            alt: None,
         };
         assert_eq!(plain.id(), "dirty::status::status");
 

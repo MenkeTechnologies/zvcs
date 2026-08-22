@@ -201,6 +201,8 @@ cargo run -p zvcs-parity                 # curated corpus
 cargo run -p zvcs-parity -- --fuzz 12    # plus generated flag combinations and workflows
 cargo run -p zvcs-parity -- --fuzz 12 --fuzz-sequences 0   # flag combinations only
 cargo run -p zvcs-parity -- --fuzz 12 --list-cases         # print what that run would execute
+cargo run -p zvcs-parity -- --alt-git /usr/bin/git         # name the second oracle
+cargo run -p zvcs-parity -- --alt-git-every-case           # ask it about passing cases too
 ```
 
 It builds fixture repositories with stock git, runs each invocation against both
@@ -283,6 +285,40 @@ newest of the rest wins. One older than the version this port targets is refused
 outright rather than measured against: the two disagree about real behaviour, so
 its numbers would read like the others while describing a git nobody runs. Name a
 specific binary with `ZVCS_STOCK_GIT` to override the search.
+
+Measuring against one git leaves a question it cannot answer. When zvcs differs
+from the newest installed git, either the port is wrong or *git* changed between
+releases and the port reproduces the older behaviour — and both read as the same
+`stdout-diff` with the same diff attached, so one of them costs an afternoon
+spent matching a behaviour upstream moved on purpose. So when a **second** real
+git is installed, a failing case is run against it too and the three answers are
+classified together: the two gits agreeing is a port defect corroborated by two
+independent releases; the two gits disagreeing while zvcs reproduces the second
+one is a version difference, reported as `version-skew` in its own column; the
+two gits disagreeing while zvcs matches neither keeps the verdict it earned,
+because no choice of target version makes that case right. A second oracle killed
+by the case timeout concludes nothing in either direction. Every case where the
+two gits answered differently is listed by name, which is a useful artifact on its
+own: it is the set of behaviours where "parity" has no single answer, and
+therefore the set of curated expectations that may be pinned to the wrong side of
+a git release.
+
+A version difference is **counted as a failure and stays inside the parity
+denominator**, and the report prints the forgiving number on a line of its own
+rather than folding it into the headline. Excluding those cases would be an
+exclusion the binary under test can trigger — the condition is "the gits disagree
+*and* zvcs reproduces the older one", and the second half is zvcs's own output, so
+a port that reproduced the older git on its hardest cases would shrink its own
+denominator. The parity percentage is therefore bit-identical with and without a
+second oracle: the dimension can move a case from one failure bucket to another
+and can never move one into or out of the numerator. Cost is one extra invocation
+on a case that already failed and nothing at all on one that matched, and each run
+prints how many cases it paid for. The second git is discovered automatically
+(the newest installed git of a *different* version than the primary oracle);
+`--alt-git <path>` or `ZVCS_STOCK_GIT_ALT` names one, `--no-alt-git` or
+`ZVCS_STOCK_GIT_ALT=none` switches it off, and a machine with one git behaves
+exactly as it did before the dimension existed — no third invocation, no new
+report line, no new column.
 
 ## [0x04] THE SUPERSET VERBS
 

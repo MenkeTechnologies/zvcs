@@ -678,6 +678,22 @@ Ergonomics: one command from the meta root replaces `git worktree add` for the
 parent plus one per submodule; the agent is launched in its private tree and
 works normally across submodules with zero cross-agent collisions.
 
+**`remove` deletes only what it can prove it wrote.** Tearing a worktree down
+means deleting each repository's `<gitdir>/worktrees/<name>/`, and the only thing
+naming that directory is the worktree's own `.git` pointer file — plain text in a
+directory an agent has write access to. So `remove` treats the pointer as a claim,
+not an instruction: it deletes a directory outside the worktree only when the
+round trip `add` created still closes (`<wt>/.git` names `<M>`, and `<M>/gitdir`
+names `<wt>/.git` back), the path ends in `worktrees/<name>`, and `<M>` is a real
+directory with a `commondir` beside it. Anything else — an unreadable or malformed
+`.git`, a relative or absolute target leading elsewhere, a symlink standing in for
+the metadata directory, a missing pointer — is refused by name on stderr, left on
+disk, and exits non-zero. A pointer resolving *inside* the tree (a nested clone an
+agent made in its own worktree) needs no separate deletion and is not refused. The
+same applies to the deletions themselves: a `remove_dir_all` that fails is
+reported rather than discarded, so `remove` cannot report success over metadata it
+left behind.
+
 ## 14. The parallel fleet layer (`parallel_map` + `[selectors]`)
 
 The many-repo half of the design. Every repo in the machine-wide index

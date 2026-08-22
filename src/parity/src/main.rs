@@ -19,6 +19,17 @@
 //!   zvcs-parity --verbose            # print every failure in detail
 //!   zvcs-parity --bin path/to/git    # explicit binary under test
 //!   zvcs-parity --html docs/port_report.html   # regenerate the HTML report
+//!   zvcs-parity --alt-git /usr/bin/git         # name the second oracle
+//!   zvcs-parity --no-alt-git                   # one oracle, as it always was
+//!   zvcs-parity --alt-git-every-case           # ask the second oracle about
+//!                                              #   passing cases too
+//!
+//! A machine with two real gits gets the second oracle without being asked: a
+//! difference against the newest git is otherwise reported identically whether
+//! the port is wrong or whether git changed between the two releases, and an
+//! opt-in flag is one nobody remembers on the run that would have needed it. It
+//! costs nothing on a case that matched — see `runner`'s header for the gate, the
+//! classification and what it does to the denominator.
 
 mod corpus;
 mod env;
@@ -67,6 +78,32 @@ struct Args {
     /// that a sampled dimension fires at all. Costs nothing: generation is pure,
     /// so no fixture is built and no child process is spawned.
     list_cases: bool,
+    /// `--alt-git <path>` / `--no-alt-git`: which second git to measure against,
+    /// or none.
+    ///
+    /// Defaults to [`stock::AltChoice::Auto`] — the newest *other* real git the
+    /// machine has — rather than to off, because a dimension that has to be
+    /// switched on is one nobody switches on for the run that needed it, and this
+    /// one exists precisely to answer a question a reader does not know they have
+    /// until a case fails. `--no-alt-git` and `ZVCS_STOCK_GIT_ALT=none` are the
+    /// escape hatches, and a machine with one git never had a choice to make.
+    alt_git: stock::AltChoice,
+    /// `--alt-git-every-case`: lift the failure gate on the second oracle.
+    ///
+    /// The gated default asks the second oracle only about cases that already
+    /// failed, which is where the port-defect-or-version-difference question is
+    /// asked and costs nothing on the ~99% that pass. It has one blind spot, and
+    /// this flag is what buys it: a case where the port matches the newest git
+    /// and the older git would have said something else never fails, so it is
+    /// never adjudicated — yet it is exactly the case whose *expected value* is
+    /// version-dependent, and therefore exactly the case where a curated
+    /// expectation might be pinned to the wrong git. Off by default because it
+    /// costs one extra invocation on every case in the corpus — and rather more
+    /// than that on a sequence, where the second oracle has to replay the prefix
+    /// to reach step *k* (see `runner::alt_sequence_side`), so a seven-step
+    /// workflow costs 1+2+…+7 = 28 invocations instead of 7. Gated, only the step
+    /// that diverged pays, and only once.
+    alt_git_every_case: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -82,6 +119,8 @@ fn parse_args() -> Result<Args> {
         shrink: false,
         html: None,
         list_cases: false,
+        alt_git: stock::AltChoice::Auto,
+        alt_git_every_case: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -129,6 +168,18 @@ fn parse_args() -> Result<Args> {
             }
             "--list-cases" => {
                 a.list_cases = true;
+                i += 1;
+            }
+            "--alt-git" => {
+                a.alt_git = stock::AltChoice::Named(next(i)?.into());
+                i += 2;
+            }
+            "--no-alt-git" => {
+                a.alt_git = stock::AltChoice::Off;
+                i += 1;
+            }
+            "--alt-git-every-case" => {
+                a.alt_git_every_case = true;
                 i += 1;
             }
             other => anyhow::bail!("unknown argument {other:?}"),
@@ -189,6 +240,15 @@ fn real_main() -> Result<ExitCode> {
         return list_cases(&args);
     }
     let zvcs_bin = runner::locate_zvcs_bin(args.bin.as_deref())?;
+
+    // Both second-oracle knobs are fixed here, before a fixture exists or a
+    // worker starts, and never touched again. The resolution behind them is
+    // memoized and read from every worker thread, so a knob that could still
+    // move once cases were running would mean two cases in one report had been
+    // measured against different oracles — a report whose own premise varies
+    // down its length is worse than one that never asked.
+    stock::set_alt_choice(args.alt_git.clone());
+    runner::set_alt_every_case(args.alt_git_every_case);
 
     // Everything lands under one root so a run leaves nothing behind.
     let root = std::env::temp_dir().join(format!("zvcs-parity-{}", std::process::id()));
@@ -319,7 +379,12 @@ fn real_main() -> Result<ExitCode> {
     let have = report::dispatched(&zvcs_bin, &templates.home, &stock, &probe_dir);
     let missing: Vec<String> = stock.iter().filter(|c| !have.contains(c)).cloned().collect();
 
-    let rep = report::tally(outcomes);
+    // The second oracle's identity travels into the tally rather than being
+    // looked up while printing, so a run that resolved one and never needed it
+    // still says so. "Configured and asked about nothing" and "not present at
+    // all" are different facts, and only the second may print nothing.
+    let alt_oracle = stock::alt_git().map(|(p, v)| (p.to_path_buf(), v));
+    let rep = report::tally(outcomes, alt_oracle, args.alt_git_every_case);
     rep.print((have.len(), stock.len()), &missing, args.verbose);
 
     // `--html <path>`: regenerate the HTML port report from THIS run's real

@@ -11,12 +11,12 @@
 //! together and `Unsupported` counts as a failure rather than a skip.
 
 use crate::env;
-use crate::runner::{config_premise, Outcome, Surface, Verdict};
+use crate::runner::{config_premise, AltFinding, OracleSurface, Outcome, Surface, Verdict};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -101,6 +101,19 @@ pub struct Tally {
     /// to be able to tell them apart at a glance; folding a flake into a content
     /// bucket is how two non-bugs came to be filed as defects.
     pub zvcs_nondeterministic: usize,
+    /// Cases where the two stock gits disagree with each other and zvcs
+    /// reproduces the **second** one — the git the report is not measured
+    /// against. Only ever non-zero on a run that had a second oracle.
+    ///
+    /// Inside the denominator, counted as a failure — see
+    /// [`Verdict::VersionSkew`] for the argument, which is
+    /// `zvcs_nondeterministic`'s argument: the condition is one the binary under
+    /// test can trigger, and an exclusion a port can trigger pays a port for
+    /// triggering it. Its own field because "the port is wrong" and "the port is
+    /// right about a different release" are different findings, and a reader who
+    /// cannot tell them apart will spend an afternoon making code match a
+    /// behaviour upstream changed on purpose.
+    pub version_skew: usize,
 }
 
 impl Tally {
@@ -132,6 +145,7 @@ impl Tally {
             + self.crash
             + self.hang
             + self.zvcs_nondeterministic
+            + self.version_skew
     }
 
     fn record(&mut self, v: Verdict) {
@@ -146,6 +160,7 @@ impl Tally {
             Verdict::Crash => self.crash += 1,
             Verdict::Hang => self.hang += 1,
             Verdict::ZvcsNondeterministic => self.zvcs_nondeterministic += 1,
+            Verdict::VersionSkew => self.version_skew += 1,
             Verdict::Nondeterministic => self.nondeterministic += 1,
             Verdict::StockTimeout => self.stock_timeout += 1,
         }
@@ -174,24 +189,174 @@ pub struct Report {
     /// entry is added. So every run prints its own.
     pub interop_probed: usize,
     pub interop_total: usize,
+    /// What the second oracle cost and found, or `None` on a machine with one
+    /// git — in which case nothing about this report differs from what it was
+    /// before the dimension existed. See [`AltSummary`].
+    pub alt: Option<AltSummary>,
 }
 
-pub fn tally(outcomes: Vec<Outcome>) -> Report {
+/// One case on which the two stock gits gave different answers.
+///
+/// Kept for *every* such case, including the ones the port passed, because this
+/// list is the dimension's most useful output on its own: it is the set of
+/// behaviours where "parity" has no single answer, and therefore the set of
+/// curated expectations that may be pinned to the wrong side of a git release. A
+/// count alone would not let anybody check that — an unnamed number reads as
+/// housekeeping, which is precisely what a version difference must never look
+/// like.
+pub struct OracleDisagreement {
+    pub id: String,
+    pub verdict: Verdict,
+    pub finding: AltFinding,
+    /// The first surface the two gits differed on, in `classify`'s own precedence
+    /// order.
+    pub surface: OracleSurface,
+    /// What each of the three binaries produced on that surface. Rendered here,
+    /// where the outcome is still in hand, rather than re-derived at print time
+    /// from a verdict that might have been about a different surface.
+    pub primary: String,
+    pub alt: String,
+    pub port: String,
+}
+
+/// What the second oracle cost this run, and what it concluded.
+///
+/// Every field is measured rather than estimated, for the reason the interop
+/// counters are: the cost argument for the dimension is that it fires on the
+/// small minority of cases that fail, and an argument about a minority that
+/// nothing counts is one nobody can check. A percentage written into a comment
+/// goes stale the first time a corpus entry is added, so every run prints its own.
+pub struct AltSummary {
+    pub path: PathBuf,
+    pub version: (u32, u32, u32),
+    /// Cases that actually paid for a third invocation.
+    pub asked: usize,
+    /// Cases run, so `asked/total` is the price of the dimension.
+    pub total: usize,
+    /// `--alt-git-every-case`: the failure gate was lifted.
+    pub every_case: bool,
+    /// All three binaries gave the same answer. Only reachable under
+    /// `--alt-git-every-case`, where matching cases are adjudicated too.
+    pub all_three_agree: usize,
+    /// The two gits agreed and the port did not — a port defect corroborated by
+    /// two independent releases, the strongest statement this harness makes.
+    ///
+    /// Counted apart from `all_three_agree` though both are "the gits agree",
+    /// because the two say opposite things about the port and one number covering
+    /// both would read as whichever the reader expected. An ungated run over a
+    /// passing corpus produces thousands of the first and none of the second;
+    /// printing their sum beside the words "the port gave another answer" would
+    /// have been a false claim on every one of them.
+    pub corroborated: usize,
+    /// The two gits disagreed and the port reproduced the second one:
+    /// [`Verdict::VersionSkew`].
+    pub port_tracks_alt: usize,
+    /// The two gits disagreed and the port reproduced neither.
+    pub gits_disagree: usize,
+    pub inconclusive: usize,
+    pub disagreements: Vec<OracleDisagreement>,
+}
+
+/// What one binary produced on the surface two oracles differed on.
+///
+/// The exit code is rendered the way the failure block already renders it
+/// (`Some(1)`), so a reader moving between the two sections is not asked to
+/// learn a second notation for the same fact.
+fn surface_value(
+    surface: OracleSurface,
+    code: Option<i32>,
+    stdout: &str,
+    state: &str,
+    stderr: &str,
+) -> String {
+    match surface {
+        OracleSurface::Exit => format!("{code:?}"),
+        OracleSurface::Stdout => stdout.to_string(),
+        OracleSurface::State => state.to_string(),
+        OracleSurface::Stderr => stderr.to_string(),
+    }
+}
+
+pub fn tally(
+    outcomes: Vec<Outcome>,
+    alt_oracle: Option<(PathBuf, (u32, u32, u32))>,
+    alt_every_case: bool,
+) -> Report {
     let mut by_cmd: BTreeMap<String, Tally> = BTreeMap::new();
     let mut overall = Tally::default();
     let mut failures = Vec::new();
     let mut interop_probed = 0;
     let mut interop_total = 0;
+    let mut alt = alt_oracle.map(|(path, version)| AltSummary {
+        path,
+        version,
+        asked: 0,
+        total: 0,
+        every_case: alt_every_case,
+        all_three_agree: 0,
+        corroborated: 0,
+        port_tracks_alt: 0,
+        gits_disagree: 0,
+        inconclusive: 0,
+        disagreements: Vec::new(),
+    });
     for o in outcomes {
         by_cmd.entry(o.case.cmd.to_string()).or_default().record(o.verdict);
         overall.record(o.verdict);
         interop_total += 1;
         interop_probed += usize::from(o.interop_probed);
+        if let Some(a) = alt.as_mut() {
+            a.total += 1;
+            if let Some(run) = &o.alt {
+                a.asked += 1;
+                match run.finding {
+                    // Split on what the *port* did, which is the only thing that
+                    // distinguishes the two: "both gits and the port agree" is a
+                    // pass, "both gits agree and the port does not" is the
+                    // strongest defect signal here, and they are the same finding
+                    // from the oracles' point of view.
+                    AltFinding::GitsAgree if o.verdict.is_match() => a.all_three_agree += 1,
+                    AltFinding::GitsAgree => a.corroborated += 1,
+                    AltFinding::PortTracksAlt => a.port_tracks_alt += 1,
+                    AltFinding::GitsDisagree => a.gits_disagree += 1,
+                    AltFinding::Inconclusive => a.inconclusive += 1,
+                }
+                if let (true, Some(surface)) = (run.finding.gits_disagreed(), run.surface) {
+                    a.disagreements.push(OracleDisagreement {
+                        id: o.id(),
+                        verdict: o.verdict,
+                        finding: run.finding,
+                        surface,
+                        primary: surface_value(
+                            surface,
+                            o.stock_code,
+                            &o.stock_stdout,
+                            &o.stock_state,
+                            &o.stock_stderr,
+                        ),
+                        alt: surface_value(
+                            surface,
+                            run.code,
+                            &run.stdout,
+                            &run.state,
+                            &run.stderr,
+                        ),
+                        port: surface_value(
+                            surface,
+                            o.zvcs_code,
+                            &o.zvcs_stdout,
+                            &o.zvcs_state,
+                            &o.zvcs_stderr,
+                        ),
+                    });
+                }
+            }
+        }
         if !o.verdict.is_match() {
             failures.push(o);
         }
     }
-    Report { by_cmd, overall, failures, interop_probed, interop_total }
+    Report { by_cmd, overall, failures, interop_probed, interop_total, alt }
 }
 
 /// Render a percentage that never rounds up to a milestone it has not reached.
@@ -294,15 +459,31 @@ impl Report {
                 self.overall.stock_timeout
             );
         }
+        self.print_alt_summary();
 
         println!("\n--- per subcommand ---");
-        println!("{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7} {:>6} {:>7}", "cmd", "total", "match", "unsupp", "out", "exit", "state", "interop", "flaky", "parity");
+        // The version-skew column exists only on a run that had a second oracle.
+        // A column that is structurally always zero reads as a clean bill of
+        // health on a question nobody asked, and a one-git machine's report has
+        // to stay byte-identical to what it was before this dimension existed —
+        // that is the promise `stock::alt_git` returning `None` makes.
+        let vskew = self.alt.is_some();
+        println!(
+            "{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7} {:>6}{} {:>7}",
+            "cmd", "total", "match", "unsupp", "out", "exit", "state", "interop", "flaky",
+            if vskew { format!("{:>7}", "vskew") } else { String::new() },
+            "parity"
+        );
         for (cmd, t) in &self.by_cmd {
             println!(
-                "{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7} {:>6} {:>6.1}%",
-                cmd, t.scored(), t.matched, t.unsupported, t.stdout_diff, t.exit_diff, t.state_diff, t.interop_diff, t.zvcs_nondeterministic, t.pct()
+                "{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7} {:>6}{} {:>6.1}%",
+                cmd, t.scored(), t.matched, t.unsupported, t.stdout_diff, t.exit_diff, t.state_diff, t.interop_diff, t.zvcs_nondeterministic,
+                if vskew { format!("{:>7}", t.version_skew) } else { String::new() },
+                t.pct()
             );
         }
+
+        self.print_oracle_disagreements(verbose);
 
         if !missing.is_empty() {
             println!("\n--- not dispatched ({}) ---", missing.len());
@@ -469,6 +650,186 @@ impl Report {
                 if !f.zvcs_stderr.is_empty() {
                     println!("  zvcs  stderr: {}", clip(&f.zvcs_stderr, 4));
                 }
+                // Which git said what, on a failure a second oracle was asked
+                // about. Printed inside the failure block rather than only in the
+                // listing below, because this is the line that decides what a
+                // reader does next: `both gits agree` means open an editor,
+                // `the two gits disagree` means find out which release changed
+                // and decide which one this port is tracking.
+                if let Some(a) = &f.alt {
+                    match a.finding {
+                        AltFinding::GitsAgree => println!(
+                            "  second oracle: git {} agrees with the primary oracle byte for \
+                             byte — two independent releases say this is the port's difference",
+                            crate::stock::version_label(a.version)
+                        ),
+                        AltFinding::PortTracksAlt => println!(
+                            "  !! the two stock gits disagree on {} and zvcs reproduces git {} \
+                             — a version difference, not a port defect; counted as a failure \
+                             against the targeted git all the same",
+                            a.surface.map(|s| s.name()).unwrap_or("this case"),
+                            crate::stock::version_label(a.version)
+                        ),
+                        AltFinding::GitsDisagree => println!(
+                            "  !! the two stock gits disagree on {} and zvcs matches neither — \
+                             the expected value here is version-dependent, so no single answer \
+                             makes this case a pass",
+                            a.surface.map(|s| s.name()).unwrap_or("this case")
+                        ),
+                        AltFinding::Inconclusive => println!(
+                            "  second oracle: git {} did not reproduce its own answer, or hit \
+                             the case timeout — nothing concluded from it in either direction",
+                            crate::stock::version_label(a.version)
+                        ),
+                    }
+                    if a.finding.gits_disagreed() {
+                        println!("  git {} said:\n{}", crate::stock::version_label(a.version), clip(&a.stdout, 12));
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the second oracle cost this run and what it concluded — the header
+    /// block's last stanza, and nothing at all when the machine has one git.
+    ///
+    /// Prints even when every count is zero, for the reason the interop line
+    /// does: a dimension that fired on nothing is a dimension a reader has to be
+    /// able to see fired on nothing, or the silence reads as a clean bill of
+    /// health rather than as an unasked question. The price is stated as
+    /// `asked/total` because that ratio *is* the cost argument for the gate, and
+    /// a ratio nobody counts is one nobody can check.
+    fn print_alt_summary(&self) {
+        let Some(a) = &self.alt else {
+            return;
+        };
+        println!(
+            "oracle 2 : {} (git {}) — {}/{} cases re-run against it ({}), one extra invocation \
+             and one extra state probe each",
+            a.path.display(),
+            crate::stock::version_label(a.version),
+            a.asked,
+            a.total,
+            if a.every_case {
+                "--alt-git-every-case: every case, including the ones that matched"
+            } else {
+                "failures only, and only the verdicts a second git can speak to"
+            }
+        );
+        println!(
+            "           all-three-agree={} corroborated-defect={} version-skew={} \
+             gits-disagree={} inconclusive={}",
+            a.all_three_agree,
+            a.corroborated,
+            a.port_tracks_alt,
+            a.gits_disagree,
+            a.inconclusive
+        );
+        if a.corroborated > 0 {
+            println!(
+                "           corroborated-defect is the strongest signal this harness produces: \
+                 two independent git releases gave the same answer and the port gave another one"
+            );
+        }
+        if a.gits_disagree > 0 {
+            println!(
+                "           gits-disagree={} is not a port excuse: the two gits differ and zvcs \
+                 matches neither, so no choice of target version makes those cases pass. They \
+                 keep the verdict they earned and are listed below because the expected value \
+                 on them is version-dependent",
+                a.gits_disagree
+            );
+        }
+        if self.overall.version_skew > 0 {
+            // The one number in this report whose treatment somebody will want
+            // to argue about, so the argument is printed beside it rather than
+            // left in a doc comment nobody reading a terminal will open.
+            println!(
+                "           vskew={} is inside the parity denominator above, counted as \
+                 failures: the two gits disagree and zvcs reproduces git {}, which is not the \
+                 git this port targets. Excluding them would be an exclusion the port can \
+                 trigger — reproduce the older git on the hard cases and the denominator \
+                 shrinks. Forgiving them instead would read {}/{} ({}); the headline number \
+                 keeps its one meaning",
+                self.overall.version_skew,
+                crate::stock::version_label(a.version),
+                self.overall.matched + self.overall.version_skew,
+                self.overall.scored(),
+                pct_str(
+                    self.overall.matched + self.overall.version_skew,
+                    self.overall.scored()
+                )
+            );
+        }
+    }
+
+    /// Every case on which the two stock gits gave different answers.
+    ///
+    /// The dimension's most valuable output, and the reason it is printed
+    /// unconditionally rather than under `--verbose`: this is the set of
+    /// behaviours where "parity" has no single answer, so it is also the set of
+    /// curated expectations that may be pinned to the wrong side of a git
+    /// release. A reader who never passes `--verbose` still needs to know that
+    /// the corpus contains such cases and which ones they are.
+    ///
+    /// `--verbose` adds what each of the three binaries actually produced, which
+    /// is what a reader needs to decide which side an expectation should be
+    /// pinned to — but the ids alone are already actionable, and printing three
+    /// clipped payloads per case by default would bury them.
+    fn print_oracle_disagreements(&self, verbose: bool) {
+        let Some(a) = &self.alt else {
+            return;
+        };
+        if a.disagreements.is_empty() {
+            return;
+        }
+        // Asked of `stock` rather than carried on the summary: the primary
+        // oracle's version is a property of the run, not of a case, and a second
+        // copy of it is a second thing that can be wrong. `unwrap_or` cannot
+        // fire here — a resolved second oracle implies a resolved first one — but
+        // it is spelled rather than unwrapped so a report never panics.
+        let primary_version = crate::stock::git_version().unwrap_or((0, 0, 0));
+        println!(
+            "\n--- stock git disagrees with stock git ({}) ---",
+            a.disagreements.len()
+        );
+        println!(
+            "  the primary oracle and git {} answered differently here, so there is no single \
+             \"what git does\" for these cases",
+            crate::stock::version_label(a.version)
+        );
+        for d in &a.disagreements {
+            println!(
+                "  [{}] {} — differ on {} ({})",
+                d.finding.label(),
+                d.id,
+                d.surface.name(),
+                d.verdict.label()
+            );
+            // The lines the two gits differ on, not the first eight lines of
+            // each answer. That distinction is the whole usefulness of this
+            // block: `filter-branch` prints an eight-line deprecation warning
+            // before it says anything, so three clipped payloads printed in full
+            // are three identical warnings and the finding is below the fold.
+            // The report already has this exactly right for state and interop
+            // digests, and this is the same tool pointed at a third pair.
+            if verbose {
+                let (pv, av) = (
+                    crate::stock::version_label(primary_version),
+                    crate::stock::version_label(a.version),
+                );
+                for (x, y) in state_diff_lines(&d.primary, &d.alt).iter().take(6) {
+                    println!("     git {pv}| {x}");
+                    println!("     git {av}| {y}");
+                }
+                // Where the port sits is already in the finding, so it is spelled
+                // out only when the finding is "neither" — the one case where a
+                // reader cannot derive zvcs's answer from the two above it.
+                if d.finding == AltFinding::GitsDisagree && d.port != d.primary {
+                    for (x, _) in state_diff_lines(&d.port, &d.primary).iter().take(4) {
+                        println!("     zvcs     | {x}");
+                    }
+                }
             }
         }
     }
@@ -584,13 +945,20 @@ pub fn emit_html(
             .then(a.0.cmp(b.0))
     });
 
+    // The version-skew column exists on this page for exactly the run that could
+    // have produced one. It is inside `cases` and outside `match` like every other
+    // failure bucket, so without a column a version difference would show up as a
+    // gap between the two that nothing on the page explains — which is the
+    // "sends a reader hunting for a bug that is not there" failure the two
+    // comments below are about. A run with one git emits the page it always did.
+    let vskew_col = rep.alt.is_some();
     let mut cmd_rows = String::new();
     for (cmd, t) in &rows {
         let cls = if t.matched == t.scored() { "ok" } else { "bad" };
         let _ = write!(
             cmd_rows,
             "<tr data-h=\"{h}\"><td class=\"cmd\">{c}</td><td>{tot}</td><td>{m}</td>\
-             <td>{o}</td><td>{e}</td><td>{s}</td><td>{i}</td><td>{f}</td><td class=\"{cls}\">{p}</td></tr>",
+             <td>{o}</td><td>{e}</td><td>{s}</td><td>{i}</td><td>{f}</td>{v}<td class=\"{cls}\">{p}</td></tr>",
             h = esc(cmd),
             c = esc(cmd),
             tot = t.scored(),
@@ -610,6 +978,10 @@ pub fn emit_html(
             // gap between `cases` and `match` is explained by nothing else visible
             // sends a reader looking for a bug that is not there.
             f = t.zvcs_nondeterministic,
+            // Its own column for the third time and the same reason: "the port is
+            // wrong" and "the port is right about an older release" are different
+            // findings, and one of them is not a bug to fix.
+            v = if vskew_col { format!("<td>{}</td>", t.version_skew) } else { String::new() },
             cls = cls,
             p = pct_str(t.matched, t.scored()),
         );
@@ -719,7 +1091,11 @@ pub fn emit_html(
     // Per-command parity table (HUD .file-table).
     let _ = write!(html, "<h3 class=\"section-h\">Per-command parity — {corpus_cmds} commands with corpus cases</h3>\n");
     html.push_str("<div class=\"controls\"><input id=\"q\" type=\"search\" placeholder=\"// filter commands…\" autocomplete=\"off\" spellcheck=\"false\"><span id=\"cnt\"></span></div>\n");
-    html.push_str("<table class=\"file-table\" id=\"tbl\"><thead><tr><th>command</th><th>cases</th><th>match</th><th>out&ne;</th><th>exit&ne;</th><th>state&ne;</th><th title=\"stdout, exit code and post-state all agreed, and stock git still read the two finished repositories differently: the port wrote a structure git would not have\">interop&ne;</th><th title=\"zvcs did not reproduce its own output or post-state on a second run; counted as failures\">flaky</th><th>parity</th></tr></thead><tbody>\n");
+    html.push_str("<table class=\"file-table\" id=\"tbl\"><thead><tr><th>command</th><th>cases</th><th>match</th><th>out&ne;</th><th>exit&ne;</th><th>state&ne;</th><th title=\"stdout, exit code and post-state all agreed, and stock git still read the two finished repositories differently: the port wrote a structure git would not have\">interop&ne;</th><th title=\"zvcs did not reproduce its own output or post-state on a second run; counted as failures\">flaky</th>");
+    if vskew_col {
+        html.push_str("<th title=\"the two installed stock gits disagree here and zvcs reproduces the older one: a version difference, not a port defect. Counted as a failure against the git this port targets, never excluded from the denominator\">vskew</th>");
+    }
+    html.push_str("<th>parity</th></tr></thead><tbody>\n");
     html.push_str(&cmd_rows);
     html.push_str("</tbody></table>\n");
 
@@ -1298,6 +1674,7 @@ mod tests {
             Verdict::Crash,
             Verdict::Hang,
             Verdict::ZvcsNondeterministic,
+            Verdict::VersionSkew,
             Verdict::Nondeterministic,
             Verdict::StockTimeout,
         ];
@@ -1313,6 +1690,7 @@ mod tests {
                 | Verdict::Crash
                 | Verdict::Hang
                 | Verdict::ZvcsNondeterministic
+                | Verdict::VersionSkew
                 | Verdict::Nondeterministic
                 | Verdict::StockTimeout => {}
             }
@@ -1324,5 +1702,56 @@ mod tests {
             // And only an actual match may reach the numerator.
             assert_eq!(t.matched, usize::from(v.is_match()), "{}", v.label());
         }
+    }
+
+    /// Where a version difference lands, and it is the same place a zvcs flake
+    /// lands: inside the denominator, outside the numerator.
+    ///
+    /// This is the number somebody will want to argue about, so it is pinned.
+    /// Excluding it would be an exclusion **the binary under test can trigger** —
+    /// the condition is "the two gits disagree *and* the port reproduces the
+    /// older one", and the second half is the port's own output, so a port that
+    /// reproduced 2.50 on its hardest cases would shrink its own denominator and
+    /// outscore one that aimed at 2.55 and missed. Counting it as a match would
+    /// redefine the number as "agrees with some git somewhere", which degrades
+    /// with every git installed on the machine. So it is a failure, and the
+    /// forgiving number is printed on a line of its own instead.
+    #[test]
+    fn a_version_difference_is_counted_as_a_failure_and_never_as_a_match() {
+        let mut t = Tally::default();
+        t.record(Verdict::Match);
+        t.record(Verdict::VersionSkew);
+        assert_eq!(t.matched, 1);
+        assert_eq!(t.version_skew, 1);
+        // In the denominator, so the case cannot be removed from measurement…
+        assert_eq!(t.scored(), 2);
+        assert_eq!(t.total(), 2);
+        // …and out of the numerator, so it cannot be paid for either.
+        assert_eq!(t.pct(), 50.0);
+    }
+
+    /// A second oracle can never change the parity number of a run it did not
+    /// reclassify — and when it does reclassify, the case moves between failure
+    /// buckets and nothing else.
+    ///
+    /// The runner-side proof is `adjudicate`'s
+    /// `the_second_oracle_cannot_move_the_parity_number`; this is the scoring
+    /// half of the same property, which has to hold in `Tally` for the claim to
+    /// mean anything: `stdout-diff` and `version-skew` have to be worth exactly
+    /// the same to both numbers.
+    #[test]
+    fn reclassifying_a_failure_as_a_version_difference_moves_no_number() {
+        let mut before = Tally::default();
+        let mut after = Tally::default();
+        for v in [Verdict::Match, Verdict::Match, Verdict::StdoutDiff] {
+            before.record(v);
+        }
+        for v in [Verdict::Match, Verdict::Match, Verdict::VersionSkew] {
+            after.record(v);
+        }
+        assert_eq!(before.matched, after.matched);
+        assert_eq!(before.scored(), after.scored());
+        assert_eq!(before.total(), after.total());
+        assert_eq!(before.pct(), after.pct());
     }
 }

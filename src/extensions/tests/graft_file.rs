@@ -63,6 +63,14 @@ impl Fixture {
         f.ok(&["init", "-q", "-b", "main"]);
         f.ok(&["config", "user.name", "A"]);
         f.ok(&["config", "user.email", "a@e"]);
+        // Every expectation below spells an abbreviated id, so the width has to be
+        // a property of the fixture rather than of whoever runs it. `core.abbrev`
+        // defaults to `auto`, which git scales with the object count, and the
+        // developer capturing these strings had `abbrev = 10` in their own
+        // `~/.gitconfig` — which this fixture then isolates away with `HOME`, so
+        // the captured widths were ten and the observed ones seven. Pinning it
+        // makes the two agree and keeps them agreeing as the fixture grows.
+        f.ok(&["config", "core.abbrev", "10"]);
         for i in 1..=4 {
             std::fs::write(f.repo.join("f"), format!("{i}\n")).unwrap();
             f.ok(&["add", "f"]);

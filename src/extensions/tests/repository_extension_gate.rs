@@ -88,11 +88,18 @@ fn repo_with(tag: &str, version: i32, extensions: &str) -> (PathBuf, PathBuf) {
 
     let config = work.join(".git/config");
     let text = std::fs::read_to_string(&config).expect("read config");
+    // The guard is that `init` wrote the line this rewrite depends on — not that
+    // the text changed. `version = 0` rewrites zero to zero and leaves the text
+    // identical, which is a correct fixture and exactly what the three
+    // `…_at_version_zero` cases ask for.
+    assert!(
+        text.contains("repositoryformatversion = 0"),
+        "`init` did not write the line this fixture rewrites; got:\n{text}"
+    );
     let rewritten = text.replace(
         "repositoryformatversion = 0",
         &format!("repositoryformatversion = {version}"),
     );
-    assert_ne!(rewritten, text, "the fixture must have rewritten the version");
     std::fs::write(&config, format!("{rewritten}{extensions}")).expect("write config");
     (work, home)
 }

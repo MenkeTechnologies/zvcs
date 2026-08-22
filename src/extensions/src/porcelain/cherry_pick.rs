@@ -1388,6 +1388,25 @@ fn pick_one(
             unresolved,
             gix::merge::tree::apply_index_entries::RemovalMode::Prune,
         );
+        // The cache-tree has to be redone *after* the conflict entries land, and the
+        // repair `update_clean_worktree()` already ran is not it: that one measured an
+        // index without them, so its root node claims a tree for entries that are now
+        // unmerged. `write_index_as_tree()` takes `cache_tree_fully_valid()` as licence to
+        // skip the rebuild entirely and hand back the cached root (cache-tree.c:797-816),
+        // so a stale-valid root here made stock's `git write-tree` *succeed* on a
+        // conflicted index — emitting a tree for a merge nobody resolved — where it must
+        // die with `error building trees`.
+        //
+        // git's own shape comes out of `unpack_trees()`: every entry the merge touched is
+        // invalidated on the way through (`invalidate_ce_path()`, unpack-trees.c:190-197),
+        // and the parting `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+        // then fails at `verify_cache()` on the unmerged entry (cache-tree.c:218-234)
+        // *before* touching anything — so the carried, partly-invalidated structure is
+        // what survives: the root marked `-1` and a directory the pick never reached still
+        // naming its tree. This is the same call every other merge-shaped verb makes in
+        // `merge_apply::three_way_merge()`; the conflicted pick was the one path that
+        // wrote its index without it.
+        super::write_tree::carry_and_repair_cache_tree(&repo, &state.index, &mut new_index);
         new_index.write(crate::config::index_write_options(repo))?;
 
         let git_dir = repo.git_dir();
@@ -1929,11 +1948,28 @@ fn continue_single_pick(
     // The resolution must be complete: any conflict stage left blocks the
     // commit. git gets here through the child `git commit`, so the diagnosis is
     // literally that command's — the `U<TAB><path>` report on stdout included.
-    let index = repo.open_index()?;
+    let mut index = repo.open_index()?;
     if index.entries().iter().any(|e| e.stage_raw() != 0) {
         return Ok(Err(super::commit::die_resolve_conflict(&index)));
     }
-    let tree_id = tree_from_index(repo, &index)?;
+    // The tree comes out of the cache-tree, and the index is written back with the
+    // refreshed extension — because the child git spawns here is `git commit`, whose
+    // `prepare_index()` runs `cache_tree_update(the_repository->index, WRITE_TREE_SILENT)`
+    // and then `write_locked_index()` (builtin/commit.c:486-491). Building the tree beside
+    // the index instead left the on-disk extension at whatever the conflict resolution had
+    // invalidated: stock's index after `cherry-pick --continue` names the new commit's tree
+    // at the root, and this port's was 19 bytes shorter with the root still marked `-1`, so
+    // the next reader paid for a rebuild git had already done.
+    //
+    // `refresh_cache_tree()` keeps git's `was_valid` gate: an already-valid extension is
+    // returned as-is and the index file is not rewritten (cache-tree.c:818).
+    let tree_id = match super::write_tree::refresh_cache_tree(repo, &mut index, false)? {
+        Ok(id) => id,
+        // Unreachable given the unmerged check just above — a directory/file collision is
+        // the only other way `cache_tree_update()` fails, and no index git wrote has one.
+        // The tree is still needed, so fall back to building it beside the index.
+        Err(_) => tree_from_index(repo, &index)?,
+    };
     let head_id = repo
         .head_id()
         .map_err(|_| anyhow::anyhow!("HEAD does not point to a commit"))?

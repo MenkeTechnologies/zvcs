@@ -1183,3 +1183,354 @@ fn the_tree_reading_verbs_leave_the_cache_tree_stock_git_leaves() {
         let _ = std::fs::remove_dir_all(&theirs);
     }
 }
+
+// ---------------------------------------------------------------------------
+// `unstage_changes_unless_new()`: the one tail of `do_apply_stash()` that is not
+// a `read-tree`
+// ---------------------------------------------------------------------------
+
+/// A `stash apply` that restores no index must leave the *merge's* cache-tree with
+/// the unstaged paths knocked out — not a repaired one.
+///
+/// `do_apply_stash()` ends one of two ways (builtin/stash.c:740-745). With
+/// `--index` and a stash that really staged something it is `reset_tree(&index_tree)`,
+/// i.e. `unpack_trees()`, and the repair that ends that leaves every node valid —
+/// which is what [`stash_apply_with_index_leaves_a_valid_cache_tree`] pins. Without
+/// one it is `unstage_changes_unless_new(&c_tree)`, which is not a tree read at all:
+/// it walks the `c_tree`→index diff and puts each pre-merge entry back one
+/// `add_index_entry()` at a time (builtin/stash.c:615-630), and that call invalidates
+/// the path it replaces and every directory above it (read-cache.c:1273-1274). The
+/// parting `write_locked_index()` (builtin/stash.c:637-640) repairs nothing.
+///
+/// So the shape is asymmetric on purpose: the root and the directories the stash
+/// passed through go stale, and a directory it never reached keeps its id. Repairing
+/// here instead wrote a fully valid extension 19 bytes longer than git's.
+#[test]
+fn stash_apply_without_index_invalidates_only_what_it_unstaged() {
+    let repo = fixture(BIN, "stash-unstage-shape");
+    std::fs::write(repo.join("sub/a.txt"), b"worktree edit\n").unwrap();
+    ok(&repo, &["stash", "push", "-q"]);
+    // The push itself is a `--mixed` reset, so start the measurement from a
+    // known-valid extension rather than from whatever it left.
+    let restored = run(&repo, &["read-tree", "HEAD"]);
+    assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
+    for n in &nodes(&repo) {
+        assert!(n.entries.is_some(), "the read-tree must leave a fully valid extension, got {n:?}");
+    }
+
+    let applied = run(&repo, &["stash", "apply", "-q"]);
+    assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+
+    let after = nodes(&repo);
+    assert_eq!(node(&after, "").entries, None, "the root the unstage passed through must go stale");
+    assert_eq!(node(&after, "sub").entries, None, "`sub/` holds the unstaged path");
+    assert!(
+        node(&after, "deeper").entries.is_some() && node(&after, "deeper").oid.is_some(),
+        "`sub/deeper/` was never reached and must keep its id"
+    );
+    assert!(
+        node(&after, "other").entries.is_some() && node(&after, "other").oid.is_some(),
+        "`other/` was never reached and must keep its id"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Every verb whose index comes out of `unstage_changes_unless_new()`, run with both
+/// binaries over identical fixtures, compared node for node.
+///
+/// The reach is wider than `git stash`: `restore_state()` (builtin/merge.c:403-427)
+/// rewinds a failed merge by running `git stash apply --index <snapshot>`, and a
+/// snapshot taken over a worktree-only change has `i_tree == b_tree`, so
+/// `do_apply_stash()` sets `has_index = 0` (builtin/stash.c:666-668) and finishes in
+/// the unstage tail rather than in `reset_tree()`. That is why a `merge` or `pull`
+/// that *refuses* over local changes — the merge itself never touching the index —
+/// still leaves a partly invalidated cache-tree behind, and why repairing in one
+/// place showed up as nine differing repositories in the differential harness.
+#[test]
+fn the_stash_unstage_tail_leaves_the_cache_tree_stock_git_leaves() {
+    let Some(git) = stock_git() else {
+        eprintln!("no stock git found — skipping cache-tree interop test");
+        return;
+    };
+
+    // (tag, needs the branched fixture?, the path to dirty, steps)
+    let cases: &[(&str, bool, &str, &[&[&str]])] = &[
+        ("stash-apply", false, "sub/a.txt", &[&["stash", "push", "-q"], &["stash", "apply", "-q"]]),
+        ("stash-pop", false, "sub/a.txt", &[&["stash", "push", "-q"], &["stash", "pop", "-q"]]),
+        // `--index` with a stash that staged nothing takes the same tail: `i_tree`
+        // equals the base, so `has_index` is cleared before the merge runs.
+        (
+            "stash-apply-index-without-a-staged-tree",
+            false,
+            "sub/a.txt",
+            &[&["stash", "push", "-q"], &["stash", "apply", "--index", "-q"]],
+        ),
+        // The merge refuses at `verify_uptodate()` without ever writing the index,
+        // and everything below is `restore_state()`'s doing.
+        ("merge-refused-over-dirty", true, "sub/a.txt", &[&["merge", "feature"]]),
+        ("merge-no-ff-refused-over-dirty", true, "sub/a.txt", &[&["merge", "--no-ff", "feature"]]),
+    ];
+
+    for (tag, branched, dirty, steps) in cases {
+        let build = if *branched { branched_fixture } else { fixture };
+        let ours = build(&git, &format!("unstage-{tag}-zvcs"));
+        let theirs = build(&git, &format!("unstage-{tag}-stock"));
+        for repo in [&ours, &theirs] {
+            std::fs::write(repo.join(dirty), b"local edit\n").unwrap();
+        }
+        for step in *steps {
+            let ours_out = run(&ours, step);
+            let theirs_out = run_with(&git, &theirs, step);
+            assert_eq!(
+                ours_out.status.code(),
+                theirs_out.status.code(),
+                "{tag}: `{step:?}` exited differently — zvcs {} vs stock {}",
+                String::from_utf8_lossy(&ours_out.stderr),
+                String::from_utf8_lossy(&theirs_out.stderr)
+            );
+        }
+
+        let ours_nodes = tree_nodes(&ours.join(".git/index"));
+        assert_eq!(
+            ours_nodes,
+            tree_nodes(&theirs.join(".git/index")),
+            "{tag}: the cache-tree must match stock git's node for node"
+        );
+        // The point of the comparison is that it is *not* the fully valid shape a
+        // repair would have produced; an all-valid result on both sides would make
+        // the equality above pass while measuring nothing.
+        let ours_nodes = ours_nodes.unwrap_or_else(|| panic!("{tag}: no TREE extension"));
+        assert!(
+            ours_nodes.iter().any(|n| n.entries.is_none()),
+            "{tag}: the unstage tail must leave at least one node stale, got {ours_nodes:#?}"
+        );
+        assert!(
+            ours_nodes.iter().any(|n| n.entries.is_some()),
+            "{tag}: it must invalidate per path, not drop the extension, got {ours_nodes:#?}"
+        );
+
+        stock_audits(&git, &ours, tag);
+        assert_eq!(
+            ok_with(&git, &ours, &["write-tree"]),
+            ok_with(&git, &theirs, &["write-tree"]),
+            "{tag}: stock must build the same tree from both indexes"
+        );
+
+        let _ = std::fs::remove_dir_all(&ours);
+        let _ = std::fs::remove_dir_all(&theirs);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the verbs that stage entries one at a time: `cherry-pick` and `apply`
+// ---------------------------------------------------------------------------
+
+/// A [`fixture`] where `main` and `theirs` each added `conflict.txt` with different
+/// content, so picking one onto the other stops on an add/add conflict.
+fn add_add_fixture(bin: &str, tag: &str) -> PathBuf {
+    let repo = fixture(bin, tag);
+    ok_with(bin, &repo, &["checkout", "-q", "-b", "theirs"]);
+    std::fs::write(repo.join("conflict.txt"), b"theirs\n").unwrap();
+    ok_with(bin, &repo, &["add", "conflict.txt"]);
+    ok_with(bin, &repo, &["commit", "-qm", "theirs"]);
+    ok_with(bin, &repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("conflict.txt"), b"ours\n").unwrap();
+    ok_with(bin, &repo, &["add", "conflict.txt"]);
+    ok_with(bin, &repo, &["commit", "-qm", "ours"]);
+    repo
+}
+
+/// A cherry-pick that stops on a conflict must leave a root `write-tree` cannot
+/// trust — and this is the one cache-tree assertion in the file where being wrong
+/// is *corruption*, not a wasted rebuild.
+///
+/// `write_index_as_tree()` takes `cache_tree_fully_valid()` as licence to skip the
+/// rebuild entirely and hand back the cached root (cache-tree.c:797-816). So a
+/// conflicted index carrying a valid-looking root makes `git write-tree` **succeed**,
+/// emitting a tree for a merge nobody resolved, where it must die with
+/// `error building trees` — and every unmerged path silently disappears from that
+/// tree. This port did exactly that until the conflicted pick started redoing its
+/// cache-tree after the conflict entries landed instead of before.
+#[test]
+fn a_conflicting_cherry_pick_leaves_a_root_write_tree_cannot_trust() {
+    let repo = add_add_fixture(BIN, "cp-conflict-shape");
+    let picked = run(&repo, &["cherry-pick", "theirs"]);
+    assert_eq!(
+        picked.status.code(),
+        Some(1),
+        "the pick must stop on the add/add conflict: {}",
+        String::from_utf8_lossy(&picked.stderr)
+    );
+
+    let after = nodes(&repo);
+    assert_eq!(
+        node(&after, "").entries,
+        None,
+        "the root covers the unmerged path and must not name a tree, got {after:#?}"
+    );
+    assert!(
+        node(&after, "sub").entries.is_some() && node(&after, "other").entries.is_some(),
+        "the directories the pick never reached must keep their ids, got {after:#?}"
+    );
+
+    // The consequence, stated as behaviour rather than as bytes.
+    let wt = run(&repo, &["write-tree"]);
+    assert_eq!(
+        wt.status.code(),
+        Some(128),
+        "`write-tree` must refuse an unmerged index, not build a tree from a stale root; it said {}",
+        String::from_utf8_lossy(&wt.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// The conflicted pick, its `--continue`, and `git apply`'s three index-writing
+/// modes, run with both binaries over identical fixtures and compared node for node.
+///
+/// The three share one root cause read from opposite ends. `cherry-pick`'s conflicted
+/// write and all three `apply` modes were **repairing** an extension git leaves partly
+/// invalid — `apply` is not an `unpack_trees()` verb at all but a sequence of
+/// `add_index_entry()` (apply.c:4499) and `remove_file_from_index()` (apply.c:4445)
+/// calls ending in a plain `write_locked_index()` (apply.c:5188), each of which
+/// invalidates only the path it touched. `cherry-pick --continue` had the opposite
+/// defect: it built its tree beside the index and never wrote the refreshed extension
+/// back, where the `git commit` git spawns there runs
+/// `cache_tree_update(the_repository->index, WRITE_TREE_SILENT)` first
+/// (builtin/commit.c:486-491) and leaves the root naming the new commit's tree.
+#[test]
+fn the_entry_staging_verbs_leave_the_cache_tree_stock_git_leaves() {
+    let Some(git) = stock_git() else {
+        eprintln!("no stock git found — skipping cache-tree interop test");
+        return;
+    };
+
+    // The pick that stops, resolved and continued: the index must come out valid at
+    // the end even though every step before it left the root stale.
+    for (tag, steps) in [
+        (
+            "cherry-pick-continue",
+            &[
+                &["cherry-pick", "theirs"][..],
+                &["checkout", "--theirs", "--", "conflict.txt"][..],
+                &["add", "conflict.txt"][..],
+                &["cherry-pick", "--continue"][..],
+            ][..],
+        ),
+        // `revert --continue` shares `continue_single_pick()`, so it must land the
+        // same way.
+        (
+            "revert-continue",
+            &[
+                &["revert", "--no-edit", "HEAD"][..],
+                &["cherry-pick", "--continue"][..],
+            ][..],
+        ),
+    ] {
+        let ours = add_add_fixture(&git, &format!("staging-{tag}-zvcs"));
+        let theirs = add_add_fixture(&git, &format!("staging-{tag}-stock"));
+        for step in steps {
+            let ours_out = run(&ours, step);
+            let theirs_out = run_with(&git, &theirs, step);
+            assert_eq!(
+                ours_out.status.code(),
+                theirs_out.status.code(),
+                "{tag}: `{step:?}` exited differently — zvcs {} vs stock {}",
+                String::from_utf8_lossy(&ours_out.stderr),
+                String::from_utf8_lossy(&theirs_out.stderr)
+            );
+        }
+        assert_eq!(
+            tree_nodes(&ours.join(".git/index")),
+            tree_nodes(&theirs.join(".git/index")),
+            "{tag}: the cache-tree must match stock git's node for node"
+        );
+        stock_audits(&git, &ours, tag);
+        assert_eq!(
+            ok_with(&git, &ours, &["write-tree"]),
+            ok_with(&git, &theirs, &["write-tree"]),
+            "{tag}: stock must build the same tree from both indexes"
+        );
+        let _ = std::fs::remove_dir_all(&ours);
+        let _ = std::fs::remove_dir_all(&theirs);
+    }
+
+    // The pick that stops and stays stopped: stock must read the port's conflicted
+    // index the way it reads its own, which here means *refusing* to build a tree.
+    {
+        let ours = add_add_fixture(&git, "staging-cherry-pick-conflict-zvcs");
+        let theirs = add_add_fixture(&git, "staging-cherry-pick-conflict-stock");
+        assert_eq!(run(&ours, &["cherry-pick", "theirs"]).status.code(), Some(1));
+        assert_eq!(
+            run_with(&git, &theirs, &["cherry-pick", "theirs"]).status.code(),
+            Some(1)
+        );
+        assert_eq!(
+            tree_nodes(&ours.join(".git/index")),
+            tree_nodes(&theirs.join(".git/index")),
+            "the conflicted pick's cache-tree must match stock git's node for node"
+        );
+        stock_audits(&git, &ours, "cherry-pick-conflict");
+        assert_eq!(
+            run_with(&git, &ours, &["write-tree"]).status.code(),
+            Some(128),
+            "stock must refuse to build a tree from the port's conflicted index"
+        );
+        let _ = std::fs::remove_dir_all(&ours);
+        let _ = std::fs::remove_dir_all(&theirs);
+    }
+
+    // `git apply`'s three index-writing modes over a patch that touches one
+    // directory, so "only `sub/` and the root went stale" is observable.
+    for mode in ["--index", "--cached", "--3way"] {
+        let tag = format!("apply{mode}");
+        let ours = patch_fixture(&git, &format!("staging-{tag}-zvcs"));
+        let theirs = patch_fixture(&git, &format!("staging-{tag}-stock"));
+        for (repo, bin) in [(&ours, BIN), (&theirs, git.as_str())] {
+            let out = run_with(bin, repo, &["apply", mode, "the.patch"]);
+            assert!(
+                out.status.success(),
+                "{tag}: `apply {mode}` failed for {bin}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let after = tree_nodes(&ours.join(".git/index"))
+            .unwrap_or_else(|| panic!("{tag}: no TREE extension"));
+        assert_eq!(
+            node(&after, "").entries,
+            None,
+            "{tag}: the root above a patched path must go stale, got {after:#?}"
+        );
+        assert!(
+            node(&after, "other").entries.is_some(),
+            "{tag}: `other/` was not patched and must keep its id, got {after:#?}"
+        );
+        assert_eq!(
+            Some(after),
+            tree_nodes(&theirs.join(".git/index")),
+            "{tag}: the cache-tree must match stock git's node for node"
+        );
+        stock_audits(&git, &ours, &tag);
+        assert_eq!(
+            ok_with(&git, &ours, &["write-tree"]),
+            ok_with(&git, &theirs, &["write-tree"]),
+            "{tag}: stock must build the same tree from both indexes"
+        );
+        let _ = std::fs::remove_dir_all(&ours);
+        let _ = std::fs::remove_dir_all(&theirs);
+    }
+}
+
+/// A [`fixture`] with `the.patch` beside it: a diff that rewrites `sub/a.txt` and
+/// nothing else, so an `apply` has exactly one directory to invalidate.
+fn patch_fixture(bin: &str, tag: &str) -> PathBuf {
+    let repo = fixture(bin, tag);
+    ok_with(bin, &repo, &["checkout", "-q", "-b", "pending"]);
+    std::fs::write(repo.join("sub/a.txt"), b"a\npatched\n").unwrap();
+    ok_with(bin, &repo, &["commit", "-aqm", "patched"]);
+    ok_with(bin, &repo, &["checkout", "-q", "main"]);
+    let diff = ok_with(bin, &repo, &["diff", "main", "pending", "--", "sub/a.txt"]);
+    std::fs::write(repo.join("the.patch"), format!("{diff}\n")).unwrap();
+    repo
+}

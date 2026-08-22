@@ -1720,9 +1720,27 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         }
         index.sort_entries();
-        // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
-        // (unpack-trees.c:2088-2092); a conflicted result simply has no node it can prove.
-        super::write_tree::rebuild_cache_tree(
+        // `git apply` is **not** an `unpack_trees()` verb, and repairing here wrote a fully
+        // valid cache-tree where git leaves a partly invalidated one — 38 bytes longer than
+        // stock's on `--index`, `--cached` and `--3way` alike.
+        //
+        // `apply_patch()` stages one entry at a time: `add_index_file()` ends in
+        // `add_index_entry(state->repo->index, ce, ADD_CACHE_OK_TO_ADD)` (apply.c:4499),
+        // `remove_file()` in `remove_file_from_index(state->repo->index, patch->old_name)`
+        // (apply.c:4445), and a conflicted `--3way` path goes through both
+        // (`add_conflicted_stages_file()`, apply.c:4664-4674). Each of those invalidates the
+        // path it touches and every directory above it — `cache_tree_invalidate_path()` from
+        // `add_index_entry_with_check()` (read-cache.c:1273-1274) and from
+        // `remove_file_from_index()` (read-cache.c:627-637). `apply_all_patches()` then
+        // finishes with a plain `write_locked_index()` (apply.c:5188) and repairs nothing.
+        //
+        // So the shape is the one every entry-mutating verb leaves: the root and the patched
+        // directories marked `-1`, and a directory no hunk reached still naming its tree.
+        // `drop_set` is exactly the set of paths that went through one of those two calls.
+        for path in &drop_set {
+            index.invalidate_path_in_tree(path.as_ref());
+        }
+        super::write_tree::prepare_offset_table(
             idx_repo.as_ref().expect("repo present when update_index"),
             index,
         );

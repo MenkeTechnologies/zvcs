@@ -2155,12 +2155,26 @@ fn restore_stash_commit(
     // stash staged nothing) or already equal to ours, it sets `has_index = 0`
     // and leaves the index alone — which is what keeps the caller's own staged
     // work staged.
-        let index_tree = if has_index {
-            i_tree
+        let (index_tree, cache_tree) = if has_index {
+            // `reset_tree(&index_tree, 0, 0)` (builtin/stash.c:741) — `unpack_trees()`
+            // with `oneway_merge`, whose parting repair proves every node of an index
+            // that is an exact expansion of a tree the repository already has.
+            (i_tree, CacheTree::LikeUnpackTrees)
         } else {
-            unstage_changes_unless_new(repo, c_tree, applied.tree_id)?
+            // `unstage_changes_unless_new(&c_tree)` (builtin/stash.c:744) is not a
+            // `read-tree`: it mutates the *merge's* index one `add_index_entry()` at a
+            // time and then writes it with a plain `write_locked_index()`
+            // (builtin/stash.c:637-640). Nothing repairs afterwards, and each of those
+            // calls invalidates the path it touches (read-cache.c:1273-1274) — so what
+            // stock leaves behind is the merge's cache-tree with the unstaged paths and
+            // the directories above them marked `-1`, while a directory the stash never
+            // reached still names its tree.
+            (
+                unstage_changes_unless_new(repo, c_tree, applied.tree_id)?,
+                CacheTree::LikeUnstagedOverMerge { merged: &applied.index },
+            )
         };
-        write_target_index(repo, index_tree, &old_index, &fresh, CacheTree::LikeUnpackTrees)?;
+        write_target_index(repo, index_tree, &old_index, &fresh, cache_tree)?;
     }
 
     // Untracked files come back last and stay untracked — their stats are
@@ -2570,7 +2584,7 @@ fn revert_paths_in_tree(
 ///
 /// `stash` reaches an index two different ways and git leaves a different extension behind for
 /// each, so this has to be a decision the caller makes rather than one this function guesses.
-enum CacheTree {
+enum CacheTree<'a> {
     /// `reset_tree()` (builtin/stash.c:334-374), i.e. `unpack_trees()` with `oneway_merge`,
     /// whose parting `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     /// (unpack-trees.c:2088-2092) leaves every node it can prove — which, for an index that
@@ -2611,6 +2625,28 @@ enum CacheTree {
     ///
     /// `head_tree` is what the reset lands on.
     KeepIndexOverHardReset { head_tree: ObjectId },
+    /// `unstage_changes_unless_new()` (builtin/stash.c:528-641), which is where a
+    /// `stash apply`/`pop` **without** a restored index ends — and the only tail of
+    /// `do_apply_stash()` that is not a `read-tree`.
+    ///
+    /// git gets here holding the index `merge_ort_nonrecursive()` produced, whose cache-tree
+    /// `unpack_trees()` already repaired, and then walks the `orig_tree`→index diff putting
+    /// each pre-merge entry back with `add_index_entry()` (builtin/stash.c:615-630). That call
+    /// invalidates the path it replaces and every directory above it (read-cache.c:1273-1274),
+    /// and the parting `write_locked_index()` (builtin/stash.c:637-640) repairs nothing. So the
+    /// extension stock writes is the *merge's*, with the unstaged paths knocked out:
+    /// `""{None} "sub"{None} "sub/deeper"{valid} "other"{valid}` for a stash that only touched
+    /// `sub/`. Only the paths that existed in `orig_tree` go through `add_index_entry()` — a
+    /// path the stash *added* keeps its merged entry and stays staged, so nothing invalidates
+    /// it — which is exactly the set of entries that differ between the merge's index and the
+    /// one being written.
+    ///
+    /// Repairing here instead produced a fully valid extension 19 bytes longer than git's on
+    /// every `stash apply`, every `stash pop`, and — through `restore_state()`
+    /// (builtin/merge.c:403-427) — every `merge`/`pull` that refused over a dirty worktree.
+    ///
+    /// `merged` is that merge result index, the one the invalidation is measured against.
+    LikeUnstagedOverMerge { merged: &'a gix::index::File },
 }
 
 /// Write the on-disk index to the state of `tree_id`, reusing `fresh` stats for
@@ -2621,7 +2657,7 @@ fn write_target_index(
     tree_id: ObjectId,
     old_index: &gix::index::File,
     fresh: &HashMap<BString, Stat>,
-    cache_tree: CacheTree,
+    cache_tree: CacheTree<'_>,
 ) -> Result<()> {
     let mut new_index = repo.index_from_tree(&tree_id)?;
 
@@ -2696,6 +2732,13 @@ fn write_target_index(
             let mut reset_index = repo.index_from_tree(&head_tree)?;
             reset_index.prime_cache_tree(&repo.objects, &head_tree)?;
             super::write_tree::carry_cache_tree_invalidating_changes(repo, &reset_index, &mut new_index);
+        }
+        // The merge's repaired extension, with every entry `add_index_entry()` put back
+        // knocked out along its whole path. Comparing the two indexes finds exactly the
+        // paths git names: an entry the unstage reverted differs from the merge's, an entry
+        // the merge added and the unstage left alone does not.
+        CacheTree::LikeUnstagedOverMerge { merged } => {
+            super::write_tree::carry_cache_tree_invalidating_changes(repo, merged, &mut new_index);
         }
     }
     // The `write_locked_index()` that ends `reset_tree()` is the one

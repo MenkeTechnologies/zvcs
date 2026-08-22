@@ -18,6 +18,7 @@
 //! probed before it is trusted. Nothing falls back to a silent `PATH` lookup —
 //! when no stock git can be found, the caller is told rather than handed zvcs.
 
+use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -73,18 +74,39 @@ fn is_zvcs(bin: &Path) -> bool {
 /// The version this port reproduces, read from its single source of truth:
 /// `GIT_VERSION` in `porcelain/version.rs`, which is what `git version` prints.
 ///
-/// It is read rather than repeated here so the two can never drift. `None` means
-/// the constant could not be found, and the floor below is then not enforced —
-/// a harness that cannot locate the target must not invent one.
-fn target_version() -> Option<(u32, u32, u32)> {
+/// It is read rather than repeated here so the two can never drift.
+///
+/// **This must not fail silently.** An earlier version matched the declaration
+/// with `starts_with("const GIT_VERSION")`, which stopped matching the moment the
+/// constant gained a `pub(crate)` visibility prefix — `trim_start` removes
+/// whitespace, not modifiers. The lookup then returned `None`, the caller's
+/// `.filter()` dropped the floor, and the harness measured against whatever git
+/// it found while still printing numbers that read exactly like enforced ones.
+/// That is the same silent-downgrade failure the floor exists to prevent, so a
+/// constant that cannot be located is now a hard error rather than an absent
+/// floor: a harness that cannot find its target must say so, not proceed.
+fn target_version() -> anyhow::Result<(u32, u32, u32)> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
+        .parent()
+        .context("parity crate has no parent directory")?
         .join("extensions/src/porcelain/version.rs");
-    let text = std::fs::read_to_string(src).ok()?;
-    let line = text.lines().find(|l| l.trim_start().starts_with("const GIT_VERSION"))?;
-    let literal = line.split('"').nth(1)?;
+    let text = std::fs::read_to_string(&src)
+        .with_context(|| format!("reading {} for GIT_VERSION", src.display()))?;
+    // Match the declaration anywhere on the line, so any visibility modifier
+    // (`pub`, `pub(crate)`, none) parses identically.
+    let line = text
+        .lines()
+        .find(|l| l.contains("const GIT_VERSION"))
+        .with_context(|| format!("no `const GIT_VERSION` declaration in {}", src.display()))?;
+    let literal = line
+        .split('"')
+        .nth(1)
+        .with_context(|| format!("GIT_VERSION in {} has no string literal", src.display()))?;
     let mut parts = literal.split('.').filter_map(|p| p.parse::<u32>().ok());
-    Some((parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
+    let major = parts
+        .next()
+        .with_context(|| format!("GIT_VERSION {literal:?} has no numeric major component"))?;
+    Ok((major, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
 }
 
 /// The newest usable stock git and its version, or `None` when there is none.
@@ -152,7 +174,8 @@ pub fn git() -> anyhow::Result<&'static Path> {
     // responsibility for it, and the refusal below tells them to do exactly that —
     // applying the floor to their choice as well would make that advice a dead end.
     let explicit = std::env::var_os("ZVCS_STOCK_GIT").is_some();
-    if let Some(target) = target_version().filter(|_| !explicit) {
+    if !explicit {
+        let target = target_version()?;
         if *version < target {
             let (a, b, c) = *version;
             let (x, y, z) = target;
@@ -177,4 +200,47 @@ pub fn git() -> anyhow::Result<&'static Path> {
 /// A [`Command`] for the stock git, or an error when there is none.
 pub fn command() -> anyhow::Result<Command> {
     Ok(Command::new(git()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The version floor is only enforceable if the target can be read, and the
+    /// read is a text scan of another crate's source — so it breaks silently
+    /// whenever that declaration is reformatted. It already did once: the scan
+    /// required the line to *start* with `const GIT_VERSION`, and a `pub(crate)`
+    /// prefix defeated it, leaving the harness measuring against any git it
+    /// found while still printing numbers that read like enforced ones.
+    ///
+    /// This test is the guard. It fails if the constant is renamed, moved, or
+    /// written in a shape the scan cannot parse.
+    #[test]
+    fn target_version_is_readable() {
+        let v = target_version().expect(
+            "GIT_VERSION must stay readable from porcelain/version.rs — if this fails, the \
+             parity version floor is silently disabled and every reported number is suspect",
+        );
+        assert!(v.0 >= 2, "git major version should be >= 2, got {v:?}");
+    }
+
+    /// Any visibility modifier must parse identically: the declaration's
+    /// privacy is not the harness's business, and a change to it must never
+    /// disable the floor.
+    #[test]
+    fn version_line_parses_under_any_visibility() {
+        for decl in [
+            r#"const GIT_VERSION: &str = "2.55.0";"#,
+            r#"pub const GIT_VERSION: &str = "2.55.0";"#,
+            r#"pub(crate) const GIT_VERSION: &str = "2.55.0";"#,
+            r#"    pub(super) const GIT_VERSION: &str = "2.55.0";"#,
+        ] {
+            assert!(
+                decl.contains("const GIT_VERSION"),
+                "scan predicate must match {decl:?}"
+            );
+            let literal = decl.split('"').nth(1).expect("literal");
+            assert_eq!(literal, "2.55.0", "parsed wrong literal from {decl:?}");
+        }
+    }
 }

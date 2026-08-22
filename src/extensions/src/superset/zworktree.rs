@@ -12,9 +12,34 @@
 //! The linked-worktree bookkeeping is written directly (gix has no create API):
 //! `<gitdir>/worktrees/<name>/{HEAD,commondir,gitdir,index}` and the worktree's
 //! `.git` file — exactly git's format.
+//!
+//! ## The safety property `remove` has to hold
+//!
+//! `remove` is the only verb here that deletes, and the two things it deletes —
+//! the worktree tree and each repository's `<gitdir>/worktrees/<name>/` — are
+//! reached by *reading a path out of a file inside the tree it is deleting*. That
+//! file, a linked worktree's `.git` pointer, is plain text in a directory an agent
+//! has been handed to work in; whoever can write in the worktree chooses the path.
+//!
+//! So the rule is: **`remove` deletes a metadata directory only when that
+//! directory proves it is the one `provision` wrote for this worktree.** The proof
+//! is the round trip [`provision`] creates at step 3 — `<wt>/.git` says
+//! `gitdir: <M>`, and `<M>/gitdir` says `<wt>/.git` — plus the shape and kind of
+//! `<M>` itself. [`classify_metadata`] is that check, and it is the only way to a
+//! `remove_dir_all` on a path this command read out of a file. Every other shape
+//! (unreadable, not a `gitdir:` line, relative or absolute but leading somewhere
+//! else, a symlink, a directory whose `gitdir` names a different `.git`) is
+//! **refused by name on stderr and left on disk** — never deleted, never silently
+//! skipped.
+//!
+//! A `.git` pointer that resolves *inside* the tree being removed is the one
+//! exception, and it is not a deletion at all: nested clones and `git submodule
+//! update` checkouts an agent made inside its worktree keep their object store
+//! there, so that metadata goes away with the tree and needs no separate — or
+//! validated — `remove_dir_all`.
 
 use anyhow::{anyhow, bail, Result};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
@@ -202,31 +227,236 @@ fn remove(args: &[String]) -> Result<ExitCode> {
         Some(p) => PathBuf::from(p),
         None => base_dir().join(name),
     };
-    if !path.exists() {
-        bail!("no worktree '{name}' at {}", path.display());
+    // `symlink_metadata` rather than `exists`: a *symlink* named `<base>/<name>`
+    // is not a worktree this command provisioned, and `remove_dir_all` through one
+    // would work on whatever it points at.
+    match std::fs::symlink_metadata(&path) {
+        Ok(md) if md.is_dir() => {}
+        Ok(_) => bail!("'{name}' at {} is not a directory", path.display()),
+        Err(_) => bail!("no worktree '{name}' at {}", path.display()),
     }
 
     // Prune each linked-worktree's metadata + its zwt/<name> branch, then delete.
+    // Nothing outside this tree is deleted without [`classify_metadata`]'s proof
+    // that it is metadata `provision` wrote for this worktree — see the module
+    // docs for why the pointer's own word is not enough.
     let mut dotgits = Vec::new();
     find_dotgit_files(&path, &mut dotgits);
+    let mut problems = 0usize;
+
+    // The walk below can only report on pointers it *found*, and it deliberately
+    // does not follow a `.git` symlink or descend a `.git` directory — so a
+    // worktree root whose own pointer is gone or is not a file would otherwise go
+    // through this command in silence, leaving `<gitdir>/worktrees/<name>` and the
+    // `zwt/<name>` branch behind with nothing said. Name that here instead: there
+    // is no pointer to identify the metadata with, so none is deleted.
+    let root_dotgit = path.join(".git");
+    match std::fs::symlink_metadata(&root_dotgit) {
+        Ok(md) if md.file_type().is_symlink() => {
+            eprintln!(
+                "error: refusing to remove metadata for '{name}': {} is a symlink, not a `gitdir:` pointer",
+                root_dotgit.display()
+            );
+            problems += 1;
+        }
+        // The pointer file itself — [`classify_metadata`] decides in the loop.
+        Ok(md) if md.is_file() => {}
+        Ok(_) => {
+            eprintln!(
+                "error: refusing to remove metadata for '{name}': {} is a directory, so this is not a linked worktree",
+                root_dotgit.display()
+            );
+            problems += 1;
+        }
+        Err(err) => {
+            eprintln!(
+                "error: refusing to remove metadata for '{name}': {} is missing ({err}), so its metadata cannot be identified",
+                root_dotgit.display()
+            );
+            problems += 1;
+        }
+    }
+
     for dotgit in &dotgits {
-        if let Ok(content) = std::fs::read_to_string(dotgit) {
-            if let Some(rest) = content.trim().strip_prefix("gitdir:") {
-                let meta = PathBuf::from(rest.trim());
-                // meta = <G>/worktrees/<name>  ->  G = meta/../..
+        match classify_metadata(dotgit, &path, name) {
+            Metadata::Ours(meta) => {
+                // meta = <G>/worktrees/<name>  ->  G = meta/../.., and the shape
+                // check already established both components.
                 if let Some(g) = meta.parent().and_then(|p| p.parent()) {
                     delete_branch(g, name);
                 }
-                let _ = std::fs::remove_dir_all(&meta);
+                // Not `let _ =`: the path is now known to be this worktree's own
+                // metadata, so a failed delete leaves a directory `git worktree
+                // list` keeps reporting and `add` would refuse to recreate. It is
+                // reported and the run keeps going, so one stuck repository does
+                // not strand the rest of the tree.
+                if let Err(err) = std::fs::remove_dir_all(&meta) {
+                    eprintln!("error: could not remove {}: {err}", meta.display());
+                    problems += 1;
+                }
+            }
+            // Deleted with the tree below; see the module docs.
+            Metadata::WithinWorktree => {}
+            Metadata::Refused(why) => {
+                eprintln!("error: refusing to remove {}: {why}", dotgit.display());
+                problems += 1;
             }
         }
     }
-    std::fs::remove_dir_all(&path).ok();
+    // Same reasoning as above: this path is the one recorded for `<name>`, so a
+    // failure to delete it is a fact the caller needs, not a `.ok()`.
+    if let Err(err) = std::fs::remove_dir_all(&path) {
+        eprintln!("error: could not remove {}: {err}", path.display());
+        problems += 1;
+    }
+    // The row is dropped whichever way the deletions went: leaving it would make
+    // `list` name a worktree that is gone and `remove` unable to reach the ones it
+    // refused, since it resolves `<name>` through this same row.
     if let Ok(conn) = crate::db::open_rw() {
         let _ = crate::db::remove_worktree(&conn, name);
     }
+    if problems > 0 {
+        return Ok(ExitCode::FAILURE);
+    }
     println!("removed worktree '{name}'");
     Ok(ExitCode::SUCCESS)
+}
+
+/// What a `.git` pointer found inside the tree being removed turned out to name.
+enum Metadata {
+    /// Provably the `<gitdir>/worktrees/<name>` directory [`provision`] wrote for
+    /// this worktree: safe to `remove_dir_all`.
+    Ours(PathBuf),
+    /// Resolves inside the tree being removed — a nested clone or submodule
+    /// checkout an agent made in its own worktree. Deleted with the tree; nothing
+    /// separate to do, and nothing to refuse.
+    WithinWorktree,
+    /// Anything else, with the reason, for stderr. Nothing is deleted for it.
+    Refused(String),
+}
+
+/// Decide whether `dotgit`'s `gitdir:` target may be deleted, and say why not when
+/// it may not.
+///
+/// Every check here exists because the target is *text an agent can write*: the
+/// only thing that makes a path outside `worktree_root` fair game is that it
+/// carries the other half of the round trip [`provision`] writes at step 3.
+fn classify_metadata(dotgit: &Path, worktree_root: &Path, name: &str) -> Metadata {
+    let content = match std::fs::read_to_string(dotgit) {
+        Ok(c) => c,
+        Err(err) => return Metadata::Refused(format!("its .git file cannot be read: {err}")),
+    };
+    // git's `.git` file is exactly one `gitdir: <path>` line. More than one line,
+    // or any other first word, is not a pointer this command wrote.
+    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    let target = match (lines.next(), lines.next()) {
+        (Some(first), None) => match first.trim().strip_prefix("gitdir:") {
+            Some(rest) if !rest.trim().is_empty() => rest.trim().to_owned(),
+            _ => return Metadata::Refused("its .git file is not a `gitdir:` pointer".into()),
+        },
+        _ => return Metadata::Refused("its .git file is not a single `gitdir:` line".into()),
+    };
+    let target = PathBuf::from(target);
+
+    // Resolve relative pointers the way git does — against the directory holding
+    // the `.git` file — so the "does it stay inside the tree" question is asked of
+    // the path that would actually be opened.
+    let parent = dotgit.parent().unwrap_or(Path::new("."));
+    let resolved = lexical_join(parent, &target);
+    let root = lexical_join(Path::new("."), worktree_root);
+    if resolved.starts_with(&root) {
+        return Metadata::WithinWorktree;
+    }
+    // Left the tree. `provision` always writes an absolute path here (step 3), so
+    // a relative one that climbs out is not ours by construction.
+    if !target.is_absolute() {
+        return Metadata::Refused(format!(
+            "its .git file names a relative gitdir `{}` that leaves the worktree",
+            target.display()
+        ));
+    }
+    let meta = target;
+
+    // Shape: the last two components must be `worktrees/<name>`. `validate_name`
+    // has already established that `<name>` is a single path segment, so this is
+    // an equality test, not another traversal question.
+    let tail: Vec<_> = meta.components().rev().take(2).collect();
+    let shaped = matches!(
+        tail.as_slice(),
+        [Component::Normal(last), Component::Normal(dir)]
+            if last.to_str() == Some(name) && dir.to_str() == Some("worktrees")
+    );
+    if !shaped {
+        return Metadata::Refused(format!(
+            "its .git file names {}, which is not a `worktrees/{name}` metadata directory",
+            meta.display()
+        ));
+    }
+
+    // Kind: a real directory, not a symlink standing in for one. `remove_dir_all`
+    // would refuse the symlink itself, but the check is here so the refusal says
+    // what is wrong instead of surfacing an `ENOTDIR` after the branch delete.
+    match std::fs::symlink_metadata(&meta) {
+        Ok(md) if md.is_dir() => {}
+        Ok(_) => {
+            return Metadata::Refused(format!("{} is not a directory", meta.display()));
+        }
+        Err(err) => {
+            return Metadata::Refused(format!("{} cannot be read: {err}", meta.display()));
+        }
+    }
+    // `commondir` is one of the two files `provision` writes at step 2; without it
+    // the directory is not linked-worktree metadata at all.
+    if !meta.join("commondir").is_file() {
+        return Metadata::Refused(format!(
+            "{} has no `commondir`, so it is not linked-worktree metadata",
+            meta.display()
+        ));
+    }
+    // The round trip. This is the check that actually confines the deletion: the
+    // metadata has to name *this* `.git` file back.
+    match std::fs::read_to_string(meta.join("gitdir")) {
+        Ok(back) if same_file_path(Path::new(back.trim()), dotgit) => Metadata::Ours(meta),
+        Ok(back) => Metadata::Refused(format!(
+            "{} points back at {} rather than at itself",
+            meta.display(),
+            back.trim()
+        )),
+        Err(err) => Metadata::Refused(format!("{}/gitdir cannot be read: {err}", meta.display())),
+    }
+}
+
+/// Join `p` onto `base` when relative and resolve `.`/`..` textually, without
+/// touching the filesystem — the target of a `gitdir:` line may not exist, and a
+/// `canonicalize` that followed symlinks would answer a different question than
+/// "where does this path lead".
+fn lexical_join(base: &Path, p: &Path) -> PathBuf {
+    let joined = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether two paths name the same `.git` file. `provision` writes the pointer and
+/// the back-pointer from the same `PathBuf`, so the textual test normally decides
+/// it; `canonicalize` is the fallback for a base directory reached through a
+/// symlink (`/tmp` -> `/private/tmp` on macOS being the everyday case).
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Delete the `zwt/<name>` branch from the common git dir at `g`, via a ref
@@ -254,6 +484,11 @@ fn delete_branch(g: &Path, name: &str) {
 
 /// Collect `.git` *files* (linked-worktree pointers) under `dir`, not descending
 /// into any `.git`.
+///
+/// `DirEntry::file_type()` does not follow symlinks, which is load-bearing for
+/// `remove`: a `.git` *symlink* is neither collected as a pointer nor descended
+/// into as a directory, so a link planted in the worktree cannot steer the walk
+/// out of the tree or hand [`classify_metadata`] a body from elsewhere.
 fn find_dotgit_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;

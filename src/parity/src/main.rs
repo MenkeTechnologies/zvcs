@@ -503,10 +503,17 @@ fn real_main() -> Result<ExitCode> {
                 }
             }
         }
-        if concurrency_defects == 0 {
+        if cases.is_empty() {
+            // "No defect found" over an empty corpus is the harness lying by
+            // omission: --only filters the concurrent cases as well, so a run
+            // restricted to commands with none would otherwise report a clean
+            // concurrency result having measured nothing at all.
+            println!("  no concurrent cases selected by --only — nothing was measured");
+        } else if concurrency_defects == 0 {
             println!(
-                "  no defect found. A race reproduces on some runs and not others, so this is \
-                 evidence,\n  not proof — re-run to accumulate it."
+                "  no defect found in {} case(s). A race reproduces on some runs and not others, \
+                 so this is\n  evidence, not proof — re-run to accumulate it.",
+                cases.len()
             );
         }
     }

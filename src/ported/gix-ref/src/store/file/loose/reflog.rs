@@ -151,6 +151,13 @@ pub mod create_or_update {
 
                     if let Some(mut file) = file_for_appending {
                         let committer = committer.ok_or(Error::MissingCommitter)?;
+                        // `ref_transaction_add_update()` stores `normalize_reflog_message(msg)`
+                        // (refs.c:1342), so by the time `log_ref_write_fd()` (refs/files-backend.c:1933)
+                        // writes it every run of whitespace is one space and the ends are trimmed.
+                        // Doing it here covers both callers of this function for the same reason
+                        // the C does it in one place: the reflog format separates the committer
+                        // from the message with a tab, and an unnormalized message can contain one.
+                        let message = crate::log::normalize_message(message);
                         write!(file, "{} {} ", previous_oid.unwrap_or_else(|| new.kind().null()), new)
                             .and_then(|_| committer.trim().write_to(&mut file))
                             .and_then(|_| {

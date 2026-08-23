@@ -2123,9 +2123,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // reflog read `revert: Revert "…"` rather than `commit: …`.
     let reflog_action = std::env::var("GIT_REFLOG_ACTION").ok().filter(|a| !a.is_empty());
     let reflog_override: Option<String> = match &reflog_action {
-        Some(action) => Some(format!("{action}: {subject}")),
-        None if whence.is_cherry_pick() => Some(format!("commit (cherry-pick): {subject}")),
-        None if whence.is_rebase() => Some(format!("commit (rebase): {subject}")),
+        Some(action) => Some(reflog_line(action, &message)),
+        None if whence.is_cherry_pick() => Some(reflog_line("commit (cherry-pick)", &message)),
+        None if whence.is_rebase() => Some(reflog_line("commit (rebase)", &message)),
         None => None,
     };
 
@@ -2157,8 +2157,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     // (builtin/commit.c:1854-1856): an amend takes the whence-derived
                     // wording from nowhere, so only `GIT_REFLOG_ACTION` displaces it.
                     message: match &reflog_action {
-                        Some(action) => format!("{action}: {subject}").into(),
-                        None => format!("commit (amend): {subject}").into(),
+                        Some(action) => reflog_line(action, &message).into(),
+                        None => reflog_line("commit (amend)", &message).into(),
                     },
                 },
                 expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(
@@ -4066,6 +4066,22 @@ fn folded_subject(msg: &str) -> String {
         out.push(line);
     }
     out.join(" ")
+}
+
+/// The reflog line a commit writes: `<action>: <first line of the message>`.
+///
+/// `update_head_with_reflog()` (sequencer.c:1259-1295) appends `msg` only as far
+/// as its first newline — `nl = strchr(msg->buf, '\n')` — and
+/// `ref_transaction_add_update()` (refs.c:1342) then normalizes the result with
+/// `copy_reflog_msg()`. That is deliberately *not* [`folded_subject`], which is
+/// `%s`: a subject written across two lines with no blank line between them is
+/// one line in the summary and one line — the first — in the reflog.
+///
+/// `1` is the parent count, which only suppresses the `(initial)`/`(merge)`
+/// wording [`gix::reference::log::message`] would otherwise derive: every caller
+/// here already has git's complete `reflog_msg`.
+fn reflog_line(action: &str, message: &str) -> String {
+    gix::reference::log::message(action, message.as_bytes().as_bstr(), 1).to_string()
 }
 
 /// The first non-blank line of a commit message — git's raw subject start, used

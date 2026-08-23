@@ -448,7 +448,7 @@ impl crate::Repository {
     ///
     /// `reference` will be created if it doesn't exist, and can be `"HEAD"` to automatically write-through to the symbolic reference
     /// that `HEAD` points to if it is not detached. For this reason, detached head states cannot be created unless the `HEAD` is detached
-    /// already. The reflog will be written as canonical git would do, like `<operation> (<detail>): <summary>`.
+    /// already. The reflog will be written as canonical git would do, like `<operation> (<detail>): <first line of the message>`.
     ///
     /// The first parent id in `parents` is expected to be the current target of `reference` and the operation will fail if it is not.
     /// If there is no parent, the `reference` is expected to not exist yet.

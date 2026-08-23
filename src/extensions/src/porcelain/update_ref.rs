@@ -226,7 +226,7 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         Ok(_) => Ok(ExitCode::SUCCESS),
         Err(e) => {
             // `-d` reports `error:` and exits 1; the update form dies with 128.
-            let msg = lock_error(&e);
+            let msg = lock_error(&repo, &e);
             if opts.delete {
                 eprintln!("error: {msg}");
                 Ok(ExitCode::from(1))
@@ -538,10 +538,10 @@ fn parse_slot(
 /// gitoxide reports the precondition that failed; git reports it as a failure to
 /// take the lock. The three preconditions `update-ref` can violate map one to
 /// one, and anything else is passed through unchanged.
-fn lock_error(e: &gix::reference::edit::Error) -> String {
+fn lock_error(repo: &gix::Repository, e: &gix::reference::edit::Error) -> String {
     use gix::refs::file::transaction::prepare::Error as P;
     let gix::reference::edit::Error::FileTransactionPrepare(p) = e else {
-        return e.to_string();
+        return chain(e);
     };
     match p {
         P::ReferenceOutOfDate {
@@ -555,8 +555,45 @@ fn lock_error(e: &gix::reference::edit::Error) -> String {
         P::MustExist { full_name, .. } => format!(
             "cannot lock ref '{full_name}': unable to resolve reference '{full_name}'"
         ),
-        _ => e.to_string(),
+        // A deletion is the only thing `update-ref` does that git locks `packed-refs` for
+        // (refs/files-backend.c:2982-3007), and git reports that failure with
+        // `unable_to_lock_message()` verbatim — the same text `pack-refs` prints, minus the
+        // `die()`, because `files_transaction_prepare()` passes no `LOCK_DIE_ON_ERROR`
+        // (`:3032`) and the failure travels back as an ordinary transaction error.
+        P::PackedTransactionAcquire(err) => {
+            gix::lock::pid::unable_to_lock_message(&repo.refs.packed_refs_path(), &packed_lock_errno(err))
+        }
+        _ => chain(e),
     }
+}
+
+/// The `errno` behind a lock-acquisition failure, for [`gix::lock::pid::unable_to_lock_message`].
+///
+/// See [`super::pack_refs::packed_refs_lock_fatal`] for why `PermanentlyLocked` is exactly
+/// `EEXIST`, and [`super::pack_refs::eexist`] for why the raw code is needed.
+fn packed_lock_errno(err: &gix::lock::acquire::Error) -> std::io::Error {
+    match err {
+        gix::lock::acquire::Error::Io(err) => err
+            .raw_os_error()
+            .map_or_else(|| std::io::Error::from(err.kind()), std::io::Error::from_raw_os_error),
+        gix::lock::acquire::Error::PermanentlyLocked { .. } => super::pack_refs::eexist(),
+    }
+}
+
+/// Render an error and its `#[source]` chain the way `anyhow`'s `{:#}` does, joined with `: `.
+///
+/// `pack-refs` returns `anyhow::Error` and gets the chain for free; `update-ref` formats the
+/// error itself, so without this only the outermost variant is shown and everything the source
+/// carries — the lock path, the attempt count, git's holder diagnostic — is dropped.
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(err) = source {
+        out.push_str(": ");
+        out.push_str(&err.to_string());
+        source = err.source();
+    }
+    out
 }
 
 /// git's `ref_transaction_prepare` check: the object a ref is about to point at
@@ -975,7 +1012,7 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
     }
     if !batch_updates {
         if let Err(e) = repo.edit_references(batch.edits) {
-            crate::git_fatal!("{}", lock_error(&e));
+            crate::git_fatal!("{}", lock_error(repo, &e));
         }
         return Ok(());
     }
@@ -984,7 +1021,7 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
         let name = edit.name.to_string();
         let (new, old) = edit_oids(&edit, &zero);
         if let Err(e) = repo.edit_reference(edit) {
-            let msg = lock_error(&e);
+            let msg = lock_error(repo, &e);
             eprintln!("error: {msg}");
             println!("rejected {name} {new} {old} {msg}");
         }

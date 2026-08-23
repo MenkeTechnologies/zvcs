@@ -114,6 +114,19 @@ mod access {
 pub struct Transaction<'s, 'p> {
     store: &'s Store,
     packed_transaction: Option<crate::store_impl::packed::Transaction>,
+    /// A `packed-refs` snapshot taken *without* the `packed-refs.lock`, held only so a
+    /// compare-and-swap can read the current value of a reference that lives there.
+    ///
+    /// git reads `packed-refs` unlocked for exactly this purpose and says so in
+    /// `files_transaction_prepare()` (`refs/files-backend.c:3010-3023`): "Ideally, we'd do this
+    /// check after the packed-refs are locked so that the file cannot change underneath our feet.
+    /// But introducing such a lock now would probably do more harm than good as users rely on
+    /// there not being a global lock with the "files" backend. […] So instead, we accept the race
+    /// for now."
+    ///
+    /// Only ever set when [`Self::packed_transaction`] is `None`; a packed transaction carries its
+    /// own buffer, and that one is authoritative because it is read under the lock.
+    packed_buffer: Option<packed::SharedBufferSnapshot>,
     updates: Option<Vec<transaction::Edit>>,
     packed_refs: transaction::PackedRefs<'p>,
 }

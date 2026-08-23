@@ -178,10 +178,29 @@ fn conflicting_creation_into_packed_refs() -> crate::Result {
             Fail::Immediately,
         );
 
-        assert_eq!(
-            &t2res.unwrap_err().to_string()[..40],
-            "The lock for the packed-ref file could n",
-            "packed-refs files will always be locked if they are present as we have to look up their content"
+        // This assertion is INVERTED from gitoxide's, deliberately, because its
+        // premise is the defect: "packed-refs files will always be locked if they
+        // are present as we have to look up their content" is exactly what git
+        // declines to do. `files_transaction_prepare()` builds a packed
+        // transaction only out of deletions (refs/files-backend.c:2982-3007) and
+        // takes the lock only if one exists (:3031-3036); the lookups every
+        // create and update needs read `packed-refs` unlocked on purpose, and git
+        // says so in the source (:3010-3023):
+        //
+        //     check after the packed-refs are locked so that the file cannot
+        //     change underneath our feet. But introducing such a lock now would
+        //     probably do more harm than good as users rely on there not being a
+        //     global lock with the "files" backend.
+        //     … So instead, we accept the race for now.
+        //
+        // Locking for a lookup made one held `packed-refs.lock` — a concurrent
+        // `pack-refs`, or one left by a killed process — refuse every ref
+        // creation on this port while stock git carried on, which on a worktree
+        // with sixteen writers is an availability failure. A creation therefore
+        // no longer contends with another creation.
+        assert!(
+            t2res.is_ok(),
+            "a creation must not take the packed-refs lock, so it cannot block another creation"
         );
     }
 

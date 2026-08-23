@@ -82,6 +82,7 @@ impl file::Store {
         Transaction {
             store: self,
             packed_transaction: None,
+            packed_buffer: None,
             updates: None,
             packed_refs: PackedRefs::default(),
         }

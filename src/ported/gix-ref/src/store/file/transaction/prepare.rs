@@ -512,13 +512,56 @@ impl Transaction<'_, '_> {
                 }
             }
 
-            if !edits_for_packed_transaction.is_empty() || needs_packed_refs_lookups {
-                // What follows means that we will only create a transaction if we have to access packed refs for looking
-                // up current ref values, or that we definitely have a transaction if we need to make updates. Otherwise
-                // we may have no transaction at all which isn't required if we had none and would only try making deletions.
+            // `packed-refs.lock` is taken if and only if we have an edit to *write* into
+            // `packed-refs`, which is precisely git's rule.
+            //
+            // `files_transaction_prepare()` builds its `packed_transaction` only from updates that
+            // delete a reference (`refs/files-backend.c:2982-3007`):
+            //
+            //     if (update->flags & REF_DELETING &&
+            //         !(update->flags & REF_LOG_ONLY) &&
+            //         !(update->flags & REF_IS_PRUNING)) {
+            //             /*
+            //              * This reference has to be deleted from
+            //              * packed-refs if it exists there.
+            //              */
+            //
+            // and takes the lock only if that transaction came into being (`:3031-3036`):
+            //
+            //     if (packed_transaction) {
+            //             if (packed_refs_lock(refs->packed_ref_store, 0, err)) {
+            //
+            // `edits_for_packed_transaction` is that same set: deletions, plus the values a
+            // `pack-refs`-style transaction migrates into `packed-refs` — which is the other place
+            // git locks, `files_pack_refs()` at `:1478`.
+            //
+            // `needs_packed_refs_lookups` deliberately does *not* take part in this decision.
+            // Creating a loose reference, or updating one whose current value happens to live in
+            // `packed-refs`, only ever *reads* the file, and git does that read unlocked on
+            // purpose (`:3010-3023`):
+            //
+            //     * Verify that none of the loose reference that we're about to write
+            //     * conflict with any existing packed references. Ideally, we'd do this
+            //     * check after the packed-refs are locked so that the file cannot
+            //     * change underneath our feet. But introducing such a lock now would
+            //     * probably do more harm than good as users rely on there not being a
+            //     * global lock with the "files" backend.
+            //     …
+            //     * So instead, we accept the race for now.
+            //
+            // Taking the lock for a read is what let one `packed-refs.lock` — a concurrent
+            // `pack-refs`, or one left behind by a killed process — fail every reference creation
+            // in the repository, where stock git creates the loose file and succeeds.
+            if !edits_for_packed_transaction.is_empty() {
                 let packed_transaction: Option<_> =
                     if maybe_updates_for_packed_refs.unwrap_or(0) > 0 || self.store.packed_refs_lock_path().is_file() {
-                        // We have to create a packed-ref even if it doesn't exist
+                        // We have to create a packed-ref even if it doesn't exist.
+                        //
+                        // The `packed-refs.lock` probe stands in for git locking unconditionally
+                        // once it has a deletion to make: a lock that is currently held means a
+                        // `packed-refs` may be about to appear, and git keeps its own lock for the
+                        // whole transaction so "somebody else doesn't pack a reference that we are
+                        // trying to delete" (`refs/files-backend.c:3053-3056`).
                         self.store
                             .packed_transaction(packed_refs_lock_fail_mode)
                             .map_err(|err| match err {
@@ -555,14 +598,29 @@ impl Transaction<'_, '_> {
                     });
                 }
             }
+
+            // Whatever is left that still has to consult `packed-refs` gets a plain snapshot.
+            // `Store::assure_packed_refs_uptodate()` opens the file for reading and takes no lock,
+            // so this is the unlocked read quoted above. A packed transaction, when we have one,
+            // already carries a buffer read under the lock and wins.
+            if self.packed_transaction.is_none() && needs_packed_refs_lookups {
+                self.packed_buffer = self.store.assure_packed_refs_uptodate()?;
+            }
         }
 
+        // The packed transaction's buffer when there is one, the unlocked snapshot otherwise —
+        // see [`Transaction::packed_buffer`][file::Transaction].
+        let packed_for_lookups = self
+            .packed_transaction
+            .as_ref()
+            .and_then(packed::Transaction::buffer)
+            .or_else(|| self.packed_buffer.as_ref().map(|b| &***b));
         for cid in 0..updates.len() {
             let change = &mut updates[cid];
             if let Err(err) = Self::lock_ref_and_apply_change(
                 self.store,
                 ref_files_lock_fail_mode,
-                self.packed_transaction.as_ref().and_then(packed::Transaction::buffer),
+                packed_for_lookups,
                 change,
                 matches!(
                     self.packed_refs,

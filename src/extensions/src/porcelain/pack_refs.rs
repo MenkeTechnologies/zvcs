@@ -228,22 +228,53 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if !edits.is_empty() {
+    // `files_pack_refs()` takes `packed-refs.lock` the moment `should_pack_refs()` clears the
+    // run, before it has looked at a single loose ref (refs/files-backend.c:1470-1478):
+    //
+    //     if (!should_pack_refs(refs, opts))
+    //             return 0;
+    //     …
+    //     packed_refs_lock(refs->packed_ref_store, LOCK_DIE_ON_ERROR, &err);
+    //
+    // and `should_pack_refs()` returns 1 outright for anything but `--auto`
+    // (`:1405-1406`), so the lock is unconditional: a run with nothing left to pack dies
+    // exactly like one that had work to do. `LOCK_DIE_ON_ERROR` routes the failure through
+    // `die()`, which is why the exit code is 128 rather than 1.
+    //
+    // A run that has edits takes this same lock inside the packed transaction below, so it is
+    // only acquired here for the empty run — and released again right away, since nothing is
+    // written through it.
+    let packed_refs = store.packed_refs_path();
+    if edits.is_empty() {
+        if let Err(e) = gix::lock::File::acquire_to_update_resource(
+            &packed_refs,
+            gix::lock::acquire::Fail::Immediately,
+            None,
+        ) {
+            return Ok(packed_refs_lock_fatal(&packed_refs, &e));
+        }
+    } else {
         let objects: Box<dyn gix::objs::Find + '_> = Box::new(&repo.objects);
         let mode = if opts.prune {
             PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(objects)
         } else {
             PackedRefs::DeletionsAndNonSymbolicUpdates(objects)
         };
-        store
-            .transaction()
-            .packed_refs(mode)
-            .prepare(
-                edits,
-                gix::lock::acquire::Fail::Immediately,
-                gix::lock::acquire::Fail::Immediately,
-            )?
-            .commit(None::<gix::actor::SignatureRef<'_>>)?;
+        let prepared = store.transaction().packed_refs(mode).prepare(
+            edits,
+            gix::lock::acquire::Fail::Immediately,
+            gix::lock::acquire::Fail::Immediately,
+        );
+        match prepared {
+            Ok(t) => {
+                t.commit(None::<gix::actor::SignatureRef<'_>>)?;
+            }
+            // The same `packed_refs_lock()` failure, just reached one layer down.
+            Err(gix::refs::file::transaction::prepare::Error::PackedTransactionAcquire(e)) => {
+                return Ok(packed_refs_lock_fatal(&packed_refs, &e));
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 
     if opts.prune {
@@ -264,6 +295,41 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Report a `packed-refs` lock failure the way `LOCK_DIE_ON_ERROR` does, and exit 128.
+///
+/// `packed_refs_lock()` hands `LOCK_DIE_ON_ERROR` to `hold_lock_file_for_update_timeout()`
+/// (refs/packed-backend.c:1235-1241), so the failure never returns to the caller: it goes
+/// through `unable_to_lock_die()`, which prints `unable_to_lock_message()` via `die()`.
+/// That is the `fatal: ` prefix and the 128.
+///
+/// [`gix::lock::acquire::Error::PermanentlyLocked`] is raised for the `EEXIST` branch and
+/// nothing else — every other `errno` becomes `Error::Io` (gix-lock/src/acquire.rs:257-262) —
+/// so the `errno` `unable_to_lock_message()` wants is reconstructed here rather than carried
+/// through the error type. `EEXIST` is also the only branch that gets git's two-paragraph form
+/// with the holder diagnostic.
+pub(super) fn packed_refs_lock_fatal(packed_refs: &Path, err: &gix::lock::acquire::Error) -> ExitCode {
+    let message = match err {
+        gix::lock::acquire::Error::Io(err) => gix::lock::pid::unable_to_lock_message(packed_refs, err),
+        gix::lock::acquire::Error::PermanentlyLocked { .. } => {
+            gix::lock::pid::unable_to_lock_message(packed_refs, &eexist())
+        }
+    };
+    eprintln!("fatal: {message}");
+    ExitCode::from(128)
+}
+
+/// The `EEXIST` that `gix_lock::acquire::Error::PermanentlyLocked` stands for, as an
+/// [`std::io::Error`] carrying the raw `errno`.
+///
+/// It has to be the raw code rather than [`std::io::ErrorKind::AlreadyExists`]: git renders it
+/// with `strerror(errno)`, and `unable_to_lock_message()`'s `strerror` helper
+/// (gix-lock/src/pid.rs:109-118) only reaches the platform string through
+/// `raw_os_error()`. A kind-only error renders as Rust's own "entity already exists" instead of
+/// git's "File exists".
+pub(super) fn eexist() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::EEXIST)
 }
 
 /// The number of packable loose refs `--auto` requires before it packs at all,

@@ -185,6 +185,34 @@ pub fn cases() -> Vec<Case> {
         // directory as the difference rather than leaving it as one of two.
         c.push(Case::new(cmd, args, Shape::Hooked));
     }
+    // Two argument checks git makes before it does anything, both found by a
+    // generated draw and pinned here so they are measured every run rather than
+    // whenever a seed happens to reach them. Git refuses each with `fatal:` and
+    // 128 before touching the repository; the port runs the command and exits 1.
+    //
+    //   --author '-1'   git: fatal, 128, after searching existing authors and
+    //                   finding none. The port refuses honestly — "only the
+    //                   `Name <email>` form is supported (author search is not
+    //                   ported)" — so this scores as `unsupported`, which is a
+    //                   failure here by design: an unported feature is the gap
+    //                   being measured, not a skip.
+    //   --reset-author  git: fatal, 128, "can be used only with -C, -c or --amend".
+    //                   The port exits **0 and writes the commit**, so an invalid
+    //                   flag combination silently produces one nobody asked for.
+    //
+    // Deliberately curated while still failing: a defect that only a lucky seed
+    // reveals is one a green run can hide.
+    c.push(Case::strict(
+        "commit",
+        &["commit", "--allow-empty", "-m", "x", "--author=-1"],
+        Shape::Linear,
+    ));
+    c.push(Case::strict(
+        "commit",
+        &["commit", "--allow-empty", "-m", "x", "--reset-author"],
+        Shape::Linear,
+    ));
+
     // `--no-verify` must skip the hooks, and the `commit-msg` hook's trailer is
     // what makes that observable: with it the message gains a line, without it
     // the message is exactly what was passed.

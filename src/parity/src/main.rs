@@ -36,6 +36,7 @@ mod concurrent;
 mod corpus;
 mod env;
 mod fixture;
+mod foreign_lock;
 mod nested;
 mod fuzz;
 mod grammars_generated;
@@ -521,6 +522,66 @@ fn real_main() -> Result<ExitCode> {
                  so this is\n  evidence, not proof — re-run to accumulate it.",
                 cases.len()
             );
+        }
+    }
+
+    // The foreign-lock corpus rides the same flag: it asks the same question
+    // (what happens when this repository is not exclusively ours) and is priced
+    // the same way — a planted lock, two invocations, no settle window.
+    if args.concurrency {
+        let mut cases = foreign_lock::cases();
+        if !args.only.is_empty() {
+            cases.retain(|c| args.only.iter().any(|o| o == c.cmd));
+        }
+        let fl_dir = root.join("foreign-lock");
+        std::fs::create_dir_all(&fl_dir)?;
+        println!("\nforeign locks ({} cases, sequential)", cases.len());
+        println!(
+            "  invariant: whatever stock git completes with the lock held, the port must \
+             complete too.\n  Doing more than git under contention is the fair queue and is \
+             recorded, not scored."
+        );
+        for case in &cases {
+            let outcome =
+                foreign_lock::run_foreign_lock_case(case, &zvcs_bin, &templates, &fl_dir);
+            let say = |label: &str, r: &Option<foreign_lock::SideRun>| {
+                if let Some(r) = r {
+                    println!("       {label}: rc={:?} {}", r.code, r.first_line);
+                }
+            };
+            match &outcome.verdict {
+                foreign_lock::Verdict::Agree => {
+                    if args.verbose {
+                        println!("  ok   {}", outcome.id);
+                        say("zvcs ", &outcome.zvcs);
+                        say("stock", &outcome.stock);
+                    }
+                }
+                foreign_lock::Verdict::Skipped(why) => println!("  skip {} — {why}", outcome.id),
+                foreign_lock::Verdict::PortDidMore => {
+                    println!("  +    {} — port completed what stock refused", outcome.id);
+                    say("zvcs ", &outcome.zvcs);
+                    say("stock", &outcome.stock);
+                }
+                foreign_lock::Verdict::RefusedWithDifferentCode => {
+                    concurrency_defects += 1;
+                    println!(
+                        "  FAIL {} — both refused, with different exit codes",
+                        outcome.id
+                    );
+                    say("zvcs ", &outcome.zvcs);
+                    say("stock", &outcome.stock);
+                }
+                foreign_lock::Verdict::PortRefusedWhatGitDid => {
+                    concurrency_defects += 1;
+                    println!("  FAIL {} — stock did the work, the port refused it", outcome.id);
+                    say("zvcs ", &outcome.zvcs);
+                    say("stock", &outcome.stock);
+                }
+            }
+        }
+        if cases.is_empty() {
+            println!("  no foreign-lock cases selected by --only — nothing was measured");
         }
     }
 

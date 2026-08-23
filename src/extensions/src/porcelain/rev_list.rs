@@ -827,6 +827,29 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     return Ok(fatal(&e));
                 }
             }
+            // ```c
+            // } else if (!strcmp(arg, "--alternate-refs")) {
+            //         add_alternate_refs_to_pending(revs, *flags);
+            // ```
+            //
+            // (`revision.c:2904-2905`.) `add_one_alternate_ref()`
+            // (`revision.c:1866-1876`) queues each id `odb_for_each_alternate_ref()`
+            // yields with `get_reference()` + `add_pending_object()`, under the
+            // hex text as its name — so an annotated tag tip is peeled by the
+            // walk, exactly as a `<rev>` operand would be, and carries the flags
+            // `--not` holds at this argv position.
+            "--alternate-refs" => {
+                for id in crate::alternate_refs::tips(&repo) {
+                    if let Some(id) = peel_recording_tags(&repo, id, &mut pending) {
+                        seeds.push(Seed {
+                            id,
+                            uninteresting: negate,
+                            symmetric_left: false,
+                            bottom: negate,
+                        });
+                    }
+                }
+            }
             s if s.starts_with("--exclude-hidden=") => {
                 // `if (exclusions->hidden_refs_configured) die(…)` — the flag is
                 // set by the *config walk*, so a second `--exclude-hidden=` is

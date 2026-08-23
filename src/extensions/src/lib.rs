@@ -7,6 +7,7 @@
 pub mod abbrev;
 pub mod advice;
 pub mod alias;
+pub mod alternate_refs;
 pub mod autocorrect;
 pub mod autostart;
 pub mod config;

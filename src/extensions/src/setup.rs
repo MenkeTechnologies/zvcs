@@ -1122,23 +1122,41 @@ pub fn report_missing_alternates(sub: &str) {
 /// unquoted arm rather than failing, which is what the `&&` in the condition
 /// buys.
 fn parse_alternates(list: &str) -> Vec<PathBuf> {
-    let bytes = list.as_bytes();
+    parse_alternates_sep(list.as_bytes(), b':', None)
+}
+
+/// `parse_alternates(buf.buf, '\n', source->path, out)` — the *file* form, as
+/// `odb_source_files_read_alternates()` (`odb/source-files.c:192-209`) calls it
+/// for an `objects/info/alternates`.
+///
+/// Two things change from the environment form: entries are separated by newlines
+/// rather than `PATH_SEP`, and a relative entry is resolved against
+/// `relative_base` — the *object directory that listed it* — rather than against
+/// the current directory.
+pub(crate) fn alternates_from_file(content: &[u8], relative_base: &Path) -> Vec<PathBuf> {
+    parse_alternates_sep(content, b'\n', Some(relative_base))
+}
+
+/// The body both forms share. `sep` is git's `sep` argument and `relative_base`
+/// its `relative_base`; `None` is the `NULL` that leaves a relative entry to be
+/// resolved against the current directory by `strbuf_realpath` itself.
+fn parse_alternates_sep(bytes: &[u8], sep: u8, relative_base: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
         let (entry, next): (Vec<u8>, usize) = if bytes[at] == b'#' {
             // A comment contributes nothing and runs to the next separator.
-            (Vec::new(), memchr_sep(bytes, at))
+            (Vec::new(), memchr_sep(bytes, sep, at))
         } else if bytes[at] == b'"' {
             match unquote_c_style_step(bytes, at) {
                 Some((text, end)) => (text, end),
                 None => {
-                    let end = memchr_sep(bytes, at);
+                    let end = memchr_sep(bytes, sep, at);
                     (bytes[at..end].to_vec(), end)
                 }
             }
         } else {
-            let end = memchr_sep(bytes, at);
+            let end = memchr_sep(bytes, sep, at);
             (bytes[at..end].to_vec(), end)
         };
         at = if next < bytes.len() { next + 1 } else { next };
@@ -1148,8 +1166,23 @@ fn parse_alternates(list: &str) -> Vec<PathBuf> {
             continue;
         }
         let path = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(entry));
-        // `strbuf_realpath(&buf, pathbuf.buf, 0)`, which resolves a relative entry
-        // against the current directory, then the trailing-slash trim.
+        // ```c
+        // if (!is_absolute_path(buf.buf) && relative_base) {
+        //         strbuf_realpath(&pathbuf, relative_base, 1);
+        //         strbuf_addch(&pathbuf, '/');
+        // }
+        // strbuf_addbuf(&pathbuf, &buf);
+        // ```
+        let path = match relative_base {
+            Some(base) if path.is_relative() => {
+                // `strbuf_realpath(&pathbuf, relative_base, 1)` is the *dying*
+                // form; a base that cannot be resolved is used as written, which
+                // then fails the resolution below like any other bad path.
+                realpath_lenient(base).unwrap_or_else(|| base.to_path_buf()).join(&path)
+            }
+            _ => path,
+        };
+        // `strbuf_realpath(&buf, pathbuf.buf, 0)`, then the trailing-slash trim.
         let Some(resolved) = realpath_lenient(&path)
             .or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(&path)))
         else {
@@ -1160,12 +1193,13 @@ fn parse_alternates(list: &str) -> Vec<PathBuf> {
     out
 }
 
-/// `strchrnul(string, sep)` for git's `PATH_SEP`, which is `:` everywhere this
-/// port runs: the offset of the next separator, or the end of the string.
-fn memchr_sep(bytes: &[u8], from: usize) -> usize {
+/// `strchrnul(string, sep)`: the offset of the next `sep`, or the end of the
+/// string. git passes `PATH_SEP` — `:` everywhere this port runs — for the
+/// environment list and `'\n'` for an `objects/info/alternates` file.
+fn memchr_sep(bytes: &[u8], sep: u8, from: usize) -> usize {
     bytes[from..]
         .iter()
-        .position(|&b| b == b':')
+        .position(|&b| b == sep)
         .map_or(bytes.len(), |off| from + off)
 }
 

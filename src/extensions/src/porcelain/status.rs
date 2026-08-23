@@ -1058,11 +1058,22 @@ fn status_report(
 
     // `wt_longstatus_print_tracking` times `format_tracking_info`, whose cost is
     // the ahead/behind revision walk — [`tracking_info`] here.
+    //
+    // The two formats measure different things: `wt_shortstatus_print_tracking`
+    // asks `stat_tracking_info()` about the upstream alone, while the long
+    // format runs `format_tracking_info()`, which walks every ref
+    // `status.compareBranches` names. Only the format about to be printed is
+    // computed, so neither pays for the other's revision walks.
     let ab_t0 = std::time::Instant::now();
-    let tracking = if unborn {
+    let tracking = if unborn || !short {
         None
     } else {
         tracking_info(&repo)?
+    };
+    let comparisons = if unborn || short {
+        Vec::new()
+    } else {
+        tracking_comparisons(&repo)?
     };
     let ab_elapsed_ms = ab_t0.elapsed().as_millis() as u64;
 
@@ -1111,7 +1122,10 @@ fn status_report(
         // `--show-stash` appends a stash-count summary after the trailer; the count
         // is the number of `refs/stash` reflog entries (git's `count_stash_entries`).
         let stash_count = if show_stash { count_stash_entries(&repo) } else { 0 };
-        let mut tracking_block = tracking_lines(tracking.as_ref(), quick, hints);
+        // `format_tracking_info(branch, &sb, s->ahead_behind_flags,
+        // !s->commit_template)` (wt-status.c:1231-1232): the editor's status
+        // block is the one caller that suppresses the divergence hint.
+        let mut tracking_block = tracking_lines(&comparisons, quick, hints, template.is_none());
         // The ahead/behind warning is appended to the same strbuf
         // `format_tracking_info` filled, so it only shows when that produced
         // something, and only for the full counts `--no-ahead-behind` skips.
@@ -2625,6 +2639,148 @@ fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
     }))
 }
 
+/// One entry of `format_tracking_info()`'s loop (`remote.c:2400-2459`) — the
+/// current branch measured against one of the refs `status.compareBranches`
+/// names.
+struct Comparison {
+    /// `short_ref` — the base ref as the message names it.
+    name: String,
+    /// `cmp < 0`: `stat_branch_pair()` (`remote.c:2190-2211`) could not read one
+    /// of the two refs, which for the upstream entry is the "upstream is gone"
+    /// report and for any other entry is silence.
+    gone: bool,
+    ahead: usize,
+    behind: usize,
+    /// `is_upstream` (`remote.c:2420`) — this ref *is* `branch_get_upstream()`'s
+    /// answer. Gates `ENABLE_ADVICE_PULL` and the divergence hint.
+    is_upstream: bool,
+    /// `is_push` (`remote.c:2421-2424`) — this ref is `branch_get_push()`'s
+    /// answer, or it is the upstream and the branch has no separate push
+    /// destination. Gates `ENABLE_ADVICE_PUSH`.
+    is_push: bool,
+}
+
+/// The value of `status.compareBranches`, split as `format_tracking_info()`
+/// splits it (`remote.c:2387-2395`):
+///
+/// ```c
+/// repo_config_get_string(the_repository, "status.comparebranches",
+///                        &compare_branches);
+///
+/// if (compare_branches) {
+///         string_list_split(&branches, compare_branches, " ", -1);
+///         string_list_remove_empty_items(&branches, 0);
+/// } else {
+///         string_list_append(&branches, "@{upstream}");
+/// }
+/// ```
+///
+/// The delimiter is one literal space, so a tab is *part of* an entry rather
+/// than a separator — `status.compareBranches="@{upstream}\t@{push}"` is one
+/// unrecognised name, and git warns about it whole. An empty value splits into a
+/// single empty item which `string_list_remove_empty_items` drops, leaving no
+/// comparisons at all and therefore no tracking block.
+///
+/// A key set with no value at all is the one shape of this variable not
+/// reproduced: `repo_config_get_string()` reports `missing value for
+/// 'status.comparebranches'` and dies *after* `On branch <name>` has already
+/// reached stdout, because git resolves the value inside the printer. This port
+/// builds the whole block before the header is rendered, so it cannot place the
+/// diagnostic where git places it; a valueless key is treated as unset, exactly
+/// as it was before this key was read at all.
+fn compare_branch_names(repo: &gix::Repository) -> Vec<String> {
+    let Some(raw) = repo.config_snapshot().string("status.compareBranches") else {
+        return vec!["@{upstream}".to_string()];
+    };
+    raw.to_string()
+        .split(' ')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `format_tracking_info()`'s loop (`remote.c:2375-2459`) up to the point it
+/// starts writing sentences: which refs are compared, in which order, and with
+/// which of the three advice flags.
+///
+/// Resolution is `resolve_compare_branch()` (`remote.c:2291-2312`) — a
+/// case-insensitive `@{upstream}` or `@{push}` and nothing else:
+///
+/// ```c
+/// if (!strcasecmp(name, "@{upstream}")) {
+///         resolved = branch_get_upstream(branch, NULL);
+/// } else if (!strcasecmp(name, "@{push}")) {
+///         resolved = branch_get_push(branch, NULL);
+/// } else {
+///         warning(_("ignoring value '%s' for status.compareBranches, "
+///                   "only @{upstream} and @{push} are supported"),
+///                 name);
+///         return NULL;
+/// }
+/// ```
+///
+/// The warning fires per occurrence, before any ref is resolved, so it is
+/// printed even for a branch that tracks nothing. A name that resolves to no ref
+/// is skipped silently.
+///
+/// `strset_add(&processed_refs, full_ref)` (`remote.c:2412`) suppresses a repeat
+/// of a ref already compared, which is why `@{push} @{upstream} @{push}` shows
+/// at most two comparisons and why one shows when the two resolve alike.
+fn tracking_comparisons(repo: &gix::Repository) -> Result<Vec<Comparison>> {
+    use gix::bstr::ByteSlice;
+
+    let Some(branch_ref) = repo.head_ref()? else {
+        return Ok(Vec::new());
+    };
+    let full = branch_ref.name().as_bstr().to_owned();
+    // `upstream_ref` / `push_ref` are this crate's `branch_get_upstream()` and
+    // `branch_get_push()`; git reads both once, outside the loop
+    // (`remote.c:2397-2398`), because the loop compares against them.
+    let upstream = super::branch::upstream_ref(repo, full.as_bstr());
+    let push = super::branch::push_ref(repo, full.as_bstr());
+    let local = repo.head_id().ok();
+
+    let mut seen: std::collections::HashSet<gix::refs::FullName> =
+        std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for name in compare_branch_names(repo) {
+        let resolved = if name.eq_ignore_ascii_case("@{upstream}") {
+            upstream.clone()
+        } else if name.eq_ignore_ascii_case("@{push}") {
+            push.clone()
+        } else {
+            eprintln!(
+                "warning: ignoring value '{name}' for status.compareBranches, \
+                 only @{{upstream}} and @{{push}} are supported"
+            );
+            None
+        };
+        let Some(full_ref) = resolved else { continue };
+        if !seen.insert(full_ref.clone()) {
+            continue;
+        }
+
+        let is_upstream = upstream.as_ref() == Some(&full_ref);
+        // `if (is_upstream && (!push_ref || !strcmp(upstream_ref, push_ref)))
+        //          is_push = 1;` — a branch with no distinct push destination
+        // still gets the "git push" hint on its upstream comparison. When the
+        // two *do* differ, the upstream comparison loses that hint, which is the
+        // whole visible effect of `remote.pushDefault` on a default `git status`.
+        let is_push = push.as_ref() == Some(&full_ref)
+            || (is_upstream && (push.is_none() || push == upstream));
+        let counts = super::branch::stat_tracking_info(repo, local, &full_ref);
+        out.push(Comparison {
+            name: full_ref.shorten().to_str_lossy().into_owned(),
+            gone: counts.is_none(),
+            ahead: counts.map_or(0, |c| c.0),
+            behind: counts.map_or(0, |c| c.1),
+            is_upstream,
+            is_push,
+        });
+    }
+    Ok(out)
+}
+
 /// Build the tracking header line(s) for the long format, matching git's
 /// `format_tracking_info` output including advice hints. Empty when there is no
 /// upstream configured.
@@ -2639,12 +2795,15 @@ fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
 ///
 /// Shared with the commands that stop mid-sequence and reprint the header
 /// themselves (`cherry-pick`, `revert`); they were rendering the branch line
-/// alone, which drops the upstream relation from output git shows.
+/// alone, which drops the upstream relation from output git shows. Both reach
+/// `format_tracking_info` through `wt_status_print`, whose `s->commit_template`
+/// is unset there, so the divergence hint is enabled — as it is for
+/// `builtin/checkout.c:941`, which passes the flag literally.
 pub(crate) fn tracking_block(repo: &gix::Repository) -> String {
     let quick = repo.config_snapshot().boolean("status.aheadBehind") == Some(false);
     let hints = crate::advice::Advice::StatusHints.enabled_in(repo);
-    let tracking = tracking_info(repo).ok().flatten();
-    let block = tracking_lines(tracking.as_ref(), quick, hints);
+    let comparisons = tracking_comparisons(repo).unwrap_or_default();
+    let block = tracking_lines(&comparisons, quick, hints, true);
     if block.is_empty() {
         block
     } else {
@@ -2652,46 +2811,87 @@ pub(crate) fn tracking_block(repo: &gix::Repository) -> String {
     }
 }
 
-fn tracking_lines(tracking: Option<&Tracking>, quick: bool, hints: bool) -> String {
-    let Some(t) = tracking else {
-        return String::new();
-    };
-    // Each state's advice line, appended only when hints are on.
-    let advice = |line: &str| if hints { format!("  ({line})\n") } else { String::new() };
-    let upstream = &t.upstream;
-    if t.gone {
-        return format!(
-            "Your branch is based on '{upstream}', but the upstream is gone.\n{}",
-            advice("use \"git branch --unset-upstream\" to fixup")
-        );
+/// The sentences `format_tracking_info()` writes for each surviving comparison,
+/// separated by the blank line `remote.c:2444-2445` inserts before every entry
+/// after the first one that reported something.
+///
+/// `divergence` is `show_divergence_advice`, git's fourth argument: `status`
+/// passes `!s->commit_template`, `checkout` passes 1.
+fn tracking_lines(
+    comparisons: &[Comparison],
+    quick: bool,
+    hints: bool,
+    divergence: bool,
+) -> String {
+    let mut sb = String::new();
+    let mut reported = false;
+    for c in comparisons {
+        // `cmp < 0` (`remote.c:2429-2442`): only the upstream entry has anything
+        // to say about a base ref that cannot be read, and it says it without a
+        // preceding blank line — the separator below is reached only by entries
+        // that got as far as `format_branch_comparison()`.
+        if c.gone {
+            if c.is_upstream {
+                sb.push_str(&format!(
+                    "Your branch is based on '{}', but the upstream is gone.\n",
+                    c.name
+                ));
+                if hints {
+                    sb.push_str("  (use \"git branch --unset-upstream\" to fixup)\n");
+                }
+                reported = true;
+            }
+            continue;
+        }
+        if reported {
+            sb.push('\n');
+        }
+        reported = true;
+
+        // `format_branch_comparison()` (`remote.c:2314-2370`). Every hint is
+        // gated on `advice_enabled(ADVICE_STATUS_HINTS)` *and* on the flag its
+        // own branch reads, so a comparison against a ref that is neither the
+        // upstream nor the push destination prints its state line bare.
+        let advice = |on: bool, line: &str| {
+            if on && hints {
+                format!("  ({line})\n")
+            } else {
+                String::new()
+            }
+        };
+        let name = &c.name;
+        let (ahead, behind) = (c.ahead, c.behind);
+        if ahead == 0 && behind == 0 {
+            sb.push_str(&format!("Your branch is up to date with '{name}'.\n"));
+        } else if quick {
+            // AHEAD_BEHIND_QUICK: git knows the branches differ but not by how much.
+            sb.push_str(&format!(
+                "Your branch and '{name}' refer to different commits.\n{}",
+                advice(c.is_push, "use \"git status --ahead-behind\" for details")
+            ));
+        } else if behind == 0 {
+            let noun = if ahead == 1 { "commit" } else { "commits" };
+            sb.push_str(&format!(
+                "Your branch is ahead of '{name}' by {ahead} {noun}.\n{}",
+                advice(c.is_push, "use \"git push\" to publish your local commits")
+            ));
+        } else if ahead == 0 {
+            let noun = if behind == 1 { "commit" } else { "commits" };
+            sb.push_str(&format!(
+                "Your branch is behind '{name}' by {behind} {noun}, and can be fast-forwarded.\n{}",
+                advice(c.is_upstream, "use \"git pull\" to update your local branch")
+            ));
+        } else {
+            sb.push_str(&format!(
+                "Your branch and '{name}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n{}",
+                advice(
+                    divergence && c.is_upstream,
+                    "use \"git pull\" if you want to integrate the remote branch with yours"
+                )
+            ));
+        }
     }
-    let (ahead, behind) = (t.ahead, t.behind);
-    if ahead == 0 && behind == 0 {
-        format!("Your branch is up to date with '{upstream}'.\n")
-    } else if quick {
-        // AHEAD_BEHIND_QUICK: git knows the branches differ but not by how much.
-        format!(
-            "Your branch and '{upstream}' refer to different commits.\n{}",
-            advice("use \"git status --ahead-behind\" for details")
-        )
-    } else if behind == 0 {
-        let noun = if ahead == 1 { "commit" } else { "commits" };
-        format!(
-            "Your branch is ahead of '{upstream}' by {ahead} {noun}.\n{}",
-            advice("use \"git push\" to publish your local commits")
-        )
-    } else if ahead == 0 {
-        let noun = if behind == 1 { "commit" } else { "commits" };
-        format!(
-            "Your branch is behind '{upstream}' by {behind} {noun}, and can be fast-forwarded.\n{}",
-            advice("use \"git pull\" to update your local branch")
-        )
-    } else {
-        format!(
-            "Your branch and '{upstream}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n{}",
-            advice("use \"git pull\" if you want to integrate the remote branch with yours")
-        )
-    }
+    sb
 }
 
 /// The `## …` line of `git status -sb`, per git's `wt_shortstatus_print_tracking`.

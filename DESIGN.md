@@ -55,6 +55,32 @@ Two locks sit underneath, with distinct jobs:
   **waits its turn** in the daemon's per-repo FIFO and then succeeds, instead of
   failing on `index.lock`. Same semantics, no fail-retry storm. Already wired.
 
+- **Lane file (the no-daemon fallback).** With no daemon reachable the guard takes
+  `<git_dir>/zvcs-lane.lock` with `flock(LOCK_EX)` and holds it for the whole
+  command. The fallback cannot be a no-op: an index write is a read-modify-write
+  and the port's only index lock is taken at *write* time
+  (`gix-index/src/file/write.rs:85`), so two unserialized writers read the same
+  base index and each write back their own copy — the loser's entry is gone and
+  both exit 0. Measured before the lane file: eight concurrent `git add`s on
+  distinct paths, no daemon, lost a write in 9 of 10 trials with `queued=0`. Git
+  does not have the bug because it locks before it reads (`builtin/add.c`:
+  `repo_hold_locked_index(repo, &lock_file, LOCK_DIE_ON_ERROR)` precedes
+  `repo_read_index_preload()`).
+
+  Not `index.lock` itself: `gix-lock` acquires that with `Fail::Immediately`, so a
+  zvcs guard holding it makes zvcs's own writer fail ("could not be obtained
+  immediately after 1 attempt(s)"). A separate zvcs-owned file excludes zvcs peers
+  without touching the writer; foreign writers stay covered by
+  `wait_for_foreign_index_lock`.
+
+  | Situation | Behavior |
+  |---|---|
+  | lane free | taken, held for the command, released on drop (including panic and `SIGKILL` — the kernel owns the lock) |
+  | lane held by one of our own ancestors (a hook, a re-exec'd child) | reentrant: proceed without waiting, the ancestor's hold already excludes everyone |
+  | lane held by a peer | wait; the budget (`ZVCS_INDEX_LOCK_WAIT_MS`, 2 s) is patience for ONE holder and restarts whenever the pid in the file changes, so a fair queue of N writers is not mistaken for a wedge |
+  | one holder past the budget | exit non-zero with the holder's pid — never run unserialized, because that is the silent-loss case |
+  | git dir absent, or a mount without `flock` | no lane possible; unserialized, as before |
+
 - **`index.lock` (interop, preserved).** The on-disk `index.lock` is retained
   via `gix-lock` as the cross-implementation guard so **non-zvcs** tools (a hook
   that runs `command git`, `gh`, libgit2 tooling) cannot corrupt the index
@@ -92,7 +118,11 @@ Two locks sit underneath, with distinct jobs:
   `#[error(transparent)]`, so the inner error is a payload, never a `source()`
   link) and the dispatcher queues the command instead of dropping it. Measured on
   a 32-way `commit` fanout with no daemon: 11–12 of these per run, each formerly a
-  hard exit-1 that lost the commit.
+  hard exit-1 that lost the commit. That measurement predates the lane file above,
+  which serializes same-repo writers even with no daemon and so removes most of
+  that fanout's races at the source; the classifier stays because a ref can still
+  move under a writer that took no index lock at all (a `push`, a bare
+  `update-ref`, a peer on a mount without `flock`).
 
 - **Stream interleaving (`src/extensions/src/cstdio.rs`).** git orders its two
   streams through C stdio, not explicitly: `stderr` is unbuffered, `stdout` is

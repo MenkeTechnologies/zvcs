@@ -1254,8 +1254,14 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // job (it will run on the daemon's fair FIFO) and return its number instead of
     // waiting. If the lane is free we hold it here for the whole command (the
     // command's own inner `acquire` is a reentrant no-op). `ZVCS_QUEUED` marks a
-    // job's own re-run so it BLOCKS on the lock rather than re-queueing (loop guard);
-    // no daemon → run inline exactly as before.
+    // job's own re-run so it BLOCKS on the lock rather than re-queueing (loop guard).
+    //
+    // With no daemon there is no queue to defer to, so `try_acquire` falls back to
+    // the lane FILE and still answers `Held`. That guard is what makes the command
+    // safe: the index write is a read-modify-write, and two unserialized writers
+    // each write back their own copy of the base index — the loser's change is gone
+    // and both exit 0. `NoDaemon` now means the strictly weaker "not even a lane
+    // file is possible here", which is the only case that still runs unserialized.
     // `-h`/`--help` never writes the index, so a contended repo must not turn a
     // help request into a queued job with empty output.
     let is_help = args.iter().any(|a| a == "-h" || a == "--help");
@@ -1316,6 +1322,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                 crate::lock::TryLock::Busy { .. } => {
                     return crate::superset::queue::queue_verb(sub, args)
                 }
+                // No coordinator AND no lane file (a mount without `flock`).
+                // Nothing to hold; the command runs unserialized.
                 crate::lock::TryLock::NoDaemon => None,
             },
             Err(_) => None,

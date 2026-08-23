@@ -511,9 +511,22 @@ file-watch fires, and the daemon reacts. It never contacts a remote itself.
 The lock is **per-repo**: unrelated repos run fully in parallel; only writers to
 the same repo serialize, first-come-first-served. Clients reach it through
 `RepoLock::acquire` (`src/extensions/src/lock.rs`), an RAII guard; release is
-automatic on drop and on socket EOF, so a crashed holder can't wedge a repo. With
-no daemon the lock degrades to a no-op guard (the op still runs). Index writes
-also go through `index.lock` via `gix-lock` for interop with stock git.
+automatic on drop and on socket EOF, so a crashed holder can't wedge a repo. Index
+writes also go through `index.lock` via `gix-lock` for interop with stock git.
+
+With **no daemon** the lock falls back to a **lane file** — `<git_dir>/zvcs-lane.lock`,
+held with `flock(LOCK_EX)` for the whole command. It cannot be a no-op: an index
+write is a read-modify-write, and the port's only index lock is the one the writer
+takes at *write* time, so two unserialized writers each read the same base index
+and write back their own copy — the loser's change disappears and both exit 0.
+(Git avoids this by holding `index.lock` from before it reads: `builtin/add.c`
+calls `repo_hold_locked_index(..., LOCK_DIE_ON_ERROR)` ahead of
+`repo_read_index_preload()`.) The lane file is deliberately *not* `index.lock`,
+which `gix-lock` acquires with `Fail::Immediately` and which zvcs holding would
+make zvcs's own writer fail. Exclusion is the kernel's `flock`, not the file's
+existence, so a killed holder releases instantly and wedges nothing; a lane a live
+peer will not release within the wait budget makes the command exit non-zero with
+a message rather than run unserialized.
 
 A **foreign** holder of that lockfile — stock git, an IDE, a hook shelling out —
 is invisible to the lane, and the index writer takes the file with one attempt

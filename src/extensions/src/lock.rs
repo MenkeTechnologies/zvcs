@@ -12,16 +12,38 @@
 //! and closes the socket, and the daemon also auto-releases on socket EOF, so a
 //! crashed holder can never wedge the repo.
 //!
-//! If no daemon is reachable the lock degrades to a **no-op guard**: the
-//! operation still runs (exactly stock-git behavior, minus the fair queue).
-//! Ensuring a daemon is running is the autonomous layer's job, not the writer's.
+//! If no daemon is reachable the lock falls back to a **lane file** —
+//! `<git_dir>/zvcs-lane.lock`, held with `flock(LOCK_EX)` for the whole command.
+//! It has to hold *something*: the port's only index lock is the one
+//! `gix_index::File::write()` takes at WRITE time
+//! (`gix-index/src/file/write.rs:85`), which is far too late. Git takes
+//! `.git/index.lock` BEFORE it reads the index — in `builtin/add.c`,
+//! `repo_hold_locked_index(repo, &lock_file, LOCK_DIE_ON_ERROR)` precedes
+//! `repo_read_index_preload()` — so the whole read-modify-write is inside the
+//! lock. Guarding only the write leaves two writers free to read the same base
+//! index and write back their own copies; the loser's entry is gone and both
+//! processes exit 0. Measured: eight concurrent `git add`s on distinct paths, no
+//! daemon, lost a write in nine of ten trials.
+//!
+//! The lane file is deliberately NOT `index.lock`: gitoxide acquires that one
+//! with `Fail::Immediately`, so holding it ourselves makes our own writer fail
+//! ("could not be obtained immediately after 1 attempt(s)"). A separate
+//! zvcs-owned file gives zvcs-vs-zvcs exclusion without touching the writer, and
+//! foreign writers are covered separately by [`wait_for_foreign_index_lock`].
+//!
+//! Exclusion is the kernel's `flock`, not the file's existence, so a killed
+//! holder wedges nothing: the lock dies with the process even on `SIGKILL`, and
+//! the leftover file is just a stale pid label. Ensuring a daemon is running is
+//! the autonomous layer's job, not the writer's.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Per-process monotonic counter making every lock id unique even when one
 /// process acquires from multiple threads (the daemon keys holder/release on the
@@ -42,8 +64,12 @@ thread_local! {
 /// granted for the repo. Release is automatic on drop.
 #[must_use = "the lock releases when this guard is dropped; bind it for the critical section"]
 pub struct RepoLock {
-    /// `Some` when held via a live daemon; `None` for the no-daemon no-op guard.
+    /// `Some` when held via a live daemon; `None` for the no-daemon fallback.
     stream: Option<UnixStream>,
+    /// `Some` when this guard holds the no-daemon lane file. Mutually exclusive
+    /// with `stream`: a daemon-granted holder already excludes every other zvcs
+    /// writer, and a reentrant guard must hold neither.
+    lane: Option<LaneFile>,
     id: String,
     /// The canonical lane key this guard registered in the thread-local `HELD` set,
     /// to clear on drop. `None` for a *reentrant* guard (an outer guard on this
@@ -69,16 +95,23 @@ pub enum TryLock {
         /// queue therefore cannot safely block either.
         owner_resolved: bool,
     },
-    /// No daemon reachable — proceed unserialized, exactly as [`RepoLock::acquire`].
+    /// Neither a daemon nor a lane file is available (a git dir that does not
+    /// exist yet, or a mount without `flock`) — proceed unserialized. Contention
+    /// with a live daemon is `Busy`; contention without one never reaches the
+    /// caller, it is refused inside the lock.
     NoDaemon,
 }
 
 impl RepoLock {
     /// Acquire the repo-wide index lock via the daemon at `<git_dir>/zvcs.sock`.
     ///
-    /// Blocks in the daemon's fair FIFO until granted. Never fails: if the daemon
-    /// is unreachable or the handshake does not complete, returns an unlocked
-    /// no-op guard so the caller proceeds unserialized rather than erroring.
+    /// Blocks in the daemon's fair FIFO until granted. If the daemon is
+    /// unreachable or the handshake does not complete, falls back to the lane
+    /// FILE (`<git_dir>/zvcs-lane.lock`, `flock`-held for the guard's life) so
+    /// concurrent zvcs writers still serialize. Returns only when the caller may
+    /// safely write: a lane a live stranger will not release within the budget
+    /// exits the process non-zero instead of handing back a guard that excludes
+    /// nobody.
     ///
     /// The client id is generated internally and is unique per acquisition
     /// (`<pid>-<seq>`), so concurrent holders — across processes or threads —
@@ -98,7 +131,7 @@ impl RepoLock {
         // same thread is blocked in `read_line` (self-deadlock). A *different*
         // thread/process still goes to the daemon and serializes normally.
         if HELD.with(|h| h.borrow().contains(&repo)) {
-            return Self { stream: None, id, held_key: None, _not_send: std::marker::PhantomData };
+            return Self { stream: None, lane: None, id, held_key: None, _not_send: std::marker::PhantomData };
         }
         HELD.with(|h| {
             h.borrow_mut().insert(repo.clone());
@@ -106,13 +139,13 @@ impl RepoLock {
 
         let mut stream = match UnixStream::connect(&sock) {
             Ok(s) => s,
-            Err(_) => return Self::unlocked(id, repo),
+            Err(_) => return Self::fallback(id, repo),
         };
         // Read on a clone so the original stream stays open for the whole
         // critical section — closing it is what signals RELEASE/auto-release.
         let reader_half = match stream.try_clone() {
             Ok(s) => s,
-            Err(_) => return Self::unlocked(id, repo),
+            Err(_) => return Self::fallback(id, repo),
         };
         let mut reader = BufReader::new(reader_half);
 
@@ -131,7 +164,7 @@ impl RepoLock {
             .is_err()
             || stream.flush().is_err()
         {
-            return Self::unlocked(id, repo);
+            return Self::fallback(id, repo);
         }
 
         // Block until the daemon answers `GRANTED` (our turn at the FIFO head).
@@ -139,19 +172,23 @@ impl RepoLock {
         match reader.read_line(&mut line) {
             Ok(n) if n > 0 && line.trim() == "GRANTED" => Self {
                 stream: Some(stream),
+                lane: None,
                 id,
                 held_key: Some(repo),
                 _not_send: std::marker::PhantomData,
             },
-            _ => Self::unlocked(id, repo),
+            _ => Self::fallback(id, repo),
         }
     }
 
-    /// Non-blocking acquire. Unlike [`acquire`], never waits: if the repo's lane is
-    /// already held, returns [`TryLock::Busy`] at once so the caller can queue its
-    /// work as a job instead of blocking. `TryLock::Held` is the lock (proceed
-    /// inline); `TryLock::NoDaemon` means no daemon is reachable (proceed
-    /// unserialized, exactly as `acquire` does in that case).
+    /// Non-blocking acquire — while there is a daemon. If the repo's lane is held,
+    /// returns [`TryLock::Busy`] at once so the caller can queue its work as a job
+    /// instead of blocking. `TryLock::Held` is the lock (proceed inline);
+    /// `TryLock::NoDaemon` means neither form of exclusion exists here at all.
+    ///
+    /// With no daemon there is no queue to defer to, so the fallback waits on the
+    /// lane file within the budget rather than reporting `Busy` — deferring to a
+    /// queue nobody is running would be the same silent success as not locking.
     pub fn try_acquire(git_dir: &Path) -> TryLock {
         let id = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
         let sock = crate::superset::zdaemon::socket_path();
@@ -159,16 +196,16 @@ impl RepoLock {
 
         // Reentrant: this thread already holds it — hand back a no-op held guard.
         if HELD.with(|h| h.borrow().contains(&repo)) {
-            return TryLock::Held(Self { stream: None, id, held_key: None, _not_send: std::marker::PhantomData });
+            return TryLock::Held(Self { stream: None, lane: None, id, held_key: None, _not_send: std::marker::PhantomData });
         }
 
         let mut stream = match UnixStream::connect(&sock) {
             Ok(s) => s,
-            Err(_) => return TryLock::NoDaemon,
+            Err(_) => return Self::fallback_try(id, repo),
         };
         let reader_half = match stream.try_clone() {
             Ok(s) => s,
-            Err(_) => return TryLock::NoDaemon,
+            Err(_) => return Self::fallback_try(id, repo),
         };
         let mut reader = BufReader::new(reader_half);
 
@@ -191,7 +228,7 @@ impl RepoLock {
         if stream.write_all(format!("TRYACQUIRE {id} {}\n", repo.display()).as_bytes()).is_err()
             || stream.flush().is_err()
         {
-            return TryLock::NoDaemon;
+            return Self::fallback_try(id, repo);
         }
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -201,26 +238,248 @@ impl RepoLock {
                 });
                 TryLock::Held(Self {
                     stream: Some(stream),
+                    lane: None,
                     id,
                     held_key: Some(repo),
                     _not_send: std::marker::PhantomData,
                 })
             }
             Ok(n) if n > 0 && line.trim() == "BUSY" => TryLock::Busy { owner_resolved },
-            _ => TryLock::NoDaemon,
+            _ => Self::fallback_try(id, repo),
         }
     }
 
-    /// No-op guard for the no-daemon / handshake-failed path. We already inserted
-    /// `repo` into `HELD`, so this guard owns the key and clears it on drop.
+    /// No-op guard: no daemon lock, no lane file. For the two cases where holding
+    /// anything would be wrong — a reentrant acquire, and an acquire whose lane is
+    /// already held by one of our own ancestors. We already inserted `repo` into
+    /// `HELD`, so this guard owns the key and clears it on drop.
     fn unlocked(id: String, repo: PathBuf) -> Self {
-        Self { stream: None, id, held_key: Some(repo), _not_send: std::marker::PhantomData }
+        Self { stream: None, lane: None, id, held_key: Some(repo), _not_send: std::marker::PhantomData }
     }
 
-    /// Whether this guard is backed by a live daemon (vs. the no-op fallback).
+    /// Guard for the no-daemon / handshake-failed path: take the lane FILE, so
+    /// concurrent zvcs writers still serialize.
+    ///
+    /// Exits non-zero rather than returning if the lane cannot be had (see
+    /// [`deny_and_exit`]) — the one thing this must never do is hand back a guard
+    /// that excludes nobody and let the caller report success on a write another
+    /// process is about to erase.
+    fn fallback(id: String, repo: PathBuf) -> Self {
+        let lane = match take_lane(&repo) {
+            LaneOutcome::Taken(lane) => Some(lane),
+            // An ancestor holds it: we run INSIDE its critical section, and
+            // waiting would be waiting on a process that is waiting on us.
+            // Nothing else can be running, so holding nothing is correct.
+            LaneOutcome::Reentrant => None,
+            LaneOutcome::Unavailable => None,
+            LaneOutcome::Denied { holder } => deny_and_exit(&repo, holder),
+        };
+        Self { stream: None, lane, id, held_key: Some(repo), _not_send: std::marker::PhantomData }
+    }
+
+    /// [`try_acquire`](Self::try_acquire)'s no-daemon answer: the lane file is the
+    /// only exclusion left, so take it and report `Held`. `NoDaemon` now means the
+    /// strictly weaker thing — not even a lane file is available — which is the
+    /// only case where dispatch still runs the command unserialized.
+    fn fallback_try(id: String, repo: PathBuf) -> TryLock {
+        let lane = match take_lane(&repo) {
+            LaneOutcome::Taken(lane) => Some(lane),
+            LaneOutcome::Reentrant => None,
+            LaneOutcome::Unavailable => return TryLock::NoDaemon,
+            LaneOutcome::Denied { holder } => deny_and_exit(&repo, holder),
+        };
+        // Register the lane the way a granted acquire does, so the porcelain's
+        // own `acquire` a moment later takes the thread-local shortcut instead of
+        // deadlocking on the lane file this very guard holds.
+        HELD.with(|h| {
+            h.borrow_mut().insert(repo.clone());
+        });
+        TryLock::Held(Self {
+            stream: None,
+            lane,
+            id,
+            held_key: Some(repo),
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// Whether this guard is backed by a live daemon (vs. the lane-file fallback
+    /// or a reentrant no-op). Callers use it to assert the coordinator was in
+    /// play, not to ask whether anything is excluded — see [`Self::excludes`].
     pub fn is_held(&self) -> bool {
         self.stream.is_some()
     }
+
+    /// Whether this guard actually excludes other zvcs writers — by daemon grant
+    /// or by lane file. A reentrant guard answers `false` because its exclusion
+    /// belongs to the outer guard, not to it.
+    pub fn excludes(&self) -> bool {
+        self.stream.is_some() || self.lane.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The no-daemon lane file
+// ---------------------------------------------------------------------------
+
+/// The lane file inside a git dir. Not `index.lock`: that name belongs to the
+/// index writer, which takes it with `Fail::Immediately` and would fail against
+/// us. This one is zvcs's own.
+const LANE_FILE_NAME: &str = "zvcs-lane.lock";
+
+/// A held lane. The `flock` lives on the open descriptor, so dropping this —
+/// normal return, `?`, panic, `SIGKILL`, `kill -9` — releases it; that is the
+/// whole reason exclusion is the kernel lock and not the file's existence.
+///
+/// The file is never unlinked. Unlinking races: a waiter blocked on `flock` of
+/// the now-deleted inode would be granted a lock on a file nobody else can find,
+/// while the next writer creates a fresh one and is granted it too. A leftover
+/// zero-to-few-byte file naming a dead pid costs nothing and blocks nobody.
+struct LaneFile {
+    _file: std::fs::File,
+}
+
+impl LaneFile {
+    /// Publish which process holds the lane, so a waiter can tell an ANCESTOR's
+    /// hold (we are inside its critical section — proceed) from a stranger's
+    /// (contention — wait).
+    ///
+    /// Truncate BEFORE writing: between taking the lock and naming ourselves the
+    /// file must not still name the previous holder, or a waiter could read a pid
+    /// that happens to be one of its own ancestors and skip a lock somebody else
+    /// is holding. An empty read means "held, holder not yet published", and the
+    /// waiter simply polls again a millisecond later.
+    fn publish(mut file: std::fs::File) -> Self {
+        let _ = file.set_len(0);
+        let _ = file.seek(std::io::SeekFrom::Start(0));
+        let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
+        let _ = file.flush();
+        Self { _file: file }
+    }
+}
+
+/// What [`take_lane`] found.
+enum LaneOutcome {
+    /// The lane is ours for as long as the guard lives.
+    Taken(LaneFile),
+    /// One of our own ancestors holds it. We are running inside its critical
+    /// section: waiting would deadlock, and no other writer can be running.
+    Reentrant,
+    /// No lane file can exist here — the key's directory does not exist yet
+    /// (`clone` takes the lane on `<dst>/.git` before creating it), or the
+    /// filesystem does not implement `flock`. Nothing to lose in the first case;
+    /// in the second the caller is back to the unserialized behavior this
+    /// fallback replaced, which is the best available on such a mount.
+    Unavailable,
+    /// A live stranger has held it past the budget. The caller must NOT proceed.
+    Denied { holder: Option<i64> },
+}
+
+/// Where the lane file for `key` lives.
+///
+/// `key` is normally a git dir, and the lane file goes inside it. `config.rs`
+/// also locks bare config FILES (`~/.gitconfig`, a `--file` target), so those get
+/// a sibling `<name>.zvcs-lane.lock` instead of a path inside a non-directory.
+/// A key that does not exist at all has no lane: see [`LaneOutcome::Unavailable`].
+fn lane_lock_path(key: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(key).ok()?;
+    if meta.is_dir() {
+        return Some(key.join(LANE_FILE_NAME));
+    }
+    let dir = key.parent()?;
+    let name = key.file_name()?;
+    Some(dir.join(format!("{}.{LANE_FILE_NAME}", name.to_string_lossy())))
+}
+
+/// The pid the lane file names, or `None` if it names nothing readable yet.
+fn lane_holder(path: &Path) -> Option<i64> {
+    std::fs::read_to_string(path).ok()?.trim().parse::<i64>().ok()
+}
+
+/// Take `key`'s lane file, waiting for a holder within the budget.
+///
+/// The budget ([`ZVCS_INDEX_LOCK_WAIT_MS`](FOREIGN_LOCK_WAIT_MS)) is patience for
+/// ONE holder, not for the whole queue: the deadline restarts whenever the pid in
+/// the file changes, because a lane that keeps changing hands is making progress
+/// and a fair wait behind eight writers must not be mistaken for a wedge. Only a
+/// single holder that sits on the lane past the budget is denied — and that
+/// holder is provably alive, because `flock` is released by the kernel the
+/// instant its process dies.
+fn take_lane(key: &Path) -> LaneOutcome {
+    let Some(path) = lane_lock_path(key) else {
+        return LaneOutcome::Unavailable;
+    };
+    let file = match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+        Ok(f) => f,
+        Err(_) => return LaneOutcome::Unavailable,
+    };
+
+    let budget = Duration::from_millis(lock_wait_budget());
+    let mut deadline = Instant::now() + budget;
+    // 1ms → 20ms: the common contended wait is one short index write, which a
+    // cheap early poll catches; a long hold stops costing wakeups.
+    let mut nap = Duration::from_millis(1);
+    let mut seen: Option<i64> = None;
+    loop {
+        // SAFETY: `file` owns the descriptor for the whole call and `flock` only
+        // reads it. `LOCK_NB` means this never blocks in the kernel, so the wait
+        // stays ours to bound.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return LaneOutcome::Taken(LaneFile::publish(file));
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => continue,
+            // The lane is held by somebody.
+            Some(libc::EWOULDBLOCK) => {}
+            // `ENOLCK`, `EOPNOTSUPP` — a mount without `flock`. No exclusion is
+            // available here at all; say so rather than pretending.
+            _ => return LaneOutcome::Unavailable,
+        }
+
+        let holder = lane_holder(&path);
+        if let Some(pid) = holder {
+            if crate::superset::zppid::is_ancestor(pid) {
+                return LaneOutcome::Reentrant;
+            }
+            if seen != Some(pid) {
+                seen = Some(pid);
+                deadline = Instant::now() + budget;
+            }
+        }
+        if Instant::now() >= deadline {
+            return LaneOutcome::Denied { holder };
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(Duration::from_millis(20));
+    }
+}
+
+/// Refuse the command rather than run it unserialized.
+///
+/// This is the whole point of the fallback. Running anyway would read an index
+/// another live writer is about to overwrite, report success, and lose the
+/// change — the failure this lock exists to prevent. Git makes the same call:
+/// `builtin/add.c` passes `LOCK_DIE_ON_ERROR`, and `lockfile.h` documents it as
+/// "if a lock is already taken for the file, `die()` with an error message".
+///
+/// Exits rather than returning an error because [`RepoLock::acquire`] is
+/// infallible by signature at ~50 call sites; giving all of them a `Result` to
+/// ignore would reintroduce exactly the silent-success shape this removes.
+fn deny_and_exit(key: &Path, holder: Option<i64>) -> ! {
+    let who = match holder {
+        Some(pid) => format!("pid {pid}"),
+        None => "another process".to_string(),
+    };
+    let lane = lane_lock_path(key).unwrap_or_else(|| key.join(LANE_FILE_NAME));
+    eprintln!(
+        "zvcs: {} is held by {who} and did not release within {}ms; refusing to run \
+         unserialized. Two writers that both read this index would each write back their own \
+         copy and the loser's change would vanish with a zero exit status. Retry, raise \
+         ZVCS_INDEX_LOCK_WAIT_MS, or start the coordinator: git zdaemon start",
+        lane.display(),
+        lock_wait_budget(),
+    );
+    std::process::exit(1)
 }
 
 /// The daemon lane key for `git_dir`.
@@ -310,11 +569,24 @@ fn lane_owner(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, repo:
     }
 }
 
-/// How long to wait for a FOREIGN `index.lock` to clear before giving up, in
-/// milliseconds. Overridable with `ZVCS_INDEX_LOCK_WAIT_MS` (`0` disables the
-/// wait entirely). Two seconds covers an IDE's or stock git's index write
-/// without making a genuinely stuck lock feel like a hang.
+/// How long to wait for a single lock holder before giving up, in milliseconds.
+/// Overridable with `ZVCS_INDEX_LOCK_WAIT_MS` (`0` disables the wait entirely).
+/// Two seconds covers an IDE's or stock git's index write without making a
+/// genuinely stuck lock feel like a hang.
+///
+/// One budget, two holders: a FOREIGN `index.lock`
+/// ([`wait_for_foreign_index_lock`]) and a zvcs peer on the lane file
+/// ([`take_lane`]). Both are "somebody else is mid-index-write"; a user who
+/// widens one means to widen the other.
 const FOREIGN_LOCK_WAIT_MS: u64 = 2_000;
+
+/// The configured lock-wait budget in milliseconds.
+fn lock_wait_budget() -> u64 {
+    std::env::var("ZVCS_INDEX_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(FOREIGN_LOCK_WAIT_MS)
+}
 
 /// Wait for `<git_dir>/index.lock` to disappear, returning `true` once the path
 /// is clear and `false` if it is still there when the budget runs out.
@@ -330,10 +602,7 @@ const FOREIGN_LOCK_WAIT_MS: u64 = 2_000;
 /// Polling, not inotify/kqueue: the wait is short, the file is on local disk,
 /// and a portable poll keeps this identical on macOS and Linux.
 pub fn wait_for_foreign_index_lock(git_dir: &Path) -> bool {
-    let budget = std::env::var("ZVCS_INDEX_LOCK_WAIT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(FOREIGN_LOCK_WAIT_MS);
+    let budget = lock_wait_budget();
     let lock = git_dir.join("index.lock");
     if budget == 0 || !lock.exists() {
         return !lock.exists();

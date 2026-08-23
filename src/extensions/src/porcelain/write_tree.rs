@@ -496,15 +496,300 @@ pub(crate) fn carry_and_repair_cache_tree(
     prepare_offset_table(repo, new);
 }
 
+/// `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)` with git's *failure*
+/// behaviour: **the half-built structure is what gets written**.
+///
+/// `cache_tree_update()` ignores nothing on the way out — it returns `update_one()`'s `-1`
+/// (cache-tree.c:499-500) — but `istate->cache_tree` still points at everything the walk
+/// managed to build, and every caller of the repair form ignores the return value and writes
+/// the index anyway (`unpack_trees()`, unpack-trees.c:2085-2093). So a failed repair is not
+/// "no cache-tree", it is "the nodes the walk proved, with the rest marked invalid".
+///
+/// [`gix::index::State::cache_tree_update()`] cannot express that: it takes the extension out
+/// of the state, hands `update_one()` a local, and drops the local on `Err`. On the paths where
+/// git's walk *always* fails that turns a partly-valid extension into no extension at all:
+///
+/// ```text
+/// git read-tree --prefix=src HEAD          (one commit over README.md and src/lib.rs)
+///   stock  ""{-1, 1 subtree}  "src"{-1, 1 subtree}  "src"{1, 4b6a70c7…}   395 bytes
+///   before no TREE extension at all                                       344 bytes
+/// ```
+///
+/// The failure there is structural, not exceptional. `cmd_read_tree()` frees the extension
+/// before unpacking (builtin/read-tree.c:268) and does *not* set `skip_cache_tree_update` for a
+/// `--prefix` read (:265-266), so the repair runs over a from-scratch tree in which every fresh
+/// node starts at `entry_count = -1` with a null oid (`cache_tree()`, cache-tree.c:28). When
+/// `src`'s new content is not a tree the repository already has, `src` stays invalid, and the
+/// root's second pass reads it as `contains_ita` → `expected_missing`, hits `is_null_oid(oid)`
+/// and takes the `return -1` (cache-tree.c:386-407). Any rebuild in which an *intermediate*
+/// directory goes invalid ends the same way.
+///
+/// Aborting costs nothing on disk, which is why git can afford it: the node that aborts and
+/// every node above it end up invalid either way — `contains_ita` sets `to_invalidate` before
+/// the check — and pass one has already built the subtrees, so the only thing the early return
+/// skips is work whose result is discarded. That is what [`repair_one`] reproduces.
 pub(crate) fn repair_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) {
     let odb = RepoOdb { repo };
-    let _ = index.cache_tree_update(
+    let carried = index.tree().cloned();
+    match index.cache_tree_update(
         &odb,
         cache_tree::Options {
             missing_ok: false,
             repair: true,
         },
-    );
+    ) {
+        Ok(_) => return,
+        // `verify_cache()` fails *before* `istate->cache_tree` is created or touched
+        // (cache-tree.c:480-483), so git keeps whatever was carried in — and so does
+        // `gix-index`, which returns before taking the extension. This is the conflicted
+        // merge's shape, and reconstructing anything here would overwrite it.
+        Err(cache_tree::Error::Unmerged(_) | cache_tree::Error::DirectoryFileConflict(_)) => return,
+        Err(_) => {}
+    }
+
+    let rebuilt = {
+        let entries = index.entries();
+        let backing = index.path_backing();
+        let mut root = carried.unwrap_or_else(|| new_node(b"", repo.object_hash()));
+        let mut skip = 0;
+        let _ = repair_one(&odb, repo.object_hash(), &mut root, entries, backing, b"", &mut skip);
+        root
+    };
+    index.set_tree(Some(rebuilt));
+}
+
+/// A fresh, invalid node — `cache_tree()` (cache-tree.c:26-31), which `xcalloc`s the struct and
+/// sets `entry_count = -1`, leaving the oid all zeroes.
+fn new_node(name: &[u8], object_hash: gix::hash::Kind) -> gix::index::extension::Tree {
+    gix::index::extension::Tree {
+        name: name.into(),
+        id: gix::ObjectId::null(object_hash),
+        num_entries: None,
+        children: Vec::new(),
+    }
+}
+
+/// `update_one()` (cache-tree.c:299-473) in `WRITE_TREE_REPAIR` mode, returning the number of
+/// index entries this level consumed — or `Err(())` for git's `return -1`, which leaves `it`
+/// exactly as the walk left it.
+///
+/// Repair never writes an object, so this cannot invent a tree id: a node is validated only
+/// after the body it would serialise has been hashed and that object found present
+/// (cache-tree.c:448-455).
+///
+/// The only reason this is not simply [`gix::index::State::cache_tree_update()`] is the `Err`
+/// case — see [`repair_cache_tree`]. Everything it can decide, it decides the same way, and it
+/// only runs after gix's copy has already returned `Err`.
+fn repair_one(
+    odb: &RepoOdb<'_>,
+    object_hash: gix::hash::Kind,
+    it: &mut gix::index::extension::Tree,
+    cache: &[gix::index::Entry],
+    backing: &[u8],
+    base: &[u8],
+    skip_count: &mut usize,
+) -> std::result::Result<usize, ()> {
+    use cache_tree::Odb as _;
+    use gix::index::entry::Flags;
+
+    let baselen = base.len();
+    *skip_count = 0;
+
+    // "If the first entry of this region is a sparse directory entry corresponding exactly to
+    // 'base', then this cache_tree struct is a 'leaf' [...]" (cache-tree.c:318-334).
+    if let Some(ce) = cache.first() {
+        let name = ce.path_in(backing);
+        if ce.mode.is_sparse() && name.len() == baselen && name.as_bytes() == base {
+            it.num_entries = Some(1);
+            it.id = ce.id;
+            return Ok(1);
+        }
+    }
+
+    // A node that is still valid and whose tree really is in the odb is reused as-is, and its
+    // whole subtree is skipped (cache-tree.c:294-297).
+    if let Some(count) = it.num_entries {
+        if odb.has_object(&it.id) {
+            return Ok(count as usize);
+        }
+    }
+
+    // Pass one: find this level's subdirectories and update them, in index order.
+    let mut previous = std::mem::take(&mut it.children);
+    let mut children: Vec<(gix::index::extension::Tree, usize)> = Vec::new();
+    let mut aborted_in_pass_one = false;
+    let mut i = 0;
+    while i < cache.len() {
+        let path = cache[i].path_in(backing);
+        // `if (pathlen <= baselen || memcmp(base, path, baselen)) break;` — end of this level.
+        if path.len() <= baselen || path[..baselen] != *base {
+            break;
+        }
+        let Some(sublen) = path[baselen..].find_byte(b'/') else {
+            i += 1;
+            continue;
+        };
+        let name: &[u8] = &path[baselen..baselen + sublen];
+        let mut sub = match previous.iter().position(|c| c.name.as_slice() == name) {
+            Some(pos) => previous.remove(pos),
+            None => new_node(name, object_hash),
+        };
+        let mut sub_skip = 0;
+        let consumed = repair_one(
+            odb,
+            object_hash,
+            &mut sub,
+            &cache[i..],
+            backing,
+            &path[..baselen + sublen + 1],
+            &mut sub_skip,
+        );
+        // `if (subcnt < 0) return subcnt;` (cache-tree.c:342-343) and the
+        // `die("index cache-tree records empty sub-tree")` next to it: either way this level
+        // stops here, before `discard_unused_subtrees()`, so the children it had not reached
+        // yet stay attached.
+        match consumed {
+            Ok(n) if n > 0 => {
+                i += n;
+                *skip_count += sub_skip;
+                children.push((sub, n));
+            }
+            _ => {
+                children.push((sub, 0));
+                aborted_in_pass_one = true;
+                break;
+            }
+        }
+    }
+    if aborted_in_pass_one {
+        // No `discard_unused_subtrees()` ran, so nothing is dropped.
+        children.extend(previous.into_iter().map(|node| (node, 0)));
+        finish_children(it, children);
+        return Err(());
+    }
+    drop(previous); // `discard_unused_subtrees(it)` (cache-tree.c:352).
+
+    // Pass two: serialise this level's tree body. Both passes walk the entries identically, so
+    // the n-th subtree met here is the n-th collected above.
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut to_invalidate = false;
+    let mut aborted = false;
+    let mut sub_idx = 0;
+    i = 0;
+    while i < cache.len() {
+        let ce = &cache[i];
+        let path = ce.path_in(backing);
+        if path.len() <= baselen || path[..baselen] != *base {
+            break;
+        }
+
+        let (id, mode, entlen, is_subtree, contains_ita) = match path[baselen..].find_byte(b'/') {
+            Some(sublen) => {
+                let (sub, consumed) = &children[sub_idx];
+                sub_idx += 1;
+                i += consumed;
+                // git names this `contains_ita`, but the test is just "the subtree node came
+                // out invalid" — for a repair that failed to find its tree in the odb exactly
+                // as much as for an intent-to-add entry below (cache-tree.c:386-390).
+                let contains_ita = sub.num_entries.is_none();
+                if contains_ita {
+                    to_invalidate = true;
+                }
+                (sub.id, 0o040_000_u32, sublen, true, contains_ita)
+            }
+            None => {
+                let mode = ce.mode.bits();
+                i += 1;
+                (ce.id, mode, path.len() - baselen, false, false)
+            }
+        };
+
+        // `ce_missing_ok = mode == S_IFGITLINK || missing_ok || !must_check_existence(ce)`
+        // (cache-tree.c:399-400); this walk only ever runs in repair mode, where `missing_ok`
+        // is never set, and promisor remotes are not modelled.
+        let ce_missing_ok = mode == 0o160_000;
+        if id.is_null() || (!ce_missing_ok && !odb.has_object(&id)) {
+            // `if (expected_missing) return -1;` and the `error()` return beside it
+            // (cache-tree.c:401-410). `it` keeps the `entry_count` it came in with — `-1` for
+            // a node this walk created — and so does every level above.
+            aborted = true;
+            break;
+        }
+
+        // "CE_REMOVE entries are removed before the index is written to disk" (cache-tree.c:412-420).
+        if ce.flags.contains(Flags::REMOVE) {
+            *skip_count += 1;
+            continue;
+        }
+        // "CE_INTENT_TO_ADD entries [...] are not part of generated trees" (cache-tree.c:422-430).
+        if !is_subtree && ce.flags.contains(Flags::INTENT_TO_ADD) {
+            to_invalidate = true;
+            continue;
+        }
+        // "'sub' can be an empty tree if all subentries are i-t-a." (cache-tree.c:432-436).
+        if contains_ita && id == gix::ObjectId::empty_tree(object_hash) {
+            continue;
+        }
+
+        write_octal(&mut buffer, mode);
+        buffer.push(b' ');
+        buffer.extend_from_slice(&path[baselen..baselen + entlen]);
+        buffer.push(0);
+        buffer.extend_from_slice(id.as_bytes());
+    }
+
+    if !aborted {
+        // `hash_object_file(...); if (odb_has_object(&oid)) oidcpy(&it->oid, &oid); else
+        // to_invalidate = 1;` (cache-tree.c:448-455). A hashing failure can only mean "not
+        // proven", which is `to_invalidate` too.
+        match gix::objs::compute_hash(object_hash, gix::object::Kind::Tree, &buffer) {
+            Ok(id) if odb.has_object(&id) => it.id = id,
+            _ => to_invalidate = true,
+        }
+        // `it->entry_count = to_invalidate ? -1 : i - *skip_count;` (cache-tree.c:466).
+        it.num_entries = if to_invalidate {
+            None
+        } else {
+            Some(u32::try_from(i - *skip_count).unwrap_or(u32::MAX))
+        };
+    }
+    finish_children(it, children);
+    if aborted { Err(()) } else { Ok(i) }
+}
+
+/// Attach `children` to `it` in the order `write_one()` insists on: git keeps `down[]` sorted by
+/// `subtree_name_cmp` at all times (`find_subtree()` inserts at the binary-searched position,
+/// cache-tree.c:59-104) and dies on an unsorted array when writing (cache-tree.c:535-540). The
+/// walk collects them in index order, which is not the same: `subtree_name_cmp` compares length
+/// first (cache-tree.c:49-57), so `z` sorts before `aa`.
+fn finish_children(
+    it: &mut gix::index::extension::Tree,
+    mut children: Vec<(gix::index::extension::Tree, usize)>,
+) {
+    children.sort_by(|a, b| {
+        a.0.name
+            .len()
+            .cmp(&b.0.name.len())
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
+    it.children = children.into_iter().map(|(node, _)| node).collect();
+}
+
+/// Append `mode` in octal the way `strbuf_addf(..., "%o", mode)` renders it — no leading zero,
+/// so `0o100644` becomes `100644` and a tree's `0o40000` becomes `40000` (cache-tree.c:439).
+fn write_octal(out: &mut Vec<u8>, mode: u32) {
+    let mut digits = [0u8; 12];
+    let mut n = digits.len();
+    let mut value = mode;
+    loop {
+        n -= 1;
+        digits[n] = b'0' + u8::try_from(value & 0o7).expect("three bits");
+        value >>= 3;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[n..]);
 }
 
 /// Recompute `index`'s cache-tree in place, discarding any failure — git's

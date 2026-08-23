@@ -880,24 +880,41 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- Apply staged (index) mutations ------------------------------------
+    // Every path that goes through one of git's two entry-mutating calls below is
+    // collected here, because `checkout_paths()` invalidates exactly those and
+    // repairs nothing (see the cache-tree note at the index write).
+    let mut invalidated: Vec<BString> = Vec::new();
     if staged {
         // Resolve unmerged matched paths: drop all their stage entries so the
         // source (a tree) can re-add a single stage-0 entry below.
+        //
+        // In git the same thing happens inside `add_index_entry()`: a stage-0 entry
+        // "will always replace all non-merged entries" (read-cache.c:1273-1283), and
+        // the `cache_tree_invalidate_path()` at read-cache.c:1259-1260 has already run.
         if !unmerged_matched.is_empty() {
             let um: HashSet<BString> = unmerged_matched.iter().cloned().collect();
             cur.remove_entries(|_, p, e| e.stage_raw() != 0 && um.contains(&p.to_owned()));
+            invalidated.extend(unmerged_matched.iter().cloned());
         }
         let mut need_sort = false;
         for (path, id, mode, stat) in &updates {
             match cur.entry_index_by_path(BStr::new(path)) {
                 Ok(idx) => {
                     let e = &mut cur.entries_mut()[idx];
+                    // `update_some()` leaves the old entry in place — and so never
+                    // reaches `add_index_entry()` — when the tree names the same blob
+                    // in the same mode and the entry is not intent-to-add
+                    // (builtin/checkout.c:214-229). Only the other case invalidates.
+                    if e.id != *id || e.mode != *mode || e.flags.contains(Flags::INTENT_TO_ADD) {
+                        invalidated.push(path.clone());
+                    }
                     e.id = *id;
                     e.mode = *mode;
                     e.stat = *stat;
                 }
                 Err(_) => {
                     cur.dangerously_push_entry(*stat, *id, Flags::empty(), *mode, BStr::new(path));
+                    invalidated.push(path.clone());
                     need_sort = true;
                 }
             }
@@ -907,11 +924,19 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         }
         for (path, id, mode, flags, stat) in &inserts {
             cur.dangerously_push_entry(*stat, *id, *flags, *mode, BStr::new(path));
+            invalidated.push(path.clone());
         }
         if !inserts.is_empty() || need_sort {
             cur.sort_entries();
         }
     }
+    // `remove_marked_cache_entries(the_repository->index, 1)` runs on both arms of
+    // `checkout_paths()` — the worktree one (builtin/checkout.c:490) and the
+    // index-only one (:689) — and `invalidate` is 1, so each dropped path takes its
+    // ancestors down with it (read-cache.c:611-616). The set is empty unless a
+    // `--source` tree was named, which is the only way an entry gets `CE_REMOVE`
+    // here (builtin/checkout.c:430-436).
+    invalidated.extend(removals.iter().cloned());
 
     // --- Apply worktree checkout -------------------------------------------
     let mut fresh_stats: HashMap<BString, Stat> = HashMap::new();
@@ -1024,8 +1049,32 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        // `unpack_trees()` leaves a repaired cache-tree behind (unpack-trees.c:2088-2092).
-        super::write_tree::rebuild_cache_tree(&repo, &mut cur);
+        // `restore` is **not** an `unpack_trees()` verb, and repairing here wrote a
+        // *fully valid* cache-tree where git leaves a partly invalidated one —
+        // `restore --staged staged.txt` over the one staged addition brought the index
+        // back to `HEAD`'s tree, that tree is already in the odb, so the repair
+        // re-validated the root git had just marked `-1` (19 bytes longer than stock's).
+        //
+        // Path-restricted checkout goes through `checkout_paths()`
+        // (builtin/checkout.c:517-719), which stages one entry at a time —
+        // `update_some()` ends in `add_index_entry(..., ADD_CACHE_OK_TO_ADD |
+        // ADD_CACHE_OK_TO_REPLACE)` (builtin/checkout.c:231-232) and
+        // `remove_marked_cache_entries(the_repository->index, 1)` drops the rest
+        // (:490, :689) — and then writes with a plain `write_locked_index()` (:701).
+        // The `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)` in this
+        // file belongs to `merge_working_tree()` (:924-925), the *branch-switching*
+        // path, which `restore` never takes.
+        //
+        // `invalidated` is exactly the set of paths that went through one of those two
+        // calls; each takes its ancestors with it (`cache_tree_invalidate_path()`,
+        // cache-tree.c:113-157). A pure `--worktree` restore from the index mutates no
+        // entry at all — `checkout_entry()` only refreshes stat data
+        // (`update_ce_after_write()`, entry.c:270-280) — so the set is empty and the
+        // extension is carried over untouched, which is what stock leaves too.
+        for path in &invalidated {
+            cur.invalidate_path_in_tree(path.as_ref());
+        }
+        super::write_tree::prepare_offset_table(&repo, &mut cur);
         // `do_write_index()` takes `skip_hash` from the settings block for every
         // index it writes (read-cache.c:2830-2831), so a `--staged` restore leaves
         // the same trailer an `add` or an `update-index` would have.

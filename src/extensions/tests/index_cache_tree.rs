@@ -1141,6 +1141,26 @@ fn the_tree_reading_verbs_leave_the_cache_tree_stock_git_leaves() {
         ),
         // `git stage` is `cmd_add` itself, so it invalidates per staged path.
         ("stage", false, &[&["stage", "sub/a.txt"]]),
+        // `restore --staged` is not an `unpack_trees()` verb: it goes through
+        // `checkout_paths()` (builtin/checkout.c:517-719), which stages one entry
+        // at a time and then writes with a plain `write_locked_index()` (:701).
+        // Repairing the whole extension here re-validated a root git had just
+        // marked `-1` — restoring the one staged addition brings the index back to
+        // `HEAD`'s tree, which is already in the odb, so a repair finds it and
+        // writes 19 bytes more than stock does. Only the paths that actually went
+        // through an entry-mutating call may be invalidated.
+        (
+            "restore-staged",
+            false,
+            &[&["add", "sub/a.txt"], &["restore", "--staged", "sub/a.txt"]],
+        ),
+        // The opposite error, and the reason this pair is worth one test: a
+        // `--prefix` read is the case where the port wrote no `TREE` extension at
+        // all where stock writes a nested spine. `--prefix` mixes the named tree
+        // into the existing index rather than replacing it, so nothing may be
+        // primed from a single tree — but the grafted subtree is still git's to
+        // keep, and dropping the extension is as wrong as over-repairing it.
+        ("read-tree-prefix", false, &[&["read-tree", "--prefix=vendor/", "HEAD"]]),
     ];
 
     for (tag, branched, steps) in cases {

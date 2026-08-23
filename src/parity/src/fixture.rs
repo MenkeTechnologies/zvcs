@@ -204,6 +204,18 @@ pub enum Shape {
     /// `status` has to name the path from both directions — through the index
     /// and through the directory walk.
     DecomposedPaths,
+    /// A repository that has hooks installed, and a subdirectory to run from.
+    ///
+    /// No shape carried a hook, so every case ran against a repository where
+    /// `.git/hooks` was empty — and the mere *existence* of a hook is enough to
+    /// change what several verbs do. It hid a total failure: committing from a
+    /// subdirectory of a repository with any hook at all exited 1 with
+    /// `No such file or directory`, because the hook's path and working
+    /// directory were resolved relative to a cwd that had already moved. A
+    /// `pre-commit` that does nothing but `exit 0` reproduces it, so this shape
+    /// needs no clever hook to be worth its build cost — it needs only to have
+    /// one, and a directory to be inside.
+    Hooked,
 }
 
 impl Shape {
@@ -230,6 +242,7 @@ impl Shape {
         Shape::Octopus,
         Shape::NoIndexTrees,
         Shape::DecomposedPaths,
+        Shape::Hooked,
     ];
 
     pub fn name(self) -> &'static str {
@@ -256,6 +269,7 @@ impl Shape {
             Shape::Octopus => "octopus",
             Shape::NoIndexTrees => "no-index-trees",
             Shape::DecomposedPaths => "decomposed-paths",
+            Shape::Hooked => "hooked",
         }
     }
 }
@@ -937,6 +951,53 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             // `status` has to name the same decomposed path from both.
             write(dir, NFD_TRACKED, "decomposed\nworktree edit\n")?;
             write(dir, NFD_UNTRACKED, "untracked, decomposed\n")?;
+        }
+
+        Shape::Hooked => {
+            // A subdirectory with tracked content, so a case carrying `cwd` runs
+            // from inside the repository rather than at its root. That
+            // combination — a hook present, and a working directory below the
+            // top level — is the one that failed outright.
+            write(dir, "sub/nested.txt", "nested\n")?;
+            write(dir, "top.txt", "top\n")?;
+            git(dir, home, &["add", "sub/nested.txt", "top.txt"])?;
+            git(dir, home, &["commit", "-qm", "hooked: a subdirectory to run from"])?;
+
+            // Deliberately hooks that do NOT invoke git. Each side of a case runs
+            // its own binary, and a hook naming one by path would make the other
+            // side execute it too — the fixture would then measure one binary
+            // through the other and call the agreement parity. `exit 0` and a
+            // plain write need no binary at all, and the defect this shape exists
+            // for reproduces with exactly that.
+            //
+            // `$GIT_INDEX_FILE` is echoed rather than used: git points a
+            // `pre-commit` hook at the real index, at `index.lock`, or at
+            // `next-index-<pid>.lock` depending on the commit mode
+            // (builtin/commit.c:468, :493, :554), and a hook that records which
+            // one it was given turns that into something a case can compare.
+            let hooks = dir.join(".git/hooks");
+            std::fs::create_dir_all(&hooks)?;
+            for (name, body) in [
+                (
+                    "pre-commit",
+                    "#!/bin/sh\nprintf 'pre-commit %s\\n' \"${GIT_INDEX_FILE##*/}\" > hook-ran.txt\nexit 0\n",
+                ),
+                // Appends a trailer to every commit message, so a case can see
+                // whether the hook's edit survived — and, for the verbs that pass
+                // `--no-verify`, whether it was correctly skipped.
+                (
+                    "commit-msg",
+                    "#!/bin/sh\nprintf 'hooked-trailer\\n' >> \"$1\"\nexit 0\n",
+                ),
+            ] {
+                let path = hooks.join(name);
+                std::fs::write(&path, body)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+                }
+            }
         }
     }
     Ok(())

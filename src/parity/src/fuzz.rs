@@ -35,7 +35,7 @@
 //!    twice instead of measuring the key once — which is the one thing a
 //!    differential harness must never do. Writing the bytes from Rust means both
 //!    sides start from a file this crate produced, byte for byte.
-//!  * *A fixture template per scope.* Twenty-two shapes crossed with the scope
+//!  * *A fixture template per scope.* Every shape crossed with the scope
 //!    combinations, built at start-up and hashed, so that a four-line text file
 //!    could exist. The premise is smaller than the machinery.
 //!
@@ -108,6 +108,15 @@ pub struct Grammar {
 }
 
 const REV_SHAPES: &[Shape] = &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached];
+/// The shapes a command with no particular topology requirement is drawn
+/// against. Not `Shape::ALL`: several shapes exist for one verb apiece (a
+/// submodule, a sparse checkout, a decomposed path) and drawing every command
+/// against them buys repetition rather than coverage.
+///
+/// `Hooked` earns its place because the *presence* of a hook changes what many
+/// verbs do, and nothing else here has one — a commit from a subdirectory of a
+/// repository with any hook at all used to fail outright, and no generated case
+/// could reach that combination.
 const ALL_SHAPES: &[Shape] = &[
     Shape::Linear,
     Shape::Branched,
@@ -116,6 +125,7 @@ const ALL_SHAPES: &[Shape] = &[
     Shape::Conflicted,
     Shape::Detached,
     Shape::AwkwardPaths,
+    Shape::Hooked,
 ];
 
 /// Rev-specs worth throwing at anything that resolves one. Includes forms that
@@ -917,6 +927,12 @@ fn shape_dirs(shape: Shape) -> &'static [&'static str] {
         // `outside/` survives only because an untracked file is written into it
         // after the cone is applied; `outside/nested` does not.
         Shape::Sparse => &["inside", "inside/nested", "outside"],
+        // The combination that mattered: a hook present AND a working directory
+        // below the top level. Committing from here with any hook at all used to
+        // exit 1 with `No such file or directory`, and with no shape_dirs entry a
+        // generated case could only ever have reached it by drawing one of the
+        // COMMON_DIRS.
+        Shape::Hooked => &["sub"],
         _ => &[],
     }
 }

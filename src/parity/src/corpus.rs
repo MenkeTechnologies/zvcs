@@ -166,6 +166,34 @@ pub fn cases() -> Vec<Case> {
     // second worker starts, and no shape has that many worktree deltas. A shape
     // added for it would cost every run, so it is pinned in the unit tests
     // instead (`reversing_moves_the_worktree_side_onto_the_pre_image`).
+    // A repository that has hooks, run from a directory below its top level.
+    //
+    // No shape carried a hook and no case combined one with a working directory,
+    // so this pair was unreachable — and it was not a subtle gap: committing from
+    // a subdirectory of a repository with *any* hook exited 1 with `No such file
+    // or directory`, because the hook's path and cwd were resolved against a
+    // directory that had already moved. A `pre-commit` that only runs `exit 0`
+    // reproduces it, so these cases need nothing clever, only the combination.
+    for (cmd, args) in [
+        ("status", &["status", "--porcelain"][..]),
+        ("commit", &["commit", "-q", "--allow-empty", "-m", "from a subdirectory"][..]),
+        ("add", &["add", "nested.txt"][..]),
+        ("stash", &["stash", "list"][..]),
+    ] {
+        c.push(Case::new(cmd, args, Shape::Hooked).in_dir("sub"));
+        // The same verb at the top level, so a failure names the working
+        // directory as the difference rather than leaving it as one of two.
+        c.push(Case::new(cmd, args, Shape::Hooked));
+    }
+    // `--no-verify` must skip the hooks, and the `commit-msg` hook's trailer is
+    // what makes that observable: with it the message gains a line, without it
+    // the message is exactly what was passed.
+    c.push(Case::new(
+        "commit",
+        &["commit", "-q", "--allow-empty", "--no-verify", "-m", "unverified"],
+        Shape::Hooked,
+    ));
+
     c.push(Case::new("diff", &["diff", "-R"], Shape::Dirty));
     c.push(Case::new("diff", &["diff", "-R", "--stat"], Shape::Dirty));
     c.push(Case::new("diff", &["diff", "-R", "--raw"], Shape::Dirty));

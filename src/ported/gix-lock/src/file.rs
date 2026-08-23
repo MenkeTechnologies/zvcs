@@ -23,6 +23,7 @@ impl File {
             inner: self.inner.close()?,
             created_from_file: true,
             lock_path: self.lock_path,
+            pid_file: self.pid_file,
         })
     }
 

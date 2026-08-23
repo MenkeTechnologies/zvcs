@@ -47,13 +47,21 @@ pub enum Error {
     #[error("Another IO error occurred while obtaining the lock")]
     Io(#[from] std::io::Error),
     #[error(
-        "The lock for resource '{resource_path}' could not be obtained {mode} after {attempts} attempt(s). The lockfile at '{resource_path}{}' might need manual deletion.",
+        "The lock for resource '{resource_path}' could not be obtained {mode} after {attempts} attempt(s). The lockfile at '{resource_path}{}' might need manual deletion. {holder}",
         super::DOT_LOCK_SUFFIX
     )]
     PermanentlyLocked {
         resource_path: PathBuf,
         mode: Fail,
         attempts: usize,
+        /// The holder paragraph of git's `unable_to_lock_message()`
+        /// (`lockfile.c:280-292`), resolved from the `~pid.lock` companion at
+        /// the moment the acquisition failed — see [`crate::pid::holder_clause`].
+        ///
+        /// It is one of git's three sentences and never empty: with no readable
+        /// companion it is the same "Another git process seems to be running in
+        /// this repository, or the lock file may be stale" git falls back to.
+        holder: String,
     },
 }
 
@@ -75,16 +83,23 @@ impl File {
         mode: Fail,
         boundary_directory: Option<PathBuf>,
     ) -> Result<File, Error> {
-        let (lock_path, handle) = lock_with_mode(at_path.as_ref(), mode, boundary_directory, &|p, d, c| {
-            if let Some(permissions) = default_permissions() {
-                gix_tempfile::writable_at_with_permissions(p, d, c, permissions)
-            } else {
-                gix_tempfile::writable_at(p, d, c)
-            }
-        })?;
+        let (lock_path, handle, pid_file) = lock_with_mode(
+            at_path.as_ref(),
+            mode,
+            boundary_directory,
+            default_permissions(),
+            &|p, d, c| {
+                if let Some(permissions) = default_permissions() {
+                    gix_tempfile::writable_at_with_permissions(p, d, c, permissions)
+                } else {
+                    gix_tempfile::writable_at(p, d, c)
+                }
+            },
+        )?;
         Ok(File {
             inner: handle,
             lock_path,
+            pid_file,
         })
     }
 
@@ -95,12 +110,17 @@ impl File {
         boundary_directory: Option<PathBuf>,
         make_permissions: impl Fn() -> std::fs::Permissions,
     ) -> Result<File, Error> {
-        let (lock_path, handle) = lock_with_mode(at_path.as_ref(), mode, boundary_directory, &|p, d, c| {
-            gix_tempfile::writable_at_with_permissions(p, d, c, make_permissions())
-        })?;
+        let (lock_path, handle, pid_file) = lock_with_mode(
+            at_path.as_ref(),
+            mode,
+            boundary_directory,
+            Some(make_permissions()),
+            &|p, d, c| gix_tempfile::writable_at_with_permissions(p, d, c, make_permissions()),
+        )?;
         Ok(File {
             inner: handle,
             lock_path,
+            pid_file,
         })
     }
 }
@@ -124,17 +144,24 @@ impl Marker {
         mode: Fail,
         boundary_directory: Option<PathBuf>,
     ) -> Result<Marker, Error> {
-        let (lock_path, handle) = lock_with_mode(at_path.as_ref(), mode, boundary_directory, &|p, d, c| {
-            if let Some(permissions) = default_permissions() {
-                gix_tempfile::mark_at_with_permissions(p, d, c, permissions)
-            } else {
-                gix_tempfile::mark_at(p, d, c)
-            }
-        })?;
+        let (lock_path, handle, pid_file) = lock_with_mode(
+            at_path.as_ref(),
+            mode,
+            boundary_directory,
+            default_permissions(),
+            &|p, d, c| {
+                if let Some(permissions) = default_permissions() {
+                    gix_tempfile::mark_at_with_permissions(p, d, c, permissions)
+                } else {
+                    gix_tempfile::mark_at(p, d, c)
+                }
+            },
+        )?;
         Ok(Marker {
             created_from_file: false,
             inner: handle,
             lock_path,
+            pid_file,
         })
     }
 
@@ -145,13 +172,18 @@ impl Marker {
         boundary_directory: Option<PathBuf>,
         make_permissions: impl Fn() -> std::fs::Permissions,
     ) -> Result<Marker, Error> {
-        let (lock_path, handle) = lock_with_mode(at_path.as_ref(), mode, boundary_directory, &|p, d, c| {
-            gix_tempfile::mark_at_with_permissions(p, d, c, make_permissions())
-        })?;
+        let (lock_path, handle, pid_file) = lock_with_mode(
+            at_path.as_ref(),
+            mode,
+            boundary_directory,
+            Some(make_permissions()),
+            &|p, d, c| gix_tempfile::mark_at_with_permissions(p, d, c, make_permissions()),
+        )?;
         Ok(Marker {
             created_from_file: false,
             inner: handle,
             lock_path,
+            pid_file,
         })
     }
 }
@@ -166,12 +198,21 @@ fn dir_cleanup(boundary: Option<PathBuf>) -> (ContainingDirectory, AutoRemove) {
     }
 }
 
+/// Take the lock, then — and only on success — write the `core.lockfilePid`
+/// companion next to it.
+///
+/// The order is git's: `lock_file()` (`lockfile.c:168-190`) creates the tempfile
+/// first and calls `create_lock_pid_file()` only `if (lk->tempfile)`, so a
+/// contended lock never leaves a PID file behind claiming a hold it does not
+/// have. `pid_permissions` is the mode the lock itself was created with, which
+/// is the `mode` argument git passes on to `create_lock_pid_file()`.
 fn lock_with_mode<T>(
     resource: &Path,
     mode: Fail,
     boundary_directory: Option<PathBuf>,
+    pid_permissions: Option<std::fs::Permissions>,
     try_lock: &dyn Fn(&Path, ContainingDirectory, AutoRemove) -> std::io::Result<T>,
-) -> Result<(PathBuf, T), Error> {
+) -> Result<(PathBuf, T, Option<gix_tempfile::Handle<gix_tempfile::handle::Closed>>), Error> {
     use std::io::ErrorKind::*;
     let (directory, cleanup) = dir_cleanup(boundary_directory);
     let lock_path = add_lock_suffix(resource);
@@ -179,10 +220,14 @@ fn lock_with_mode<T>(
     match mode {
         Fail::Immediately => try_lock(&lock_path, directory, cleanup),
         Fail::AfterDurationWithBackoff(time) => {
+            let mut locked = None;
             for wait in backoff::Quadratic::default_with_random().until_no_remaining(time) {
                 attempts += 1;
                 match try_lock(&lock_path, directory, cleanup.clone()) {
-                    Ok(v) => return Ok((lock_path, v)),
+                    Ok(v) => {
+                        locked = Some(Ok(v));
+                        break;
+                    }
                     #[cfg(windows)]
                     Err(err) if err.kind() == AlreadyExists || err.kind() == PermissionDenied => {
                         std::thread::sleep(wait);
@@ -193,18 +238,32 @@ fn lock_with_mode<T>(
                         std::thread::sleep(wait);
                         continue;
                     }
-                    Err(err) => return Err(Error::from(err)),
+                    Err(err) => {
+                        locked = Some(Err(err));
+                        break;
+                    }
                 }
             }
-            try_lock(&lock_path, directory, cleanup)
+            match locked {
+                Some(res) => res,
+                None => try_lock(&lock_path, directory, cleanup),
+            }
         }
     }
-    .map(|v| (lock_path, v))
+    .map(|v| {
+        let pid_file = crate::pid::create(resource, pid_permissions);
+        (lock_path, v, pid_file)
+    })
     .map_err(|err| match err.kind() {
+        // `EEXIST` is the branch `unable_to_lock_message()` answers with the
+        // holder paragraph (`lockfile.c:256`), and it has to be read *here*:
+        // the companion belongs to whoever still holds the lock, so it is gone
+        // by the time a caller formats the error at leisure.
         AlreadyExists => Error::PermanentlyLocked {
             resource_path: resource.into(),
             mode,
             attempts,
+            holder: crate::pid::holder_clause(resource),
         },
         _ => Error::Io(err),
     })
@@ -241,5 +300,17 @@ mod tests {
     #[test]
     fn add_lock_suffix_to_file_without_extension() {
         assert_eq!(add_lock_suffix(Path::new("hello")), Path::new("hello.lock"));
+    }
+
+    /// `get_pid_path()` is a plain concatenation onto the *resource* path, so the
+    /// companion sits next to a `foo.ext.lock` as `foo.ext~pid.lock` — not as
+    /// `foo.ext~pid` or `foo~pid.ext.lock`.
+    #[test]
+    fn pid_path_appends_infix_and_suffix_to_the_resource() {
+        assert_eq!(
+            crate::pid::path_for(Path::new("hello.ext")),
+            Path::new("hello.ext~pid.lock")
+        );
+        assert_eq!(crate::pid::path_for(Path::new("index")), Path::new("index~pid.lock"));
     }
 }

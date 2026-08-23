@@ -44,6 +44,9 @@ impl Marker {
             });
         }
         let resource_path = self.resource_path();
+        // `commit_lock_file()` unlinks the PID companion before persisting
+        // (`lockfile.c:356`); dropping the handle is that `delete_tempfile()`.
+        self.pid_file.take();
         match self.inner.persist(&resource_path) {
             Ok(_) => Ok(resource_path),
             Err(err) => Err(Error {
@@ -62,6 +65,8 @@ impl File {
     /// and an open file handle on success.
     pub fn commit(mut self) -> Result<(PathBuf, Option<std::fs::File>), Error<Self>> {
         let resource_path = self.resource_path();
+        // Same `delete_tempfile(&lk->pid_tempfile)` as above (`lockfile.c:356`).
+        self.pid_file.take();
         match self.inner.persist(&resource_path) {
             Ok(possibly_file) => Ok((resource_path, possibly_file)),
             Err(err) => Err(Error {

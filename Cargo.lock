@@ -1238,6 +1238,7 @@ version = "23.0.1"
 dependencies = [
  "gix-tempfile",
  "gix-utils",
+ "rustix",
  "thiserror",
 ]
 

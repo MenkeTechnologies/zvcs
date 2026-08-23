@@ -74,6 +74,14 @@
 //! [`DefaultConfig::sparse_expect_files_outside_of_patterns`]; see their docs for
 //! why neither has an observable effect on this substrate.
 //!
+//! `core.lockfilePid` is the one key here that is *honored* rather than merely
+//! validated, and it is honored the way C does it: not by landing in
+//! [`DefaultConfig`] but by assigning a process global, `gix::lock::pid`'s port of
+//! `lockfile_pid_enabled` (environment.c:532-535). With it on, every lock this
+//! process takes writes a `<resource>~pid.lock` companion naming the holder, and a
+//! later failed acquisition reads that companion to say whether the holder is
+//! still running. See [`gix::lock::pid`].
+//!
 //! # The three keys deliberately left out
 //!
 //! `core.fsync`, `core.fsyncMethod` and `core.fsyncObjectFiles` belong to
@@ -265,8 +273,8 @@ fn core_config(v: &ConfigValue, name: &str, out: &mut DefaultConfig) -> Result<(
         // `git_config_bool(var, value)`, so a value neither the word nor the
         // integer grammar reads dies with `bad boolean config value`.
         "filemode" | "trustctime" | "quotepath" | "symlinks" | "ignorecase" | "bare"
-        | "ignorestat" | "lockfilepid" | "sparsecheckout" | "sparsecheckoutcone"
-        | "precomposeunicode" | "protecthfs" | "protectntfs" => {
+        | "ignorestat" | "sparsecheckout" | "sparsecheckoutcone" | "precomposeunicode"
+        | "protecthfs" | "protectntfs" => {
             bool_value(v, key)?;
         }
 
@@ -421,6 +429,35 @@ fn core_config(v: &ConfigValue, name: &str, out: &mut DefaultConfig) -> Result<(
                     )))
                 }
             };
+        }
+
+        // `core.lockfilePid` — environment.c:532-535:
+        //
+        //     if (!strcmp(var, "core.lockfilepid")) {
+        //             lockfile_pid_enabled = git_config_bool(var, value);
+        //             return 0;
+        //     }
+        //
+        // The one `core.*` boolean whose *only* effect is on a process global, so
+        // it is assigned here rather than collected into [`DefaultConfig`] — this
+        // callback is git's own assignment point, and every config walk that
+        // reaches `git_default_config` reaches it (`crate::diff_config`,
+        // `crate::log_config`, `crate::status_config` and `crate::cmd_config` all
+        // chain into this function, exactly as their C counterparts end in
+        // `return git_default_config(...)`).
+        //
+        // Assigning on every occurrence rather than on the last one is not a
+        // shortcut: the walk is in parse order, so the last occurrence is the last
+        // assignment, which is the value that stands — the same way repeated
+        // `git_config_bool` calls settle in C.
+        //
+        // The global it drives is `gix::lock::pid`'s, which decides whether taking
+        // a `<resource>.lock` also writes the `<resource>~pid.lock` companion that
+        // a later failed acquisition reads to name the holder. `bool_value` gives
+        // git's boolean grammar verbatim, valueless-means-true included, and dies
+        // with `bad boolean config value` on anything else.
+        "lockfilepid" => {
+            gix::lock::pid::set_enabled(bool_value(v, key)?);
         }
 
         // environment.c:475-501: read by `crate::config::FsyncPolicy` at the write

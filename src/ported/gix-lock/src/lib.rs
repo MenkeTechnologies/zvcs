@@ -52,6 +52,8 @@ pub use gix_utils::backoff;
 ///
 pub mod commit;
 
+pub mod pid;
+
 /// Locks a resource to eventually be overwritten with the content of this file.
 ///
 /// Dropping the file without [committing][File::commit] will delete it, leaving the underlying resource unchanged.
@@ -60,6 +62,11 @@ pub mod commit;
 pub struct File {
     inner: gix_tempfile::Handle<Writable>,
     lock_path: PathBuf,
+    /// `struct lock_file`'s `pid_tempfile` (`lockfile.h:122`) — the
+    /// `<resource>~pid.lock` companion, present only while `core.lockfilePid`
+    /// is on. Dropping it unlinks the file, which is what git's
+    /// `delete_tempfile(&lk->pid_tempfile)` does on commit and on rollback.
+    pid_file: Option<gix_tempfile::Handle<Closed>>,
 }
 
 /// Locks a resource to allow related resources to be updated using [files][File].
@@ -72,6 +79,9 @@ pub struct Marker {
     inner: gix_tempfile::Handle<Closed>,
     created_from_file: bool,
     lock_path: PathBuf,
+    /// See [`File::pid_file`]; a marker takes the same companion, since git's
+    /// `lock_file()` writes one for every lock it hands out.
+    pid_file: Option<gix_tempfile::Handle<Closed>>,
 }
 
 ///

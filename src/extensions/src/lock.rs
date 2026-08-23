@@ -381,14 +381,29 @@ enum LaneOutcome {
 /// also locks bare config FILES (`~/.gitconfig`, a `--file` target), so those get
 /// a sibling `<name>.zvcs-lane.lock` instead of a path inside a non-directory.
 /// A key that does not exist at all has no lane: see [`LaneOutcome::Unavailable`].
+/// Where a repository's lane file lives — **outside** the repository.
+///
+/// It used to sit at `<git_dir>/zvcs-lane.lock`, which was wrong for a reason
+/// that has nothing to do with locking: the git directory's contents are part of
+/// what this port is measured on. `revert_auto_merge_state` compares the whole
+/// `.git` listing against stock git's after each verb, and every one of its
+/// cases failed on the extra entry — correctly, because a repository that stock
+/// git would not have written is exactly what that test exists to catch. The
+/// file also survives the process that made it (unlinking races a waiter already
+/// blocked on the inode), so it is not transient enough to excuse.
+///
+/// `flock` does not care where the inode is, only that every writer agrees on
+/// it, so the lane moves beside the daemon's own socket and is keyed by a hash
+/// of the canonical git directory. Two processes reaching one repository by
+/// different paths still agree, because [`lane_key`] canonicalises before this
+/// is called.
 fn lane_lock_path(key: &Path) -> Option<PathBuf> {
-    let meta = std::fs::metadata(key).ok()?;
-    if meta.is_dir() {
-        return Some(key.join(LANE_FILE_NAME));
-    }
-    let dir = key.parent()?;
-    let name = key.file_name()?;
-    Some(dir.join(format!("{}.{LANE_FILE_NAME}", name.to_string_lossy())))
+    use std::hash::{Hash, Hasher};
+    let dir = crate::superset::zdaemon::zvcs_home().join("lanes");
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    Some(dir.join(format!("{:016x}.lock", hasher.finish())))
 }
 
 /// The pid the lane file names, or `None` if it names nothing readable yet.

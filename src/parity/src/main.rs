@@ -467,14 +467,20 @@ fn real_main() -> Result<ExitCode> {
                     if args.verbose {
                         if let Some(z) = &outcome.zvcs {
                             println!(
-                                "  ok   {} — {}/{} landed, {} queued",
-                                outcome.id, z.landed, z.exited_ok, z.queued
+                                "  ok   {} — {} exited 0, {} of those landed, {} queued",
+                                outcome.id, z.exited_ok, z.exited_ok_landed, z.queued
                             );
                         }
                     }
                 }
                 concurrent::Verdict::Skipped(why) => {
                     println!("  skip {} — {why}", outcome.id);
+                }
+                // Printed unconditionally, not behind --verbose: a case that
+                // measures nothing is a defect in this corpus, and the only way it
+                // gets fixed is by being visible on the run that produced it.
+                concurrent::Verdict::Vacuous(why) => {
+                    println!("  ??   {} — measured nothing: {why}", outcome.id);
                 }
                 concurrent::Verdict::ControlAlsoFails => {
                     println!(
@@ -490,14 +496,14 @@ fn real_main() -> Result<ExitCode> {
                             println!("       zvcs : {line}");
                         }
                         println!(
-                            "       zvcs : {} exited 0, {} landed, {} queued",
-                            z.exited_ok, z.landed, z.queued
+                            "       zvcs : {} exited 0, {} of those landed, {} queued",
+                            z.exited_ok, z.exited_ok_landed, z.queued
                         );
                     }
                     if let Some(s) = &outcome.stock {
                         println!(
-                            "       stock: {} exited 0, {} landed — invariant held",
-                            s.exited_ok, s.landed
+                            "       stock: {} exited 0, {} of those landed — invariant held",
+                            s.exited_ok, s.exited_ok_landed
                         );
                     }
                 }

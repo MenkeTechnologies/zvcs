@@ -203,6 +203,7 @@ cargo run -p zvcs-parity -- --fuzz 12 --fuzz-sequences 0   # flag combinations o
 cargo run -p zvcs-parity -- --fuzz 12 --list-cases         # print what that run would execute
 cargo run -p zvcs-parity -- --alt-git /usr/bin/git         # name the second oracle
 cargo run -p zvcs-parity -- --alt-git-every-case           # ask it about passing cases too
+cargo run -p zvcs-parity -- --concurrency                  # concurrent writers and held locks
 ```
 
 It builds fixture repositories with stock git, runs each invocation against both
@@ -268,6 +269,37 @@ malformed content, which is where git's line-numbered
 `bad config line 12 in file .git/config` lives; `-c` has no line to number. Each
 case id names the scope every setting came from, so a failure is reconstructed by
 hand from the id alone.
+
+Every dimension above runs one writer against a repository nobody else is
+touching, which is the one condition under which lock handling cannot be wrong —
+and not the condition this port ships into, where sixteen agents and stock git
+share a worktree. `--concurrency` adds the two dimensions that ask about the
+rest, and neither can be a byte comparison. Stock git guards the index with an
+`O_EXCL` lock and does not wait, so its losers die; zvcs routes contended writers
+through a daemon FIFO so they queue and land. Under six-way contention stock
+stages one file and zvcs stages six, and diffing that reports the fair queue as a
+six-way regression.
+
+So each asserts an invariant instead. **Concurrent writers** — N processes
+released against one repository at the same instant — assert that *a writer that
+exits 0 has done its work*, which stock satisfies by failing its losers honestly
+and which the port may satisfy by queueing or serializing. Every case also runs
+against stock, and an invariant stock breaks too is not scored, so the bar stays
+git's. Deferral is not loss: a writer that announced a queued job is given a
+settle window before its effect is required. **Foreign locks** plant a lock a
+killed process or a concurrent `pack-refs` would have left, and assert only the
+indefensible direction — *whatever stock completes with the lock held, the port
+must complete too*. Doing more than git under contention is the feature; doing
+less is an availability failure. When both refuse, their exit codes must match,
+which is the one axis the queue cannot excuse.
+
+Both are opt-in, and the only dimensions that are: a case costs seconds rather
+than milliseconds, and its result is a distribution rather than a fact, since a
+race reproduces on some runs and not others. A defect either finds still fails
+the run — reporting success for work that never happened is not a softer failure
+than a stdout diff — but a clean run is evidence, not proof. A case where no
+writer succeeded scores `Vacuous` rather than passing, because an invariant that
+held for want of any writer that exited 0 has measured nothing.
 
 A case that fails is then re-run on **both** sides, because a byte comparison is
 only meaningful between values each binary can produce twice. A case stock git

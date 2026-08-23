@@ -23,6 +23,7 @@
 //!   zvcs-parity --no-alt-git                   # one oracle, as it always was
 //!   zvcs-parity --alt-git-every-case           # ask the second oracle about
 //!                                              #   passing cases too
+//!   zvcs-parity --concurrency        # also run the concurrent-writer corpus
 //!
 //! A machine with two real gits gets the second oracle without being asked: a
 //! difference against the newest git is otherwise reported identically whether
@@ -31,6 +32,7 @@
 //! costs nothing on a case that matched — see `runner`'s header for the gate, the
 //! classification and what it does to the denominator.
 
+mod concurrent;
 mod corpus;
 mod env;
 mod fixture;
@@ -104,6 +106,22 @@ struct Args {
     /// workflow costs 1+2+…+7 = 28 invocations instead of 7. Gated, only the step
     /// that diverged pays, and only once.
     alt_git_every_case: bool,
+    /// `--concurrency`: also run the concurrent-writer corpus.
+    ///
+    /// Off by default, and the only dimension that is. Every other case is one
+    /// invocation against a pristine copy; a concurrency case releases up to
+    /// eight processes at once and then waits out a settle window, so it is
+    /// priced in seconds rather than milliseconds and it is the one dimension
+    /// that can saturate the machine it runs on. It is also the only dimension
+    /// whose result is a *distribution* — a read-modify-write race reproduces on
+    /// some runs and not others — so a green concurrency run is weaker evidence
+    /// than a green case elsewhere, and folding it into the headline parity
+    /// number would make that number noisier without making it more true.
+    ///
+    /// It is reported and gated separately for the same reason: a defect it finds
+    /// is a defect (the port lost a write it said it had done), but a run that
+    /// found none has not proved the race absent.
+    concurrency: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -121,6 +139,7 @@ fn parse_args() -> Result<Args> {
         list_cases: false,
         alt_git: stock::AltChoice::Auto,
         alt_git_every_case: false,
+        concurrency: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -180,6 +199,10 @@ fn parse_args() -> Result<Args> {
             }
             "--alt-git-every-case" => {
                 a.alt_git_every_case = true;
+                i += 1;
+            }
+            "--concurrency" => {
+                a.concurrency = true;
                 i += 1;
             }
             other => anyhow::bail!("unknown argument {other:?}"),
@@ -417,6 +440,77 @@ fn real_main() -> Result<ExitCode> {
         eprintln!("wrote {path}");
     }
 
+    // The concurrent-writer corpus runs after everything else, sequentially, and
+    // is tallied on its own. Sequentially because each case already spawns up to
+    // eight children at once: multiplying that by the worker pool is how this
+    // harness previously exhausted the machine's fork capacity and took every
+    // shell on the box down with it. Its cases are independent of the pool's, so
+    // nothing is lost but wall clock.
+    let mut concurrency_defects = 0usize;
+    if args.concurrency {
+        let mut cases = concurrent::cases();
+        if !args.only.is_empty() {
+            cases.retain(|c| args.only.iter().any(|o| o == c.cmd));
+        }
+        let conc_dir = root.join("concurrent");
+        std::fs::create_dir_all(&conc_dir)?;
+        println!("\nconcurrent writers ({} cases, sequential)", cases.len());
+        println!(
+            "  invariant: a writer that exits 0 has done its work — asserted against \
+             stock git, which\n  satisfies it by failing its losers honestly. An \
+             invariant stock breaks too is not scored."
+        );
+        for case in &cases {
+            let outcome = concurrent::run_concurrent_case(case, &zvcs_bin, &templates, &conc_dir);
+            match &outcome.verdict {
+                concurrent::Verdict::Honest => {
+                    if args.verbose {
+                        if let Some(z) = &outcome.zvcs {
+                            println!(
+                                "  ok   {} — {}/{} landed, {} queued",
+                                outcome.id, z.landed, z.exited_ok, z.queued
+                            );
+                        }
+                    }
+                }
+                concurrent::Verdict::Skipped(why) => {
+                    println!("  skip {} — {why}", outcome.id);
+                }
+                concurrent::Verdict::ControlAlsoFails => {
+                    println!(
+                        "  ==   {} — stock git breaks the same invariant, so the port may too",
+                        outcome.id
+                    );
+                }
+                concurrent::Verdict::Defect => {
+                    concurrency_defects += 1;
+                    println!("  FAIL {}", outcome.id);
+                    if let Some(z) = &outcome.zvcs {
+                        for line in z.failures() {
+                            println!("       zvcs : {line}");
+                        }
+                        println!(
+                            "       zvcs : {} exited 0, {} landed, {} queued",
+                            z.exited_ok, z.landed, z.queued
+                        );
+                    }
+                    if let Some(s) = &outcome.stock {
+                        println!(
+                            "       stock: {} exited 0, {} landed — invariant held",
+                            s.exited_ok, s.landed
+                        );
+                    }
+                }
+            }
+        }
+        if concurrency_defects == 0 {
+            println!(
+                "  no defect found. A race reproduces on some runs and not others, so this is \
+                 evidence,\n  not proof — re-run to accumulate it."
+            );
+        }
+    }
+
     // Minimizing is opt-in: it costs a re-run per dropped argument, but turns a
     // three-flag failure into the one flag actually responsible.
     if args.shrink && !rep.failures.is_empty() {
@@ -474,8 +568,11 @@ fn real_main() -> Result<ExitCode> {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Non-zero when anything failed, so CI can gate on it.
-    Ok(if rep.overall.matched == rep.overall.total() {
+    // Non-zero when anything failed, so CI can gate on it. A concurrency defect
+    // counts: the port reporting success for a write it did not perform is not a
+    // softer failure than a stdout diff, it is a harder one — the caller cannot
+    // detect it and cannot retry it.
+    Ok(if rep.overall.matched == rep.overall.total() && concurrency_defects == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

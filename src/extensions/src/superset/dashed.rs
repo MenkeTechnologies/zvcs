@@ -35,7 +35,7 @@ pub fn link_target(dir: &Path) -> Result<PathBuf> {
     if dir.join("git").exists() {
         Ok(PathBuf::from("git"))
     } else {
-        std::env::current_exe().context("cannot resolve the zvcs binary path")
+        crate::hosted::git_exe().context("cannot resolve the zvcs binary path")
     }
 }
 

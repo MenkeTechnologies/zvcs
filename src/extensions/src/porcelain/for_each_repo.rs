@@ -59,7 +59,7 @@
 //! Two deliberate deviations, both forced by this being the git shadow binary and
 //! not git:
 //!   * git spawns `git -C <path> <args>` (`child.git_cmd = 1`). zvcs has no
-//!     global `-C`, so the child is `current_exe()` with its working directory set
+//!     global `-C`, so the child is `hosted::git_exe()` with its working directory set
 //!     to `<path>` — the same semantics, and it keeps the promise that zvcs never
 //!     forks upstream git (see `credential_cache.rs`, `upload_archive.rs`).
 //!   * Because the child is zvcs, an empty `<arguments>` list produces zvcs's own
@@ -379,7 +379,7 @@ fn bad_config(key: &str) -> ExitCode {
 /// git builds `git -C <path> <args>`; zvcs has no global `-C`, so the child is
 /// this same binary with its working directory set to `path`.
 fn run_command_on_repo(path: &std::path::Path, args: &[String]) -> Result<u8> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let mut child = Command::new(exe);
     child.args(args);
     // `git -C ''` is a documented no-op, so an empty value stays in the cwd.

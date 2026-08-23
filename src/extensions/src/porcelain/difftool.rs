@@ -1117,9 +1117,10 @@ fn absolute_workdir(repo: &gix::Repository) -> Result<PathBuf> {
         .collect())
 }
 
-/// The running executable, which stands in for git's `git_cmd = 1` children.
+/// The `git` binary to run for git's `git_cmd = 1` children — this process
+/// when zvcs owns it, the one [`crate::hosted::git_exe`] finds when a host does.
 fn current_exe() -> Result<PathBuf> {
-    std::env::current_exe().map_err(|e| anyhow!("cannot locate the running executable: {e}"))
+    crate::hosted::git_exe().map_err(|e| anyhow!("cannot locate the git binary: {e}"))
 }
 
 // ---------------------------------------------------------------------------

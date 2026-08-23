@@ -222,7 +222,7 @@ fn mode_ws(args: &[String]) -> Result<Vec<u8>> {
 /// which is what a shell pipeline whose last stage is `perl` (or the bare
 /// command, for `mode_ws`) does with it.
 fn run_self(leading: &[&str], args: &[String]) -> Result<Vec<u8>> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let out = std::process::Command::new(exe)
         .args(leading)
         .args(args)
@@ -358,7 +358,7 @@ fn mode_grep(args: &[String]) -> Result<Vec<u8>> {
     let mut argv: Vec<std::ffi::OsString> = match &configured {
         Some(cmd) => cmd.split_whitespace().map(Into::into).collect(),
         None => {
-            let exe = std::env::current_exe()?;
+            let exe = crate::hosted::git_exe()?;
             vec![exe.into(), "grep".into(), "-n".into(), "--column".into()]
         }
     };

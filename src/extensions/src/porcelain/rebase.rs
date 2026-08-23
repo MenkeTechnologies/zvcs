@@ -3662,7 +3662,7 @@ fn run_am(a: &AmRun<'_>) -> Result<AmOutcome> {
     use std::io::IsTerminal;
     use std::process::{Command, Stdio};
 
-    let exe = std::env::current_exe()
+    let exe = crate::hosted::git_exe()
         .map_err(|e| anyhow!("cannot locate the running executable: {e}"))?;
     let workdir = a.repo.workdir().map(|w| w.to_path_buf());
     let rebased_patches = a.repo.git_dir().join("rebased-patches");
@@ -3771,7 +3771,7 @@ fn spawn_am(
     a: &AmRun<'_>,
     configure: impl FnOnce(&mut std::process::Command) -> std::io::Result<()>,
 ) -> Result<std::result::Result<(), ExitCode>> {
-    let exe = std::env::current_exe()
+    let exe = crate::hosted::git_exe()
         .map_err(|e| anyhow!("cannot locate the running executable: {e}"))?;
     let mut am = std::process::Command::new(&exe);
     am.arg("am");
@@ -6000,7 +6000,7 @@ impl<'r> Sequencer<'r> {
         args: &[String],
         env: Vec<(String, String)>,
     ) -> Result<(bool, Vec<u8>)> {
-        let exe = std::env::current_exe()
+        let exe = crate::hosted::git_exe()
             .map_err(|e| anyhow!("cannot locate the running executable: {e}"))?;
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("commit").args(args);

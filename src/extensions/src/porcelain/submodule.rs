@@ -2954,7 +2954,7 @@ fn fetch_in_submodule(
         return Ok(crate::fatal::EXIT_FATAL);
     }
 
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("fetch");
     if quiet {
@@ -3066,7 +3066,7 @@ fn run_update_command(
     display: &str,
 ) -> Result<u8> {
     let hex = oid.to_hex().to_string();
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let mut cmd = std::process::Command::new(exe);
     match strategy {
         UpdateStrategy::Checkout => {
@@ -3176,7 +3176,7 @@ fn clone_submodule(
             return Ok(out);
         }
 
-        let exe = std::env::current_exe()?;
+        let exe = crate::hosted::git_exe()?;
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("clone");
         if opts.quiet {

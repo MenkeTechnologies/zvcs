@@ -4,7 +4,7 @@
 //! Torvalds 2005) whose entire body is a `case` over the three input blob ids
 //! followed by calls to git's own plumbing. This port keeps that shape: the
 //! decision table, the messages and the file-system steps are native, and each
-//! `git <plumbing>` step re-invokes this same binary (`current_exe()`) so the
+//! `git <plumbing>` step re-invokes the git binary (`hosted::git_exe()`) so the
 //! already-ported `update-index`, `checkout-index`, `unpack-file` and
 //! `merge-file` implementations do the work — exactly the commands, argument
 //! vectors and exit-code propagation the script uses. Re-deriving index and
@@ -368,7 +368,7 @@ fn exec(argv: &[&str]) -> Result<ExitCode> {
 /// A `Command` re-invoking this binary with `argv`, rooted at the worktree top
 /// (the process has already chdir'd there).
 fn command(argv: &[&str]) -> Result<Command> {
-    let exe = std::env::current_exe()
+    let exe = crate::hosted::git_exe()
         .map_err(|e| anyhow!("cannot locate the running executable: {e}"))?;
     let mut cmd = Command::new(exe);
     cmd.args(argv);

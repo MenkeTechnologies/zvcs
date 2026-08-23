@@ -36,7 +36,7 @@ pub fn zstash(args: &[String]) -> Result<ExitCode> {
         bail!("stash '{name}' already exists ({} repo(s)); `git zunstash {name}` first", existing.len());
     }
     crate::db::stash_begin(&conn, &name)?;
-    let exe = std::env::current_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
+    let exe = crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
     let mut n = 0usize;
     walk_stash(&repo, &name, &conn, &exe, &mut n)?;
     println!("stashed {n} repo(s) as '{name}'");
@@ -86,7 +86,7 @@ pub fn zunstash(args: &[String]) -> Result<ExitCode> {
     if entries.is_empty() {
         bail!("no stash named '{name}'");
     }
-    let exe = std::env::current_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
+    let exe = crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
     let mut popped = 0usize;
     let mut kept = 0usize;
     for wd in &entries {

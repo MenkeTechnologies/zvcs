@@ -1119,7 +1119,7 @@ pub(super) fn maybe_recurse_submodules(
     let Some(workdir) = repo.workdir() else {
         return Ok(());
     };
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     for sm in subs {
         if !sm.is_active().unwrap_or(false) {
             continue;

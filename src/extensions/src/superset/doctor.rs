@@ -39,7 +39,7 @@ pub fn zdoctor(_args: &[String]) -> Result<ExitCode> {
     report(Level::Ok, "version", env!("CARGO_PKG_VERSION").to_string());
 
     // Is this binary the `git` PATH resolves to?
-    match (first_git_on_path(), std::env::current_exe().ok()) {
+    match (first_git_on_path(), crate::hosted::git_exe().ok()) {
         (Some(found), Some(me)) => {
             let same = canon(&found) == canon(&me);
             if same {

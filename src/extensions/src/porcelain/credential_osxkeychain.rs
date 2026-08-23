@@ -123,7 +123,7 @@ pub fn credential_osxkeychain(args: &[String]) -> Result<ExitCode> {
 fn lock_self() -> Result<Option<std::fs::File>, String> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let exe = std::env::current_exe().map_err(|_| String::from("<self>"))?;
+    let exe = crate::hosted::git_exe().map_err(|_| String::from("<self>"))?;
     std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_EXLOCK)

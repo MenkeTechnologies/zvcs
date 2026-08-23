@@ -229,7 +229,7 @@ fn run_advice(code: &str, env: &[(&str, String)]) -> i32 {
 /// Run the original git command in a child process (so after-advice sees its
 /// status), with the loop guard set so it is not re-intercepted.
 fn run_original(sub: &str, args: &[String]) -> i32 {
-    let Ok(exe) = std::env::current_exe() else { return 127 };
+    let Ok(exe) = crate::hosted::git_exe() else { return 127 };
     Command::new(exe)
         .arg(sub)
         .args(args)

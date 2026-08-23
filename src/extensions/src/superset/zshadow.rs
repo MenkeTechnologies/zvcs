@@ -59,7 +59,7 @@ fn install(bin: &Path, comp: &Path) -> Result<()> {
 
     // The `git` shim first: with it in place the dashed links are made relative
     // to it, so a rebuild at a new path only needs the shim repointed.
-    let me = std::env::current_exe().context("cannot resolve the zvcs binary path")?;
+    let me = crate::hosted::git_exe().context("cannot resolve the zvcs binary path")?;
     let mut shim = dashed::LinkStats::default();
     dashed::link_to(&bin.join("git"), &me, &mut shim)?;
     let links = dashed::install_links(bin, &dashed::link_target(bin)?)?;

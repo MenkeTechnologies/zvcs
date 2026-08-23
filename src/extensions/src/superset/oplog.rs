@@ -171,7 +171,7 @@ pub fn zundo(args: &[String]) -> Result<ExitCode> {
 
     // Reuse the faithful porcelain reset (moves ref + index + worktree, reflogged
     // so the undo is itself undoable).
-    let exe = std::env::current_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
+    let exe = crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
     let status = Command::new(exe)
         .args(["reset", "--hard", &prev])
         .current_dir(&workdir)

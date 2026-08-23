@@ -6525,7 +6525,7 @@ fn submodule_inline_diff(
 
     let workdir = repo.workdir()?;
     let dir = workdir.join(gix::path::from_bstr(path.as_bstr()).as_ref());
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::hosted::git_exe().ok()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("diff").arg("--submodule=diff");
     cmd.arg(format!(

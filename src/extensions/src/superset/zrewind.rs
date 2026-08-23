@@ -31,7 +31,7 @@ pub fn zrewind(args: &[String]) -> Result<ExitCode> {
     let cutoff = now_secs() - secs;
 
     let top = gix::discover(".")?;
-    let exe = std::env::current_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
+    let exe = crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
 
     // The tree = the top repo + every initialized submodule.
     let mut repos = vec![top.clone()];

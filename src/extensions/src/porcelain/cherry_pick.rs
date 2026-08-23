@@ -1614,7 +1614,7 @@ fn run_merge_strategy(
     std::fs::write(repo.git_dir().join("MERGE_MSG"), &message[..])?;
 
     let base = base_id.unwrap_or_else(|| ObjectId::empty_tree(repo.object_hash()));
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
     cmd.arg(format!("merge-{strategy}"));
     for x in xopts {
         cmd.arg(format!("--{x}"));

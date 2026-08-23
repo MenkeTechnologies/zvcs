@@ -141,7 +141,7 @@ fn exec_spec(argv: Vec<String>) -> Value {
 /// daemon's jobpool runs it, it BLOCKS on the repo's fair lane rather than
 /// re-queueing (loop guard). Prints the job number; runs inline if no daemon.
 pub fn queue_verb(sub: &str, args: &[String]) -> Result<ExitCode> {
-    let exe = std::env::current_exe().map_err(|e| anyhow!("cannot resolve zvcs binary: {e}"))?;
+    let exe = crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve zvcs binary: {e}"))?;
     let mut argv = vec![exe.to_string_lossy().into_owned(), sub.to_string()];
     argv.extend(args.iter().cloned());
     let mut spec = exec_spec(argv);

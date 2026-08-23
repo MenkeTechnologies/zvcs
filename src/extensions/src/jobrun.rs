@@ -67,7 +67,7 @@ pub struct JobResult {
 
 /// This binary's path, for spawning child porcelain with a set cwd.
 fn self_exe() -> Result<std::path::PathBuf> {
-    std::env::current_exe().map_err(|e| anyhow!("cannot resolve current exe: {e}"))
+    crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve current exe: {e}"))
 }
 
 /// Run one child `git <args>` in `cwd`; return `(success, combined-output)`.

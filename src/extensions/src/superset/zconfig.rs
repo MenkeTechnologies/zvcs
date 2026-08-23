@@ -217,7 +217,7 @@ fn config_int(key: &str) -> Option<i64> {
 
 /// Write `zvcs.<key> = <val>` to the global config via zvcs's own porcelain.
 fn write_key(key: &str, val: &str) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let ok = Command::new(exe)
         .args(["config", "--global", &format!("zvcs.{key}"), val])
         .status()?
@@ -230,7 +230,7 @@ fn write_key(key: &str, val: &str) -> Result<()> {
 
 /// Unset `zvcs.<key>` from the global config; a missing key (git rc 5) is fine.
 fn unset_key(key: &str) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let status = Command::new(exe)
         .args(["config", "--global", "--unset", &format!("zvcs.{key}")])
         .status()?;
@@ -244,7 +244,7 @@ fn unset_key(key: &str) -> Result<()> {
 /// one — a stopped daemon reads the new value on its next start.
 fn apply() -> Result<ExitCode> {
     if super::zdaemon::is_running() {
-        let exe = std::env::current_exe()?;
+        let exe = crate::hosted::git_exe()?;
         let _ = Command::new(exe).args(["zdaemon", "reload"]).status();
         println!("(reloaded the running daemon)");
     } else {

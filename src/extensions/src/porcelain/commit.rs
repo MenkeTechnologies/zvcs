@@ -3094,7 +3094,7 @@ fn append_verbose_diff(
         file.write_all(scissors_line(&comment).as_bytes())?;
     }
     file.flush()?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let workdir = repo.workdir().unwrap_or_else(|| repo.git_dir()).to_owned();
     let _ = std::process::Command::new(exe)
         .args(["diff", "--cached"])

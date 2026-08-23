@@ -51,7 +51,7 @@ pub fn ensure_if_configured() {
 /// forget — a race with another spawner is harmless (the loser's `start` bails
 /// "daemon already running"). Used by autostart and by `zdaemon restart`.
 pub fn spawn_detached(workdir: &Path) {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::hosted::git_exe() else {
         return;
     };
     let mut cmd = Command::new(exe);
@@ -71,7 +71,7 @@ pub fn spawn_detached(workdir: &Path) {
 /// a whole-device crawl to a child. `env` is set on the child only — used to
 /// tell it that its stdout IS the log. Fire-and-forget; output lands in `zvcs.log`.
 pub fn spawn_detached_self(args: &[&str], env: &[(&str, &str)]) {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::hosted::git_exe() else {
         return;
     };
     let mut cmd = Command::new(exe);

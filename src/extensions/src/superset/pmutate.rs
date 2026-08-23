@@ -26,7 +26,7 @@ enum Outcome {
 
 /// Run a git subcommand (via this binary) in `workdir`, capturing its output.
 fn git_in(workdir: &Path, sub: &str, extra: &[&str]) -> Outcome {
-    let exe = match std::env::current_exe() {
+    let exe = match crate::hosted::git_exe() {
         Ok(e) => e,
         Err(e) => return Outcome::Ran(false, format!("cannot resolve zvcs binary: {e}")),
     };

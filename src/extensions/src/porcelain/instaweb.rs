@@ -104,7 +104,7 @@
 //!   `$(gitwebdir)` its build baked in — for the installed git that is
 //!   `<prefix>/share/gitweb`, holding the `gitweb.cgi` Perl program. zvcs ships
 //!   no gitweb, so the same prefix-relative rule is applied to *this* binary
-//!   (`current_exe()/../../share/gitweb`), which normally does not exist: point
+//!   (`hosted::git_exe()/../../share/gitweb`), which normally does not exist: point
 //!   `instaweb.gitwebdir` at a real gitweb installation to serve anything. The
 //!   generated configs are otherwise identical, and setting that key makes them
 //!   byte-identical to stock's.
@@ -340,7 +340,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
     // (`porcelain/web__browse.rs`), so re-invoking this executable runs exactly
     // that code — and, unlike an in-process call, yields the exit status the
     // script's `||` needs, since `ExitCode` cannot be inspected.
-    let ran = std::env::current_exe().ok().and_then(|exe| {
+    let ran = crate::hosted::git_exe().ok().and_then(|exe| {
         Command::new(exe)
             .arg("web--browse")
             .args(&browse)
@@ -1263,7 +1263,7 @@ fn kill_words(text: &str) {
         );
         return;
     }
-    let argv0 = std::env::current_exe()
+    let argv0 = crate::hosted::git_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "git-instaweb".to_string());
     for word in words {
@@ -1303,7 +1303,7 @@ fn exec_path() -> String {
 /// sets to `<prefix>/share/gitweb`. Applied to this binary's own prefix; zvcs
 /// ships no gitweb, so `instaweb.gitwebdir` is normally what makes this useful.
 fn default_gitwebdir() -> String {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::hosted::git_exe() else {
         return "share/gitweb".to_string();
     };
     let prefix = exe.parent().and_then(Path::parent);

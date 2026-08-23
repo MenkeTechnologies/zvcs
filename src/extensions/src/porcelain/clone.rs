@@ -1957,7 +1957,7 @@ fn write_alternates(git_dir: &Path, alternates: &[PathBuf]) -> Result<()> {
 /// [`transport_allowed`] refuses a `user`-scoped transport for it. Passing it
 /// down here is what makes a recursive clone honor `protocol.file.allow`.
 fn run_self(dir: &str, args: &[&str], from_user: bool) -> Result<u8> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("-C").arg(dir).args(args);
     if !from_user {

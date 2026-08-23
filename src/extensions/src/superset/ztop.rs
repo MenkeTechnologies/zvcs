@@ -886,7 +886,7 @@ fn parse_palette(s: &str) -> Option<Palette> {
 /// Persist the chosen theme (and, for a custom palette, its values), like
 /// htoprs's theme chooser + editor save.
 pub(crate) fn save_palette(label: &str, pal: Palette) {
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = crate::hosted::git_exe() else { return };
     let _ = Command::new(&exe).args(["config", "--global", "zvcs.topscheme", label]).status();
     if label.eq_ignore_ascii_case("Custom") {
         let s = pal.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");

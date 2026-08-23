@@ -2978,7 +2978,7 @@ fn count_commits(repo: &gix::Repository, tip: ObjectId, hidden: ObjectId) -> Res
 /// A child that cannot be spawned (or a bare repository, which has no worktree to
 /// diff) contributes no patch, exactly as git's empty diff would.
 fn verbose_patch(workdir: Option<&std::path::Path>, args: &[&str]) -> String {
-    let (Some(dir), Ok(exe)) = (workdir, std::env::current_exe()) else {
+    let (Some(dir), Ok(exe)) = (workdir, crate::hosted::git_exe()) else {
         return String::new();
     };
     let out = std::process::Command::new(exe)
@@ -3004,7 +3004,7 @@ fn submodule_summary(
     limit: i64,
     reference: Reference,
 ) -> String {
-    let (Some(dir), Ok(exe)) = (workdir, std::env::current_exe()) else {
+    let (Some(dir), Ok(exe)) = (workdir, crate::hosted::git_exe()) else {
         return String::new();
     };
     let mut cmd = std::process::Command::new(exe);

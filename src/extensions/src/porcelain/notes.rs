@@ -1057,7 +1057,7 @@ fn prepare_note_data(
 /// `write_commented_object()`'s child: `git show --stat --no-notes <object>`,
 /// run as our own binary (git's `show.git_cmd = 1`) with its stderr inherited.
 fn show_stat(object: &ObjectId) -> Result<Vec<u8>> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let out = std::process::Command::new(exe)
         .args(["show", "--stat", "--no-notes", &object.to_string()])
         .stdin(std::process::Stdio::null())

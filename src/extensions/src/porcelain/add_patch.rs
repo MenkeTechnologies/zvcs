@@ -721,7 +721,7 @@ fn run_git_in_index(
     dir: Option<&std::path::Path>,
     index_file: Option<&std::path::Path>,
 ) -> std::io::Result<(bool, Vec<u8>)> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let mut cmd = Command::new(exe);
     cmd.args(args);
     if let Some(d) = dir {

@@ -113,7 +113,7 @@ fn plan_repo(git_dir: &Path, workdir: &Path, steps: usize, apply: bool, force: b
 
 /// Reuse the faithful porcelain reset (ref + index + worktree, reflogged).
 fn reset_hard(workdir: &Path, target: &str) -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = crate::hosted::git_exe() else { return false };
     Command::new(exe)
         .args(["reset", "--hard", target])
         .current_dir(workdir)

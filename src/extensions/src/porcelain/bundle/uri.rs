@@ -429,7 +429,7 @@ fn download_https_uri_to_file(filename: &Path, uri: &str) -> Result<(), ()> {
         return Err(());
     }
 
-    let exe = std::env::current_exe().map_err(|_| ())?;
+    let exe = crate::hosted::git_exe().map_err(|_| ())?;
     let mut child = std::process::Command::new(exe)
         .args(["remote-https", uri, uri])
         .stdin(std::process::Stdio::piped())

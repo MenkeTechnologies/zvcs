@@ -649,7 +649,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
     let _cleanup = TempDir(tempdir.clone());
 
     let mut ctx = Ctx {
-        exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("git")),
+        exe: crate::hosted::git_exe().unwrap_or_else(|_| PathBuf::from("git")),
         git_dir,
         workdir: tempdir.join("t"),
         index_file: tempdir.join("index"),
@@ -697,7 +697,7 @@ fn require_clean_work_tree(repo: &gix::Repository) -> Result<()> {
         eprintln!("fatal: Needed a single revision");
         return Err(Exit(1).into());
     }
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = crate::hosted::git_exe() {
         let _ = Command::new(exe)
             .args(["update-index", "-q", "--ignore-submodules", "--refresh"])
             .status();

@@ -353,7 +353,7 @@ pub fn run_auto_maintenance(repo: &gix::Repository, quiet: bool) -> Result<()> {
             )
         });
 
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::hosted::git_exe() else {
         return Ok(());
     };
     let mut child = std::process::Command::new(exe);
@@ -795,7 +795,7 @@ fn delegate(outcome: Result<ExitCode>) -> bool {
 /// `stdout` is inherited: none of these children print anything on their success
 /// path, and git lets what they do print through.
 fn spawn_git(repo: &gix::Repository, args: &[&str]) -> bool {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::hosted::git_exe() else {
         return false;
     };
     std::process::Command::new(exe)
@@ -847,7 +847,7 @@ fn pack_loose(repo: &gix::Repository, quiet: bool) -> bool {
         return true;
     }
 
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::hosted::git_exe() else {
         return false;
     };
     let mut child = std::process::Command::new(exe);

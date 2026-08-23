@@ -3230,7 +3230,7 @@ fn push_refspec_dest(
 /// git's `grab_describe_values`: run `describe <atom args> <oid>` and take its
 /// trailing-whitespace-stripped stdout. A failed run leaves the atom empty.
 fn run_describe(args: &[String], id: ObjectId) -> Result<Vec<u8>> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let out = std::process::Command::new(exe)
         .arg("describe")
         .args(args)

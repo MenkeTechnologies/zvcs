@@ -75,7 +75,7 @@ pub fn zrestore(args: &[String]) -> Result<ExitCode> {
     if entries.is_empty() {
         anyhow::bail!("no snapshot named '{name}'");
     }
-    let exe = std::env::current_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
+    let exe = crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
 
     let mut restored = 0usize;
     let mut failed = 0usize;

@@ -448,7 +448,7 @@ pub fn git_ancestor() -> Option<bool> {
     if chain.is_empty() {
         return None; // ancestry unavailable — caller must assume the unsafe case
     }
-    let self_exe = std::env::current_exe().ok();
+    let self_exe = crate::hosted::git_exe().ok();
     let mut any_readable = false;
     let mut found = false;
     for pid in chain {

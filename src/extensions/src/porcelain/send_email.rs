@@ -2552,7 +2552,7 @@ fn execute_cmd(prefix: &str, cmd: &str, file: &str) -> Result<Vec<String>, Strin
 /// `Git::command_input_pipe(['imap-send', …])` reach the ported subcommands
 /// rather than whatever `git` happens to be on `PATH`.
 pub(crate) fn self_exe() -> std::path::PathBuf {
-    std::env::current_exe().unwrap_or_else(|_| "git".into())
+    crate::hosted::git_exe().unwrap_or_else(|_| "git".into())
 }
 
 /// `unfold_headers` — RFC 2822 continuation lines are folded into their header.

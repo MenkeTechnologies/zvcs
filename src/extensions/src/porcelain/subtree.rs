@@ -1683,7 +1683,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
     // then run from the top of the work tree, since `<prefix>` and every
     // index/worktree child command are relative to it.
     let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("git"));
+        let exe = crate::hosted::git_exe().unwrap_or_else(|_| PathBuf::from("git"));
         return die(&format!(
             "fatal: {} cannot be used without a working tree.",
             exe.display()
@@ -1862,7 +1862,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         trimmed.to_string()
     };
 
-    let exe = std::env::current_exe()
+    let exe = crate::hosted::git_exe()
         .map_err(|e| anyhow::anyhow!("cannot resolve the git binary: {e}"))?;
     let mut ctx = Ctx {
         repo,

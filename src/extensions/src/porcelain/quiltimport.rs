@@ -532,7 +532,7 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
 
     // The shell shells out to `git <subcommand>`; this binary provides those
     // subcommands, so re-invoke it the same way `for-each-repo` does.
-    let exe = std::env::current_exe()
+    let exe = crate::hosted::git_exe()
         .map_err(|e| anyhow::anyhow!("cannot locate the running executable: {e}"))?;
 
     for line in complete_lines(&series) {

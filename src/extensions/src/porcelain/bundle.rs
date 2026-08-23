@@ -1606,7 +1606,7 @@ pub(crate) fn index_pack(
     // `.git` directory it is standing inside; the work tree is the directory to
     // hand it, falling back to the git dir itself for a bare repository.
     let cwd = repo.workdir().unwrap_or_else(|| repo.git_dir());
-    let status = std::process::Command::new(std::env::current_exe()?)
+    let status = std::process::Command::new(crate::hosted::git_exe()?)
         .current_dir(cwd)
         .args(["index-pack", "--fix-thin", "--stdin"])
         .args(extra_args)

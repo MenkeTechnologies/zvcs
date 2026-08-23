@@ -26,7 +26,7 @@ use std::process::Command;
 
 /// The zvcs `git` binary, so config writes go through its own porcelain.
 fn exe() -> Result<PathBuf> {
-    std::env::current_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))
+    crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))
 }
 
 /// Resolve a directory argument (default `.`) to the `(git_dir, workdir)` of the

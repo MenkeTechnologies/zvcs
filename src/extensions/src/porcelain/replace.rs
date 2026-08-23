@@ -438,7 +438,7 @@ fn export_object(filename: &std::path::Path, oid: ObjectId, kind: Kind, raw: boo
         .open(filename)
         .map_err(|e| anyhow!("unable to create '{}': {}", filename.display(), os_msg(&e)))?;
     let selector = if raw { kind.to_string() } else { "-p".to_string() };
-    let status = std::process::Command::new(std::env::current_exe()?)
+    let status = std::process::Command::new(crate::hosted::git_exe()?)
         .args(["cat-file", &selector, &oid.to_string()])
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .stdin(std::process::Stdio::null())
@@ -466,7 +466,7 @@ fn import_object(
 ) -> Option<ObjectId> {
     if !raw && kind == Kind::Tree {
         let listing = std::fs::File::open(filename).ok()?;
-        let out = std::process::Command::new(std::env::current_exe().ok()?)
+        let out = std::process::Command::new(crate::hosted::git_exe().ok()?)
             .arg("mktree")
             .stdin(listing)
             .output()

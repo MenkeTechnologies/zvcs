@@ -34,7 +34,7 @@
 //! Not covered:
 //!   * The daemon itself. `git-credential-cache--daemon` is its own command; this
 //!     module only spawns it and requires its `ok\n` handshake. Spawning goes
-//!     through `current_exe()`, which is what git's `git_cmd = 1` amounts to for
+//!     through `hosted::git_exe()`, which is what git's `git_cmd = 1` amounts to for
 //!     the shadow binary, so the daemon that serves the cache is zvcs's own —
 //!     when that subcommand is absent the handshake fails and this reports
 //!     `fatal: cache daemon did not start: …` rather than pretending to cache.
@@ -301,7 +301,7 @@ fn send_request(socket: &Path, request: &[u8]) -> Result<(), Option<String>> {
 /// The daemon's stderr stays inherited so its own `fatal:` reaches the terminal.
 fn spawn_daemon(socket: &Path) -> Result<(), String> {
     // `daemon.git_cmd = 1` — run our own git, not whatever is first on PATH.
-    let exe = std::env::current_exe()
+    let exe = crate::hosted::git_exe()
         .map_err(|e| format!("unable to start cache daemon: {}", errno(&e)))?;
     let mut child = Command::new(exe)
         .arg("credential-cache--daemon")

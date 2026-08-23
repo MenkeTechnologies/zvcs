@@ -768,7 +768,7 @@ fn log_debug(opts: &Opts, args: std::fmt::Arguments<'_>) {
 
 /// The path stock interpolates as `$0`. Ours names this binary instead.
 fn program_name() -> String {
-    std::env::current_exe()
+    crate::hosted::git_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "git-credential-netrc".to_string())
 }

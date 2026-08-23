@@ -385,7 +385,7 @@ fn strip_path_suffix(path: &Path, suffix: &str) -> Option<std::path::PathBuf> {
 /// is git's own — `GIT_EXEC_PATH` (`libexec/git-core`), `BINDIR` (`bin`), then the
 /// bare `git` a Git-for-Windows layout uses.
 fn prefix_from_executable() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::hosted::git_exe().ok()?;
     let dir = exe.parent()?;
     ["libexec/git-core", "bin", "git"]
         .iter()
@@ -415,7 +415,7 @@ fn prefix_from_executable() -> Option<std::path::PathBuf> {
 fn installation_config() -> Option<&'static Path> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let me = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+        let me = crate::hosted::git_exe().and_then(|p| p.canonicalize()).ok();
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .filter(|dir| !dir.as_os_str().is_empty())

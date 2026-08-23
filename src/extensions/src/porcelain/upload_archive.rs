@@ -81,7 +81,7 @@ pub fn upload_archive(args: &[String]) -> Result<ExitCode> {
     // error the client learns about as a NACK rather than on a sideband. The
     // writer inherits this process's stdin: it, not this process, reads the
     // client's argument pkt-lines.
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let child = Command::new(exe)
         .arg("upload-archive--writer")
         .args(args)

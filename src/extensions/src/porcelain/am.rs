@@ -18,7 +18,7 @@
 //!      stage by shelling out to `git mailinfo`/`git apply`/`git write-tree`/
 //!      `git commit-tree`/`git update-ref`/`git stripspace`/`git reset`; because
 //!      those subcommands are themselves ported, this module drives them by
-//!      re-executing this binary (`std::env::current_exe`) as a child — the same
+//!      re-executing the git binary (`hosted::git_exe`) as a child — the same
 //!      pattern `for_each_repo`/`quiltimport` use.
 //!
 //! ## What is served
@@ -1759,7 +1759,7 @@ struct Ctx {
 
 impl Ctx {
     fn new(repo: &gix::Repository, state_dir: &Path) -> Result<Ctx> {
-        let exe = std::env::current_exe()
+        let exe = crate::hosted::git_exe()
             .map_err(|e| anyhow::anyhow!("cannot locate the running executable: {e}"))?;
         let (cwd, sdir) = match repo.workdir() {
             Some(w) if state_dir.starts_with(w) => (

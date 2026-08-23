@@ -1621,7 +1621,7 @@ pub(super) fn local_service_program(
     if url?.scheme != gix::url::Scheme::File {
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::hosted::git_exe().ok()?;
     let exe = gix::path::into_bstr(exe).into_owned();
 
     // The local transport hands an override to a shell (`conn->use_shell = 1`
@@ -2918,7 +2918,7 @@ fn fetch_submodules(repo: &gix::Repository, opts: &FetchOpts) -> Result<bool> {
         return Ok(false);
     }
 
-    let exe = std::env::current_exe()?;
+    let exe = crate::hosted::git_exe()?;
     let mut forwarded: Vec<String> = vec!["fetch".into(), "--recurse-submodules".into()];
     if opts.quiet {
         forwarded.push("--quiet".into());

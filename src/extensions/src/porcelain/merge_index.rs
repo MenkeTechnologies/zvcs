@@ -309,7 +309,7 @@ fn errno_text(e: &std::io::Error) -> String {
 /// this binary the way stock git resolves them out of its exec-path.
 ///
 /// A bare `git-<verb>` — no directory component — naming a verb this binary
-/// dispatches becomes `current_exe()` run under that `argv[0]`, which
+/// dispatches becomes `hosted::git_exe()` run under that `argv[0]`, which
 /// `lib.rs: dashed_subcommand` turns straight back into `<verb>`. Anything else
 /// is spawned by name and looked up on the `PATH` [`path_with_git_exec_path`]
 /// builds, exactly as `setup_path()` arranges for stock git's children.
@@ -320,7 +320,7 @@ fn spawn_program(pgm: &OsString) -> Command {
         .and_then(|n| n.to_str())
         .and_then(|n| n.strip_prefix("git-"))
         .filter(|verb| crate::dispatch::is_verb(verb));
-    match dashed.and_then(|_| std::env::current_exe().ok()) {
+    match dashed.and_then(|_| crate::hosted::git_exe().ok()) {
         Some(exe) => {
             let mut cmd = Command::new(exe);
             cmd.arg0(pgm);
@@ -355,7 +355,7 @@ fn git_exec_path() -> Option<PathBuf> {
     // shelling out to a foreign one both forks and takes the answer from a
     // different installation. The helper directory is the one holding this
     // executable, which is where zvcs's own `git-*` programs sit.
-    std::env::current_exe()
+    crate::hosted::git_exe()
         .ok()
         .and_then(|exe| exe.parent().map(PathBuf::from))
 }

@@ -17,7 +17,7 @@ use crate::superset::query::{parallel_map, selected};
 /// Run a git subcommand (via this binary) in `workdir`, returning captured
 /// stdout on success, or `None` on failure.
 fn git_out(workdir: &Path, sub: &str, extra: &[&str]) -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::hosted::git_exe().ok()?;
     let o = Command::new(exe).arg(sub).args(extra).current_dir(workdir).output().ok()?;
     if !o.status.success() {
         return None;

@@ -154,7 +154,7 @@ fn alternate_refs_command(repo: &gix::Repository, git_dir: &Path) -> Option<Comm
             [git_dir.as_os_str()],
         ),
         None => {
-            let mut cmd = Command::new(std::env::current_exe().ok()?);
+            let mut cmd = Command::new(crate::hosted::git_exe().ok()?);
             let mut git_dir_arg = OsString::from("--git-dir=");
             git_dir_arg.push(git_dir);
             cmd.arg(git_dir_arg);

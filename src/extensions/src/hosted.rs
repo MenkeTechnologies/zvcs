@@ -164,6 +164,17 @@ where
 
     let outcome = panic::catch_unwind(AssertUnwindSafe(f));
 
+    // The pager owns fd 1 (and sometimes fd 2) between `maybe_setup` and
+    // `finish`, and the ordinary path through `run_command` closes that window
+    // itself. An `exit` from inside a paged verb does not: it unwinds straight
+    // past the teardown, and in a host that would leave the shell writing into
+    // a pipe whose reader has gone — `git log`, quit `less` with `q`, and the
+    // terminal is silent from then on. `finish` is a no-op when no pager is
+    // installed, so this is the same guarantee as the working-directory
+    // restore below: whichever way the invocation left, the host gets its
+    // descriptors back.
+    crate::pager::finish();
+
     HOSTED.set(previously);
     if let Some(dir) = cwd {
         let _ = std::env::set_current_dir(dir);

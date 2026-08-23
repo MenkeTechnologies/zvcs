@@ -13,7 +13,7 @@
 //! then wait for it so control returns to the shell only after the user quits.
 
 use std::io::{IsTerminal, Write};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, Stdio};
 use std::sync::Mutex;
 
@@ -46,6 +46,21 @@ const DEFAULT_PAGER_CMDS: &[&str] = &[
 struct Pager {
     child: Child,
     stderr_redirected: bool,
+    /// The host's own fd 1 and fd 2, parked out of the way while the pager owns
+    /// the low numbers. `None` when zvcs owns the process: git closes fd 1 to
+    /// end the pager session and then exits, so there is nothing to give back.
+    ///
+    /// Hosted there is. `finish` used to close fd 1 outright, which inside
+    /// zshrs-native closed *the shell's* stdout — every command after a paged
+    /// `git status` wrote to a descriptor that was gone, and the terminal went
+    /// silent for the rest of the session.
+    saved_stdout: Option<RawFd>,
+    /// The same for fd 2, parked only when the pager took stderr as well.
+    saved_stderr: Option<RawFd>,
+    /// `$GIT_PAGER_IN_USE` as the host had it, restored with the descriptors —
+    /// it is read by color and column-width decisions, so leaving it set makes
+    /// every later command in that shell believe it is writing into a pager.
+    prev_pager_in_use: Option<Option<std::ffi::OsString>>,
 }
 
 static PAGER: Mutex<Option<Pager>> = Mutex::new(None);
@@ -186,6 +201,8 @@ fn spawn(program: &str) {
 
     // Also mark our own environment so in-process checks (e.g. column layout,
     // color auto-detection) treat output as a terminal, matching git.
+    let hosted = crate::hosted::is_hosted();
+    let prev_pager_in_use = hosted.then(|| std::env::var_os("GIT_PAGER_IN_USE"));
     std::env::set_var("GIT_PAGER_IN_USE", "true");
 
     let stdin = child.stdin.take().expect("stdin piped");
@@ -194,15 +211,27 @@ fn spawn(program: &str) {
     // Flush anything already buffered on stdout before swapping the fd out.
     let _ = std::io::stdout().flush();
 
+    // Park the host's descriptors before anything is dup2'd over them. They go
+    // to fd >= 10 with CLOEXEC, which is the same discipline zsh applies to its
+    // own internal fds (`movefd`): a shell script may well name fds 3-9 itself,
+    // and a spare copy of stdout sitting on one of them would be visible to
+    // `exec 3>&-`. Nothing to park when zvcs owns the process.
+    let saved_stdout = hosted.then(|| park_fd(libc::STDOUT_FILENO)).flatten();
+
     let stderr_redirected;
+    let saved_stderr;
     // SAFETY: raw fd dup/isatty on our own descriptors; single-threaded here
     // (called before dispatch spawns any worker).
     unsafe {
         libc::dup2(pipe_fd, libc::STDOUT_FILENO);
         stderr_redirected = libc::isatty(libc::STDERR_FILENO) == 1;
-        if stderr_redirected {
+        saved_stderr = if stderr_redirected {
+            let parked = hosted.then(|| park_fd(libc::STDERR_FILENO)).flatten();
             libc::dup2(pipe_fd, libc::STDERR_FILENO);
-        }
+            parked
+        } else {
+            None
+        };
     }
     // Drop the original pipe end: only fd 1 (and fd 2) now hold the write side,
     // so the pager sees EOF once `finish` closes them.
@@ -211,7 +240,23 @@ fn spawn(program: &str) {
     *PAGER.lock().unwrap() = Some(Pager {
         child,
         stderr_redirected,
+        saved_stdout,
+        saved_stderr,
+        prev_pager_in_use,
     });
+}
+
+/// Duplicate `fd` onto a descriptor at 10 or above, close-on-exec.
+///
+/// `dup` hands back the lowest free number, which would put the parked copy in
+/// the 3-9 range a shell script manipulates directly. `F_DUPFD_CLOEXEC` takes a
+/// floor instead, and the CLOEXEC keeps the copy out of the pager child and out
+/// of anything else spawned while it runs.
+fn park_fd(fd: RawFd) -> Option<RawFd> {
+    // SAFETY: fcntl on a descriptor we own; returns -1 on failure, never a
+    // borrowed fd.
+    let parked = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+    (parked >= 0).then_some(parked)
 }
 
 /// Is a pager child of ours installed over stdout?
@@ -231,12 +276,38 @@ pub fn finish() {
     };
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    // SAFETY: closing the fds we dup2'd in `spawn`; git's `wait_for_pager` does
-    // the same `close(1)` to signal end-of-input to the pager.
+    // SAFETY: closing or restoring the fds we dup2'd in `spawn`. git's
+    // `wait_for_pager` does the plain `close(1)` to signal end-of-input, and
+    // that is still what happens when zvcs owns the process. Hosted, the parked
+    // copy is dup2'd back instead: that closes the pipe end sitting on fd 1 —
+    // so the pager still reads EOF — and hands the host its own stdout back in
+    // one step, rather than leaving it with a closed descriptor.
     unsafe {
-        libc::close(libc::STDOUT_FILENO);
+        match pager.saved_stdout {
+            Some(saved) => {
+                libc::dup2(saved, libc::STDOUT_FILENO);
+                libc::close(saved);
+            }
+            None => {
+                libc::close(libc::STDOUT_FILENO);
+            }
+        }
         if pager.stderr_redirected {
-            libc::close(libc::STDERR_FILENO);
+            match pager.saved_stderr {
+                Some(saved) => {
+                    libc::dup2(saved, libc::STDERR_FILENO);
+                    libc::close(saved);
+                }
+                None => {
+                    libc::close(libc::STDERR_FILENO);
+                }
+            }
+        }
+    }
+    if let Some(prev) = pager.prev_pager_in_use {
+        match prev {
+            Some(value) => std::env::set_var("GIT_PAGER_IN_USE", value),
+            None => std::env::remove_var("GIT_PAGER_IN_USE"),
         }
     }
     let _ = pager.child.wait();
@@ -254,6 +325,53 @@ fn env_flag(name: &str) -> bool {
 /// `$GIT_PAGER` / `$PAGER` and moves down the chain).
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod hosted_fd_tests {
+    use super::*;
+
+    /// fd 1's identity: the file description behind it, which survives a `dup2`
+    /// of a copy back onto it and does not survive a `close`.
+    fn stdout_identity() -> Option<(u64, u64)> {
+        // SAFETY: fstat on a descriptor we own, into a zeroed stat we then read.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            (libc::fstat(libc::STDOUT_FILENO, &mut st) == 0)
+                .then_some((st.st_dev as u64, st.st_ino as u64))
+        }
+    }
+
+    /// A hosted pager session gives the host back the stdout it started with.
+    ///
+    /// The regression: `finish` closed fd 1 outright — right for git, which
+    /// exits next, fatal for a host, which does not. Inside zshrs-native every
+    /// command after a paged `git log` wrote to a closed descriptor and the
+    /// terminal stayed silent for the rest of the session.
+    #[test]
+    fn a_hosted_pager_session_leaves_stdout_where_it_found_it() {
+        let before = stdout_identity().expect("fd 1 open at test start");
+        let prior_flag = std::env::var_os("GIT_PAGER_IN_USE");
+
+        // `cat` is a pager that needs no terminal and exits on EOF, so the
+        // session completes without a human pressing `q`.
+        crate::hosted::run(|| {
+            spawn("cat");
+            finish();
+            0
+        });
+
+        assert_eq!(
+            stdout_identity(),
+            Some(before),
+            "fd 1 must be the same file description the host had"
+        );
+        assert_eq!(
+            std::env::var_os("GIT_PAGER_IN_USE"),
+            prior_flag,
+            "the in-use flag must not outlive the pager"
+        );
+    }
 }
 
 #[cfg(test)]

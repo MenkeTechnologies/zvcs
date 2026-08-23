@@ -7,6 +7,12 @@
 //! pointed at stderr (as git does), and — for hooks that receive one — a payload
 //! on stdin. A non-zero exit aborts the operation that invoked it.
 //!
+//! The commit hooks additionally get `GIT_INDEX_FILE` naming the index that
+//! commit is being built from (`commit.c:1994`), which is not always the
+//! repository's own; [`run_with_env`] carries it, and reports back whether a hook
+//! was there to run at all, because `git commit` re-reads that index afterwards
+//! precisely when one was (`builtin/commit.c:1101-1109`).
+//!
 //! This is git's `find_hook()` (`hook.c:26-64`) plus the `git_path()` machinery
 //! it leans on (`path.c:387-431`), and it is the single lookup every hook site in
 //! zvcs goes through — `git hook` included — so the path git would name and the
@@ -115,6 +121,21 @@ fn git_dir_as_git_spells_it(repo: &gix::Repository) -> PathBuf {
     }
 }
 
+/// `path` as an absolute path, resolved against the current directory and then
+/// collapsed textually.
+///
+/// Anything a hook is handed — the executable, its working directory, `GIT_DIR`,
+/// `GIT_INDEX_FILE` — has to survive the child's `chdir` into the work tree root,
+/// and gitoxide hands back exactly the relative paths the repository was
+/// discovered with.
+pub(crate) fn absolutize(path: &Path) -> PathBuf {
+    let joined = match std::env::current_dir() {
+        Ok(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_owned(),
+    };
+    lexical_normalize(&joined)
+}
+
 /// Collapse `.` and `..` textually, without touching the filesystem. gitoxide
 /// hands back a linked worktree's common directory as
 /// `…/.git/worktrees/<id>/../..`; git prints the collapsed form.
@@ -140,6 +161,25 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// What a hook run amounted to: whether a hook was actually there to run, and
+/// whether it let the operation proceed.
+///
+/// The two are distinct because git keeps them distinct. `run_commit_hook()`
+/// takes an `int *invoked_hook` out-parameter (`commit.h:379-380`) that
+/// `run_hooks_opt()` clears to 0 before the lookup (`hook.c:823-824`) and sets to
+/// 1 only once a hook is about to be executed (`hook.c:659-660`) — and
+/// `prepare_to_commit()` keys its post-hook index re-read on that flag, not on
+/// the exit status (`builtin/commit.c:1101`). A repository with no `pre-commit`
+/// hook therefore keeps the index it already read, which is the difference
+/// between "nothing ran" and "something ran and changed nothing".
+pub struct Outcome {
+    /// A hook file was found, was executable, and was executed —
+    /// `*opt->invoked_hook = 1` (`hook.c:659-660`).
+    pub invoked: bool,
+    /// The operation may proceed: no hook, or a hook that exited 0.
+    pub ok: bool,
+}
+
 /// Run the client-side hook `event` if present, feeding `args` and (optionally)
 /// `stdin`. Returns `Ok(true)` to proceed — no hook installed, or the hook exited
 /// 0 — and `Ok(false)` when the hook exited non-zero, which the caller treats as
@@ -150,21 +190,54 @@ pub fn run(
     args: &[&str],
     stdin: Option<&[u8]>,
 ) -> Result<bool> {
+    Ok(run_with_env(repo, event, args, stdin, &[])?.ok)
+}
+
+/// [`run`], plus the environment git exports to the hook and the `invoked_hook`
+/// flag git needs back from it.
+///
+/// `env` is git's `strvec_pushf(&opt.env, "GIT_INDEX_FILE=%s", index_file)`
+/// (`commit.c:1994`): the commit hooks do not see whatever index the caller
+/// happens to discover, they see *the index this commit is being built from*,
+/// which for `--only` is a temporary file and for `-a`/`-i` is the locked one.
+/// A hook that runs `git add` therefore stages into the same index the commit
+/// will read back, which is the whole reason an auto-formatter hook works.
+pub fn run_with_env(
+    repo: &gix::Repository,
+    event: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    env: &[(&str, &Path)],
+) -> Result<Outcome> {
     let Some(path) = find(repo, event)? else {
-        return Ok(true);
+        return Ok(Outcome { invoked: false, ok: true });
     };
 
     // Hooks run in the worktree (or the git dir for a bare repo) with GIT_DIR set,
     // and git points their stdout at stderr so hook chatter never pollutes the
     // command's own stdout.
-    let workdir = repo
-        .workdir()
-        .unwrap_or_else(|| repo.git_dir())
-        .to_owned();
-    let mut cmd = Command::new(&path);
+    //
+    // Every path handed to the child is absolute first. git can afford relative
+    // ones because `setup.c` has already `chdir`'d it to the top of the work tree,
+    // so its `.git/hooks/pre-commit` means the same thing before and after the
+    // spawn; zvcs stays where it was invoked, and a repository discovered from a
+    // subdirectory spells the same file `../.git/hooks/pre-commit`. Handing *that*
+    // to `Command` while also moving the child's cwd to the work tree root points
+    // the exec one directory above the repository, and `git commit` from any
+    // subdirectory of a repository with any hook installed failed outright:
+    //
+    // ```text
+    // $ cd deep && git commit -m m
+    // zvcs: commit: No such file or directory (os error 2)
+    // ```
+    let workdir = absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir()));
+    let program = absolutize(&path);
+    let git_dir = absolutize(repo.git_dir());
+    let mut cmd = Command::new(&program);
     cmd.args(args)
         .current_dir(&workdir)
-        .env("GIT_DIR", repo.git_dir())
+        .env("GIT_DIR", &git_dir)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .stdin(if stdin.is_some() {
@@ -182,5 +255,5 @@ pub fn run(
             sink.write_all(data)?;
         }
     }
-    Ok(child.wait()?.success())
+    Ok(Outcome { invoked: true, ok: child.wait()?.success() })
 }

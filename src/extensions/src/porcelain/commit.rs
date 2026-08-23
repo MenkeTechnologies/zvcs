@@ -1535,11 +1535,100 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         return Ok(die_resolve_conflict(&index));
     }
 
+    // --- `prepare_index()`'s return value: the index this commit is built from ---
+    // git's `prepare_index()` hands `prepare_to_commit()` a *path*, and every hook
+    // on the commit path is pointed at it through `GIT_INDEX_FILE`
+    // (`commit.c:1994`). Which path depends on the mode, measured against git
+    // 2.55.0 by a `pre-commit` hook that echoes `$GIT_INDEX_FILE`:
+    //
+    // ```text
+    // git commit            .git/index                 COMMIT_AS_IS  (commit.c:493)
+    // git commit --amend    .git/index                 COMMIT_AS_IS  (commit.c:493)
+    // git commit -a         .git/index.lock            COMMIT_NORMAL (commit.c:468)
+    // git commit -i <path>  .git/index.lock            COMMIT_NORMAL (commit.c:468)
+    // git commit --only <p> .git/next-index-<pid>.lock COMMIT_PARTIAL(commit.c:554)
+    // ```
+    //
+    // A partial commit gets a whole temporary index of its own — HEAD's tree with
+    // only the named paths swapped in — and the commit is built from *that*, never
+    // from the real index; [`PartialIndex`] is that file.
+    let mut partial = if only_mode {
+        Some(PartialIndex::prepare(&repo, &pathspecs)?)
+    } else {
+        None
+    };
+    // Absolute, because the hook is spawned with its cwd moved to the top of the
+    // work tree while zvcs stays where it was invoked ([`crate::hooks::absolutize`]).
+    let index_file: std::path::PathBuf = match &partial {
+        Some(p) => crate::hooks::absolutize(&p.path),
+        // `-a`/`-i` reach here too. git points their hook at the *lock* it is
+        // holding over the real index, and rolls that lock back if the commit is
+        // then abandoned, so a hook's staging under `-a` does not survive an
+        // aborted commit. zvcs cannot hand a hook `.git/index.lock`: this port
+        // serialises index writers through the daemon lane and treats an existing
+        // `.git/index.lock` as a *foreign* holder to wait out
+        // (`lock.rs:604-623`), so the `git add` inside the hook would sit waiting
+        // on the lock its own parent is holding. It gets the real index instead,
+        // which agrees with git on every path that reaches a commit and differs
+        // only in that an aborted `-a` commit leaves the hook's staging in place
+        // rather than discarding it.
+        None => crate::hooks::absolutize(&repo.index_path()),
+    };
+
     // `pre-commit` runs before the commit is built; a non-zero exit aborts it
     // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
     // skips it, as it does `commit-msg`.
-    if verify && !crate::hooks::run(&repo, "pre-commit", &[], None)? {
-        return Ok(ExitCode::from(1));
+    if verify {
+        let hook = crate::hooks::run_with_env(
+            &repo,
+            "pre-commit",
+            &[],
+            None,
+            &[("GIT_INDEX_FILE", index_file.as_path())],
+        )?;
+        if !hook.ok {
+            return Ok(ExitCode::from(1));
+        }
+        // ```c
+        // if (!no_verify && invoked_hook) {
+        //         /*
+        //          * Re-read the index as the pre-commit-commit hook was invoked
+        //          * and could have updated it. We must do this before we invoke
+        //          * the editor and after we invoke run_status above.
+        //          */
+        //         discard_index(the_repository->index);
+        // }
+        // read_index_from(the_repository->index, index_file, repo_get_git_dir(the_repository));
+        // ```
+        //
+        // (builtin/commit.c:1101-1109.) The `read_index_from()` call is
+        // unconditional but returns immediately while the index is still loaded
+        // (`read-cache.c:2371-2372`, and `do_read_index` again at `:2225-2226`), so
+        // the `discard_index()` above it is the entire mechanism: a hook that ran
+        // invalidates what was read, and nothing else does. Without it the
+        // auto-formatter pattern — reformat, `git add`, exit 0 — silently loses the
+        // hook's staging, because the tree is built from the index as it was read
+        // *before* the hook.
+        //
+        // The re-read is from `index_file`, not from `.git/index`, which is why
+        // this is not a plain "re-open the index": under `--only` the hook staged
+        // into the temporary index and that is what the commit must pick up.
+        //
+        // It keys on `invoked_hook`, so a repository with no `pre-commit` hook does
+        // not pay for a second decode of its index.
+        //
+        // `pre-commit` is the only hook on the commit path that gets this: git's
+        // `prepare-commit-msg` (`commit.c:1116`) and `commit-msg` (`:1133`) both run
+        // *after* the `cache_tree_update()` at `:1111` has already built the tree,
+        // and `discard_index()` appears nowhere between them — measured, a
+        // `commit-msg` hook that runs `git add` leaves the path staged but out of
+        // the commit.
+        if hook.invoked {
+            match &mut partial {
+                Some(p) => p.reread(&repo)?,
+                None => index = open_or_empty_index(&repo)?,
+            }
+        }
     }
 
     // The tree a commit records *is* the index's cache-tree root:
@@ -1562,9 +1651,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     //
     // In pathspec-limited ("only") mode the tree comes from HEAD's tree with only
     // the listed paths swapped for their worktree content instead — see
-    // `build_only_mode_tree`, which also stages those paths into the real index.
-    let tree_id: ObjectId = if only_mode {
-        build_only_mode_tree(&repo, &pathspecs)?
+    // [`PartialIndex`], which also stages those paths into the real index.
+    let tree_id: ObjectId = if let Some(partial) = partial.take() {
+        partial.finish(&repo)?
     } else {
         match super::write_tree::refresh_cache_tree(&repo, &mut index, false)? {
             Ok(id) => id,
@@ -3136,61 +3225,141 @@ pub(crate) fn write_commit_object(
     Ok(repo.write_object(&commit)?.detach())
 }
 
-/// `git commit <pathspec>...` — git's default `--only`/`-o` mode.
+/// git's "false index" for a partial commit — `git commit <pathspec>...`, its
+/// default `--only`/`-o` mode.
 ///
-/// The commit tree is HEAD's tree with only the matched pathspec paths replaced
-/// by their WORKING-TREE content: a present file is added/modified, a tracked
-/// path whose worktree file is gone is deleted, and every other path keeps its
-/// HEAD version — so any staged (index) changes to *other* paths are disregarded.
-/// After the tree is built the same matched paths are staged into the real
-/// on-disk index (leaving unrelated index entries untouched) so later commits see
-/// them. Returns the tree id the commit is written against.
+/// It is a real file on disk holding HEAD's tree with only the matched pathspec
+/// paths replaced by their WORKING-TREE content: a present file is
+/// added/modified, a tracked path whose worktree file is gone is deleted, and
+/// every other path keeps its HEAD version — so any staged (index) changes to
+/// *other* paths are disregarded. The commit is built from this file rather than
+/// from the repository's index, and the same matched paths are separately staged
+/// into the real on-disk index (leaving unrelated index entries untouched) so
+/// later commits see them.
 ///
 /// A pathspec matches a path when the path equals it or lives under `<spec>/`;
 /// literal files and directory prefixes are supported, as are the worktree globs
 /// the dirwalk resolves. Blob hashing and mode detection mirror `git add`.
-fn build_only_mode_tree(repo: &gix::Repository, pathspecs: &[String]) -> Result<ObjectId> {
-    // The commit tree comes from git's "false index" — HEAD's tree with only the
-    // matched paths taken from the worktree. The same staged set is then applied
-    // to the real index, so the worktree is walked and hashed exactly once.
-    let (temp, staged) = only_mode_stage(repo, pathspecs)?;
+///
+/// It is a file rather than an in-memory index because the hooks have to be able
+/// to see it and write to it. git
+/// creates it in `prepare_index()` (builtin/commit.c:541-555) — steps (4) to (8)
+/// of the partial-commit plan spelled out at `:497-515` — hands its path to
+/// `prepare_to_commit()`, and exports that path to every commit hook as
+/// `GIT_INDEX_FILE`. So a `pre-commit` hook that runs `git add` under `--only`
+/// stages into *this* index, its staging lands in the commit, and the real index
+/// is left alone; measured against git 2.55.0, a hook staging an unrelated path
+/// under `git commit --only <p>` puts that path in the commit but not in the
+/// repository's index.
+///
+/// Two consequences the port has to keep, both measured:
+///
+/// * the file is built *before* the hook runs, so a hook that rewrites a listed
+///   file without staging it does not change what is committed — `--only` records
+///   the worktree as it was when the command started;
+/// * paths the user staged but did not name stay out of the commit, hook or no
+///   hook, because the base is HEAD's tree rather than the index.
+struct PartialIndex {
+    /// Where the false index lives, and the value the hooks see in
+    /// `GIT_INDEX_FILE`. git's is `<git-dir>/next-index-<pid>` held open as a
+    /// lockfile, so what it actually exports is the `.lock` name
+    /// (builtin/commit.c:541-544 with `get_lock_file_path()` at `:554`); this is
+    /// the same name so a hook that reports its index reports git's.
+    path: std::path::PathBuf,
+    /// The false index itself, re-read from [`Self::path`] after a hook ran.
+    index: gix::index::File,
+    /// The same worktree content, kept so it can be replayed onto the *real*
+    /// index without hashing anything twice — git's steps (2)/(3).
+    staged: StagedSet,
+}
 
-    let hash = repo.object_hash();
-    let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
-    {
-        let backing = temp.path_backing();
-        for entry in temp.entries() {
-            let path = entry.path_in(backing);
-            let mode = entry
-                .mode
-                .to_tree_entry_mode()
-                .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
-            editor.upsert(
-                path.split(|&b| b == b'/').map(|c| c.as_bstr()),
-                mode.kind(),
-                entry.id,
-            )?;
-        }
+impl PartialIndex {
+    /// Steps (0) through (8) of builtin/commit.c:497-515, up to the point where
+    /// git returns the false index's path to its caller.
+    fn prepare(repo: &gix::Repository, pathspecs: &[String]) -> Result<Self> {
+        let (mut index, staged) = only_mode_stage(repo, pathspecs)?;
+        // `hold_lock_file_for_update(&false_lock, git_path("next-index-%"PRIuMAX,
+        // getpid()), LOCK_DIE_ON_ERROR)` (builtin/commit.c:541-544). The pid keeps
+        // two concurrent partial commits in one repository off each other's file.
+        let path = repo
+            .git_dir()
+            .join(format!("next-index-{}.lock", std::process::id()));
+        index.set_path(&path);
+        // A valid cache-tree in the false index is what makes the tree build below
+        // cheap and what a hook's own `git add` extends rather than rebuilds.
+        super::write_tree::update_cache_tree_quietly(repo, &mut index);
+        index.write(crate::config::index_write_options(repo))?;
+        Ok(Self { path, index, staged })
     }
-    let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
 
-    // Stage the same paths into the REAL on-disk index, leaving all other entries
-    // — git's step (2)/(3), which is what makes the partial commit visible to the
-    // next one.
-    let mut real = open_or_empty_index(repo)?;
-    staged.apply_to(&mut real);
-    // Step (2)/(3) (builtin/commit.c:534-539) rewrites the real on-disk index,
-    // so it carries the
-    // repository's index-write options like every other write does
-    // (read-cache.c:2830-2831). The `cache_tree_update()` that git runs between
-    // the staging and the write (builtin/commit.c:537) is what leaves the real
-    // index with a *valid* cache-tree afterwards rather than the invalidated one
-    // `apply_to` produced — the partial commit's whole point is that the next
-    // command sees a ready index.
-    super::write_tree::update_cache_tree_quietly(repo, &mut real);
-    real.write(crate::config::index_write_options(repo))?;
+    /// `discard_index()` + `read_index_from(index_file)` (builtin/commit.c:1107-1109)
+    /// for the partial case: whatever the hook staged into the false index becomes
+    /// what this commit records.
+    fn reread(&mut self, repo: &gix::Repository) -> Result<()> {
+        self.index = gix::index::File::at_or_default_with_git_dir(
+            &self.path,
+            Some(repo.git_dir()),
+            repo.object_hash(),
+            // The same `index.skipHash` the write above honoured, so an index
+            // written with a zeroed trailer reads back instead of failing
+            // verification.
+            crate::config::index_write_options(repo).skip_hash,
+            gix::index::decode::Options::default(),
+        )?;
+        Ok(())
+    }
 
-    Ok(tree_id)
+    /// The tree the commit records, plus git's steps (2)/(3): the named paths are
+    /// staged into the *real* on-disk index, leaving every other entry alone, so
+    /// the next command sees a ready index.
+    fn finish(self, repo: &gix::Repository) -> Result<ObjectId> {
+        let hash = repo.object_hash();
+        let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
+        {
+            let backing = self.index.path_backing();
+            for entry in self.index.entries() {
+                let path = entry.path_in(backing);
+                let mode = entry.mode.to_tree_entry_mode().ok_or_else(|| {
+                    anyhow::anyhow!("index entry `{path}` has an unrepresentable mode")
+                })?;
+                editor.upsert(
+                    path.split(|&b| b == b'/').map(|c| c.as_bstr()),
+                    mode.kind(),
+                    entry.id,
+                )?;
+            }
+        }
+        let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
+
+        // Step (2)/(3) (builtin/commit.c:534-539) rewrites the real on-disk index,
+        // so it carries the repository's index-write options like every other write
+        // does (read-cache.c:2830-2831). The `cache_tree_update()` that git runs
+        // between the staging and the write (builtin/commit.c:537) is what leaves
+        // the real index with a *valid* cache-tree afterwards rather than the
+        // invalidated one `apply_to` produced — the partial commit's whole point is
+        // that the next command sees a ready index.
+        //
+        // Note that this replays the pre-hook staged set, not the false index: what
+        // a hook staged goes into the commit and stops there, which is git's
+        // behaviour and follows from the false index being the lock git rolls back
+        // (`rollback_lock_file(&false_lock)`, builtin/commit.c:244) while the real
+        // one is committed.
+        let mut real = open_or_empty_index(repo)?;
+        self.staged.apply_to(&mut real);
+        super::write_tree::update_cache_tree_quietly(repo, &mut real);
+        real.write(crate::config::index_write_options(repo))?;
+
+        Ok(tree_id)
+    }
+}
+
+impl Drop for PartialIndex {
+    /// `rollback_lock_file(&false_lock)` — the false index is torn down on every
+    /// exit, the successful one included (`commit_index_files()` rolls it back
+    /// after committing the real index, builtin/commit.c:243-244).
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// `-i`/`--include <paths>`: refresh the *index-known* paths from the worktree,

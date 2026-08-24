@@ -339,6 +339,252 @@ pub enum Shape {
     /// diagnostic would differ by construction and the case would measure the
     /// harness. An empty entry exercises the same parser and stays silent.
     Damaged,
+    /// Index entries added with `add -N`: recorded as paths, with no content.
+    ///
+    /// No shape had one, and the intent-to-add bit is not a detail — it is a
+    /// third state between tracked and untracked that half a dozen commands
+    /// have a dedicated branch for. `status` renders it ` A` where a real
+    /// staged add is `A ` and a staged-then-edited add is `AM`; `diff` shows an
+    /// ITA path as an *addition in the worktree* and `diff --cached` hides it
+    /// entirely, which is what `--ita-visible-in-index` and
+    /// `--ita-invisible-in-index` exist to flip; `commit` has to decide whether
+    /// a path with no content is being committed; `stash push` has to decide
+    /// what to do with an entry whose blob is the empty one. With no fixture
+    /// carrying an ITA entry, every one of those branches was dead code the
+    /// corpus could not enter, and the two `--ita-*` flags were measured as
+    /// argument parsing alone.
+    ///
+    /// Four subjects, because the branch taken depends on what is on disk under
+    /// the entry: `ita-new.txt` has content, `sub/ita-nested.txt` has content
+    /// and is below the top level, `ita-gone.txt` was added and then deleted
+    /// from the worktree (` D` against an entry whose blob is empty), and
+    /// `both.txt` is a *real* staged add that was then edited, which is the
+    /// `AM` rendering an ITA is so often confused with. `staged.txt` and
+    /// `untracked.txt` are the two unambiguous neighbours.
+    IntentToAdd,
+    /// A rename that has not been committed yet: staged through `git mv`, and
+    /// pending in the worktree through an intent-to-add.
+    ///
+    /// [`Shape::Renamed`] has its renames in *history* over a clean tree, so
+    /// `status` had nothing to pair and `status --porcelain=v2`'s `2` record —
+    /// the rename record, half the format's grammar — has never once been
+    /// produced by this corpus. `--find-renames=<n>`, `--no-renames` and
+    /// `status.renames` were therefore pinned on argument parsing only: with no
+    /// candidate pair in the index, every threshold produced the same output.
+    ///
+    /// Five pairs, chosen so a threshold sweep separates them rather than
+    /// moving them all at once. Measured on stock 2.55.0:
+    ///
+    /// * `pure.txt` -> `pure-renamed.txt` and `pkg/deep.txt` ->
+    ///   `pkg/deep-renamed.txt` — content untouched, `R100`, and the second is
+    ///   below the top level.
+    /// * `near.txt` -> `near-renamed.txt` — staged at `R100` and then edited
+    ///   again in the worktree, which is the `2 RM` record: a rename in the
+    ///   index column and a modification in the worktree column at once.
+    /// * `far.txt` -> `far-renamed.txt` — 12 of 40 lines rewritten, `R060`: a
+    ///   rename at `-M60` and two unrelated files at `-M70`.
+    /// * `wild.txt` -> `wild-renamed.txt` — 20 of 40 lines rewritten, `R039`: a
+    ///   rename at `-M30` and two unrelated files at the default `-M50`.
+    /// * `wt.txt` -> `wt-renamed.txt` — renamed on disk with the destination
+    ///   marked intent-to-add, which is the only way git can see a rename that
+    ///   is *not* staged (`2 .R`).
+    ///
+    /// `copy.txt` -> `copy-two.txt` keeps the source in place, so `-C` has a
+    /// copy candidate that `-M` alone must not report.
+    PendingRename,
+    /// Notes on three refs and two `refs/replace/*` entries, present before the
+    /// case runs.
+    ///
+    /// Every verb in this family only changes how an **existing** note or
+    /// replacement is read, and a pristine fixture had neither: `log --notes=`,
+    /// `--no-notes` and `notes.displayRef` selected between empty answers,
+    /// `notes merge` had one side, and `--no-replace-objects` /
+    /// `GIT_NO_REPLACE_OBJECTS` turned off a substitution that was never
+    /// happening. A corpus agent established that the port *writes*
+    /// `refs/replace/*` correctly and then never consults it when walking; that
+    /// is invisible until an ordinary read verb runs over a repository that
+    /// already has one.
+    ///
+    /// Three notes refs rather than one, because selecting between them is the
+    /// behaviour: `refs/notes/commits` (the default, two commits annotated),
+    /// `refs/notes/review` (a second ref, a different pair of commits), and
+    /// `refs/notes/other`, which annotates the same commit as
+    /// `refs/notes/commits` with different text — so `notes merge other`
+    /// conflicts rather than fast-forwarding, and the `NOTES_MERGE_*` state is
+    /// reachable.
+    ///
+    /// Two replacements, because commits and blobs take different paths through
+    /// the object layer. `notes: commit 1` is replaced by a commit with the
+    /// same tree and parent and a different message, so `log --oneline` prints
+    /// the replacement's subject at the original's id and
+    /// `--no-replace-objects` prints the original's; `README.md`'s blob is
+    /// replaced by another blob, so `cat-file -p HEAD:README.md` answers
+    /// differently with and without the flag while every id in the repository
+    /// stays the same.
+    NotesReplace,
+    /// Hooks that **refuse**, and hooks of the kinds [`Shape::Hooked`] does not
+    /// install.
+    ///
+    /// `Hooked` ships `exit 0` hooks, deliberately, because the defect it was
+    /// built for reproduces with a hook that does nothing. That leaves the
+    /// other half unmeasured: a hook's *non-zero exit* is a control-flow edge
+    /// in every verb that runs one, and a corpus agent recorded that
+    /// `--no-verify` therefore could not be measured at all — with no hook that
+    /// refuses, skipping the hooks and running them are the same outcome.
+    ///
+    /// What each one is for, and what it makes measurable:
+    ///
+    /// * `pre-commit` — exits 1. `commit` aborts; `commit --no-verify` does
+    ///   not. That pair *is* the measurement of `--no-verify`.
+    /// * `prepare-commit-msg` — appends a paragraph to the message file.
+    ///   `--no-verify` does **not** skip it (verified on stock 2.55.0: after
+    ///   `commit --no-verify`, `hook-prepare-commit-msg.txt` exists and
+    ///   `hook-commit-msg.txt` does not), so it is how a case sees that a
+    ///   commit which bypassed the gate still went through the rewrite.
+    /// * `commit-msg` — appends a second paragraph. Skipped by `--no-verify`
+    ///   and reached through `merge --no-ff`, which runs it and not
+    ///   `pre-commit`.
+    /// * `pre-merge-commit`, `post-merge`, `post-commit`, `post-checkout`,
+    ///   `post-rewrite` — each writes a file naming the arguments it was given,
+    ///   so which hooks ran, in which order, and with what, survives into the
+    ///   worktree where the state probe reads it. The `post-*` hooks' exit
+    ///   status is ignored by git, which is itself worth pinning.
+    /// * `pre-push` — exits 1, over a real peer, so `push` refuses and
+    ///   `push --no-verify` does not.
+    /// * `pre-rebase` and `pre-auto-gc` — exit 1, the two remaining refusals
+    ///   that no other shape can produce.
+    /// * `.remote.git/hooks/update` — refuses `refs/heads/veto` and accepts
+    ///   everything else. A hook running in the **receiving** repository is a
+    ///   kind no shape has had, and it is the one refusal `--no-verify` cannot
+    ///   bypass, because it does not run on this side at all.
+    ///
+    /// No hook invokes git, for the reason [`Shape::Hooked`] gives: each side
+    /// of a case runs its own binary, and a hook naming one by path would make
+    /// the other side execute it too.
+    HooksFail,
+    /// A recorded rerere resolution, replayed, over a merge that is still in
+    /// progress.
+    ///
+    /// A case is one argv against a pristine copy, so it cannot conflict,
+    /// resolve, and then ask about the resolution — which left every `rerere`
+    /// path that needs a *prior* record unreachable. `rerere diff`, `rerere
+    /// status` and `rerere remaining` all read `.git/MERGE_RR` and the cache
+    /// under `.git/rr-cache`, and both are absent from every other shape;
+    /// `rerere forget`, `rerere clear` and `rerere gc` had nothing to act on;
+    /// and the replay itself — git recognising a conflict it has seen and
+    /// writing the old resolution back into the worktree — had never run.
+    ///
+    /// The shape is left mid-merge with all three outcomes present at once,
+    /// which is what makes one `status` separate them:
+    ///
+    /// * `rr.txt` and `other.txt` conflicted, were resolved, and conflict
+    ///   identically again — so git resolved them from the cache
+    ///   (`Resolved 'rr.txt' using previous resolution.`) and the worktree
+    ///   holds the *recorded* text, not conflict markers, while the index still
+    ///   has stages 1/2/3.
+    /// * `fresh.txt` conflicts for the first time, so only a preimage was
+    ///   recorded and the markers are still there. It is what `rerere
+    ///   remaining` and `rerere status` name, and what `rerere diff` diffs.
+    ///
+    /// `rerere.enabled` is in the repository config rather than passed per
+    /// case: the record was made at build time and the replay has to happen
+    /// without a case having to ask for it.
+    Rerere,
+    /// Three linked worktrees: one locked with a reason, one open, and one
+    /// whose directory is gone.
+    ///
+    /// [`Shape::Worktree`] has a single, ordinary linked worktree, so the whole
+    /// lock protocol was unreachable — and a case is one argv against a
+    /// pristine copy, so it cannot lock one first. `worktree unlock` could only
+    /// ever be measured on "not locked", `worktree lock` on "not locked yet",
+    /// `worktree remove` on the path where nothing objects, and `worktree
+    /// list --porcelain`'s `locked` and `prunable` lines had never been
+    /// printed.
+    ///
+    /// * `wt` — locked, with the reason `held by the fixture`, so
+    ///   `.git/worktrees/wt/locked` has content rather than being empty (git
+    ///   writes an empty file for `lock` without `--reason`, and the two are
+    ///   different answers to `worktree list --porcelain`). `worktree remove
+    ///   wt` must refuse.
+    /// * `wt-open` — not locked, so `unlock` must refuse it and `remove` must
+    ///   accept it.
+    /// * `wt-gone` — registered, with its directory deleted, which is the
+    ///   `prunable gitdir file points to non-existent location` state and the
+    ///   only thing `worktree prune` has ever had to prune.
+    ///
+    /// Registered with `--relative-paths` and re-`read-tree`d for the two
+    /// reasons [`Shape::Worktree`] documents: absolute registrations would make
+    /// both copies of the fixture point at the template, and a checkout's stat
+    /// data would make the shape hash differently at two build locations.
+    WorktreeLocked,
+    /// A tag pointing at a tag pointing at a tag, plus tags on a blob and on a
+    /// tree.
+    ///
+    /// Every tag in the corpus points straight at a commit, so peeling was a
+    /// one-step operation everywhere it was measured and an implementation that
+    /// peels once scored the same as one that peels to the end. `rev-parse
+    /// <tag>^{}`, `show-ref -d`'s `^{}` line, `for-each-ref`'s `%(*objecttype)`,
+    /// `describe`'s peel and `tag -d` over a chain all had a one-deep case and
+    /// nothing else — and `cat-file -t` on a tag object whose target is *not* a
+    /// commit had no object at all.
+    ///
+    /// `inner` -> commit, `outer` -> `inner`, `outermost` -> `outer`, so the
+    /// peel is three deep; `light-to-tag` is a lightweight ref at the same tag
+    /// object, so the same peel is reached through a ref that is not itself a
+    /// tag object. `blobtag` and `treetag` annotate a blob and a tree, which is
+    /// where an implementation that assumes a tag's target is a commit stops
+    /// agreeing.
+    TagChain,
+    /// A shallow clone: `.git/shallow` grafted two commits below the tip, with
+    /// the rest of the history reachable only from a peer inside the fixture.
+    ///
+    /// `fetch --unshallow`, `fetch --depth`, `fetch --deepen`, `clone
+    /// --shallow-since`, `rev-parse --is-shallow-repository`, `log`'s grafted
+    /// boundary and `fsck`'s tolerance of missing parents had no repository to
+    /// be true of: no shape carried a `shallow` file, and a case cannot create
+    /// one because a case is one argv.
+    ///
+    /// **Built without the network, and that is a constraint rather than a
+    /// convenience.** The peer is a bare repository at `.remote.git` inside the
+    /// fixture — the same place [`Shape::BehindRemote`] keeps its own, so the
+    /// per-case copy carries it and `probe_peer` already reads it — and the
+    /// clone runs with `--no-local` (git refuses `--depth` over a plain local
+    /// path: `--depth is ignored in local clones; use file:// instead`) under an
+    /// explicit `protocol.file.allow=always`. Nothing resolves a hostname at
+    /// build time or at case time; `remote.origin.url` is rewritten to
+    /// `./.remote.git` afterwards so a case that deepens the clone reaches its
+    /// own copy's peer and never the template's.
+    ///
+    /// `--no-single-branch` keeps the full fetch refspec, so `sh-side` is a
+    /// shallow remote-tracking branch as well and `--unshallow` has more than
+    /// one line of `.git/shallow` to retire.
+    Shallow,
+    /// A partial clone: a promisor remote, promisor packs, and blobs that are
+    /// genuinely absent from the object store.
+    ///
+    /// `--filter=`, `rev-list --missing=`, `--exclude-promisor-objects`, `gc
+    /// --exclude-promisor-objects`, `repack --filter-to` and `backfill` all
+    /// describe a repository that is missing objects on purpose, and every
+    /// shape in the corpus has every object it references. A missing object was
+    /// therefore only ever reachable as *damage* ([`Shape::Damaged`]), which is
+    /// the opposite condition: damage is an error, and a promisor absence is
+    /// not.
+    ///
+    /// `hist.txt` is rewritten across four commits, so three of its four blobs
+    /// exist only in history and stay missing after the checkout fetches the
+    /// fourth. `rev-list --missing=print --objects --all` prints exactly those
+    /// three with a `?` prefix on stock 2.55.0, and `status` is clean — the
+    /// worktree is a normal one, which is what separates this from a
+    /// `--no-checkout` clone.
+    ///
+    /// Built from the same local peer as [`Shape::Shallow`], for the same
+    /// reason and with the same `--no-local` +
+    /// `protocol.file.allow=always` handling, plus `uploadpack.allowFilter` on
+    /// the peer — without it the server silently ignores the filter
+    /// (`warning: filtering not recognized by server, ignoring`) and the clone
+    /// comes back complete, which would leave the shape looking built and
+    /// measuring nothing.
+    Promisor,
 }
 
 impl Shape {
@@ -372,6 +618,15 @@ impl Shape {
         Shape::Symlinks,
         Shape::CommitGraph,
         Shape::Damaged,
+        Shape::IntentToAdd,
+        Shape::PendingRename,
+        Shape::NotesReplace,
+        Shape::HooksFail,
+        Shape::Rerere,
+        Shape::WorktreeLocked,
+        Shape::TagChain,
+        Shape::Shallow,
+        Shape::Promisor,
     ];
 
     pub fn name(self) -> &'static str {
@@ -405,6 +660,15 @@ impl Shape {
             Shape::Symlinks => "symlinks",
             Shape::CommitGraph => "commit-graph",
             Shape::Damaged => "damaged",
+            Shape::IntentToAdd => "intent-to-add",
+            Shape::PendingRename => "pending-rename",
+            Shape::NotesReplace => "notes-replace",
+            Shape::HooksFail => "hooks-fail",
+            Shape::Rerere => "rerere",
+            Shape::WorktreeLocked => "worktree-locked",
+            Shape::TagChain => "tag-chain",
+            Shape::Shallow => "shallow",
+            Shape::Promisor => "promisor",
         }
     }
 }
@@ -1339,9 +1603,622 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             // rather than a path that does not exist.
             write(dir, ".git/objects/info/alternates", "\n")?;
         }
+
+        Shape::IntentToAdd => {
+            // A committed neighbour, so the shape has a path that is plainly
+            // tracked next to the ones that are only half-tracked.
+            write(dir, "tracked.txt", "tracked\n")?;
+            git(dir, home, &["add", "tracked.txt"])?;
+            git(dir, home, &["commit", "-qm", "intent-to-add: a tracked file"])?;
+
+            // The intent-to-add entries. `add -N` records the path with the
+            // *empty* blob, so the index and the worktree disagree for every one
+            // of these by construction — which is what makes ` A` a state and not
+            // a rendering detail.
+            write(dir, "ita-new.txt", "ita with content\nsecond line\n")?;
+            write(dir, "sub/ita-nested.txt", "nested ita\n")?;
+            write(dir, "ita-gone.txt", "ita then deleted\n")?;
+            git(dir, home, &["add", "-N", "ita-new.txt", "sub/ita-nested.txt", "ita-gone.txt"])?;
+            // Deleted after the entry was made: an ITA path with nothing under
+            // it, which stock renders ` D` against a blob that is empty rather
+            // than ` A`.
+            std::fs::remove_file(dir.join("ita-gone.txt"))?;
+
+            // The contrast case. A real staged add, then edited — `AM`, which is
+            // the rendering an intent-to-add is most often confused with.
+            write(dir, "both.txt", "staged then modified\n")?;
+            git(dir, home, &["add", "both.txt"])?;
+            write(dir, "both.txt", "staged then modified\nmore\n")?;
+
+            write(dir, "staged.txt", "plain staged\n")?;
+            git(dir, home, &["add", "staged.txt"])?;
+            write(dir, "untracked.txt", "untracked plain\n")?;
+        }
+
+        Shape::PendingRename => {
+            for name in ["pure", "near", "far", "wild", "wt", "copy"] {
+                write(dir, &format!("{name}.txt"), &numbered(name, 40))?;
+            }
+            write(dir, "pkg/deep.txt", &numbered("deep", 40))?;
+            git(dir, home, &["add", "."])?;
+            git(dir, home, &["commit", "-qm", "pending-rename: seed"])?;
+
+            // Content untouched: `R100`, at the top level and below it.
+            git(dir, home, &["mv", "pure.txt", "pure-renamed.txt"])?;
+            git(dir, home, &["mv", "pkg/deep.txt", "pkg/deep-renamed.txt"])?;
+
+            // Staged at `R100`, then edited again in the worktree. The index
+            // column says rename and the worktree column says modified at the
+            // same time, which is the `2 RM` record.
+            git(dir, home, &["mv", "near.txt", "near-renamed.txt"])?;
+            write(dir, "near-renamed.txt", &numbered_with_edits("near", 40, &[7]))?;
+
+            // The two thresholds. `numbered_with_edits` keeps the line count
+            // fixed and rewrites `k` of them, so the similarity index is a
+            // function of `k` alone: 12 of 40 measures `R060` on stock 2.55.0
+            // and 20 of 40 measures `R039`.
+            let far_edits: Vec<usize> = (1..=12).collect();
+            let wild_edits: Vec<usize> = (1..=20).collect();
+            git(dir, home, &["mv", "far.txt", "far-renamed.txt"])?;
+            write(dir, "far-renamed.txt", &numbered_with_edits("far", 40, &far_edits))?;
+            git(dir, home, &["add", "far-renamed.txt"])?;
+            git(dir, home, &["mv", "wild.txt", "wild-renamed.txt"])?;
+            write(dir, "wild-renamed.txt", &numbered_with_edits("wild", 40, &wild_edits))?;
+            git(dir, home, &["add", "wild-renamed.txt"])?;
+
+            // The worktree column's own rename. Git pairs a worktree deletion
+            // with a worktree addition only when the addition is in the index,
+            // so an intent-to-add entry is the only way to express a rename that
+            // has not been staged.
+            std::fs::rename(dir.join("wt.txt"), dir.join("wt-renamed.txt"))?;
+            git(dir, home, &["add", "-N", "wt-renamed.txt"])?;
+
+            // Source left in place: a copy, which `-C` may report and `-M` alone
+            // must not.
+            std::fs::copy(dir.join("copy.txt"), dir.join("copy-two.txt"))?;
+            git(dir, home, &["add", "copy-two.txt"])?;
+        }
+
+        Shape::NotesReplace => {
+            for n in 1..=3 {
+                write(dir, &format!("note{n}.txt"), &format!("note subject {n}\n"))?;
+                git(dir, home, &["add", &format!("note{n}.txt")])?;
+                git(dir, home, &["commit", "-qm", &format!("notes: commit {n}")])?;
+            }
+
+            git(dir, home, &["notes", "add", "-m", "default note on HEAD", "HEAD"])?;
+            git(dir, home, &["notes", "add", "-m", "default note on HEAD~1", "HEAD~1"])?;
+            git(dir, home, &["notes", "--ref=review", "add", "-m", "review note on HEAD", "HEAD"])?;
+            git(dir, home, &["notes", "--ref=review", "add", "-m", "review note on HEAD~2", "HEAD~2"])?;
+            // Annotates the same commit as `refs/notes/commits` with different
+            // text, so `notes merge other` conflicts instead of fast-forwarding.
+            git(
+                dir,
+                home,
+                &["notes", "--ref=other", "add", "-m", "other note on HEAD, conflicting", "HEAD"],
+            )?;
+
+            // A commit replaced by one with the same tree and the same parent
+            // and a different message: every id in the repository is unchanged,
+            // so the only thing that can differ is whether the walk consults
+            // `refs/replace/*`.
+            let target = rev(dir, home, "HEAD~2")?;
+            let tree = rev(dir, home, "HEAD~2^{tree}")?;
+            let parent = rev(dir, home, "HEAD~3")?;
+            let replacement = git(
+                dir,
+                home,
+                &["commit-tree", "-p", &parent, "-m", "notes: replacement for commit 1", &tree],
+            )?
+            .trim()
+            .to_string();
+            git(dir, home, &["replace", &target, &replacement])?;
+
+            // And a blob, which reaches the substitution through a different
+            // door: `cat-file -p HEAD:README.md` answers with the replacement
+            // and `--no-replace-objects` with the original.
+            //
+            // Hashed from a file rather than from stdin because [`git`] does not
+            // feed one; the file is removed again so the shape's worktree is not
+            // changed by the way its objects were made.
+            const SCRATCH: &str = ".replacement-readme";
+            write(dir, SCRATCH, "# replaced readme\n")?;
+            let new_blob = git(dir, home, &["hash-object", "-w", SCRATCH])?.trim().to_string();
+            std::fs::remove_file(dir.join(SCRATCH))?;
+            let old_blob = rev(dir, home, "HEAD:README.md")?;
+            git(dir, home, &["replace", &old_blob, &new_blob])?;
+        }
+
+        Shape::HooksFail => {
+            write(dir, "side-base.txt", "base\n")?;
+            git(dir, home, &["add", "side-base.txt"])?;
+            git(dir, home, &["commit", "-qm", "hooks-fail: base"])?;
+
+            git(dir, home, &["checkout", "-q", "-b", "hf-side"])?;
+            write(dir, "hf-side.txt", "side\n")?;
+            git(dir, home, &["add", "hf-side.txt"])?;
+            git(dir, home, &["commit", "-qm", "hooks-fail: side commit"])?;
+            git(dir, home, &["checkout", "-q", "main"])?;
+            // So `merge hf-side` is a three-way rather than a fast-forward, and
+            // therefore runs `pre-merge-commit` and `commit-msg`.
+            write(dir, "hf-main.txt", "main\n")?;
+            git(dir, home, &["add", "hf-main.txt"])?;
+            git(dir, home, &["commit", "-qm", "hooks-fail: main commit"])?;
+
+            // The peer `pre-push` has to refuse a transport to. Same place, same
+            // relative URL and same `info/exclude` as [`Shape::BehindRemote`].
+            git(dir, home, &["init", "-q", "--bare", "-b", "main", PEER])?;
+            git(dir, home, &["remote", "add", "origin", PEER_URL])?;
+            git(dir, home, &["push", "-q", "origin", "main", "hf-side"])?;
+            git(dir, home, &["branch", "--set-upstream-to=origin/main", "main"])?;
+            // One commit past the remote, so `push` has something to send and
+            // the refusal is not a no-op.
+            write(dir, "hf-ahead.txt", "ahead of the remote\n")?;
+            git(dir, home, &["add", "hf-ahead.txt"])?;
+            git(dir, home, &["commit", "-qm", "hooks-fail: ahead of origin"])?;
+            // The branch the *receiving* repository's `update` hook rejects by
+            // name. It exists only here, so a case can push a ref the local
+            // hooks are happy with and the remote's is not.
+            git(dir, home, &["branch", "veto"])?;
+            write(dir, ".git/info/exclude", ".remote.git/\n")?;
+
+            // Dirty, so `commit -a` has something to be refused over.
+            write(dir, "side-base.txt", "base\nedited in the worktree\n")?;
+
+            install_hooks(&dir.join(".git/hooks"), FAILING_HOOKS)?;
+            install_hooks(&dir.join(PEER).join("hooks"), PEER_HOOKS)?;
+        }
+
+        Shape::Rerere => {
+            // In the repository config rather than per case: the record below is
+            // made at build time, and the replay has to happen without a case
+            // having to ask for it.
+            git(dir, home, &["config", "rerere.enabled", "true"])?;
+
+            write(dir, "rr.txt", "base one\nbase two\nbase three\n")?;
+            write(dir, "other.txt", "other one\nother two\nother three\n")?;
+            git(dir, home, &["add", "."])?;
+            git(dir, home, &["commit", "-qm", "rerere: base"])?;
+
+            git(dir, home, &["checkout", "-q", "-b", "rr-side"])?;
+            write(dir, "rr.txt", "side one\nbase two\nside three\n")?;
+            write(dir, "other.txt", "side other\nother two\nother three\n")?;
+            git(dir, home, &["commit", "-qam", "rerere: side"])?;
+            git(dir, home, &["checkout", "-q", "main"])?;
+            write(dir, "rr.txt", "main one\nbase two\nmain three\n")?;
+            write(dir, "other.txt", "main other\nother two\nother three\n")?;
+            git(dir, home, &["commit", "-qam", "rerere: main"])?;
+
+            // The recording pass: conflict, resolve by hand, commit. Stock
+            // reports `Recorded preimage` on the conflict and `Recorded
+            // resolution` on the commit, and leaves preimage/postimage pairs
+            // under `.git/rr-cache`.
+            git_conflicting(dir, home, &["merge", "rr-side"])?;
+            write(dir, "rr.txt", "resolved one\nbase two\nresolved three\n")?;
+            write(dir, "other.txt", "resolved other\nother two\nother three\n")?;
+            git(dir, home, &["add", "rr.txt", "other.txt"])?;
+            git(dir, home, &["commit", "-qm", "rerere: resolved merge"])?;
+
+            // Undo the merge and give both sides one more commit, so the same
+            // two conflicts recur *byte for byte* — which is the condition
+            // rerere keys on — beside a third that has never been seen.
+            git(dir, home, &["reset", "-q", "--hard", "HEAD~1"])?;
+            git(dir, home, &["checkout", "-q", "rr-side"])?;
+            write(dir, "fresh.txt", "side fresh\ncommon\n")?;
+            git(dir, home, &["add", "fresh.txt"])?;
+            git(dir, home, &["commit", "-qm", "rerere: side fresh"])?;
+            git(dir, home, &["checkout", "-q", "main"])?;
+            write(dir, "fresh.txt", "main fresh\ncommon\n")?;
+            git(dir, home, &["add", "fresh.txt"])?;
+            git(dir, home, &["commit", "-qm", "rerere: main fresh"])?;
+
+            // Left mid-merge on purpose: `rerere diff`, `rerere status` and
+            // `rerere remaining` all read `.git/MERGE_RR`, which exists only
+            // while a merge is unresolved.
+            git_conflicting(dir, home, &["merge", "rr-side"])?;
+        }
+
+        Shape::WorktreeLocked => {
+            write(dir, "second.txt", "second\n")?;
+            git(dir, home, &["add", "second.txt"])?;
+            git(dir, home, &["commit", "-qm", "worktree-locked: a second commit"])?;
+
+            write(dir, ".git/info/exclude", "wt/\nwt-open/\nwt-gone/\n")?;
+            for (name, branch) in [("wt", "wt-held"), ("wt-open", "wt-open"), ("wt-gone", "wt-gone")] {
+                git(dir, home, &["worktree", "add", "--relative-paths", "-q", "-b", branch, name])?;
+                // Same reason as [`Shape::Worktree`]: `worktree add` records the
+                // checkout's inode and mtime in the linked worktree's own index,
+                // and that index is not exempt from the determinism check.
+                git(&dir.join(name), home, &["read-tree", "HEAD"])?;
+            }
+
+            git(dir, home, &["worktree", "lock", "--reason", "held by the fixture", "wt"])?;
+            // Registered and gone: the `prunable` state, and the only thing
+            // `worktree prune` has ever had to prune.
+            std::fs::remove_dir_all(dir.join("wt-gone"))?;
+        }
+
+        Shape::TagChain => {
+            write(dir, "a.txt", "one\n")?;
+            git(dir, home, &["add", "a.txt"])?;
+            git(dir, home, &["commit", "-qm", "tags: one"])?;
+
+            // `advice.nestedTag` is silenced on the command line rather than in
+            // the repository config: the hint is the point of the shape, and a
+            // persisted setting would show up in the `config --list --local`
+            // probe as a fact about the fixture rather than about the case.
+            git(dir, home, &["tag", "-a", "inner", "-m", "inner annotated tag"])?;
+            for (name, target) in [("outer", "inner"), ("outermost", "outer")] {
+                let msg = format!("{name} tag, points at {target}");
+                let quiet = "advice.nestedTag=false";
+                git(dir, home, &["-c", quiet, "tag", "-a", name, "-m", &msg, target])?;
+            }
+            // A lightweight ref at the same tag object: the same three-deep peel
+            // reached through a ref that is not itself a tag object.
+            git(dir, home, &["tag", "light-to-tag", "inner"])?;
+
+            write(dir, "b.txt", "two\n")?;
+            git(dir, home, &["add", "b.txt"])?;
+            git(dir, home, &["commit", "-qm", "tags: two"])?;
+
+            // Tags whose target is not a commit at all.
+            let blob = rev(dir, home, "HEAD:a.txt")?;
+            let tree = rev(dir, home, "HEAD^{tree}")?;
+            git(dir, home, &["tag", "-a", "blobtag", "-m", "tag on a blob", &blob])?;
+            git(dir, home, &["tag", "-a", "treetag", "-m", "tag on a tree", &tree])?;
+
+            // Two commits past `inner`, so `describe` has a distance to render
+            // and has to peel to find it.
+            write(dir, "c.txt", "three\n")?;
+            git(dir, home, &["add", "c.txt"])?;
+            git(dir, home, &["commit", "-qm", "tags: three"])?;
+        }
+
+        Shape::Shallow => {
+            for n in 1..=5usize {
+                write(dir, "deep.txt", &format!("deep {n}\n"))?;
+                if n == 1 {
+                    git(dir, home, &["add", "deep.txt"])?;
+                }
+                let msg = format!("shallow: deep {n}");
+                git(dir, home, &["commit", "-qam", &msg])?;
+            }
+            // Forks below the graft, so `--unshallow` has a second line of
+            // `.git/shallow` to retire and not just a deeper first parent.
+            git(dir, home, &["branch", "sh-side", "main~3"])?;
+            git(dir, home, &["init", "-q", "--bare", "-b", "main", PEER])?;
+            git(dir, home, &["remote", "add", "origin", PEER_URL])?;
+            git(dir, home, &["push", "-q", "origin", "main", "sh-side"])?;
+
+            restage_as_clone(dir, home, &["--no-single-branch", "--depth=2"])?;
+        }
+
+        Shape::Promisor => {
+            write(dir, "hist.txt", "hist v0\n")?;
+            git(dir, home, &["add", "hist.txt"])?;
+            git(dir, home, &["commit", "-qm", "partial: hist v0"])?;
+            for n in 1..=3usize {
+                write(dir, "hist.txt", &format!("hist v{n}\n"))?;
+                let msg = format!("partial: hist v{n}");
+                git(dir, home, &["commit", "-qam", &msg])?;
+            }
+            git(dir, home, &["branch", "pc-side", "main~2"])?;
+
+            git(dir, home, &["init", "-q", "--bare", "-b", "main", PEER])?;
+            // Without this the server ignores the filter and answers with a
+            // complete pack (`warning: filtering not recognized by server,
+            // ignoring`), which would leave the shape looking built and
+            // measuring nothing.
+            git(&dir.join(PEER), home, &["config", "uploadpack.allowFilter", "true"])?;
+            git(dir, home, &["remote", "add", "origin", PEER_URL])?;
+            git(dir, home, &["push", "-q", "origin", "main", "pc-side"])?;
+
+            restage_as_clone(dir, home, &["--no-single-branch", "--filter=blob:none"])?;
+        }
     }
     Ok(())
 }
+
+/// The bare peer every shape that needs one keeps *inside* the fixture, so the
+/// per-case copy carries its own. Spelled the same as `runner::PEER_DIR`, which
+/// is where `probe_peer` looks.
+const PEER: &str = ".remote.git";
+/// The peer as a URL: relative, so the copy resolves to its own peer rather than
+/// to the template's. Absolute would make every case share one remote.
+const PEER_URL: &str = "./.remote.git";
+/// Where [`restage_as_clone`] puts the clone before moving it up.
+const STAGE_DIR: &str = ".stage";
+
+/// One revision resolved to its id, trimmed.
+fn rev(dir: &Path, home: &Path, spec: &str) -> Result<String> {
+    Ok(git(dir, home, &["rev-parse", spec])?.trim().to_string())
+}
+
+/// Write executable hook scripts into `hooks_dir`.
+fn install_hooks(hooks_dir: &Path, hooks: &[(&str, &str)]) -> Result<()> {
+    std::fs::create_dir_all(hooks_dir)?;
+    for (name, body) in hooks {
+        let path = hooks_dir.join(name);
+        std::fs::write(&path, body).with_context(|| format!("write hook {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(())
+}
+
+/// Replace the repository at `dir` with a clone of the peer already built
+/// inside it, keeping the peer.
+///
+/// Shallow and partial clones cannot be *made* out of a repository that already
+/// has every object: `--depth` and `--filter` are properties of what the server
+/// sent, so the only faithful way to build one is to clone. [`build`] has
+/// already initialised `dir` and committed into it by the time a shape's arm
+/// runs, and `git clone` refuses a non-empty destination — hence the wipe, the
+/// clone into [`STAGE_DIR`], and the move back up.
+///
+/// Three details are load-bearing:
+///
+/// * `--no-local`. Git ignores both `--depth` and `--filter` when it recognises
+///   a local path and takes its directory-copy shortcut (`warning: --depth is
+///   ignored in local clones; use file:// instead`), so the shape would build
+///   without failing and carry neither property.
+/// * a **relative** URL, not `file://`. Either would work as a transport;
+///   neither survives the clone unchanged. Git resolves the URL before it
+///   records it, so `remote.origin.url` and the `clone: from <url>` line in
+///   every reflog it writes name the build directory, and a fixture built at
+///   two locations differs there — which is what `shapes_build_reproducibly`
+///   fails on. Both are put back: the config below, the reflogs in
+///   [`scrub_clone_url`]. The relative form is preferred anyway because it is
+///   what the fixture ends up carrying, so the two spellings never disagree.
+/// * `protocol.file.allow=always`, explicitly. The default is `user`, which
+///   happens to permit this clone today; naming it means the shape does not
+///   depend on that default staying put.
+///
+/// Nothing here resolves a hostname, at build time or at case time: the peer is
+/// a directory inside the fixture and the URL that survives into the config is
+/// `./.remote.git`.
+fn restage_as_clone(dir: &Path, home: &Path, clone_args: &[&str]) -> Result<()> {
+    let doomed: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name() != std::ffi::OsStr::new(PEER))
+        .map(|e| e.path())
+        .collect();
+    for path in doomed {
+        if std::fs::symlink_metadata(&path)?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+
+    let mut args: Vec<&str> =
+        vec!["-c", "protocol.file.allow=always", "clone", "-q", "--no-local"];
+    args.extend_from_slice(clone_args);
+    args.push(PEER_URL);
+    args.push(STAGE_DIR);
+    git(dir, home, &args)?;
+
+    let stage = dir.join(STAGE_DIR);
+    let moved: Vec<PathBuf> =
+        std::fs::read_dir(&stage)?.filter_map(Result::ok).map(|e| e.path()).collect();
+    for path in moved {
+        let name = path.file_name().context("staged entry has no name")?;
+        std::fs::rename(&path, dir.join(name))?;
+    }
+    std::fs::remove_dir(&stage)?;
+
+    // The clone recorded the peer's absolute path; put the relative form back so
+    // the per-case copy reaches its own peer.
+    git(dir, home, &["config", "remote.origin.url", PEER_URL])?;
+    // The prologue's setting went with the old `.git`. See [`build`] for why
+    // every fixture needs it.
+    git(dir, home, &["config", "core.checkStat", "minimal"])?;
+    write(dir, ".git/info/exclude", ".remote.git/\n")?;
+    scrub_clone_url(dir)?;
+    Ok(())
+}
+
+/// Rewrite the absolute peer path git recorded in the clone's reflogs back to
+/// the relative one, and fail loudly if any of it survives.
+///
+/// `git clone` writes `clone: from <url>` into `.git/logs/HEAD` and into the
+/// reflog of every ref it created, and it absolutises the URL first — so a
+/// fixture built at two locations differs in exactly those files and
+/// `shapes_build_reproducibly` fails on it. The reflog is real repository state
+/// that `probe_reflogs` compares, so it is normalised rather than deleted:
+/// both sides of a case then read the same three lines, and they name the same
+/// relative peer the config does.
+///
+/// The check at the end is the part that matters. A future git that records the
+/// path somewhere else would otherwise reintroduce the leak silently, and the
+/// determinism test would report it as a mystery rather than as this.
+fn scrub_clone_url(dir: &Path) -> Result<()> {
+    // The *whole* message is rewritten rather than the path inside it. Replacing
+    // the path meant computing it, and the computed form and the recorded form
+    // differ by whichever symlinks `getcwd(2)` resolved — on macOS the fixture
+    // is under `/tmp` and git records `/private/tmp/...`, so a substring
+    // replacement of the un-resolved path matched the tail and left `/private`
+    // behind. A reflog message has exactly one shape here, so replacing it
+    // outright has nothing to get wrong.
+    const MARKER: &str = "\tclone: from ";
+    let roots: Vec<String> = [Some(dir.to_path_buf()), dir.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+        .map(|p| p.display().to_string())
+        .collect();
+
+    for (_, path) in walk(&dir.join(".git").join("logs")) {
+        let body = std::fs::read_to_string(&path)?;
+        let fixed: String = body
+            .lines()
+            .map(|line| match line.split_once(MARKER) {
+                Some((head, _)) => format!("{head}{MARKER}{PEER_URL}\n"),
+                None => format!("{line}\n"),
+            })
+            .collect();
+        for root in &roots {
+            if fixed.contains(root.as_str()) {
+                bail!(
+                    "fixture: {} still names the build directory after scrubbing",
+                    path.display()
+                );
+            }
+        }
+        if fixed != body {
+            std::fs::write(&path, fixed)?;
+        }
+    }
+    Ok(())
+}
+
+/// Every regular file under `dir`, as `(path relative to dir, absolute path)`,
+/// sorted. Empty when `dir` does not exist.
+fn walk(dir: &Path) -> Vec<(String, PathBuf)> {
+    fn rec(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let path = entry.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => rec(&path, &rel, out),
+                Ok(m) if m.is_file() => out.push((rel, path)),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    rec(dir, "", &mut out);
+    out.sort();
+    out
+}
+
+/// The hooks [`Shape::HooksFail`] installs in the repository under test.
+///
+/// Every one of them writes a file into the worktree naming what it was handed,
+/// so *which* hooks ran and in what order survives the command and is read by
+/// the state probe — a hook that only exits cannot be distinguished from one
+/// that was never called. None of them invokes git: each side of a case runs its
+/// own binary, and a hook naming one by path would make the other side execute
+/// it too.
+///
+/// The refusals are `pre-commit`, `pre-push`, `pre-rebase` and `pre-auto-gc`.
+/// `post-commit` exits 1 deliberately and git ignores it, which is the other
+/// half of the same question.
+const FAILING_HOOKS: &[(&str, &str)] = &[
+    (
+        "pre-commit",
+        r##"#!/bin/sh
+printf 'pre-commit refuses\n' >&2
+printf 'pre-commit %s\n' "${GIT_INDEX_FILE##*/}" > hook-pre-commit.txt
+exit 1
+"##,
+    ),
+    // Not skipped by `--no-verify`, unlike the two hooks around it, so this is
+    // what shows that a commit which bypassed the gate still went through the
+    // rewrite.
+    (
+        "prepare-commit-msg",
+        r##"#!/bin/sh
+printf '\nprepared-by-hook\n' >> "$1"
+printf 'prepare-commit-msg %s %s\n' "$2" "$3" > hook-prepare-commit-msg.txt
+exit 0
+"##,
+    ),
+    (
+        "commit-msg",
+        r##"#!/bin/sh
+printf '\ncommit-msg-trailer\n' >> "$1"
+printf 'commit-msg %s\n' "${1##*/}" > hook-commit-msg.txt
+exit 0
+"##,
+    ),
+    (
+        "pre-merge-commit",
+        r##"#!/bin/sh
+printf 'pre-merge-commit\n' > hook-pre-merge-commit.txt
+exit 0
+"##,
+    ),
+    (
+        "post-merge",
+        r##"#!/bin/sh
+printf 'post-merge %s\n' "$1" > hook-post-merge.txt
+exit 0
+"##,
+    ),
+    // Exits 1 on purpose: git ignores a `post-commit` failure, and an
+    // implementation that propagates it turns a successful commit into a
+    // failing one.
+    (
+        "post-commit",
+        r##"#!/bin/sh
+printf 'post-commit\n' > hook-post-commit.txt
+exit 1
+"##,
+    ),
+    (
+        "post-checkout",
+        r##"#!/bin/sh
+printf 'post-checkout %s %s %s\n' "$1" "$2" "$3" > hook-post-checkout.txt
+exit 0
+"##,
+    ),
+    // Reads its stdin: the ref list git feeds it is a function of the rewrite,
+    // so recording it turns `post-rewrite` into something a case can compare.
+    (
+        "post-rewrite",
+        r##"#!/bin/sh
+printf 'post-rewrite %s\n' "$1" > hook-post-rewrite.txt
+cat >> hook-post-rewrite.txt
+exit 0
+"##,
+    ),
+    (
+        "pre-push",
+        r##"#!/bin/sh
+printf 'pre-push %s\n' "$1" > hook-pre-push.txt
+cat >> hook-pre-push.txt
+printf 'pre-push refuses\n' >&2
+exit 1
+"##,
+    ),
+    (
+        "pre-rebase",
+        r##"#!/bin/sh
+printf 'pre-rebase %s %s\n' "$1" "$2" > hook-pre-rebase.txt
+printf 'pre-rebase refuses\n' >&2
+exit 1
+"##,
+    ),
+    (
+        "pre-auto-gc",
+        r##"#!/bin/sh
+printf 'pre-auto-gc refuses\n' > hook-pre-auto-gc.txt
+exit 1
+"##,
+    ),
+];
+
+/// The hook [`Shape::HooksFail`] installs in its **peer**.
+///
+/// It runs inside the receiving repository, which is the one refusal
+/// `--no-verify` cannot bypass: `--no-verify` skips the hooks on the pushing
+/// side and has no say over the other end. It refuses one ref by name so a
+/// single push can be accepted and rejected at once.
+const PEER_HOOKS: &[(&str, &str)] = &[(
+    "update",
+    r##"#!/bin/sh
+if [ "$1" = "refs/heads/veto" ]; then
+	printf 'update refuses %s\n' "$1" >&2
+	exit 1
+fi
+exit 0
+"##,
+)];
 
 /// The id `refs/heads/dangling` points at in [`Shape::Damaged`]: well-formed,
 /// and belonging to no object. A literal rather than a hash of anything, so it

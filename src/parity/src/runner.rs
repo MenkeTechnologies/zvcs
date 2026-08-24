@@ -162,6 +162,7 @@ use crate::env;
 use crate::fixture::{Shape, Templates};
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -1998,13 +1999,39 @@ fn run_side(bin: &Path, repo: &Path, home: &Path, case: &Case) -> Result<Side> {
 /// thing under test. Any single probe failing is folded into the digest as an
 /// `<err>` marker rather than aborting: a command under test is allowed to
 /// leave a repo in a state some probes reject, and that difference is signal.
+///
+/// The command probes above ask git what the repository *means*; the sections
+/// appended below read what is on disk, and each one was added because a class
+/// of command was being scored on its report alone. In digest order:
+/// [`probe_storage`] (object layout), [`probe_reflogs`], [`probe_rr_cache`],
+/// [`probe_op_state`] (in-progress operations, and `shallow`),
+/// [`probe_worktrees`] (a linked worktree's own HEAD, reflog and operation
+/// state), [`probe_pack_headers`] (what a midx or bitmap claims to cover),
+/// [`probe_worktree_content`] (the bytes a merge or a checkout actually wrote),
+/// [`probe_index_meta`] (the index's version and extension chain),
+/// [`probe_fetch_head`], and [`probe_peer`] (the bare repository a push landed
+/// on). Every one of them appends: no existing line moves, so no probe here can
+/// turn a failing case into a passing one.
 fn probe_state(repo: &Path, home: &Path) -> String {
     const PROBES: &[&[&str]] = &[
         &["status", "--porcelain=v1", "--untracked-files=all"],
         &["for-each-ref", "--format=%(refname) %(objecttype) %(objectname)"],
         &["rev-parse", "--abbrev-ref", "HEAD"],
         &["rev-parse", "HEAD"],
-        &["ls-files", "--stage"],
+        // `-v` prefixes each entry with the tag `ls-files` computes from the
+        // index flags — `H` cached, `S` skip-worktree, `h` assume-unchanged, `M`
+        // unmerged. Those bits are invisible to `--stage`, which prints mode,
+        // object id and stage number and nothing else, so `update-index
+        // --skip-worktree` / `--assume-unchanged` (and every sparse-checkout
+        // command that sets them) moved a bit no probe read. Measured on stock
+        // 2.55.0 over one path: `S 100644 <oid> 0\tc.txt` after
+        // `--skip-worktree`, `h …` after `--assume-unchanged`, `H …` otherwise
+        // — including for a file deleted from the worktree, so the tag is a
+        // function of the index and not of the filesystem underneath it.
+        //
+        // A column added to a line that was already compared: every existing
+        // difference is still a difference, so this can only add.
+        &["ls-files", "--stage", "-v"],
         &["stash", "list"],
         &["cat-file", "--batch-check", "--batch-all-objects"],
         // Repository-local config. A command that reports success while failing
@@ -2046,6 +2073,12 @@ fn probe_state(repo: &Path, home: &Path) -> String {
     digest.push_str(&probe_reflogs(repo));
     digest.push_str(&probe_rr_cache(repo));
     digest.push_str(&probe_op_state(repo));
+    digest.push_str(&probe_worktrees(repo));
+    digest.push_str(&probe_pack_headers(repo));
+    digest.push_str(&probe_worktree_content(repo));
+    digest.push_str(&probe_index_meta(repo));
+    digest.push_str(&probe_fetch_head(repo));
+    digest.push_str(&probe_peer(repo, home));
     digest
 }
 
@@ -2349,13 +2382,14 @@ fn write_tree_probe(
     out
 }
 
-/// Root-level files and refs that record an **in-progress operation**.
+/// Root-level files and refs that record an **in-progress operation**, plus the
+/// one root file that records a *persistent* one: `shallow`.
 ///
 /// Enumerated from git 2.55.0 rather than globbed over `.git`, because a glob
-/// would sweep in `index`, `COMMIT_EDITMSG`, `FETCH_HEAD`, `shallow` and the
-/// hook samples — machine-local scratch and already-measured facts — and would
-/// make the probe's meaning depend on whatever else happens to sit in the
-/// directory. Each name below is cited to the code that writes or deletes it:
+/// would sweep in `index`, `COMMIT_EDITMSG` and the hook samples — machine-local
+/// scratch — and would make the probe's meaning depend on whatever else happens
+/// to sit in the directory. Each name below is cited to the code that writes or
+/// deletes it:
 ///
 ///  * `wt-status.c:1823` `wt_status_get_state` reads `MERGE_HEAD`,
 ///    `CHERRY_PICK_HEAD` and `REVERT_HEAD` to decide which operation is live;
@@ -2377,6 +2411,25 @@ fn write_tree_probe(
 /// `COMMIT_EDITMSG` is deliberately *not* here. It is the editor scratch buffer
 /// every commit leaves behind, not state any `--continue`/`--abort` consults,
 /// and `wt_status_get_state` never looks at it.
+///
+/// **`shallow` is here, and it is the odd one out.** It is not an operation in
+/// progress; it is the graft boundary of a shallow repository, and it is the
+/// entire state `--unshallow`, `--deepen` and a second `--depth` act on. Nothing
+/// else in this crate reads it: `for-each-ref` and `cat-file
+/// --batch-all-objects` both report the object and ref set a shallow fetch
+/// produced without saying a word about the boundary that makes it shallow, so
+/// `fetch --depth=1`, `--deepen=1` and `--unshallow` were measured on their
+/// reports and their exit codes alone. Its content is one abbreviated-free
+/// object id per line — measured, not assumed: after `git fetch --depth=1 origin
+/// main` against a two-commit peer, stock 2.55.0 left
+/// `b015a4d60ee11600ec4c9413e74ce42c7a9593d3\n` and nothing else — so it is a
+/// function of repository content, has no timestamp, no path and no pid in it,
+/// and two correct implementations must write the same bytes. `read_as_value`
+/// flattens it to one line like every other fact here.
+///
+/// This can only ever *add* a difference: every existing name still produces its
+/// own line in its own position, and a repository that is not shallow reports
+/// `shallow: <absent>` on both sides.
 const OP_STATE_FILES: &[&str] = &[
     "AUTO_MERGE",
     "BISECT_ANCESTORS_OK",
@@ -2400,6 +2453,9 @@ const OP_STATE_FILES: &[&str] = &[
     "REBASE_HEAD",
     "REVERT_HEAD",
     "SQUASH_MSG",
+    // Lower-cased and last because it is the one name here git does not spell in
+    // capitals, and the one fact that outlives the command that wrote it.
+    "shallow",
 ];
 
 /// Directories whose whole contents are operation state.
@@ -2475,13 +2531,19 @@ fn probe_op_state(repo: &Path) -> String {
 /// the fact occupies exactly one line.
 fn read_as_value(path: &Path) -> String {
     match std::fs::read(path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes)
-            .replace('\\', "\\\\")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r"),
+        Ok(bytes) => escape_bytes(&bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => "<absent>".to_string(),
         Err(_) => "<unreadable>".to_string(),
     }
+}
+
+/// Bytes as one line: backslash, newline and carriage return escaped, so a value
+/// carrying its own newlines cannot shift every following fact in the digest.
+fn escape_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Every regular file under `dir`, as `(path relative to dir, absolute path)`,
@@ -2507,6 +2569,172 @@ fn walk_files(dir: &Path) -> Vec<(String, PathBuf)> {
     rec(dir, "", &mut out);
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// The **bytes in the worktree**, which nothing else in this crate reads.
+///
+/// # The gap
+///
+/// Every probe above reports what git *thinks*: `status --porcelain` says `AA
+/// conflict.txt` whatever bytes are on disk, `ls-files --stage` prints the three
+/// stages the index holds, and neither moves when the file itself changes. So
+/// the whole family of commands whose entire job is to write a particular byte
+/// sequence into the worktree was measured on its exit code:
+/// `checkout --ours`/`--theirs`/`-m`, `--conflict=diff3`/`merge`/`zdiff3`,
+/// `merge -X ours`/`-X theirs`, `restore`, and every conflict-marker style.
+/// `checkout --ours` and `checkout --theirs` produced *identical* digests.
+///
+/// The corpus knows it: `corpus/merge_family.rs`'s header documents three routes
+/// a content case has to take to be asserted at all — print the result on stdout
+/// with `merge-file -p`, hide it in a tree id with `merge-tree --write-tree`, or
+/// pick a strategy backend that stages its result so `ls-files --stage` carries
+/// the blob — and records that "cases that merely rewrite a worktree file in
+/// place are kept for their exit code". This probe is what those workarounds
+/// were working around.
+///
+/// # What is compared
+///
+/// One line per worktree entry, `path <x|-> : value`, sorted. The `x` column is
+/// the executable bit and nothing else of the mode: the rest is umask-derived.
+///
+/// The value is the file's own bytes when it is UTF-8 and small, and a length
+/// otherwise. That split is not a convenience, it is the same relaxation
+/// [`probe_storage`] makes and for the same reason: a `bundle`, a `pack` or an
+/// `archive` written into the worktree is a pack stream, the vendored gitoxide
+/// cannot reproduce git's pack bytes, and comparing them would fail every
+/// valid-but-different pack. Binary is therefore compared by length; text — the
+/// merged file, the conflict markers, the patch, the checked-out blob — is
+/// compared byte for byte.
+///
+/// # What is not walked
+///
+///  * **`.git`**, and **any nested directory that is itself a repository**
+///    (`HEAD` + `objects/` + `refs/`). The fixture's bare peer at `.remote.git`
+///    is one; a `clone` target's git directory is another. Their presence is
+///    still reported as a line, so a case that fails to create one differs from
+///    a case that creates one; what is inside them belongs to [`probe_peer`] and
+///    to `probe_storage`'s counting rules, not to a byte comparison.
+///  * **Symlink targets are read, symlinks are not followed.** Following one
+///    would walk out of the fixture — `Shape::Symlinks` contains a link that
+///    points outside it on purpose — and the target string is the fact anyway.
+///
+/// # Determinism
+///
+/// Paths go through [`stable_entry_name`] before they are sorted, exactly as in
+/// `probe_storage`: a `pack-objects` or `bundle` invocation writes a
+/// checksum-named or `.tmp-<pid>-`named file into the working directory, and a
+/// pid is machine noise that would make thousands of cases flaky. Contents carry
+/// no timestamp: `env::harden` pins the identities and the dates that end up
+/// inside patches and archives. Absolute paths inside a file are handled by
+/// [`normalize`], which is applied to the whole digest — which is also why the
+/// content is kept as text rather than hashed: a hash cannot be normalized.
+///
+/// # Direction
+///
+/// A new section appended to the digest: every existing line keeps its content
+/// and its position, both sides are asked the same question, and no line is ever
+/// removed. It can only ever add differences.
+fn probe_worktree_content(repo: &Path) -> String {
+    let mut out = String::from("# worktree-content\n");
+    if git_dir(repo) == repo {
+        out.push_str("<bare: no worktree>\n");
+        return out;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    collect_worktree(repo, "", &mut lines);
+    lines.sort();
+    // A ceiling rather than an unbounded walk: a case that unpacks a large tree
+    // into the worktree would otherwise put megabytes into every digest, and the
+    // digests are held in memory for the whole comparison. Both sides truncate
+    // the same sorted listing at the same point, so the cut is symmetric.
+    let truncated = lines.len().saturating_sub(WORKTREE_ENTRY_CAP);
+    for line in lines.iter().take(WORKTREE_ENTRY_CAP) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if truncated > 0 {
+        out.push_str(&format!("<truncated: {truncated} more entries>\n"));
+    }
+    out
+}
+
+/// Entries listed by [`probe_worktree_content`] before it truncates.
+const WORKTREE_ENTRY_CAP: usize = 4096;
+/// Largest file whose bytes are compared; above this only the length is.
+const WORKTREE_CONTENT_MAX: u64 = 64 * 1024;
+
+/// Whether `dir` is a git directory — bare or otherwise — by the same three
+/// things `setup.c` looks for.
+fn looks_like_git_dir(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
+}
+
+fn collect_worktree(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            out.push(format!("{} -: <unreadable>", stable_entry_name(&rel)));
+            continue;
+        };
+        let rel = stable_entry_name(&rel);
+        if meta.is_symlink() {
+            let target = std::fs::read_link(&path)
+                .map(|t| escape_bytes(t.to_string_lossy().as_bytes()))
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            out.push(format!("{rel} -: <symlink -> {target}>"));
+        } else if meta.is_dir() {
+            if name == ".git" {
+                out.push(format!("{rel} -: <git directory>"));
+            } else if looks_like_git_dir(&path) {
+                out.push(format!("{rel} -: <repository>"));
+            } else {
+                out.push(format!("{rel} -: <dir>"));
+                collect_worktree(&path, &rel, out);
+            }
+        } else if meta.is_file() {
+            let x = if meta.permissions().mode() & 0o111 != 0 { 'x' } else { '-' };
+            out.push(format!("{rel} {x}: {}", file_value(&path, meta.len())));
+        } else {
+            // A socket, a fifo, a device. Named, never opened: `open` on a fifo
+            // with no writer blocks forever, and nothing in this crate puts a
+            // timeout around a state probe — one such file in one fixture would
+            // park a worker for the rest of the run. The type is the fact.
+            let kind = {
+                use std::os::unix::fs::FileTypeExt;
+                let t = meta.file_type();
+                if t.is_fifo() {
+                    "fifo"
+                } else if t.is_socket() {
+                    "socket"
+                } else if t.is_block_device() {
+                    "block-device"
+                } else if t.is_char_device() {
+                    "char-device"
+                } else {
+                    "unknown"
+                }
+            };
+            out.push(format!("{rel} -: <special {kind}>"));
+        }
+    }
+}
+
+/// One worktree file as a single line: its text where the bytes are text, its
+/// length where they are not.
+fn file_value(path: &Path, len: u64) -> String {
+    if len > WORKTREE_CONTENT_MAX {
+        return format!("<{len} bytes>");
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => match std::str::from_utf8(&bytes) {
+            Ok(text) => escape_bytes(text.as_bytes()),
+            Err(_) => format!("<binary {} bytes>", bytes.len()),
+        },
+        Err(_) => "<unreadable>".to_string(),
+    }
 }
 
 /// Reduce one entry of the object store to a name two correct implementations
@@ -2570,6 +2798,121 @@ fn elide_hashes(name: &str) -> String {
     out
 }
 
+/// The **headers** of the two accelerator files [`probe_storage`] can only count:
+/// the multi-pack-index and every `*.bitmap`.
+///
+/// `probe_storage` enumerates the directory, so `objects/pack/multi-pack-index`
+/// and `pack-<hash>.bitmap` do appear there — as names. A name is presence, and
+/// presence is where that probe deliberately stops, because a pack's *bytes* are
+/// not reproducible by the vendored gitoxide. The consequence is that a
+/// multi-pack-index covering the wrong packs, or a bitmap built over a different
+/// object set, matched a correct one line for line: `multi-pack-index write
+/// --bitmap` was caught by its exit code and by nothing else.
+///
+/// **Only counts and versions are taken — never bytes.** Both formats put every
+/// fact this probe reports in a fixed-offset header, and every one of them is a
+/// function of repository content rather than of byte layout:
+///
+///  * **`MIDX`** — verified against stock 2.55.0's own output: `4d 49 44 58`,
+///    version `1`, hash version `1`, chunk count `6`, base-midx count `0`, then
+///    a big-endian pack count at offset 8 (`1`). The chunk table that follows is
+///    `(id, offset)` pairs, and the ids name what the file actually contains
+///    (`PNAM OIDF OIDL OOFF RIDX BTMP` for a `write --bitmap`, and no `BTMP`
+///    without it). The object count is the last entry of the `OIDF` fanout —
+///    read at `OIDF + 1020`, and cross-checked against `cat-file
+///    --batch-all-objects`: the midx said 9 where the repository held 11, the
+///    two loose objects being outside the pack, which is exactly the fact a
+///    logical probe cannot see.
+///  * **`BITM`** — `42 49 54 4d`, a 2-byte version (`1`), 2-byte flags (`5`),
+///    then a big-endian entry count (`3` for a three-object pack).
+///
+/// The *offsets* inside both files are byte layout and are not reported; the ids,
+/// counts and versions are what the file claims about the repository.
+///
+/// **Direction: appended, so it can only add differences.** The section is new
+/// and both sides are asked the same question; a repository with neither file
+/// reports an empty section on both sides.
+///
+/// **The bounded relaxation, stated rather than left to be found.** An entry
+/// count is a count of the objects a pack or midx covers, so a port that packs
+/// the same objects into a different *grouping* can report a different count
+/// legitimately. That is the same class of difference `probe_storage` already
+/// reports by counting packs, so this adds no new class of false positive — but
+/// it is a difference reported on a valid repository, and it is recorded here.
+fn probe_pack_headers(repo: &Path) -> String {
+    let pack = git_dir(repo).join("objects").join("pack");
+    let mut lines: Vec<String> = Vec::new();
+    for (rel, path) in walk_files(&pack) {
+        let name = rel.rsplit('/').next().unwrap_or(rel.as_str()).to_string();
+        let header = if name == "multi-pack-index" {
+            midx_header(&path)
+        } else if name.ends_with(".bitmap") {
+            bitmap_header(&path)
+        } else {
+            continue;
+        };
+        // Elided and sorted afterwards for the same reason `probe_storage` does
+        // it: `multi-pack-index-<hash>.bitmap` names its own checksum, and the
+        // pre-elision order of two names that collapse together is arbitrary.
+        lines.push(format!("{}: {header}", stable_entry_name(&rel)));
+    }
+    lines.sort();
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    format!("# pack-headers\n{body}")
+}
+
+/// Big-endian `u32` at `off`, or `None` past the end.
+fn be32(bytes: &[u8], off: usize) -> Option<u32> {
+    bytes.get(off..off + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The multi-pack-index header: version, pack count, chunk ids, object count.
+fn midx_header(path: &Path) -> String {
+    let Ok(b) = std::fs::read(path) else { return "<unreadable>".to_string() };
+    if b.len() < 12 || &b[..4] != b"MIDX" {
+        return format!("<not-a-midx {} bytes>", b.len());
+    }
+    let (version, hash, chunks, base) = (b[4], b[5], b[6] as usize, b[7]);
+    let packs = be32(&b, 8).map_or("<truncated>".to_string(), |n| n.to_string());
+    let mut ids: Vec<String> = Vec::new();
+    let mut objects = "<no-oidf>".to_string();
+    for i in 0..chunks {
+        let off = 12 + i * 12;
+        let (Some(id), Some(start)) = (
+            b.get(off..off + 4),
+            b.get(off + 4..off + 12).map(|w| {
+                u64::from_be_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]) as usize
+            }),
+        ) else {
+            ids.push("<truncated>".to_string());
+            break;
+        };
+        let id = String::from_utf8_lossy(id).into_owned();
+        // The fanout's last bucket is the object count; the chunk is 256 4-byte
+        // buckets, so it sits 1020 bytes in.
+        if id == "OIDF" {
+            objects = be32(&b, start + 1020).map_or("<truncated>".to_string(), |n| n.to_string());
+        }
+        ids.push(id);
+    }
+    format!(
+        "MIDX v{version} hash={hash} base={base} packs={packs} chunks=[{}] objects={objects}",
+        ids.join(",")
+    )
+}
+
+/// A pack or midx bitmap header: version, flags, and how many objects it covers.
+fn bitmap_header(path: &Path) -> String {
+    let Ok(b) = std::fs::read(path) else { return "<unreadable>".to_string() };
+    if b.len() < 12 || &b[..4] != b"BITM" {
+        return format!("<not-a-bitmap {} bytes>", b.len());
+    }
+    let version = u16::from_be_bytes([b[4], b[5]]);
+    let flags = u16::from_be_bytes([b[6], b[7]]);
+    let entries = be32(&b, 8).map_or("<truncated>".to_string(), |n| n.to_string());
+    format!("BITM v{version} flags={flags} entries={entries}")
+}
+
 /// Reflogs: `.git/logs/**`, compared line for line.
 ///
 /// Nothing above reads them, so a command that lands the right ref value while
@@ -2585,13 +2928,75 @@ fn elide_hashes(name: &str) -> String {
 /// constant rather than a clock read, normalising it would only hide an
 /// implementation that ignores the pinned date and stamps wall-clock time.
 fn probe_reflogs(repo: &Path) -> String {
-    let logs = repo.join(".git").join("logs");
-    let mut out = String::from("# reflogs\n");
-    for (rel, path) in walk_files(&logs) {
+    format!("# reflogs\n{}", reflog_listing(&repo.join(".git").join("logs")))
+}
+
+/// Every reflog under one `logs` directory, verbatim.
+///
+/// Split out of [`probe_reflogs`] so [`probe_peer`] can ask the same question of
+/// the bare peer: `receive-pack` writes `logs/refs/heads/<branch>` there when the
+/// peer enables reflogs, and nothing in this crate has ever looked.
+fn reflog_listing(logs: &Path) -> String {
+    let mut out = String::new();
+    for (rel, path) in walk_files(logs) {
         let body = std::fs::read(&path)
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_else(|_| "<unreadable>\n".to_string());
         out.push_str(&format!("## {rel}\n{body}"));
+    }
+    out
+}
+
+/// A **linked worktree's** administrative directory: `.git/worktrees/<name>/**`.
+///
+/// [`probe_reflogs`] walks `.git/logs` and stops there, and that is the whole
+/// blind spot: a linked worktree does not share the main worktree's `HEAD`,
+/// `ORIG_HEAD`, index, reflog or operation state. Every one of those lives under
+/// `.git/worktrees/<name>/` (`git worktree add --relative-paths -b linked wt`
+/// creates `HEAD`, `commondir`, `gitdir`, `index` and `logs/HEAD` there, as the
+/// `Worktree` shape builds and this probe's test asserts). So `git -C wt reset
+/// --hard HEAD~1` moved a ref, wrote a reflog line and wrote `ORIG_HEAD` — in a
+/// directory nothing in this crate read. `worktree` scored 100% and that number
+/// was not evidence.
+///
+/// **Direction: this can only add differences.** It is a new section appended to
+/// the digest; every existing line keeps its content and its position, and a
+/// repository with no linked worktree reports the single line `<absent>` on both
+/// sides.
+///
+/// **What is reported, and what is deliberately not.** Every file under the
+/// directory, one `path: value` line each, contents included — the same
+/// "contents, not presence" rule [`probe_op_state`] states, and for the same
+/// reason: a `logs/HEAD` with the wrong message or the wrong old-value is the
+/// silent-but-wrong case the reflog probe exists to catch, and presence alone
+/// would pass it.
+///
+/// The one exception is a file named `index`. A worktree index carries `ctime`,
+/// `ino` and `dev` for every entry — facts about the filesystem, not the
+/// repository, which differ between the two sides the moment either writes one.
+/// (The fixture builder says the same thing where it has to `read-tree` the
+/// linked worktree's index to make the shape reproducible at all.) Comparing
+/// those bytes would report the inode allocator as a parity defect, so only the
+/// file's length is taken: a length is content-derived — entry count and
+/// extensions determine it — and stat data does not move it.
+fn probe_worktrees(repo: &Path) -> String {
+    let dir = git_dir(repo).join("worktrees");
+    let mut out = String::from("# linked-worktrees\n");
+    if !dir.is_dir() {
+        out.push_str("<absent>\n");
+        return out;
+    }
+    for (rel, path) in walk_files(&dir) {
+        let is_index = Path::new(&rel).file_name().and_then(|n| n.to_str()) == Some("index");
+        let value = if is_index {
+            match std::fs::metadata(&path) {
+                Ok(m) => format!("<index {} bytes>", m.len()),
+                Err(_) => "<unreadable>".to_string(),
+            }
+        } else {
+            read_as_value(&path)
+        };
+        out.push_str(&format!("{rel}: {value}\n"));
     }
     out
 }
@@ -2647,8 +3052,16 @@ fn probe_rr_cache(repo: &Path) -> String {
 /// below is enumerated from the directory instead of from a whitelist, so a
 /// file type nobody thought of is compared the day git starts writing it.
 fn probe_storage(repo: &Path) -> String {
-    let objects = repo.join(".git").join("objects");
+    format!("# storage-layout\n{}", storage_of(&repo.join(".git").join("objects")))
+}
 
+/// The census itself, for one object directory: the loose count and the elided,
+/// sorted listing of `pack/` and `info/`.
+///
+/// Split out of [`probe_storage`] so [`probe_peer`] can take the same census of
+/// the bare peer's object store — the same question, asked of the repository the
+/// case pushed *to*, where the answer was previously nobody's.
+fn storage_of(objects: &Path) -> String {
     // Loose objects live in the 256 fan-out directories; everything else under
     // `objects/` (pack/, info/) is not a loose object.
     let loose = std::fs::read_dir(&objects)
@@ -2682,8 +3095,301 @@ fn probe_storage(repo: &Path) -> String {
     entries.sort();
     let listing: String = entries.iter().map(|e| format!("{e}\n")).collect();
 
-    format!("# storage-layout\nloose {loose}\n{listing}")
+    format!("loose {loose}\n{listing}")
 }
+
+/// `FETCH_HEAD`, which was excluded from [`OP_STATE_FILES`] and is not
+/// "already-measured" after all.
+///
+/// # Re-reading the exclusion
+///
+/// The reasoning that kept it out was that a glob over `.git` would sweep in
+/// "machine-local scratch and already-measured facts" — `index`,
+/// `COMMIT_EDITMSG`, `FETCH_HEAD`, `shallow`, the hook samples. That argument is
+/// right about `COMMIT_EDITMSG` and about the sample hooks. It is wrong about
+/// `FETCH_HEAD`, on both halves:
+///
+///  * **Not machine-local.** Its three fields are an object id, the
+///    `not-for-merge` marker, and a description ending in the URL *as the case
+///    named it* — for the fixture's peer, the relative `./.remote.git`, which
+///    git renders with the suffix stripped. Verified against stock 2.55.0:
+///    `b015a4d6…\\t\\tbranch 'main' of ./.remote` after `fetch origin`, and the
+///    same line with `not-for-merge` in the middle field on the second fetch.
+///    No timestamp, no pid, no temp name, and an absolute URL — the one case
+///    that names a path outside the fixture — is covered by [`normalize`], which
+///    is applied to this digest like every other surface.
+///  * **Not already measured.** `git fetch <remote> <ref>` updates no branch,
+///    and `--no-write-fetch-head` differs from the default in nothing else at
+///    all: `for-each-ref` and `cat-file --batch-all-objects` report the same
+///    refs and the same objects either way. For that whole family of
+///    invocations `FETCH_HEAD` *is* the result, and the harness was scoring them
+///    on their report alone.
+///
+/// So it is probed, in its own section rather than inside the operation-state
+/// list, because it is not operation state: nothing consults it to continue or
+/// abort anything.
+///
+/// # Direction
+///
+/// One appended line, `<absent>` on a repository that has never fetched, flattened
+/// to a single line by [`read_as_value`] like every other file-backed fact.
+fn probe_fetch_head(repo: &Path) -> String {
+    format!("# fetch-head\nFETCH_HEAD: {}\n", read_as_value(&git_dir(repo).join("FETCH_HEAD")))
+}
+
+/// What the **index file itself** is, as opposed to what it holds: its version,
+/// its entry count and the extensions chained onto the end of it.
+///
+/// # The gap
+///
+/// `ls-files --stage` prints one line per entry — mode, object id, stage, path —
+/// and that is the whole of the index this crate saw. Everything *about* the
+/// index was invisible: which on-disk version was written (`index.version=2/3/4`
+/// are three different file formats for the same entries), and which extensions
+/// are chained after the entries — `TREE` (the cache-tree), `REUC` (the
+/// resolve-undo record that makes `checkout -m` able to recreate a conflict),
+/// `UNTR` (the untracked cache), `link` (a split index), `EOIE`/`IEOT` (the
+/// index-offset tables `index.threads` needs), `sdir` (sparse directories).
+///
+/// [`probe_interop`] catches part of this indirectly and it is worth being exact
+/// about which part, because the rest is what this probe is for. It hands the
+/// index to stock `write-tree` and reports whether stock had to *repair* it and
+/// how the byte length moved, which detects a missing or wrong **cache-tree**
+/// and nothing else — and only on a case that wrote under the git directory.
+/// What it cannot see: a `REUC` that was dropped (`checkout -m` then silently
+/// fails to recreate the conflict, and nothing until the *next* command
+/// notices), an `UNTR` that was written when git writes none or left stale, a
+/// `link`/`sdir` extension missing on a split or sparse index, the index version
+/// itself, and an entry count that disagrees with the entries actually present.
+/// This probe reports all of those, on every case, for the cost of one file
+/// read.
+///
+/// # Why the file is parsed here rather than asked of git
+///
+/// There is no porcelain for it: `ls-files --debug` is the closest and it prints
+/// `ctime`, `dev` and `ino` per entry — filesystem facts that differ between the
+/// two sides' copies, which is exactly why [`probe_interop`] rejected it. The
+/// header and the extension chain, by contrast, are fixed-offset and
+/// content-derived. Parsed against the documented layout: `DIRC`, a big-endian
+/// version and entry count, then entries of 62 bytes plus a NUL-terminated name
+/// padded so each entry is a multiple of eight (64 bytes plus name for a v3
+/// entry carrying extended flags), then `(4-byte signature, 4-byte length,
+/// data)` triples until the trailing checksum.
+///
+/// **v4 is not parsed.** Its entry names are prefix-compressed and unpadded, so
+/// the extension chain cannot be reached without decompressing every name;
+/// version and entry count are still reported and the chain reads
+/// `<unparsed>` — on both sides, since both were handed the same fixture. The
+/// same fallback covers a truncated or corrupt index and a repository using an
+/// object format whose ids are not 20 bytes. Reporting `<unparsed>` symmetrically
+/// is a blind spot, not a false pass: it is exactly what was reported before this
+/// probe existed.
+///
+/// # Direction
+///
+/// Appended, and every value is a function of the index's own bytes rather than
+/// of where it sits. Sizes are included with the signatures because a `TREE`
+/// that covers fewer subtrees is a smaller `TREE`, and that is the shape of the
+/// cache-tree defect this harness has already had once.
+fn probe_index_meta(repo: &Path) -> String {
+    let git = git_dir(repo);
+    let mut lines: Vec<String> = vec![format!("index: {}", index_meta(&git.join("index")))];
+    // A split index parks the shared half beside it under a checksum-bearing
+    // name; the name is elided the way every other checksum-bearing name in this
+    // crate is, and what it *is* is reported.
+    if let Ok(rd) = std::fs::read_dir(&git) {
+        for entry in rd.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("sharedindex.") {
+                lines.push(format!(
+                    "{}: {}",
+                    stable_entry_name(&name),
+                    index_meta(&entry.path())
+                ));
+            }
+        }
+    }
+    // A linked worktree has an index of its own, and `probe_worktrees` reports
+    // only its length — deliberately, because its stat fields are not comparable.
+    // Its version and extension chain are.
+    if let Ok(rd) = std::fs::read_dir(git.join("worktrees")) {
+        for entry in rd.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            lines.push(format!(
+                "worktrees/{name}/index: {}",
+                index_meta(&entry.path().join("index"))
+            ));
+        }
+    }
+    lines.sort();
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    format!("# index-meta\n{body}")
+}
+
+/// One index file reduced to `v<version> entries=<n> ext=[SIG:len,…]`.
+fn index_meta(path: &Path) -> String {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return "<absent>".to_string(),
+        Err(_) => return "<unreadable>".to_string(),
+    };
+    // 12-byte header plus the trailing checksum is the smallest possible index.
+    if bytes.len() < 32 || &bytes[..4] != b"DIRC" {
+        return format!("<not-an-index {} bytes>", bytes.len());
+    }
+    let (Some(version), Some(entries)) = (be32(&bytes, 4), be32(&bytes, 8)) else {
+        return format!("<truncated {} bytes>", bytes.len());
+    };
+    format!("v{version} entries={entries} ext={}", index_extensions(&bytes, version, entries))
+}
+
+/// The extension chain of a v2/v3 index: `[TREE:53,REUC:117]`, or `<unparsed>`
+/// where the entries cannot be walked to find it.
+///
+/// `<unparsed>` is returned rather than a guess for every case the layout is not
+/// certain about — a v4 index, a hash that is not 20 bytes, a truncated file, a
+/// signature that is not four ASCII letters. Both sides return it for the same
+/// input, so an unparsed chain reports no difference where there is none.
+fn index_extensions(bytes: &[u8], version: u32, entries: u32) -> String {
+    const UNPARSED: &str = "<unparsed>";
+    if version != 2 && version != 3 {
+        return UNPARSED.to_string();
+    }
+    // The trailing checksum is not part of the chain.
+    let end = bytes.len() - 20;
+    let mut pos = 12usize;
+    for _ in 0..entries {
+        // 62 bytes of fixed fields: two timestamps, dev, ino, mode, uid, gid,
+        // size, a 20-byte object id and the 2-byte flags.
+        if pos + 62 > end {
+            return UNPARSED.to_string();
+        }
+        let flags = u16::from_be_bytes([bytes[pos + 60], bytes[pos + 61]]);
+        // Bit 0x4000 is the extended flag: two more bytes before the name.
+        let name_at = pos + 62 + if flags & 0x4000 != 0 { 2 } else { 0 };
+        let Some(nul) = bytes.get(name_at..end).and_then(|w| w.iter().position(|b| *b == 0)) else {
+            return UNPARSED.to_string();
+        };
+        // Padded with NULs so the whole entry is a multiple of eight.
+        let used = name_at + nul + 1 - pos;
+        pos += used.div_ceil(8) * 8;
+    }
+    let mut exts: Vec<String> = Vec::new();
+    while pos < end {
+        let (Some(sig), Some(len)) = (bytes.get(pos..pos + 4), be32(bytes, pos + 4)) else {
+            return UNPARSED.to_string();
+        };
+        if !sig.iter().all(|b| b.is_ascii_alphabetic()) {
+            return UNPARSED.to_string();
+        }
+        exts.push(format!("{}:{len}", String::from_utf8_lossy(sig)));
+        let Some(next) = pos.checked_add(8).and_then(|p| p.checked_add(len as usize)) else {
+            return UNPARSED.to_string();
+        };
+        if next > end {
+            return UNPARSED.to_string();
+        }
+        pos = next;
+    }
+    format!("[{}]", exts.join(","))
+}
+
+/// The **peer repository** the case pushed to, fetched from, or pruned.
+///
+/// # The gap
+///
+/// `Shape::BehindRemote` carries a real bare repository inside the fixture at
+/// `.remote.git`, reached by the relative URL `./.remote.git` so each side's copy
+/// talks to its own. Every probe in this crate runs in the fixture root and
+/// never descends, and the fixture builder writes `.remote.git/` into
+/// `.git/info/exclude` so even `status --untracked-files=all` says nothing about
+/// it. The consequence: `push`, `send-pack` and `fetch --prune` were measured on
+/// the report they printed and on the local refs they updated — a port that
+/// printed a correct report and wrote *nothing at all* on the peer matched
+/// identically. Three `send-pack` cases pass today and are not evidence of
+/// anything having arrived.
+///
+/// # What is asked, and of whom
+///
+/// **Stock git, run inside the peer**, exactly as [`probe_state`] runs it inside
+/// the fixture — never the binary under test. Two invocations:
+///
+///  * `for-each-ref` — did the ref move, and to what. This is the whole point of
+///    a push.
+///  * `cat-file --batch-check --batch-all-objects` — did the objects the ref
+///    names actually arrive, with the right types and sizes. A ref update
+///    without the objects behind it is the failure that leaves a peer corrupt,
+///    and `for-each-ref` alone would call it a success.
+///
+/// Both were verified to work with the working directory set to a bare
+/// repository under the same hardened environment (`for-each-ref` and `cat-file`
+/// against `.remote.git` returned the ref and the object listing, exit 0).
+///
+/// Everything else is read from the filesystem and costs no process: `HEAD`
+/// (`receive-pack` on an empty peer points it at the branch that arrives), the
+/// object-store census [`storage_of`] — so a push that lands a pack instead of
+/// loose objects is visible — and the peer's reflogs.
+///
+/// # Cost, and the gate
+///
+/// Two child processes per side, **only where the peer exists**. The gate is the
+/// directory: `.remote.git` present *and* shaped like a repository (`HEAD` +
+/// `objects/` + `refs/`). No other shape in the corpus has one, so every case
+/// outside `BehindRemote` pays one `is_file`/`is_dir` triple and prints
+/// `<absent>` on both sides.
+///
+/// # Determinism
+///
+/// Every fact is content-derived: object ids and ref names are what both sides
+/// pushed, `cat-file`'s sizes are the objects' own, and the pack census counts
+/// rather than compares bytes, which is the relaxation [`probe_storage`] already
+/// makes for the same reason. Nothing here reads a path, an inode, a timestamp
+/// or a pid.
+///
+/// # Direction
+///
+/// A new section appended to the digest, identical in shape on both sides,
+/// containing `<absent>` wherever there is no peer. Nothing above it moves. It
+/// can only ever add differences.
+fn probe_peer(repo: &Path, home: &Path) -> String {
+    const PROBES: &[&[&str]] = &[
+        &["for-each-ref", "--format=%(refname) %(objecttype) %(objectname)"],
+        &["cat-file", "--batch-check", "--batch-all-objects"],
+    ];
+    let peer = repo.join(PEER_DIR);
+    let mut out = format!("# peer {PEER_DIR}\n");
+    if !looks_like_git_dir(&peer) {
+        out.push_str(if peer.exists() { "<not a repository>\n" } else { "<absent>\n" });
+        return out;
+    }
+    out.push_str(&format!("HEAD: {}\n", read_as_value(&peer.join("HEAD"))));
+
+    let Ok(stock) = crate::stock::git() else {
+        out.push_str("<no-stock-git>\n");
+        return out;
+    };
+    for probe in PROBES {
+        let mut cmd = Command::new(stock);
+        env::harden(&mut cmd, home);
+        cmd.current_dir(&peer).args(*probe);
+        let rendered = match cmd.output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Ok(_) => "<err>\n".to_string(),
+            Err(_) => "<spawn-failed>\n".to_string(),
+        };
+        out.push_str(&format!("## {}\n{}", probe.join(" "), rendered));
+    }
+    out.push_str("## storage\n");
+    out.push_str(&storage_of(&peer.join("objects")));
+    out.push_str("## reflogs\n");
+    out.push_str(&reflog_listing(&peer.join("logs")));
+    out
+}
+
+/// Where every fixture that has a peer keeps it: a bare repository inside the
+/// fixture root, so the per-case copy carries it and the relative URL in
+/// `remote.origin.url` resolves to the copy's own.
+const PEER_DIR: &str = ".remote.git";
 
 /// Strip the three things that legitimately differ between two copies of the same
 /// repo: their filesystem paths, and where each binary is installed.
@@ -2713,22 +3419,122 @@ fn probe_storage(repo: &Path) -> String {
 /// where this particular copy happens to live. Every other byte still has to
 /// agree, which is why `version --build-options` still fails — its values
 /// describe a C toolchain, not a location.
+///
+/// **The masking happens on bytes, and output that is not text is rendered
+/// exactly.** See [`mask_paths`] for the hole that closes — a lossy decode here
+/// made two different binary streams compare equal — and [`render_binary`] for
+/// what a non-text surface looks like in the digest. Text output is unaffected:
+/// on valid UTF-8 the byte substitution and the string substitution produce the
+/// same bytes, so nothing that was compared before is compared differently now.
 fn normalize(raw: &[u8], repo: &Path, home: &Path, exec_dir: &Path) -> String {
-    let mut s = String::from_utf8_lossy(raw).into_owned();
-    // Exec-path first: on the zvcs side it lives under `home`, so masking `home`
-    // ahead of it would rewrite the prefix and leave the two sides unequal.
+    let masked = mask_paths(raw, repo, home, exec_dir);
+    match String::from_utf8(masked) {
+        Ok(text) => text,
+        Err(e) => render_binary(e.as_bytes()),
+    }
+}
+
+/// The masking itself, on **bytes**.
+///
+/// This used to run on `String::from_utf8_lossy(raw)`, and that one call was a
+/// hole under every comparison in this crate: `from_utf8_lossy` maps *every*
+/// invalid byte to U+FFFD, so two different binary streams collapse to one
+/// string and compare equal. Measured on the smallest possible example —
+/// `1f 8b c0 80 41` against `1f 8b c1 80 41`: raw equal `False`, lossy equal
+/// `True`, both rendering `'\x1f\u{fffd}\u{fffd}\u{fffd}A'`. Every case whose
+/// stdout is binary was therefore compared through a filter that erases the
+/// differences: `pack-objects --stdout`, `bundle create -`, `archive
+/// --format=zip|tar.gz`, `cat-file blob` on a binary object, `fast-export` and
+/// `upload-archive`. The byte differences this harness *did* find in that family
+/// were the ones that happened to also move a valid-UTF-8 byte or the length.
+///
+/// Masking on bytes is the direct translation of what the string version did and
+/// keeps the same three substitutions in the same order — exec-path first,
+/// because on the zvcs side it lives under `home` and masking `home` first would
+/// rewrite its prefix. The needles are the paths' own bytes
+/// (`OsStr::as_bytes`) rather than their lossy renderings, so a path is masked
+/// wherever it appears, including inside a binary stream.
+fn mask_paths(raw: &[u8], repo: &Path, home: &Path, exec_dir: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = raw.to_vec();
     for (path, token) in [(exec_dir, "<EXEC-PATH>"), (repo, "<REPO>"), (home, "<HOME>")] {
-        let p = path.to_string_lossy().into_owned();
-        if p.is_empty() {
+        let needle = path.as_os_str().as_bytes();
+        if needle.is_empty() {
             continue;
         }
-        s = s.replace(&p, token);
+        out = replace_bytes(&out, needle, token.as_bytes());
         // Both the symlinked and resolved forms show up on macOS (/tmp vs /private/tmp).
         if let Ok(canon) = path.canonicalize() {
-            s = s.replace(&canon.to_string_lossy().into_owned(), token);
+            out = replace_bytes(&out, canon.as_os_str().as_bytes(), token.as_bytes());
         }
     }
-    s
+    out
+}
+
+/// Every occurrence of `needle` in `hay` replaced by `with`.
+///
+/// Naive, and deliberately: the needles are three filesystem paths of a few
+/// dozen bytes each and the haystacks are one command's output, so the scan is
+/// linear in practice and there is no dependency to justify.
+fn replace_bytes(hay: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let n = needle.len();
+    if n == 0 || hay.len() < n {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len());
+    let mut i = 0;
+    while i + n <= hay.len() {
+        if hay[i] == needle[0] && &hay[i..i + n] == needle {
+            out.extend_from_slice(with);
+            i += n;
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out.extend_from_slice(&hay[i..]);
+    out
+}
+
+/// Output that is not text, rendered **exactly** rather than lossily.
+///
+/// Hex, 32 bytes to a line, under a header naming the length. Exact is the whole
+/// point — a rendering that can map two different streams onto one string is the
+/// defect this replaces — and hex-per-line rather than one long string because
+/// `report.rs` pairs the two sides' surfaces by line position, so a human reading
+/// a failure is shown the 32-byte window that moved rather than "the output
+/// differs".
+///
+/// Above the cap the length and an FNV-1a fingerprint stand in. That is a hash
+/// and hashes can collide, so it is a bounded weakening — bounded at
+/// 2^-64 per pair, against a rendering that today collides on *every* pair of
+/// binary streams — and it is reachable only by a case whose stdout exceeds a
+/// megabyte, which no fixture in this crate can produce (the largest blob any
+/// shape builds is 1 KiB).
+fn render_binary(bytes: &[u8]) -> String {
+    /// Above this many bytes, the exact rendering is traded for a fingerprint.
+    const HEX_CAP: usize = 1 << 20;
+    if bytes.len() > HEX_CAP {
+        return format!("<non-utf8 stream: {} bytes, fnv1a {:016x}>\n", bytes.len(), fnv1a(bytes));
+    }
+    let mut out = format!("<non-utf8 stream: {} bytes>\n", bytes.len());
+    for chunk in bytes.chunks(32) {
+        for b in chunk {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// FNV-1a, 64-bit. Used only for the over-the-cap case in [`render_binary`].
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 /// What `bin` reports as its exec-path, under the same hardened environment the
@@ -3872,6 +4678,8 @@ mod tests {
     use super::{
         adjudicate, alt_reproduced, alt_speaks_to, case_timeout, classify, config_premise, git_dir,
         interop_disagreement, is_unsupported, judge, oracle_diff, probe_op_state,
+        probe_fetch_head, probe_index_meta, probe_pack_headers, probe_peer, probe_worktree_content,
+        probe_worktrees,
         quote_config_value, render_config_entry, repeat_disagreement,
         scope_file, split_config_key, step_is_final, AltFinding, AltRun, Case, Compared,
         ConfigEntry, ConfigScope, OracleSurface,
@@ -4844,6 +5652,644 @@ mod tests {
         // …and a missing sequencer differs from a present one.
         let c = scratch("op-state-todo-c");
         assert_ne!(probe_op_state(&a), probe_op_state(&c));
+    }
+
+    /// A repository with no linked worktree says so in one line, so the two
+    /// digests being compared line up positionally.
+    #[test]
+    fn linked_worktrees_report_absence_as_one_line() {
+        let repo = scratch("worktrees-absent");
+        assert_eq!(probe_worktrees(&repo), "# linked-worktrees\n<absent>\n");
+    }
+
+    /// The reset-inside-`wt/` blind spot: a reflog line and an `ORIG_HEAD` that
+    /// `.git/logs` never sees must not compare equal to their absence, and must
+    /// not compare equal to a *different* reflog line.
+    #[test]
+    fn linked_worktrees_compare_the_admin_files_by_content() {
+        let before = scratch("worktrees-before");
+        let after = scratch("worktrees-after");
+        let other = scratch("worktrees-other");
+        for repo in [&before, &after, &other] {
+            let wt = repo.join(".git/worktrees/wt");
+            std::fs::create_dir_all(wt.join("logs")).unwrap();
+            std::fs::write(wt.join("HEAD"), b"ref: refs/heads/linked\n").unwrap();
+            std::fs::write(wt.join("commondir"), b"../..\n").unwrap();
+        }
+        // The state a `git -C wt reset --hard HEAD~1` leaves behind.
+        std::fs::write(after.join(".git/worktrees/wt/ORIG_HEAD"), b"1111111111111111111111111111111111111111\n").unwrap();
+        std::fs::write(
+            after.join(".git/worktrees/wt/logs/HEAD"),
+            b"1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 A U Thor <a@u.thor> 1112911993 +0000\treset: moving to HEAD~1\n",
+        )
+        .unwrap();
+        // Same act, different message: the silent-but-wrong case.
+        std::fs::write(other.join(".git/worktrees/wt/ORIG_HEAD"), b"1111111111111111111111111111111111111111\n").unwrap();
+        std::fs::write(
+            other.join(".git/worktrees/wt/logs/HEAD"),
+            b"1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 A U Thor <a@u.thor> 1112911993 +0000\tcheckout: moving from linked to HEAD~1\n",
+        )
+        .unwrap();
+
+        assert_ne!(probe_worktrees(&before), probe_worktrees(&after));
+        assert_ne!(probe_worktrees(&after), probe_worktrees(&other));
+        // One fact per line: a reflog's own newline must not shift the digest.
+        assert!(probe_worktrees(&after).lines().all(|l| !l.starts_with(' ')));
+        assert!(probe_worktrees(&after)
+            .lines()
+            .any(|l| l.starts_with("wt/logs/HEAD: ") && l.ends_with("reset: moving to HEAD~1\\n")));
+    }
+
+    /// A worktree index is reported by length only. Its `ctime`/`ino`/`dev`
+    /// fields are facts about the filesystem, so two sides that wrote the same
+    /// entries must still compare equal.
+    #[test]
+    fn linked_worktree_index_is_measured_by_length_not_bytes() {
+        let a = scratch("worktrees-index-a");
+        let b = scratch("worktrees-index-b");
+        for (repo, stat) in [(&a, 0x11u8), (&b, 0x22u8)] {
+            let wt = repo.join(".git/worktrees/wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            // Same length, different stat bytes.
+            let mut index = b"DIRC".to_vec();
+            index.extend(std::iter::repeat(stat).take(60));
+            std::fs::write(wt.join("index"), &index).unwrap();
+        }
+        assert_eq!(probe_worktrees(&a), probe_worktrees(&b));
+        assert!(probe_worktrees(&a).contains("wt/index: <index 64 bytes>"));
+
+        // A different *length* — an entry added, an extension dropped — still moves.
+        let c = scratch("worktrees-index-c");
+        std::fs::create_dir_all(c.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(c.join(".git/worktrees/wt/index"), vec![0x11u8; 72]).unwrap();
+        assert_ne!(probe_worktrees(&a), probe_worktrees(&c));
+    }
+
+    /// A multi-pack-index built the way stock 2.55.0 builds one, as bytes, so the
+    /// header parse is pinned against a real layout rather than against itself.
+    ///
+    /// `packs` and `objects` are the two facts a logical probe cannot see, and
+    /// the two this test moves independently.
+    fn midx_bytes(packs: u32, objects: u32, with_bitmap_chunk: bool) -> Vec<u8> {
+        let chunks: &[&[u8; 4]] =
+            if with_bitmap_chunk { &[b"PNAM", b"OIDF", b"BTMP"] } else { &[b"PNAM", b"OIDF"] };
+        let table = 12 + (chunks.len() + 1) * 12;
+        // PNAM is a stub here; OIDF has to be a real 256-entry fanout, because
+        // that is where the object count is read from.
+        let pnam_at = table;
+        let oidf_at = pnam_at + 8;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"MIDX");
+        out.extend_from_slice(&[1, 1, chunks.len() as u8, 0]);
+        out.extend_from_slice(&packs.to_be_bytes());
+        for (i, id) in chunks.iter().enumerate() {
+            out.extend_from_slice(&id[..]);
+            let at = if i == 0 { pnam_at } else { oidf_at + (i - 1) * 1024 };
+            out.extend_from_slice(&(at as u64).to_be_bytes());
+        }
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&(0u64).to_be_bytes());
+        out.resize(oidf_at, 0);
+        // 256 fanout buckets; only the last one is read.
+        for _ in 0..255 {
+            out.extend_from_slice(&objects.to_be_bytes());
+        }
+        out.extend_from_slice(&objects.to_be_bytes());
+        out
+    }
+
+    fn write_pack_file(repo: &Path, name: &str, bytes: &[u8]) {
+        let pack = repo.join(".git/objects/pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join(name), bytes).unwrap();
+    }
+
+    /// The `multi-pack-index write --bitmap` blind spot: a midx that covers
+    /// different packs, or different objects, or that was written without its
+    /// bitmap chunk, must not compare equal to one that was not.
+    #[test]
+    fn pack_headers_read_the_midx_beyond_its_name() {
+        let a = scratch("pack-headers-midx-a");
+        write_pack_file(&a, "multi-pack-index", &midx_bytes(2, 9, true));
+        let probe = probe_pack_headers(&a);
+        assert!(
+            probe.contains("multi-pack-index: MIDX v1 hash=1 base=0 packs=2 chunks=[PNAM,OIDF,BTMP] objects=9"),
+            "got:\n{probe}"
+        );
+
+        // One pack instead of two: same filename, same length class, different
+        // repository.
+        let b = scratch("pack-headers-midx-b");
+        write_pack_file(&b, "multi-pack-index", &midx_bytes(1, 9, true));
+        assert_ne!(probe_pack_headers(&a), probe_pack_headers(&b));
+
+        // Same packs, different object coverage.
+        let c = scratch("pack-headers-midx-c");
+        write_pack_file(&c, "multi-pack-index", &midx_bytes(2, 8, true));
+        assert_ne!(probe_pack_headers(&a), probe_pack_headers(&c));
+
+        // Written without `--bitmap`: the chunk list is the difference.
+        let d = scratch("pack-headers-midx-d");
+        write_pack_file(&d, "multi-pack-index", &midx_bytes(2, 9, false));
+        assert_ne!(probe_pack_headers(&a), probe_pack_headers(&d));
+    }
+
+    /// A bitmap is measured by what it covers, and its checksum-bearing name is
+    /// elided the way `probe_storage` elides every other name in that directory.
+    #[test]
+    fn pack_headers_read_the_bitmap_beyond_its_name() {
+        let bitmap = |entries: u32| {
+            let mut out = b"BITM".to_vec();
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&5u16.to_be_bytes());
+            out.extend_from_slice(&entries.to_be_bytes());
+            out.extend_from_slice(&[0xab; 20]);
+            out
+        };
+        let a = scratch("pack-headers-bitmap-a");
+        write_pack_file(
+            &a,
+            "pack-7d1e44081191d78cb9d33f3985bdace415d89e77.bitmap",
+            &bitmap(3),
+        );
+        let probe = probe_pack_headers(&a);
+        assert!(
+            probe.contains("pack-<hash>.bitmap: BITM v1 flags=5 entries=3"),
+            "got:\n{probe}"
+        );
+
+        // A different pack checksum is not a difference — the port cannot
+        // reproduce git's pack bytes, and `probe_storage` says so.
+        let b = scratch("pack-headers-bitmap-b");
+        write_pack_file(
+            &b,
+            "pack-0000000000000000000000000000000000000000.bitmap",
+            &bitmap(3),
+        );
+        assert_eq!(probe_pack_headers(&a), probe_pack_headers(&b));
+
+        // A different object coverage is.
+        let c = scratch("pack-headers-bitmap-c");
+        write_pack_file(
+            &c,
+            "pack-7d1e44081191d78cb9d33f3985bdace415d89e77.bitmap",
+            &bitmap(2),
+        );
+        assert_ne!(probe_pack_headers(&a), probe_pack_headers(&c));
+
+        // A repository with neither file reports the section and nothing else,
+        // on both sides.
+        let empty = scratch("pack-headers-empty");
+        assert_eq!(probe_pack_headers(&empty), "# pack-headers\n");
+    }
+
+    /// The blind spot itself: `checkout --ours` and `checkout --theirs` leave the
+    /// same `status --porcelain` and the same `ls-files --stage`, and differ only
+    /// in the bytes on disk.
+    #[test]
+    fn worktree_content_separates_ours_from_theirs() {
+        let ours = scratch("worktree-ours");
+        let theirs = scratch("worktree-theirs");
+        let diff3 = scratch("worktree-diff3");
+        std::fs::write(ours.join("conflict.txt"), b"ours\n").unwrap();
+        std::fs::write(theirs.join("conflict.txt"), b"theirs\n").unwrap();
+        // And a third marker style over the same unmerged path.
+        std::fs::write(
+            diff3.join("conflict.txt"),
+            b"<<<<<<< ours\nours\n||||||| base\nbase\n=======\ntheirs\n>>>>>>> theirs\n",
+        )
+        .unwrap();
+
+        assert_ne!(probe_worktree_content(&ours), probe_worktree_content(&theirs));
+        assert_ne!(probe_worktree_content(&ours), probe_worktree_content(&diff3));
+        assert_ne!(probe_worktree_content(&theirs), probe_worktree_content(&diff3));
+
+        // One fact per line, contents escaped: `report.rs` pairs the two digests
+        // by line position, so a conflict marker's own newlines must not shift
+        // every following fact.
+        let probe = probe_worktree_content(&diff3);
+        assert_eq!(
+            probe.lines().filter(|l| l.starts_with("conflict.txt")).count(),
+            1,
+            "the whole file is one fact on one line:\n{probe}"
+        );
+        assert!(probe.contains("conflict.txt -: <<<<<<< ours\\nours\\n"), "got:\n{probe}");
+    }
+
+    /// The walk stops at a git directory — the fixture's bare peer, a clone
+    /// target — but still reports that one is there.
+    #[test]
+    fn worktree_content_does_not_walk_into_repositories() {
+        let repo = scratch("worktree-nested");
+        let peer = repo.join(".remote.git");
+        std::fs::create_dir_all(peer.join("objects")).unwrap();
+        std::fs::create_dir_all(peer.join("refs")).unwrap();
+        std::fs::write(peer.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(peer.join("secret"), b"not compared here\n").unwrap();
+        // The main git directory is not worktree content either.
+        std::fs::write(repo.join(".git/COMMIT_EDITMSG"), b"scratch\n").unwrap();
+        std::fs::write(repo.join("tracked.txt"), b"content\n").unwrap();
+
+        let probe = probe_worktree_content(&repo);
+        assert!(probe.contains(".remote.git -: <repository>"), "got:\n{probe}");
+        assert!(probe.contains(".git -: <git directory>"), "got:\n{probe}");
+        assert!(!probe.contains("not compared here"), "walked into the peer:\n{probe}");
+        assert!(!probe.contains("scratch"), "walked into the git directory:\n{probe}");
+        assert!(probe.contains("tracked.txt -: content\\n"), "got:\n{probe}");
+    }
+
+    /// Binary is compared by length, text by bytes — the same relaxation
+    /// `probe_storage` makes, because a pack written into the worktree is not
+    /// reproducible byte for byte.
+    #[test]
+    fn worktree_content_compares_binary_by_length_only() {
+        let a = scratch("worktree-binary-a");
+        let b = scratch("worktree-binary-b");
+        std::fs::write(a.join("out.pack"), [0xffu8, 0x00, 0xfe, 0x01]).unwrap();
+        std::fs::write(b.join("out.pack"), [0x00u8, 0xff, 0x01, 0xfe]).unwrap();
+        assert_eq!(probe_worktree_content(&a), probe_worktree_content(&b));
+        assert!(probe_worktree_content(&a).contains("out.pack -: <binary 4 bytes>"));
+
+        // A different length is still a difference.
+        let c = scratch("worktree-binary-c");
+        std::fs::write(c.join("out.pack"), [0xffu8, 0x00, 0xfe]).unwrap();
+        assert_ne!(probe_worktree_content(&a), probe_worktree_content(&c));
+    }
+
+    /// A symlink is reported by its target and never followed: `Shape::Symlinks`
+    /// carries one that points out of the fixture on purpose.
+    #[test]
+    fn worktree_content_reads_symlinks_without_following_them() {
+        let repo = scratch("worktree-symlink");
+        std::fs::write(repo.join("real.txt"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.txt", repo.join("link")).unwrap();
+        let probe = probe_worktree_content(&repo);
+        assert!(probe.contains("link -: <symlink -> real.txt>"), "got:\n{probe}");
+
+        // Retargeted: the same file on the other end, a different fact.
+        let other = scratch("worktree-symlink-other");
+        std::fs::write(other.join("real.txt"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("../outside.txt", other.join("link")).unwrap();
+        assert_ne!(probe, probe_worktree_content(&other));
+    }
+
+    /// A checkout that loses the executable bit is a difference, and the rest of
+    /// the mode — umask-derived — is not compared.
+    #[test]
+    fn worktree_content_reports_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let plain = scratch("worktree-mode-plain");
+        let exec = scratch("worktree-mode-exec");
+        for repo in [&plain, &exec] {
+            std::fs::write(repo.join("run.sh"), b"#!/bin/sh\n").unwrap();
+        }
+        std::fs::set_permissions(exec.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(probe_worktree_content(&plain).contains("run.sh -: "));
+        assert!(probe_worktree_content(&exec).contains("run.sh x: "));
+        assert_ne!(probe_worktree_content(&plain), probe_worktree_content(&exec));
+    }
+
+    /// A checksum- or pid-named file left in the working directory is machine
+    /// noise in its *name* only; the elision is `probe_storage`'s, so the fact
+    /// that a file was left behind survives.
+    #[test]
+    fn worktree_content_elides_unreproducible_names() {
+        let a = scratch("worktree-name-a");
+        let b = scratch("worktree-name-b");
+        std::fs::write(a.join("pack-7d1e44081191d78cb9d33f3985bdace415d89e77.pack"), b"x\n")
+            .unwrap();
+        std::fs::write(b.join("pack-0000000000000000000000000000000000000000.pack"), b"x\n")
+            .unwrap();
+        assert_eq!(probe_worktree_content(&a), probe_worktree_content(&b));
+        assert!(probe_worktree_content(&a).contains("pack-<hash>.pack -: x\\n"));
+
+        // A repository that left nothing behind still differs from one that did.
+        let empty = scratch("worktree-name-empty");
+        assert_ne!(probe_worktree_content(&a), probe_worktree_content(&empty));
+    }
+
+    /// Every shape without a peer says so in one line, so the two digests line up
+    /// positionally and the gate costs three `stat`s.
+    #[test]
+    fn peer_reports_absence_where_there_is_none() {
+        let repo = scratch("peer-absent");
+        assert_eq!(probe_peer(&repo, &repo), "# peer .remote.git\n<absent>\n");
+
+        // A `.remote.git` that is not a repository is a different fact again —
+        // a case that replaced the peer with a file has not left the fixture
+        // as it found it.
+        let odd = scratch("peer-not-a-repo");
+        std::fs::write(odd.join(".remote.git"), b"not a repository\n").unwrap();
+        assert_eq!(probe_peer(&odd, &odd), "# peer .remote.git\n<not a repository>\n");
+    }
+
+    /// The `send-pack` blind spot: a peer whose ref moved must not compare equal
+    /// to a peer whose ref did not, and a ref that moved *without its object*
+    /// must not compare equal to one that arrived whole.
+    ///
+    /// Built with stock git, because that is what the probe runs; this crate
+    /// cannot measure anything at all without one.
+    #[test]
+    fn peer_sees_what_arrived_on_the_other_side() {
+        let stock = crate::stock::git().expect("this crate needs a stock git to measure anything");
+        let build = |tag: &str, body: &str, point_at_ref: bool| -> (PathBuf, String) {
+            let repo = scratch(tag);
+            let peer = repo.join(".remote.git");
+            let run = |args: &[&str]| {
+                let mut cmd = Command::new(stock);
+                crate::env::harden(&mut cmd, &repo);
+                let out = cmd.current_dir(&peer).args(args).output().expect("stock git runs");
+                assert!(
+                    out.status.success(),
+                    "stock git {args:?} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let mut init = Command::new(stock);
+            crate::env::harden(&mut init, &repo);
+            init.current_dir(&repo)
+                .args(["init", "-q", "--bare", ".remote.git"])
+                .status()
+                .expect("stock git runs");
+            let oid = {
+                let mut cmd = Command::new(stock);
+                crate::env::harden(&mut cmd, &repo);
+                let out = cmd
+                    .current_dir(&peer)
+                    .args(["hash-object", "-w", "-t", "blob", "--stdin"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .and_then(|mut c| {
+                        use std::io::Write;
+                        c.stdin.take().unwrap().write_all(body.as_bytes())?;
+                        c.wait_with_output()
+                    })
+                    .expect("stock git runs");
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            if point_at_ref {
+                // A tag rather than a branch: `update-ref` refuses to point a
+                // branch at anything that is not a commit, and what this test
+                // needs is a ref that arrived, not a history.
+                run(&["update-ref", "refs/tags/arrived", &oid]);
+            }
+            (repo, oid)
+        };
+
+        // Nothing pushed: the objects are there, no ref names them.
+        let (quiet, _) = build("peer-quiet", "payload\n", false);
+        // The push landed.
+        let (pushed, _) = build("peer-pushed", "payload\n", true);
+        // The push landed something else.
+        let (other, _) = build("peer-other", "different payload\n", true);
+
+        let quiet_digest = probe_peer(&quiet, &quiet);
+        let pushed_digest = probe_peer(&pushed, &pushed);
+        assert_ne!(
+            quiet_digest, pushed_digest,
+            "a ref that arrived on the peer must be visible:\n{pushed_digest}"
+        );
+        assert_ne!(
+            pushed_digest,
+            probe_peer(&other, &other),
+            "a peer holding different bytes must not match"
+        );
+        assert!(
+            pushed_digest.contains("refs/tags/arrived blob "),
+            "the peer's refs are read with stock git:\n{pushed_digest}"
+        );
+        assert!(
+            pushed_digest.contains("HEAD: ref: refs/heads/"),
+            "the peer's HEAD is read from the filesystem:\n{pushed_digest}"
+        );
+        // The object census is taken of the peer's own store, so a push that
+        // wrote a ref and no object is not the same fact as one that wrote both.
+        assert!(pushed_digest.contains("## storage\nloose 1\n"), "got:\n{pushed_digest}");
+    }
+
+    /// A v2/v3 index laid out the way git lays one out: 12-byte header, entries
+    /// of 62 fixed bytes plus a NUL-terminated name padded to a multiple of
+    /// eight, then `(signature, length, data)` triples, then the checksum.
+    ///
+    /// The parser is pinned against real stock 2.55.0 indexes in its doc
+    /// comment (`v2 entries=1 ext=[TREE:6,REUC:87]`, `v3 entries=31
+    /// ext=[TREE:6,UNTR:396]`, `v4 … ext=<unparsed>`); this builds the same
+    /// shape so the extensions can be moved one at a time.
+    fn index_bytes(version: u32, names: &[&str], exts: &[(&str, usize)]) -> Vec<u8> {
+        let mut out = b"DIRC".to_vec();
+        out.extend_from_slice(&version.to_be_bytes());
+        out.extend_from_slice(&(names.len() as u32).to_be_bytes());
+        for name in names {
+            let start = out.len();
+            out.extend_from_slice(&[0x11; 60]); // times, dev, ino, mode, uid, gid, size, oid
+            out.extend_from_slice(&(name.len() as u16).to_be_bytes()); // flags
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            while (out.len() - start) % 8 != 0 {
+                out.push(0);
+            }
+        }
+        for (sig, len) in exts {
+            out.extend_from_slice(sig.as_bytes());
+            out.extend_from_slice(&(*len as u32).to_be_bytes());
+            out.extend(std::iter::repeat(0xab).take(*len));
+        }
+        out.extend_from_slice(&[0xcd; 20]); // trailing checksum
+        out
+    }
+
+    /// The index's own shape — version and extension chain — is compared, and a
+    /// dropped `TREE` or `REUC` is a difference `ls-files --stage` cannot show.
+    #[test]
+    fn index_meta_reads_the_extension_chain() {
+        let full = scratch("index-meta-full");
+        std::fs::write(
+            full.join(".git/index"),
+            index_bytes(2, &["a.txt"], &[("TREE", 6), ("REUC", 87)]),
+        )
+        .unwrap();
+        assert_eq!(
+            probe_index_meta(&full),
+            "# index-meta\nindex: v2 entries=1 ext=[TREE:6,REUC:87]\n"
+        );
+
+        // The cache-tree destroyed: the defect this harness has already had once,
+        // found by hand because no probe asked.
+        let no_tree = scratch("index-meta-no-tree");
+        std::fs::write(no_tree.join(".git/index"), index_bytes(2, &["a.txt"], &[("REUC", 87)]))
+            .unwrap();
+        assert_ne!(probe_index_meta(&full), probe_index_meta(&no_tree));
+
+        // The resolve-undo record dropped: `checkout -m` silently stops working.
+        let no_reuc = scratch("index-meta-no-reuc");
+        std::fs::write(no_reuc.join(".git/index"), index_bytes(2, &["a.txt"], &[("TREE", 6)]))
+            .unwrap();
+        assert_ne!(probe_index_meta(&full), probe_index_meta(&no_reuc));
+
+        // A cache-tree that covers less is a smaller cache-tree.
+        let short_tree = scratch("index-meta-short-tree");
+        std::fs::write(
+            short_tree.join(".git/index"),
+            index_bytes(2, &["a.txt"], &[("TREE", 3), ("REUC", 87)]),
+        )
+        .unwrap();
+        assert_ne!(probe_index_meta(&full), probe_index_meta(&short_tree));
+
+        // The on-disk version is a fact in its own right.
+        let v3 = scratch("index-meta-v3");
+        std::fs::write(
+            v3.join(".git/index"),
+            index_bytes(3, &["a.txt"], &[("TREE", 6), ("REUC", 87)]),
+        )
+        .unwrap();
+        assert_ne!(probe_index_meta(&full), probe_index_meta(&v3));
+    }
+
+    /// What the parser refuses to guess at, it says so about — symmetrically, so
+    /// an unparsed chain reports no difference where there is none.
+    #[test]
+    fn index_meta_reports_what_it_cannot_parse() {
+        // v4 names are prefix-compressed; version and entry count still count.
+        let v4 = scratch("index-meta-v4");
+        std::fs::write(v4.join(".git/index"), index_bytes(4, &["a.txt"], &[("TREE", 6)])).unwrap();
+        assert_eq!(probe_index_meta(&v4), "# index-meta\nindex: v4 entries=1 ext=<unparsed>\n");
+
+        // Truncated, corrupt, and absent are three different facts.
+        let corrupt = scratch("index-meta-corrupt");
+        std::fs::write(corrupt.join(".git/index"), vec![0x00; 64]).unwrap();
+        assert!(probe_index_meta(&corrupt).contains("index: <not-an-index 64 bytes>"));
+
+        let absent = scratch("index-meta-absent");
+        assert_eq!(probe_index_meta(&absent), "# index-meta\nindex: <absent>\n");
+    }
+
+    /// A split index and a linked worktree's index are indexes too, and the
+    /// shared half's checksum-bearing name is elided like every other one.
+    #[test]
+    fn index_meta_covers_shared_and_linked_indexes() {
+        let repo = scratch("index-meta-split");
+        std::fs::write(repo.join(".git/index"), index_bytes(2, &["a.txt"], &[("link", 24)]))
+            .unwrap();
+        std::fs::write(
+            repo.join(".git/sharedindex.7d1e44081191d78cb9d33f3985bdace415d89e77"),
+            index_bytes(2, &["a.txt", "b.txt"], &[("TREE", 6)]),
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(
+            repo.join(".git/worktrees/wt/index"),
+            index_bytes(2, &["a.txt"], &[("TREE", 6)]),
+        )
+        .unwrap();
+
+        let probe = probe_index_meta(&repo);
+        assert!(probe.contains("index: v2 entries=1 ext=[link:24]"), "got:\n{probe}");
+        assert!(
+            probe.contains("sharedindex.<hash>: v2 entries=2 ext=[TREE:6]"),
+            "got:\n{probe}"
+        );
+        assert!(
+            probe.contains("worktrees/wt/index: v2 entries=1 ext=[TREE:6]"),
+            "got:\n{probe}"
+        );
+    }
+
+    /// `fetch <remote> <ref>` updates no branch: `FETCH_HEAD` is its whole
+    /// result, and it is one line so a multi-ref fetch cannot shift the digest.
+    #[test]
+    fn fetch_head_is_measured_as_one_line() {
+        let none = scratch("fetch-head-absent");
+        assert_eq!(probe_fetch_head(&none), "# fetch-head\nFETCH_HEAD: <absent>\n");
+
+        let fetched = scratch("fetch-head-written");
+        std::fs::write(
+            fetched.join(".git/FETCH_HEAD"),
+            b"b015a4d60ee11600ec4c9413e74ce42c7a9593d3\t\tbranch 'main' of ./.remote\n",
+        )
+        .unwrap();
+        assert_eq!(
+            probe_fetch_head(&fetched),
+            "# fetch-head\nFETCH_HEAD: b015a4d60ee11600ec4c9413e74ce42c7a9593d3\t\tbranch 'main' of ./.remote\\n\n"
+        );
+
+        // `--no-write-fetch-head` against the default, and a fetch that recorded
+        // the wrong ref: neither moves any other surface.
+        assert_ne!(probe_fetch_head(&none), probe_fetch_head(&fetched));
+        let other = scratch("fetch-head-other");
+        std::fs::write(
+            other.join(".git/FETCH_HEAD"),
+            b"b015a4d60ee11600ec4c9413e74ce42c7a9593d3\tnot-for-merge\tbranch 'main' of ./.remote\n",
+        )
+        .unwrap();
+        assert_ne!(probe_fetch_head(&fetched), probe_fetch_head(&other));
+
+        // A two-ref fetch is still one line.
+        let many = scratch("fetch-head-many");
+        std::fs::write(
+            many.join(".git/FETCH_HEAD"),
+            b"aaa\t\tbranch 'main' of ./.remote\nbbb\tnot-for-merge\tbranch 'div' of ./.remote\n",
+        )
+        .unwrap();
+        assert_eq!(probe_fetch_head(&many).lines().count(), 2);
+    }
+
+    /// The hole under every comparison in this crate: `String::from_utf8_lossy`
+    /// maps every invalid byte to U+FFFD, so two different binary streams
+    /// compared equal. `pack-objects --stdout`, `bundle create -` and `archive`
+    /// are all compared through this function.
+    #[test]
+    fn two_different_binary_streams_do_not_normalize_to_one_string() {
+        let root = scratch("normalize-binary");
+        let a = [0x1fu8, 0x8b, 0xc0, 0x80, 0x41];
+        let b = [0x1fu8, 0x8b, 0xc1, 0x80, 0x41];
+        assert_eq!(
+            String::from_utf8_lossy(&a),
+            String::from_utf8_lossy(&b),
+            "the premise: a lossy decode collapses these two"
+        );
+        let n = |raw: &[u8]| super::normalize(raw, &root, &root, Path::new(""));
+        assert_ne!(n(&a), n(&b), "the two streams must not compare equal");
+        assert!(n(&a).contains("<non-utf8 stream: 5 bytes>"), "got:\n{}", n(&a));
+        // Exact, not hashed: the rendering names the bytes that moved.
+        assert!(n(&a).contains("1f8bc08041"), "got:\n{}", n(&a));
+        // And a stream that really is the same still matches.
+        assert_eq!(n(&a), n(&[0x1fu8, 0x8b, 0xc0, 0x80, 0x41]));
+    }
+
+    /// Text is unaffected: the byte substitution masks exactly what the string
+    /// substitution masked, so nothing that was compared before is compared
+    /// differently now.
+    #[test]
+    fn text_normalization_is_unchanged_by_the_byte_level_masking() {
+        let repo = scratch("normalize-text");
+        let home = scratch("normalize-home");
+        let raw = format!(
+            "fatal: could not read {}/.git/HEAD\nhint: see {}/.gitconfig\n",
+            repo.display(),
+            home.display()
+        );
+        let out = super::normalize(raw.as_bytes(), &repo, &home, Path::new(""));
+        assert_eq!(out, "fatal: could not read <REPO>/.git/HEAD\nhint: see <HOME>/.gitconfig\n");
+
+        // An empty exec-path masks nothing rather than everything.
+        assert_eq!(super::normalize(b"plain\n", &repo, &home, Path::new("")), "plain\n");
+    }
+
+    /// A path inside a binary stream is masked too — the two sides run at
+    /// different roots, and a pack that embeds one would otherwise differ for a
+    /// reason that is not a defect.
+    #[test]
+    fn a_path_inside_a_binary_stream_is_still_masked() {
+        let repo = scratch("normalize-binary-path");
+        let mut raw = vec![0x00u8, 0xff];
+        raw.extend_from_slice(repo.to_string_lossy().as_bytes());
+        raw.extend_from_slice(&[0xfe, 0x00]);
+        let out = super::normalize(&raw, &repo, &repo, Path::new(""));
+        // `<REPO>` in hex, between the two invalid bytes it sat between.
+        let masked: String = "<REPO>".bytes().map(|b| format!("{b:02x}")).collect();
+        assert!(out.contains(&format!("00ff{masked}fe00")), "got:\n{out}");
     }
 
     /// A gap is only a gap when the port says so in its own voice.

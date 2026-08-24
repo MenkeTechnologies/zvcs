@@ -1083,23 +1083,6 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
     for remote in repo.remote_names() {
         let remote = remote.to_str_lossy();
         let full = format!("refs/remotes/{remote}/{name}");
-<<<<<<< Updated upstream
-        // A name git's own DWIM would simply not find is not an error here.
-        // `refs/remotes/<remote>/Cargo.lock` is REJECTED BY REF VALIDATION
-        // rather than merely absent — a ref may not end in `.lock`, since that
-        // is the suffix of its own lock file — and propagating that turned
-        // `git checkout Cargo.lock` in any repo with a remote configured into
-        //
-        //     error: The ref name or path is not a valid ref name:
-        //            Reference name cannot end with '.lock'
-        //
-        // for a path that is right there in the index. `unique_tracking_name()`
-        // (builtin/checkout.c) asks `dwim_ref()`, which answers "no match" for
-        // a name it cannot parse, and checkout then treats the argument as the
-        // pathspec it is. Every Rust project has a `Cargo.lock`; this fired on
-        // all of them, and only when a remote existed to look under.
-        if repo.try_find_reference(full.as_str()).ok().flatten().is_some() {
-=======
         // See the identical guard in `checkout::unique_remote_branch`: a name git
         // could never have made a ref under is not a ref and not an error, and
         // gix reports that rejection as an `Err` which must not propagate.
@@ -1109,7 +1092,6 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
             continue;
         }
         if repo.try_find_reference(full.as_str())?.is_some() {
->>>>>>> Stashed changes
             matches.push(remote.into_owned());
         }
     }

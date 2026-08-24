@@ -1877,43 +1877,28 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
     for remote in repo.remote_names() {
         let remote = remote.to_str_lossy();
         let full = format!("refs/remotes/{remote}/{name}");
-<<<<<<< Updated upstream
-        // A name git's own DWIM would simply not find is not an error here.
-        // `refs/remotes/<remote>/Cargo.lock` is REJECTED BY REF VALIDATION
-        // rather than merely absent — a ref may not end in `.lock`, since that
-        // is the suffix of its own lock file — and propagating that turned
-        // `git checkout Cargo.lock` in any repo with a remote configured into
-        //
-        //     error: The ref name or path is not a valid ref name:
-        //            Reference name cannot end with '.lock'
-        //
-        // for a path that is right there in the index. `unique_tracking_name()`
-        // (builtin/checkout.c) asks `dwim_ref()`, which answers "no match" for
-        // a name it cannot parse, and checkout then treats the argument as the
-        // pathspec it is. Every Rust project has a `Cargo.lock`; this fired on
-        // all of them, and only when a remote existed to look under.
-        if repo.try_find_reference(full.as_str()).ok().flatten().is_some() {
-=======
-        // A name git could never have created a ref under is not a ref, and not
-        // an error either: `check_refname_format()` rejects it, the DWIM lookup
-        // finds nothing, and `git checkout <arg>` falls through to reading the
-        // argument as a path. gix reports that same rejection from
+        // A name git could never have made a ref under is not a ref, and not an
+        // error either: `check_refname_format()` rejects it, `dwim_ref()` — which
+        // `unique_tracking_name()` (builtin/checkout.c) asks — answers "no match"
+        // for a name it cannot parse, and checkout falls through to reading the
+        // argument as the pathspec it is. gix reports that same rejection from
         // `try_find_reference` as an `Err`, so propagating it turned every
         // argument ending in `.lock` into
         //
         //     fatal: … The ref name or path is not a valid ref name:
         //            Reference name cannot end with '.lock'
         //
-        // in any repository with a remote configured — `git checkout Cargo.lock`
-        // in every Rust repository there is. With no remote the loop body never
-        // ran, which is why it looked like a submodule or packed-refs problem.
-        // The same reasoning already guards the sibling lookup above, whose
-        // comment notes that `HEAD~3` is not a valid ref *name*.
+        // for a path that is right there in the index — `git checkout Cargo.lock`
+        // in every Rust repository there is, and only when a remote existed to
+        // look under. With no remote the loop body never ran, which is why it
+        // looked like a submodule or packed-refs problem. The same reasoning
+        // already guards the sibling lookup above, whose comment notes that
+        // `HEAD~3` is not a valid ref *name*. Only the validation failure is
+        // swallowed; a real lookup error still propagates.
         if gix::validate::reference::name(BStr::new(full.as_bytes())).is_err() {
             continue;
         }
         if repo.try_find_reference(full.as_str())?.is_some() {
->>>>>>> Stashed changes
             matches.push(remote.into_owned());
         }
     }

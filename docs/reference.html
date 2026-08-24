@@ -57,7 +57,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">zvcs v0.21.0 · 118 superset verbs · generated from <code>src/extensions/src/superset/manpage.rs</code>, the same table <code>git help &lt;verb&gt;</code> renders</p>
+          <p class="docs-build-line">zvcs v0.21.0 · 119 superset verbs · generated from <code>src/extensions/src/superset/manpage.rs</code>, the same table <code>git help &lt;verb&gt;</code> renders</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -79,7 +79,7 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>SUPERSET VERBS</h2>
-      <p class="tutorial-subtitle">The 118 <code>z*</code> verbs — the coordination layer stock git has no equivalent for. Every entry is the verb's man page: <code>git help &lt;verb&gt;</code> shows the same text in a terminal.</p>
+      <p class="tutorial-subtitle">The 119 <code>z*</code> verbs — the coordination layer stock git has no equivalent for. Every entry is the verb's man page: <code>git help &lt;verb&gt;</code> shows the same text in a terminal.</p>
 
       <section class="tutorial-section" id="verb-index">
         <h2>Index</h2>
@@ -178,6 +178,7 @@
         <li><a href="#ztop">ztop</a> <span class="verb-summary">live htop-style fleet monitor, most churn on top</span></li>
         <li><a href="#zevents">zevents</a> <span class="verb-summary">one live feed of commits/reconciles/status-changes across the tree</span></li>
         <li><a href="#ztail">ztail</a> <span class="verb-summary">alias of git zevents</span></li>
+        <li><a href="#znative">znative</a> <span class="verb-summary">the plugin package manager: install and load native and script plugins</span></li>
         <li><a href="#zintercept">zintercept</a> <span class="verb-summary">AOP hooks that run advice around matching git commands</span></li>
         <li><a href="#zcommands">zcommands</a> <span class="verb-summary">live feed of every git command run across the fleet</span></li>
         <li><a href="#zaudit">zaudit</a> <span class="verb-summary">queryable audit trail over the fleet command log</span></li>
@@ -358,6 +359,7 @@
         <pre class="doc-synopsis"><code>git zworktree &lt;add &lt;name&gt;|list|remove &lt;name&gt;&gt;</code></pre>
         <p>add &lt;name&gt; provisions a complete, object-sharing, isolated worktree of the repository plus all nested submodules (each on a zwt/&lt;name&gt; branch) at ~/.zvcs/worktrees/&lt;name&gt;/, so each agent gets a private tree that cannot collide with any other — no re-clone.</p>
         <p>list and remove &lt;name&gt; manage them.</p>
+        <p>remove tears down the worktree tree and, in each repository, the linked-worktree metadata it provisioned — identified by the round trip between the worktree's .git pointer and that metadata's own gitdir file. A pointer that is unreadable, malformed, symlinked, or names anything else is refused by name on stderr and left on disk, and the command exits non-zero rather than deleting a path it cannot prove it wrote.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>
       <article class="doc-entry" id="zstash">
@@ -809,6 +811,15 @@
         <h3><span class="doc-sigil">git</span> ztail <span class="doc-summary">alias of git zevents</span></h3>
         <pre class="doc-synopsis"><code>git ztail [-n &lt;count&gt;] [--kind commit|stage|status|reconcile] [--repo &lt;substr&gt;] [--json] [--no-follow]</code></pre>
         <p>An alias for <code>git zevents</code> — the single live feed of commits, reconciles, and status-changes across the whole indexed tree. See <code>git help zevents</code> for the full description.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="znative">
+        <h3><span class="doc-sigil">git</span> znative <span class="doc-summary">the plugin package manager: install and load native and script plugins</span></h3>
+        <pre class="doc-synopsis"><code>git znative load|add|remove|list|info|update|gc|clean [SOURCE|NAME]</code></pre>
+        <p>Installs plugins that extend this binary with new subcommands, from one content-addressed global store under $ZVCS_HOME/pkg. Two kinds are served from that one store: a *native* plugin is a Rust cdylib compiled against the <code>znative</code> C ABI and loaded with dlopen, and a *script* plugin is a repository of <code>git-&lt;verb&gt;</code> executables. Ported from the zshrs package manager of the same name.</p>
+        <p>A source is <code>owner/repo</code>, <code>github:owner/repo</code>, <code>git+URL</code>, or a local <code>path:DIR</code>; any remote form may carry an <code>@ref</code> suffix to pin a tag, branch or commit (<code>owner/repo@v1.2.0</code>), and the pin is recorded so <code>update</code> re-fetches that exact ref. <code>add</code> resolves the source, builds the cdylib when the plugin ships source, copies the loadable subset into <code>store/&lt;name&gt;@&lt;version&gt;/</code>, SHA-256 pins it, and records what it provides in <code>installed.toml</code>. <code>load</code> is the idempotent form for a bootstrap script: it installs a source that is not in the store yet and otherwise just re-verifies, with no network.</p>
+        <p>A native plugin's verbs are discovered by loading it at install time, never declared: whatever it registers through the ABI is what gets recorded. A plugin may also *override* an existing verb, in which case its handler runs in place of the built-in one and calls back through the host to run the original. <code>git znative</code> itself can never be overridden, so a bad plugin cannot lock you out of removing it.</p>
+        <p>Nothing is loaded until a verb proves to belong to a plugin. The index's two derived tables, verbs.tsv and overrides.tsv, answer that question, and are deleted rather than written empty when there is nothing in them — so a machine with no plugin installed pays two failed stats per command and never opens a file. <code>list</code>, <code>info</code> and <code>remove</code> manage what is installed; <code>gc</code> reclaims store directories left by old versions plus the clone cache, and <code>clean</code> clears the scratch directories.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>
       <article class="doc-entry" id="zintercept">

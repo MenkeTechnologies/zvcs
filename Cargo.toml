@@ -3,5 +3,8 @@
 #   src/extensions : the zvcs superset — the single `git` shadow binary + coordination layer
 [workspace]
 resolver = "2"
-members = ["src/extensions", "src/parity"]
-exclude = ["src/ported"]
+members = ["src/extensions", "src/parity", "src/plugin"]
+# src/ported has its own workspace; examples/ holds standalone plugin crates that
+# the package manager builds on install (`git znative add path:examples/…`), not
+# members of this build.
+exclude = ["src/ported", "examples"]

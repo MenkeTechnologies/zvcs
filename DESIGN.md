@@ -507,6 +507,8 @@ commits/pushes that should not block.
 | `git zjobs` / `git zjob <id>[ stop\|restart]` | 2 | read/ctl | job ledger status & control |
 | `git zrepos` / `git zreindex [path]` | 2 | read/ctl | indexed-repo listing & rescan |
 | `git zrepl` | 2 | interactive | line REPL into the live daemon |
+| `git znative add\|load\|remove\|list\|info\|update\|gc` | 2 | read/ctl | the plugin package manager (§18) — install native (cdylib) and script (`git-<verb>`) plugins into one content-addressed store |
+| `git <plugin verb>` | plugin | sync | a verb an installed plugin provides, served from the `dlopen`ed library or the stored executable |
 
 ## 9. Design principles / non-goals
 
@@ -543,6 +545,7 @@ commits/pushes that should not block.
 | Filesystem hooks across all indexed repos (`hooks.rs`, `watch.rs`, `zvcs.hook`) | built |
 | `zcommit`/`zpush` async via daemon `SUBMIT` (`queue.rs`, `jobrun.rs`) | built |
 | `zjobs`/`zjob` + `zrepl` (`ledger.rs`, `repl.rs`) | built |
+| Plugin system: C ABI + `dlopen` host + package manager (`src/plugin`, `plugin_host.rs`, `pkg/`) | built |
 
 **Resolved partials** (all landed with tests):
 - **`zpush` pre-flight is a live `ls-refs`** (`queue.rs`) — one ref advertisement
@@ -870,3 +873,70 @@ streams and `jq -s` slurps to an array. A shared `json_flag`/`emit_json` helper
 (`query.rs`) strips the flag before selector parsing and prints uniformly; the
 integration test `tests/json_output.rs` runs the real binary and parses every
 verb's `--json` output, so the guarantee can't drift.
+
+## 18. The plugin system (`znative`)
+
+Ported from zshrs, which generalised zsh's `Src/module.c` — `dlopen`ing C
+modules that call `addbuiltin` against the shell's own symbols — into a stable,
+versioned C ABI so third parties ship a compiled `cdylib` and load it at
+runtime. Here the same machinery is retargeted from shell builtins to git
+subcommands: `git znative` installs plugins, and dispatch serves their verbs
+from a `dlopen`ed library rather than forking a `git-<verb>` script off `PATH`.
+
+**Three parts.**
+
+- **`src/plugin`** (crate `zvcs-native`, lib `znative`) — the ABI. `#[repr(C)]`
+  structs and `extern "C"` function pointers, no dependencies, compiled into
+  both the host and every plugin so the two agree on the exact layout. A
+  `declare_plugin!` macro emits the one exported symbol (`zvcs_native_init`) and
+  the trampolines that adapt each C-ABI handler to `fn(&Host, &Args) -> c_int`.
+  The zshrs table's shell entries map to VCS ones: `register_builtin` →
+  `register_verb`, `eval` → `run` (a subcommand run in-process, no fork),
+  `getvar`/`setvar` → `config_get`/`config_set`, the structured
+  `getfunction`/`addfunction` pair → `object_read`/`object_write`, and the
+  compsys-function override (`register_compfn` + `comp_dispatch`) →
+  `register_override` + `dispatch_verb`. `repo_info` and `resolve_rev` have no
+  shell analogue and are new.
+- **`plugin_host.rs`** — the runtime. `dlopen`, the magic + `ABI_VERSION` gate,
+  the staging buffers that tag a plugin's registrations with its name once
+  `init` returns it, the verb and override registries, and `unload`, which
+  purges the registries *before* the `dlclose` so no live function pointer
+  survives it.
+- **`pkg/`** — the package manager: `manifest` (`znative.toml`), `store`
+  (`$ZVCS_HOME/pkg/` + `installed.toml`), `resolver` (`owner/repo`, `git+URL`,
+  `path:DIR`, `@ref` pins), `commands`.
+
+**Two kinds, one store.** A **native** plugin is a Rust cdylib; a **script**
+plugin is a repository of `git-<verb>` executables, which is the shape every
+third-party git subcommand already ships in. Both install into the same
+content-addressed store, both are SHA-256 pinned, and the kind is auto-detected
+when no manifest declares it. The clone runs through this binary's own native
+`clone`, so installing a plugin needs no second VCS on the machine.
+
+**Where a verb resolves.** A plugin verb is consulted in `lib.rs` after builtins
+and aliases and before `external::try_dashed` — the slot git gives dashed
+externals. An override is consulted at the top of `dispatch::run`, next to the
+AOP intercept hook of §16, and delegates to the built-in implementation through
+`dispatch_verb`, which pushes the verb on a thread-local bypass stack so the
+override cannot re-enter itself. `git znative` is exempt from overriding, so a
+misbehaving plugin cannot lock you out of removing it.
+
+**The per-process adaptation.** This is the one place the zshrs design could not
+be copied. A shell loads every plugin once into a process that lives for hours;
+`git` is a fresh process per command, so loading anything eagerly would put a
+`dlopen` on the hot path of every invocation. Instead the verbs a native plugin
+registers are *discovered by loading it once at install time* — never declared,
+so the record cannot lie — and recorded in the index. Two derived tables,
+`verbs.tsv` and `overrides.tsv`, answer "who owns this verb" with one `stat`
+and at most one small read, and exactly one library is then loaded. Both tables
+are deleted rather than written empty when they have no rows, so a machine with
+no plugins installed pays two failed `stat`s per command and never opens a file.
+They are pure projections of `installed.toml`; `git znative load` rebuilds them.
+
+[ZNATIVE.md](ZNATIVE.md) documents the command surface, the store layout and the
+ABI a plugin is written against; `examples/plugin-hello` is a working plugin.
+
+Refusals are checked at install, where they can be reported, rather than at
+dispatch: a plugin cannot *add* a verb that is already a git command or that
+another installed plugin owns, and cannot *override* a verb that does not exist
+(the row would land in a table dispatch never consults for it).

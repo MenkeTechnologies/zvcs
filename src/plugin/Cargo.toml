@@ -1,0 +1,21 @@
+[package]
+name = "zvcs-native"
+version = "0.21.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Stable C-ABI SDK for writing native (Rust) zvcs plugins loaded at runtime by the shadow `git` binary"
+license = "MIT"
+repository = "https://github.com/MenkeTechnologies/zvcs"
+
+[lib]
+# Plugin authors write `use znative::…`, matching the zshrs SDK of the same
+# name. The two are separate ABIs and deliberately cannot cross-load: the init
+# symbol differs (`zvcs_native_init` vs `znative_init`) and every table carries
+# a magic word, so a shell plugin handed to the VCS host is refused rather than
+# read through a struct layout it does not share.
+name = "znative"
+path = "src/lib.rs"
+
+# No dependencies. A stable ABI crate is tiny, has zero transitive deps and
+# still builds in 2035; everything crosses the boundary as `#[repr(C)]`.
+[dependencies]

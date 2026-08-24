@@ -6776,6 +6776,7 @@ _git_commands () {
     zevents:'zvcs: live feed of commits/reconciles/status-changes across the tree'
     ztail:'zvcs: alias of git zevents'
     zcommands:'zvcs: live feed of every git command run across the fleet'
+    znative:'zvcs: plugin package manager (native cdylib + git-<verb> script plugins)'
     zintercept:'zvcs: AOP hooks that run advice around matching git commands'
     zaudit:'zvcs: queryable audit trail over the fleet command log'
     zscan:'zvcs: parallel secret scan of tracked content across the fleet'

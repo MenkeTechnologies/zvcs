@@ -1,0 +1,23 @@
+# A minimal native zvcs plugin: one added subcommand and one overridden verb.
+#
+# Build and install it with the package manager, which does both in one step:
+#     git znative add path:examples/plugin-hello
+#     git hello
+#
+# `git znative add` runs `cargo build --release` itself when a plugin ships no
+# prebuilt cdylib, so there is nothing to build by hand.
+[package]
+name = "zvcs-plugin-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# `cdylib` is what makes the artifact dlopen-able. A plugin that forgets this
+# builds an rlib and the installer refuses it for having produced no cdylib.
+crate-type = ["cdylib"]
+
+[dependencies]
+# The stable C ABI both sides compile against. Outside this repository, depend
+# on it by git URL: znative = { git = "https://github.com/MenkeTechnologies/zvcs" }
+znative = { package = "zvcs-native", path = "../../src/plugin" }

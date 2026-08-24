@@ -106,6 +106,21 @@ rustls-pki-types = { version = "1.15.0", features = ["std"] }
 # handshake when no CA path is configured ("use the OpenSSL defaults").
 rustls-native-certs = "0.8.4"
 
+# The native plugin system (`git znative`). `libloading` is the dlopen wrapper
+# the plugin host loads a plugin cdylib through; the ABI itself is the
+# dependency-free `zvcs-native` crate in this workspace, which both the host and
+# every plugin compile against so the two agree on the exact struct layout.
+libloading = "0.8"
+znative = { package = "zvcs-native", path = "../plugin" }
+# The plugin store's manifest (`znative.toml`) and install index
+# (`installed.toml`). Foundational, vendorable crates; `serde`'s derive is what
+# the index round-trips through.
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+# SHA-256 integrity pinning for an installed plugin tree. Already in the tree
+# via the vendored gitoxide, so naming it adds no crate.
+sha2 = "0.11"
+
 # macOS Keychain FFI for `git credential-osxkeychain` <get|store|erase>. The
 # vendored gitoxide TLS stack already pulls this crate in transitively; naming it
 # directly gives the helper the raw Security.framework symbols git's

@@ -43,6 +43,8 @@ pub mod optint;
 pub mod pager;
 pub mod parseopt;
 pub mod pathspec;
+pub mod pkg;
+pub mod plugin_host;
 pub mod porcelain;
 pub mod precompose;
 pub mod progress;
@@ -107,7 +109,7 @@ pub fn run_argv(argv: &[String]) -> i32 {
 /// `ExitCode` exposes no accessor on stable Rust — only `From<u8>` and equality
 /// — so the value is recovered by finding the one byte that constructs an equal
 /// code. There are 256 candidates and the scan runs once per process, at exit.
-fn exit_status(code: ExitCode) -> i32 {
+pub(crate) fn exit_status(code: ExitCode) -> i32 {
     (0u8..=255).find(|&n| code == ExitCode::from(n)).map_or(1, i32::from)
 }
 
@@ -688,6 +690,22 @@ fn run_command(argv: &[String]) -> ExitCode {
     let (sub, rest): (String, Vec<String>) = if dispatch::is_verb(&sub) {
         (sub, rest)
     } else {
+        // Not a builtin. An installed plugin (`git znative`) gets the verb
+        // first: that is the slot zsh gives an autoloaded module builtin and
+        // git gives nothing at all, and it must precede the PATH lookup below
+        // so a plugin verb never loses to a same-named script someone happens
+        // to have installed. One failed `stat` on `$ZVCS_HOME/pkg/verbs.tsv`
+        // when no plugin is installed.
+        if let Some(result) = plugin_host::try_verb(&sub, &rest) {
+            return match result {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("zvcs: {sub}: {e:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+
         // Not a builtin. Try an external `git-<verb>` from PATH first (git's
         // precedence: builtin → external → help_unknown_cmd). Skip it when we were
         // ourselves invoked AS `git-<verb>` — the matching external is this very

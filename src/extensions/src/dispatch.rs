@@ -13,6 +13,7 @@ use std::process::ExitCode;
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zsubmit", "zevents", "ztail", "zcommands", "zintercept", "zaudit", "zscan", "zsigs", "zreview", "zremote",
+    "znative",
     "zrollback", "zsched",
     "zpin", "zunpin", "zbroadcast", "zhandoff", "zon", "zsince", "zcontend", "zwaitfor", "zgraph", "zrewind",
     "zguard", "zpolicy",
@@ -670,6 +671,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zpolicy" => "usage: git zpolicy <deny|warn|list|rm|clear|test> ... — alias of `git zguard`",
         "ztail" => "usage: git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — alias of git zevents",
         "zcommands" => "usage: git zcommands [-n <count>] [--repo <substr>] [--json] [--no-follow] [--off] [--clear] — live feed of every git command run across the fleet",
+        "znative" => "usage: git znative load|add|remove|list|info|update|gc|clean [SOURCE|NAME] — the plugin package manager: install and register native (Rust cdylib) and script (git-<verb>) plugins from one content-addressed store",
         "zintercept" => "usage: git zintercept before|after|around <pattern> -- <cmd> | list | remove <id> | clear — AOP hooks that run advice around matching git commands",
         "zaudit" => "usage: git zaudit [--agent <ppid>] [--repo <substr>] [--cmd <substr>] [--mutating] [--summary] [-n <count>] [--json] — queryable audit trail over the fleet command log",
         "zscan" => "usage: git zscan [selectors] — parallel secret scan of tracked content across indexed repos (exits non-zero if any found)",
@@ -1092,6 +1094,18 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         return result;
     }
 
+    // Plugin verb overrides (`git znative`): a native plugin may REPLACE an
+    // existing verb, in which case its handler runs here instead of the built-in
+    // implementation — and calls back through `dispatch_verb` when it wants the
+    // original. The check is one failed `stat` on `$ZVCS_HOME/pkg/overrides.tsv`
+    // for anyone who has installed no overriding plugin, which is why the table
+    // is deleted rather than written empty when there are none.
+    if sub != "znative" {
+        if let Some(result) = crate::plugin_host::try_override(sub, args) {
+            return result;
+        }
+    }
+
     // The repository half of `do_git_config_sequence()`. `run_builtin()`
     // (git.c:479-491) runs `setup_git_directory()` and then `check_pager_config()`
     // — which is `read_early_config()`, the whole system→XDG→user→repo→worktree
@@ -1371,6 +1385,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zrewind" => superset::zrewind(args),
         "zguard" | "zpolicy" => superset::guard::zguard(args),
         "zcommands" => superset::zcommands(args),
+        "znative" => superset::znative(args),
         "zintercept" => superset::zintercept(args),
         "zaudit" => superset::zaudit(args),
         "zscan" => superset::zscan(args),

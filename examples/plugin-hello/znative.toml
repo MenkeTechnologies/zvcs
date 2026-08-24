@@ -1,0 +1,11 @@
+# Optional. Without it the installer infers the same thing from the tree (a
+# Cargo.toml declaring crate-type = ["cdylib"] means a native plugin), but
+# declaring it pins the name and version the store keys on rather than taking
+# them from the directory basename.
+[plugin]
+name = "hello"
+version = "0.1.0"
+description = "the example zvcs plugin: one added verb, one overridden verb"
+
+[native]
+lib = "zvcs_plugin_hello"

@@ -685,6 +685,17 @@ pub const DOCS: &[Doc] = &[
         desc: &["An alias for `git zevents` \\(em the single live feed of commits, reconciles, and status-changes across the whole indexed tree. See `git help zevents` for the full description."],
     },
     Doc {
+        verb: "znative",
+        summary: "the plugin package manager: install and load native and script plugins",
+        synopsis: "git znative load|add|remove|list|info|update|gc|clean [SOURCE|NAME]",
+        desc: &[
+            "Installs plugins that extend this binary with new subcommands, from one content-addressed global store under $ZVCS_HOME/pkg. Two kinds are served from that one store: a *native* plugin is a Rust cdylib compiled against the `znative` C ABI and loaded with dlopen, and a *script* plugin is a repository of `git-<verb>` executables. Ported from the zshrs package manager of the same name.",
+            "A source is `owner/repo`, `github:owner/repo`, `git+URL`, or a local `path:DIR`; any remote form may carry an `@ref` suffix to pin a tag, branch or commit (`owner/repo@v1.2.0`), and the pin is recorded so `update` re-fetches that exact ref. `add` resolves the source, builds the cdylib when the plugin ships source, copies the loadable subset into `store/<name>@<version>/`, SHA-256 pins it, and records what it provides in `installed.toml`. `load` is the idempotent form for a bootstrap script: it installs a source that is not in the store yet and otherwise just re-verifies, with no network.",
+            "A native plugin's verbs are discovered by loading it at install time, never declared: whatever it registers through the ABI is what gets recorded. A plugin may also *override* an existing verb, in which case its handler runs in place of the built-in one and calls back through the host to run the original. `git znative` itself can never be overridden, so a bad plugin cannot lock you out of removing it.",
+            "Nothing is loaded until a verb proves to belong to a plugin. The index's two derived tables, verbs.tsv and overrides.tsv, answer that question, and are deleted rather than written empty when there is nothing in them \\(em so a machine with no plugin installed pays two failed stats per command and never opens a file. `list`, `info` and `remove` manage what is installed; `gc` reclaims store directories left by old versions plus the clone cache, and `clean` clears the scratch directories.",
+        ],
+    },
+    Doc {
         verb: "zintercept",
         summary: "AOP hooks that run advice around matching git commands",
         synopsis: "git zintercept before|after|around <pattern> -- <cmd> | list | remove <id> | clear",

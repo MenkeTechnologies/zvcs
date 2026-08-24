@@ -151,6 +151,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Audit | `zaudit [--agent <ppid>] [--repo <s>] [--cmd <s>] [--mutating] [--summary]` | queryable **audit trail** over that same command log — filter by agent (which ppid ran it), repo, or command; `--mutating` keeps only state-changing commands; `--summary` tallies per-agent and per-command; `--json` for tooling |
 | Event feed | `zevents` `ztail` | one live semantic feed of commits, reconciles, and status changes across the whole tree (from the append-only events table) |
 | AOP | `zintercept before\|after\|around <pattern> -- <cmd>` | aspect-oriented hooks on git commands (ported from zshrs) — run advice before/after/around any matching command, with `INTERCEPT_NAME`/`ARGS`/`CMD` (and `STATUS`/`MS`/`US` for after) in the environment; an around advice runs `"$INTERCEPT_CMD"` to proceed |
+| Plugins | `znative add\|load\|remove\|list\|info\|update\|gc <SOURCE\|NAME>` | the **plugin package manager** (ported from zshrs) — install third-party subcommands from one content-addressed store under `$ZVCS_HOME/pkg`, in two kinds: a **native** plugin is a Rust cdylib compiled against the stable `znative` C ABI and `dlopen`ed, a **script** plugin is a repo of `git-<verb>` executables. Sources are `owner/repo`, `git+URL` or `path:DIR`, `@ref`-pinnable and SHA-256 integrity-pinned; a plugin verb resolves after built-ins and before the `git-<verb>` PATH lookup, and a native plugin may **override** an existing verb and delegate back to the original |
 | Policy | `zguard`/`zpolicy` `deny\|warn <pattern> [--when <pred>]` | declarative fleet-wide command policy — refuse or warn on a matching git command *before it runs* (the veto evolution of `zintercept`). Glob on the command line (`deny 'push*--force*'`, `warn 'rm*-rf*'`) plus repo-state predicates (`--when detached\|dirty\|protected\|unsigned`, e.g. `deny 'commit*' --when unsigned` requires signed commits). `list`/`rm`/`clear`/`test`; a single `stat` on the hot path when no rule is set |
 | Autonomy config | `zconfig [<name> on\|off\|<n>]` | toggle the daemon's feature switches from the CLI (`autoreconcile`, `autobump`, `autostatus`, …, `statusinterval`, `watchmru`); `all on\|off` flips them together, reloading a running daemon |
 | Automation | `zpin` `zunpin` `zbroadcast` `zhandoff` `zon` `zsince` `zcontend` `zwaitfor` `zgraph` `zrewind` | freeze repos from autonomy; inter-agent messaging and claim hand-off; run a command on a semantic feed event; a time-window feed; live agent-vs-agent contention; block until a tree-wide state holds; fleet topology (dup groups) |
@@ -437,6 +438,31 @@ original. The advice sees the intercepted command through `INTERCEPT_NAME` /
 `$ZVCS_HOME/intercepts.tsv` and load at dispatch, gated by a single `stat` when
 none are set. `list` / `remove <id>` / `clear` manage them.
 
+**Plugins.** `git znative add <source>` installs a plugin that adds subcommands to
+this binary, from one content-addressed store under `$ZVCS_HOME/pkg` — ported
+from the zshrs package manager of the same name. Two kinds share that store: a
+**native** plugin is a Rust `cdylib` compiled against the stable `znative` C ABI
+and loaded with `dlopen`, and a **script** plugin is a repository of
+`git-<verb>` executables. A source is `owner/repo`, `github:owner/repo`,
+`git+URL`, or a local `path:DIR`, optionally `@ref`-pinned so `update` re-fetches
+that exact tag or commit; each install is SHA-256 pinned. Installing needs no
+second VCS on the machine — the clone runs through this binary's own native
+`clone`.
+
+A plugin verb resolves **after** built-in verbs and aliases and **before** the
+`git-<verb>` PATH lookup, so it wins over a same-named script on PATH and can
+never shadow a git command by accident. A native plugin may instead **override**
+an existing verb, running in place of the built-in implementation and calling
+the host back to run the original when it wants it — so it can wrap `git blame`
+without reimplementing it. `git znative` itself can never be overridden.
+
+Nothing is loaded until a verb proves to belong to a plugin: the verbs a native
+plugin registers are discovered by loading it once at install time and recorded
+in the index's two derived tables, which are deleted rather than written empty
+when there is nothing in them. A machine with no plugins installed therefore
+pays two failed `stat`s per command. See [ZNATIVE.md](ZNATIVE.md) for
+the ABI and [examples/plugin-hello](examples/plugin-hello) for a working plugin.
+
 **Autonomy config.** `git zconfig` toggles the daemon's feature switches from the
 CLI instead of editing `~/.gitconfig`: with no argument it lists every setting
 and whether it is on; `git zconfig <name> on|off` (or a count) sets one, `git
@@ -658,6 +684,8 @@ own writes. For a repo's *git* hook (ref-change semantics in `.git/config`), use
 |------|----------|
 | `src/ported` | Vendored gitoxide crates (`gix` + the `gix-*` library crates), in-tree. A self-contained workspace, excluded from the root and consumed as a path dependency. The `gix`/`ein` CLI binaries and their `gitoxide-core` backend are removed; `git` is the only binary. |
 | `src/extensions` | The zvcs crate (library + the `git` binary): `main.rs`/`lib.rs` (entry, `session_key`, notify-on-next-command), `dispatch.rs` (routing), `porcelain/` (git-compat), `lock.rs` (daemon client), `config.rs` (`[zvcs]` settings plus the shared stock-git config primitives, the ordered config walk, and the config-*file* refusals — `bad config line <n> in file <path>` and the repository-format check, neither of which `-c` can reach), `repo_settings.rs`/`default_config.rs`/`diff_config.rs`/`status_config.rs`/`log_config.rs`/`cmd_config.rs` (git's config callbacks, which refuse an unreadable value with git's own diagnostic before the command runs), `autostart.rs` (daemon auto-spawn), `db.rs` (SQLite ledger/index), `rcache.rs` (zero-copy rkyv caches for tree diffs/blames/abbreviations), `crawler.rs` (repo crawl), `jobpool.rs`/`jobrun.rs`/`index_commit.rs` (async jobs), `worktree.rs` (checkout helper), and `superset/` (`zdaemon`, `zsync`, `zbump`, `reconcile`, `attach`, `watch`, `hooks`, `trigger`, `ledger`, `status`, `oplog`, `snapshot`, `claim`, `queue`, `repl`, `zworktree`). |
+| `src/plugin` | The `znative` plugin SDK — the stable, versioned C ABI (`#[repr(C)]` structs + `extern "C"` function pointers) that the plugin host and every native plugin compile against, so the two agree on the exact layout. Deliberately dependency-free. |
+| `examples` | Standalone plugin crates, built on install by `git znative add path:examples/…` rather than by this workspace. |
 
 ## [0x07] STATUS & ROADMAP
 
@@ -904,6 +932,7 @@ in 0.52 s).
 - **Design document** — [DESIGN.md](DESIGN.md) — daemon architecture, concurrency model, autonomous behaviors, ledger/queue
 - **Command listing for completions** — `git --list-cmds=<group>[,<group>...]` answers the same groups stock git does (`builtins`, `main`, `others`, `nohelpers`, `alias`, `config`, `deprecated`, `list-<category>`), so a completion script written against git works unchanged. The binary groups are derived from the dispatch table, so the `z*` verbs are listed alongside the git verbs; the `list-<category>` groups come from the same tables `git help -a`/`-g` print and match stock byte for byte. `--list-cmds=parseopt` answers empty: it names the commands that implement `--git-completion-helper`, and none do here yet.
 - **zsh completion** — [completions/_git](completions/_git) — the stock zsh `_git` forked with the `z*` verbs; put the dir first on `fpath` to shadow the system `_git`. It is compiled into the binary, so `git zshadow` installs it as `~/.zvcs/completions/_git` and prints the `fpath` line for it (put that line before `compinit`)
+- **Plugin system** — [ZNATIVE.md](ZNATIVE.md) — `git znative`, the store layout, the two plugin kinds, and the C ABI a native plugin is written against; [examples/plugin-hello](examples/plugin-hello) is a working plugin
 - **Performance architecture** — <https://menketechnologies.github.io/zvcs/#performance> — diagrams of how the speedup is achieved: the worker pool over work git does single-threaded, the pickaxe rewrite, the ledger of never-stale values, daemon precompute, and the off-critical-path write queue
 - **Verb reference** — <https://menketechnologies.github.io/zvcs/reference.html> — every superset (`z*`) verb with its synopsis and manual text; the same content `git help <verb>` opens in a terminal. Generated by `perl scripts/gen_reference.pl` from `src/extensions/src/superset/manpage.rs`, so the page can never drift from the man pages; `--check` fails if it is stale.
 - **Engineering report** — <https://menketechnologies.github.io/zvcs/report.html>

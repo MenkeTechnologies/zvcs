@@ -1,3 +1,4 @@
 /target
 /src/ported/target
 **/*.rs.bk
+/examples/*/Cargo.lock

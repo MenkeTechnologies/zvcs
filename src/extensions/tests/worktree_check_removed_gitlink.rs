@@ -37,10 +37,23 @@ fn real_git_path() -> String {
 fn run(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
         .args([
-            "-c", "user.email=t@e.x",
-            "-c", "user.name=t",
-            "-c", "commit.gpgsign=false",
-            "-c", "protocol.file.allow=always",
+            "-c",
+            "user.email=t@e.x",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "protocol.file.allow=always",
+            // Every patch expectation below slices a hash at [..10], which
+            // only matches when core.abbrev says 10. Left to `auto` git sizes
+            // the abbreviation from the object count, so a fresh scratch repo
+            // renders 7 and the expectations only held on a machine whose
+            // global config pinned 10. Sibling tests
+            // (diff_submodule_format, rev_parse_gitlink_abbrev) pass the same
+            // -c for the same reason.
+            "-c",
+            "core.abbrev=10",
         ])
         .args(args)
         .env("PATH", real_git_path())
@@ -73,7 +86,8 @@ fn git1(dir: &Path, args: &[&str]) -> String {
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!("zvcs-checkremoved-{name}-{}", std::process::id()));
+    let root =
+        std::env::temp_dir().join(format!("zvcs-checkremoved-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create scratch");
     root.canonicalize().expect("canonicalize scratch")
@@ -111,7 +125,10 @@ fn repo_with_submodule(root: &Path, name: &str) -> std::path::PathBuf {
     std::fs::write(dir.join("keep"), b"keep\n").expect("write keep");
     git(&dir, &["add", "keep"]);
     git(&dir, &["commit", "-q", "-m", "base"]);
-    git(&dir, &["submodule", "add", "-q", src.to_str().unwrap(), "sm"]);
+    git(
+        &dir,
+        &["submodule", "add", "-q", src.to_str().unwrap(), "sm"],
+    );
     git(&dir, &["commit", "-q", "-m", "addsub"]);
     dir
 }
@@ -168,7 +185,10 @@ fn blob_replaced_by_a_repository_is_a_typechange_to_a_gitlink() {
         &zero[..10],
         &head[..10],
     );
-    assert_eq!(patch, expected, "type change splits into deletion + creation");
+    assert_eq!(
+        patch, expected,
+        "type change splits into deletion + creation"
+    );
 
     // All four status views. `--short` and `--porcelain` disagree on purpose:
     // `short_submodule_status()` (wt-status.c:449) only runs for `STATUS_FORMAT_SHORT`,
@@ -225,7 +245,10 @@ fn blob_replaced_by_a_plain_directory_is_a_deletion_that_still_renders() {
         ),
         "the deletion renders instead of dying on `Is a directory`"
     );
-    assert_eq!(git(&repo, &["diff-files", "--summary"]), " delete mode 100644 f\n");
+    assert_eq!(
+        git(&repo, &["diff-files", "--summary"]),
+        " delete mode 100644 f\n"
+    );
 
     // `index_name_is_other()` (read-cache.c:3442) strips the trailing `/` before the
     // lookup, so the collapsed directory entry is dropped: the index still holds `f`.
@@ -334,9 +357,8 @@ fn submodule_dirtiness_letters_split_short_from_porcelain() {
         git(&both, &["status", "--porcelain=v2"]),
         format!("1 .M S.MU 160000 160000 160000 {head} {head} sm\n")
     );
-    assert!(
-        git(&both, &["status"]).contains("\tmodified:   sm (modified content, untracked content)\n")
-    );
+    assert!(git(&both, &["status"])
+        .contains("\tmodified:   sm (modified content, untracked content)\n"));
 
     // A moved submodule outranks both: `new_submodule_commits` short-circuits
     // `short_submodule_status()` back to `M`.
@@ -379,7 +401,10 @@ fn nested_untracked_content_propagates_without_becoming_modified() {
     std::fs::write(mid.join("m"), b"m\n").expect("write m");
     git(&mid, &["add", "m"]);
     git(&mid, &["commit", "-q", "-m", "m"]);
-    git(&mid, &["submodule", "add", "-q", inner.to_str().unwrap(), "sub"]);
+    git(
+        &mid,
+        &["submodule", "add", "-q", inner.to_str().unwrap(), "sub"],
+    );
     git(&mid, &["commit", "-q", "-m", "add inner"]);
 
     let outer = root.join("outer");
@@ -388,7 +413,10 @@ fn nested_untracked_content_propagates_without_becoming_modified() {
     std::fs::write(outer.join("o"), b"o\n").expect("write o");
     git(&outer, &["add", "o"]);
     git(&outer, &["commit", "-q", "-m", "o"]);
-    git(&outer, &["submodule", "add", "-q", mid.to_str().unwrap(), "mid"]);
+    git(
+        &outer,
+        &["submodule", "add", "-q", mid.to_str().unwrap(), "mid"],
+    );
     git(&outer, &["commit", "-q", "-m", "add mid"]);
     git(&outer, &["submodule", "update", "--init", "--recursive"]);
 

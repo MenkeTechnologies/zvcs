@@ -15,3 +15,9 @@ anyhow = "1"
 # Wildcard matching of `section.<name>.key` config variables against the source
 # when generating the port report's config-support matrix.
 regex = "1"
+# `kill(2)` on a process group and `fcntl(2)` on a pipe: the two calls that keep
+# a case a case — a verb that spawns helpers dies with them, and a pipe a
+# forgotten grandchild still holds cannot park a worker forever. See
+# `runner::kill_group` and `runner::drain`. Already in the workspace lockfile,
+# and this crate is measurement tooling that never links into the `git` binary.
+libc = "0.2"

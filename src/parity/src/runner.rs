@@ -162,8 +162,10 @@ use crate::env;
 use crate::fixture::{Shape, Templates};
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// One invocation to compare.
@@ -1832,6 +1834,84 @@ fn apply_config_env(cmd: &mut Command, repo: &Path, case: &Case) {
     }
 }
 
+/// How long [`drain`] keeps reading a pipe whose write end nobody has closed.
+///
+/// Only reached when a process the case started is still holding the pipe open,
+/// because a pipe every writer has closed answers EOF on the first read. That
+/// makes this a bound on the pathological path and not a budget the ordinary one
+/// spends: a case whose child has exited pays one non-blocking read.
+const DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+/// Kill `child` and everything still in its process group, then reap it.
+///
+/// The group is the child's own — [`CommandExt::process_group`] gave it one at
+/// spawn — so the negative pid reaches the helpers it started without ever
+/// naming a process this harness did not create. The child is killed by pid as
+/// well, because a group kill is not a guarantee: anything that called `setsid`
+/// has left the group, and only the direct child is certain to still be in it.
+///
+/// Ordered kill-then-reap deliberately: `wait` frees the pid, and a pid that has
+/// been freed may be reused, so signalling after the reap is signalling a number
+/// rather than a process.
+fn kill_group(child: &mut Child) {
+    // SAFETY: `kill` is async-signal-safe and takes no memory from this process;
+    // the pid is the child's, which is still unreaped here.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Read what a finished child left in a pipe, without waiting on writers it left
+/// behind.
+///
+/// `read_to_end` was the obvious spelling and it deadlocked a full run. A pipe
+/// answers EOF only when *every* write end is closed, and the child's descendants
+/// inherit those write ends: a `git daemon` case exited, the daemon it had
+/// already forked kept both ends open with no parent left to reap it, and the
+/// worker parked in `read_to_end` for as long as that daemon lived. Nothing else
+/// bounded it — the case timeout covers waiting for the child and had already
+/// been paid — so one case stalled the whole run indefinitely. Observed on a
+/// corpus run: the worker's stack sat in `run_side`, and `lsof` named an orphaned
+/// `git-daemon` holding the other end of both pipes.
+///
+/// Non-blocking reads make that case terminate: EOF ends the loop the moment the
+/// last writer closes, and `WouldBlock` is retried only until [`DRAIN_GRACE`]
+/// runs out. The bytes a finished child wrote are already in the pipe buffer, so
+/// nothing a case legitimately produced is lost to the deadline; what the
+/// deadline gives up on is output that has not been written yet by a process the
+/// case forked and abandoned, which is not a comparison either side can rely on.
+fn drain<H: Read + AsRawFd>(mut h: H) -> Vec<u8> {
+    // SAFETY: `fcntl` on a fd this function owns for the duration of the call.
+    // A failure leaves the fd blocking, which is the behaviour that predates
+    // this function — the loop below still terminates on EOF.
+    unsafe {
+        let flags = libc::fcntl(h.as_raw_fd(), libc::F_GETFL);
+        if flags != -1 {
+            libc::fcntl(h.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let start = Instant::now();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match h.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() >= DRAIN_GRACE {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 /// Run one side of a case.
 ///
 /// Takes the whole [`Case`] rather than a parameter per dimension: every
@@ -1856,6 +1936,11 @@ fn run_side(bin: &Path, repo: &Path, home: &Path, case: &Case) -> Result<Side> {
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Its own process group, so a verb that spawns helpers — a hook, a
+    // transport, the `git` a porcelain runs for itself — leaves a tree the
+    // timeout path can kill in one call instead of a child whose descendants
+    // outlive it. See `kill_group`.
+    cmd.process_group(0);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {} {:?}", bin.display(), case.argv()))?;
@@ -1880,8 +1965,7 @@ fn run_side(bin: &Path, repo: &Path, home: &Path, case: &Case) -> Result<Side> {
             break Some(status);
         }
         if start.elapsed() >= ceiling {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
             break None;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -1893,16 +1977,10 @@ fn run_side(bin: &Path, repo: &Path, home: &Path, case: &Case) -> Result<Side> {
         let _ = w.join();
     }
 
-    // Pipes are drained after exit; every fixture case produces bounded output,
-    // so this cannot deadlock on a full pipe buffer in practice.
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut h) = child.stdout.take() {
-        let _ = h.read_to_end(&mut stdout);
-    }
-    if let Some(mut h) = child.stderr.take() {
-        let _ = h.read_to_end(&mut stderr);
-    }
+    // Pipes are drained after exit, with a deadline — see `drain` for the case
+    // that made the deadline necessary.
+    let stdout = child.stdout.take().map(drain).unwrap_or_default();
+    let stderr = child.stderr.take().map(drain).unwrap_or_default();
 
     // A killed child's pipes still hold whatever it managed to write. Those bytes
     // are kept for a human to read, and `timed_out` is the flag that keeps them
@@ -3800,10 +3878,43 @@ mod tests {
         Outcome, Repeat,
         Sequence, StepRef, Surface, Verdict, CASE_TIMEOUT, OP_STATE_DIRS, OP_STATE_FILES,
     };
+    use super::{drain, DRAIN_GRACE};
     use crate::fixture::Shape;
+    use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// The hang this harness actually suffered: a pipe whose write end a
+    /// forgotten grandchild still holds.
+    ///
+    /// `sh -c 'sleep 5 &'` exits immediately and leaves `sleep` holding the
+    /// stdout it inherited, which is the shape of the `git daemon` case that
+    /// parked a worker in `read_to_end` for as long as the daemon lived. The
+    /// child is reaped first, so the only thing keeping the pipe open is the
+    /// process nobody is waiting for — exactly the state [`drain`] has to
+    /// return from.
+    #[test]
+    fn a_pipe_a_grandchild_still_holds_does_not_park_the_drain() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 5 &"])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn /bin/sh");
+        child.wait().expect("the shell exits at once; the sleep it forked does not");
+
+        let start = Instant::now();
+        let out = drain(child.stdout.take().expect("stdout piped"));
+        let waited = start.elapsed();
+
+        assert!(out.is_empty(), "the shell wrote nothing, got {out:?}");
+        assert!(
+            waited < DRAIN_GRACE * 4,
+            "drain waited {waited:?} on a pipe with no EOF coming; the deadline is {DRAIN_GRACE:?}"
+        );
+    }
 
     /// A side that answered, with the surfaces spelled out. Everything the
     /// classification reads and nothing else — no binary, no repo, no clock, so

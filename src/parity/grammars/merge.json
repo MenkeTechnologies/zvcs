@@ -116,7 +116,14 @@
     "origin/div",
     "theirs",
     "side",
-    ""
+    "",
+    "cc-a",
+    "cc-b",
+    "cc-left",
+    "cc-right",
+    "alien",
+    "alien-clash",
+    "alien-tip"
   ],
   "shapes": [
     "linear",
@@ -137,6 +144,8 @@
     "sparse",
     "stashed",
     "packed",
-    "decomposed-paths"
+    "decomposed-paths",
+    "criss-cross",
+    "unrelated"
   ]
 }

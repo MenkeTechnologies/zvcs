@@ -97,7 +97,14 @@
     "linked",
     "origin/main",
     "conflict.txt",
-    "--"
+    "--",
+    "sym-pending",
+    "link-wt",
+    "link-to-file",
+    "link-to-dir",
+    "dir/link-up",
+    "empty.txt",
+    "stray-link"
   ],
   "shapes": [
     "linear",
@@ -117,6 +124,7 @@
     "octopus",
     "mergeable-dirty",
     "mergeable-staged",
-    "decomposed-paths"
+    "decomposed-paths",
+    "symlinks"
   ]
 }

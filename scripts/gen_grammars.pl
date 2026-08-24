@@ -33,6 +33,23 @@
 # splitting them would destroy the quoting cases most likely to catch a bug.
 # Hence the two forms: the string form is unchanged and still means one token.
 #
+# SHAPES. A grammar's `shapes` list is what the fuzzer draws the fixture from,
+# and a shape belongs in a list only where it CHANGES AN ANSWER. Two rules,
+# both learned the expensive way:
+#
+#  * *A shape that only makes the verb refuse buys nothing.* Both sides refuse,
+#    the case passes, and it has spent a share of that grammar's budget. That is
+#    why `commit-graph` is in `gc`'s list (a `gc` rewrites the graph file, so the
+#    state probe has something to disagree about) and not in `fsck`'s, where
+#    `fsck` on a valid graph exits 0 exactly as it does with no graph at all
+#    (verified against stock 2.55.0 on the shape).
+#  * *A shape pays only if the positionals can name what is in it.* The refs and
+#    paths a shape carries exist in that shape alone -- `cc-left`/`cc-right`,
+#    `alien`, `topic`, `link-to-file`, `refs/heads/dangling` -- so adding the
+#    shape without adding its names draws the fixture and then asks it about
+#    `main` and `feature`, which resolve to nothing. Every shape added here
+#    comes with the names that make it reachable.
+#
 # WIRE FORMAT. `Grammar::flags` and `Grammar::positionals` are
 # `&'static [&'static str]` -- one `&str` per entry -- and `sample_argv` pushes
 # each drawn entry into a `Vec<String>` with one `push`. No `&str` can become
@@ -60,6 +77,12 @@ die "no grammar JSON files in $dir\n" unless @files;
 
 # Only the shapes fixture.rs actually builds. An unknown shape is a typo, not a
 # new fixture, so it is rejected loudly rather than silently dropped.
+#
+# The other direction fails quietly, and has twice: a shape fixture.rs builds but
+# this map does not name is unreachable to every generated grammar, and nothing
+# says so -- the JSON simply never spells it. `Shape::ALL` gained 14 shapes and
+# then 7 more before this map caught up. So the map is cross-checked against
+# `Shape::name`'s arms below and any shape it is missing is printed.
 my %SHAPE = (
     'linear'           => 'Shape::Linear',
     'branched'         => 'Shape::Branched',
@@ -83,7 +106,42 @@ my %SHAPE = (
     'octopus'          => 'Shape::Octopus',
     'no-index-trees'   => 'Shape::NoIndexTrees',
     'decomposed-paths' => 'Shape::DecomposedPaths',
+    'hooked'           => 'Shape::Hooked',
+    'unrelated'        => 'Shape::Unrelated',
+    'criss-cross'      => 'Shape::CrissCross',
+    'cherry'           => 'Shape::Cherry',
+    'symlinks'         => 'Shape::Symlinks',
+    'commit-graph'     => 'Shape::CommitGraph',
+    'damaged'          => 'Shape::Damaged',
+    'intent-to-add'    => 'Shape::IntentToAdd',
+    'pending-rename'   => 'Shape::PendingRename',
+    'notes-replace'    => 'Shape::NotesReplace',
+    'hooks-fail'       => 'Shape::HooksFail',
+    'rerere'           => 'Shape::Rerere',
+    'worktree-locked'  => 'Shape::WorktreeLocked',
+    'tag-chain'        => 'Shape::TagChain',
+    'shallow'          => 'Shape::Shallow',
+    'promisor'         => 'Shape::Promisor',
 );
+
+# The shapes fixture.rs names, read out of `Shape::name`'s match arms -- the one
+# place every variant must appear, since the compiler rejects a non-exhaustive
+# match. Read for reporting only: nothing here reaches the generated text, so
+# the output stays a pure function of the JSON.
+sub fixture_shape_names {
+    my $src = "$root/src/parity/src/fixture.rs";
+    open(my $sfh, '<', $src) or return ();
+    my $body = do { local $/; <$sfh> };
+    close($sfh);
+    my @names;
+    while ($body =~ /Shape::\w+\s*=>\s*"([a-z0-9-]+)"/g) { push @names, $1 }
+    my %seen;
+    return grep { !$seen{$_}++ } @names;
+}
+
+my @unmapped = grep { !$SHAPE{$_} } fixture_shape_names();
+printf STDERR "warning: %d shape(s) fixture.rs builds are unreachable to every grammar (not in %%SHAPE): %s\n",
+    scalar(@unmapped), join(' ', @unmapped) if @unmapped;
 
 # The separator between the tokens of a multi-token entry. See WIRE FORMAT
 # above for why the tokens travel inside one string rather than as a nested

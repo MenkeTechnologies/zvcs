@@ -119,7 +119,11 @@
     "div",
     "FETCH_HEAD",
     "refs/remotes/origin/main",
-    "./.remote.git"
+    "./.remote.git",
+    "topic",
+    "main...topic",
+    "topic...main",
+    "main..topic"
   ],
   "shapes": [
     "linear",
@@ -132,6 +136,7 @@
     "whitespace",
     "octopus",
     "behind-remote",
-    "patches"
+    "patches",
+    "cherry"
   ]
 }

@@ -102,7 +102,9 @@
     "refs/remotes/*",
     "refs/stash",
     "refs/worktree/*",
-    "refs/heads/oct-*"
+    "refs/heads/oct-*",
+    "refs/heads/dangling",
+    "refs/heads/broken-symref"
   ],
   "shapes": [
     "linear",
@@ -118,6 +120,7 @@
     "stashed",
     "octopus",
     "packed",
-    "attributes"
+    "attributes",
+    "damaged"
   ]
 }

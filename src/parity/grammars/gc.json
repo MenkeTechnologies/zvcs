@@ -32,6 +32,8 @@
     "stashed",
     "worktree",
     "behind-remote",
-    "octopus"
+    "octopus",
+    "damaged",
+    "commit-graph"
   ]
 }

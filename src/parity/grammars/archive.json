@@ -63,7 +63,18 @@
     "oct-side",
     "HEAD^2",
     "HEAD^3",
-    "HEAD^4"
+    "HEAD^4",
+    "sym-pending",
+    "link-to-file",
+    "link-to-dir",
+    "link-to-link",
+    "link-broken",
+    "link-escape",
+    "link-wt",
+    "dir/link-up",
+    "empty.txt",
+    "dir",
+    "patches/symlink.patch"
   ],
   "shapes": [
     "linear",
@@ -80,6 +91,7 @@
     "sparse",
     "octopus",
     "worktree",
-    "decomposed-paths"
+    "decomposed-paths",
+    "symlinks"
   ]
 }

@@ -39,6 +39,7 @@
     "packed",
     "octopus",
     "worktree",
-    "behind-remote"
+    "behind-remote",
+    "commit-graph"
   ]
 }

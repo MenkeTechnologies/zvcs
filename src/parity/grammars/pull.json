@@ -121,7 +121,12 @@
     "main",
     "div",
     "does-not-exist",
-    ""
+    "",
+    ".",
+    "alien",
+    "alien-clash",
+    [".", "alien"],
+    [".", "alien-clash"]
   ],
   "shapes": [
     "linear",
@@ -139,6 +144,7 @@
     "packed",
     "worktree",
     "sparse",
-    "stashed"
+    "stashed",
+    "unrelated"
   ]
 }

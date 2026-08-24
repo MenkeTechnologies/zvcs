@@ -30,7 +30,11 @@
     "v0.2.0",
     "HEAD^{tree}",
     "HEAD:README.md",
-    "does-not-exist"
+    "does-not-exist",
+    "refs/heads/dangling",
+    "refs/heads/broken-symref",
+    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "ab1234567890123456789012345678901234abcd"
   ],
   "shapes": [
     "linear",
@@ -46,6 +50,7 @@
     "stashed",
     "behind-remote",
     "octopus",
-    "patches"
+    "patches",
+    "damaged"
   ]
 }

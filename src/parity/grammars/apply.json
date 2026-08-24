@@ -67,7 +67,8 @@
     "mail/one.eml",
     "quilt/series",
     "quilt/0001-first.patch",
-    "quilt/0002-second.patch"
+    "quilt/0002-second.patch",
+    "patches/symlink.patch"
   ],
   "shapes": [
     "linear",
@@ -85,6 +86,7 @@
     "sparse",
     "mergeable-dirty",
     "mergeable-staged",
-    "decomposed-paths"
+    "decomposed-paths",
+    "symlinks"
   ]
 }

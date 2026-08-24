@@ -196,7 +196,12 @@
     "oct-side",
     "HEAD^2",
     "HEAD^3",
-    "HEAD^4"
+    "HEAD^4",
+    "sym-pending",
+    ["main", "sym-pending"],
+    ["main", "sym-pending", "--", "dir/target.txt"],
+    "link-to-file",
+    "empty.txt"
   ],
   "shapes": [
     "linear",
@@ -213,6 +218,7 @@
     "octopus",
     "packed",
     "sparse",
-    "decomposed-paths"
+    "decomposed-paths",
+    "symlinks"
   ]
 }

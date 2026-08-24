@@ -48,7 +48,11 @@
     "HEAD^3",
     "HEAD^4",
     "refs/stash",
-    "refs/remotes/origin/main"
+    "refs/remotes/origin/main",
+    "refs/heads/dangling",
+    "dangling",
+    "refs/heads/broken-symref",
+    "broken-symref"
   ],
   "shapes": [
     "linear",
@@ -61,6 +65,7 @@
     "worktree",
     "stashed",
     "octopus",
-    "packed"
+    "packed",
+    "damaged"
   ]
 }

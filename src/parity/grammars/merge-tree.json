@@ -38,7 +38,9 @@
     "--strategy-option=theirs",
     "--strategy-option=no-renames",
     "--strategy-option=diff-algorithm=patience",
-    "--no-strategy-option"
+    "--no-strategy-option",
+    "--merge-base=cc-a",
+    "--merge-base=cc-b"
   ],
   "positionals": [
     "main",
@@ -69,7 +71,17 @@
     "oct-side",
     "HEAD^2",
     "HEAD^3",
-    "HEAD^4"
+    "HEAD^4",
+    "cc-a",
+    "cc-b",
+    "cc-left",
+    "cc-right",
+    "clash.txt",
+    "cc.txt",
+    "calm.txt",
+    "alien",
+    "alien-clash",
+    "alien-tip"
   ],
   "shapes": [
     "linear",
@@ -86,6 +98,8 @@
     "renamed",
     "whitespace",
     "attributes",
-    "decomposed-paths"
+    "decomposed-paths",
+    "criss-cross",
+    "unrelated"
   ]
 }

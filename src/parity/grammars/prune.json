@@ -22,7 +22,9 @@
     "v0.2.0",
     "HEAD^",
     "refs/heads/main",
-    "does-not-exist"
+    "does-not-exist",
+    "refs/heads/dangling",
+    "dangling"
   ],
   "shapes": [
     "linear",
@@ -37,6 +39,7 @@
     "stashed",
     "worktree",
     "behind-remote",
-    "octopus"
+    "octopus",
+    "damaged"
   ]
 }

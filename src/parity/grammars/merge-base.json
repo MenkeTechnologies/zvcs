@@ -51,7 +51,21 @@
     "div",
     "FETCH_HEAD",
     "refs/remotes/origin/main",
-    "./.remote.git"
+    "./.remote.git",
+    "cc-a",
+    "cc-b",
+    "cc-left",
+    "cc-right",
+    ["cc-left", "cc-right"],
+    ["cc-a", "cc-b"],
+    ["cc-left", "cc-right", "main"],
+    ["cc-a", "cc-b", "cc-left", "cc-right"],
+    "alien",
+    "alien-clash",
+    "alien-tip",
+    ["main", "alien"],
+    ["alien", "alien-clash"],
+    ["main", "alien", "alien-clash"]
   ],
   "shapes": [
     "linear",
@@ -62,6 +76,8 @@
     "behind-remote",
     "packed",
     "mergeable-dirty",
-    "mergeable-staged"
+    "mergeable-staged",
+    "criss-cross",
+    "unrelated"
   ]
 }

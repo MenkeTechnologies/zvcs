@@ -238,7 +238,15 @@
     "oct-side",
     "HEAD^2",
     "HEAD^3",
-    "HEAD^4"
+    "HEAD^4",
+    "topic",
+    "main..topic",
+    "topic..main",
+    "main...topic",
+    "alien",
+    "alien-clash",
+    "main..alien",
+    "main...alien"
   ],
   "shapes": [
     "linear",
@@ -255,6 +263,8 @@
     "patches",
     "behind-remote",
     "attributes",
-    "decomposed-paths"
+    "decomposed-paths",
+    "cherry",
+    "unrelated"
   ]
 }

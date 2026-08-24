@@ -83,7 +83,14 @@
     "é.txt",
     "é-new.txt",
     "conflict.txt",
-    "sub"
+    "sub",
+    "link-wt",
+    "stray-link",
+    "stray-empty.txt",
+    "empty.txt",
+    "link-to-file",
+    "dir/link-up",
+    "patches"
   ],
   "shapes": [
     "linear",
@@ -103,6 +110,7 @@
     "packed",
     "decomposed-paths",
     "mergeable-dirty",
-    "mergeable-staged"
+    "mergeable-staged",
+    "symlinks"
   ]
 }

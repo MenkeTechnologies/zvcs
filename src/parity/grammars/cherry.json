@@ -43,7 +43,12 @@
     "oct-side",
     "HEAD^2",
     "HEAD^3",
-    "HEAD^4"
+    "HEAD^4",
+    "topic",
+    "topic~1",
+    ["main", "topic"],
+    ["topic", "main"],
+    ["main", "topic", "main~1"]
   ],
   "shapes": [
     "linear",
@@ -55,6 +60,7 @@
     "octopus",
     "renamed",
     "packed",
-    "mergeable-dirty"
+    "mergeable-dirty",
+    "cherry"
   ]
 }

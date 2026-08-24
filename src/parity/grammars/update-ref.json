@@ -38,7 +38,9 @@
     "FETCH_HEAD",
     "refs/remotes/origin/main",
     "./.remote.git",
-    "refs/stash"
+    "refs/stash",
+    "refs/heads/dangling",
+    "refs/heads/broken-symref"
   ],
   "shapes": [
     "linear",
@@ -50,6 +52,7 @@
     "worktree",
     "stashed",
     "octopus",
-    "packed"
+    "packed",
+    "damaged"
   ]
 }

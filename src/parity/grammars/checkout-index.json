@@ -53,7 +53,16 @@
     "with space.txt",
     "üñïçødé.txt",
     "nested/deep/path.txt",
-    "conflict.txt"
+    "conflict.txt",
+    "link-to-file",
+    "link-to-dir",
+    "link-to-link",
+    "link-broken",
+    "link-escape",
+    "link-wt",
+    "dir/link-up",
+    "empty.txt",
+    "dir/empty-nested.txt"
   ],
   "shapes": [
     "linear",
@@ -68,6 +77,7 @@
     "attributes",
     "renamed",
     "decomposed-paths",
-    "mergeable-dirty"
+    "mergeable-dirty",
+    "symlinks"
   ]
 }

@@ -657,14 +657,23 @@ fn expand_tilde(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A private directory for one test.
+    ///
+    /// The counter is what makes it private. Seeding the name from
+    /// `SystemTime::now().subsec_nanos()` looks unique and is not: macOS
+    /// reports the wall clock at microsecond granularity, so the low three
+    /// digits are always zero and two of these tests running in parallel
+    /// inside the same process — same pid, same microsecond — got the *same*
+    /// directory and overwrote each other's store. That is what failed
+    /// `index_round_trip_and_side_tables` on the macOS CI runner while every
+    /// local run passed.
     fn tmp() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
             "zvcs-host-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
+            N.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();

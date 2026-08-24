@@ -934,7 +934,9 @@ no plugins installed pays two failed `stat`s per command and never opens a file.
 They are pure projections of `installed.toml`; `git znative load` rebuilds them.
 
 [ZNATIVE.md](ZNATIVE.md) documents the command surface, the store layout and the
-ABI a plugin is written against; `examples/plugin-hello` is a working plugin.
+ABI a plugin is written against; `examples/` holds three runnable plugins —
+`plugin-hello` (minimal + an override), `plugin-wip` (real work through
+`host.run`), and `plugin-todo` (the script kind).
 
 Refusals are checked at install, where they can be reported, rather than at
 dispatch: a plugin cannot *add* a verb that is already a git command or that

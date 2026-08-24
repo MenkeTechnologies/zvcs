@@ -1,0 +1,8 @@
+#!/bin/sh
+# git todo [<pathspec>…] — every TODO/FIXME/XXX/HACK marker in tracked content.
+#
+# A script plugin is exec'd from the store with the arguments after the verb, so
+# it needs nothing from the ABI. `git` here is whichever git invoked it — the
+# zvcs binary — so the search is served by the same engine the caller is using.
+set -e
+exec git grep -n -I -E '(TODO|FIXME|XXX|HACK)([(:]| )' -- "$@"

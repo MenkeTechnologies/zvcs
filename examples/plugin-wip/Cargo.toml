@@ -1,0 +1,19 @@
+# A native zvcs plugin that does real work: `git wip` stages everything and
+# commits it, in one process — no fork, because the host runs the porcelain
+# through the same dispatch table the command line uses.
+#
+#     git znative add path:examples/plugin-wip
+#     git wip                       # commit everything as "wip on <branch>"
+#     git wip fixing the parser     # …or with a message
+[package]
+name = "zvcs-plugin-wip"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Outside this repository: znative = { git = "https://github.com/MenkeTechnologies/zvcs" }
+znative = { package = "zvcs-native", path = "../../src/plugin" }

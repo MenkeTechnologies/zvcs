@@ -64,14 +64,13 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     (repo, home)
 }
 
-/// Build `examples/plugin-hello` and lay its artifact out as a prebuilt plugin:
-/// the cdylib plus a `znative.toml`, which is exactly what a plugin ships when
-/// it publishes binaries instead of source. Returns the directory to install
-/// from. `None` when there is no cargo to build with, which is the one
-/// environment this test cannot run in.
-fn staged_plugin(root: &Path, work: &Path) -> Option<PathBuf> {
-    let manifest = root.join("examples/plugin-hello/Cargo.toml");
-    let target = work.join("build");
+/// Build a native example plugin and lay its artifact out the way a plugin that
+/// publishes binaries ships: the cdylib plus its `znative.toml`. Returns the
+/// directory to install from. `None` when there is no cargo to build with,
+/// which is the one environment this test cannot run in.
+fn staged_plugin(root: &Path, work: &Path, example: &str) -> Option<PathBuf> {
+    let manifest = root.join("examples").join(example).join("Cargo.toml");
+    let target = work.join(format!("build-{example}"));
     let out = Command::new("cargo")
         .arg("build")
         .arg("--release")
@@ -96,10 +95,10 @@ fn staged_plugin(root: &Path, work: &Path) -> Option<PathBuf> {
         })
         .expect("the example plugin produced no cdylib");
 
-    let staged = work.join("plugin-hello");
+    let staged = work.join(format!("staged-{example}"));
     std::fs::create_dir_all(&staged).unwrap();
     std::fs::copy(rel.join(&lib), staged.join(&lib)).unwrap();
-    std::fs::copy(root.join("examples/plugin-hello/znative.toml"), staged.join("znative.toml"))
+    std::fs::copy(root.join("examples").join(example).join("znative.toml"), staged.join("znative.toml"))
         .unwrap();
     Some(staged)
 }
@@ -108,7 +107,7 @@ fn staged_plugin(root: &Path, work: &Path) -> Option<PathBuf> {
 fn installs_a_native_plugin_and_serves_its_verb() {
     let (repo, home) = fixture("install");
     let root = repo_root();
-    let Some(staged) = staged_plugin(&root, &home) else {
+    let Some(staged) = staged_plugin(&root, &home, "plugin-hello") else {
         eprintln!("no cargo on PATH; skipping");
         return;
     };
@@ -149,7 +148,7 @@ fn installs_a_native_plugin_and_serves_its_verb() {
 fn an_override_runs_before_the_original_and_can_delegate_to_it() {
     let (repo, home) = fixture("override");
     let root = repo_root();
-    let Some(staged) = staged_plugin(&root, &home) else {
+    let Some(staged) = staged_plugin(&root, &home, "plugin-hello") else {
         eprintln!("no cargo on PATH; skipping");
         return;
     };
@@ -182,7 +181,7 @@ fn a_plugin_verb_wins_over_a_same_named_dashed_external() {
     // autoloaded module builtin. A `git-hello` on PATH must not shadow one.
     let (repo, home) = fixture("precedence");
     let root = repo_root();
-    let Some(staged) = staged_plugin(&root, &home) else {
+    let Some(staged) = staged_plugin(&root, &home, "plugin-hello") else {
         eprintln!("no cargo on PATH; skipping");
         return;
     };
@@ -280,5 +279,63 @@ fn a_machine_with_no_plugins_keeps_the_verb_tables_absent() {
     assert!(!pkg.join("verbs.tsv").exists());
     assert!(!pkg.join("overrides.tsv").exists());
     assert!(!pkg.join("installed.toml").exists());
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn the_wip_example_composes_the_porcelain_through_the_host() {
+    // `examples/plugin-wip` is the useful-work example: it runs `diff`, `add`
+    // and `commit` through `host.run`, in-process, and reports their status.
+    // Shipping it means the ABI's `run` path is covered by a real plugin.
+    let (repo, home) = fixture("wip");
+    let root = repo_root();
+    let Some(staged) = staged_plugin(&root, &home, "plugin-wip") else {
+        eprintln!("no cargo on PATH; skipping");
+        return;
+    };
+    ok(&git(&repo, &home, &["znative", "add", &format!("path:{}", staged.display())]), "add");
+    ok(&git(&repo, &home, &["config", "user.email", "t@e.x"]), "config email");
+    ok(&git(&repo, &home, &["config", "user.name", "t"]), "config name");
+
+    std::fs::write(repo.join("a.txt"), b"one\n").unwrap();
+    ok(&git(&repo, &home, &["wip"]), "git wip");
+    let log = ok(&git(&repo, &home, &["log", "--oneline", "-1"]), "log");
+    assert!(log.contains("wip on main"), "{log}");
+
+    // Its message argument wins over the generated one.
+    std::fs::write(repo.join("a.txt"), b"two\n").unwrap();
+    ok(&git(&repo, &home, &["wip", "second", "pass"]), "git wip <msg>");
+    let log = ok(&git(&repo, &home, &["log", "--oneline", "-1"]), "log");
+    assert!(log.contains("second pass"), "{log}");
+
+    // A clean tree is refused, non-zero — the status of `diff --quiet HEAD`
+    // read back through the host, not a guess.
+    let out = git(&repo, &home, &["wip"]);
+    assert!(!out.status.success(), "wip committed an empty change");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing to commit"));
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn the_todo_example_installs_and_runs_straight_from_its_source_tree() {
+    // `examples/plugin-todo` is the script-kind example: no ABI, no build step,
+    // installed from the repository as it stands.
+    let (repo, home) = fixture("todo");
+    let example = repo_root().join("examples/plugin-todo");
+
+    let out = ok(
+        &git(&repo, &home, &["znative", "add", &format!("path:{}", example.display())]),
+        "znative add (todo)",
+    );
+    assert!(out.contains("added todo@0.1.0 (script)"), "{out}");
+    assert!(out.contains("verbs: todo"), "{out}");
+
+    std::fs::write(repo.join("a.rs"), b"fn main() {} // TODO: write it\nfine\n").unwrap();
+    ok(&git(&repo, &home, &["add", "a.rs"]), "add");
+    let out = ok(&git(&repo, &home, &["todo"]), "git todo");
+    assert!(out.contains("a.rs:1:"), "{out}");
+    assert!(!out.contains("fine"), "matched an untagged line: {out}");
+
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }

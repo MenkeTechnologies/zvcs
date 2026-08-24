@@ -1,0 +1,7 @@
+[plugin]
+name = "wip"
+version = "0.1.0"
+description = "git wip — stage everything and commit it in one step"
+
+[native]
+lib = "zvcs_plugin_wip"

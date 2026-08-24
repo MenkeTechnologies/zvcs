@@ -1,0 +1,11 @@
+[plugin]
+name = "todo"
+version = "0.1.0"
+description = "git todo — every TODO/FIXME/XXX marker in tracked content"
+
+# The second plugin kind: no ABI, no build, just `git-<verb>` executables the
+# store runs. This is the shape most third-party git subcommands already ship
+# in, so an existing one installs unchanged.
+[script]
+# `bin` defaults to the plugin root and `verbs` to every `git-<verb>` found
+# there, so declaring the kind is all this needs.

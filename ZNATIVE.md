@@ -164,7 +164,22 @@ Without a manifest the name and version come from the source basename and
 
 ## Writing a native plugin
 
-The full working example is [`examples/plugin-hello`](examples/plugin-hello).
+Three runnable examples ship with the repository:
+
+| Example | Kind | What it shows |
+| --- | --- | --- |
+| [`examples/plugin-hello`](examples/plugin-hello) | native | the minimum: one added verb, one overridden verb that delegates to the original, and every host read (`repo_info`, `config_get`, `object_write`/`object_read`) |
+| [`examples/plugin-wip`](examples/plugin-wip) | native | useful work: `git wip` stages everything and commits it, composing `diff`/`add`/`commit` through `host.run` — in this process, no fork, reading each verb's status back |
+| [`examples/plugin-todo`](examples/plugin-todo) | script | the other kind: `git todo` is a `git-todo` shell script, installed and run from the store with no ABI and no build step |
+
+Install any of them straight from the tree:
+
+```sh
+git znative add path:examples/plugin-wip
+git wip
+```
+
+The minimal native plugin is the whole of `plugin-hello`:
 
 ```rust
 use std::os::raw::c_int;

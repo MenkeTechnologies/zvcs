@@ -107,7 +107,24 @@ pub struct Grammar {
     pub shapes: &'static [Shape],
 }
 
-const REV_SHAPES: &[Shape] = &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached];
+/// The shapes a rev-resolving command is drawn against.
+///
+/// `BehindRemote` is here for one reason and it is not topology: it is the only
+/// shape whose `main` has an upstream, and without it the whole `@{upstream}`
+/// half of git's rev grammar — `@{u}`, `@{push}`, `main@{upstream}`,
+/// `origin/main`, `refs/remotes/origin/main` — could only ever be measured on
+/// its refusal (`fatal: no upstream configured for branch 'main'`, verified
+/// against stock 2.55.0 on every other shape here). A port that resolves the
+/// spelling but reads the wrong `branch.<name>.merge` looks correct until one
+/// case resolves it for real. The template already exists for the round trips
+/// and generated grammars, so the shape costs no fixture and no case.
+const REV_SHAPES: &[Shape] = &[
+    Shape::Linear,
+    Shape::Branched,
+    Shape::Merged,
+    Shape::Detached,
+    Shape::BehindRemote,
+];
 /// The shapes a command with no particular topology requirement is drawn
 /// against. Not `Shape::ALL`: several shapes exist for one verb apiece (a
 /// submodule, a sparse checkout, a decomposed path) and drawing every command
@@ -140,6 +157,63 @@ const REVS: &[&str] = &[
     "HEAD:README.md", ":/fixture", ":0:src/lib.rs", "refs/heads/main",
     "0000000000000000000000000000000000000000", "deadbeef",
     "does-not-exist", "@{999}", "HEAD~999", "",
+    // The parent-set notations. Each expands to a *set* rather than to one
+    // commit — `revision.c:handle_revision_arg` turns `^@` into every parent,
+    // `^!` into the commit with its parents negated, `^-` into
+    // `<rev> ^<rev>^1` — and a port that treats them as suffixes on a single
+    // resolution prints one id where stock prints two. Verified against stock
+    // 2.55.0: `HEAD^!` prints the commit then `^<parent>`, `HEAD^@` prints the
+    // parent alone, and `HEAD^-` matches `HEAD^-1`.
+    "HEAD^@", "HEAD^!", "HEAD^-", "HEAD^-1",
+    // Ranges with an omitted endpoint. `..HEAD`, `HEAD..` and `...HEAD` are all
+    // legal and all default the missing side to `HEAD`; a range parser that
+    // splits on `..` and resolves both halves rejects every one of them.
+    "..HEAD", "HEAD..", "...HEAD",
+    // Upstream-relative forms. Fatal on every shape but `BehindRemote`, which is
+    // exactly why that shape is in [`REV_SHAPES`] — see its comment.
+    "@{u}", "@{push}", "main@{upstream}", "origin/main", "refs/remotes/origin/main",
+    // The DWIM table (`refs.c:ref_rev_parse_rules`) spelled at its three depths:
+    // fully qualified, namespace-relative, and short. A port with a two-entry
+    // table resolves `refs/tags/v0.1.0` and `v0.1.0` and misses `tags/v0.2.0`.
+    "refs/tags/v0.1.0", "heads/main", "tags/v0.2.0",
+    // `feature` is a branch on `Branched` and *also* a tag for the duration of
+    // the `tag-shadows-branch` round trip, which is the only place in the
+    // harness where one name resolves through two rules. Verified against stock
+    // 2.55.0 with both refs present: `rev-parse feature` warns
+    // `refname 'feature' is ambiguous.` and answers with the **tag**, not the
+    // branch — `refs/tags/%.*s` precedes `refs/heads/%.*s` in
+    // `refs.c:ref_rev_parse_rules`, so the answer is the tagged commit
+    // (`add two`) while `refs/heads/feature` points a commit further on. A port
+    // that walks the table in the order a reader would guess answers with the
+    // branch and looks right on every other case in this pool.
+    "feature",
+    // Peeling to a type the object is not, and peeling a tag to a tree rather
+    // than to its commit — two different arms of `peel_to_type`. Verified:
+    // `v0.1.0^{tree}` yields the tree, `HEAD^{blob}` dies with
+    // `expected blob type, but the object dereferences to tree type`.
+    "v0.1.0^{tree}", "HEAD^{blob}",
+    // `:/text` searches every ref; `<rev>^{/text}` searches only from a rev.
+    // Same syntax, two different walks, and a miss is a third outcome.
+    "main^{/two}", ":/nomatchhere",
+    // `:path` with no stage number is stage 0; `:1:path` names a stage that only
+    // a conflicted index has, and stock answers the miss with a *hint* naming
+    // `:0:` rather than with the generic ambiguous-argument text.
+    ":README.md", ":1:README.md",
+    // Abbreviated object names are deliberately **not** sampled here beyond the
+    // `deadbeef` above, and the reason is worth stating so the next widening
+    // does not re-add them. An abbreviation only measures `get_short_oid` if it
+    // is a prefix of an object the repository *has*, and a static pool cannot
+    // name one: every fixture oid is a function of the fixture and changes the
+    // moment `fixture::build` changes by a byte. The empty blob is the one id
+    // that is a hash-function constant rather than a fixture value, but no shape
+    // stores it — no fixture writes an empty file — so it does not resolve
+    // either. Verified against stock 2.55.0 on `Branched`: `rev-parse` answers
+    // `dea`, `dead`, `e69de29`, `e69de29bb2d1` and the `deadbeef` already in
+    // this pool with byte-identical `fatal: ambiguous argument …` text, and
+    // `cat-file -t` answers all five with `fatal: Not a valid object name …`.
+    // Four more spellings of one refusal is four more draws that cannot
+    // disagree; `core.abbrev` and `core.disambiguate` are reached from the
+    // `abbrev-disambiguate` group against revs that do resolve.
 ];
 
 /// Path arguments including magic pathspecs, which have their own parser in git
@@ -149,6 +223,47 @@ const PATHS: &[&str] = &[
     "*.md", "**/*.rs", "no/such/path",
     ":(glob)**/*.rs", ":(icase)readme.md", ":!src", ":(exclude)*.md",
     ":(top)README.md", ":(attr:text)", "with space.txt", "üñïçødé.txt",
+    // `literal` is the magic that *disables* the glob the same string would
+    // otherwise be: `:(literal)*.md` matches a file actually named `*.md` and
+    // therefore nothing, while the bare `*.md` above matches. A port that
+    // parses the magic and then globs anyway passes every case in this pool
+    // except this one.
+    ":(literal)*.md",
+    // Combined magic. `pathspec.c` parses the long form as a comma list and
+    // applies every flag; a parser that takes the first word and stops gets
+    // `:(glob,icase)` right by accident and `:(exclude,icase)` inverted.
+    // Verified against stock 2.55.0: `:(glob,icase)**/*.RS` matches
+    // `src/lib.rs` and `:(exclude,icase)*.MD` leaves `README.md` out.
+    ":(glob,icase)**/*.RS", ":(exclude,icase)*.MD", ":(top,glob)src/*.rs",
+    // The short spelling of `:(top)`. `:/` is the whole tree and `:/src` is a
+    // path from the top — the same two-character prefix that starts a `:/text`
+    // *rev*, which is why a shared scanner gets one of the two wrong.
+    ":/", ":/src",
+    // The attribute magic beyond the plain `:(attr:text)` above: a negated
+    // attribute and a valued one, which are two more branches of
+    // `parse_attr_spec` and both match nothing here — so they measure the
+    // parse rather than the fixture.
+    ":(attr:!text)", ":(attr:diff=rust)",
+    // Magic that is not. Stock dies with
+    // `fatal: Invalid pathspec magic 'bogus' in ':(bogus)x'`; an empty exclude
+    // is legal and selects nothing.
+    ":(bogus)x", ":(exclude)",
+    // Paths that look like options. Without a `--` separator stock's
+    // parse-options rejects these before any pathspec parser sees them —
+    // `error: unknown switch \`R'` (rc 129) for the short form and
+    // `error: unknown option \`README.md'` for the long — and with one they are
+    // ordinary paths that match nothing. The `--` is injected on a quarter of
+    // draws, so both sides of that boundary are reached.
+    "-README.md", "--README.md",
+    // A path that needs quoting on output, and the decomposed spelling of a
+    // path that `Shape::DecomposedPaths` tracks (`fixture::NFD_TRACKED`). The
+    // precomposed sibling is written out separately: which of the two matches
+    // is the whole content of `core.precomposeUnicode`, and a pool holding one
+    // form measures the setting never.
+    "quote\"name.txt", "e\u{301}.txt", "\u{e9}.txt",
+    // Path spellings git normalises before matching: a doubled separator and a
+    // `..` that climbs back inside the tree.
+    "src//lib.rs", "./src/../README.md",
 ];
 
 /// Replacement values for `--flag=value` mutation: empty, boundary, overflow,
@@ -157,6 +272,25 @@ const PATHS: &[&str] = &[
 const VALUES: &[&str] = &[
     "", "0", "1", "-1", "999999999", "99999999999999999999999999",
     "abc", "true", "false", "v1", "=", "%H%n", "\t", "0x10",
+    // The number spellings `strtol` accepts and a hand-written parser does not,
+    // and the one it rejects. Verified against stock 2.55.0 on `core.abbrev`,
+    // which is the same integer parser every `--flag=<n>` reaches from the
+    // other side: `" 4"` is **4** (leading whitespace is skipped), `"4 "` is
+    // **fatal** (`invalid unit`), `"+4"` and `"04"` are 4, `"0x10"` is 16, and
+    // `"4k"` is 4096 — the `k`/`m`/`g` suffix is not a size-key privilege, it
+    // applies to every integer git parses from configuration. The flag parser
+    // disagrees with all of that (`rev-parse --short=4k` is 4, and so are
+    // `--short=" 4"`, `--short=+4` and `--short=0x10`), and the disagreement is
+    // the point: one pool feeding both sides is what makes a port that shares
+    // one parser between them visible.
+    //
+    // Demonstrated at 4 rather than at 1 because `core.abbrev` has a *second*
+    // check under the parse: 1 parses fine and is then refused with
+    // `error: abbrev length out of range: 1`, which says nothing about the
+    // spelling. The pool below is spelled at 1 anyway — as a `--flag=` value it
+    // meets whichever range each flag has, and [`CONFIG_EDGE_VALUES`] is where
+    // the same spellings meet `core.abbrev`'s range check on purpose.
+    " 1", "1 ", "+1", "01", "1k", "2m", "-0",
 ];
 
 // ---------------------------------------------------------------------------
@@ -243,6 +377,45 @@ const CONFIG_KEYS: &[(&str, &[&str])] = &[
     // `pretty.<name>` defines a format `--pretty=<name>` then resolves, so this
     // one key reaches the whole placeholder language from the config side.
     ("pretty.custom", &["%H", "%h %s", "format:%an", "tformat:%H", "%(bogus)"]),
+    // `commit.cleanup` is the one setting that changes the bytes of a commit
+    // *object* rather than of an output line, so a wrong reading survives into
+    // the state probe and into every later read. Verified against stock 2.55.0
+    // on a `-m` message holding a `#` line, a blank run and a scissors marker:
+    // `strip` removes the `#` line and collapses the blank run, `whitespace`
+    // keeps the `#` line and collapses the run, `verbatim` keeps both, and
+    // `bogus` is `fatal: Invalid cleanup mode bogus` with rc 128.
+    //
+    // `scissors` is in the pool for what it does **not** do: with `-m` (and with
+    // `-F`) it is byte-for-byte `default`, marker and all — the cut only happens
+    // for a message an editor produced, which `env::harden` pins to `true` so no
+    // case can reach it. A port that applies the cut wherever the mode is set
+    // truncates a message stock keeps, and that difference is in the commit
+    // object rather than in a printed line.
+    ("commit.cleanup", &["strip", "whitespace", "verbatim", "scissors", "default", "bogus"]),
+    // The `git_config_pathname` vocabulary, which nothing else in this pool
+    // has: `~`, `~user`, `%(prefix)/` and a plain relative path are four
+    // different expansions before the file is even opened, and `~nosuchuser/x`
+    // is `fatal: failed to expand user dir in: '~nosuchuser/x'` (verified).
+    ("core.attributesFile", &[".gitattributes", "no-such", "~/x", "~nosuchuser/x", "%(prefix)/x", ""]),
+    // The arm that accumulates *every* bad token into one non-fatal warning
+    // block instead of dying on the first — verified: `diff.dirstat=bogus,alsobogus`
+    // prints two `Unknown dirstat parameter` lines under one `warning:` header
+    // and still exits 0.
+    ("diff.dirstat", &["changes", "lines", "files", "cumulative", "10", "files,10", "bogus,alsobogus"]),
+    // Unknown value only warns and keeps going, which is the opposite of what
+    // most enum keys here do — verified: `blame.coloring=bogus` prints
+    // `warning: invalid value for 'blame.coloring': 'bogus'` and exits 0.
+    ("blame.coloring", &["repeatedLines", "highlightRecent", "none", "bogus"]),
+    // Any value at all is legal *including none*, and the value becomes a MIME
+    // boundary in the output — verified: `format.attach=BOUND` yields
+    // `Content-Type: multipart/mixed; boundary="------------BOUND"`.
+    ("format.attach", &["BOUND", "true", "false", ""]),
+    // A name in `advice.c`'s table is parsed as a boolean and a name outside it
+    // is not parsed at all. Verified: `advice.statusHints=bogus` is
+    // `fatal: bad boolean config value 'bogus' for 'advice.statushints'` while
+    // `advice.noSuchAdvice=bogus` exits 0 — the same value, two outcomes,
+    // decided by a table a port has to have transcribed.
+    ("advice.statusHints", BOOLS),
 ];
 
 /// Values thrown at *any* key, whatever it expects: empty, whitespace, garbage,
@@ -253,6 +426,27 @@ const CONFIG_KEYS: &[(&str, &[&str])] = &[
 const CONFIG_EDGE_VALUES: &[&str] = &[
     "", " ", "auto", "abc", "-1", "0", "1", "999999999", "99999999999999999999999999",
     "true", "false", "yes", "no", "on", "off", "none", "\t", "=", "%H",
+    // `git_parse_int`'s own branches, which nothing above reaches: the four
+    // spellings it accepts and the one it does not. Every entry below was run
+    // through stock 2.55.0 as `-c core.abbrev=<v> rev-parse --short HEAD`:
+    //
+    //   `" 1"`   parses to 1, then `error: abbrev length out of range: 1` +
+    //            `fatal: unable to parse 'core.abbrev' from command-line config`
+    //   `"1 "`   `fatal: bad numeric config value '1 ' for 'core.abbrev':
+    //            invalid unit` — the trailing space is a unit suffix, not blank
+    //   `"+1"`   same as `" 1"`: parses to 1, then out of range
+    //   `"0x10"` parses to 16 → a 16-character id, so a leading `0x` *is* hex
+    //   `"1k"`   parses to 1024, clamped to the full 40-character id
+    //   `"-0"`   `error: abbrev length out of range: 0`
+    //
+    // The two-line refusal for the in-range-syntax-out-of-range-value cases is
+    // the point: the *parse* succeeded and a second check rejected the number,
+    // which is a different failure from the one-line `bad numeric config value`
+    // that `"1 "` gets. A port that reaches for `str::parse::<i64>()` gets
+    // `" 1"`, `"+1"`, `"0x10"` and `"1k"` wrong in four different directions and
+    // `"1 "` right by accident. Spelled at 1 rather than at a legal abbreviation
+    // length so both checks are crossed by one pool.
+    " 1", "1 ", "+1", "0x10", "1k", "-0",
 ];
 
 // ---------------------------------------------------------------------------
@@ -280,6 +474,32 @@ const EXPIRY: &[&str] =
     &["never", "now", "2.weeks.ago", "1.day.ago", "all", "bogus", "", "false", "3.months.ago"];
 /// Byte sizes, which git parses with a `k`/`m`/`g` suffix.
 const SIZE: &[&str] = &["0", "1", "16k", "2m", "1g", "512", "-1", "bogus", ""];
+/// File names, as `git_config_pathname` sees them.
+///
+/// Not a generic string pool: this parser expands `~`, `~user` and
+/// `%(prefix)/` before anything opens the file, and each expansion has its own
+/// failure. Verified against stock 2.55.0 — `~nosuchuser/x` is
+/// `fatal: failed to expand user dir in: '~nosuchuser/x'` on every one of the
+/// keys that reads this pool (`core.attributesFile`, `core.excludesFile`,
+/// `commit.template`, `blame.ignoreRevsFile`, `diff.orderFile`,
+/// `format.signatureFile`), because the expansion happens before anything looks
+/// at the name. A pool of plain relative names would measure the open six times
+/// and the expansion never.
+///
+/// `no-such` is the entry that separates those six keys from each other rather
+/// than joining them, and it does not behave uniformly — verified:
+/// `blame.ignoreRevsFile` is `fatal: could not open object name list: no-such`,
+/// `commit.template` is `fatal: could not read 'no-such': No such file or
+/// directory`, `diff.orderFile` is `fatal: failed to read orderfile 'no-such':
+/// …`, `format.signatureFile` is `fatal: unable to read signature file
+/// 'no-such': …`, while `core.attributesFile` and `core.excludesFile` accept a
+/// missing file in silence and exit 0. Four distinct refusals and one silent
+/// acceptance from one string is the whole reason it is in the pool.
+///
+/// Relative names only: the two sides live at different roots, and
+/// `config_pool_is_well_formed` rejects a leading `/` for exactly that reason.
+const PATHNAME: &[&str] =
+    &[".gitattributes", "no-such", "src", "~/x", "~nosuchuser/x", "%(prefix)/x", ""];
 
 /// A set of configuration keys that only matter **together**.
 ///
@@ -742,6 +962,282 @@ const CONFIG_GROUPS: &[ConfigGroup] = &[
             ("column.ui", &["never", "always", "auto", "column", "row", "plain", "bogus"]),
             ("column.branch", &["never", "always", "auto", "bogus"]),
             ("column.tag", &["never", "always", "auto", "bogus"]),
+            // `column.status` overrides `column.ui` for one verb, under the same
+            // guard that reads it (`status_config.rs:143-158`), and each key
+            // names *itself* in its refusal. Verified against stock 2.55.0: a
+            // bogus value is two lines, `error: unsupported option 'bogus'` then
+            // `error: invalid column.status mode bogus` — with `column.ui` and
+            // `column.branch` printing their own names in the second line the
+            // same way. A port that normalises the pair to one key reports the
+            // wrong one of the two.
+            ("column.status", &["never", "always", "auto", "bogus"]),
+        ],
+    },
+    // What a `-m` message becomes once it is a commit object. `commit.cleanup`
+    // decides whether comment lines are stripped and
+    // `core.commentChar`/`core.commentString` decide what a comment line *is*,
+    // so the pair decides the bytes that get hashed — a difference that outlives
+    // the invocation and is visible to `runner::probe_state`, not merely to the
+    // line the command printed. Verified against stock 2.55.0: with
+    // `commit.cleanup=strip` and `core.commentChar=';'` a `; semi` line is
+    // stripped from the message while `# hash` survives, and with
+    // `core.commentString='//'` a `// slash` line is the one that goes.
+    // `commit.status`/`commit.verbose` decide what else the template holds, and
+    // `status.displayCommentPrefix` decides whether that block is commented at
+    // all — which is the same comment character again, read by a second reader.
+    ConfigGroup {
+        name: "commit-message",
+        keys: &[
+            ("commit.cleanup", &["strip", "whitespace", "verbatim", "scissors", "default", "bogus"]),
+            ("core.commentChar", &["#", ";", "auto", "", "ab", "\n"]),
+            // `//` is the obvious second multi-character marker and is *not*
+            // here: `config_pool_is_well_formed` rejects a leading `/` because a
+            // value is written into argv unsubstituted and a literal root would
+            // name one side's copy to both. `--` is the same shape and passes.
+            ("core.commentString", &["#", ";", "auto", "", "--", "REM"]),
+            ("commit.status", BOOLS),
+            ("commit.verbose", &["true", "false", "0", "1", "2", "bogus"]),
+            ("commit.gpgSign", BOOLS),
+            ("commit.template", PATHNAME),
+            ("status.displayCommentPrefix", BOOLS),
+        ],
+    },
+    // `blame`'s output is decided by three keys that are each inert without
+    // another. `blame.markIgnoredLines`/`markUnblamableLines` mark only lines
+    // attributed to a revision `blame.ignoreRevsFile` named, so neither mark can
+    // appear without the file; and `blame.coloring` selects *which* of the two
+    // `color.blame.*` slots is consulted.
+    //
+    // Verified against stock 2.55.0, and not the way the obvious reading
+    // predicts: `blame.coloring` alone is what turns the paint on, and it
+    // ignores `color.ui` entirely. `blame.coloring=highlightRecent` puts
+    // `\e[34m` on every line with `color.ui` unset, still does so under
+    // `color.ui=never`, and takes the slot's colour when
+    // `color.blame.highlightRecent=red` is also set (`\e[31m`); dropping
+    // `blame.coloring` is the only one of the three that removes the escapes.
+    // So the pair that matters is coloring+slot — the slot is unobservable
+    // without the coloring key, and `color.ui` is a decoy in this decision that
+    // a port implementing the usual `want_color` gate would honour.
+    //
+    // The ignore-revs pool reaches three outcomes rather than one: a missing
+    // file is `fatal: could not open object name list: no-such`, a file that
+    // exists but holds something else is
+    // `fatal: invalid object name: ref: refs/heads/main` (verified with
+    // `.git/HEAD`), and the empty value is accepted and ignored.
+    ConfigGroup {
+        name: "blame-render",
+        keys: &[
+            ("blame.ignoreRevsFile", &["no-such", ".git/HEAD", "", ".gitignore"]),
+            ("blame.markIgnoredLines", BOOLS),
+            ("blame.markUnblamableLines", BOOLS),
+            ("blame.coloring", &["repeatedLines", "highlightRecent", "none", "bogus"]),
+            ("color.blame.repeatedLines", COLOR),
+            ("color.blame.highlightRecent", &["red", "red,1.month.ago,blue", "bogus", ""]),
+            ("color.ui", COLORBOOL),
+            ("blame.showEmail", BOOLS),
+            ("blame.showRoot", BOOLS),
+            ("blame.blankBoundary", BOOLS),
+            ("blame.date", &["iso", "short", "raw", "relative", "bogus"]),
+        ],
+    },
+    // The one config pair in this table that changes an **exit code** by itself.
+    // `diff.external` hands the comparison to another program, and
+    // `diff.trustExitCode` decides whether that program's non-zero exit means
+    // "differences" or "the driver died". Verified against stock 2.55.0:
+    // `-c diff.external=false diff <a> <b>` is `fatal: external diff died,
+    // stopping at …` with rc 128, and adding `-c diff.trustExitCode=true` makes
+    // the same invocation exit 0 — and 1 under `--exit-code`. One key alone can
+    // only ever measure the death.
+    //
+    // `true`/`false` are shell builtins, so the drivers named here exist on
+    // every machine and produce no output; `no-such-driver` is the third
+    // outcome, where the spawn itself fails.
+    ConfigGroup {
+        name: "diff-driver",
+        keys: &[
+            ("diff.external", &["true", "false", "no-such-driver", ""]),
+            ("diff.trustExitCode", BOOLS),
+            ("diff.autoRefreshIndex", BOOLS),
+            ("diff.wordRegex", &["[a-z]+", ".", "[", "", "bogus("]),
+            ("diff.orderFile", PATHNAME),
+            // `diff.textconv` is *not* here. It reads like a sibling of
+            // `diff.trustExitCode` and is not a key at all — git spells it
+            // `diff.<driver>.textconv`, per-driver. Verified against stock
+            // 2.55.0: it is absent from `git help -c`'s 1005-line list, and
+            // `-c diff.textconv=bogus diff HEAD~1` prints the diff and exits 0
+            // where every real boolean key in this table dies on `bogus`. A key
+            // git does not know is a draw that cannot disagree.
+        ],
+    },
+    // Two integers dividing one fixed width. `diff.statNameWidth` is the budget
+    // for the path and `diff.statGraphWidth` the budget for the bar, and the
+    // renderer resolves them against each other and against the terminal width —
+    // so a port that clamps them independently prints the right line for either
+    // key alone and the wrong one for both. Verified against stock 2.55.0:
+    // `diff.statNameWidth=5` turns ` src/lib.rs | 1 +` into ` ...rs | 1 +` —
+    // the path is truncated from the left to the budget and the elision is
+    // `...`, not `…` — and a non-numeric value is
+    // `fatal: bad numeric config value 'bogus' for 'diff.statnamewidth':
+    // invalid unit`.
+    ConfigGroup {
+        name: "diff-stat",
+        keys: &[
+            ("diff.statNameWidth", INT),
+            ("diff.statGraphWidth", INT),
+            ("diff.dirstat", &["changes", "lines", "files", "cumulative", "10", "files,10", "bogus,alsobogus"]),
+            ("diff.context", &["0", "1", "3", "10", "-1"]),
+            ("diff.relative", &["true", "false", "src/", "no/such/"]),
+        ],
+    },
+    // Four keys that are **fatal under `log` and accepted under `format-patch`**,
+    // because `git_format_config` claims them before the diff callback can
+    // reject them (`log_config.rs:105`, one arm, four keys, empty body).
+    // Verified against stock 2.55.0 on the same repository:
+    // `-c diff.noprefix=bogus log -1` is `fatal: bad boolean config value
+    // 'bogus' for 'diff.noprefix'` with rc 128, while
+    // `-c diff.noprefix=bogus format-patch --stdout -1` prints the patch and
+    // exits 0 — and `color.ui=bogus` behaves the same way.
+    //
+    // `format.noprefix` is the replacement spelling that stayed validated, and
+    // its refusal carries two `hint:` lines nothing else here prints. A port
+    // that validates configuration once, before dispatch, gets every one of
+    // these six backwards for one of the two verbs.
+    ConfigGroup {
+        name: "format-shortcircuit",
+        keys: &[
+            ("format.noprefix", BOOLS),
+            ("diff.noprefix", BOOLS),
+            ("diff.color", COLORBOOL),
+            ("color.diff", COLORBOOL),
+            ("color.ui", COLORBOOL),
+            ("diff.submodule", &["log", "short", "diff", "bogus"]),
+        ],
+    },
+    // The mail `format-patch` writes. Three interactions, each needing two keys:
+    // `format.signatureFile` and `format.signature` name the same trailer from a
+    // file and from a literal (verified: the literal wins whichever order the
+    // two are read in, and a missing file is `fatal: unable to read signature
+    // file 'no-such'`); `format.forceInBodyFrom` adds a second in-body `From:`
+    // line only once `format.from` has rewritten the header one (verified);
+    // and `format.coverFromDescription` is consulted only where
+    // `format.coverLetter` produced a cover to take a description from — while
+    // being the key in this set that dies on a bad value
+    // (`fatal: bogus: invalid cover from description mode`).
+    //
+    // `format.thread` is deliberately absent: it emits a `Message-ID` built from
+    // the wall clock, which would make every case that drew it nondeterministic
+    // on both sides for a reason that has nothing to do with the port.
+    ConfigGroup {
+        name: "format-patch",
+        keys: &[
+            ("format.coverLetter", &["auto", "true", "false", "bogus"]),
+            (
+                "format.coverFromDescription",
+                &["default", "none", "message", "subject", "auto", "bogus"],
+            ),
+            ("format.numbered", &["auto", "true", "false", "bogus"]),
+            ("format.subjectPrefix", &["RFC", "", "PATCH v2"]),
+            // No embedded newline. A `-c` value goes into the case id verbatim,
+            // and an id that spans two lines stops being one record to
+            // `scripts/split_failures.pl` and to the report — a multi-line
+            // signature is not worth a triage surface that cannot parse it.
+            ("format.signature", &["SIG", "", "-- dashes"]),
+            ("format.signatureFile", PATHNAME),
+            ("format.filenameMaxLength", INT),
+            ("format.attach", &["BOUND", "true", "false", ""]),
+            ("format.from", &["true", "false", "Bot <bot@example.invalid>"]),
+            ("format.forceInBodyFrom", BOOLS),
+            ("format.mboxrd", BOOLS),
+        ],
+    },
+    // Sparse checkout is three keys and one worktree. `core.sparseCheckout`
+    // decides whether the skip-worktree bits are honoured at all,
+    // `core.sparseCheckoutCone` decides which pattern dialect
+    // `.git/info/sparse-checkout` is read in, and
+    // `sparse.expectFilesOutsideOfPatterns` decides whether a file that is
+    // present but outside the patterns gets its bit cleared. Only the first is
+    // meaningful alone; the other two are inert without it, which is precisely
+    // what a one-key draw cannot show — and the outcome is a *worktree*, so it
+    // lands in the state probe rather than in a line of output.
+    ConfigGroup {
+        name: "sparse-checkout",
+        keys: &[
+            ("core.sparseCheckout", BOOLS),
+            ("core.sparseCheckoutCone", BOOLS),
+            ("sparse.expectFilesOutsideOfPatterns", BOOLS),
+            ("index.sparse", BOOLS),
+            ("core.untrackedCache", &["true", "false", "keep", "bogus"]),
+        ],
+    },
+    // Whether a hint is printed, and what colour it is if so. Two facts here,
+    // and both need two keys. A name inside `advice.c`'s table is parsed as a
+    // boolean and a name outside it is not parsed at all — verified against
+    // stock 2.55.0: `advice.statusHints=bogus` is `fatal: bad boolean config
+    // value 'bogus' for 'advice.statushints'` while `advice.noSuchAdvice=bogus`
+    // exits 0 — so the *table* is the thing under test and only a pair of draws
+    // straddles it. And `advice.<slot>=false` suppresses the hint entirely,
+    // which makes whatever `color.advice.<slot>` says unobservable, so the
+    // colour keys are only measurable against a slot that is still on.
+    //
+    // `GIT_ADVICE` in [`ENV_VARS`] is the third switch over the same decision
+    // and is drawn independently, so the two can disagree.
+    ConfigGroup {
+        name: "advice",
+        keys: &[
+            ("advice.statusHints", BOOLS),
+            ("advice.statusUoption", BOOLS),
+            ("advice.detachedHead", BOOLS),
+            ("advice.noSuchAdvice", BOOLS),
+            ("color.advice", COLORBOOL),
+            ("color.advice.hint", COLOR),
+            ("color.advice.reset", COLOR),
+            ("color.advice.bogusSlot", COLOR),
+        ],
+    },
+    // What counts as an unchanged file. `core.checkStat=minimal` narrows the
+    // set of stat fields compared, `core.trustCtime=false` removes another field
+    // from that same comparison, `core.ignoreStat=true` suppresses it outright
+    // and `core.fileMode` decides whether the mode bit is part of it — four keys
+    // feeding one predicate in `read-cache.c`. A port that honours each key on
+    // its own gets every single-key case right and still refreshes the wrong
+    // entries when two of them apply, which shows up as a different `.git/index`
+    // rather than as a different line.
+    ConfigGroup {
+        name: "stat-cache",
+        keys: &[
+            ("core.checkStat", &["default", "minimal", "bogus"]),
+            ("core.trustCtime", BOOLS),
+            ("core.ignoreStat", BOOLS),
+            ("core.fileMode", BOOLS),
+            ("core.fsmonitor", BOOLS),
+            ("diff.autoRefreshIndex", BOOLS),
+        ],
+    },
+    // One parser, seven entry points. Every key here is read through
+    // `git_config_pathname`, which expands `~`, `~user` and `%(prefix)/` before
+    // anything opens the named file, and every one of them fails identically on
+    // an expansion it cannot do — verified against stock 2.55.0:
+    // `-c core.attributesFile='~nosuchuser/x' check-attr text -- README.md` is
+    // `fatal: failed to expand user dir in: '~nosuchuser/x'`, and the same value
+    // on `blame.ignoreRevsFile` or `commit.template` dies the same way. Which
+    // key dies first is decided by configuration order rather than by the order
+    // the command would have consulted them, so drawing two of them together is
+    // what puts the *ordering* under test; drawing one measures the expansion
+    // once and the ordering never.
+    //
+    // `attr.tree` is the odd member and is here for that: it names a tree rather
+    // than a file and *overrides* the source `core.attributesFile` contributes
+    // to, so the pair decides which attributes exist at all.
+    ConfigGroup {
+        name: "config-pathnames",
+        keys: &[
+            ("core.attributesFile", PATHNAME),
+            ("core.excludesFile", PATHNAME),
+            ("attr.tree", &["HEAD", "HEAD^{tree}", "no-such-tree", ""]),
+            ("commit.template", PATHNAME),
+            ("blame.ignoreRevsFile", PATHNAME),
+            ("diff.orderFile", PATHNAME),
+            ("format.signatureFile", PATHNAME),
         ],
     },
 ];
@@ -856,6 +1352,77 @@ const ENV_VARS: &[(&str, &[&str])] = &[
     ("GIT_NO_REPLACE_OBJECTS", &["1", "0"]),
     ("GIT_OPTIONAL_LOCKS", &["0", "1", "bogus"]),
     ("GIT_FLUSH", &["0", "1"]),
+    // The reflog message itself. Nothing else in the harness can set it, and the
+    // reflog is where this port has historically been most wrong — the first run
+    // of the curated sequence corpus found eight defects and five were reflog
+    // messages. `GIT_REFLOG_ACTION` replaces the verb's own prefix wholesale, so
+    // a port that hard-codes `"commit: "` writes a line stock does not. Verified
+    // against stock 2.55.0 by committing a message of `z` under each value:
+    // `gen action` gives `HEAD@{0}: gen action: z`, and the empty string gives
+    // `HEAD@{0}: : z` — an empty action still gets its separator.
+    ("GIT_REFLOG_ACTION", &["gen action", "", "checkout", "rebase (pick)"]),
+    // Which ref the notes machinery reads and writes. `log` decorates from it,
+    // `notes` writes to it, and a port that resolves the default in one place
+    // and the variable in the other disagrees only when the two differ.
+    ("GIT_NOTES_REF", &["refs/notes/commits", "refs/notes/gen", "bogus", ""]),
+    // Where attributes come from, as the environment spelling of
+    // `--attr-source`. Both the option and the variable are drawn, so a port
+    // that implements one of the two is caught by whichever it skipped.
+    // Verified: an unreadable source — including the *empty* value — is
+    // `fatal: bad --attr-source or GIT_ATTR_SOURCE`, which is a refusal taken
+    // before any attribute is looked up.
+    ("GIT_ATTR_SOURCE", &["HEAD", "HEAD^{tree}", "does-not-exist", ""]),
+    // The second half of object lookup. `GIT_OBJECT_DIRECTORY` above replaces
+    // the store; this one *adds* to it, and a missing entry is reported
+    // (`error: object directory … does not exist; check
+    // .git/objects/info/alternates`) without failing the command — a
+    // warn-and-continue path nothing else reaches.
+    (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        &["{repo}/.git/objects", "{repo}/.git/no-such-objects", ""],
+    ),
+    // The linked-worktree split: which directory holds the refs and config that
+    // are shared, as opposed to the per-worktree `HEAD` and index. A port that
+    // treats the git dir as one directory resolves every case on every other
+    // shape and none once this points somewhere else.
+    ("GIT_COMMON_DIR", &["{repo}/.git", "{repo}/.git/no-such", ".git"]),
+    // The on-disk format of the file every command rewrites. Versions 2, 3 and 4
+    // have different entry encodings — v4 prefix-compresses path names — and an
+    // unusable value warns rather than refusing: verified against stock 2.55.0,
+    // `0`, `9` and `bogus` each print
+    // `warning: GIT_INDEX_VERSION set, but the value is invalid.` followed by
+    // `Using version 3` and exit 0, so the *warning text on stderr* is what a
+    // case drawing one of them compares. `3` is the other surprise: asking for
+    // it writes a v2 index (`update-index --show-index-version` answers 2),
+    // because v3 is only chosen when an entry needs an extended flag.
+    //
+    // The version itself is **not** in the state probe — `runner::probe_state`
+    // reads the index through `ls-files --stage`, whose three lines are the same
+    // whichever version wrote them — so a port that writes v2 for `4` is caught
+    // only by a case that asks for the version back or by the interop probe
+    // failing to read the file at all.
+    ("GIT_INDEX_VERSION", &["2", "3", "4", "0", "9", "bogus"]),
+    // Where `replace` refs live. The empty value is the interesting one and is
+    // verified: stock takes it to mean *every* ref is a replacement and prints
+    // `warning: bad replace ref name: refs/heads/main` for each — a whole-ref-
+    // namespace reinterpretation from one empty string.
+    //
+    // The trailing slashes are load-bearing. Verified against stock 2.55.0:
+    // `GIT_REPLACE_REF_BASE=refs/replace git log -1` aborts with
+    // `BUG: refs.c:1900: ref pattern must end in a trailing slash when trimming`
+    // and rc 134 — stock kills itself on a value that is a prefix without its
+    // separator, so a case spelling one would compare a SIGABRT against whatever
+    // the port does and measure git's own assertion rather than the port. With
+    // the slash both spellings exit 0.
+    ("GIT_REPLACE_REF_BASE", &["refs/replace/", "refs/gen-replace/", ""]),
+    // How much a merge says about what it did. Deterministic (the levels select
+    // fixed message sets, not timings) and orthogonal to `merge.verbosity` in
+    // the `merge-conflict` group, so the two can be drawn against each other.
+    ("GIT_MERGE_VERBOSITY", &["0", "1", "2", "5", "bogus"]),
+    // Whether a broken or unreadable ref aborts the iteration or is skipped.
+    // Nothing in the fixtures is broken, so this measures the *decision* rather
+    // than a repair — which is the half a port implements as a constant.
+    ("GIT_REF_PARANOIA", &["0", "1"]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -893,6 +1460,51 @@ const GLOBAL_OPTIONS: &[&[&str]] = &[
     &["--attr-source=HEAD"],
     &["--attr-source=does-not-exist"],
     &["--list-cmds=main"],
+    // The *other* half of the pager switch. `--no-pager` and `-P` are already
+    // here; `-p` and `--paginate` take the opposite branch of the same code, and
+    // that branch is the one that has been wrong — `pager: give the host its
+    // stdout back` is a commit in this repository's history. `GIT_PAGER=cat` is
+    // pinned by `env::harden`, so the pager runs and the output stays
+    // deterministic instead of the option being untestable.
+    &["-p"],
+    &["--paginate"],
+    // `setup.c` refuses the pair rather than honouring it. Verified against
+    // stock 2.55.0 over a worktree: `git --bare status --porcelain` is
+    // `fatal: not a git repository: '<path>'` with rc 128 — a refusal taken
+    // before the subcommand exists, which `core.bare=true` in the `repo-format`
+    // group reaches from the configuration side and nothing reached from here.
+    &["--bare"],
+    &["--no-lazy-fetch"],
+    // The one delivery mechanism for a setting that is neither a file, a `-c`,
+    // nor `GIT_CONFIG_KEY_<n>`: a key whose *value* is the name of a variable.
+    // `env::harden` clears the environment, so the named variable is guaranteed
+    // absent and the outcome is deterministic — verified:
+    // `fatal: missing environment variable 'PARITY_UNSET' for configuration
+    // 'core.abbrev'`, rc 128.
+    &["--config-env=core.abbrev=PARITY_UNSET"],
+    // An option git *used* to parse. Verified: stock 2.55.0 answers
+    // `unknown option: --super-prefix=x/` with rc 129 and the usage block, so a
+    // port that kept the option alive for compatibility is caught by the one
+    // case that spells it.
+    &["--super-prefix=x/"],
+    // `--list-cmds` takes a *group* name, and the group decides both the list
+    // and whether there is one. `main` is already here; `parseopt` is a
+    // different list, and `bogus` is
+    // `fatal: unsupported command listing type 'bogus'` with rc 128.
+    &["--list-cmds=parseopt"],
+    &["--list-cmds=bogus"],
+    // Discovery pointed somewhere that is not a repository, from both spellings.
+    &["--git-dir=no-such"],
+    &["--work-tree=src"],
+    // `-C` is repeatable and each hop is resolved against the previous one, so
+    // this pair lands back at the fixture root by a route that is not the root.
+    // Kept as one entry because the shrinker drops entries whole: half a chain
+    // is a different case, not a smaller one.
+    &["-C", "src", "-C", ".."],
+    // Terminates option handling and prints instead of dispatching, like
+    // `--list-cmds`. Safe to compare: the port answers `git version 2.55.0`,
+    // the same string stock does.
+    &["--version"],
 ];
 
 // ---------------------------------------------------------------------------
@@ -980,6 +1592,90 @@ const P_INDEX_INFO: &[u8] = b"100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\t0
 const P_EMPTY: &[u8] = b"";
 /// Bytes that are not text, including embedded NULs and invalid UTF-8.
 const P_BINARY: &[u8] = b"\x00\x01\x02\xff\xfe\n\x00garbage\x00\n";
+/// A message with everything `stripspace` exists to remove: trailing blanks, a
+/// run of empty lines, a leading blank run, and a comment line.
+///
+/// The payloads above are all *clean* — `P_TRAILERS` has no trailing whitespace,
+/// no blank run and no comment — so `stripspace`'s entire job was measured only
+/// by its ability to copy bytes through. Verified against stock 2.55.0, this one
+/// input reaches three different answers from the same command: bare
+/// `stripspace` collapses the blank run and keeps `# comment`, `-s` removes the
+/// comment as well, and `-c` prefixes every line including the blank ones.
+const P_STRIPSPACE_MESSY: &[u8] = b"stripme  \n\n\n\n# comment\n\ttabbed  \n\n\n";
+/// A trailer with no blank line in front of it.
+///
+/// `P_TRAILERS` has a proper block, so `interpret-trailers` only ever had to
+/// append to one. Here the last line *looks* like a trailer while the message
+/// has no block at all, which is the case `trailer.c` decides by scanning
+/// backwards — and stock 2.55.0 inserts the blank line the message was missing.
+const P_TRAILERS_NO_BLOCK: &[u8] = b"subject only\nSigned-off-by: A <a@example.invalid>\n";
+/// A patch that creates a file rather than editing one.
+///
+/// `P_PATCH` edits a tracked path, so `apply`'s creation path — `/dev/null` on
+/// the old side, a mode line, no preimage to match — was unreachable. Verified:
+/// `apply --check` accepts this against every shape, because it depends on the
+/// absence of a path rather than on the content of one.
+const P_PATCH_CREATE: &[u8] = b"diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..3b18e51\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello world\n";
+/// The same edit as [`P_PATCH`] with CRLF line endings in the hunk.
+///
+/// The payload whose acceptance depends on a *flag in the same argv*: verified
+/// against stock 2.55.0, `apply --check` on this exits **1** with
+/// `patch does not apply`, and `apply --check --ignore-whitespace` exits **0**.
+/// Nothing else in this pool makes the sampled flags decide whether the input is
+/// valid, which is what makes it worth a payload of its own.
+const P_PATCH_CRLF: &[u8] = b"diff --git a/README.md b/README.md\nindex 0000000..1111111 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\r\n # fixture\r\n+added\r\n";
+/// Ref transactions in the `-z` dialect: `create SP <ref> NUL <value> NUL`.
+///
+/// A different parser from [`P_REF_UPDATES`], not a different payload — the
+/// newline dialect splits on whitespace and dequotes, the NUL dialect does
+/// neither. A port with one reader and a flag passes every case that draws the
+/// first and none that draws this. Verified: creates the ref under
+/// `update-ref --stdin -z`.
+const P_REF_UPDATES_NUL: &[u8] = b"create refs/heads/parity-fuzz-z\0HEAD\0";
+/// The transaction verbs of `update-ref --stdin`.
+///
+/// `start`/`prepare`/`commit` are a state machine layered on top of the command
+/// vocabulary, and `option no-deref` changes what the update in between means.
+/// They also *print*: stock 2.55.0 answers `start: ok`, `prepare: ok`,
+/// `commit: ok` on stdout, so the machine is compared rather than only its
+/// effect. Nothing else reaches these verbs at all.
+const P_REF_TRANSACTION: &[u8] =
+    b"option no-deref\nstart\ncreate refs/heads/parity-fuzz-tx HEAD\nprepare\ncommit\n";
+/// A `cat-file --batch-command` request stream.
+///
+/// `--batch` reads *object names*; `--batch-command` reads **commands** —
+/// `info`, `contents`, `flush` — and feeding the first dialect to the second
+/// mode measures a rejection rather than the parser. This payload also depends
+/// on a sampled flag, the other way round from [`P_PATCH_CRLF`]: verified
+/// against stock 2.55.0, `flush` without `--buffer` is
+/// `fatal: flush is only for --buffer mode` with rc 128, and with `--buffer` the
+/// same stream succeeds.
+const P_BATCH_COMMANDS: &[u8] = b"info HEAD\ncontents HEAD\nflush\n";
+/// An `--index-info` line that **removes** a path: mode 0 and the null oid.
+///
+/// [`P_INDEX_INFO`] adds an entry, so the deletion half of the same reader was
+/// unmeasured. Verified: this drops `README.md` from the index, which the state
+/// probe's `ls-files --stage` reports.
+const P_INDEX_INFO_DELETE: &[u8] =
+    b"0 0000000000000000000000000000000000000000\tREADME.md\n";
+/// A tag object body that is well formed and names an object the repository does
+/// not have.
+///
+/// `mktree` has had a shaped payload since this pool existed; `mktag` never did,
+/// so it drew from the whole pool and met a real tag header once in fifteen
+/// draws. The empty blob's id is a hash-function constant rather than a fixture
+/// value, so this reaches the *object lookup* after the header parse succeeded:
+/// stock 2.55.0 answers `fatal: could not read tagged object
+/// 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391'` with rc 128.
+const P_MKTAG: &[u8] = b"object e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\ntype blob\ntag gen\ntagger zvcs parity <parity@example.invalid> 1700000000 +0000\n\nmsg\n";
+/// The same four headers in the wrong order.
+///
+/// The other half of `mktag`: the fsck check that runs *before* any lookup.
+/// Verified — `error: tag input does not pass fsck: missingObject: invalid
+/// format - expected 'object' line`, then
+/// `fatal: tag on stdin did not pass our strict fsck check`, rc 128. A port that
+/// parses headers by name rather than by position accepts this.
+const P_MKTAG_BAD_ORDER: &[u8] = b"type blob\nobject e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\ntag gen\ntagger zvcs parity <parity@example.invalid> 1700000000 +0000\n\nmsg\n";
 
 /// Every payload, as one pool. Sampling draws an **index** into this table
 /// rather than generating bytes, so a case's input is a compile-time literal and
@@ -1000,6 +1696,16 @@ const STDIN_PAYLOADS: &[&[u8]] = &[
     P_INDEX_INFO,
     P_EMPTY,
     P_BINARY,
+    P_STRIPSPACE_MESSY,
+    P_TRAILERS_NO_BLOCK,
+    P_PATCH_CREATE,
+    P_PATCH_CRLF,
+    P_REF_UPDATES_NUL,
+    P_REF_TRANSACTION,
+    P_BATCH_COMMANDS,
+    P_INDEX_INFO_DELETE,
+    P_MKTAG,
+    P_MKTAG_BAD_ORDER,
 ];
 
 /// The payloads that are the *right shape* for a given subcommand.
@@ -1011,18 +1717,28 @@ const STDIN_PAYLOADS: &[&[u8]] = &[
 fn preferred_payloads(cmd: &str) -> &'static [&'static [u8]] {
     match cmd {
         "mktree" => &[P_TREE_ENTRY, P_TREE_ENTRY_BAD],
+        // `mktag` used to fall through to the whole pool, which meant its header
+        // parser and its object lookup were each reached about a fifteenth as
+        // often as its rejection of arbitrary bytes. Two bodies now separate the
+        // two failures: one that passes fsck and misses the object, one that
+        // fails fsck before any lookup.
+        "mktag" => &[P_MKTAG, P_MKTAG_BAD_ORDER, P_BINARY],
         "interpret-trailers" | "stripspace" | "mailinfo" | "mailsplit" | "fmt-merge-msg" => {
-            &[P_TRAILERS, P_PATCH, P_EMPTY]
+            &[P_TRAILERS, P_TRAILERS_NO_BLOCK, P_STRIPSPACE_MESSY, P_PATCH, P_EMPTY]
         }
-        "patch-id" | "apply" | "am" => &[P_PATCH, P_PATCH_TRUNCATED, P_EMPTY],
-        "update-ref" => &[P_REF_UPDATES, P_REF_UPDATES_FAIL],
+        "patch-id" | "apply" | "am" => {
+            &[P_PATCH, P_PATCH_TRUNCATED, P_PATCH_CREATE, P_PATCH_CRLF, P_EMPTY]
+        }
+        "update-ref" => {
+            &[P_REF_UPDATES, P_REF_UPDATES_FAIL, P_REF_UPDATES_NUL, P_REF_TRANSACTION]
+        }
         "cat-file" | "rev-list" | "diff-tree" | "name-rev" | "pack-objects" | "for-each-ref" => {
-            &[P_OIDS, P_PATHS, P_EMPTY]
+            &[P_OIDS, P_BATCH_COMMANDS, P_PATHS, P_EMPTY]
         }
         "check-ignore" | "check-attr" | "check-mailmap" | "hash-object" | "ls-files" => {
             &[P_PATHS, P_PATHS_NUL, P_PATHS_CRLF, P_PATH_NO_EOL]
         }
-        "update-index" => &[P_INDEX_INFO, P_PATHS, P_PATHS_NUL],
+        "update-index" => &[P_INDEX_INFO, P_INDEX_INFO_DELETE, P_PATHS, P_PATHS_NUL],
         "unpack-objects" | "index-pack" | "show-index" | "get-tar-commit-id" => {
             &[P_BINARY, P_EMPTY]
         }
@@ -1099,26 +1815,93 @@ fn wants_stdin(cmd: &str, args: &[String]) -> bool {
 /// time this file explains what the harness does not do.
 pub fn grammars() -> Vec<Grammar> {
     vec![
+        // `rev-parse` is two commands wearing one name — a rev resolver and the
+        // query surface every script uses to find out where it is — and the
+        // second half was represented by three flags. The additions below are
+        // the ones that change a *decision* rather than a string: the four
+        // `--is-*` predicates (each a different question `setup.c` answers),
+        // `--path-format=` (which re-renders every path-valued query and is a
+        // mode, not an option), `--sq`/`--sq-quote` (a quoting engine of its
+        // own), `--disambiguate=` (the short-oid walk the `abbrev-disambiguate`
+        // config group configures and nothing invoked), the `--glob=`/
+        // `--exclude=` ref filters, and the `--flags`/`--revs-only`/`--no-revs`
+        // partition of an argument list into two kinds.
+        //
+        // `--parseopt` is deliberately absent: it reads a specification from
+        // stdin, and [`wants_stdin`] does not know that, so a case drawing it
+        // would carry an id that says nothing about the input the command
+        // actually consumed.
+        //
+        // `--since=`/`--until=` are absent for a harder reason: `rev-parse`
+        // *prints* what the date parsed to, and `approxidate` fills a date with
+        // no time-of-day in from the **current clock**. Verified against stock
+        // 2.55.0 — two runs of `rev-parse --since=2020-01-01 HEAD` two seconds
+        // apart printed `--max-age=1577851712` and `--max-age=1577851713` — so
+        // any case drawing one would diverge from itself, let alone across two
+        // sides run one after the other. `log`/`rev-list` keep the same options
+        // because there the parsed date only filters a walk that has nothing in
+        // that window either way.
         Grammar {
             cmd: "rev-parse",
             flags: &[
                 "--abbrev-ref", "--short", "--verify", "--quiet", "--git-dir",
                 "--show-toplevel", "--is-inside-work-tree", "--is-bare-repository",
                 "--symbolic", "--symbolic-full-name", "--all", "--branches", "--tags",
+                "--abbrev-ref=strict", "--abbrev-ref=loose", "--short=4", "--short=40",
+                "--is-inside-git-dir", "--is-shallow-repository", "--show-object-format",
+                "--show-prefix", "--show-cdup", "--git-common-dir", "--shared-index-path",
+                "--show-superproject-working-tree", "--resolve-git-dir=.git",
+                "--path-format=relative", "--path-format=absolute",
+                "--sq", "--sq-quote", "--end-of-options", "--local-env-vars",
+                "--disambiguate=e69de29", "--disambiguate=dead", "--default=HEAD",
+                "--glob=refs/heads/*", "--exclude=refs/tags/*", "--remotes",
+                "--no-revs", "--revs-only", "--flags",
             ],
             positionals: REVS,
             shapes: REV_SHAPES,
         },
+        // `--porcelain=v2` is a different serializer from v1, not a variant of
+        // it — it prints per-entry mode and oid triples nothing in v1 carries —
+        // and it was absent while `runner::probe_state` used it, so the format
+        // the harness trusts to describe a repository was never itself compared.
+        // `-z` is the third serializer again (no quoting, NUL records).
+        // `--ignored=` takes a mode where the bare `--ignored` takes none, and
+        // `--ignore-submodules=` and `--no-ahead-behind` each remove a whole
+        // walk from the answer. `status` also takes pathspecs, which it did not
+        // draw at all: the porcelain that reads a pathspec is the one most
+        // callers write.
         Grammar {
             cmd: "status",
             flags: &[
                 "--porcelain", "--porcelain=v1", "--short", "--branch", "--long",
                 "--untracked-files=all", "--untracked-files=no", "--untracked-files=normal",
                 "--ignored", "--no-renames", "--find-renames",
+                "--porcelain=v2", "--porcelain=bogus", "-z", "--null",
+                "--ignored=matching", "--ignored=traditional", "--ignored=no",
+                "--ignore-submodules=all", "--ignore-submodules=dirty",
+                "--ignore-submodules=untracked", "--ignore-submodules=none",
+                "--ahead-behind", "--no-ahead-behind", "--show-stash", "--no-column",
+                "--column", "--renames", "--find-renames=50%", "-v", "-vv",
+                "--untracked-files", "--no-untracked-files",
             ],
-            positionals: &[],
+            positionals: PATHS,
             shapes: ALL_SHAPES,
         },
+        // The flag list here described what `log` *prints*. What it selects — a
+        // different engine each time — was almost entirely absent: history
+        // simplification (`--full-history`, `--simplify-merges`,
+        // `--ancestry-path`, `--max-parents=`/`--min-parents=`), the grep engine
+        // and its four mutually-qualifying modifiers, the reflog walk
+        // (`-g`/`--walk-reflogs`/`--reflog`, which reads a store the commit walk
+        // never touches), line-level history (`-L`, an engine of its own), and
+        // `--diff-merges=`/`--remerge-diff`, which decide what a merge commit
+        // even shows. Each of those changes which commits come out, not how they
+        // are spelled, and a port can render every format correctly while
+        // walking the wrong set.
+        //
+        // The positional list gains the rev pool for the same reason: `log`
+        // resolving one of three names measured the walk and never the parser
+        // that feeds it.
         Grammar {
             cmd: "log",
             flags: &[
@@ -1126,84 +1909,319 @@ pub fn grammars() -> Vec<Grammar> {
                 "--pretty=oneline", "--pretty=short", "--pretty=format:%an", "--name-only",
                 "--name-status", "--stat", "--graph", "--all", "--reverse", "--no-merges",
                 "--merges", "--date-order", "--topo-order",
+                "-p", "--patch", "--no-patch", "--first-parent", "--full-history",
+                "--simplify-merges", "--ancestry-path", "--boundary", "--left-right",
+                "--cherry-mark", "--children", "--source", "--skip=1",
+                "--max-parents=1", "--min-parents=2", "--follow",
+                "-g", "--walk-reflogs", "--reflog",
+                "--grep=fixture", "--grep=two", "--all-match", "--invert-grep",
+                "--regexp-ignore-case", "--extended-regexp", "--fixed-strings",
+                "--author=parity", "--committer=parity",
+                "--since=2020-01-01", "--until=2030-01-01",
+                "--diff-merges=first-parent", "--diff-merges=separate",
+                "--diff-merges=bogus", "--remerge-diff",
+                "-L1,1:src/lib.rs", "-L2,+1:README.md",
+                "--decorate=full", "--decorate=short", "--no-decorate",
+                "--abbrev-commit", "--no-abbrev-commit", "--date=raw", "--date=iso",
+                "--date=format:%Y-%m-%d", "--date=bogus",
+                "--pretty=fuller", "--pretty=raw", "--pretty=%(bogus)",
+                "--notes", "--no-notes", "--full-diff", "-w", "-M", "-C",
+                "--word-diff", "--stat=20",
             ],
-            positionals: &["HEAD", "main", ""],
+            positionals: REVS,
             shapes: REV_SHAPES,
         },
+        // `rev-list` is the walk `log` renders, so its flag list is where the
+        // walk's *modes* belong: `--bisect`/`--bisect-vars`/`--bisect-all` are a
+        // separate midpoint search (`git bisect` is built on them, and the
+        // `gen/bisect` walks drive that machine from the porcelain side while
+        // nothing drove it from here), `--filter=` is the partial-clone object
+        // filter with its own spec grammar, `--no-walk`/`--do-walk` turn the walk
+        // off and on, and `--disk-usage` reports a number derived from the object
+        // store rather than from the walk at all. `--stdin` is here because it
+        // makes [`wants_stdin`] fire and hands the same command its revisions
+        // through a second parser.
         Grammar {
             cmd: "rev-list",
             flags: &[
                 "--count", "--max-count=2", "--all", "--reverse", "--no-merges",
                 "--merges", "--objects", "--parents", "--topo-order",
+                "--first-parent", "--left-right", "--boundary", "--cherry-mark",
+                "--cherry-pick", "--ancestry-path", "--children", "--header",
+                "--timestamp", "--quiet", "--no-walk", "--do-walk", "--in-commit-order",
+                "--bisect", "--bisect-vars", "--bisect-all",
+                "--filter=blob:none", "--filter=tree:0", "--filter=blob:limit=1k",
+                "--filter=bogus", "--filter-provided-objects", "--no-filter",
+                "--missing=allow-any", "--missing=print", "--missing=bogus",
+                "--exclude-promisor-objects", "--object-names", "--no-object-names",
+                "--disk-usage", "--max-parents=1", "--min-parents=2",
+                "--branches", "--tags", "--remotes", "--reflog", "--not",
+                "--abbrev-commit", "--abbrev=7", "--pretty=oneline", "--stdin",
             ],
-            positionals: &["HEAD", "main"],
-            shapes: REV_SHAPES,
-        },
-        Grammar {
-            cmd: "cat-file",
-            flags: &["-t", "-s", "-p", "-e"],
             positionals: REVS,
             shapes: REV_SHAPES,
         },
+        // Four single-object queries described a command whose other half is a
+        // *request stream*. The `--batch` family reads object names (or, under
+        // `--batch-command`, commands) from stdin and answers each one, which is
+        // a different loop, a different error policy and — with `--buffer` — a
+        // different flush discipline; [`wants_stdin`] already routes a payload to
+        // anything spelling `--batch`, so these flags are what makes that rule
+        // fire for this command. `--textconv`/`--filters` run the content through
+        // the attribute-driven conversion stack, `--allow-unknown-type` relaxes
+        // the type check `-t` enforces, and `--batch-all-objects` walks the store
+        // instead of taking an argument at all.
         Grammar {
-            cmd: "ls-tree",
-            flags: &["-r", "-t", "-d", "--name-only", "--name-status", "--full-tree", "--abbrev=7", "-z"],
-            positionals: &["HEAD", "HEAD^{tree}", "main"],
+            cmd: "cat-file",
+            flags: &[
+                "-t", "-s", "-p", "-e",
+                "--batch", "--batch-check", "--batch-command", "--buffer",
+                "--batch-check=%(objecttype) %(objectsize)", "--batch=%(objectname)",
+                "--batch-all-objects", "--unordered",
+                "--allow-unknown-type", "--textconv", "--filters", "--path=README.md",
+                "--use-mailmap", "--follow-symlinks",
+            ],
+            positionals: REVS,
             shapes: REV_SHAPES,
         },
+        // `ls-tree` takes `<tree> [<path>…]`, and the path half was missing: the
+        // pathspec restricts which entries are listed and is what turns the
+        // command into a lookup rather than a dump. `--format=` is a whole
+        // template language (`ref-filter`'s atoms) that the fixed layouts above
+        // never reach, and `--long`/`--object-only` are two more layouts again.
+        Grammar {
+            cmd: "ls-tree",
+            flags: &[
+                "-r", "-t", "-d", "--name-only", "--name-status", "--full-tree", "--abbrev=7", "-z",
+                "-l", "--long", "--object-only", "--full-name", "--abbrev",
+                "--format=%(objectname) %(path)", "--format=%(objectmode) %(objecttype)",
+                "--format=%(bogus)",
+            ],
+            positionals: &[
+                "HEAD", "HEAD^{tree}", "main", "src", "src/", "README.md", "*.rs",
+                ":(glob)**/*.rs", "no/such/path",
+            ],
+            shapes: REV_SHAPES,
+        },
+        // The selectors were here; the things that change what a selection
+        // *means* were not. `--error-unmatch` turns a silent empty answer into
+        // rc 1 — the only flag in this command that moves the exit code, and the
+        // one a script depends on. `--exclude-standard`/`--exclude=`/`-i` bring
+        // the ignore machinery into a command that otherwise never consults it,
+        // `--directory` collapses an untracked tree into one entry,
+        // `--with-tree=` mixes a tree into the index listing, and `-t`/`-v` /
+        // `--eol` are three more layouts — `-v` being the one that shows the
+        // assume-unchanged and skip-worktree bits, which no other reader in this
+        // harness prints.
+        //
+        // `--debug` is deliberately absent: it prints device, inode and
+        // timestamps, which differ between two copies on the same machine and
+        // would make every case that drew it fail for a reason that is not the
+        // port.
         Grammar {
             cmd: "ls-files",
             flags: &[
                 "--cached", "--stage", "--modified", "--deleted", "--others",
                 "--unmerged", "--full-name", "-z", "--abbrev",
+                "--error-unmatch", "--exclude-standard", "--ignored", "-i",
+                "--exclude=*.md", "--exclude=src", "--directory", "--no-empty-directory",
+                "--eol", "-t", "-v", "-f", "--deduplicate", "--sparse",
+                "--resolve-undo", "--with-tree=HEAD", "--with-tree=main",
+                "--recurse-submodules", "--abbrev=7",
+                "--format=%(path) %(objectmode)", "--format=%(bogus)",
             ],
             positionals: PATHS,
             shapes: ALL_SHAPES,
         },
+        // The single most under-described grammar in this file, and the one whose
+        // options are shared with `log`, `show`, `format-patch` and every other
+        // verb that renders a diff — so a gap here was a gap in a dozen commands
+        // at once.
+        //
+        // `--exit-code`/`--quiet` are the reason this list needed widening most:
+        // they are the only diff options that change the **exit code** (verified
+        // against stock 2.55.0: rc 1 where the same invocation without them is
+        // rc 0), which makes them the one part of the diff surface a port cannot
+        // get right by rendering correctly. After that come the engine choices —
+        // `--diff-algorithm=`, `--anchored=`, `--indent-heuristic`, the four
+        // whitespace-ignoring modes, `-B`/`-M<n>%`/`--find-copies-harder` — the
+        // pickaxe (`-S`/`-G`/`--find-object=`, a content search, not a
+        // renderer), the prefix controls the `diff-prefix` config group
+        // configures from the other side, and `--no-index`, which compares two
+        // paths with no repository involved at all.
         Grammar {
             cmd: "diff",
             flags: &[
                 "--cached", "--staged", "--stat", "--shortstat", "--numstat",
                 "--name-only", "--name-status", "--raw", "--no-color", "--unified=1",
                 "--ignore-all-space", "--find-renames",
+                "--exit-code", "--quiet",
+                "-p", "--patch", "--no-patch", "-s", "--stat=20", "--compact-summary",
+                "--summary", "--patch-with-stat", "--patch-with-raw",
+                "--diff-filter=AMD", "--diff-filter=bogus",
+                "-M50%", "-B", "-C", "--find-copies-harder", "--irreversible-delete",
+                "--binary", "--full-index", "--abbrev=7", "-R",
+                "--src-prefix=X/", "--dst-prefix=Y/", "--no-prefix", "--default-prefix",
+                "--relative", "--relative=src", "--text", "-a",
+                "-b", "-w", "--ignore-space-at-eol", "--ignore-blank-lines",
+                "--ignore-cr-at-eol", "--ignore-matching-lines=fn",
+                "--inter-hunk-context=2", "--function-context", "-U0",
+                "--word-diff", "--word-diff=porcelain", "--word-diff-regex=.",
+                "--color-words", "--color-moved", "--color-moved=zebra",
+                "--color-moved-ws=allow-indentation-change", "--ws-error-highlight=all",
+                "--check", "--anchored=fn", "--diff-algorithm=histogram",
+                "--diff-algorithm=bogus", "--minimal", "--patience", "--histogram",
+                "--indent-heuristic", "--no-indent-heuristic",
+                "--textconv", "--no-textconv", "--ext-diff", "--no-ext-diff",
+                "--output-indicator-new=>", "--line-prefix=| ",
+                "-Sfn", "-Gfn", "--pickaxe-all", "--pickaxe-regex", "--find-object=HEAD",
+                "--merge-base", "--cc", "--combined-all-paths", "--no-index",
             ],
-            positionals: &["", "HEAD", "HEAD~1"],
+            positionals: &["", "HEAD", "HEAD~1", "main", "main..HEAD", "README.md", "src"],
             shapes: ALL_SHAPES,
         },
+        // `show` dispatches on the *type* of what it is given — a commit, a tag,
+        // a tree and a blob each take a different renderer — so the rev pool is
+        // already doing most of the work here. What was missing is the choice of
+        // renderer for the commit case: `--diff-merges=`/`--remerge-diff` decide
+        // whether a merge shows anything at all, `--expand-tabs=` and
+        // `--encoding=` re-render the message body, and `-s`/`--quiet` suppress
+        // the diff the other flags configure.
         Grammar {
             cmd: "show",
-            flags: &["--oneline", "--no-patch", "--stat", "--name-only", "--format=%H", "--raw"],
+            flags: &[
+                "--oneline", "--no-patch", "--stat", "--name-only", "--format=%H", "--raw",
+                "-s", "--quiet", "--patch", "--unified=0", "--numstat", "--shortstat",
+                "--pretty=fuller", "--pretty=raw", "--format=%(bogus)",
+                "--expand-tabs=4", "--no-expand-tabs", "--encoding=UTF-8",
+                "--encoding=ISO-8859-1", "--first-parent",
+                "--diff-merges=on", "--diff-merges=first-parent", "--diff-merges=bogus",
+                "--remerge-diff", "--textconv", "--no-textconv",
+                "--notes", "--no-notes", "--abbrev-commit", "--decorate", "--no-decorate",
+                "--word-diff", "--color-moved", "--find-renames", "--name-status",
+            ],
             positionals: REVS,
             shapes: REV_SHAPES,
         },
+        // `branch --list` is a `ref-filter` front end, and none of the filter was
+        // here: `--contains=`/`--no-contains=`/`--merged`/`--no-merged`/
+        // `--points-at=` each run a reachability query to decide what to print,
+        // and `--sort=` runs the same field parser `tag.sort`/`branch.sort` do
+        // (verified: an unknown field is `fatal: unknown field name: bogus`,
+        // rc 128, from the flag exactly as from the config key). The positional
+        // was one empty string, so the pattern argument — the thing that decides
+        // *which* branches a list names — was never given.
         Grammar {
             cmd: "branch",
-            flags: &["--list", "-a", "-r", "-v", "-vv", "--show-current", "--all", "--format=%(refname)"],
-            positionals: &[""],
+            flags: &[
+                "--list", "-a", "-r", "-v", "-vv", "--show-current", "--all", "--format=%(refname)",
+                "--contains=HEAD", "--no-contains=HEAD", "--merged", "--no-merged",
+                "--points-at=HEAD", "--points-at=does-not-exist",
+                "--sort=refname", "--sort=-committerdate", "--sort=bogus",
+                "--column", "--no-column", "--ignore-case", "-i", "--omit-empty",
+                "--abbrev=7", "--no-abbrev", "-q",
+                "--format=%(refname:short) %(upstream:track)", "--format=%(bogus)",
+            ],
+            positionals: &["", "main", "feature", "*e*", "feature*", "no-such-branch"],
             shapes: ALL_SHAPES,
         },
+        // The same `ref-filter` surface again, over a different ref namespace and
+        // with the peeling `branch` does not do — `%(objecttype)` on a tag is
+        // `tag` for the annotated one and `commit` for the lightweight one, which
+        // is a distinction only `Shape::Branched` carries and only a format
+        // string shows. `-n<n>` prints that many lines of the annotation, which
+        // is the one output here that reads the tag object's body.
         Grammar {
             cmd: "tag",
-            flags: &["--list", "-l", "-n", "--sort=refname", "--format=%(refname:short)"],
-            positionals: &["", "v0.*"],
+            flags: &[
+                "--list", "-l", "-n", "--sort=refname", "--format=%(refname:short)",
+                "-n1", "-n99", "--contains=HEAD", "--no-contains=HEAD",
+                "--merged", "--no-merged", "--points-at=HEAD",
+                "--sort=-refname", "--sort=version:refname", "--sort=taggerdate",
+                "--sort=bogus", "--ignore-case", "-i", "--column", "--omit-empty",
+                "--format=%(objecttype) %(refname)", "--format=%(bogus)",
+            ],
+            positionals: &["", "v0.*", "V0.*", "v0.1.0", "*", "no-such-tag"],
             shapes: &[Shape::Branched, Shape::Linear],
         },
+        // `describe` is a search with a budget, and the budget was not sampled.
+        // `--candidates=` bounds how many tags it will consider — verified:
+        // `--candidates=0` turns a successful describe into
+        // `fatal: no tag exactly matches …` — `--match=`/`--exclude=` change the
+        // candidate set itself, and `--exact-match`/`--contains` are two
+        // different searches from the default one. `--abbrev=0` drops the
+        // suffix entirely, which is the answer scripts parse.
         Grammar {
             cmd: "describe",
-            flags: &["--always", "--tags", "--all", "--long", "--abbrev=7", "--dirty"],
-            positionals: &["", "HEAD"],
+            flags: &[
+                "--always", "--tags", "--all", "--long", "--abbrev=7", "--dirty",
+                "--exact-match", "--contains", "--first-parent", "--broken",
+                "--match=v0.*", "--match=no-such*", "--exclude=v0.2*",
+                "--candidates=0", "--candidates=1", "--candidates=99",
+                "--abbrev=0", "--abbrev=40", "--dirty=-X", "--broken=-B", "--debug",
+            ],
+            positionals: &["", "HEAD", "main", "HEAD~1", "does-not-exist"],
             shapes: &[Shape::Branched, Shape::Linear, Shape::Dirty],
         },
+        // `config` is the one command in this file that *reads the thing the
+        // whole configuration dimension writes*, so it is where a scope or a
+        // parse the rest of the harness delivered can be asked about directly.
+        // `--show-origin`/`--show-scope` name where a value came from, which is
+        // the exact fact [`ConfigScope`] exists to vary and which nothing could
+        // previously print; `--type=` runs a named converter over the stored
+        // string (verified: `--type=expiry-date core.bare` answers `0` rather
+        // than refusing, which is not the obvious behaviour); `--default=`
+        // supplies an answer for a key that is absent; and `--get-color`/
+        // `--get-colorbool` are two more converters again, over the vocabulary
+        // the `color-cascade` group writes.
+        //
+        // The shape stays `Linear`: `config` answers about a file, and the other
+        // shapes differ in history rather than in configuration.
         Grammar {
             cmd: "config",
-            flags: &["--list", "--get", "--get-all", "--local", "--name-only"],
-            positionals: &["core.bare", "user.name", "no.such.key"],
+            flags: &[
+                "--list", "--get", "--get-all", "--local", "--name-only",
+                "--get-regexp", "--get-urlmatch", "--show-origin", "--show-scope",
+                "--global", "--system", "--worktree", "--includes", "--no-includes",
+                "--type=bool", "--type=int", "--type=path", "--type=expiry-date",
+                "--type=color", "--type=bool-or-int", "--type=bogus",
+                "--bool", "--int", "--path", "--null", "-z",
+                "--default=X", "--get-color", "--get-colorbool", "--fixed-value",
+                "--unset", "--unset-all", "--remove-section", "--rename-section",
+            ],
+            positionals: &[
+                "core.bare", "user.name", "no.such.key", "core.abbrev",
+                "diff.renames", "core.repositoryformatversion",
+                "core\\..*", "no-section", "core.", ".key",
+            ],
             shapes: &[Shape::Linear],
         },
+        // Five flags described a command whose whole subject is *which commit a
+        // line came from*. What decides that was absent: `-M`/`-C` follow a line
+        // across a move within and between files, `-w` ignores whitespace when
+        // deciding whether a line changed, `--ignore-rev`/`--ignore-revs-file`
+        // skip a commit and reattribute its lines (and the second is the flag
+        // spelling of `blame.ignoreRevsFile` in the `blame-render` group —
+        // verified to die identically: `fatal: could not open object name list:
+        // no-such`), and `-L` restricts the answer to a line range in three
+        // different syntaxes, one of which is a regex.
+        //
+        // `--incremental` is a machine-readable protocol rather than a layout,
+        // and `-t` prints the raw timestamp — both deterministic here because
+        // `env::harden` pins the clock.
         Grammar {
             cmd: "blame",
-            flags: &["--porcelain", "--line-porcelain", "-s", "-l", "--show-name"],
-            positionals: &["README.md", "src/lib.rs"],
+            flags: &[
+                "--porcelain", "--line-porcelain", "-s", "-l", "--show-name",
+                "--incremental", "-c", "-t", "-f", "-n", "-e", "--root",
+                "-w", "-M", "-C", "--minimal", "--first-parent", "--score-debug",
+                "-L1,1", "-L2,+1", "-L/one/,+1", "-L99,100",
+                "--abbrev=7", "--abbrev=40", "--date=iso", "--date=raw", "--date=bogus",
+                "--ignore-rev=HEAD", "--ignore-rev=does-not-exist",
+                "--ignore-revs-file=no-such", "--ignore-revs-file=.git/HEAD",
+                "--color-lines", "--color-by-age",
+            ],
+            positionals: &["README.md", "src/lib.rs", "no/such/path", "src"],
             shapes: &[Shape::Linear, Shape::Branched],
         },
     ]
@@ -1887,8 +2905,38 @@ const RESUME_EXTRA: &[&str] = &["--retry", "--edit-todo", "--show-current-patch"
 /// which — a walk drawn from it uniformly spends most of its steps on
 /// `bisect v0.1.0`, which is a usage error rather than a transition. The grammar
 /// still supplies this family's flags, and [`REVS`] supplies the operands.
-const BISECT_VERBS: &[&str] =
-    &["start", "good", "bad", "skip", "next", "log", "terms", "reset", "old", "new", "help"];
+/// `run` and `replay` are the two verbs that drive the machine from outside it:
+/// `run` answers every step from a command's exit status instead of from a
+/// caller, and `replay` re-feeds a log. Both are reachable only here — the
+/// grammar's positionals do not distinguish a verb from a rev. `visualize`/
+/// `view` are deliberately absent: they launch a viewer.
+///
+/// `run`'s operand is **not** drawn from [`REVS`], and that is a correctness
+/// requirement rather than a preference: `bisect run <word>` *executes* the
+/// word. `HEAD` is the obvious rev to draw and is also `/usr/bin/HEAD`, the
+/// libwww-perl request tool, which with no URL reads stdin — verified against
+/// stock 2.55.0, `git bisect run HEAD` inside a started bisect printed
+/// `running 'HEAD'` and then blocked until a 20-second timeout killed it. A
+/// generator that hands this verb a rev pool is a generator that hangs on a
+/// machine where some rev happens to name a program. [`BISECT_RUN_COMMANDS`]
+/// supplies the operand instead.
+const BISECT_VERBS: &[&str] = &[
+    "start", "good", "bad", "skip", "next", "log", "terms", "reset", "old", "new", "help",
+    "run", "replay",
+];
+
+/// The only operands `bisect run` is ever given.
+///
+/// Two programs that exist on every POSIX machine, take no input and terminate
+/// at once, which between them reach both of `run`'s outcomes on the fixtures'
+/// short histories. Verified against stock 2.55.0 on `Branched` with `bad`/
+/// `good` already answered: `bisect run false` converges and prints
+/// `<oid> is the first 'bad' commit` with rc 0, and `bisect run true` marks the
+/// same commit both ways and answers
+/// `error: bisect run failed: 'git bisect good' exited with error code -1` with
+/// rc 1. The empty entry is `bisect run` with no command at all, which is
+/// `error: 'git bisect run' failed: no command provided.`
+const BISECT_RUN_COMMANDS: &[&str] = &["false", "true", ""];
 
 /// Read-only invocations whose answer a mutation is supposed to change.
 ///
@@ -1927,6 +2975,26 @@ const OBSERVERS: &[&[&str]] = &[
     &["tag", "--list"],
     &["worktree", "list"],
     &["show-ref", "--head"],
+    // The index *flags*, which no other reader here prints. `probe_state` uses
+    // `ls-files --stage`, and that layout shows mode, oid and stage while saying
+    // nothing about assume-unchanged, skip-worktree or fsmonitor-valid — so a
+    // step that set one of those bits and a step that did not produced the same
+    // observation. `-v` is the layout that distinguishes them (`H` against `h`,
+    // verified against stock 2.55.0 either side of
+    // `update-index --assume-unchanged`), which is what makes the
+    // `update-index-assume-unchanged` round trip below observable at the step
+    // that failed rather than not at all.
+    &["ls-files", "-v"],
+    // What the working tree and the index think the line endings are. The
+    // `crlf` config group changes exactly this, and nothing read it back:
+    // `status` reports a path as modified or not, which conflates a conversion
+    // that happened with one that was not needed.
+    &["ls-files", "--eol"],
+    // Where each setting came from after the step ran. `probe_state` compares
+    // `config --list --local`, which is the file; this is the *resolved* view
+    // with its origin, so a step that wrote the right value into the wrong scope
+    // is named by the observer rather than inferred from a later difference.
+    &["config", "--list", "--show-scope"],
 ];
 
 /// Verbs whose purpose is to write repository state.
@@ -2134,6 +3202,43 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         forward: &[&["read-tree", "HEAD~1"]],
         inverse: &[&["read-tree", "HEAD"]],
     },
+    // The only way this harness can produce an **ambiguous refname**. `Branched`
+    // has a branch called `feature`; tagging `feature` makes one name resolve
+    // through two rules at once, and the fixtures cannot be edited from here to
+    // arrange that statically. Verified against stock 2.55.0: with both refs
+    // present, `rev-parse feature` prints
+    // `warning: refname 'feature' is ambiguous.` and answers with the **tag**
+    // (`refs/tags/` precedes `refs/heads/` in `refs.c:ref_rev_parse_rules`, and
+    // the tag was cut one commit behind the branch, so the two answers are
+    // different oids rather than the same one),
+    // `show-ref feature` lists `refs/heads/feature` and `refs/tags/feature`, and
+    // `tag -d feature` prints `Deleted tag 'feature' (was 5915d79)` and leaves
+    // the branch behind. Every observer between the
+    // halves — and `feature` in [`REVS`], drawn by any step in the window — is
+    // then asking a question with two right-looking answers, which is where a
+    // port that walks `ref_rev_parse_rules` in the wrong order stops agreeing.
+    RoundTrip {
+        cmd: "tag",
+        name: "tag-shadows-branch",
+        shape: Shape::Branched,
+        forward: &[&["tag", "feature", "HEAD"]],
+        inverse: &[&["tag", "-d", "feature"]],
+    },
+    // An index *flag* round trip. Every other pair here moves a ref, a file or a
+    // stanza; this one changes a bit inside `.git/index` and nothing else — no
+    // ref moves, no content changes, and `ls-files --stage` (which is what
+    // `probe_state` compares) prints the same three lines either way. The
+    // difference is only visible to the `ls-files -v` observer added above, and
+    // that is the point: a port whose `--no-assume-unchanged` clears the wrong
+    // bit, or clears it for every entry, ends the round trip in a state that
+    // looks identical to every reader that does not ask.
+    RoundTrip {
+        cmd: "update-index",
+        name: "update-index-assume-unchanged",
+        shape: Shape::Linear,
+        forward: &[&["update-index", "--assume-unchanged", "README.md"]],
+        inverse: &[&["update-index", "--no-assume-unchanged", "README.md"]],
+    },
 ];
 
 /// Generate `per_entry` sequences for every entry point, from `seed`.
@@ -2319,14 +3424,22 @@ fn bisect_walk(rng: &mut Rng, grammars: &[Grammar], n: usize) -> Sequence {
     seq = seq.step_argv(start, None);
 
     for _ in 0..=rng.below(5) {
-        let mut args = vec!["bisect".to_string(), rng.pick(BISECT_VERBS).to_string()];
+        let verb = *rng.pick(BISECT_VERBS);
+        let mut args = vec!["bisect".to_string(), verb.to_string()];
         // An operand a third of the time. `bisect bad HEAD~2` and `bisect bad`
         // are different transitions — one names a commit, the other means "the
         // one you just checked out" — and only a walk can reach the second.
+        //
+        // `run` takes its operand from [`BISECT_RUN_COMMANDS`] instead, because
+        // its operand is a program it executes rather than a rev it resolves;
+        // see that constant for the hang a rev pool produces here. The roll and
+        // the pick are taken either way, so the RNG stream — and therefore every
+        // case id downstream of it — does not depend on which verb came up.
         if rng.chance(1, 3) {
-            let rev = *rng.pick(REVS);
-            if !rev.is_empty() {
-                args.push(rev.to_string());
+            let pool = if verb == "run" { BISECT_RUN_COMMANDS } else { REVS };
+            let operand = *rng.pick(pool);
+            if !operand.is_empty() {
+                args.push(operand.to_string());
             }
         }
         seq = seq.step_argv(args, None);

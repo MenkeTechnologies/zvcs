@@ -1,6 +1,6 @@
 [package]
 name = "zvcs-native"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Stable C-ABI SDK for writing native (Rust) zvcs plugins loaded at runtime by the shadow `git` binary"

@@ -56,7 +56,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">zvcs v0.21.0 · one Rust binary named <code>git</code> · git-compat via vendored gitoxide · superset: fair FIFO index-lock daemon, reconcile-to-mainline attaching, forward-only gitlink bumps · MIT · in active development</p>
+          <p class="docs-build-line">zvcs v0.22.0 · one Rust binary named <code>git</code> · git-compat via vendored gitoxide · superset: fair FIFO index-lock daemon, reconcile-to-mainline attaching, forward-only gitlink bumps · MIT · in active development</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -83,7 +83,7 @@
         <div class="stat-card"><div class="stat-val accent">git</div><div class="stat-label">the one binary, shadowed</div></div>
         <div class="stat-card"><div class="stat-val">119</div><div class="stat-label">superset verbs</div></div>
         <div class="stat-card"><div class="stat-val">181</div><div class="stat-label">git-compat verbs dispatched</div></div>
-        <div class="stat-card"><div class="stat-val">v0.21.0</div><div class="stat-label">version</div></div>
+        <div class="stat-card"><div class="stat-val">v0.22.0</div><div class="stat-label">version</div></div>
         <div class="stat-card"><div class="stat-val">MIT</div><div class="stat-label">license · free / OSS</div></div>
       </div>
 
@@ -91,7 +91,7 @@
         <h2>Summary</h2>
         <p>gitoxide already ports git to Rust. zvcs does the thing git structurally cannot: it wraps that library in a single binary named <code>git</code> that shadows stock git on <code>PATH</code>, and layers on coordination verbs designed for the exact failure modes of driving a large meta-repo of submodules under many concurrent automated agents. There is <strong>no fork/exec of stock git</strong> — every subcommand is served in-process against the vendored <code>gix</code> crates, so tools already on <code>PATH</code> (RustRover, <code>gh</code>, <code>cargo</code>) read the same on-disk <code>.git</code> and see identical behavior.</p>
         <p>The world's-first leg is the superset, not the port. Its founding three verbs close three reproducible stock-git failure modes: <strong><code>zdaemon</code></strong> replaces the <code>index.lock</code> flock with a fair FIFO backed by a machine-wide daemon; <strong><code>zsync</code></strong> reconciles submodules to their tracked mainline and keeps <code>HEAD</code> attached; <strong><code>zbump</code></strong> makes gitlink bumps forward-only and commits them. The superset has since grown to 116 verbs — coordination, an async job queue, a machine-wide repo index and status cache, cross-repo timeline and undo, tree-wide snapshots, per-agent worktrees, policy, and live monitoring.</p>
-        <p>The current tree dispatches 181 git-compat verbs and 118 superset verbs natively — no fork/exec of stock git at any point — across ~311k lines in <code>src/extensions</code>, on top of 67 vendored <code>gix</code> crates, with 672 integration tests across 183 files. Coverage is not parity: a subcommand that dispatches is not thereby byte-faithful, and depth varies per subcommand. See <a href="index.html#performance">the performance section</a> for how the read path compares to stock git, measured rather than asserted.</p>
+        <p>The current tree dispatches 181 git-compat verbs and 119 superset verbs natively — no fork/exec of stock git at any point — across ~381k lines in <code>src/extensions</code>, on top of 67 vendored <code>gix</code> crates, with 2,556 integration tests across 404 files. Coverage is not parity: a subcommand that dispatches is not thereby byte-faithful, and depth varies per subcommand. See <a href="index.html#performance">the performance section</a> for how the read path compares to stock git, measured rather than asserted.</p>
       </section>
 
       <hr class="section-rule">

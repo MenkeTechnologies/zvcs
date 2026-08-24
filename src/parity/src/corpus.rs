@@ -13,10 +13,13 @@
 use crate::fixture::Shape;
 use crate::runner::{Case, Sequence};
 
+mod add_rm_mv_clean;
+mod branch_remote;
 mod commit_family;
 mod config_cmd;
 mod diff_family;
 mod discovery;
+mod history_query;
 mod history_rewrite;
 mod info_attrs;
 mod mail_patch;
@@ -24,12 +27,14 @@ mod maintenance;
 mod merge_dirty;
 mod merge_family;
 mod misc_commands;
+mod object_pack;
 mod plumbing_objects;
 mod plumbing_refs;
 mod reset_family;
 mod sequences;
 mod shape_reach;
 mod stdin_plumbing;
+mod submodule_family;
 mod switch_restore;
 mod tag_describe;
 mod transport_local;
@@ -417,10 +422,13 @@ pub fn cases() -> Vec<Case> {
     stdin_driven(&mut c);
 
     // ---- per-subsystem corpora, one module each ----
+    add_rm_mv_clean::cases(&mut c);
+    branch_remote::cases(&mut c);
     commit_family::cases(&mut c);
     config_cmd::cases(&mut c);
     diff_family::cases(&mut c);
     discovery::cases(&mut c);
+    history_query::cases(&mut c);
     history_rewrite::cases(&mut c);
     info_attrs::cases(&mut c);
     mail_patch::cases(&mut c);
@@ -428,11 +436,13 @@ pub fn cases() -> Vec<Case> {
     merge_dirty::cases(&mut c);
     merge_family::cases(&mut c);
     misc_commands::cases(&mut c);
+    object_pack::cases(&mut c);
     plumbing_objects::cases(&mut c);
     plumbing_refs::cases(&mut c);
     reset_family::cases(&mut c);
     shape_reach::cases(&mut c);
     stdin_plumbing::cases(&mut c);
+    submodule_family::cases(&mut c);
     switch_restore::cases(&mut c);
     tag_describe::cases(&mut c);
     transport_local::cases(&mut c);

@@ -13,6 +13,8 @@
 use crate::fixture::Shape;
 use crate::runner::{Case, Sequence};
 
+mod commit_family;
+mod config_cmd;
 mod diff_family;
 mod discovery;
 mod history_rewrite;
@@ -24,8 +26,12 @@ mod merge_family;
 mod misc_commands;
 mod plumbing_objects;
 mod plumbing_refs;
+mod reset_family;
 mod sequences;
 mod shape_reach;
+mod stdin_plumbing;
+mod switch_restore;
+mod tag_describe;
 mod transport_local;
 mod worktree_index;
 
@@ -411,6 +417,8 @@ pub fn cases() -> Vec<Case> {
     stdin_driven(&mut c);
 
     // ---- per-subsystem corpora, one module each ----
+    commit_family::cases(&mut c);
+    config_cmd::cases(&mut c);
     diff_family::cases(&mut c);
     discovery::cases(&mut c);
     history_rewrite::cases(&mut c);
@@ -422,7 +430,11 @@ pub fn cases() -> Vec<Case> {
     misc_commands::cases(&mut c);
     plumbing_objects::cases(&mut c);
     plumbing_refs::cases(&mut c);
+    reset_family::cases(&mut c);
     shape_reach::cases(&mut c);
+    stdin_plumbing::cases(&mut c);
+    switch_restore::cases(&mut c);
+    tag_describe::cases(&mut c);
     transport_local::cases(&mut c);
     worktree_index::cases(&mut c);
     config_and_globals(&mut c);

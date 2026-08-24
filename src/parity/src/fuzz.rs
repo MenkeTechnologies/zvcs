@@ -1677,6 +1677,36 @@ const P_MKTAG: &[u8] = b"object e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\ntype b
 /// parses headers by name rather than by position accepts this.
 const P_MKTAG_BAD_ORDER: &[u8] = b"type blob\nobject e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\ntag gen\ntagger zvcs parity <parity@example.invalid> 1700000000 +0000\n\nmsg\n";
 
+/// A complete `fast-import` stream: one blob, one root commit on
+/// `refs/heads/gen-fi`, terminated by `done`.
+///
+/// `fast-import` is the one command in this harness whose *entire* input is a
+/// language, and until this payload existed it was handed nothing at all — it
+/// was not in [`STDIN_ALWAYS`] and has no `--stdin` flag, so every generated
+/// `fast-import` case read EOF, imported no commands and exited 0. Its argv
+/// parser was measured and its stream parser was not.
+///
+/// Every field is a literal so the result is a function of the bytes and not of
+/// the repository: the commit has no `from`, so it is a root commit whose id
+/// does not depend on the fixture's history, and both identities carry the
+/// timestamp inline rather than inheriting `env::harden`'s pins. Verified
+/// against stock 2.55.0 by importing it into two independently built
+/// repositories: `rev-parse refs/heads/gen-fi` answered
+/// `c53a4fafd7058d39286733184a6a6fa0bc3aef81` in both. The statistics block
+/// (`Alloc'd objects`, `Memory total`) is written to **stderr**, which generated
+/// cases do not compare, so the machine-dependent half of the output is not in
+/// the comparison.
+const P_FAST_IMPORT: &[u8] = b"blob\nmark :1\ndata 12\ngen import\n\ncommit refs/heads/gen-fi\nmark :2\nauthor zvcs parity <parity@example.invalid> 1700000000 +0000\ncommitter zvcs parity <parity@example.invalid> 1700000000 +0000\ndata 11\ngen commit\nM 100644 :1 gen.txt\n\ndone\n";
+/// The same stream with a dangling mark.
+///
+/// The reject path, reached *after* the command parser has accepted every line:
+/// stock 2.55.0 answers `fatal: mark :99 not declared` and dumps a crash report
+/// to `.git/fast_import_crash_<pid>` — a filename carrying the process id, which
+/// is why it matters that `runner::probe_op_state` names the state files it
+/// reads instead of walking `.git`, and why this payload is safe to draw even
+/// though the two sides write differently-named reports.
+const P_FAST_IMPORT_BAD: &[u8] = b"commit refs/heads/gen-fi-bad\ncommitter zvcs parity <parity@example.invalid> 1700000000 +0000\ndata 3\nbad\nM 100644 :99 f.txt\n\ndone\n";
+
 /// Every payload, as one pool. Sampling draws an **index** into this table
 /// rather than generating bytes, so a case's input is a compile-time literal and
 /// the case replays byte-for-byte from its seed.
@@ -1706,6 +1736,8 @@ const STDIN_PAYLOADS: &[&[u8]] = &[
     P_INDEX_INFO_DELETE,
     P_MKTAG,
     P_MKTAG_BAD_ORDER,
+    P_FAST_IMPORT,
+    P_FAST_IMPORT_BAD,
 ];
 
 /// The payloads that are the *right shape* for a given subcommand.
@@ -1739,6 +1771,14 @@ fn preferred_payloads(cmd: &str) -> &'static [&'static [u8]] {
             &[P_PATHS, P_PATHS_NUL, P_PATHS_CRLF, P_PATH_NO_EOL]
         }
         "update-index" => &[P_INDEX_INFO, P_INDEX_INFO_DELETE, P_PATHS, P_PATHS_NUL],
+        // Two streams and an empty one. The empty stream is the *third* outcome
+        // and not padding: verified against stock 2.55.0 in a fresh repository,
+        // `fast-import --quiet < /dev/null` exits 0 and leaves `.git/objects`
+        // with the same zero files it started with — no pack, no ref. That is
+        // precisely what every `fast-import` case did before this command read a
+        // payload at all, so keeping it in the pool keeps the old behaviour
+        // reachable beside the two that are new.
+        "fast-import" => &[P_FAST_IMPORT, P_FAST_IMPORT_BAD, P_EMPTY],
         "unpack-objects" | "index-pack" | "show-index" | "get-tar-commit-id" => {
             &[P_BINARY, P_EMPTY]
         }
@@ -1769,6 +1809,13 @@ const STDIN_ALWAYS: &[&str] = &[
     // supplying it unconditionally costs nothing and covers the no-operand form.
     "apply",
     "am",
+    // `fast-import` takes no file operand at all — its whole input is the stream
+    // on stdin (`builtin/fast-import.c` reads it with no flag to ask for it), so
+    // it belongs here for the same reason `mktree` does. It was missing, and the
+    // consequence was not a narrower id but a command that did nothing: with
+    // stdin closed it read EOF, imported no commands, wrote nothing and exited
+    // 0, so every case scored on the flag table alone. See [`P_FAST_IMPORT`].
+    "fast-import",
 ];
 
 /// Whether the sampled invocation actually asks for input.
@@ -1801,18 +1848,25 @@ fn wants_stdin(cmd: &str, args: &[String]) -> bool {
         })
 }
 
-/// The hand-written grammars: read-only commands, described by hand because
-/// their flag sets are worth stating deliberately.
+/// The hand-written grammars: the commands whose flag sets are worth stating
+/// deliberately rather than deriving from a manual page.
+///
+/// Two kinds, in that order. The first twelve are commands with **no** generated
+/// grammar, described here because they have no other description. The last five
+/// **shadow** a generated grammar for a verb whose mutating half the derivation
+/// could not reach; the block comment above them says why, and what that costs.
 ///
 /// These are **not** the whole fuzz corpus — [`all_grammars`] concatenates
-/// [`crate::grammars_generated::generated`], which covers eighty-odd more
+/// [`crate::grammars_generated::generated`], which covers a hundred-odd more
 /// commands including mutating ones (`init`, `cherry-pick`, `rebase`, `revert`,
-/// `submodule`, `gc`, `repack`, …). That was once untrue: fuzzing a mutating
-/// command used to hang on an editor or a prompt, so the corpus carried
-/// read-only grammars only. `env::harden` closed that by neutralizing every
-/// interactive hook, and the generated grammars followed. The comment here
-/// outlived the restriction it described, which is worth remembering the next
-/// time this file explains what the harness does not do.
+/// `submodule`, `gc`, `repack`, …). Read-only was once the rule for both halves:
+/// fuzzing a mutating command used to hang on an editor or a prompt, so the
+/// corpus carried read-only grammars only. `env::harden` closed that by
+/// neutralizing every interactive hook, and the generated grammars followed —
+/// but only per *command*, and a subcommand-dispatching verb keeps the old shape
+/// inside a grammar that no longer claims it. That is the gap the last five
+/// entries close, and it is worth remembering the next time this file explains
+/// what the harness does not do.
 pub fn grammars() -> Vec<Grammar> {
     vec![
         // `rev-parse` is two commands wearing one name — a rev resolver and the
@@ -2223,6 +2277,253 @@ pub fn grammars() -> Vec<Grammar> {
             ],
             positionals: &["README.md", "src/lib.rs", "no/such/path", "src"],
             shapes: &[Shape::Linear, Shape::Branched],
+        },
+        // ------------------------------------------------------------------
+        // The five verbs below are written by hand for a different reason from
+        // the twelve above, and it is worth stating once rather than five times.
+        //
+        // Each of them already has a generated grammar, so each costs one extra
+        // grammar's worth of cases rather than opening a command that had none.
+        // What they buy is that the *mutating* half of the verb becomes
+        // reachable at all. `grammars_generated.rs` is derived from git's
+        // documentation and its header says what it is — "read-only ones only" —
+        // which for a subcommand-dispatching verb means the pool of positionals
+        // holds `list` and no `add`. All five are named in [`MUTATORS`], and
+        // [`grammar_for`] answers with the first grammar carrying the name, so
+        // a hand-written entry here is also what the `gen/observe/<verb>`
+        // sequences draw from: before this, `gen/observe/worktree` could draw
+        // `worktree list` and nothing else, and then ran observers over a
+        // repository that nothing had written to.
+        //
+        // Two mechanical defects in the generated pools are worth recording so
+        // that a future regeneration is measured against them rather than
+        // trusted. A grammar's positional is one **argv token**
+        // ([`sample_argv`] pushes it whole), so a pool entry spelling two words
+        // is one operand containing a space. Verified against stock 2.55.0:
+        //
+        //   `git sparse-checkout 'set src'` -> `error: unknown subcommand: `set src'`, rc 129
+        //   `git reflog 'show HEAD'`        -> `fatal: ambiguous argument 'show HEAD'`, rc 128
+        //   `git symbolic-ref '-q --short'` -> `error: unknown switch ` '`, rc 129
+        //
+        // Every one of those is a usage error rather than the invocation it
+        // reads as, and each of the three pools carries several of them:
+        // `reflog`'s positionals spell its `show` and `exists` subcommands this
+        // way and nothing else, `sparse-checkout`'s spell most of its
+        // subcommands this way and nothing else, and `symbolic-ref`'s *flags*
+        // are mostly multi-word combinations. The hand-written pools below spell
+        // each token separately, which is also why they can be shorter than the
+        // generated ones and still reach more: a two-word entry is one draw that
+        // cannot dispatch.
+        //
+        // **None of these five verbs runs a program named by an operand**, and
+        // that was checked per subcommand rather than assumed. It is the rule
+        // [`BISECT_RUN_COMMANDS`] exists for: an operand drawn from a general
+        // pool and then *executed* is how `bisect run HEAD` came to run
+        // `/usr/bin/HEAD` and block until the case timeout. `notes` runs merge
+        // strategies that are internal to `notes-merge.c`, `worktree` spawns
+        // nothing, `reflog` and `symbolic-ref` take refs, and
+        // `sparse-checkout`'s only file operand is `--rules-file=`, which is
+        // read and not run. A verb that did execute an operand would need its
+        // own pool here before it could be given a grammar at all.
+        // ------------------------------------------------------------------
+
+        // `notes` is a store with its own ref namespace, its own merge machine
+        // and eleven subcommands, and the generated pool reaches three of them
+        // (`list`, `show`, `get-ref`) — all readers. Nothing generated could add
+        // a note, so `refs/notes/*` never moved and the flag half of the grammar
+        // (`-m`, `-F`, `-C`, `--allow-empty`, `--separator=`, `--stripspace`)
+        // was carried into invocations that reject flags before reading them.
+        //
+        // The value-taking short options are spelled **sticky** (`-mgen`,
+        // `-CHEAD`) rather than bare, because a bare `-m` consumes whatever
+        // positional the sampler drew next as its message and the case id then
+        // reads as an operand that was never an operand. Verified against stock
+        // 2.55.0: `notes add -mgen HEAD` writes the note (rc 0),
+        // `notes append -mmore HEAD` appends a second paragraph, and
+        // `notes add -CHEAD -f main` dies with `fatal: cannot read note data
+        // from non-blob object 'HEAD'` — the reuse path reaching its type check.
+        //
+        // `--stdin` is here because it makes [`wants_stdin`] fire: `notes remove
+        // --stdin` takes its object list from a payload, which is a second
+        // parser for the same operand.
+        Grammar {
+            cmd: "notes",
+            flags: &[
+                "--ref=refs/notes/commits", "--ref=refs/notes/other", "--ref=other",
+                "--ref=", "--no-ref", "-f", "--force", "--allow-empty",
+                "--message=gen", "-mgen", "--file=README.md", "--file=does-not-exist",
+                "--reuse-message=HEAD", "-CHEAD", "--reedit-message=HEAD",
+                "--separator=;", "--separator", "--no-separator",
+                "--stripspace", "--no-stripspace", "--ignore-missing", "--stdin",
+                "-n", "--dry-run", "-q", "--quiet", "-v", "--verbose", "-e",
+                "--strategy=ours", "--strategy=theirs", "--strategy=union",
+                "--strategy=cat_sort_uniq", "--strategy=manual", "--strategy=bogus",
+                "--commit", "--abort",
+            ],
+            positionals: &[
+                "add", "append", "copy", "edit", "list", "merge", "prune", "remove",
+                "show", "get-ref",
+                "HEAD", "HEAD~1", "main", "feature", "other", "refs/notes/other",
+                "does-not-exist", "",
+            ],
+            shapes: ALL_SHAPES,
+        },
+        // `worktree` had exactly one reachable subcommand. The generated pool is
+        // `list`, `wt`, `wt/README.md`, `linked`, `does-not-exist` and two
+        // spellings of nothing, and its flags are `list`'s and `prune`'s — so
+        // `add`, `remove`, `move`, `lock`, `unlock` and `repair` were reachable
+        // only through the two curated round trips, and never with a drawn flag.
+        //
+        // Every flag below was read out of `git worktree <sub> -h` on stock
+        // 2.55.0 rather than from the manual page, because the options are
+        // per-subcommand and the top-level usage lists none of them:
+        // `add` takes `-f/-b/-B/--orphan/-d/--checkout/--lock/--reason/-q/
+        // --track/--guess-remote/--relative-paths`, `list` takes
+        // `--porcelain/-v/--expire/-z`, `move` takes `-f/--relative-paths`,
+        // `prune` takes `-n/-v/--expire`, `remove` takes `-f`, and `repair`
+        // takes `--relative-paths`. Drawing them against the wrong subcommand is
+        // deliberate — that is one of the two things a flat pool is good at —
+        // but the set has to be the real one for the right pairings to happen at
+        // all.
+        //
+        // The paths are all repository-relative and none of them climbs: a
+        // `worktree add ..` would put an administrative file outside the
+        // fixture root, which is the one place a case may not write.
+        Grammar {
+            cmd: "worktree",
+            flags: &[
+                "--porcelain", "-z", "-v", "--verbose", "-n", "--dry-run", "-q", "--quiet",
+                "--expire=now", "--expire=never", "--expire=2020-01-01", "--expire=bogus",
+                "-f", "--force", "-d", "--detach", "--checkout", "--no-checkout",
+                "--lock", "--no-lock", "--reason=gen", "--orphan",
+                "-bgen-wtb", "-Bgen-wtb", "--track", "--no-track",
+                "--guess-remote", "--no-guess-remote",
+                "--relative-paths", "--no-relative-paths",
+            ],
+            positionals: &[
+                "add", "list", "lock", "move", "prune", "remove", "repair", "unlock",
+                "wt", "wt-gen", "wt/README.md", "linked",
+                "HEAD", "main", "feature", "does-not-exist", "",
+            ],
+            shapes: &[
+                Shape::Linear,
+                Shape::Branched,
+                Shape::Detached,
+                Shape::Dirty,
+                Shape::Worktree,
+            ],
+        },
+        // `reflog` is two commands again: a `log` front end over `.git/logs`, and
+        // the store's own `expire`/`delete`/`drop`/`write` writers. The generated
+        // grammar describes the reader in a hundred flags and cannot reach a
+        // single writer — `expire` and `delete` are not in its positionals, so
+        // `--expire=`, `--expire-unreachable=`, `--rewrite`, `--updateref` and
+        // `--stale-fix` were only ever parsed by `reflog show`, which rejects
+        // them. `runner::probe_reflogs` reads every byte under `.git/logs`, so a
+        // reflog write is fully observed the moment one can be spelled.
+        //
+        // The expiry values are chosen so that the wall clock cannot decide the
+        // answer. `env::harden` pins `GIT_COMMITTER_DATE`, not the clock, so
+        // every reflog entry in every fixture carries one fixed timestamp far in
+        // the past: `now` and `all` expire all of them, `never` expires none,
+        // and `2020-01-01` expires none — none of the four is near a boundary
+        // where two runs seconds apart could disagree. A relative window like
+        // `2.weeks.ago` would be just as safe today and is left out anyway,
+        // because what makes it safe is a fixture date nobody promised to keep.
+        //
+        // `git reflog drop --dry-run` is deliberately reachable and is a
+        // rejection rather than an operation: verified against stock 2.55.0,
+        // `drop` does not take that option and answers ``error: unknown option
+        // `dry-run'`` with rc 129, while `expire` and `delete` both accept it.
+        // Three subcommands sharing a store and disagreeing about one option is
+        // exactly the kind of table a port flattens.
+        Grammar {
+            cmd: "reflog",
+            flags: &[
+                "-n", "--dry-run", "--verbose", "--rewrite", "--updateref",
+                "--all", "--single-worktree", "--stale-fix",
+                "--expire=now", "--expire=never", "--expire=all",
+                "--expire=2020-01-01", "--expire=bogus",
+                "--expire-unreachable=now", "--expire-unreachable=never",
+                "--expire-unreachable=bogus",
+                "--oneline", "--no-abbrev", "--abbrev=7", "--date=iso", "--date=raw",
+                "--format=%gd %gs", "--format=%(bogus)", "-n2", "--no-rewrite",
+                "--no-updateref", "--no-all",
+            ],
+            positionals: &[
+                "show", "list", "exists", "expire", "delete", "drop", "write",
+                "HEAD", "main", "feature", "refs/heads/main", "refs/heads/feature",
+                "HEAD@{0}", "HEAD@{1}", "main@{0}", "refs/heads/does-not-exist",
+                "does-not-exist", "",
+            ],
+            shapes: ALL_SHAPES,
+        },
+        // `sparse-checkout` writes `.git/info/sparse-checkout` and the index's
+        // skip-worktree bits, and it is the one piece of repository state
+        // `runner::probe_state` does not read — `probe_op_state` names the files
+        // it reads and that is not one of them, and `ls-files --stage` prints
+        // the same three lines whether or not an entry is sparse. Which is why
+        // an observer for it is added below beside this grammar: writing the
+        // patterns and reading them back are useless apart.
+        //
+        // The generated pool spells six of its eight subcommands as two-word
+        // positionals (`"set src"`, `"init --cone"`), which are single operands
+        // and cannot dispatch — see the block comment above. Verified against
+        // stock 2.55.0 for the shape of the reachable ones: `clean` refuses
+        // without a mode (`fatal: for safety, refusing to clean without one of
+        // --force or --dry-run`) and accepts either, `check-rules` reads its
+        // paths from stdin unless `--rules-file` names one — which is why
+        // `--stdin` and `--rules-file=` are both here, the first so
+        // [`wants_stdin`] fires and the second so the file path is taken instead
+        // — and `list`, `add`, `reapply` and `clean` all die with
+        // `fatal: … not … sparse` on a repository that has no patterns, so the
+        // `Sparse` shape is what makes most of this grammar do work.
+        Grammar {
+            cmd: "sparse-checkout",
+            flags: &[
+                "--cone", "--no-cone", "--sparse-index", "--no-sparse-index",
+                "--skip-checks", "-z", "--stdin", "--force", "--dry-run", "-n",
+                "--rules-file=.gitignore", "--rules-file=does-not-exist",
+                "--no-rules-file",
+            ],
+            positionals: &[
+                "init", "list", "set", "add", "reapply", "disable", "check-rules", "clean",
+                "src", "inside", "inside/keep.txt", "outside", "README.md", "/src/",
+                "does-not-exist", "",
+            ],
+            shapes: &[Shape::Sparse, Shape::Linear, Shape::Branched, Shape::Dirty],
+        },
+        // The smallest grammar here and the one whose generated version is most
+        // clearly mechanical: its flag pool contains the empty string and six
+        // multi-word entries (`"-q --short"`, `"--quiet --short --no-recurse"`)
+        // that are single argv tokens, and `error: unknown switch ` '` is all
+        // any of them can produce. The two flags that make this command a
+        // *writer* — `-d`/`--delete`, and `-m` for the reflog reason — are
+        // absent from it entirely, so the verb that names `HEAD` was represented
+        // by its reader alone.
+        //
+        // `-m` is left bare on purpose, unlike `notes`' `-m` above: it takes the
+        // next token as the reason, and here that consumes a *ref name* the
+        // sampler drew, which shifts every following operand by one. That is a
+        // real caller mistake and a real parse, and the id shows the whole argv
+        // either way. Verified against stock 2.55.0:
+        // `symbolic-ref -m gen refs/gen-sym refs/heads/main` writes the symref
+        // (rc 0) and `symbolic-ref -d refs/gen-sym` removes it (rc 0), while
+        // `symbolic-ref --delete -q refs/heads/main` answers
+        // `fatal: Cannot delete refs/heads/main, not a symbolic ref` with rc 128.
+        Grammar {
+            cmd: "symbolic-ref",
+            flags: &[
+                "-q", "--quiet", "--no-quiet", "--short", "--no-short",
+                "--recurse", "--no-recurse", "-d", "--delete", "-m", "--bogus-flag",
+            ],
+            positionals: &[
+                "HEAD", "refs/gen-sym", "refs/heads/main", "refs/heads/feature",
+                "refs/tags/v0.1.0", "refs/remotes/origin/HEAD",
+                "MERGE_HEAD", "ORIG_HEAD", "gen",
+                "refs/heads/does-not-exist", "does-not-exist", "bad..name", "",
+            ],
+            shapes: ALL_SHAPES,
         },
     ]
 }
@@ -2839,6 +3140,59 @@ const STOPPERS: &[Stopper] = &[
         entry: &[&["merge", "theirs"]],
         entry_stdin: None,
     },
+    // A conflict that leaves **no `MERGE_HEAD`**, which every other stopper here
+    // writes one of. `--squash` is documented as not updating `HEAD`, and what
+    // that means for the parked state is not obvious until it is measured.
+    // Verified against stock 2.55.0 on this shape after `merge --abort`:
+    //
+    //   merge --squash theirs   rc 1, `CONFLICT (add/add)`, index `AA conflict.txt`
+    //   MERGE_HEAD              absent          MERGE_MODE   absent
+    //   MERGE_MSG               written         SQUASH_MSG   written
+    //   AUTO_MERGE              written
+    //   merge --abort           `fatal: There is no merge to abort (MERGE_HEAD missing).`, rc 128
+    //   merge --continue        `fatal: There is no merge in progress (MERGE_HEAD missing).`, rc 128
+    //   cherry-pick --continue  `error: no cherry-pick or revert in progress`, rc 128
+    //
+    // So this is a repository with a conflicted index and nothing to resume, and
+    // every resumption verb the walk draws must refuse. A port that decides
+    // "a merge is in progress" from the index — an unmerged entry exists —
+    // rather than from `MERGE_HEAD` passes `merge-conflict` above and offers to
+    // continue or abort an operation stock says is not running. That is a whole
+    // class of wrong answer that no existing premise can produce, and it costs
+    // one entry point.
+    Stopper {
+        cmd: "merge",
+        name: "merge-squash-conflict",
+        shape: Shape::Conflicted,
+        setup: &[&["merge", "--abort"]],
+        entry: &[&["merge", "--squash", "theirs"]],
+        entry_stdin: None,
+    },
+    // A merge that stopped **without** conflicting: `--no-commit` parks
+    // `MERGE_HEAD` and `MERGE_MSG` over a *clean, fully staged* index. Every
+    // other stopper in this list parks a broken tree, so "is an operation in
+    // progress" and "does the index have conflicts" were the same question in
+    // every walk, and a port that answers the first with the second was right
+    // every time. Verified against stock 2.55.0 on this shape:
+    // `merge --no-commit div-other` exits **0** with `Automatic merge went well;
+    // stopped before committing as requested`, writes `MERGE_HEAD` and an empty
+    // `MERGE_MODE`, and leaves `status --porcelain` reporting `A  other.txt`
+    // staged beside the shape's own `M hot.txt`/`M keep.txt`/`?? squat.txt`.
+    //
+    // `div-other` is the branch chosen from `fixture::mergeable_history` on
+    // purpose: it adds `other.txt` and touches none of the three paths this
+    // shape leaves dirty, so the merge is not refused per path before it can
+    // stop. The shape's dirt is still there while the walk runs, which is what
+    // makes `merge --abort` here a different unwind from the one after a
+    // conflict — it has to restore a worktree that was already modified.
+    Stopper {
+        cmd: "merge",
+        name: "merge-no-commit-stop",
+        shape: Shape::MergeableDirty,
+        setup: &[],
+        entry: &[&["merge", "--no-commit", "div-other"]],
+        entry_stdin: None,
+    },
     // `.git/rebase-apply/`, which nothing else parks in. The mailbox applies
     // once and then fails against the tree it just created, so the stop needs no
     // corrupt input to manufacture.
@@ -2995,6 +3349,18 @@ const OBSERVERS: &[&[&str]] = &[
     // with its origin, so a step that wrote the right value into the wrong scope
     // is named by the observer rather than inferred from a later difference.
     &["config", "--list", "--show-scope"],
+    // The sparsity patterns. This is the only observer that reads a file the
+    // state probe does not: `probe_op_state` names the files it reads and
+    // `.git/info/sparse-checkout` is not among them, `probe_storage` looks only
+    // at `.git/objects`, and `ls-files --stage` — what `probe_state` compares —
+    // prints an identical line for an entry whether or not it is sparse. So a
+    // step that wrote the right skip-worktree bits from the wrong patterns, or
+    // the patterns without the bits, was invisible to every reader here.
+    // Verified against stock 2.55.0 on a repository with no patterns:
+    // `fatal: this worktree is not sparse`, rc 128 — a deterministic answer on
+    // the shapes where it says nothing, which is what makes it safe to draw
+    // uniformly beside the readers that always answer.
+    &["sparse-checkout", "list"],
 ];
 
 /// Verbs whose purpose is to write repository state.
@@ -3028,6 +3394,22 @@ struct RoundTrip {
     shape: Shape,
     forward: &'static [&'static [&'static str]],
     inverse: &'static [&'static [&'static str]],
+    /// Payload for the **first** forward step, and only for it.
+    ///
+    /// Narrow on purpose. Two of the pairs below are round trips through a
+    /// *stream* rather than through a repository object — `fast-import` and
+    /// `update-ref --stdin` both take their whole instruction list on stdin —
+    /// and there is no other way to spell them: a step's argv cannot redirect a
+    /// file, and the payload has to be a `&'static [u8]` literal for the case to
+    /// replay byte for byte. Every other pair leaves this `None`, and no inverse
+    /// step ever takes one, because the half that *reads back* what the forward
+    /// half wrote reads it from the repository — which is the property this
+    /// family exists to measure.
+    ///
+    /// [`generated_steps_only_get_stdin_where_it_is_read`] holds this to the same
+    /// rule as every other payload in the file: the step it lands on must be one
+    /// [`wants_stdin`] says reads input.
+    forward_stdin: Option<&'static [u8]>,
 }
 
 /// The inverse pairs.
@@ -3051,6 +3433,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Dirty,
         forward: &[&["stash", "push", "-m", "gen"]],
         inverse: &[&["stash", "pop"]],
+        forward_stdin: None,
     },
     // The untracked half: `-u` stashes a file that was never in the index, and
     // popping it has to put it back *untracked*, which is a different code path
@@ -3061,6 +3444,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Dirty,
         forward: &[&["stash", "push", "-u", "-m", "gen"]],
         inverse: &[&["stash", "pop"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "branch",
@@ -3068,6 +3452,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["branch", "-m", "main", "gen-renamed"]],
         inverse: &[&["branch", "-m", "gen-renamed", "main"]],
+        forward_stdin: None,
     },
     // `add` writes `.git/worktrees/<n>/{gitdir,HEAD,commondir}` and a `.git`
     // file in the new tree; `remove` has to delete both ends of that pair.
@@ -3077,6 +3462,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["worktree", "add", "-b", "gen-wtb", "wt-gen"]],
         inverse: &[&["worktree", "remove", "wt-gen"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "worktree",
@@ -3084,6 +3470,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Worktree,
         forward: &[&["worktree", "lock", "wt"]],
         inverse: &[&["worktree", "unlock", "wt"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "sparse-checkout",
@@ -3091,6 +3478,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Sparse,
         forward: &[&["sparse-checkout", "set", "inside"]],
         inverse: &[&["sparse-checkout", "disable"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "sparse-checkout",
@@ -3098,6 +3486,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["sparse-checkout", "init", "--cone"]],
         inverse: &[&["sparse-checkout", "disable"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "tag",
@@ -3105,6 +3494,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["tag", "gen-tag", "HEAD"]],
         inverse: &[&["tag", "-d", "gen-tag"]],
+        forward_stdin: None,
     },
     // `switch -` resolves `@{-1}` out of the reflog, so the inverse half reads
     // state the forward half wrote into a place neither command names.
@@ -3114,6 +3504,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["switch", "-c", "gen-branch"]],
         inverse: &[&["switch", "-"], &["branch", "-D", "gen-branch"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "checkout",
@@ -3121,6 +3512,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["checkout", "-b", "gen-co"]],
         inverse: &[&["checkout", "main"], &["branch", "-D", "gen-co"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "update-ref",
@@ -3128,6 +3520,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["update-ref", "refs/heads/gen-ref", "HEAD"]],
         inverse: &[&["update-ref", "-d", "refs/heads/gen-ref"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "remote",
@@ -3135,6 +3528,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::BehindRemote,
         forward: &[&["remote", "add", "gen", "./.remote.git"]],
         inverse: &[&["remote", "remove", "gen"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "notes",
@@ -3142,6 +3536,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["notes", "add", "-m", "gen note", "HEAD"]],
         inverse: &[&["notes", "remove", "HEAD"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "commit",
@@ -3149,6 +3544,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["commit", "--allow-empty", "-m", "gen"]],
         inverse: &[&["reset", "--hard", "HEAD~1"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "add",
@@ -3156,6 +3552,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Dirty,
         forward: &[&["add", "untracked.txt"]],
         inverse: &[&["restore", "--staged", "untracked.txt"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "rm",
@@ -3163,6 +3560,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["rm", "--cached", "README.md"]],
         inverse: &[&["add", "README.md"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "config",
@@ -3170,6 +3568,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["config", "gen.key", "value"]],
         inverse: &[&["config", "--unset", "gen.key"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "mv",
@@ -3177,6 +3576,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["mv", "README.md", "gen-moved.md"]],
         inverse: &[&["mv", "gen-moved.md", "README.md"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "symbolic-ref",
@@ -3184,6 +3584,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["symbolic-ref", "refs/gen-sym", "refs/heads/main"]],
         inverse: &[&["symbolic-ref", "-d", "refs/gen-sym"]],
+        forward_stdin: None,
     },
     // `--soft` moves only `HEAD` and records `ORIG_HEAD`; the inverse reads that
     // record back, so a port that moves the branch without writing `ORIG_HEAD`
@@ -3194,6 +3595,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["reset", "--soft", "HEAD~1"]],
         inverse: &[&["reset", "--soft", "ORIG_HEAD"]],
+        forward_stdin: None,
     },
     RoundTrip {
         cmd: "read-tree",
@@ -3201,6 +3603,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["read-tree", "HEAD~1"]],
         inverse: &[&["read-tree", "HEAD"]],
+        forward_stdin: None,
     },
     // The only way this harness can produce an **ambiguous refname**. `Branched`
     // has a branch called `feature`; tagging `feature` makes one name resolve
@@ -3223,6 +3626,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["tag", "feature", "HEAD"]],
         inverse: &[&["tag", "-d", "feature"]],
+        forward_stdin: None,
     },
     // An index *flag* round trip. Every other pair here moves a ref, a file or a
     // stanza; this one changes a bit inside `.git/index` and nothing else — no
@@ -3238,6 +3642,147 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["update-index", "--assume-unchanged", "README.md"]],
         inverse: &[&["update-index", "--no-assume-unchanged", "README.md"]],
+        forward_stdin: None,
+    },
+    // ----------------------------------------------------------------------
+    // Pairs where one verb writes a *file* and another reads it back.
+    //
+    // The five below close a gap `corpus/transport_local.rs` states in its own
+    // header as unclosable — "a round trip through a file the case itself wrote
+    // … is two invocations; a case is one" — and it is unclosable for a case and
+    // not for a sequence. Until now the read halves were only ever measured on
+    // their error paths: `bundle unbundle` against a file that is not a bundle,
+    // `am` against a mailbox nobody produced. Each pair costs one entry point,
+    // which is `--fuzz-sequences` sequences of five to eight steps per side.
+    // ----------------------------------------------------------------------
+
+    // `bundle create` writes a packfile with a ref list on the front and three
+    // readers parse it back. Verified against stock 2.55.0 on a repository with
+    // two branches and two tags: `create gen.bundle --all` exits 0, `verify`
+    // prints the four refs and `The bundle records a complete history.`,
+    // `list-heads` prints the same four lines without the prose, and `unbundle`
+    // prints them again while unpacking the pack into `.git/objects/pack` —
+    // creating **no refs**, which is why this pair returns the repository to a
+    // state equal to the one it started from with only `gen.bundle` untracked
+    // beside it. The file is written into the worktree rather than under `.git`
+    // deliberately: `status --untracked-files=all` is the first thing
+    // `probe_state` runs, so a port that writes the bundle somewhere else is a
+    // difference at the step that wrote it rather than at the step that failed
+    // to read it.
+    RoundTrip {
+        cmd: "bundle",
+        name: "bundle-create-unbundle",
+        shape: Shape::Branched,
+        forward: &[
+            &["bundle", "create", "gen.bundle", "--all"],
+            &["bundle", "verify", "gen.bundle"],
+            &["bundle", "list-heads", "gen.bundle"],
+        ],
+        inverse: &[&["bundle", "unbundle", "gen.bundle"]],
+        forward_stdin: None,
+    },
+    // The mail round trip, and the one whose end state is *byte-identical* to
+    // its start state rather than merely equivalent. `format-patch` serializes a
+    // commit into a mail, `reset --hard` throws the commit away, and `am`
+    // reconstructs it from the mail — and because `env::harden` pins both
+    // identities and `GIT_COMMITTER_DATE`, and `format-patch` carries the author
+    // date in the mail header, the reconstruction has the same object id.
+    // Verified against stock 2.55.0 on a two-commit history: `rev-parse HEAD`
+    // read `d775b986a6d95734898cf9348813782f191d40d0` before the round trip and
+    // `d775b986a6d95734898cf9348813782f191d40d0` after it, with
+    // `Applying: add two` and rc 0 from `am`.
+    //
+    // That equality is the assertion. A port whose `format-patch` drops a
+    // header, or whose `am` fills a missing one from the clock, ends with a
+    // different commit id and the step comparison names which of the two did it.
+    // `--numbered-files` is what makes the pair expressible at all: without it
+    // the output is `0001-<subject>.patch`, whose name is a function of the
+    // fixture's commit message, and a step's argv is a literal.
+    RoundTrip {
+        cmd: "format-patch",
+        name: "format-patch-am",
+        shape: Shape::Branched,
+        forward: &[
+            &["format-patch", "--numbered-files", "-o", "gen-patches", "HEAD~1..HEAD"],
+            &["reset", "--hard", "HEAD~1"],
+        ],
+        inverse: &[&["am", "gen-patches/1"]],
+        forward_stdin: None,
+    },
+    // The stream round trip. `fast-import` is the largest input language in git
+    // and, until [`P_FAST_IMPORT`] existed, this harness never handed it one —
+    // see [`STDIN_ALWAYS`] for what that cost. Here the stream creates a root
+    // commit on `refs/heads/gen-fi`, `fast-export --all` serializes the whole
+    // repository back out through the reader half of the same format, and the
+    // inverse removes the ref the stream created.
+    //
+    // `Linear` is the shape because `fast-export --all` prints every object in
+    // the repository and the point is the round trip, not the volume. The
+    // `--quiet` on the import is not cosmetic: the statistics block it
+    // suppresses is written to stderr, which generated steps do not compare, but
+    // it also contains `Memory total` and an allocator count, and leaving a
+    // machine-dependent number out of a stream nobody reads is cheaper than
+    // explaining every time why it is allowed to differ.
+    RoundTrip {
+        cmd: "fast-import",
+        name: "fast-import-export",
+        shape: Shape::Linear,
+        forward: &[&["fast-import", "--quiet", "--done"], &["fast-export", "--all"]],
+        inverse: &[&["update-ref", "-d", "refs/heads/gen-fi"]],
+        forward_stdin: Some(P_FAST_IMPORT),
+    },
+    // `update-ref --stdin` is a *transaction*: a command list read from a
+    // payload, applied all-or-nothing. `update-ref-create-delete` above covers
+    // the one-ref argv form, which shares an entry point's worth of steps with
+    // this one and none of its code — the batch parser, the transaction and the
+    // rollback are only reachable through stdin. Verified against stock 2.55.0:
+    // `create refs/heads/parity-fuzz HEAD` on stdin exits 0 and
+    // `for-each-ref refs/heads/` then lists `refs/heads/parity-fuzz` beside the
+    // fixture's own branches; `update-ref -d` on it exits 0 and removes it.
+    // [`P_REF_UPDATES`] is that payload, already in the pool and already the
+    // preferred one for this command.
+    RoundTrip {
+        cmd: "update-ref",
+        name: "update-ref-stdin-transaction",
+        shape: Shape::Linear,
+        forward: &[&["update-ref", "--stdin"]],
+        inverse: &[&["update-ref", "-d", "refs/heads/parity-fuzz"]],
+        forward_stdin: Some(P_REF_UPDATES),
+    },
+    // `bisect` writes `.git/BISECT_LOG` as it goes and `bisect replay` reads a
+    // log back — and the two do not compose, which is the finding this pair
+    // pins. Verified against stock 2.55.0 on a two-commit history:
+    //
+    //   bisect start                 rc 0, `status: waiting for both …`
+    //   bisect bad HEAD              rc 0, `status: waiting for 'good' commit(s) …`
+    //   bisect good HEAD~1           rc 0, `<oid> is the first 'bad' commit`
+    //   .git/BISECT_LOG              present, five lines
+    //   bisect replay .git/BISECT_LOG  rc **1**
+    //   .git/BISECT_LOG              gone
+    //   bisect reset                 rc 0
+    //
+    // `replay` resets the bisection before it reads its input, and the reset
+    // unlinks the very file it was told to replay — so naming git's own log
+    // fails, on stock, every time. A port that opens the file before resetting
+    // succeeds where stock fails, and the difference is an exit code rather than
+    // prose. Nothing else in this harness can produce it: the log's path is the
+    // only file a step can name without capturing output, and a case is one
+    // invocation.
+    //
+    // `bisect reset` closes the pair whether or not `replay` already reset:
+    // verified rc 0 both while bisecting and with no bisection in progress, so
+    // the sequence ends on the same state it started from either way.
+    RoundTrip {
+        cmd: "bisect",
+        name: "bisect-log-replay",
+        shape: Shape::Branched,
+        forward: &[
+            &["bisect", "start"],
+            &["bisect", "bad", "HEAD"],
+            &["bisect", "good", "HEAD~1"],
+        ],
+        inverse: &[&["bisect", "replay", ".git/BISECT_LOG"], &["bisect", "reset"]],
+        forward_stdin: None,
     },
 ];
 
@@ -3487,8 +4032,11 @@ fn round_trip(rng: &mut Rng, rt: &RoundTrip, n: usize) -> Sequence {
     if rng.chance(1, 3) {
         seq = seq.step(rng.pick(OBSERVERS));
     }
-    for step in rt.forward {
-        seq = seq.step(step);
+    for (i, step) in rt.forward.iter().enumerate() {
+        // The payload rides on the first forward step and nowhere else; see
+        // [`RoundTrip::forward_stdin`] for why that is the whole contract.
+        let stdin = if i == 0 { rt.forward_stdin } else { None };
+        seq = seq.step_argv(step.iter().map(|t| t.to_string()).collect(), stdin);
     }
     seq = observe(rng, seq, 2);
     for step in rt.inverse {

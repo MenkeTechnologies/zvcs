@@ -54,9 +54,19 @@ fn run(dir: &Path, args: &[&str]) -> std::process::Output {
             // -c for the same reason.
             "-c",
             "core.abbrev=10",
+            "-c",
+            "advice.statusHints=true",
         ])
         .args(args)
         .env("PATH", real_git_path())
+        // The long `git status` format prints its hints only while
+        // advice.statusHints is on, and this fixture pinned no HOME, so the
+        // runner's own ~/.gitconfig decided. On the macOS runner the hints were
+        // off and the dirty-submodule line never appeared. Both config scopes
+        // are neutralised here and the setting is pinned in the -c list above.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@e.x")
         .env("GIT_COMMITTER_NAME", "t")

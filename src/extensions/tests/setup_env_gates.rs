@@ -84,6 +84,12 @@ fn run(f: &Fixture, dir: &Path, args: &[&str]) -> Output {
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env_remove("GIT_CONFIG_GLOBAL")
+        // The XDG fallback is `$XDG_CONFIG_HOME/git/config` when that
+        // variable is set and `$HOME/.config/git/config` only when it is not.
+        // The ubuntu runner exports it, so a fixture writing under the pinned
+        // HOME wrote a file nothing would read and `--global --list` came back
+        // empty there while passing on macOS, which exports no such variable.
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_ALLOW_PROTOCOL")
         .env_remove("GIT_PROTOCOL_FROM_USER")
@@ -113,6 +119,12 @@ fn run_env(f: &Fixture, dir: &Path, env: &[(&str, &str)], args: &[&str]) -> Outp
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env_remove("GIT_CONFIG_GLOBAL")
+        // The XDG fallback is `$XDG_CONFIG_HOME/git/config` when that
+        // variable is set and `$HOME/.config/git/config` only when it is not.
+        // The ubuntu runner exports it, so a fixture writing under the pinned
+        // HOME wrote a file nothing would read and `--global --list` came back
+        // empty there while passing on macOS, which exports no such variable.
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_ALLOW_PROTOCOL")
         .env_remove("GIT_PROTOCOL_FROM_USER")
@@ -203,7 +215,12 @@ fn dubious_ownership_applies_to_the_commands_that_need_a_repository() {
     // The gentle and no-setup side: none of these needs the repository, so none of
     // them refuses. Their exit codes are their own business; what is asserted is
     // that the ownership message is absent.
-    for args in [&["version"][..], &["help"], &["config", "--list"], &["hash-object", "a.txt"]] {
+    for args in [
+        &["version"][..],
+        &["help"],
+        &["config", "--list"],
+        &["hash-object", "a.txt"],
+    ] {
         let o = run_env(&f, &f.work, &assume, args);
         assert!(
             !err(&o).contains("dubious ownership"),
@@ -273,15 +290,24 @@ fn safe_directory_exemptions_match_setup_c() {
     // parent's glob covers the repository, the repository's own does not cover
     // itself.
     accepts(with(&[&format!("{root}/*")]), "the parent's `/*` form");
-    refuses(with(&[&format!("{work}/*")]), "`<work>/*` must not match `<work>`");
+    refuses(
+        with(&[&format!("{work}/*")]),
+        "`<work>/*` must not match `<work>`",
+    );
     // A path that is not there is skipped without a warning: a `~/.gitconfig` is
     // shared across machines and an entry naming a repository on another one is not
     // an error here.
-    refuses(with(&["/definitely/not/here"]), "a missing entry exempts nothing");
+    refuses(
+        with(&["/definitely/not/here"]),
+        "a missing entry exempts nothing",
+    );
 
     // The scan does not stop at a match — `is_safe` is rewritten by every entry, so
     // an empty value *resets* it and the last word wins.
-    refuses(with(&[&work, ""]), "an empty value resets an earlier exemption");
+    refuses(
+        with(&[&work, ""]),
+        "an empty value resets an earlier exemption",
+    );
     accepts(with(&["", &work]), "and only what precedes it");
 
     // A relative entry other than `.` is refused with a warning and does not exempt.
@@ -308,7 +334,16 @@ fn safe_directory_exemptions_match_setup_c() {
 #[test]
 fn safe_directory_is_not_read_from_the_repository_itself() {
     let f = fixture("own-local");
-    ok(&f, &f.work, &["config", "--local", "safe.directory", f.work.to_str().unwrap()]);
+    ok(
+        &f,
+        &f.work,
+        &[
+            "config",
+            "--local",
+            "safe.directory",
+            f.work.to_str().unwrap(),
+        ],
+    );
     let o = run_env(
         &f,
         &f.work,
@@ -326,7 +361,11 @@ fn safe_directory_is_not_read_from_the_repository_itself() {
 fn dubious_ownership_of_a_bare_repository_names_the_git_directory() {
     let f = fixture("own-bare");
     let bare = f.root.join("bare.git");
-    ok(&f, &f.root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    ok(
+        &f,
+        &f.root,
+        &["init", "-q", "--bare", bare.to_str().unwrap()],
+    );
 
     let o = run_env(
         &f,
@@ -341,7 +380,12 @@ fn dubious_ownership_of_a_bare_repository_names_the_git_directory() {
         &f,
         &bare,
         &[("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")],
-        &["-c", &format!("safe.directory={}", bare.display()), "rev-parse", "--git-dir"],
+        &[
+            "-c",
+            &format!("safe.directory={}", bare.display()),
+            "rev-parse",
+            "--git-dir",
+        ],
     );
     assert_eq!(err(&o), "");
     assert_eq!(out(&o), ".\n");
@@ -380,7 +424,11 @@ fn the_exception_line_is_shell_quoted_only_when_it_has_to_be() {
 #[test]
 fn an_owned_repository_is_never_questioned() {
     let f = fixture("own-clean");
-    for args in [&["status", "--short"][..], &["log", "--oneline"], &["rev-parse", "HEAD"]] {
+    for args in [
+        &["status", "--short"][..],
+        &["log", "--oneline"],
+        &["rev-parse", "HEAD"],
+    ] {
         let o = run(&f, &f.work, args);
         assert!(!err(&o).contains("dubious"), "git {args:?}: {}", err(&o));
         assert_eq!(code(&o), 0, "git {args:?}: {}", err(&o));
@@ -403,7 +451,11 @@ fn a_local_url_is_refused_when_it_did_not_come_from_the_user() {
     let o = run_env(&f, &f.work, &not_user, &["ls-remote", "."]);
     assert_eq!(err(&o), "fatal: transport 'file' not allowed\n");
     assert_eq!(code(&o), 128);
-    assert_eq!(out(&o), "", "no refs are listed once the transport is refused");
+    assert_eq!(
+        out(&o),
+        "",
+        "no refs are listed once the transport is refused"
+    );
 
     // The same URL spelled as a scheme reaches the same policy.
     let url = format!("file://{}", f.work.display());
@@ -428,19 +480,32 @@ fn the_policy_can_be_widened_and_narrowed() {
     let o = run_env(
         &f,
         &f.work,
-        &[("GIT_PROTOCOL_FROM_USER", "0"), ("GIT_ALLOW_PROTOCOL", "file")],
+        &[
+            ("GIT_PROTOCOL_FROM_USER", "0"),
+            ("GIT_ALLOW_PROTOCOL", "file"),
+        ],
         &["ls-remote", "."],
     );
     assert!(listed(&o) && code(&o) == 0, "{}{}", out(&o), err(&o));
 
     // …which is why listing only *another* scheme refuses `file` even though the
     // built-in default would have allowed it to a user typing the command.
-    let o = run_env(&f, &f.work, &[("GIT_ALLOW_PROTOCOL", "ssh")], &["ls-remote", "."]);
+    let o = run_env(
+        &f,
+        &f.work,
+        &[("GIT_ALLOW_PROTOCOL", "ssh")],
+        &["ls-remote", "."],
+    );
     assert_eq!(err(&o), "fatal: transport 'file' not allowed\n");
     assert_eq!(code(&o), 128);
 
     // An empty list is still a list, and allows nothing.
-    let o = run_env(&f, &f.work, &[("GIT_ALLOW_PROTOCOL", "")], &["ls-remote", "."]);
+    let o = run_env(
+        &f,
+        &f.work,
+        &[("GIT_ALLOW_PROTOCOL", "")],
+        &["ls-remote", "."],
+    );
     assert_eq!(err(&o), "fatal: transport 'file' not allowed\n");
     assert_eq!(code(&o), 128);
 
@@ -457,13 +522,24 @@ fn the_policy_can_be_widened_and_narrowed() {
     }
 
     // `never` refuses even a URL the user typed.
-    let o = run(&f, &f.work, &["-c", "protocol.file.allow=never", "ls-remote", "."]);
+    let o = run(
+        &f,
+        &f.work,
+        &["-c", "protocol.file.allow=never", "ls-remote", "."],
+    );
     assert_eq!(err(&o), "fatal: transport 'file' not allowed\n");
     assert_eq!(code(&o), 128);
 
     // A value outside the three words is `die()`, not a fallback.
-    let o = run(&f, &f.work, &["-c", "protocol.file.allow=bogus", "ls-remote", "."]);
-    assert_eq!(err(&o), "fatal: unknown value for config 'protocol.file.allow': bogus\n");
+    let o = run(
+        &f,
+        &f.work,
+        &["-c", "protocol.file.allow=bogus", "ls-remote", "."],
+    );
+    assert_eq!(
+        err(&o),
+        "fatal: unknown value for config 'protocol.file.allow': bogus\n"
+    );
     assert_eq!(code(&o), 128);
 }
 
@@ -504,12 +580,25 @@ fn the_transport_gate_fires_where_the_connection_is_opened() {
 fn fetch_and_push_are_gated_too() {
     let f = fixture("proto-fetch");
     let other = f.root.join("other");
-    ok(&f, &f.root, &["clone", "-q", f.work.to_str().unwrap(), other.to_str().unwrap()]);
+    ok(
+        &f,
+        &f.root,
+        &[
+            "clone",
+            "-q",
+            f.work.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
     let not_user = [("GIT_PROTOCOL_FROM_USER", "0")];
 
     for args in [&["fetch", "origin"][..], &["push", "origin", "main"]] {
         let o = run_env(&f, &other, &not_user, args);
-        assert_eq!(err(&o), "fatal: transport 'file' not allowed\n", "git {args:?}");
+        assert_eq!(
+            err(&o),
+            "fatal: transport 'file' not allowed\n",
+            "git {args:?}"
+        );
         assert_eq!(code(&o), 128, "git {args:?}");
     }
 
@@ -517,7 +606,10 @@ fn fetch_and_push_are_gated_too() {
     let o = run_env(
         &f,
         &other,
-        &[("GIT_PROTOCOL_FROM_USER", "0"), ("GIT_ALLOW_PROTOCOL", "file")],
+        &[
+            ("GIT_PROTOCOL_FROM_USER", "0"),
+            ("GIT_ALLOW_PROTOCOL", "file"),
+        ],
         &["fetch", "origin"],
     );
     assert_eq!(code(&o), 0, "{}", err(&o));
@@ -643,7 +735,10 @@ fn a_missing_alternate_is_reported_and_the_command_continues() {
     let o = run_env(
         &f,
         &f.work,
-        &[("GIT_ALTERNATE_OBJECT_DIRECTORIES", missing.to_str().unwrap())],
+        &[(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            missing.to_str().unwrap(),
+        )],
         &["log", "--oneline"],
     );
     assert_eq!(err(&o), line);
@@ -710,9 +805,14 @@ fn a_missing_alternate_is_reported_and_the_command_continues() {
 fn an_unreachable_object_directory_hides_the_repository() {
     let f = fixture("objdir");
     let missing = f.work.join(".git/no-such-objects");
-    const NOT_A_REPO: &str = "fatal: not a git repository (or any of the parent directories): .git\n";
+    const NOT_A_REPO: &str =
+        "fatal: not a git repository (or any of the parent directories): .git\n";
 
-    for args in [&["status"][..], &["log", "--oneline"], &["rev-parse", "--git-dir"]] {
+    for args in [
+        &["status"][..],
+        &["log", "--oneline"],
+        &["rev-parse", "--git-dir"],
+    ] {
         let o = run_env(
             &f,
             &f.work,
@@ -737,7 +837,10 @@ fn an_unreachable_object_directory_hides_the_repository() {
     let o = run_env(
         &f,
         &f.work,
-        &[("GIT_OBJECT_DIRECTORY", f.work.join(".git/objects").to_str().unwrap())],
+        &[(
+            "GIT_OBJECT_DIRECTORY",
+            f.work.join(".git/objects").to_str().unwrap(),
+        )],
         &["status", "--short"],
     );
     assert_eq!(err(&o), "");
@@ -755,7 +858,10 @@ fn an_unreachable_object_directory_hides_the_repository() {
         ],
         &["status"],
     );
-    assert_eq!(err(&o), format!("fatal: not a git repository: '{}'\n", git_dir.display()));
+    assert_eq!(
+        err(&o),
+        format!("fatal: not a git repository: '{}'\n", git_dir.display())
+    );
     assert_eq!(code(&o), 128);
 }
 
@@ -769,7 +875,10 @@ fn the_object_directory_gate_precedes_the_config_gate() {
         &f,
         &f.work,
         &[
-            ("GIT_OBJECT_DIRECTORY", f.work.join(".git/nope").to_str().unwrap()),
+            (
+                "GIT_OBJECT_DIRECTORY",
+                f.work.join(".git/nope").to_str().unwrap(),
+            ),
             ("GIT_CONFIG_COUNT", "bogus"),
         ],
         &["status"],
@@ -796,18 +905,33 @@ fn a_malformed_command_line_config_environment_is_fatal() {
 
     let cases: &[(&[(&str, &str)], &str)] = &[
         // `strtoul` leaves `endp` on the junk.
-        (&[("GIT_CONFIG_COUNT", "bogus")], "error: bogus count in GIT_CONFIG_COUNT\n"),
-        (&[("GIT_CONFIG_COUNT", "1x")], "error: bogus count in GIT_CONFIG_COUNT\n"),
+        (
+            &[("GIT_CONFIG_COUNT", "bogus")],
+            "error: bogus count in GIT_CONFIG_COUNT\n",
+        ),
+        (
+            &[("GIT_CONFIG_COUNT", "1x")],
+            "error: bogus count in GIT_CONFIG_COUNT\n",
+        ),
         // …and wraps a negative, which then trips the `> INT_MAX` arm instead.
-        (&[("GIT_CONFIG_COUNT", "-1")], "error: too many entries in GIT_CONFIG_COUNT\n"),
+        (
+            &[("GIT_CONFIG_COUNT", "-1")],
+            "error: too many entries in GIT_CONFIG_COUNT\n",
+        ),
         (
             &[("GIT_CONFIG_COUNT", "99999999999999999999999")],
             "error: too many entries in GIT_CONFIG_COUNT\n",
         ),
         // `strtoul` skips leading whitespace, so this is one override and the
         // failure that follows is the missing key, not a bogus count.
-        (&[("GIT_CONFIG_COUNT", " 1")], "error: missing config key GIT_CONFIG_KEY_0\n"),
-        (&[("GIT_CONFIG_COUNT", "3")], "error: missing config key GIT_CONFIG_KEY_0\n"),
+        (
+            &[("GIT_CONFIG_COUNT", " 1")],
+            "error: missing config key GIT_CONFIG_KEY_0\n",
+        ),
+        (
+            &[("GIT_CONFIG_COUNT", "3")],
+            "error: missing config key GIT_CONFIG_KEY_0\n",
+        ),
         (
             &[("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "a.b")],
             "error: missing config value GIT_CONFIG_VALUE_0\n",
@@ -830,7 +954,12 @@ fn a_malformed_command_line_config_environment_is_fatal() {
 
     // An empty value is zero overrides, not an error: `strtoul("")` is 0 with
     // `endp` at the terminator.
-    let o = run_env(&f, &f.work, &[("GIT_CONFIG_COUNT", "")], &["status", "--short"]);
+    let o = run_env(
+        &f,
+        &f.work,
+        &[("GIT_CONFIG_COUNT", "")],
+        &["status", "--short"],
+    );
     assert_eq!(err(&o), "");
     assert_eq!(code(&o), 0);
 
@@ -866,7 +995,12 @@ fn the_config_gate_skips_only_the_commands_that_read_no_config() {
         );
     }
 
-    for args in [&["status"][..], &["config", "--list"], &["init"], &["ls-remote", "."]] {
+    for args in [
+        &["status"][..],
+        &["config", "--list"],
+        &["init"],
+        &["ls-remote", "."],
+    ] {
         let o = run_env(&f, &f.work, &bogus, args);
         assert_eq!(
             err(&o),
@@ -886,7 +1020,10 @@ fn the_config_gate_precedes_the_ownership_gate() {
     let o = run_env(
         &f,
         &f.work,
-        &[("GIT_CONFIG_COUNT", "bogus"), ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")],
+        &[
+            ("GIT_CONFIG_COUNT", "bogus"),
+            ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1"),
+        ],
         &["status"],
     );
     assert_eq!(

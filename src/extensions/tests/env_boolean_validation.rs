@@ -66,6 +66,12 @@ fn run(dir: &Path, home: &Path, extra: &[(&str, &str)], args: &[&str]) -> Output
         .env("GIT_COMMITTER_NAME", "A")
         .env("GIT_COMMITTER_EMAIL", "a@example.com")
         .env("LC_ALL", "C")
+        // `git var GIT_EDITOR` exits 1 when no editor resolves, so leaving this to
+        // the ambient environment made the exit status depend on whether the
+        // developer had EDITOR set — green locally, 1 on a CI runner. Pinned like
+        // the identity and locale above; stock git 2.55.0 prints `vi` and exits 0
+        // with it set, and so does this binary.
+        .env("EDITOR", "vi")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("XDG_CONFIG_HOME");

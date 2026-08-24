@@ -160,7 +160,7 @@ index 0000000..1111111 100644\n\
 --- a/README.md\n\
 +++ b/README.md\n\
 @@ -1 +1,2 @@\n\
- # fixture\n\
+\x20# fixture\n\
 +added line\n";
 
 /// Two files under a commit header. The header's oid is what `patch-id` prints
@@ -176,14 +176,14 @@ index 0000000..1111111 100644\n\
 --- a/README.md\n\
 +++ b/README.md\n\
 @@ -1 +1,2 @@\n\
- # fixture\n\
+\x20# fixture\n\
 +added line\n\
 diff --git a/src/lib.rs b/src/lib.rs\n\
 index 2222222..3333333 100644\n\
 --- a/src/lib.rs\n\
 +++ b/src/lib.rs\n\
 @@ -1 +1,2 @@\n\
- pub fn one() -> u32 { 1 }\n\
+\x20pub fn one() -> u32 { 1 }\n\
 +pub fn two() -> u32 { 2 }\n";
 
 /// A rename with an edit: the header carries `rename from`/`rename to` lines as
@@ -196,7 +196,7 @@ index 4444444..5555555 100644\n\
 --- a/old/name.txt\n\
 +++ b/new/name.txt\n\
 @@ -1,2 +1,2 @@\n\
- keep this line\n\
+\x20keep this line\n\
 -drop this line\n\
 +add this line\n";
 
@@ -219,7 +219,7 @@ index 0000000..1111111 100644\r\n\
 --- a/README.md\r\n\
 +++ b/README.md\r\n\
 @@ -1 +1,2 @@\r\n\
- # fixture\r\n\
+\x20# fixture\r\n\
 +added line\r\n";
 
 /// Prose. `patch-id` finds no diff and prints nothing, at exit 0 — a different

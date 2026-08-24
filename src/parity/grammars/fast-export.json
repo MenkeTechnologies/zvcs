@@ -67,8 +67,8 @@
     "main...feature",
     "HEAD~1..HEAD",
     "--all",
-    "-- README.md",
-    "-- src/lib.rs",
+    ["--", "README.md"],
+    ["--", "src/lib.rs"],
     "does-not-exist",
     ""
   ],

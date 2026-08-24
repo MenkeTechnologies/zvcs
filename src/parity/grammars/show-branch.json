@@ -34,7 +34,7 @@
     "HEAD",
     "main",
     "feature",
-    "main feature",
+    ["main", "feature"],
     "v0.1.0",
     "v0.2.0",
     "HEAD~1",

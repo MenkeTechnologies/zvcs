@@ -2772,6 +2772,40 @@ fn sample(rng: &mut Rng, g: &Grammar) -> Case {
 /// way, and [`Rng::count_upto`] consumes the same three values whatever its
 /// bound, so an existing seed still produces the case ids it produced before
 /// this split.
+/// The byte a generated grammar uses to hold several argv tokens in one entry.
+///
+/// A grammar entry is one `&'static str` and reaches the child as one argument:
+/// `Case::argv` extends from `args` without splitting, and the samplers below
+/// push each drawn entry with `Vec<String>::push`. That was fine until the
+/// entries were read off git's own documentation, where an example is written
+/// the way a caller types it — `HEAD -- README.md`, `set src`, `-m 1`. Each of
+/// those arrived as a single argument, and stock git answered
+///
+///     fatal: ambiguous argument 'HEAD -- README.md'
+///     error: unknown subcommand: `set src'
+///
+/// on both sides. The case matched, and measured nothing about the port. The id
+/// hid it too: `Case::id_tail` joins argv with a space, so one token containing
+/// spaces renders exactly like several tokens.
+///
+/// `scripts/gen_grammars.pl` now distinguishes the two — a JSON string is one
+/// token however many spaces it holds, a JSON array is several — and encodes an
+/// array with this separator, because the element type is pinned to
+/// `&'static str` by `mutate_value`, by the `RESUME_EXTRA` membership tests and
+/// by both `rng.pick(...).to_string()` call sites. Splitting on it here is what
+/// turns the encoding back into argv, and it leaves every legitimate
+/// space-bearing entry — `--since=1 year ago`, `path with spaces` — untouched,
+/// since none of them contains a unit separator.
+const TOKEN_SEP: char = '\u{1f}';
+
+/// Expand any multi-token entries in `args` into the argv they encode.
+fn split_tokens(args: Vec<String>) -> Vec<String> {
+    if !args.iter().any(|a| a.contains(TOKEN_SEP)) {
+        return args;
+    }
+    args.iter().flat_map(|a| a.split(TOKEN_SEP).map(str::to_string)).collect()
+}
+
 fn sample_argv(rng: &mut Rng, g: &Grammar, max_flags: usize, max_pos: usize) -> Vec<String> {
     // Up to `max_flags` flags, WITH repetition allowed. Repeats are not
     // dilution: a re-declared flag is exactly what surfaces last-wins and
@@ -2836,7 +2870,7 @@ fn sample_argv(rng: &mut Rng, g: &Grammar, max_flags: usize, max_pos: usize) -> 
         }
         args.extend(pos_tokens);
     }
-    args
+    split_tokens(args)
 }
 
 /// The payload for an invocation that asks for one, and `None` for one that does
@@ -3916,7 +3950,10 @@ fn walk(rng: &mut Rng, s: &Stopper, grammars: &[Grammar], n: usize) -> Sequence 
                 .filter(|f| !RESUME_TOKENS.contains(f) && !RESUME_EXTRA.contains(f))
                 .collect();
             let count = if usable.is_empty() { 0 } else { rng.count_upto(2) };
-            (0..count).map(|_| rng.pick(&usable).to_string()).collect()
+            // Through `split_tokens` for the same reason `sample_argv` is: this
+            // pushes a grammar flag into a step without passing through the
+            // sampler, so a multi-token flag would arrive here still encoded.
+            split_tokens((0..count).map(|_| rng.pick(&usable).to_string()).collect())
         }
         _ => Vec::new(),
     };
@@ -3966,7 +4003,10 @@ fn bisect_walk(rng: &mut Rng, grammars: &[Grammar], n: usize) -> Sequence {
             start.push(rng.pick(g.flags).to_string());
         }
     }
-    seq = seq.step_argv(start, None);
+    // Latent today — `bisect`'s grammar has no multi-token flag — but the same
+    // shape as the decoration path above, and a grammar edit should not have to
+    // remember this call site.
+    seq = seq.step_argv(split_tokens(start), None);
 
     for _ in 0..=rng.below(5) {
         let verb = *rng.pick(BISECT_VERBS);

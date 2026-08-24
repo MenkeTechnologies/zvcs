@@ -6,7 +6,7 @@
     "--prefix=src/",
     "--prefix=does-not-exist/",
     "--prefix=README.md/",
-    "--missing-ok --prefix=src/"
+    ["--missing-ok", "--prefix=src/"]
   ],
   "positionals": [
     "",

@@ -18,10 +18,15 @@ mod branch_remote;
 mod commit_family;
 mod config_cmd;
 mod diff_family;
+mod fetch_clone;
+mod fixture_gaps;
 mod discovery;
 mod history_query;
+mod index_plumbing;
 mod history_rewrite;
 mod info_attrs;
+mod log_format;
+mod mail_series;
 mod mail_patch;
 mod maintenance;
 mod merge_dirty;
@@ -427,10 +432,15 @@ pub fn cases() -> Vec<Case> {
     commit_family::cases(&mut c);
     config_cmd::cases(&mut c);
     diff_family::cases(&mut c);
+    fetch_clone::cases(&mut c);
+    fixture_gaps::cases(&mut c);
     discovery::cases(&mut c);
     history_query::cases(&mut c);
+    index_plumbing::cases(&mut c);
     history_rewrite::cases(&mut c);
     info_attrs::cases(&mut c);
+    log_format::cases(&mut c);
+    mail_series::cases(&mut c);
     mail_patch::cases(&mut c);
     maintenance::cases(&mut c);
     merge_dirty::cases(&mut c);
@@ -607,7 +617,7 @@ index 9741694..2a1b3c4 100644\n\
 --- a/README.md\n\
 +++ b/README.md\n\
 @@ -1 +1,2 @@\n\
- # fixture\n\
+\x20# fixture\n\
 +added line\n";
 
 /// A diff whose hunk header does not match its body — `apply` must reject it.
@@ -615,7 +625,7 @@ const BROKEN_PATCH: &[u8] = b"diff --git a/README.md b/README.md\n\
 --- a/README.md\n\
 +++ b/README.md\n\
 @@ -1,5 +1,5 @@\n\
- nothing like the real file\n";
+\x20nothing like the real file\n";
 
 /// A single-patch mbox with fixed headers, so `am` produces a fixed commit id.
 ///
@@ -631,15 +641,15 @@ Subject: [PATCH] add a line to README\n\
 \n\
 commit body\n\
 ---\n\
- README.md | 1 +\n\
- 1 file changed, 1 insertion(+)\n\
+\x20README.md | 1 +\n\
+\x201 file changed, 1 insertion(+)\n\
 \n\
 diff --git a/README.md b/README.md\n\
 index 9741694..2a1b3c4 100644\n\
 --- a/README.md\n\
 +++ b/README.md\n\
 @@ -1 +1,2 @@\n\
- # fixture\n\
+\x20# fixture\n\
 +added line\n\
 -- \n\
 2.55.0\n\

@@ -8,12 +8,12 @@
     "--short",
     "--recurse",
     "--no-recurse",
-    "-q --short",
-    "--quiet --short",
-    "--short --no-recurse",
-    "-q --no-recurse",
-    "--short --recurse",
-    "--quiet --short --no-recurse"
+    ["-q", "--short"],
+    ["--quiet", "--short"],
+    ["--short", "--no-recurse"],
+    ["-q", "--no-recurse"],
+    ["--short", "--recurse"],
+    ["--quiet", "--short", "--no-recurse"]
   ],
   "positionals": [
     "HEAD",

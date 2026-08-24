@@ -22,9 +22,9 @@
     "--diff-algorithm=bogus",
     "--object-id",
     "--no-object-id",
-    "-L mine",
-    "-L base",
-    "-L theirs"
+    ["-L", "mine"],
+    ["-L", "base"],
+    ["-L", "theirs"]
   ],
   "positionals": [
     "README.md",

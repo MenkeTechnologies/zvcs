@@ -216,6 +216,129 @@ pub enum Shape {
     /// needs no clever hook to be worth its build cost — it needs only to have
     /// one, and a directory to be inside.
     Hooked,
+    /// Three root commits in one repository: `main`'s, and two orphan branches
+    /// that share no ancestor with it or with each other.
+    ///
+    /// Every other shape descends from the one `initial` commit
+    /// (`edfab1b71619a22120a8da1a3d85d68e0200290a` in all of them), so a pair of
+    /// revisions with **no** merge base could not be named at all. That made a
+    /// whole family unreachable: `merge-base` returning exit 1 with no output,
+    /// `merge`/`pull` refusing with `refusing to merge unrelated histories` and
+    /// then being told `--allow-unrelated-histories`, `rev-list --not` over
+    /// disjoint graphs, `format-patch` across roots, and
+    /// `rev-list --max-parents=0` finding more than one root.
+    ///
+    /// The two orphans differ in what they collide with, because the allowed
+    /// merge has two outcomes and one shape has to reach both: `alien` shares no
+    /// path with `main`, so `merge --allow-unrelated-histories alien` is clean;
+    /// `alien-clash` carries its own `README.md`, so the same merge is an
+    /// add/add conflict on a path that has no common ancestor to diff against.
+    Unrelated,
+    /// A criss-cross: two branches that each merged the other, so their two
+    /// merge bases are incomparable.
+    ///
+    /// No other shape has one, which left three things unmeasurable.
+    /// `merge-base --all` could never return more than one id, so an
+    /// implementation that stops at the first base scored the same as one that
+    /// enumerates them; `merge-base --independent` had nothing to prune; and the
+    /// recursive strategy's virtual-merge-base path — merging the bases with
+    /// each other to build the base it then merges against, the most intricate
+    /// path in `merge-ort` — was never entered.
+    ///
+    /// `clash.txt` is what forces that path to *show*: the two bases disagree on
+    /// it (`a` against `b`), so the virtual base is itself a conflicted merge and
+    /// stage 1 of the outer conflict holds a blob that exists in no commit —
+    /// stock writes conflict markers there. A port that picks one of the two
+    /// bases instead leaves `a`, `b` or `base` in stage 1 and is caught by the
+    /// state probe even though its stdout matches. `cc.txt` merges cleanly
+    /// through the same virtual base, and `calm.txt` is untouched by anything, so
+    /// one merge exercises all three outcomes.
+    CrissCross,
+    /// The same patch on both sides of a fork, applied by `cherry-pick` rather
+    /// than shared through history.
+    ///
+    /// No fixture carried one commit's patch id twice, so `cherry`'s `-` marker,
+    /// `rev-list --cherry-mark`'s `=` class and `--cherry-pick`'s omission were
+    /// all unreachable — every case could only ever produce `+`, `<` and `>` —
+    /// and `rebase`'s `skipped previously applied commit` path was never taken.
+    ///
+    /// `topic` forks at `cherry: seed`, commits once so the cherry-pick lands on
+    /// a different parent (without that the copy is byte-identical to the
+    /// original and the two branches share the commit rather than duplicating
+    /// its patch), picks `main`'s `cherry: shared patch`, then commits again. So
+    /// each side holds one commit the other does not, plus one whose patch id
+    /// both have.
+    Cherry,
+    /// Symlink entries and zero-byte blobs, tracked, untracked, and inside a
+    /// patch.
+    ///
+    /// No shape wrote either. Mode `120000` never appeared in `ls-files
+    /// --stage`, so `checkout`, `archive` and `apply` were only ever asked about
+    /// regular files, and `cat-file --follow-symlinks` had nothing to follow —
+    /// its four answers (a resolved blob, `dangling`, a `symlink` that leaves the
+    /// tree, and resolution *through* a symlinked directory) are one shape's
+    /// worth of fixture apart from unreachable. The empty blob
+    /// (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) is a constant of the hash
+    /// function that no fixture had ever stored, so `--batch-check` never saw a
+    /// zero-length object and `apply` never created one.
+    ///
+    /// Every symlink target is relative. An absolute one would bake the build
+    /// directory into a tracked blob and the shape would stop being reproducible
+    /// at a second location — `link-escape` points *out* of the worktree by
+    /// relative path, which is what makes the out-of-tree answer reachable
+    /// without naming a machine.
+    ///
+    /// `sym-pending` carries the changes `patches/symlink.patch` describes, so
+    /// the patch applies to `main`'s tree: a new symlink, a new empty file, and a
+    /// regular file replaced by a symlink (`T` in `--raw`). A case is one argv
+    /// against a pristine copy and cannot write a patch first, which is the same
+    /// reason [`Shape::Patches`] exists.
+    Symlinks,
+    /// A written commit-graph, with one commit deliberately left out of it.
+    ///
+    /// `fixture.rs` never ran `commit-graph write`, so `core.commitGraph` chose
+    /// between two code paths over the same objects and could not change an
+    /// answer — the setting was measurable only as an argument-parsing question.
+    /// `commit-graph verify`, `--changed-paths` (the Bloom filters `log -- path`
+    /// consults) and the generation-number traversal had no file to read.
+    ///
+    /// `cg-late` is committed *after* the write, so the graph is valid but
+    /// incomplete: a traversal has to fall back to reading that commit's object
+    /// and to mixing graph-supplied generation numbers with computed ones, which
+    /// a graph covering every commit never asks of it. `cg-side` is merged and
+    /// `cg-loose` is not, so the graph holds a merge and a fork.
+    ///
+    /// The file is byte-identical between two builds: it is a function of the
+    /// object ids and the write options alone.
+    CommitGraph,
+    /// A repository with four things wrong with it, none of which stops git
+    /// from operating.
+    ///
+    /// `fsck`, `gc`, `prune` and `rev-parse --verify` ran only on healthy
+    /// repositories, so "what does the port do when the repository is damaged"
+    /// had no fixture at all — and the answers are not uniform, which is what
+    /// makes them worth pinning: `rev-parse --verify` *succeeds* on a ref
+    /// pointing at a missing object and prints the id, while `show-ref` and
+    /// `for-each-ref` fail with exit 128; `rev-parse --verify` on a dangling
+    /// symref warns and fails; `branch --list` prints one of the two broken refs
+    /// and hides the other. A port that treats "broken" as one condition gets
+    /// several of those wrong.
+    ///
+    /// The four:
+    ///
+    /// * `refs/heads/dangling` — a well-formed id no object has.
+    /// * `refs/heads/broken-symref` — a symref to a branch that does not exist.
+    /// * a loose object file whose contents are not a zlib stream, at a path
+    ///   whose name is a valid object id.
+    /// * an empty line in `.git/objects/info/alternates`.
+    ///
+    /// The alternates entry is empty rather than a path that does not exist, and
+    /// that is a constraint rather than a preference: a missing alternate makes
+    /// git print the *absolute* path of the directory it could not find on
+    /// stderr, and the two sides of a case run in two different copies, so the
+    /// diagnostic would differ by construction and the case would measure the
+    /// harness. An empty entry exercises the same parser and stays silent.
+    Damaged,
 }
 
 impl Shape {
@@ -243,6 +366,12 @@ impl Shape {
         Shape::NoIndexTrees,
         Shape::DecomposedPaths,
         Shape::Hooked,
+        Shape::Unrelated,
+        Shape::CrissCross,
+        Shape::Cherry,
+        Shape::Symlinks,
+        Shape::CommitGraph,
+        Shape::Damaged,
     ];
 
     pub fn name(self) -> &'static str {
@@ -270,6 +399,12 @@ impl Shape {
             Shape::NoIndexTrees => "no-index-trees",
             Shape::DecomposedPaths => "decomposed-paths",
             Shape::Hooked => "hooked",
+            Shape::Unrelated => "unrelated",
+            Shape::CrissCross => "criss-cross",
+            Shape::Cherry => "cherry",
+            Shape::Symlinks => "symlinks",
+            Shape::CommitGraph => "commit-graph",
+            Shape::Damaged => "damaged",
         }
     }
 }
@@ -999,8 +1134,277 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
                 }
             }
         }
+
+        Shape::Unrelated => {
+            write(dir, "src/lib.rs", "pub fn one() -> u32 { 1 }\npub fn two() -> u32 { 2 }\n")?;
+            git(dir, home, &["commit", "-qam", "unrelated: main moves"])?;
+
+            // Shares no path with `main`, so the allowed merge is clean and the
+            // resulting tree is the union of two roots.
+            orphan(dir, home, "alien", &["README.md", "src/lib.rs"])?;
+            write(dir, "alien.txt", "alien root\n")?;
+            git(dir, home, &["add", "alien.txt"])?;
+            git(dir, home, &["commit", "-qm", "alien root"])?;
+            write(dir, "alien.txt", "alien root\nalien second\n")?;
+            git(dir, home, &["commit", "-qam", "alien second"])?;
+            // A tag on the far root, so `describe`, `format-patch` and the
+            // `--contains` queries can name it without an id.
+            git(dir, home, &["tag", "alien-tip"])?;
+
+            // Collides with `main` on `README.md`. An add/add conflict between
+            // unrelated roots has no common ancestor to diff against, which is a
+            // different path through the strategy than the add/add conflicts
+            // every other shape can produce.
+            orphan(dir, home, "alien-clash", &["alien.txt"])?;
+            write(dir, "README.md", "# alien fixture\n\nsame path, no common ancestor\n")?;
+            git(dir, home, &["add", "README.md"])?;
+            git(dir, home, &["commit", "-qm", "alien clash root"])?;
+
+            git(dir, home, &["checkout", "-q", "main"])?;
+        }
+
+        Shape::CrissCross => {
+            write(dir, "cc.txt", &numbered("cc", 12))?;
+            write(dir, "clash.txt", "base\n")?;
+            write(dir, "calm.txt", "calm\n")?;
+            git(dir, home, &["add", "."])?;
+            git(dir, home, &["commit", "-qm", "criss-cross: base"])?;
+
+            // The two future merge bases. They disagree on `clash.txt`, which is
+            // what makes the virtual base a conflicted merge rather than a
+            // second copy of `base`.
+            git(dir, home, &["checkout", "-q", "-b", "cc-a", "main"])?;
+            write(dir, "cc.txt", &numbered_with_edits("cc", 12, &[2]))?;
+            write(dir, "clash.txt", "a\n")?;
+            git(dir, home, &["commit", "-qam", "criss-cross: a"])?;
+
+            git(dir, home, &["checkout", "-q", "-b", "cc-b", "main"])?;
+            write(dir, "cc.txt", &numbered_with_edits("cc", 12, &[11]))?;
+            write(dir, "clash.txt", "b\n")?;
+            git(dir, home, &["commit", "-qam", "criss-cross: b"])?;
+
+            // Each side merges the other and resolves `clash.txt` its own way,
+            // so the two tips disagree there again and the outer merge has to
+            // reach for a base.
+            for (tip, from, other, keep, edit) in [
+                ("cc-left", "cc-a", "cc-b", "a\n", 5usize),
+                ("cc-right", "cc-b", "cc-a", "b\n", 8usize),
+            ] {
+                git(dir, home, &["checkout", "-q", "-b", tip, from])?;
+                git_conflicting(dir, home, &["merge", "--no-commit", other])?;
+                write(dir, "clash.txt", keep)?;
+                git(dir, home, &["add", "clash.txt"])?;
+                let msg = format!("criss-cross: {tip} merge");
+                git(dir, home, &["commit", "-qm", &msg])?;
+                // One more commit per side on a path that merges cleanly, so the
+                // criss-cross merge is not *only* a conflict.
+                write(dir, "cc.txt", &numbered_with_edits("cc", 12, &[2, edit, 11]))?;
+                let msg = format!("criss-cross: {tip} tip");
+                git(dir, home, &["commit", "-qam", &msg])?;
+            }
+
+            // HEAD stays on `cc-left`: a case is one argv and cannot check out
+            // first, so the branch the criss-cross is merged *from* has to be the
+            // one already checked out.
+            git(dir, home, &["checkout", "-q", "cc-left"])?;
+        }
+
+        Shape::Cherry => {
+            write(dir, "app.txt", &numbered("app", 10))?;
+            git(dir, home, &["add", "app.txt"])?;
+            git(dir, home, &["commit", "-qm", "cherry: seed"])?;
+            git(dir, home, &["branch", "topic"])?;
+
+            write(dir, "app.txt", &numbered_with_edits("app", 10, &[3]))?;
+            git(dir, home, &["commit", "-qam", "cherry: shared patch"])?;
+            write(dir, "app.txt", &numbered_with_edits("app", 10, &[3, 8]))?;
+            git(dir, home, &["commit", "-qam", "cherry: upstream only"])?;
+
+            git(dir, home, &["checkout", "-q", "topic"])?;
+            // Committed *before* the pick on purpose. Every input to a commit id
+            // is pinned here except the parent, so picking onto the fork point
+            // would reproduce the original commit byte for byte and the two
+            // branches would share it instead of holding two commits with one
+            // patch id.
+            write(dir, "topic-base.txt", "topic\n")?;
+            git(dir, home, &["add", "topic-base.txt"])?;
+            git(dir, home, &["commit", "-qm", "cherry: topic base"])?;
+            git(dir, home, &["cherry-pick", "main~1"])?;
+            write(dir, "app.txt", &numbered_with_edits("app", 10, &[3, 10]))?;
+            git(dir, home, &["commit", "-qam", "cherry: topic only"])?;
+        }
+
+        Shape::Symlinks => {
+            write(dir, "empty.txt", "")?;
+            write(dir, "dir/empty-nested.txt", "")?;
+            write(dir, "dir/target.txt", "target content\n")?;
+            // One per answer `cat-file --follow-symlinks` has: a blob, a blob
+            // reached through a symlinked directory, `dangling`, `symlink` for a
+            // target outside the tree, and a link to a link.
+            symlink(dir, "link-to-file", "README.md")?;
+            symlink(dir, "link-to-dir", "dir")?;
+            symlink(dir, "link-broken", "no/such/target")?;
+            symlink(dir, "link-escape", "../outside.txt")?;
+            symlink(dir, "link-to-link", "link-to-file")?;
+            symlink(dir, "dir/link-up", "../dir/target.txt")?;
+            // Retargeted in the worktree below, so one symlink is dirty and the
+            // rest stay clean.
+            symlink(dir, "link-wt", "README.md")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "symlinks: seed"])?;
+
+            // The patch's subject changes live on a side branch so `main`'s tree
+            // stays the pre-image the patch applies to, as in [`Shape::Patches`].
+            git(dir, home, &["checkout", "-q", "-b", "sym-pending"])?;
+            symlink(dir, "later-link", "empty.txt")?;
+            write(dir, "later-empty.txt", "")?;
+            std::fs::remove_file(dir.join("dir/target.txt"))?;
+            symlink(dir, "dir/target.txt", "../empty.txt")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "symlinks: pending changes"])?;
+            git(dir, home, &["checkout", "-q", "main"])?;
+
+            let patch = git(dir, home, &["diff", "main", "sym-pending"])?;
+            write(dir, "patches/symlink.patch", &patch)?;
+            git(dir, home, &["add", "patches"])?;
+            git(dir, home, &["commit", "-qm", "symlinks: a patch that adds one"])?;
+
+            // Dirty through the index and dirty through the directory walk: a
+            // retargeted symlink and an untracked one, plus an untracked empty
+            // file for the `add`/`status`/`clean` side of the question.
+            std::fs::remove_file(dir.join("link-wt"))?;
+            symlink(dir, "link-wt", "src/lib.rs")?;
+            symlink(dir, "stray-link", "README.md")?;
+            write(dir, "stray-empty.txt", "")?;
+        }
+
+        Shape::CommitGraph => {
+            for n in 1..=5usize {
+                write(dir, "cg.txt", &numbered("cg", n))?;
+                if n == 1 {
+                    git(dir, home, &["add", "cg.txt"])?;
+                }
+                let msg = format!("commit-graph: {n}");
+                git(dir, home, &["commit", "-qam", &msg])?;
+            }
+
+            // A fork that is never merged and a branch that is, so the graph
+            // holds both a merge commit and a tip off the main chain.
+            git(dir, home, &["checkout", "-q", "-b", "cg-loose", "main~3"])?;
+            write(dir, "cg-loose.txt", "loose\n")?;
+            git(dir, home, &["add", "cg-loose.txt"])?;
+            git(dir, home, &["commit", "-qm", "commit-graph: loose fork"])?;
+
+            git(dir, home, &["checkout", "-q", "-b", "cg-side", "main"])?;
+            write(dir, "cg-side.txt", "side\n")?;
+            git(dir, home, &["add", "cg-side.txt"])?;
+            git(dir, home, &["commit", "-qm", "commit-graph: side"])?;
+            git(dir, home, &["checkout", "-q", "main"])?;
+            git(dir, home, &["merge", "-q", "--no-ff", "-m", "commit-graph: merge side", "cg-side"])?;
+
+            // `--changed-paths` writes the Bloom filters `log -- <path>` reads;
+            // without them the flag is a write option with no reader.
+            git(dir, home, &["commit-graph", "write", "--reachable", "--changed-paths"])?;
+
+            // After the write, so the graph is valid and incomplete.
+            write(dir, "cg-late.txt", "committed after the graph was written\n")?;
+            git(dir, home, &["add", "cg-late.txt"])?;
+            git(dir, home, &["commit", "-qm", "commit-graph: after the write"])?;
+        }
+
+        Shape::Damaged => {
+            write(dir, "second.txt", "second\n")?;
+            git(dir, home, &["add", "second.txt"])?;
+            git(dir, home, &["commit", "-qm", "damaged: a second commit"])?;
+
+            // Written as files rather than through `update-ref`, which refuses
+            // both: git will not create a ref to an object it cannot find, and
+            // will not point a symref at a branch that does not exist. The
+            // damage this shape exists for is precisely the state git's own
+            // plumbing declines to produce.
+            write(dir, ".git/refs/heads/dangling", &format!("{MISSING_OBJECT}\n"))?;
+            write(dir, ".git/refs/heads/broken-symref", "ref: refs/heads/does-not-exist\n")?;
+
+            // A loose object whose name is a valid id and whose contents are not
+            // a zlib stream. `cat-file --batch-all-objects` still lists it — as
+            // `missing` — so the object *set* stays enumerable and the damage is
+            // in the read.
+            write(
+                dir,
+                &format!(".git/objects/{}/{}", &CORRUPT_OBJECT[..2], &CORRUPT_OBJECT[2..]),
+                "this is not a zlib stream\n",
+            )?;
+
+            // An empty entry. See the shape's doc comment for why it is empty
+            // rather than a path that does not exist.
+            write(dir, ".git/objects/info/alternates", "\n")?;
+        }
     }
     Ok(())
+}
+
+/// The id `refs/heads/dangling` points at in [`Shape::Damaged`]: well-formed,
+/// and belonging to no object. A literal rather than a hash of anything, so it
+/// cannot accidentally become an object the fixture also stores.
+pub const MISSING_OBJECT: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+/// The id of [`Shape::Damaged`]'s corrupt loose object, chosen the same way and
+/// for the same reason.
+pub const CORRUPT_OBJECT: &str = "ab1234567890123456789012345678901234abcd";
+
+/// Start an unborn branch and clear the previous history out of the index and
+/// the worktree, so the next commit is a *root* rather than a child.
+///
+/// `git checkout --orphan` moves HEAD alone: the index and worktree are left
+/// holding the branch that was checked out, and committing them would make a
+/// root whose tree is the old one. `carried` names the files that survive the
+/// index reset and have to be removed by hand.
+fn orphan(dir: &Path, home: &Path, name: &str, carried: &[&str]) -> Result<()> {
+    git(dir, home, &["checkout", "-q", "--orphan", name])?;
+    git(dir, home, &["rm", "-r", "-q", "--cached", "."])?;
+    for path in carried {
+        std::fs::remove_file(dir.join(path))?;
+    }
+    Ok(())
+}
+
+/// Run stock git for a step whose *failure* is the state being built, and fail
+/// loudly if it succeeds.
+///
+/// A conflicted merge exits non-zero, so [`git`] cannot run one — and a step
+/// that silently stopped conflicting would leave a shape that still builds and
+/// no longer carries what its cases need.
+fn git_conflicting(dir: &Path, home: &Path, args: &[&str]) -> Result<()> {
+    let mut cmd = crate::stock::command()?;
+    env::harden(&mut cmd, home);
+    cmd.current_dir(dir).args(args);
+    let out = cmd.output().with_context(|| format!("spawn stock git {args:?}"))?;
+    if out.status.success() {
+        bail!("fixture: stock git {args:?} in {} was expected to conflict", dir.display());
+    }
+    Ok(())
+}
+
+/// Create a symlink at `rel` pointing at `target`.
+///
+/// Targets are always relative: an absolute one would put the build directory
+/// into a tracked blob, and the shape would hash differently at a second build
+/// location — which is exactly what `shapes_build_reproducibly` fails on.
+#[cfg(unix)]
+fn symlink(dir: &Path, rel: &str, target: &str) -> Result<()> {
+    let path = dir.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(target, &path)
+        .with_context(|| format!("symlink {} -> {target}", path.display()))
+}
+
+/// Symlink fixtures need a filesystem that has symlinks. Reported rather than
+/// silently degraded: a shape built without its symlinks would still build, and
+/// every case using it would then measure nothing.
+#[cfg(not(unix))]
+fn symlink(_dir: &Path, rel: &str, target: &str) -> Result<()> {
+    bail!("fixture: symlink {rel} -> {target} needs a unix filesystem")
 }
 
 /// `é.txt`, decomposed: `e` + U+0301, the form macOS stores and hands back.
@@ -1255,21 +1659,44 @@ mod tests {
         Ok(())
     }
 
+    /// One probe's answer: its stdout, and the exit code it left.
+    ///
+    /// The code is part of the answer because a probe is allowed to *fail* here.
+    /// [`Shape::Damaged`] carries a ref pointing at a missing object, and
+    /// `for-each-ref` exits 128 rather than printing it, so a probe runner that
+    /// insisted on success could not ask any question at all about a repository
+    /// with something wrong in it. Recording the code keeps the check strict in
+    /// the direction that matters: a probe that succeeds in one build and fails
+    /// in the other is still a difference, and the failing probe's stdout is
+    /// still compared. stderr is deliberately left out — it names paths, and the
+    /// two builds are at two different ones.
+    fn probe(dir: &Path, home: &Path, args: &[&str]) -> Result<String> {
+        let mut cmd = crate::stock::command()?;
+        env::harden(&mut cmd, home);
+        cmd.current_dir(dir).args(args);
+        let out = cmd.output().with_context(|| format!("spawn stock git {args:?}"))?;
+        Ok(format!(
+            "exit {}\n{}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout)
+        ))
+    }
+
     /// Repository state as stock git reports it, plus the on-disk bytes.
     fn digest(dir: &Path, home: &Path) -> Result<String> {
         let mut s = String::new();
-        for probe in [
+        for args in [
             &["for-each-ref", "--format=%(refname) %(objecttype) %(objectname)"][..],
             &["ls-files", "-v", "--full-name"][..],
             &["cat-file", "--batch-check", "--batch-all-objects"][..],
             &["status", "--porcelain=v1", "--untracked-files=all"][..],
         ] {
             let mut lines: Vec<String> =
-                git(dir, home, probe)?.lines().map(str::to_string).collect();
+                probe(dir, home, args)?.lines().map(str::to_string).collect();
             // `--batch-all-objects` walks packs and loose storage in an order the
             // filesystem influences; the object *set* is what must be stable.
             lines.sort();
-            s.push_str(&format!("# {}\n{}\n", probe.join(" "), lines.join("\n")));
+            s.push_str(&format!("# {}\n{}\n", args.join(" "), lines.join("\n")));
         }
         let mut files = Vec::new();
         hash_tree(dir, Path::new(""), &mut files)?;

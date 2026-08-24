@@ -98,7 +98,7 @@
     "REFS/HEADS/MAIN",
     "refs/does-not-exist/*",
     "does-not-exist",
-    "refs/heads/* refs/tags/*",
+    ["refs/heads/*", "refs/tags/*"],
     "refs/remotes/*",
     "refs/stash",
     "refs/worktree/*",

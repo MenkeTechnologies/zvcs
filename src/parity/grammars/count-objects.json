@@ -8,11 +8,11 @@
     "--human-readable",
     "--no-verbose",
     "--no-human-readable",
-    "-v -H",
-    "--verbose --human-readable",
-    "-H -v",
-    "--verbose --no-human-readable",
-    "--human-readable --no-verbose"
+    ["-v", "-H"],
+    ["--verbose", "--human-readable"],
+    ["-H", "-v"],
+    ["--verbose", "--no-human-readable"],
+    ["--human-readable", "--no-verbose"]
   ],
   "positionals": [
     "",

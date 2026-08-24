@@ -69,6 +69,12 @@ pub fn sequences() -> Vec<Sequence> {
     remote_side(&mut s);
     submodule(&mut s);
     unwind(&mut s);
+    criss_cross(&mut s);
+    unrelated(&mut s);
+    cherry(&mut s);
+    damaged(&mut s);
+    symlinks(&mut s);
+    commit_graph(&mut s);
     s
 }
 
@@ -1711,5 +1717,1019 @@ fn unwind(out: &mut Vec<Sequence>) {
             .step(&["diff"])
             .step(&["merge", "--abort"])
             .step(&["status", "--porcelain"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// criss-cross: the workflows that follow a merge with two merge bases
+// ---------------------------------------------------------------------------
+//
+// [`Shape::CrissCross`] is checked out on `cc-left`, clean, with `cc-right` a
+// second tip that shares two incomparable merge bases with it (`cc-a` and
+// `cc-b`). Merging the two makes `merge-ort` build a *virtual* base by merging
+// those two bases with each other, and the fixture's `clash.txt` makes that
+// inner merge itself conflict — so stage 1 of the outer conflict holds a blob
+// that exists in no commit. Stock's is
+// `<<<<<<<<< Temporary merge branch 1\nb\n=========\na\n>>>>>>>>> Temporary
+// merge branch 2\n`, nine-character markers and all.
+//
+// A single case can see that stop. What it cannot see is whether the stop can
+// be resumed, aborted or recorded — whether the operation-state files describe
+// a merge that is really in progress — which is what every sequence below is
+// for.
+
+fn criss_cross(out: &mut Vec<Sequence>) {
+    // The whole conflicted criss-cross merge, resolved and finished. Steps 3-5
+    // print the three index stages on **stdout**, which is the only place in
+    // this corpus where the virtual merge base is directly readable rather than
+    // inferred from a state digest: step 3 is the inner merge's own conflict,
+    // steps 4 and 5 are the two tips. A port that picks one of the two real
+    // bases instead of building a virtual one prints `a`, `b` or `base` at step
+    // 3 and is caught there rather than at the commit.
+    //
+    // `cc.txt` merges cleanly through the same virtual base and is staged by the
+    // same invocation, so step 2's `M  cc.txt` beside `UU clash.txt` is the
+    // assertion that the strategy did not simply give up at the first conflict.
+    out.push(
+        Sequence::new("merge", "criss-cross-conflict-resolve-continue", Shape::CrissCross)
+            .step(&["merge", "cc-right"])
+            .step(&["status", "--porcelain"])
+            .step(&["show", ":1:clash.txt"])
+            .step(&["show", ":2:clash.txt"])
+            .step(&["show", ":3:clash.txt"])
+            .step(&["checkout", "--ours", "--", "clash.txt"])
+            .step(&["add", "clash.txt"])
+            .step(&["merge", "--continue"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "--graph", "-4"]),
+    );
+
+    // The same merge, thrown away, then re-run with a strategy option that
+    // resolves the conflict instead of stopping. The pair is the point: step 3
+    // reads the virtual base out of the stopped index, step 5 discards it, and
+    // step 6 makes the identical merge succeed — so step 7's `show HEAD:clash.txt`
+    // must be `a`, ours, the side `-X ours` names.
+    //
+    // `-X ours` over a criss-cross is the case that shipped wrong: a port that
+    // builds no virtual base at all can still exit 0 here and commit *theirs*'
+    // content, which every state file and every exit code agrees with. Step 7 is
+    // one line of stdout and is the only thing that separates them.
+    //
+    // Steps 1-2 are the base enumeration that has to be right for any of it:
+    // `--all` must return both `cc-a` and `cc-b`, and `--independent` must prune
+    // the pair down to the two tips.
+    out.push(
+        Sequence::new("merge", "criss-cross-virtual-base-then-strategy-ours", Shape::CrissCross)
+            .step(&["merge-base", "--all", "cc-left", "cc-right"])
+            .step(&["merge-base", "--independent", "cc-left", "cc-right", "cc-a", "cc-b"])
+            .step(&["merge", "cc-right"])
+            .step(&["show", ":1:clash.txt"])
+            .step(&["merge", "--abort"])
+            .step(&["merge", "-X", "ours", "--no-edit", "cc-right"])
+            .step(&["show", "HEAD:clash.txt"])
+            .step(&["log", "--oneline", "--graph", "-3"]),
+    );
+
+    // The abort, cross-examined. `merge --abort` has to put `cc-left` back and
+    // remove `MERGE_HEAD`/`MERGE_MSG`/`MERGE_MODE`/`AUTO_MERGE`, after which
+    // both finishing verbs must refuse — `There is no merge to abort (MERGE_HEAD
+    // missing).` and `There is no merge in progress (MERGE_HEAD missing).`, two
+    // different sentences from two different gates.
+    //
+    // `strict`, because those two refusals are the tail and both exit 128 with
+    // empty stdout. Safe to make strict here where it is not for the rebase
+    // sequences below: every step of this one writes its diagnostics to stdout
+    // and stock leaves stderr empty until step 5, so a port cannot be stopped at
+    // step 1 by a progress line.
+    out.push(
+        Sequence::new("merge", "criss-cross-abort-then-refuse-resumption", Shape::CrissCross)
+            .strict()
+            .with_globals(&[&["--no-advice"]])
+            .step(&["merge", "cc-right"])
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["merge", "--abort"])
+            .step(&["merge", "--continue"]),
+    );
+
+    // `--quit` over the criss-cross stop. The state files go and the unmerged
+    // index stays, so step 3 must still report `M  cc.txt` *and* `UU clash.txt`
+    // — the clean half of the merge is still staged, which is the part a port
+    // that implements `--quit` as `--abort` throws away along with everything
+    // else. Steps 5-7 are the three refusals that prove it: two because the
+    // state files are gone and one, differently worded, because the index is
+    // still unmerged.
+    out.push(
+        Sequence::new("merge", "criss-cross-quit-keeps-the-index", Shape::CrissCross)
+            .strict()
+            .with_globals(&[&["--no-advice"]])
+            .step(&["merge", "cc-right"])
+            .step(&["merge", "--quit"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["merge", "--abort"])
+            .step(&["merge", "--continue"])
+            .step(&["commit", "-m", "nope"]),
+    );
+
+    // rerere over a conflict whose preimage came out of a *virtual* base. The
+    // recorded preimage is the normalised outer conflict — `a` against `b` with
+    // the branch names stripped from the markers — and `probe_rr_cache` compares
+    // it byte for byte at every step, so a port whose virtual base differs
+    // records different bytes at step 1 and is named there rather than at the
+    // replay.
+    //
+    // Step 8 is the replay and its outcome is not "the merge succeeds": stock
+    // re-runs the same merge, rerere rewrites the file, and the merge still
+    // exits 1 with `UU clash.txt` because the resolution was applied to the
+    // worktree and not staged. Step 9 is what pins that — a port that treats a
+    // replayed resolution as a resolution scores exit 0 and a clean tree.
+    out.push(
+        Sequence::new("rerere", "criss-cross-record-then-replay", Shape::CrissCross)
+            .with_config(&[("rerere.enabled", "true")])
+            .step(&["merge", "cc-right"])
+            .step(&["rerere", "status"])
+            .step(&["rerere", "diff"])
+            .step(&["checkout", "--ours", "--", "clash.txt"])
+            .step(&["add", "clash.txt"])
+            .step(&["commit", "--no-edit"])
+            .step(&["reset", "--hard", "HEAD~1"])
+            .step(&["merge", "cc-right"])
+            .step(&["status", "--porcelain"])
+            .step(&["rerere", "forget", "clash.txt"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // Rebasing across the criss-cross. `rebase cc-b` linearises `cc-left` onto
+    // one of the two bases: the merge commit is dropped, `criss-cross: a` is
+    // replayed first and conflicts on `clash.txt`, and one pick stays queued —
+    // so this is a rebase stop whose premise is a two-base history rather than a
+    // two-branch one. Step 5's `--continue` has to commit the resolution and
+    // replay the remaining pick in the same invocation, which step 7's `log`
+    // (four commits, no merge) is what says.
+    //
+    // Deliberately **not** `strict`: stock writes `Rebasing (1/2)` and the
+    // `could not apply` line to stderr at step 1, so a stderr comparison would
+    // stop the sequence at its first step and leave the resume unmeasured. The
+    // exit code, the unmerged index and `rebase-merge/` are compared regardless.
+    out.push(
+        Sequence::new("rebase", "criss-cross-conflict-resolve-continue", Shape::CrissCross)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["rebase", "cc-b"])
+            .step(&["status", "--porcelain"])
+            .step(&["checkout", "--theirs", "--", "clash.txt"])
+            .step(&["add", "clash.txt"])
+            .step(&["rebase", "--continue"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-5"]),
+    );
+
+    // The same stop, walked with `--skip`. Two picks and only the first
+    // conflicts, so the skip drops it *and finishes the rebase in the same
+    // invocation* — `rebase-merge/` is gone at step 3 and `cc-left` is three
+    // commits long at step 4, with `criss-cross: a` absent. Step 5 is the proof
+    // that the operation really ended rather than merely advancing: `fatal: no
+    // rebase in progress`.
+    out.push(
+        Sequence::new("rebase", "criss-cross-skip-drops-the-pick-and-finishes", Shape::CrissCross)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["rebase", "cc-b"])
+            .step(&["rebase", "--skip"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-4"])
+            .step(&["rebase", "--abort"])
+            .step(&["log", "--oneline", "-4"]),
+    );
+
+    // The abort of the same stop, which has to restore a *merge* — `cc-left`'s
+    // tip is a commit whose parent is the criss-cross merge, and putting it back
+    // means putting both parents back. Step 5's `log --graph` is where a port
+    // that resets to the first parent alone is caught; step 6 is where one that
+    // left `rebase-merge/` behind is.
+    out.push(
+        Sequence::new("rebase", "criss-cross-abort-restores-the-merge", Shape::CrissCross)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["rebase", "cc-b"])
+            .step(&["status", "--porcelain"])
+            .step(&["rebase", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "--graph", "-5"])
+            .step(&["rebase", "--continue"]),
+    );
+
+    // Cherry-picking the criss-cross *merge* onto the branch that already
+    // contains both its parents' content. `-m 1` names the mainline, the pick
+    // applies, and the result is **empty** — so git stops with `CHERRY_PICK_HEAD`
+    // and `MERGE_MSG` written, `AUTO_MERGE` written, a clean worktree, and exit
+    // 1. That is a sequencer stop with nothing unmerged to look at, which no
+    // other sequence in this file reaches: every other stop here has an unmerged
+    // index, and a port that keys "is something in progress" off the index alone
+    // reports no operation at step 2.
+    //
+    // Step 3's `--continue` must re-report the same emptiness rather than
+    // committing it; step 5's `--skip` is the way out and leaves `cc-left`
+    // unmoved, which step 6's `log` says.
+    out.push(
+        Sequence::new("cherry-pick", "criss-cross-pick-a-merge-goes-empty", Shape::CrissCross)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["cherry-pick", "-m", "1", "cc-right~1"])
+            .step(&["status", "--porcelain"])
+            .step(&["cherry-pick", "--continue"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["cherry-pick", "--skip"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["status", "--porcelain"])
+            .step(&["cherry-pick", "--abort"]),
+    );
+
+    // Picking the far tip instead, which merges cleanly through the same two
+    // bases and commits in one invocation — so nothing is parked and step 4's
+    // `cherry-pick --abort` must refuse with `error: no cherry-pick or revert in
+    // progress` / `fatal: cherry-pick failed`.
+    //
+    // Run beside `criss-cross-pick-a-merge-goes-empty` because the two differ
+    // only in whether the pick had anything to do: a port that parks a sequencer
+    // for every pick passes the empty case and acts at step 4 here.
+    //
+    // `strict`, because that refusal is the tail, exits 128 and prints nothing
+    // on stdout; stock leaves stderr empty on steps 1-3.
+    out.push(
+        Sequence::new("cherry-pick", "criss-cross-pick-the-far-tip-parks-nothing", Shape::CrissCross)
+            .strict()
+            .with_globals(&[&["--no-advice"]])
+            .step(&["cherry-pick", "cc-right"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["cherry-pick", "--abort"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// unrelated histories: two roots, and the operations that join them
+// ---------------------------------------------------------------------------
+//
+// [`Shape::Unrelated`] is checked out on `main`, clean, beside two orphan
+// branches: `alien`, which shares no path with `main`, and `alien-clash`, which
+// carries its own `README.md`. Every pair of revisions across that boundary has
+// **no** merge base, so `merge` and `pull` refuse until told otherwise and
+// `merge-base` exits 1 with no output.
+//
+// The refusal is a single invocation and is already covered by the case corpus.
+// What is not is what happens *after* the flag is given, and — the sharper
+// question — what happens after `replace --graft` makes the two histories
+// related, which changes the answer for every later command.
+
+fn unrelated(out: &mut Vec<Sequence>) {
+    // The documented recovery, end to end: the refusal, then the same merge with
+    // `--allow-unrelated-histories`. `alien` shares no path with `main`, so the
+    // allowed merge is *clean* and the resulting tree is the union of two roots
+    // — step 7's `rev-list --max-parents=0 --count` must be `2`, which is a fact
+    // only a two-root repository can produce and which a port that quietly
+    // fast-forwarded instead gets wrong.
+    //
+    // `strict`, because step 1's `fatal: refusing to merge unrelated histories`
+    // is the contract the rest of the workflow exists to lift, and it exits 128
+    // with empty stdout. Stock leaves stderr empty on every other step here.
+    out.push(
+        Sequence::new("merge", "unrelated-refused-then-allowed", Shape::Unrelated)
+            .strict()
+            .with_globals(&[&["--no-advice"]])
+            .step(&["merge", "alien"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["merge", "--allow-unrelated-histories", "--no-edit", "alien"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "--graph", "-5"])
+            .step(&["rev-list", "--max-parents=0", "--count", "HEAD"]),
+    );
+
+    // The other outcome of the same flag. `alien-clash` carries its own
+    // `README.md`, so the allowed merge is an **add/add conflict between two
+    // roots**: there is no common ancestor, so the index gets stages 2 and 3 and
+    // *no stage 1* — step 3's `ls-files -u` is two lines, not three, which is
+    // the one place in this corpus where a conflict legitimately has no base.
+    // A port that synthesises an empty stage 1 prints three lines there.
+    out.push(
+        Sequence::new("merge", "unrelated-add-add-resolve-continue", Shape::Unrelated)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["merge", "--allow-unrelated-histories", "alien-clash"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "-u"])
+            .step(&["checkout", "--theirs", "--", "README.md"])
+            .step(&["add", "README.md"])
+            .step(&["merge", "--continue"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "--graph", "-4"]),
+    );
+
+    // The abort of that stop. A merge between two roots writes the same state
+    // files as any other, so `--abort` has to remove them and put `main` back —
+    // and both finishing verbs must then refuse from their own gates.
+    out.push(
+        Sequence::new("merge", "unrelated-add-add-abort-then-refuse", Shape::Unrelated)
+            .strict()
+            .with_globals(&[&["--no-advice"]])
+            .step(&["merge", "--allow-unrelated-histories", "alien-clash"])
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["merge", "--abort"])
+            .step(&["merge", "--continue"]),
+    );
+
+    // `pull` down the same road, which is the composite: fetch from the
+    // repository itself by relative URL, then merge what `FETCH_HEAD` names. The
+    // refusal at step 1 arrives *after* the fetch has already written
+    // `FETCH_HEAD` and printed its `* branch alien -> FETCH_HEAD` line, so a
+    // port that checks relatedness before fetching prints nothing and is caught
+    // on stderr; one that never fetches at all is caught at step 3, where the
+    // second `pull` has to succeed against the same URL.
+    //
+    // Not `strict`: the refusal is step 1 of 5 and a stderr mismatch there would
+    // hide the allowed pull behind it. `--no-advice` is on the envelope so the
+    // refusal stays the refusal.
+    out.push(
+        Sequence::new("pull", "unrelated-refused-then-allowed", Shape::Unrelated)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["pull", "--no-rebase", ".", "alien"])
+            .step(&["status", "--porcelain"])
+            .step(&["pull", "--no-rebase", "--allow-unrelated-histories", "--no-edit", ".", "alien"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "--graph", "-5"]),
+    );
+
+    // `rebase --onto <other root> --root`, which replays a *root commit* onto a
+    // history it shares nothing with — the one way to move commits across the
+    // boundary without a merge. Onto `alien` it is clean, because the two sides
+    // touch disjoint paths, and the result is a single-root history four commits
+    // long: step 3's `log` is the assertion, and step 4's refusal is what says
+    // the rebase ended rather than parking.
+    out.push(
+        Sequence::new("rebase", "unrelated-root-replayed-onto-the-far-root", Shape::Unrelated)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["rebase", "--onto", "alien", "--root", "main"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-5"])
+            .step(&["rebase", "--continue"])
+            .step(&["log", "--oneline", "-5"])
+            .step(&["rev-list", "--max-parents=0", "--count", "HEAD"]),
+    );
+
+    // The same replay onto the root that *does* collide. `initial` and `alien
+    // clash root` both add `README.md`, so the first of the two picks stops on an
+    // add/add conflict with one pick still queued — a rebase stop whose conflict
+    // has no ancestor, which no other shape can produce. Step 4's `--continue`
+    // has to commit the resolution and replay the remaining pick.
+    out.push(
+        Sequence::new("rebase", "unrelated-root-onto-clash-resolve-continue", Shape::Unrelated)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["rebase", "--onto", "alien-clash", "--root", "main"])
+            .step(&["status", "--porcelain"])
+            .step(&["checkout", "--theirs", "--", "README.md"])
+            .step(&["add", "README.md"])
+            .step(&["rebase", "--continue"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-4"]),
+    );
+
+    // The abort of that stop. `main` was rewritten from its *root*, so putting it
+    // back is not "reset one commit" — step 4's `log` has to be the fixture's two
+    // commits again, `edfab1b initial` included, and step 5 has to find no rebase.
+    out.push(
+        Sequence::new("rebase", "unrelated-root-onto-clash-abort", Shape::Unrelated)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["rebase", "--onto", "alien-clash", "--root", "main"])
+            .step(&["rebase", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["rebase", "--continue"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `format-patch` across the boundary, then `am` of what it wrote. `--root`
+    // is required because `alien` has no ancestor to bound the range with, and
+    // it makes the *root commit itself* a patch — the `--- /dev/null` creation
+    // form for every file in the tree. Step 2 names the two files it produced on
+    // stdout; steps 4 and 7 read those files back by the names step 2 printed,
+    // which is a dependency between steps that no single case has: a port whose
+    // `format-patch` numbers or slugs a subject differently fails at step 4 with
+    // `does not exist` rather than silently producing a different file.
+    //
+    // The `am` lands on `landing`, forked from `main`, so the patches apply to a
+    // tree they were never generated against — and both apply cleanly, because
+    // `alien` shares no path with `main`.
+    out.push(
+        Sequence::new("format-patch", "unrelated-format-patch-then-am-across-roots", Shape::Unrelated)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["format-patch", "--stdout", "main..alien"])
+            .step(&["format-patch", "-o", "out", "--root", "alien"])
+            .step(&["checkout", "-b", "landing", "main"])
+            .step(&["am", "out/0001-alien-root.patch"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["am", "out/0002-alien-second.patch"])
+            .step(&["log", "--oneline", "-4"])
+            .step(&["am", "--skip"]),
+    );
+
+    // `replace --graft`, which is the only thing in git that makes two unrelated
+    // histories related — and it does so for *every later command* rather than
+    // for the one that ran it, which is precisely what a single case cannot show.
+    //
+    // Step 1 is the before: `merge-base main alien` exits 1 and prints nothing.
+    // Step 2 grafts `alien root` onto `main`'s tip. From then on the same
+    // question has an answer (step 5), `alien` walks through `main`'s commits
+    // (step 4), and the repository has *one* root rather than two (step 6). Step
+    // 7 takes the replacement back off and step 8 must return to exit 1 — a port
+    // whose `replace -d` leaves the ref, or whose object reader caches the
+    // replaced parent, keeps answering.
+    out.push(
+        Sequence::new("replace", "unrelated-graft-joins-two-roots", Shape::Unrelated)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["merge-base", "main", "alien"])
+            .step(&["replace", "--graft", "alien~1", "main"])
+            .step(&["replace", "-l"])
+            .step(&["log", "--oneline", "alien"])
+            .step(&["merge-base", "main", "alien"])
+            .step(&["rev-list", "--max-parents=0", "--count", "alien"])
+            .step(&["replace", "-d", "alien~1"])
+            .step(&["merge-base", "main", "alien"]),
+    );
+
+    // The same graft, aimed at the refusal instead. Step 1 is
+    // `refusing to merge unrelated histories`; step 3 is the **identical argv**
+    // succeeding — and not as a merge but as a *fast-forward*, because the graft
+    // made `alien` a descendant of `main`. Stock's step 3 deletes `README.md` and
+    // `src/lib.rs` from the worktree and moves `main` to `alien`'s tip.
+    //
+    // Step 5 then removes the replacement, and step 6 is the finding the abort
+    // sequences elsewhere in this file exist for: the history `main` now points
+    // at is genuinely the alien root's, two commits long, and un-grafting does
+    // not put the deleted files back. That is stock's behaviour and it is
+    // measured rather than avoided — a port that keeps the pre-graft parent
+    // cached prints four commits at step 6.
+    out.push(
+        Sequence::new("replace", "unrelated-graft-turns-a-refusal-into-a-fast-forward", Shape::Unrelated)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["merge", "alien"])
+            .step(&["replace", "--graft", "alien~1", "main"])
+            .step(&["merge", "--no-edit", "alien"])
+            .step(&["log", "--oneline", "--graph", "-5"])
+            .step(&["replace", "-d", "alien~1"])
+            .step(&["log", "--oneline", "--graph", "-5"])
+            .step(&["status", "--porcelain"])
+            .step(&["merge-base", "main", "alien"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cherry: one patch, two commits, and what replays it a second time
+// ---------------------------------------------------------------------------
+//
+// [`Shape::Cherry`] is checked out on `topic`, clean. `main` and `topic` each
+// hold a commit the other does not, plus one commit whose *patch id* both have —
+// `topic`'s copy was made by `cherry-pick` onto a different parent, so the two
+// commits differ in every byte except the diff they carry.
+//
+// That duplicate is the only way to reach git's "already applied" paths, and
+// every one of them is a decision made by one invocation about work a *previous*
+// one did: `rebase` drops the commit before it replays anything, `cherry-pick`
+// stops with an empty result, `am --3way` reports `No changes` and exits 0. What
+// a sequence adds is what each of those leaves behind for the next command.
+
+fn cherry(out: &mut Vec<Sequence>) {
+    // The duplicate, named three ways, then rebased away. Steps 1-2 are the two
+    // readers that can see it — `cherry`'s `-` marker and `--cherry-mark`'s `=`
+    // class — and step 3 is the writer: `rebase main` builds a todo of *two*
+    // picks rather than three, because `topic`'s copy of the shared patch is
+    // dropped at todo-generation time with `warning: skipped previously applied
+    // commit`.
+    //
+    // Step 6 is the assertion that closes the loop: after the rebase, `cherry`
+    // must report only `+` lines, because the duplicate is gone rather than
+    // duplicated again. A port that replays all three commits prints a `-` line
+    // there and a five-commit history at step 5.
+    out.push(
+        Sequence::new("rebase", "cherry-already-applied-is-dropped", Shape::Cherry)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["cherry", "-v", "main"])
+            .step(&["rev-list", "--cherry-mark", "--left-right", "main...topic"])
+            .step(&["rebase", "main"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-5"])
+            .step(&["cherry", "-v", "main"]),
+    );
+
+    // The same rebase, undone, then re-run with the two flags that change what
+    // "already applied" means — and the undo is the step under test. `rebase`
+    // writes `ORIG_HEAD`, so step 3 can put `topic` back without naming an id;
+    // step 4 must show the fixture's history again, `7a4b88a cherry: shared
+    // patch` included. A port whose rebase never writes `ORIG_HEAD` fails at step
+    // 3 with `unknown revision`, which is a defect no single case can see because
+    // the file is written by the invocation before.
+    //
+    // Step 5 is then the three-way contrast in one argv:
+    // `--reapply-cherry-picks` puts the duplicate *into* the todo (three picks,
+    // not two) and `--empty=keep` stops it being dropped when it applies to
+    // nothing — so stock's step 6 is six commits with `cherry: shared patch`
+    // appearing **twice**, once from `main` and once as an empty commit.
+    out.push(
+        Sequence::new("rebase", "cherry-orig-head-then-reapply-keeps-the-empty", Shape::Cherry)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["rebase", "main"])
+            .step(&["log", "--oneline", "-5"])
+            .step(&["reset", "--hard", "ORIG_HEAD"])
+            .step(&["log", "--oneline", "-5"])
+            .step(&["rebase", "--reapply-cherry-picks", "--empty=keep", "main"])
+            .step(&["log", "--oneline", "-6"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `cherry-pick` of the commit whose patch `topic` already carries. The pick
+    // applies to nothing, so git stops with exit 1, a **clean worktree**, and
+    // `CHERRY_PICK_HEAD` written — the sequencer's empty-result stop, which is
+    // not a conflict and which a port that only parks state on conflicts never
+    // reaches.
+    //
+    // Step 4's `--continue` must re-report the emptiness rather than committing
+    // it — the stop survives its own resumption verb — and step 6's `--skip` is
+    // the way out, after which `topic` is exactly where step 3 found it. That
+    // last equality is the finding: a `--skip` that resets instead of dropping
+    // the pick loses `cherry: topic only`.
+    out.push(
+        Sequence::new("cherry-pick", "cherry-already-applied-empty-stop-skip", Shape::Cherry)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["cherry-pick", "main~1"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["cherry-pick", "--continue"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["cherry-pick", "--skip"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-3"]),
+    );
+
+    // The same pick under the two `--empty` modes that do not stop, run back to
+    // back so the second's premise is the first's result. `--empty=drop` exits 0,
+    // prints `dropping <oid> … -- patch contents already upstream` on stderr and
+    // leaves `topic` unmoved; `--empty=keep` exits 0 and commits an **empty**
+    // `cherry: shared patch` on top. Same argv but for one word, opposite effect
+    // on history, and step 5's `log` is where a port that treats the two modes
+    // alike is caught.
+    out.push(
+        Sequence::new("cherry-pick", "cherry-empty-drop-then-empty-keep", Shape::Cherry)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["cherry-pick", "--empty=drop", "main~1"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["cherry-pick", "--empty=keep", "main~1"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["status", "--porcelain"])
+            .step(&["cherry-pick", "--abort"]),
+    );
+
+    // `am` of a patch the branch already carries, in both of its forms, over a
+    // mailbox this sequence generates for itself. Step 1 writes it; nothing else
+    // in the corpus can, because a case is one argv against a pristine copy.
+    //
+    // Step 2 is the plain apply, which fails at the *text* level — the context
+    // lines no longer match — with exit 128, and parks `.git/rebase-apply/`.
+    // Step 3 reads the parked patch back out. Step 4 clears it. Step 6 is the
+    // same mailbox with `--3way`, which reconstructs the pre-image from the
+    // `index` line, finds the change already present, prints `No changes --
+    // Patch already applied.` and exits **0** while parking nothing — and step 9's
+    // refusal is the proof that nothing was parked.
+    //
+    // The pair is the point: the same bytes are a hard failure in one mode and a
+    // silent success in the other, and a port that shares one apply path between
+    // them gets exactly one of the two right.
+    out.push(
+        Sequence::new("am", "cherry-already-applied-plain-then-three-way", Shape::Cherry)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["format-patch", "-o", "out", "main~2..main~1"])
+            .step(&["am", "out/0001-cherry-shared-patch.patch"])
+            .step(&["am", "--show-current-patch=diff"])
+            .step(&["am", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["am", "--3way", "out/0001-cherry-shared-patch.patch"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["am", "--skip"]),
+    );
+
+    // `am --empty`, all three modes, over a mailbox that carries no diff at all.
+    // Steps 1-3 manufacture it — an empty commit, `format-patch --always` (which
+    // is what makes a patchless mail rather than no file), then `reset --hard` so
+    // the mail has somewhere to land — and none of those three can be done by a
+    // case.
+    //
+    // The three modes then run against the identical file: `drop` prints
+    // `Skipping: empty-mail` and exits 0 leaving history alone; `keep` prints
+    // `Creating an empty commit: empty-mail` and exits 0 having made one; `stop`
+    // prints `Patch is empty.`, exits 128 and **parks** `rebase-apply/`, which is
+    // the one of the three that leaves an operation in progress and which step 11
+    // has to clear. A port with one behaviour for all three passes a third of
+    // this and is named at the step that diverged.
+    out.push(
+        Sequence::new("am", "cherry-empty-mail-drop-keep-stop", Shape::Cherry)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["commit", "--allow-empty", "-m", "empty-mail"])
+            .step(&["format-patch", "-o", "out", "--always", "-1"])
+            .step(&["reset", "--hard", "HEAD~1"])
+            .step(&["am", "--empty=drop", "out/0001-empty-mail.patch"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["am", "--empty=keep", "out/0001-empty-mail.patch"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["reset", "--hard", "HEAD~1"])
+            .step(&["am", "--empty=stop", "out/0001-empty-mail.patch"])
+            .step(&["status", "--porcelain"])
+            .step(&["am", "--abort"])
+            .step(&["log", "--oneline", "-2"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// damaged: maintenance verbs over a repository that is already broken
+// ---------------------------------------------------------------------------
+//
+// [`Shape::Damaged`] carries a ref to a missing object, a dangling symref, a
+// loose object file that is not a zlib stream, and an empty `alternates` entry.
+// Stock git operates on it — `log` walks, `status` is clean — and every
+// maintenance verb refuses in its own way.
+//
+// This is the one shape where a port can *destroy data*, so every sequence below
+// ends in a read that says what survived: `cat-file --batch-all-objects
+// --batch-check` enumerates the object set (the corrupt one included, as
+// `missing`) and `log` proves the two commits are still walkable. Stock's answer
+// to all four workflows is the same and it is worth stating plainly: it refuses,
+// and it deletes nothing. A port that "repairs" by dropping the corrupt object,
+// or that repacks past the broken ref, diverges on the last step rather than the
+// first.
+
+fn damaged(out: &mut Vec<Sequence>) {
+    // `fsck` → `gc` → `fsck`. Stock's `gc` refuses at step 2 — `error:
+    // refs/heads/dangling does not point to a valid object!` then `fatal: bad
+    // object refs/heads/dangling` then `fatal: failed to run repack`, exit 128 —
+    // *before* repacking anything, so step 3's `fsck` must report the identical
+    // five errors step 1 did and step 5 must list the identical nine objects.
+    //
+    // The question the sequence asks is whether the port's `gc` makes it worse.
+    // A `gc` that skips the unreadable ref and repacks anyway exits 0 here, which
+    // looks better than stock and is the failure: the corrupt loose object is
+    // then either copied into a pack or deleted, and either answer shows up at
+    // step 5 as a different object listing.
+    out.push(
+        Sequence::new("fsck", "damaged-fsck-gc-fsck-changes-nothing", Shape::Damaged)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["fsck", "--no-progress"])
+            .step(&["gc", "--quiet"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"])
+            .step(&["for-each-ref", "--format=%(refname)"]),
+    );
+
+    // The same `gc`, given the one repair a sequence can perform. `branch -D
+    // dangling` removes the ref to the missing object — stock prints `Deleted
+    // branch dangling (was deadbee).`, abbreviating an id it cannot resolve —
+    // after which `rev-list --all` works (step 4) and `gc` gets *further* before
+    // failing: `fatal: unable to add cruft objects` rather than `bad object`,
+    // still exit 128, still nothing deleted.
+    //
+    // That progression is the finding. A port whose `branch -D` refuses to delete
+    // a ref it cannot resolve fails at step 2 and never reaches the second `gc`
+    // at all; one whose `gc` succeeds where stock's cruft pass gives up has
+    // written a pack stock would not have, which step 7's object listing sees.
+    out.push(
+        Sequence::new("gc", "damaged-ref-deleted-then-gc-still-refuses", Shape::Damaged)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["branch", "--list"])
+            .step(&["branch", "-D", "dangling"])
+            .step(&["branch", "--list"])
+            .step(&["rev-list", "--all", "--count"])
+            .step(&["gc", "--quiet"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"])
+            .step(&["fsck", "--no-progress"]),
+    );
+
+    // `prune`, which is the verb with the most to lose: its whole job is to
+    // delete unreachable objects, and this repository's reachability cannot be
+    // computed. Stock refuses three times for two different reasons — `fatal:
+    // unable to parse object: refs/heads/dangling` while the ref is there, and
+    // `fatal: unable to mark recent objects` once it is gone and the corrupt
+    // loose object is what stops the walk — and the `--dry-run` at step 3 and the
+    // real `prune` at step 4 give the *same* answer, which is the property that
+    // matters: a dry run that refuses and a real run that proceeds is the worst
+    // possible pairing and is exactly what step 5's object listing would catch.
+    out.push(
+        Sequence::new("prune", "damaged-prune-dry-run-and-real-both-refuse", Shape::Damaged)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["prune", "--dry-run", "--expire=all"])
+            .step(&["branch", "-D", "dangling"])
+            .step(&["prune", "--dry-run", "--expire=all"])
+            .step(&["prune", "--expire=all"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["fsck", "--no-progress"]),
+    );
+
+    // `repack -ad`, and the one maintenance verb here that *succeeds*. With the
+    // broken ref present it dies at `fatal: bad object refs/heads/dangling`
+    // (step 1) and leaves the nine loose objects alone (step 2). With the ref
+    // gone it exits **0** (step 4) and packs the reachable objects — and the
+    // corrupt loose object survives untouched, because `-d` deletes only what it
+    // packed and it could not read that one. Step 5's listing must still name
+    // `ab1234…` as `missing` and step 6 must still walk both commits.
+    //
+    // The success is what makes this worth a sequence: a port that refuses at
+    // step 4 diverges, and so does one that succeeds while deleting the object it
+    // failed to read. Both are single-step facts that only exist because step 2
+    // removed the ref first.
+    out.push(
+        Sequence::new("repack", "damaged-repack-refuses-then-packs-what-it-can", Shape::Damaged)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["repack", "-ad"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"])
+            .step(&["branch", "-D", "dangling"])
+            .step(&["repack", "-ad"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["fsck", "--no-progress"]),
+    );
+
+    // The dangling *symref*, which is a different kind of damage from the
+    // dangling id and is handled by a different set of answers. `symbolic-ref`
+    // reads it happily (step 1, `refs/heads/does-not-exist` on stdout);
+    // `rev-parse --verify` warns and fails (step 2); `branch -D` deletes **the
+    // symref itself** rather than its target and says so — `Deleted branch
+    // broken-symref (was refs/heads/does-not-exist).`, a "was" that is a ref name
+    // rather than an id (step 3).
+    //
+    // Steps 5-7 are the after: `symbolic-ref -d` must now refuse because there is
+    // nothing there, `show-ref` must still fail on the *other* damage, and
+    // `for-each-ref` must still succeed and list two refs. Those three
+    // disagreeing about the same repository is the fixture's whole point, and
+    // only a sequence can ask them in an order where the second damage is all
+    // that is left.
+    out.push(
+        Sequence::new("branch", "damaged-broken-symref-deleted-by-branch-d", Shape::Damaged)
+            .with_globals(&[&["--no-advice"]])
+            .step(&["symbolic-ref", "refs/heads/broken-symref"])
+            .step(&["rev-parse", "--verify", "refs/heads/broken-symref"])
+            .step(&["branch", "-D", "broken-symref"])
+            .step(&["branch", "--list"])
+            .step(&["symbolic-ref", "-d", "refs/heads/broken-symref"])
+            .step(&["show-ref"])
+            .step(&["for-each-ref", "--format=%(refname)"])
+            .step(&["fsck", "--no-progress"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// symlinks: mode 120000 across a workflow
+// ---------------------------------------------------------------------------
+//
+// [`Shape::Symlinks`] is checked out on `main` with `link-wt` retargeted in the
+// worktree and two untracked entries beside it, one of which is itself a
+// symlink. `sym-pending` holds the same tree with `dir/target.txt` replaced by a
+// symlink — a **typechange**, `T` in `--raw` — and `patches/symlink.patch`
+// describes exactly that difference.
+//
+// A single case can ask `ls-files --stage` what mode a path has. What it cannot
+// do is move a path between `100644` and `120000` and then ask again, which is
+// the transition every sequence below is built around.
+
+fn symlinks(out: &mut Vec<Sequence>) {
+    // The typechange, walked in both directions. `dir/target.txt` is a regular
+    // file at step 2, a symlink at step 5, and a regular file again at step 8 —
+    // and the dirt the fixture ships with has to survive all three: `link-wt` is
+    // reported modified at every `status`, and stock's `checkout` prints
+    // `M\tlink-wt` on stdout as it carries the edit across.
+    //
+    // A port that writes the symlink's *target text* into a regular file gets the
+    // mode wrong at step 5, and one that refuses to carry the dirty symlink
+    // across the branch switch fails at step 3 before anything else is measured.
+    out.push(
+        Sequence::new("checkout", "symlink-typechange-across-branches", Shape::Symlinks)
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "--stage", "dir/target.txt"])
+            .step(&["checkout", "sym-pending"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "--stage", "dir/target.txt"])
+            .step(&["diff", "--raw", "main", "sym-pending"])
+            .step(&["checkout", "main"])
+            .step(&["ls-files", "--stage", "dir/target.txt"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `checkout -- <path>` over a retargeted symlink: the index still holds the
+    // committed target, so restoring the path means *replacing a symlink with a
+    // different symlink* rather than rewriting a file's bytes. Step 3 must leave
+    // the tree clean but for the two untracked entries, and step 4's `diff` must
+    // be empty.
+    //
+    // Step 5 is the tail and the contract: `stray-link` is an untracked symlink,
+    // so `checkout --` has nothing in the index to restore it from and must
+    // refuse with `error: pathspec 'stray-link' did not match any file(s) known
+    // to git`, exit 1. A port whose directory walk treats a symlink as a tracked
+    // path answers something else there.
+    //
+    // `strict`, because that refusal is the tail and carries no stdout; stock
+    // leaves stderr empty on steps 1-4.
+    out.push(
+        Sequence::new("checkout", "symlink-restore-then-untracked-refusal", Shape::Symlinks)
+            .strict()
+            .with_globals(&[&["--no-advice"]])
+            .step(&["ls-files", "--stage", "link-wt"])
+            .step(&["checkout", "--", "link-wt"])
+            .step(&["status", "--porcelain"])
+            .step(&["diff", "--stat"])
+            .step(&["checkout", "--", "stray-link"]),
+    );
+
+    // `stash push -u` over a worktree whose dirt *is* symlinks: one tracked link
+    // retargeted, one untracked link, and one untracked zero-byte file. The
+    // stash has to store all three as objects — the untracked half in its own
+    // third commit — and `pop` has to put all three back as the same modes.
+    //
+    // Step 4 is the assertion in the middle: with the edit stashed, `link-wt`'s
+    // index entry must be the *committed* target blob, mode `120000`. A port that
+    // stashed the symlink by reading through it stores `README.md`'s contents and
+    // step 4 shows a `100644`. Step 9's empty `stash list` proves the pop
+    // consumed the entry rather than leaving it.
+    out.push(
+        Sequence::new("stash", "symlink-push-untracked-then-pop", Shape::Symlinks)
+            .step(&["status", "--porcelain"])
+            .step(&["stash", "push", "-u", "-m", "links"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "--stage", "link-wt"])
+            .step(&["stash", "show", "--stat"])
+            .step(&["stash", "pop"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "--stage", "link-wt"])
+            .step(&["stash", "list"]),
+    );
+
+    // `apply --index` of the fixture's own symlink patch, committed, then
+    // reversed. The patch does three things no other patch in this harness does:
+    // it replaces a regular file with a symlink (`T`), it creates a symlink, and
+    // it creates a **zero-byte** file — so step 3 must show
+    // `e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`, the empty blob, which is a
+    // constant of the hash function a port has to be able to write rather than
+    // derive.
+    //
+    // Step 5's `commit` is what turns the staged typechange into history and
+    // prints `mode change 100644 => 120000 dir/target.txt`; step 7 reverses the
+    // same patch against the tree the commit made, which is the half `apply -R`
+    // is usually never asked for because nothing committed in between.
+    out.push(
+        Sequence::new("apply", "symlink-patch-index-commit-then-reverse", Shape::Symlinks)
+            .step(&["apply", "--index", "patches/symlink.patch"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "--stage", "dir/target.txt", "later-link", "later-empty.txt"])
+            .step(&["diff", "--cached", "--raw"])
+            .step(&["commit", "-m", "applied-symlinks"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["apply", "-R", "--index", "patches/symlink.patch"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `archive`, then the archive read back **through git**. Step 1 writes a tar
+    // of a tree holding six symlinks and two empty files; step 2 hashes it into
+    // the object store and prints the id; step 4 stages it, so step 5 prints the
+    // same id again out of the index. Two independent readings of the same bytes.
+    //
+    // That is what makes this a read-back rather than a write nobody checks: git
+    // cannot extract a tar, so the only way to compare two implementations' tar
+    // output inside this harness is to turn it into an object id. A single byte
+    // of difference — a `lrwxrwxrwx` entry stored as a regular file, a mode, the
+    // pinned mtime, the padding — moves the id at step 2, and `probe_storage`
+    // sees the extra loose object at every step after it.
+    out.push(
+        Sequence::new("archive", "symlink-archive-hashed-back-in", Shape::Symlinks)
+            .step(&["archive", "--format=tar", "-o", "arc.tar", "HEAD"])
+            .step(&["hash-object", "-w", "arc.tar"])
+            .step(&["status", "--porcelain"])
+            .step(&["add", "arc.tar"])
+            .step(&["ls-files", "--stage", "arc.tar"])
+            .step(&["commit", "-m", "archived"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["status", "--porcelain"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// commit-graph: a cache that is written by one command and trusted by the next
+// ---------------------------------------------------------------------------
+//
+// [`Shape::CommitGraph`] ships `.git/objects/info/commit-graph` covering every
+// commit but the last: `cg-late` was committed *after* the write, so the graph
+// is valid and incomplete. Every traversal therefore mixes graph-supplied
+// generation numbers with computed ones, and `commit-graph verify` has to accept
+// it — an incomplete graph is not a corrupt one.
+//
+// A case can run one of these verbs. It cannot ask whether the file one verb
+// wrote is the file the next one reads, which is the only thing a commit-graph
+// is for.
+
+fn commit_graph(out: &mut Vec<Sequence>) {
+    // The staleness question, asked twice. Step 1 verifies the shipped graph
+    // (exit 0, silent, even though `cg-late` is outside it); step 3 adds another
+    // commit outside it; step 4 must *still* verify, because being behind is not
+    // being wrong. Step 6 rewrites it and step 7 verifies the new one.
+    //
+    // `log` runs on both sides of every write, because the traversal is what
+    // consumes the file: a port that rebuilds the graph incorrectly at step 6 —
+    // wrong generation numbers, a commit's parents mis-recorded — reports the
+    // same exit code at step 7 and a differently ordered history at step 8.
+    out.push(
+        Sequence::new("commit-graph", "stale-graph-verifies-then-is-rewritten", Shape::CommitGraph)
+            .step(&["commit-graph", "verify"])
+            .step(&["log", "--oneline", "-4"])
+            .step(&["commit", "--allow-empty", "-m", "after-graph"])
+            .step(&["commit-graph", "verify"])
+            .step(&["log", "--oneline", "-4"])
+            .step(&["commit-graph", "write", "--reachable", "--changed-paths"])
+            .step(&["commit-graph", "verify"])
+            .step(&["log", "--oneline", "-4"])
+            .step(&["rev-list", "--count", "HEAD"]),
+    );
+
+    // The **split** graph, which is a different on-disk layout for the same
+    // answers: `--split` replaces `objects/info/commit-graph` with
+    // `objects/info/commit-graphs/` holding a `commit-graph-chain` and one
+    // `graph-<hash>.graph` per layer. `probe_storage` enumerates `objects/info`
+    // rather than matching a whitelist, so the move — a file disappearing and a
+    // directory appearing — is compared at the step that made it.
+    //
+    // Step 5 is the step under test and it is deliberately not step 1: steps 1-4
+    // re-verify the shipped graph, rewrite it whole, verify that, and commit past
+    // it, so four supported transitions are measured before the layout question
+    // is asked. A sequence that opened with `--split` would report one fact and
+    // nothing else.
+    //
+    // Stock writes a **two**-layer chain there, because step 2 left a full graph
+    // for the split write to keep as its base layer, and step 6 has to accept the
+    // chain — a chain whose layers disagree is the failure mode this layout has
+    // and no other does.
+    out.push(
+        Sequence::new("commit-graph", "split-chain-over-a-written-graph", Shape::CommitGraph)
+            .step(&["commit-graph", "verify"])
+            .step(&["commit-graph", "write", "--reachable"])
+            .step(&["commit-graph", "verify"])
+            .step(&["commit", "--allow-empty", "-m", "more"])
+            .step(&["commit-graph", "write", "--reachable", "--split"])
+            .step(&["commit-graph", "verify"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["rev-list", "--count", "HEAD"]),
+    );
+
+    // `gc` over a repository that has a commit-graph. `gc` repacks *and* refreshes
+    // the graph, so this asks whether the port's `gc` leaves a graph that still
+    // describes the objects it just moved into a pack — a stale graph pointing at
+    // a repacked object store is the classic way this cache goes wrong, and it is
+    // invisible to every command except the one that reads it.
+    //
+    // Steps 1 and 6 are the same `log -- <path>` query on either side of the
+    // collect, and they must give the same one-line answer. That query is what
+    // consumes the `--changed-paths` Bloom filters the fixture wrote: a `gc` that
+    // rewrites the graph *without* them still verifies at step 5 and still
+    // answers step 6 correctly, only slower — so this sequence deliberately does
+    // not claim to measure their presence, only that the graph survives usable.
+    out.push(
+        Sequence::new("gc", "commit-graph-survives-a-collect", Shape::CommitGraph)
+            .step(&["log", "--oneline", "--", "cg-side.txt"])
+            .step(&["commit-graph", "verify"])
+            .step(&["reflog", "expire", "--expire=all", "--all"])
+            .step(&["gc", "--prune=all", "--quiet"])
+            .step(&["commit-graph", "verify"])
+            .step(&["log", "--oneline", "--", "cg-side.txt"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["rev-list", "--count", "--all"]),
+    );
+
+    // The harder half of the same question: `gc` after the objects the graph
+    // describes have become **unreachable**. `cg-loose` is the fixture's
+    // never-merged fork; deleting it and expiring the reflogs makes its commit
+    // prunable, and `gc --prune=all` at step 3 both removes it and must rewrite
+    // the graph without it.
+    //
+    // Step 4's `verify` is where a graph that still names a pruned commit is
+    // caught, step 5's count must be 9 rather than 10, and step 7's `fsck
+    // --no-dangling` must be silent — a graph referencing a missing commit is
+    // exactly the corruption `verify` exists to find, and a port that prunes the
+    // object while leaving the file alone passes every other probe in this
+    // harness.
+    out.push(
+        Sequence::new("gc", "commit-graph-rewritten-after-a-prune", Shape::CommitGraph)
+            .step(&["branch", "-D", "cg-loose"])
+            .step(&["reflog", "expire", "--expire=all", "--all"])
+            .step(&["gc", "--prune=all", "--quiet"])
+            .step(&["commit-graph", "verify"])
+            .step(&["rev-list", "--all", "--count"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["fsck", "--no-progress", "--no-dangling"]),
     );
 }

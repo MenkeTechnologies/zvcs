@@ -118,12 +118,112 @@ pub struct Grammar {
 /// spelling but reads the wrong `branch.<name>.merge` looks correct until one
 /// case resolves it for real. The template already exists for the round trips
 /// and generated grammars, so the shape costs no fixture and no case.
+///
+/// The four below it are here for the opposite reason: each is a *history* that
+/// answers a question the five above cannot be asked at all. Every one of those
+/// descends from the one `initial` commit, has at most one merge base for any
+/// pair of tips, carries each patch once, and is read straight out of its
+/// objects — so four answers a walk can give were unreachable however the argv
+/// was drawn.
+///
+///  * `Unrelated` — three roots in one repository. Verified against stock 2.55.0
+///    on this shape: `rev-list --max-parents=0 --all` prints **three** ids where
+///    every shape above prints one, `merge alien-clash` is `fatal: refusing to
+///    merge unrelated histories` (rc 128), and the same merge under
+///    `--allow-unrelated-histories` is an add/add conflict on `README.md` whose
+///    index holds stages 2 and 3 and **no stage 1** — the only conflict this
+///    harness can produce with no base to diff against.
+///  * `CrissCross` — two incomparable merge bases. Verified: `merge-base --all
+///    cc-left cc-right` prints two ids (`0a24ba32…`, `27e7a991…`) where every
+///    other shape prints one, and after `merge cc-right` (rc 1, `CONFLICT
+///    (content): Merge conflict in clash.txt`) stage 1 is a blob no commit holds
+///    — `cat-file -p :1:clash.txt` starts `<<<<<<<<< Temporary merge branch 1`.
+///    `--ancestry-path`, `--simplify-merges` and `--topo-order` are engines
+///    whose interesting input is exactly this graph.
+///  * `Cherry` — one patch id on both sides of a fork. `--cherry-mark` and
+///    `--cherry-pick` are already in the `log` and `rev-list` flag pools and
+///    could only ever print `+`, `<` and `>`; the `=` class needs a duplicated
+///    patch and no other shape has one.
+///  * `CommitGraph` — the same commits read through
+///    `.git/objects/info/commit-graph` rather than through their objects, with
+///    one commit deliberately left outside the file so a walk has to mix
+///    graph-supplied generation numbers with computed ones. Verified:
+///    `commit-graph verify` exits 0 on the shape as built, and
+///    `-c core.commitGraph=false log --oneline` walks the same history the other
+///    way — which is why `core.commitGraph` is in [`CONFIG_KEYS`], and why that
+///    key would have been worth nothing until this shape was drawn.
+///
+/// `Symlinks` and `Damaged` are deliberately **not** here. Neither changes what
+/// a walk answers — one differs in a file mode and one in a broken ref and a
+/// corrupt loose object — so both are drawn by [`STORE_SHAPES`] instead, which
+/// is the pool for the readers that answer about the stores rather than about
+/// the history.
 const REV_SHAPES: &[Shape] = &[
     Shape::Linear,
     Shape::Branched,
     Shape::Merged,
     Shape::Detached,
     Shape::BehindRemote,
+    Shape::Unrelated,
+    Shape::CrissCross,
+    Shape::Cherry,
+    Shape::CommitGraph,
+];
+/// [`REV_SHAPES`] plus the two shapes whose *stores* are unusual rather than
+/// whose history is, for the three readers whose subject is a store.
+///
+/// `rev-parse` resolves names against the ref store, `cat-file` answers about
+/// the object store, and `ls-tree` reads a tree out of it. Those three are the
+/// only place `Damaged` and `Symlinks` pay, and both would be waste anywhere
+/// else — which is the same judgement [`ALL_SHAPES`] documents, applied to two
+/// shapes rather than to a pool.
+///
+///  * `Symlinks` is the only shape whose trees carry mode `120000` and the empty
+///    blob. Verified against stock 2.55.0: `ls-tree -r --format='%(objectmode)
+///    %(path)'` prints seven `120000` entries and two `e69de29b…` blobs here and
+///    none on any other shape, and `cat-file --batch-check --follow-symlinks`
+///    reaches all four of its answers — a resolved blob, `dangling`, `symlink`
+///    with the out-of-tree target, and resolution through a symlinked directory
+///    — from [`P_SYMLINK_SPECS`]. That flag is in `cat-file`'s pool already and
+///    had nothing to follow on any shape above: the same four request lines
+///    answer `missing` four times on `Branched`, with and without the flag.
+///  * `Damaged` answers differently rather than merely refusing, which is what
+///    earns it a pool at all. Verified on this shape: `rev-parse --verify
+///    refs/heads/dangling` **succeeds** and prints
+///    `deadbeefdeadbeefdeadbeefdeadbeefdeadbeef` (rc 0) while `show-ref` dies
+///    `fatal: git show-ref: bad ref refs/heads/dangling` (rc 128) and
+///    `rev-parse --verify refs/heads/broken-symref` warns `ignoring dangling
+///    symref` and dies `fatal: Needed a single revision`; `rev-parse --all`
+///    prints the dangling id beside the real one; `cat-file
+///    --batch-all-objects --batch-check` lists the corrupt object as `missing`
+///    and exits **0** while `log --oneline --all` on the same repository is
+///    `fatal: bad object refs/heads/dangling` (rc 128).
+///
+/// `Damaged` goes no further than this, on purpose. A repository with a broken
+/// ref makes `--all` fatal for every walking verb and a corrupt object makes
+/// every full read of the store fatal, so putting it in [`REV_SHAPES`] or
+/// [`ALL_SHAPES`] would buy one refusal, repeated across the ten grammars those
+/// two pools cover, at the price of a share of every one of their budgets.
+/// Where a damaged store is the *subject* rather than the obstacle is
+/// `gc`/`prune`/`fsck`, and those are
+/// generated grammars whose shape lists this file does not own — so the walk
+/// [`STOPPERS`] gains for `gc` is how a generated case reaches one.
+///
+/// Written out rather than derived because `&[Shape]` cannot be concatenated in
+/// a const; `store_shapes_extends_rev_shapes` fails `cargo test` if the two ever
+/// drift.
+const STORE_SHAPES: &[Shape] = &[
+    Shape::Linear,
+    Shape::Branched,
+    Shape::Merged,
+    Shape::Detached,
+    Shape::BehindRemote,
+    Shape::Unrelated,
+    Shape::CrissCross,
+    Shape::Cherry,
+    Shape::CommitGraph,
+    Shape::Symlinks,
+    Shape::Damaged,
 ];
 /// The shapes a command with no particular topology requirement is drawn
 /// against. Not `Shape::ALL`: several shapes exist for one verb apiece (a
@@ -134,6 +234,27 @@ const REV_SHAPES: &[Shape] = &[
 /// verbs do, and nothing else here has one — a commit from a subdirectory of a
 /// repository with any hook at all used to fail outright, and no generated case
 /// could reach that combination.
+///
+/// `Symlinks` earns its place the same way, one layer down: the commands drawn
+/// against this pool are the index and worktree readers — `status`, `ls-files`,
+/// `diff` — and every one of them had only ever been asked about regular files.
+/// Mode `120000` is not a rendering detail to them; it decides what the
+/// directory walk stats, what a content diff can even mean, and what `--eol`
+/// reports. Verified against stock 2.55.0 on the shape: `ls-files --stage`
+/// prints seven `120000` entries, `status --porcelain` reports the retargeted
+/// symlink as ` M link-wt` and the untracked one as `?? stray-link`, `diff --
+/// link-wt` renders a one-line hunk with `\ No newline at end of file` on both
+/// sides and a `120000` index line, and one `ls-files --eol` reaches three
+/// different answers on this shape alone — `i/lf w/lf` for `README.md`,
+/// `i/none w/none` for the zero-byte `empty.txt`, and two empty fields for
+/// `link-to-file`. Both of the last two are new here: no other fixture writes an
+/// empty file either.
+///
+/// The rest of the six are absent for the reasons [`REV_SHAPES`] and
+/// [`STORE_SHAPES`] give: four of them differ in their history or in how it is
+/// read, which says nothing to a porcelain looking at one commit's worth of
+/// index, and `Damaged` would spend a share of seven grammars' budgets on the
+/// same refusal.
 const ALL_SHAPES: &[Shape] = &[
     Shape::Linear,
     Shape::Branched,
@@ -143,6 +264,7 @@ const ALL_SHAPES: &[Shape] = &[
     Shape::Detached,
     Shape::AwkwardPaths,
     Shape::Hooked,
+    Shape::Symlinks,
 ];
 
 /// Rev-specs worth throwing at anything that resolves one. Includes forms that
@@ -195,6 +317,23 @@ const REVS: &[&str] = &[
     // `:/text` searches every ref; `<rev>^{/text}` searches only from a rev.
     // Same syntax, two different walks, and a miss is a third outcome.
     "main^{/two}", ":/nomatchhere",
+    // The two broken refs [`Shape::Damaged`] carries, spelled fully qualified so
+    // the DWIM table is not what is being measured. They resolve on that shape
+    // and nowhere else, which is the same trade `@{u}` above makes for
+    // `BehindRemote` — and the answers are not one answer. Verified against
+    // stock 2.55.0 on `Damaged`: `rev-parse refs/heads/dangling` prints
+    // `deadbeef…` and exits **0** with no object behind it, while
+    // `rev-parse --verify refs/heads/broken-symref` warns
+    // `ignoring dangling symref refs/heads/broken-symref` and dies
+    // `fatal: Needed a single revision` (rc 128). `cat-file -t` refuses both and
+    // in two different ways: `refs/heads/dangling` is
+    // `fatal: git cat-file: could not get object info` and
+    // `refs/heads/broken-symref` is the same warning followed by
+    // `fatal: Not a valid object name refs/heads/broken-symref`. On `Branched`
+    // both names are the ordinary `fatal: ambiguous argument …` (rc 128), which
+    // is a fourth answer again. A port that treats "the ref does not lead to an
+    // object" as one condition gets at least one of the four wrong.
+    "refs/heads/dangling", "refs/heads/broken-symref",
     // `:path` with no stage number is stage 0; `:1:path` names a stage that only
     // a conflicted index has, and stock answers the miss with a *hint* naming
     // `:0:` rather than with the generic ambiguous-argument text.
@@ -264,6 +403,19 @@ const PATHS: &[&str] = &[
     // Path spellings git normalises before matching: a doubled separator and a
     // `..` that climbs back inside the tree.
     "src//lib.rs", "./src/../README.md",
+    // Three paths [`Shape::Symlinks`] tracks and no other shape has, named for
+    // the same reason `üñïçødé.txt` and `é.txt` are named above: a pathspec that
+    // matches only on one shape is how that shape's index entries get asked
+    // about individually rather than through a `.` that sweeps everything.
+    // `link-wt` is the retargeted symlink (` M link-wt`, and a `diff` hunk whose
+    // both sides end `\ No newline at end of file`), `link-broken` points at a
+    // target that does not exist so the directory walk has to stat something
+    // absent, and `empty.txt` is the zero-byte blob. Verified against stock
+    // 2.55.0: all three are ordinary matches on `Symlinks` and none of them
+    // exists elsewhere — `ls-files --error-unmatch link-to-file` on `Branched`
+    // is `error: pathspec 'link-to-file' did not match any file(s) known to git`
+    // with rc 1, which is the exit-code-moving refusal that pool entry is for.
+    "link-wt", "link-broken", "empty.txt",
 ];
 
 /// Replacement values for `--flag=value` mutation: empty, boundary, overflow,
@@ -335,6 +487,19 @@ const CONFIG_KEYS: &[(&str, &[&str])] = &[
     // `setup.c` rejects the pair rather than honouring it.
     ("core.bare", BOOLS),
     ("core.fileMode", BOOLS),
+    // The one key in this pool that chooses between two *implementations* of the
+    // same answer rather than changing the answer: with a graph file present,
+    // `true` reads generation numbers out of `.git/objects/info/commit-graph`
+    // and `false` walks the commit objects, and the two must agree. It is worth
+    // a key now and was worth nothing before, because until `Shape::CommitGraph`
+    // entered [`REV_SHAPES`] no fixture had the file. Verified against stock
+    // 2.55.0 on that shape: `-c core.commitGraph=false log --oneline -3` prints
+    // the same three lines the default does, `commit-graph verify` exits 0, and
+    // `-c core.commitGraph=bogus` is
+    // `fatal: bad boolean config value 'bogus' for 'core.commitgraph'` (rc 128)
+    // — the lower-cased key name in the message being its own small parity
+    // question.
+    ("core.commitGraph", BOOLS),
     // diff.*: rename detection and hunk shape, none of which any case could set.
     ("diff.renames", &["true", "false", "copies", "copy"]),
     ("diff.renameLimit", &["0", "1", "2", "1000", "-1", "99999999999999999999999999"]),
@@ -1545,6 +1710,16 @@ fn shape_dirs(shape: Shape) -> &'static [&'static str] {
         // generated case could only ever have reached it by drawing one of the
         // COMMON_DIRS.
         Shape::Hooked => &["sub"],
+        // A real directory and a **symlink to it**, which is the one discovery
+        // question no other shape can pose: what a command answers about where
+        // it is when the path it was started in is not the path it is at.
+        // Verified against stock 2.55.0 on this shape,
+        // `rev-parse --show-toplevel --show-prefix --show-cdup` run from each:
+        // the two answers are byte-identical — the worktree root, `dir/`, `../`
+        // — so git resolves the cwd rather than reporting the way it got there.
+        // A port that takes its prefix from the logical path answers
+        // `link-to-dir/` and is right about everything else.
+        Shape::Symlinks => &["dir", "link-to-dir"],
         _ => &[],
     }
 }
@@ -1676,6 +1851,28 @@ const P_MKTAG: &[u8] = b"object e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\ntype b
 /// `fatal: tag on stdin did not pass our strict fsck check`, rc 128. A port that
 /// parses headers by name rather than by position accepts this.
 const P_MKTAG_BAD_ORDER: &[u8] = b"type blob\nobject e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\ntag gen\ntagger zvcs parity <parity@example.invalid> 1700000000 +0000\n\nmsg\n";
+/// Four `<tree-ish>:<path>` requests that name symlinks, for `cat-file
+/// --batch-check --follow-symlinks`.
+///
+/// The payload that makes a *flag already in the pool* do something. Every
+/// request line here is a path in [`Shape::Symlinks`] and nothing but a `missing`
+/// on every other shape, and the four are one per answer `--follow-symlinks`
+/// has. Verified against stock 2.55.0 on `Symlinks`, with the four lines in this
+/// order:
+///
+///     --batch-check                  four blobs, the symlink blobs themselves
+///     --batch-check --follow-symlinks
+///         9741694d… blob 10          link-to-file, resolved to README.md
+///         dangling 16 / HEAD:link-broken
+///         symlink 14 / ../outside.txt
+///         2ceb84c5… blob 15          reached *through* the symlinked directory
+///
+/// and on `Branched` all four lines answer `missing` with rc 0 whether or not
+/// the flag is given — which is what the flag measured before this shape was in
+/// [`STORE_SHAPES`]. No object id here is a fixture value: the paths are
+/// literals and the ids above are what the reader prints, not what it is asked.
+const P_SYMLINK_SPECS: &[u8] =
+    b"HEAD:link-to-file\nHEAD:link-broken\nHEAD:link-escape\nHEAD:dir/link-up\n";
 
 /// A complete `fast-import` stream: one blob, one root commit on
 /// `refs/heads/gen-fi`, terminated by `done`.
@@ -1764,7 +1961,13 @@ fn preferred_payloads(cmd: &str) -> &'static [&'static [u8]] {
         "update-ref" => {
             &[P_REF_UPDATES, P_REF_UPDATES_FAIL, P_REF_UPDATES_NUL, P_REF_TRANSACTION]
         }
-        "cat-file" | "rev-list" | "diff-tree" | "name-rev" | "pack-objects" | "for-each-ref" => {
+        // `cat-file` is split out of the group below rather than added to it:
+        // [`P_SYMLINK_SPECS`] is a request stream for one flag of one command,
+        // and handing it to `rev-list --stdin` would be a `fatal: not a commit`
+        // in a fifth of that command's draws. The four it shared are all still
+        // here.
+        "cat-file" => &[P_OIDS, P_BATCH_COMMANDS, P_PATHS, P_EMPTY, P_SYMLINK_SPECS],
+        "rev-list" | "diff-tree" | "name-rev" | "pack-objects" | "for-each-ref" => {
             &[P_OIDS, P_BATCH_COMMANDS, P_PATHS, P_EMPTY]
         }
         "check-ignore" | "check-attr" | "check-mailmap" | "hash-object" | "ls-files" => {
@@ -1912,7 +2115,7 @@ pub fn grammars() -> Vec<Grammar> {
                 "--no-revs", "--revs-only", "--flags",
             ],
             positionals: REVS,
-            shapes: REV_SHAPES,
+            shapes: STORE_SHAPES,
         },
         // `--porcelain=v2` is a different serializer from v1, not a variant of
         // it — it prints per-entry mode and oid triples nothing in v1 carries —
@@ -2036,7 +2239,7 @@ pub fn grammars() -> Vec<Grammar> {
                 "--use-mailmap", "--follow-symlinks",
             ],
             positionals: REVS,
-            shapes: REV_SHAPES,
+            shapes: STORE_SHAPES,
         },
         // `ls-tree` takes `<tree> [<path>…]`, and the path half was missing: the
         // pathspec restricts which entries are listed and is what turns the
@@ -2054,8 +2257,16 @@ pub fn grammars() -> Vec<Grammar> {
             positionals: &[
                 "HEAD", "HEAD^{tree}", "main", "src", "src/", "README.md", "*.rs",
                 ":(glob)**/*.rs", "no/such/path",
+                // A ref that resolves and names no object, which only
+                // [`Shape::Damaged`] has and which this command answers its own
+                // way: verified against stock 2.55.0, `ls-tree
+                // refs/heads/dangling` is `fatal: not a tree object` with rc 128
+                // — not the `fatal: ambiguous argument` every other missing name
+                // in this pool produces, because the name resolved and the
+                // *lookup* is what failed.
+                "refs/heads/dangling",
             ],
-            shapes: REV_SHAPES,
+            shapes: STORE_SHAPES,
         },
         // The selectors were here; the things that change what a selection
         // *means* were not. `--error-unmatch` turns a silent empty answer into
@@ -3105,6 +3316,22 @@ struct Stopper {
 /// actually stop turns its whole walk into resumption verbs against a clean
 /// repository, which is a refusal the corpus already covers. Reusing proven ones
 /// spends the budget on the transitions instead — which is what is unmeasured.
+///
+/// The four premises the six new fixture shapes made expressible are held to the
+/// same rule: each was run against stock 2.55.0 first, and each entry's comment
+/// records the exit codes and the parked files that were observed rather than
+/// the ones the documentation promises. Each is one entry point — one sequence
+/// per unit of `--fuzz-sequences`, three to eight steps long depending on how
+/// many transitions and observers the draw puts after the entry, run on both
+/// sides — and each reaches a state that has no other route into this file:
+///
+///   `merge-criss-cross`       the virtual-merge-base path, stage 1 holding a
+///                             blob no commit has
+///   `merge-unrelated-forced`  a refusal, then the same merge forced, over a
+///                             conflict with no base at all
+///   `pick-already-applied`    an operation in progress over a *clean* index
+///   `gc-damaged-store`        a maintenance verb told to rewrite a store it
+///                             cannot read
 const STOPPERS: &[Stopper] = &[
     Stopper {
         cmd: "cherry-pick",
@@ -3123,6 +3350,33 @@ const STOPPERS: &[Stopper] = &[
         shape: Shape::Whitespace,
         setup: &[&["restore", "."], &["checkout", "-b", "side", "main~4"]],
         entry: &[&["cherry-pick", "main~2", "main~1", "main"]],
+        entry_stdin: None,
+    },
+    // A pick whose patch the branch **already has**. Every stopper above parks a
+    // broken index; this one parks a clean one, which is the distinction a port
+    // is most likely to collapse. Verified against stock 2.55.0 on
+    // [`Shape::Cherry`], whose `topic` already carries `main~1`'s patch:
+    //
+    //   cherry-pick main~1   rc 1, `The previous cherry-pick is now empty, …`
+    //   status --porcelain   **empty** — nothing staged, nothing modified
+    //   CHERRY_PICK_HEAD     written      .git/sequencer   absent
+    //   cherry-pick --continue  rc 1, the identical refusal again
+    //   cherry-pick --skip      rc 0, and `topic` is back at `cherry: topic only`
+    //
+    // So this is an operation that is genuinely in progress over a repository
+    // that looks pristine to every reader that does not open `CHERRY_PICK_HEAD`,
+    // and one whose legal continuation is `--skip` rather than `--continue` —
+    // the reverse of every other walk in this list. A port that decides "a pick
+    // is running" from unmerged index entries reports nothing to resume here,
+    // and one that treats `--continue` as always-forward commits an empty commit
+    // git refuses to make. The shape is the only one carrying a duplicated patch
+    // id, so nothing else can express the premise.
+    Stopper {
+        cmd: "cherry-pick",
+        name: "pick-already-applied",
+        shape: Shape::Cherry,
+        setup: &[],
+        entry: &[&["cherry-pick", "main~1"]],
         entry_stdin: None,
     },
     // `revert` shares `sequencer.c` and writes `REVERT_HEAD` instead of
@@ -3227,6 +3481,63 @@ const STOPPERS: &[Stopper] = &[
         entry: &[&["merge", "--no-commit", "div-other"]],
         entry_stdin: None,
     },
+    // A merge with **two merge bases**, parked. The recursive strategy merges the
+    // bases with each other into a virtual base and merges against that, and
+    // until [`Shape::CrissCross`] existed no premise in this harness entered
+    // that path at all — so a port that picks one of the two bases and proceeds
+    // was scored identical to one that builds the virtual base. Verified against
+    // stock 2.55.0 on the shape, whose `HEAD` is `cc-left`:
+    //
+    //   merge-base --all cc-left cc-right   two ids, `0a24ba32…` and `27e7a991…`
+    //   merge cc-right                      rc 1, `Auto-merging cc.txt`,
+    //                                       `CONFLICT (content): … clash.txt`
+    //   status --porcelain                  `M  cc.txt` staged, `UU clash.txt`
+    //   MERGE_HEAD / MERGE_MODE / AUTO_MERGE   all written
+    //   cat-file -p :1:clash.txt            `<<<<<<<<< Temporary merge branch 1`
+    //   merge --abort                       rc 0
+    //
+    // Stage 1 holding a blob that exists in **no commit** is the whole finding,
+    // and it is a state difference rather than a stdout one: both sides can
+    // print the same conflict summary while their indexes disagree about what
+    // the base was. The staged `M cc.txt` beside the conflict is the other half
+    // — one path merged cleanly *through* the virtual base — so a walk that
+    // aborts here has to unwind both.
+    Stopper {
+        cmd: "merge",
+        name: "merge-criss-cross",
+        shape: Shape::CrissCross,
+        setup: &[],
+        entry: &[&["merge", "cc-right"]],
+        entry_stdin: None,
+    },
+    // A merge refused for a reason that is not a conflict, and then forced. No
+    // other premise here has a *first* entry step that fails on purpose: the
+    // refusal is half of what is being measured, because a port that never
+    // implemented the check reaches the same parked state one step earlier and
+    // agrees with stock from there on. Verified against stock 2.55.0 on
+    // [`Shape::Unrelated`], from `main`:
+    //
+    //   merge alien-clash                              rc 128,
+    //       `fatal: refusing to merge unrelated histories`, nothing written
+    //   merge --allow-unrelated-histories alien-clash  rc 1,
+    //       `CONFLICT (add/add): Merge conflict in README.md`
+    //   ls-files -u        stages **2 and 3 only** — no stage 1 exists
+    //   MERGE_HEAD / MERGE_MODE / AUTO_MERGE   all written
+    //
+    // An add/add between two roots is the only conflict this harness can produce
+    // with no common ancestor to diff against, so every resumption verb the walk
+    // then draws is addressed to a merge whose base is absent rather than empty.
+    Stopper {
+        cmd: "merge",
+        name: "merge-unrelated-forced",
+        shape: Shape::Unrelated,
+        setup: &[],
+        entry: &[
+            &["merge", "alien-clash"],
+            &["merge", "--allow-unrelated-histories", "alien-clash"],
+        ],
+        entry_stdin: None,
+    },
     // `.git/rebase-apply/`, which nothing else parks in. The mailbox applies
     // once and then fails against the tree it just created, so the stop needs no
     // corrupt input to manufacture.
@@ -3261,6 +3572,48 @@ const STOPPERS: &[Stopper] = &[
             &["commit", "-am", "gen-base"],
         ],
         entry: &[&["stash", "pop"]],
+        entry_stdin: None,
+    },
+    // The one premise here that is not an interrupted *operation*: a repository
+    // that cannot be read, and a maintenance verb told to rewrite it. It is a
+    // stopper because the machinery fits and nothing else in this file reaches
+    // it — `gc`'s grammar is generated and its shape list, which this file does
+    // not own, has no `Damaged`, so `gen/observe/gc` can never draw one.
+    //
+    // What it measures is a refusal that has to leave **nothing behind**.
+    // Verified against stock 2.55.0 on [`Shape::Damaged`]:
+    //
+    //   gc --prune=now   rc 128
+    //       `error: refs/heads/dangling does not point to a valid object!`
+    //       `fatal: bad object refs/heads/dangling`
+    //       `fatal: failed to run repack`
+    //   .git/objects     byte for byte what it was — the corrupt loose object
+    //                    `ab12345…` still there, no `pack/`, no `gc.log`
+    //   gc               the same three lines and the same rc, run twice
+    //   prune            rc 128, `fatal: unable to parse object: refs/heads/dangling`
+    //
+    // `runner::probe_storage` walks `.git/objects`, so a port that deletes the
+    // corrupt object, or that leaves the half-written pack of a repack it could
+    // not finish, is a state difference at this step rather than a mystery in a
+    // later one. That is the specific defect the curated corpus found from the
+    // other direction, and a generated walk is how a *drawn* `gc` argument
+    // reaches it: a third of walks decorate the entry from `gc`'s own flag pool
+    // (`--aggressive`, `--cruft`, `--keep-largest-pack`, `--no-prune`), which is
+    // eleven more ways to ask the same question.
+    //
+    // The resumption verbs the walk then draws are all cross-machine, exactly as
+    // for `stash-pop-conflict` above, and on this shape they are the ordinary
+    // refusals — verified: `cherry-pick --abort` is `error: no cherry-pick or
+    // revert in progress`, `merge --abort` is `fatal: There is no merge to abort
+    // (MERGE_HEAD missing).`, `rebase --continue` is `fatal: no rebase in
+    // progress`. The damage does not change them, so what those steps are worth
+    // is the state comparison after each one, not their stdout.
+    Stopper {
+        cmd: "gc",
+        name: "gc-damaged-store",
+        shape: Shape::Damaged,
+        setup: &[],
+        entry: &[&["gc", "--prune=now"]],
         entry_stdin: None,
     },
 ];
@@ -3676,6 +4029,39 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["update-index", "--assume-unchanged", "README.md"]],
         inverse: &[&["update-index", "--no-assume-unchanged", "README.md"]],
+        forward_stdin: None,
+    },
+    // The only pair whose two halves are the *same command* with `-R` between
+    // them, and the only one that moves a file mode rather than a ref, an entry
+    // or a stanza. `patches/symlink.patch` is `diff main sym-pending`, written
+    // into the fixture at build time, and it does three things a patch in this
+    // harness had never done: create a symlink, create a zero-byte file, and
+    // replace a regular file with a symlink — the `T` of `--raw`. Verified
+    // against stock 2.55.0 on [`Shape::Symlinks`]:
+    //
+    //   status --porcelain   ` M link-wt`, `?? stray-empty.txt`, `?? stray-link`
+    //   apply patches/symlink.patch    rc 0
+    //   status --porcelain   the three above **plus** ` T dir/target.txt`,
+    //                        `?? later-empty.txt`, `?? later-link`
+    //   apply -R patches/symlink.patch rc 0
+    //   status --porcelain   the original three, exactly
+    //
+    // The equality of the first and last of those is the assertion, and it is
+    // what `runner::probe_state` compares first. A port whose `apply` writes the
+    // symlink as a regular file containing its target ends the round trip with a
+    // `100644` where a `120000` belongs and the reverse half then fails to
+    // recognise its own preimage; one that handles creation and not type change
+    // ends it with `dir/target.txt` still a symlink. `apply`'s generated grammar
+    // has no `Symlinks` in its shape list, so nothing else in this file can hand
+    // that command a patch with a mode change in it. One entry point: one
+    // sequence per unit of `--fuzz-sequences`, four to eight steps depending on
+    // how many observers the draw puts around the two halves.
+    RoundTrip {
+        cmd: "apply",
+        name: "apply-symlink-patch",
+        shape: Shape::Symlinks,
+        forward: &[&["apply", "patches/symlink.patch"]],
+        inverse: &[&["apply", "-R", "patches/symlink.patch"]],
         forward_stdin: None,
     },
     // ----------------------------------------------------------------------
@@ -4117,6 +4503,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// [`STORE_SHAPES`] is [`REV_SHAPES`] plus the two store shapes, and the
+    /// only reason it is written out rather than derived is that `&[Shape]`
+    /// cannot be concatenated in a const. So the containment is asserted here
+    /// instead: a shape added to `REV_SHAPES` tomorrow and forgotten here would
+    /// leave `rev-parse`, `cat-file` and `ls-tree` quietly narrower than `log`
+    /// and `rev-list`, which is a hole nothing in a report would show.
+    #[test]
+    fn store_shapes_extends_rev_shapes() {
+        for shape in REV_SHAPES {
+            assert!(
+                STORE_SHAPES.contains(shape),
+                "{} is in REV_SHAPES and not in STORE_SHAPES",
+                shape.name()
+            );
+        }
+        for shape in [Shape::Symlinks, Shape::Damaged] {
+            assert!(STORE_SHAPES.contains(&shape), "{} is what STORE_SHAPES is for", shape.name());
+            assert!(!REV_SHAPES.contains(&shape), "{} is not a history", shape.name());
+        }
+        // The pool that decides what a *walk* reads must not silently become the
+        // pool that decides what a store reader reads.
+        assert_eq!(STORE_SHAPES.len(), REV_SHAPES.len() + 2);
     }
 
     /// Every config key has values, and no value is an absolute path — config

@@ -64,7 +64,20 @@ impl Fixture {
             .env("LC_ALL", "C")
             .env("TZ", "UTC")
             .env("GIT_AUTHOR_DATE", "1700000000 +0000")
-            .env("GIT_COMMITTER_DATE", "1700000000 +0000");
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            // The identity has to come from this fixture's own `git config`
+            // lines, and an ambient GIT_AUTHOR_* / GIT_COMMITTER_* beats repo
+            // config. CI exports all four (`Configure git identity` in
+            // ci.yml), so every `From:` line rendered `zvcs ci
+            // <ci@zvcs.test>` there while passing on a developer machine that
+            // sets none of them. Removed rather than pinned, so the config
+            // lines below stay the thing under test; the one commit that wants
+            // a different author still sets GIT_AUTHOR_* explicitly.
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
+            .env_remove("EMAIL");
         c
     }
 

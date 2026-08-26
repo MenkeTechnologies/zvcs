@@ -8,6 +8,13 @@ A git-shadowing superset VCS: a pure-Rust `git` binary (built on vendored
 gitoxide) plus a singleton coordination daemon that removes three structural
 pains of a many-agent, deeply-nested-submodule monorepo.
 
+This document was written in layers, and sections that described work in the
+future tense kept that tense after the work landed — four features were still
+advertised here as gaps long after they shipped. Where this prose and the code
+disagree, **the code is right**: every claim below is anchored to the file that
+implements it so the disagreement is findable, and a claim with no such anchor
+should be checked before it is relied on.
+
 ## 1. Motivating problem
 
 The target workload: one meta repository that is a shell of ~162 git submodules
@@ -170,10 +177,12 @@ Thread topology — **no timers, no polling; everything is reactive**:
 - **Reaper** — idle-timeout shutdown (the per-repo model had none). One process,
   so this is tractable or the daemon simply stays up as the single service.
 
-Wire protocol (line-framed) extends the current
-`ACQUIRE`/`RELEASE`/`STATUS`/`STOP` with a repo key on `ACQUIRE`
-(`ACQUIRE <git-dir> <client-id>`), plus `SUBMIT`/`JOB`, `JOBSTOP`,
-`JOBRESTART`, `REINDEX`, and a `REPL` upgrade.
+Wire protocol (line-framed), nine verbs, exactly as `zdaemon.rs` parses them:
+`ACQUIRE <client-id> <git-dir>` and its non-blocking `TRYACQUIRE <client-id>
+<git-dir>`, `HOLDER <git-dir>`, `RELEASE <client-id>`, `SUBMIT <job-json>`,
+`JOBSTOP <id>`, `JOBRESTART <id>`, `STATUS`, `STOP`. The client id comes first;
+the repo key is the second field, not the first. `zreindex` and `zrepl` are not
+wire verbs — the crawler and the console both go through the ledger directly.
 
 **Lifetime:** a daemon exits when the socket it serves or its own pid file
 disappears — the pid file rather than the home directory, because `zvcs_home()`
@@ -260,11 +269,13 @@ meet a detached HEAD and the stash/attach/pop dance becomes unnecessary.
     catch-up-to-`origin/main` waits for a clean moment (never clobbers).
 - **Guard:** never move `main` backward. Only create `main` at HEAD, or
   fast-forward it. A stale detached commit never resets a newer `main`.
-- **Reconcile early-return fix.** `reconcile_repo` currently returns
-  `"up to date"` (`superset/zsync.rs:68`) *before* the attach step
-  (`:86-116`), so a submodule detached **at** `origin/main` — the default
-  post-`submodule update` state — is left detached. Fix: in the up-to-date path,
-  if HEAD is detached, attach it (local, no fetch).
+- **Reconcile early-return.** The up-to-date path returns before the
+  fast-forward, so a submodule detached **at** `origin/main` — the default
+  post-`submodule update` state — would be left detached by an early return that
+  never reached the attach. `fast_forward_to` therefore attaches inside that
+  path: when the local tip already equals the remote tip, a detached HEAD still
+  goes through `ensure_attached` and the call reports `up to date, re-attached to
+  <mainline>`. Local, no fetch, no clobber.
 
 ### 5.2 autobump — kill the `(new commits)` marker
 
@@ -279,10 +290,12 @@ gitlink to the submodule's **local** HEAD and **commits** it locally.
 - **Coalesced.** One root commit per debounce burst covering every changed
   submodule (message `zvcs: autobump <n> pointer(s)`), not one commit per
   pointer.
-- **Gap to close:** `zbump` today stages and stops (`zbump.rs:141-144`,
-  `index.write`, no commit). Staging alone does **not** clear the marker — it
-  only moves from unstaged to staged. Committing is what erases it. Closing this
-  stage→commit gap is the line of work that removes the marker.
+- **Committed, not just staged.** Staging alone does **not** clear the
+  marker — it only moves it from unstaged to staged; committing is what erases
+  it. `zbump` writes the index and then commits, building the tree from HEAD
+  plus **only** the bumped gitlinks rather than the raw index, so an unrelated
+  `git add` in the worktree is never swept into an autobump commit
+  (`zbump.rs`, `index_commit::commit_index_autonomous`).
 
 ### 5.3 Reactive reconcile & the no-autopush boundary
 
@@ -319,15 +332,31 @@ environment (the meta repo's `.git/config`, or the machine's `~/.gitconfig`);
 leave it unset everywhere else and zvcs is a plain faithful-`git` with a fair
 lock and no autonomy.
 
+The autonomy switches live in one table, `zconfig.rs::SETTINGS`, which is what
+`git zconfig` lists, sets and validates — that table is authoritative and this
+block is an illustration of it, not a second copy to keep in step. Defaults as
+declared there:
+
 ```gitconfig
 [zvcs]
-    autoreconcile = true            ; auto-zsync: keep clean submodules attached at origin/main (reactive)
-    autobump      = true            ; auto-zbump: forward-only local pointer bumps + commit (kills the marker)
-    interval      = 2               ; debounce window (seconds) for coalescing bump/attach bursts
-    autocrawl     = true            ; background repo-index crawl on daemon start (opt-in)
-    crawlroots    = ~/src ~/work    ; roots for the crawler (whitespace/comma separated; default $HOME)
-    hook          = ~/bin/on-change ; run on ref-change in any indexed repo (see §5.6)
+    autoreconcile  = true            ; reconcile submodules to origin/main on change      (default off)
+    autobump       = true            ; forward-only submodule gitlink bumps + commit      (default off)
+    autocrawl      = true            ; crawl zvcs.crawlroots into the index on start      (default off)
+    autostatus     = true            ; recompute a repo status cache when it changes      (default off)
+    autohook       = true            ; fire each repo zvcs.hook on change (see 5.6)       (default off)
+    autodups       = true            ; fan a commit out to local duplicate checkouts      (default off)
+    statusinterval = 10              ; status-cache backstop sweep, seconds (0 disables)  (default 10)
+    watchmru       = 512             ; file-watch the N most-recent repos (0 disables)    (default 512)
+    interval       = 30              ; autonomy debounce, seconds — always on             (default 30)
 ```
+
+Seven further `zvcs.*` keys are read outside that table, because they carry a
+value rather than gate a loop and `git zconfig <name> on|off` has nothing to say
+about them: `crawlroots` (roots for the crawler, whitespace/comma separated,
+default `$HOME`), `hook` (the ref-change command, 5.6), `precache` (warm the
+derived-answer caches for freshly arrived commits, default **on** — the one key
+whose default is not off), `worktreebase` (13), `replvimode`, `topscheme` and
+`toppalette` (the repl and `ztop`, which write the last two back themselves).
 
 ### 5.6 Hooks — filesystem-driven, across every indexed repo
 
@@ -568,9 +597,13 @@ commits/pushes that should not block.
   external one.
 
 **Remaining minor notes** (intentional / low-risk):
-- On an **external** process holding `index.lock`, a zvcs index write fails
-  fast (matching git) rather than bounded-waiting; zvcs-vs-zvcs fairness is the
-  daemon FIFO, and external contention is rare.
+- On an **external** process holding `index.lock`, the ported index writer
+  itself fails fast (`gix_lock`, `Fail::Immediately`), so the wait is layered
+  above it: a lock-taking verb polls the path for `ZVCS_INDEX_LOCK_WAIT_MS`
+  (default 2s) before running and queues the command as a job if the budget runs
+  out (`lock::wait_for_foreign_index_lock`, `dispatch.rs`). The caller never sees
+  the raw lock error. zvcs-vs-zvcs fairness is the daemon FIFO, which is a
+  separate lock and a separate budget.
 - `zjob stop` of a *mid-run* job (child-kill path) is implemented but not covered
   by a deterministic test (jobs finish too fast to race reliably); the
   queued-stop and finished-stop paths are tested.
@@ -591,8 +624,9 @@ commits/pushes that should not block.
 - **P4 — SQLite ledger + repo index.** ✅ `jobs` + `repos` (WAL), crawler,
   `zrepos`/`zreindex`. Test: `ledger.rs`.
 - **P5 — Async write-verbs.** ✅ `zcommit`/`zpush` via daemon `SUBMIT`,
-  `zjobs`/`zjob`, network-free push pre-flight. Tests: `queue.rs`,
-  `push_preflight.rs`. (`zjob stop`/`restart` still to wire — §10.)
+  `zjobs`/`zjob`, network-free push pre-flight. `zjob stop`/`restart` are
+  wired through the daemon's `JOBSTOP`/`JOBRESTART` verbs. Tests: `queue.rs`,
+  `push_preflight.rs`, `jobctl.rs`.
 - **P6 — `zrepl`.** ✅ Interactive verb console. Test: `repl.rs`.
 
 **Rollback:** autonomous behaviors stay behind `[zvcs]` config flags — off →

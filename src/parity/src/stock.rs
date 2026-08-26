@@ -52,6 +52,7 @@
 //! When the machine has one git, [`alt_git`] is `None` and every caller is
 //! exactly what it was: no third invocation, no new report line, no new column.
 
+use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -107,18 +108,38 @@ fn is_zvcs(bin: &Path) -> bool {
 /// The version this port reproduces, read from its single source of truth:
 /// `GIT_VERSION` in `porcelain/version.rs`, which is what `git version` prints.
 ///
-/// It is read rather than repeated here so the two can never drift. `None` means
-/// the constant could not be found, and the floor below is then not enforced —
-/// a harness that cannot locate the target must not invent one.
-fn target_version() -> Option<(u32, u32, u32)> {
+/// It is read rather than repeated here so the two can never drift — but reading
+/// another crate's source as text is a coupling that breaks on a reformat, and
+/// this one already did. The scan required the line to *start* with
+/// `const GIT_VERSION`; `trim_start` removes whitespace, not visibility, so the
+/// declaration gaining a `pub(crate)` prefix stopped matching. The lookup
+/// returned `None`, the caller dropped the floor, and the harness went on
+/// measuring against whatever git it found while printing numbers that read
+/// exactly like enforced ones — the silent downgrade the floor exists to catch.
+///
+/// So: match the declaration anywhere on the line, and fail loudly rather than
+/// returning an absence the caller reads as "no floor to apply". A harness that
+/// cannot find its own target must say so instead of proceeding.
+fn target_version() -> anyhow::Result<(u32, u32, u32)> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
+        .parent()
+        .context("the parity crate directory has no parent")?
         .join("extensions/src/porcelain/version.rs");
-    let text = std::fs::read_to_string(src).ok()?;
-    let line = text.lines().find(|l| l.trim_start().starts_with("const GIT_VERSION"))?;
-    let literal = line.split('"').nth(1)?;
+    let text = std::fs::read_to_string(&src)
+        .with_context(|| format!("reading {} for GIT_VERSION", src.display()))?;
+    let line = text
+        .lines()
+        .find(|l| l.contains("const GIT_VERSION"))
+        .with_context(|| format!("no `const GIT_VERSION` declaration in {}", src.display()))?;
+    let literal = line
+        .split('"')
+        .nth(1)
+        .with_context(|| format!("`const GIT_VERSION` in {} has no string literal", src.display()))?;
     let mut parts = literal.split('.').filter_map(|p| p.parse::<u32>().ok());
-    Some((parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
+    let major = parts
+        .next()
+        .with_context(|| format!("GIT_VERSION {literal:?} has no numeric major component"))?;
+    Ok((major, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
 }
 
 /// The newest usable stock git and its version, or `None` when there is none.
@@ -186,7 +207,8 @@ pub fn git() -> anyhow::Result<&'static Path> {
     // responsibility for it, and the refusal below tells them to do exactly that —
     // applying the floor to their choice as well would make that advice a dead end.
     let explicit = std::env::var_os("ZVCS_STOCK_GIT").is_some();
-    if let Some(target) = target_version().filter(|_| !explicit) {
+    if !explicit {
+        let target = target_version()?;
         if *version < target {
             let (a, b, c) = *version;
             let (x, y, z) = target;
@@ -367,7 +389,7 @@ pub fn version_label(v: (u32, u32, u32)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{alt_choice_from, same_file, version_label, AltChoice};
+    use super::{alt_choice_from, same_file, target_version, version_label, AltChoice};
     use std::path::{Path, PathBuf};
 
     /// Every spelling of "no second oracle" a caller can reach through the only
@@ -431,5 +453,20 @@ mod tests {
     fn a_version_is_labelled_the_way_git_prints_it() {
         assert_eq!(version_label((2, 50, 1)), "2.50.1");
         assert_eq!(version_label((0, 0, 0)), "0.0.0");
+    }
+
+    /// The floor is only enforceable while the target can be read, and the read
+    /// is a text scan of another crate's source — so it breaks whenever that
+    /// declaration is renamed, moved, or reformatted. It broke once already on a
+    /// `pub(crate)` prefix, and nothing failed: the harness kept measuring
+    /// against an unchecked git. This test is what makes the next such change
+    /// loud, and it has to run the real function against the real file to do it.
+    #[test]
+    fn the_targeted_version_is_readable_from_the_port() {
+        let read = target_version().expect(
+            "GIT_VERSION must stay readable from porcelain/version.rs; while it is not, \
+             the version floor is off and every number this crate prints is unguarded",
+        );
+        assert!(read.0 >= 2, "GIT_VERSION parsed as {read:?}, which is not a git version");
     }
 }

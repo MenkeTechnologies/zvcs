@@ -88,10 +88,6 @@
 //!   * `visualize`/`view`: `bisect_next_check(terms, NULL)` is reproduced (a
 //!     silent exit 1 when either side is unmarked); a live session bails, because
 //!     the command shells out to gitk / `git log`.
-//!   * Pathspec limiting is parsed and recorded in `BISECT_NAMES`, but it does
-//!     not constrain candidate selection, so a `--`-limited bisection with
-//!     revisions would pick a different midpoint; only the empty-pathspec case
-//!     (recording state, then reporting status) is faithful.
 //!   * The worktree update goes through this crate's `checkout`, which refuses to
 //!     switch across a dirty tracked worktree; stock git refuses with a different
 //!     message in the same situation.

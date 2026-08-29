@@ -362,15 +362,23 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
         common.clone()
     };
     let is_bare = repo.is_bare();
+    // `add_head_info()` reads each entry's `HEAD` from *that worktree's* ref store
+    // (worktree.c:46), and the main worktree's is the common one. Reading the current repository's
+    // `HEAD` instead reports the main worktree as sitting on the branch of whichever linked
+    // worktree the command was run from.
+    let main_head = if is_bare {
+        HeadInfo::Unknown
+    } else {
+        match gix::open(&common) {
+            Ok(main) => head_info(&main),
+            Err(_) => head_info(repo),
+        }
+    };
     let mut out = vec![Wt {
         path: main_path,
         id: None,
         is_bare,
-        head: if is_bare {
-            HeadInfo::Unknown
-        } else {
-            head_info(repo)
-        },
+        head: main_head,
         locked: None,
         prunable: None,
     }];
@@ -397,10 +405,12 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
         if trimmed.is_empty() {
             continue;
         }
-        // The file names the worktree's `.git` entry; `should_prune_worktree()`
-        // tests exactly this string for existence, before any normalisation.
+        // The file names the worktree's `.git` entry. `should_prune_worktree()` tests it for
+        // existence after resolving a *relative* recording against the administrative directory
+        // (worktree.c:995) — the spelling `worktree add --relative-paths` and
+        // `worktree.useRelativePaths` write.
         let dot_git = PathBuf::from(String::from_utf8_lossy(trimmed).into_owned());
-        let missing = !dot_git.exists();
+        let missing = !recorded_dot_git(&admin, trimmed).exists();
 
         // The checkout path drops that `/.git` suffix; a relative recording is
         // resolved against the administrative directory and then realpath'd.
@@ -1076,9 +1086,12 @@ fn should_prune(admin: &Path, expire: u64) -> PruneCheck {
         return PruneCheck::Prune("invalid gitdir file".to_owned());
     }
     let recorded = &content[..len];
-    let target = gix::path::from_byte_slice(recorded);
+    // git hands the *resolved* `.git` path back through `*wtpath`, so a relative recording takes
+    // part in dup detection under the same name an absolute one would (worktree.c:995-1010).
+    let target = recorded_dot_git(admin, recorded);
+    let resolved = gix::path::into_bstr(target.as_path()).into_owned().into();
     if target.exists() {
-        return PruneCheck::Keep(Some(recorded.to_vec()));
+        return PruneCheck::Keep(Some(resolved));
     }
     // A missing checkout only prunes once its administrative `index` has gone
     // stale: `stat()` failure, or mtime no newer than the expiry threshold.
@@ -1092,8 +1105,23 @@ fn should_prune(admin: &Path, expire: u64) -> PruneCheck {
     if stale {
         PruneCheck::Prune("gitdir file points to non-existent location".to_owned())
     } else {
-        PruneCheck::Keep(Some(recorded.to_vec()))
+        PruneCheck::Keep(Some(resolved))
     }
+}
+
+/// `should_prune_worktree()`'s reading of a `worktrees/<id>/gitdir` file (worktree.c:995): an
+/// absolute recording stands as it is, a relative one is joined onto the realpath of the
+/// administrative directory and resolved as far as it can be. `worktree add --relative-paths` and
+/// `worktree.useRelativePaths` write the relative spelling, and testing that string for existence
+/// from wherever the process happens to stand reports a healthy worktree as prunable.
+fn recorded_dot_git(admin: &Path, recorded: &[u8]) -> PathBuf {
+    let path = gix::path::from_byte_slice(recorded);
+    if path.is_absolute() {
+        return path.to_owned();
+    }
+    let base = gix::path::realpath(admin).unwrap_or_else(|_| admin.to_owned());
+    let joined = base.join(path);
+    gix::path::realpath(&joined).unwrap_or(joined)
 }
 
 /// Port of `prune_worktree()`: announce under `-n`/`-v`, delete unless dry-run.
@@ -1669,6 +1697,9 @@ enum Start {
     NewBranch { name: FullName, oid: ObjectId, force: bool, from: String },
     /// `--detach`, or a commit-ish that is not a branch.
     Detached(ObjectId),
+    /// `--orphan`: `HEAD` names a branch that does not exist yet, and nothing is checked out.
+    /// git creates no ref here — the branch comes into being with the worktree's first commit.
+    Orphan(FullName),
 }
 
 impl Start {
@@ -1676,6 +1707,8 @@ impl Start {
         match self {
             Start::Branch(_, oid) | Start::Detached(oid) => *oid,
             Start::NewBranch { oid, .. } => *oid,
+            // An unborn `HEAD` has no commit; every use of this value is skipped for `Orphan`.
+            Start::Orphan(_) => ObjectId::null(gix::hash::Kind::Sha1),
         }
     }
 
@@ -1685,12 +1718,40 @@ impl Start {
             Start::Branch(name, _) => {
                 format!("checking out '{}'", name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/"))
             }
-            Start::NewBranch { name, .. } => format!(
+            // `print_preparing_worktree_line()`: `-B` looks the branch up, and an existing one is
+            // announced as a reset naming the commit it is about to leave
+            // (builtin/worktree.c:640-647).
+            Start::NewBranch { name, force, .. } => {
+                let short = name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/").to_string();
+                let existing = force
+                    .then(|| repo.try_find_reference(name.as_ref()).ok().flatten())
+                    .flatten()
+                    .and_then(|mut r| r.peel_to_id_in_place().ok().map(|id| id.detach()));
+                match existing {
+                    Some(oid) => format!("resetting branch '{short}'; was at {}", abbrev(repo, oid)),
+                    None => format!("new branch '{short}'"),
+                }
+            }
+            Start::Detached(oid) => format!("detached HEAD {}", abbrev(repo, *oid)),
+            // `--orphan` reaches `print_preparing_worktree_line()` with `new_branch` set and no
+            // force, so it prints the same line `-b` does (builtin/worktree.c:648).
+            Start::Orphan(name) => format!(
                 "new branch '{}'",
                 name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/")
             ),
-            Start::Detached(oid) => format!("detached HEAD {}", abbrev(repo, *oid)),
         }
+    }
+}
+
+/// Port of `worktree_basename()` (builtin/worktree.c:296): trailing separators are dropped and
+/// what follows the last remaining one is the name. It is plain text, not a path component —
+/// `worktree add .` therefore asks for a branch called `.`, which the `git branch` child refuses,
+/// where `Path::file_name()` answers `None` and would silently ask for an empty name.
+fn worktree_basename(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(std::path::is_separator);
+    match trimmed.rfind(std::path::is_separator) {
+        Some(sep) => &trimmed[sep + 1..],
+        None => trimmed,
     }
 }
 
@@ -1723,6 +1784,9 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // `worktree.guessRemote`, which `--[no-]guess-remote` then overrides
     // (worktree.c:131, :138-139, :823).
     let mut guess_remote: Option<bool> = None;
+    // `--[no-]relative-paths` over `worktree.useRelativePaths`, resolved once the repository is
+    // open below.
+    let mut relative_paths: Option<bool> = None;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut i = 0;
@@ -1776,12 +1840,10 @@ fn add(args: &[String]) -> Result<ExitCode> {
             // the command line is simply the last word.
             "--guess-remote" => guess_remote = Some(true),
             "--no-guess-remote" => guess_remote = Some(false),
-            // Refused rather than approximated: relative worktree links need the
-            // `extensions.relativeWorktrees` writer this port only has for
-            // `worktree repair`.
-            "--relative-paths" | "--no-relative-paths" => {
-                bail!("`worktree add {a}` is not ported")
-            }
+            // `OPT_BOOL(0, "relative-paths", &opts.relative_paths, …)` (worktree.c:824), which
+            // `worktree.useRelativePaths` initialises.
+            "--relative-paths" => relative_paths = Some(true),
+            "--no-relative-paths" => relative_paths = Some(false),
             // Named as parse-options names it: a long one keeps whatever
             // followed its `=`, a short one is reported as a switch by its first
             // character alone.
@@ -1800,10 +1862,21 @@ fn add(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: options '--orphan' and '--track' cannot be used together");
         return Ok(ExitCode::from(128));
     }
-    // `--orphan` on its own is still a floor: it needs an unborn HEAD over an
-    // empty index, which this port does not build.
-    if orphan {
-        bail!("`worktree add --orphan` is not ported")
+    // worktree.c:836-847, in git's order and with git's wording. `--detach` is checked before
+    // `--track` (which was answered above), then `--no-checkout`, then a `<commit-ish>`: an
+    // unborn branch has nothing to detach from, nothing to withhold from the worktree, and no
+    // start point to accept.
+    if orphan && detach {
+        eprintln!("fatal: options '--orphan' and '--detach' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    if orphan && !checkout {
+        eprintln!("fatal: options '--orphan' and '--no-checkout' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    if orphan && positional.len() == 2 {
+        eprintln!("fatal: option '--orphan' and commit-ish cannot be used together");
+        return Ok(ExitCode::from(128));
     }
 
     let Some(path_arg) = positional.first().copied() else {
@@ -1818,11 +1891,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
 
     // `add()`: with no `<commit-ish>` and no `-b`, git invents a branch named
     // after the final path component.
-    let dwim_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_owned)
-        .unwrap_or_default();
+    let dwim_name = worktree_basename(path_arg).to_owned();
 
     // `add()` puts the `<commit-ish>` through `lookup_commit_reference_by_name()`
     // — and so through `get_oid_basic()` — at four points, each of which warns:
@@ -1872,17 +1941,48 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // first. The hint is for the DWIM forms only: with an explicit `<commit-ish>`
     // that does not resolve, the user named something that does not exist rather
     // than reaching for an unborn branch.
-    let start = match resolve_start(&repo, new_branch.as_deref(), force_branch, detach, commit_ish, &dwim_name, guessed_start.as_deref()) {
-        Ok(start) => start,
-        Err(e) => {
-            match invalid_reference(&repo, branch_arg, path_arg, new_branch.as_deref(), quiet, commit_ish.is_none())? {
-                Some(code) => return Ok(code),
-                // `dwim_orphan()` inferred `--orphan` instead of dying, which is
-                // the unborn-worktree floor this port does not build; let the
-                // resolver's own failure stand.
-                None => return Err(e),
+    // The branch this add will ask `git branch` to create, if it asks for one at all: `-b`/`-B`,
+    // or — with no `<commit-ish>` and no `--detach` — the DWIM name taken from the path. A name
+    // the child would refuse is reported by the child, after the `Preparing worktree` line that
+    // `add()` prints before running it, so `git worktree add .` announces the branch `.` and only
+    // then says it is not a valid one.
+    let intended_new_branch = new_branch
+        .clone()
+        .or_else(|| (commit_ish.is_none() && !detach).then(|| dwim_name.clone()));
+    if let Some(name) = intended_new_branch.as_deref() {
+        if !super::branch::valid_branch_name(name) {
+            if !quiet {
+                eprintln!("Preparing worktree (new branch '{name}')");
+            }
+            if let Some(code) = super::branch::child_branch_invalid_name(&repo, name) {
+                return Ok(code);
             }
         }
+    }
+
+    // `--orphan` names a branch that does not exist yet — `-b`'s name, or the path's last
+    // component (worktree.c:877-882) — and skips the `lookup_commit_reference_by_name()` floor
+    // below, which is what `!opts.orphan &&` in the C guard says.
+    let orphan_start = if orphan {
+        let name = new_branch.clone().unwrap_or_else(|| dwim_name.clone());
+        Some(Start::Orphan(FullName::try_from(format!("refs/heads/{name}"))?))
+    } else {
+        None
+    };
+    let start = match orphan_start {
+        Some(start) => start,
+        None => match resolve_start(&repo, new_branch.as_deref(), force_branch, detach, commit_ish, &dwim_name, guessed_start.as_deref()) {
+            Ok(start) => start,
+            Err(e) => {
+                match invalid_reference(&repo, branch_arg, path_arg, new_branch.as_deref(), quiet, commit_ish.is_none())? {
+                    Some(code) => return Ok(code),
+                    // `dwim_orphan()` inferred `--orphan` instead of dying, which is
+                    // the unborn-worktree floor this port does not build; let the
+                    // resolver's own failure stand.
+                    None => return Err(e),
+                }
+            }
+        },
     };
 
     // `print_preparing_worktree_line()` looks a name up only on the two arms that
@@ -1975,47 +2075,10 @@ fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `add_worktree()`: the destination must be absent, or an empty directory.
-    let occupied = match std::fs::read_dir(&path) {
-        Ok(mut entries) => entries.next().is_some(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        // A plain file at the path is just as occupied as a full directory.
-        Err(_) => path.exists(),
-    };
-    // `check_candidate_path()`'s first line is not gated by `--force`:
-    //
-    // ```c
-    // if (file_exists(path) && !is_empty_dir(path))
-    //         die(_("'%s' already exists"), path);
-    // ```
-    //
-    // `--force` only overrides the *registered worktree* checks below it, so
-    // `git worktree add -f <non-empty-dir>` dies in stock 2.55.0 too.
-    if occupied {
-        eprintln!("fatal: '{path_arg}' already exists");
-        return Ok(ExitCode::from(128));
-    }
-
-    // `add_worktree()`:490 — the fourth and last lookup, after
-    // `check_candidate_path()` above has had its say.
-    crate::objname::warn_ambiguous_refname(&repo, branch_arg);
-
-    // The administrative directory, named after the path's last component with
-    // git's `<name>N` de-duplication when that name is taken.
-    let id = unique_admin_id(&common, &dwim_name);
-    let admin = common.join("worktrees").join(&id);
-    std::fs::create_dir_all(admin.join("logs"))?;
-    std::fs::create_dir_all(admin.join("refs"))?;
-    std::fs::create_dir_all(&path)?;
-    let worktree_abs = gix::path::realpath(&path)?;
-
-    // `<path>/.git` points at the administrative directory, and `gitdir` points
-    // back at that file — the two halves `repair` checks against each other.
-    std::fs::write(path.join(".git"), format!("gitdir: {}\n", path_to_string(&admin)))?;
-    std::fs::write(admin.join("gitdir"), format!("{}\n", path_to_string(&worktree_abs.join(".git"))))?;
-    std::fs::write(admin.join("commondir"), "../..\n")?;
-
-    // `-b`/`-B` creates the branch before `HEAD` can name it.
+    // `-b`/`-B` creates the branch through a child `git branch` in `add()` (worktree.c:936-950),
+    // which runs *before* `add_worktree()` looks at the destination — so a `worktree add <name>`
+    // that dies on an occupied path still leaves `refs/heads/<name>` behind, and repeating the
+    // command then fails on the branch instead.
     if let Start::NewBranch { name, oid, force, from } = &start {
         create_branch(&repo, name, *oid, *force, from)?;
         // The child `git branch <new> <start> [<opt_track>]` sets the upstream after
@@ -2054,17 +2117,103 @@ fn add(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+
+    // `add_worktree()`: the destination must be absent, or an empty directory.
+    let occupied = match std::fs::read_dir(&path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // A plain file at the path is just as occupied as a full directory.
+        Err(_) => path.exists(),
+    };
+    // `check_candidate_path()`'s first line is not gated by `--force`:
+    //
+    // ```c
+    // if (file_exists(path) && !is_empty_dir(path))
+    //         die(_("'%s' already exists"), path);
+    // ```
+    //
+    // `--force` only overrides the *registered worktree* checks below it, so
+    // `git worktree add -f <non-empty-dir>` dies in stock 2.55.0 too.
+    if occupied {
+        eprintln!("fatal: '{path_arg}' already exists");
+        return Ok(ExitCode::from(128));
+    }
+
+    // `add_worktree()`:490 — the fourth and last lookup, after
+    // `check_candidate_path()` above has had its say.
+    crate::objname::warn_ambiguous_refname(&repo, branch_arg);
+
+    // The administrative directory, named after the path's last component with
+    // git's `<name>N` de-duplication when that name is taken.
+    let id = unique_admin_id(&common, &dwim_name);
+    let admin = common.join("worktrees").join(&id);
+    std::fs::create_dir_all(admin.join("logs"))?;
+    std::fs::create_dir_all(admin.join("refs"))?;
+    std::fs::create_dir_all(&path)?;
+    let worktree_abs = gix::path::realpath(&path)?;
+
+    // `<path>/.git` points at the administrative directory, and `gitdir` points
+    // back at that file — the two halves `repair` checks against each other. With
+    // `--relative-paths` (or `worktree.useRelativePaths`) each side names the other relatively and
+    // the repository declares `extensions.relativeWorktrees`, which is what
+    // `write_worktree_linking_files()` (worktree.c:1092) does for both `add` and `repair`.
+    let relative = relative_paths.unwrap_or_else(|| {
+        repo.config_snapshot().boolean("worktree.useRelativePaths").unwrap_or(false)
+    });
+    write_worktree_linking_files(&common, &path.join(".git"), &admin.join("gitdir"), relative);
+    std::fs::write(admin.join("commondir"), "../..\n")?;
+
     let head_line = match &start {
         Start::Branch(name, _) => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
         Start::NewBranch { name, .. } => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
         Start::Detached(oid) => format!("{}\n", oid.to_hex()),
+        Start::Orphan(name) => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
     };
     std::fs::write(admin.join("HEAD"), head_line)?;
-    std::fs::write(admin.join("ORIG_HEAD"), format!("{}\n", start.oid().to_hex()))?;
-    write_worktree_reflog(&repo, &admin, start.oid())?;
 
+    // `--orphan` stops here. `add_worktree()` writes no reflog for it (there is no id to log),
+    // `make_worktree_orphan()` only points `HEAD` at the unborn branch, and the `reset --hard`
+    // that follows leaves an empty index and an empty worktree — no `ORIG_HEAD`, no
+    // `HEAD is now at` line, and no ref: the branch is born with the first commit.
+    if let Start::Orphan(_) = start {
+        let mut empty = gix::index::State::new(repo.object_hash());
+        // The `reset --hard` over an unborn `HEAD` unpacks the empty tree, so its cache-tree names
+        // that tree over zero entries. git records the id whether or not the object was ever
+        // written — a fresh orphan worktree's index is `DIRC` + `TREE` + `0 0\n` + the empty tree.
+        empty.set_tree(Some(gix::index::extension::Tree {
+            name: Default::default(),
+            id: gix::ObjectId::empty_tree(repo.object_hash()),
+            num_entries: Some(0),
+            children: Vec::new(),
+        }));
+        gix::index::File::from_state(empty, admin.join("index")).write_to(
+            std::fs::File::create(admin.join("index"))?,
+            crate::config::index_write_options(&repo),
+        )?;
+        if lock_it {
+            let reason = lock_reason.unwrap_or_else(|| "added with --lock".to_string());
+            std::fs::write(admin.join("locked"), format!("{reason}\n"))?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    // `ORIG_HEAD` and the `reset: moving to HEAD` reflog line are both written by the
+    // `reset --hard` child `checkout_worktree()` runs (builtin/worktree.c:400), so `--no-checkout`
+    // leaves neither behind. That reset only logs when `HEAD` is symbolic: the branch it
+    // dereferences to already names the same commit, so the branch update is a no-op while the
+    // symref's own log-only entry is still appended. A detached `HEAD` updates itself to the value
+    // it already holds and logs nothing.
+    if checkout {
+        std::fs::write(admin.join("ORIG_HEAD"), format!("{}\n", start.oid().to_hex()))?;
+    }
+    let reset_line = checkout && !matches!(start, Start::Detached(_));
+    write_worktree_reflog(&repo, &admin, start.oid(), reset_line)?;
+
+    // `add_worktree()` writes `initializing` into `locked` for the duration of the setup and
+    // removes it at the end; `--lock` keeps the file, and its content is the `--reason` or, with
+    // none, git's own `added with --lock` (builtin/worktree.c:529, :853).
     if lock_it {
-        std::fs::write(admin.join("locked"), lock_reason.map(|r| format!("{r}\n")).unwrap_or_default())?;
+        let reason = lock_reason.unwrap_or_else(|| "added with --lock".to_string());
+        std::fs::write(admin.join("locked"), format!("{reason}\n"))?;
     }
 
     if checkout {
@@ -2405,12 +2554,20 @@ fn create_branch(
 ) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     let expected = if force { PreviousValue::Any } else { PreviousValue::MustNotExist };
+    // `create_branch()` (branch.c:615-631): `forcing` is set by the validation that finds the
+    // branch already there, so `-B` over an existing branch logs `Reset to`, and `-B` that creates
+    // one logs `Created from` like `-b` does.
+    let forcing = force && repo.try_find_reference(name.as_ref()).ok().flatten().is_some();
+    let message = match forcing {
+        true => format!("branch: Reset to {from}"),
+        false => format!("branch: Created from {from}"),
+    };
     let edit = RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: format!("branch: Created from {from}").into(),
+                message: message.into(),
             },
             expected,
             new: gix::refs::Target::Object(oid),
@@ -2427,9 +2584,9 @@ fn create_branch(
     Ok(())
 }
 
-/// The two `logs/HEAD` lines `add_worktree()` leaves behind: the creation of the
-/// new `HEAD`, then the checkout that follows it.
-fn write_worktree_reflog(repo: &gix::Repository, admin: &Path, oid: ObjectId) -> Result<()> {
+/// The `logs/HEAD` lines `add_worktree()` leaves behind: the creation of the new `HEAD`, and —
+/// when `reset_line` — the `reset --hard` that checks the worktree out.
+fn write_worktree_reflog(repo: &gix::Repository, admin: &Path, oid: ObjectId, reset_line: bool) -> Result<()> {
     let now = gix::date::Time::now_local_or_utc().format_or_unix(gix::date::time::Format::Raw);
     let sig = match repo.committer() {
         Some(Ok(sig)) => sig,
@@ -2441,15 +2598,17 @@ fn write_worktree_reflog(repo: &gix::Repository, admin: &Path, oid: ObjectId) ->
     };
     let sig = format!("{} <{}> {}", sig.name, sig.email, sig.time);
     let zero = ObjectId::null(repo.object_hash());
-    let text = format!(
-        "{} {} {}\t\n{} {} {}\treset: moving to HEAD\n",
-        zero.to_hex(),
-        oid.to_hex(),
-        sig,
-        oid.to_hex(),
-        oid.to_hex(),
-        sig
-    );
+    // `log_ref_write_fd()` (refs/files-backend.c) adds the tab *with* the message and nothing at
+    // all without one, so the first line — `add_worktree()` creates `HEAD` with no message — ends
+    // right after the committer.
+    let mut text = format!("{} {} {sig}\n", zero.to_hex(), oid.to_hex());
+    if reset_line {
+        text.push_str(&format!(
+            "{} {} {sig}\treset: moving to HEAD\n",
+            oid.to_hex(),
+            oid.to_hex()
+        ));
+    }
     std::fs::write(admin.join("logs").join("HEAD"), text)?;
     Ok(())
 }
@@ -2487,9 +2646,16 @@ fn checkout_into(repo: &gix::Repository, admin: &Path, path: &Path, oid: ObjectI
         &std::sync::atomic::AtomicBool::default(),
         opts,
     )?;
+    // `add_worktree()` checks out through `unpack_trees()`, which ends in
+    // `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`; the index it writes
+    // therefore carries a fully valid `TREE` extension. An index built straight from a tree is
+    // exactly what `prime_cache_tree()` (cache-tree.c:897) describes, so prime it from the same
+    // tree rather than leaving the extension out — a later `write-tree` or `status` would
+    // otherwise have to rebuild what git had already recorded.
+    index.prime_cache_tree(&repo.objects, &tree)?;
     index.write_to(
         std::fs::File::create(admin.join("index"))?,
-        gix::index::write::Options::default(),
+        crate::config::index_write_options(repo),
     )?;
     Ok(())
 }
@@ -2567,7 +2733,8 @@ fn remove(args: &[String]) -> Result<ExitCode> {
             ));
         }
     }
-    let admin = repo.common_dir().join("worktrees").join(&id);
+    let worktrees_dir = repo.common_dir().join("worktrees");
+    let admin = worktrees_dir.join(&id);
     if let Err(e) = std::fs::remove_dir_all(&admin) {
         return die(&format!(
             "failed to delete '{}': {}",
@@ -2575,6 +2742,10 @@ fn remove(args: &[String]) -> Result<ExitCode> {
             errno_str(&e)
         ));
     }
+    // `delete_worktrees_dir_if_empty()` (builtin/worktree.c:164, called at :1427): removing the
+    // last linked worktree takes `worktrees/` with it, so the repository is left as it was before
+    // any worktree existed. `rmdir` fails harmlessly while other worktrees remain.
+    let _ = std::fs::remove_dir(&worktrees_dir);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2612,6 +2783,30 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
     let Some(id) = wt.id.clone() else {
         return die(&format!("'{arg}' is a main working tree"));
     };
+    // `git worktree move a b` where `b` is a directory moves the checkout *into* it,
+    // keeping its own name — the same rule `mv` follows.
+    let mut dest = PathBuf::from(dest_arg);
+    if dest.is_dir() {
+        let Some(name) = wt.path.file_name() else {
+            return die(&format!(
+                "could not figure out destination name from '{}'",
+                path_to_string(&wt.path)
+            ));
+        };
+        dest = dest.join(name);
+    }
+    // `check_candidate_path()` (builtin/worktree.c:317), which runs *before* the lock check and
+    // names the destination it computed: `worktree move wt .` refuses `'./wt' already exists`,
+    // not the `.` the caller typed. An empty directory there is not in the way.
+    let occupied = match std::fs::read_dir(&dest) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => dest.exists(),
+    };
+    if occupied {
+        return die(&format!("'{}' already exists", path_to_string(&dest)));
+    }
+
     if !force {
         if let Some(reason) = &wt.locked {
             return die(&if reason.is_empty() {
@@ -2623,18 +2818,6 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
                 )
             });
         }
-    }
-
-    // `git worktree move a b` where `b` is a directory moves the checkout *into* it,
-    // keeping its own name — the same rule `mv` follows.
-    let mut dest = PathBuf::from(dest_arg);
-    if dest.is_dir() {
-        if let Some(name) = wt.path.file_name() {
-            dest = dest.join(name);
-        }
-    }
-    if dest.exists() {
-        return die(&format!("target '{dest_arg}' already exists"));
     }
     if let Err(e) = std::fs::rename(&wt.path, &dest) {
         return die(&format!(

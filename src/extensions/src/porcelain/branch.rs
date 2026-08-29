@@ -364,6 +364,21 @@ pub(crate) fn valid_branch_name(name: &str) -> bool {
         && gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_ok()
 }
 
+/// The child `git branch <name> <start>` refusing a name `check_branch_ref()` will not take:
+/// `fatal: '<name>' is not a valid branch name` with the `advice.refSyntax` hints behind it.
+///
+/// `worktree add` reaches this through the same child it uses for every other `-b` refusal, and
+/// `run_command()` returning non-zero is its `return -1` — which git reports as 255, not as the
+/// child's own 128.
+pub(crate) fn child_branch_invalid_name(repo: &gix::Repository, name: &str) -> Option<ExitCode> {
+    if valid_branch_name(name) {
+        return None;
+    }
+    eprintln!("fatal: '{name}' is not a valid branch name");
+    ref_syntax_hints(repo);
+    Some(ExitCode::from(255))
+}
+
 /// The `refSyntax` advice git prints after rejecting a branch name. git spells
 /// this `advise_if_enabled(ADVICE_REF_SYNTAX, …)` (`builtin/branch.c`), so the
 /// `Disable this message with …` trailer appears only while the slot is

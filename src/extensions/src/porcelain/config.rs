@@ -296,6 +296,9 @@ fn usage_error(msg: &str) -> Result<ExitCode> {
 /// canonicalization applied to the value.
 #[derive(Default, Clone)]
 struct Display {
+    /// `--fixed-value` (`CONFIG_FLAGS_FIXED_VALUE`): every `<value-pattern>` is compared
+    /// literally instead of as a POSIX ERE.
+    fixed_value: bool,
     show_origin: bool,
     show_scope: bool,
     /// `--show-names` (`display_opts.show_keys`, builtin/config.c:118): a `get` prints the key
@@ -364,16 +367,28 @@ impl ValueType {
     /// the first value that does not. Only the message differs; what parses and
     /// what does not is the same either way, so the error is always described and
     /// the caller decides whether to print it.
-    fn canonicalize(self, key: &str, value: &[u8]) -> std::result::Result<Vec<u8>, TypeError> {
+    fn canonicalize(
+        self,
+        key: &str,
+        value: &[u8],
+        implicit: bool,
+    ) -> std::result::Result<Vec<u8>, TypeError> {
         // Verbatim: git hands the stored bytes to each type's reader untouched,
         // and the number grammar itself skips *leading* blanks only — so a
         // trailing one is an unreadable unit rather than something to trim away.
         //
-        // Gap: a key written with no `=` is git's `NULL` value, which reads as
-        // *true* rather than as the empty string. `gix_config` only exposes that
-        // distinction for a name's last occurrence (`BodyRef::value_implicit`),
-        // so this port cannot tell the two apart here — the same reason
-        // `--list` prints `test.q=` for one where git prints `test.q`.
+        // A key written with no `=` is git's `NULL` value, and the boolean readers answer
+        // *true* for it: `git_config_bool(key, NULL)` reaches `git_parse_maybe_bool(NULL)`,
+        // which returns 1 (config.c). The empty string is a different thing entirely — it
+        // reads as false — so the two have to be told apart before the text is examined.
+        if implicit {
+            match self {
+                ValueType::Bool | ValueType::BoolOrInt | ValueType::BoolOrStr => {
+                    return Ok(b"true".to_vec());
+                }
+                _ => {}
+            }
+        }
         let text = String::from_utf8_lossy(value).to_string();
         match self {
             ValueType::Bool => optint::maybe_bool(&text)
@@ -835,6 +850,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // `--bool --type=int` can be rejected and an unported type named. Mapped to
     // a [`ValueType`] once every usage check has run.
     let mut ty_name: Option<&'static str> = None;
+    // `--comment=<message>` (builtin/config.c) and `--fixed-value`, which turns every
+    // `<value-pattern>` from a POSIX ERE into a literal string comparison.
+    let mut comment: Option<String> = None;
+    let mut fixed_value = false;
     // `include.path` / `includeIf` following. git resolves includes for the
     // implicit scopes and, for an explicitly named file, only when asked.
     let mut includes = false;
@@ -1051,7 +1070,23 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             // `--no-default` NULLs the `OPT_STRING` behind `--default`; the other
             // two clear slots this port does not read.
             "--no-default" => d.default_value = None,
-            "--no-comment" | "--no-fixed-value" => {}
+            "--no-comment" => comment = None,
+            "--no-fixed-value" => {
+                fixed_value = false;
+                d.fixed_value = false;
+            }
+            "--fixed-value" => {
+                fixed_value = true;
+                d.fixed_value = true;
+            }
+            "--comment" => {
+                let Some(v) = args.get(i) else {
+                    return Ok(super::missing_option_value(a));
+                };
+                i += 1;
+                comment = Some(v.clone());
+            }
+            _ if a.starts_with("--comment=") => comment = Some(a["--comment=".len()..].to_string()),
             "--worktree" => bail!(
                 "--worktree scope is not supported: it reads and writes \
                  $GIT_COMMON_DIR/worktrees/<id>/config.worktree behind the \
@@ -1293,14 +1328,14 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             let name = positional.first().copied().unwrap_or_default();
             let value = positional.get(1).copied().unwrap_or_default();
             match normalized(d.ty, name, value) {
-                Ok(value) => replace_all(&write_target()?, name, &value, positional.get(2).copied()),
+                Ok(value) => replace_all(&write_target()?, name, &value, positional.get(2).copied(), d.fixed_value),
                 Err(code) => Ok(code),
             }
         }
         // No action flag: one positional reads, two set the value.
         Mode::Auto if positional.len() == 1 => get(file, positional[0], false, None, &d),
         Mode::Auto if positional.len() == 2 => match normalized(d.ty, positional[0], positional[1]) {
-            Ok(value) => write_scoped(&write_target()?, positional[0], &value, WriteOp::Set),
+            Ok(value) => write_scoped(&write_target()?, positional[0], &value, WriteOp::Set, comment.as_deref()),
             Err(code) => Ok(code),
         },
         // `<name> <value> <value-pattern>` rewrites the values whose text matches
@@ -1314,21 +1349,34 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::Add => {
             let (name, value) = name_and_value(&positional)?;
             match normalized(d.ty, name, value) {
-                Ok(value) => write_scoped(&write_target()?, name, &value, WriteOp::Add),
+                Ok(value) => write_scoped(&write_target()?, name, &value, WriteOp::Add, comment.as_deref()),
                 Err(code) => Ok(code),
             }
         }
+        // `git config --unset <name> [<value-pattern>]`: the optional third operand narrows
+        // which values are removed, exactly as it narrows a `--replace-all`
+        // (`repo_config_set_multivar_in_file_gently(..., value_pattern, ...)`, config.c).
         Mode::Unset => {
-            let name = one_name(&positional)?;
-            write_scoped(&write_target()?, name, "", WriteOp::Unset)
+            let (name, pattern) = name_and_pattern(&positional)?;
+            unset_scoped(&write_target()?, name, pattern, false, d.fixed_value)
         }
         Mode::UnsetAll => {
-            let name = one_name(&positional)?;
-            write_scoped(&write_target()?, name, "", WriteOp::UnsetAll)
+            let (name, pattern) = name_and_pattern(&positional)?;
+            unset_scoped(&write_target()?, name, pattern, true, d.fixed_value)
         }
     }
 }
 
+
+/// `<name> [<value-pattern>]`, the operand shape of `--unset`/`--unset-all`.
+fn name_and_pattern<'a>(positional: &[&'a str]) -> Result<(&'a str, Option<&'a str>)> {
+    match positional {
+        [name] => Ok((*name, None)),
+        [name, pattern] => Ok((*name, Some(*pattern))),
+        [] => crate::git_fatal!("no config key given"),
+        _ => crate::git_fatal!("too many arguments, expected a single `<name>`"),
+    }
+}
 
 fn one_name<'a>(positional: &[&'a str]) -> Result<&'a str> {
     match positional {
@@ -1345,30 +1393,65 @@ fn name_and_value<'a>(positional: &[&'a str]) -> Result<(&'a str, &'a str)> {
     }
 }
 
-/// Parse `section[.subsection].name`, erroring the way stock git does when the
-/// key has no section component.
+/// Parse `section[.subsection].name`.
+///
+/// ```c
+/// if (last_dot == NULL || last_dot == key) {
+///         if (!quiet)
+///                 error(_("key does not contain a section: %s"), key);
+///         return -CONFIG_NO_SECTION_OR_NAME;
+/// }
+///
+/// if (!last_dot[1]) {
+///         if (!quiet)
+///                 error(_("key does not contain variable name: %s"), key);
+///         return -CONFIG_NO_SECTION_OR_NAME;
+/// }
+/// ```
+///
+/// (`do_parse_config_key()`, config.c:545-567.) Both are `error()`s — the `error:` prefix,
+/// no usage block — and both exit 2 (`CONFIG_NO_SECTION_OR_NAME`, config.h:28), where this
+/// port reported its own `zvcs:` line at exit 1.
 fn parse_key(name: &str) -> Result<KeyRef<'_>> {
-    KeyRef::parse_unvalidated(name.into())
-        .ok_or_else(|| anyhow::anyhow!("key does not contain a section: {name}"))
+    if let Some(key) = KeyRef::parse_unvalidated(name.into()) {
+        return Ok(key);
+    }
+    let message = match name.rfind('.') {
+        Some(dot) if dot + 1 == name.len() => "key does not contain variable name",
+        _ => "key does not contain a section",
+    };
+    eprintln!("error: {message}: {name}");
+    Err(anyhow::Error::new(crate::fatal::Silent(2)))
 }
 
 /// A compiled `<value-pattern>`: the optional second operand of a read, an
 /// unanchored POSIX ERE matched against the value bytes, inverted by a leading
 /// `!` — the same grammar the value-pattern *set* form uses.
 struct ValueFilter {
-    re: regex::bytes::Regex,
+    /// `--fixed-value`: the pattern is compared literally rather than compiled, which is
+    /// `CONFIG_FLAGS_FIXED_VALUE` — `matches()` in config.c calls `strcmp()` instead of
+    /// `regexec()`. A leading `!` still inverts.
+    fixed: Option<Vec<u8>>,
+    re: Option<regex::bytes::Regex>,
     invert: bool,
 }
 
 impl ValueFilter {
     /// Compile `pattern`, or report git's `error: invalid pattern: <p>` at exit 6.
-    fn parse(pattern: &str) -> Result<Self, ExitCode> {
+    fn parse(pattern: &str, fixed: bool) -> Result<Self, ExitCode> {
         let (invert, pat) = match pattern.strip_prefix('!') {
             Some(rest) => (true, rest),
             None => (false, pattern),
         };
+        if fixed {
+            return Ok(Self {
+                fixed: Some(pat.as_bytes().to_vec()),
+                re: None,
+                invert,
+            });
+        }
         match regex::bytes::Regex::new(pat) {
-            Ok(re) => Ok(Self { re, invert }),
+            Ok(re) => Ok(Self { fixed: None, re: Some(re), invert }),
             Err(_) => {
                 eprintln!("error: invalid pattern: {pat}");
                 Err(ExitCode::from(6))
@@ -1377,7 +1460,12 @@ impl ValueFilter {
     }
 
     fn matches(&self, value: &[u8]) -> bool {
-        self.re.is_match(value) != self.invert
+        let hit = match (&self.fixed, &self.re) {
+            (Some(literal), _) => literal.as_slice() == value,
+            (None, Some(re)) => re.is_match(value),
+            (None, None) => false,
+        };
+        hit != self.invert
     }
 }
 
@@ -1397,7 +1485,7 @@ fn get(
     d: &Display,
 ) -> Result<ExitCode> {
     let key = parse_key(name)?;
-    let filter = match value_pattern.map(ValueFilter::parse) {
+    let filter = match value_pattern.map(|p| ValueFilter::parse(p, d.fixed_value)) {
         Some(Err(code)) => return Ok(code),
         Some(Ok(f)) => Some(f),
         None => None,
@@ -1439,7 +1527,7 @@ fn get(
         };
         let formatted = match d.ty {
             None => Ok(default.as_bytes().to_vec()),
-            Some(t) => t.canonicalize(name, default.as_bytes()),
+            Some(t) => t.canonicalize(name, default.as_bytes(), false),
         };
         return match formatted {
             Ok(value) => {
@@ -1463,7 +1551,7 @@ fn get(
     // later one, so the error names the same value stock git names.
     let mut canonical: Vec<(Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
     for (v, implicit, meta) in &selected {
-        match typed(d, name, v, meta) {
+        match typed(d, name, v, *implicit, meta) {
             Ok(v) => canonical.push((v, *implicit, meta.clone())),
             Err(code) => return Ok(code),
         }
@@ -1597,10 +1685,11 @@ fn typed(
     d: &Display,
     key: &str,
     value: &[u8],
+    implicit: bool,
     meta: &gix::config::file::Metadata,
 ) -> std::result::Result<Vec<u8>, ExitCode> {
     let Some(t) = d.ty else { return Ok(value.to_vec()) };
-    t.canonicalize(key, value)
+    t.canonicalize(key, value, implicit)
         .map_err(|err| report_type_error(err, key, value, meta.path.as_deref()))
 }
 
@@ -1679,7 +1768,7 @@ fn normalize_value(ty: Option<ValueType>, key: &str, value: &str) -> Option<Stri
     if matches!(ty, ValueType::Path | ValueType::ExpiryDate) {
         return Some(value.to_string());
     }
-    match ty.canonicalize(key, value.as_bytes()) {
+    match ty.canonicalize(key, value.as_bytes(), false) {
         // The parsed escape sequence is a "sanity-check" only; git returns the
         // value it was given (builtin/config.c:693-700).
         Ok(_) if ty == ValueType::Color => Some(value.to_string()),
@@ -1781,7 +1870,7 @@ fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
         let _ = (meta, implicit);
         let canonical = match d.ty {
             None => value.to_vec(),
-            Some(t) => match t.canonicalize(key, value) {
+            Some(t) => match t.canonicalize(key, value, false) {
                 Ok(v) => v,
                 Err(_) => return Ok(()),
             },
@@ -1816,7 +1905,7 @@ fn get_regexp(
         }
     };
     // The optional second operand narrows by VALUE, on top of the key match.
-    let filter = match value_pattern.map(ValueFilter::parse) {
+    let filter = match value_pattern.map(|p| ValueFilter::parse(p, d.fixed_value)) {
         Some(Err(code)) => return Ok(code),
         Some(Ok(f)) => Some(f),
         None => None,
@@ -1835,7 +1924,7 @@ fn get_regexp(
         if filter.as_ref().is_some_and(|f| !f.matches(value)) {
             return Ok(());
         }
-        match typed(d, key, value, meta) {
+        match typed(d, key, value, false, meta) {
             Ok(v) => collected.push((key.to_owned(), v, implicit, meta.clone())),
             Err(code) => failed = Some(code),
         }
@@ -2428,11 +2517,12 @@ fn replace_all(
     name: &str,
     value: &str,
     value_pattern: Option<&str>,
+    fixed_value: bool,
 ) -> Result<ExitCode> {
     let key = parse_key(name)?;
     let section_lc = key.section_name.to_lowercase();
     let value_lc = key.value_name.to_lowercase();
-    let filter = match value_pattern.map(ValueFilter::parse) {
+    let filter = match value_pattern.map(|p| ValueFilter::parse(p, fixed_value)) {
         Some(Err(code)) => return Ok(code),
         Some(Ok(f)) => Some(f),
         None => None,
@@ -2698,10 +2788,34 @@ fn resolve_write_target(scope: &Scope, repo: Option<&gix::Repository>) -> Result
             })
         }
         Scope::System => {
-            let mut env = |k: &str| std::env::var_os(k);
-            let path = Source::System
-                .storage_location(&mut env)
-                .ok_or_else(|| anyhow::anyhow!("the system config is unavailable"))?;
+            // ```c
+            // char *git_system_config(void)
+            // {
+            //         char *system_config = xstrdup_or_null(getenv("GIT_CONFIG_SYSTEM"));
+            //         if (system_config)
+            //                 return system_config;
+            //         return system_path(ETC_GITCONFIG);
+            // }
+            // ```
+            //
+            // (config.c.) `GIT_CONFIG_NOSYSTEM` gates *reading* the system file, not naming
+            // it, so `git config --system <k> <v>` under that variable still tries to write
+            // — and reports whatever locking the path it names says. gix's
+            // `storage_location()` returns nothing at all there, which turned a lock error
+            // into a refusal of this port's own.
+            let path = match std::env::var_os("GIT_CONFIG_SYSTEM") {
+                Some(path) => std::path::PathBuf::from(path),
+                None => {
+                    let mut env = |k: &str| std::env::var_os(k);
+                    let mut without_nosystem = |k: &str| match k {
+                        "GIT_CONFIG_NOSYSTEM" => None,
+                        other => env(other),
+                    };
+                    Source::System
+                        .storage_location(&mut without_nosystem)
+                        .ok_or_else(|| anyhow::anyhow!("the system config is unavailable"))?
+                }
+            };
             Ok(WriteTarget {
                 lock_key: path.clone(),
                 path,
@@ -2725,7 +2839,101 @@ fn resolve_write_target(scope: &Scope, repo: Option<&gix::Repository>) -> Result
 /// through the coordinator (keyed on the target file) so a concurrent zvcs writer
 /// can't interleave a partial rewrite; the parent directory is created for a
 /// first-time global/system write.
-fn write_scoped(target: &WriteTarget, name: &str, value: &str, op: WriteOp) -> Result<ExitCode> {
+/// `--unset`/`--unset-all`, with the optional `<value-pattern>` that narrows which values
+/// are removed.
+///
+/// The counting is git's: nothing matched is `CONFIG_NOTHING_SET` (exit 5), and more than
+/// one match without `--unset-all` warns and changes nothing (`store_aux()`, config.c).
+fn unset_scoped(
+    target: &WriteTarget,
+    name: &str,
+    value_pattern: Option<&str>,
+    all: bool,
+    fixed_value: bool,
+) -> Result<ExitCode> {
+    let key = parse_key(name)?;
+    let filter = match value_pattern.map(|p| ValueFilter::parse(p, fixed_value)) {
+        Some(Err(code)) => return Ok(code),
+        Some(Ok(f)) => Some(f),
+        None => None,
+    };
+
+    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
+    prepare_parent(target);
+    let path = &target.path;
+    let Some(mut file) = load_for_write(path, target.source)? else {
+        return Ok(ExitCode::from(3));
+    };
+
+    {
+        let Ok(mut section) = file.section_mut(key.section_name, key.subsection_name) else {
+            return Ok(ExitCode::from(5));
+        };
+        let values = section.values(key.value_name);
+        let matched: Vec<usize> = values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| filter.as_ref().is_none_or(|f| f.matches(v)))
+            .map(|(i, _)| i)
+            .collect();
+        if matched.is_empty() {
+            return Ok(ExitCode::from(5));
+        }
+        if !all && matched.len() > 1 {
+            eprintln!("warning: {name} has multiple values");
+            return Ok(ExitCode::from(5));
+        }
+        // `SectionMut` removes by name, last occurrence first, so the surviving values are
+        // put back in order rather than removed one by one.
+        let keep: Vec<gix::bstr::BString> = values
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !matched.contains(i))
+            .map(|(_, v)| v.clone())
+            .collect();
+        while section.remove(key.value_name).is_some() {}
+        for value in &keep {
+            section.push(key.value_name, value.as_slice())?;
+        }
+    }
+    persist_or_lock_error(path, &file)
+}
+
+/// ```c
+/// if (strchr(comment, '\n'))
+///         die(_("no multi-line comment allowed: '%s'"), comment);
+///
+/// leading_blanks = strspn(comment, " \t");
+/// if (leading_blanks && comment[leading_blanks] == '#')
+///         prepared = xstrdup(comment); /* use it as-is */
+/// else if (comment[0] == '#')
+///         prepared = xstrfmt(" %s", comment);
+/// else
+///         prepared = xstrfmt(" # %s", comment);
+/// ```
+///
+/// (`git_config_prepare_comment_string()`, config.c:2921-2952.) The result is the whole
+/// trailer that follows the value, `#` included.
+fn prepare_comment(comment: &str) -> Result<String> {
+    if comment.contains('\n') {
+        crate::git_fatal!("no multi-line comment allowed: '{comment}'");
+    }
+    let blanks = comment.len() - comment.trim_start_matches([' ', '\t']).len();
+    let rest = &comment[blanks..];
+    Ok(match (blanks > 0, rest.starts_with('#')) {
+        (true, true) => comment.to_string(),
+        (_, true) => format!(" {comment}"),
+        _ => format!(" # {comment}"),
+    })
+}
+
+fn write_scoped(
+    target: &WriteTarget,
+    name: &str,
+    value: &str,
+    op: WriteOp,
+    comment: Option<&str>,
+) -> Result<ExitCode> {
     let key = parse_key(name)?;
     let section_lc = key.section_name.to_lowercase();
     let value_lc = key.value_name.to_lowercase();
@@ -2738,13 +2946,31 @@ fn write_scoped(target: &WriteTarget, name: &str, value: &str, op: WriteOp) -> R
         return Ok(ExitCode::from(3));
     };
 
+    let comment = comment.map(prepare_comment).transpose()?;
     match op {
+        // A comment can only be attached to a line as it is written, so a `set` that would
+        // have rewritten an existing value in place pushes a new one instead — which is
+        // what git does too, since `git_config_set_multivar_in_file()` writes the whole
+        // line (value and comment) whenever a comment is given.
+        WriteOp::Set if comment.is_some() => {
+            let comment = comment.as_deref().expect("checked above");
+            let mut section = file.section_mut_or_create_new(&section_lc, key.subsection_name)?;
+            while section.remove(&value_lc).is_some() {}
+            section.push_with_prepared_comment(&value_lc, value, comment.into())?;
+        }
         WriteOp::Set => {
             file.set_raw_value_by(&section_lc, key.subsection_name, &value_lc, value)?;
         }
         WriteOp::Add => {
-            file.section_mut_or_create_new(&section_lc, key.subsection_name)?
-                .push(&value_lc, value)?;
+            let mut section = file.section_mut_or_create_new(&section_lc, key.subsection_name)?;
+            match comment.as_deref() {
+                Some(comment) => {
+                    section.push_with_prepared_comment(&value_lc, value, comment.into())?;
+                }
+                None => {
+                    section.push(&value_lc, value)?;
+                }
+            }
         }
         WriteOp::Unset | WriteOp::UnsetAll => {
             let mut section = match file.section_mut(key.section_name, key.subsection_name) {
@@ -2756,8 +2982,18 @@ fn write_scoped(target: &WriteTarget, name: &str, value: &str, op: WriteOp) -> R
             if count == 0 {
                 return Ok(ExitCode::from(5));
             }
+            // ```c
+            // if (store->seen_nr == 1 && store->multi_replace == 0) {
+            //         warning(_("%s has multiple values"), key);
+            // }
+            // ```
+            //
+            // (`store_aux()`, config.c:2673-2677.) `git config --unset` on a key with more
+            // than one value is not fatal: it warns, changes nothing, and returns
+            // `CONFIG_NOTHING_SET` — exit 5 (config.h:33).
             if matches!(op, WriteOp::Unset) && count > 1 {
-                crate::git_fatal!("key contains multiple values: {name}");
+                eprintln!("warning: {name} has multiple values");
+                return Ok(ExitCode::from(5));
             }
             if matches!(op, WriteOp::UnsetAll) {
                 while section.remove(key.value_name).is_some() {}

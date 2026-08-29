@@ -56,7 +56,7 @@ impl SectionMut<'_> {
         value: impl AsBStrOpt,
     ) -> Result<&mut Self, file::section::value::Error> {
         let value_name = ValueName::try_from(value_name.as_ref())?;
-        self.push_with_comment_inner(value_name, value.as_bstr_opt(), None)?;
+        self.push_with_comment_inner(value_name, value.as_bstr_opt(), None, false)?;
         Ok(self)
     }
 
@@ -71,7 +71,26 @@ impl SectionMut<'_> {
         comment: impl crate::AsBStr,
     ) -> Result<&mut Self, file::section::value::Error> {
         let value_name = ValueName::try_from(value_name.as_ref())?;
-        self.push_with_comment_inner(value_name, value.as_bstr_opt(), Some(comment.as_bstr()))?;
+        self.push_with_comment_inner(value_name, value.as_bstr_opt(), Some(comment.as_bstr()), false)?;
+        Ok(self)
+    }
+
+    /// Adds an entry whose comment is written *exactly* as given: `comment` is the whole
+    /// trailer, starting with the whitespace that separates it from the value and then the
+    /// `#`.
+    ///
+    /// git's `git_config_prepare_comment_string()` (config.c) decides that shape itself —
+    /// ` # <text>` for a plain comment, ` <text>` for one that already starts with `#`, and
+    /// the string as-is when it starts with blanks followed by `#` — so a caller that has
+    /// run it must not have the shape massaged a second time.
+    pub fn push_with_prepared_comment(
+        &mut self,
+        value_name: impl AsRef<str>,
+        value: impl AsBStrOpt,
+        comment: &BStr,
+    ) -> Result<&mut Self, file::section::value::Error> {
+        let value_name = ValueName::try_from(value_name.as_ref())?;
+        self.push_with_comment_inner(value_name, value.as_bstr_opt(), Some(comment), true)?;
         Ok(self)
     }
 
@@ -80,6 +99,7 @@ impl SectionMut<'_> {
         value_name: ValueName,
         value: Option<&BStr>,
         comment: Option<&BStr>,
+        prepared: bool,
     ) -> Result<(), parse::span::Error> {
         let mut events = Vec::new();
         if let Some(ws) = &self.whitespace.pre_key {
@@ -98,16 +118,27 @@ impl SectionMut<'_> {
             None => events.push(Event::Value(Span::append(self.backing, b"")?)),
         }
         if let Some(comment) = comment {
-            events.push(Event::Whitespace(Span::append(self.backing, b" ")?));
-            let mut c = Vec::with_capacity(comment.len());
-            let mut bytes = comment.iter().peekable();
-            if !bytes.peek().is_none_or(|b| b.is_ascii_whitespace()) {
-                c.insert(0, b' ');
-            }
-            c.extend(bytes.map(|b| if *b == b'\n' { b' ' } else { *b }));
+            let (whitespace, text) = match prepared {
+                // The caller's string is the whole trailer: whitespace, the `#`, then the
+                // text. Split it where the `#` is rather than composing one here.
+                true => match comment.iter().position(|b| *b == b'#') {
+                    Some(hash) => (comment[..hash].to_vec(), comment[hash + 1..].to_vec()),
+                    None => (b" ".to_vec(), comment.to_vec()),
+                },
+                false => {
+                    let mut c = Vec::with_capacity(comment.len());
+                    let mut bytes = comment.iter().peekable();
+                    if !bytes.peek().is_none_or(|b| b.is_ascii_whitespace()) {
+                        c.insert(0, b' ');
+                    }
+                    c.extend(bytes.map(|b| if *b == b'\n' { b' ' } else { *b }));
+                    (b" ".to_vec(), c)
+                }
+            };
+            events.push(Event::Whitespace(Span::append(self.backing, &whitespace)?));
             events.push(Event::Comment(parse::Comment {
                 tag: b'#',
-                text: Span::append(self.backing, &c)?,
+                text: Span::append(self.backing, &text)?,
             }));
         }
         if self.implicit_newline {
@@ -185,7 +216,7 @@ impl SectionMut<'_> {
     ) -> Result<Option<BString>, parse::span::Error> {
         match self.section.body.key_and_value_range_by_in(self.backing, &value_name) {
             None => {
-                self.push_with_comment_inner(value_name, Some(value), None)?;
+                self.push_with_comment_inner(value_name, Some(value), None, false)?;
                 Ok(None)
             }
             Some((key_range, value_range)) => {

@@ -148,6 +148,11 @@ enum Order {
     Topo,
     /// `--date-order`: no parent before all its children, otherwise by date.
     DateTopo,
+    /// `--author-date-order`: the same walk, breaking ties by *author* date
+    /// (`REV_SORT_BY_AUTHOR_DATE`, revision.c:2456-2458). The commit date a walk
+    /// normally orders by is the one a rebase or an amend rewrites; the author
+    /// date survives both.
+    AuthorDateTopo,
 }
 
 /// Where one argument in the scanned vector came from.
@@ -426,6 +431,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut left_only = false;
     let mut right_only = false;
     let mut ancestry_path = false;
+    // `revs->ancestry_path_bottoms` as `--ancestry-path=<commit>` fills it.
+    let mut ancestry_bottoms: Vec<ObjectId> = Vec::new();
     let mut simplify_by_decoration = false;
     let mut bisect = false;
     let mut quiet = false;
@@ -632,6 +639,38 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 max_parents = Some(1);
             }
             "--ancestry-path" => ancestry_path = true,
+            // ```c
+            // } else if (skip_prefix(arg, "--ancestry-path=", &optarg)) {
+            //         revs->ancestry_path = 1;
+            //         revs->simplify_history = 0;
+            //         revs->limited = 1;
+            //
+            //         if (repo_get_oid_committish(revs->repo, optarg, &oid))
+            //                 return error(msg, optarg);
+            //         …
+            //         commit_list_insert(c, &revs->ancestry_path_bottoms);
+            // ```
+            //
+            // (`revision.c:2411-2426`.) The named commits *replace* the bottoms
+            // the range would have supplied — `ancestry_path_implicit_bottoms`
+            // stays 0 — and they accumulate, so several may be given.
+            s if s.starts_with("--ancestry-path=") => {
+                let spec = &s["--ancestry-path=".len()..];
+                ancestry_path = true;
+                match repo.rev_parse_single(spec.as_bytes()) {
+                    Ok(id) => ancestry_bottoms.push(id.detach()),
+                    Err(_) => {
+                        // `handle_revision_opt()` returns `error()`, and
+                        // `setup_revisions()` turns a negative return into
+                        // `exit(128)` rather than the 129 a parse-options failure
+                        // would give.
+                        eprintln!(
+                            "error: could not get commit for --ancestry-path argument {spec}"
+                        );
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
             // `--simplify-by-decoration`: `simplify_commit()` keeps a decorated commit,
             // and — since simplification may not change the shape of the history — a
             // root or a merge; everything else is walked past.
@@ -690,6 +729,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--single-worktree" => {}
             "--topo-order" => order = Order::Topo,
             "--date-order" => order = Order::DateTopo,
+            "--author-date-order" => order = Order::AuthorDateTopo,
             "--merges" => min_parents = 2,
             "--no-merges" => max_parents = Some(1),
             "--no-min-parents" => min_parents = 0,
@@ -1264,7 +1304,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     // `--ancestry-path`: keep only the commits that descend from an excluded tip.
     if ancestry_path {
-        let bottoms: Vec<ObjectId> = seeds.iter().filter(|s| s.bottom).map(|s| s.id).collect();
+        // `collect_bottom_commits()` runs only for the argument-less spelling
+        // (`ancestry_path_implicit_bottoms`, revision.c:1448-1453), so a
+        // `--ancestry-path=<commit>` needs no range to have excluded anything.
+        let bottoms: Vec<ObjectId> = match ancestry_bottoms.is_empty() {
+            false => ancestry_bottoms.clone(),
+            true => seeds.iter().filter(|s| s.bottom).map(|s| s.id).collect(),
+        };
         if bottoms.is_empty() {
             return Ok(fatal(
                 "--ancestry-path given but there are no bottom commits",
@@ -1336,12 +1382,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         if let Some(abort) = abort {
             return Ok(abort.die_setup());
         }
-        let dates: Option<HashMap<ObjectId, i64>> = (order == Order::DateTopo).then(|| {
-            commits
-                .iter()
-                .map(|id| (*id, commit_date(&repo, *id)))
-                .collect()
-        });
+        // `record_author_date()` (commit.c:866-891) reads the `author` header of
+        // every listed commit up front; one without a parsable date keeps the
+        // slab's zero and so sorts as the epoch rather than being dropped.
+        let dates: Option<HashMap<ObjectId, i64>> = match order {
+            Order::DateTopo => Some(commits.iter().map(|id| (*id, commit_date(&repo, *id))).collect()),
+            Order::AuthorDateTopo => {
+                Some(commits.iter().map(|id| (*id, author_date(&repo, *id))).collect())
+            }
+            Order::Date | Order::Topo => None,
+        };
         commits = topo_sort(&commits, &parents_of, dates.as_ref());
     }
 
@@ -2584,6 +2634,16 @@ pub(crate) fn commit_date(repo: &gix::Repository, id: ObjectId) -> i64 {
         return 0;
     }
     object.into_commit().time().map(|t| t.seconds).unwrap_or(0)
+}
+
+/// `record_author_date()`: the `author` header's timestamp, or 0 when the commit
+/// has no author line or its date does not parse.
+fn author_date(repo: &gix::Repository, id: ObjectId) -> i64 {
+    let author = || -> Option<i64> {
+        let commit = repo.find_object(id).ok()?.try_into_commit().ok()?;
+        Some(commit.author().ok()?.time().ok()?.seconds)
+    };
+    author().unwrap_or(0)
 }
 
 /// The commit's parent ids, empty when the object cannot be read.

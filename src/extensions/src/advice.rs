@@ -120,6 +120,9 @@ pub enum Advice {
     /// because an explicit `<commit-ish>` that does not resolve is a typo, not a
     /// missing `--orphan`.
     WorktreeAddOrphan,
+    /// `checkout` detached `HEAD` without being asked to (`opts->force_detach` unset), so it
+    /// explains what a detached `HEAD` is (builtin/checkout.c, `ADVICE_DETACHED_HEAD`).
+    DetachedHead,
 }
 
 impl Advice {
@@ -164,6 +167,7 @@ impl Advice {
             Advice::SkippedCherryPicks => "advice.skippedCherryPicks",
             Advice::FetchShowForcedUpdates => "advice.fetchShowForcedUpdates",
             Advice::WorktreeAddOrphan => "advice.worktreeAddOrphan",
+            Advice::DetachedHead => "advice.detachedHead",
         }
     }
 

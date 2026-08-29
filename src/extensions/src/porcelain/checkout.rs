@@ -241,6 +241,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut quiet = false;
     // `-f`/`--force` → git's `opts->discard_changes`.
     let mut force = false;
+    // `opts->ignore_skipworktree` (builtin/checkout.c:1821).
+    let mut ignore_skipworktree = false;
     // `-t`/`--track` vs `--no-track`; `None` leaves the decision to
     // `branch.autoSetupMerge`, which is how `checkout -b x origin/x` gets its upstream.
     let mut track: Option<bool> = None;
@@ -441,7 +443,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--progress" | "--no-progress" => {}
             "--overwrite-ignore" | "--no-overwrite-ignore" => {}
             "--ignore-other-worktrees" | "--no-ignore-other-worktrees" => {}
-            "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
+            "--ignore-skip-worktree-bits" => ignore_skipworktree = true,
+            "--no-ignore-skip-worktree-bits" => ignore_skipworktree = false,
             "-p" | "--patch" => patch_mode = true,
             "--no-patch" => patch_mode = false,
             "--recurse-submodules" => recurse_submodules = Some(true),
@@ -756,7 +759,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // `<tree-ish>` source; anything else is git's incompatibility error.
     if let Some(file) = pathspec_from_file {
         if has_dashdash || !post.is_empty() {
-            crate::git_fatal!("--pathspec-from-file is incompatible with pathspec arguments");
+            crate::git_fatal!("'--pathspec-from-file' and pathspec arguments cannot be used together");
         }
         if new_branch.is_some() || orphan.is_some() || writeout_stage.is_some() {
             crate::git_fatal!("--pathspec-from-file cannot be combined with branch creation or --ours/--theirs");
@@ -764,7 +767,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         let specs = super::commit::read_pathspec_file(&file, pathspec_file_nul)?;
         let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
         return match pre.len() {
-            0 => restore_from_index(&repo, &refs, false, quiet, merge_opt(merge, &conflict_style, ""), force),
+            0 => restore_from_index(&repo, &refs, false, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree),
             // `--pathspec-from-file` rejects a `--` above, so this is the bare
             // form: stock reports `Updated N paths from <tree>` here.
             1 => restore_from_tree(&repo, pre[0], &refs, overlay, true, quiet),
@@ -873,10 +876,17 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     if has_dashdash {
         if post.is_empty() {
-            crate::git_fatal!("you must specify path(s) to restore");
+            // `opts.empty_pathspec_ok = 1` for `checkout` and `0` for `restore`
+            // (builtin/checkout.c:2118, :2202): `git checkout --` is not an error, it is the
+            // no-argument `git checkout` — the local-changes listing, exit 0. Only `restore`
+            // dies with `you must specify path(s) to restore`. A `<tree-ish> --` with nothing
+            // after it is the same: the pathspec is empty, so `checkout_paths()` writes nothing
+            // and the run ends in the same listing (verified against stock for both spellings).
+            let code = checkout_head_in_place(&repo, quiet, force)?;
+            return Ok(code);
         }
         return match pre.len() {
-            0 => restore_from_index(&repo, &post, false, quiet, merge_opt(merge, &conflict_style, ""), force),
+            0 => restore_from_index(&repo, &post, false, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree),
             // Reached only under `has_dashdash`, and stock stays silent for the
             // `--` form even though it updates the same paths.
             1 => restore_from_tree(&repo, pre[0], &post, overlay, false, quiet),
@@ -1025,7 +1035,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             }
         }
         // Not a ref/rev — treat as a path restore from the index (bare form).
-        return restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force);
+        return restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree);
     }
 
     // Multiple positionals, no `--`: if the first resolves to a tree-ish it is the
@@ -1033,7 +1043,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     if crate::objname::resolve_quiet(&repo, pre[0]).is_some() {
         return restore_from_tree(&repo, pre[0], &pre[1..], overlay, true, quiet);
     }
-    restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force)
+    restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree)
 }
 
 /// What an object name means to the checkout family once it has been resolved
@@ -1215,6 +1225,14 @@ pub(crate) fn switch_to_branch_opts(
     reflog_message: Option<&str>,
     merge: Option<MergeOpt<'_>>,
 ) -> Result<ExitCode> {
+    // `merge_working_tree()` runs for every switch, the no-op one included, and its first act is
+    // to refuse an unmerged index.
+    if !force {
+        if let Some(code) = refuse_unmerged_index(repo)? {
+            return Ok(code);
+        }
+    }
+
     // Already on it → the branch `HEAD` points at does not change, but git still
     // goes through `refs_update_symref("HEAD", ...)`, so the move is reflogged
     // ("checkout: moving from main to main") before "Already on 'x'" is printed.
@@ -1382,9 +1400,9 @@ fn detached_checkout(
                 let (abbrev, summary) = describe(repo, old)?;
                 eprintln!("Previous HEAD position was {abbrev} {summary}");
             }
-        } else if !force_detach
-            && repo.config_snapshot().boolean("advice.detachedHead") != Some(false)
-        {
+        // Through the advice machinery rather than the config key alone, so `--no-advice`
+        // (`GIT_ADVICE=0`) silences this block the way it silences every other hint.
+        } else if !force_detach && crate::advice::Advice::DetachedHead.enabled_in(repo) {
             // Leaving an attached HEAD without an explicit --detach: git warns.
             print_detached_head_advice(spec);
         }
@@ -1566,7 +1584,14 @@ fn create_and_switch(
         repo,
         branch_full,
         &format!("checkout: moving from {old_label} to {name}"),
-        old_id,
+        // `update_refs_for_switch()` logs `HEAD` *after* `create_branch()` has moved the ref, and
+        // the entry's old value is whatever `HEAD` resolves to then. Resetting the branch `HEAD`
+        // is already on (`-B <current>`) therefore records `<new> <new>`, not the tip the branch
+        // just left — the branch's own log is where that move is written.
+        match already_on {
+            true => Some(start_id),
+            false => old_id,
+        },
         Some(start_id),
     )?;
 
@@ -2108,11 +2133,29 @@ fn restore_from_index(
     // `opts->force`: the unmerged refusal becomes a warning, and the path is
     // then left alone (`checkout_paths()` has no branch that writes it).
     force: bool,
+    // `opts->ignore_skipworktree`: let the pathspec reach the entries the sparse-checkout
+    // definition keeps out of the worktree, and write them out.
+    ignore_skipworktree: bool,
 ) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let mut index = repo.open_index()?;
-    let matched = match match_paths(&index, paths) {
+    // `mark_ce_for_checkout_*()` (builtin/checkout.c:392, :426) skips a skip-worktree entry
+    // before it ever consults the pathspec, so naming one is `did not match any file(s) known to
+    // git` — unless `--ignore-skip-worktree-bits` says otherwise.
+    let sparse: HashSet<BString> = match ignore_skipworktree {
+        true => HashSet::new(),
+        false => {
+            let backing = index.path_backing();
+            index
+                .entries()
+                .iter()
+                .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+                .map(|e| e.path_in(backing).to_owned())
+                .collect()
+        }
+    };
+    let matched = match match_paths_excluding(&index, paths, &sparse) {
         Ok(m) => m,
         Err(spec) => {
             eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
@@ -2185,6 +2228,11 @@ fn restore_from_index(
     });
     for e in subset.entries_mut() {
         e.flags.remove(Flags::STAGE_MASK);
+        // `--ignore-skip-worktree-bits` checks the path out for real, so the entry stops being a
+        // sparse one: stock leaves it `H` in `ls-files -v`, with the file on disk.
+        if ignore_skipworktree {
+            e.flags.remove(Flags::SKIP_WORKTREE);
+        }
     }
     {
         let backing = subset.path_backing().to_owned();
@@ -2212,6 +2260,9 @@ fn restore_from_index(
         if let Ok(idx) = index.entry_index_by_path(BStr::new(path)) {
             if let Some((id, mode, stat)) = fresh.get(path) {
                 let e = &mut index.entries_mut()[idx];
+                if ignore_skipworktree {
+                    e.flags.remove(Flags::SKIP_WORKTREE);
+                }
                 if e.id != *id || e.mode != *mode {
                     stale.push(path.clone());
                 }
@@ -2343,6 +2394,14 @@ fn restore_from_tree(
     let fresh = stats_by_path(&subset);
     let mut index = repo.open_index()?;
     let mut pushed = false;
+    // `add_index_entry()` replaces *every* stage of the path it writes (`ADD_CACHE_OK_TO_REPLACE`,
+    // builtin/checkout.c:231), so `git checkout HEAD -- <conflicted>` resolves the conflict: the
+    // stage 1/2/3 entries go and a stage-0 entry from the tree takes their place. Dropping them
+    // here is what leaves the index merged instead of still `AA`.
+    let matched_set: HashSet<BString> = matched.iter().cloned().collect();
+    index.remove_entries(|_, path, entry| {
+        entry.stage() != gix::index::entry::Stage::Unconflicted && matched_set.contains(&path.to_owned())
+    });
     // `update_some()` (builtin/checkout.c:219-229) replaces an entry only when its mode or id
     // differs, and `add_index_entry()` invalidates the cache-tree along that path; an entry the
     // tree already agrees with is left in place and invalidates nothing.
@@ -2476,6 +2535,36 @@ pub(super) enum Gate {
 /// and why the run still exits 0. Only the *tracked* refusals are stashable: an
 /// untracked file standing where the target tree has one is not a local change
 /// git can carry, so `-m` does not apply and the refusal stands.
+/// `merge_working_tree()`'s first gate (builtin/checkout.c:883-889): the index is refreshed —
+/// which is where `<path>: needs merge` comes from, on stdout, one line per unmerged path — and a
+/// switch over an unmerged index is then refused with
+/// `error: you need to resolve your current index first`, exit 1.
+///
+/// `--discard-changes`/`-f` takes `reset_tree()` instead and never reaches this, which is why a
+/// forced switch out of a conflicted state works.
+pub(super) fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
+    let index = repo.index_or_load_from_head_or_empty()?;
+    let backing = index.path_backing();
+    let mut unmerged: Vec<BString> = Vec::new();
+    for entry in index.entries() {
+        if entry.stage() == gix::index::entry::Stage::Unconflicted {
+            continue;
+        }
+        let path = entry.path_in(backing).to_owned();
+        if unmerged.last() != Some(&path) {
+            unmerged.push(path);
+        }
+    }
+    if unmerged.is_empty() {
+        return Ok(None);
+    }
+    for path in &unmerged {
+        println!("{path}: needs merge");
+    }
+    eprintln!("error: you need to resolve your current index first");
+    Ok(Some(ExitCode::from(1)))
+}
+
 pub(super) fn switch_gate(
     repo: &gix::Repository,
     cur_tree: ObjectId,
@@ -3201,7 +3290,17 @@ fn match_paths<'a>(
     index: &gix::index::File,
     specs: &[&'a str],
 ) -> std::result::Result<Vec<BString>, &'a str> {
-    let (matched, hit) = matches_in(index, specs);
+    match_paths_excluding(index, specs, &HashSet::new())
+}
+
+/// [`match_paths`] with the entries in `exclude` taken out of the index first — the sparse
+/// entries `PS_IGNORE_SKIP_WORKTREE` hides from a pathspec.
+fn match_paths_excluding<'a>(
+    index: &gix::index::File,
+    specs: &[&'a str],
+    exclude: &HashSet<BString>,
+) -> std::result::Result<Vec<BString>, &'a str> {
+    let (matched, hit) = matches_in_excluding(index, specs, exclude);
     match hit.iter().position(|h| !h) {
         Some(si) => Err(specs[si]),
         None => Ok(matched),
@@ -3213,6 +3312,15 @@ fn match_paths<'a>(
 /// consider several indexes (e.g. no-overlay's tree ∪ index) can decide the
 /// "did not match" error against their own union.
 fn matches_in(index: &gix::index::File, specs: &[&str]) -> (Vec<BString>, Vec<bool>) {
+    matches_in_excluding(index, specs, &HashSet::new())
+}
+
+/// [`matches_in`] over the entries that are not in `exclude`.
+fn matches_in_excluding(
+    index: &gix::index::File,
+    specs: &[&str],
+    exclude: &HashSet<BString>,
+) -> (Vec<BString>, Vec<bool>) {
     let mut matched: Vec<BString> = Vec::new();
     let mut seen: HashSet<BString> = HashSet::new();
     let mut hit = vec![false; specs.len()];
@@ -3222,7 +3330,16 @@ fn matches_in(index: &gix::index::File, specs: &[&str]) -> (Vec<BString>, Vec<bo
 
     let backing = index.path_backing();
     for e in index.entries() {
+        // `PS_IGNORE_SKIP_WORKTREE`: `mark_ce_for_checkout_*()` (builtin/checkout.c:392, :426)
+        // returns before matching for an entry the sparse-checkout definition keeps out of the
+        // worktree, so such a path cannot satisfy a pathspec — naming one is git's
+        // `did not match any file(s) known to git`, not a checkout of a file that should not be
+        // there. `--ignore-skip-worktree-bits` is the caller's way past that, and it filters the
+        // index before calling here.
         let path = e.path_in(backing);
+        if !exclude.is_empty() && exclude.contains(&path.to_owned()) {
+            continue;
+        }
         let bytes: &[u8] = path.as_ref();
         for (si, spec) in norm.iter().enumerate() {
             if spec_matches(bytes, spec) {

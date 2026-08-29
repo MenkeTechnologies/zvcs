@@ -7446,16 +7446,17 @@ fn check_format(fmt: &str) -> Result<()> {
                 'H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'b' | 'B' | 'f' | 'n' | '%' | 'C' | 'd'
                 | 'D' | 'N',
             ) => {}
-            Some('a') => match it.next() {
-                // `%aN`/`%aE` are the mailmap-resolved name and address, which
-                // `format_person_part()` maps whether or not `--use-mailmap` is on.
-                Some('n' | 'e' | 'N' | 'E' | 'd' | 'i' | 'I' | 't' | 'r') => {}
+            // `format_person_part()` (pretty.c:788-867) in full: `n`/`N` the name,
+            // `e`/`E` the address, `l`/`L` its local part, `t` the raw timestamp
+            // and `d`/`D`/`r`/`i`/`I`/`h`/`s` the seven dates. The capitalized
+            // three are the mailmap-resolved forms, which the function looks up
+            // whether or not `--use-mailmap` is on.
+            Some('a' | 'c') => match it.next() {
+                Some(
+                    'n' | 'N' | 'e' | 'E' | 'l' | 'L' | 't' | 'd' | 'D' | 'r' | 'i' | 'I' | 'h'
+                    | 's',
+                ) => {}
                 Some(x) => anyhow::bail!("unsupported format placeholder %a{x}"),
-                None => anyhow::bail!("unsupported trailing % in format"),
-            },
-            Some('c') => match it.next() {
-                Some('n' | 'e' | 'N' | 'E' | 'd' | 'i' | 'I' | 't' | 'r') => {}
-                Some(x) => anyhow::bail!("unsupported format placeholder %c{x}"),
                 None => anyhow::bail!("unsupported trailing % in format"),
             },
             // Reflog placeholders, all empty outside a `--walk-reflogs` walk:
@@ -7482,6 +7483,10 @@ fn check_format(fmt: &str) -> Result<()> {
                 Some(x) => anyhow::bail!("unsupported format placeholder %G{x}"),
                 None => anyhow::bail!("unsupported trailing % in format"),
             },
+            // `%e` is the commit's `encoding` header, empty when there is none —
+            // which is every commit git itself writes, since it re-encodes to
+            // UTF-8 and drops the header.
+            Some('e') => {}
             // `%xNN` is always accepted: two hex digits emit that byte, and
             // anything else prints literally rather than failing, so there is
             // nothing here to reject.
@@ -7496,8 +7501,17 @@ fn check_format(fmt: &str) -> Result<()> {
             // not a placeholder at all, and git prints it literally rather than
             // failing (see [`pretty_pad`]).
             Some('<' | '>' | 'w') => {}
-            Some(x) => anyhow::bail!("unsupported format placeholder %{x}"),
-            None => anyhow::bail!("unsupported trailing % in format"),
+            // The two `format_commit_one()` cases this port does not answer:
+            // `%m` is `rev->left_right`'s marker and `%S` the `--source` ref, both
+            // of which are walk state a bare format string cannot see from here.
+            // They are git's placeholders, so expanding them literally would print
+            // something plausible and wrong; they stay refused.
+            Some(x @ ('m' | 'S')) => anyhow::bail!("unsupported format placeholder %{x}"),
+            // Anything else is not a placeholder git knows either.
+            // `format_commit_item()` returns 0 for it and the driver prints the `%`
+            // and rescans from the character after it — so `%zz` is `%zz` and a
+            // format ending in `%` ends in `%`.
+            Some(_) | None => {}
         }
     }
     Ok(())
@@ -7807,6 +7821,21 @@ fn expand_one(
             )?);
         }
         'f' => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
+        // ```c
+        // case 'e':	/* encoding */
+        //         if (c->commit_encoding)
+        //                 strbuf_addstr(sb, c->commit_encoding);
+        //         return 1;
+        // ```
+        //
+        // (`pretty.c:1747-1751`.) The `encoding` header verbatim, and nothing at
+        // all for a commit without one — which is every commit git writes itself,
+        // since it re-encodes the message to UTF-8 and drops the header.
+        'e' => {
+            if let Some(encoding) = commit.decode()?.encoding {
+                out.extend_from_slice(encoding);
+            }
+        }
         'n' => out.push(b'\n'),
         // `%xNN`: the byte with that hex code, which is how a format asks for
         // a literal tab, NUL or any byte the shell would eat. Two hex digits
@@ -7828,36 +7857,12 @@ fn expand_one(
         // / `--decorate=full` switches them to full ref names.
         'd' => expand_decoration(out, commit, ctx, *auto, true, ctx.decorate == DecorateStyle::Full),
         'D' => expand_decoration(out, commit, ctx, *auto, false, ctx.decorate == DecorateStyle::Full),
-        'a' => {
-            let author = commit.author()?;
-            match chars.get(*i).copied() {
-                Some('n') => out.extend_from_slice(author.name),
-                Some('e') => out.extend_from_slice(author.email),
-                Some('N') => out.extend_from_slice(mapped_name(&author, ctx.identity_mailmap)),
-                Some('E') => out.extend_from_slice(mapped_email(&author, ctx.identity_mailmap)),
-                Some('d') => expand_date(out, &author, date_mode, ctx.now)?,
-                Some('i') => expand_date(out, &author, DateMode::Iso, ctx.now)?,
-                Some('I') => expand_date(out, &author, DateMode::IsoStrict, ctx.now)?,
-                Some('r') => expand_date(out, &author, DateMode::Relative, ctx.now)?,
-                Some('t') => write!(out, "{}", author.time()?.seconds)?,
-                _ => unreachable!("check_format rejected this already"),
-            }
-            *i += 1;
-        }
-        'c' => {
-            let committer = commit.committer()?;
-            match chars.get(*i).copied() {
-                Some('n') => out.extend_from_slice(committer.name),
-                Some('e') => out.extend_from_slice(committer.email),
-                Some('N') => out.extend_from_slice(mapped_name(&committer, ctx.identity_mailmap)),
-                Some('E') => out.extend_from_slice(mapped_email(&committer, ctx.identity_mailmap)),
-                Some('d') => expand_date(out, &committer, date_mode, ctx.now)?,
-                Some('i') => expand_date(out, &committer, DateMode::Iso, ctx.now)?,
-                Some('I') => expand_date(out, &committer, DateMode::IsoStrict, ctx.now)?,
-                Some('r') => expand_date(out, &committer, DateMode::Relative, ctx.now)?,
-                Some('t') => write!(out, "{}", committer.time()?.seconds)?,
-                _ => unreachable!("check_format rejected this already"),
-            }
+        'a' | 'c' => {
+            let who = match p {
+                'a' => commit.author()?,
+                _ => commit.committer()?,
+            };
+            expand_person(out, &who, chars.get(*i).copied(), date_mode, ctx)?;
             *i += 1;
         }
         // The reflog placeholders. `format_reflog_person()` and the selector both
@@ -7925,12 +7930,10 @@ fn expand_one(
         // (pretty.c:1799), which breaks the chain without printing a bare `%`,
         // and the driver rescans from this `%`.
         '%' => return Ok(false),
-        // That rescan realigns the format by one byte, so the placeholders after
-        // it are not the ones [`check_format`] validated — `%<(20)%Cred%%|` walks
-        // in here with `%|`, which the pair reading made literal text. Report it
-        // the way `check_format` would rather than treat an unvalidated character
-        // as impossible.
-        _ => anyhow::bail!("unsupported format placeholder %{p}"),
+        // Not a placeholder at all: `format_commit_item()` falls off the end of
+        // its switch and returns 0, which makes the driver print the `%` and
+        // rescan from here.
+        _ => return Ok(false),
     }
     Ok(true)
 }
@@ -8907,6 +8910,53 @@ pub(crate) fn fmt_time(seconds: i64, offset: i32, mode: DateMode, now: i64) -> S
         DateMode::Relative => format_relative(seconds, now),
         other => format_date(seconds, offset, other),
     }
+}
+
+/// `format_person_part()` (pretty.c:788-867) for one identity and one part
+/// letter.
+///
+/// The mailmap is consulted for `N`/`E`/`L` alone (:806-807), so `%an` and `%aN`
+/// can disagree; the local part is everything before the first `@` of whichever
+/// address that left (:816-822); and `%at` prints the recorded seconds
+/// unformatted while the seven date letters each pin their own mode.
+fn expand_person(
+    out: &mut Vec<u8>,
+    who: &gix::actor::SignatureRef<'_>,
+    part: Option<char>,
+    date_mode: DateMode,
+    ctx: &RenderCtx<'_>,
+) -> Result<()> {
+    let local_part = |mail: &[u8]| -> Vec<u8> {
+        match mail.iter().position(|b| *b == b'@') {
+            Some(at) => mail[..at].to_vec(),
+            None => mail.to_vec(),
+        }
+    };
+    match part {
+        Some('n') => out.extend_from_slice(who.name),
+        Some('e') => out.extend_from_slice(who.email),
+        Some('N') => out.extend_from_slice(mapped_name(who, ctx.identity_mailmap)),
+        Some('E') => out.extend_from_slice(mapped_email(who, ctx.identity_mailmap)),
+        Some('l') => out.extend_from_slice(&local_part(who.email)),
+        Some('L') => {
+            out.extend_from_slice(&local_part(mapped_email(who, ctx.identity_mailmap)))
+        }
+        Some('d') => expand_date(out, who, date_mode, ctx.now)?,
+        Some('D') => expand_date(out, who, DateMode::Rfc, ctx.now)?,
+        Some('i') => expand_date(out, who, DateMode::Iso, ctx.now)?,
+        Some('I') => expand_date(out, who, DateMode::IsoStrict, ctx.now)?,
+        Some('r') => expand_date(out, who, DateMode::Relative, ctx.now)?,
+        Some('s') => expand_date(out, who, DateMode::Short, ctx.now)?,
+        Some('h') => expand_date(
+            out,
+            who,
+            DateMode::Show(crate::showdate::DateMode::new(crate::showdate::DateType::Human)),
+            ctx.now,
+        )?,
+        Some('t') => write!(out, "{}", who.time()?.seconds)?,
+        _ => unreachable!("check_format rejected this already"),
+    }
+    Ok(())
 }
 
 /// git's `%b`: the message body — everything after the blank line that ends the

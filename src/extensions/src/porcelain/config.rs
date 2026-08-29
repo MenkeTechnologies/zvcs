@@ -281,6 +281,11 @@ enum Scope {
     /// (builtin/config.c:820-821) refuses to write one, and `show_editor()`
     /// (:1299-1300) refuses to edit one.
     Blob(String),
+    /// `--worktree`: `$GIT_DIR/config.worktree` when `extensions.worktreeConfig`
+    /// is on, and the repository's own `config` when it is not — see
+    /// [`worktree_config_file`], which is `location_options_init()`'s arm for it
+    /// (builtin/config.c:975-991).
+    Worktree,
 }
 
 /// A resolved write destination: the file to rewrite, its config `Source` (so a
@@ -499,7 +504,8 @@ fn scope_word(source: Source) -> &'static str {
     match source {
         Source::System => "system",
         Source::Git | Source::User => "global",
-        Source::Local | Source::Worktree => "local",
+        Source::Local => "local",
+        Source::Worktree => "worktree",
         Source::Cli => "command",
         Source::Env | Source::EnvOverride => "command",
         _ => "unknown",
@@ -550,19 +556,26 @@ pub(super) fn errno_text(err: &std::io::Error) -> String {
 ///     unless only the XDG file exists, created if absent. Never needs a repo.
 ///   * `--system` → `$(prefix)/etc/gitconfig` (honoring `GIT_CONFIG_SYSTEM` /
 ///     `GIT_CONFIG_NOSYSTEM`). Never needs a repo.
+///   * `--worktree` → `$GIT_DIR/config.worktree` when `extensions.worktreeConfig`
+///     is on, else the repository's own `config` — and with the extension off and
+///     more than one working tree, the three-line refusal that names the
+///     extension. See [`worktree_config_file`].
 ///   * `-f <path>` / `--file <path>` → exactly that file, `include.path`
-///     directives NOT followed (git only honors them here under `--includes`,
-///     which is not implemented). Never needs a repo; created on write, but its
-///     parent directory is not — a missing one is git's
+///     directives followed only under `--includes` (every other scope follows
+///     them unless `--no-includes` says otherwise). Never needs a repo; created
+///     on write, but its parent directory is not — a missing one is git's
 ///     `could not lock config file <path>: <errno>` at exit 255. Reading a
 ///     missing file is exit 1 for the get forms and
 ///     `fatal: unable to read config file '<path>': <errno>` at exit 128 for
-///     `--list`, exactly as git splits those two paths.
+///     `--list`, exactly as git splits those two paths. One that will not parse
+///     is `bad config line <n> in file <path>` before the action runs, a write
+///     included.
+///   * `--blob <rev>` → configuration read out of an object, never written; see
+///     [`blob_config`].
 /// ```
 /// The default (no scope) write still targets the repository-local file and so
 /// still needs a repo — attempting one without one fails with `not in a git
-/// directory`. `--worktree` is rejected with a precise error rather than
-/// silently mistargeted. Two *different* scope flags at once → `only one config
+/// directory`. Two *different* scope flags at once → `only one config
 /// file at a time`; a repeated `--file` just replaces the path, as git's
 /// `given_config_source.file` does.
 ///
@@ -1037,6 +1050,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // moment it is parsed.
         let new_scope = match a {
             "--local" => Some(Scope::Local),
+            "--worktree" => Some(Scope::Worktree),
             "--global" => Some(Scope::Global),
             "--system" => Some(Scope::System),
             _ => None,
@@ -1172,10 +1186,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             // `--no-<location>` clears the corresponding `use_*_config` int (or
             // NULLs the `--file`/`--blob` string), which is exactly "unpin the
             // file again": back to git's implicit merged read.
-            "--no-global" | "--no-local" | "--no-system" | "--no-file" => {
+            "--no-global" | "--no-local" | "--no-system" | "--no-file" | "--no-worktree" => {
                 scope = Scope::Default;
             }
-            "--no-worktree" => {}
             "--no-blob" => {
                 if matches!(scope, Scope::Blob(_)) {
                     scope = Scope::Default;
@@ -1201,11 +1214,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 comment = Some(v.clone());
             }
             _ if a.starts_with("--comment=") => comment = Some(a["--comment=".len()..].to_string()),
-            "--worktree" => bail!(
-                "--worktree scope is not supported: it reads and writes \
-                 $GIT_COMMON_DIR/worktrees/<id>/config.worktree behind the \
-                 `extensions.worktreeConfig` gate, a config source this port does not open"
-            ),
+
             other if other.starts_with('-') => return reject(other),
             // Unreachable: a token that does not start with `-` ended option
             // parsing above. Push the argument as typed, never the respelling.
@@ -1385,6 +1394,20 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 .ok_or_else(|| anyhow::anyhow!("--local can only be used inside a git repository"))?;
             let path = repo.common_dir().join("config");
             scoped = load_or_empty(&path, Source::Local)?;
+            &scoped
+        }
+        // `opts->source.scope = CONFIG_SCOPE_LOCAL` for this one too
+        // (builtin/config.c:990), so `--show-scope` says `local` here even when
+        // the file it picked is `config.worktree` — which the *merged* read
+        // reports as `worktree`, because there it is the sequence that assigns
+        // the scope rather than this option.
+        Scope::Worktree => {
+            let repo = repo.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--worktree can only be used inside a git repository")
+            })?;
+            scope_file = worktree_config_file(repo)?;
+            source_file = Some(&scope_file);
+            scoped = load_or_empty(&scope_file, Source::Local)?;
             &scoped
         }
         // `location_options_init()` (builtin/config.c:959-972): a scope flag does
@@ -3290,6 +3313,43 @@ fn blob_config(repo: &gix::Repository, spec: &str) -> std::result::Result<Config
     .map_err(|_| ())
 }
 
+/// The file `--worktree` names:
+///
+/// ```c
+/// struct worktree **worktrees = get_worktrees();
+/// if (the_repository->repository_format_worktree_config)
+///         opts->source.file = opts->file_to_free =
+///                 repo_git_path(the_repository, "config.worktree");
+/// else if (worktrees[0] && worktrees[1])
+///         die(_("--worktree cannot be used with multiple working trees unless the config\n"
+///               "extension worktreeConfig is enabled. Please read \"CONFIGURATION FILE\"\n"
+///               "section in \"git help worktree\" for details"));
+/// else
+///         opts->source.file = opts->file_to_free =
+///                 repo_git_path(the_repository, "config");
+/// ```
+///
+/// (`builtin/config.c:975-991`.) `config.worktree` is per-worktree, so it is
+/// `$GIT_DIR/config.worktree`; `config` is a common file, which `adjust_git_path()`
+/// sends to `$GIT_COMMON_DIR` — the same file `--local` writes. Without the
+/// extension the option is therefore only meaningful while there is exactly one
+/// working tree, and `get_worktrees()` always lists the main one first, so a
+/// single linked worktree already makes two.
+fn worktree_config_file(repo: &gix::Repository) -> Result<std::path::PathBuf> {
+    if repo.config_snapshot().boolean("extensions.worktreeConfig").unwrap_or(false) {
+        return Ok(repo.git_dir().join("config.worktree"));
+    }
+    if !repo.worktrees().map(|w| w.is_empty()).unwrap_or(true) {
+        let message = concat!(
+            "--worktree cannot be used with multiple working trees unless the config\n",
+            "extension worktreeConfig is enabled. Please read \"CONFIGURATION FILE\"\n",
+            "section in \"git help worktree\" for details",
+        );
+        return Err(crate::fatal::Fatal(message.to_owned()).into());
+    }
+    Ok(repo.common_dir().join("config"))
+}
+
 /// An empty config file carrying `path`/`source` metadata, so entries written
 /// into it later report the right provenance.
 fn empty_config(path: &std::path::Path, source: Source) -> ConfigFile {
@@ -3474,6 +3534,17 @@ fn resolve_write_target(scope: &Scope, repo: Option<&gix::Repository>) -> Result
                 source: Source::Local,
                 lock_key: repo.git_dir().to_path_buf(),
                 create_parent: true,
+            })
+        }
+        Scope::Worktree => {
+            let repo = repo.ok_or_else(|| {
+                anyhow::anyhow!("--worktree can only be used inside a git repository")
+            })?;
+            Ok(WriteTarget {
+                path: worktree_config_file(repo)?,
+                source: Source::Local,
+                lock_key: repo.git_dir().to_path_buf(),
+                create_parent: false,
             })
         }
         Scope::Global => {

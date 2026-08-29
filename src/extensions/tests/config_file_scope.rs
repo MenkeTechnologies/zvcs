@@ -307,6 +307,73 @@ fn an_unparsable_named_file_is_fatal_before_anything_reads_or_writes_it() {
     );
 }
 
+/// `--worktree` picks `$GIT_DIR/config.worktree` only when
+/// `extensions.worktreeConfig` is on; without it the option means the ordinary
+/// repository config, and only while there is one working tree. Its scope is
+/// `CONFIG_SCOPE_LOCAL` either way, so `--show-scope` says `local` even when the
+/// file it read was `config.worktree` — while the *merged* read of that same
+/// file says `worktree`, because there the sequence assigns the scope.
+#[test]
+fn worktree_scope_follows_the_extension_and_reports_itself_as_local() {
+    let dir = scratch("worktree-scope");
+    assert!(zvcs(&dir, &["init", "-q", "-b", "main"]).status.success(), "init failed");
+    assert!(zvcs(&dir, &["config", "wt.k", "fromlocal"]).status.success(), "set failed");
+    std::fs::write(dir.join(".git").join("config.worktree"), "[wt]\n\tk = fromworktree\n")
+        .expect("write config.worktree");
+
+    // Without the extension the worktree file is not part of the cascade at all.
+    let before = zvcs(&dir, &["config", "--show-scope", "--get-all", "wt.k"]);
+    assert_eq!(stdout_of(&before), "local\tfromlocal\n");
+    let unextended = zvcs(&dir, &["config", "--worktree", "--get", "wt.k"]);
+    assert_eq!(stdout_of(&unextended), "fromlocal\n", "--worktree is the repo config here");
+
+    assert!(
+        zvcs(&dir, &["config", "extensions.worktreeConfig", "true"]).status.success(),
+        "enabling the extension failed"
+    );
+    let after = zvcs(&dir, &["config", "--show-scope", "--get-all", "wt.k"]);
+    assert_eq!(after.status.code(), Some(0));
+    assert_eq!(stdout_of(&after), "local\tfromlocal\nworktree\tfromworktree\n");
+
+    let scoped = zvcs(&dir, &["config", "--worktree", "--show-scope", "--show-origin", "--list"]);
+    assert_eq!(stdout_of(&scoped), "local\tfile:.git/config.worktree\twt.k=fromworktree\n");
+
+    // A write lands in the worktree file, not the repository one.
+    assert!(zvcs(&dir, &["config", "--worktree", "wt.new", "v"]).status.success(), "write failed");
+    let written = std::fs::read_to_string(dir.join(".git").join("config.worktree")).expect("read");
+    assert!(written.contains("new = v"), "{written}");
+    let repo_config = std::fs::read_to_string(dir.join(".git").join("config")).expect("read");
+    assert!(!repo_config.contains("new = v"), "{repo_config}");
+}
+
+/// With the extension off, a second working tree makes `--worktree` ambiguous
+/// and git refuses rather than guess — the message names the extension that
+/// would resolve it.
+#[test]
+fn worktree_scope_refuses_a_second_working_tree_without_the_extension() {
+    let dir = scratch("worktree-multiple");
+    assert!(zvcs(&dir, &["init", "-q", "-b", "main"]).status.success(), "init failed");
+    let commit = Command::new(BIN)
+        .args(["-c", "user.email=a@example.com", "-c", "user.name=n", "commit", "-qm", "x", "--allow-empty"])
+        .current_dir(&dir)
+        .output()
+        .expect("run zvcs git");
+    assert!(commit.status.success(), "commit failed: {}", stderr_of(&commit));
+    let linked = dir.join("linked");
+    let linked = linked.to_str().expect("utf-8 fixture path");
+    let add = zvcs(&dir, &["worktree", "add", "-q", linked]);
+    assert!(add.status.success(), "worktree add failed: {}", stderr_of(&add));
+
+    let out = zvcs(&dir, &["config", "--worktree", "--list"]);
+    assert_eq!(out.status.code(), Some(128));
+    assert_eq!(
+        stderr_of(&out),
+        "fatal: --worktree cannot be used with multiple working trees unless the config\n\
+         extension worktreeConfig is enabled. Please read \"CONFIGURATION FILE\"\n\
+         section in \"git help worktree\" for details\n"
+    );
+}
+
 #[test]
 fn missing_file_is_exit_1_to_read_but_fatal_to_list() {
     let dir = scratch("missing");

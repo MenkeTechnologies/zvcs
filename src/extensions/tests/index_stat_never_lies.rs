@@ -161,9 +161,21 @@ fn reset_keep_leaves_a_new_staged_file_untracked() {
 /// which is what `ce_smudge_racily_clean_entry()` exists for (read-cache.c:2560, called from
 /// `do_write_index()` at :2902).
 ///
-/// Without the smudge the change is invisible for good: the next index write moves the index
-/// timestamp past the entry's mtime, the entry stops looking racy, and its stat goes on matching a
-/// file it no longer describes.
+/// Asserted on `status`/`diff`, NOT on the smudged `size: 0`, because the smudge is one mechanism
+/// and not the invariant. Whether it fires depends on a nanosecond comparison between the index's
+/// timestamp and the entry's recorded mtime (`is_racy_stat`, read-cache.c:1590), and on a
+/// nanosecond-resolution filesystem the two land in the same second with the index a few hundred
+/// microseconds later — so the entry is racy or not depending on scheduling. Measured over 8 runs
+/// of this exact sequence against stock git 2.55.0 on APFS, `ls-files --debug` reported
+/// `size: 0` five times and `size: 10` three times, while `status` reported `AM r.txt` in all
+/// eight. The binary under test matches: 10 runs, `size` split 7/3, `status` and `diff` identical
+/// every time.
+///
+/// An assertion on `size` is therefore a coin flip on this platform — it failed CI at
+/// 4692cc7de3 and reproduced at 10 failures in 20 locally — and it pins an implementation detail
+/// that stock git does not hold to either. The module header already says the invariant is stated
+/// on the RESULT: if the file hashes to something other than the entry, `status` must say so.
+/// That is what is checked here.
 #[test]
 fn a_racily_clean_entry_is_smudged_when_the_index_is_written() {
     let p = repo("racy");
@@ -176,24 +188,20 @@ fn a_racily_clean_entry_is_smudged_when_the_index_is_written() {
     std::fs::write(p.join("t.txt"), "t\n").unwrap();
     git(&p, &["add", "t.txt"]);
 
-    // The recorded size must now be zero for the racy entry: no file can match it, so every later
-    // comparison reads the file.
-    let debug = git(&p, &["ls-files", "--debug", "r.txt"]);
-    let size = debug
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("size: "))
-        .and_then(|s| s.split_whitespace().next())
-        .unwrap_or("<none>")
-        .to_owned();
+    // Staged from the first `add`, modified in the worktree by the rewrite — both halves visible.
+    let status = git(&p, &["status", "--porcelain", "r.txt"]);
     assert_eq!(
-        size, "0",
-        "the racily-clean entry kept its recorded size, so its stat still matches a file it no \
-         longer describes:\n{debug}"
+        status.trim(),
+        "AM r.txt",
+        "a same-second, same-length rewrite is invisible to `status`, which is the whole failure \
+         this file exists to catch"
     );
 
-    let status = git(&p, &["status", "--porcelain", "r.txt"]);
-    assert!(
-        status.contains("r.txt"),
-        "a same-second, same-length rewrite is invisible to `status`"
+    // And the same difference reaches `diff`, so it is not a `status`-only formatting accident.
+    let diff = git(&p, &["diff", "--name-only", "r.txt"]);
+    assert_eq!(
+        diff.trim(),
+        "r.txt",
+        "`status` reported the change but `diff` does not see it"
     );
 }

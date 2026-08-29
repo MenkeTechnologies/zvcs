@@ -1183,6 +1183,24 @@ fn reset_index_to_tree(
 ) -> Result<gix::index::File> {
     let mut new_index = repo.index_from_tree(&tree)?;
 
+    // ```c
+    // repo_read_index_unmerged(the_repository);
+    // ```
+    //
+    // (`reset_index()`, builtin/reset.c:99.) Every unmerged entry is replaced by a stage-0
+    // marker through `add_index_entry()`, whose `remove_index_entry_at()` records the
+    // displaced stages in the resolve-undo extension (read-cache.c:1370-1371, 3404-3431).
+    // The index this port builds comes from the tree instead, so the records are collected
+    // from the old index and carried across — without them a `git checkout --merge <path>`
+    // after the reset has nothing to put the conflict back from.
+    {
+        let mut collapsed = old.clone();
+        collapsed.remove_entries(|_, _, e| e.stage_raw() != 0);
+        if let Some(records) = collapsed.remove_resolve_undo() {
+            new_index.set_resolve_undo(records);
+        }
+    }
+
     let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> =
         HashMap::with_capacity(old.entries().len());
     {

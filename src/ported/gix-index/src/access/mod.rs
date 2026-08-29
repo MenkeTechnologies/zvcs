@@ -683,6 +683,17 @@ impl State {
     pub fn remove_resolve_undo(&mut self) -> Option<extension::resolve_undo::Paths> {
         self.resolve_undo.take()
     }
+    /// Install the resolve-undo extension, replacing whatever was there.
+    ///
+    /// Used where a verb rebuilds its index from a tree rather than mutating the old one —
+    /// `git reset --mixed` is the case that matters — and so never passes through
+    /// `remove_index_entry_at()`, which is where git records the stages
+    /// (`record_resolve_undo()`, read-cache.c:1370-1371). The records are the same either
+    /// way: the unmerged entries that did not survive.
+    pub fn set_resolve_undo(&mut self, paths: extension::resolve_undo::Paths) {
+        self.resolve_undo = (!paths.is_empty()).then_some(paths);
+    }
+
     /// Forget the resolve-undo record for `path`, returning whether there was one.
     ///
     /// git's `unmerge_index_entry()` ends with

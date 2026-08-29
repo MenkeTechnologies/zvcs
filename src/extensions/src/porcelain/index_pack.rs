@@ -3,10 +3,11 @@
 //! Covered, byte-for-byte against stock git on stdout and on the files left
 //! behind:
 //!
-//!   * `git index-pack [-v] [-o <index-file>] [--[no-]rev-index] <pack-file>`
-//!     — indexes a `.pack` already on disk, writes `<pack>.idx` (or the `-o`
-//!     path), writes the matching `.rev` unless `--no-rev-index` /
-//!     `pack.writeReverseIndex=false`, and prints the pack hash plus `\n`.
+//!   * `git index-pack [-v] [-o <index-file>] [--keep[=<msg>]] [--[no-]rev-index]
+//!     <pack-file>` — indexes a `.pack` already on disk, writes `<pack>.idx` (or
+//!     the `-o` path), writes the matching `.rev` unless `--no-rev-index` /
+//!     `pack.writeReverseIndex=false`, drops a `<pack>.keep` under `--keep`, and
+//!     prints the pack hash plus `\n`.
 //!   * `git index-pack --stdin [--fix-thin] [--keep[=<msg>]] [--[no-]rev-index]
 //!     [--max-input-size=<n>] [<pack-file>]` — streams the pack from stdin into
 //!     `objects/pack/pack-<hash>.{pack,idx,rev}` (or into `<pack-file>` when one
@@ -17,7 +18,10 @@
 //!     bytes read from stdin, dying with git's `pack exceeds maximum allowed
 //!     size (<n>)` when exceeded.
 //!   * `git index-pack --verify <pack-file>` — checks an existing `.idx`
-//!     against its pack and exits 0 with no output when they agree.
+//!     against its pack and exits 0 with no output when they agree. A missing
+//!     `.pack` is `Cannot open existing pack file '<idx>'` and a missing or
+//!     unreadable `.idx` is `Cannot open existing pack idx file for '<idx>'`,
+//!     both naming the *index* path, as `read_idx_option()` does.
 //!   * `--threads=<n>` (`0` = auto), `--object-format=<sha1|sha256>`, and `-h`
 //!     (usage on stdout, exit 129). Without the flag the hash comes from the
 //!     surrounding repository, and outside one it is git's compiled-in `sha1`.
@@ -91,8 +95,7 @@
 //! `--check-self-contained-and-connected` (git's connectivity pass over the
 //! whole reachable set, which exceeds the vendored `gix-fsck` primitive),
 //! `--promisor`, `--pack_header`, `--index-version` other than a plain `2`,
-//! `--verify` combined with `--stdin`, `--keep`
-//! without `--stdin`, and a `<pack-file>` on disk (or a self-contained pack read
+//! `--verify` combined with `--stdin`, and a `<pack-file>` on disk (or a self-contained pack read
 //! from stdin without `--fix-thin`) holding REF_DELTA entries — which stock git
 //! resolves in-pack — since `gix_pack::index::write_data_iter_to_stream` refuses
 //! ref-deltas outright and the odb lookup would duplicate an in-pack base rather
@@ -389,7 +392,45 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
 fn die_on_error(outcome: Result<ExitCode>) -> ExitCode {
     match outcome {
         Ok(code) => code,
-        Err(e) => fatal(format!("{e:#}")),
+        Err(e) => fatal(git_wording(&e).unwrap_or_else(|| format!("{e:#}"))),
+    }
+}
+
+/// Give the two pack-stream failures git names the wording git names them with.
+///
+/// ```c
+/// ssize_t ret = xread(input_fd, ...);
+/// if (ret <= 0) {
+///         if (!ret)
+///                 die(_("early EOF"));
+///         die_errno(_("read error on input"));
+/// }
+/// ```
+///
+/// (builtin/index-pack.c:325-331, in `fill()`.) A pack that stops mid-entry is a short read to
+/// git, which is `early EOF` — gitoxide reaches the same end as an `UnexpectedEof` while
+/// streaming. The trailer check is the other one git spells out:
+///
+/// ```c
+/// if (!hasheq(fill(the_hash_algo->rawsz), hash, the_repository->hash_algo))
+///         die(_("pack is corrupted (SHA1 mismatch)"));
+/// ```
+///
+/// (builtin/index-pack.c:1297-1298, in `parse_pack_objects()`.) git never prints the two hashes,
+/// so neither does this. Anything else keeps gitoxide's own text, which says more than an
+/// invented `fatal:` line that only looks like git's.
+fn git_wording(e: &anyhow::Error) -> Option<String> {
+    let stream = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<pack::data::input::Error>())?;
+    match stream {
+        pack::data::input::Error::Io(gix::hash::io::Error::Io(io))
+            if io.kind() == io::ErrorKind::UnexpectedEof =>
+        {
+            Some("early EOF".into())
+        }
+        pack::data::input::Error::Verify(_) => Some("pack is corrupted (SHA1 mismatch)".into()),
+        _ => None,
     }
 }
 
@@ -472,9 +513,6 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     }
 
     reject_unported(opts)?;
-    if opts.keep.is_some() {
-        anyhow::bail!("unsupported: `--keep` without `--stdin`");
-    }
 
     // `parse_pack_header()` is the first thing git does with the bytes, and its
     // three deaths outrank anything the pack decoder below could report.
@@ -491,8 +529,43 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     }
     set_read_only(index_path)?;
 
+    // ```c
+    // if (keep_msg)
+    //         write_special_file("keep", keep_msg, final_pack_name, hash, &report);
+    // ```
+    //
+    // (builtin/index-pack.c:1626-1628, in `final()`.) `final()` runs for the named-pack path too,
+    // so `--keep` leaves a `.keep` beside the pack that was indexed; only the `report` word it
+    // sets is `--stdin`-only, because the non-stdin arm prints the bare hash.
+    if let Some(msg) = &opts.keep {
+        if let Some(code) = write_keep_file(pack_path, msg.as_deref()) {
+            return Ok(code);
+        }
+    }
+
     println!("{hash}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// `write_special_file("keep", ...)`: the `.keep` beside `pack_path`, named by
+/// `derive_filename(pack_name, "pack", "keep")` and opened `O_CREAT|O_EXCL, 0600`.
+///
+/// An empty message writes an empty file — git only appends the trailing newline
+/// when `msg_len > 0`. `Some` is the exit code to die with, which is git's death
+/// when the pack it was asked to index is not named `*.pack`.
+fn write_keep_file(pack_path: &Path, msg: Option<&str>) -> Option<ExitCode> {
+    let name = pack_path.to_string_lossy();
+    let Some(stem) = name.strip_suffix(".pack").filter(|s| !s.is_empty()) else {
+        return Some(fatal(format!(
+            "packfile name '{name}' does not end with '.pack'"
+        )));
+    };
+    let keep_path = PathBuf::from(format!("{stem}.keep"));
+    let body = msg.filter(|m| !m.is_empty()).map(|m| format!("{m}\n"));
+    if fs::write(&keep_path, body.unwrap_or_default()).is_ok() {
+        let _ = fs::set_permissions(&keep_path, fs::Permissions::from_mode(0o600));
+    }
+    None
 }
 
 /// Index the pack at `pack_path` into `index_path`, returning the pack checksum.
@@ -514,7 +587,7 @@ fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Res
 
     let tmp = with_suffix(index_path, ".tmp");
     let mut out = io::BufWriter::new(fs::File::create(&tmp)?);
-    let outcome = pack::index::write_data_iter_to_stream(
+    let written = pack::index::write_data_iter_to_stream(
         pack::index::Version::default(),
         || {
             let data = fs::read(pack_path)?;
@@ -528,7 +601,17 @@ fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Res
         hash,
         None,
         pack_version,
-    )?;
+    );
+    // git indexes into a `git_mkstemp_mode()` file that is only ever renamed into place, so a
+    // pack it cannot read leaves nothing behind; the temporary here has to go the same way.
+    let outcome = match written {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            drop(out);
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+    };
     out.flush()?;
     drop(out);
 
@@ -555,25 +638,42 @@ fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Res
 /// either fails it dies naming the index path.
 fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
     let name = index_path.to_string_lossy().into_owned();
-    let cannot_open = || fatal(format!("Cannot open existing pack file '{name}'"));
+    let cannot_open_pack = || fatal(format!("Cannot open existing pack file '{name}'"));
 
-    let Some(stem) = name.strip_suffix(".idx") else {
-        return Ok(cannot_open());
+    // ```c
+    // if (!p)
+    //         die(_("Cannot open existing pack file '%s'"), pack_name);
+    // if (open_pack_index(p))
+    //         die(_("Cannot open existing pack idx file for '%s'"), pack_name);
+    // ```
+    //
+    // (builtin/index-pack.c:1747-1750, in `read_idx_option()`, called with `index_name`.) The two
+    // deaths are not interchangeable and both name the *index* path, because that is the argument
+    // `read_idx_option()` was handed. `add_packed_git()` — the `!p` arm — fails when the name does
+    // not end in `.idx` or when the sibling `.pack` cannot be `stat`ed as a regular file
+    // (packfile.c); the idx itself is only opened afterwards, by `open_pack_index()`.
+    let Some(stem) = name.strip_suffix(".idx").filter(|s| !s.is_empty()) else {
+        return Ok(cannot_open_pack());
     };
     let pack_path = PathBuf::from(format!("{stem}.pack"));
+    if !fs::metadata(&pack_path).map(|m| m.is_file()).unwrap_or(false) {
+        return Ok(cannot_open_pack());
+    }
 
     let hash = opts.object_hash();
-    let opened = pack::index::File::at(index_path, hash)
-        .ok()
-        .zip(pack::data::File::at(&pack_path, hash).ok());
-    let Some((index, data)) = opened else {
-        return Ok(cannot_open());
+    let Ok(index) = pack::index::File::at(index_path, hash) else {
+        return Ok(fatal(format!(
+            "Cannot open existing pack idx file for '{name}'"
+        )));
+    };
+    let Ok(data) = pack::data::File::at(&pack_path, hash) else {
+        return Ok(cannot_open_pack());
     };
 
     reject_unported(opts)?;
-    if opts.keep.is_some() {
-        anyhow::bail!("unsupported: `--verify --keep` (the .keep file is not written here)");
-    }
+    // `final()` — and with it `write_special_file()` — is skipped under `--verify`
+    // (`if (!verify) final(...); else close(input_fd);`, builtin/index-pack.c:2106-2113), so a
+    // `--keep` alongside `--verify` leaves no file behind.
 
     let options = pack::index::verify::integrity::Options {
         // git checks each object's hash and CRC32 against the index plus the
@@ -778,10 +878,11 @@ fn index_from_stdin(
 
     match &opts.keep {
         Some(msg) => {
-            let keep_path = data_path.with_extension("keep");
-            let body = msg.as_ref().map(|m| format!("{m}\n")).unwrap_or_default();
-            fs::write(&keep_path, body)?;
-            fs::set_permissions(&keep_path, fs::Permissions::from_mode(0o600))?;
+            if let Some(code) = write_keep_file(&data_path, msg.as_deref()) {
+                return Ok(code);
+            }
+            // `*report = suffix` in `write_special_file()`: the word `final()` prints changes
+            // only because a `.keep` was created.
             println!("keep\t{hash}");
         }
         None => println!("pack\t{hash}"),

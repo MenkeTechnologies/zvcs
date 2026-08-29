@@ -2377,9 +2377,9 @@ fn for_each_entry(
 /// whose URL is a prefix-match for `<url>` is a candidate, and the most specific
 /// candidate wins per key. Specificity is git's tuple, compared in this order:
 ///
-///   1. a pattern that names a user beats one that does not,
-///   2. a longer matched host wins,
-///   3. a longer matched path wins.
+///   1. a longer matched host wins,
+///   2. a longer matched path wins,
+///   3. a pattern that names a user beats one that does not.
 ///
 /// A bare `<section>` prints `key value` for every key the winning candidates
 /// define (git lower-cases the key here); `<section>.<key>` prints just that
@@ -2394,13 +2394,15 @@ fn get_urlmatch(file: &gix::config::File, positional: &[&str], d: &Display) -> R
         Some((s, k)) => (s.to_lowercase(), Some(k.to_lowercase())),
         None => (spec.to_lowercase(), None),
     };
-    let Some(want) = UrlParts::parse(url) else {
-        eprintln!("fatal: bad URL: {url}");
-        return Ok(ExitCode::from(128));
+    // `url_normalize()` fills in `out_info->err` and `cmd_config_get_urlmatch()`
+    // prints that message and nothing else.
+    let want = match url_normalize(url, false) {
+        Ok(info) => info,
+        Err(message) => return Ok(fatal(message)),
     };
 
-    // key -> (score, value): the winner for each key seen so far.
-    let mut best: std::collections::BTreeMap<String, (UrlScore, Vec<u8>)> =
+    // key -> (match, value): the winner for each key seen so far.
+    let mut best: std::collections::BTreeMap<String, (UrlMatch, Vec<u8>)> =
         std::collections::BTreeMap::new();
 
     for sec in file.sections() {
@@ -2408,11 +2410,17 @@ fn get_urlmatch(file: &gix::config::File, positional: &[&str], d: &Display) -> R
             continue;
         }
         let score = match sec.header().subsection_name() {
-            // The generic section matches every URL, at the lowest specificity.
-            None => UrlScore::default(),
+            // A section with no subsection carries no URL to match, so
+            // `urlmatch_config_entry()` never calls `match_urls()` for it and its
+            // `urlmatch_item` stays all-zero: it matches every URL, at the lowest
+            // specificity there is.
+            None => UrlMatch::default(),
             Some(pattern) => {
                 let text = pattern.to_string();
-                match UrlParts::parse(&text).and_then(|p| p.score_against(&want)) {
+                // A subsection that will not normalize is simply not a match —
+                // `url_normalize_1()` returning NULL is `retval = 0` there
+                // (urlmatch.c:707-714), never a diagnostic.
+                match url_normalize(&text, true).ok().and_then(|p| match_urls(&want, &p)) {
                     Some(score) => score,
                     None => continue,
                 }
@@ -2424,7 +2432,7 @@ fn get_urlmatch(file: &gix::config::File, positional: &[&str], d: &Display) -> R
                 continue;
             }
             let Some(value) = sec.value(&lname) else { continue };
-            let entry = best.entry(lname).or_insert_with(|| (UrlScore::default(), Vec::new()));
+            let entry = best.entry(lname).or_insert_with(|| (UrlMatch::default(), Vec::new()));
             if entry.1.is_empty() || score >= entry.0 {
                 *entry = (score, value.to_vec());
             }
@@ -2448,67 +2456,350 @@ fn get_urlmatch(file: &gix::config::File, positional: &[&str], d: &Display) -> R
     Ok(ExitCode::SUCCESS)
 }
 
-/// How specifically a config URL pattern matched the queried URL. Ordered the
-/// way git ranks candidates: user first, then host length, then path length.
-#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct UrlScore {
-    user: bool,
-    host_len: usize,
-    path_len: usize,
+/// The RFC 3986 character classes `urlmatch.c` works from (urlmatch.c:10-18).
+mod url_chars {
+    pub const SCHEME: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-";
+    /// IPv6 literals need `[:]`.
+    pub const HOST: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_[:]";
+    pub const UNSAFE: &str = " <>\"%{}|\\^`";
+    /// `URL_GEN_RESERVED URL_SUB_RESERVED` — the only allowed delimiters.
+    pub const RESERVED: &str = ":/?#[]@!$&'()*+,;=";
 }
 
-/// The pieces of a URL git compares: scheme, optional user, host (with port),
-/// and path. Deliberately hand-split rather than parsed by a URL crate, because
-/// the comparison is textual and git's is too.
-struct UrlParts {
-    scheme: String,
-    user: Option<String>,
-    host: String,
-    path: String,
-}
-
-impl UrlParts {
-    fn parse(url: &str) -> Option<UrlParts> {
-        let (scheme, rest) = url.split_once("://")?;
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, ""),
-        };
-        let (user, host) = match authority.rsplit_once('@') {
-            Some((u, h)) => (Some(u.to_string()), h),
-            None => (None, authority),
-        };
-        Some(UrlParts {
-            scheme: scheme.to_lowercase(),
-            user,
-            host: host.to_lowercase(),
-            path: path.trim_end_matches('/').to_string(),
-        })
+/// `append_normalized_escapes()` (urlmatch.c:20-70): copy `from` into `buf`,
+/// unescaping what does not need escaping and escaping what does.
+///
+/// The unsafe set is RFC 3986's (`0x00-0x1F`, `0x7F-0xFF` and
+/// [`url_chars::UNSAFE`]); characters in `esc_ok` are left escaped when they
+/// arrived escaped but are never escaped otherwise, which is how delimiters
+/// survive normalization without being introduced by it. Every `%XX` comes out
+/// upper-case. `None` when a `%` is not followed by two hex digits.
+fn append_normalized_escapes(buf: &mut Vec<u8>, from: &[u8], esc_ok: &str) -> Option<()> {
+    let mut i = 0;
+    while i < from.len() {
+        let mut ch = from[i];
+        i += 1;
+        let mut was_esc = false;
+        if ch == b'%' {
+            let hex = from.get(i..i + 2)?;
+            ch = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+            i += 2;
+            was_esc = true;
+        }
+        let escape = ch <= 0x1F
+            || ch >= 0x7F
+            || url_chars::UNSAFE.as_bytes().contains(&ch)
+            || (was_esc && esc_ok.as_bytes().contains(&ch));
+        match escape {
+            true => buf.extend_from_slice(format!("%{ch:02X}").as_bytes()),
+            false => buf.push(ch),
+        }
     }
+    Some(())
+}
 
-    /// Score this PATTERN against `url`, or `None` when it does not match.
-    fn score_against(&self, url: &UrlParts) -> Option<UrlScore> {
-        if self.scheme != url.scheme || self.host != url.host {
-            return None;
-        }
-        // A pattern that names a user matches only that user's URLs.
-        if self.user.is_some() && self.user != url.user {
-            return None;
-        }
-        // The pattern's path must be a prefix of the URL's, at a `/` boundary.
-        let path = self.path.trim_end_matches('/');
-        if !path.is_empty() {
-            let rest = url.path.strip_prefix(path)?;
-            if !(rest.is_empty() || rest.starts_with('/')) {
-                return None;
+/// A normalized URL and the offsets of its parts — git's `struct url_info`,
+/// filled in by [`url_normalize`].
+#[derive(Default)]
+struct UrlInfo {
+    url: Vec<u8>,
+    scheme_len: usize,
+    user_off: usize,
+    user_len: usize,
+    host_off: usize,
+    host_len: usize,
+    port_off: usize,
+    port_len: usize,
+    path_off: usize,
+}
+
+/// `url_normalize_1()` (urlmatch.c:115-437), whose own comment lists what it
+/// does: lower-case the case-insensitive parts, unescape what needs no escape
+/// and escape what does, upper-case every `%XX`, drop leading zeroes and default
+/// ports, give a path-less URL a `/`, and resolve `.`/`..` segments. IPv6
+/// literals are passed through unvalidated.
+///
+/// `allow_globs` is what separates a config subsection from the URL being looked
+/// up: a pattern may carry `*` in its host (urlmatch.c:244-247), which
+/// [`match_host`] then matches component by component.
+///
+/// The `Err` is git's own message, which `cmd_config_get_urlmatch()` prints
+/// verbatim, so the failures are named exactly as git names them.
+fn url_normalize(url: &str, allow_globs: bool) -> std::result::Result<UrlInfo, &'static str> {
+    let src = url.as_bytes();
+    let mut info = UrlInfo::default();
+    let norm = &mut info.url;
+
+    // The scheme is `URL_SCHEME_CHARS` starting with a letter, then `://`; no
+    // %-escapes are allowed in it.
+    let spanned = src.iter().take_while(|c| url_chars::SCHEME.as_bytes().contains(c)).count();
+    if spanned == 0
+        || !src[0].is_ascii_alphabetic()
+        || spanned + 3 > src.len()
+        || &src[spanned..spanned + 3] != b"://"
+    {
+        return Err("invalid URL scheme name or missing '://' suffix");
+    }
+    info.scheme_len = spanned;
+    norm.extend(src[..spanned + 3].iter().map(u8::to_ascii_lowercase));
+    let mut rest = &src[spanned + 3..];
+
+    // `user[:password]@`, if the `@` comes before the path starts.
+    let slash_at = |s: &[u8]| s.iter().position(|c| b"/?#".contains(c)).unwrap_or(s.len());
+    let at = rest.iter().position(|c| *c == b'@');
+    if let Some(at) = at.filter(|at| *at < slash_at(rest)) {
+        info.user_off = norm.len();
+        if at > 0 {
+            append_normalized_escapes(norm, &rest[..at], url_chars::RESERVED)
+                .ok_or("invalid %XX escape sequence")?;
+            // A `:` in what was just appended splits user from password.
+            match norm[info.scheme_len + 3..].iter().position(|c| *c == b':') {
+                Some(colon) => info.user_len = colon,
+                None => info.user_len = norm.len() - (info.scheme_len + 3),
             }
         }
-        Some(UrlScore {
-            user: self.user.is_some(),
-            host_len: self.host.len(),
-            path_len: path.len(),
-        })
+        norm.push(b'@');
+        rest = &rest[at + 1..];
     }
+
+    // The host, without its port; no %-escapes allowed here either.
+    let slash = slash_at(rest);
+    if rest.is_empty() || b":/?#".contains(&rest[0]) {
+        // Only `file:` may have no host.
+        if !norm.starts_with(b"file:") {
+            return Err("missing host and scheme is not 'file:'");
+        }
+    } else {
+        info.host_off = norm.len();
+    }
+    // Scan back from the path for a port colon, stopping at an IPv6 `]`.
+    let mut colon = slash;
+    while colon > 0 && rest[colon - 1] != b':' && rest[colon - 1] != b']' {
+        colon -= 1;
+    }
+    colon = match colon > 0 && rest[colon - 1] == b':' {
+        true => colon - 1,
+        false => slash,
+    };
+    if info.host_off == 0 && colon < slash && colon + 1 != slash {
+        return Err("a 'file:' URL may not have a port number");
+    }
+    let host_chars = match allow_globs {
+        true => &format!("{}*", url_chars::HOST),
+        false => url_chars::HOST,
+    };
+    let spanned = rest.iter().take_while(|c| host_chars.as_bytes().contains(c)).count();
+    if spanned < colon {
+        return Err("invalid characters in host name");
+    }
+    norm.extend(rest[..colon].iter().map(u8::to_ascii_lowercase));
+
+    // The port, kept only when it is not the scheme's default. Leading zeroes go
+    // first, and what is left must be 1..=65535.
+    if colon < slash {
+        let mut port = &rest[colon + 1..slash];
+        let zeros = port.iter().take_while(|c| **c == b'0').count();
+        port = &port[zeros..];
+        if port.is_empty() && zeros > 0 {
+            // All zeroes: keep the last one so the range check refuses it.
+            port = &rest[slash - 1..slash];
+        }
+        let default = (port == b"80" && norm.starts_with(b"http:"))
+            || (port == b"443" && norm.starts_with(b"https:"));
+        if !port.is_empty() && !default {
+            if !port.iter().all(u8::is_ascii_digit) {
+                return Err("invalid port number");
+            }
+            let number = match port.len() <= 5 {
+                true => std::str::from_utf8(port).ok().and_then(|p| p.parse::<u32>().ok()),
+                false => Some(0),
+            };
+            // 0 means "next available" on just about every system, so it is not a
+            // port a URL may name.
+            if !matches!(number, Some(1..=65535)) {
+                return Err("invalid port number");
+            }
+            norm.push(b':');
+            info.port_off = norm.len();
+            info.port_len = port.len();
+            norm.extend_from_slice(port);
+        }
+    }
+    if info.host_off != 0 {
+        info.host_len =
+            norm.len() - info.host_off - if info.port_len != 0 { info.port_len + 1 } else { 0 };
+    }
+
+    // The path, with a leading `/` added if it is missing and `.`/`..` resolved.
+    // The delimiters must survive, so the segments are unescaped for the
+    // comparison only (RFC 3986 asks for exactly that).
+    info.path_off = norm.len();
+    let path_start = info.path_off;
+    norm.push(b'/');
+    let mut tail = &rest[slash..];
+    if tail.first() == Some(&b'/') {
+        tail = &tail[1..];
+    }
+    loop {
+        let seg_start = norm.len();
+        let next = slash_at(tail);
+        append_normalized_escapes(norm, &tail[..next], url_chars::RESERVED)
+            .ok_or("invalid %XX escape sequence")?;
+        let mut skip_add_slash = false;
+        match &norm[seg_start..] {
+            b"." => {
+                // Be careful not to remove the initial `/`.
+                match seg_start == path_start + 1 {
+                    true => {
+                        norm.truncate(norm.len() - 1);
+                        skip_add_slash = true;
+                    }
+                    false => norm.truncate(norm.len() - 2),
+                }
+            }
+            b".." => {
+                let mut prev = norm.len() - 3;
+                if prev == path_start {
+                    return Err("invalid '..' path segment");
+                }
+                // `while (*--prev_slash != '/') {}` — the byte it starts on is the
+                // `/` this segment opened with, so the scan steps back first.
+                loop {
+                    prev -= 1;
+                    if norm[prev] == b'/' {
+                        break;
+                    }
+                }
+                match prev == path_start {
+                    true => {
+                        norm.truncate(prev + 1);
+                        skip_add_slash = true;
+                    }
+                    false => norm.truncate(prev),
+                }
+            }
+            _ => {}
+        }
+        tail = &tail[next..];
+        // Anything but another `/` ends the path.
+        if tail.first() != Some(&b'/') {
+            break;
+        }
+        tail = &tail[1..];
+        if !skip_add_slash {
+            norm.push(b'/');
+        }
+    }
+
+    // Whatever is left (a query or fragment) is copied with its escapes
+    // normalized and nothing else touched.
+    if !tail.is_empty() {
+        append_normalized_escapes(norm, tail, url_chars::RESERVED)
+            .ok_or("invalid %XX escape sequence")?;
+    }
+    Ok(info)
+}
+
+impl UrlInfo {
+    fn part(&self, off: usize, len: usize) -> &[u8] {
+        &self.url[off..off + len]
+    }
+
+    /// The path and everything after it, which is what `match_urls()` compares
+    /// (`url_prefix->url_len - url_prefix->path_off`).
+    fn path(&self) -> &[u8] {
+        &self.url[self.path_off..]
+    }
+}
+
+/// `match_host()` (urlmatch.c:80-113): host names match component by component,
+/// and a pattern component of exactly `*` matches any one component.
+fn match_host(url: &UrlInfo, pattern: &UrlInfo) -> bool {
+    let mut url = url.part(url.host_off, url.host_len);
+    let mut pat = pattern.part(pattern.host_off, pattern.host_len);
+    while !url.is_empty() && !pat.is_empty() {
+        let url_next = url.iter().position(|c| *c == b'.').unwrap_or(url.len());
+        let pat_next = pat.iter().position(|c| *c == b'.').unwrap_or(pat.len());
+        if !(pat[..pat_next] == *b"*" || url[..url_next] == pat[..pat_next]) {
+            return false;
+        }
+        url = &url[(url_next + 1).min(url.len())..];
+        pat = &pat[(pat_next + 1).min(pat.len())..];
+    }
+    url.is_empty() && pat.is_empty()
+}
+
+/// `url_match_prefix()` (urlmatch.c:570-600): `prefix` matches `url` when it is
+/// the whole of it or a prefix ending on a path-component boundary. Both are
+/// treated as having a trailing `/` they may not carry.
+///
+/// The answer is the length of the match *including* that final `/`, so a
+/// prefix that matched nothing but the root still scores 1 — which is what
+/// separates a generic section from no match at all.
+fn url_match_prefix(url: &[u8], prefix: &[u8]) -> usize {
+    if prefix.is_empty() || prefix == b"/" {
+        return match url.is_empty() || url[0] == b'/' {
+            true => 1,
+            false => 0,
+        };
+    }
+    let prefix = match prefix.last() {
+        Some(b'/') => &prefix[..prefix.len() - 1],
+        _ => prefix,
+    };
+    if !url.starts_with(prefix) {
+        return 0;
+    }
+    match url.len() == prefix.len() || url[prefix.len()] == b'/' {
+        true => prefix.len() + 1,
+        false => 0,
+    }
+}
+
+/// How well a config subsection matched, and therefore which of two candidates
+/// wins — git's `struct urlmatch_item` ordered by `cmp_matches()`
+/// (urlmatch.c:671-681): the longer matched host first, then the longer matched
+/// path, and only then a pattern that named a user over one that did not.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct UrlMatch {
+    hostmatch_len: usize,
+    pathmatch_len: usize,
+    user_matched: bool,
+}
+
+/// `match_urls()` (urlmatch.c:602-669): a pattern matches when its scheme, host
+/// and port are the URL's and its path is the URL's or a prefix of it at a `/`
+/// boundary. A user name in the pattern must match exactly; one in the URL alone
+/// does not stop a pattern without one from matching.
+fn match_urls(url: &UrlInfo, pattern: &UrlInfo) -> Option<UrlMatch> {
+    if pattern.scheme_len != url.scheme_len
+        || url.url[..url.scheme_len] != pattern.url[..pattern.scheme_len]
+    {
+        return None;
+    }
+    let mut user_matched = false;
+    if pattern.user_off != 0 {
+        if url.user_off == 0
+            || url.user_len != pattern.user_len
+            || url.part(url.user_off, url.user_len) != pattern.part(pattern.user_off, pattern.user_len)
+        {
+            return None;
+        }
+        user_matched = true;
+    }
+    if !match_host(url, pattern) {
+        return None;
+    }
+    if url.port_len != pattern.port_len
+        || url.part(url.port_off, url.port_len) != pattern.part(pattern.port_off, pattern.port_len)
+    {
+        return None;
+    }
+    let pathmatch_len = url_match_prefix(url.path(), pattern.path());
+    if pathmatch_len == 0 {
+        return None;
+    }
+    Some(UrlMatch { hostmatch_len: pattern.host_len, pathmatch_len, user_matched })
 }
 
 /// `git config -e|--edit` — open the target config in the user's editor.

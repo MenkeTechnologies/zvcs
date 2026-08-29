@@ -29,6 +29,10 @@ fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 /// A repo whose LOCAL config carries a known set of entries: a multivar
 /// (`remote.origin.fetch` twice), a subsection key, mixed-case names to prove
 /// normalization, and the `branch.main.*` keys gh probes.
@@ -450,4 +454,76 @@ fn the_get_subcommand_accepts_name_only_and_default_with_a_regexp() {
     let default = zvcs(&dir, &["config", "get", "--local", "--default", "fallback", "--regexp", r"^zz\."]);
     assert!(default.status.success(), "--default under `get` must not be a usage error");
     assert_eq!(stdout_of(&default), "fallback\n");
+}
+
+/// The URL a `--get-urlmatch` compares is `url_normalize()`'s output, not the
+/// string as typed: the scheme and host fold to lower case, a default port
+/// disappears, `.`/`..` segments resolve, and `%XX` escapes are unescaped where
+/// they need not be there and upper-cased where they do. Two spellings of one
+/// URL must therefore pick the same entry.
+#[test]
+fn urlmatch_compares_normalized_urls() {
+    let dir = url_config("urlmatch-normalize");
+    let cfg = dir.join("norm.cfg");
+    std::fs::write(
+        &cfg,
+        "[http]\n\tcookieFile = generic\n\
+         [http \"https://example.com/a/b\"]\n\tcookieFile = deep\n\
+         [http \"https://*.example.com\"]\n\tcookieFile = wild\n",
+    )
+    .expect("write norm.cfg");
+    let cfg = cfg.to_str().expect("utf-8 fixture path");
+
+    let same = |url: &str| {
+        let out = zvcs(&dir, &["config", "-f", cfg, "--get-urlmatch", "http.cookieFile", url]);
+        stdout_of(&out)
+    };
+
+    // :443 is https's default, `.`/`..` resolve, and case folds — all four of
+    // these normalize to the same URL as the `/a/b` pattern.
+    assert_eq!(same("https://example.com/a/b"), "deep\n");
+    assert_eq!(same("https://example.com:443/a/b"), "deep\n");
+    assert_eq!(same("HTTPS://EXAMPLE.COM/a/./b"), "deep\n");
+    assert_eq!(same("https://example.com/a/x/../b/"), "deep\n");
+    // %62 is 'b', which needs no escape, so it unescapes before the comparison.
+    assert_eq!(same("https://example.com/a/%62"), "deep\n");
+
+    // A `*` in a pattern's host matches one whole component, and nothing else:
+    // `sub.example.com` matches, `example.com` does not (there is no component
+    // for the `*` to consume) and neither does a two-label subdomain.
+    assert_eq!(same("https://sub.example.com/"), "wild\n");
+    assert_eq!(same("https://example.com/"), "generic\n");
+    assert_eq!(same("https://a.b.example.com/"), "generic\n");
+
+    // A port that is not the default is part of the comparison, so it stops the
+    // otherwise-matching pattern.
+    assert_eq!(same("https://example.com:8443/a/b"), "generic\n");
+}
+
+/// `url_normalize()` names each way a URL can be malformed, and
+/// `cmd_config_get_urlmatch()` prints that message and nothing else.
+#[test]
+fn urlmatch_refuses_a_malformed_url_in_gits_own_words() {
+    let dir = url_config("urlmatch-refusals");
+    let cfg = dir.join("norm.cfg");
+    std::fs::write(&cfg, "[http]\n\tcookieFile = generic\n").expect("write norm.cfg");
+    let cfg = cfg.to_str().expect("utf-8 fixture path");
+
+    for (url, message) in [
+        ("not-a-url", "invalid URL scheme name or missing '://' suffix"),
+        ("1http://example.com/", "invalid URL scheme name or missing '://' suffix"),
+        ("http://", "missing host and scheme is not 'file:'"),
+        // Only a `file:` URL with no host at all reaches this one; `file:` with
+        // a host and a port is a perfectly ordinary URL.
+        ("file://:80/x", "a 'file:' URL may not have a port number"),
+        ("http://ex ample.com/", "invalid characters in host name"),
+        ("http://example.com:99999/", "invalid port number"),
+        ("http://example.com:0/", "invalid port number"),
+        ("http://example.com/%zz", "invalid %XX escape sequence"),
+        ("http://example.com/../x", "invalid '..' path segment"),
+    ] {
+        let out = zvcs(&dir, &["config", "-f", cfg, "--get-urlmatch", "http.cookieFile", url]);
+        assert_eq!(out.status.code(), Some(128), "{url}");
+        assert_eq!(stderr_of(&out), format!("fatal: {message}\n"), "{url}");
+    }
 }

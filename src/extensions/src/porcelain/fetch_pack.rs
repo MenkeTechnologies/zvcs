@@ -63,7 +63,8 @@
 //!     low-level fetch function this port does not drive), so a partial-clone
 //!     filter cannot be requested faithfully.
 //!   * `--refetch`.
-//!   * `--upload-pack=<exec>` / `--exec=<exec>` — the vendored transport `connect`
+//!   * `--upload-pack=<exec>` / `--exec=<exec>` naming anything but the default
+//!     `git-upload-pack` — the vendored transport `connect`
 //!     takes no per-invocation override for the remote program.
 //!   * `--diag-url` **on an ssh URL**. The local, `file://` and `git://` forms
 //!     are covered: [`parse_connect_url`] is a direct port of `connect.c`'s own
@@ -147,6 +148,9 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     let mut deepen_relative = false;
     let mut shallow_since: Option<String> = None;
     let mut shallow_exclude: Vec<String> = Vec::new();
+    // Flags git's loop accepts that this port cannot act on; refused once the
+    // whole command line has been read, so a later usage error still wins.
+    let mut unported: Vec<String> = Vec::new();
 
     for a in args {
         let a = a.as_str();
@@ -172,15 +176,30 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             // whose path `cmd_fetch_pack()` prints as `lock <path>` and expects
             // the caller to release; there is no lockfile protocol here to hand
             // that ownership to.
-            "--lock-pack" => bail!("unsupported flag {a:?} ({PORTED}, -k/--keep)"),
+            // ```c
+            // if (!strcmp("--stateless-rpc", arg)) { args.stateless_rpc = 1; continue; }
+            // …
+            // usage(fetch_pack_usage);
+            // ```
+            //
+            // (builtin/fetch-pack.c:144-181.) Every flag git's loop knows is *accepted*
+            // there, whether or not this port can act on it; only an unrecognised one is
+            // the usage error. Refusing early would answer "unsupported" where git answers
+            // `usage:` — `fetch-pack --stateless-rpc --advertise-refs` is 129 because of
+            // the second flag, which the loop never reaches if the first one bails.
+            "--lock-pack"
+            | "--refetch"
+            | "--check-self-contained-and-connected"
+            | "--stateless-rpc"
+            | "--cloning"
+            | "--update-shallow"
+            | "--from-promisor"
+            | "--no-filter" => unported.push(a.to_string()),
             "--include-tag" => include_tag = true,
             // `--deepen-relative` is a modifier on `--depth`; git only appends the
             // `deepen-relative` line when a depth is present, so we just record it.
             "--deepen-relative" => deepen_relative = true,
             "--diag-url" => diag_url = true,
-            "--refetch" => bail!("unsupported flag {a:?} ({PORTED})"),
-            "--check-self-contained-and-connected" | "--stateless-rpc"
-            | "--no-filter" => bail!("unsupported flag {a:?} ({PORTED})"),
             // `--depth=<n>` — git does `strtol(arg, NULL, 0)`; a non-numeric value
             // there degrades to 0 (no deepen), but we surface it as an error rather
             // than silently dropping the request.
@@ -198,13 +217,15 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--shallow-exclude=") => {
                 shallow_exclude.push(a["--shallow-exclude=".len()..].to_string());
             }
-            _ if a.starts_with("--upload-pack=")
-                || a.starts_with("--exec=")
-                || a.starts_with("--filter=") =>
-            {
-                let flag = &a[..a.find('=').unwrap_or(a.len())];
-                bail!("unsupported flag {flag:?} ({PORTED})")
+            // `--upload-pack=<exec>` / `--exec=<exec>` only matter when they name
+            // something other than the program the transport would have run anyway.
+            _ if a.starts_with("--upload-pack=") || a.starts_with("--exec=") => {
+                let value = &a[a.find('=').map(|at| at + 1).unwrap_or(a.len())..];
+                if value != "git-upload-pack" {
+                    unported.push(a[..a.find('=').unwrap_or(a.len())].to_string());
+                }
             }
+            _ if a.starts_with("--filter=") => unported.push("--filter".to_string()),
             // Anything else is a usage error for git: usage on stderr, 129.
             _ => {
                 eprint!("{USAGE}");
@@ -217,6 +238,10 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     };
+
+    if let Some(flag) = unported.first() {
+        bail!("unsupported flag {flag:?} ({PORTED})");
+    }
 
     // `--diag-url` short-circuits everything: `git_connect()` decomposes the URL,
     // prints the breakdown, returns NULL, and `cmd_fetch_pack()` exits 0 without

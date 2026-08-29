@@ -296,26 +296,40 @@ pub fn show_index(args: &[String]) -> Result<ExitCode> {
             offsets.push(be32(raw));
         }
 
-        let off64_nr = offsets.iter().filter(|o| *o & 0x8000_0000 != 0).count();
-        let mut off64: Vec<u64> = Vec::with_capacity(off64_nr);
-        if off64_nr > 0 {
-            let Some(raw) = r.take(off64_nr * 8) else {
-                return fatal("unable to read 64b offsets");
-            };
-            off64.extend(raw.chunks_exact(8).map(be64));
-        }
-
+        // ```c
+        // uint32_t off = ntohl(entries[i].off);
+        // if (!(off & 0x80000000)) {
+        //         offset = off;
+        // } else {
+        //         uint32_t off64[2];
+        //         if ((off & 0x7fffffff) != off64_nr)
+        //                 die(_("inconsistent 64b offset index"));
+        //         if (fread(off64, 8, 1, stdin) != 1)
+        //                 die(_("unable to read 64b offset %u"), off64_nr);
+        //         offset = (((uint64_t)ntohl(off64[0])) << 32) | ntohl(off64[1]);
+        //         off64_nr++;
+        // }
+        // ```
+        //
+        // (builtin/show-index.c:105-119.) The large-offset table is read one entry at a
+        // time *while* the offsets are printed, and each high-bit slot must name the next
+        // unread entry — so a slot pointing anywhere else is `inconsistent 64b offset
+        // index`, not a lookup that came up empty. Reading a sha1 index as sha256 shifts
+        // every field, which is exactly how a wrong index lands here.
+        let mut off64_nr: u32 = 0;
         for idx in 0..nr {
             let slot = offsets[idx];
             let offset = if slot & 0x8000_0000 != 0 {
-                let large = (slot & 0x7fff_ffff) as usize;
-                match off64.get(large) {
-                    Some(v) => *v,
-                    None => {
-                        print!("{out}");
-                        return fatal("bad 64b offset");
-                    }
+                if slot & 0x7fff_ffff != off64_nr {
+                    print!("{out}");
+                    return fatal("inconsistent 64b offset index");
                 }
+                let Some(raw) = r.take(8) else {
+                    print!("{out}");
+                    return fatal(format!("unable to read 64b offset {off64_nr}"));
+                };
+                off64_nr += 1;
+                be64(raw)
             } else {
                 u64::from(slot)
             };

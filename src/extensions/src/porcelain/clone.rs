@@ -284,6 +284,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `--no-local` / `--no-hardlinks`, which decide whether a local source's object
     // store is adopted directly and whether that adoption may hardlink.
     let mut no_local = false;
+    // git's `option_local` is a tri-state: -1 by default, 0 for `--no-local`, 1 for an
+    // explicit `-l`/`--local`. Only the last of the three makes git say the option was
+    // ignored, so the explicit form is tracked apart from the effective value.
+    let mut local_explicit = false;
     let mut hardlinks = true;
     let mut recurse_submodules = false;
     // The `<pathspec>` arguments of `--recurse-submodules[=<pathspec>]`, recorded
@@ -413,8 +417,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // `clone_local()`: a local source has its object store copied (hardlinked
             // where the filesystem allows) instead of being packed and unpacked.
             // `--no-local` forces the transport, `--no-hardlinks` copies the bytes.
-            "-l" | "--local" => no_local = false,
-            "--no-local" => no_local = true,
+            "-l" | "--local" => {
+                no_local = false;
+                local_explicit = true;
+            }
+            "--no-local" => {
+                no_local = true;
+                local_explicit = false;
+            }
             "--no-hardlinks" => hardlinks = false,
             "--hardlinks" => hardlinks = true,
             // `-n`/`--no-checkout`: fetch refs and set `HEAD`, but do not populate
@@ -581,7 +591,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     match c {
                         'q' => quiet = true,
                         'v' => {}
-                        'l' => no_local = false,
+                        'l' => {
+                            no_local = false;
+                            local_explicit = true;
+                        }
                         'n' => no_checkout = true,
                         's' => shared = true,
                         '4' => {
@@ -712,8 +725,50 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let shallow_depth_given = depth.is_some();
     let shallow_since_given = shallow_since.is_some();
     let shallow_exclude_given = !shallow_exclude.is_empty();
-    let local_path_source = !url_str.contains("://") && Path::new(url_str).is_dir();
-    let shallow = if local_path_source {
+    // ```c
+    // path = get_repo_path(remote->url.v[0], &is_bundle);
+    // is_local = option_local != 0 && path && !is_bundle;
+    // ```
+    //
+    // (builtin/clone.c:1323-1324.) One flag decides everything that follows: whether the
+    // shallow selectors and `--filter` are ignored with a warning, whether the object store
+    // is adopted instead of fetched, and whether the clone ends with `done.`. `--no-local`
+    // clears it, which is what makes `git clone --no-local --depth 1 <path>` a genuinely
+    // shallow clone of a path on this machine.
+    //
+    // A source that is shallow itself takes `is_local` away again further down.
+    let mut is_local = !no_local && !url_str.contains("://") && Path::new(url_str).is_dir();
+    if is_local && gix::open(url_str).map(|r| r.is_shallow()).unwrap_or(false) {
+        // ```c
+        // if (!access(mkpath("%s/shallow", path), F_OK)) {
+        //         if (reject_shallow)
+        //                 die(_("source repository is shallow, reject to clone."));
+        //         if (option_local > 0)
+        //                 warning(_("source repository is shallow, ignoring --local"));
+        //         is_local = 0;
+        // }
+        // ```
+        //
+        // (builtin/clone.c:1334-1340.) Copying a shallow object store would carry its
+        // `shallow` boundary without the file that records it, so git falls back to the
+        // transport, which negotiates the boundary properly.
+        let reject = reject_shallow.unwrap_or_else(|| {
+            config_pairs
+                .iter()
+                .rev()
+                .find(|(k, _)| k.eq_ignore_ascii_case("clone.rejectShallow"))
+                .map(|(_, v)| v != "false" && v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        });
+        if reject {
+            crate::git_fatal!("source repository is shallow, reject to clone.");
+        }
+        if local_explicit {
+            eprintln!("warning: source repository is shallow, ignoring --local");
+        }
+        is_local = false;
+    }
+    let shallow = if is_local {
         // Ignored for a local path clone — see the warning at the banner.
         Shallow::NoChange
     } else if !shallow_exclude.is_empty() {
@@ -804,12 +859,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     //
     // (builtin/clone.c:1324-1331.) `--no-local` sets `option_local` to 0, so the clone runs
     // the transport after all and the selectors are honoured rather than warned about.
-    let local_path_clone = !url_str.contains("://") && Path::new(url_str).is_dir() && !no_local;
-    if local_path_clone && !quiet {
+    if is_local && !quiet {
         for (given, flag) in [
             (shallow_depth_given, "--depth"),
             (shallow_since_given, "--shallow-since"),
             (shallow_exclude_given, "--shallow-exclude"),
+            (filter.is_some(), "--filter"),
         ] {
             if given {
                 eprintln!("warning: {flag} is ignored in local clones; use file:// instead.");
@@ -1128,7 +1183,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // local pack receive/resolve and worktree checkout counters — the same
     // information git surfaces. When progress is suppressed the tree is still used
     // but no renderer is attached, so nothing is drawn.
-    let show_progress = force_progress.unwrap_or_else(|| std::io::stderr().is_terminal()) && !quiet;
+    // A local clone transfers nothing: `clone_local()` copies or links the object store and
+    // the only transport call is the ls-refs that built the ref map, so git has no
+    // progress to report however loudly `--progress` asks for it. This port runs a real
+    // fetch underneath and would otherwise narrate work git never does.
+    let show_progress =
+        force_progress.unwrap_or_else(|| std::io::stderr().is_terminal()) && !quiet && !is_local;
     let root = prodash::tree::Root::new();
     // Create the operation node BEFORE launching the renderer. prodash's line
     // renderer can otherwise race an empty tree at startup and exit before gix
@@ -1389,9 +1449,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // object store through `objects/info/alternates` — recorded above, where git records
     // the `--reference` ones — and copies nothing at all. The pack the local fetch left
     // behind is dropped either way, since git's transport never ran.
-    if local_path_source && !no_local && filter.is_none() && shared {
+    if is_local && shared {
         drop_fetched_pack(&git_dir);
-    } else if local_path_source && !no_local && filter.is_none() {
+    } else if is_local {
         adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)?;
     } else if let Some(cloned) = gix::open(&git_dir)
         .ok()
@@ -1500,7 +1560,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     } else {
         match &*single_outcome.lock().expect("clone is single-threaded here") {
             Some((fetched, head_target)) => head_target.as_deref() != fetched.as_deref(),
-            None => false,
+            // `update_remote_refs()` writes `refs/remotes/<name>/HEAD` from
+            // `remote_head_points_at`, which `guess_remote_head()` leaves NULL when the
+            // remote's HEAD names a branch it does not advertise — so there is no ref for
+            // the symref to point at and git writes none.
+            None => remote_head_branch.is_none(),
         }
     };
     if drop_head_tracking {
@@ -1531,8 +1595,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         super::init::enable_submodule_path_config(&git_dir)?;
     }
 
-    // git closes the clone banner with `done.` (suppressed by `-q`).
-    if !quiet {
+    // ```c
+    //         copy_or_link_directory(&src, &dest, src_repo);
+    //         [...]
+    // }
+    //
+    // if (0 <= option_verbosity)
+    //         fprintf(stderr, _("done.\n"));
+    // ```
+    //
+    // (`clone_local()`, builtin/clone.c:365-371.) The line belongs to the local-clone
+    // routine, not to `cmd_clone`: a clone that ran the transport prints whatever the
+    // progress meter printed and nothing more, so `--no-local` ends after the banner.
+    if is_local && !quiet {
         eprintln!("done.");
     }
 

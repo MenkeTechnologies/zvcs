@@ -352,6 +352,27 @@ pub(super) fn refresh_cache_tree(
 /// cache-tree if it is not fully valid, and write the index back when that
 /// happened. The root tree id is discarded — callers that need it use
 /// [`refresh_cache_tree`], which is the same operation with the id kept.
+/// `update_main_cache_tree(WRITE_TREE_SILENT)` on an index that is *not* going to be
+/// written back: the tree objects it computes land in the object database, the index file
+/// on disk is left alone.
+///
+/// This is `prepare_index()`'s ending for the branches whose prepared index lives in a lock
+/// file git never commits — `commit --dry-run -a`, `-i`, or with a pathspec. The trees are
+/// real (a later `commit` finds them already present); the staging is not.
+pub(super) fn write_cache_tree_only(repo: &gix::Repository, index: &mut gix::index::File) {
+    let odb = RepoOdb { repo };
+    if index.cache_tree_fully_valid(&odb) {
+        return;
+    }
+    let _ = index.cache_tree_update(
+        &odb,
+        cache_tree::Options {
+            missing_ok: false,
+            repair: false,
+        },
+    );
+}
+
 pub(super) fn update_cache_tree_if_stale(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
     refresh_cache_tree(repo, index, false)?.ok();
     Ok(())

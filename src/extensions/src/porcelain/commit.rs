@@ -2600,16 +2600,29 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     // The index git would commit from: `-a` stages tracked changes, `-i` adds the
     // named paths to the real index, and a pathspec-limited commit builds the
     // "false index" from HEAD's tree plus those paths.
+    // ```c
+    // update_main_cache_tree(WRITE_TREE_SILENT);
+    // ```
+    //
+    // (`prepare_index()`, builtin/commit.c.) Every branch that prepares an index ends by
+    // updating its cache tree, and `cache_tree_update()` *writes* the tree objects it
+    // computes — so a dry run leaves the trees the commit would have used in the object
+    // store, exactly as the real commit's preparation does. Only the commit object and the
+    // ref update are skipped.
     let prepared: Option<gix::index::File> = if o.all {
         let mut index = crate::index_open::or_empty(repo)?;
         collect_tracked_changes(repo, &index)?.apply_to(&mut index);
+        super::write_tree::write_cache_tree_only(repo, &mut index);
         Some(index)
     } else if o.include {
         let mut index = crate::index_open::or_empty(repo)?;
         include_stage(repo, &o.pathspecs, &index)?.apply_to(&mut index);
+        super::write_tree::write_cache_tree_only(repo, &mut index);
         Some(index)
     } else if !o.pathspecs.is_empty() {
-        Some(only_mode_stage(repo, &o.pathspecs)?.0)
+        let mut index = only_mode_stage(repo, &o.pathspecs)?.0;
+        super::write_tree::write_cache_tree_only(repo, &mut index);
+        Some(index)
     } else {
         // An as-is dry run is not read-only, and that is not an accident of this
         // port: `dry_run_commit()` calls `prepare_index(..., is_status=1)` and
@@ -2725,12 +2738,16 @@ fn index_differs_from_reference(
         let backing = idx.path_backing();
         idx.entries()
             .iter()
+            .filter(|e| e.stage() == Stage::Unconflicted)
             .map(|e| (e.path_in(backing).to_owned(), e.mode.to_tree_entry_mode(), e.id))
             .collect()
     };
-    if index.entries().iter().any(|e| e.stage() != Stage::Unconflicted) {
-        return Ok(true);
-    }
+    // An unmerged path is not a *committable* change: `wt_status_collect_changes_index()`
+    // sets `s->committable` for the staged changes it walks, and the unmerged ones go
+    // through their own collector, which does not (wt-status.c). `dry_run_commit()` returns
+    // `committable ? 0 : 1`, so a repository whose only difference from HEAD is a conflict
+    // exits 1 — the conflict has to be resolved before there is anything to commit. The
+    // comparison below therefore looks at the stage-0 entries alone.
     // `if (repo_get_oid(parent, &oid))` — an unresolvable parent (an amend of a
     // root commit, or a commit with no `HEAD` yet) makes git fall back to "is
     // there anything in the index at all", which the empty tree stands in for.
@@ -2738,11 +2755,28 @@ fn index_differs_from_reference(
         Some(id) => Some(repo.find_commit(id.detach())?.tree_id()?.detach()),
         None => None,
     };
+    // A path that is unmerged in the index is compared on neither side: the diff against
+    // HEAD would otherwise read as a deletion and count as something to commit, where git
+    // classifies it as a conflict and leaves `s->committable` alone.
+    let unmerged: std::collections::HashSet<BString> = {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .filter(|e| e.stage() != Stage::Unconflicted)
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
     let old = match reference_tree {
         Some(t) => flatten(&repo.index_from_tree(&t)?),
         None => Vec::new(),
     };
-    Ok(flatten(index) != old)
+    let keep = |list: Vec<(BString, Option<EntryMode>, ObjectId)>| {
+        list.into_iter()
+            .filter(|(path, _, _)| !unmerged.contains(path))
+            .collect::<Vec<_>>()
+    };
+    Ok(keep(flatten(index)) != keep(old))
 }
 
 /// git's `index.lock` around `commit --interactive` (`prepare_index()`,
@@ -3675,8 +3709,11 @@ fn stage_pathspecs(
 /// Stage every *tracked* path whose worktree state diverges from the index —
 /// `git commit -a`, which is `git add -u` over the whole worktree.
 ///
-/// Only stage-0 entries participate: conflicted stages are left for the caller's
-/// unmerged-files check to reject. Submodule gitlinks move to the submodule's
+/// An unmerged path participates too, and that is the point of `git commit -a` after a
+/// conflict: `add_files_to_cache()` stages the worktree content, which collapses the three
+/// stages into one and resolves the path — `refresh_cache_or_die()` runs *after* it
+/// (`prepare_index()`, builtin/commit.c), so there is nothing left to refuse by then.
+/// Submodule gitlinks move to the submodule's
 /// checked-out HEAD, which is what git's `-a` does (`add_files_to_cache()` diffs
 /// with `ignore_submodule_ignore_config`, so a moved pointer shows up as modified
 /// and `add_file_to_index()` re-resolves it). Untracked files are deliberately not
@@ -3717,11 +3754,15 @@ fn collect_tracked_changes(
 
     {
         let backing = index.path_backing();
+        // An unmerged path has two or three entries; it is staged once, from the worktree,
+        // with no baseline to compare against.
+        let mut seen_unmerged: HashSet<BString> = HashSet::new();
         for e in index.entries() {
-            if e.stage() != Stage::Unconflicted {
+            let unmerged = e.stage() != Stage::Unconflicted;
+            let path = e.path_in(backing).to_owned();
+            if unmerged && !seen_unmerged.insert(path.clone()) {
                 continue;
             }
-            let path = e.path_in(backing).to_owned();
             let Some(abs) = repo.workdir_path(&path) else {
                 continue;
             };
@@ -3742,7 +3783,7 @@ fn collect_tracked_changes(
                 else {
                     continue;
                 };
-                if id == e.id && e.mode == Mode::COMMIT {
+                if !unmerged && id == e.id && e.mode == Mode::COMMIT {
                     continue;
                 }
                 staged.push(StagedFile {
@@ -3777,7 +3818,7 @@ fn collect_tracked_changes(
             // Hash first, write only on a real change: an unmodified worktree
             // must not churn the index or touch the object database.
             let id = gix::objs::compute_hash(repo.object_hash(), gix::object::Kind::Blob, &bytes)?;
-            if id == e.id && mode == e.mode {
+            if !unmerged && id == e.id && mode == e.mode {
                 continue;
             }
             let id = repo.write_blob(&bytes)?.detach();

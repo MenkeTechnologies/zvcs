@@ -96,12 +96,21 @@ fn write_to_local_config(config: &gix_config::File, mode: WriteMode) -> std::io:
         gix_config::Source::Local,
         "made for appending to local configuration file"
     );
+    let overwrite = matches!(mode, WriteMode::Overwrite);
     let mut local_config = std::fs::OpenOptions::new()
         .create(false)
-        .write(matches!(mode, WriteMode::Overwrite))
+        .write(overwrite)
+        // Overwriting replaces the whole file: without this a shorter rewrite would leave the
+        // tail of the previous content behind.
+        .truncate(overwrite)
         .append(matches!(mode, WriteMode::Append))
         .open(config.meta().path.as_deref().expect("local config with path set"))?;
-    local_config.write_all(config.detect_newline_style())?;
+    // The separator only makes sense when appending to what is already there. Writing it in
+    // overwrite mode put a blank first line into every cloned repository's config, which
+    // `git clone` never produces.
+    if !overwrite {
+        local_config.write_all(config.detect_newline_style())?;
+    }
     config.write_to_filter(&mut local_config, |s| s.meta().source == gix_config::Source::Local)
 }
 

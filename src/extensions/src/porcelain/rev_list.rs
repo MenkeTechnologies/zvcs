@@ -1731,8 +1731,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 }
                 gix::object::Kind::Blob => match blob_filtered(&repo, entry.id, &mut absent, &walk)?
                 {
-                    Ok(true) => {}
-                    Ok(false) => object_lines.push((entry.id, entry.name.clone())),
+                    Ok(BlobVerdict::Filtered) => omitted.push(entry.id),
+                    Ok(BlobVerdict::Absent) => {}
+                    Ok(BlobVerdict::Show) => object_lines.push((entry.id, entry.name.clone())),
                     Err(code) => return Ok(code),
                 },
                 _ => object_lines.push((entry.id, entry.name.clone())),
@@ -3028,7 +3029,30 @@ fn resolve(
 }
 
 /// Peel `id` down to a commit, pushing every tag object passed through onto
-/// `tags` under its own name — which is what `--objects` reports for them.
+/// `pending` under its own name — which is what `--objects` reports for them.
+///
+/// ```c
+/// while (object->type == OBJ_TAG) {
+///         struct tag *tag = (struct tag *) object;
+///         if (revs->tag_objects && !(flags & UNINTERESTING))
+///                 add_pending_object(revs, object, tag->tag);
+///         …
+///         object = parse_object(revs->repo, get_tagged_oid(tag));
+///         …
+///         /*
+///          * We'll handle the tagged object by looping or dropping
+///          * through to the non-tag handlers below. Do not
+///          * propagate path data from the tag's pending entry.
+///          */
+///         path = NULL;
+///         mode = 0;
+/// }
+/// ```
+///
+/// (`handle_commit()`, revision.c.) A chain that ends at a tree or a blob is not
+/// a seed for the commit walk, but it is still an object to list — pended with
+/// *no* path, which is why `git rev-list --objects --all` prints a tagged blob
+/// with an empty name rather than the one its tree gives it.
 fn peel_recording_tags(
     repo: &gix::Repository,
     id: ObjectId,
@@ -3040,6 +3064,15 @@ fn peel_recording_tags(
         let kind = object.kind;
         match kind {
             gix::object::Kind::Commit => return Some(id),
+            gix::object::Kind::Tree | gix::object::Kind::Blob => {
+                pending.push(Pending {
+                    id,
+                    name: Vec::new(),
+                    kind,
+                    uninteresting: false,
+                });
+                return None;
+            }
             gix::object::Kind::Tag => {
                 let tag = object.into_tag();
                 let tag_id = tag.id;
@@ -3055,7 +3088,6 @@ fn peel_recording_tags(
                 });
                 id = target;
             }
-            _ => return None,
         }
     }
 }
@@ -3396,15 +3428,12 @@ fn walk_tree(
             continue;
         }
         match blob_filtered(repo, id, absent, walk)? {
-            Ok(true) => {
-                // A blob the *filter* omitted joins the omitted set; one that is
-                // simply missing does not — `finish_object__ma()` owns that one.
-                if walk.filter.is_some() && repo.find_header(id).is_ok() {
-                    omitted.push(id);
-                }
+            Ok(BlobVerdict::Filtered) => {
+                omitted.push(id);
                 continue;
             }
-            Ok(false) => {}
+            Ok(BlobVerdict::Absent) => continue,
+            Ok(BlobVerdict::Show) => {}
             Err(code) => return Ok(Err(code)),
         }
         lines.push((id, path));
@@ -3537,7 +3566,7 @@ fn blob_filtered(
     id: ObjectId,
     absent: &mut Vec<ObjectId>,
     walk: &ObjectWalk<'_>,
-) -> Result<Result<bool, ExitCode>> {
+) -> Result<Result<BlobVerdict, ExitCode>> {
     // ```c
     // if (ctx->filter_fn) {
     //         r = ctx->filter_fn(ctx->revs->repo, LOFS_BLOB, obj, …);
@@ -3553,21 +3582,32 @@ fn blob_filtered(
     // clone whose blobs are not there; asking about them first turned the
     // listing into `missing object '<oid>'`.
     if matches!(walk.filter, Some(Filter::BlobNone)) {
-        return Ok(Ok(true));
+        return Ok(Ok(BlobVerdict::Filtered));
     }
     let header = repo.find_header(id).ok();
     let Some(header) = header else {
         if let Some(code) = note_missing(repo, id, absent, walk.missing) {
             return Ok(Err(code));
         }
-        // A missing object is skipped rather than listed.
-        return Ok(Ok(true));
+        // A missing object is skipped rather than listed — and it is *not* one
+        // the filter omitted, so it belongs to the missing report, not the
+        // omitted one.
+        return Ok(Ok(BlobVerdict::Absent));
     };
     Ok(Ok(match walk.filter {
-        Some(Filter::BlobNone) => true,
-        Some(Filter::BlobLimit(limit)) => header.size() >= limit,
-        _ => false,
+        Some(Filter::BlobLimit(limit)) if header.size() >= limit => BlobVerdict::Filtered,
+        _ => BlobVerdict::Show,
     }))
+}
+
+/// What [`blob_filtered`] decided about one blob.
+enum BlobVerdict {
+    /// The filter omitted it: `--filter-print-omitted` names this one.
+    Filtered,
+    /// The repository does not have it; `--missing` has already been consulted.
+    Absent,
+    /// List it.
+    Show,
 }
 
 /// git's `get_object_disk_usage`: the bytes the object occupies in the object

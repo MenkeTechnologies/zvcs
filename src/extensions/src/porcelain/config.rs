@@ -1199,7 +1199,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     }
     // The two applicability checks below belong to `cmd_config_actions()`, the
     // legacy form; `cmd_config_get()` has its own option table where `--name-only`
-    // and `--default` are unconditional (builtin/config.c:1221-1236) and its own
+    // and `--default` are unconditional (builtin/config.c:1082-1097) and its own
     // three refusals, already applied during the rewrite. So a `get` that came
     // through the subcommand table skips them.
     let get_subcommand = from_subcommand
@@ -1269,7 +1269,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     //         opts->options.respect_includes = opts->respect_includes_opt;
     // ```
     //
-    // (`builtin/config.c:970-973`, `location_options_init()`.) `source.file` is
+    // (`builtin/config.c:1001-1004`, `location_options_init()`.) `source.file` is
     // set only by `--file`/`--blob`, so every other scope follows includes
     // unless `--no-includes` says not to, and a named file does not unless
     // `--includes` says it should.
@@ -1637,7 +1637,7 @@ fn get(
     // in file order, and git's `--get` is the LAST value that survives the
     // filter.
     // `collect_config()` hands `format_config()` the *entry's* key, not the one
-    // that was asked for (builtin/config.c:357-358), so `--show-names` and the
+    // that was asked for (builtin/config.c:527-528), so `--show-names` and the
     // type diagnostics both name the git-normalized spelling.
     let wanted = key_of(&key);
     let mut selected: Vec<(String, Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
@@ -1647,21 +1647,8 @@ fn get(
         }
         Ok(())
     })?;
-    // ```c
-    // if (!values.nr && display_opts->default_value) {
-    //         struct key_value_info kvi = KVI_INIT;
-    //         kvi_from_param(&kvi);
-    //         …
-    //         status = format_config(display_opts, item, key_, display_opts->default_value, &kvi, 0);
-    //         if (status < 0)
-    //                 die(_("failed to format default config value: %s"), display_opts->default_value);
-    // ```
-    //
-    // (`builtin/config.c:608-628`.) The default is formatted by the same
-    // `format_config()` the stored values go through, so `--type` applies to it —
-    // and `kvi_from_param()` gives it no file of origin, which is what shortens the
-    // diagnostic when the type rejects it. Only a `--get` that found *nothing* uses
-    // it; a key that exists but was filtered out by a value-pattern still exits 1.
+    // Only a `--get` that found *nothing* reaches the `--default` arm; a key that
+    // exists but was filtered out by a value-pattern still exits 1.
     if selected.is_empty() {
         return emit_default(&mut out, d, name);
     }
@@ -1693,17 +1680,24 @@ fn get(
 /// if (!values.nr && display_opts->default_value) {
 ///         struct key_value_info kvi = KVI_INIT;
 ///         struct strbuf *item;
+///         int status;
 ///
 ///         kvi_from_param(&kvi);
 ///         …
-///         if (format_config(display_opts, item, key_,
-///                           display_opts->default_value, &kvi) < 0)
+///         status = format_config(display_opts, item, key_,
+///                                display_opts->default_value, &kvi, 0);
+///         if (status < 0)
 ///                 die(_("failed to format default config value: %s"),
 ///                     display_opts->default_value);
+///         if (status) {
+///                 /* default was a missing optional value */
+///                 values.nr--;
+///                 strbuf_release(item);
+///         }
 /// }
 /// ```
 ///
-/// (`builtin/config.c:537-551`.) The default is formatted by the same
+/// (`builtin/config.c:608-628`.) The default is formatted by the same
 /// `format_config()` the stored values go through, so `--type` applies to it —
 /// and `kvi_from_param()` gives it no file of origin, which is what shortens the
 /// diagnostic when the type rejects it. `key_` is the name as it was asked for,
@@ -2166,7 +2160,7 @@ fn get_regexp(
     //         fwrite(buf->buf, 1, buf->len, stdout);
     // ```
     //
-    // (`builtin/config.c:546-548`.)
+    // (`builtin/config.c:632-637`.)
     let emit: &[_] = if all { &collected } else { &collected[collected.len() - 1..] };
     for (key, value, implicit, meta) in emit {
         // A key with no `=` prints as its name alone under `--show-names`, and as an
@@ -2191,7 +2185,7 @@ fn get_regexp(
 ///         *tl = tolower(*tl);
 /// ```
 ///
-/// (`builtin/config.c:490-496`.) The first loop walks back from the end to the
+/// (`builtin/config.c:563-569`.) The first loop walks back from the end to the
 /// last `.`, the second forward from the start to the first one; a pattern with
 /// no `.` at all is lower-cased entirely by the first. Regexp metacharacters are
 /// carried along untouched, which is why `DEMO\.ONE` matches `demo.one`.

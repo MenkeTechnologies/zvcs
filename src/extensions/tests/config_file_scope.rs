@@ -136,7 +136,7 @@ fn include_directives_are_not_followed() {
 
 /// The mirror image of the case above: for every scope that is not a named
 /// file, `location_options_init()` turns include following ON by default
-/// (builtin/config.c:970-973), and only `--no-includes` turns it back off. The
+/// (builtin/config.c:1001-1004), and only `--no-includes` turns it back off. The
 /// repository cascade resolves its includes while it is being built, so the
 /// flag has to reach the read before the snapshot exists — a regression here
 /// shows up as the included key still being answered for.

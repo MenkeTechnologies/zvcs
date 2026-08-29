@@ -385,7 +385,7 @@ fn edit_runs_the_configured_editor_on_the_target_file() {
 
 /// `git config get --regexp` and `git config --get-regexp` share `get_value()`
 /// but disagree on display: the subcommand form is a *value* reader with a
-/// regexp key (`GET_VALUE_KEY_REGEXP`, builtin/config.c:306-313), printing the
+/// regexp key (`GET_VALUE_KEY_REGEXP`, builtin/config.c:511-516), printing the
 /// last match alone unless `--all` asks for every one, while the legacy option
 /// prints `key value` for all of them.
 #[test]
@@ -413,7 +413,7 @@ fn the_get_subcommand_regexp_prints_values_and_the_legacy_option_prints_pairs() 
 
 /// `get_value()` lower-cases the *pattern* before compiling it — the section
 /// name up to the first `.` and the variable name back from the last one, with
-/// the subsection between them untouched (builtin/config.c:490-496). Regexp
+/// the subsection between them untouched (builtin/config.c:563-569). Regexp
 /// metacharacters ride along, so `USER\.NAME` still matches `user.name`.
 #[test]
 fn a_key_pattern_is_lower_cased_the_way_a_key_is() {
@@ -436,7 +436,7 @@ fn a_key_pattern_is_lower_cased_the_way_a_key_is() {
 }
 
 /// The `get` subcommand's own option table makes `--name-only` and `--default`
-/// unconditional (builtin/config.c:1221-1236); only the legacy form restricts
+/// unconditional (builtin/config.c:1082-1097); only the legacy form restricts
 /// them to `--list`/`--get-regexp` and `--get`. An empty regexp result with a
 /// `--default` prints the default, formatted the same way a stored value is.
 #[test]

@@ -18,8 +18,17 @@
 //! `branched` and `merged` harness fixtures, including the tag-tip regrouping
 //! `--include-tag` exercises.
 //!
-//! **The deflate stream is the one part not written here**, so it is worth
-//! saying what has actually been observed of it rather than assuming. The
+//! An object already stored in one of the repository's packs is copied out of it
+//! byte for byte — git's `write_reuse_object()`, see [`write_reuse_entry`] — so
+//! for those the deflate stream is not written at all, only re-headered. That is
+//! why a repack of an already-packed repository ignores `pack.compression`,
+//! `core.compression` and `--compression`: there is nothing left to compress.
+//! `--no-reuse-object` switches the copy off and sends every entry through the
+//! deflater below.
+//!
+//! **For everything else the deflate stream is the one part not written here**,
+//! so it is worth saying what has actually been observed of it rather than
+//! assuming. The
 //! vendored `gix-zlib` compresses through `zlib-rs` where git links zlib, and
 //! at the pack's default level the two have matched byte-for-byte on every
 //! corpus checked so far: the `packed` fixture's 31-object pack, a 402-object
@@ -32,12 +41,12 @@
 //! which is the shape to look for. `git verify-pack`, `git index-pack --verify`
 //! and `git unpack-objects` all accept what is written either way.
 //!
-//! Deltas *are* reused from an existing pack, as `check_object()` reuses them:
-//! see [`reused_delta_bases`]. What is reused is the delta *relationship* — the
-//! base, and therefore the chain — and not the stored bytes, so
-//! `write_reuse_object()`'s byte copy still has no counterpart and the delta is
-//! recomputed from base and target at write time. Since it is recomputed by the
-//! same encoder that produced it, the instruction stream comes out the same.
+//! Deltas are reused from an existing pack as `check_object()` reuses them (see
+//! [`reused_delta_bases`]), and the chains they form are cut back to `--depth`
+//! by [`break_delta_chains`] exactly as `get_object_details()`'s second pass
+//! does. A reused delta's stored bytes are copied across with the entry; only a
+//! delta the pack split made unusable is recomputed, by the same encoder that
+//! produced it.
 //!
 //! One layout input is still absent, and is not reachable from the default
 //! configuration: delta islands do not split the write order into layers — with
@@ -45,9 +54,8 @@
 //! which is what [`compute_write_order`] reproduces.
 //!
 //! The knobs with nothing to steer are the ones tied to substrate that is still
-//! missing: `--no-reuse-object` (the stored bytes are never copied, so there is
-//! no object reuse to switch off), `--delta-islands`,
-//! `--name-hash-version`, `--path-walk`, `--sparse` and `--shallow`. `--thin`
+//! missing: `--delta-islands`, `--name-hash-version`, `--path-walk`, `--sparse`
+//! and `--shallow`. `--thin`
 //! is likewise accepted without effect, a thin pack needing bases outside the
 //! pack. `--write-bitmap-index` *does* write a `.bitmap` — see [`bitmap_file`] —
 //! unless the pack is missing part of the closure a bitmap must cover, in which
@@ -129,7 +137,10 @@
 //!     overridable by its command-line counterpart. A window or depth of zero
 //!     turns the search off and every object is stored whole.
 //!   * `pack.compression`, falling back to `core.compression` — the zlib level
-//!     every entry is deflated at, shadowed by `--compression`.
+//!     every entry that is *not* copied out of an existing pack is deflated at,
+//!     shadowed by `--compression`.
+//!   * `core.bigFileThreshold` — `get_object_details()` sets `no_try_delta` on
+//!     anything over it, so an oversized object is never a delta candidate.
 //!   * `core.fsync` / `core.fsyncMethod` — the pack is hardened when the `pack`
 //!     component is in the set, its `.idx`/`.rev`/`.mtimes` when `pack-metadata`
 //!     is. `core.fsyncObjectFiles` is read for its deprecation warning and its
@@ -495,6 +506,9 @@ struct State {
     /// `--reuse-delta` / `--no-reuse-delta`: whether a delta already on disk is
     /// kept rather than searched for again. Unset leaves git's default, on.
     reuse_delta: Option<bool>,
+    /// `--reuse-object` / `--no-reuse-object`: whether an entry already stored
+    /// in a pack is copied out of it verbatim. Unset leaves git's default, on.
+    reuse_object: Option<bool>,
     /// `--filter=<spec>`, as given; see [`apply_filter`].
     filter: Option<String>,
     /// `--write-bitmap-index`: write a `.bitmap` beside the `.idx`.
@@ -1197,6 +1211,13 @@ struct DeltaConfig {
     /// a fresh one. git's `reuse_delta`, which defaults on
     /// (`pack-objects.c:209`) and is what `check_object()` acts on.
     reuse_delta: bool,
+    /// `--[no-]reuse-object`: whether an entry already in one of the
+    /// repository's packs is copied out of it byte for byte instead of being
+    /// deflated afresh. git's `reuse_object`, which defaults on
+    /// (`pack-objects.c:210`) and is what `write_object()` acts on. It is why a
+    /// repack of an already-packed repository ignores the compression level:
+    /// nothing is compressed, the stored bytes are copied.
+    reuse_object: bool,
 }
 
 impl Default for DeltaConfig {
@@ -1206,6 +1227,7 @@ impl Default for DeltaConfig {
             allow_ofs_delta: false,
             use_islands: false,
             reuse_delta: true,
+            reuse_object: true,
         }
     }
 }
@@ -1259,6 +1281,9 @@ impl DeltaConfig {
         }
         if let Some(v) = st.delta_base_offset {
             self.allow_ofs_delta = v;
+        }
+        if let Some(v) = st.reuse_object {
+            self.reuse_object = v;
         }
         if let Some(v) = st.reuse_delta {
             self.reuse_delta = v;
@@ -1321,13 +1346,30 @@ fn write_pack(
     for count in counts {
         use gix::odb::HeaderExt;
         counting.tick();
-        let Ok(header) = repo.objects.header(count.id) else {
-            crate::git_fatal!("unable to read {}", count.id);
+        let (kind, size) = match repo.objects.header(count.id) {
+            Ok(header) => (header.kind(), header.size()),
+            // ```c
+            // static const struct inmemory_object empty_tree = {
+            //         .type = OBJ_TREE,
+            //         .buf = "",
+            // };
+            // if (oid->algo && oideq(oid, hash_algos[oid->algo].empty_tree))
+            //         return &empty_tree;
+            // ```
+            //
+            // (odb/source-inmemory.c:18-31, in `find_cached_object()`.) git's object database
+            // answers for the empty tree whether or not it was ever written, so
+            // `pack-objects <empty tree>` packs it out of nothing. gitoxide has no such
+            // cached object, so it is supplied here.
+            Err(_) if count.id == ObjectId::empty_tree(repo.object_hash()) => {
+                (gix::object::Kind::Tree, 0)
+            }
+            Err(_) => crate::git_fatal!("unable to read {}", count.id),
         };
         objects.push(delta::Object {
             id: count.id,
-            kind: header.kind(),
-            size: header.size(),
+            kind,
+            size,
             name_hash: 0,
         });
     }
@@ -1358,15 +1400,31 @@ fn write_pack(
             resolved_threads(delta.search.threads)
         );
     }
-    // `check_object()`'s delta reuse runs before the search, because what it
-    // settles is also what the search must leave alone: an object that keeps a
-    // delta from an existing pack is not a search candidate at all.
-    let reused = if delta.reuse_delta {
-        reused_delta_bases(repo, &objects, &islands)
+    // `check_object()` runs before the search, because what it settles is also
+    // what the search must leave alone: an object that keeps a delta from an
+    // existing pack is not a search candidate at all. The same pass records how
+    // every object is already stored, which is what `write_object()` consults to
+    // decide whether the entry can be copied out byte for byte.
+    let (packs, in_pack) = in_pack_table(repo, &objects);
+    let mut reused = if delta.reuse_delta {
+        reused_delta_bases(&objects, &in_pack, &islands)
     } else {
         vec![None; objects.len()]
     };
-    let already_deltified: Vec<bool> = reused.iter().map(Option::is_some).collect();
+    // `break_delta_chains()` is the second pass of `get_object_details()`: the
+    // reused chains are the only ones that exist yet, and nothing bounded their
+    // length, so this is where `--depth` gets applied to them.
+    break_delta_chains(&mut reused, delta.search.depth as u32);
+    // `should_attempt_deltas()`: an object that kept a delta is not a candidate,
+    // and neither is one over `core.bigFileThreshold` — `get_object_details()`
+    // sets `entry->no_try_delta` for those. The size floor of 50 bytes is the
+    // search's own.
+    let threshold = super::fsck::big_file_threshold(repo);
+    let already_deltified: Vec<bool> = objects
+        .iter()
+        .zip(&reused)
+        .map(|(object, reused)| reused.is_some() || object.size > threshold)
+        .collect();
     let mut compressing =
         Meter::counted("Compressing objects", objects.len(), compressing_progress);
     let mut deltas = delta::find_deltas(
@@ -1381,9 +1439,9 @@ fn write_pack(
         },
     );
     // The reused pairs join the result the search left a hole for. `data: None`
-    // sends [`write_entry`] down `get_delta()`'s recompute path rather than
-    // git's `write_reuse_object()` byte copy; the delta encoder is the same one
-    // that produced the on-disk entry, so it reproduces the same instructions.
+    // leaves the bytes to [`write_entry`], which copies the stored entry out
+    // verbatim — `write_reuse_object()` — or, when the pack split made the base
+    // unusable, recomputes the delta through `get_delta()`.
     for at in 0..reused.len() {
         let Some(entry) = reused[at] else { continue };
         deltas[at] = Some(delta::Delta {
@@ -1406,6 +1464,13 @@ fn write_pack(
     let mut entries: Vec<PackedEntry> = Vec::with_capacity(objects.len());
     let mut offsets: Vec<Option<u64>> = vec![None; objects.len()];
     let mut written_deltas = 0usize;
+    let from_reuse: Vec<bool> = reused.iter().map(Option::is_some).collect();
+    let reuse = Reuse {
+        enabled: delta.reuse_object,
+        packs: &packs,
+        in_pack: &in_pack,
+        from_reuse: &from_reuse,
+    };
     for at in write_order {
         writing.tick();
         write_entry(
@@ -1415,6 +1480,7 @@ fn write_pack(
             &deltas,
             delta.allow_ofs_delta,
             level,
+            &reuse,
             &mut body,
             &mut offsets,
             &mut entries,
@@ -1444,38 +1510,30 @@ fn write_pack(
     })
 }
 
-/// git's `check_object()` delta reuse: for each position in `objects`, the
-/// position of the base it should keep deltifying against, or `None` when it has
-/// no delta to reuse and must be searched for one.
+/// git's `check_object()`: how each object in the set is *already* stored.
 ///
-/// git reads an object's *existing* representation before searching for a new
-/// one. When the odb resolved the object out of a pack and stored it there as an
-/// `OBJ_OFS_DELTA` or `OBJ_REF_DELTA`, `check_object()` resolves that entry's
-/// base to an object id and hands it to `can_reuse_delta()`, which keeps the
-/// pair when the base is itself in the set being packed. The delta then survives
-/// the repack untouched — which is why a clone of a packed repository reproduces
-/// the source pack's delta bases rather than whatever a fresh window scan
-/// happens to prefer, and why a pack written without this differs from git's.
+/// git reads an object's existing representation before deciding anything else.
+/// When the odb resolved it out of a pack, `check_object()` records the pack,
+/// the entry offset, the header length and the stored type — everything
+/// `write_object()` needs to decide whether the entry can be copied out
+/// verbatim, and everything `write_reuse_object()` needs to do the copying.
 ///
 /// Only the *first* index that holds an object is consulted, because that is the
-/// one the odb resolves it from and therefore git's `IN_PACK(entry)`. An object
-/// stored whole, or stored as a delta on a base that is not being packed, gets
-/// `None` and goes to the search.
-fn reused_delta_bases(
+/// one the odb resolves it from and therefore git's `IN_PACK(entry)`.
+fn in_pack_table(
     repo: &gix::Repository,
     objects: &[pack::data::output::delta::Object],
-    islands: &pack::data::output::delta::Islands,
-) -> Vec<Option<ReusedDelta>> {
+) -> (Vec<pack::data::File>, Vec<Option<InPack>>) {
     use gix::odb::store::structure::Record;
 
-    let mut out: Vec<Option<ReusedDelta>> = vec![None; objects.len()];
-    let at: std::collections::HashMap<ObjectId, usize> =
-        objects.iter().enumerate().map(|(i, o)| (o.id, i)).collect();
+    let mut packs: Vec<pack::data::File> = Vec::new();
+    let mut out: Vec<Option<InPack>> = vec![None; objects.len()];
+    let at: std::collections::HashMap<ObjectId, usize> = objects.iter().enumerate().map(|(i, o)| (o.id, i)).collect();
     // Which objects some earlier index already answered for, so a second copy in
     // a later pack cannot override the representation the odb actually reads.
     let mut decided = vec![false; objects.len()];
     let Ok(records) = repo.objects.store_ref().structure() else {
-        return out;
+        return (packs, out);
     };
     let hash = repo.object_hash();
 
@@ -1486,19 +1544,17 @@ fn reused_delta_bases(
             continue;
         };
 
-        // An `OBJ_OFS_DELTA` names its base by a backwards distance, so turning
-        // one into an object id needs the index's offset -> id mapping, which is
-        // `offset_to_pack_pos()` followed by `nth_packed_object_id()`.
+        // `offset_to_pack_pos()` + `nth_packed_object_id()`, which an
+        // `OBJ_OFS_DELTA`'s backwards distance needs to name a base, and
+        // `pack_pos_to_offset(p, pos + 1)`, which is where the entry's stored
+        // bytes end. The last entry ends at the trailer.
         let mut by_offset: Vec<(u64, ObjectId)> =
             idx.iter().map(|e| (e.pack_offset, e.oid)).collect();
         by_offset.sort_unstable_by_key(|(offset, _)| *offset);
-        let id_at = |offset: u64| -> Option<ObjectId> {
-            by_offset
-                .binary_search_by_key(&offset, |(o, _)| *o)
-                .ok()
-                .map(|i| by_offset[i].1)
-        };
+        let pack_end = data.pack_end() as u64;
+        let pos_of = |offset: u64| by_offset.binary_search_by_key(&offset, |(o, _)| *o).ok();
 
+        let pack = packs.len();
         for entry in idx.iter() {
             let Some(&target) = at.get(&entry.oid) else { continue };
             if decided[target] {
@@ -1506,33 +1562,167 @@ fn reused_delta_bases(
             }
             decided[target] = true;
             let Ok(packed) = data.entry(entry.pack_offset) else { continue };
+            let Some(pos) = pos_of(entry.pack_offset) else { continue };
+            let ends_at = match by_offset.get(pos + 1) {
+                Some((offset, _)) => *offset,
+                None => pack_end,
+            };
             let base_id = match packed.header {
-                pack::data::entry::Header::OfsDelta { base_distance } => {
-                    match entry.pack_offset.checked_sub(base_distance) {
-                        Some(offset) => id_at(offset),
-                        None => None,
-                    }
-                }
+                pack::data::entry::Header::OfsDelta { base_distance } => entry
+                    .pack_offset
+                    .checked_sub(base_distance)
+                    .and_then(|offset| pos_of(offset).map(|i| by_offset[i].1)),
                 pack::data::entry::Header::RefDelta { base_id } => Some(base_id),
                 _ => None,
             };
-            // `can_reuse_delta()`: the base has to be one we are sending, and
-            // islands must allow the pair. git's second arm — a base the
-            // receiver is known to have from a reachability bitmap — belongs to
-            // `--thin`, which this port does not produce.
-            let Some(base) = base_id.and_then(|id| at.get(&id).copied()) else { continue };
-            if base == target || !islands.in_same_island(target, base) {
-                continue;
-            }
-            out[target] = Some(ReusedDelta {
-                base,
-                // `SET_DELTA_SIZE(entry, in_pack_size)`: a delta entry's header
-                // size is the length of its instruction stream.
-                size: packed.decompressed_size,
+            out[target] = Some(InPack {
+                pack,
+                data_offset: packed.data_offset,
+                data_len: ends_at.saturating_sub(packed.data_offset),
+                stored_delta: base_id.is_some(),
+                entry_size: packed.decompressed_size,
+                base_id,
             });
         }
+        packs.push(data);
+    }
+    (packs, out)
+}
+
+/// git's `check_object()` delta reuse: for each position in `objects`, the
+/// position of the base it should keep deltifying against, or `None` when it has
+/// no delta to reuse and must be searched for one.
+///
+/// When the stored entry is an `OBJ_OFS_DELTA` or `OBJ_REF_DELTA`, its base is
+/// resolved to an object id and handed to `can_reuse_delta()`, which keeps the
+/// pair when the base is itself in the set being packed. The delta then survives
+/// the repack untouched — which is why a clone of a packed repository reproduces
+/// the source pack's delta bases rather than whatever a fresh window scan
+/// happens to prefer, and why a pack written without this differs from git's.
+///
+/// An object stored whole, or stored as a delta on a base that is not being
+/// packed, gets `None` and goes to the search.
+fn reused_delta_bases(
+    objects: &[pack::data::output::delta::Object],
+    in_pack: &[Option<InPack>],
+    islands: &pack::data::output::delta::Islands,
+) -> Vec<Option<ReusedDelta>> {
+    let mut out: Vec<Option<ReusedDelta>> = vec![None; objects.len()];
+    let at: std::collections::HashMap<ObjectId, usize> = objects.iter().enumerate().map(|(i, o)| (o.id, i)).collect();
+    for (target, stored) in in_pack.iter().enumerate() {
+        let Some(stored) = stored else { continue };
+        // `can_reuse_delta()`: the base has to be one we are sending, and islands
+        // must allow the pair. git's second arm — a base the receiver is known to
+        // have from a reachability bitmap — belongs to `--thin`, which this port
+        // does not produce.
+        let Some(base) = stored.base_id.and_then(|id| at.get(&id).copied()) else { continue };
+        if base == target || !islands.in_same_island(target, base) {
+            continue;
+        }
+        out[target] = Some(ReusedDelta {
+            base,
+            // `SET_DELTA_SIZE(entry, in_pack_size)`: a delta entry's header size
+            // is the length of its instruction stream.
+            size: stored.entry_size,
+        });
     }
     out
+}
+
+/// How an object is stored in one of the repository's existing packs — git's
+/// `IN_PACK(entry)` and the four `entry->in_pack_*` fields beside it.
+#[derive(Debug, Clone, Copy)]
+struct InPack {
+    /// Which pack, as an index into the table [`in_pack_table`] returns.
+    pack: usize,
+    /// `entry->in_pack_offset + entry->in_pack_header_size`: where the deflated
+    /// bytes start, past the header *and* past any delta base reference.
+    data_offset: u64,
+    /// `pack_pos_to_offset(p, pos + 1) - offset - in_pack_header_size`: the
+    /// deflated bytes, bounded by the next entry or by the pack trailer.
+    data_len: u64,
+    /// `entry->in_pack_type` is a delta type.
+    stored_delta: bool,
+    /// The size the stored header encodes: the object's size, or for a delta the
+    /// length of its instruction stream.
+    entry_size: u64,
+    /// The id the stored entry deltifies against, when it is a delta.
+    base_id: Option<ObjectId>,
+}
+
+/// git's `break_delta_chains()` (builtin/pack-objects.c:2489), run over the
+/// reused deltas — the only ones that exist when `get_object_details()` calls it.
+///
+/// A chain kept from an existing pack can be longer than `--depth` allows, so it
+/// is snipped into pieces that are not:
+///
+/// ```c
+/// cur->depth = (total_depth--) % (depth + 1);
+/// if (!cur->depth)
+///         drop_reused_delta(cur);
+/// ```
+///
+/// The first pass walks to the bottom of the chain, memoizing what it has seen so
+/// a shared tail is measured once, and cuts any cycle it finds before it can
+/// loop. The second pass walks back up assigning the final depths, dropping every
+/// entry whose depth comes out zero — which is what makes the cut.
+fn break_delta_chains(reused: &mut [Option<ReusedDelta>], depth: u32) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Dfs {
+        None,
+        Active,
+        Done,
+    }
+    let mut state = vec![Dfs::None; reused.len()];
+    let mut depths = vec![0u32; reused.len()];
+
+    for entry in 0..reused.len() {
+        // ```c
+        // for (cur = entry, total_depth = 0; cur; cur = DELTA(cur), total_depth++)
+        // ```
+        let mut total_depth = 0u32;
+        let mut cursor = entry;
+        loop {
+            if state[cursor] == Dfs::Done {
+                // Seen before and known acyclic; its measured depth completes ours.
+                total_depth += depths[cursor];
+                break;
+            }
+            let Some(entry) = reused[cursor] else {
+                state[cursor] = Dfs::Done;
+                break;
+            };
+            state[cursor] = Dfs::Active;
+            if state[entry.base] == Dfs::Active {
+                // `drop_reused_delta(cur)` — cutting here rather than further up
+                // is what keeps `total_depth` honest for the entries above.
+                reused[cursor] = None;
+                depths[cursor] = 0;
+                state[cursor] = Dfs::Done;
+                break;
+            }
+            cursor = entry.base;
+            total_depth += 1;
+        }
+
+        let mut cursor = entry;
+        loop {
+            let next = reused[cursor].map(|entry| entry.base);
+            if state[cursor] == Dfs::Done {
+                break;
+            }
+            depths[cursor] = total_depth % (depth + 1);
+            total_depth = total_depth.saturating_sub(1);
+            if depths[cursor] == 0 {
+                reused[cursor] = None;
+            }
+            state[cursor] = Dfs::Done;
+            match next {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+    }
 }
 
 /// How long the delta chain ending at `at` is, counting `at` itself.
@@ -1745,6 +1935,7 @@ fn write_entry(
     deltas: &[Option<pack::data::output::delta::Delta>],
     allow_ofs_delta: bool,
     level: gix::zlib::Compression,
+    reuse: &Reuse<'_>,
     body: &mut Vec<u8>,
     offsets: &mut [Option<u64>],
     entries: &mut Vec<PackedEntry>,
@@ -1761,6 +1952,7 @@ fn write_entry(
             deltas,
             allow_ofs_delta,
             level,
+            reuse,
             body,
             offsets,
             entries,
@@ -1768,15 +1960,64 @@ fn write_entry(
         )?;
     }
 
-    let mut buf = Vec::new();
-    let Ok((object, _location)) = repo.objects.find(&objects[at].id, &mut buf) else {
-        // Readable header, unreadable body: drop it, and with it any delta that
-        // named it as a base, which the `offsets` gap below takes care of.
-        return Ok(());
-    };
-
     // A delta whose base was itself dropped cannot be written as a delta.
     let base_offset = deltas[at].as_ref().and_then(|delta| offsets[delta.base]);
+
+    // ```c
+    // if (!reuse_object)
+    //         to_reuse = 0;                    /* explicit */
+    // else if (!IN_PACK(entry))
+    //         to_reuse = 0;                    /* can't reuse what we don't have */
+    // else if (oe_type(entry) == OBJ_REF_DELTA || oe_type(entry) == OBJ_OFS_DELTA)
+    //         to_reuse = usable_delta;         /* check_object() decided it for us ... */
+    // else if (oe_type(entry) != entry->in_pack_type)
+    //         to_reuse = 0;                    /* pack has delta which is unusable */
+    // else if (DELTA(entry))
+    //         to_reuse = 0;                    /* we want to pack afresh */
+    // else
+    //         to_reuse = 1;                    /* we have it in-pack undeltified, and
+    //                                             we do not need to deltify it. */
+    // ```
+    //
+    // (builtin/pack-objects.c:759-775, in `write_object()`.) `oe_type(entry)` is a delta type
+    // exactly when `check_object()` kept the stored delta, which here is `from_reuse`; the
+    // `usable_delta` it then falls back on is whether the base made it into this pack, which
+    // is `base_offset`. Everything else stored as a delta we did not keep, and everything the
+    // search deltified afresh, has to be written the long way.
+    let stored = reuse.enabled.then(|| reuse.in_pack[at]).flatten();
+    let to_reuse = stored.filter(|stored| match reuse.from_reuse[at] {
+        true => base_offset.is_some(),
+        false => !stored.stored_delta && deltas[at].is_none(),
+    });
+    if let Some(stored) = to_reuse {
+        return write_reuse_entry(
+            at,
+            objects,
+            deltas,
+            allow_ofs_delta,
+            reuse,
+            &stored,
+            base_offset,
+            body,
+            offsets,
+            entries,
+            written_deltas,
+        );
+    }
+
+    let mut buf = Vec::new();
+    let found = repo.objects.find(&objects[at].id, &mut buf).map(|(object, _)| object);
+    let object = match found {
+        Ok(object) => object,
+        // `find_cached_object()`'s empty tree again; see [`write_pack`].
+        Err(_) if objects[at].id == ObjectId::empty_tree(repo.object_hash()) => {
+            gix::objs::Data::new(&[], gix::object::Kind::Tree, repo.object_hash())
+        }
+        // Readable header, unreadable body: drop it, and with it any delta that
+        // named it as a base, which the `offsets` gap below takes care of.
+        Err(_) => return Ok(()),
+    };
+
     let payload = match (&deltas[at], base_offset) {
         (Some(delta), Some(_)) => delta_bytes(repo, &objects[delta.base].id, delta, &object)?,
         _ => None,
@@ -1818,6 +2059,89 @@ fn write_entry(
         offset,
         crc32: gix::features::hash::crc32(&body[start..]),
         kind: object.kind,
+        name_hash: objects[at].name_hash,
+    });
+    Ok(())
+}
+
+/// Everything [`write_entry`] needs in order to copy an entry out of an existing
+/// pack instead of deflating it again.
+struct Reuse<'a> {
+    /// `reuse_object`, i.e. `--[no-]reuse-object`.
+    enabled: bool,
+    /// The packs [`in_pack_table`] opened, indexed by [`InPack::pack`].
+    packs: &'a [pack::data::File],
+    /// How each object in the set is already stored, if it is.
+    in_pack: &'a [Option<InPack>],
+    /// Whether the delta at this position is one `check_object()` kept, rather
+    /// than one the window search found.
+    from_reuse: &'a [bool],
+}
+
+/// git's `write_reuse_object()` (builtin/pack-objects.c:633): re-encode the
+/// entry header and the delta base reference for the *new* pack, then copy the
+/// stored deflate stream across without touching it.
+///
+/// This is why a repack of an already-packed repository ignores
+/// `pack.compression`, `core.compression` and `--compression` for the objects it
+/// finds in a pack: nothing is compressed, the bytes are copied. The size in the
+/// header is the size the stored header encodes — the object's size, or for a
+/// delta the length of its instruction stream — because that is what the copied
+/// stream inflates to.
+#[allow(clippy::too_many_arguments)]
+fn write_reuse_entry(
+    at: usize,
+    objects: &[pack::data::output::delta::Object],
+    deltas: &[Option<pack::data::output::delta::Delta>],
+    allow_ofs_delta: bool,
+    reuse: &Reuse<'_>,
+    stored: &InPack,
+    base_offset: Option<u64>,
+    body: &mut Vec<u8>,
+    offsets: &mut [Option<u64>],
+    entries: &mut Vec<PackedEntry>,
+    written_deltas: &mut usize,
+) -> Result<()> {
+    let range = stored.data_offset..stored.data_offset + stored.data_len;
+    let Some(data) = reuse.packs[stored.pack].entry_slice(range) else {
+        // A pack that cannot hand back the span it indexed is corrupt; git's
+        // `copy_pack_data()` would die. Dropping the entry keeps the pack
+        // writable and consistent, and the object simply does not appear.
+        return Ok(());
+    };
+    let data = data.to_owned();
+
+    let start = body.len();
+    let offset = PACK_HEADER_LEN + start as u64;
+    // `if (DELTA(entry)) type = (allow_ofs_delta && DELTA(entry)->idx.offset) ?
+    // OBJ_OFS_DELTA : OBJ_REF_DELTA;`
+    let header = match (&deltas[at], base_offset) {
+        (Some(delta), Some(base_offset)) => {
+            *written_deltas += 1;
+            match allow_ofs_delta {
+                true => pack::data::entry::Header::OfsDelta {
+                    base_distance: offset - base_offset,
+                },
+                false => pack::data::entry::Header::RefDelta {
+                    base_id: objects[delta.base].id,
+                },
+            }
+        }
+        _ => match objects[at].kind {
+            gix::object::Kind::Tree => pack::data::entry::Header::Tree,
+            gix::object::Kind::Blob => pack::data::entry::Header::Blob,
+            gix::object::Kind::Commit => pack::data::entry::Header::Commit,
+            gix::object::Kind::Tag => pack::data::entry::Header::Tag,
+        },
+    };
+    header.write_to(stored.entry_size, body)?;
+    body.extend_from_slice(&data);
+    offsets[at] = Some(offset);
+    entries.push(PackedEntry {
+        id: objects[at].id,
+        offset,
+        crc32: gix::features::hash::crc32(&body[start..]),
+        kind: objects[at].kind,
         name_hash: objects[at].name_hash,
     });
     Ok(())
@@ -4348,6 +4672,7 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "threads" => st.threads = Some(if on { to_number(value.unwrap_or("0")).unwrap_or(0) } else { 0 }),
         "delta-base-offset" => st.delta_base_offset = Some(on),
         "reuse-delta" => st.reuse_delta = Some(on),
+        "reuse-object" => st.reuse_object = Some(on),
         // Already validated by `check_index_version`, so the `strtoul` prefix is
         // the version and the rest is the `,<offset>` tail.
         "index-version" => st.index_version = value.map(|v| strtoul(v).0),

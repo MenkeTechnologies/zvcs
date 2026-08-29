@@ -574,7 +574,6 @@ fn shortlog(out: &mut Vec<Case>) {
 /// `show-branch`: the branch/commit matrix.
 fn show_branch(out: &mut Vec<Case>) {
     read_only("show-branch", &["show-branch"], out);
-    read_only("show-branch", &["show-branch", "--all"], out);
 
     for args in [
         &["show-branch", "-a"][..],

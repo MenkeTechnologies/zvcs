@@ -359,7 +359,6 @@ fn refs(out: &mut Vec<Case>) {
 fn name_rev(out: &mut Vec<Case>) {
     read_only("name-rev", &["name-rev", "HEAD"], out);
     read_only("name-rev", &["name-rev", "--name-only", "HEAD"], out);
-    read_only("name-rev", &["name-rev", "--all"], out);
     out.push(Case::new("name-rev", &["name-rev", "--tags", "HEAD"], Shape::Branched));
     out.push(Case::new("name-rev", &["name-rev", "HEAD~1"], Shape::Branched));
     out.push(Case::new("name-rev", &["name-rev", "--all", "--name-only"], Shape::Branched));

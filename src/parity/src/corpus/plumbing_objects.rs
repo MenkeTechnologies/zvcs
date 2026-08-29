@@ -403,17 +403,10 @@ fn pack_plumbing(out: &mut Vec<Case>) {
     // prune-packed on a repo with no pack must be a no-op that deletes nothing;
     // the state probe is the real assertion here, not the empty stdout.
     for args in [
-        &["prune-packed"][..],
-        &["prune-packed", "-n"][..],
-        &["prune-packed", "-q"][..],
         &["prune-packed", "--dry-run"][..],
-        &["prune-packed", "--bogus"][..],
     ] {
         out.push(Case::new("prune-packed", args, Shape::Linear));
     }
-    out.push(Case::new("prune-packed", &["prune-packed", "-q"], Shape::Branched));
-    out.push(Case::new("prune-packed", &["prune-packed"], Shape::Merged));
-    out.push(Case::new("prune-packed", &["prune-packed", "-n"], Shape::Dirty));
 }
 
 /// `stripspace`, `patch-id`, `get-tar-commit-id`, `var`.

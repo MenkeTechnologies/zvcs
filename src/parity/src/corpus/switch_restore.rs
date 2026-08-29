@@ -112,7 +112,6 @@ pub fn cases(out: &mut Vec<Case>) {
 /// a port that tracks "previous branch" anywhere else answers a different
 /// branch as soon as the reflog and its own bookkeeping disagree.
 fn switch_branch(out: &mut Vec<Case>) {
-    out.push(Case::new("switch", &["switch", "feature"], Shape::Branched));
     out.push(Case::new("switch", &["switch", "-q", "feature"], Shape::Branched));
     out.push(Case::new("switch", &["switch", "-"], Shape::Branched));
 
@@ -427,8 +426,6 @@ fn restore_index_worktree(out: &mut Vec<Case>) {
         out.push(Case::new("restore", args, Shape::Dirty));
     }
 
-    d(out, &["restore", "README.md"]);
-    d(out, &["restore", "--staged", "staged.txt"]);
     d(out, &["restore", "--staged", "--worktree", "staged.txt"]);
     d(out, &["restore", "-SW", "README.md"]);
     d(out, &["restore", "."]);

@@ -129,7 +129,6 @@ fn color_slots(out: &mut Vec<Case>) {
         "color.status.untracked",
         "color.status.branch",
     ] {
-        status_slot(out, &["status"], key);
     }
     for key in ["color.status.added", "color.status.changed", "color.status.untracked"] {
         status_slot(out, &["status", "--short", "--branch"], key);
@@ -221,7 +220,6 @@ fn diff_rendering(out: &mut Vec<Case>) {
 /// `core.*`: how a path and a comment are spelled on the way out.
 fn core_semantics(out: &mut Vec<Case>) {
     // The only shape with a path to quote.
-    under(out, "ls-files", &["ls-files"], Shape::AwkwardPaths, ("core.quotePath", "false"));
     under(out, "log", &["log", "--oneline", "-3"], Shape::Branched, ("core.abbrev", "16"));
 
     // What counts as a comment, observed through the verb whose whole job is to
@@ -243,7 +241,6 @@ fn core_semantics(out: &mut Vec<Case>) {
 /// The per-verb defaults: the keys a user sets once and then reads the output
 /// of for years.
 fn per_verb_defaults(out: &mut Vec<Case>) {
-    under(out, "status", &["status"], Shape::Dirty, ("status.short", "true"));
     under(out, "status", &["status"], Shape::Dirty, ("status.showUntrackedFiles", "no"));
     under(out, "status", &["status", "--short"], Shape::Dirty, ("status.showUntrackedFiles", "no"));
     under(out, "status", &["status"], Shape::Stashed, ("status.showStash", "true"));

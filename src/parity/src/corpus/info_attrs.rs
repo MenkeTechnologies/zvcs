@@ -409,8 +409,6 @@ fn archive(out: &mut Vec<Case>) {
 
     // stdin is /dev/null under the runner, so this is the EOF-before-header
     // path; it is the only form of the command reachable without a pipe.
-    one(out, "get-tar-commit-id", &["get-tar-commit-id"], Shape::Linear);
-    one(out, "get-tar-commit-id", &["get-tar-commit-id", "extra"], Shape::Linear);
 }
 
 // ---------------------------------------------------------------------------

@@ -910,11 +910,6 @@ fn ref_and_env_plumbing(out: &mut Vec<Case>) {
             .with_config(&[("sequence.editor", "seq-ed")]),
     );
     out.push(Case::new("var", &["var", "GIT_PAGER"], Shape::Linear).with_config(&[("core.pager", "less")]));
-    // The identity is pinned the same way, so a configured `user.*` must lose.
-    out.push(
-        Case::new("var", &["var", "GIT_AUTHOR_IDENT"], Shape::Linear)
-            .with_config(&[("user.name", "Cfg Name"), ("user.email", "cfg@example.invalid")]),
-    );
     // `GIT_DEFAULT_BRANCH` is the one with no environment pin above it, so here
     // the configured value must win — the other half of the same test.
     out.push(

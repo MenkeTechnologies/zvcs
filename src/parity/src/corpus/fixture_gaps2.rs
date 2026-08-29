@@ -1348,10 +1348,12 @@ fn promisor(out: &mut Vec<Case>) {
     );
     // The same read with the lazy fetch forbidden, which is what separates
     // "absent and fetchable" from "absent".
-    for args in [&["cat-file", "-p", "HEAD~3:hist.txt"][..], &["log", "-p", "--oneline"][..]] {
-        let cmd: &'static str = if args[0] == "cat-file" { "cat-file" } else { "log" };
-        out.push(Case::new(cmd, args, Shape::Promisor).with_globals(&[&["--no-lazy-fetch"]]));
-    }
+    // `cat-file -p HEAD~3:hist.txt` under this global belongs to `globals_layer`;
+    // the walk is this module's, because only the Promisor shape can answer it.
+    out.push(
+        Case::new("log", &["log", "-p", "--oneline"], Shape::Promisor)
+            .with_globals(&[&["--no-lazy-fetch"]]),
+    );
 
     each(
         Shape::Promisor,

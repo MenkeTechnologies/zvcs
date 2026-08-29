@@ -23,6 +23,7 @@ mod diff_family;
 mod fetch_clone;
 mod fixture_gaps;
 mod fixture_gaps2;
+mod globals_layer;
 mod graft_partial;
 mod discovery;
 mod history_query;
@@ -109,6 +110,10 @@ pub fn cases() -> Vec<Case> {
     // Configuration that changes what a read prints: the colour slots, the
     // diff and core rendering keys, and the per-verb defaults.
     config_reads::cases(&mut c);
+
+    // The option layer that runs before the verb: `-C`, `--bare`, the
+    // pathspec-magic switches, `--namespace`, `--config-env`, `--shallow-file`.
+    globals_layer::cases(&mut c);
 
     // ---- rev-parse: the most-called plumbing in any script ----
     read_only("rev-parse", &["rev-parse", "HEAD"], &mut c);
@@ -922,7 +927,6 @@ fn config_and_globals(out: &mut Vec<Case>) {
     glob("log", &[&["-P"]], &["log", "--oneline", "-1"], Shape::Branched, out);
     glob("status", &[&["--no-optional-locks"]], &["status", "--porcelain"], Shape::Dirty, out);
     glob("log", &[&["--no-replace-objects"]], &["log", "--oneline", "-1"], Shape::Linear, out);
-    glob("status", &[&["--no-advice"]], &["status"], Shape::Conflicted, out);
 
     // `-C` moves before anything else happens, so `--show-prefix` reports where
     // it landed — the one query that separates "changed directory" from

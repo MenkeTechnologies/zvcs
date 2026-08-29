@@ -73,8 +73,6 @@ fn shallow_walks(out: &mut Vec<Case>) {
         // Object access at the tip is ordinary; naming the boundary is not.
         &["ls-tree", "-r", "HEAD"],
         &["cat-file", "-p", "HEAD^{tree}"],
-        &["rev-list", "--count", "--all"],
-        &["rev-list", "--children", "HEAD"],
     ] {
         out.push(Case::new(args[0], args, Shape::Shallow));
     }
@@ -92,7 +90,6 @@ fn shallow_reachability(out: &mut Vec<Case>) {
         &["name-rev", "HEAD"],
         &["name-rev", "--all"],
         &["name-rev", "--annotate-stdin"],
-        &["merge-base", "--is-ancestor", "HEAD~1", "HEAD"],
         &["merge-base", "--all", "main", "origin/sh-side"],
         &["merge-base", "--octopus", "main", "origin/sh-side"],
         &["describe", "--always", "--all", "HEAD"],

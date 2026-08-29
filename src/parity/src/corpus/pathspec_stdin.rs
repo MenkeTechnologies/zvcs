@@ -560,9 +560,10 @@ fn magic_spelling(out: &mut Vec<Case>) {
 ///   other global pathspec settings`, rc 128.
 fn pathspec_globals(out: &mut Vec<Case>) {
     let aw = Shape::AwkwardPaths;
-    for opt in ["--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs"] {
-        out.push(Case::new("ls-files", &["ls-files", "--", "*.txt"], aw).with_globals(&[&[opt]]));
-    }
+    // Only `--icase-pathspecs` here: the other three spellings of this exact
+    // invocation are `globals_layer`'s, which owns the options `git` parses
+    // before the verb, and a second copy would be counted twice.
+    out.push(Case::new("ls-files", &["ls-files", "--", "*.txt"], aw).with_globals(&[&["--icase-pathspecs"]]));
     for var in [
         "GIT_LITERAL_PATHSPECS",
         "GIT_GLOB_PATHSPECS",

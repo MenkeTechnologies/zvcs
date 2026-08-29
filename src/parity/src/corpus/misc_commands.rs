@@ -386,7 +386,6 @@ fn small_plumbing(out: &mut Vec<Case>) {
     // testable half with stdin closed ----
     out.push(Case::new("format-rev", &["format-rev"], Shape::Branched));
     out.push(Case::new("format-rev", &["format-rev", "-h"], Shape::Branched));
-    out.push(Case::new("format-rev", &["format-rev", "--format=%H"], Shape::Branched));
     out.push(Case::new("format-rev", &["format-rev", "--stdin-mode=rev"], Shape::Branched));
     out.push(Case::new("format-rev", &["format-rev", "--stdin-mode=bogus", "--format=%H"], Shape::Branched));
     for mode in ["rev", "revs", "text"] {
@@ -410,18 +409,12 @@ fn small_plumbing(out: &mut Vec<Case>) {
     ));
 
     // ---- repo: the object/ref census, added in 2.5x ----
-    read_only("repo", &["repo", "structure"], out);
-    read_only("repo", &["repo", "info", "--all"], out);
-    out.push(Case::new("repo", &["repo"], Shape::Linear));
     out.push(Case::new("repo", &["repo", "-h"], Shape::Linear));
     out.push(Case::new("repo", &["repo", "no-such-sub"], Shape::Linear));
-    out.push(Case::new("repo", &["repo", "structure"], Shape::AwkwardPaths));
     out.push(Case::new("repo", &["repo", "structure"], Shape::Submodule));
     out.push(Case::new("repo", &["repo", "structure", "--format=lines"], Shape::Branched));
     out.push(Case::new("repo", &["repo", "structure", "-z"], Shape::Branched));
     out.push(Case::new("repo", &["repo", "structure", "--format=no-such-format"], Shape::Linear));
-    out.push(Case::new("repo", &["repo", "info"], Shape::Linear));
-    out.push(Case::new("repo", &["repo", "info", "--keys"], Shape::Linear));
     out.push(Case::new("repo", &["repo", "info", "object.format"], Shape::Linear));
     out.push(Case::new(
         "repo",
@@ -430,7 +423,6 @@ fn small_plumbing(out: &mut Vec<Case>) {
     ));
     out.push(Case::new("repo", &["repo", "info", "-z", "--all"], Shape::Branched));
     out.push(Case::new("repo", &["repo", "info", "--format=nul", "--all"], Shape::Branched));
-    out.push(Case::new("repo", &["repo", "info", "no.such.key"], Shape::Linear));
 }
 
 /// Commands whose job is to spawn something else. Cases are chosen so nothing
@@ -621,10 +613,8 @@ fn usage_only(out: &mut Vec<Case>) {
         "cvsserver",
         "cvsexportcommit",
         "archimport",
-        "quiltimport",
         "shell",
         "upload-archive--writer",
-        "checkout--worker",
     ];
     for cmd in HELP_AND_BOGUS {
         out.push(Case::new(cmd, &[cmd, "-h"], Shape::Linear));

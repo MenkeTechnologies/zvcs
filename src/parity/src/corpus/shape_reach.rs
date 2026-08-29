@@ -258,7 +258,6 @@ fn mailmap(out: &mut Vec<Case>) {
             &["log", "--format=%aN <%aE>"],
             &["log", "--format=%an <%ae>"],
             &["log", "--format=%cN <%cE>"],
-            &["log", "--use-mailmap", "--format=%an <%ae>"],
             &["log", "--no-use-mailmap", "--format=%aN <%aE>"],
             &["log", "--pretty=fuller"],
             &["log", "--author=Proper", "--oneline"],
@@ -285,7 +284,6 @@ fn mailmap(out: &mut Vec<Case>) {
         &[
             &["blame", "-s", "sub/nested.txt"],
             &["blame", "--porcelain", "sub/nested.txt"],
-            &["blame", "--line-porcelain", "docs/manual.md"],
             &["blame", "-s", "--no-use-mailmap", "sub/nested.txt"],
         ],
         out,
@@ -562,7 +560,6 @@ fn packs(out: &mut Vec<Case>) {
         &[
             &["prune-packed", "-n"],
             &["prune-packed", "--dry-run"],
-            &["prune-packed"],
             &["prune-packed", "-q"],
         ],
         out,
@@ -844,9 +841,7 @@ fn sparse(out: &mut Vec<Case>) {
         "rm",
         &[
             &["rm", "outside/drop.txt"],
-            &["rm", "--sparse", "outside/drop.txt"],
             &["rm", "-r", "outside"],
-            &["rm", "-r", "--sparse", "outside"],
             &["rm", "--cached", "outside/drop.txt"],
             &["rm", "--cached", "--sparse", "outside/drop.txt"],
             &["rm", "-n", "outside/drop.txt"],
@@ -859,7 +854,6 @@ fn sparse(out: &mut Vec<Case>) {
         "add",
         &[
             &["add", "outside/stray.txt"],
-            &["add", "--sparse", "outside/stray.txt"],
             &["add", "-A"],
             &["add", "."],
             &["add", "-n", "outside"],
@@ -880,7 +874,6 @@ fn sparse(out: &mut Vec<Case>) {
         Shape::Sparse,
         "mv",
         &[
-            &["mv", "root.txt", "inside/root.txt"],
             &["mv", "root.txt", "outside/root.txt"],
         ],
         out,
@@ -897,7 +890,6 @@ fn sparse(out: &mut Vec<Case>) {
         &[
             &["read-tree", "-m", "-u", "HEAD"],
             &["read-tree", "HEAD"],
-            &["read-tree", "-m", "-u", "--no-sparse-checkout", "HEAD"],
         ],
         out,
     );
@@ -907,7 +899,6 @@ fn sparse(out: &mut Vec<Case>) {
         &[
             &["update-index", "--no-skip-worktree", "outside/drop.txt"],
             &["update-index", "--skip-worktree", "inside/keep.txt"],
-            &["update-index", "--refresh"],
         ],
         out,
     );

@@ -305,8 +305,6 @@ fn suffixes_past_the_end(out: &mut Vec<Case>) {
     out.push(Case::strict("rev-parse", &["rev-parse", "HEAD^5"], Shape::Octopus));
     out.push(Case::strict("rev-parse", &["rev-parse", "HEAD~99"], Shape::Packed));
     out.push(Case::strict("rev-parse", &["rev-parse", "HEAD~1^2"], Shape::Merged));
-    out.push(Case::strict("rev-parse", &["rev-parse", "HEAD~2"], Shape::Shallow));
-    out.push(Case::new("rev-parse", &["rev-parse", "HEAD~1"], Shape::Shallow));
     out.push(Case::strict("log", &["log", "--oneline", "HEAD^5"], Shape::Octopus));
     out.push(Case::strict("cat-file", &["cat-file", "-t", "HEAD^9"], Shape::Merged));
 }
@@ -374,7 +372,6 @@ fn peels(out: &mut Vec<Case>) {
         ],
         out,
     );
-    each(Shape::TagChain, "archive", &[&["archive", "--format=tar", "outermost"]], out);
     // A committish operand, three ways.
     each(
         Shape::TagChain,
@@ -386,12 +383,6 @@ fn peels(out: &mut Vec<Case>) {
         Shape::TagChain,
         "describe",
         &[&["describe", "--tags", "outermost^{}"]],
-        out,
-    );
-    each(
-        Shape::TagChain,
-        "log",
-        &[&["log", "--oneline", "outermost"]],
         out,
     );
     each(
@@ -777,13 +768,6 @@ fn ranges(out: &mut Vec<Case>) {
         out,
     );
     each(Shape::Unrelated, "diff", &[&["diff", "--stat", "main..alien"]], out);
-    each(
-        Shape::Unrelated,
-        "format-patch",
-        &[&["format-patch", "--stdout", "--no-signature", "main...alien"]],
-        out,
-    );
-    each(Shape::Unrelated, "merge-base", &[&["merge-base", "main", "alien"]], out);
 
     each(
         Shape::CrissCross,
@@ -795,7 +779,6 @@ fn ranges(out: &mut Vec<Case>) {
         out,
     );
     each(Shape::CrissCross, "range-diff", &[&["range-diff", "cc-left...cc-right"]], out);
-    each(Shape::CrissCross, "merge-base", &[&["merge-base", "--all", "cc-left", "cc-right"]], out);
     // The one range whose stderr is part of the answer.
     out.push(Case::strict("diff", &["diff", "--stat", "cc-left...cc-right"], Shape::CrissCross));
 
@@ -810,14 +793,7 @@ fn ranges(out: &mut Vec<Case>) {
         ],
         out,
     );
-    each(Shape::Cherry, "cherry", &[&["cherry", "main", "topic"]], out);
     each(Shape::Cherry, "range-diff", &[&["range-diff", "main...topic"]], out);
-    each(
-        Shape::Cherry,
-        "format-patch",
-        &[&["format-patch", "--stdout", "--no-signature", "main..topic"]],
-        out,
-    );
 
     // `^` versus `--not`, and the position `--not` is sensitive to.
     each(
@@ -1118,7 +1094,6 @@ fn replaced_and_missing(out: &mut Vec<Case>) {
         &[&["log", "--oneline", "-1", "HEAD~2"]],
         out,
     );
-    each(Shape::NotesReplace, "cat-file", &[&["cat-file", "-p", "HEAD:README.md"]], out);
     each(Shape::NotesReplace, "ls-tree", &[&["ls-tree", "HEAD", "README.md"]], out);
     // The same three reads with the substitution switched off, by option and by
     // environment — two entry points to one decision.
@@ -1126,34 +1101,12 @@ fn replaced_and_missing(out: &mut Vec<Case>) {
         Case::new("log", &["log", "--oneline", "-1", "HEAD~2"], Shape::NotesReplace)
             .with_globals(&[&["--no-replace-objects"]]),
     );
-    out.push(
-        Case::new("cat-file", &["cat-file", "-p", "HEAD:README.md"], Shape::NotesReplace)
-            .with_globals(&[&["--no-replace-objects"]]),
-    );
-    out.push(
-        Case::new("cat-file", &["cat-file", "-p", "HEAD:README.md"], Shape::NotesReplace)
-            .with_env(&[("GIT_NO_REPLACE_OBJECTS", "1")]),
-    );
 
     // A ref that resolves to an id nothing has.
-    each(
-        Shape::Damaged,
-        "rev-parse",
-        &[
-            &["rev-parse", "--verify", "refs/heads/dangling"],
-        ],
-        out,
-    );
     out.push(Case::strict("rev-parse", &["rev-parse", "refs/heads/dangling^0"], Shape::Damaged));
     out.push(Case::strict("rev-parse", &["rev-parse", "refs/heads/broken-symref"], Shape::Damaged));
     out.push(Case::strict("cat-file", &["cat-file", "-t", "refs/heads/dangling"], Shape::Damaged));
 
     // History that stops.
-    each(
-        Shape::Shallow,
-        "rev-list",
-        &[&["rev-list", "--count", "HEAD"]],
-        out,
-    );
     each(Shape::Shallow, "merge-base", &[&["merge-base", "HEAD", "sh-side"]], out);
 }

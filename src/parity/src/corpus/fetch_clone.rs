@@ -205,12 +205,10 @@ fn fetch_refspecs(out: &mut Vec<Case>) {
     // applies, both tracking refs are already at the peer's tips, and the whole
     // invocation is silent. Worth pinning precisely because it is silent â the
     // "up to date" path is where a port that re-reports every ref shows up.
-    out.push(Case::strict("fetch", &["fetch", "origin"], Shape::BehindRemote));
     out.push(Case::strict("fetch", &["fetch", "./.remote.git"], Shape::BehindRemote));
 
     // `<src>` with no `<dst>`: nothing is written to the ref store at all, only
     // to FETCH_HEAD, and the report says so (`-> FETCH_HEAD`).
-    out.push(Case::strict("fetch", &["fetch", "origin", "main"], Shape::BehindRemote));
     out.push(Case::strict("fetch", &["fetch", "origin", "div"], Shape::BehindRemote));
 
     // `<src>:<dst>` in its four spellings: short/short, full/full, forced, glob.

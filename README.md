@@ -150,7 +150,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Command feed | `zcommands` | live feed of **every git command run across the fleet** — time, pid←ppid (which agent), cwd, and argv, appended to its own `$ZVCS_HOME/commands.log`; a single `stat` gates the hot path when off |
 | Audit | `zaudit [--agent <ppid>] [--repo <s>] [--cmd <s>] [--mutating] [--summary]` | queryable **audit trail** over that same command log — filter by agent (which ppid ran it), repo, or command; `--mutating` keeps only state-changing commands; `--summary` tallies per-agent and per-command; `--json` for tooling |
 | Event feed | `zevents` `ztail` | one live semantic feed of commits, reconciles, and status changes across the whole tree (from the append-only events table) |
-| AOP | `zintercept before\|after\|around <pattern> -- <cmd>` | aspect-oriented hooks on git commands (ported from zshrs) — run advice before/after/around any matching command, with `INTERCEPT_NAME`/`ARGS`/`CMD` (and `STATUS`/`MS`/`US` for after) in the environment; an around advice runs `"$INTERCEPT_CMD"` to proceed |
+| AOP | `zintercept before\|after\|around <pattern> -- <cmd>` | aspect-oriented hooks on git commands (ported from zshrs) — run advice before/after/around any matching command, with `INTERCEPT_NAME`/`ARGS`/`CMD` (and `STATUS`/`MS`/`US` for after) in the environment; an around advice runs `eval "$INTERCEPT_CMD"` to proceed |
 | Plugins | `znative add\|load\|remove\|list\|info\|update\|gc <SOURCE\|NAME>` | the **plugin package manager** (ported from zshrs) — install third-party subcommands from one content-addressed store under `$ZVCS_HOME/pkg`, in two kinds: a **native** plugin is a Rust cdylib compiled against the stable `znative` C ABI and `dlopen`ed, a **script** plugin is a repo of `git-<verb>` executables. Sources are `owner/repo`, `git+URL` or `path:DIR`, `@ref`-pinnable and SHA-256 integrity-pinned; a plugin verb resolves after built-ins and before the `git-<verb>` PATH lookup, and a native plugin may **override** an existing verb and delegate back to the original |
 | Policy | `zguard`/`zpolicy` `deny\|warn <pattern> [--when <pred>]` | declarative fleet-wide command policy — refuse or warn on a matching git command *before it runs* (the veto evolution of `zintercept`). Glob on the command line (`deny 'push*--force*'`, `warn 'rm*-rf*'`) plus repo-state predicates (`--when detached\|dirty\|protected\|unsigned`, e.g. `deny 'commit*' --when unsigned` requires signed commits). `list`/`rm`/`clear`/`test`; a single `stat` on the hot path when no rule is set |
 | Autonomy config | `zconfig [<name> on\|off\|<n>]` | toggle the daemon's feature switches from the CLI (`autoreconcile`, `autobump`, `autostatus`, …, `statusinterval`, `watchmru`); `all on\|off` flips them together, reloading a running daemon |
@@ -443,7 +443,7 @@ and status changes across the tree.
 registers aspect-oriented advice on git commands, ported from zshrs. A before
 hook runs a shell command before every matching git command, an after hook runs
 after it (with the command's exit status and timing in `INTERCEPT_STATUS`/`_MS`),
-and an around hook replaces it — running `"$INTERCEPT_CMD"` to proceed with the
+and an around hook replaces it — running `eval "$INTERCEPT_CMD"` to proceed with the
 original. The advice sees the intercepted command through `INTERCEPT_NAME` /
 `INTERCEPT_ARGS` / `INTERCEPT_CMD`; the pattern matches the git subcommand
 (`commit`, `commit *`, `*`/`all`). Registrations persist to

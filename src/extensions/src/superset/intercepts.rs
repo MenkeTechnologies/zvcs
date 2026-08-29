@@ -14,7 +14,7 @@
 //! Usage:
 //!   git zintercept before <pattern> -- <cmd>   run <cmd> before a match
 //!   git zintercept after  <pattern> -- <cmd>   run <cmd> after (status/timing set)
-//!   git zintercept around <pattern> -- <cmd>   replace; <cmd> runs $INTERCEPT_CMD to proceed
+//!   git zintercept around <pattern> -- <cmd>   replace; <cmd> runs `eval "$INTERCEPT_CMD"` to proceed
 //!   git zintercept list | remove <id> | clear
 //!
 //!   <pattern> matches the git subcommand: `commit`, `push`, `commit *`, `*`/`all`.
@@ -33,7 +33,13 @@ pub enum AdviceKind {
     Before,
     /// Run code after the command executes. INTERCEPT_STATUS/MS available.
     After,
-    /// Wrap the command. Code runs $INTERCEPT_CMD to run the original.
+    /// Wrap the command. Code runs `eval "$INTERCEPT_CMD"` to run the original.
+    ///
+    /// The `eval` is not decoration: `INTERCEPT_CMD` is a whole command line
+    /// (`git commit -qam msg`), so the quoted-without-eval spelling makes `sh`
+    /// look for one program named `git commit -qam msg` and answer `command not
+    /// found`. An around advice written that way silently *blocks* every
+    /// command it wraps instead of wrapping it.
     Around,
 }
 
@@ -253,7 +259,7 @@ usage: git zintercept before|after|around <pattern> -- <cmd>   register advice
 
   <pattern> matches the git subcommand: e.g. commit, push, 'commit *', '*'/all.
   advice <cmd> is a shell command; it sees INTERCEPT_NAME/ARGS/CMD, and (after)
-  INTERCEPT_STATUS/MS/US. An around advice runs \"$INTERCEPT_CMD\" to proceed.";
+  INTERCEPT_STATUS/MS/US. An around advice runs `eval \"$INTERCEPT_CMD\"` to proceed.";
 
 pub fn zintercept(args: &[String]) -> Result<ExitCode> {
     let Some(action) = args.first().map(String::as_str) else {

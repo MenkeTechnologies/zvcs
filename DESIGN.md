@@ -859,7 +859,7 @@ function and both a single `stat` when inactive:
   `$ZVCS_HOME/intercepts.tsv` and advice is a shell command run with
   `INTERCEPT_NAME`/`ARGS`/`CMD` (and `STATUS`/`MS`/`US` for after) in the
   environment. `maybe_intercept` orchestrates before → around/after; an around
-  advice runs `"$INTERCEPT_CMD"` to proceed, and a `ZVCS_INTERCEPTED` env guard
+  advice runs `eval "$INTERCEPT_CMD"` to proceed, and a `ZVCS_INTERCEPTED` env guard
   stops re-interception of the wrapped command.
 
 ## 17. Coordination, event automation & scripting verbs

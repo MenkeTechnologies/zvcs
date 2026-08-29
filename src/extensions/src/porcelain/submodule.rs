@@ -107,7 +107,9 @@ const SUBCOMMANDS: &[&str] = &[
 ///     `remote.<default-remote>.url` inside the submodule's own config, where the
 ///     default remote is `branch.<current>.remote` (else `origin`). Prints
 ///     `Synchronizing submodule url for '<displaypath>'` per active submodule.
-///     A relative (`./`, `../`) url bails: `resolve_relative_url` is not ported.
+///     A relative (`./`, `../`) url is resolved against the default remote by
+///     `resolve_relative_url`, twice: the superproject records the plain answer
+///     and the submodule's own remote the `get_up_path`-prefixed one.
 ///
 ///   * `git submodule [--quiet] update [--init] [--remote] [-N|--no-fetch]
 ///     [-f|--force] [--checkout|--merge|--rebase] [--recursive] [--] [<path>...]`
@@ -122,11 +124,10 @@ const SUBCOMMANDS: &[&str] = &[
 ///     first runs the same registration pass as `init`; `--recursive` descends.
 ///     Each non-checkout step is a re-exec of the matching ported subcommand
 ///     (`merge`/`rebase`/`clone`), so the whole `git-submodule.sh` update path is
-///     covered except the pieces that are not a ported-command re-exec: a relative
-///     `.gitmodules` url (`resolve_relative_url`), the clone/fetch-shaping flags
-///     (`--depth`, `--reference`, `--dissociate`, `--recommend-shallow`,
-///     `--single-branch`, `--filter`, `--require-init`), and a `!command` update
-///     strategy — each of which bails.
+///     covered except the pieces that are not a ported-command re-exec: the
+///     clone/fetch-shaping flags (`--depth`, `--reference`, `--dissociate`,
+///     `--recommend-shallow`, `--single-branch`, `--filter`, `--require-init`),
+///     and a `!command` update strategy — each of which bails.
 ///
 ///   * `git submodule [--quiet] set-branch (--default|--branch <branch>) [--] <path>`
 ///     Writes (or, under `--default`, removes) `submodule.<name>.branch` in the
@@ -185,13 +186,13 @@ const SUBCOMMANDS: &[&str] = &[
 /// usage block goes to **stdout** and the exit status is 0, unlike every parse
 /// error, which prints the same block on stderr and exits 1.
 ///
-/// All eleven subcommands are ported. What still bails, in every one of them, is
-/// a `.gitmodules` url that is relative (`./`, `../`) — git's
-/// `resolve_relative_url` resolves it against the superproject's default remote,
-/// and that is not ported — plus, in `update`, the clone/fetch-shaping flags
-/// (`--depth`, `--reference`, `--dissociate`, `--recommend-shallow`,
-/// `--single-branch`, `--filter`, `--require-init`) and a `!command` update
-/// strategy.
+/// All eleven subcommands are ported. A `.gitmodules` url that is relative
+/// (`./`, `../`) is resolved the way git's `resolve_relative_url` →
+/// `relative_url()` (remote.c:2933) does, against `remote.<default>.url` or —
+/// when the superproject has none, so it is its own upstream — the current
+/// directory. What still bails is, in `update`, the clone/fetch-shaping flags
+/// (`--reference`, `--dissociate`, `--recommend-shallow`, `--single-branch`,
+/// `--filter`, `--require-init`) and a `!command` update strategy.
 ///
 /// Every url this porcelain dials comes out of `.gitmodules` rather than off the
 /// command line, so — exactly as `git-submodule.sh:29` does — `GIT_PROTOCOL_FROM_USER`
@@ -623,12 +624,21 @@ fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Resul
                 eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
                 return Ok(128);
             };
-            if url.starts_with(b"./") || url.starts_with(b"../") {
-                bail!(
-                    "submodule '{sub_name}' has the relative url {:?}; resolving it against the default remote is not ported",
-                    url.to_str_lossy()
-                );
-            }
+            // ```c
+            // if (starts_with_dot_dot_slash(url) || starts_with_dot_slash(url)) {
+            //         char *oldurl = url;
+            //         url = resolve_relative_url(oldurl, NULL, 0);
+            //         free(oldurl);
+            // }
+            // ```
+            //
+            // (builtin/submodule--helper.c:617-622, in `init_submodule()`.) The registered
+            // url is the *resolved* one, and this call is not quiet — a superproject with
+            // no default remote warns before falling back to its own directory.
+            let url = match url.starts_with(b"./") || url.starts_with(b"../") {
+                true => resolve_relative_url(&repo, url.as_ref(), None, false)?,
+                false => url,
+            };
             config.set_raw_value_by("submodule", Some(sub_name), "url", url.as_bstr())?;
             dirty = true;
             if !quiet {
@@ -1655,21 +1665,47 @@ fn sync_one(
     let sub_name = sub.name().to_owned();
     let sub_name = sub_name.as_bstr();
 
-    // The url git copies to both the superproject and the submodule remote.
-    // A relative url needs `resolve_relative_url` against the superproject's
-    // default remote, which is not ported — bail rather than register a
-    // literal `./`/`../` url git would have rewritten.
+    // ```c
+    // if (starts_with_dot_dot_slash(sub->url) || starts_with_dot_slash(sub->url)) {
+    //         char *up_path = get_up_path(path);
+    //         sub_origin_url = resolve_relative_url(sub->url, up_path, 1);
+    //         super_config_url = resolve_relative_url(sub->url, NULL, 1);
+    //         free(up_path);
+    // } else {
+    //         sub_origin_url = xstrdup(sub->url);
+    //         super_config_url = xstrdup(sub->url);
+    // }
+    // ```
+    //
+    // (builtin/submodule--helper.c:1450-1458, in `sync_submodule()`.) The superproject
+    // records the url resolved against its own default remote; the submodule's `origin`
+    // records the same url prefixed with the `../`s that climb back out of its worktree.
+    // Both resolutions are quiet.
     let url = modules.and_then(|m| m.string_by("submodule", Some(sub_name), "url"));
-    if let Some(u) = url.as_ref() {
-        if u.starts_with(b"./") || u.starts_with(b"../") {
-            bail!(
-                "submodule '{sub_name}' has the relative url {:?}; resolving it against the default remote is not ported",
-                u.to_str_lossy()
-            );
-        }
-    }
+    let relative = url
+        .as_ref()
+        .is_some_and(|u| u.starts_with(b"./") || u.starts_with(b"../"));
+    let sub_origin_url: Option<BString> = match relative {
+        true => Some(resolve_relative_url(
+            repo,
+            url.as_ref().expect("relative implies present").as_ref(),
+            Some(&up_path(path.as_bstr())),
+            true,
+        )?),
+        false => url.clone(),
+    };
+    let url = match relative {
+        true => Some(resolve_relative_url(
+            repo,
+            url.as_ref().expect("relative implies present").as_ref(),
+            None,
+            true,
+        )?),
+        false => url,
+    };
     // git uses an empty string when the submodule has no url at all.
     let url_bytes: BString = url.unwrap_or_default();
+    let sub_origin_url: BString = sub_origin_url.unwrap_or_else(|| url_bytes.clone());
 
     if !quiet {
         println!("Synchronizing submodule url for '{display}'");
@@ -1695,7 +1731,16 @@ fn sync_one(
         let _sub_lock = crate::lock::RepoLock::acquire(sub_repo.git_dir());
         let mut sub_config =
             ConfigFile::from_path_no_includes(sub_config_path.clone(), Source::Local)?;
-        sub_config.set_raw_value_by("remote", Some(remote.as_bstr()), "url", url_bytes.as_bstr())?;
+        // `repo_config_set_in_file_gently(..., remote_key, NULL, sub_origin_url)`
+        // (builtin/submodule--helper.c:1490): the submodule's own remote gets the
+        // `up_path`-prefixed spelling, which differs from the superproject's only when the
+        // superproject's default remote is itself a relative url.
+        sub_config.set_raw_value_by(
+            "remote",
+            Some(remote.as_bstr()),
+            "url",
+            sub_origin_url.as_bstr(),
+        )?;
         persist(&sub_config_path, &sub_config)?;
     }
 
@@ -1743,6 +1788,165 @@ fn default_remote(repo: &gix::Repository) -> Result<String> {
         Some(v) => v.to_str_lossy().into_owned(),
         None => "origin".to_string(),
     })
+}
+
+
+/// git's `get_up_path()` (builtin/submodule--helper.c:288): one `../` per slash
+/// in `path`, plus one more unless `path` already ends in a slash — the prefix
+/// that climbs from inside the submodule back to the superproject root.
+fn up_path(path: &BStr) -> String {
+    let slashes = path.iter().filter(|b| **b == b'/').count();
+    let trailing = usize::from(path.last() != Some(&b'/'));
+    "../".repeat(slashes + trailing)
+}
+
+/// git's `resolve_relative_url()` (builtin/submodule--helper.c:53): resolve a
+/// `./`/`../` submodule url against the superproject's default remote.
+///
+/// ```c
+/// strbuf_addf(&remotesb, "remote.%s.url", remote);
+/// if (repo_config_get_string(the_repository, remotesb.buf, &remoteurl)) {
+///         if (!quiet)
+///                 warning(_("could not look up configuration '%s'. "
+///                           "Assuming this repository is its own "
+///                           "authoritative upstream."), remotesb.buf);
+///         remoteurl = xgetcwd();
+/// }
+/// resolved_url = relative_url(remoteurl, rel_url, up_path);
+/// ```
+///
+/// A superproject with no `remote.<default>.url` *is* its own upstream, so the
+/// anchor becomes the current directory — which is why a submodule cloned from
+/// a plain local superproject ends up with an absolute url.
+fn resolve_relative_url(
+    repo: &gix::Repository,
+    rel_url: &BStr,
+    up_path: Option<&str>,
+    quiet: bool,
+) -> Result<BString> {
+    let remote = default_remote(repo)?;
+    let configured = repo.config_snapshot().string(KeyRef {
+        section_name: "remote",
+        subsection_name: Some(remote.as_str().into()),
+        value_name: "url",
+    });
+    let remote_url = match configured {
+        Some(url) => url,
+        None => {
+            if !quiet {
+                eprintln!(
+                    "warning: could not look up configuration 'remote.{remote}.url'. \
+                     Assuming this repository is its own authoritative upstream."
+                );
+            }
+            gix::path::into_bstr(std::env::current_dir()?).into_owned()
+        }
+    };
+    Ok(relative_url(remote_url.as_ref(), rel_url, up_path))
+}
+
+/// remote.c's `relative_url()` (remote.c:2933), verbatim.
+///
+/// `remote_url` is the anchor, `url` the `./`/`../` url to resolve against it,
+/// and `up_path` the prefix that turns the answer into one usable from inside
+/// the submodule. A url that is not local-not-ssh, or is absolute, comes back
+/// unchanged.
+fn relative_url(remote_url: &BStr, url: &BStr, up_path: Option<&str>) -> BString {
+    if !url_is_local_not_ssh(url) || is_absolute(url) {
+        return url.to_owned();
+    }
+    debug_assert!(!remote_url.is_empty(), "invalid empty remote_url");
+
+    let mut remoteurl = remote_url.to_owned();
+    if remoteurl.last() == Some(&b'/') {
+        remoteurl.pop();
+    }
+
+    // A relative anchor is normalised to start with `./` or `../`, so that
+    // chopping components off it below stays unambiguous.
+    let is_relative = url_is_local_not_ssh(remoteurl.as_ref()) && !is_absolute(remoteurl.as_ref());
+    if is_relative && !remoteurl.starts_with(b"./") && !remoteurl.starts_with(b"../") {
+        let mut prefixed = BString::from("./");
+        prefixed.extend_from_slice(&remoteurl);
+        remoteurl = prefixed;
+    }
+
+    // Each leading `../` in the url eats the last component of the anchor.
+    let mut rest = url.as_bytes();
+    let mut colonsep = false;
+    loop {
+        if rest.starts_with(b"../") {
+            rest = &rest[3..];
+            colonsep |= chop_last_dir(&mut remoteurl, is_relative);
+        } else if rest.starts_with(b"./") {
+            rest = &rest[2..];
+        } else {
+            break;
+        }
+    }
+
+    let mut out = remoteurl;
+    out.push(if colonsep { b':' } else { b'/' });
+    out.extend_from_slice(rest);
+    if rest.ends_with(b"/") {
+        out.pop();
+    }
+    let out = match out.strip_prefix(b"./".as_slice()) {
+        Some(rest) => BString::from(rest),
+        None => out,
+    };
+
+    match up_path.filter(|_| is_relative) {
+        Some(up) => {
+            let mut prefixed = BString::from(up);
+            prefixed.extend_from_slice(&out);
+            prefixed
+        }
+        None => out,
+    }
+}
+
+/// remote.c's `chop_last_dir()`: drop the last path component of `remoteurl`,
+/// returning whether the chop landed on the `:` of an scp-style url.
+///
+/// ```c
+/// if (is_relative || !strcmp(".", *remoteurl))
+///         die(_("cannot strip one component off url '%s'"), *remoteurl);
+/// ```
+///
+/// An absolute anchor with nothing left to strip degrades to `.`; a relative one
+/// would be a bug, and git dies. Nothing here can die, because the caller only
+/// reaches it with an anchor that still has components.
+fn chop_last_dir(remoteurl: &mut BString, is_relative: bool) -> bool {
+    if let Some(at) = remoteurl.iter().rposition(|b| *b == b'/') {
+        remoteurl.truncate(at);
+        return false;
+    }
+    if let Some(at) = remoteurl.iter().rposition(|b| *b == b':') {
+        remoteurl.truncate(at);
+        return true;
+    }
+    if !is_relative && remoteurl.as_slice() != b"." {
+        *remoteurl = BString::from(".");
+    }
+    false
+}
+
+/// url.c's `url_is_local_not_ssh()`: no colon at all, or a slash before the
+/// first colon.
+fn url_is_local_not_ssh(url: &BStr) -> bool {
+    let colon = url.iter().position(|b| *b == b':');
+    let slash = url.iter().position(|b| *b == b'/');
+    match (colon, slash) {
+        (None, _) => true,
+        (Some(c), Some(s)) => s < c,
+        (Some(_), None) => false,
+    }
+}
+
+/// `is_absolute_path()` on the platforms this port builds for: a leading `/`.
+fn is_absolute(url: &BStr) -> bool {
+    url.first() == Some(&b'/')
 }
 
 // --------------------------------------------------------------- set-url ----
@@ -2564,13 +2768,14 @@ fn update_repo(
                     "submodule '{display}' has no registered `submodule.{sub_name}.url`; run `submodule init` (or `update --init`) first"
                 );
             };
-            if url.starts_with(b"./") || url.starts_with(b"../") {
-                bail!(
-                    "submodule '{sub_name}' has the relative url {:?}; resolving it against the default remote is not ported",
-                    url.to_str_lossy()
-                );
-            }
-            Some(url.to_owned())
+            // `if (starts_with_dot_slash(url) || starts_with_dot_dot_slash(url)) url =
+            // resolve_relative_url(sub->url, NULL, 0);` (builtin/submodule--helper.c:2313-2316,
+            // in `prepare_to_clone_next_submodule()`).
+            let url = match url.starts_with(b"./") || url.starts_with(b"../") {
+                true => resolve_relative_url(&repo, url.as_ref(), None, false)?,
+                false => url,
+            };
+            Some(url)
         };
 
         plans.push(Plan {
@@ -2943,17 +3148,13 @@ fn fetch_in_submodule(
     quiet: bool,
     direct: Option<(&str, &ObjectId)>,
 ) -> Result<u8> {
-    // git's `git fetch` child runs `transport_check_allowed()` before it dials,
-    // and dies `fatal: transport '<type>' not allowed` when the policy refuses —
-    // which is what stops a `file` submodule url unless `protocol.file.allow` is
-    // relaxed. The ported `fetch` does not implement the allow-list, so the same
-    // check is applied here instead: one layer above the child, with the same
-    // message, the same exit code, and before any transfer can start.
-    if let Some(kind) = refused_transport(sm_dir, direct.map(|(remote, _)| remote))? {
-        eprintln!("fatal: transport '{kind}' not allowed");
-        return Ok(crate::fatal::EXIT_FATAL);
-    }
-
+    // The `git fetch` child runs `transport_check_allowed()` itself — the ported `fetch`
+    // implements the allow-list, and `submodule()` has already exported
+    // `GIT_PROTOCOL_FROM_USER=0` the way `git-submodule.sh:29` does, so a `file` url is
+    // refused there unless `protocol.file.allow` is relaxed. Checking it here instead would
+    // skip what git does *before* it dials: `do_fetch()` truncates `FETCH_HEAD`
+    // (builtin/fetch.c:1912-1917) and only then asks the transport, so even a refused fetch
+    // leaves an empty `FETCH_HEAD` in the submodule.
     let exe = crate::hosted::git_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("fetch");
@@ -2966,90 +3167,6 @@ fn fetch_in_submodule(
     submodule_child_env(&mut cmd, sm_dir);
     let status = cmd.status()?;
     Ok(child_code(status))
-}
-
-/// The transport name `git fetch` inside `sm_dir` would refuse, or `None` when
-/// the fetch may proceed (including when there is no url to judge — `git fetch`
-/// then fails on its own terms, with its own message).
-///
-/// `remote` names the remote the fetch will use; `None` means the default one,
-/// git's `repo_get_default_remote`.
-fn refused_transport(sm_dir: &std::path::Path, remote: Option<&str>) -> Result<Option<String>> {
-    let Ok(repo) = gix::open(sm_dir) else {
-        return Ok(None);
-    };
-    let name = match remote {
-        Some(r) => r.to_string(),
-        None => default_remote(&repo)?,
-    };
-    let snapshot = repo.config_snapshot();
-    let url = snapshot.string(KeyRef {
-        section_name: "remote",
-        subsection_name: Some(BStr::new(name.as_bytes())),
-        value_name: "url",
-    });
-    let Some(url) = url else { return Ok(None) };
-    let Ok(url) = gix::url::parse(url.as_ref()) else {
-        return Ok(None);
-    };
-    let kind = match url.scheme {
-        gix::url::Scheme::File => "file".to_string(),
-        gix::url::Scheme::Git => "git".to_string(),
-        gix::url::Scheme::Ssh => "ssh".to_string(),
-        gix::url::Scheme::Http => "http".to_string(),
-        gix::url::Scheme::Https => "https".to_string(),
-        gix::url::Scheme::Ext(ref name) => name.clone(),
-    };
-    Ok((!transport_allowed(&snapshot, &kind)?).then_some(kind))
-}
-
-/// git's `is_transport_allowed` (transport.c:1124), the CVE-2022-39253 policy,
-/// read against the repository the fetch will run in.
-///
-/// `GIT_ALLOW_PROTOCOL`, when set, is an exhaustive colon-separated allow-list
-/// and nothing else is consulted. Otherwise `protocol.<type>.allow` decides,
-/// falling back to `protocol.allow`, then to the built-in defaults: `http`,
-/// `https`, `git` and `ssh` are `always`, `ext` is `never`, and everything else
-/// — `file` included — is `user`, i.e. allowed only when the url came off the
-/// command line rather than out of a file the repository carries.
-fn transport_allowed(snapshot: &gix::config::Snapshot<'_>, kind: &str) -> Result<bool> {
-    if let Ok(list) = std::env::var("GIT_ALLOW_PROTOCOL") {
-        return Ok(list.split(':').any(|entry| entry == kind));
-    }
-    // git's `parse_protocol_config`: anything but these three is fatal.
-    let parse = |key: &str, value: &BStr| match value.to_str_lossy().to_ascii_lowercase().as_str() {
-        "always" => Ok(TransportPolicy::Always),
-        "never" => Ok(TransportPolicy::Never),
-        "user" => Ok(TransportPolicy::User),
-        other => Err(anyhow::anyhow!("unknown value for config '{key}': {other}")),
-    };
-    let key = format!("protocol.{kind}.allow");
-    let policy = match snapshot.string(key.as_str()) {
-        Some(v) => parse(&key, v.as_ref())?,
-        None => match snapshot.string("protocol.allow") {
-            Some(v) => parse("protocol.allow", v.as_ref())?,
-            None => match kind {
-                "http" | "https" | "git" | "ssh" => TransportPolicy::Always,
-                "ext" => TransportPolicy::Never,
-                _ => TransportPolicy::User,
-            },
-        },
-    };
-    Ok(match policy {
-        TransportPolicy::Always => true,
-        TransportPolicy::Never => false,
-        // `git_env_bool("GIT_PROTOCOL_FROM_USER", 1)`; `submodule` clears it.
-        TransportPolicy::User => {
-            !matches!(std::env::var("GIT_PROTOCOL_FROM_USER").as_deref(), Ok("0"))
-        }
-    })
-}
-
-/// git's `protocol_allow_config` (transport.c:1066).
-enum TransportPolicy {
-    Never,
-    User,
-    Always,
 }
 
 /// git's `run_update_command`: re-exec the ported subcommand for the chosen
@@ -4209,29 +4326,29 @@ fn pathdiff_relative(from: &std::path::Path, to: &std::path::Path) -> String {
     out.to_string_lossy().into_owned()
 }
 
-/// `git submodule add [-b <branch>] [-f] [--name <name>] [--] <repository> [<path>]`
-/// — clone `<repository>` into `<path>`, register it in `.gitmodules` and the
-/// local config, and stage both the file and the new gitlink.
+/// `git submodule add [-b <branch>] [-f] [--name <name>] [--depth <depth>] [--]
+/// <repository> [<path>]` — git's `module_add` (builtin/submodule--helper.c:3642).
 ///
-/// Ported behaviourally from git's `cmd_add`/`module_add` (builtin/submodule.c
-/// plus git-submodule.sh's `add` in older versions): resolve the path, refuse a
-/// path that is already occupied or already in the index, clone, write
-/// `submodule.<name>.path` / `.url` into `.gitmodules`, mirror the url into the
-/// repository config (git's `git config submodule.<name>.url`), then stage
-/// `.gitmodules` and a mode-160000 entry at the clone's HEAD.
+/// The order of the checks is the order git makes them, because the message a
+/// wrong invocation gets depends on it: the url is resolved first, then the path
+/// is matched against the index, then against the working tree, and only then is
+/// anything cloned.
 ///
-/// Built entirely out of already-ported pieces — the clone runs through this
-/// binary's own `clone`, the gitlink through its own `update-index --cacheinfo`
-/// — so there is no second implementation of either to drift.
+/// The clone itself is `add_submodule()` → `clone_submodule()`: a re-exec of this
+/// binary's own `clone` with `--no-checkout --separate-git-dir <modules/<name>>`
+/// against the *absolute* worktree path, followed by `git checkout -f -q` inside
+/// it. Cloning straight into `modules/` is what makes the submodule survive its
+/// worktree being deleted, and the absolute path is why git's `Cloning into
+/// '/…/other'…` line is absolute where a plain `git clone other` is not.
 ///
-/// Deliberate scope: `--reference`, `--depth`, `--ref-format` and the
-/// `--branch`-tracking extras of newer git are not accepted; a relative
-/// `<repository>` url is taken verbatim rather than resolved against the default
-/// remote, the same restriction the rest of this port already documents.
+/// Deliberate scope: `--reference`/`--dissociate`/`--ref-format` are not
+/// accepted.
 fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     let mut force = false;
+    let mut progress = false;
     let mut name: Option<String> = None;
     let mut branch: Option<String> = None;
+    let mut depth: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut end_of_options = false;
 
@@ -4262,8 +4379,10 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
             "--" => end_of_options = true,
             "-f" | "--force" => force = true,
             "-q" | "--quiet" => {}
+            "--progress" => progress = true,
             "--name" => name = Some(value(inline)?),
             "-b" | "--branch" => branch = Some(value(inline)?),
+            "--depth" => depth = Some(value(inline)?),
             other => bail!("`submodule add {other}` is not ported"),
         }
         i += 1;
@@ -4273,8 +4392,8 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         Some(u) => u.clone(),
         None => return usage_exit(),
     };
-    // git defaults the path to the url's last component with a trailing `.git`
-    // and any trailing slashes removed.
+    // `add_data.sm_path = git_url_basename(add_data.repo, 0, 0)` — the url's last
+    // component with any trailing slashes and a trailing `.git` removed.
     let path = match rest.get(1) {
         Some(p) => p.trim_end_matches('/').to_string(),
         None => {
@@ -4285,7 +4404,6 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     if path.is_empty() {
         crate::git_fatal!("'{url}' does not name a submodule path");
     }
-    let name = name.unwrap_or_else(|| path.clone());
 
     let repo = gix::discover(".")?;
     let workdir = repo
@@ -4293,55 +4411,183 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         .ok_or_else(|| anyhow::anyhow!("a working tree is required"))?
         .to_path_buf();
 
-    // An occupied path is git's refusal, not something to clone over.
-    let abs = workdir.join(&path);
-    let occupied = std::fs::read_dir(&abs).map(|mut d| d.next().is_some()).unwrap_or(false);
-    if occupied && !force {
-        crate::git_fatal!("'{path}' already exists and is not an empty directory");
-    }
-    if !force && repo.index_or_empty()?.entry_by_path(BStr::new(path.as_bytes())).is_some() {
-        crate::git_fatal!("'{path}' already exists in the index");
+    // ```c
+    // if (starts_with_dot_dot_slash(add_data.repo) || starts_with_dot_slash(add_data.repo)) {
+    //         /* dereference source url relative to parent's url */
+    //         to_free = resolve_relative_url(add_data.repo, NULL, 1);
+    //         add_data.realrepo = to_free;
+    // } else if (is_dir_sep(add_data.repo[0]) || strchr(add_data.repo, ':')) {
+    //         add_data.realrepo = add_data.repo;
+    // } else {
+    //         die(_("repo URL: '%s' must be absolute or begin with ./|../"), add_data.repo);
+    // }
+    // ```
+    //
+    // (builtin/submodule--helper.c:3708-3722.) `realrepo` is what gets cloned and
+    // what lands in `.git/config`; `.gitmodules` keeps the argument as typed, so a
+    // `./sub` there stays portable while this checkout's config points at a real path.
+    let realrepo = if url.starts_with("./") || url.starts_with("../") {
+        resolve_relative_url(&repo, BStr::new(url.as_bytes()), None, true)?
+            .to_str_lossy()
+            .into_owned()
+    } else if url.starts_with('/') || url.contains(':') {
+        url.clone()
+    } else {
+        crate::git_fatal!("repo URL: '{url}' must be absolute or begin with ./|../");
+    };
+
+    // `die_on_index_match(add_data.sm_path, force)`: a *pathspec* match, so a path
+    // whose contents are tracked counts even though the path itself is not an entry.
+    let index = repo.index_or_empty()?;
+    let matched = index.entries().iter().find(|e| {
+        let p = e.path(&index);
+        p == path.as_bytes() || p.starts_with(format!("{path}/").as_bytes())
+    });
+    if let Some(entry) = matched {
+        if !force {
+            crate::git_fatal!("'{path}' already exists in the index");
+        }
+        if entry.mode != gix::index::entry::Mode::COMMIT {
+            crate::git_fatal!("'{path}' already exists in the index and is not a submodule");
+        }
     }
 
-    // ---- clone, through this binary's own porcelain -------------------------
-    let mut clone_args = vec!["--".to_string(), url.clone(), path.clone()];
-    if let Some(b) = &branch {
-        clone_args.splice(0..0, ["--branch".to_string(), b.clone()]);
-    }
-    if quiet {
-        clone_args.insert(0, "--quiet".to_string());
-    }
-    let code = super::clone(&clone_args)?;
-    if code != ExitCode::SUCCESS {
-        return Ok(code);
-    }
-
-    // ---- absorb the clone's git dir, as git does ----------------------------
-    // `git submodule add` does not leave a standalone repository in the worktree:
-    // the git dir moves to `<parent>/.git/modules/<name>` and the worktree gets a
-    // `.git` FILE pointing at it, so the superproject owns the submodule's
-    // objects and refs. Without this the tree looks right but every tool that
-    // expects a gitfile (including this port's own crawler) sees a nested
-    // independent repo.
-    let modules_dir = repo.common_dir().join("modules").join(&name);
-    if let Some(parent) = modules_dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let cloned_git = abs.join(".git");
-    if cloned_git.is_dir() && !modules_dir.exists() {
-        std::fs::rename(&cloned_git, &modules_dir)?;
-        // The gitfile is relative so the pair survives moving the checkout.
-        let rel_to_modules = pathdiff_relative(&abs, &modules_dir);
-        std::fs::write(&cloned_git, format!("gitdir: {rel_to_modules}\n"))?;
-        // The moved git dir needs to know where its worktree went.
-        let cfg_path = modules_dir.join("config");
-        let mut cfg = ConfigFile::from_path_no_includes(cfg_path.clone(), Source::Local)?;
-        let rel_to_worktree = pathdiff_relative(&modules_dir, &abs);
-        cfg.set_raw_value_by("core", None, "worktree", rel_to_worktree.as_str())?;
-        std::fs::write(&cfg_path, cfg.to_bstring())?;
+    // `die_on_repo_without_commits()`: an existing checkout with no commit yet has
+    // nothing to record as a gitlink.
+    //
+    // `clone_submodule()` resolves the path against `repo_get_work_tree()`, which is
+    // absolute — which is why git's `Cloning into '/…/other'…` and its
+    // `clone of '…' into submodule path '/…/other' failed` both name an absolute path
+    // where a plain `git clone other` would not.
+    let abs = absolute(&workdir.join(&path));
+    if is_nonbare_repository_dir(&abs) && gix::open(&abs).ok().is_none_or(|r| r.head_id().is_err()) {
+        crate::git_fatal!("'{path}' does not have a commit checked out");
     }
 
-    // ---- register in .gitmodules and in the repository config ---------------
+    // ```c
+    // strvec_pushl(&cp.args, "add", "--dry-run", "--ignore-missing",
+    //              "--no-warn-embedded-repo", add_data.sm_path, NULL);
+    // ```
+    //
+    // (builtin/submodule--helper.c:3742-3748.) Its only job is to reject a path an
+    // ignore rule covers, and it reports that in `git add`'s own words.
+    if !force {
+        let exe = crate::hosted::git_exe()?;
+        let probe = std::process::Command::new(exe)
+            .args(["add", "--dry-run", "--ignore-missing", "--no-warn-embedded-repo", "--", &path])
+            .stdout(std::process::Stdio::null())
+            .output()?;
+        if !probe.status.success() {
+            use std::io::Write;
+            std::io::stderr().write_all(&probe.stderr)?;
+            return Ok(ExitCode::from(child_code(probe.status)));
+        }
+    }
+
+    let name = name.unwrap_or_else(|| path.clone());
+    let sm_gitdir = submodule_name_to_gitdir(&repo, BStr::new(name.as_bytes()))?;
+
+    // ---- add_submodule (submodule--helper.c:3404) ---------------------------
+    if abs.is_dir() {
+        // An existing directory is either already a repository — which git adopts,
+        // saying so — or it is in the way.
+        if !is_nonbare_repository_dir(&abs) {
+            crate::git_fatal!("'{path}' already exists and is not a valid git repo");
+        }
+        println!("Adding existing repo at '{path}' to the index");
+    } else {
+        if sm_gitdir.is_dir() {
+            if !force {
+                crate::git_fatal!(
+                    "A git directory for '{name}' is found locally with remote(s):\n\
+                     If you want to reuse this local git directory instead of cloning again from\n  \
+                     {realrepo}\nuse the '--force' option. If the local git directory is not the \
+                     correct repo\nor you are unsure what this means choose another name with the \
+                     '--name' option."
+                );
+            }
+            println!("Reactivating local git directory for submodule '{name}'");
+        }
+        if let Some(parent) = sm_gitdir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let exe = crate::hosted::git_exe()?;
+        let mut cmd = std::process::Command::new(exe);
+        // git passes `--no-checkout` here and leaves the worktree to the `checkout -f -q`
+        // below. This port does not, for the reason [`clone_submodule`] documents: its
+        // `checkout` cannot populate a worktree from the absent index a `--no-checkout`
+        // clone leaves behind. Same end state, one extra worktree write.
+        cmd.arg("clone");
+        if quiet {
+            cmd.arg("--quiet");
+        }
+        if progress {
+            cmd.arg("--progress");
+        }
+        if let Some(depth) = &depth {
+            cmd.arg(format!("--depth={depth}"));
+        }
+        cmd.arg("--separate-git-dir").arg(&sm_gitdir);
+        cmd.arg("--").arg(&realrepo).arg(&abs);
+        cmd.current_dir(&workdir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_PREFIX");
+        if child_code(cmd.status()?) != 0 {
+            crate::git_fatal!(
+                "clone of '{realrepo}' into submodule path '{}' failed",
+                abs.display()
+            );
+        }
+
+        // `strvec_pushl(&cp.args, "checkout", "-f", "-q", NULL)` with `cp.dir =
+        // add_data->sm_path`: the `--no-checkout` clone above left the worktree empty.
+        let exe = crate::hosted::git_exe()?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("checkout").arg("-f").arg("-q");
+        if let Some(b) = &branch {
+            cmd.arg("-B").arg(b).arg(format!("origin/{b}"));
+        }
+        submodule_child_env(&mut cmd, &abs);
+        if child_code(cmd.status()?) != 0 {
+            crate::git_fatal!("unable to checkout submodule '{path}'");
+        }
+    }
+    connect_work_tree_and_git_dir(&abs, &sm_gitdir)?;
+
+    // ---- configure_added_submodule (submodule--helper.c:3518) ---------------
+    let local_config = repo.common_dir().join("config");
+    let mut cfg = ConfigFile::from_path_no_includes(local_config.clone(), Source::Local)?;
+    cfg.set_raw_value_by("submodule", Some(name.as_str().into()), "url", realrepo.as_str())?;
+    // `if (repo_config_get(the_repository, "submodule.active")) { … set
+    // submodule.<name>.active = true; }` — an explicit `submodule.active` pathspec
+    // list owns the decision, so the per-submodule flag is only written when there
+    // is none.
+    if repo.config_snapshot().string("submodule.active").is_none() {
+        cfg.set_raw_value_by("submodule", Some(name.as_str().into()), "active", "true")?;
+    }
+    std::fs::write(&local_config, cfg.to_bstring())?;
+
+    // git stages the gitlink with `git add --no-warn-embedded-repo [-f] -- <path>`
+    // before it writes `.gitmodules`; the entry it produces is the submodule's HEAD.
+    let head = gix::open(&abs)?
+        .head_id()
+        .map_err(|_| anyhow::anyhow!("the cloned submodule has an unborn HEAD"))?
+        .detach();
+    let cacheinfo = format!("160000,{},{}", head.to_hex(), path);
+    let staged = crate::dispatch::run(
+        "update-index",
+        &["--add".to_string(), "--cacheinfo".to_string(), cacheinfo],
+    )?;
+    if staged != ExitCode::SUCCESS {
+        return Ok(staged);
+    }
+
+    // `config_submodule_in_gitmodules(name, "url", add_data->repo)`: the *argument*,
+    // not `realrepo` — `.gitmodules` is shared with every other clone of the
+    // superproject, so a relative url has to stay relative there.
     let gitmodules = workdir.join(".gitmodules");
     let mut file = if gitmodules.exists() {
         ConfigFile::from_path_no_includes(gitmodules.clone(), Source::Worktree)?
@@ -4358,33 +4604,12 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     }
     std::fs::write(&gitmodules, file.to_bstring())?;
 
-    // git mirrors the url into the repository config so the submodule is
-    // initialized in place, the same effect as a following `submodule init`.
-    let local_config = repo.common_dir().join("config");
-    let mut cfg = ConfigFile::from_path_no_includes(local_config.clone(), Source::Local)?;
-    cfg.set_raw_value_by("submodule", Some(name.as_str().into()), "url", url.as_str())?;
-    std::fs::write(&local_config, cfg.to_bstring())?;
-
-    // ---- stage .gitmodules and the gitlink ---------------------------------
-    let head = gix::open(&abs)?
-        .head_id()
-        .map_err(|_| anyhow::anyhow!("the cloned submodule has an unborn HEAD"))?
-        .detach();
-    let cacheinfo = format!("160000,{},{}", head.to_hex(), path);
     let staged = crate::dispatch::run(
-        "update-index",
-        &["--add".to_string(), "--cacheinfo".to_string(), cacheinfo],
+        "add",
+        &["--force".to_string(), "--".to_string(), ".gitmodules".to_string()],
     )?;
     if staged != ExitCode::SUCCESS {
         return Ok(staged);
-    }
-    let staged = crate::dispatch::run("add", &["--".to_string(), ".gitmodules".to_string()])?;
-    if staged != ExitCode::SUCCESS {
-        return Ok(staged);
-    }
-
-    if !quiet {
-        println!("Adding existing repo at '{path}' to the index");
     }
     Ok(ExitCode::SUCCESS)
 }

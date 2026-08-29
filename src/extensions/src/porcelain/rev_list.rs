@@ -420,6 +420,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut boundary = false;
     let mut left_right = false;
     let mut cherry_mark = false;
+    /// `revs->cherry_pick`: drop the commits whose change is already on the other side.
+    let mut cherry_pick = false;
+    /// `revs->left_only` / `revs->right_only`.
+    let mut left_only = false;
+    let mut right_only = false;
     let mut ancestry_path = false;
     let mut simplify_by_decoration = false;
     let mut bisect = false;
@@ -616,6 +621,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--boundary" => boundary = true,
             "--left-right" => left_right = true,
             "--cherry-mark" => cherry_mark = true,
+            "--cherry-pick" => cherry_pick = true,
+            "--left-only" => left_only = true,
+            "--right-only" => right_only = true,
+            // `OPT_SET_INT('\0', "cherry", …)`: `--cherry` is the shorthand
+            // `--right-only --cherry-mark --no-merges` (revision.c).
+            "--cherry" => {
+                right_only = true;
+                cherry_mark = true;
+                max_parents = Some(1);
+            }
             "--ancestry-path" => ancestry_path = true,
             // `--simplify-by-decoration`: `simplify_commit()` keeps a decorated commit,
             // and — since simplification may not change the shape of the history — a
@@ -1224,15 +1239,27 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         .collect();
     let left = reachable_from(&left_tips, &parents_of);
 
-    // `cherry_pick_list` gives up before computing any patch id when one side of
-    // the symmetric difference is empty, which is the only case this port covers.
-    if cherry_mark {
-        let left_count = commits.iter().filter(|id| left.contains(*id)).count();
-        if left_count != 0 && left_count != commits.len() {
-            return Ok(fatal(
-                "--cherry-mark with commits on both sides is not supported",
-            ));
-        }
+    // `cherry_pick_list()` (revision.c): with commits on both sides of a symmetric difference,
+    // the two sides are compared by *patch id* and every commit whose change appears on the other
+    // side is marked `PATCHSAME`. git computes the ids for the smaller side and looks the larger
+    // side up in that table — the same work `git cherry` does, through the same
+    // `commit_patch_id()`.
+    let patch_same: HashSet<ObjectId> = if cherry_mark || cherry_pick {
+        cherry_pick_list(&repo, &commits, &left)?
+    } else {
+        HashSet::new()
+    };
+    // `if (revs->cherry_pick && (commit->object.flags & PATCHSAME)) continue;`: `--cherry-pick`
+    // without `--cherry-mark` drops the equivalent commits instead of marking them.
+    if cherry_pick && !cherry_mark {
+        commits.retain(|id| !patch_same.contains(id));
+    }
+    // `--left-only` / `--right-only` keep one side of the difference.
+    if left_only {
+        commits.retain(|id| left.contains(id));
+    }
+    if right_only {
+        commits.retain(|id| !left.contains(id));
     }
 
     // `--ancestry-path`: keep only the commits that descend from an excluded tip.
@@ -1472,7 +1499,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut out: Vec<u8> = Vec::new();
     let mut count_left = 0usize;
     let mut count_right = 0usize;
-    let count_same = 0usize;
+    let mut count_same = 0usize;
     let mut disk_total: u64 = 0;
 
     // Objects reachable from an excluded (`^rev`) commit are pre-marked as seen
@@ -1583,7 +1610,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
         }
         if count_only && !quiet {
-            if left.contains(id) {
+            // `--count` with `--cherry-mark` reports the equivalent commits in a column of their
+            // own rather than among the two sides (`print_commit_counts()`), which is how
+            // `3\t2` distinguishes "three commits, two of them already upstream".
+            if cherry_mark && patch_same.contains(id) {
+                count_same += 1;
+            } else if left.contains(id) {
                 count_left += 1;
             } else {
                 count_right += 1;
@@ -1611,6 +1643,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 out.extend_from_slice(revision_mark(
                     *is_boundary,
                     left.contains(id),
+                    patch_same.contains(id),
                     left_right,
                     cherry_mark,
                 ));
@@ -1787,6 +1820,66 @@ fn long_opt_value(args: &[String], i: usize, name: &str) -> Option<LongOpt> {
     None
 }
 
+/// `cherry_pick_list()` (revision.c) — mark the commits whose *change* appears on both sides of a
+/// symmetric difference.
+///
+/// ```c
+/// if (!left_count || !right_count)
+///         return 0;
+/// left_first = left_count < right_count;
+/// … /* patch ids for the smaller side */
+/// … /* look the larger side up in that table */
+/// ```
+///
+/// The smaller side is the one that gets a patch-id table, because that is the side whose diffs
+/// have to be held in memory; every commit on the other side is then a lookup. A merge has no
+/// patch id (`commit_patch_id()` answers `None`) and can never be equivalent.
+///
+/// Returns the ids marked `PATCHSAME` — on *both* sides, since git flags the pair.
+fn cherry_pick_list(
+    repo: &gix::Repository,
+    commits: &[ObjectId],
+    left: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>> {
+    let (mut lefts, mut rights): (Vec<ObjectId>, Vec<ObjectId>) = (Vec::new(), Vec::new());
+    for id in commits {
+        match left.contains(id) {
+            true => lefts.push(*id),
+            false => rights.push(*id),
+        }
+    }
+    let mut same = HashSet::new();
+    if lefts.is_empty() || rights.is_empty() {
+        return Ok(same);
+    }
+    // `left_first = left_count < right_count`.
+    let (table_side, probe_side) = match lefts.len() < rights.len() {
+        true => (&lefts, &rights),
+        false => (&rights, &lefts),
+    };
+
+    let mut ids: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    for id in table_side {
+        if let Some(pid) = super::cherry::commit_patch_id(repo, *id)? {
+            ids.entry(pid).or_default().push(*id);
+        }
+    }
+    for id in probe_side {
+        let Some(pid) = super::cherry::commit_patch_id(repo, *id)? else {
+            continue;
+        };
+        // `patch_id_iter_first()`: one match is enough, and git flags the commit it found as
+        // well as the one it was looking for.
+        if let Some(matches) = ids.get(&pid) {
+            if let Some(other) = matches.first() {
+                same.insert(*id);
+                same.insert(*other);
+            }
+        }
+    }
+    Ok(same)
+}
+
 /// git's `get_revision_mark`: the character printed in front of the object name.
 ///
 /// A boundary commit wins over everything, then a patch-equivalent one (which
@@ -1795,11 +1888,17 @@ fn long_opt_value(args: &[String], i: usize, name: &str) -> Option<LongOpt> {
 fn revision_mark(
     is_boundary: bool,
     is_left: bool,
+    is_patch_same: bool,
     left_right: bool,
     cherry_mark: bool,
 ) -> &'static [u8] {
     if is_boundary {
         b"-"
+    } else if is_patch_same {
+        // `else if (commit->object.flags & PATCHSAME) return "=";` — ahead of the symmetric
+        // side, so `--cherry-mark --left-right` prints `=` rather than `<`/`>` for a commit that
+        // exists on both sides.
+        b"="
     } else if left_right {
         if is_left {
             b"<"

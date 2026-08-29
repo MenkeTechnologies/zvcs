@@ -802,12 +802,29 @@ fn create(args: &[String]) -> Result<ExitCode> {
         seen.push(display.clone());
         out.extend_from_slice(format!("{} {display}\n", entry.id).as_bytes());
     }
+    // ```c
+    // /* end header */
+    // write_or_die(bundle_fd, "\n", 1);
+    // return ref_count;
+    // ```
+    //
+    // (`write_bundle_refs()`, bundle.c.) The blank line that ends the header goes out
+    // *before* the count is returned, so it is there even for the bundle that turns out
+    // to be empty.
+    out.push(b'\n');
     if seen.is_empty() {
+        // git writes the header through `write_or_die(bundle_fd, …)` as it builds it
+        // (bundle.c:533-547), so by the time `create_bundle()` sees a zero ref count the
+        // whole header has already reached the destination. For a file that destination
+        // is a lockfile the error path rolls back and nothing survives; for `-` it is
+        // stdout, and the two lines are already out.
+        if file == "-" {
+            io::stdout().write_all(&out)?;
+            io::stdout().flush()?;
+        }
         eprintln!("fatal: Refusing to create empty bundle.");
         return Ok(ExitCode::from(128));
     }
-    // `write_or_die(bundle_fd, "\n", 1)` — the blank line that ends the header.
-    out.push(b'\n');
 
     // `write_pack_data()`: the objects reachable from the tips and not from the
     // prerequisites. git's pack is thin (its deltas may name bases the receiver

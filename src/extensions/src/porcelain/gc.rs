@@ -330,6 +330,9 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // here is that `-1`: it is distinct from `Some(false)`, because only the
     // unasked state lets `gc.autoDetach` fill it in under `--auto`.
     let mut detach: Option<bool> = None;
+    // git's `int keep_largest_pack = -1`: unasked, on, or off, with the last two
+    // both overriding `gc.bigPackThreshold`.
+    let mut keep_largest_pack: Option<bool> = None;
 
     let mut end_of_opts = false;
     let mut i = 0;
@@ -380,11 +383,25 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             // [`report_last_gc_error`].
             "--detach" => detach = Some(true),
             "--no-detach" => detach = Some(false),
+            // ```c
+            // if (keep_largest_pack != -1) {
+            //         if (keep_largest_pack)
+            //                 find_base_packs(&keep_pack, 0);
+            // } else if (cfg.big_pack_threshold) {
+            //         find_base_packs(&keep_pack, cfg.big_pack_threshold);
+            // }
+            // ```
+            //
+            // (`builtin/gc.c:951-956`.) The flag is a tri-state: given, it
+            // *overrides* `gc.bigPackThreshold` — including `--no-keep-largest-pack`,
+            // which keeps nothing at all where the config would have kept the big
+            // packs.
+            "--keep-largest-pack" => keep_largest_pack = Some(true),
+            "--no-keep-largest-pack" => keep_largest_pack = Some(false),
             "--force" | "--no-force"
-            | "--keep-largest-pack"
             // `--no-expire-to` is a valid negation (USAGE spells it `--[no-]expire-to`);
             // `--max-cruft-size` has no `--no-` form, so one is left to error out.
-            | "--no-keep-largest-pack" | "--no-expire-to" => {}
+            | "--no-expire-to" => {}
             // `--prune=<date>` is the only optional-value option.
             _ if a.starts_with("--prune=") => {
                 // `--prune` is an `OPT_STRING`: the value is only kept here and
@@ -649,6 +666,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         unreachable,
         delta_options(&repo, aggressive, crate::progress::enabled(quiet)),
         quiet,
+        keep_largest_pack,
     )?;
 
     // `repack` has already removed every unreachable object under `Drop`, so the
@@ -795,6 +813,7 @@ fn repack_all(
     unreachable: Unreachable,
     delta: super::pack_objects::WriteOptions,
     quiet: bool,
+    keep_largest_pack: Option<bool>,
 ) -> Result<()> {
     let hash = repo.object_hash();
     let objdir = repo.objects.store_ref().path().to_path_buf();
@@ -804,7 +823,19 @@ fn repack_all(
     // remembers its path and mtime: the path so it can be unlinked once packed,
     // the mtime because a cruft pack has to record it.
     let loose = loose_objects(&objdir, hash);
-    let rewritable = local_packs(&pack_dir, hash, big_pack_threshold(repo));
+    // `find_base_packs()` (builtin/gc.c:485-505) picks the packs `gc` hands
+    // `repack --keep-pack`: with a threshold, every local non-cruft pack at or
+    // over it; without, the single largest. `--keep-largest-pack` overrides
+    // `gc.bigPackThreshold` either way (:951-956).
+    let base_packs = match keep_largest_pack {
+        Some(true) => find_base_packs(&pack_dir, 0),
+        Some(false) => Vec::new(),
+        None => match big_pack_threshold(repo) {
+            0 => Vec::new(),
+            limit => find_base_packs(&pack_dir, limit),
+        },
+    };
+    let rewritable = local_packs(&pack_dir, hash, &base_packs);
 
     let mut existing: Vec<ObjectId> = loose.keys().copied().collect();
     // A packed object is dated by its `.pack`'s mtime, which is what git's
@@ -823,6 +854,21 @@ fn repack_all(
     }
     existing.sort_unstable();
     existing.dedup();
+    // `--keep-pack=<name>` does not merely spare the pack: `pack-objects` treats
+    // everything in it as already delivered, so the new pack holds only what the
+    // kept packs do not. Without this an object that is both loose and inside a
+    // kept pack is written *again*, leaving `gc` with one more pack than it
+    // started with rather than one fewer.
+    if !base_packs.is_empty() {
+        let mut kept_objects: HashSet<ObjectId> = HashSet::new();
+        for base in &base_packs {
+            let idx = pack_dir.join(format!("{base}.idx"));
+            if let Ok(index) = pack::index::File::at(&idx, hash) {
+                kept_objects.extend(index.iter().map(|entry| entry.oid));
+            }
+        }
+        existing.retain(|id| !kept_objects.contains(id));
+    }
     if existing.is_empty() {
         // `gc` reaches its repacking through a `repack -d -l` child
         // (`builtin/gc.c:897`, with `-a`/`-A`/`--cruft` appended by
@@ -935,6 +981,20 @@ fn repack_all(
             let _ = std::fs::remove_file(&entry.path);
         }
     }
+    // `repack -d` finishes with `prune-packed`, which removes *every* loose
+    // object a pack already holds — including the packs `--keep-pack` spared, and
+    // so including the copies that were never candidates for the new pack. Left
+    // behind, they are the objects `gc` was asked to collect still sitting loose.
+    for base in &base_packs {
+        let Ok(index) = pack::index::File::at(pack_dir.join(format!("{base}.idx")), hash) else {
+            continue;
+        };
+        for entry in index.iter() {
+            if let Some(loose) = loose.get(&entry.oid) {
+                let _ = std::fs::remove_file(&loose.path);
+            }
+        }
+    }
     for (base, _) in &rewritable {
         // A pack this run just wrote must not be deleted as if it were an old
         // one — possible when the object set and its order reproduce a checksum.
@@ -1014,6 +1074,56 @@ fn big_pack_threshold(repo: &gix::Repository) -> u64 {
         .unwrap_or(0)
 }
 
+/// `find_base_packs()` (builtin/gc.c:485-505): the packs `gc` asks `repack` to
+/// keep.
+///
+/// ```c
+/// repo_for_each_pack(the_repository, p) {
+///         if (!p->pack_local || p->is_cruft)
+///                 continue;
+///         if (limit) {
+///                 if (p->pack_size >= limit)
+///                         string_list_append(packs, p->pack_name);
+///         } else if (!base || base->pack_size < p->pack_size) {
+///                 base = p;
+///         }
+/// }
+/// ```
+///
+/// A `limit` of 0 means "the single largest", which is `--keep-largest-pack`;
+/// any other value is `gc.bigPackThreshold`, and every pack at or over it is
+/// kept. A cruft pack — one with a `.mtimes` beside it — is never a base: it
+/// holds the unreachable objects the next collection has to be free to rewrite.
+fn find_base_packs(pack_dir: &Path, limit: u64) -> Vec<String> {
+    let Some(names) = super::prune::read_dir_raw(pack_dir) else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    let mut largest: Option<(String, u64)> = None;
+    for name in names {
+        let name = name.to_string_lossy().into_owned();
+        let Some(base) = name.strip_suffix(".idx") else { continue };
+        if pack_dir.join(format!("{base}.mtimes")).exists() {
+            continue;
+        }
+        let Ok(size) = std::fs::metadata(pack_dir.join(format!("{base}.pack"))).map(|md| md.len())
+        else {
+            continue;
+        };
+        match limit {
+            0 => {
+                if largest.as_ref().is_none_or(|(_, biggest)| *biggest < size) {
+                    largest = Some((base.to_string(), size));
+                }
+            }
+            limit if size >= limit => kept.push(base.to_string()),
+            _ => {}
+        }
+    }
+    kept.extend(largest.map(|(base, _)| base));
+    kept
+}
+
 /// Every local pack that may be rewritten, as `(base name, index)`.
 ///
 /// Alternates are deliberately not included: `repack` rewrites the repository's
@@ -1025,7 +1135,7 @@ fn big_pack_threshold(repo: &gix::Repository) -> u64 {
 fn local_packs(
     pack_dir: &Path,
     hash: gix::hash::Kind,
-    big_pack_threshold: u64,
+    base_packs: &[String],
 ) -> Vec<(String, pack::index::File)> {
     let mut out = Vec::new();
     let Some(names) = super::prune::read_dir_raw(pack_dir) else {
@@ -1039,13 +1149,8 @@ fn local_packs(
         if pack_dir.join(format!("{base}.keep")).exists() {
             continue;
         }
-        if big_pack_threshold > 0 {
-            let size = std::fs::metadata(pack_dir.join(format!("{base}.pack")))
-                .map(|md| md.len())
-                .unwrap_or(0);
-            if size >= big_pack_threshold {
-                continue;
-            }
+        if base_packs.iter().any(|kept| kept == base) {
+            continue;
         }
         if !matches!(std::fs::metadata(pack_dir.join(format!("{base}.pack"))), Ok(md) if md.is_file())
         {

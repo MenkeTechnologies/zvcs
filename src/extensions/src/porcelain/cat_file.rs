@@ -1048,6 +1048,7 @@ enum Token {
     ObjectType,
     ObjectSize,
     ObjectSizeDisk,
+    DeltaBase,
     Rest,
 }
 
@@ -1059,6 +1060,8 @@ struct Format {
     /// Whether `%(objectsize:disk)` appears, so the on-disk lookup — which costs
     /// a pack-entry decode per object — is only paid for when it is asked for.
     has_disk_size: bool,
+    /// Whether `%(deltabase)` appears; same reasoning, a different lookup.
+    has_delta_base: bool,
 }
 
 const DEFAULT_FORMAT: &str = "%(objectname) %(objecttype) %(objectsize)";
@@ -1072,6 +1075,7 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
     let mut lit: Vec<u8> = Vec::new();
     let mut has_rest = false;
     let mut has_disk_size = false;
+    let mut has_delta_base = false;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -1114,10 +1118,8 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
                 Token::ObjectSizeDisk
             }
             b"deltabase" => {
-                // Valid in git, but naming the delta base needs the pack entry's
-                // OFS_DELTA/REF_DELTA header resolved back to an object id, which
-                // this port does not do. Reject rather than fake.
-                return Err("git cat-file: format atom %(deltabase) is not yet ported".into());
+                has_delta_base = true;
+                Token::DeltaBase
             }
             _ => {
                 // git dies `bad cat-file format: %(<atom>)`.
@@ -1134,7 +1136,7 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
     if !lit.is_empty() {
         tokens.push(Token::Literal(lit));
     }
-    Ok(Format { tokens, has_rest, has_disk_size })
+    Ok(Format { tokens, has_rest, has_disk_size, has_delta_base })
 }
 
 /// Render one info line into `out` (no trailing delimiter).
@@ -1147,6 +1149,7 @@ fn render_info(
     kind: Kind,
     size: u64,
     disk: u64,
+    delta_base: &gix::hash::ObjectId,
     rest: &[u8],
     out: &mut Vec<u8>,
 ) {
@@ -1157,6 +1160,7 @@ fn render_info(
             Token::ObjectType => out.extend_from_slice(kind.to_string().as_bytes()),
             Token::ObjectSize => out.extend_from_slice(size.to_string().as_bytes()),
             Token::ObjectSizeDisk => out.extend_from_slice(disk.to_string().as_bytes()),
+            Token::DeltaBase => out.extend_from_slice(delta_base.to_hex().to_string().as_bytes()),
             Token::Rest => out.extend_from_slice(rest),
         }
     }
@@ -1261,6 +1265,59 @@ pub(crate) fn disk_size(repo: &gix::Repository, id: gix::hash::ObjectId) -> Resu
         }
     }
     crate::git_fatal!("cannot determine on-disk size of {hex}")
+}
+
+/// git's `oi.delta_base_oid`: the object this one is stored as a delta against, or the null
+/// id when it is stored whole.
+///
+/// ```c
+/// } else if (is_atom("deltabase", atom, len)) {
+///         if (data)
+///                 data->info.delta_base_oid = &data->delta_base_oid;
+/// ```
+///
+/// (`expand_atom()`, builtin/cat-file.c.) `packed_object_info()` fills it from the pack
+/// entry's header: a `REF_DELTA` names its base outright, an `OFS_DELTA` names it by
+/// distance backwards in the pack, and everything else — every loose object included —
+/// reports the null id.
+pub(crate) fn delta_base(
+    repo: &gix::Repository,
+    id: gix::hash::ObjectId,
+) -> Result<gix::hash::ObjectId> {
+    use gix::odb::pack::Find as _;
+    let null = gix::ObjectId::null(repo.object_hash());
+    let mut buf = Vec::new();
+    let mut odb = repo.objects.clone();
+    odb.prevent_pack_unload();
+    let Some(location) = odb.location_by_oid(id.as_ref(), &mut buf) else {
+        return Ok(null);
+    };
+    let Some(entry) = odb.entry_by_location(&location) else {
+        return Ok(null);
+    };
+    let Ok(parsed) = gix::odb::pack::data::Entry::from_bytes(
+        &entry.data,
+        location.pack_offset,
+        repo.object_hash(),
+    ) else {
+        return Ok(null);
+    };
+    use gix::odb::pack::data::entry::Header;
+    match parsed.header {
+        Header::RefDelta { base_id } => Ok(base_id),
+        Header::OfsDelta { base_distance } => {
+            let base_offset = location.pack_offset.saturating_sub(base_distance);
+            let Some(pairs) = odb.pack_offsets_and_oid(location.pack_id) else {
+                return Ok(null);
+            };
+            Ok(pairs
+                .into_iter()
+                .find(|(offset, _)| *offset == base_offset)
+                .map(|(_, oid)| oid)
+                .unwrap_or(null))
+        }
+        _ => Ok(null),
+    }
 }
 
 /// Every `objects/` directory backing this repository — the primary one first,
@@ -1427,7 +1484,25 @@ fn run_batch(
         }
         let want_contents = kind == BatchKind::Contents;
         for oid in ids {
+            // ```c
+            // ret = oid_object_info_extended(the_repository, &data->oid, &data->info, ...);
+            // if (ret < 0) {
+            //         strbuf_addf(scratch, "%s missing\n", ...);
+            //         batch_write(opt, scratch->buf, scratch->len);
+            //         return 0;
+            // }
+            // ```
+            //
+            // (`batch_object_write()`, builtin/cat-file.c.) An object the enumeration found
+            // but the odb cannot read — a corrupt loose file, whose name is still a name —
+            // is reported as `missing` rather than dropped from the listing.
             let Ok(header) = repo.find_header(oid) else {
+                out.write_all(oid.to_hex().to_string().as_bytes())?;
+                out.write_all(b" missing")?;
+                out.write_all(&[output_delim])?;
+                if !buffer {
+                    out.flush()?;
+                }
                 continue;
             };
             if let Some(f) = &objfilter {
@@ -1564,11 +1639,68 @@ fn handle_command(
     transform: Option<&mut Transform<'_>>,
     follow_symlinks: bool,
 ) -> Result<CommandResult> {
-    // Split the command word from its argument on the first ASCII space.
-    let (word, arg) = match line.iter().position(|&b| b == b' ') {
-        Some(sp) => (&line[..sp], &line[sp + 1..]),
-        None => (line, &b""[..]),
-    };
+    // ```c
+    // if (!input.len)
+    //         die(_("empty command in input"));
+    // if (isspace(*input.buf))
+    //         die(_("whitespace before command: '%s'"), input.buf);
+    //
+    // for (i = 0; i < ARRAY_SIZE(commands); i++) {
+    //         if (!skip_prefix(input.buf, commands[i].name, &cmd_end))
+    //                 continue;
+    //         cmd = &commands[i];
+    //         if (cmd->takes_args) {
+    //                 if (*cmd_end != ' ')
+    //                         die(_("%s requires arguments"), commands[i].name);
+    //                 p = cmd_end + 1;
+    //         } else if (*cmd_end) {
+    //                 die(_("%s takes no arguments"), commands[i].name);
+    //         }
+    //         break;
+    // }
+    // if (!cmd)
+    //         die(_("unknown command: '%s'"), input.buf);
+    // ```
+    //
+    // (`batch_objects_command()`, builtin/cat-file.c:770-795.) The match is a *prefix*
+    // match against the table in its own order, so the argument requirement is what tells
+    // `info` from a word that merely starts with it — splitting on the first space instead
+    // read a bare `info` as a request for the empty object name and answered ` missing`.
+    if line.is_empty() {
+        eprintln!("fatal: empty command in input");
+        return Ok(CommandResult::Die(128));
+    }
+    if line[0].is_ascii_whitespace() {
+        eprintln!(
+            "fatal: whitespace before command: '{}'",
+            String::from_utf8_lossy(line)
+        );
+        return Ok(CommandResult::Die(128));
+    }
+    let mut word: &[u8] = b"";
+    let mut arg: &[u8] = b"";
+    for (name, takes_args) in [
+        (&b"contents"[..], true),
+        (&b"info"[..], true),
+        (&b"flush"[..], false),
+        (&b"mailmap"[..], true),
+    ] {
+        let Some(rest) = line.strip_prefix(name) else {
+            continue;
+        };
+        word = name;
+        if takes_args {
+            if rest.first() != Some(&b' ') {
+                eprintln!("fatal: {} requires arguments", String::from_utf8_lossy(name));
+                return Ok(CommandResult::Die(128));
+            }
+            arg = &rest[1..];
+        } else if !rest.is_empty() {
+            eprintln!("fatal: {} takes no arguments", String::from_utf8_lossy(name));
+            return Ok(CommandResult::Die(128));
+        }
+        break;
+    }
 
     match word {
         b"flush" => {
@@ -2032,7 +2164,12 @@ fn emit_object(
     } else {
         0
     };
-    render_info(fmt, &oid, kind, size, disk, rest, &mut info);
+    let delta_base = if fmt.has_delta_base {
+        delta_base(repo, oid)?
+    } else {
+        gix::ObjectId::null(repo.object_hash())
+    };
+    render_info(fmt, &oid, kind, size, disk, &delta_base, rest, &mut info);
     out.write_all(&info)?;
     out.write_all(&[delim])?;
 

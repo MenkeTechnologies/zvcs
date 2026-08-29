@@ -382,3 +382,72 @@ fn edit_runs_the_configured_editor_on_the_target_file() {
     let read_back = zvcs(&dir, &["config", "--local", "--get", "edited.by"]);
     assert_eq!(stdout_of(&read_back), "zvcs\n", "the editor's write landed in the target file");
 }
+
+/// `git config get --regexp` and `git config --get-regexp` share `get_value()`
+/// but disagree on display: the subcommand form is a *value* reader with a
+/// regexp key (`GET_VALUE_KEY_REGEXP`, builtin/config.c:306-313), printing the
+/// last match alone unless `--all` asks for every one, while the legacy option
+/// prints `key value` for all of them.
+#[test]
+fn the_get_subcommand_regexp_prints_values_and_the_legacy_option_prints_pairs() {
+    let dir = repo("sub-vs-legacy");
+    let pattern = r"^branch\.main\.";
+
+    let last = zvcs(&dir, &["config", "get", "--local", "--regexp", pattern]);
+    assert!(last.status.success(), "get --regexp failed");
+    assert_eq!(stdout_of(&last), "refs/heads/main\n", "only the last value, no key");
+
+    let all = zvcs(&dir, &["config", "get", "--local", "--all", "--regexp", pattern]);
+    assert_eq!(stdout_of(&all), "origin\nrefs/heads/main\n", "every value, in file order");
+
+    let named = zvcs(&dir, &["config", "get", "--local", "--all", "--show-names", "--regexp", pattern]);
+    assert_eq!(
+        stdout_of(&named),
+        "branch.main.remote origin\nbranch.main.merge refs/heads/main\n",
+        "--show-names restores the keys the legacy form always prints"
+    );
+
+    let legacy = zvcs(&dir, &["config", "--local", "--get-regexp", pattern]);
+    assert_eq!(stdout_of(&legacy), stdout_of(&named), "legacy is --all --show-names");
+}
+
+/// `get_value()` lower-cases the *pattern* before compiling it — the section
+/// name up to the first `.` and the variable name back from the last one, with
+/// the subsection between them untouched (builtin/config.c:490-496). Regexp
+/// metacharacters ride along, so `USER\.NAME` still matches `user.name`.
+#[test]
+fn a_key_pattern_is_lower_cased_the_way_a_key_is() {
+    let dir = repo("pattern-case");
+
+    // Without --regexp the name is a literal key, and key lookup folds case
+    // itself — so the same spelling finds the entry.
+    let upper = zvcs(&dir, &["config", "get", "--local", "USER.NAME"]);
+    assert_eq!(stdout_of(&upper), "Ada\n", "a literal key lookup folds case too");
+
+    let matched = zvcs(&dir, &["config", "get", "--local", "--regexp", r"^USER\.NAME$"]);
+    assert!(matched.status.success(), "lower-cased pattern should match");
+    assert_eq!(stdout_of(&matched), "Ada\n");
+
+    // The subsection keeps its case, so a pattern that lower-cases it misses.
+    let sub = zvcs(&dir, &["config", "get", "--local", "--regexp", r"^REMOTE\.origin\.URL$"]);
+    assert_eq!(stdout_of(&sub), "git@github.com:o/r.git\n", "section and name fold, subsection does not");
+    let folded = zvcs(&dir, &["config", "get", "--local", "--regexp", r"^remote\.ORIGIN\.url$"]);
+    assert_eq!(folded.status.code(), Some(1), "a folded subsection is a different key");
+}
+
+/// The `get` subcommand's own option table makes `--name-only` and `--default`
+/// unconditional (builtin/config.c:1221-1236); only the legacy form restricts
+/// them to `--list`/`--get-regexp` and `--get`. An empty regexp result with a
+/// `--default` prints the default, formatted the same way a stored value is.
+#[test]
+fn the_get_subcommand_accepts_name_only_and_default_with_a_regexp() {
+    let dir = repo("sub-display-opts");
+
+    let names = zvcs(&dir, &["config", "get", "--local", "--name-only", "--all", "--regexp", r"^branch\."]);
+    assert!(names.status.success(), "--name-only under `get` must not be a usage error");
+    assert_eq!(stdout_of(&names), "\n\n", "values omitted, keys not asked for: two empty lines");
+
+    let default = zvcs(&dir, &["config", "get", "--local", "--default", "fallback", "--regexp", r"^zz\."]);
+    assert!(default.status.success(), "--default under `get` must not be a usage error");
+    assert_eq!(stdout_of(&default), "fallback\n");
+}

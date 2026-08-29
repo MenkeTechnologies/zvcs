@@ -231,6 +231,13 @@ enum Mode {
     RenameSection,
     RemoveSection,
     Edit,
+    /// `git config get --regexp <name>`: `get_value()` with `GET_VALUE_KEY_REGEXP`
+    /// (builtin/config.c:1086), which is the `--get`/`--get-all` reader with a
+    /// regexp *name* — values only, no keys, unlike the legacy `--get-regexp`.
+    /// Not spellable on the command line; the `get` subcommand maps to it.
+    GetKeyRegexp,
+    /// [`Mode::GetKeyRegexp`] with `--all`.
+    GetKeyRegexpAll,
 }
 
 impl Mode {
@@ -242,6 +249,7 @@ impl Mode {
             Mode::Get => "--get",
             Mode::GetAll => "--get-all",
             Mode::GetRegexp => "--get-regexp",
+            Mode::GetKeyRegexp | Mode::GetKeyRegexpAll => "--regexp",
             Mode::GetUrlMatch => "--get-urlmatch",
             Mode::GetColor => "--get-color",
             Mode::GetColorBool => "--get-colorbool",
@@ -686,8 +694,15 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
                     out.push(operands[0].clone());
                     out.push(u.clone());
                 }
-                (None, true, _) => {
-                    out.push("--get-regexp".into());
+                // `get --regexp` is `get_value()` with `GET_VALUE_KEY_REGEXP`
+                // (builtin/config.c:1086,1125) — the same reader `--get`/`--get-all` use,
+                // so it prints *values*, the last one unless `--all` asked for them all.
+                // The legacy `--get-regexp` is a different display (`key value` pairs).
+                (None, true, all) => {
+                    out.push(match all {
+                        true => "--get-key-regexp-all".into(),
+                        false => "--get-key-regexp".into(),
+                    });
                     out.push(operands[0].clone());
                     out.extend(value_pattern.clone());
                 }
@@ -833,9 +848,11 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // with its own table, and anything else falls through to `cmd_config_actions()` — the legacy
     // option form this file already implements.
     let rewritten;
+    let mut from_subcommand = false;
     let args = match rewrite_subcommand(args) {
         Some(Ok(argv)) => {
             rewritten = argv;
+            from_subcommand = true;
             &rewritten[..]
         }
         Some(Err(code)) => return Ok(code),
@@ -914,6 +931,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "--get" => Some(Mode::Get),
             "--get-all" => Some(Mode::GetAll),
             "--get-regexp" => Some(Mode::GetRegexp),
+            // Internal spellings the `get` subcommand mapping emits; git has no
+            // command-line form for them.
+            "--get-key-regexp" => Some(Mode::GetKeyRegexp),
+            "--get-key-regexp-all" => Some(Mode::GetKeyRegexpAll),
             "--get-urlmatch" => Some(Mode::GetUrlMatch),
             "--get-color" => Some(Mode::GetColor),
             "--get-colorbool" => Some(Mode::GetColorBool),
@@ -1116,8 +1137,22 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     if mode == Mode::Auto && !(1..=3).contains(&positional.len()) {
         return usage_error("no action specified");
     }
+    // The two applicability checks below belong to `cmd_config_actions()`, the
+    // legacy form; `cmd_config_get()` has its own option table where `--name-only`
+    // and `--default` are unconditional (builtin/config.c:1221-1236) and its own
+    // three refusals, already applied during the rewrite. So a `get` that came
+    // through the subcommand table skips them.
+    let get_subcommand = from_subcommand
+        && matches!(
+            mode,
+            Mode::Get
+                | Mode::GetAll
+                | Mode::GetKeyRegexp
+                | Mode::GetKeyRegexpAll
+                | Mode::GetUrlMatch
+        );
     d.name_only = name_only;
-    if name_only && !matches!(mode, Mode::List | Mode::GetRegexp) {
+    if name_only && !get_subcommand && !matches!(mode, Mode::List | Mode::GetRegexp) {
         return usage_error("--name-only is only applicable to --list or --get-regexp");
     }
     // ```c
@@ -1130,6 +1165,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // resolved (`case 1: actions = ACTION_GET`), so the bare one-operand read —
     // `git config --default=x some.missing` — is a `--get` by then and is allowed.
     if d.default_value.is_some()
+        && !get_subcommand
         && !(mode == Mode::Get || (mode == Mode::Auto && positional.len() == 1))
     {
         return usage_error("--default is only applicable to --get");
@@ -1138,7 +1174,13 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::List if !positional.is_empty() => {
             return usage_error("wrong number of arguments, should be 0");
         }
-        Mode::Get | Mode::GetAll | Mode::GetRegexp if !(1..=2).contains(&positional.len()) => {
+        Mode::Get
+        | Mode::GetAll
+        | Mode::GetRegexp
+        | Mode::GetKeyRegexp
+        | Mode::GetKeyRegexpAll
+            if !(1..=2).contains(&positional.len()) =>
+        {
             return usage_error("wrong number of arguments, should be from 1 to 2");
         }
         // `check_argc(argc, 1, 2)` (builtin/config.c:1607) — the same window and
@@ -1188,6 +1230,8 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         | Mode::Get
         | Mode::GetAll
         | Mode::GetRegexp
+        | Mode::GetKeyRegexp
+        | Mode::GetKeyRegexpAll
         | Mode::GetUrlMatch
         | Mode::GetColor
         | Mode::GetColorBool => true,
@@ -1311,8 +1355,16 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // second operand filters the returned values by an ERE (`!` inverts).
         Mode::Get => get(file, positional[0], false, positional.get(1).copied(), &d),
         Mode::GetAll => get(file, positional[0], true, positional.get(1).copied(), &d),
+        Mode::GetKeyRegexp | Mode::GetKeyRegexpAll => get_regexp(
+            file,
+            positional[0],
+            positional.get(1).copied(),
+            &d,
+            mode == Mode::GetKeyRegexpAll,
+            false,
+        ),
         Mode::GetRegexp => {
-            get_regexp(file, positional[0], positional.get(1).copied(), &d)
+            get_regexp(file, positional[0], positional.get(1).copied(), &d, true, true)
         }
         Mode::GetUrlMatch => get_urlmatch(file, &positional, &d),
         Mode::GetColor => get_color(file, positional[0], positional.get(1).copied()),
@@ -1498,11 +1550,14 @@ fn get(
     // arrives with the metadata `--show-origin`/`--show-scope` need; the walk is
     // in file order, and git's `--get` is the LAST value that survives the
     // filter.
+    // `collect_config()` hands `format_config()` the *entry's* key, not the one
+    // that was asked for (builtin/config.c:357-358), so `--show-names` and the
+    // type diagnostics both name the git-normalized spelling.
     let wanted = key_of(&key);
-    let mut selected: Vec<(Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
+    let mut selected: Vec<(String, Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
     for_each_entry(file, |k, value, implicit, meta| {
         if k == wanted && filter.as_ref().is_none_or(|f| f.matches(value)) {
-            selected.push((value.to_vec(), implicit, meta.clone()));
+            selected.push((k.to_owned(), value.to_vec(), implicit, meta.clone()));
         }
         Ok(())
     })?;
@@ -1522,49 +1577,77 @@ fn get(
     // diagnostic when the type rejects it. Only a `--get` that found *nothing* uses
     // it; a key that exists but was filtered out by a value-pattern still exits 1.
     if selected.is_empty() {
-        let Some(default) = d.default_value.as_deref() else {
-            return Ok(ExitCode::from(1));
-        };
-        let formatted = match d.ty {
-            None => Ok(default.as_bytes().to_vec()),
-            Some(t) => t.canonicalize(name, default.as_bytes(), false),
-        };
-        return match formatted {
-            Ok(value) => {
-                emit_kv(&mut out, d, name, &value, &param_metadata(), b' ', d.show_names)?;
-                Ok(ExitCode::SUCCESS)
-            }
-            // A `format_config()` that returns < 0 is the `die()` above rather than
-            // the callback's usual `bad config line` follow-up, because the default
-            // came from the command line and has no config line behind it.
-            Err(TypeError::Callback(message)) => {
-                eprintln!("{message}");
-                eprintln!("fatal: failed to format default config value: {default}");
-                Ok(ExitCode::from(128))
-            }
-            Err(err) => Ok(report_type_error(err, name, default.as_bytes(), None)),
-        };
+        return emit_default(&mut out, d, name);
     }
 
     // git canonicalizes in file order and dies on the first value that does not
     // parse as the requested type — even when `--get` would have returned a
     // later one, so the error names the same value stock git names.
-    let mut canonical: Vec<(Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
-    for (v, implicit, meta) in &selected {
-        match typed(d, name, v, *implicit, meta) {
-            Ok(v) => canonical.push((v, *implicit, meta.clone())),
+    let mut canonical: Vec<(String, Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
+    for (k, v, implicit, meta) in &selected {
+        match typed(d, k, v, *implicit, meta) {
+            Ok(v) => canonical.push((k.clone(), v, *implicit, meta.clone())),
             Err(code) => return Ok(code),
         }
     }
 
     let emit: &[_] = if all { &canonical } else { &canonical[canonical.len() - 1..] };
-    for (v, implicit, meta) in emit {
+    for (name, v, implicit, meta) in emit {
         // A key with no `=` prints as its name alone under `--show-names`, and as an empty line
         // without it — `format_config()` backs the delimiter out (builtin/config.c:454-461).
         let shown = (!implicit || d.ty.is_some()).then_some(v.as_slice());
         emit_kv_opt(&mut out, d, name, shown, meta, b' ', d.show_names)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `get_value()`'s `--default` arm, reached when the walk collected nothing:
+///
+/// ```c
+/// if (!values.nr && display_opts->default_value) {
+///         struct key_value_info kvi = KVI_INIT;
+///         struct strbuf *item;
+///
+///         kvi_from_param(&kvi);
+///         …
+///         if (format_config(display_opts, item, key_,
+///                           display_opts->default_value, &kvi) < 0)
+///                 die(_("failed to format default config value: %s"),
+///                     display_opts->default_value);
+/// }
+/// ```
+///
+/// (`builtin/config.c:537-551`.) The default is formatted by the same
+/// `format_config()` the stored values go through, so `--type` applies to it —
+/// and `kvi_from_param()` gives it no file of origin, which is what shortens the
+/// diagnostic when the type rejects it. `key_` is the name as it was asked for,
+/// the raw pattern included, since no entry was matched to supply one.
+///
+/// Exit 1 with no output when no default was configured; a key that exists but
+/// was filtered out by a value-pattern never reaches here.
+fn emit_default(out: &mut impl std::io::Write, d: &Display, name: &str) -> Result<ExitCode> {
+    let Some(default) = d.default_value.as_deref() else {
+        return Ok(ExitCode::from(1));
+    };
+    let formatted = match d.ty {
+        None => Ok(default.as_bytes().to_vec()),
+        Some(t) => t.canonicalize(name, default.as_bytes(), false),
+    };
+    match formatted {
+        Ok(value) => {
+            emit_kv(out, d, name, &value, &param_metadata(), b' ', d.show_names)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        // A `format_config()` that returns < 0 is the `die()` above rather than
+        // the callback's usual `bad config line` follow-up, because the default
+        // came from the command line and has no config line behind it.
+        Err(TypeError::Callback(message)) => {
+            eprintln!("{message}");
+            eprintln!("fatal: failed to format default config value: {default}");
+            Ok(ExitCode::from(128))
+        }
+        Err(err) => Ok(report_type_error(err, name, default.as_bytes(), None)),
+    }
 }
 
 /// The git-normalized `section[.subsection].name` spelling of a parsed key, so a
@@ -1867,15 +1950,32 @@ fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
     // a `--list --type=<t>` quietly drops every entry the type cannot read rather
     // than dying on the first one.
     for_each_entry(file, |key, value, implicit, meta| {
-        let _ = (meta, implicit);
         let canonical = match d.ty {
             None => value.to_vec(),
-            Some(t) => match t.canonicalize(key, value, false) {
+            // A valueless key is git's `NULL`, and the boolean readers answer *true*
+            // for it — the same distinction `--get` already makes.
+            Some(t) => match t.canonicalize(key, value, implicit) {
                 Ok(v) => v,
                 Err(_) => return Ok(()),
             },
         };
-        emit_kv(&mut out, d, key, &canonical, meta, b'=', true)
+        // ```c
+        // case TYPE_NONE:
+        //         if (value_) {
+        //                 strbuf_addstr(buf, value_);
+        //         } else {
+        //                 /* Just show the key name; back out delimiter */
+        //                 if (opts->show_keys)
+        //                         strbuf_setlen(buf, buf->len - 1);
+        //         }
+        // ```
+        //
+        // (builtin/config.c:454-461.) A name written with no `=` has *no* value, which is
+        // not the same as an empty one: `flag` lists as `demo.flag` and `empty =` as
+        // `demo.empty=`. Any `--type` takes the entry out of the `TYPE_NONE` arm, and
+        // the delimiter stays — which is what makes `--type=bool` print `demo.flag=true`.
+        let shown = (!implicit || d.ty.is_some()).then_some(canonical.as_slice());
+        emit_kv_opt(&mut out, d, key, shown, meta, b'=', true)
     })?;
 
     Ok(ExitCode::SUCCESS)
@@ -1891,13 +1991,20 @@ fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
 /// Exit 1 with no output when nothing matched. An invalid ERE is git's
 /// `error: invalid key pattern: <pattern>` at exit 6 — note "key pattern" here,
 /// against the plain "pattern" the value-pattern form reports.
+///
+/// `all` and `show_keys` are what separates the two spellings that share this
+/// reader: the legacy `--get-regexp` sets both (every match, `key value`), while
+/// `git config get --regexp` sets neither, so it prints bare values and only the
+/// last one unless `--all` was given.
 fn get_regexp(
     file: &gix::config::File,
     pattern: &str,
     value_pattern: Option<&str>,
     d: &Display,
+    all: bool,
+    show_keys: bool,
 ) -> Result<ExitCode> {
-    let re = match regex::bytes::Regex::new(pattern) {
+    let re = match regex::bytes::Regex::new(&lowercase_key_pattern(pattern)) {
         Ok(re) => re,
         Err(_) => {
             eprintln!("error: invalid key pattern: {pattern}");
@@ -1924,7 +2031,7 @@ fn get_regexp(
         if filter.as_ref().is_some_and(|f| !f.matches(value)) {
             return Ok(());
         }
-        match typed(d, key, value, false, meta) {
+        match typed(d, key, value, implicit, meta) {
             Ok(v) => collected.push((key.to_owned(), v, implicit, meta.clone())),
             Err(code) => failed = Some(code),
         }
@@ -1936,11 +2043,58 @@ fn get_regexp(
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for (key, value, implicit, meta) in &collected {
-        emit_kv_opt(&mut out, d, key, (!implicit).then_some(value.as_slice()), meta, b' ', true)?;
+    if collected.is_empty() {
+        return emit_default(&mut out, d, pattern);
+    }
+    // ```c
+    // if ((get_value_flags & GET_VALUE_ALL) || i == values.nr - 1)
+    //         fwrite(buf->buf, 1, buf->len, stdout);
+    // ```
+    //
+    // (`builtin/config.c:546-548`.)
+    let emit: &[_] = if all { &collected } else { &collected[collected.len() - 1..] };
+    for (key, value, implicit, meta) in emit {
+        // A key with no `=` prints as its name alone under `--show-names`, and as an
+        // empty line without it — `format_config()` backs the delimiter out
+        // (builtin/config.c:454-461) — but a `--type` reader answers for the missing
+        // value, so it has one to print.
+        let shown = (!implicit || d.ty.is_some()).then_some(value.as_slice());
+        emit_kv_opt(&mut out, d, key, shown, meta, b' ', show_keys || d.show_names)?;
     }
 
-    Ok(if collected.is_empty() { ExitCode::from(1) } else { ExitCode::SUCCESS })
+    Ok(ExitCode::SUCCESS)
+}
+
+/// git lower-cases a key *pattern* the way it lower-cases a key: the section
+/// name and the variable name, leaving the subsection between them alone.
+///
+/// ```c
+/// key = xstrdup(key_);
+/// for (tl = key + strlen(key) - 1; tl >= key && *tl != '.'; tl--)
+///         *tl = tolower(*tl);
+/// for (tl = key; *tl && *tl != '.'; tl++)
+///         *tl = tolower(*tl);
+/// ```
+///
+/// (`builtin/config.c:490-496`.) The first loop walks back from the end to the
+/// last `.`, the second forward from the start to the first one; a pattern with
+/// no `.` at all is lower-cased entirely by the first. Regexp metacharacters are
+/// carried along untouched, which is why `DEMO\.ONE` matches `demo.one`.
+fn lowercase_key_pattern(pattern: &str) -> String {
+    let mut bytes = pattern.as_bytes().to_vec();
+    for b in bytes.iter_mut().rev() {
+        if *b == b'.' {
+            break;
+        }
+        b.make_ascii_lowercase();
+    }
+    for b in bytes.iter_mut() {
+        if *b == b'.' {
+            break;
+        }
+        b.make_ascii_lowercase();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Walk every visible entry of `file` in file order, handing `emit` the

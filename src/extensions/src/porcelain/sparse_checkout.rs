@@ -1118,7 +1118,7 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
             continue;
         };
         let _ = std::fs::remove_file(&full);
-        prune_empty_dirs(&workdir, &full);
+        crate::worktree::prune_empty_dirs(&workdir, &full);
     }
 
     if !unmerged.is_empty() {
@@ -1183,21 +1183,6 @@ fn is_modified(repo: &gix::Repository, full: &Path, id: ObjectId, mode: Mode) ->
         Ok(actual) => actual != id,
         // If we cannot hash it we must not delete it.
         Err(_) => true,
-    }
-}
-
-/// Remove the now-empty ancestor directories of `full`, stopping at `workdir`
-/// or at the first directory that still holds something.
-fn prune_empty_dirs(workdir: &Path, full: &Path) {
-    let mut cur = full.parent();
-    while let Some(dir) = cur {
-        if dir == workdir || !dir.starts_with(workdir) {
-            break;
-        }
-        if std::fs::remove_dir(dir).is_err() {
-            break;
-        }
-        cur = dir.parent();
     }
 }
 

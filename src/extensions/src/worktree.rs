@@ -111,3 +111,28 @@ where
     )
     .map(|_| ())
 }
+
+/// Remove the now-empty ancestor directories of `full`, stopping at `workdir` or at the
+/// first directory that still holds something.
+///
+/// ```c
+/// if (remove_or_warn(ce->ce_mode, ce->name))
+///         return;
+/// schedule_dir_for_removal(ce->name, ce_namelen(ce));
+/// ```
+///
+/// (`unlink_entry()`, unpack-trees.c.) Deleting the last file in a directory takes the
+/// directory with it — `remove_scheduled_dirs()` walks back up as far as the emptiness
+/// goes — so a checkout that drops `nested/deep/path.txt` leaves no `nested/` behind.
+pub fn prune_empty_dirs(workdir: &std::path::Path, full: &std::path::Path) {
+    let mut cur = full.parent();
+    while let Some(dir) = cur {
+        if dir == workdir || !dir.starts_with(workdir) {
+            break;
+        }
+        if std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        cur = dir.parent();
+    }
+}

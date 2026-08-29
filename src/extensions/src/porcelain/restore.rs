@@ -353,6 +353,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let mut ignore_unmerged = false;
     let mut pathspec_from_file: Option<String> = None;
     let mut pathspec_file_nul = false;
+    let mut ignore_skip_worktree = false;
     let mut recurse_submodules = false;
 
     // Parse a `--conflict` style value; git errors with exit 129 on unknown.
@@ -487,8 +488,18 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             }
             // Accepted no-ops: quiet/progress/default no-recurse/diff-context knobs
             // (context knobs only affect interactive `--patch`, unsupported here).
-            "-q" | "--quiet" | "--no-quiet" | "--progress" | "--no-progress"
-            | "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
+            "-q" | "--quiet" | "--no-quiet" | "--progress" | "--no-progress" => {}
+            // ```c
+            // if (!opts->ignore_skipworktree && ce_skip_worktree(ce))
+            //         return;
+            // ```
+            //
+            // (`mark_ce_for_checkout_overlay()`/`_no_overlay()`, builtin/checkout.c:392,
+            // 426.) Without it a path the sparse-checkout definition keeps out of the
+            // worktree cannot be matched at all; with it the entry matches, is written, and
+            // stops being a skip-worktree entry.
+            "--ignore-skip-worktree-bits" => ignore_skip_worktree = true,
+            "--no-ignore-skip-worktree-bits" => ignore_skip_worktree = false,
             "-p" | "--patch" => patch_mode = true,
             "--no-patch" => patch_mode = false,
             "--recurse-submodules" => recurse_submodules = true,
@@ -518,6 +529,47 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 eprintln!("error: unknown option `{}'", &s[2..]);
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
+            }
+            // A short cluster, walked the way `parse_options_step()` walks one
+            // (parse-options.c:1061-1107): every character is an option of its own, a
+            // value-taking one swallows the rest of the token or the next argv element, and
+            // the first character the table does not claim is named alone. This is what
+            // makes `git restore -SW <path>` the same as `-S -W <path>`.
+            s if s.starts_with('-') && !s.starts_with("--") && s.len() > 2 => {
+                for (off, c) in s.char_indices().skip(1) {
+                    let rest = &s[off + c.len_utf8()..];
+                    match c {
+                        'S' => staged = Some(true),
+                        'W' => worktree = Some(true),
+                        '2' => pick = Some(Pick::Ours),
+                        '3' => pick = Some(Pick::Theirs),
+                        'm' => merge_flag = true,
+                        'q' => {}
+                        'p' => patch_mode = true,
+                        'h' => return Ok(super::show_usage(USAGE)),
+                        's' => {
+                            source = Some(match rest.is_empty() {
+                                false => rest.to_string(),
+                                true => {
+                                    i += 1;
+                                    match args.get(i) {
+                                        Some(v) => v.clone(),
+                                        None => {
+                                            eprintln!("error: switch `s' requires a value");
+                                            return Ok(ExitCode::from(129));
+                                        }
+                                    }
+                                }
+                            });
+                            break;
+                        }
+                        _ => {
+                            eprintln!("error: unknown switch `{c}'");
+                            eprint!("{USAGE}");
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
+                }
             }
             s if s.starts_with('-') && s != "-" => {
                 eprintln!("error: unknown switch `{}'", &s[1..2]);
@@ -676,11 +728,21 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
 
     // Normalize pathspecs: `.`/empty (at root) restores everything; the rest are
     // resolved to repo-root-relative paths. A spec escaping the worktree is fatal.
-    let mut match_all = false;
+    // Only a run with no pathspec at all matches everything on its own. A `.` is a
+    // pathspec like any other and goes to the engine, which is what lets
+    // `git restore . :!<path>` exclude something: short-circuiting on the `.` skipped the
+    // exclusion entirely and restored the path it names.
+    let match_all = pathspecs.is_empty();
     let mut specs: Vec<(String, Vec<u8>)> = Vec::new();
     for p in &pathspecs {
+        // A magic pathspec (`:!x`, `:(exclude)x`, `:/`, …) is not a path to resolve against
+        // the prefix, and an exclusion that matches nothing is not the error a positive
+        // spec's failure to match is — so it is handed to the engine and to nothing else.
+        if p.starts_with(':') {
+            continue;
+        }
         match resolve_spec(&prefix_components, &wd_c, p) {
-            Ok(None) => match_all = true,
+            Ok(None) => {}
             Ok(Some(rel)) => specs.push((p.clone(), rel.into_bytes())),
             Err(()) => {
                 eprintln!("fatal: {p}: '{p}' is outside repository at '{}'", wd_c.display());
@@ -692,8 +754,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // the ones `resolve_spec` already made repo-root-relative: the engine applies
     // the repository prefix itself, and feeding it resolved specs would apply it
     // twice, so a spec given from a subdirectory would match nothing.
-    let raw_specs: Vec<String> = specs.iter().map(|(raw, _)| raw.clone()).collect();
-    let spec_set = super::log::PathspecMatcher::new(&repo, &raw_specs)?;
+    let spec_set = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
 
     // Serialize the whole read-modify-write through the repo coordinator so a
     // concurrent zvcs writer can't race `index.lock`. Held for the function.
@@ -771,7 +832,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // `PS_IGNORE_SKIP_WORKTREE`: a path the sparse-checkout definition keeps out
         // of the worktree cannot be matched by a pathspec, so naming one is git's
         // "did not match" rather than a restore of a file that should not be there.
-        let sparse: std::collections::HashSet<BString> = {
+        let sparse: std::collections::HashSet<BString> = if ignore_skip_worktree {
+            std::collections::HashSet::new()
+        } else {
             let index = repo.index_or_empty()?;
             let backing = index.path_backing();
             index
@@ -873,7 +936,20 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 inserts.push((path.clone(), *id, *mode, *flags, *stat));
             }
             (None, true) => {
-                removals.insert(path.clone());
+                // ```c
+                // if (opts->source_tree && !(ce->ce_flags & CE_UPDATE))
+                //         /*
+                //          * If a file was not present in the source tree, it must be removed.
+                //          */
+                //         ce->ce_flags |= CE_REMOVE;
+                // ```
+                //
+                // (`mark_ce_for_checkout_no_overlay()`, builtin/checkout.c.) Only the
+                // no-overlay marker removes: `mark_ce_for_checkout_overlay()` leaves an
+                // entry the source does not carry exactly where it is, index included.
+                if !overlay {
+                    removals.insert(path.clone());
+                }
             }
             (None, false) => {}
         }
@@ -947,6 +1023,11 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // conflict-resolved entries; checked out over the existing worktree.
         let mut subset = source_index.clone();
         subset.remove_entries(|_, p, e| e.stage_raw() != 0 || !path_matches(p, match_all, &spec_set));
+        if ignore_skip_worktree {
+            for e in subset.entries_mut() {
+                e.flags.remove(Flags::SKIP_WORKTREE);
+            }
+        }
         for (path, id, mode) in &resolved_entries {
             subset.dangerously_push_entry(Stat::default(), *id, Flags::empty(), *mode, BStr::new(path));
         }
@@ -985,13 +1066,15 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         if !overlay {
             for path in &removals {
                 if let Some(full) = repo.workdir_path(BStr::new(path)) {
-                    let _ = std::fs::remove_file(full);
+                    let _ = std::fs::remove_file(&full);
+                    crate::worktree::prune_empty_dirs(workdir.as_path(), &full);
                 }
             }
         }
         for path in &resolved_remove {
             if let Some(full) = repo.workdir_path(BStr::new(path)) {
-                let _ = std::fs::remove_file(full);
+                let _ = std::fs::remove_file(&full);
+                crate::worktree::prune_empty_dirs(workdir.as_path(), &full);
             }
         }
 
@@ -1046,6 +1129,11 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 }
                 if let Some(stat) = fresh_stats.get(&p.to_owned()) {
                     e.stat = *stat;
+                    // The file is in the worktree now, so the bit that said it was not
+                    // there no longer describes it.
+                    if ignore_skip_worktree {
+                        e.flags.remove(Flags::SKIP_WORKTREE);
+                    }
                 }
             }
         }

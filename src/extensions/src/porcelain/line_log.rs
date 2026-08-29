@@ -426,7 +426,21 @@ fn compile(pattern: &str) -> std::result::Result<regex::bytes::Regex, String> {
 
 /// The POSIX `regcomp` diagnostics this port reproduces verbatim. Checked before
 /// handing the pattern to the regex crate, whose own error text is its own.
-fn bre_syntax_error(pattern: &str) -> Option<&'static str> {
+///
+/// In an extended regular expression the grouping and interval operators are the
+/// *bare* `(`/`)` and `{`/`}` — the escaped forms are literals — which is the one
+/// difference between the two dialects here. `-L`'s own patterns are BRE, hence
+/// the default.
+pub(crate) fn bre_syntax_error(pattern: &str) -> Option<&'static str> {
+    syntax_error(pattern, false)
+}
+
+/// [`bre_syntax_error`] for an extended regular expression.
+pub(crate) fn ere_syntax_error(pattern: &str) -> Option<&'static str> {
+    syntax_error(pattern, true)
+}
+
+fn syntax_error(pattern: &str, extended: bool) -> Option<&'static str> {
     let b = pattern.as_bytes();
     let (mut parens, mut braces) = (0i32, 0i32);
     let mut i = 0usize;
@@ -468,10 +482,38 @@ fn bre_syntax_error(pattern: &str) -> Option<&'static str> {
                 i = j + 1;
                 continue;
             }
+            // In an ERE these four are the operators themselves; in a BRE they
+            // are literals and the escaped forms below are the operators.
+            b'(' | b')' | b'{' | b'}' if extended => {
+                match b[i] {
+                    b'(' => parens += 1,
+                    b')' => {
+                        parens -= 1;
+                        if parens < 0 {
+                            return Some("parentheses not balanced");
+                        }
+                    }
+                    b'{' => braces += 1,
+                    _ => {
+                        braces -= 1;
+                        if braces < 0 {
+                            return Some("braces not balanced");
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
             b'\\' => {
                 let Some(&n) = b.get(i + 1) else {
                     return Some("trailing backslash (\\)");
                 };
+                if extended {
+                    // An escaped operator is a literal here, and a `\1` back
+                    // reference is not an ERE construct at all.
+                    i += 2;
+                    continue;
+                }
                 match n {
                     b'(' => parens += 1,
                     b')' => {

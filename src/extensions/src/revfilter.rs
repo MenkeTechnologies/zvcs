@@ -20,11 +20,79 @@ pub fn compile_patterns(
     patterns: &[String],
     dialect: Dialect,
     ignore_case: bool,
+    origin: Origin,
 ) -> Result<Vec<regex::bytes::Regex>> {
     patterns
         .iter()
-        .map(|p| build_regex(p, dialect, ignore_case))
+        .map(|p| build_regex(p, dialect, ignore_case, origin))
         .collect()
+}
+
+/// Where a pattern came from, which decides how a `regcomp` failure over it is
+/// worded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// `p->origin = "command line"` — a `--grep`.
+    CommandLine,
+    /// `p->origin = "header"` — `--author`/`--committer`, which
+    /// `compile_grep_patterns()` appends as header patterns.
+    Header,
+    /// The pickaxe, which is not a `grep_pat` at all: `diffcore_pickaxe()` calls
+    /// `regcomp()` itself and dies `invalid regex: <regerror>` with no origin and
+    /// no quoted pattern (diffcore-pickaxe.c).
+    Pickaxe,
+}
+
+impl Origin {
+    /// `compile_regexp_failed()`'s `where` prefix.
+    fn describe(self, pattern: &str, text: &str) -> String {
+        match self {
+            Origin::CommandLine => format!("command line, '{pattern}': {text}"),
+            Origin::Header => format!("header, '{pattern}': {text}"),
+            Origin::Pickaxe => format!("invalid regex: {text}"),
+        }
+    }
+}
+
+/// `compile_regexp_failed()` (grep.c):
+///
+/// ```c
+/// static NORETURN void compile_regexp_failed(const struct grep_pat *p, const char *error)
+/// {
+///         char where[1024];
+///
+///         if (p->no)
+///                 xsnprintf(where, sizeof(where), "In '%s' at %d, ", p->origin, p->no);
+///         else if (p->origin)
+///                 xsnprintf(where, sizeof(where), "%s, ", p->origin);
+///         else
+///                 where[0] = 0;
+///
+///         die("%s'%s': %s", where, p->pattern, error);
+/// }
+/// ```
+///
+/// A `--grep`/`--author`/`--committer` pattern has `origin = "command line"`, so
+/// the refusal reads `fatal: command line, '<pattern>': <regerror text>`. The
+/// tail is the platform's `regerror()`, which [`crate::porcelain::line_log::bre_syntax_error`]
+/// reproduces for the syntax errors that have a stable wording; anything else
+/// keeps the `regex` crate's own text, which is this binary speaking for itself.
+fn regex_failure(
+    pattern: &str,
+    dialect: Dialect,
+    origin: Origin,
+    err: regex::Error,
+) -> anyhow::Error {
+    let text = match dialect {
+        Dialect::Basic => crate::porcelain::line_log::bre_syntax_error(pattern),
+        Dialect::Extended | Dialect::Perl => crate::porcelain::line_log::ere_syntax_error(pattern),
+        // `-F` escapes the pattern into a literal, so there is no syntax to fail.
+        Dialect::Fixed => None,
+    };
+    match text {
+        Some(text) => crate::fatal::Fatal(origin.describe(pattern, text)).into(),
+        None => anyhow!("invalid regex: {err}"),
+    }
 }
 
 /// Build one byte regex from a pattern in `dialect`, mirroring git's engine as
@@ -34,6 +102,7 @@ pub fn build_regex(
     pattern: &str,
     dialect: Dialect,
     ignore_case: bool,
+    origin: Origin,
 ) -> Result<regex::bytes::Regex> {
     let translated = match dialect {
         Dialect::Fixed => regex::escape(pattern),
@@ -53,7 +122,7 @@ pub fn build_regex(
         // the braces and retrying — a genuine error still surfaces.
         Err(_) => {
             let lenient = translated.replace('{', "\\{").replace('}', "\\}");
-            compile(&lenient).map_err(|e| anyhow!("invalid regex: {e}"))
+            compile(&lenient).map_err(|e| regex_failure(pattern, dialect, origin, e))
         }
     }
 }

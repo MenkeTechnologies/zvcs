@@ -667,7 +667,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // Config supplies the defaults; the flags below override them. git reads
     // these in `git_log_config` before parsing args, and validates `log.date`
     // there — an invalid value is fatal even when `--date` later overrides it.
-    let (cfg_abbrev_commit, cfg_date_mode, cfg_show_root, cfg_decorate, cfg_mailmap, cfg_follow) = {
+    let (
+        cfg_abbrev_commit,
+        cfg_date_mode,
+        cfg_show_root,
+        cfg_decorate,
+        cfg_mailmap,
+        cfg_follow,
+        cfg_pretty,
+    ) = {
         let snap = repo.config_snapshot();
         let abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
         // `log.follow` (`default_follow` in builtin/log.c:588) is NOT `--follow`:
@@ -711,7 +719,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             None => DateMode::Default,
         };
-        (abbrev, date, show_root, decorate, mailmap, follow)
+        (abbrev, date, show_root, decorate, mailmap, follow, snap.string("format.pretty").map(|v| v.to_string()))
     };
     // `git_log_config()` also reads the two keys behind `--pretty=email`'s
     // headers (builtin/log.c:560-561 and 566-569), so `git log --pretty=email`
@@ -754,8 +762,32 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
 
     let mut max_count: Option<usize> = None;
     let mut skip: usize = 0;
-    let mut pretty = Pretty::Medium;
-    let mut terminator = false;
+    // ```c
+    // static void cmd_log_init_defaults(struct rev_info *rev, struct log_config *cfg)
+    // {
+    //         if (cfg->fmt_pretty)
+    //                 get_commit_format(cfg->fmt_pretty, rev);
+    // ```
+    //
+    // (`builtin/log.c:201-205`.) `format.pretty` is applied *before* the command
+    // line is parsed, so a `--pretty` overrides it — and it goes through
+    // `get_commit_format()`, which does not set `rev->pretty_given`. That flag is
+    // `handle_revision_opt()`'s alone, so a format from config still lets the
+    // built-in note display through where the same format on the command line
+    // would not.
+    let (mut pretty, mut terminator) = (Pretty::Medium, false);
+    if let Some(spec) = cfg_pretty.as_deref() {
+        match get_commit_format(Some(&repo), spec)? {
+            Some((p, t)) => {
+                pretty = p;
+                terminator = t;
+            }
+            None => {
+                eprintln!("fatal: invalid --pretty format: {spec}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    }
     // `-z`: `line_termination = 0` — the raw/name records use NUL field and record
     // separators and stop C-quoting, and the per-commit record terminator/separator
     // becomes NUL too.
@@ -3358,19 +3390,35 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             std::sync::Arc::new(move |name: &[u8], email: &[u8]| m.mapped(name, email))
                 as crate::revfilter::IdentMapper
         }),
-        author_res: crate::revfilter::compile_patterns(&author_pats, grep_dialect, grep_ignore_case)?,
+        author_res: crate::revfilter::compile_patterns(
+            &author_pats,
+            grep_dialect,
+            grep_ignore_case,
+            crate::revfilter::Origin::Header,
+        )?,
         committer_res: crate::revfilter::compile_patterns(
             &committer_pats,
             grep_dialect,
             grep_ignore_case,
+            crate::revfilter::Origin::Header,
         )?,
-        grep_res: crate::revfilter::compile_patterns(&grep_pats, grep_dialect, grep_ignore_case)?,
+        grep_res: crate::revfilter::compile_patterns(
+            &grep_pats,
+            grep_dialect,
+            grep_ignore_case,
+            crate::revfilter::Origin::CommandLine,
+        )?,
         all_match: grep_all_match,
         invert_grep: grep_invert,
     };
     // Pickaxe `-G<regex>` compiles once, in the same dialect as --grep.
     let pickaxe_g_re = match &pickaxe_g {
-        Some(p) => Some(crate::revfilter::build_regex(p, grep_dialect, grep_ignore_case)?),
+        Some(p) => Some(crate::revfilter::build_regex(
+            p,
+            grep_dialect,
+            grep_ignore_case,
+            crate::revfilter::Origin::Pickaxe,
+        )?),
         None => None,
     };
     // `diff_setup_done()` (diff.c:5262-5273) rejects two pickaxe combinations outright,
@@ -7849,7 +7897,7 @@ fn expand_one(
             None => return Ok(false),
         },
         'C' => {
-            if !expand_color(out, chars, i, ctx.want_color, auto) {
+            if !expand_color(out, chars, i, ctx.want_color, auto)? {
                 return Ok(false);
             }
         }
@@ -7963,7 +8011,7 @@ fn expand_color(
     i: &mut usize,
     want_color: bool,
     auto: &mut bool,
-) -> bool {
+) -> Result<bool> {
     // git suppresses the `%C(auto)` reset when nothing has been emitted yet for
     // this commit's format, so record that before appending anything.
     let out_empty = out.is_empty();
@@ -7972,12 +8020,12 @@ fn expand_color(
     if rest.starts_with('(') {
         if let Some(close) = rest.find(')') {
             let spec = &rest[1..close];
-            out.extend_from_slice(parse_color_spec(spec, want_color, auto, out_empty).as_bytes());
+            out.extend_from_slice(parse_color_spec(spec, want_color, auto, out_empty)?.as_bytes());
             // Consume through the `)`. `find` answered in bytes and `i` indexes
             // characters, so a non-ASCII byte in the spec would otherwise push the
             // cursor past it — `%C(café)%s` swallowed the `%` of the `%s`.
             *i += rest[..=close].chars().count();
-            return true;
+            return Ok(true);
         }
         // No closing paren: git prints the rest verbatim. Fall through to literal.
     }
@@ -7993,67 +8041,78 @@ fn expand_color(
                 out.extend_from_slice(ansi.as_bytes());
             }
             *i += name.len();
-            return true;
+            return Ok(true);
         }
     }
     // Unrecognized: git renders the `%C` literally and continues.
-    false
+    Ok(false)
 }
 
 /// Parse a `%C(<spec>)` color specification into an ANSI escape (empty when color
 /// is disabled). Handles `reset`, `auto`/`auto,<colors>` (which also latches the
 /// auto-color flag on), attribute words (`bold`, `dim`, `ul`, …), and up to two
 /// color names (foreground then background).
-fn parse_color_spec(spec: &str, want_color: bool, auto: &mut bool, out_empty: bool) -> String {
-    let spec = spec.trim();
-    let colors = if let Some(rest) = spec.strip_prefix("auto") {
-        // `%C(auto)` alone enables auto-coloring and emits a reset — but git omits
-        // that reset at the very start of a commit's output. `%C(auto,<colors>)`
-        // additionally applies those colors.
+fn parse_color_spec(
+    spec: &str,
+    want_color: bool,
+    auto: &mut bool,
+    out_empty: bool,
+) -> Result<String> {
+    // ```c
+    // if (skip_prefix(begin, "auto,", &begin)) {
+    //         if (!want_color(c->pretty_ctx->color))
+    //                 return end - placeholder + 1;
+    // } else if (skip_prefix(begin, "always,", &begin)) {
+    //         /* nothing to do; we do not respect want_color at all */
+    // } else {
+    //         /* the default is the same as "auto" */
+    //         if (!want_color(c->pretty_ctx->color))
+    //                 return end - placeholder + 1;
+    // }
+    //
+    // if (color_parse_mem(begin, end - begin, color) < 0)
+    //         die(_("unable to parse --pretty format"));
+    // ```
+    //
+    // (`pretty.c:1078-1090`.) A bare `%C(auto)` never reaches this: it is
+    // `format_commit_one()`'s own case, which latches auto-coloring on and emits a
+    // reset — omitted at the very start of a commit's output, where there is
+    // nothing yet to reset.
+    if spec == "auto" {
         *auto = true;
-        let rest = rest.strip_prefix(',').unwrap_or(rest).trim();
-        if rest.is_empty() {
-            return if want_color && !out_empty {
-                "\x1b[m".to_string()
-            } else {
-                String::new()
-            };
+        return Ok(match want_color && !out_empty {
+            true => "\x1b[m".to_string(),
+            false => String::new(),
+        });
+    }
+    let colors = match spec.strip_prefix("auto,") {
+        // Only the bare `%C(auto)` latches auto-coloring on — `c->auto_color` is
+        // set in `format_commit_one()`'s own case for it, and the `auto,` prefix
+        // here means nothing more than "obey `want_color`".
+        Some(rest) => {
+            if !want_color {
+                return Ok(String::new());
+            }
+            rest
         }
-        rest
-    } else {
-        spec
+        None => match spec.strip_prefix("always,") {
+            // `always,` does not consult `want_color` at all.
+            Some(rest) => rest,
+            None if !want_color => return Ok(String::new()),
+            None => spec,
+        },
     };
-    if !want_color {
-        return String::new();
-    }
-    if colors == "reset" {
-        return "\x1b[m".to_string();
-    }
-    let mut codes: Vec<String> = Vec::new();
-    let mut foreground = true;
-    for tok in colors.split_whitespace() {
-        let attr = match tok {
-            "bold" => Some("1"),
-            "dim" => Some("2"),
-            "italic" => Some("3"),
-            "ul" | "underline" => Some("4"),
-            "blink" => Some("5"),
-            "reverse" => Some("7"),
-            "strike" => Some("9"),
-            "nobold" | "no-bold" => Some("22"),
-            _ => None,
-        };
-        if let Some(a) = attr {
-            codes.push(a.to_string());
-        } else if let Some(base) = color_base(tok) {
-            codes.push((if foreground { base } else { base + 10 }).to_string());
-            foreground = false;
+    // `color_parse_mem()` is the same parser the `color.*` config slots go
+    // through, so a spec is spelled identically wherever it appears — including
+    // `bright<name>`, `#rrggbb`, a 0..=255 palette index and the attribute
+    // negations. A spec it refuses is fatal here rather than rendered as
+    // something plausible.
+    match super::color::parse_color_spec(colors) {
+        Some(rendered) => Ok(rendered),
+        None => {
+            eprintln!("error: invalid color value: {colors}");
+            Err(crate::fatal::Fatal("unable to parse --pretty format".to_owned()).into())
         }
-    }
-    if codes.is_empty() {
-        String::new()
-    } else {
-        format!("\x1b[{}m", codes.join(";"))
     }
 }
 

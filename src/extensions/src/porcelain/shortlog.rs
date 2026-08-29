@@ -715,8 +715,18 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     // Compile the message/ident patterns to byte regexes now that the dialect
     // and `-i` are final. git's default is POSIX basic; `-E`/`-P` extended/perl,
     // `-F` a literal. A pattern that cannot compile is git's fatal regcomp error.
-    filters.grep_res = compile_patterns(&filters.grep, filters.dialect, filters.ignore_case)?;
-    filters.author_res = compile_patterns(&filters.author, filters.dialect, filters.ignore_case)?;
+    filters.grep_res = compile_patterns(
+        &filters.grep,
+        filters.dialect,
+        filters.ignore_case,
+        crate::revfilter::Origin::CommandLine,
+    )?;
+    filters.author_res = compile_patterns(
+        &filters.author,
+        filters.dialect,
+        filters.ignore_case,
+        crate::revfilter::Origin::Header,
+    )?;
 
     let repo = gix::discover(".").ok();
     let mailmap = repo

@@ -588,7 +588,7 @@ mod instaweb;
 mod interpret_trailers;
 mod jump;
 mod last_modified;
-mod line_log;
+pub(crate) mod line_log;
 pub(crate) mod log;
 mod ls_files;
 mod ls_remote;

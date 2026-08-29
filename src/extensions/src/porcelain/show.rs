@@ -1802,6 +1802,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 p,
                 crate::revfilter::Dialect::Basic,
                 false,
+                crate::revfilter::Origin::CommandLine,
             )?),
             None => None,
         },

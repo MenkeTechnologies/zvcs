@@ -1415,9 +1415,24 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let cfilter = CommitFilter {
         // `rev-list` loads no mailmap, so its header greps see the recorded identities.
         ident_map: None,
-        author_res: compile_patterns(&author_pats, dialect, ignore_case)?,
-        committer_res: compile_patterns(&committer_pats, dialect, ignore_case)?,
-        grep_res: compile_patterns(&grep_pats, dialect, ignore_case)?,
+        author_res: compile_patterns(
+            &author_pats,
+            dialect,
+            ignore_case,
+            crate::revfilter::Origin::Header,
+        )?,
+        committer_res: compile_patterns(
+            &committer_pats,
+            dialect,
+            ignore_case,
+            crate::revfilter::Origin::Header,
+        )?,
+        grep_res: compile_patterns(
+            &grep_pats,
+            dialect,
+            ignore_case,
+            crate::revfilter::Origin::CommandLine,
+        )?,
         all_match,
         invert_grep,
     };

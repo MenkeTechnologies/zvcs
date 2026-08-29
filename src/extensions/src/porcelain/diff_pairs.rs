@@ -556,7 +556,13 @@ pub(crate) fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
         .unicode(false)
         .multi_line(true)
         .build()
-        .map_err(|e| e.to_string())
+        // `diffcore_pickaxe()` dies with the platform `regerror()` text, which
+        // [`super::line_log::ere_syntax_error`] reproduces for the syntax errors
+        // that have a stable wording — the pickaxe compiles with `REG_EXTENDED`.
+        .map_err(|e| match super::line_log::ere_syntax_error(s) {
+            Some(text) => text.to_owned(),
+            None => e.to_string(),
+        })
 }
 
 fn matches_any(pats: &[Needle], line: &[u8]) -> bool {

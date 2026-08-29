@@ -34,6 +34,10 @@ fn ok(dir: &Path, args: &[&str]) -> Output {
     out
 }
 
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 fn fmt(dir: &Path, spec: &str) -> String {
     String::from_utf8_lossy(&ok(dir, &["log", "-1", &format!("--format={spec}")]).stdout)
         .trim_end_matches('\n')
@@ -109,4 +113,74 @@ fn an_unknown_placeholder_is_printed_as_typed() {
     // `%e` is the `encoding` header, which a commit git wrote itself does not
     // carry — it re-encodes to UTF-8 and drops it.
     assert_eq!(fmt(&dir, "[%e]"), "[]");
+}
+
+/// `%C(<spec>)` goes through the same `color_parse_mem()` the `color.*` config
+/// slots do, so a spec is spelled identically wherever it appears — and one it
+/// refuses is fatal rather than rendered as something plausible.
+#[test]
+fn a_color_spec_is_parsed_the_way_config_colors_are() {
+    let dir = fixture("color");
+
+    let colored = |spec: &str| -> String {
+        let out = ok(&dir, &["log", "-1", "--color=always", &format!("--format=%C({spec})x")]);
+        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string()
+    };
+
+    // The forms the port used to drop on the floor: a bright name, 24-bit hex,
+    // a palette index, and `normal` (which names no code at all).
+    assert_eq!(colored("brightred"), "\u{1b}[91mx");
+    assert_eq!(colored("#ff0000"), "\u{1b}[38;2;255;0;0mx");
+    assert_eq!(colored("255"), "\u{1b}[38;5;255mx");
+    assert_eq!(colored("normal"), "x");
+    // …beside the ones it already handled.
+    assert_eq!(colored("bold red"), "\u{1b}[1;31mx");
+    assert_eq!(colored("red blue"), "\u{1b}[31;44mx");
+    assert_eq!(colored("reset"), "\u{1b}[mx");
+
+    // A spec the parser refuses names the value and then gives up on the format.
+    let bad = run(&dir, &["log", "-1", "--color=always", "--format=%C(nosuchcolor)%h"]);
+    assert_eq!(bad.status.code(), Some(128));
+    assert_eq!(
+        stderr_of(&bad),
+        "error: invalid color value: nosuchcolor\nfatal: unable to parse --pretty format\n"
+    );
+
+    // With color off the spec is never parsed at all, so the same format is fine.
+    let uncolored = ok(&dir, &["log", "-1", "--no-color", "--format=%C(nosuchcolor)%s"]);
+    assert_eq!(String::from_utf8_lossy(&uncolored.stdout).trim_end(), "add two");
+}
+
+/// `compile_regexp_failed()` (grep.c) words a bad pattern by where it came from:
+/// `--grep` is `command line`, `--author`/`--committer` are `header`, and the
+/// pickaxe is neither — it compiles its own regex and dies without an origin.
+#[test]
+fn a_bad_pattern_is_reported_by_where_it_came_from() {
+    let dir = fixture("regex");
+
+    let fails = |args: &[&str]| -> String {
+        let out = run(&dir, args);
+        assert_eq!(out.status.code(), Some(128), "{args:?}");
+        stderr_of(&out)
+    };
+
+    assert_eq!(
+        fails(&["log", "--grep=[bad"]),
+        "fatal: command line, '[bad': brackets ([ ]) not balanced\n"
+    );
+    assert_eq!(
+        fails(&["log", "--author=[bad"]),
+        "fatal: header, '[bad': brackets ([ ]) not balanced\n"
+    );
+    assert_eq!(
+        fails(&["log", "-G[bad"]),
+        "fatal: invalid regex: brackets ([ ]) not balanced\n"
+    );
+    // An unbalanced `(` is an error only where it is an operator: in an extended
+    // regular expression, not in the default basic one.
+    assert_eq!(
+        fails(&["log", "-E", "--grep=(unclosed"]),
+        "fatal: command line, '(unclosed': parentheses not balanced\n"
+    );
+    assert!(ok(&dir, &["log", "--grep=(unclosed"]).stdout.is_empty(), "a BRE `(` is a literal");
 }

@@ -660,10 +660,28 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
         crate::git_fatal!("bad object {name}");
     }
 
+    // ```c
+    // if (repo_has_promisor_remote(repo))
+    //         strvec_push(&cmd.args, "--exclude-promisor-objects");
+    // ```
+    //
+    // (`cmd_repack()`, builtin/repack.c:354-355.) What that does to the walk is
+    // `odb_for_each_object(..., mark_uninteresting, ...,
+    // ODB_FOR_EACH_OBJECT_PROMISOR_ONLY)` (revision.c:4001-4003): every object a
+    // `.promisor` pack holds is marked UNINTERESTING before the traversal
+    // starts, so it is neither packed nor walked through — which is also what
+    // keeps the walk off the blobs such a pack promises but does not hold.
+    // Those objects are not dropped: `repack_promisor_objects()` writes them
+    // into a promisor pack of their own, below.
+    let promisor_held = match super::rev_list::has_promisor_remote(&repo) {
+        true => super::rev_list::promisor_pack_objects(&repo),
+        false => HashSet::new(),
+    };
+
     // git's `--all --reflog --indexed-objects`, which `prune` already builds.
     let mut roots = Vec::new();
     super::prune::collect_roots(&repo, &mut roots)?;
-    let reachable = super::prune::close_over(&repo, roots);
+    let reachable = super::prune::close_over_excluding(&repo, roots, &promisor_held);
 
     let existing = super::prune::pack_indices(&repo, &objdir);
     let candidates: Vec<ObjectId> = reachable
@@ -684,6 +702,9 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
                 .iter()
                 .filter(|entry| entry.mode != gix::index::entry::Mode::COMMIT)
                 .map(|entry| entry.id)
+                // `--indexed-objects` adds the index's blobs to the same walk,
+                // where the UNINTERESTING mark applies to them too.
+                .filter(|id| !promisor_held.contains(id))
                 .collect()
         })
         .unwrap_or_default();
@@ -724,24 +745,6 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     to_pack.sort();
     to_pack.dedup();
 
-    // `if (!names.nr)` (`builtin/repack.c:460-462`): git says so and carries on,
-    // and it says so about the *first* `pack-objects` alone — the notice sits
-    // between that child and the cruft and filtered packs, so a run that goes on
-    // to write a filtered pack still prints it. Everything after the pack write
-    // still runs too — in particular `-d`'s `prune_packed_objects()`, which is
-    // what drops the loose copies of objects an *existing* pack already holds,
-    // and `--write-midx`. Returning here instead left those loose objects behind.
-    //
-    // The gate is `!names.nr && !po_args.quiet` and nothing else: `-a` does not
-    // exempt a run from it. `-a` normally has something to pack, so the two
-    // conditions coincide almost everywhere — but an empty object store leaves
-    // `pack-objects` with nothing to write whatever the mode, and stock prints
-    // the notice there. Testing `all_into_one` here made
-    // `git init --bare b && git -C b repack -ad` silent where stock says so.
-    if to_pack.is_empty() && !st.quiet {
-        println!("Nothing new to pack.");
-    }
-
     // `write_filtered_pack()` (`repack-filtered.c`) drives the second pack with
     // `pack-objects --stdin-packs`, fed the existing non-kept and cruft packs
     // with the just-written pack excluded by `^`. So it holds what those packs
@@ -752,7 +755,12 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // ever loose is not in it: `prune-packed` leaves a loose object no pack holds
     // alone, so it simply stays loose. Keeping it here instead would move it into
     // a pack git never writes.
-    let in_new_pack: HashSet<ObjectId> = to_pack.iter().copied().collect();
+    let mut in_new_pack: HashSet<ObjectId> = to_pack.iter().copied().collect();
+    // `names` at that point holds the promisor pack too, so its objects are
+    // `^`-excluded from the filtered pack alongside the main pack's.
+    if st.all_into_one {
+        in_new_pack.extend(promisor_held.iter().copied());
+    }
     let mut filtered_out: Vec<ObjectId> = existing
         .iter()
         .filter(|f| droppable(st, f.path()))
@@ -797,6 +805,29 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // repository's own* `objects/pack`, with the number of objects it holds. It
     // is the set `write_midx_included_packs()` picks the preferred pack out of.
     let mut new_packs: Vec<(String, usize)> = Vec::new();
+    // ```c
+    // if (pack_everything & ALL_INTO_ONE) {
+    //         repack_promisor_objects(repo, &po_args, &names, packtmp);
+    // ```
+    //
+    // (builtin/repack.c:365-366.) `repack_promisor_objects()`
+    // (repack-promisor.c:82-111) feeds `pack-objects` every object the promisor
+    // packs hold — the objects `--exclude-promisor-objects` kept out of the main
+    // pack — and then writes the empty `.promisor` file beside the result
+    // (:56-69), so what `-d` is about to delete is replaced in kind rather than
+    // lost. It runs before the main `pack-objects`, so its pack is the first
+    // name in `names`.
+    if st.all_into_one && !promisor_held.is_empty() {
+        let mut ids: Vec<ObjectId> = promisor_held.iter().copied().collect();
+        ids.sort();
+        let path = write_pack(&repo, st, &ids, &packtmp, write_rev, progress, false)?;
+        let hash = pack_hash(&pack_base_name(&path));
+        // `write_promisor_file(promisor_name, NULL, 0)`: an empty file, named
+        // for the pack it marks.
+        fs::write(suffixed(&packtmp, &format!("-{hash}.promisor")), b"")?;
+        new_packs.push((hash, ids.len()));
+    }
+
     // Everything filtered out is about to be written elsewhere, so a run whose
     // spec rejects the whole set still has a second pack to produce.
     if !to_pack.is_empty() {
@@ -814,6 +845,27 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
             write_bitmaps(st, &repo) && !st.write_midx,
         )?;
         new_packs.push((pack_hash(&pack_base_name(&path)), to_pack.len()));
+    }
+
+    // `if (!names.nr)` (`builtin/repack.c:460-462`): git says so and carries on,
+    // and it says so about the *first* `pack-objects` alone — the notice sits
+    // between that child and the cruft and filtered packs, so a run that goes on
+    // to write a filtered pack still prints it. Everything after the pack write
+    // still runs too — in particular `-d`'s `prune_packed_objects()`, which is
+    // what drops the loose copies of objects an *existing* pack already holds,
+    // and `--write-midx`. Returning here instead left those loose objects behind.
+    //
+    // The gate is `!names.nr && !po_args.quiet` and nothing else: `-a` does not
+    // exempt a run from it. `-a` normally has something to pack, so the two
+    // conditions coincide almost everywhere — but an empty object store leaves
+    // `pack-objects` with nothing to write whatever the mode, and stock prints
+    // the notice there. Testing `all_into_one` here made
+    // `git init --bare b && git -C b repack -ad` silent where stock says so.
+    // The gate is `names` rather than `to_pack`, which are the same set
+    // everywhere but a partial clone: there the promisor pack is a name the run
+    // wrote, so a main pack-objects that found nothing left to do is silent.
+    if new_packs.is_empty() && !st.quiet {
+        println!("Nothing new to pack.");
     }
 
     // With `--filter` git writes a second pack holding the filtered-out objects.

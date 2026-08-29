@@ -3517,9 +3517,37 @@ pub(super) fn promisor_objects(repo: &gix::Repository) -> &'static HashSet<Objec
     })
 }
 
+/// `repo_has_promisor_remote()` (promisor-remote.c:222-225), which is
+/// `promisor_remote_init()` (:166-189) having found one: a `remote.<name>.promisor`
+/// that is true, a `remote.<name>.partialclonefilter` at all — the filter alone
+/// creates the entry (:146-160) — or the remote `extensions.partialClone` names.
+/// A name beginning with `/` is refused (`promisor_remote_new()`, :74-78).
+pub(super) fn has_promisor_remote(repo: &gix::Repository) -> bool {
+    let snapshot = repo.config_snapshot();
+    if let Some(sections) = snapshot.plumbing().sections_by_name("remote") {
+        for section in sections {
+            let Some(name) = section.header().subsection_name() else { continue };
+            if name.starts_with(b"/") {
+                continue;
+            }
+            if section.value("partialclonefilter").is_some() {
+                return true;
+            }
+            let promisor = section
+                .value("promisor")
+                .and_then(|v| gix::config::Boolean::try_from(v.as_ref() as &gix::bstr::BStr).ok())
+                .is_some_and(|b| b.0);
+            if promisor {
+                return true;
+            }
+        }
+    }
+    snapshot.string("extensions.partialClone").is_some()
+}
+
 /// The objects held by every pack with a `.promisor` file beside it — git's
 /// `FOR_EACH_OBJECT_PROMISOR_ONLY` enumeration.
-fn promisor_pack_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
+pub(super) fn promisor_pack_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
     let mut set = HashSet::new();
     let store = repo.objects.store_ref();
     for dir in std::iter::once(store.path().to_path_buf())

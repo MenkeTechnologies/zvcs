@@ -921,10 +921,34 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// cannot be found or decoded are dropped from the walk but stay in the set, so
 /// a corrupt object is never mistaken for an unreachable one.
 pub(super) fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>) -> HashSet<ObjectId> {
+    close_over_excluding(repo, roots, &HashSet::new())
+}
+
+/// [`close_over`] with a set of objects marked UNINTERESTING before the walk
+/// starts, which is what `--exclude-promisor-objects` does to every object a
+/// promisor pack holds (revision.c:4001-4003). An uninteresting object is
+/// neither in the result nor walked through, so a commit in a promisor pack ends
+/// the traversal there rather than dragging its history in.
+pub(super) fn close_over_excluding(
+    repo: &gix::Repository,
+    roots: Vec<ObjectId>,
+    uninteresting: &HashSet<ObjectId>,
+) -> HashSet<ObjectId> {
+    // `register_shallow()` (shallow.c:34-47) installs a graft with
+    // `nr_parent = -1` for every commit named in `.git/shallow` and clears the
+    // parents of one already parsed, so a shallow boundary commit contributes no
+    // parents to any traversal. Without the graft the walk names the parents the
+    // commit object still records, which a shallow clone does not have.
+    let shallow: HashSet<ObjectId> = repo
+        .shallow_commits()
+        .ok()
+        .flatten()
+        .map(|c| c.iter().copied().collect())
+        .unwrap_or_default();
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut stack: Vec<ObjectId> = Vec::new();
     for id in roots {
-        if seen.insert(id) {
+        if !uninteresting.contains(&id) && seen.insert(id) {
             stack.push(id);
         }
     }
@@ -947,7 +971,9 @@ pub(super) fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>) -> HashSe
                     .map(|c| (c.tree(), c.parents().collect::<Vec<_>>()));
                 if let Some((tree, parents)) = ids {
                     next.push(tree);
-                    next.extend(parents);
+                    if !shallow.contains(&id) {
+                        next.extend(parents);
+                    }
                 }
             }
             Kind::Tag => {
@@ -969,7 +995,7 @@ pub(super) fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>) -> HashSe
             }
         }
         for id in next {
-            if seen.insert(id) {
+            if !uninteresting.contains(&id) && seen.insert(id) {
                 stack.push(id);
             }
         }

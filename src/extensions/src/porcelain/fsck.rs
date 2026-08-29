@@ -734,6 +734,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             queue.push((id, None));
         }
     }
+    // The two shapes in which an object this repository does not have is not an
+    // error: a shallow boundary, whose parents were never sent, and a promisor
+    // pack's promise, which the remote still holds.
+    let shallow: HashSet<ObjectId> = repo
+        .shallow_commits()
+        .ok()
+        .flatten()
+        .map(|commits| commits.iter().copied().collect())
+        .unwrap_or_default();
+    let promisor = super::rev_list::promisor_objects(&repo);
     while let Some((id, expected)) = queue.pop() {
         let kind = match repo.find_header(id) {
             Ok(h) => h.kind(),
@@ -784,6 +794,31 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // only a tree's children are recorded.
             if kind == Kind::Tree {
                 state.note(child);
+            }
+            // A shallow boundary commit has no parents at all as far as the
+            // object graph is concerned: `parse_commit()` applies the graft, so
+            // `fsck_walk_commit()` never sees them and their absence is not a
+            // break in the chain. Its tree is still walked.
+            if child_kind == Kind::Commit && shallow.contains(&id) {
+                continue;
+            }
+            // ```c
+            // if (is_promisor_object(options->repo, &obj->oid))
+            //         /*
+            //          * Further recursion does not need to be performed on this
+            //          * object since it is a promisor object …
+            //          */
+            //         return 0;
+            // ```
+            //
+            // (`mark_object()`, builtin/fsck.c:155-161, after the object has
+            // been marked REACHABLE.) `check_reachable_object()` (:265-267)
+            // likewise says nothing about a promisor object that is missing —
+            // the remote still has it, which is the whole point of the pack that
+            // promised it.
+            if promisor.contains(&child) {
+                state.reachable.insert(child);
+                continue;
             }
             // A corrupt object never got `HAS_OBJ`, so `check_reachable_object()`
             // prints `missing` for it with the type the reference site expected.

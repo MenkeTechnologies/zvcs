@@ -3479,7 +3479,7 @@ fn note_missing(
 ///
 /// git builds the set once per process and keeps it; so does this, because the
 /// walk asks about one object at a time.
-fn promisor_objects(repo: &gix::Repository) -> &'static HashSet<ObjectId> {
+pub(super) fn promisor_objects(repo: &gix::Repository) -> &'static HashSet<ObjectId> {
     static SET: std::sync::OnceLock<HashSet<ObjectId>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         let mut set = promisor_pack_objects(repo);

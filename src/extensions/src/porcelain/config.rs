@@ -842,6 +842,61 @@ fn valid_config_key(key: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// The repository at the current directory, opened with gix's include
+/// permission cleared so its merged snapshot is the one `--no-includes` asks
+/// for. `None` when there is no repository here, exactly as `gix::discover`
+/// answers for the including case.
+fn discover_without_includes() -> Option<gix::Repository> {
+    let mut open = gix::open::Options::default();
+    open.permissions.config.includes = false;
+    let trust_map = gix::sec::trust::Mapping { full: open.clone(), reduced: open };
+    gix::ThreadSafeRepository::discover_with_environment_overrides_opts(
+        ".",
+        Default::default(),
+        trust_map,
+    )
+    .ok()
+    .map(|r| r.to_thread_local())
+}
+
+/// [`crate::config::global_config`] without following includes — the repo-less
+/// half of `--no-includes`. `File::from_globals()` hard-codes the following, so
+/// the source list it walks is reproduced here with `no_follow` instead.
+fn global_config_without_includes() -> gix::config::File {
+    use gix::config::file::{Metadata, includes, init};
+    use gix::config::source::Kind;
+
+    // `gix_path::env::var`, which is not re-exported through `gix`.
+    let mut env_var = |name: &str| -> Option<std::ffi::OsString> {
+        match name {
+            "HOME" => home_dir().map(std::path::PathBuf::into_os_string),
+            _ => std::env::var_os(name),
+        }
+    };
+    let metas = [Kind::GitInstallation, Kind::System, Kind::Global]
+        .iter()
+        .flat_map(|kind| kind.sources())
+        .filter_map(|source| {
+            let path = source.storage_location(&mut env_var).filter(|p| p.is_file());
+            Metadata { path, source: *source, level: 0, trust: gix::sec::Trust::Full }.into()
+        });
+    let options =
+        init::Options { includes: includes::Options::no_follow(), ..Default::default() };
+    let mut file = gix::config::File::from_paths_metadata(metas, options)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if let Ok(env) = gix::config::File::from_environment_overrides() {
+        let _ = file.append(env);
+    }
+    file
+}
+
+/// `gix_path::env::home_dir`: `HOME` when set, else the platform's own answer.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(Into::into).or_else(std::env::home_dir)
+}
+
 pub fn config(args: &[String]) -> Result<ExitCode> {
     // `cmd_config()`'s outer `parse_options()` is nothing but `OPT_SUBCOMMAND`s: a leading `list`,
     // `get`, `set`, `unset`, `rename-section`, `remove-section` or `edit` selects a subcommand
@@ -871,9 +926,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // `<value-pattern>` from a POSIX ERE into a literal string comparison.
     let mut comment: Option<String> = None;
     let mut fixed_value = false;
-    // `include.path` / `includeIf` following. git resolves includes for the
-    // implicit scopes and, for an explicitly named file, only when asked.
-    let mut includes = false;
+    // `include.path` / `includeIf` following, as git's tri-state
+    // `respect_includes_opt`: unset until `--includes`/`--no-includes` says
+    // otherwise, and resolved against the scope below.
+    let mut respect_includes: Option<bool> = None;
     let mut positional: Vec<&str> = Vec::new();
     // git config parses options with `PARSE_OPT_STOP_AT_NON_OPTION`: option
     // scanning ends at the FIRST argument that is not an option, and that token
@@ -1030,8 +1086,8 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
 
         match a {
-            "--includes" => includes = true,
-            "--no-includes" => includes = false,
+            "--includes" => respect_includes = Some(true),
+            "--no-includes" => respect_includes = Some(false),
             "--show-origin" => d.show_origin = true,
             // parse_options_step()'s `internal_help`, ahead of the
             // subcommand dispatch: the block on stdout at 129.
@@ -1201,6 +1257,28 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // here — only an attempted write without a repo is.
     let repo = gix::discover(".").ok();
 
+    // ```c
+    // if (opts->respect_includes_opt == -1)
+    //         opts->options.respect_includes = !opts->source.file;
+    // else
+    //         opts->options.respect_includes = opts->respect_includes_opt;
+    // ```
+    //
+    // (`builtin/config.c:970-973`, `location_options_init()`.) `source.file` is
+    // set only by `--file`/`--blob`, so every other scope follows includes
+    // unless `--no-includes` says not to, and a named file does not unless
+    // `--includes` says it should.
+    let includes = respect_includes.unwrap_or(!matches!(scope, Scope::File(_)));
+
+    // The `Default` cascade resolves its includes while it is being built, so
+    // turning them off means building it again — the repository re-opened with
+    // gix's own include permission cleared, or the repo-less global cascade
+    // re-read the same way.
+    let no_include_repo = match (&scope, includes) {
+        (Scope::Default, false) => discover_without_includes(),
+        _ => None,
+    };
+
     // The config to READ from, by scope. Owned holders live to the end of the
     // function so `file` can borrow whichever one this scope selects:
     //   * Default → the repo's fully-merged snapshot inside one, else the
@@ -1209,7 +1287,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     //   * Global  → the ONE file `git_global_config()` names; see [`global_config_file`].
     //   * System  → `$GIT_CONFIG_SYSTEM`, else `$(prefix)/etc/gitconfig`, alone.
     //   * File    → the named file alone, includes not followed.
-    let snapshot = repo.as_ref().map(gix::Repository::config_snapshot);
+    let snapshot = no_include_repo.as_ref().or(repo.as_ref()).map(gix::Repository::config_snapshot);
     let default_global;
     let scoped;
     let scope_file;
@@ -1248,7 +1326,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Scope::Default => match snapshot.as_ref() {
             Some(s) => s.plumbing(),
             None => {
-                default_global = crate::config::global_config();
+                default_global = match includes {
+                    true => crate::config::global_config(),
+                    false => global_config_without_includes(),
+                };
                 &default_global
             }
         },

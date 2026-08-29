@@ -134,6 +134,41 @@ fn include_directives_are_not_followed() {
     assert_eq!(stdout_of(&out), "include.path=cfg\n", "only the file itself");
 }
 
+/// The mirror image of the case above: for every scope that is not a named
+/// file, `location_options_init()` turns include following ON by default
+/// (builtin/config.c:970-973), and only `--no-includes` turns it back off. The
+/// repository cascade resolves its includes while it is being built, so the
+/// flag has to reach the read before the snapshot exists — a regression here
+/// shows up as the included key still being answered for.
+#[test]
+fn the_repository_cascade_follows_includes_unless_told_not_to() {
+    let dir = scratch("cascade-includes");
+    assert!(zvcs(&dir, &["init", "-q", "-b", "main"]).status.success(), "init failed");
+    std::fs::write(dir.join("extra.cfg"), "[inc]\n\tk = from-included\n").expect("write extra");
+    let local = dir.join(".git").join("config");
+    let mut text = std::fs::read_to_string(&local).expect("read local config");
+    // Relative to the including file, which is `.git/config`.
+    text.push_str("[include]\n\tpath = ../extra.cfg\n");
+    std::fs::write(&local, text).expect("write local config");
+
+    let followed = zvcs(&dir, &["config", "--get", "inc.k"]);
+    assert!(followed.status.success(), "the default cascade follows includes");
+    assert_eq!(stdout_of(&followed), "from-included\n");
+
+    let not_followed = zvcs(&dir, &["config", "--no-includes", "--get", "inc.k"]);
+    assert_eq!(not_followed.status.code(), Some(1), "--no-includes makes the key absent");
+    assert_eq!(stdout_of(&not_followed), "");
+
+    // The include directive itself is still config, so it stays in the listing.
+    let listed = zvcs(&dir, &["config", "--no-includes", "--local", "--list"]);
+    assert!(
+        stdout_of(&listed).contains("include.path=../extra.cfg"),
+        "the directive is still an entry: {}",
+        stdout_of(&listed)
+    );
+    assert!(!stdout_of(&listed).contains("inc.k"), "but what it points at is not read");
+}
+
 #[test]
 fn missing_file_is_exit_1_to_read_but_fatal_to_list() {
     let dir = scratch("missing");

@@ -354,20 +354,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
 /// The repo-relative path of the current directory, with a trailing `/`, which
 /// git prepends to every pathspec. Empty at the worktree root or in a bare repo.
 fn cwd_prefix(repo: &gix::Repository) -> Result<Vec<u8>> {
-    let Some(workdir) = repo.workdir() else {
-        return Ok(Vec::new());
-    };
-    let cwd = std::env::current_dir()?;
-    let workdir_abs = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
-    let cwd_abs = cwd.canonicalize().unwrap_or(cwd);
-    let Ok(rel) = cwd_abs.strip_prefix(&workdir_abs) else {
-        return Ok(Vec::new());
-    };
-    let rel = rel.to_string_lossy();
-    if rel.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(format!("{rel}/").into_bytes())
+    Ok(crate::setup::prefix_bytes(repo))
 }
 
 /// git's `commit_graph_generation()` (commit-graph.c:126) for `id`.

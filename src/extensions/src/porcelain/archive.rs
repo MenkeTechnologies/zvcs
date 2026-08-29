@@ -285,17 +285,26 @@ enum Added {
     /// canonicalised the same way tree blobs are, and the bytes are read from
     /// disk at archive-writing time.
     File {
-        /// `basename(path)`; the `--prefix` is prepended when the record is written.
+        /// `basename(path)`; `base` is prepended when the record is written.
         name: Vec<u8>,
+        /// `info->base = xstrdup_or_null(base)` (archive.c:581) — the value of
+        /// `--prefix` *at the moment this option was parsed*, since `base` is read
+        /// through `opt->defval` while `parse_options()` is still walking the
+        /// command line. A `--prefix` that comes later therefore does not reach
+        /// this record, and `--no-prefix` in between takes it away again.
+        base: Vec<u8>,
         /// Whether any execute bit is set on disk (`st_mode & 0111`).
         exec: bool,
         /// The path to read the bytes from, resolved against the process cwd.
         disk: std::path::PathBuf,
     },
-    /// `--add-virtual-file <path:content>`: the archive name is the literal path
-    /// before the first colon — git does *not* prepend `--prefix` to it — the mode
-    /// is a non-executable blob's, and the content is the literal bytes after the
-    /// first colon.
+    /// `--add-virtual-file <path:content>`: the archive name is the path before
+    /// the first colon, C-style-unquoted when it is quoted. git does *not*
+    /// prepend `--prefix` to it — but it does prepend the *cwd* prefix
+    /// (`prefix_filename(args->prefix, path)`, archive.c:608-612), which is the
+    /// opposite of `--add-file`, where the cwd prefix reaches the path on disk
+    /// and `--prefix` reaches the name in the archive. The mode is a
+    /// non-executable blob's and the content is the bytes after that colon.
     Virtual { name: Vec<u8>, content: Vec<u8> },
 }
 
@@ -367,7 +376,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             "--mtime" => opts.mtime = Some(value_of(args, &mut i, a)?),
             "--add-file" => {
                 let value = value_of(args, &mut i, a)?;
-                match resolve_add_file(&value) {
+                match resolve_add_file(&value, opts.prefix.as_deref()) {
                     Ok(item) => opts.added.push(item),
                     Err(msg) => {
                         eprintln!("fatal: {msg}");
@@ -394,7 +403,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--prefix=") => opts.prefix = Some(a[9..].to_string()),
             _ if a.starts_with("--output=") => opts.output = Some(a[9..].to_string()),
             _ if a.starts_with("--mtime=") => opts.mtime = Some(a[8..].to_string()),
-            _ if a.starts_with("--add-file=") => match resolve_add_file(&a[11..]) {
+            _ if a.starts_with("--add-file=") => match resolve_add_file(&a[11..], opts.prefix.as_deref()) {
                 Ok(item) => opts.added.push(item),
                 Err(msg) => {
                     eprintln!("fatal: {msg}");
@@ -781,8 +790,8 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         raw[..8].copy_from_slice(&((idx as u64) + 1).to_be_bytes());
         let oid = ObjectId::from_bytes_or_panic(&raw);
         match added {
-            Added::File { name, exec, disk } => {
-                let mut path = base.clone().into_bytes();
+            Added::File { name, base, exec, disk } => {
+                let mut path = base.clone();
                 path.extend_from_slice(name);
                 let data = std::fs::read(disk)?;
                 let kind = if *exec {
@@ -793,8 +802,11 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
                 tar.entry(&path, kind, &oid, &data)?;
             }
             Added::Virtual { name, content } => {
-                // git does not prepend `--prefix` to a virtual file's path.
-                tar.entry(name, EntryKind::Blob, &oid, content)?;
+                // git does not prepend `--prefix` to a virtual file's path, but
+                // `prefix_filename()` has already put the *cwd* prefix on it.
+                let mut path = crate::setup::prefix_bytes(&repo);
+                path.extend_from_slice(name);
+                tar.entry(&path, EntryKind::Blob, &oid, content)?;
             }
         }
     }
@@ -868,14 +880,44 @@ fn value_of(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
 /// splits the (literal, un-prefixed) archive path from the content. Returns the
 /// `fatal:` text git would `die()` with (exit 128) on the `Err` side.
 fn resolve_virtual_file(value: &str) -> std::result::Result<Added, String> {
-    match value.find(':') {
-        None => Err(format!("missing colon: '{value}'")),
-        Some(0) => Err(format!("empty file name: '{value}'")),
-        Some(idx) => Ok(Added::Virtual {
-            name: value.as_bytes()[..idx].to_vec(),
-            content: value.as_bytes()[idx + 1..].to_vec(),
-        }),
+    // ```c
+    // if (*p != '"')
+    //         p = strchr(p, ':');
+    // else if (unquote_c_style(&buf, p, &p) < 0)
+    //         die(_("unclosed quote: '%s'"), arg);
+    // if (!p || *p != ':')
+    //         die(_("missing colon: '%s'"), arg);
+    // if (p == arg)
+    //         die(_("empty file name: '%s'"), arg);
+    // path = buf.len ? strbuf_detach(&buf, NULL) : xstrndup(arg, p - arg);
+    // ```
+    //
+    // (`archive.c:592-606`.) A quoted name is decoded and the colon must be the
+    // very next byte; an unquoted one runs to the first colon. The `buf.len`
+    // fallback is why `"":x` archives a file literally named `""` — an empty
+    // decode is indistinguishable from no decode at all.
+    let bytes = value.as_bytes();
+    let (name, colon) = match bytes.first() {
+        Some(b'"') => match crate::setup::unquote_c_style_step(bytes, 0) {
+            Some((name, end)) => (name, Some(end)),
+            None => return Err(format!("unclosed quote: '{value}'")),
+        },
+        _ => (Vec::new(), value.find(':')),
+    };
+    let colon = match colon {
+        Some(at) if bytes.get(at) == Some(&b':') => at,
+        _ => return Err(format!("missing colon: '{value}'")),
+    };
+    if colon == 0 {
+        return Err(format!("empty file name: '{value}'"));
     }
+    Ok(Added::Virtual {
+        name: match name.is_empty() {
+            true => bytes[..colon].to_vec(),
+            false => name,
+        },
+        content: bytes[colon + 1..].to_vec(),
+    })
 }
 
 /// git's `add_file_cb` for `--add-file <path>`: it `stat()`s the file while
@@ -884,7 +926,7 @@ fn resolve_virtual_file(value: &str) -> std::result::Result<Added, String> {
 /// diagnostics. The path is resolved against the process cwd exactly as git's
 /// `prefix_filename()` does when run from a subdirectory; the archive name is
 /// the basename, with `--prefix` prepended later at writing time.
-fn resolve_add_file(path: &str) -> std::result::Result<Added, String> {
+fn resolve_add_file(path: &str, base: Option<&str>) -> std::result::Result<Added, String> {
     let Ok(meta) = std::fs::metadata(path) else {
         return Err(format!("File not found: {path}"));
     };
@@ -905,6 +947,7 @@ fn resolve_add_file(path: &str) -> std::result::Result<Added, String> {
         .unwrap_or_else(|| path.as_bytes().to_vec());
     Ok(Added::File {
         name,
+        base: base.unwrap_or_default().as_bytes().to_vec(),
         exec,
         disk: std::path::PathBuf::from(path),
     })
@@ -1313,8 +1356,8 @@ fn write_zip(
     }
     for added in &opts.added {
         match added {
-            Added::File { name, exec, disk } => {
-                let mut path = base.as_bytes().to_vec();
+            Added::File { name, base, exec, disk } => {
+                let mut path = base.clone();
                 path.extend_from_slice(name);
                 let data = std::fs::read(disk)?;
                 let kind = if *exec { EntryKind::BlobExecutable } else { EntryKind::Blob };
@@ -1322,8 +1365,10 @@ fn write_zip(
                 zip.entry(&path, kind, &data, level, binary)?;
             }
             Added::Virtual { name, content } => {
+                let mut path = crate::setup::prefix_bytes(repo);
+                path.extend_from_slice(name);
                 let binary = conv.is_binary(name, content)?;
-                zip.entry(name, EntryKind::Blob, content, level, binary)?;
+                zip.entry(&path, EntryKind::Blob, content, level, binary)?;
             }
         }
     }

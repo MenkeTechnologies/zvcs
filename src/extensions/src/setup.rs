@@ -36,6 +36,16 @@ pub fn prefix(repo: &gix::Repository) -> Option<PathBuf> {
     (!rel.as_os_str().is_empty()).then(|| rel.to_owned())
 }
 
+/// [`prefix`] in the byte form the pathspec and archive code wants: the
+/// repo-relative path of the current directory with a trailing `/`, empty at the
+/// top of the work tree and in a bare repository.
+pub fn prefix_bytes(repo: &gix::Repository) -> Vec<u8> {
+    match prefix(repo).as_deref().map(Path::to_string_lossy) {
+        Some(rel) if !rel.is_empty() => format!("{rel}/").into_bytes(),
+        _ => Vec::new(),
+    }
+}
+
 /// `is_inside_dir()`: whether the current directory is `dir` or below it.
 fn is_inside_dir(dir: &Path) -> bool {
     std::env::current_dir()
@@ -1221,7 +1231,7 @@ fn memchr_sep(bytes: &[u8], sep: u8, from: usize) -> usize {
 /// `unquote_c_style()` (quote.c) in its `endp`-reporting form: decode the quoted
 /// run that starts at `at` and report where it ended. `None` is git's failure
 /// return, which leaves the caller to treat the text as unquoted.
-fn unquote_c_style_step(bytes: &[u8], at: usize) -> Option<(Vec<u8>, usize)> {
+pub(crate) fn unquote_c_style_step(bytes: &[u8], at: usize) -> Option<(Vec<u8>, usize)> {
     let mut out = Vec::new();
     let mut i = at + 1;
     while i < bytes.len() {

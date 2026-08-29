@@ -1025,7 +1025,7 @@ pub(super) fn unmatched_pathspec_check(
     }
     if !ignored.is_empty() {
         eprintln!("The following paths are ignored by one of your .gitignore files:");
-        for p in &ignored {
+        for p in collapsed_ignored_names(repo, index, &ignored) {
             eprintln!("{p}");
         }
         if crate::advice::enabled("addIgnoredFile") {
@@ -1037,6 +1037,66 @@ pub(super) fn unmatched_pathspec_check(
         return Ok(SpecVerdict::Ignored);
     }
     Ok(SpecVerdict::Ok)
+}
+
+/// The names git's walk recorded for an ignored `relative`, which are not the
+/// path itself.
+///
+/// `add_files()` prints `dir->ignored[i]->name` (builtin/add.c:349-350), and what
+/// the walk put there is what `treat_directory()` decided: a directory an ignore
+/// rule names, *or* one whose every entry is ignored, is collapsed into a single
+/// ignored entry and its contents are never visited. So `git add logs/debug.log`
+/// in a tree where `*.log` covers all of `logs/` reports `logs`, not the file —
+/// and the recorded name carries no trailing slash.
+///
+/// The collapse is the walk's, so it is asked of the walk rather than
+/// re-derived: the same dirwalk in `CollapseDirectory` mode over this one path.
+/// An element that names nothing on disk — the `--ignore-missing` arm, where git
+/// calls `dir_add_ignored()` with the pathspec's own path — walks to nothing and
+/// keeps its name.
+fn collapsed_ignored_names(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    relative: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    // The collapse is a property of the walk, not of the element that reached it,
+    // so the walk has to run over the whole worktree — restricting it to the
+    // element would hand back the element again, which is the very thing the
+    // collapse replaces.
+    let collapsed = || -> Result<Vec<String>> {
+        let options = repo
+            .dirwalk_options()?
+            .emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory))
+            .emit_untracked(gix::dir::walk::EmissionMode::CollapseDirectory);
+        let patterns = vec![BString::from(":/")];
+        let mut names = Vec::new();
+        for item in repo.dirwalk_iter(index.clone(), patterns, Default::default(), options)? {
+            let item = item?;
+            if !matches!(item.entry.status, gix::dir::entry::Status::Ignored(_)) {
+                continue;
+            }
+            names.push(item.entry.rela_path.to_string());
+        }
+        Ok(names)
+    };
+    let collapsed = collapsed().unwrap_or_default();
+    relative
+        .iter()
+        .map(|spec| {
+            let spec = spec.trim_end_matches('/');
+            collapsed
+                .iter()
+                .find_map(|name| {
+                    let name = name.trim_end_matches('/');
+                    // The entry covers the element when it *is* it, or is a
+                    // directory it sits under.
+                    let covers = spec == name
+                        || spec.strip_prefix(name).is_some_and(|r| r.starts_with('/'));
+                    covers.then(|| name.to_string())
+                })
+                .unwrap_or_else(|| spec.to_string())
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

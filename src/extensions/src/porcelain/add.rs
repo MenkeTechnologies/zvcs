@@ -475,7 +475,25 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             .map(|e| (e.path_in(backing).to_owned(), (e.stat, e.id, e.mode)))
             .collect()
     };
-    let existing: HashSet<BString> = tracked.keys().cloned().collect();
+    // An unmerged path has no stage-0 entry, so it is not in `tracked` — but it is
+    // very much *in the index*, and `-u` restages exactly the paths that are.
+    // `run_diff_files()` reports an unmerged entry as modified (`diff_unmerge()`),
+    // and `add_file_to_index()` then drops its three stages and writes the
+    // worktree content at stage 0, which is how `git add -u` resolves a conflict.
+    let existing: HashSet<BString> = {
+        let backing = index.path_backing();
+        tracked
+            .keys()
+            .cloned()
+            .chain(
+                index
+                    .entries()
+                    .iter()
+                    .filter(|e| e.stage() != Stage::Unconflicted)
+                    .map(|e| e.path_in(backing).to_owned()),
+            )
+            .collect()
+    };
     // The stage-0 paths `is_racy_stat()` calls racily clean. `run_diff_files()` is
     // asked with `CE_MATCH_RACY_IS_DIRTY` and so is `add_to_index()`
     // (read-cache.c:717), so each of them is indexed — and hashed with
@@ -502,6 +520,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // `pathspec.items[i].original` and `.match`, both 1:1 with `pathspecs`.
     let (typed, resolved): (Vec<String>, Vec<String>) =
         resolve_pathspecs(&repo, &mut pathspecs)?.into_iter().unzip();
+    // `die_in_unpopulated_submodule()` and `die_path_inside_submodule()`
+    // (builtin/add.c:498-499) both run before `fill_directory()`.
+    if let Some(code) = die_path_inside_submodule(&index, &typed, &resolved) {
+        return Ok(code);
+    }
     // `fill_directory()` (builtin/add.c:510) runs before the pathspec check can die,
     // so its `could not open directory` warning is the first thing on stderr. Only
     // the modes that look for untracked files reach it (`add_new_files`,
@@ -525,10 +548,25 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         .iter()
         .map(|s| BString::from(s.clone().into_bytes()))
         .collect();
+    // ```c
+    // /* Set up the default git porcelain excludes */
+    // if (!ignored_too) {
+    //         dir.flags |= DIR_COLLECT_IGNORED;
+    //         setup_standard_excludes(&dir);
+    // }
+    // ```
+    //
+    // (`builtin/add.c:504-508`.) Under `-f` git sets up no excludes at all, so the
+    // walk has nothing to stop at: an ignored *directory* is descended into like
+    // any other. Without that, `add -f -A` misses every file whose whole
+    // directory the ignore rules covered — `build/output.o` under a `build/` rule,
+    // and a `logs/` whose entries all matched `*.log` — while still picking up the
+    // ignored files that sit beside tracked ones.
     let options = repo
         .dirwalk_options()?
         .emit_tracked(true)
-        .emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
+        .emit_ignored(Some(gix::dir::walk::EmissionMode::Matching))
+        .recurse_ignored_directories(force);
 
     let dirwalk_index = repo.index_or_load_from_head_or_empty()?;
     let mut iter = repo.dirwalk_iter(dirwalk_index, patterns.clone(), Default::default(), options)?;
@@ -1749,6 +1787,69 @@ fn split_pathspec_magic(spec: &str) -> (usize, bool) {
 ///
 /// An element that resolves outside the worktree is `prefix_path_gently()` returning
 /// NULL, which is a die, not a skip. It exits the process (128), as git's does.
+/// `die_path_inside_submodule()` (submodule.c:340-368):
+///
+/// ```c
+/// for (i = 0; i < istate->cache_nr; i++) {
+///         struct cache_entry *ce = istate->cache[i];
+///         int ce_len = ce_namelen(ce);
+///
+///         if (!S_ISGITLINK(ce->ce_mode))
+///                 continue;
+///
+///         for (j = 0; j < ps->nr ; j++) {
+///                 const struct pathspec_item *item = &ps->items[j];
+///
+///                 if (item->len <= ce_len)
+///                         continue;
+///                 if (item->match[ce_len] != '/')
+///                         continue;
+///                 if (strncmp(ce->name, item->match, ce_len))
+///                         continue;
+///                 if (item->len == ce_len + 1)
+///                         continue;
+///
+///                 die(_("Pathspec '%s' is in submodule '%.*s'"),
+///                     item->original, ce_len, ce->name);
+///         }
+/// }
+/// ```
+///
+/// A path *inside* a submodule is not this repository's to stage, and git says
+/// so rather than letting the walk call it untracked. The trailing-slash form is
+/// deliberately let through — `item->len == ce_len + 1` is exactly `sub/`, which
+/// names the gitlink itself and is a no-op, not an error.
+///
+/// The message quotes the spec as it was typed and the gitlink as the index
+/// records it; the first *index* entry that matches any spec is the one that
+/// dies, which is index order rather than command-line order.
+fn die_path_inside_submodule(
+    index: &gix::index::File,
+    typed: &[String],
+    resolved: &[String],
+) -> Option<ExitCode> {
+    let backing = index.path_backing();
+    for entry in index.entries() {
+        if entry.mode != Mode::COMMIT {
+            continue;
+        }
+        let name = entry.path_in(backing);
+        for (original, matched) in typed.iter().zip(resolved) {
+            let matched = matched.as_bytes();
+            if matched.len() <= name.len()
+                || matched.get(name.len()) != Some(&b'/')
+                || matched[..name.len()] != name[..]
+                || matched.len() == name.len() + 1
+            {
+                continue;
+            }
+            eprintln!("fatal: Pathspec '{original}' is in submodule '{name}'");
+            return Some(ExitCode::from(128));
+        }
+    }
+    None
+}
+
 pub(super) fn resolve_pathspecs(
     repo: &gix::Repository,
     pathspecs: &mut [String],

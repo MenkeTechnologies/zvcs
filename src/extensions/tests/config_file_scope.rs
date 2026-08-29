@@ -203,6 +203,110 @@ fn show_origin_paths_are_spelled_from_the_top_of_the_work_tree() {
     assert_eq!(stdout_of(&absolute), format!("file:{abs}\tc\n"));
 }
 
+/// `--blob <rev>` reads configuration out of an object. Its four refusals are
+/// each a different message: an unresolvable spec, a spec that resolves to
+/// something other than a blob, a blob whose contents will not parse, and any
+/// attempt to write one — and only `--list` turns a failed read into a fatal,
+/// because `cmd_config_list()` dies where `get_value()` just finds nothing.
+#[test]
+fn blob_config_is_read_only_and_names_itself_in_every_refusal() {
+    let dir = scratch("blob");
+    assert!(zvcs(&dir, &["init", "-q", "-b", "main"]).status.success(), "init failed");
+    std::fs::write(dir.join("cfg.ini"), "[a]\n\tb = c\n").expect("write cfg.ini");
+    std::fs::write(dir.join("bad.ini"), "not config\n").expect("write bad.ini");
+    std::fs::create_dir(dir.join("d")).expect("mkdir d");
+    std::fs::write(dir.join("d").join("f"), "x\n").expect("write d/f");
+    assert!(zvcs(&dir, &["add", "cfg.ini", "bad.ini", "d/f"]).status.success(), "add failed");
+    let commit = Command::new(BIN)
+        .args(["-c", "user.email=a@example.com", "-c", "user.name=n", "commit", "-qm", "x"])
+        .current_dir(&dir)
+        .output()
+        .expect("run zvcs git");
+    assert!(commit.status.success(), "commit failed: {}", stderr_of(&commit));
+
+    let read = zvcs(&dir, &["config", "--blob", "HEAD:cfg.ini", "--get", "a.b"]);
+    assert!(read.status.success(), "reading a blob: {}", stderr_of(&read));
+    assert_eq!(stdout_of(&read), "c\n");
+
+    // Every entry carries `CONFIG_ORIGIN_BLOB` and the spec, and the scope is
+    // `command` — a blob is `CONFIG_SCOPE_COMMAND` like `--file` is.
+    let origin =
+        zvcs(&dir, &["config", "--blob", "HEAD:cfg.ini", "--show-origin", "--show-scope", "--list"]);
+    assert_eq!(stdout_of(&origin), "command\tblob:HEAD:cfg.ini\ta.b=c\n");
+
+    // Under --null those two column separators are NULs, not tabs.
+    let nul =
+        zvcs(&dir, &["config", "--blob", "HEAD:cfg.ini", "--show-origin", "-z", "--list"]);
+    assert_eq!(stdout_of(&nul), "blob:HEAD:cfg.ini\0a.b\nc\0");
+
+    let unparsable = zvcs(&dir, &["config", "--blob", "HEAD:bad.ini", "--list"]);
+    assert_eq!(unparsable.status.code(), Some(128));
+    assert_eq!(
+        stderr_of(&unparsable),
+        "error: bad config line 1 in blob HEAD:bad.ini\nfatal: error processing config file(s)\n"
+    );
+
+    // The same blob under a get reports the error and then simply finds nothing.
+    let unparsable_get = zvcs(&dir, &["config", "--blob", "HEAD:bad.ini", "--get", "a.b"]);
+    assert_eq!(unparsable_get.status.code(), Some(1));
+    assert_eq!(stderr_of(&unparsable_get), "error: bad config line 1 in blob HEAD:bad.ini\n");
+
+    let missing = zvcs(&dir, &["config", "--blob", "HEAD:nope", "--list"]);
+    assert_eq!(missing.status.code(), Some(128));
+    assert!(
+        stderr_of(&missing).starts_with("error: unable to resolve config blob 'HEAD:nope'\n"),
+        "{}",
+        stderr_of(&missing)
+    );
+
+    let tree = zvcs(&dir, &["config", "--blob", "HEAD:d", "--list"]);
+    assert!(
+        stderr_of(&tree).starts_with("error: reference 'HEAD:d' does not point to a blob\n"),
+        "{}",
+        stderr_of(&tree)
+    );
+
+    let write = zvcs(&dir, &["config", "--blob", "HEAD:cfg.ini", "a.b", "v"]);
+    assert_eq!(write.status.code(), Some(128));
+    assert_eq!(stderr_of(&write), "fatal: writing config blobs is not supported\n");
+
+    let edit = zvcs(&dir, &["config", "--blob", "HEAD:cfg.ini", "--edit"]);
+    assert_eq!(edit.status.code(), Some(128));
+    assert_eq!(stderr_of(&edit), "fatal: editing blobs is not supported\n");
+
+    // A blob and a file are two config files, and git takes only one.
+    let both = zvcs(&dir, &["config", "--blob", "HEAD:cfg.ini", "-f", "cfg.ini", "--list"]);
+    assert_eq!(both.status.code(), Some(129));
+    assert_eq!(stderr_of(&both), "error: only one config file at a time\n");
+}
+
+/// git's parser dies where it stands, so a `--file` that will not parse is fatal
+/// before the action runs — including a write, which is why git refuses to
+/// append to a file it cannot read back. `--edit` never parses it.
+#[test]
+fn an_unparsable_named_file_is_fatal_before_anything_reads_or_writes_it() {
+    let dir = scratch("unparsable");
+    let bad = dir.join("bad.cfg");
+    std::fs::write(&bad, "not config\n").expect("write bad.cfg");
+    let expected = "fatal: bad config line 1 in file bad.cfg\n";
+
+    for args in [
+        vec!["config", "-f", "bad.cfg", "--list"],
+        vec!["config", "-f", "bad.cfg", "--get", "a.b"],
+        vec!["config", "-f", "bad.cfg", "--unset", "a.b"],
+        vec!["config", "-f", "bad.cfg", "a.b", "v"],
+    ] {
+        let out = zvcs(&dir, &args);
+        assert_eq!(out.status.code(), Some(128), "{args:?}");
+        assert_eq!(stderr_of(&out), expected, "{args:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&bad).expect("read back"),
+        "not config\n",
+        "the refused write must not have touched the file"
+    );
+}
+
 #[test]
 fn missing_file_is_exit_1_to_read_but_fatal_to_list() {
     let dir = scratch("missing");

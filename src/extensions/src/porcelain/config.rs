@@ -276,6 +276,11 @@ enum Scope {
     Global,
     System,
     File(std::path::PathBuf),
+    /// `--blob <blob-id>`: the config text is an object in the repository, named
+    /// by any revision spec that resolves to a blob. Read-only — `check_write()`
+    /// (builtin/config.c:820-821) refuses to write one, and `show_editor()`
+    /// (:1299-1300) refuses to edit one.
+    Blob(String),
 }
 
 /// A resolved write destination: the file to rewrite, its config `Source` (so a
@@ -324,6 +329,10 @@ struct Display {
     /// needs because git prints its paths from the top of the work tree and the
     /// port never moved there. See [`write_origin`].
     prefix: Option<String>,
+    /// `--blob <blob-id>` as it was given. Every entry a blob read produces
+    /// carries `CONFIG_ORIGIN_BLOB` and this name in its `key_value_info`, which
+    /// is what `--show-origin` prints instead of a file.
+    blob: Option<String>,
 }
 
 /// `--type=<t>` and its legacy spellings (`--bool`, `--int`, `--bool-or-int`,
@@ -1059,12 +1068,31 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 .or_else(|| other.strip_prefix("-f"))
                 .map(ToOwned::to_owned),
         };
+        let blob_value = match a {
+            "--blob" => match args.get(i) {
+                Some(v) => {
+                    i += 1;
+                    Some(v.clone())
+                }
+                None => return usage_error("option `blob' requires a value"),
+            },
+            other => other.strip_prefix("--blob=").map(ToOwned::to_owned),
+        };
+        if let Some(blob) = blob_value {
+            if !matches!(scope, Scope::Default | Scope::Blob(_)) {
+                return usage_error("only one config file at a time");
+            }
+            scope = Scope::Blob(blob);
+            continue;
+        }
+
         if let Some(path) = file_value {
             // git counts `--file` once no matter how often it is given, so only
             // a *different* kind of scope flag collides with it.
             if !matches!(scope, Scope::Default | Scope::File(_)) {
                 return usage_error("only one config file at a time");
             }
+
             scope = Scope::File(path.into());
             continue;
         }
@@ -1147,7 +1175,12 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "--no-global" | "--no-local" | "--no-system" | "--no-file" => {
                 scope = Scope::Default;
             }
-            "--no-worktree" | "--no-blob" => {}
+            "--no-worktree" => {}
+            "--no-blob" => {
+                if matches!(scope, Scope::Blob(_)) {
+                    scope = Scope::Default;
+                }
+            }
             // `--no-default` NULLs the `OPT_STRING` behind `--default`; the other
             // two clear slots this port does not read.
             "--no-default" => d.default_value = None,
@@ -1261,6 +1294,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // here — only an attempted write without a repo is.
     let repo = gix::discover(".").ok();
     d.prefix = repo.as_ref().and_then(crate::setup::prefix).map(|p| format!("{}/", p.display()));
+    d.blob = match &scope {
+        Scope::Blob(spec) => Some(spec.clone()),
+        _ => None,
+    };
 
     // ```c
     // if (opts->respect_includes_opt == -1)
@@ -1300,6 +1337,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // that fatal for `--list`; the get forms treat it as "key not found" (exit 1),
     // so the error is carried to the dispatch below rather than raised here.
     let mut unreadable: Option<std::io::Error> = None;
+    // Whether `config_with_options()` failed on a `--blob`, which `--list` turns
+    // into `error processing config file(s)` and every other read leaves as an
+    // empty configuration.
+    let mut blob_failed = false;
     // git's `location_opts.source.file` — the single file the scope resolved to, or
     // `None` for the scopes that read a cascade. `cmd_config_list()` names it in the
     // fatal it dies with (builtin/config.c:1063-1065), so the two have to travel
@@ -1372,6 +1413,27 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 read_single_scope_file(&scope_file, Source::System, reads_config, &mut unreadable)?;
             &scoped
         }
+        // `--blob` is `CONFIG_SCOPE_COMMAND` too, so its entries are `Source::Cli`
+        // — `--show-scope` says `command` for them — and `--show-origin` takes
+        // the blob name from [`Display::blob`] rather than from a path.
+        Scope::Blob(spec) => {
+            let Some(repo) = repo.as_ref() else {
+                return Err(crate::fatal::Fatal(
+                    "--blob can only be used inside a git repository".to_owned(),
+                )
+                .into());
+            };
+            scoped = match blob_config(repo, spec) {
+                Ok(file) => file,
+                // The three `error()`s are already on stderr; what happens next is
+                // the caller's, and only `--list` makes it fatal.
+                Err(()) => {
+                    blob_failed = true;
+                    ConfigFile::new(gix::config::file::Metadata::from(Source::Cli))
+                }
+            };
+            &scoped
+        }
         // `--file` is git's `CONFIG_SCOPE_COMMAND`, hence `Source::Cli`. Read
         // through `fs::read` so a missing or unreadable path surfaces as a
         // plain `io::Error` whose errno git reports verbatim.
@@ -1416,6 +1478,26 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // `git_config_from_file_with_options()` leaves `default_error_action` at
+    // `CONFIG_ERROR_DIE` (config.c:1394), so a `--file` that will not parse is
+    // fatal before the action runs — a write to it included, which is why git
+    // refuses to append to a file it cannot read back. `--edit` never parses the
+    // file, so it is the one action a malformed file survives.
+    if let Scope::File(path) = &scope {
+        if mode != Mode::Edit {
+            // Read straight through rather than with [`read_config_bytes`]: an
+            // unreadable file is not this diagnostic, and its warning belongs to
+            // the read that follows, once.
+            if let Some(line) =
+                std::fs::read(path).ok().and_then(|b| crate::config::first_bad_config_line(&b))
+            {
+                let text = path.to_string_lossy();
+                let shown = origin_path(&d, Source::Cli, &text);
+                return Ok(fatal(&format!("bad config line {line} in file {shown}")));
+            }
+        }
+    }
+
     // Resolve the write destination for this scope, erroring like git when a
     // repository is required but absent.
     let write_target = || resolve_write_target(&scope, repo.as_ref());
@@ -1435,6 +1517,16 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 );
                 Ok(ExitCode::from(128))
             }
+            // ```c
+            // if (location_opts.source.file)
+            //         die_errno(_("unable to read config file '%s'"), location_opts.source.file);
+            // else
+            //         die(_("error processing config file(s)"));
+            // ```
+            //
+            // (`builtin/config.c:1063-1067`.) A blob names no file, so it takes
+            // the second arm.
+            _ if blob_failed => Ok(fatal("error processing config file(s)")),
             _ => list(file, &d),
         },
         // `--get`/`--get-all`/`--get-regexp <name> <value-pattern>`: the optional
@@ -1455,6 +1547,11 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::GetUrlMatch => get_urlmatch(file, &positional, &d),
         Mode::GetColor => get_color(file, positional[0], positional.get(1).copied()),
         Mode::GetColorBool => get_colorbool(file, &positional),
+        // `show_editor()` refuses a blob before `check_write()` would have
+        // (builtin/config.c:1299-1300), so this is not the write message.
+        Mode::Edit if matches!(scope, Scope::Blob(_)) => {
+            Ok(fatal("editing blobs is not supported"))
+        }
         Mode::Edit => edit_config(&write_target()?),
         Mode::RenameSection => rename_section(&write_target()?, &positional),
         Mode::RemoveSection => remove_section(&write_target()?, &positional),
@@ -1779,7 +1876,7 @@ fn emit_kv_opt(
     let Some(value) = value else {
         if d.show_scope {
             out.write_all(scope_word(meta.source).as_bytes())?;
-            out.write_all(b"\t")?;
+            out.write_all(column_term(d))?;
         }
         if d.show_origin {
             write_origin(out, d, meta)?;
@@ -1792,7 +1889,7 @@ fn emit_kv_opt(
     };
     if d.show_scope {
         out.write_all(scope_word(meta.source).as_bytes())?;
-        out.write_all(b"\t")?;
+        out.write_all(column_term(d))?;
     }
     if d.show_origin {
         write_origin(out, d, meta)?;
@@ -1814,6 +1911,14 @@ fn emit_kv_opt(
 /// The `--show-origin` column: `file:<path>` for a real file, else the source's own word, then a
 /// tab.
 fn write_origin(out: &mut impl Write, d: &Display, meta: &gix::config::file::Metadata) -> Result<()> {
+    // `--blob` is a whole scope, so every entry in it has the same origin and
+    // there is no file to name.
+    if let Some(spec) = &d.blob {
+        out.write_all(b"blob:")?;
+        out.write_all(spec.as_bytes())?;
+        out.write_all(column_term(d))?;
+        return Ok(());
+    }
     match &meta.path {
         Some(path) => {
             out.write_all(b"file:")?;
@@ -1821,8 +1926,19 @@ fn write_origin(out: &mut impl Write, d: &Display, meta: &gix::config::file::Met
         }
         None => out.write_all(origin_word(meta.source).as_bytes())?,
     }
-    out.write_all(b"\t")?;
+    out.write_all(column_term(d))?;
     Ok(())
+}
+
+/// `const char term = opts->end_nul ? '\0' : '\t';` — the separator both
+/// `show_config_origin()` and `show_config_scope()` put after their column
+/// (builtin/config.c:238, 253). Under `--null` every field boundary is a NUL,
+/// these two included.
+fn column_term(d: &Display) -> &'static [u8] {
+    match d.null {
+        true => b"\0",
+        false => b"\t",
+    }
 }
 
 /// The path `--show-origin` prints, respelled from the top of the work tree.
@@ -2848,6 +2964,41 @@ fn read_config_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     })
 }
 
+/// `git_config_from_blob_ref()` (config.c:1483-1494) and the
+/// `git_config_from_blob_oid()` it calls (:1456-1481): resolve `spec`, insist the
+/// object is a blob, and parse its bytes as configuration.
+///
+/// Each of the three failures is an `error()` returning -1, never a `die()`, so
+/// the caller decides what a failed read means; `Err(())` says the message is
+/// already on stderr.
+fn blob_config(repo: &gix::Repository, spec: &str) -> std::result::Result<ConfigFile, ()> {
+    let Ok(id) = repo.rev_parse_single(spec) else {
+        eprintln!("error: unable to resolve config blob '{spec}'");
+        return Err(());
+    };
+    let Ok(object) = id.object() else {
+        eprintln!("error: unable to load config blob object '{spec}'");
+        return Err(());
+    };
+    if object.kind != gix::object::Kind::Blob {
+        eprintln!("error: reference '{spec}' does not point to a blob");
+        return Err(());
+    }
+    // `git_config_from_mem()` reports a parse failure against the blob name,
+    // where a file would have been named as a file (config.c's
+    // `git_parse_source()`, `CONFIG_ORIGIN_BLOB`).
+    if let Some(line) = crate::config::first_bad_config_line(&object.data) {
+        eprintln!("error: bad config line {line} in blob {spec}");
+        return Err(());
+    }
+    ConfigFile::from_bytes_no_includes(
+        &object.data,
+        gix::config::file::Metadata::from(Source::Cli),
+        Default::default(),
+    )
+    .map_err(|_| ())
+}
+
 /// An empty config file carrying `path`/`source` metadata, so entries written
 /// into it later report the right provenance.
 fn empty_config(path: &std::path::Path, source: Source) -> ConfigFile {
@@ -3018,6 +3169,8 @@ fn read_scope(sources: &[Source]) -> ConfigFile {
 /// `given_config_source` resolution.
 fn resolve_write_target(scope: &Scope, repo: Option<&gix::Repository>) -> Result<WriteTarget> {
     match scope {
+        // `check_write()` (builtin/config.c:812-822).
+        Scope::Blob(_) => crate::git_fatal!("writing config blobs is not supported"),
         Scope::Default | Scope::Local => {
             let repo = repo.ok_or_else(|| match scope {
                 Scope::Local => {

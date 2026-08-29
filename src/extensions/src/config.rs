@@ -1342,13 +1342,13 @@ fn check_config_file(
         // diagnostic.
         return None;
     };
-    let events = match gix::config::parse::Events::from_bytes(&bytes, None) {
-        Ok(events) => events,
-        Err(err) => return Some((candidate.shown.clone(), err.line_number())),
-    };
-    if let Some(line) = unterminated_valueless_key(&events) {
+    if let Some(line) = first_bad_config_line(&bytes) {
         return Some((candidate.shown.clone(), line));
     }
+    // Only a file that parsed has includes to follow.
+    let Ok(events) = gix::config::parse::Events::from_bytes(&bytes, None) else {
+        return None;
+    };
     for included in included_paths(&events, &candidate.path) {
         let shown = included.to_string_lossy().into_owned();
         let next = ConfigCandidate {
@@ -1360,6 +1360,19 @@ fn check_config_file(
         }
     }
     None
+}
+
+/// The 1-based line `git_parse_source()` would refuse in `bytes`, or `None` when
+/// git's parser would accept the whole thing.
+///
+/// Two refusals, because gitoxide's parser is the stricter one in some places
+/// and the looser one in others: whatever its own parser rejects outright, plus
+/// [`unterminated_valueless_key`] for the form it accepts and git does not.
+pub fn first_bad_config_line(bytes: &[u8]) -> Option<usize> {
+    match gix::config::parse::Events::from_bytes(bytes, None) {
+        Err(err) => Some(err.line_number()),
+        Ok(events) => unterminated_valueless_key(&events),
+    }
 }
 
 /// The line of the first valueless key that is not the last thing on its line,

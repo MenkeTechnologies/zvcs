@@ -1621,7 +1621,14 @@ fn create_and_switch(
         // git prints the tracking confirmation to stdout, after the stderr
         // transition line, and only when not quiet.
         if let Some(info) = &track_info {
-            println!("branch '{name}' set up to track '{}'.", info.display);
+            println!(
+                "{}",
+                super::branch::tracking_line(
+                    name,
+                    &info.display,
+                    super::branch::autosetup_rebase(repo, &info.remote)
+                )
+            );
         }
         // `report_tracking()` follows for a branch that already existed; a brand-new
         // one has nothing to report beyond the upstream just configured.
@@ -1881,6 +1888,12 @@ fn write_tracking_config(repo: &gix::Repository, name: &str, info: &TrackInfo) -
         gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)?;
     file.set_raw_value_by("branch", Some(gix::bstr::BStr::new(name)), "remote", info.remote.as_str())?;
     file.set_raw_value_by("branch", Some(gix::bstr::BStr::new(name)), "merge", info.merge.as_str())?;
+    // `install_branch_config()` records `branch.<name>.rebase` for the `branch.autoSetupRebase`
+    // modes that apply to this upstream — the same decision `branch` and `switch` make, through
+    // the same function.
+    if super::branch::autosetup_rebase(repo, &info.remote) {
+        file.set_raw_value_by("branch", Some(gix::bstr::BStr::new(name)), "rebase", "true")?;
+    }
     let bytes = file.to_bstring();
     let tmp = path.with_extension("zvcs-tmp");
     std::fs::write(&tmp, &bytes)?;

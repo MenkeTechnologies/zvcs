@@ -1134,6 +1134,8 @@ fn list_tags(
         // `FILTER_REFS_TAGS` never produces one, and `cmd_tag()` does not set the
         // flag anyway.
         detached_head_first: false,
+        // `git tag` has no `-v` listing flag of its own; `filter.verbose` stays 0.
+        verbose: false,
     };
 
     let out_lines = match super::ref_filter::filter_and_format(&spec)? {

@@ -1044,7 +1044,11 @@ pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<
         let Ok(raw) = std::fs::read(wt.join("gitdir")) else {
             continue;
         };
-        let git_dir = gix::path::from_byte_slice(raw.trim()).to_path_buf();
+        // `get_linked_worktree()` (worktree.c:158-162) resolves a *relative* recording against
+        // the administrative directory before using it, which is what `worktree add
+        // --relative-paths` and `worktree.useRelativePaths` write. Taking the string literally
+        // printed `../../../wt` where git prints the worktree's absolute path.
+        let git_dir = super::worktree::recorded_dot_git(&wt, raw.trim());
         add(&wt, checkout_of(&git_dir));
     }
     map
@@ -1406,6 +1410,9 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // call, so `%(is-base:<x>)` is always empty under `git branch`.
         run_is_base: false,
         detached_head_first,
+        // `filter.verbose = !!verbose` (builtin/branch.c), which is what makes `-v` drop a branch
+        // whose object is missing while a plain listing still names it.
+        verbose: o.verbose > 0,
     };
 
     let lines = match ref_filter::filter_and_format(&spec)? {
@@ -1707,6 +1714,21 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let existed = repo.try_find_reference(full.as_str())?.is_some();
     if existed && !o.force {
         return fatal(format!("a branch named '{name}' already exists"));
+    }
+    // ```c
+    // if ((path = branch_checked_out(ref->buf)))
+    //         die(_("cannot force update the branch '%s' used by worktree at '%s'"), …);
+    // ```
+    // (branch.c:481-484, `validate_new_branchname()`.) `--force` overrides the branch already
+    // being there, never a worktree standing on it: moving the ref would leave that checkout's
+    // index and worktree describing a commit its own `HEAD` no longer names.
+    if existed && o.force {
+        if let Some(path) = super::worktree::branch_checked_out(repo, &full)? {
+            return fatal(format!(
+                "cannot force update the branch '{name}' used by worktree at '{}'",
+                super::worktree::path_to_string(&path)
+            ));
+        }
     }
 
     let verb = if existed { "Reset to" } else { "Created from" };
@@ -2090,8 +2112,31 @@ fn install_tracking(
     file.set_raw_value_by("branch", Some(sub), "remote", remote.as_str())?;
     file.set_raw_value_by("branch", Some(sub), "merge", merge_ref.as_str())?;
 
+    let want_rebase = autosetup_rebase(repo, remote);
+    if want_rebase {
+        file.set_raw_value_by("branch", Some(sub), "rebase", "true")?;
+    }
+
+    write_config(&path, &file)?;
+
+    if !quiet {
+        // `printf_ln(rebasing ? _("branch '%s' set up to track '%s' by rebasing.") :
+        //                       _("branch '%s' set up to track '%s'."), …)` (branch.c:168-171):
+        // the same `rebasing` that wrote `branch.<name>.rebase` picks the wording, so a
+        // `branch.autoSetupRebase` that took effect says so.
+        println!("{}", tracking_line(branch, short, want_rebase));
+    }
+    Ok(())
+}
+
+/// `branch.autoSetupRebase` for one upstream: whether `install_branch_config()` records
+/// `branch.<name>.rebase = true` — and therefore whether its notice says `by rebasing.`
+///
+/// `always` for either kind of upstream, `local` only for the `.` remote, `remote` only for a real
+/// one, and `never` (the default, and anything unrecognised) for neither.
+pub(super) fn autosetup_rebase(repo: &gix::Repository, remote: &str) -> bool {
     let is_local = remote == ".";
-    let want_rebase = match repo
+    match repo
         .config_snapshot()
         .string("branch.autoSetupRebase")
         .map(|v| v.to_str_lossy().into_owned())
@@ -2101,17 +2146,17 @@ fn install_tracking(
         Some("local") => is_local,
         Some("remote") => !is_local,
         _ => false,
-    };
-    if want_rebase {
-        file.set_raw_value_by("branch", Some(sub), "rebase", "true")?;
     }
+}
 
-    write_config(&path, &file)?;
-
-    if !quiet {
-        println!("branch '{branch}' set up to track '{short}'.");
+/// The notice `install_branch_config_multiple_remotes()` prints for a single upstream
+/// (branch.c:168-171). One function because git has one `printf_ln`, and the `by rebasing.`
+/// half went missing from every copy of it in this port.
+pub(super) fn tracking_line(branch: &str, short: &str, rebasing: bool) -> String {
+    match rebasing {
+        true => format!("branch '{branch}' set up to track '{short}' by rebasing."),
+        false => format!("branch '{branch}' set up to track '{short}'."),
     }
-    Ok(())
 }
 
 /// Append the `<tip> <tip>` entry a rename or copy onto the branch's *own* name
@@ -2436,19 +2481,38 @@ fn move_branch_config(
         return Ok(());
     }
 
-    if !pairs.is_empty() {
+    if remove_old {
+        // `git_config_rename_section()` rewrites the *header* and leaves the section where it is,
+        // so `branch -m` keeps the file's section order. Appending a new section and deleting the
+        // old one moves it to the end instead, which shows up in `git config --list` order and in
+        // any diff of `.git/config`.
+        let renamed = file.rename_section(
+            "branch",
+            Some(BStr::new(old.as_bytes())),
+            "branch",
+            Some(gix::bstr::BString::from(new.as_bytes())),
+        );
+        // A branch with no config section of its own has nothing to rename, which is not an error.
+        if let Err(err) = renamed {
+            if !matches!(
+                err,
+                gix::config::file::rename_section::Error::Lookup(
+                    gix::config::lookup::existing::Error::SectionMissing
+                        | gix::config::lookup::existing::Error::SubSectionMissing
+                        | gix::config::lookup::existing::Error::KeyMissing
+                )
+            ) {
+                return Err(err.into());
+            }
+        }
+    } else if !pairs.is_empty() {
+        // `-c`/`-C` copies the section rather than moving it, so the copy is appended — which is
+        // where `git config --list` shows it after `git branch -c`.
         let sub = BStr::new(new.as_bytes());
         let mut section = file.section_mut_or_create_new("branch", Some(sub))?;
         for (key, value) in &pairs {
             section.push(key.as_str(), value.as_str())?;
         }
-    }
-
-    if remove_old {
-        while file
-            .remove_section("branch", Some(BStr::new(old.as_bytes())))
-            .is_some()
-        {}
     }
 
     write_config(&path, &file)?;
@@ -2482,8 +2546,30 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // Serialize all deletions through the repo coordinator, held across the loop.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    // ```c
+    // switch (kinds) {
+    // case FILTER_REFS_REMOTES:
+    //         fmt = "refs/remotes/%s";
+    //         remote_branch = 1;
+    //         force = 1;
+    //         break;
+    // case FILTER_REFS_BRANCHES:
+    //         fmt = "refs/heads/%s";
+    // ```
+    // (builtin/branch.c.) `-r` deletes remote-tracking refs, and force is implied there: a
+    // remote-tracking branch has no upstream of its own to be "not fully merged" with.
+    let remote_branch = o.mode == ListMode::Remotes;
+    let force = o.force || remote_branch;
+    let kind_word = if remote_branch { "remote-tracking branch" } else { "branch" };
+    // git reports each failure and carries on to the next operand (`ret = 1; continue;`), so one
+    // missing name does not hide the deletion of the ones that follow it.
+    let mut status = ExitCode::SUCCESS;
+
     for name in &o.names {
-        let full = format!("refs/heads/{name}");
+        let full = match remote_branch {
+            true => format!("refs/remotes/{name}"),
+            false => format!("refs/heads/{name}"),
+        };
 
         // `delete_branches()` (builtin/branch.c) refuses when `branch_checked_out(name)`
         // names a worktree: any worktree's `HEAD`, not just this one's, and the branch an
@@ -2498,23 +2584,60 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // dir; `repo.workdir()` is relative whenever the repository was discovered from the
         // current directory, and printed `.` or `../..` where git prints the checkout's
         // full path.
-        if let Some(path) = super::worktree::branch_checked_out(repo, &full)? {
-            return error_exit(format!(
-                "cannot delete branch '{name}' used by worktree at '{}'",
-                super::worktree::path_to_string(&path)
-            ));
+        // `if (kinds == FILTER_REFS_BRANCHES)`: the check is on local branches only, since no
+        // worktree's `HEAD` can be on a remote-tracking ref.
+        if !remote_branch {
+            if let Some(path) = super::worktree::branch_checked_out(repo, &full)? {
+                error_exit(format!(
+                    "cannot delete branch '{name}' used by worktree at '{}'",
+                    super::worktree::path_to_string(&path)
+                ))?;
+                status = ExitCode::from(1);
+                continue;
+            }
         }
 
-        let mut reference = match repo.try_find_reference(full.as_str())? {
+        // `refs_resolve_ref_unsafe(..., RESOLVE_REF_READING | RESOLVE_REF_NO_RECURSE |
+        // RESOLVE_REF_ALLOW_BAD_NAME, &oid, &flags)`: the ref's *recorded* value, with no
+        // dereference and no object read. A branch pointing at an object that is not in the
+        // repository is still deletable, which is most of the reason `-D` exists.
+        let reference = match repo.try_find_reference(full.as_str())? {
             Some(r) => r,
-            None => return error_exit(format!("branch '{name}' not found")),
+            None => {
+                error_exit(format!("{kind_word} '{name}' not found"))?;
+                status = ExitCode::from(1);
+                continue;
+            }
+        };
+        let symref_target = reference
+            .target()
+            .try_name()
+            .map(|n| n.as_bstr().to_str_lossy().into_owned());
+        let recorded = reference.target().try_id().map(ToOwned::to_owned);
+
+        // `(flags & REF_ISBROKEN) ? "broken" : (flags & REF_ISSYMREF) ? target : find_unique_abbrev()`
+        // — the three spellings of `(was …)`.
+        let (was, tip) = match (&symref_target, recorded) {
+            (Some(target), _) => (target.clone(), None),
+            (None, Some(id)) => {
+                // `find_unique_abbrev()` on an id whose object is absent still answers: the
+                // default length, no disambiguation pass.
+                let abbrev = {
+                    use gix::prelude::ObjectIdExt as _;
+                    id.attach(repo)
+                        .shorten()
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|_| id.to_hex_with_len(7).to_string())
+                };
+                (abbrev, Some(id))
+            }
+            (None, None) => ("broken".to_string(), None),
         };
 
-        let tip_id = reference.peel_to_id()?;
-        let abbrev = tip_id.shorten_or_id();
-        let tip = tip_id.detach();
-
-        if !o.force {
+        // `if (!(flags & (REF_ISSYMREF|REF_ISBROKEN)) && check_branch_commit(...))`: the
+        // merged-into-HEAD test needs a commit, so a symbolic or broken ref skips it.
+        if !force && tip.is_some() {
+            let tip = tip.expect("checked");
             let merged = match repo.head_id() {
                 Ok(head_id) => match repo.merge_base(tip, head_id.detach()) {
                     Ok(base) => base.detach() == tip,
@@ -2523,12 +2646,13 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 Err(_) => false, // unborn HEAD → nothing merged into
             };
             if !merged {
-                let code = error_exit(format!("the branch '{name}' is not fully merged"))?;
+                error_exit(format!("the branch '{name}' is not fully merged"))?;
                 crate::advice::Advice::ForceDeleteBranch.advise_in(
                     repo,
                     &format!("If you are sure you want to delete it, run 'git branch -D {name}'"),
                 );
-                return Ok(code);
+                status = ExitCode::from(1);
+                continue;
             }
         }
 
@@ -2547,11 +2671,13 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         })?;
 
         if !o.quiet {
-            println!("Deleted branch {name} (was {abbrev}).");
+            // `printf(remote_branch ? _("Deleted remote-tracking branch %s (was %s).\n") : …)`.
+            let what = if remote_branch { "remote-tracking branch" } else { "branch" };
+            println!("Deleted {what} {name} (was {was}).");
         }
     }
 
-    Ok(ExitCode::SUCCESS)
+    Ok(status)
 }
 
 /// Point the last reflog entry's *old* id at `old`, which is what a rename records: the

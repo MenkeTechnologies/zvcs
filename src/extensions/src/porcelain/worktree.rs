@@ -1114,7 +1114,7 @@ fn should_prune(admin: &Path, expire: u64) -> PruneCheck {
 /// administrative directory and resolved as far as it can be. `worktree add --relative-paths` and
 /// `worktree.useRelativePaths` write the relative spelling, and testing that string for existence
 /// from wherever the process happens to stand reports a healthy worktree as prunable.
-fn recorded_dot_git(admin: &Path, recorded: &[u8]) -> PathBuf {
+pub(super) fn recorded_dot_git(admin: &Path, recorded: &[u8]) -> PathBuf {
     let path = gix::path::from_byte_slice(recorded);
     if path.is_absolute() {
         return path.to_owned();

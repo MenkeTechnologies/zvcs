@@ -180,6 +180,23 @@ pub(super) struct ListSpec<'a> {
     /// `if (sorting)`, and with an empty `--sort` list the detached pseudo entry
     /// keeps the position `do_filter_refs()` gave it, which is last.
     pub(super) detached_head_first: bool,
+    /// `filter->verbose` (`git branch -v`). It joins the reachability filters in
+    /// `apply_ref_filter()`'s one object lookup:
+    ///
+    /// ```c
+    /// if (filter->reachable_from || filter->unreachable_from ||
+    ///     filter->with_commit || filter->no_commit || filter->verbose) {
+    ///         commit = lookup_commit_reference_gently(the_repository, ref->oid, 1);
+    ///         if (!commit)
+    ///                 return NULL;
+    /// ```
+    ///
+    /// (ref-filter.c:2987-2991.) *Gently*, and the ref is dropped when the object
+    /// is not there — which is why `git branch -v` in a repository with a branch
+    /// pointing at a missing object lists the healthy branches and says nothing
+    /// about the broken one, while `git branch --list` still names it: without
+    /// `-v` nothing opens the object at all.
+    pub(super) verbose: bool,
 }
 
 /// What a listing produced: rendered lines, or the exit code a format/sort parse
@@ -409,6 +426,14 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<Vec<Candidate>>
             (symref, id, is_packed(repo, name_str))
         };
 
+        // `apply_ref_filter()`'s gentle commit lookup (ref-filter.c:2987-2991): the reachability
+        // filters and `-v` all need the commit, and a ref whose object is missing is dropped here
+        // rather than reported. Nothing else in the walk opens an object, so a listing that asks
+        // for none still names a branch pointing at a missing object — which is what stock does.
+        if (filters_active || spec.verbose) && repo.find_header(id).is_err() {
+            continue;
+        }
+
         let chain = if !spec.points_at.is_empty() || filters_active || sort_derefs {
             peel_chain(repo, id)?
         } else {
@@ -480,9 +505,33 @@ fn populate(
         HashSet::new()
     };
 
+    // Which atoms actually reach into the object. git opens none until one does — "We do not open
+    // the object yet; sort may only need refname to do its job" (ref-filter.c:3002-3006) — so a
+    // ref whose object is missing renders fine for `%(refname)`, and only a format that asks about
+    // the object is `missing object %s for %s`.
+    let needs_object = needs_data
+        || needs_peel
+        || atoms(items, sorts).any(|a| {
+            matches!(
+                a.field,
+                Field::ObjectType | Field::ObjectSize
+            )
+        });
+
     let mut refs = Vec::with_capacity(candidates.len());
     for c in candidates {
-        let obj = load(repo, c.id, needs_data)?;
+        let obj = match load(repo, c.id, needs_data) {
+            Ok(obj) => obj,
+            // Nothing in this run will look at it, so the ref is listed by name — the state a
+            // branch pointing at a missing object is in.
+            Err(_) if !needs_object => super::for_each_ref::ObjInfo {
+                id: c.id,
+                kind: Kind::Commit,
+                size: 0,
+                data: None,
+            },
+            Err(err) => return Err(err),
+        };
         let chain = if needs_peel && c.chain.is_empty() && obj.kind == Kind::Tag {
             peel_chain(repo, c.id)?
         } else {

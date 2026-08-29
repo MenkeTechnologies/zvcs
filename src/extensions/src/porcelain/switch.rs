@@ -1274,18 +1274,7 @@ fn install_tracking(
     // branch.autoSetupRebase also records `branch.<name>.rebase=true`, gated on
     // whether the upstream is local (`remote == "."`) or remote-tracking. git's
     // default is "never".
-    let is_local = remote == ".";
-    let want_rebase = match repo
-        .config_snapshot()
-        .string("branch.autoSetupRebase")
-        .map(|v| v.to_str_lossy().into_owned())
-        .as_deref()
-    {
-        Some("always") => true,
-        Some("local") => is_local,
-        Some("remote") => !is_local,
-        _ => false, // "never" (default) or unset
-    };
+    let want_rebase = super::branch::autosetup_rebase(repo, remote);
     if want_rebase {
         file.set_raw_value_by("branch", Some(sub), "rebase", "true")?;
     }
@@ -1299,7 +1288,9 @@ fn install_tracking(
     }
     std::fs::rename(&tmp, &path)?;
 
-    println!("branch '{branch}' set up to track '{short}'.");
+    // `install_branch_config_multiple_remotes()` (branch.c:168-171) picks the wording from the
+    // same `rebasing` that wrote `branch.<name>.rebase`.
+    println!("{}", super::branch::tracking_line(branch, short, want_rebase));
     Ok(())
 }
 

@@ -800,7 +800,13 @@ fn finish(o: Opts) -> Result<ExitCode> {
         checkout_subset(&repo, &mut new_index, &wanted)?;
         for path in &removed {
             if let Some(full) = repo.workdir_path(path.as_bstr()) {
-                let _ = std::fs::remove_file(full);
+                let _ = std::fs::remove_file(&full);
+                // `unlink_entry()` schedules the directory it just emptied, and
+                // `remove_scheduled_dirs()` takes it — so dropping the last file
+                // under `src/` drops `src/` too.
+                if let Some(workdir) = repo.workdir() {
+                    crate::worktree::prune_empty_dirs(workdir, &full);
+                }
             }
         }
     }
@@ -1093,7 +1099,13 @@ fn multi_tree_read(
         checkout_subset(repo, &mut new_index, &wanted)?;
         for path in &removed {
             if let Some(full) = repo.workdir_path(path.as_bstr()) {
-                let _ = std::fs::remove_file(full);
+                let _ = std::fs::remove_file(&full);
+                // `unlink_entry()` schedules the directory it just emptied, and
+                // `remove_scheduled_dirs()` takes it — so dropping the last file
+                // under `src/` drops `src/` too.
+                if let Some(workdir) = repo.workdir() {
+                    crate::worktree::prune_empty_dirs(workdir, &full);
+                }
             }
         }
     }

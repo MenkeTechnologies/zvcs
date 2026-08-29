@@ -11,6 +11,15 @@
 //! before returning, so the only lasting change is the set of loose objects —
 //! matching stock git's end state.
 //!
+//! Because git writes as it goes, a pack that fails part-way still leaves behind
+//! the objects that preceded the damage, and the trailer check that would reject
+//! it happens only after the last one is out (`:684-686`). A staged pack cannot
+//! hand back a partial result, so the stream is held in memory and re-read in
+//! `Mode::Restore` when the strict pass fails: the salvaged entries are written,
+//! and only then does the run die with the failure the strict pass reported.
+//! Buffering costs little here — `transfer.unpackLimit` (100 objects) is what
+//! decides between this command and `index-pack`, which streams.
+//!
 //! The argument parser mirrors git's loop in `cmd_unpack_objects()` exactly:
 //! the flags are tested in git's order (`-n`, `-q`, `-r`, `--strict`,
 //! `--strict=`, `--pack_header=`, `--max-input-size=`) and both an unknown
@@ -70,14 +79,11 @@
 //!     `--pack_header` is therefore refused with a fatal and 128 instead of
 //!     being handed through. A v3 pack arriving on stdin still reaches that
 //!     assert, which is a `gix-pack` limit this module cannot route around.
-//!   * a damaged pack leaves the object database untouched here, where git may
-//!     already have exploded the objects that preceded the corruption: this
-//!     port validates the whole pack before writing anything. The exit code
-//!     agrees; the set of salvaged loose objects can differ.
 //!   * the `fatal:` text for a malformed pack is git's only where the error
-//!     chain says which of git's fatals it is — `early EOF`, `bad pack file`
-//!     and `unknown pack file version <n>`; see [`pack_fatal`]. Everything else
-//!     keeps `gix-pack`'s own diagnostic. The exit code is 128 either way.
+//!     chain says which of git's fatals it is — `early EOF`, `bad pack file`,
+//!     `unknown pack file version <n>` and `final sha1 did not match`; see
+//!     [`pack_fatal`]. Everything else keeps `gix-pack`'s own diagnostic. The
+//!     exit code is 128 either way.
 //!   * a pack whose declared object count is zero and whose trailing hash is
 //!     missing is accepted here and exits 0; git reads the trailer through the
 //!     same `fill()` and answers `early EOF`. The pack writer verifies the
@@ -338,18 +344,28 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     let should_interrupt = AtomicBool::new(false);
     let mut progress = gix::features::progress::Discard;
 
-    let written = gix::odb::pack::Bundle::write_to_directory(
-        &mut input,
-        // A dry run still decodes and verifies every entry; it just discards
-        // the index and pack instead of keeping them around to read back.
-        scratch.as_ref().map(|s| s.path.as_path()),
-        &mut progress,
-        &should_interrupt,
-        // Thin packs reference bases by id that only exist in the odb; letting
-        // the writer look them up completes the pack the way git resolves them.
-        Some(repo.objects.clone()),
-        options,
-    );
+    // ```c
+    // for (i = 0; i < nr_objects; i++) {
+    //         unpack_one(i);
+    //         display_progress(progress, i + 1);
+    // }
+    // ```
+    //
+    // (`unpack_all()`, builtin/unpack-objects.c:602-605.) git writes each object into the
+    // odb as it decodes it and only checks the trailer afterwards (:684-686), so a pack
+    // that is truncated — or whose trailing hash is wrong — still leaves behind everything
+    // it managed to read. This port decodes through a staged pack instead, which cannot
+    // hand back a partial result; so the bytes are held and, when the strict pass fails,
+    // re-read in `Restore` mode to recover exactly the entries git would have written.
+    //
+    // Buffering is affordable here because `unpack-objects` is the *small* half of the
+    // receive path: `transfer.unpackLimit` (100 objects) is what decides between it and
+    // `index-pack`, which streams and is untouched by this.
+    let mut raw = Vec::new();
+    if let Err(e) = input.read_to_end(&mut raw) {
+        eprintln!("fatal: {}", pack_fatal(&e));
+        return Ok(ExitCode::from(128));
+    }
 
     // git checks the running byte count as it fills its input buffer, so a pack
     // over the limit dies whether or not it is otherwise well formed. Checking
@@ -359,11 +375,39 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    let outcome = match written {
+    let mut write_pack = |mode| {
+        gix::odb::pack::Bundle::write_to_directory(
+            &mut raw.as_slice(),
+            // A dry run still decodes and verifies every entry; it just discards
+            // the index and pack instead of keeping them around to read back.
+            scratch.as_ref().map(|s| s.path.as_path()),
+            &mut progress,
+            &should_interrupt,
+            // Thin packs reference bases by id that only exist in the odb; letting
+            // the writer look them up completes the pack the way git resolves them.
+            Some(repo.objects.clone()),
+            gix::odb::pack::bundle::write::Options { iteration_mode: mode, ..options },
+        )
+    };
+
+    // `die()` is deferred until the salvage below has written what git would have
+    // written; `None` means the pack was whole.
+    let mut deferred_fatal: Option<String> = None;
+    let outcome = match write_pack(options.iteration_mode) {
         Ok(outcome) => outcome,
         Err(e) => {
-            eprintln!("fatal: {}", pack_fatal(&e));
-            return Ok(ExitCode::from(128));
+            let message = pack_fatal(&e);
+            match write_pack(gix::odb::pack::data::input::Mode::Restore) {
+                Ok(outcome) => {
+                    deferred_fatal = Some(message);
+                    outcome
+                }
+                // Nothing was decodable at all — a bad signature, an empty stream.
+                Err(_) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         }
     };
 
@@ -373,14 +417,24 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     let has_errors = recover
         && declared_objects.is_some_and(|declared| outcome.index.num_objects < declared);
 
+    // The salvaged run still dies — git's does, once every object it decoded is out of
+    // the buffer and into the odb. Every exit below goes through this.
+    let finish = |code: ExitCode| match &deferred_fatal {
+        Some(message) => {
+            eprintln!("fatal: {message}");
+            ExitCode::from(128)
+        }
+        None => code,
+    };
+
     if dry_run {
-        return Ok(done(has_errors));
+        return Ok(finish(done(has_errors)));
     }
 
     // `to_bundle` is `None` only when nothing was written to disk, which for a
     // non-dry run means an empty pack — a valid input carrying zero objects.
     let Some(bundle) = outcome.to_bundle() else {
-        return Ok(done(has_errors));
+        return Ok(finish(done(has_errors)));
     };
     let bundle = match bundle {
         Ok(bundle) => bundle,
@@ -413,7 +467,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         }
-        return Ok(done(has_errors));
+        return Ok(finish(done(has_errors)));
     }
 
     // Strict is git's deferred path. Blobs go out as they are decoded; every
@@ -487,7 +541,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    Ok(done(has_errors))
+    Ok(finish(done(has_errors)))
 }
 
 /// git's `cmd_unpack_objects()` ends in `return has_errors`, so a run that lost
@@ -671,6 +725,10 @@ fn classify_pack_error(err: &(dyn std::error::Error + 'static)) -> Option<String
         return match e {
             InputError::Io(e) => classify_pack_error(e),
             InputError::PackParse(e) => classify_pack_error(e),
+            // `if (!hasheq(fill(the_hash_algo->rawsz), oid.hash, …)) die("final sha1 did
+            // not match");` (builtin/unpack-objects.c:684-686) — the trailer check, which
+            // git makes after every object is already in the odb.
+            InputError::Verify(_) => Some("final sha1 did not match".to_string()),
             _ => None,
         };
     }

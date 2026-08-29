@@ -231,7 +231,19 @@ fn fetch_fsck_objects_rejects_a_broken_object_and_stores_nothing() {
             "{key}"
         );
         assert_eq!(fx.ok(&dst, &["for-each-ref"]), "", "{key}: no ref may be stored");
-        assert!(!dst.join(".git/FETCH_HEAD").exists(), "{key}: no FETCH_HEAD either");
+        // FETCH_HEAD is TRUNCATED, not absent. git opens it before it knows
+        // whether the transfer will succeed (`builtin/fetch.c` opens the file
+        // ahead of `store_updated_refs`), so a fetch that dies in index-pack
+        // leaves a zero-byte file behind rather than no file. Measured against
+        // stock git 2.55.0 on this fixture: `.git/FETCH_HEAD` exists at 0
+        // bytes, `for-each-ref` is empty, and no `.pack` is installed.
+        let fetch_head = dst.join(".git/FETCH_HEAD");
+        assert!(fetch_head.is_file(), "{key}: FETCH_HEAD is opened up front");
+        assert_eq!(
+            std::fs::read(&fetch_head).unwrap(),
+            b"",
+            "{key}: nothing may be recorded in FETCH_HEAD"
+        );
         assert!(!has_pack(&dst), "{key}: index-pack dies before installing the pack");
     }
 }

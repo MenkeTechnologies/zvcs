@@ -63,14 +63,16 @@ impl Fixture {
         f
     }
 
-    /// The upstream path as it is recorded in FETCH_HEAD — canonical, which on
-    /// macOS means `/private/var/…` for a `/var/…` temporary directory.
+    /// The upstream path as it is recorded in FETCH_HEAD: the string `clone`
+    /// was handed, VERBATIM. git stores the url it was given — it does not
+    /// resolve symlinks — so on macOS, where `std::env::temp_dir()` returns a
+    /// `/var/folders/…` path that is a symlink to `/private/var/folders/…`,
+    /// `remote.origin.url`, FETCH_HEAD and the merge title all carry the
+    /// `/var/…` spelling. Canonicalising here asserted `/private/var/…` and
+    /// failed on every macOS runner while passing on Linux, where the two
+    /// spellings coincide.
     fn srv_url(&self) -> String {
-        self.srv
-            .canonicalize()
-            .unwrap_or_else(|_| self.srv.clone())
-            .display()
-            .to_string()
+        self.srv.display().to_string()
     }
 
     /// A local commit the upstream does not have, which makes the branch diverge.

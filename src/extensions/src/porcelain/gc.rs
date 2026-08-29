@@ -1341,7 +1341,7 @@ fn reverse_index_bytes(hash: gix::hash::Kind, offsets: &[u64], pack_id: &[u8]) -
 ///
 /// Confirmed against a git 2.55.0 cruft pack of two objects, whose 60 bytes are
 /// the 12-byte header, two timestamps, the pack checksum and its own.
-fn mtimes_bytes(hash: gix::hash::Kind, stamps: &[u32], pack_id: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn mtimes_bytes(hash: gix::hash::Kind, stamps: &[u32], pack_id: &[u8]) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(12 + stamps.len() * 4);
     bytes.extend_from_slice(b"MTME");
     bytes.extend_from_slice(&1u32.to_be_bytes());

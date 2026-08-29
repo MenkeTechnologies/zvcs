@@ -168,10 +168,18 @@
 //! # Deliberate gaps, so this doc claims no more than the code does
 //!
 //! ```text
-//!   * **`--cruft`** writes no `.mtimes`, there being no reader or writer for
-//!     that format in `gix-pack`. On any repository whose objects are all
-//!     reachable — every harness fixture — git writes no cruft pack either, so
-//!     this is only observable where unreachable objects exist.
+//!   * **`--cruft`** writes the cruft pack and its `.mtimes` sidecar, but dates
+//!     an object that came out of an existing *cruft* pack by that pack's file
+//!     mtime rather than by the stamp its `.mtimes` recorded — there is no
+//!     reader for that format here. `gc.recentObjectsHook`
+//!     (`load_gc_recent_objects()`, reachable.c:189-191) is not consulted under
+//!     `--cruft-expiration` either, so an object it would have called recent is
+//!     dated by its own mtime. `--combine-cruft-below-size` and
+//!     `--max-cruft-size` do not size or split the result: one cruft pack is
+//!     always written, and `--expire-to` writes no second one — with no
+//!     `--cruft-expiration` beside it the pack it would hold is empty and
+//!     `--non-empty` suppresses it anyway (`cmd_repack()`,
+//!     builtin/repack.c:510-544).
 //!   * **`--max-pack-size`** does not split the output; one pack is always
 //!     written. Its diagnostics *are* reproduced: a value below 1 MiB warns
 //!     `warning: minimum pack size limit is 1 MiB`, and `pack.packSizeLimit`
@@ -200,10 +208,9 @@
 //!     `OBJ_REF_DELTA`. `repack.packKeptObjects` is not: it tunes a kept-object
 //!     exclusion this writer does not perform. `repack.cruftWindow` /
 //!     `repack.cruftWindowMemory` / `repack.cruftDepth` / `repack.cruftThreads`
-//!     are not read *here* either, because `--cruft` writes no cruft pack in
-//!     this module — but they are not dead: git reaches a cruft pack through
-//!     `gc`, and [`super::gc`] does produce one and does tune its delta search
-//!     with all four. `repack.updateServerInfo` *is* honoured, since the closing
+//!     are not read here either: the cruft pack this module writes uses the same
+//!     delta search the main pack does. [`super::gc`] does tune its own cruft
+//!     pack with all four. `repack.updateServerInfo` *is* honoured, since the closing
 //!     `update-server-info` it gates is real; see [`execute`].
 //!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
 //!     of it depends on resolving and parsing the named blob;
@@ -224,12 +231,13 @@
 //! ```
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::hash::ObjectId;
+use gix::odb::pack;
 
 /// Stock git's `repack` usage block, byte-for-byte (2699 bytes, git 2.55.0),
 /// including the trailing blank line. Printed on `-h` (stdout) and after the
@@ -413,6 +421,10 @@ struct State {
     loosen_unreachable: bool,
     keep_unreachable: bool,
     cruft: bool,
+    /// `--cruft-expiration=<approxidate>`, kept as typed: its presence picks
+    /// `enumerate_and_traverse_cruft_objects()` over `enumerate_cruft_objects()`
+    /// (pack-objects.c:4349-4352), and its parsed value dates the cut.
+    cruft_expiration: Option<String>,
     /// git's tri-state `write_bitmaps`: `None` is "nobody said", which
     /// `repack.writeBitmaps` / `pack.writeBitmaps` then answer, and which
     /// finally falls back to "only when everything goes into one pack in a bare
@@ -778,6 +790,44 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     } else {
         Vec::new()
     };
+    // What `write_cruft_pack()` (repack-cruft.c:40-98) feeds `pack-objects
+    // --cruft`: every local pack, the kept ones as INCLUDE and the rest — the
+    // non-kept and the cruft packs alike — with a `-`. `read_cruft_objects()`
+    // (pack-objects.c:4300-4357) marks the INCLUDE ones kept-in-core, so
+    // `add_objects_in_unpacked_packs()` (:4501-4526) skips their objects and
+    // takes everything else, and `add_unreachable_loose_objects()` (:4564-4568)
+    // adds every loose object on top. `want_found_object()` then drops whatever
+    // a kept pack — which by then includes the packs this run just wrote — also
+    // holds.
+    //
+    // The stamp is the `.pack`'s mtime, which is what `add_recent_packed()` uses
+    // for an object in an ordinary pack. An object that came out of an *existing
+    // cruft* pack should carry the mtime that pack's `.mtimes` recorded for it
+    // rather than the file's; that sidecar has no reader here, so it is dated by
+    // its pack like any other.
+    let (cruft_candidates, cruft_kept): (Vec<(ObjectId, u32)>, HashSet<ObjectId>) = match st.cruft {
+        false => (Vec::new(), HashSet::new()),
+        true => {
+            let mut candidates = Vec::new();
+            let mut kept = HashSet::new();
+            for file in &existing {
+                // `ODB_FOR_EACH_OBJECT_LOCAL_ONLY`: a borrowed pack is not this
+                // repository's to repack.
+                if file.path().parent() != Some(pack_dir.as_path()) {
+                    continue;
+                }
+                if !droppable(st, file.path()) {
+                    kept.extend(file.iter().map(|e| e.oid));
+                    continue;
+                }
+                let stamp = super::prune::mtime_of(&file.path().with_extension("pack"))
+                    .unwrap_or(0)
+                    .clamp(0, i64::from(u32::MAX)) as u32;
+                candidates.extend(file.iter().map(|e| (e.oid, stamp)));
+            }
+            (candidates, kept)
+        }
+    };
     drop(existing);
 
     fs::create_dir_all(&pack_dir)?;
@@ -866,6 +916,94 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // wrote, so a main pack-objects that found nothing left to do is silent.
     if new_packs.is_empty() && !st.quiet {
         println!("Nothing new to pack.");
+    }
+
+    // ```c
+    // if (pack_everything & PACK_CRUFT) {
+    //         [...]
+    //         ret = write_cruft_pack(&opts, cruft_expiration,
+    //                                combine_cruft_below_size, &names,
+    //                                &existing);
+    // ```
+    //
+    // (`cmd_repack()`, builtin/repack.c:480-506.) It runs after the main
+    // `pack-objects` and before the filtered pack, so `names` — the set whose
+    // objects are already delivered — is the main pack plus the promisor one.
+    // What is left over is by construction what the traversal did not reach.
+    if st.cruft {
+        let mut stamps: HashMap<ObjectId, u32> = HashMap::new();
+        for (id, stamp) in cruft_candidates {
+            if in_new_pack.contains(&id) || cruft_kept.contains(&id) {
+                continue;
+            }
+            // Two packs holding one object date it by the newer of them, which
+            // is the copy `add_object_in_unpacked_pack()` reaches last.
+            let slot = stamps.entry(id).or_insert(stamp);
+            *slot = (*slot).max(stamp);
+        }
+        for id in super::prune::all_object_ids(&repo, &objdir) {
+            if in_new_pack.contains(&id) || cruft_kept.contains(&id) {
+                continue;
+            }
+            let stamp = super::prune::mtime_of(&loose_path(&objdir, &id))
+                .unwrap_or(0)
+                .clamp(0, i64::from(u32::MAX)) as u32;
+            // A loose copy is the fresher one by definition: `add_loose_object()`
+            // stamps it with its own `st_mtime` whatever a pack said.
+            stamps.insert(id, stamp);
+        }
+        // ```c
+        // if (cruft_expiration)
+        //         enumerate_and_traverse_cruft_objects(&fresh_packs);
+        // else
+        //         enumerate_cruft_objects();
+        // ```
+        //
+        // (`read_cruft_objects()`, pack-objects.c:4349-4352.) With a date, only
+        // the objects *newer* than it are tips (`obj_is_recent()`,
+        // reachable.c:183-192, a strict `>`), and the pack is their closure:
+        // an older object still goes in when something recent reaches it, since
+        // dropping it would break the recent object. `show_cruft_object()`
+        // (pack-objects.c:4188-4201) stamps one reached that way with the
+        // expiration itself rather than its real mtime, so it is still "too old"
+        // on the next run with the same date.
+        //
+        // `load_gc_recent_objects()`'s `gc.recentObjectsHook` (reachable.c:189-191)
+        // has no reader here, so an object it would have rescued is dated by its
+        // own mtime like any other.
+        if let Some(spec) = st.cruft_expiration.as_deref() {
+            let expire = crate::date::parse_expiry_date(spec).unwrap_or(0);
+            let expire = expire.clamp(0, i64::from(u32::MAX)) as u32;
+            let tips: Vec<ObjectId> = stamps
+                .iter()
+                .filter(|(_, mtime)| **mtime > expire)
+                .map(|(id, _)| *id)
+                .collect();
+            // `cruft_include_check()` (pack-objects.c:4208-4216): the walk stops
+            // at anything a kept pack holds, which by now includes the packs this
+            // run wrote.
+            let mut delivered: HashSet<ObjectId> = in_new_pack.clone();
+            delivered.extend(cruft_kept.iter().copied());
+            let reached = super::prune::close_over_excluding(&repo, tips, &delivered);
+            stamps = reached
+                .into_iter()
+                .map(|id| {
+                    let mtime = stamps.get(&id).copied().filter(|m| *m > expire).unwrap_or(expire);
+                    (id, mtime)
+                })
+                .collect();
+        }
+
+        let mut cruft: Vec<ObjectId> = stamps.keys().copied().collect();
+        cruft.sort();
+        // `--non-empty`: with nothing left over there is no cruft pack, which is
+        // the ordinary case for a repository whose objects are all reachable.
+        if !cruft.is_empty() {
+            let path = write_pack(&repo, st, &cruft, &packtmp, write_rev, progress, false)?;
+            let hash = pack_hash(&pack_base_name(&path));
+            write_mtimes(&repo, &path, &suffixed(&packtmp, &format!("-{hash}.mtimes")), &stamps)?;
+            new_packs.push((hash, cruft.len()));
+        }
     }
 
     // With `--filter` git writes a second pack holding the filtered-out objects.
@@ -1159,6 +1297,32 @@ fn write_pack(
         }
     }
     Ok(index_path)
+}
+
+/// The loose path an object id would live at, `objects/ab/cdef…`.
+fn loose_path(objdir: &Path, id: &ObjectId) -> PathBuf {
+    let hex = id.to_string();
+    objdir.join(&hex[..2]).join(&hex[2..])
+}
+
+/// The `.mtimes` sidecar for a pack just written: one 32-bit stamp per object,
+/// in the `.idx`'s order, which is object-id order.
+///
+/// `write_promisor_file()`'s neighbour in `finish_pack_objects_cmd()`: git has
+/// `pack-objects --cruft` write it, this port writes it beside the pack the same
+/// way it writes the `.idx` and `.rev`.
+fn write_mtimes(
+    repo: &gix::Repository,
+    index_path: &Path,
+    to: &Path,
+    stamps: &HashMap<ObjectId, u32>,
+) -> Result<()> {
+    let hash = repo.object_hash();
+    let index = pack::index::File::at(index_path, hash)
+        .with_context(|| format!("read back {}", index_path.display()))?;
+    let ordered: Vec<u32> =
+        index.iter().map(|e| stamps.get(&e.oid).copied().unwrap_or(0)).collect();
+    install(to, &super::gc::mtimes_bytes(hash, &ordered, index.pack_checksum().as_slice())?)
 }
 
 /// Put one pack artifact in place, `0444` and by rename, as git installs them.
@@ -1794,6 +1958,7 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
             st.cruft = on;
             st.all_into_one |= on;
         }
+        "cruft-expiration" => st.cruft_expiration = value.filter(|_| on).map(str::to_string),
         // Forwarded verbatim to `pack-objects`, where it shadows
         // `pack.packSizeLimit` and drives the 1 MiB floor warning.
         "max-pack-size" => {

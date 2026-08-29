@@ -1231,7 +1231,7 @@ fn worktree_prune_condition(repo: &gix::Repository) -> bool {
         if limit == 0 {
             break;
         }
-        if super::gc::should_prune_worktree(&entry.path(), expire) {
+        if super::worktree::is_prunable(&entry.path(), expire.max(0) as u64) {
             limit -= 1;
         }
     }

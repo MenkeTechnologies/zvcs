@@ -1019,7 +1019,9 @@ enum PruneCheck {
 /// Port of `prune_worktrees()`: prune each stale administrative directory, then
 /// `prune_dups()` over the survivors plus the main worktree, then drop an empty
 /// `worktrees/` directory.
-fn prune_worktrees(repo: &gix::Repository, show_only: bool, verbose: bool, expire: u64) {
+///
+/// Shared with `gc`, which runs `git worktree prune --expire <gc.worktreePruneExpire>`.
+pub(super) fn prune_worktrees(repo: &gix::Repository, show_only: bool, verbose: bool, expire: u64) {
     let common = repo.common_dir();
     let wt_dir = common.join("worktrees");
 
@@ -1050,6 +1052,12 @@ fn prune_worktrees(repo: &gix::Repository, show_only: bool, verbose: bool, expir
     if !show_only {
         let _ = std::fs::remove_dir(&wt_dir); // rmdir; ignore failure, as git does
     }
+}
+
+/// Whether `should_prune_worktree()` would prune this administrative directory — the
+/// question `gc`'s and `maintenance`'s auto-conditions ask without doing the pruning.
+pub(super) fn is_prunable(admin: &Path, expire: u64) -> bool {
+    matches!(should_prune(admin, expire), PruneCheck::Prune(_))
 }
 
 /// Port of `should_prune_worktree()` (worktree.c). Reason strings are verbatim.

@@ -279,16 +279,6 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
              prune_shallow(), and there is no shallow-file writer in the vendored crates"
         );
     }
-    if fs::read_dir(repo.common_dir().join("worktrees"))
-        .map(|mut d| d.next().is_some())
-        .unwrap_or(false)
-    {
-        bail!(
-            "prune with linked worktrees is not supported: git additionally seeds reachability \
-             from every other worktree's HEAD and index, which this port does not read"
-        );
-    }
-
     // Command-line `<head>`s are resolved before any reachability work — and
     // before anything is unlinked — so an unusable one fails exactly where
     // git's `die()` does, leaving the object store untouched.
@@ -769,7 +759,68 @@ pub(super) fn collect_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) -
     }
 
     collect_reflog_roots(repo, roots);
+    collect_other_worktree_roots(repo, roots);
     Ok(())
+}
+
+/// ```c
+/// other_head_refs(add_one_ref, revs);
+/// [...]
+/// if (add_index_objects) {
+///         struct worktree **worktrees = get_worktrees(), **p;
+///
+///         for (p = worktrees; *p; p++) {
+///                 struct worktree *wt = *p;
+///                 [...]
+///                 read_index_from(&istate, worktree_git_path(the_repository, wt, "index"),
+///                                 get_worktree_git_dir(wt));
+///                 do_add_index_objects_to_pending(revs, &istate, flags);
+///         }
+/// }
+/// ```
+///
+/// (`mark_reachable_objects()`, reachable.c.) A linked worktree keeps its own `HEAD` and its
+/// own index, and neither is reachable from the common ref store: a detached worktree HEAD
+/// and anything staged there would otherwise be pruned out from under it.
+fn collect_other_worktree_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) {
+    let Ok(entries) = fs::read_dir(repo.common_dir().join("worktrees")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let admin = entry.path();
+        // The worktree this command is running in has already contributed both.
+        if admin == repo.git_dir() {
+            continue;
+        }
+        if let Ok(text) = fs::read_to_string(admin.join("HEAD")) {
+            let text = text.trim();
+            // A symbolic HEAD names a ref of the common store, which the loop above already
+            // collected; only a detached one names an object nothing else does.
+            if !text.starts_with("ref:") {
+                if let Ok(id) = ObjectId::from_hex(text.as_bytes()) {
+                    roots.push(id);
+                }
+            }
+        }
+        let index = admin.join("index");
+        let Ok(index) = gix::index::File::at(
+            &index,
+            repo.object_hash(),
+            false,
+            gix::index::decode::Options::default(),
+        ) else {
+            continue;
+        };
+        for entry in index.entries() {
+            if entry.mode == gix::index::entry::Mode::COMMIT {
+                continue;
+            }
+            roots.push(entry.id);
+        }
+        if let Some(tree) = index.tree() {
+            push_cache_tree(tree, roots);
+        }
+    }
 }
 
 /// Add every valid cache-tree id, recursively. A section with no entry count is

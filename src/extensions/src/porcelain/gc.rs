@@ -1747,10 +1747,34 @@ pub(super) fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
     let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let cfg = load_reflog_config(repo, now_secs);
 
-    let logs_dir = repo.common_dir().join("logs");
+    // ```c
+    // worktrees = get_worktrees();
+    // for (p = worktrees; *p; p++) {
+    //         if (!all_worktrees && !(*p)->is_current)
+    //                 continue;
+    //         refs_for_each_reflog(get_worktree_ref_store(*p), collect_reflog, &collected);
+    // }
+    // ```
+    //
+    // (`cmd_reflog_expire()`, builtin/reflog.c.) `--all` reaches every worktree's ref
+    // store, and a linked worktree keeps its own `logs/HEAD` under its admin directory —
+    // which is not below the common `logs/` this used to be the whole of.
+    let mut dirs: Vec<PathBuf> = vec![repo.common_dir().join("logs")];
+    if let Ok(entries) = std::fs::read_dir(repo.common_dir().join("worktrees")) {
+        for entry in entries.flatten() {
+            dirs.push(entry.path().join("logs"));
+        }
+    }
+    dirs.push(repo.git_dir().join("logs"));
+    dirs.sort();
+    dirs.dedup();
+
     let mut files: Vec<(String, PathBuf)> = Vec::new();
-    collect_reflog_files(&logs_dir, &logs_dir, &mut files);
+    for dir in &dirs {
+        collect_reflog_files(dir, dir, &mut files);
+    }
     files.sort();
+    files.dedup();
 
     // The `UE_HEAD` closure (all ref tips) is identical across reflogs, so it is
     // computed at most once.
@@ -2044,58 +2068,13 @@ pub(super) fn prune_worktrees(repo: &gix::Repository) -> Result<()> {
         None => default_expire,
     };
 
-    let dir = repo.common_dir().join("worktrees");
-    let Ok(read) = std::fs::read_dir(&dir) else {
-        return Ok(());
-    };
-    let mut any_left = false;
-    for entry in read.flatten() {
-        let admin = entry.path();
-        if should_prune_worktree(&admin, expire) {
-            let _ = std::fs::remove_dir_all(&admin);
-        } else {
-            any_left = true;
-        }
-    }
-    // `delete_worktrees_dir_if_empty()`: drop the container once nothing is left.
-    if !any_left {
-        let _ = std::fs::remove_dir(&dir);
-    }
+    // git's gc runs `git worktree prune --expire <gc.worktreePruneExpire>` as a child
+    // (builtin/gc.c), so this calls the same `prune_worktrees()` the subcommand does rather
+    // than a second, thinner copy of `should_prune_worktree()` — the copy here read a
+    // relative `gitdir` recording as a path from the current directory, which reports a
+    // healthy `worktree add --relative-paths` checkout as prunable and deletes it.
+    super::worktree::prune_worktrees(repo, false, false, expire.max(0) as u64);
     Ok(())
-}
-
-/// `should_prune_worktree()`: a worktree is prunable when its administrative
-/// directory is invalid, its `gitdir` file is missing/empty, or the checkout it
-/// names is gone *and* the administrative `index` has aged past `expire`. A
-/// locked worktree is never pruned.
-pub(super) fn should_prune_worktree(admin: &Path, expire: i64) -> bool {
-    if !admin.is_dir() {
-        return true;
-    }
-    if admin.join("locked").exists() {
-        return false;
-    }
-    let Ok(raw) = std::fs::read(admin.join("gitdir")) else {
-        return true;
-    };
-    let mut end = raw.len();
-    while end > 0 && (raw[end - 1] == b'\n' || raw[end - 1] == b'\r') {
-        end -= 1;
-    }
-    let trimmed = &raw[..end];
-    if trimmed.is_empty() {
-        return true;
-    }
-    let target = PathBuf::from(String::from_utf8_lossy(trimmed).into_owned());
-    if target.exists() {
-        return false;
-    }
-    // Gone: prune only once the administrative `index` has aged past `expire`
-    // (or cannot be stat'ed), matching git's `stat()`-failure branch.
-    match super::prune::mtime_of(&admin.join("index")) {
-        Some(mtime) => mtime <= expire,
-        None => true,
-    }
 }
 
 /// git's size parser for `--max-cruft-size`: `OPT_UNSIGNED` over a `size_t`, so

@@ -41,7 +41,7 @@ pub(crate) enum DateType {
 }
 
 /// `struct date_mode`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DateMode {
     pub(crate) kind: DateType,
     /// The `-local` suffix: ignore the recorded zone, use the process's own.

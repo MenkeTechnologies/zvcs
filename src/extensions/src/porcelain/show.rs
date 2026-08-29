@@ -2518,12 +2518,12 @@ fn show_tag(
             match pretty {
                 Pretty::Medium => {
                     let t = tagger.time()?;
-                    let date = super::log::fmt_time(t.seconds, t.offset, disp.date_mode, now);
+                    let date = super::log::fmt_time(t.seconds, t.offset, disp.date_mode.clone(), now);
                     writeln!(out, "Date:   {date}")?;
                 }
                 Pretty::Fuller => {
                     let t = tagger.time()?;
-                    let date = super::log::fmt_time(t.seconds, t.offset, disp.date_mode, now);
+                    let date = super::log::fmt_time(t.seconds, t.offset, disp.date_mode.clone(), now);
                     writeln!(out, "TaggerDate: {date}")?;
                 }
                 _ => {}
@@ -2778,7 +2778,7 @@ fn show_commit_record(
         pretty,
         &super::log::ShowEntry {
             abbrev_commit: disp.abbrev_commit,
-            date_mode: disp.date_mode,
+            date_mode: disp.date_mode.clone(),
             decorate: disp.decorate,
             decorations: disp.decorations,
             mailmap: disp.mailmap,

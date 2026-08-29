@@ -2514,11 +2514,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // Append the tips of the ref-selecting pseudo-options that stood at argument
     // index `at`. Each yields its refs in refname order — the ref iterator's own
     // order, which is what breaks a commit-date tie between two of them.
+    // `get_reference()`'s `die()` cannot unwind out of the closure below, so the offending name is
+    // carried out and reported by the caller.
     let mut push_ref_tips = |at: usize,
                              tips: &mut Vec<ObjectId>,
                              tip_names: &mut Vec<String>,
                              tip_sources: &mut Vec<String>,
-                             neg_ids: &mut Vec<ObjectId>| {
+                             neg_ids: &mut Vec<ObjectId>,
+                             bad_object: &mut Option<String>| {
         for sel in ref_selections.iter().filter(|s| s.at == at) {
             // `handle_one_ref()` names each pending object by the name the
             // iterator handed it: trimmed for `--branches`/`--tags`/`--remotes`,
@@ -2547,12 +2550,28 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 let Ok(reference) = repo.find_reference(full.as_str()) else {
                     continue;
                 };
-                let Ok(id) = reference.into_fully_peeled_id() else {
-                    continue;
+                // A *direct* ref whose object is absent cannot be peeled, and that is the `bad
+                // object` case below rather than a ref to skip; a dangling *symbolic* ref is
+                // dropped by `do_for_each_ref()` before `handle_one_ref()` ever sees it.
+                let recorded = reference.target().try_id().map(ToOwned::to_owned);
+                let oid = match reference.into_fully_peeled_id() {
+                    Ok(id) => id.detach(),
+                    Err(_) => match recorded {
+                        Some(id) => id,
+                        None => continue,
+                    },
                 };
-                let oid = id.detach();
+                // `handle_one_ref()` pends through `get_reference()`, whose `die(_("bad object
+                // %s"), name)` fires when the object is not in the repository — with the *name the
+                // iterator handed it*, so `--all` reports `refs/heads/dangling` and `--branches`
+                // reports `dangling`. Skipping such a ref instead logged the healthy history and
+                // reported success, hiding a corrupt repository.
+                let Ok(object) = repo.find_object(oid) else {
+                    *bad_object = Some(name.to_string());
+                    return;
+                };
                 // A tag pointing at a tree or blob is not a history tip.
-                if !repo.find_object(oid).is_ok_and(|o| o.kind == gix::objs::Kind::Commit) {
+                if object.kind != gix::objs::Kind::Commit {
                     continue;
                 }
                 pend(oid, name, tips, tip_names, tip_sources, neg_ids);
@@ -2594,7 +2613,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut in_paths = false;
     let mut specs = pos_specs.iter().peekable();
     for at in 0..=revs.len() {
-        push_ref_tips(at, &mut tips, &mut tip_names, &mut tip_sources, &mut neg_ids);
+        let mut bad_object: Option<String> = None;
+        push_ref_tips(at, &mut tips, &mut tip_names, &mut tip_sources, &mut neg_ids, &mut bad_object);
+        if let Some(name) = bad_object.take() {
+            eprintln!("fatal: bad object {name}");
+            return Ok(ExitCode::from(128));
+        }
         // `handle_dotdot()` is the first thing `handle_revision_arg_1()` tries, so a
         // range whose endpoints resolve as names but not as usable objects dies here
         // — before this token is read as a tip and long before the walk finds out.
@@ -5360,7 +5384,7 @@ fn entry_block_from(
     let ctx = RenderCtx {
         abbrev_commit: p.abbrev_commit,
         abbrev,
-        date_mode: p.date_mode,
+        date_mode: p.date_mode.clone(),
         extra,
         want_color: p.want_color,
         colors: p.colors,
@@ -7551,7 +7575,7 @@ fn expand_one(
     pad: &mut PadState,
     wrap: &mut WrapState,
 ) -> Result<bool> {
-    let date_mode = ctx.date_mode;
+    let date_mode = ctx.date_mode.clone();
     // `%(trailers[:<options>])` — the one parenthesised placeholder that is not
     // a colour request. `format_trailers_from_commit()` renders the message's
     // trailer block; an unparsable option list makes git print the placeholder
@@ -8948,13 +8972,13 @@ pub(crate) fn rev_list_pretty_body(
                     writeln!(
                         out,
                         "AuthorDate: {}",
-                        fmt_time(at.seconds, at.offset, ctx.date_mode, ctx.now)
+                        fmt_time(at.seconds, at.offset, ctx.date_mode.clone(), ctx.now)
                     )?;
                     write_person(&mut out, b"Commit:     ", &committer, None);
                     writeln!(
                         out,
                         "CommitDate: {}",
-                        fmt_time(ct.seconds, ct.offset, ctx.date_mode, ctx.now)
+                        fmt_time(ct.seconds, ct.offset, ctx.date_mode.clone(), ctx.now)
                     )?;
                 }
                 Pretty::Full => {
@@ -9078,7 +9102,7 @@ impl<'r> EntryRenderer<'r> {
             abbrev_commit: opts.abbrev_commit,
             abbrev: &self.abbrev,
             show_signature: opts.show_signature,
-            date_mode: opts.date_mode,
+            date_mode: opts.date_mode.clone(),
             // No `--parents`/`--children` in `cmd_show`; the one thing that can
             // stand in this slot is `show_log()`'s ` (from <oid>)` insert, printed
             // at the abbreviation width the header itself uses (log-tree.c:824-826).
@@ -9332,7 +9356,7 @@ fn render_entry(
         }
         Pretty::Reference => {
             // `%h (%s, %ad)` with `--date=short` unless `--date=` overrode it.
-            let date_mode = match ctx.date_mode {
+            let date_mode = match ctx.date_mode.clone() {
                 DateMode::Default => DateMode::Short,
                 other => other,
             };
@@ -9477,13 +9501,13 @@ fn render_entry(
                     writeln!(
                         out,
                         "AuthorDate: {}",
-                        fmt_time(at.seconds, at.offset, ctx.date_mode, ctx.now)
+                        fmt_time(at.seconds, at.offset, ctx.date_mode.clone(), ctx.now)
                     )?;
                     write_person(out, b"Commit:     ", &committer, ctx.mailmap);
                     writeln!(
                         out,
                         "CommitDate: {}",
-                        fmt_time(ct.seconds, ct.offset, ctx.date_mode, ctx.now)
+                        fmt_time(ct.seconds, ct.offset, ctx.date_mode.clone(), ctx.now)
                     )?;
                 }
                 Pretty::Full => {
@@ -9499,7 +9523,7 @@ fn render_entry(
                         writeln!(
                             out,
                             "Date:   {}",
-                            fmt_time(time.seconds, time.offset, ctx.date_mode, ctx.now)
+                            fmt_time(time.seconds, time.offset, ctx.date_mode.clone(), ctx.now)
                         )?;
                     }
                 }
@@ -9564,7 +9588,7 @@ fn write_reflog_selector(
     ctx: &RenderCtx<'_>,
     shorten: bool,
 ) {
-    let sel = entry.selector(ctx.repo, shorten, ctx.date_mode, ctx.date_explicit, ctx.now);
+    let sel = entry.selector(ctx.repo, shorten, ctx.date_mode.clone(), ctx.date_explicit, ctx.now);
     out.extend_from_slice(sel.as_bytes());
 }
 
@@ -12148,7 +12172,7 @@ impl Graph {
 /// The `--date=` output modes this port renders byte-for-byte, plus `relative`,
 /// which is measured against the current wall clock. The remaining process-time /
 /// zone-dependent modes (`human`, `local`) are still rejected rather than faked.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum DateMode {
     /// git's `DATE_NORMAL`: `Www Mmm D HH:MM:SS YYYY +ZZZZ`.
     Default,
@@ -12166,6 +12190,14 @@ pub(crate) enum DateMode {
     Raw,
     /// `relative`: `N <unit> ago`, measured against the current time.
     Relative,
+    /// A mode this file does not render itself — `human`, `format:<strftime>`,
+    /// `format-local:<strftime>` and every `-local` spelling — carried as `show_date()`'s own
+    /// mode and rendered by [`crate::showdate`], which is the full port of `date.c`.
+    ///
+    /// One renderer rather than a second copy of the calendar: `format:` has to reach the
+    /// platform `strftime(3)` git calls, and `-local`/`human` read the process's zone through
+    /// `localtime_r()`, neither of which this file's arithmetic can stand in for.
+    Show(crate::showdate::DateMode),
 }
 
 /// `--color=<when>` (and `--color`/`--no-color`): whether `%C`/`%d` emit ANSI.
@@ -12189,7 +12221,10 @@ pub(crate) fn parse_date_mode(spec: &str) -> Option<DateMode> {
         "unix" => DateMode::Unix,
         "raw" => DateMode::Raw,
         "relative" => DateMode::Relative,
-        _ => return None,
+        // Everything else `parse_date_format()` accepts: `human`, `format:<strftime>`, and the
+        // `-local` variant of any mode. An unknown spelling still comes back `None`, which is the
+        // caller's `unknown date format <s>`.
+        other => DateMode::Show(crate::showdate::parse_date_format(other).ok()?),
     })
 }
 
@@ -12212,6 +12247,13 @@ pub(crate) fn show_date_rfc2822(seconds: i64, offset: i32) -> String {
 /// Format a timestamp in the requested [`DateMode`], matching git byte-for-byte.
 fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {
     match mode {
+        // `show_date()` itself, for the modes whose rendering needs libc.
+        DateMode::Show(ref m) => {
+            // git's `tz` is the `[-+]HHMM` integer off the object header; this file carries the
+            // offset in seconds, so it is converted back on the way in.
+            let tz = (offset / 3600) * 100 + (offset % 3600) / 60;
+            crate::showdate::show_date(seconds, tz, m, now_secs())
+        }
         DateMode::Default => format_git_date(seconds, offset),
         // Relative dates need the current time; callers route them through
         // `fmt_time`, but keep this arm self-contained rather than unreachable.

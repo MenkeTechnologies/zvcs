@@ -1107,6 +1107,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
     // ```c
+    // if (force_author && renew_authorship)
+    //         die(_("options '%s' and '%s' cannot be used together"), "--reset-author", "--author");
+    // ```
+    //
+    // (builtin/commit.c:1322-1323.) It comes first because `--author` has already been
+    // through `find_author_by_nickname()` by this point.
+    if author_arg.is_some() && reset_author {
+        crate::git_fatal!("options '--reset-author' and '--author' cannot be used together");
+    }
+    // ```c
     // die_for_incompatible_opt4(!!use_message, "-C", !!edit_message, "-c",
     //                           !!logfile, "-F", !!fixup_message, "--fixup");
     // die_for_incompatible_opt4(have_option_m, "-m", !!edit_message, "-c",
@@ -1322,6 +1332,28 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if amend && whence != Whence::Commit {
         crate::git_fatal!("You are in the middle of a {} -- cannot amend.", whence.noun());
     }
+
+    // ```c
+    // if (amend && !use_message && !fixup_message)
+    //         use_message = "HEAD";
+    // if (!use_message && !is_from_cherry_pick(whence) &&
+    //     !is_from_rebase(whence) && renew_authorship)
+    //         die(_("--reset-author can be used only with -C, -c or --amend."));
+    // ```
+    //
+    // (builtin/commit.c:1353-1357.) There has to be an authorship to reset: `-C`/`-c`
+    // name one, `--amend` reuses HEAD's, and a stopped cherry-pick or rebase carries the
+    // picked commit's. Note the trailing full stop, which the surrounding `die()`s do not
+    // have.
+    if reset_author
+        && reuse_arg.is_none()
+        && !(amend && fixup_arg.is_none())
+        && !whence.is_cherry_pick()
+        && !whence.is_rebase()
+    {
+        crate::git_fatal!("--reset-author can be used only with -C, -c or --amend.");
+    }
+
     // `prepare_index()`: a pathspec-limited commit builds a tree that ignores the
     // rest of the index, which would silently drop the operation's other paths.
     if only_mode && whence != Whence::Commit {
@@ -1414,9 +1446,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut from_flags = !messages.is_empty();
     let mut message = messages.join("\n\n");
     if from_flags {
-        if message.trim().is_empty() && !allow_empty_message {
-            crate::git_fatal!("empty commit message (use --allow-empty-message to override)");
-        }
+        // An empty `-m` is *not* refused here. git has one empty-message check and it is
+        // `message_is_empty(&sb, cleanup_mode)` at the end of `prepare_to_commit()`
+        // (builtin/commit.c:1906-1909) — by which point `prepare_index()` has already
+        // built and written the tree, which is why `git commit -m ''` leaves a tree
+        // object behind that this port's early refusal never created.
+        //
         // Match git's on-disk message, which is newline-terminated.
         if !message.ends_with('\n') {
             message.push('\n');
@@ -1424,14 +1459,35 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // `-C`/`-c <commit>`: resolve the commit whose message and author are reused.
+    // ```c
+    // commit = lookup_commit_reference_by_name(name);
+    // if (!commit)
+    //         die(_("could not lookup commit '%s'"), name);
+    // ```
+    //
+    // (`read_commit_message()`, builtin/commit.c.) An object that is not a commit has
+    // already been reported by `object_as_type()`'s `error: object %s is a %s, not a %s`,
+    // so the death is the *second* line of two.
     let reuse_commit = match &reuse_arg {
-        Some(spec) => Some(
-            repo.find_commit(
-                repo.rev_parse_single(spec.as_str())
-                    .map_err(|e| anyhow::anyhow!("could not resolve `{spec}`: {e}"))?
-                    .detach(),
-            )?,
-        ),
+        Some(spec) => {
+            let resolved = repo
+                .rev_parse_single(spec.as_str())
+                .ok()
+                .and_then(|id| repo.find_object(id).ok());
+            match resolved {
+                Some(object) if object.kind == gix::object::Kind::Commit => {
+                    Some(object.into_commit())
+                }
+                Some(object) => {
+                    eprintln!(
+                        "error: object {} is a {}, not a commit",
+                        object.id, object.kind
+                    );
+                    crate::git_fatal!("could not lookup commit '{spec}'");
+                }
+                None => crate::git_fatal!("could not lookup commit '{spec}'"),
+            }
+        }
         None => None,
     };
     // `-C` (unlike `-c`) supplies the message directly, with no editor.
@@ -1896,8 +1952,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     } else if let Some(m) = &merge_msg_seed {
         m.clone()
     } else if let Some(path) = &template_file {
-        std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("could not read commit template '{}': {e}", path.display()))?
+        // `if (strbuf_read_file(&sb, template_file, 0) < 0) die_errno(_("could not read
+        // '%s'"), template_file);` (builtin/commit.c:883-885) — `die_errno`, so the
+        // strerror text follows with no ` (os error N)` tail.
+        match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => crate::git_fatal!(
+                "could not read '{}': {}",
+                path.display(),
+                crate::external::strerror(&e)
+            ),
+        }
     } else {
         String::new()
     };
@@ -2106,9 +2171,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         }
     }
     if message.trim().is_empty() && !allow_empty_message {
-        if from_flags {
-            crate::git_fatal!("empty commit message (use --allow-empty-message to override)");
-        }
         // Not a `die()`: `commit.c:1906-1909` writes this with `fprintf(stderr,
         // …)` and calls `exit(1)`, so it carries no `fatal:` prefix and exits 1,
         // exactly like the untouched-template abort a few lines above. Reachable
@@ -2217,10 +2279,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             deref: true,
         })?;
         new.attach(&repo)
-    } else if signer.is_some() || reflog_override.is_some() {
+    } else if signer.is_some() || reflog_override.is_some() || commit_encoding(&repo).is_some() {
         // A signed commit needs the `gpgsig` header, which `Repository::commit`
-        // cannot carry, and a sequencer commit needs its own reflog wording; both
-        // write the object here and advance `HEAD` themselves, otherwise with
+        // cannot carry — and neither can it carry the `encoding` header
+        // `i18n.commitEncoding` asks for. A sequencer commit needs its own reflog
+        // wording; all three write the object here and advance `HEAD` themselves, otherwise with
         // gix's `commit`/`commit (initial)`/`commit (merge)` line — the same
         // wording and the same first-parent safety check the fast path uses.
         let committer = committer_owned()?;
@@ -2384,8 +2447,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // a reused message (`-C`/`-c`), an amend, the commit a pick is replaying, or
     // `--date`. It is *not* inferred from the two dates differing, so a pick whose
     // author second happens to equal the committer's still prints the line.
+    //
+    // `use_message` is what sets `author_message`, and `--amend` only defaults it to
+    // `"HEAD"` when there is no `--fixup`: `if (amend && !use_message && !fixup_message)
+    // use_message = "HEAD";` (builtin/commit.c:1353-1354). So `git commit --amend
+    // --fixup=<c>` prints no ` Date:` line where a plain `--amend` does.
     let author_date_is_interesting = date_override.is_some()
-        || (!reset_author && (reuse_commit.is_some() || amend || cherry_author.is_some()));
+        || (!reset_author
+            && (reuse_commit.is_some()
+                || (amend && fixup_arg.is_none())
+                || cherry_author.is_some()));
     if author_date_is_interesting {
         let a_time = author.time()?;
         let dt = a_time
@@ -3238,6 +3309,28 @@ fn resolve_cleanup(
 /// `gpgsig` first among the extra headers — the slot git writes it in. What the
 /// signature looks like is the backend's business: armored PGP for
 /// `openpgp`/`x509`, an `SSH SIGNATURE` block for `ssh`.
+/// The `encoding` header `commit_tree_extended()` writes: present only when
+/// `i18n.commitEncoding` names something other than UTF-8.
+///
+/// ```c
+/// /* Not having i18n.commitencoding is the same as having utf-8 */
+/// encoding_is_utf8 = is_encoding_utf8(git_commit_encoding);
+/// ```
+///
+/// (commit.c:1702-1703.) `is_encoding_utf8()` compares through
+/// `same_utf_encoding()`, which strips the `utf` prefix and an optional `-` from
+/// both sides before a case-insensitive compare — so `utf8`, `UTF-8` and `Utf-8`
+/// all mean the default and write no header.
+pub(super) fn commit_encoding(repo: &gix::Repository) -> Option<gix::bstr::BString> {
+    repo.config_snapshot()
+        .string("i18n.commitEncoding")
+        .and_then(|v| {
+            let name = v.to_str_lossy();
+            let utf8 = name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8");
+            (!utf8).then_some(v)
+        })
+}
+
 pub(crate) fn write_commit_object(
     repo: &gix::Repository,
     committer: &gix::actor::Signature,
@@ -3255,7 +3348,10 @@ pub(crate) fn write_commit_object(
         parents: parents.into(),
         author: author.clone(),
         committer: committer.clone(),
-        encoding: None,
+        // `if (!encoding_is_utf8) strbuf_addf(buffer, "encoding %s\n", git_commit_encoding);`
+        // (commit.c:1723-1724, in `commit_tree_extended`'s buffer builder) — every commit
+        // git writes carries the header, not just `commit-tree`'s.
+        encoding: commit_encoding(repo),
         message: message.into(),
         extra_headers: Vec::new(),
     };
@@ -3435,7 +3531,19 @@ fn include_stage(
 ) -> Result<StagedSet> {
     let tracked = tracked_map(index);
     let known: HashSet<BString> = tracked.keys().cloned().collect();
-    stage_pathspecs(repo, pathspecs, &tracked, &known)
+    stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree_paths(index))
+}
+
+/// The paths a sparse checkout marks `CE_SKIP_WORKTREE`, which is what
+/// `list_paths()` tags and `add_remove_files()` then skips.
+fn skip_worktree_paths(index: &gix::index::File) -> HashSet<BString> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+        .map(|e| e.path_in(backing).to_owned())
+        .collect()
 }
 
 /// HEAD's tree id, refusing an unborn branch the way a pathspec-limited commit
@@ -3470,7 +3578,10 @@ fn only_mode_stage(
     let real = crate::index_open::or_empty(repo)?;
     let backing = real.path_backing();
     known.extend(real.entries().iter().map(|e| e.path_in(backing).to_owned()));
-    let staged = stage_pathspecs(repo, pathspecs, &tracked, &known)?;
+    // `list_paths()` reads `ce_skip_worktree(ce)` off the *real* index, not the
+    // HEAD-derived one this false index is built from.
+    let skip_worktree = skip_worktree_paths(&real);
+    let staged = stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree)?;
     staged.apply_to(&mut temp);
     Ok((temp, staged))
 }
@@ -3552,6 +3663,7 @@ fn stage_pathspecs(
     pathspecs: &[String],
     tracked: &HashMap<BString, (ObjectId, Mode)>,
     known: &HashSet<BString>,
+    skip_worktree: &HashSet<BString>,
 ) -> Result<StagedSet> {
     if repo.workdir().is_none() {
         crate::git_fatal!("this operation must be run in a work tree");
@@ -3582,7 +3694,7 @@ fn stage_pathspecs(
         let path = entry.rela_path;
         // git only ever updates paths it already knows: `git commit <untracked>`
         // and `git commit -i <untracked>` both fail rather than adding the file.
-        if !known.contains(&path) {
+        if !known.contains(&path) || skip_worktree.contains(&path) {
             continue;
         }
         let Some(abs) = repo.workdir_path(&path) else {
@@ -3666,9 +3778,25 @@ fn stage_pathspecs(
     }
 
     // Deletions: tracked paths matched by the pathspec whose worktree file is gone.
+    //
+    // ```c
+    // /* p->util is skip-worktree */
+    // if (p->util)
+    //         continue;
+    //
+    // if (!lstat(p->string, &st)) { … add_to_index(…) }
+    // else remove_file_from_index(the_repository->index, p->string);
+    // ```
+    //
+    // (`add_remove_files()`, builtin/commit.c, over the list `list_paths()` built and
+    // tagged with `ce_skip_worktree(ce)`.) An entry the sparse checkout deliberately left
+    // out of the work tree is neither restaged nor removed — its absence means nothing.
     let mut deletions: Vec<BString> = Vec::new();
     for path in tracked.keys() {
-        if staged_set.contains(path) || !pathspec.is_included(path.as_bstr(), Some(false)) {
+        if staged_set.contains(path)
+            || skip_worktree.contains(path)
+            || !pathspec.is_included(path.as_bstr(), Some(false))
+        {
             continue;
         }
         let gone = match repo.workdir_path(path.as_bstr()) {
@@ -3685,6 +3813,7 @@ fn stage_pathspecs(
     // known path that is present but unchanged still counts (its entry is simply
     // left alone), which is why the whole `known` set is searched, not just the
     // paths that were restaged.
+    let mut unmatched = false;
     for p in pathspecs {
         if p == "." || p.starts_with(':') || p.contains(['*', '?', '[']) {
             continue;
@@ -3699,8 +3828,23 @@ fn stage_pathspecs(
             // `report_path_error()` writes `error:` and the caller exits 1 — this
             // is not a `die()`, so it is neither `fatal:` nor 128.
             eprintln!("error: pathspec '{p}' did not match any file(s) known to git");
-            return Err(anyhow::Error::new(crate::fatal::Silent(1)));
+            unmatched = true;
         }
+    }
+    // ```c
+    // for (i = 0; i < pathspec->nr; i++) {
+    //         ...
+    //         if (!seen[i]) error(_("pathspec '%s' did not match any file(s) known to git"), ...);
+    //         ...
+    // }
+    // return errors;
+    // ```
+    //
+    // (`report_path_error()`, pathspec.c.) Every unmatched spec is reported before the
+    // caller gives up, so a `--pathspec-from-file` whose lines are all wrong names them
+    // all rather than stopping at the first.
+    if unmatched {
+        return Err(anyhow::Error::new(crate::fatal::Silent(1)));
     }
 
     Ok(StagedSet { staged, deletions })
@@ -3758,6 +3902,19 @@ fn collect_tracked_changes(
         // with no baseline to compare against.
         let mut seen_unmerged: HashSet<BString> = HashSet::new();
         for e in index.entries() {
+            // ```c
+            // if (ce_skip_worktree(ce))
+            //         continue;
+            // ```
+            //
+            // (`run_diff_files()`, diff-lib.c, which is what `add_files_to_cache()`
+            // drives.) A sparse checkout leaves the entries outside the cone absent from
+            // the work tree on purpose; reading that absence as a deletion is what turns
+            // `git commit -a` into a commit that empties the parts of the tree the user
+            // never asked to see.
+            if e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE) {
+                continue;
+            }
             let unmerged = e.stage() != Stage::Unconflicted;
             let path = e.path_in(backing).to_owned();
             if unmerged && !seen_unmerged.insert(path.clone()) {

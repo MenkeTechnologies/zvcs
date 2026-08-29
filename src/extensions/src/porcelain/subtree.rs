@@ -897,18 +897,6 @@ fn write_commit(repo: &gix::Repository, commit: gix::objs::Commit) -> Result<Obj
     Ok(repo.write_object(&commit)?.detach())
 }
 
-/// The `encoding` header `git commit-tree` would write: present only when
-/// `i18n.commitEncoding` names something other than UTF-8.
-fn commit_encoding(repo: &gix::Repository) -> Option<gix::bstr::BString> {
-    repo.config_snapshot().string("i18n.commitEncoding").and_then(|v| {
-        let utf8 = {
-            let name = v.to_str_lossy();
-            name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8")
-        };
-        (!utf8).then_some(v)
-    })
-}
-
 /// Turn a configured identity into an owned signature, as
 /// `porcelain/commit_tree.rs` does: git's gecos-derived fallback is not ported,
 /// so an unconfigured identity is an error rather than a commit whose author
@@ -951,7 +939,7 @@ fn copy_commit(ctx: &Ctx, rev: ObjectId, tree: ObjectId, parents: &[ObjectId]) -
             parents: parents.iter().copied().collect(),
             author: decoded.author()?.to_owned()?,
             committer: decoded.committer()?.to_owned()?,
-            encoding: commit_encoding(&ctx.repo),
+            encoding: super::commit::commit_encoding(&ctx.repo),
             message: message.into(),
             extra_headers: Vec::new(),
         },
@@ -971,7 +959,7 @@ fn commit_tree(ctx: &Ctx, tree: ObjectId, parents: &[ObjectId], message: &str) -
             parents: parents.iter().copied().collect(),
             author,
             committer,
-            encoding: commit_encoding(&ctx.repo),
+            encoding: super::commit::commit_encoding(&ctx.repo),
             message: message.into(),
             extra_headers: Vec::new(),
         },

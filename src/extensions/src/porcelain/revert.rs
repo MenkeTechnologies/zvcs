@@ -851,11 +851,23 @@ fn continue_single_pick(
         return Ok(Err(ExitCode::from(128)));
     }
 
-    let index = repo.open_index()?;
+    let mut index = repo.open_index()?;
     if index.entries().iter().any(|e| e.stage_raw() != 0) {
         return Ok(Err(super::commit::die_resolve_conflict(&index)));
     }
-    let tree_id = index_tree(repo, &index)?;
+    // The tree comes out of the cache-tree, and the index is written back with the
+    // refreshed extension — because the child git spawns here is `git commit`, whose
+    // `prepare_index()` runs `cache_tree_update(the_repository->index, WRITE_TREE_SILENT)`
+    // and then `write_locked_index()` (builtin/commit.c:486-491). Building the tree beside
+    // the index instead left the on-disk extension at whatever the conflict resolution had
+    // invalidated, so the next reader paid for a rebuild git had already done. Identical to
+    // what `cherry-pick --continue` does, for the same reason.
+    let tree_id = match super::write_tree::refresh_cache_tree(repo, &mut index, false)? {
+        Ok(id) => id,
+        // A directory/file collision is the only other way `cache_tree_update()` fails, and
+        // no index git wrote has one; the tree is still needed either way.
+        Err(_) => index_tree(repo, &index)?,
+    };
     let head_id = repo.head_id()?.detach();
 
     // `--cleanup=strip` is what git passes, so the `# Conflicts:` block the stop
@@ -1640,7 +1652,13 @@ fn apply(
                 eprintln!("warning: unable to rmdir '{path}': Directory not empty");
             }
         } else {
-            let _ = std::fs::remove_file(full);
+            let _ = std::fs::remove_file(&full);
+        }
+        // `unlink_entry()` schedules the directory it emptied and
+        // `remove_scheduled_dirs()` takes it, so reverting the commit that created
+        // `src/lib.rs` leaves no `src/` behind.
+        if let Some(workdir) = repo.workdir() {
+            crate::worktree::prune_empty_dirs(workdir, &full);
         }
     }
 

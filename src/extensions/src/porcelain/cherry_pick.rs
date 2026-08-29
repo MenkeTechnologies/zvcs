@@ -2398,7 +2398,12 @@ fn update_clean_worktree(
             let path = e.path_in(backing);
             if !new_paths.contains(&path.to_owned()) {
                 if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(full);
+                    let _ = std::fs::remove_file(&full);
+                    // `unlink_entry()`'s `schedule_dir_for_removal()`: the directory
+                    // whose last file just went goes with it.
+                    if let Some(workdir) = repo.workdir() {
+                        crate::worktree::prune_empty_dirs(workdir, &full);
+                    }
                 }
             }
         }

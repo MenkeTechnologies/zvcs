@@ -611,11 +611,28 @@ fn replacement_objects_refs_prefix(
     lenient: bool,
     mut filter_config_section: fn(&gix_config::file::Metadata) -> bool,
 ) -> Result<Option<BString>, Error> {
-    let is_disabled = config::shared::is_replace_refs_enabled(config, lenient, filter_config_section)
+    // ```c
+    // if (getenv(NO_REPLACE_OBJECTS_ENVIRONMENT))
+    //         disable_replace_refs();
+    // ```
+    //
+    // (`setup_git_env()`, setup.c.) The variable is tested for *presence*, so an empty
+    // value disables replacement too; `git --no-replace-objects` is exactly this variable
+    // being set.
+    if std::env::var_os("GIT_NO_REPLACE_OBJECTS").is_some() {
+        return Ok(None);
+    }
+
+    // `core.useReplaceRefs` is the *enable* switch — `read_replace_refs` in git, default
+    // on — so an unset or true value is what installs the `refs/replace/` mapping. The
+    // guard used to be spelled as though the value meant "disabled", which turned the
+    // whole mechanism inside out: `git replace` had no effect at all, and setting
+    // `core.useReplaceRefs=false` was the only way to get one.
+    let is_enabled = config::shared::is_replace_refs_enabled(config, lenient, filter_config_section)
         .map_err(config::Error::ConfigBoolean)?
         .unwrap_or(true);
 
-    if is_disabled {
+    if !is_enabled {
         return Ok(None);
     }
 

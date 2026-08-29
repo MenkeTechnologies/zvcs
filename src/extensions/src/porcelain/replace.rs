@@ -45,6 +45,11 @@
 //!   * `core.graftFile` — git 2.55 does not honour it either (only
 //!     `$GIT_GRAFT_FILE` and the default path), so neither does this.
 //!   * `GIT_REPLACE_REF_BASE` — the namespace is always `refs/replace/`.
+//!
+//! The replacements themselves *are* in effect: every command that reads an object
+//! goes through the odb's replacement map, which is built from `refs/replace/*` at
+//! open time and switched off by `core.useReplaceRefs=false`,
+//! `GIT_NO_REPLACE_OBJECTS` or the `--no-replace-objects` that sets it.
 //!   * `error: Could not read <oid>` followed by `fatal: Failed to traverse
 //!     parents of commit <oid>`, which `repo_parse_commit_internal()`
 //!     (commit.c:644) emits once a graft has named a parent the object database

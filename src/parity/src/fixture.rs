@@ -585,6 +585,243 @@ pub enum Shape {
     /// comes back complete, which would leave the shape looking built and
     /// measuring nothing.
     Promisor,
+    /// One name held by two ref namespaces at once, four times over, plus a
+    /// name that is both a branch and a tracked path.
+    ///
+    /// A corpus agent compared `for-each-ref refs/heads` against `refs/tags`
+    /// across every built template and found the intersection empty in all of
+    /// them, which left `ref_rev_parse_rules` — the table in `refs.c` that
+    /// decides *which* `refs/…/<name>` a bare `<name>` means — unmeasurable.
+    /// With no name in two namespaces, every rule in the table resolves the
+    /// same ref, so an implementation that consults one rule scores exactly
+    /// like one that walks all six, and git's
+    /// `warning: refname '<name>' is ambiguous.` had never been printed by any
+    /// case in the corpus.
+    ///
+    /// Four names, one per adjacent pair of rules, so a table walked in the
+    /// wrong order is caught where it went wrong rather than in aggregate.
+    /// Measured on stock 2.55.0 over this shape:
+    ///
+    /// * `ambi` — a branch at `HEAD~1` and a *lightweight* tag at `HEAD`.
+    ///   `rev-parse ambi` answers the tag's commit, so `refs/tags/` outranks
+    ///   `refs/heads/`.
+    /// * `ambi-ann` — the same pair with an *annotated* tag, so the winning
+    ///   answer is a tag object rather than a commit and `cat-file -t ambi-ann`
+    ///   says `tag`. Precedence and peeling are separable only with both
+    ///   spellings present.
+    /// * `top` — `refs/top`, `refs/heads/top` and `refs/tags/top`, three refs
+    ///   for one name. `refs/<name>` is the first rule in the table and beats
+    ///   the other two.
+    /// * `rem/ambi` — `refs/heads/rem/ambi` and `refs/remotes/rem/ambi`, where
+    ///   the branch wins. The only pair here whose answer is a *branch*, and
+    ///   the one a DWIM checkout is built on.
+    ///
+    /// `dual` is the other kind of ambiguity and needs no second ref: a branch
+    /// and a tracked file of the same name, which is
+    /// `fatal: ambiguous argument 'dual': both revision and filename` — a
+    /// refusal every verb taking `<rev> [--] <path>` shares, and one no shape
+    /// could produce, because no shape had a path whose name was also a ref.
+    ///
+    /// Every diagnostic here goes to **stderr** and the resolved id to stdout,
+    /// so the cases that measure the warning are strict ones.
+    AmbiguousRef,
+    /// Two objects whose ids share a four-character prefix — twice, once
+    /// between a commit and a blob and once between two blobs.
+    ///
+    /// Four is git's floor for an abbreviation (`minimum_abbrev`), and the
+    /// corpus is nowhere near large enough to reach it by luck: measured across
+    /// the shapes, `Packed` holds 34 objects, `CrissCross` 33, `Octopus` 24 and
+    /// `Branched` 13, with no two ids sharing four characters anywhere. So
+    /// `core.disambiguate`, an ambiguous `rev-parse`, the
+    /// `error: short object ID … is ambiguous` / `hint: The candidates are:`
+    /// report, `rev-parse --disambiguate=`, and the *widening* an abbreviation
+    /// does to stay unique were all unreachable — a port that abbreviates by
+    /// truncating a string scored the same as one that asks the object store
+    /// how many characters are needed.
+    ///
+    /// A collision this small is constructed, not found. Candidate blob bodies
+    /// `collide <n>\n` were hashed the way git hashes a blob —
+    /// `sha1("blob " + len + "\0" + body)` — for `n` from 0 upwards, and the
+    /// first `n` whose id carried the four characters wanted was kept and is
+    /// baked in below as a literal. Nothing probabilistic is left at build
+    /// time: the same three bodies always produce the same three ids.
+    ///
+    /// * `edfa` — the `initial` commit every shape in this file descends from
+    ///   is `edfab1b71619a22120a8da1a3d85d68e0200290a`, so that half needed no
+    ///   search at all; `collide 62671` hashes to
+    ///   `edfaaf1e9919bbb3ea91c4aee0ba9bde868cdbba` and is tracked as
+    ///   `commit-mate.txt`. A commit and a blob at one prefix is the pair
+    ///   `core.disambiguate` exists for: `=commit` and `=committish` answer the
+    ///   commit, `=blob` answers the blob, and with neither set `rev-parse`
+    ///   prints both candidates and exits 128.
+    /// * `a366` — `collide 105` and `collide 215` hash to
+    ///   `a36664d0c037c06c0ee81cfcfb3af000a19a60ed` and
+    ///   `a3660f2dc25d8d30ea9d1ae52b12eed1d2cd3bd7`, tracked as `pair-a.txt`
+    ///   and `pair-b.txt`. Two objects of the *same* type at one prefix is the
+    ///   ambiguity no `core.disambiguate` value can resolve, which is what
+    ///   separates a port that implements the setting from one that reads it as
+    ///   "take the first candidate".
+    ///
+    /// The widening is what makes the commit half worth more than the
+    /// disambiguation: on this shape `log --oneline --abbrev=4` prints the
+    /// initial commit as **five** characters (`edfab`) and every other commit
+    /// as four, because four characters of that one id are no longer unique.
+    /// `core.abbrev` is left at its default, so ordinary output is unaffected
+    /// and only a case that asks for four sees it.
+    ///
+    /// The colliding blobs are *tracked* rather than written loose, so `gc`,
+    /// `prune` and `repack` cannot quietly take the shape's premise away.
+    ///
+    /// A commit-to-commit collision is deliberately absent. It would have taken
+    /// a search over commit *messages* whose answer is valid for one exact tree
+    /// and parent — a literal that silently stops colliding the first time
+    /// anything earlier in the shape moves. The build asserts all three ids
+    /// instead, so this shape fails loudly rather than quietly measuring
+    /// nothing.
+    PrefixCollision,
+    /// The three `am` hooks, and two hooks that are present and **not
+    /// executable**.
+    ///
+    /// [`install_hooks`] chmods every hook it writes to 0755 and both
+    /// hook-bearing shapes go through it, so "a hook that is there and does not
+    /// run" had no fixture — and it is a branch git takes deliberately, not an
+    /// edge case: it stats the file, skips it, and says
+    /// `hint: The '.git/hooks/pre-commit' hook was ignored because it's not set
+    /// as executable.` through `advice.ignoredHook`. `git hook run pre-commit`
+    /// answers `error: cannot find a hook named pre-commit` and exits 1.
+    ///
+    /// `applypatch-msg`, `pre-applypatch` and `post-applypatch` are installed
+    /// by no shape at all, which left all four `am` hook spellings —
+    /// `--no-verify` among them — pinned on nothing but "the flag parses and is
+    /// inert".
+    ///
+    /// What each one is for:
+    ///
+    /// * `applypatch-msg` (0755) — appends `applypatch-trailer` to the message
+    ///   file it is handed, and exits 1 when that file contains `REJECT`. The
+    ///   trailer is how a case sees that the hook ran; the refusal is how it
+    ///   sees `am` stop before applying anything.
+    /// * `pre-applypatch` (0755) — exits 1 when `veto-preapply.txt` is in the
+    ///   worktree. It runs *after* the patch reaches the index and before the
+    ///   commit, so a mailbox that creates that path leaves a state nothing
+    ///   else in the corpus produces: the change staged, no commit made, `am`
+    ///   still in progress.
+    /// * `post-applypatch` (0755) — records that it ran and exits **1**, which
+    ///   git ignores. That a `post-*` hook's status does not reach the caller
+    ///   is worth a case of its own.
+    /// * `pre-commit` (0644) — would append to `hook-pre-commit.txt` and exit
+    ///   1. A `commit` on this shape must succeed and must leave that file
+    ///   absent.
+    /// * `commit-msg` (0644) — would append `not-executable-trailer` to the
+    ///   message. A `commit` must produce a message without it.
+    ///
+    /// Three mailboxes, because `am` is the verb under test and a case is one
+    /// argv against a pristine copy: `mail/ok.mbox` (two patches that apply),
+    /// `mail/reject.mbox` (the message `applypatch-msg` refuses) and
+    /// `mail/preveto.mbox` (the patch that trips `pre-applypatch`). They are
+    /// produced by `format-patch --no-signature` for the reason
+    /// [`Shape::Patches`] gives: the signature carries the *builder's* git
+    /// version into tracked content.
+    ///
+    /// No hook invokes git, for the reason [`Shape::Hooked`] gives.
+    AmHooks,
+    /// A submodule that carries a submodule, registered and not initialised, so
+    /// `submodule update --init --recursive` has two levels to descend and
+    /// `--init` alone has one.
+    ///
+    /// [`Shape::Submodule`] is one level deep, which makes `--recursive` a
+    /// synonym for its own absence: with one level to visit, a port that never
+    /// recurses scores exactly like one that does. Here the two spellings
+    /// produce different repositories — `--init` leaves `mid/leaf` empty and
+    /// `--init --recursive` fills it — so the flag is measured by what it
+    /// builds rather than by whether it parses.
+    ///
+    /// **Reproducible, and not exempt from [`tests::shapes_build_reproducibly`].**
+    /// That is the difficulty of the shape and the reason a previous wave
+    /// skipped it: `Submodule` bakes its upstream's absolute path into
+    /// `.gitmodules` and `.git/config` and is exempt from that test by
+    /// construction, and a nested one would record four such paths instead of
+    /// two. None is recorded here:
+    ///
+    /// * both upstreams are **bare repositories inside the fixture** —
+    ///   `.leaf.git` and `.mid.git`, hidden from status through
+    ///   `.git/info/exclude`, the arrangement [`Shape::BehindRemote`] uses for
+    ///   its peer — so the per-case copy carries its own and never reaches the
+    ///   template's.
+    /// * neither registration is made by `submodule add`. That command clones,
+    ///   and a clone resolves the URL and writes the absolute answer into
+    ///   `.git/config`, into the module's `remote.origin.url`, and into the
+    ///   `clone: from` line of every reflog it creates. Both `.gitmodules` are
+    ///   written directly and both gitlinks staged with
+    ///   `update-index --cacheinfo`, so the only URLs anywhere are the relative
+    ///   ones in the two tracked `.gitmodules` files: `./.mid.git` in the
+    ///   parent, read from the parent's root, and `../.leaf.git` in `mid`, read
+    ///   from `mid/`.
+    ///
+    /// **Why it is registered rather than checked out**, which is the honest
+    /// limit of this shape. A populated submodule cannot be hashed by that test
+    /// at all, and not because of anything a builder does: `digest` runs
+    /// `status` over the shape, `status` recurses into every populated
+    /// submodule to decide whether it is dirty, and that refresh rewrites the
+    /// submodule's own index with fresh `stat` data. Measured directly on a
+    /// populated build of this shape — `for-each-ref` and `ls-files` leave
+    /// `.git/modules/mid/index` byte-identical, and `status --porcelain=v1
+    /// --untracked-files=all` changes it. Inode and ctime cannot agree between
+    /// two build locations, so the digest of any shape with a checked-out
+    /// submodule differs from itself; `read-tree` does not help, because the
+    /// probe runs after it. That is a second, independent reason
+    /// [`Shape::Submodule`] must stay exempt, beside the absolute paths its doc
+    /// names.
+    ///
+    /// An empty `mid/` directory is left in place because that is what a
+    /// non-recursive clone leaves: with the directory missing, `status` calls
+    /// the gitlink deleted, which is a different repository state from an
+    /// unpopulated one. Git cannot track an empty directory, so it survives
+    /// only because the per-case copy is a directory walk — the same reason
+    /// [`Shape::NoIndexTrees`]'s empty sides survive.
+    ///
+    /// `leaf` is recorded at `leaf: two` while its history holds `leaf: one`
+    /// before it, so a recursive update that stopped at the first level, or
+    /// checked out the wrong commit, is visible in one line of
+    /// `submodule status --recursive`.
+    NestedSubmodule,
+    /// A split index: the entries parked in `.git/sharedindex.<sha>`, with
+    /// `.git/index` holding little more than the link to it.
+    ///
+    /// No shape had one, so `core.splitIndex`, `update-index --split-index`,
+    /// `--no-split-index`, `splitIndex.maxPercentChange` and the `link`
+    /// extension were argument-parsing questions — and
+    /// [`crate::runner`]'s index probe already knows how to report a shared
+    /// index that no fixture ever produced.
+    ///
+    /// The previous wave skipped this for a stated reason: `sharedindex.<sha>`
+    /// is named for a hash over the index it holds, that index stores per-entry
+    /// `stat` data, and two builds therefore disagree on the file's *name* as
+    /// well as on its bytes — which `shapes_build_reproducibly` fails on, since
+    /// it exempts `.git/index` alone. Confirmed directly: two builds of the
+    /// same repository three seconds apart produced `sharedindex.a2f349d0…`
+    /// and `sharedindex.1834a108…`.
+    ///
+    /// The reason is also the fix, and it needs no exemption. `read-tree`
+    /// rewrites the entries from the tree with the `stat` fields **zeroed** —
+    /// the normalisation [`Shape::Worktree`] applies to a linked worktree's
+    /// index, and a state git writes itself — so the shared index that splits
+    /// out of it is a function of the tree alone. Under that ordering the same
+    /// two builds produce `sharedindex.11c3c770b7d0f1d25e1f9d17209f24c247ffc268`
+    /// byte for byte.
+    ///
+    /// A second commit follows the split, so `.git/index` holds entries of its
+    /// own beside the link and the shape is not the degenerate "everything is
+    /// shared" case.
+    ///
+    /// The untracked cache is **not** here, and this is the shape it would have
+    /// belonged to. It cannot be built on the machine that builds these
+    /// fixtures at all: `update-index --untracked-cache` answers
+    /// `warning: untracked cache is disabled on this system or location` and
+    /// records nothing, because git probes the filesystem's mtime behaviour
+    /// first and refuses where it does not trust it. A shape carrying the flag
+    /// and not the cache would look built and measure nothing.
+    SplitIndex,
 }
 
 impl Shape {
@@ -627,6 +864,11 @@ impl Shape {
         Shape::TagChain,
         Shape::Shallow,
         Shape::Promisor,
+        Shape::AmbiguousRef,
+        Shape::PrefixCollision,
+        Shape::AmHooks,
+        Shape::NestedSubmodule,
+        Shape::SplitIndex,
     ];
 
     pub fn name(self) -> &'static str {
@@ -669,6 +911,11 @@ impl Shape {
             Shape::TagChain => "tag-chain",
             Shape::Shallow => "shallow",
             Shape::Promisor => "promisor",
+            Shape::AmbiguousRef => "ambiguous-ref",
+            Shape::PrefixCollision => "prefix-collision",
+            Shape::AmHooks => "am-hooks",
+            Shape::NestedSubmodule => "nested-submodule",
+            Shape::SplitIndex => "split-index",
         }
     }
 }
@@ -1955,6 +2202,232 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
 
             restage_as_clone(dir, home, &["--no-single-branch", "--filter=blob:none"])?;
         }
+
+        Shape::AmbiguousRef => {
+            write(dir, "a1.txt", "a1\n")?;
+            git(dir, home, &["add", "a1.txt"])?;
+            git(dir, home, &["commit", "-qm", "ambiguous: second"])?;
+            // A tracked path whose name is also a branch. Committed last so the
+            // path exists at the tip, which is where a case looks for it.
+            write(dir, "dual", "a path whose name is also a branch\n")?;
+            git(dir, home, &["add", "dual"])?;
+            git(dir, home, &["commit", "-qm", "ambiguous: third"])?;
+
+            // Three distinct commits, so which rule won is visible in the answer
+            // rather than having to be inferred. `root` is the `initial` commit
+            // every shape descends from.
+            let root = rev(dir, home, "HEAD~2")?;
+            let mid = rev(dir, home, "HEAD~1")?;
+            let tip = rev(dir, home, "HEAD")?;
+
+            git(dir, home, &["branch", "ambi", &mid])?;
+            git(dir, home, &["tag", "ambi", &tip])?;
+            git(dir, home, &["branch", "ambi-ann", &mid])?;
+            git(dir, home, &["tag", "-a", "ambi-ann", "-m", "annotated, and also a branch", &tip])?;
+            // `refs/<name>` is the first of the six rules, and the only one no
+            // porcelain writes — hence `update-ref` rather than `branch`/`tag`.
+            git(dir, home, &["update-ref", "refs/top", &root])?;
+            git(dir, home, &["branch", "top", &mid])?;
+            git(dir, home, &["tag", "top", &tip])?;
+            git(dir, home, &["branch", "dual", &mid])?;
+            git(dir, home, &["branch", "rem/ambi", &mid])?;
+            git(dir, home, &["update-ref", "refs/remotes/rem/ambi", &tip])?;
+
+            // The premise, asserted rather than assumed: a shape whose names
+            // stopped being ambiguous would still build, and every case on it
+            // would then measure an ordinary lookup while claiming otherwise.
+            for (name, want) in [("ambi", &tip), ("top", &root), ("rem/ambi", &mid)] {
+                let got = rev(dir, home, name)?;
+                if &got != want {
+                    bail!("fixture: ambiguous-ref: {name} resolved to {got}, wanted {want}");
+                }
+            }
+        }
+
+        Shape::PrefixCollision => {
+            write(dir, "commit-mate.txt", COLLIDE_COMMIT_MATE)?;
+            write(dir, "pair-a.txt", COLLIDE_PAIR_A)?;
+            write(dir, "pair-b.txt", COLLIDE_PAIR_B)?;
+            git(dir, home, &["add", "commit-mate.txt", "pair-a.txt", "pair-b.txt"])?;
+            git(dir, home, &["commit", "-qm", "collision: three blobs at two prefixes"])?;
+            // A second commit, so `log --oneline --abbrev=4` has a row whose id
+            // is *not* the colliding one to print beside it: the widening shows
+            // as a difference between two rows of one listing.
+            write(dir, "src/lib.rs", "pub fn one() -> u32 { 1 }\npub fn two() -> u32 { 2 }\n")?;
+            git(dir, home, &["commit", "-qam", "collision: a second commit to abbreviate"])?;
+
+            // Both halves of the premise, asserted. `--disambiguate` lists every
+            // object with the prefix, so this is the property itself rather than
+            // a proxy for it: two candidates each, and a commit among the first
+            // pair.
+            for (prefix, want_kinds) in
+                [("edfa", ["commit", "blob"].as_slice()), ("a366", ["blob", "blob"].as_slice())]
+            {
+                let arg = format!("--disambiguate={prefix}");
+                let listed = git(dir, home, &["rev-parse", &arg])?;
+                let ids: Vec<&str> = listed.lines().collect();
+                if ids.len() != want_kinds.len() {
+                    bail!(
+                        "fixture: prefix-collision: {prefix} names {} objects, wanted {}",
+                        ids.len(),
+                        want_kinds.len()
+                    );
+                }
+                let mut kinds: Vec<String> = Vec::new();
+                for id in &ids {
+                    kinds.push(git(dir, home, &["cat-file", "-t", id])?.trim().to_string());
+                }
+                kinds.sort();
+                let mut wanted: Vec<String> = want_kinds.iter().map(|k| (*k).to_string()).collect();
+                wanted.sort();
+                if kinds != wanted {
+                    bail!("fixture: prefix-collision: {prefix} holds {kinds:?}, wanted {wanted:?}");
+                }
+            }
+        }
+
+        Shape::AmHooks => {
+            write(dir, "app/main.c", MAIN_C_BASE)?;
+            git(dir, home, &["add", "app"])?;
+            git(dir, home, &["commit", "-qm", "am-hooks: seed"])?;
+
+            // The patches live on side branches so `main`'s tree stays the
+            // pre-image every mailbox applies to, the way `Shape::Patches` does
+            // it.
+            git(dir, home, &["checkout", "-q", "-b", "am-pending"])?;
+            write(dir, "app/main.c", MAIN_C_ONE)?;
+            git(dir, home, &["commit", "-qam", "am-hooks: add subtract"])?;
+            write(dir, "app/main.c", MAIN_C_TWO)?;
+            git(dir, home, &["commit", "-qam", "am-hooks: bump version"])?;
+
+            // The word `applypatch-msg` refuses on, in the message rather than
+            // in the diff: the hook is handed the message file alone.
+            git(dir, home, &["checkout", "-q", "-b", "am-reject", "main"])?;
+            write(dir, "rejected.txt", "the message asks the hook to refuse\n")?;
+            git(dir, home, &["add", "rejected.txt"])?;
+            git(dir, home, &["commit", "-qm", "am-hooks: REJECT this one"])?;
+
+            // The path `pre-applypatch` refuses on, in the diff rather than in
+            // the message: that hook is given no arguments and can only look at
+            // the tree the patch has already been applied to.
+            git(dir, home, &["checkout", "-q", "-b", "am-preveto", "main"])?;
+            write(dir, "veto-preapply.txt", "stop before the commit\n")?;
+            git(dir, home, &["add", "veto-preapply.txt"])?;
+            git(dir, home, &["commit", "-qm", "am-hooks: trips pre-applypatch"])?;
+
+            git(dir, home, &["checkout", "-q", "main"])?;
+            for (file, args) in [
+                ("mail/ok.mbox", ["main..am-pending"].as_slice()),
+                ("mail/reject.mbox", ["-1", "am-reject"].as_slice()),
+                ("mail/preveto.mbox", ["-1", "am-preveto"].as_slice()),
+            ] {
+                let mut argv = vec!["format-patch", "--no-signature", "--stdout"];
+                argv.extend_from_slice(args);
+                let mbox = git(dir, home, &argv)?;
+                write(dir, file, &mbox)?;
+            }
+            git(dir, home, &["add", "mail"])?;
+            git(dir, home, &["commit", "-qm", "am-hooks: mailboxes"])?;
+
+            install_hooks(&dir.join(".git/hooks"), AM_HOOKS)?;
+            // The two that must NOT run. Written here rather than through
+            // `install_hooks` precisely because that function's contract is to
+            // make a hook executable, and the absence of that bit is the whole
+            // measurement.
+            install_inert_hooks(&dir.join(".git/hooks"), INERT_HOOKS)?;
+        }
+
+        Shape::NestedSubmodule => {
+            // Both upstreams are staged inside the fixture and the staging
+            // directory is removed before the parent commits, so no path outside
+            // `dir` is touched and nothing untracked is left behind. A staging
+            // checkout beside the template — how `Shape::Submodule` builds its
+            // upstream — would put the build location into the fixture, which is
+            // the one thing this shape must not do.
+            let stage = dir.join(NESTED_STAGE);
+            let leaf_work = stage.join("leaf");
+            std::fs::create_dir_all(&leaf_work)?;
+            git(&leaf_work, home, &["init", "-q", "-b", "main", "."])?;
+            write(&leaf_work, "leaf.txt", "leaf one\n")?;
+            git(&leaf_work, home, &["add", "leaf.txt"])?;
+            git(&leaf_work, home, &["commit", "-qm", "leaf: one"])?;
+            write(&leaf_work, "leaf.txt", "leaf two\n")?;
+            git(&leaf_work, home, &["commit", "-qam", "leaf: two"])?;
+            let leaf_head = rev(&leaf_work, home, "HEAD")?;
+            git(dir, home, &["init", "-q", "--bare", "-b", "main", LEAF_PEER])?;
+            // Relative, resolved against the staging checkout's own directory,
+            // so even the transient repository never names the build location.
+            git(&leaf_work, home, &["remote", "add", "origin", "../../.leaf.git"])?;
+            git(&leaf_work, home, &["push", "-q", "origin", "main"])?;
+
+            let mid_work = stage.join("mid");
+            std::fs::create_dir_all(&mid_work)?;
+            git(&mid_work, home, &["init", "-q", "-b", "main", "."])?;
+            write(&mid_work, "mid.txt", "mid\n")?;
+            // Written, not produced by `submodule add`: that would clone the
+            // leaf into *this* directory and record the path it resolved.
+            write(
+                &mid_work,
+                ".gitmodules",
+                "[submodule \"leaf\"]\n\tpath = leaf\n\turl = ../.leaf.git\n",
+            )?;
+            git(&mid_work, home, &["add", "mid.txt", ".gitmodules"])?;
+            let cacheinfo = format!("160000,{leaf_head},leaf");
+            git(&mid_work, home, &["update-index", "--add", "--cacheinfo", &cacheinfo])?;
+            git(&mid_work, home, &["commit", "-qm", "mid: carry a leaf submodule"])?;
+            let mid_head = rev(&mid_work, home, "HEAD")?;
+            git(dir, home, &["init", "-q", "--bare", "-b", "main", MID_PEER])?;
+            git(&mid_work, home, &["remote", "add", "origin", "../../.mid.git"])?;
+            git(&mid_work, home, &["push", "-q", "origin", "main"])?;
+            std::fs::remove_dir_all(&stage)?;
+
+            // The parent registers `mid` the same way `mid` registers `leaf`,
+            // and for the same reason: `submodule add` clones, and a clone
+            // writes the absolute path it resolved into `.git/config` and into
+            // every reflog it creates.
+            write(dir, ".gitmodules", "[submodule \"mid\"]\n\tpath = mid\n\turl = ./.mid.git\n")?;
+            git(dir, home, &["add", ".gitmodules"])?;
+            let cacheinfo = format!("160000,{mid_head},mid");
+            git(dir, home, &["update-index", "--add", "--cacheinfo", &cacheinfo])?;
+            git(dir, home, &["commit", "-qm", "nested: a submodule that carries one"])?;
+
+            // The empty directory a clone leaves at an uninitialised
+            // submodule's path. Without it `status` calls the gitlink deleted,
+            // which is a different repository state from an unpopulated one;
+            // the per-case copy is a directory walk, so it survives.
+            std::fs::create_dir_all(dir.join("mid"))?;
+            write(dir, ".git/info/exclude", ".leaf.git/\n.mid.git/\n")?;
+        }
+
+        Shape::SplitIndex => {
+            write(dir, "si-a.txt", "a\n")?;
+            write(dir, "si-b.txt", "b\n")?;
+            write(dir, "sub/si-c.txt", "c\n")?;
+            git(dir, home, &["add", "si-a.txt", "si-b.txt", "sub/si-c.txt"])?;
+            git(dir, home, &["commit", "-qm", "split-index: seed"])?;
+
+            // Order is the whole trick: `read-tree` zeroes the `stat` fields, so
+            // the shared index that splits out of the result is a function of
+            // the tree alone and both builds name it the same.
+            git(dir, home, &["read-tree", "HEAD"])?;
+            git(dir, home, &["update-index", "--split-index"])?;
+
+            // A commit after the split, so `.git/index` carries entries of its
+            // own beside the `link` extension rather than being a bare pointer.
+            // Verified not to re-share: the shared half keeps one name and one
+            // set of bytes across two builds.
+            write(dir, "si-d.txt", "d\n")?;
+            git(dir, home, &["add", "si-d.txt"])?;
+            git(dir, home, &["commit", "-qm", "split-index: after the split"])?;
+
+            let shared = std::fs::read_dir(dir.join(".git"))?
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("sharedindex."))
+                .count();
+            if shared != 1 {
+                bail!("fixture: split-index: {shared} shared index files, wanted exactly 1");
+            }
+        }
     }
     Ok(())
 }
@@ -1988,6 +2461,94 @@ fn install_hooks(hooks_dir: &Path, hooks: &[(&str, &str)]) -> Result<()> {
     }
     Ok(())
 }
+
+/// Write hook scripts into `hooks_dir` **without** the executable bit.
+///
+/// The mirror image of [`install_hooks`], and a separate function rather than a
+/// mode argument on that one: every existing caller means "install a hook that
+/// runs", and a shape whose hooks silently stopped running would go on passing
+/// while measuring nothing. Here the missing bit *is* the subject, so it is
+/// spelled in the name.
+fn install_inert_hooks(hooks_dir: &Path, hooks: &[(&str, &str)]) -> Result<()> {
+    std::fs::create_dir_all(hooks_dir)?;
+    for (name, body) in hooks {
+        let path = hooks_dir.join(name);
+        std::fs::write(&path, body).with_context(|| format!("write hook {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        }
+    }
+    Ok(())
+}
+
+
+/// The bare upstreams [`Shape::NestedSubmodule`] keeps inside the fixture, and
+/// the directory its two staging checkouts are built in and removed from.
+const LEAF_PEER: &str = ".leaf.git";
+const MID_PEER: &str = ".mid.git";
+/// The mid upstream as the parent reads it: relative to the parent's own root,
+/// which is where `submodule update` runs.
+const MID_PEER_URL: &str = "./.mid.git";
+const NESTED_STAGE: &str = ".stage-mod";
+
+/// Blob bodies whose ids collide with something else in
+/// [`Shape::PrefixCollision`] at four characters. See that variant's doc for how
+/// they were found; the ids they must produce are asserted at build time.
+const COLLIDE_COMMIT_MATE: &str = "collide 62671\n";
+const COLLIDE_PAIR_A: &str = "collide 105\n";
+const COLLIDE_PAIR_B: &str = "collide 215\n";
+
+/// The three `am` hooks [`Shape::AmHooks`] installs, executable.
+///
+/// None of them runs git, for the reason [`Shape::Hooked`] gives: each side of a
+/// case runs its own binary, and a hook naming one by path would make the other
+/// side execute it too.
+const AM_HOOKS: &[(&str, &str)] = &[
+    (
+        "applypatch-msg",
+        "#!/bin/sh\n\
+         printf 'applypatch-msg\\n' >> hook-applypatch-msg.txt\n\
+         grep -q REJECT \"$1\" && exit 1\n\
+         printf '\\napplypatch-trailer\\n' >> \"$1\"\n\
+         exit 0\n",
+    ),
+    (
+        "pre-applypatch",
+        "#!/bin/sh\n\
+         printf 'pre-applypatch\\n' >> hook-pre-applypatch.txt\n\
+         test -f veto-preapply.txt && exit 1\n\
+         exit 0\n",
+    ),
+    // Exits non-zero on purpose: git ignores a `post-*` hook's status, and a
+    // case that sees `am` succeed anyway is what pins that.
+    (
+        "post-applypatch",
+        "#!/bin/sh\n\
+         printf 'post-applypatch\\n' >> hook-post-applypatch.txt\n\
+         exit 1\n",
+    ),
+];
+
+/// The two hooks [`Shape::AmHooks`] installs **without** the executable bit.
+///
+/// Both would be loud if they ran: one refuses the commit outright, the other
+/// rewrites its message. A commit on that shape must show neither.
+const INERT_HOOKS: &[(&str, &str)] = &[
+    (
+        "pre-commit",
+        "#!/bin/sh\n\
+         printf 'pre-commit ran\\n' >> hook-pre-commit.txt\n\
+         exit 1\n",
+    ),
+    (
+        "commit-msg",
+        "#!/bin/sh\n\
+         printf '\\nnot-executable-trailer\\n' >> \"$1\"\n\
+         exit 0\n",
+    ),
+];
 
 /// Replace the repository at `dir` with a clone of the peer already built
 /// inside it, keeping the peer.

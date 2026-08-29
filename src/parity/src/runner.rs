@@ -2009,9 +2009,11 @@ fn run_side(bin: &Path, repo: &Path, home: &Path, case: &Case) -> Result<Side> {
 /// state), [`probe_pack_headers`] (what a midx or bitmap claims to cover),
 /// [`probe_worktree_content`] (the bytes a merge or a checkout actually wrote),
 /// [`probe_index_meta`] (the index's version and extension chain),
-/// [`probe_fetch_head`], and [`probe_peer`] (the bare repository a push landed
-/// on). Every one of them appends: no existing line moves, so no probe here can
-/// turn a failing case into a passing one.
+/// [`probe_fetch_head`], [`probe_peer`] (the bare repository a push landed on),
+/// [`probe_modules`] (a submodule's own git directory) and
+/// [`probe_pack_contents`] (which objects went into which pack, everywhere).
+/// Every one of them appends: no existing line moves, so no probe here can turn
+/// a failing case into a passing one.
 fn probe_state(repo: &Path, home: &Path) -> String {
     const PROBES: &[&[&str]] = &[
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -2080,6 +2082,7 @@ fn probe_state(repo: &Path, home: &Path) -> String {
     digest.push_str(&probe_fetch_head(repo));
     digest.push_str(&probe_peer(repo, home));
     digest.push_str(&probe_modules(repo, home));
+    digest.push_str(&probe_pack_contents(repo));
     digest
 }
 
@@ -2266,7 +2269,10 @@ const INTEROP_UNPROBED: &str = "# interop\n<not probed: neither side wrote under
 /// **Three invocations per side, and only on a case that wrote under the git
 /// directory.** Two are stock git (`fsck`, `write-tree`) and the third is the
 /// binary under test answering `write-tree` about the same repository — the
-/// mirror. Everything else pays two `stat` walks of `.git` per side (see
+/// mirror. A **fourth** is spent only where the repository holds an accelerator
+/// structure at all; see [`accelerator_read_probe`], which also records the four
+/// candidates rejected as measurably redundant with the `fsck` above.
+/// Everything else pays two `stat` walks of `.git` per side (see
 /// [`git_fingerprint`]) and nothing more: no child process, no copy, no
 /// comparison. A case that does mutate goes from the 18 child processes it
 /// already pays (two invocations plus two eight-probe state digests) to 24, and
@@ -2318,6 +2324,145 @@ fn probe_interop(repo: &Path, home: &Path, scratch: &Path, zvcs_bin: &Path) -> S
     out.push_str(&write_tree_probe("stock", stock, repo, home, &scratch.join("stock")));
     out.push_str(&write_tree_probe("zvcs", zvcs_bin, repo, home, &scratch.join("zvcs")));
     let _ = std::fs::remove_dir_all(scratch);
+
+    // 3. The mirror, widened: the port reading the structures only stock
+    //    writes. Gated on one of them being there, so most cases pay a handful
+    //    of `stat` calls and no process at all.
+    out.push_str(&accelerator_read_probe(zvcs_bin, repo, home));
+    out
+}
+
+/// The accelerator files a repository holds, in a fixed order: the ones a
+/// reader has to parse rather than re-derive.
+///
+/// Fixed rather than enumerated from the directory so the line is one fact per
+/// name and the two sides line up positionally even when only one of them wrote
+/// the structure. `.bitmap` is a wildcard because its name carries the pack's
+/// checksum.
+fn accelerators(repo: &Path) -> Vec<&'static str> {
+    let git = git_dir(repo);
+    let objects = git.join("objects");
+    let mut out: Vec<&'static str> = Vec::new();
+    if objects.join("info/commit-graph").is_file() {
+        out.push("commit-graph");
+    }
+    if objects.join("info/commit-graphs").is_dir() {
+        out.push("commit-graph-chain");
+    }
+    if objects.join("pack/multi-pack-index").is_file() {
+        out.push("multi-pack-index");
+    }
+    if walk_files(&objects.join("pack")).iter().any(|(rel, _)| rel.ends_with(".bitmap")) {
+        out.push("bitmap");
+    }
+    if git.join("packed-refs").is_file() {
+        out.push("packed-refs");
+    }
+    out
+}
+
+/// Ask **the binary under test** to enumerate the repository through whatever
+/// accelerator it finds there, and report what it said.
+///
+/// # Why this, and why the four obvious candidates are not here
+///
+/// [`probe_interop`]'s charter is the structures a logical probe is blind to,
+/// and the natural way to widen it is to ask stock more questions about the
+/// port's repository. Four were considered and each was rejected on a
+/// measurement rather than on taste, recorded here so the next reader does not
+/// re-derive them:
+///
+///  * **`commit-graph verify`.** Redundant: `fsck --strict` already performs the
+///    identical check. Measured on stock 2.55.0 against a commit-graph whose
+///    `CDAT` chunk was edited to name the wrong root tree, with the trailing
+///    checksum re-stamped so the file is internally consistent — `fsck` printed
+///    `root tree OID for commit 13168c53… in commit-graph is b7130d30…faa8… !=
+///    b7130d30…f9a8…` and exited 16, and `commit-graph verify` printed the same
+///    sentence and exited 1. A corrupted checksum is caught by both as well
+///    (`the commit-graph file has incorrect checksum and is likely corrupt`,
+///    exit 16 and exit 2). Adding it would spend an invocation to print a
+///    message the digest already carries.
+///  * **`multi-pack-index verify`.** Redundant for the same measured reason: one
+///    byte moved inside a `multi-pack-index` with the checksum re-stamped gives
+///    `fatal: bad pack-int-id: 16777216 (1 total packs)` from `fsck` at exit 32
+///    and the same sentence from `multi-pack-index verify` at exit 128.
+///  * **`verify-pack`.** Its validity check is `fsck`'s — a `.bitmap` with one
+///    byte moved is already `error: bitmap file … has invalid checksum` and exit
+///    128 from `fsck` — and of its six columns, `size-in-pack`, `offset`,
+///    `depth` and `base` are the compression choices this crate has ruled
+///    uncomparable while `type` and `size` are in the batch listing. The one
+///    column that was missing is *which objects are in which pack*, and that is
+///    now [`probe_pack_contents`], read out of the `.idx` for no process at all.
+///  * **`for-each-ref` and `ls-files --stage`.** Both are already asked, of
+///    stock, in [`probe_state`] — the second with `-v`, which is a strict
+///    superset. Asking them again here would compare a line against its own
+///    copy.
+///
+/// What is left is the direction that is genuinely thin. Stock reading the
+/// port's repository has `fsck`, `write-tree` and eight `probe_state`
+/// invocations behind it. **The port reading stock's repository has one
+/// question**: `write-tree`, which reads the index and the object store and
+/// touches no accelerator at all. A repository stock has just `gc`'d,
+/// `repack --write-bitmap-index`'d, `pack-refs`'d, `commit-graph write`'n or
+/// `multi-pack-index write`'n holds exactly the structures a port is most
+/// likely to misread, and nothing asked the port to read one.
+///
+/// `rev-list --objects --all` is the question that goes through all of them at
+/// once: it resolves every ref (so `packed-refs`), walks every commit (so the
+/// commit-graph, and the commit-graph chain), and names every tree and blob (so
+/// the pack index, the multi-pack-index and the bitmap). A port that reads any
+/// of them wrongly answers differently about a repository whose logical content
+/// is identical on both sides.
+///
+/// # Direction
+///
+/// Appended below `## write-tree`, so nothing above it moves. The output is
+/// **sorted** before it is rendered: `--objects` emits in walk order, and this
+/// probe is about the object set rather than about the order a walk reached it.
+/// Sorting can only make two answers agree that would otherwise differ, which is
+/// the direction this file is allowed to fail in; it cannot make two equal
+/// answers differ.
+///
+/// A repository holding none of the five structures prints one line naming
+/// that, on both sides, and spawns nothing.
+///
+/// # Cost
+///
+/// A handful of `stat` calls on every case that opened the interop gate, and
+/// **one** invocation of the binary under test on those that hold an
+/// accelerator — the fourth on a case that pays three today, and only for the
+/// cases it can speak to. `rev-list` is a read-only command in git, so it needs
+/// none of the write redirection [`write_tree_probe`] documents; it has the same
+/// standing as the `fsck` invocation above it.
+fn accelerator_read_probe(zvcs_bin: &Path, repo: &Path, home: &Path) -> String {
+    let present = accelerators(repo);
+    let mut out = format!("## accelerator-read\npresent: {}\n", present.join(" "));
+    if present.is_empty() {
+        out.push_str("<none present: not asked>\n");
+        return out;
+    }
+    let mut cmd = Command::new(zvcs_bin);
+    env::harden(&mut cmd, home);
+    cmd.current_dir(repo).args(["rev-list", "--objects", "--all"]);
+    match cmd.output() {
+        Ok(o) => {
+            out.push_str(&format!("zvcs exit: {:?}\n", o.status.code()));
+            // Sorted **on the bytes**, before they are rendered: `decode_exact`
+            // renders a stream that is not text through `render_binary`, whose
+            // hex lines are positional, and sorting those would scramble a
+            // rendering built to be read.
+            let mut lines: Vec<&[u8]> = trim_bytes(&o.stdout).split(|b| *b == b'\n').collect();
+            lines.sort_unstable();
+            out.push_str(&decode_exact(lines.join(&b'\n')));
+            // The trailing newline `trim_bytes` took off, so this section ends
+            // the way every other one does and the next line a reader sees is a
+            // heading rather than the tail of an object listing.
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        Err(_) => out.push_str("zvcs exit: <spawn-failed>\n"),
+    }
     out
 }
 
@@ -3509,19 +3654,10 @@ fn module_refs(gitdir: &Path, home: &Path, rel: &str) -> String {
     }
     // The validator, appended: see the header for what the census above cannot
     // see. Its exit code is a fact in its own right, so it is not folded into
-    // the success/`<err>` shape the two listings use.
-    let mut cmd = Command::new(stock);
-    env::harden(&mut cmd, home);
-    cmd.current_dir(gitdir).args(["fsck", "--strict", "--no-progress", "--no-dangling"]);
-    out.push_str(&format!("## {rel} fsck --strict\n"));
-    match cmd.output() {
-        Ok(o) => {
-            out.push_str(&format!("exit: {:?}\n", o.status.code()));
-            out.push_str(&decode_exact(o.stdout));
-            out.push_str(&decode_exact(o.stderr));
-        }
-        Err(_) => out.push_str("<spawn-failed>\n"),
-    }
+    // the success/`<err>` shape the two listings use. [`fsck_section`] is the
+    // one copy of it — a peer needs the identical question, and two spellings of
+    // it would be two things to keep right.
+    out.push_str(&fsck_section(stock, home, gitdir, rel));
     out
 }
 
@@ -3588,6 +3724,35 @@ fn probe_storage(repo: &Path) -> String {
 /// Split out of [`probe_storage`] so [`probe_peer`] can take the same census of
 /// the bare peer's object store — the same question, asked of the repository the
 /// case pushed *to*, where the answer was previously nobody's.
+///
+/// # What the census does not read, and what pins it instead
+///
+/// It reads no object. A loose object is zlib at the writer's chosen level and a
+/// pack carries a delta window and an object ordering, so neither one's *bytes*
+/// are comparable between two implementations, and that relaxation is
+/// permanent. Three things stand in its place, and between them the objects'
+/// **content** is pinned even though their bytes are not:
+///
+///  * The object's *name is the hash of its inflated content*, and
+///    `cat-file --batch-check --batch-all-objects` lists every name with its
+///    type and its inflated size. Two stores holding different content
+///    therefore list different names — **provided something checks that a
+///    file's name is the hash of what is in it**.
+///  * [`fsck_section`] is that something, and it now runs in the fixture
+///    ([`probe_interop`]), in every submodule ([`module_refs`]) and in every
+///    peer ([`peer_section`]). Measured: a loose blob rewritten to hold
+///    different content under its own name is `blob 2, exit 0` to the census and
+///    `hash-path mismatch, exit 3` to `fsck`. `fsck` inflates and re-hashes the
+///    objects inside packs too, which is the same guarantee for the packed half.
+///  * [`probe_pack_contents`] reads which objects went into which pack out of
+///    the `.idx`, which is the one fact about a pack that is neither a
+///    compression choice nor already in the batch listing.
+///
+/// What is left uncompared, deliberately and stated rather than carried
+/// silently: the zlib stream of a loose object, the bytes of a pack, and the
+/// bytes of an `init` template hook (see [`hook_value`], which compares an
+/// installed hook by content and a `*.sample` by length because a sample's
+/// bytes describe which git is installed rather than what the command did).
 fn storage_of(objects: &Path) -> String {
     // Loose objects live in the 256 fan-out directories; everything else under
     // `objects/` (pack/, info/) is not a loose object.
@@ -3623,6 +3788,160 @@ fn storage_of(objects: &Path) -> String {
     let listing: String = entries.iter().map(|e| format!("{e}\n")).collect();
 
     format!("loose {loose}\n{listing}")
+}
+
+/// **Which objects are in which pack**, for every object store this crate can
+/// reach: the fixture's own, every peer's, and every submodule's.
+///
+/// # What was compared, and what that left out
+///
+/// Object *bytes* are the standing relaxation of this crate: a loose object is
+/// zlib at the writer's chosen level, and a pack's bytes carry a delta window,
+/// a compression level and an object ordering that the vendored gitoxide does
+/// not reproduce. [`storage_of`] therefore counts — loose objects by number,
+/// packs by elided name — and `cat-file --batch-check --batch-all-objects`
+/// lists the object set with types and sizes.
+///
+/// Between the two of them, one fact falls straight through: **the partition**.
+/// The census says "two packs"; the batch listing says "eleven objects"; nothing
+/// says which eleven went into which two. So `repack` splitting a store the
+/// wrong way, `gc` putting reachable objects in the cruft pack, `repack -a -d`
+/// leaving half the objects in the old pack it should have replaced, and a
+/// `clone` whose single pack is missing an object that arrived loose beside it
+/// were all one census line and one batch listing — identical to the correct
+/// answer.
+///
+/// # Why the `.idx` is read rather than git asked
+///
+/// `verify-pack -v` prints the list, and every line of it is
+/// `<oid> <type> <size> <size-in-pack> <offset>` plus, for a delta, `<depth>
+/// <base>` — of which `size-in-pack`, `offset`, `depth` and `base` are the
+/// compression choices this crate has already ruled uncomparable, and `type`
+/// and `size` are already in the batch listing. The one new column is the first
+/// one, and it is in the pack index verbatim: `\xfftOc`, version 2, a 256-entry
+/// fan-out whose last cell is the object count, then that many object ids **in
+/// sorted order**. Reading it costs no child process at all — measured against
+/// stock 2.55.0, `verify-pack -v` and the ids at offset 1032 of the same `.idx`
+/// list the same nine objects.
+///
+/// Everything after the id table — the CRCs (of compressed data), the offsets,
+/// the trailing checksums — is skipped for the reason above.
+///
+/// # Determinism
+///
+/// The ids are content and the table is sorted by git, so the rendering is a
+/// function of the pack's object set and nothing else. The pack's *name* is a
+/// checksum, so it is elided by [`stable_entry_name`] exactly as it is in the
+/// census, and the lines are sorted **after** eliding — which means two packs
+/// are compared as an unordered pair of object sets rather than by which
+/// checksum-named file happens to hold which, and a store that packs the same
+/// objects into the same shaped packs matches however the two files are named.
+///
+/// A store with more objects in one pack than [`PACK_LISTING_MAX`] prints the
+/// count and an FNV-1a of the id table instead of the table, on both sides
+/// alike: the same pure function of the same bytes, so a difference in the set
+/// is still a difference in the line.
+///
+/// A v1 index, a truncated one, or a repository whose ids are not 20 bytes
+/// (SHA-256) reads `<unparsed>` — symmetrically, since both sides are handed
+/// the same fixture, which is the same not-a-false-pass argument
+/// [`probe_index_meta`] makes for a v4 index.
+///
+/// # Direction
+///
+/// A new section appended below every section [`probe_state`] already emits, so
+/// no existing line moves. A store with no packs prints its label and nothing
+/// else, on both sides.
+///
+/// # Cost
+///
+/// No child process, and one `read` of each `.idx` — files that are a few
+/// kilobytes in this corpus. Stores with no `pack/` directory cost one failed
+/// `read_dir`.
+fn probe_pack_contents(repo: &Path) -> String {
+    let mut out = String::from("# pack-contents\n");
+    let mut stores: Vec<(String, PathBuf)> =
+        vec![("self".to_string(), git_dir(repo).join("objects"))];
+    // The peers, named exactly as `probe_peer` names them, so a reader can pair
+    // the two sections by eye.
+    let named = repo.join(PEER_DIR);
+    if looks_like_git_dir(&named) {
+        stores.push((format!("peer {PEER_DIR}"), named.join("objects")));
+    }
+    for (name, dir) in other_peers(repo) {
+        stores.push((format!("peer {name}"), dir.join("objects")));
+    }
+    // And the submodules, named as `probe_modules` names them.
+    for gitdir in module_gitdirs(&git_dir(repo).join("modules")) {
+        let rel = gitdir
+            .strip_prefix(git_dir(repo).join("modules"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        stores.push((format!("module {rel}"), gitdir.join("objects")));
+    }
+    for (label, objects) in stores {
+        out.push_str(&format!("## {label}\n"));
+        for line in pack_contents_of(&objects) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The pack listings of one object store, sorted after eliding; see
+/// [`probe_pack_contents`] for why the sort comes second.
+fn pack_contents_of(objects: &Path) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (rel, path) in walk_files(&objects.join("pack")) {
+        if !rel.ends_with(".idx") {
+            continue;
+        }
+        lines.push(format!("{}: {}", stable_entry_name(&rel), idx_object_list(&path)));
+    }
+    lines.sort();
+    lines
+}
+
+/// Above this many objects in one pack, the listing collapses to a count and a
+/// hash of the id table.
+///
+/// A number rather than no limit at all because the digest is compared line by
+/// line and printed in full by `--verbose`: a `clone` of something large would
+/// otherwise put a hundred thousand ids on one line of a failure report. Every
+/// fixture in this corpus packs tens of objects, so the cap is not reached; it
+/// is there so that a future shape cannot make the report unreadable.
+const PACK_LISTING_MAX: usize = 1024;
+
+/// The sorted object ids of one pack index v2, as `<count> <oid> <oid> …`.
+///
+/// The four-byte magic `\xfftOc` distinguishes v2 from the v1 layout, which has
+/// no magic at all and interleaves offsets with the ids; git has written v2
+/// since 1.5.2 and this returns `<unparsed>` for anything else.
+fn idx_object_list(path: &Path) -> String {
+    const UNPARSED: &str = "<unparsed>";
+    const MAGIC: &[u8] = b"\xfftOc";
+    // Magic, version, then 256 four-byte fan-out cells.
+    const IDS_AT: usize = 8 + 1024;
+    let Ok(bytes) = std::fs::read(path) else { return "<unreadable>".to_string() };
+    if bytes.len() < IDS_AT || &bytes[..4] != MAGIC || be32(&bytes, 4) != Some(2) {
+        return UNPARSED.to_string();
+    }
+    // The last fan-out cell is the total object count.
+    let Some(count) = be32(&bytes, IDS_AT - 4) else { return UNPARSED.to_string() };
+    let count = count as usize;
+    let Some(ids) = count.checked_mul(OID_LEN).and_then(|n| bytes.get(IDS_AT..IDS_AT + n)) else {
+        return UNPARSED.to_string();
+    };
+    if count > PACK_LISTING_MAX {
+        return format!("{count} objects {:016x}", fnv1a64(ids));
+    }
+    let mut out = count.to_string();
+    for id in ids.chunks(OID_LEN) {
+        out.push(' ');
+        out.push_str(&hex(id));
+    }
+    out
 }
 
 /// `FETCH_HEAD`, which was excluded from [`OP_STATE_FILES`] and is not
@@ -3875,25 +4194,37 @@ fn index_extensions(bytes: &[u8], version: u32, entries: u32) -> String {
 ///    the v2 opaque token. The clock and the token stop the parse; the version
 ///    is in front of them and a port that writes v1 where git writes v2 is a
 ///    difference two equal lengths can hide.
-///  * **`link`** (split index) — **null-or-not, and whether the bitmaps are
-///    there.** The shared index's checksum stays unread for the reason already
-///    given, but the doc says a *null* object id there is a distinct meaning
-///    ("the index does not require a split index"), and a body that is exactly
-///    one hash long carries no `delete`/`replace` bitmap at all. Both facts are
-///    a function of what the command did, both fit in two words, and neither
-///    exposes one byte of the checksum.
-///  * **`EOIE`** — **left, and now for a provable reason rather than a
-///    cautious one.** Its two fields are a 32-bit offset to the end of the
-///    index entries, which is byte layout, and a hash over "the extension types
-///    and their sizes (but not their contents)" — which is to say a hash over
+///  * **`link`** (split index) — **null-or-not, whether the bitmaps are there,
+///    and now the bit sets they hold.** The shared index's checksum stays
+///    unread for the reason already given, but the doc says a *null* object id
+///    there is a distinct meaning ("the index does not require a split index"),
+///    and a body that is exactly one hash long carries no `delete`/`replace`
+///    bitmap at all. Both facts are a function of what the command did, both
+///    fit in two words, and neither exposes one byte of the checksum. The two
+///    ewah bitmaps behind them are **decoded** — see [`ewah_detail`], and the
+///    re-examination in [`split_index_detail`]: an ewah *encoding* is a
+///    compression choice, but the bit set it encodes is one bit per shared-index
+///    entry in path order, which is content, and "which entries this command
+///    deleted and which it replaced" is the whole meaning of a split index.
+///  * **`EOIE`** — **left, and for a provable reason rather than a cautious
+///    one.** Its two fields are a 32-bit offset to the end of the index
+///    entries, which is byte layout, and a hash over "the extension types and
+///    their sizes (but not their contents)" — which is to say a hash over
 ///    exactly the `SIG:len` pairs this chain already prints in full. It cannot
 ///    report a difference the chain does not already report, so parsing it
-///    would add nothing.
-///  * **`IEOT`** — **version only, for the same shape of reason as `FSMN`.**
-///    Behind the 32-bit version is a table of (offset, entry count) pairs whose
-///    *partition* is the writer's threading choice, not a fact about the
-///    repository — git picks it from `index.threads` or the online CPU count —
-///    and whose counts sum to an entry count `index_meta` already prints.
+///    would add nothing. Re-examined and unchanged.
+///  * **`IEOT`** — **version only, and the offset table stays unread after a
+///    second look.** Behind the 32-bit version is a table of (offset, entry
+///    count) pairs. Both columns were re-examined field by field and neither
+///    survives: the offsets are byte positions inside this index file, which is
+///    layout by definition; the counts are how the writer chose to *partition*
+///    its entries across threads — git takes the block count from
+///    `index.threads`, or from the online CPU count when that is `0` — so a
+///    correct implementation on a machine with a different core count writes a
+///    different table for a byte-identical set of entries. What the table says
+///    about the repository is the sum of its counts, and that sum is the entry
+///    count in the index header, which [`index_meta`] already prints on its own
+///    line. There is nothing left in it that is not one of those two things.
 ///
 /// Every one of the five still contributes its signature and its length,
 /// exactly as before. Nothing is removed.
@@ -4072,18 +4403,159 @@ fn version_detail(body: &[u8]) -> String {
     }
 }
 
-/// One split-index link as `(base=set bitmaps=yes)`.
+/// One split-index link as `(base=set bitmaps=yes del=0:[] rep=3:[0 1 2])`.
 ///
 /// The shared index's checksum is read only to ask whether it is the null id,
 /// which is the format's way of saying "no shared index": its actual value is a
 /// checksum over bytes that include per-entry stat data and stays unrendered.
 /// `bitmaps` is whether the `delete`/`replace` pair is present at all, which
 /// git omits when there is nothing to record.
+///
+/// # The two bitmaps, re-examined
+///
+/// They were left at `bitmaps=yes` on the grounds that an ewah bitmap is a
+/// compressed encoding. The encoding is; **the bit set it encodes is not**.
+/// `gitformat-index` says what each bit means — "each bit represents an entry
+/// in the shared index. If a bit is set, its corresponding entry in the shared
+/// index will be removed" for `delete`, "…will be replaced with an entry in
+/// this index file" for `replace` — and the shared index's entries are sorted
+/// by path, so a bit position is a *path*, which is content. Which entries a
+/// command deleted and which it replaced is the entire meaning of a split
+/// index, and it was one word.
+///
+/// The **decoded set** is rendered and the encoding is not, which is the
+/// stricter of the two readings in the only direction that matters: two
+/// encoders that spell the same bit set with a different number of words
+/// compare equal, and two different bit sets cannot.
 fn split_index_detail(body: &[u8]) -> String {
     let Some(oid) = body.get(..OID_LEN) else { return "(<unparsed>)".to_string() };
     let base = if oid.iter().all(|b| *b == 0) { "null" } else { "set" };
     let bitmaps = if body.len() > OID_LEN { "yes" } else { "no" };
-    format!("(base={base} bitmaps={bitmaps})")
+    let mut out = format!("(base={base} bitmaps={bitmaps}");
+    let mut pos = OID_LEN;
+    if body.len() > OID_LEN {
+        for label in ["del", "rep"] {
+            match ewah_detail(body, &mut pos) {
+                Some(bits) => out.push_str(&format!(" {label}={bits}")),
+                None => {
+                    out.push_str(&format!(" {label}=<unparsed>"));
+                    break;
+                }
+            }
+        }
+    }
+    out.push(')');
+    out
+}
+
+/// The largest bit count [`ewah_detail`] will decode: one bit per shared-index
+/// entry, and no index in this corpus has a thousandth of that. A body claiming
+/// more is a misparse rather than a bitmap, and is reported as one.
+const EWAH_BIT_MAX: usize = 1 << 20;
+
+/// One serialised ewah bitmap at `*pos`, as `<bit count>:[<set positions>]`,
+/// advancing `*pos` past it.
+///
+/// # The layout, measured rather than recalled
+///
+/// `gitformat-index` describes the split-index bitmaps as "ewah-encoded" and
+/// stops there; no installed man page on this machine states the serialisation.
+/// So it was read off an index **stock 2.55.0 wrote** — three files added and
+/// committed, then `update-index --split-index` — whose 68-byte `link` body is
+///
+/// ```text
+///   6981…0dee                                   20  the shared index's id
+///   00000000 00000001 0000000000000000 00000000 20  delete: 0 bits, 1 word
+///   00000003 00000002 0000000200000000
+///                     0000000000000007 00000000 28  replace: 3 bits, 2 words
+/// ```
+///
+/// which fixes the layout as a 32-bit bit count, a 32-bit word count, that many
+/// **big-endian 64-bit** words, and a trailing 32-bit position that is an index
+/// into the words rather than data. 20 + 20 + 28 = 68, the length the extension
+/// header declares.
+///
+/// The words are run-length encoded: each *run word* carries the repeated bit
+/// in position 0, the number of repetitions in positions 1..=32, and the number
+/// of literal words that follow it in positions 33..=63. That split is not a
+/// guess either — it is forced by the same body. The replace bitmap's run word
+/// is `0x0000000200000000`, and the file says two words in total, so exactly one
+/// literal word follows it: `>> 33` yields 1 and `>> 32` yields 2, and only the
+/// first is consistent with the word count. The literal that follows is
+/// `0x…0007`, which is bits 0, 1 and 2 — three entries replaced, in a bitmap
+/// whose declared bit count is 3.
+///
+/// # Direction
+///
+/// A pure function of the body, like every other parser in this chain: it can
+/// map two different bodies onto one string, which is a difference not found,
+/// and it can never map one body onto two. A reported difference is always a
+/// real byte difference. The walk is bounded by the declared word count and by
+/// the body's own length, and it reads nothing past the bitmap it was asked
+/// for.
+fn ewah_detail(body: &[u8], pos: &mut usize) -> Option<String> {
+    let bits = be32(body, *pos)? as usize;
+    let words = be32(body, *pos + 4)? as usize;
+    // A declared bit count larger than any index could have entries is a
+    // misparse, not a bitmap; refusing it keeps the decode bounded by a number
+    // the body cannot make arbitrary.
+    if bits > EWAH_BIT_MAX {
+        return None;
+    }
+    let start = pos.checked_add(8)?;
+    let end = words.checked_mul(8).and_then(|n| start.checked_add(n))?;
+    // The trailing run-word position is layout, not content: read only to step
+    // past it.
+    let after = end.checked_add(4)?;
+    if after > body.len() {
+        return None;
+    }
+    let word = |i: usize| -> u64 {
+        let at = start + i * 8;
+        u64::from_be_bytes(body[at..at + 8].try_into().unwrap_or([0; 8]))
+    };
+    let mut set: Vec<usize> = Vec::new();
+    let mut bit = 0usize;
+    let mut i = 0usize;
+    while i < words && bit < bits {
+        let rlw = word(i);
+        i += 1;
+        let run_value = rlw & 1;
+        let run_len = ((rlw >> 1) & 0xffff_ffff) as usize;
+        let literals = (rlw >> 33) as usize;
+        for _ in 0..run_len {
+            // A run may legitimately declare more clean words than the declared
+            // bit count needs; past it there is nothing to record and the walk
+            // stops rather than counting to four billion.
+            if bit >= bits {
+                break;
+            }
+            if run_value == 1 {
+                for b in 0..64 {
+                    if bit + b < bits {
+                        set.push(bit + b);
+                    }
+                }
+            }
+            bit += 64;
+        }
+        for _ in 0..literals {
+            if i >= words {
+                break;
+            }
+            let lit = word(i);
+            i += 1;
+            for b in 0..64 {
+                if lit >> b & 1 == 1 && bit + b < bits {
+                    set.push(bit + b);
+                }
+            }
+            bit += 64;
+        }
+    }
+    *pos = after;
+    let rendered: Vec<String> = set.iter().map(usize::to_string).collect();
+    Some(format!("{bits}:[{}]", rendered.join(" ")))
 }
 
 /// One NUL-terminated string from `body` at `pos`, advancing `pos` past the NUL.
@@ -4442,6 +4914,74 @@ fn peer_section(home: &Path, name: &str, peer: &Path, root: &Path) -> String {
     out.push_str(&storage_of(&peer.join("objects")));
     out.push_str("## reflogs\n");
     out.push_str(&reflog_listing(root, &peer.join("logs")));
+    out.push_str(&fsck_section(stock, home, peer, &format!("peer {name}")));
+    out
+}
+
+/// `fsck --strict --no-progress --no-dangling` run by **stock git** inside one
+/// repository, as `exit:` plus everything it said on both streams.
+///
+/// # The hole this closes, and it is the same hole twice
+///
+/// [`module_refs`] earned this question inside `.git/modules/**` and stated why:
+/// the object census believes the filenames. A loose blob rewritten to hold
+/// different content *under its own name* reads as `blob 2, exit 0` to
+/// `cat-file --batch-check --batch-all-objects`, which takes the id from the
+/// path, and as `hash-path mismatch, exit 3` to `fsck`, which takes it from the
+/// bytes. Every peer had the census and not the validator, so the identical
+/// hole sat under `.remote.git` and under every repository [`other_peers`]
+/// finds — which is to say under every `push`, `send-pack`, `clone` and
+/// `fetch --prune` target in this corpus.
+///
+/// It is not reachable from anywhere else, either. [`probe_interop`] runs
+/// `fsck` in the *fixture*, and [`git_fingerprint`] — the gate that decides
+/// whether it runs at all — walks `git_dir(repo)` and nothing else, so a `push`
+/// that writes only into the peer does not open it. The peer's object store had
+/// no validator on any code path.
+///
+/// # What the validator sees that a census cannot
+///
+/// Measured against stock 2.55.0, not recalled: `fsck --strict` verifies more
+/// than loose-object naming. A commit-graph whose CDAT chunk names the wrong
+/// root tree, with the trailing checksum re-stamped so the file is internally
+/// consistent, produces
+/// `root tree OID for commit 13168c53… in commit-graph is b7130d30…faa8… !=
+/// b7130d30…f9a8…` and exit 16; a `multi-pack-index` with one byte moved and its
+/// checksum re-stamped produces `fatal: bad pack-int-id: 16777216 (1 total
+/// packs)` and exit 32; a `.bitmap` with one byte moved produces
+/// `error: bitmap file … has invalid checksum` and exit 128. So one invocation
+/// covers the accelerators the census names but never opens.
+///
+/// # Determinism
+///
+/// The paths `fsck` prints are relative to the directory it ran in
+/// (`./objects/28/…`), and the ids it prints are content. [`normalize`] is
+/// applied to this digest like every other surface, so an absolute path in a
+/// message that carries one is masked as it is everywhere else.
+///
+/// # Direction
+///
+/// Appended below every section the peer already had, so nothing that was
+/// compared before is compared differently. A healthy store prints
+/// `exit: Some(0)` and nothing else, on both sides.
+///
+/// # Cost
+///
+/// One stock invocation per peer per side, and only where a peer exists — the
+/// same gate [`peer_section`] already pays two invocations behind.
+fn fsck_section(stock: &Path, home: &Path, dir: &Path, label: &str) -> String {
+    let mut cmd = Command::new(stock);
+    env::harden(&mut cmd, home);
+    cmd.current_dir(dir).args(["fsck", "--strict", "--no-progress", "--no-dangling"]);
+    let mut out = format!("## {label} fsck --strict\n");
+    match cmd.output() {
+        Ok(o) => {
+            out.push_str(&format!("exit: {:?}\n", o.status.code()));
+            out.push_str(&decode_exact(o.stdout));
+            out.push_str(&decode_exact(o.stderr));
+        }
+        Err(_) => out.push_str("<spawn-failed>\n"),
+    }
     out
 }
 
@@ -5735,6 +6275,7 @@ pub fn locate_zvcs_bin(explicit: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
+        accelerator_read_probe, accelerators, other_peers, peer_section, probe_pack_contents,
         adjudicate, alt_reproduced, alt_speaks_to, case_timeout, classify, config_premise, git_dir,
         decode_varint, escape_bytes, ext_detail, index_meta, walk_files, interop_disagreement, is_unsupported, judge, oracle_diff, probe_op_state,
         probe_fetch_head, probe_index_meta, probe_modules, probe_pack_headers, probe_peer,
@@ -7250,9 +7791,13 @@ mod tests {
 
         let probe = probe_index_meta(&repo);
         // `index_bytes` fills the body with 0xab, so the split-index link reads
-        // as a non-null base with a bitmap pair behind it.
+        // as a non-null base with a bitmap pair behind it — and the four filler
+        // bytes behind the id are not a serialised ewah bitmap, which the parser
+        // says rather than guesses. A real `link` body is decoded down to its
+        // two bit sets in
+        // [`a_split_index_link_is_read_down_to_its_two_bit_sets`].
         assert!(
-            probe.contains("index: v2 entries=1 ext=[link:24(base=set bitmaps=yes)]"),
+            probe.contains("index: v2 entries=1 ext=[link:24(base=set bitmaps=yes del=<unparsed>)]"),
             "got:\n{probe}"
         );
         assert!(
@@ -8608,10 +9153,12 @@ mod tests {
         assert_eq!(ext_detail(b"link", &null), "(base=null bitmaps=no)");
         assert_eq!(ext_detail(b"link", &set), "(base=set bitmaps=no)");
         // A bitmap pair present is a fact; the checksum's own bytes are not read,
-        // so two different real checksums stay equal.
+        // so two different real checksums stay equal. A four-byte tail is not a
+        // bitmap, and saying so is the same not-a-guess the rest of the chain
+        // says — it is *more* than `bitmaps=yes` alone reported, never less.
         let mut with_bitmaps = set.to_vec();
         with_bitmaps.extend_from_slice(&[0, 0, 0, 1]);
-        assert_eq!(ext_detail(b"link", &with_bitmaps), "(base=set bitmaps=yes)");
+        assert_eq!(ext_detail(b"link", &with_bitmaps), "(base=set bitmaps=yes del=<unparsed>)");
         let mut other = set;
         other[19] = 7;
         assert_eq!(ext_detail(b"link", &set), ext_detail(b"link", &other));
@@ -8778,5 +9325,314 @@ mod tests {
         std::fs::create_dir_all(bare.join("refs")).unwrap();
         std::fs::write(bare.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
         assert_eq!(probe_peer(&bare, &bare), "# peer .remote.git\n<absent>\n");
+    }
+
+    /// A repository **outside the fixture root** is not a peer and must never
+    /// become one.
+    ///
+    /// This is not a hypothetical boundary. [`run_case`] lays the two sides out
+    /// as `<workdir>/stock` and `<workdir>/zvcs`, siblings under one parent,
+    /// with both repeat copies and both interop scratch directories beside
+    /// them. A walk that went up one level would splice the port's repository
+    /// into stock's digest and stock's into the port's — a comparison of each
+    /// side against the other side's work, which is not a stricter measurement
+    /// but a meaningless one. The test builds that exact layout and asserts the
+    /// walk stays inside its own root.
+    #[test]
+    fn a_repository_beside_the_fixture_is_never_probed_as_its_peer() {
+        let make = |at: &Path, head: &str| {
+            std::fs::create_dir_all(at.join("objects")).unwrap();
+            std::fs::create_dir_all(at.join("refs")).unwrap();
+            std::fs::write(at.join("HEAD"), format!("ref: {head}\n")).unwrap();
+        };
+        let workdir = std::env::temp_dir()
+            .join(format!("zvcs-parity-sibling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workdir);
+        // The layout `run_case` builds, plus the interop scratch beside it.
+        let stock = workdir.join("stock");
+        make(&stock.join(".git"), "refs/heads/main");
+        make(&workdir.join("zvcs/.git"), "refs/heads/theirs");
+        make(&workdir.join("repeat-stock/.git"), "refs/heads/main");
+        make(&workdir.join("interop-stock"), "refs/heads/main");
+
+        assert_eq!(
+            other_peers(&stock),
+            Vec::new(),
+            "nothing outside the fixture root may be offered up as a peer"
+        );
+        let digest = probe_peer(&stock, &stock);
+        assert_eq!(digest, "# peer .remote.git\n<absent>\n", "got:\n{digest}");
+        for name in ["zvcs", "repeat-stock", "interop-stock"] {
+            assert!(
+                !digest.contains(name),
+                "the other side's repository must not appear in this side's digest:\n{digest}"
+            );
+            assert!(
+                !probe_pack_contents(&stock).contains(name),
+                "nor in the pack census, which walks the same peer list"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    /// The peer gets git's own validator, and the census cannot replace it.
+    ///
+    /// One loose blob is overwritten with **another real loose object's bytes,
+    /// under its original name** — the rewrite the object census is blind to by
+    /// construction, because `cat-file --batch-check --batch-all-objects` takes
+    /// the id from the path. Both facts are asserted on the same peer: the
+    /// census still reports the object it always did, and `fsck` reports the
+    /// mismatch. Before this section existed the peer's whole store had no
+    /// validator on any code path — [`probe_interop`] runs one in the fixture,
+    /// and its gate ([`git_fingerprint`]) walks the fixture's git directory,
+    /// which a push into the peer never touches.
+    #[test]
+    fn a_peer_is_validated_and_not_only_counted() {
+        let stock = crate::stock::git().expect("this crate needs a stock git to measure anything");
+        let repo = scratch("peer-fsck");
+        let peer = repo.join(".remote.git");
+        let git = |args: &[&str]| -> std::process::Output {
+            let mut cmd = Command::new(stock);
+            crate::env::harden(&mut cmd, &repo);
+            cmd.current_dir(&repo).args(args).output().expect("stock git runs")
+        };
+        assert!(git(&["init", "-q", "--bare", ".remote.git"]).status.success());
+        let blob = |body: &str| -> String {
+            let mut cmd = Command::new(stock);
+            crate::env::harden(&mut cmd, &repo);
+            let out = cmd
+                .current_dir(&peer)
+                .args(["hash-object", "-w", "-t", "blob", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    c.stdin.take().unwrap().write_all(body.as_bytes())?;
+                    c.wait_with_output()
+                })
+                .expect("stock git runs");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let loose = |oid: &str| peer.join("objects").join(&oid[..2]).join(&oid[2..]);
+        let one = blob("one\n");
+        let two = blob("two\n");
+
+        let clean = peer_section(&repo, ".remote.git", &peer, &repo);
+        assert!(clean.contains("fsck --strict\nexit: Some(0)\n"), "got:\n{clean}");
+
+        // The rewrite: `one`'s file now holds `two`'s bytes, under `one`'s name.
+        let bytes = std::fs::read(loose(&two)).unwrap();
+        let _ = std::fs::remove_file(loose(&one));
+        std::fs::write(loose(&one), &bytes).unwrap();
+
+        let dirty = peer_section(&repo, ".remote.git", &peer, &repo);
+        assert!(
+            dirty.contains(&format!("{one} blob 4")),
+            "the census still believes the filename, which is why fsck is here:\n{dirty}"
+        );
+        assert!(
+            dirty.contains("hash-path mismatch"),
+            "the validator reads the bytes rather than the name:\n{dirty}"
+        );
+        assert!(
+            !dirty.contains("fsck --strict\nexit: Some(0)\n"),
+            "and it says so in its exit code too:\n{dirty}"
+        );
+        assert_ne!(clean, dirty, "the two peers must not compare equal");
+    }
+
+    /// Which objects went into which pack, cross-checked against the plumbing
+    /// this probe deliberately does **not** spawn.
+    ///
+    /// `verify-pack -v` is the documented way to ask, and four of its six
+    /// columns are compression choices this crate has already ruled
+    /// uncomparable. The claim being pinned is that the first column — the one
+    /// new fact — is in the `.idx` verbatim, so the listing can be read with no
+    /// child process at all and still name the same objects git names.
+    #[test]
+    fn the_pack_listing_names_what_verify_pack_names() {
+        let stock = crate::stock::git().expect("this crate needs a stock git to measure anything");
+        let repo = scratch("pack-contents");
+        let git = |args: &[&str]| -> std::process::Output {
+            let mut cmd = Command::new(stock);
+            crate::env::harden(&mut cmd, &repo);
+            cmd.current_dir(&repo).args(args).output().expect("stock git runs")
+        };
+        let ok = |args: &[&str]| {
+            let out = git(args);
+            assert!(
+                out.status.success(),
+                "stock git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        ok(&["init", "-q", "-b", "main"]);
+        // A store with no pack at all reports its label and nothing under it.
+        let empty = probe_pack_contents(&repo);
+        assert!(empty.starts_with("# pack-contents\n## self\n"), "got:\n{empty}");
+
+        for n in ["1", "2", "3"] {
+            std::fs::write(repo.join(format!("f{n}.txt")), format!("{n}\n")).unwrap();
+            ok(&["add", "-A"]);
+            ok(&["commit", "-qm", n]);
+        }
+        ok(&["repack", "-a", "-d", "-q"]);
+
+        let digest = probe_pack_contents(&repo);
+        assert_ne!(digest, empty, "packing the store must move the section");
+
+        // The oracle: every id in the first column of `verify-pack -v`.
+        let idx = walk_files(&repo.join(".git/objects/pack"))
+            .into_iter()
+            .find(|(rel, _)| rel.ends_with(".idx"))
+            .expect("repack wrote a pack index");
+        let out = git(&["verify-pack", "-v", &idx.1.to_string_lossy()]);
+        assert!(out.status.success(), "verify-pack must succeed on a pack git just wrote");
+        let mut named: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+            .filter(|t| t.len() == OID_LEN * 2 && t.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect();
+        named.sort();
+        assert!(named.len() >= 8, "the fixture should hold commits, trees and blobs");
+
+        let line = digest.lines().find(|l| l.starts_with("pack-")).expect("a pack line");
+        let listed: Vec<String> =
+            line.split_whitespace().skip(2).map(str::to_string).collect();
+        assert_eq!(listed, named, "the .idx names exactly what verify-pack names");
+        assert!(
+            line.contains(&format!(": {} ", named.len())),
+            "the count is printed beside the ids:\n{line}"
+        );
+        assert!(
+            line.starts_with("pack-<hash>.idx:"),
+            "a pack's checksum name is elided like every other one:\n{line}"
+        );
+    }
+
+    /// The split-index bitmaps, against the `link` extension **stock 2.55.0
+    /// wrote** for three files and one `update-index --split-index`.
+    ///
+    /// The serialisation is in no man page on this machine, so it was read off
+    /// this body; the body is reproduced here so the parser is pinned to
+    /// something git produced rather than to its own author's reading. See
+    /// [`ewah_detail`] for the derivation of the run-word field split, which
+    /// this body decides on its own: two words in the file, one of them the run
+    /// word, so the run word declares exactly one literal.
+    #[test]
+    fn a_split_index_link_is_read_down_to_its_two_bit_sets() {
+        let mut body: Vec<u8> = Vec::new();
+        // The shared index's id, `sharedindex.6981…0dee`.
+        body.extend_from_slice(&[
+            0x69, 0x81, 0x65, 0x95, 0x25, 0xce, 0x97, 0xcb, 0xe2, 0xdd, 0x1a, 0x5a, 0x48, 0x60,
+            0x7d, 0x02, 0x71, 0xf7, 0x0d, 0xee,
+        ]);
+        // delete: 0 bits, one all-clear word.
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        body.extend_from_slice(&[0; 8]);
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        // replace: 3 bits, a run word declaring one literal, and that literal.
+        body.extend_from_slice(&[0, 0, 0, 3, 0, 0, 0, 2]);
+        body.extend_from_slice(&[0, 0, 0, 2, 0, 0, 0, 0]);
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 7]);
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(body.len(), 68, "the length the extension header declared");
+        assert_eq!(
+            ext_detail(b"link", &body),
+            "(base=set bitmaps=yes del=0:[] rep=3:[0 1 2])"
+        );
+
+        // Two different bit sets of one length must not compare equal — the
+        // whole reason for reading the body at all.
+        let mut other = body.clone();
+        let last = other.len() - 5;
+        other[last] = 5;
+        assert_eq!(ext_detail(b"link", &other), "(base=set bitmaps=yes del=0:[] rep=3:[0 2])");
+
+        // A run of set bits is decoded as a run, and is bounded by the declared
+        // bit count rather than by the run length.
+        let mut run: Vec<u8> = vec![0; OID_LEN];
+        run[0] = 1;
+        run.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        run.extend_from_slice(&[0; 8]);
+        run.extend_from_slice(&[0, 0, 0, 0]);
+        run.extend_from_slice(&[0, 0, 0, 70, 0, 0, 0, 1]);
+        // Running bit 1, running length 2, no literals: 128 clean set bits, of
+        // which only the declared 70 are reported.
+        run.extend_from_slice(&(((2u64 << 1) | 1).to_be_bytes()));
+        run.extend_from_slice(&[0, 0, 0, 0]);
+        let rendered = ext_detail(b"link", &run);
+        assert!(rendered.contains("rep=70:[0 1 2"), "got:\n{rendered}");
+        assert!(rendered.ends_with("68 69])"), "the run stops at the declared width:\n{rendered}");
+    }
+
+    /// The widened mirror costs a process only where there is a structure to
+    /// misread, and it names which structures those were.
+    ///
+    /// Stock git stands in for the binary under test here: the probe's contract
+    /// is "ask this binary to enumerate the repository", and which binary is
+    /// asked is the caller's business. What is pinned is the gate — a repository
+    /// with no accelerator spawns nothing and still emits its line, so the two
+    /// sides line up positionally — and the sort, which is what makes an object
+    /// *set* comparable when `--objects` emits in walk order.
+    #[test]
+    fn the_accelerator_read_is_asked_only_where_there_is_one() {
+        let stock = crate::stock::git().expect("this crate needs a stock git to measure anything");
+        let repo = scratch("interop-accel");
+        let git = |args: &[&str]| -> std::process::Output {
+            let mut cmd = Command::new(stock);
+            crate::env::harden(&mut cmd, &repo);
+            cmd.current_dir(&repo).args(args).output().expect("stock git runs")
+        };
+        let ok = |args: &[&str]| {
+            let out = git(args);
+            assert!(
+                out.status.success(),
+                "stock git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        ok(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), b"a\n").unwrap();
+        ok(&["add", "-A"]);
+        ok(&["commit", "-qm", "one"]);
+
+        // A repository git has only committed into holds none of the five.
+        assert_eq!(accelerators(&repo), Vec::<&str>::new());
+        let quiet = accelerator_read_probe(stock, &repo, &repo);
+        assert_eq!(quiet, "## accelerator-read\npresent: \n<none present: not asked>\n");
+
+        // Each structure is named as stock writes it, and each opens the gate.
+        ok(&["pack-refs", "--all"]);
+        assert_eq!(accelerators(&repo), vec!["packed-refs"]);
+        ok(&["commit-graph", "write", "--reachable"]);
+        ok(&["repack", "-a", "-d", "-q", "--write-bitmap-index"]);
+        ok(&["multi-pack-index", "write"]);
+        assert_eq!(
+            accelerators(&repo),
+            vec!["commit-graph", "multi-pack-index", "bitmap", "packed-refs"]
+        );
+
+        let loud = accelerator_read_probe(stock, &repo, &repo);
+        assert!(
+            loud.starts_with(
+                "## accelerator-read\npresent: commit-graph multi-pack-index bitmap packed-refs\n\
+                 zvcs exit: Some(0)\n"
+            ),
+            "got:\n{loud}"
+        );
+        // The commit, its tree and its blob, and the object set is sorted so it
+        // is a set rather than a walk order.
+        let ids: Vec<&str> = loud
+            .lines()
+            .skip(3)
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        assert_eq!(ids.len(), 3, "one commit, one tree, one blob:\n{loud}");
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "the object set is rendered sorted:\n{loud}");
+        assert!(loud.contains(" a.txt\n"), "`--objects` names the path too:\n{loud}");
     }
 }

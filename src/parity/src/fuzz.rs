@@ -762,6 +762,27 @@ const CONFIG_EDGE_VALUES: &[&str] = &[
     // `"1 "` right by accident. Spelled at 1 rather than at a legal abbreviation
     // length so both checks are crossed by one pool.
     " 1", "1 ", "+1", "0x10", "1k", "-0",
+    // Enum words that are legal *somewhere*. The pool already carried `none` and
+    // `auto`; these four are the rest of the vocabulary git spreads across keys,
+    // and the point is that one word reaches five different outcomes depending on
+    // which key it lands on. Every row measured with `-c <key>=always status
+    // --porcelain` against stock 2.55.0:
+    //
+    //   core.autocrlf     fatal: bad boolean config value 'always' (128)
+    //   core.ignorecase   the same refusal
+    //   core.abbrev       fatal: bad numeric config value 'always': invalid unit
+    //   status.showUntrackedFiles  error: Invalid untracked files mode 'always'
+    //                              + fatal: unable to parse … (128)
+    //   core.logAllRefUpdates      rc 0 — `always` is one of its three values
+    //   core.eol                   rc 0 — accepted and ignored, though `lf`,
+    //                              `crlf` and `native` are the documented set
+    //
+    // `input` is the same experiment from the other direction: legal for
+    // `core.autocrlf` and `fatal: bad boolean config value 'input' for
+    // 'core.safecrlf'` one key over. A port with one shared enum table accepts
+    // every row, and the two rc-0 rows are what stop that from being visible with
+    // a single draw.
+    "always", "input", "warn", "all",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1268,32 @@ const CONFIG_GROUPS: &[ConfigGroup] = &[
             ("pack.writeBitmaps", BOOLS),
             ("diff.color", COLORBOOL),
             ("color.diff", COLORBOOL),
+            // The hyphenated spelling git kept for compatibility, and the camel
+            // one that replaced it. Verified against stock 2.55.0 that both are
+            // live and that each names **itself**: `-c add.ignoreErrors=bogus add
+            // README.md` is `fatal: bad boolean config value 'bogus' for
+            // 'add.ignoreerrors'` and `-c add.ignore-errors=bogus` is the same
+            // sentence ending in `'add.ignore-errors'`. A port that folds the two
+            // into one key reports the wrong name, and one that knows only the
+            // camel spelling ignores a setting git honours.
+            //
+            // The hyphenated one is **absent from `git help -c`** — 1005 lines,
+            // and `add.ignoreErrors` is the only `add.ignore*` in it — so it is
+            // also a key a port built from that listing cannot know it needs.
+            // This is `diff.textconv`'s test run in reverse: there, absence from
+            // the listing meant the key was not real; here the same absence sits
+            // beside a measured refusal, and the refusal is what decides.
+            ("add.ignoreErrors", BOOLS),
+            ("add.ignore-errors", BOOLS),
+            // The same shape one section over, and this pair is an *integer*
+            // rather than a boolean: `-c merge.summary=bogus merge <branch>` is
+            // `fatal: bad numeric config value 'bogus' for 'merge.summary':
+            // invalid unit` and `merge.log` gives the identical sentence under
+            // its own name (verified on [`Shape::MergeableDirty`]). `merge.log`
+            // is already drawn by `merge-conflict`; the deprecated spelling is
+            // drawn nowhere else, is likewise absent from `git help -c`, and is
+            // what a port is likeliest not to have.
+            ("merge.summary", &["true", "false", "20", "bogus"]),
         ],
     },
     // The repository's own format, which decides whether the rest of the
@@ -1263,6 +1310,34 @@ const CONFIG_GROUPS: &[ConfigGroup] = &[
             ("extensions.noSuchExtension", BOOLS),
             ("core.bare", BOOLS),
             ("core.logAllRefUpdates", &["true", "false", "always"]),
+            // The key whose whole behaviour is a function of the **scope** it
+            // arrives from, which is what makes it belong here rather than in the
+            // flat pool. `setup.c` reads the repository's own configuration
+            // before it knows which verb is running and never looks at the
+            // command line for this one. Verified against stock 2.55.0 on
+            // [`Shape::Linear`]:
+            //
+            //   -c core.worktree=src status                rc 0, ignored outright
+            //   [core] worktree = src   in .git/config     fatal: cannot chdir to
+            //                                              'src': No such file …
+            //   [core] worktree = ..    in .git/config     rc 0, and
+            //                                              rev-parse --show-toplevel
+            //                                              is the fixture root
+            //   [core] worktree = . + [core] bare = true   warning: core.bare and
+            //                                              core.worktree do not
+            //                                              make sense
+            //                                              fatal: unable to set up
+            //                                              work tree using invalid
+            //                                              config
+            //
+            // The last row is why it is in *this* group: the refusal needs
+            // `core.bare` beside it and needs both of them in a file, so it is
+            // reachable only by a two-key draw that also lands in a file scope —
+            // and [`sample_scope`] biases a draw toward one scope precisely so
+            // that happens. The relative value is resolved against `$GIT_DIR`,
+            // not the worktree root, which is why `..` is the spelling that works
+            // and `src` is the one that fails.
+            ("core.worktree", &["..", ".", "src", "no-such", ""]),
         ],
     },
     // Ref ordering and the `versionsort.suffix` list `version:` sorting consults,
@@ -1553,6 +1628,210 @@ const CONFIG_GROUPS: &[ConfigGroup] = &[
             ("blame.ignoreRevsFile", PATHNAME),
             ("diff.orderFile", PATHNAME),
             ("format.signatureFile", PATHNAME),
+            // The eighth reader of that parser, and the only one whose *hit* is
+            // an exit code rather than a rendering. Verified against stock 2.55.0
+            // on [`Shape::HooksFail`], whose `pre-commit` refuses:
+            // `commit -m x --allow-empty` is rc 1 and prints `pre-commit
+            // refuses`, `-c core.hooksPath=no-such` on the same invocation
+            // **commits** at rc 0, and `-c core.hooksPath=.git/hooks` — the same
+            // directory named the long way — refuses again. The expansion failure
+            // is shared with the rest of the group: `~nosuchuser/x` is
+            // `fatal: failed to expand user dir in: '~nosuchuser/x'` here too,
+            // and it happens before any hook is looked for.
+            ("core.hooksPath", &[".git/hooks", "no-such", "~/x", "~nosuchuser/x", "%(prefix)/x", ""]),
+        ],
+    },
+    // The decoration line, which four keys and a colour table decide between
+    // them. `log.decorate` says whether any decoration is printed at all,
+    // `log.initialDecorationSet` and `log.excludeDecoration` say which refs
+    // survive into it, `color.decorate.<slot>` says what colour each surviving
+    // kind is, and `color.ui` says whether the colour is emitted. Every one of
+    // them is inert without `log.decorate`, which is exactly what a single-key
+    // draw cannot show.
+    //
+    // Three facts, each verified against stock 2.55.0 on [`Shape::Branched`]:
+    //
+    //  * **The slot table decides whether the value is parsed at all.**
+    //    `-c color.decorate.branch=bogus log --oneline -1` is
+    //    `error: invalid color value: bogus` + `fatal: unable to parse
+    //    'color.decorate.branch' from command-line config` at rc 128, while
+    //    `-c color.decorate.bogusSlot=bogus` on the same invocation prints the
+    //    commit and exits 0 — `parse_decorate_color_config` returns before it
+    //    reads the value for a slot outside `color_decorate_slots[]`
+    //    (`log_config.rs:225-240`). `format-patch` does **not** short-circuit
+    //    this one (verified: same fatal), unlike the five keys in
+    //    `format-shortcircuit`.
+    //  * **`log.excludeDecoration` is multi-valued.** Two entries both apply:
+    //    with `refs/tags/*` alone the line is `(HEAD -> main)`, and with
+    //    `refs/heads/*` added it is `(HEAD)`. Every other key in this table is
+    //    last-wins, so a port that stores this one in a `String` reads the second
+    //    draw and drops the first — a difference only a repeated key can show,
+    //    and repetition is something [`sample_config`] already does.
+    //  * **`log.graphColors` refuses without dying.** `-c log.graphColors=bogus
+    //    log --graph` prints `error: invalid color value: bogus` *and*
+    //    `warning: ignored invalid color 'bogus' in log.graphColors` and still
+    //    exits **0** — the same `invalid color value` text that is fatal for
+    //    `color.decorate.branch`, from the same parser, with the opposite
+    //    outcome. With `red,blue` and `color.ui=always` the second graph column
+    //    is `\e[34m` where the default paints `\e[32m`, so the setting is
+    //    measurable in stdout and not only in an exit code.
+    ConfigGroup {
+        name: "decoration",
+        keys: &[
+            ("log.decorate", &["short", "full", "auto", "no", "true", "false", "bogus"]),
+            ("log.excludeDecoration", &["refs/tags/*", "refs/heads/*", "bogus", ""]),
+            ("log.initialDecorationSet", &["all", "short", "bogus", ""]),
+            ("log.graphColors", &["red,blue", "bogus", "red", ""]),
+            ("color.decorate.branch", COLOR),
+            ("color.decorate.tag", COLOR),
+            ("color.decorate.HEAD", COLOR),
+            ("color.decorate.grafted", COLOR),
+            ("color.decorate.bogusSlot", COLOR),
+            ("color.ui", COLORBOOL),
+        ],
+    },
+    // Keys whose value is parsed **at the moment the code that needs it runs**,
+    // beside keys from the same section that are parsed while the file is read.
+    // One value, one repository, and whether it is fatal depends on the verb —
+    // which is the half of configuration handling a port that validates once,
+    // eagerly, gets wrong in both directions at the same time.
+    //
+    // Every row verified against stock 2.55.0 on [`Shape::Dirty`] with the value
+    // `bogus` delivered by `-c`:
+    //
+    // ```text
+    // key                        inert under          fatal under
+    // core.bigFileThreshold      hash-object (rc 0)   add (128, invalid unit)
+    // core.filesRefLockTimeout   status      (rc 0)   update-ref (128)
+    // core.packedRefsTimeout     status      (rc 0)   pack-refs (128)
+    // core.splitIndex            add         (rc 0)   — never read
+    // core.deltaBaseCacheLimit   —                    status (128)
+    // core.packedGitLimit        —                    status (128)
+    // core.preloadIndex          —                    status (128)
+    // core.multiPackIndex        —                    status (128)
+    // core.warnAmbiguousRefs     —                    status (128)
+    // core.maxTreeDepth          —                    status (128)
+    // ```
+    //
+    // So the interaction is an *ordering* one, the same shape `config-pathnames`
+    // has: drawing a lazy key with an eager one means the eager refusal happens
+    // first and the lazy key is never reached, and drawing two lazy ones means
+    // the verb decides which of them speaks. A port that answers each key
+    // correctly on its own still has to agree about which refusal wins.
+    //
+    // `core.lockfilePid` is here because it is the newest reader in the set and
+    // the one with a *filesystem* consequence rather than a printed one: with it
+    // on, git writes a `<resource>~pid.lock` companion beside every lock it takes
+    // and unlinks it before the lock is persisted, so a step that dies between
+    // the two leaves a file behind for `probe_state` to find. Verified:
+    // `-c core.lockfilePid=bogus status` is `fatal: bad boolean config value
+    // 'bogus' for 'core.lockfilepid'`, and `=true` exits 0 leaving nothing.
+    ConfigGroup {
+        name: "lazy-validation",
+        keys: &[
+            ("core.bigFileThreshold", SIZE),
+            ("core.filesRefLockTimeout", INT),
+            ("core.packedRefsTimeout", INT),
+            ("core.splitIndex", BOOLS),
+            ("core.deltaBaseCacheLimit", SIZE),
+            ("core.packedGitLimit", SIZE),
+            ("core.packedGitWindowSize", SIZE),
+            ("core.preloadIndex", BOOLS),
+            ("core.multiPackIndex", BOOLS),
+            ("core.warnAmbiguousRefs", BOOLS),
+            ("core.maxTreeDepth", INT),
+            ("core.lockfilePid", BOOLS),
+        ],
+    },
+    // The cruft-pack and multi-pack-index settings `gc` and `repack` divide
+    // between them, and the only group in this table whose members reach **three
+    // different exit codes** from one value.
+    //
+    // `repack`'s cruft knobs are not parsed as configuration at all: they are
+    // spliced into an option list and handed to a child `repack`, so their
+    // refusal is a *usage* error from the other side of a fork. Verified against
+    // stock 2.55.0 on [`Shape::Packed`], all with `bogus`:
+    //
+    // ```text
+    // repack.cruftWindow     repack -d          rc 0    (never reached)
+    // repack.cruftWindow     repack --cruft -d  rc 129  error: option `window'
+    //                                                   expects an integer value…
+    // repack.cruftDepth      gc                 rc 128  the same error, then
+    //                                                   fatal: failed to run repack
+    // repack.midxSplitFactor repack -d          rc 128  bad numeric config value
+    // repack.packKeptObjects repack -d          rc 128  bad boolean config value
+    // gc.cruftPacks          gc                 rc 128  bad boolean config value
+    // gc.repackFilter        repack -d          rc 0    (a string, unvalidated)
+    // ```
+    //
+    // 0, 128 and 129 for the same word, decided by which verb ran and whether a
+    // cruft pack was being written. A port that validates these where it
+    // validates the rest of `[repack]` turns the 129 into a 128 and the 0 into
+    // either — and the 129 is the one no other group in this file can produce,
+    // because it comes from a child's `parse-options` rather than from a config
+    // callback. Every key here was added to `cmd_config.rs` by the config-chain
+    // work, and none of them was drawn by any generated case before this group.
+    ConfigGroup {
+        name: "repack-cruft",
+        keys: &[
+            ("repack.cruftWindow", INT),
+            ("repack.cruftWindowMemory", SIZE),
+            ("repack.cruftDepth", INT),
+            ("repack.cruftThreads", INT),
+            ("repack.midxMustContainCruft", BOOLS),
+            ("repack.midxSplitFactor", INT),
+            ("repack.midxNewLayerThreshold", SIZE),
+            ("repack.packKeptObjects", BOOLS),
+            ("repack.useDeltaIslands", BOOLS),
+            ("repack.updateServerInfo", BOOLS),
+            ("repack.useDeltaBaseOffset", BOOLS),
+            ("gc.cruftPacks", BOOLS),
+            ("gc.maxCruftSize", SIZE),
+            ("gc.repackFilter", &["blob:none", "blob:limit=1k", "bogus", ""]),
+            ("gc.repackFilterTo", &["gen-filtered.pack", "no/such/dir/x", ""]),
+            ("pack.deltaCacheSize", SIZE),
+        ],
+    },
+    // Which notes ref is read, which are displayed, and what happens to them when
+    // a commit is rewritten. Three keys, three *severities*, and each severity is
+    // only reachable through the reader that owns it — verified against stock
+    // 2.55.0 on [`Shape::NotesReplace`], which carries three notes refs holding
+    // different text for `HEAD`:
+    //
+    // ```text
+    // core.notesRef=refs/notes/other  notes show HEAD  prints the *other* note
+    // core.notesRef=bogus             notes show HEAD  fatal: refusing to show
+    //                                 notes in bogus (outside of refs/notes/)
+    // core.notesRef=bogus             status           rc 0
+    // notes.displayRef=refs/notes/*   log --notes      three notes, concatenated
+    // notes.displayRef=bogus          log --notes      warning: notes ref bogus
+    //                                 is invalid — and the default note anyway,
+    //                                 rc 0
+    // notes.displayRef=bogus          notes list       rc 0, silent
+    // notes.rewriteMode=bogus         commit --amend   error: Bad
+    //                                 notes.rewriteMode value: 'bogus' — and the
+    //                                 commit is **made**, rc 0
+    // notes.rewrite.amend=bogus       commit --amend   fatal: bad boolean config
+    //                                 value…, rc 128
+    // notes.mergeStrategy=bogus       notes merge      error + fatal, rc 128
+    // ```
+    //
+    // Fatal, warning, non-fatal `error:` and silence, from four keys of one
+    // family — and the `notes.rewriteMode` row is the one worth the group on its
+    // own, because a port that treats a bad value there as fatal refuses a commit
+    // git makes. `core.notesRef` is also the key that decides which ref every
+    // other row is about, so a wrong reading of it makes the rest look right.
+    ConfigGroup {
+        name: "notes-refs",
+        keys: &[
+            ("core.notesRef", &["refs/notes/commits", "refs/notes/other", "bogus", ""]),
+            ("notes.displayRef", &["refs/notes/*", "refs/notes/other", "bogus", ""]),
+            ("notes.rewriteMode", &["overwrite", "concatenate", "cat_sort_uniq", "ignore", "bogus"]),
+            ("notes.rewrite.amend", BOOLS),
+            ("notes.rewrite.rebase", BOOLS),
+            ("notes.rewriteRef", &["refs/notes/commits", "refs/notes/*", "bogus", ""]),
+            ("notes.mergeStrategy", &["manual", "ours", "theirs", "union", "bogus"]),
+            ("format.notes", &["true", "false", "refs/notes/other", "bogus"]),
         ],
     },
 ];
@@ -1607,6 +1886,62 @@ const CONFIG_ODD_LINES: &[&str] = &[
     "[core] abbrev = 4",
     "[branch \"a.b\"]\n\tmerge = refs/heads/main",
     "\n",
+];
+
+/// Keys written with **no value at all**, which is a fifth thing only a file can
+/// say.
+///
+/// `-c key=` and `key` on its own line are different inputs: the first delivers
+/// the empty string and the second delivers `NULL`, and git's callbacks branch on
+/// which one arrived. [`crate::runner::ConfigEntry::set`] always renders
+/// `key=value`, so no keyed draw in this file can produce the second — a raw line
+/// is the only route, and until now the only valueless line in the pools was
+/// `[core]\n\tabbrev`, which measures the `NULL` branch of exactly one key.
+///
+/// The reason it is worth its own pool rather than six more entries in
+/// [`CONFIG_ODD_LINES`] is that "no value" is not one outcome. Each line below
+/// was run against stock 2.55.0 appended to `.git/config`, and they reach five
+/// different renderings of the same condition:
+///
+/// ```text
+/// [core] quotePath     status         rc 0 — git_config_bool(NULL) is *true*
+/// [format] headers     format-patch   fatal: format.headers without value
+/// [format] headers     log            rc 0 — the arm is only in git_format_config
+/// [diff] context       status         fatal: bad numeric config value '' for
+///                                     'diff.context' in file .git/config:
+///                                     invalid unit
+/// [log] diffMerges     log            error: missing value for 'log.diffmerges'
+///                                     fatal: bad config variable
+///                                     'log.diffmerges' in file '.git/config' at
+///                                     line 10
+/// [core] worktree      status         error: missing value for 'core.worktree'
+///                                     fatal: bad config line 10 in file
+///                                     .git/config
+/// ```
+///
+/// Four fatal sentences and one silent acceptance, and the `format.headers` pair
+/// is the whole shape this pool exists for: one key, one value, two verbs, and
+/// the refusal lives in the callback `format-patch` installs and `log` does not
+/// (`log_config.rs:88-93`). A port that validates configuration once, before
+/// dispatch, cannot get both rows right.
+///
+/// `core.worktree` is the odd one and is here for it: its refusal is *setup*'s
+/// rather than the config reader's, so it names a line and not a variable, and it
+/// happens before the verb is even reached.
+///
+/// `[gc]\n\tpruneExpire` is the sixth and shares `log.diffMerges`'s rendering —
+/// verified, `gc --auto` gives `error: missing value for 'gc.pruneexpire'` and
+/// the same `bad config variable … at line 10` fatal — reached through a
+/// different callback (`cmd_config.rs`'s gc chain rather than the log one), which
+/// is the half of the pair a port can get right in one place and wrong in the
+/// other.
+const CONFIG_VALUELESS_LINES: &[&str] = &[
+    "[core]\n\tquotePath",
+    "[format]\n\theaders",
+    "[diff]\n\tcontext",
+    "[log]\n\tdiffMerges",
+    "[core]\n\tworktree",
+    "[gc]\n\tpruneExpire",
 ];
 
 /// The scopes a given key may be delivered from.
@@ -3055,9 +3390,11 @@ fn sample_scope(rng: &mut Rng, key: &str, primary: ConfigScope) -> ConfigScope {
 /// nothing the first one did not.
 ///
 /// A raw line is appended on a minority of draws, always into a file scope,
-/// because a line is a thing only a file has — half of them malformed (the
-/// line-numbered refusal that `-c` cannot produce) and half legal-but-
-/// unreachable (a valueless key, a continuation, a trailing comment).
+/// because a line is a thing only a file has — a third of them malformed (the
+/// line-numbered refusal that `-c` cannot produce), a third legal-but-
+/// unreachable (a continuation, a trailing comment, a folded spelling) and a
+/// third valueless, which is the `NULL`-value branch of a real key and neither
+/// of the other two.
 ///
 /// It goes *after* the settings rather than being shuffled among them, and the
 /// reason is the legal half rather than the malformed half. A legal file-only
@@ -3092,7 +3429,17 @@ fn sample_config(rng: &mut Rng) -> Vec<ConfigEntry> {
 
     if rng.chance(1, 5) {
         let scope = *rng.pick(ConfigScope::FILES);
-        let pool = if rng.chance(1, 2) { CONFIG_BAD_LINES } else { CONFIG_ODD_LINES };
+        // Three pools, one draw. The valueless pool is a third of the raw lines
+        // rather than a handful of entries appended to the legal one because its
+        // members are not legal-or-malformed at all — a line with no value parses
+        // fine and is then accepted or refused by the *key's* callback, which is a
+        // third outcome and the only one that separates `NULL` from the empty
+        // string. See [`CONFIG_VALUELESS_LINES`].
+        let pool = match rng.below(3) {
+            0 => CONFIG_BAD_LINES,
+            1 => CONFIG_ODD_LINES,
+            _ => CONFIG_VALUELESS_LINES,
+        };
         out.push(ConfigEntry::raw(scope, *rng.pick(pool)));
     }
     out
@@ -3369,10 +3716,48 @@ fn drop_each<T: Clone>(
 /// the one of them that is responsible, and while argv was the only dimension
 /// sampled it was also the only one that needed peeling.
 ///
-/// Order is coarsest first. The whole-fact dimensions (stdin, cwd) are single
-/// drops that often remove the failure's entire premise, and the environment
-/// redirects discovery wholesale, so trying them before the token-by-token walk
-/// through argv means the expensive walk usually runs on an already-smaller case.
+/// Order is coarsest first. The whole-fact dimensions (stdin, cwd, shape) are
+/// single substitutions that often remove the failure's entire premise, and the
+/// environment redirects discovery wholesale, so trying them before the
+/// token-by-token walk through argv means the expensive walk usually runs on an
+/// already-smaller case.
+///
+/// # Dropping is not the only reduction
+///
+/// Four of the dimensions a case carries cannot be *dropped* at all — every case
+/// has a shape, every config entry has a scope, a payload is either present or
+/// absent, and a working directory is a path rather than a list. Peeling was the
+/// whole vocabulary while argv was the whole case, and it left those four
+/// unreduced while the corpus started drawing all of them: a failure reported on
+/// `Shape::Promisor` from `.git/worktrees/wt` with a key delivered through
+/// `.git/config.worktree` says nothing about whether any of that mattered.
+///
+/// So each of them is *simplified* rather than dropped, and in every one the
+/// substitute is a value the harness already treats as the plain case:
+///
+///  * **Shape** walks [`SIMPLER_SHAPES`], stopping at the case's own shape. The
+///    fixture is built by the runner from the shape alone, so a candidate on a
+///    plainer one is an ordinary case and not a special form.
+///  * **Config scope** moves an entry to [`ConfigScope::CommandLine`], which is
+///    the scope every entry had before scopes were sampled and the one a reader
+///    can retype as a `-c`. A keyed entry only; a raw line is meaningless
+///    anywhere but a file and is left where it is.
+///  * **Stdin** shortens the payload to a line-boundary prefix, shortest first,
+///    which is a strict reduction of a `&'static [u8]` literal and stays
+///    `'static` because a subslice of a `'static` slice is one.
+///  * **Cwd** walks the parents of the sampled directory, shortest first. The
+///    runner creates a missing directory on both sides, so a parent is always a
+///    runnable case.
+///
+/// Every one of those is a fixed, ordered walk with no randomness in it: the same
+/// failing case and the same predicate produce the same minimal case on every
+/// run, which is the property that makes a printed `→` line something a reader
+/// can act on.
+///
+/// [`crate::runner::Case::size`] does not count any of the four, so a run that
+/// only simplified them leaves the size unchanged and `main` prints nothing —
+/// the reduction still happens, and it shows up in the id whenever anything else
+/// was dropped alongside it.
 pub fn shrink(case: &Case, still_fails: &mut dyn FnMut(&Case) -> bool) -> Case {
     let mut best = case.clone();
 
@@ -3391,12 +3776,132 @@ pub fn shrink(case: &Case, still_fails: &mut dyn FnMut(&Case) -> bool) -> Case {
             best = candidate;
         }
     }
+    simplify_shape(&mut best, still_fails);
 
     drop_each(&mut best, 0, |c| &mut c.env, still_fails);
     drop_each(&mut best, 0, |c| &mut c.globals, still_fails);
     drop_each(&mut best, 0, |c| &mut c.config, still_fails);
     drop_each(&mut best, 1, |c| &mut c.args, still_fails);
+
+    // The four non-droppable dimensions, on whatever survived the peeling. After
+    // it rather than before: a scope walk over five config entries costs five
+    // re-runs, and four of them are usually about to be dropped.
+    simplify_scopes(&mut best, still_fails);
+    shorten_stdin(&mut best, still_fails);
+    shorten_cwd(&mut best, still_fails);
     best
+}
+
+/// The shapes a failing case is re-tried on, plainest first.
+///
+/// Three rather than the whole [`ALL_SHAPES`] list, and these three because they
+/// are the ones every other shape is a decoration of: [`Shape::Linear`] is
+/// documented as the floor case, `Branched` adds refs to it and `Dirty` adds
+/// worktree state. Trying forty shapes would cost forty re-runs to report a fact
+/// — "it also fails on `Octopus`" — that is not simpler than the one the case
+/// already carries.
+///
+/// A shape is only tried if it comes *before* the case's own in this list, so a
+/// case that already runs on `Linear` is left alone and one on `Dirty` is only
+/// re-tried on `Linear` and `Branched`. A shape outside the list is treated as
+/// after all three, which is what makes the exotic shapes — the ones a reader
+/// most wants removed from a report — reducible.
+const SIMPLER_SHAPES: &[Shape] = &[Shape::Linear, Shape::Branched, Shape::Dirty];
+
+/// Re-run the case on a plainer fixture, keeping the first that still fails.
+fn simplify_shape(best: &mut Case, still_fails: &mut dyn FnMut(&Case) -> bool) {
+    let own = SIMPLER_SHAPES.iter().position(|s| *s == best.shape).unwrap_or(SIMPLER_SHAPES.len());
+    for shape in &SIMPLER_SHAPES[..own] {
+        let candidate = Case { shape: *shape, ..best.clone() };
+        if still_fails(&candidate) {
+            *best = candidate;
+            return;
+        }
+    }
+}
+
+/// Move each keyed config entry to the command line, keeping every move that
+/// still fails.
+///
+/// One entry at a time and left alone when the move stops the failure, because
+/// the scope *is* the finding for a whole class of case: `core.worktree` is inert
+/// from `-c` and fatal from `.git/config`, a raw line only exists in a file, and
+/// `extensions.worktreeConfig` gates whether `.git/config.worktree` is read at
+/// all. A shrinker that rewrote the scope unconditionally would report those as
+/// command-line cases that do not reproduce.
+fn simplify_scopes(best: &mut Case, still_fails: &mut dyn FnMut(&Case) -> bool) {
+    for i in 0..best.config.len() {
+        if best.config[i].is_raw() || best.config[i].scope == ConfigScope::CommandLine {
+            continue;
+        }
+        let mut candidate = best.clone();
+        candidate.config[i].scope = ConfigScope::CommandLine;
+        if still_fails(&candidate) {
+            *best = candidate;
+        }
+    }
+}
+
+/// Cut the stdin payload down to its shortest line-boundary prefix that still
+/// fails.
+///
+/// Prefixes rather than arbitrary subsets: a payload is a *language* — a patch, a
+/// mailbox, a fast-import stream — and dropping a line from the middle produces
+/// input whose refusal is about the hole rather than about the port. A prefix is
+/// the truncation git itself has to survive, and `P_PATCH_TRUNCATED` is already
+/// in the pool because that path is worth measuring.
+///
+/// Shortest first, so the answer is the least input that reproduces, and capped
+/// at [`STDIN_PREFIX_TRIES`] candidates so a long payload cannot turn one
+/// reported failure into fifty re-runs.
+fn shorten_stdin(best: &mut Case, still_fails: &mut dyn FnMut(&Case) -> bool) {
+    let Some(payload) = best.stdin else { return };
+    let mut ends: Vec<usize> = payload
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\n')
+        .map(|(i, _)| i + 1)
+        .filter(|end| *end < payload.len())
+        .collect();
+    ends.truncate(STDIN_PREFIX_TRIES);
+    for end in ends {
+        let candidate = Case { stdin: Some(&payload[..end]), ..best.clone() };
+        if still_fails(&candidate) {
+            *best = candidate;
+            return;
+        }
+    }
+}
+
+/// How many stdin prefixes one shrink may try. Every payload in [`STDIN_PAYLOADS`]
+/// is under a dozen lines, so this bounds the cost without reaching a payload's
+/// real end.
+const STDIN_PREFIX_TRIES: usize = 12;
+
+/// Move the working directory up toward the fixture root, keeping the shallowest
+/// parent that still fails.
+///
+/// `shrink` already tried the root itself and failed, so the failure needs *a*
+/// directory; this asks how much of the path it needs. `.git/objects/pack`
+/// reducing to `.git` is the difference between "inside the pack directory" and
+/// "inside the git directory", and the second is the sentence a discovery bug is
+/// written in.
+fn shorten_cwd(best: &mut Case, still_fails: &mut dyn FnMut(&Case) -> bool) {
+    let Some(dir) = best.cwd else { return };
+    // Ascending prefixes, shortest first: `a`, `a/b`, … and never the whole
+    // string, which is what the case already has.
+    let parents: Vec<&'static str> = dir
+        .char_indices()
+        .filter(|(_, c)| *c == '/')
+        .map(|(i, _)| &dir[..i])
+        .collect();
+    for parent in parents {
+        let candidate = Case { cwd: Some(parent), ..best.clone() };
+        if still_fails(&candidate) {
+            *best = candidate;
+            return;
+        }
+    }
 }
 
 // ===========================================================================
@@ -3452,6 +3957,11 @@ pub fn shrink(case: &Case, still_fails: &mut dyn FnMut(&Case) -> bool) -> Case {
 //    the end state must equal the start state on both sides — so a `remove` that
 //    half-cleans, or an `unset` that leaves a stanza behind, is a state
 //    difference at the step that failed to clean rather than a mystery later.
+//    This is also the one family that reads the forward half's artifact **by
+//    name**: [`RoundTrip::reads`] asks one question about the thing that was just
+//    written, once while it exists and once after the inverse, so the answer is a
+//    value the earlier step produced rather than a generic listing that happens
+//    to contain it.
 //
 // # What is drawn from the grammars and what cannot be
 //
@@ -4177,6 +4687,44 @@ struct RoundTrip {
     shape: Shape,
     forward: &'static [&'static [&'static str]],
     inverse: &'static [&'static [&'static str]],
+    /// Reads that **name the thing the forward half created**, run once between
+    /// the halves and again after the inverse.
+    ///
+    /// The one dependency a generated step could not express until now. Every
+    /// other step in this file is either a fixed script or an argv drawn from a
+    /// pool, and [`OBSERVERS`] is drawn uniformly and deliberately names nothing —
+    /// which is right for a family whose oracle is the state probe, and is why a
+    /// wrong write shows up there as "some step changed the repository" rather
+    /// than as an answer to a question about the thing that was written.
+    ///
+    /// A read here is the answer to that question. `stash push -m gen` is
+    /// followed by `log -g --format=%gd %gs refs/stash`, which prints
+    /// `stash@{0} On main: gen` — a *value the earlier step produced*, read back
+    /// under the name that step chose. Nothing about that breaks the rule that a
+    /// step's argv is a compile-time literal, because the name is the literal:
+    /// the pair already had to name `gen` to create it, and the read names the
+    /// same string. What the read cannot do is carry an id forward — no step can
+    /// substitute an oid a previous step printed — so every entry below is
+    /// phrased as a question whose *answer* is the produced value rather than as
+    /// an argument containing it.
+    ///
+    /// Run **twice** on purpose, and the second run is the half that pays: after
+    /// the inverse the same question must have the other answer, and the two
+    /// answers are usually a value and a refusal — `refs/heads/gen-ref` resolving
+    /// to an oid, then `fatal: Needed a single revision` at rc 128. A port whose
+    /// inverse half-cleans answers the first reading correctly and the second one
+    /// with the value that should be gone, at the step that asked rather than
+    /// three steps later.
+    ///
+    /// Empty for the five pairs whose artifact is already named by something
+    /// else, since a second reader of the same fact costs an invocation per side
+    /// and adds nothing: `sparse-init-disable` (the `sparse-checkout list`
+    /// observer), `bisect-log-replay` (`bisect log`, in its own halves),
+    /// `bundle-create-unbundle` (`bundle verify` and `list-heads`, in its forward
+    /// half), `read-tree-back` and `apply-symlink-patch`, whose artifact is the
+    /// whole index or the whole worktree and is what `probe_state` compares
+    /// first.
+    reads: &'static [&'static [&'static str]],
     /// Payload for the **first** forward step, and only for it.
     ///
     /// Narrow on purpose. Two of the pairs below are round trips through a
@@ -4204,7 +4752,8 @@ struct RoundTrip {
 /// and a round-trip whose inverse no longer inverts is a sequence whose premise
 /// its own first step destroyed. That is the nonsense case this file must not
 /// generate, so the pairs are exact and the drawn part is which pair runs, which
-/// observers sit between the halves, and the envelope.
+/// of the pair's [`RoundTrip::reads`] is asked, which observers sit between the
+/// halves, and the envelope.
 ///
 /// Both halves are still compared step by step like everything else, so the
 /// finding is never "these differ after four commands": a `disable` that leaves
@@ -4216,6 +4765,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Dirty,
         forward: &[&["stash", "push", "-m", "gen"]],
         inverse: &[&["stash", "pop"]],
+        reads: &[
+            &["stash", "show", "--stat", "stash@{0}"],
+            &["log", "-g", "--format=%gd %gs", "refs/stash"],
+        ],
         forward_stdin: None,
     },
     // The untracked half: `-u` stashes a file that was never in the index, and
@@ -4227,6 +4780,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Dirty,
         forward: &[&["stash", "push", "-u", "-m", "gen"]],
         inverse: &[&["stash", "pop"]],
+        reads: &[
+            &["stash", "show", "--include-untracked", "--stat", "stash@{0}"],
+            &["log", "-g", "--format=%gd %gs", "refs/stash"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4235,6 +4792,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["branch", "-m", "main", "gen-renamed"]],
         inverse: &[&["branch", "-m", "gen-renamed", "main"]],
+        reads: &[
+            &["log", "-g", "--format=%gd %gs", "refs/heads/gen-renamed"],
+            &["rev-parse", "--verify", "refs/heads/gen-renamed"],
+        ],
         forward_stdin: None,
     },
     // `add` writes `.git/worktrees/<n>/{gitdir,HEAD,commondir}` and a `.git`
@@ -4245,6 +4806,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["worktree", "add", "-b", "gen-wtb", "wt-gen"]],
         inverse: &[&["worktree", "remove", "wt-gen"]],
+        reads: &[
+            &["worktree", "list", "--porcelain"],
+            &["rev-parse", "--verify", "refs/heads/gen-wtb"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4253,6 +4818,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Worktree,
         forward: &[&["worktree", "lock", "wt"]],
         inverse: &[&["worktree", "unlock", "wt"]],
+        reads: &[
+            &["worktree", "list", "--porcelain"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4261,6 +4829,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Sparse,
         forward: &[&["sparse-checkout", "set", "inside"]],
         inverse: &[&["sparse-checkout", "disable"]],
+        reads: &[
+            &["ls-files", "-t", "outside"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4269,6 +4840,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["sparse-checkout", "init", "--cone"]],
         inverse: &[&["sparse-checkout", "disable"]],
+        reads: &[],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4277,6 +4849,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["tag", "gen-tag", "HEAD"]],
         inverse: &[&["tag", "-d", "gen-tag"]],
+        reads: &[
+            &["rev-parse", "--verify", "refs/tags/gen-tag"],
+            &["cat-file", "-t", "gen-tag"],
+        ],
         forward_stdin: None,
     },
     // `switch -` resolves `@{-1}` out of the reflog, so the inverse half reads
@@ -4287,6 +4863,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["switch", "-c", "gen-branch"]],
         inverse: &[&["switch", "-"], &["branch", "-D", "gen-branch"]],
+        reads: &[
+            &["log", "-g", "--format=%gd %gs", "refs/heads/gen-branch"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4295,6 +4874,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["checkout", "-b", "gen-co"]],
         inverse: &[&["checkout", "main"], &["branch", "-D", "gen-co"]],
+        reads: &[
+            &["log", "-g", "--format=%gd %gs", "refs/heads/gen-co"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4303,6 +4885,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["update-ref", "refs/heads/gen-ref", "HEAD"]],
         inverse: &[&["update-ref", "-d", "refs/heads/gen-ref"]],
+        reads: &[
+            &["log", "-g", "--format=%gd %gs", "refs/heads/gen-ref"],
+            &["rev-parse", "--verify", "refs/heads/gen-ref"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4311,6 +4897,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::BehindRemote,
         forward: &[&["remote", "add", "gen", "./.remote.git"]],
         inverse: &[&["remote", "remove", "gen"]],
+        reads: &[
+            &["remote", "get-url", "gen"],
+            &["config", "--get", "remote.gen.url"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4319,6 +4909,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["notes", "add", "-m", "gen note", "HEAD"]],
         inverse: &[&["notes", "remove", "HEAD"]],
+        reads: &[
+            &["notes", "show", "HEAD"],
+            &["rev-parse", "--verify", "refs/notes/commits"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4327,6 +4921,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["commit", "--allow-empty", "-m", "gen"]],
         inverse: &[&["reset", "--hard", "HEAD~1"]],
+        reads: &[
+            &["log", "-g", "--format=%gd %gs", "HEAD"],
+            &["log", "-1", "--format=%s %P"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4335,6 +4933,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Dirty,
         forward: &[&["add", "untracked.txt"]],
         inverse: &[&["restore", "--staged", "untracked.txt"]],
+        reads: &[
+            &["ls-files", "--stage", "untracked.txt"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4343,6 +4944,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["rm", "--cached", "README.md"]],
         inverse: &[&["add", "README.md"]],
+        reads: &[
+            &["ls-files", "--stage", "README.md"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4351,6 +4955,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["config", "gen.key", "value"]],
         inverse: &[&["config", "--unset", "gen.key"]],
+        reads: &[
+            &["config", "--get", "gen.key"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4359,6 +4966,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["mv", "README.md", "gen-moved.md"]],
         inverse: &[&["mv", "gen-moved.md", "README.md"]],
+        reads: &[
+            &["ls-files", "--stage", "gen-moved.md"],
+            &["diff", "--cached", "-M", "--name-status"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4367,6 +4978,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["symbolic-ref", "refs/gen-sym", "refs/heads/main"]],
         inverse: &[&["symbolic-ref", "-d", "refs/gen-sym"]],
+        reads: &[
+            &["symbolic-ref", "refs/gen-sym"],
+        ],
         forward_stdin: None,
     },
     // `--soft` moves only `HEAD` and records `ORIG_HEAD`; the inverse reads that
@@ -4378,6 +4992,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["reset", "--soft", "HEAD~1"]],
         inverse: &[&["reset", "--soft", "ORIG_HEAD"]],
+        reads: &[
+            &["rev-parse", "--verify", "ORIG_HEAD"],
+            &["log", "-g", "--format=%gd %gs", "HEAD"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4386,6 +5004,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["read-tree", "HEAD~1"]],
         inverse: &[&["read-tree", "HEAD"]],
+        reads: &[],
         forward_stdin: None,
     },
     // The only way this harness can produce an **ambiguous refname**. `Branched`
@@ -4409,6 +5028,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Branched,
         forward: &[&["tag", "feature", "HEAD"]],
         inverse: &[&["tag", "-d", "feature"]],
+        reads: &[
+            &["show-ref", "feature"],
+            &["rev-parse", "feature"],
+        ],
         forward_stdin: None,
     },
     // An index *flag* round trip. Every other pair here moves a ref, a file or a
@@ -4425,6 +5048,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["update-index", "--assume-unchanged", "README.md"]],
         inverse: &[&["update-index", "--no-assume-unchanged", "README.md"]],
+        reads: &[
+            &["ls-files", "-v", "README.md"],
+        ],
         forward_stdin: None,
     },
     // The only pair whose two halves are the *same command* with `-R` between
@@ -4458,6 +5084,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Symlinks,
         forward: &[&["apply", "patches/symlink.patch"]],
         inverse: &[&["apply", "-R", "patches/symlink.patch"]],
+        reads: &[],
         forward_stdin: None,
     },
     // ----------------------------------------------------------------------
@@ -4495,6 +5122,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
             &["bundle", "list-heads", "gen.bundle"],
         ],
         inverse: &[&["bundle", "unbundle", "gen.bundle"]],
+        reads: &[],
         forward_stdin: None,
     },
     // The mail round trip, and the one whose end state is *byte-identical* to
@@ -4523,6 +5151,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
             &["reset", "--hard", "HEAD~1"],
         ],
         inverse: &[&["am", "gen-patches/1"]],
+        reads: &[
+            &["apply", "--stat", "gen-patches/1"],
+        ],
         forward_stdin: None,
     },
     // The stream round trip. `fast-import` is the largest input language in git
@@ -4545,6 +5176,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["fast-import", "--quiet", "--done"], &["fast-export", "--all"]],
         inverse: &[&["update-ref", "-d", "refs/heads/gen-fi"]],
+        reads: &[
+            &["rev-parse", "--verify", "refs/heads/gen-fi"],
+            &["cat-file", "-p", "refs/heads/gen-fi:gen.txt"],
+        ],
         forward_stdin: Some(P_FAST_IMPORT),
     },
     // `update-ref --stdin` is a *transaction*: a command list read from a
@@ -4563,6 +5198,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Linear,
         forward: &[&["update-ref", "--stdin"]],
         inverse: &[&["update-ref", "-d", "refs/heads/parity-fuzz"]],
+        reads: &[
+            &["rev-parse", "--verify", "refs/heads/parity-fuzz"],
+            &["log", "-g", "--format=%gd %gs", "refs/heads/parity-fuzz"],
+        ],
         forward_stdin: Some(P_REF_UPDATES),
     },
     // `bisect` writes `.git/BISECT_LOG` as it goes and `bisect replay` reads a
@@ -4628,6 +5267,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::IntentToAdd,
         forward: &[&["add", "ita-new.txt"]],
         inverse: &[&["rm", "--cached", "-f", "ita-new.txt"], &["add", "-N", "ita-new.txt"]],
+        reads: &[
+            &["ls-files", "--stage", "-v", "ita-new.txt"],
+        ],
         forward_stdin: None,
     },
     // A staged rename **cancelled**, and staged again. `mv-there-and-back` above
@@ -4659,6 +5301,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::PendingRename,
         forward: &[&["mv", "pure-renamed.txt", "pure.txt"]],
         inverse: &[&["mv", "pure.txt", "pure-renamed.txt"]],
+        reads: &[
+            &["ls-files", "--stage", "pure.txt"],
+            &["diff", "--cached", "-M", "--name-status"],
+        ],
         forward_stdin: None,
     },
     // A worktree lock released and re-taken **with its reason**.
@@ -4688,6 +5334,9 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::WorktreeLocked,
         forward: &[&["worktree", "unlock", "wt"]],
         inverse: &[&["worktree", "lock", "--reason", "held by the fixture", "wt"]],
+        reads: &[
+            &["worktree", "list", "--porcelain"],
+        ],
         forward_stdin: None,
     },
     // A tag object in the middle of a chain, deleted and rebuilt **to the same
@@ -4719,6 +5368,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::TagChain,
         forward: &[&["tag", "-d", "outermost"]],
         inverse: &[&["tag", "-a", "outermost", "-m", "outermost tag, points at outer", "outer"]],
+        reads: &[
+            &["rev-parse", "outermost"],
+            &["cat-file", "-p", "outermost"],
+        ],
         forward_stdin: None,
     },
     // A blob that is **not in the repository**, demanded by a step and supplied
@@ -4760,6 +5413,10 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         shape: Shape::Promisor,
         forward: &[&["checkout", "pc-side"]],
         inverse: &[&["checkout", "main"]],
+        reads: &[
+            &["cat-file", "-p", "pc-side:hist.txt"],
+            &["rev-list", "--missing=print", "--objects", "--all"],
+        ],
         forward_stdin: None,
     },
     RoundTrip {
@@ -4772,6 +5429,7 @@ const ROUND_TRIPS: &[RoundTrip] = &[
             &["bisect", "good", "HEAD~1"],
         ],
         inverse: &[&["bisect", "replay", ".git/BISECT_LOG"], &["bisect", "reset"]],
+        reads: &[],
         forward_stdin: None,
     },
 ];
@@ -4875,8 +5533,65 @@ fn resume_step(rng: &mut Rng, own: &str, grammars: &[Grammar]) -> Vec<String> {
     vec![cmd.to_string(), rng.pick(&verbs).to_string()]
 }
 
+/// The record an interrupted operation parks, read back **by name**.
+///
+/// The same dependency [`RoundTrip::reads`] adds to the round trips, for the
+/// family where it is cheapest to state: a stopper's entry step writes a
+/// pseudo-ref (or, for `am`, a mail) whose name is fixed by git and known at
+/// compile time, and every one of the resumption verbs is defined by what it does
+/// to that record. `--abort` clears it, `--quit` leaves the work and clears it,
+/// `--continue` consumes it — so a walk that never asks about it measures the
+/// transitions through the state probe alone and cannot say *which* record a port
+/// forgot to clean.
+///
+/// Every row was run against stock 2.55.0 on a premise from this table, before
+/// and after the operation was aborted — `cherry-pick theirs` and `merge theirs`
+/// on [`Shape::Conflicted`], `revert --no-edit main~2` on `Whitespace`,
+/// `rebase theirs` on `Conflicted`, `am mail/one.eml` twice on `Patches`,
+/// `fetch --deepen=1` on `Shallow`, and `merge --no-commit div-other` on
+/// `MergeableDirty`, which is the row the obvious reading gets wrong: a merge
+/// that *succeeded* and stopped before committing parks `MERGE_HEAD` exactly like
+/// one that conflicted (verified, `e62c76f…` then the refusal after `--abort`):
+///
+/// ```text
+/// cherry-pick  CHERRY_PICK_HEAD  d3928f9… → fatal: Needed a single revision (128)
+/// revert       REVERT_HEAD       35a528b… → the same refusal
+/// rebase       REBASE_HEAD       38ab0cb… → the same refusal
+/// merge        MERGE_HEAD        d3928f9… → the same refusal
+/// am           the parked mail   `am --show-current-patch=raw` prints the whole
+///                                mail `.git/rebase-apply` holds; with nothing in
+///                                progress it is `fatal: Resolve operation not in
+///                                progress, we are not resuming.` (128)
+/// fetch        FETCH_HEAD        b56bdca… after `fetch --deepen=1`, and the same
+///                                id afterwards — the one row whose answer is not
+///                                supposed to change
+/// ```
+///
+/// `None` for the four stoppers with no such record: `stash`'s entry leaves the
+/// entry itself, which the `stash list` observer already prints; `gc`, `commit`
+/// and `push` park nothing a plumbing command can name — a refused commit leaves
+/// only `COMMIT_EDITMSG`, and no verb reads a file by path.
+fn parked_read(cmd: &str) -> Option<&'static [&'static str]> {
+    Some(match cmd {
+        "cherry-pick" => &["rev-parse", "--verify", "CHERRY_PICK_HEAD"],
+        "revert" => &["rev-parse", "--verify", "REVERT_HEAD"],
+        "rebase" => &["rev-parse", "--verify", "REBASE_HEAD"],
+        "merge" => &["rev-parse", "--verify", "MERGE_HEAD"],
+        "am" => &["am", "--show-current-patch=raw"],
+        "fetch" => &["rev-parse", "--verify", "FETCH_HEAD"],
+        _ => return None,
+    })
+}
+
 /// A state-machine walk: setup, the invocation that stops, then resumption verbs
 /// with observers between them.
+///
+/// The parked record is read twice — once as soon as the entry has stopped and
+/// once after the transitions have run — for the reason [`round_trip`] gives for
+/// bracketing the inverse: the first answer measures the write and the second
+/// measures the clean-up, and only the pair distinguishes "never parked" from
+/// "parked and cleared". Two steps per walk, on the sixteen stoppers that have a
+/// record.
 fn walk(rng: &mut Rng, s: &Stopper, grammars: &[Grammar], n: usize) -> Sequence {
     let mut seq =
         Sequence::new(s.cmd, format!("gen/walk/{}#{n}", s.name), s.shape);
@@ -4926,6 +5641,12 @@ fn walk(rng: &mut Rng, s: &Stopper, grammars: &[Grammar], n: usize) -> Sequence 
         seq = seq.step_argv(args, s.entry_stdin);
     }
 
+    // What the entry parked, named. See [`parked_read`].
+    let parked = parked_read(s.cmd);
+    if let Some(step) = parked {
+        seq = seq.step(step);
+    }
+
     // The walk. Each verb is followed by an observer half the time — often
     // enough that a wrong write is attributed to the verb that made it, rarely
     // enough that the walk is mostly transitions rather than mostly reads.
@@ -4934,6 +5655,9 @@ fn walk(rng: &mut Rng, s: &Stopper, grammars: &[Grammar], n: usize) -> Sequence 
         if rng.chance(1, 2) {
             seq = seq.step(rng.pick(OBSERVERS));
         }
+    }
+    if let Some(step) = parked {
+        seq = seq.step(step);
     }
     seq = observe(rng, seq, 2);
     envelope_dims(rng, seq, s.shape)
@@ -5022,6 +5746,15 @@ fn mutate_then_observe(rng: &mut Rng, g: &Grammar, n: usize) -> Sequence {
 }
 
 /// An operation, then its inverse, with reads between the halves.
+///
+/// One [`RoundTrip::reads`] entry is drawn per sequence and asked **twice** —
+/// once while the forward half's artifact exists and once after the inverse has
+/// removed it. Drawn rather than run in full because the pairs carry one to three
+/// of them and a sequence that ran every read twice would spend more steps on
+/// reading than on the round trip; asked twice rather than once because the
+/// second answer is the one that catches an inverse that half-cleans, and a
+/// question asked only after the inverse cannot tell "never written" from
+/// "written and removed".
 fn round_trip(rng: &mut Rng, rt: &RoundTrip, n: usize) -> Sequence {
     let mut seq =
         Sequence::new(rt.cmd, format!("gen/roundtrip/{}#{n}", rt.name), rt.shape);
@@ -5034,8 +5767,19 @@ fn round_trip(rng: &mut Rng, rt: &RoundTrip, n: usize) -> Sequence {
         let stdin = if i == 0 { rt.forward_stdin } else { None };
         seq = seq.step_argv(step.iter().map(|t| t.to_string()).collect(), stdin);
     }
+    // The draw is taken whether or not the pair has reads, so the RNG stream —
+    // and every sequence id downstream of it — does not depend on which pair
+    // came up.
+    let read = rng.below(rt.reads.len().max(1));
+    let named: Option<&'static [&'static str]> = rt.reads.get(read).copied();
+    if let Some(step) = named {
+        seq = seq.step(step);
+    }
     seq = observe(rng, seq, 2);
     for step in rt.inverse {
+        seq = seq.step(step);
+    }
+    if let Some(step) = named {
         seq = seq.step(step);
     }
     seq = observe(rng, seq, 2);
@@ -5247,6 +5991,14 @@ mod tests {
             raws.iter().any(|e| CONFIG_ODD_LINES.contains(&e.value.as_str())),
             "no case ever drew a legal file-only config line"
         );
+        // The third pool. Its members are the only way this file can deliver a
+        // `NULL` value rather than an empty string — `ConfigEntry::set` always
+        // writes `key=value` — so a draw that never reached it would leave every
+        // callback's valueless branch unmeasured.
+        assert!(
+            raws.iter().any(|e| CONFIG_VALUELESS_LINES.contains(&e.value.as_str())),
+            "no case ever drew a valueless config line"
+        );
     }
 
     /// The `::config[…]` segment names the scope of every entry it carries, and
@@ -5419,6 +6171,115 @@ mod tests {
         assert_eq!(minimal.size(), 1);
     }
 
+    /// The four dimensions that cannot be dropped are *simplified* instead.
+    ///
+    /// A case has exactly one shape, one working directory and one payload, and
+    /// every config entry has exactly one scope, so `drop_each` has nothing to say
+    /// about any of them — and all four are now drawn by the corpus. The predicate
+    /// here accepts anything that still sets *something*, which is the case where
+    /// the minimal answer is the plainest one the harness can express.
+    #[test]
+    fn shrink_simplifies_what_it_cannot_drop() {
+        let case = Case::new("status", &["status"], Shape::Promisor)
+            .with_scoped_config(vec![ConfigEntry::set(
+                ConfigScope::Worktree,
+                "status.short",
+                "true",
+            )])
+            .in_dir(".git/objects/pack");
+        let case = Case { stdin: Some(P_PATHS), ..case };
+
+        // Everything reduces except the config entry itself, so the walk reaches
+        // the scope rather than emptying the list before it gets there.
+        let minimal = shrink(&case, &mut |c| !c.config.is_empty());
+
+        assert_eq!(minimal.shape, Shape::Linear, "the shape was never simplified");
+        assert_eq!(
+            minimal.config[0].scope,
+            ConfigScope::CommandLine,
+            "the config scope was never simplified"
+        );
+        // stdin and cwd are dropped outright when the predicate accepts it, which
+        // is a better answer than a shorter one.
+        assert_eq!(minimal.stdin, None);
+        assert_eq!(minimal.cwd, None);
+    }
+
+    /// A dimension whose *value* is the finding is left alone.
+    ///
+    /// The half of the previous test that matters more: a shrinker that rewrote
+    /// the scope, the shape or the payload unconditionally would report a case
+    /// that does not reproduce. Each predicate below pins one dimension, and the
+    /// shrunk case has to come back carrying it — while the parts nothing pins
+    /// still reduce.
+    #[test]
+    fn shrink_keeps_the_dimension_that_is_the_finding() {
+        let case = Case::new("status", &["status", "--short"], Shape::Sparse)
+            .with_scoped_config(vec![ConfigEntry::set(ConfigScope::Repo, "core.worktree", "..")])
+            .in_dir("src/nested");
+        let case = Case { stdin: Some(P_PATHS), ..case };
+
+        // Only a file-scoped entry reproduces — the `core.worktree` shape, where
+        // `-c` is inert and the file is fatal.
+        let minimal = shrink(&case, &mut |c| {
+            c.config.iter().any(|e| e.scope == ConfigScope::Repo)
+        });
+        assert_eq!(minimal.config[0].scope, ConfigScope::Repo);
+        assert_eq!(minimal.config[0].key.as_deref(), Some("core.worktree"));
+
+        // Only the sparse fixture reproduces.
+        let minimal = shrink(&case, &mut |c| c.shape == Shape::Sparse);
+        assert_eq!(minimal.shape, Shape::Sparse);
+
+        // Only a payload with every line in it reproduces.
+        let minimal = shrink(&case, &mut |c| c.stdin == Some(P_PATHS));
+        assert_eq!(minimal.stdin, Some(P_PATHS));
+
+        // Only the deepest directory reproduces.
+        let minimal = shrink(&case, &mut |c| c.cwd == Some("src/nested"));
+        assert_eq!(minimal.cwd, Some("src/nested"));
+    }
+
+    /// Shrinking is a pure function of the case and the predicate.
+    ///
+    /// The new simplifications are ordered walks with no RNG in them, and they
+    /// have to stay that way: a shrink that depended on which candidate happened
+    /// to be tried first would print a different `→` line for the same failure on
+    /// the next run, which is worse than not shrinking at all. Predicate is a
+    /// pure function of the case, so two runs may only differ if `shrink` itself
+    /// carries state.
+    #[test]
+    fn shrinking_is_deterministic() {
+        let case = Case::new("log", &["log", "--oneline", "-1", "--graph"], Shape::Octopus)
+            .with_config(&[("core.abbrev", "4"), ("log.decorate", "full")])
+            .with_globals(&[&["--no-pager"]])
+            .with_env(&[("GIT_NAMESPACE", "ns")])
+            .in_dir(".git/refs/heads");
+        let case = Case { stdin: Some(P_PATHS), ..case };
+        let predicate = |c: &Case| c.args.len() > 2 && c.shape != Shape::Linear;
+
+        let first = shrink(&case, &mut |c| predicate(c));
+        let second = shrink(&case, &mut |c| predicate(c));
+        assert_eq!(first.id(), second.id());
+        assert_eq!(first.shape, second.shape);
+    }
+
+    /// The stdin walk cuts at line boundaries and only ever shortens.
+    ///
+    /// A payload is a language — a patch, a mailbox, a fast-import stream — and a
+    /// cut inside a line produces input whose refusal is about the cut. The
+    /// predicate keeps any payload holding the first line, so the answer must be
+    /// the first line and nothing after it.
+    #[test]
+    fn shrink_cuts_stdin_at_a_line_boundary() {
+        let case = Case::new("hash-object", &["hash-object", "--stdin"], Shape::Linear);
+        let case = Case { stdin: Some(P_PATHS), ..case };
+        let minimal = shrink(&case, &mut |c| {
+            c.stdin.is_some_and(|s| s.starts_with(b"README.md\n"))
+        });
+        assert_eq!(minimal.stdin, Some(&b"README.md\n"[..]));
+    }
+
     // -----------------------------------------------------------------------
     // Generated sequences
     // -----------------------------------------------------------------------
@@ -5467,8 +6328,91 @@ mod tests {
                 check(step, rt.name);
             }
         }
+        for rt in ROUND_TRIPS {
+            for step in rt.reads {
+                check(step, rt.name);
+            }
+        }
         for o in OBSERVERS {
             check(o, "observer");
+        }
+    }
+
+    /// A walk asks about the parked record on both sides of its transitions.
+    ///
+    /// Same invariant as the round trips', in the family where the record is a
+    /// pseudo-ref rather than an artifact: written by the entry, read once while
+    /// the operation is in progress, and read again after the walk has run
+    /// whatever transitions it drew. A generator that asked only before the
+    /// transitions would measure that the entry parked something and never that a
+    /// transition cleared it.
+    #[test]
+    fn walks_read_the_parked_record_on_both_sides() {
+        let seqs = generate_sequences(555, 1);
+        let mut reached = 0;
+        for s in STOPPERS {
+            let Some(read) = parked_read(s.cmd) else { continue };
+            reached += 1;
+            let name = format!("gen/walk/{}#0", s.name);
+            let seq = seqs.iter().find(|q| q.name == name).expect("walk generated");
+            let want: Vec<String> = read.iter().map(|t| t.to_string()).collect();
+            let asked: Vec<usize> = (0..seq.len())
+                .filter(|i| seq.step_case(*i).args == want)
+                .collect();
+            assert_eq!(asked.len(), 2, "{name} asks {want:?} {} times, not twice", asked.len());
+            let entry_end = s.setup.len() + s.entry.len();
+            assert_eq!(asked[0], entry_end, "{name} does not read the record right after the entry");
+            assert!(asked[1] > asked[0], "{name} reads the record twice in the same place");
+        }
+        assert_eq!(reached, 16, "the set of stoppers with a parked record changed");
+    }
+
+    /// A pair's named read is asked on **both** sides of the inverse.
+    ///
+    /// The two askings are the whole family: one answer while the forward half's
+    /// artifact exists and one after it should be gone. A generator that emitted
+    /// only the first would measure the write and never the clean-up, which is
+    /// the half the round trips exist for — so this pins the bracketing rather
+    /// than the presence.
+    #[test]
+    fn round_trip_reads_bracket_the_inverse() {
+        let seqs = generate_sequences(555, 1);
+        for rt in ROUND_TRIPS {
+            if rt.reads.is_empty() {
+                continue;
+            }
+            let name = format!("gen/roundtrip/{}#0", rt.name);
+            let s = seqs.iter().find(|q| q.name == name).expect("round trip generated");
+            let argvs: Vec<Vec<String>> = (0..s.len()).map(|i| s.step_case(i).args).collect();
+            let drawn: Vec<&&[&str]> = rt
+                .reads
+                .iter()
+                .filter(|r| {
+                    let want: Vec<String> = r.iter().map(|t| t.to_string()).collect();
+                    argvs.contains(&want)
+                })
+                .collect();
+            assert_eq!(
+                drawn.len(),
+                1,
+                "{name} should ask exactly one of its reads, asked {}",
+                drawn.len()
+            );
+            let want: Vec<String> = drawn[0].iter().map(|t| t.to_string()).collect();
+            let asked: Vec<usize> =
+                argvs.iter().enumerate().filter(|(_, a)| **a == want).map(|(i, _)| i).collect();
+            assert_eq!(asked.len(), 2, "{name} asks {want:?} {} times, not twice", asked.len());
+            let first_inverse: Vec<String> =
+                rt.inverse[0].iter().map(|t| t.to_string()).collect();
+            let inverse_at = argvs
+                .iter()
+                .position(|a| *a == first_inverse)
+                .expect("the inverse half runs");
+            assert!(
+                asked[0] < inverse_at && asked[1] > inverse_at,
+                "{name} asks {want:?} at {asked:?}, which does not bracket the inverse at \
+                 {inverse_at}"
+            );
         }
     }
 

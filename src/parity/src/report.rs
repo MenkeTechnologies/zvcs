@@ -423,7 +423,8 @@ impl Report {
             "interop  : {}/{} cases probed — on every case that wrote under the git directory, \
              stock git re-read both finished repositories (`fsck --strict`, `write-tree`) \
              and the binary under test answered the same `write-tree` about each of them. \
-             Three invocations per side where the gate opens, nothing at all where it does \
+             Three invocations per side where the gate opens — four where the port left an \
+             accelerator for stock to read back — and nothing at all where it does \
              not",
             self.interop_probed, self.interop_total
         );

@@ -93,6 +93,12 @@ pub fn sequences() -> Vec<Sequence> {
     worktree_locked(&mut s);
     tag_chain(&mut s);
     intent_to_add(&mut s);
+    maintenance_workflow(&mut s);
+    reflog_as_a_resource(&mut s);
+    worktree_across_commands(&mut s);
+    config_drives_the_next_step(&mut s);
+    update_ref_transactions(&mut s);
+    side_records(&mut s);
     s
 }
 
@@ -137,6 +143,71 @@ const UPDATE_REF_BAD_TXN: &[u8] = b"start\n\
 delete refs/heads/txn-a\n\
 create refs/heads/nope refs/heads/does-not-exist\n\
 commit\n";
+
+/// The transaction from [`UPDATE_REF_TXN_SYMREF`], thrown away at `abort`.
+///
+/// `prepare` has already taken every lock by the time `abort` arrives, so this
+/// is the one shape that separates "took the locks and released them" from
+/// "never took them": a port that applies at `prepare` leaves both refs behind,
+/// and a port that never locks at all prints the same three `ok` lines as one
+/// that did.
+const UPDATE_REF_TXN_ABORTED: &[u8] = b"start\n\
+create refs/heads/txn-sym-a HEAD\n\
+symref-create refs/heads/txn-sym refs/heads/main\n\
+prepare\n\
+abort\n";
+
+/// The same two creations, committed — one ordinary ref and one **symbolic**
+/// ref, inside a single transaction.
+///
+/// `symref-create` is the half a port is most likely to write as an ordinary
+/// ref: `for-each-ref` prints the same `%(objectname)` either way, and only
+/// `%(symref)` and `symbolic-ref` tell them apart.
+const UPDATE_REF_TXN_SYMREF: &[u8] = b"start\n\
+create refs/heads/txn-sym-a HEAD\n\
+symref-create refs/heads/txn-sym refs/heads/main\n\
+prepare\n\
+commit\n";
+
+/// A transaction whose `verify` is a *no-such-ref* assertion against a ref that
+/// exists, so the whole thing must fail after its `update` was accepted.
+///
+/// `verify <ref> <zero-oid>` means "this ref must not exist". `refs/heads/main`
+/// does, so stock dies with `cannot lock ref 'refs/heads/main': reference
+/// already exists` at exit 128 and `refs/heads/txn-sym-a` must **not** have
+/// moved — which is the all-or-nothing property, measured on a command that was
+/// individually legal and came first.
+const UPDATE_REF_TXN_VERIFY_FAILS: &[u8] = b"start\n\
+update refs/heads/txn-sym-a refs/heads/feature\n\
+verify refs/heads/main 0000000000000000000000000000000000000000\n\
+commit\n";
+
+/// The same transaction with the assertion inverted so it holds, which is the
+/// half that proves the failure above was the `verify` and not the `update`.
+const UPDATE_REF_TXN_VERIFY_HOLDS: &[u8] = b"start\n\
+update refs/heads/txn-sym-a refs/heads/feature\n\
+verify refs/heads/main refs/heads/main\n\
+commit\n";
+
+/// The NUL-delimited form of a committing transaction.
+///
+/// `-z` is not a formatting flag: it changes the *grammar*, because a value and
+/// its ref name are separated by NUL rather than by SP, and `delete` takes a
+/// trailing empty field where the line form takes nothing. A port that
+/// implements `--stdin` by splitting on whitespace parses this as one giant
+/// argument and either creates nothing or creates a ref whose name contains a
+/// NUL.
+const UPDATE_REF_TXN_NUL: &[u8] =
+    b"start\0create refs/heads/z-a\0HEAD\0create refs/heads/z-b\0refs/heads/feature\0prepare\0commit\0";
+
+/// The NUL-delimited transaction that must not land: a legal `delete` with its
+/// empty old-value field, followed by a `create` whose new value names a ref
+/// that does not exist.
+///
+/// `refs/heads/z-a` must survive, which is what says the delete was staged
+/// rather than applied.
+const UPDATE_REF_TXN_NUL_BAD: &[u8] =
+    b"start\0delete refs/heads/z-a\0\0create refs/heads/z-c\0refs/heads/nope\0commit\0";
 
 // ---------------------------------------------------------------------------
 // cherry-pick
@@ -3773,5 +3844,904 @@ fn intent_to_add(out: &mut Vec<Sequence>) {
             .step(&["stash", "pop"])
             .step(&["ls-files", "-s"])
             .step(&["diff", "--cached", "--name-status", "-M"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// maintenance, gc and repack as a workflow rather than as one invocation
+// ---------------------------------------------------------------------------
+//
+// Every housekeeping verb in this family is judged the same way by a case: it
+// exits 0. That is the weakest possible assertion about a command whose entire
+// job is to *rewrite the object store while preserving what it means*, and it
+// is the assertion under which the two worst outcomes — an object silently
+// dropped, and an accelerator left describing a store that has moved — both
+// pass.
+//
+// A sequence can ask the question a case cannot: run the housekeeping, then
+// **read the repository back**. `fsck` says whether the store is still valid,
+// `rev-list --count --all` and `log` say whether the history is still walkable,
+// `prune-packed -n` says which loose objects are now redundant, and
+// `runner::probe_storage` enumerates the packs, the multi-pack-index and the
+// commit-graph by name at every step, so a structure that appeared or vanished
+// is attributed to the step that did it.
+//
+// No `count-objects -v` anywhere below, for the reason `gc::prune-packed-expire
+// -collect` already gives: its `size` and `size-pack` are pack *byte* counts,
+// and two correct implementations are not obliged to agree on how many bytes a
+// pack of the same objects takes. `prune-packed -n` names paths instead, which
+// is the same information without the number that is allowed to differ.
+//
+// [`Shape::Packed`] is the substrate for most of them: two packs, eight loose
+// objects of which five duplicate packed ones, and one commit (`9c4078d`) that
+// no ref reaches. That unreachable commit is what makes the destroy/keep
+// distinction visible — it is the object every one of these verbs has an
+// opportunity to lose.
+
+fn maintenance_workflow(out: &mut Vec<Sequence>) {
+    // `maintenance run --task=loose-objects` is two operations git does not
+    // document as two: it prunes the loose objects that are already packed, and
+    // *then* packs a batch of what is left into a new `loose-<hash>.pack`. Steps
+    // 1 and 3 are the same `prune-packed -n` on either side of it, and they must
+    // print **different** listings — five paths before, three after, and not one
+    // path in common, because the five it removed are gone and the three it
+    // packed are newly redundant.
+    //
+    // That inversion is the assertion. A port that implements the task as
+    // "repack everything" prints an empty listing at step 3; one that implements
+    // it as "prune only" prints the same five paths again; one that does nothing
+    // prints the identical five. All three exit 0.
+    //
+    // Step 4's `incremental-repack` then writes the multi-pack-index over the
+    // packs the step before it left, and steps 5-9 are the read-back: the midx
+    // must verify, `fsck` must still find `9c4078d` dangling rather than gone,
+    // and the object listing at step 9 must still hold every object the
+    // repository started with.
+    out.push(
+        Sequence::new("maintenance", "loose-objects-then-incremental-repack-then-read-back", Shape::Packed)
+            .step(&["prune-packed", "-n"])
+            .step(&["maintenance", "run", "--task=loose-objects", "--no-detach"])
+            .step(&["prune-packed", "-n"])
+            .step(&["maintenance", "run", "--task=incremental-repack", "--no-detach"])
+            .step(&["multi-pack-index", "verify"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["rev-list", "--count", "--all"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"]),
+    );
+
+    // The `gc` task, which is `gc` reached through `maintenance`'s dispatcher
+    // rather than through its own verb. The two are the same collector and are
+    // allowed to differ in nothing, so this is worth a sequence only because of
+    // what follows it: after the collect, `9c4078d` is still dangling.
+    //
+    // That is the whole point. `maintenance run --task=gc` uses the *default*
+    // prune horizon, so the unreachable commit is kept, and a port whose
+    // maintenance dispatcher forwards to a `gc --prune=now` — or to a `gc` that
+    // ignores the horizon — deletes an object stock keeps and says so at step 4
+    // by printing nothing where stock prints `dangling commit`.
+    out.push(
+        Sequence::new("maintenance", "gc-task-packs-the-loose-and-keeps-the-unreachable", Shape::Packed)
+            .step(&["prune-packed", "-n"])
+            .step(&["maintenance", "run", "--task=gc", "--no-detach", "--quiet"])
+            .step(&["prune-packed", "-n"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["rev-list", "--count", "--all"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"]),
+    );
+
+    // `prefetch`, the one maintenance task whose effect is a **ref namespace**.
+    // It fetches every remote into `refs/prefetch/remotes/<remote>/*` rather than
+    // into the tracking refs, so `refs/remotes/origin/*` must be untouched and
+    // four refs must become six — a port that implements it as a plain `fetch`
+    // moves the tracking refs and produces the same exit code.
+    //
+    // Step 5's `pack-refs` task then packs all six into `.git/packed-refs`, and
+    // step 6 asks `for-each-ref` for the same listing it printed at step 4: a
+    // port whose ref reader does not consult `packed-refs` answers with an empty
+    // listing there, having just made every ref in the repository unreadable
+    // while exiting 0 twice.
+    out.push(
+        Sequence::new("maintenance", "prefetch-writes-its-own-namespace-then-pack-refs", Shape::BehindRemote)
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["maintenance", "run", "--task=prefetch", "--no-detach"])
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["maintenance", "run", "--task=pack-refs", "--no-detach"])
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["rev-list", "--count", "--all"]),
+    );
+
+    // `gc` writes a commit-graph as part of collecting (`gc.writeCommitGraph`
+    // defaults on), which is a side effect no case can see: the file lands under
+    // `.git/objects/info/`, `gc` says nothing about it, and the next command that
+    // reads it gives the same answer whether it is there or not.
+    //
+    // `runner::probe_storage` enumerates that directory, so step 2 is where the
+    // graph has to appear. Steps 3-4 then verify it and re-derive it through
+    // `maintenance run --task=commit-graph`, and step 5 verifies it again: a
+    // graph that verifies before a refresh and not after describes a store the
+    // refresh moved without telling it, which is the failure this cache has and
+    // the reason it is worth writing at all.
+    out.push(
+        Sequence::new("gc", "collect-writes-a-commit-graph-then-maintenance-refreshes-it", Shape::Packed)
+            .step(&["commit-graph", "verify"])
+            .step(&["gc", "--quiet"])
+            .step(&["commit-graph", "verify"])
+            .step(&["maintenance", "run", "--task=commit-graph", "--no-detach"])
+            .step(&["commit-graph", "verify"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["rev-list", "--count", "--all"])
+            .step(&["fsck", "--no-progress"]),
+    );
+
+    // A cruft pack is the mechanism by which `repack -a -d` is allowed to drop
+    // every loose object without losing the unreachable ones: they go into a
+    // second pack carrying a `.mtimes` file that records when each was last
+    // seen. `repack -a -d` **without** `--cruft` would delete them outright.
+    //
+    // So step 3 is the finding in one line: after the repack, `fsck` must still
+    // say `dangling commit 9c4078d…`. A port that ignores `--cruft` and repacks
+    // only what is reachable has destroyed an object here while exiting 0, and
+    // the object listing at step 7 is where the loss is enumerated rather than
+    // merely named.
+    //
+    // Step 4's `prune --expire=now` is the second half and it must do **nothing**:
+    // `prune` only ever removes *loose* objects, and after the repack there are
+    // none, so an unreachable object inside a cruft pack survives a pruning that
+    // names it. A port whose `prune` walks packs as well removes it there and
+    // fails at step 5 rather than at step 3.
+    out.push(
+        Sequence::new("repack", "cruft-keeps-the-unreachable-and-prune-cannot-reach-it", Shape::Packed)
+            .step(&["fsck", "--no-progress"])
+            .step(&["repack", "-a", "-d", "--cruft"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["prune", "--expire=now", "-v"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["rev-list", "--count", "--all"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // The other direction, on the same fixture: the collect that is *supposed*
+    // to drop it. `reflog expire --expire=all` removes the last thing that could
+    // be holding `9c4078d`, and `gc --prune=now` then has both the permission and
+    // the horizon to delete it out of the cruft pack the step before wrote.
+    //
+    // The pair is what makes either half meaningful. Alone, "the object is gone"
+    // and "the object is kept" are each satisfiable by a port that always does
+    // one of them; together they are only satisfiable by a port that reads the
+    // horizon. Step 6's `fsck` must be silent where the sequence above's step 3
+    // must not be.
+    out.push(
+        Sequence::new("repack", "cruft-then-a-pruning-collect-finally-drops-it", Shape::Packed)
+            .step(&["fsck", "--no-progress"])
+            .step(&["repack", "-a", "-d", "--cruft"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["reflog", "expire", "--expire=all", "--all"])
+            .step(&["gc", "--prune=now", "--quiet"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["rev-list", "--count", "--all"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // `--write-midx` folds the multi-pack-index write into the repack itself, so
+    // the index is written over packs that are being replaced in the same
+    // invocation — the one ordering in which a midx can end up describing a pack
+    // that no longer exists. Step 3 is the check that it does not.
+    //
+    // `multi-pack-index expire` at step 4 then removes the packs the midx has
+    // made redundant, which is a *delete* driven entirely by an accelerator: a
+    // port that expires a pack still referenced by the index destroys objects,
+    // and step 5's re-verify plus step 6's `fsck` are the two independent readers
+    // that would notice.
+    out.push(
+        Sequence::new("repack", "write-midx-then-expire-then-verify-again", Shape::Packed)
+            .step(&["prune-packed", "-n"])
+            .step(&["repack", "-a", "-d", "--write-midx"])
+            .step(&["multi-pack-index", "verify"])
+            .step(&["multi-pack-index", "expire"])
+            .step(&["multi-pack-index", "verify"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["rev-list", "--count", "--all"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"]),
+    );
+
+    // What a notes ref does **not** do: keep the commit it annotates alive. A
+    // note is a blob filed under a tree whose entry *name* is the annotated
+    // commit's id, so nothing in `refs/notes/commits` points at that commit as
+    // an object, and stock's `gc --prune=now` deletes it — verified by hand:
+    // after step 6 `cat-file -t 77494d6…` is `fatal: git cat-file: could not get
+    // object info`.
+    //
+    // That makes this the sharpest reachability question in the family, because
+    // every plausible wrong answer is a *different* wrong answer:
+    //
+    //  * a port that treats `refs/notes/*` as a root **keeps** the commit, and
+    //    step 10's object listing holds one more object than stock's;
+    //  * a port that treats the note tree's entry names as object references
+    //    keeps it for the same reason and diverges the same way;
+    //  * a port whose collect drops the notes ref instead prints an empty
+    //    `notes list` at step 7 and loses the surviving annotation as well;
+    //  * a port that gets the object right and the bookkeeping wrong still has
+    //    to print, at step 7, a note pointing at a commit that is not there —
+    //    which stock does, and which is the line most likely to be "cleaned up".
+    //
+    // Steps 8-9 are the proof that the surviving half is intact: `notes show
+    // HEAD` must still be `note-on-head` and the history must still walk. Step 9
+    // is `fsck`, and it must be **silent**: the deleted commit leaves nothing
+    // dangling, because the only thing that referred to it was a path name.
+    out.push(
+        Sequence::new("gc", "a-pruning-collect-drops-the-commit-its-note-still-names", Shape::Branched)
+            .step(&["notes", "add", "-m", "note-on-head", "HEAD"])
+            .step(&["commit", "--allow-empty", "-m", "soon-unreachable"])
+            .step(&["notes", "add", "-m", "note-on-doomed", "HEAD"])
+            .step(&["reset", "--hard", "HEAD~1"])
+            .step(&["reflog", "expire", "--expire=all", "--all"])
+            .step(&["gc", "--prune=now", "--quiet"])
+            .step(&["notes", "list"])
+            .step(&["notes", "show", "HEAD"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["cat-file", "--batch-all-objects", "--batch-check"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the reflog as a resource that later commands resolve against
+// ---------------------------------------------------------------------------
+//
+// `reflog` already has one sequence in this file, and it asks whether the *file*
+// survives being edited: `delete`, then `expire --expire=all`, with
+// `runner::probe_reflogs` comparing `.git/logs/**` line for line.
+//
+// These ask the other half, which no probe reaches, because it is not a file
+// comparison: **can the next command still resolve against what is left**.
+// `HEAD@{2}`, `@{-3}` and `stash@{1}` are all reflog lookups performed by the
+// revision parser rather than by `reflog`, and each of them has its own failure
+// mode — an off-by-one after a deletion, a `@{-n}` that counts entries instead
+// of counting *branch switches*, a stash stack held somewhere other than the
+// reflog of `refs/stash`. All three are invisible until something asks.
+
+fn reflog_as_a_resource(out: &mut Vec<Sequence>) {
+    // The two expiry horizons, separated. `--expire=never` pins the age-based
+    // pass off entirely so the only thing that can drop an entry is
+    // `--expire-unreachable=now`, and the result is exact rather than
+    // approximate: of `HEAD`'s seven entries, the two naming `cdf39f4` — the
+    // commit step 2 reset away from — go, and the entry naming `07e86d1` stays,
+    // because `refs/heads/feature` still reaches it.
+    //
+    // Written this way on purpose. Leaving `--expire` at its default would make
+    // the sequence depend on the wall clock: the fixture's committer date is
+    // pinned to 2023, `gc.reflogExpire` is 90 days, and every entry is therefore
+    // *always* expired — which empties the log, hides the unreachable pass
+    // completely, and would have measured nothing while looking like it measured
+    // something.
+    //
+    // Steps 7-9 are the read-back: the surviving `HEAD@{1}` must resolve to
+    // `07e86d1`, `fsck` must report `cdf39f4` as dangling now that nothing holds
+    // it, and the `gc` at step 9 must then collect it.
+    out.push(
+        Sequence::new("reflog", "expire-unreachable-drops-only-the-unreachable-entries", Shape::Branched)
+            .step(&["commit", "--allow-empty", "-m", "unreachable-soon"])
+            .step(&["reset", "--hard", "HEAD~1"])
+            .step(&["reflog", "show", "HEAD"])
+            .step(&["reflog", "expire", "--expire=never", "--expire-unreachable=now", "--all"])
+            .step(&["reflog", "show", "HEAD"])
+            .step(&["reflog", "show", "main"])
+            .step(&["rev-parse", "HEAD@{1}"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["gc", "--prune=now", "--quiet"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["log", "--oneline", "-2"]),
+    );
+
+    // What `HEAD@{n}` means once the log is empty, which is not what an empty
+    // log looks like from `reflog show`. Stock's answers are asymmetric and both
+    // halves matter: `HEAD@{0}` still resolves — to `HEAD` itself, because index
+    // zero falls back to the ref — while `HEAD@{1}` is `fatal: log for HEAD is
+    // empty` at exit 128.
+    //
+    // A port that implements `@{n}` as "index into the log" fails the first; one
+    // that implements it as "resolve the ref and ignore the log" fails the
+    // second, silently, by answering a commit id where stock refuses. The two
+    // steps are adjacent so neither can be satisfied by guessing.
+    //
+    // Steps 3-4 are the same lookup *before* the expiry, so the failure at step
+    // 8 is attributable to the expiry rather than to `@{n}` never having worked.
+    out.push(
+        Sequence::new("reflog", "expire-all-then-the-at-brace-lookup-splits-in-two", Shape::Branched)
+            .step(&["reflog", "show", "HEAD"])
+            .step(&["rev-parse", "HEAD@{2}"])
+            .step(&["reflog", "delete", "HEAD@{1}"])
+            .step(&["rev-parse", "HEAD@{2}"])
+            .step(&["reflog", "show", "HEAD"])
+            .step(&["reflog", "expire", "--expire=all", "--all"])
+            .step(&["rev-parse", "HEAD@{0}"])
+            .step(&["rev-parse", "HEAD@{1}"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["fsck", "--no-progress", "--no-dangling"]),
+    );
+
+    // `@{-n}` counts **branch switches recorded in `HEAD`'s reflog**, not reflog
+    // entries and not branches, so it is only meaningful after several checkouts
+    // have happened in one repository — which is the definition of a sequence.
+    //
+    // Four switches, then the three lookups read back in one direction: after
+    // `checkout -` has returned to `main`, `@{-1}` is `third`, `@{-2}` is `main`
+    // and `@{-3}` is `feature`. `main` appearing at `-2` is the part that catches
+    // a port counting distinct branches instead of switches, and `checkout -`
+    // itself being a switch — so it *shifts* the window it just used — is the
+    // part that catches one counting from the wrong end.
+    //
+    // Step 8 then uses `@{-3}` as a checkout target rather than as a name to
+    // print, which is a different code path in git (`checkout` resolves it
+    // before the reflog gains its own entry) and the one that would leave `HEAD`
+    // detached if the resolution came back as an id instead of a branch. Step 9
+    // is what says it did not.
+    out.push(
+        Sequence::new("checkout", "previous-branch-dance-then-at-brace-minus-three", Shape::Branched)
+            .step(&["checkout", "feature"])
+            .step(&["checkout", "main"])
+            .step(&["checkout", "-b", "third"])
+            .step(&["checkout", "-"])
+            .step(&["rev-parse", "--abbrev-ref", "@{-1}"])
+            .step(&["rev-parse", "--abbrev-ref", "@{-2}"])
+            .step(&["rev-parse", "--abbrev-ref", "@{-3}"])
+            .step(&["checkout", "@{-3}"])
+            .step(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .step(&["reflog", "-8"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // The stash stack **is** the reflog of `refs/stash`, and that identity is the
+    // whole design: `stash@{1}` is a reflog lookup, `stash drop` is a reflog
+    // delete that renumbers everything below it, and `stash list` is `reflog
+    // show` with a different format.
+    //
+    // Steps 2 and 4 print the same stack through `reflog show` and through
+    // `stash list` on either side of a push, so a port that keeps the stack in a
+    // side file agrees with stock on `stash list` and disagrees on `reflog show
+    // stash` — which is the step it would otherwise never be asked.
+    //
+    // Step 5 drops the *middle* entry, which is where renumbering is observable:
+    // the entry that was `stash@{2}` must become `stash@{1}`, and step 8's
+    // `rev-parse refs/stash@{1}` must resolve to it under the fully-qualified
+    // name as well as under the short one.
+    out.push(
+        Sequence::new("stash", "the-stack-is-the-reflog-of-the-stash-ref", Shape::Stashed)
+            .step(&["stash", "list"])
+            .step(&["reflog", "show", "stash"])
+            .step(&["stash", "push", "-m", "second"])
+            .step(&["reflog", "show", "stash"])
+            .step(&["stash", "drop", "stash@{1}"])
+            .step(&["reflog", "show", "stash"])
+            .step(&["rev-parse", "stash@{0}"])
+            .step(&["rev-parse", "refs/stash@{1}"])
+            .step(&["stash", "list"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // The consequence of that identity, which is destructive and which nothing
+    // in the corpus asked before: `reflog expire --expire=all --all` includes
+    // `refs/stash`, so it **empties the entire stash stack**. Stock's `stash
+    // list` at step 7 prints nothing, and the three stashed states are gone.
+    //
+    // This is the sequence most likely to find a port that is *more* careful
+    // than stock. Special-casing `refs/stash` out of `--all` looks like data
+    // protection and is a divergence: step 7 then lists three entries where
+    // stock lists none, and steps 8-9 disagree about what the repository holds.
+    //
+    // Step 5's `stash show --name-only` is the premise being proven live rather
+    // than assumed: the entry named there is one of the three the expiry then
+    // removes.
+    out.push(
+        Sequence::new("stash", "expiring-every-reflog-empties-the-whole-stack", Shape::Stashed)
+            .step(&["stash", "list"])
+            .step(&["fsck", "--no-progress", "--no-dangling"])
+            .step(&["gc", "--prune=now", "--quiet"])
+            .step(&["stash", "list"])
+            .step(&["stash", "show", "--name-only", "stash@{2}"])
+            .step(&["reflog", "expire", "--expire=all", "--all"])
+            .step(&["stash", "list"])
+            .step(&["reflog", "show", "stash"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-2"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a worktree that other commands then have to account for
+// ---------------------------------------------------------------------------
+//
+// The three worktree sequences already in this file administer worktrees:
+// `add`/`move`/`remove`/`prune`, `lock`, and a commit made inside one. These ask
+// what a linked worktree does to **commands that are not `worktree`** — the
+// branch-in-use guard that `checkout` and `branch -D` owe it, and the second
+// worktree on one branch that `--force` allows.
+//
+// Every one of those guards lives in a different command and reads the same
+// `.git/worktrees/*/HEAD` files, which is exactly the arrangement where a port
+// implements the bookkeeping once and the guard nowhere.
+
+fn worktree_across_commands(out: &mut Vec<Sequence>) {
+    // A branch checked out in a linked worktree is *claimed*, and two commands in
+    // the main worktree have to notice: `checkout feature` is `fatal: 'feature'
+    // is already used by worktree at …` at exit 128, and `branch -D feature` is
+    // `error: cannot delete branch 'feature' used by worktree at …` at exit 1.
+    // Two different exit codes for the same claim, which is why both are asked.
+    //
+    // The claim is not permanent, and steps 8-12 are what prove the port models
+    // it as state rather than as a rule: after `worktree remove`, the identical
+    // `checkout` and `branch -D` must succeed. A port that never registers the
+    // claim passes steps 6-7 by doing the wrong thing and then passes 9-12 by
+    // accident; a port that registers it and never releases it fails at step 9.
+    //
+    // Step 3 commits *inside* the linked tree, so step 5's `log feature` in the
+    // main worktree is reading a branch another worktree moved — the reason the
+    // claim exists at all.
+    out.push(
+        Sequence::new("worktree", "branch-in-use-refuses-checkout-and-delete-until-removed", Shape::Branched)
+            .step(&["worktree", "add", "wt2", "feature"])
+            .step(&["worktree", "list"])
+            .step(&["-C", "wt2", "commit", "--allow-empty", "-m", "inside-linked"])
+            .step(&["-C", "wt2", "log", "--oneline", "-2"])
+            .step(&["log", "--oneline", "-1", "feature"])
+            .step(&["checkout", "feature"])
+            .step(&["branch", "-D", "feature"])
+            .step(&["worktree", "remove", "wt2"])
+            .step(&["worktree", "list"])
+            .step(&["checkout", "feature"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["checkout", "main"])
+            .step(&["branch", "-D", "feature"])
+            .step(&["worktree", "prune", "-v"]),
+    );
+
+    // `--force` is the escape hatch from that guard, and what it produces is the
+    // state the guard exists to prevent: two working trees on one branch. Step 2
+    // is the refusal and step 3 is the same command overriding it, so the pair
+    // measures the flag rather than the guard.
+    //
+    // Steps 5-7 are why the state is worth reaching. A commit made in `wt3` moves
+    // `refs/heads/wtb`, and `wt2` — whose index and worktree still describe the
+    // old tip — resolves `HEAD` through the same branch and therefore *reports
+    // the new commit it does not contain*. Both `log` steps must print
+    // `in-wt3`. A port that gives each worktree its own resolution of a shared
+    // branch prints two different answers.
+    out.push(
+        Sequence::new("worktree", "force-adds-a-second-tree-on-one-branch", Shape::Branched)
+            .step(&["worktree", "add", "-b", "wtb", "wt2"])
+            .step(&["worktree", "add", "wt3", "wtb"])
+            .step(&["worktree", "add", "--force", "wt3", "wtb"])
+            .step(&["worktree", "list"])
+            .step(&["-C", "wt3", "commit", "--allow-empty", "-m", "in-wt3"])
+            .step(&["-C", "wt2", "log", "--oneline", "-1"])
+            .step(&["-C", "wt3", "log", "--oneline", "-1"])
+            .step(&["worktree", "remove", "--force", "wt3"])
+            .step(&["worktree", "remove", "--force", "wt2"])
+            .step(&["worktree", "prune", "-v"])
+            .step(&["branch", "--format=%(refname:short)"])
+            .step(&["log", "--oneline", "-1", "wtb"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a config write, and the step it changes
+// ---------------------------------------------------------------------------
+//
+// `Case::with_config` can deliver a key from any scope, which covers the whole
+// question of *reading* configuration. It cannot cover the other half: a key
+// **written by one invocation and consulted by the next**, where the write is
+// itself the thing being measured.
+//
+// Those are two different failures. A port that parses `core.bare` and ignores
+// it fails a case. A port whose `config set core.bare true` writes the key to a
+// file nothing later reads — or writes it under a name that differs in case, or
+// into `config.worktree` when it should go to `config` — passes every case in
+// the corpus and fails here, at the step that reads it back through behaviour
+// rather than through `config get`.
+//
+// Each sequence below therefore has the same three-part shape: prove the
+// behaviour before, write the key, prove the behaviour changed — and, where the
+// key can be withdrawn, prove it changes back. The last part is what separates
+// "honours the setting" from "always does the second thing".
+
+fn config_drives_the_next_step(out: &mut Vec<Sequence>) {
+    // `--worktree` is not a scope that always exists: it is gated on
+    // `extensions.worktreeConfig`, and with the extension off git does not
+    // refuse — it **silently writes to `--local` instead**. Step 2 is that
+    // fallback and step 7 is where it becomes visible, as a `local demo.key`
+    // line in `config list --show-scope` that the sequence never asked for.
+    //
+    // Step 3 turns the extension on and step 4 repeats the identical write,
+    // which now lands in `.git/config.worktree`. So after step 4 the same key
+    // exists twice in two scopes with the same value, and step 6's plain `config
+    // get` has to pick one: stock answers with the worktree scope, because it
+    // outranks local. That precedence is the assertion a port most often gets
+    // backwards, and it is only reachable after two writes that a case cannot
+    // perform.
+    //
+    // Step 8 withdraws the worktree copy and step 9 must then fail with exit 1 —
+    // not fall back to the local copy that is still there, which is what a port
+    // that implements `--worktree` as "the merged view" does.
+    out.push(
+        Sequence::new("config", "worktree-scope-is-gated-on-the-extension", Shape::Branched)
+            .step(&["config", "get", "--worktree", "demo.key"])
+            .step(&["config", "set", "--worktree", "demo.key", "wt-scope"])
+            .step(&["config", "set", "extensions.worktreeConfig", "true"])
+            .step(&["config", "set", "--worktree", "demo.key", "wt-scope"])
+            .step(&["config", "get", "--worktree", "demo.key"])
+            .step(&["config", "get", "demo.key"])
+            .step(&["config", "list", "--show-scope"])
+            .step(&["config", "unset", "--worktree", "demo.key"])
+            .step(&["config", "get", "--worktree", "demo.key"])
+            .step(&["config", "list", "--show-scope"]),
+    );
+
+    // `core.bare` rewrites what the repository *is* for every command after it,
+    // and it does so without moving a single file: the worktree is still on disk,
+    // still full of tracked content, and now unreachable.
+    //
+    // The three steps after the write are chosen because they take three
+    // different paths through git's setup. `status` needs a worktree and dies
+    // with `fatal: this operation must be run in a work tree` at 128;
+    // `rev-parse --show-toplevel` needs one for a different reason and dies with
+    // the same words; `log` needs none and must keep working, printing the same
+    // commit it printed before. A port that treats the flag as "refuse
+    // everything" fails on `log`; one that ignores it fails on the other two;
+    // one that honours it and forgets to *unset* it fails at step 9.
+    //
+    // Step 9 is the withdrawal, and it is the step that says the repository was
+    // never actually damaged — a port that responds to `core.bare` by discarding
+    // the index or the worktree cannot come back from it.
+    out.push(
+        Sequence::new("config", "core-bare-turns-two-verbs-into-refusals-and-back", Shape::Branched)
+            .step(&["rev-parse", "--is-bare-repository"])
+            .step(&["config", "set", "core.bare", "true"])
+            .step(&["rev-parse", "--is-bare-repository"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["rev-parse", "--show-toplevel"])
+            .step(&["config", "set", "core.bare", "false"])
+            .step(&["rev-parse", "--is-bare-repository"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // Two worktrees, one key, two values — the property `extensions.worktreeConfig`
+    // exists for and the only one that proves each tree reads *its own*
+    // `.git/worktrees/<name>/config.worktree` rather than a single shared file.
+    //
+    // Steps 5-6 are the pair: the same `config get --worktree demo.where` run
+    // from the two trees must answer `main-tree` and `linked-tree`. A port that
+    // stores the worktree scope in one place answers the same thing twice, and
+    // which of the two it answers only says which write landed last.
+    //
+    // Step 8's unqualified `config get` from the main tree must be `main-tree`,
+    // not `linked-tree`: the merged view is per-worktree too. Step 10 is after
+    // the linked tree is gone and must still be `main-tree` — a `worktree remove`
+    // that takes the main tree's worktree config with it is a data loss that
+    // nothing else in this corpus would see.
+    out.push(
+        Sequence::new("config", "per-worktree-values-diverge-between-two-trees", Shape::Branched)
+            .step(&["config", "set", "extensions.worktreeConfig", "true"])
+            .step(&["worktree", "add", "-b", "wtb", "wt2"])
+            .step(&["config", "set", "--worktree", "demo.where", "main-tree"])
+            .step(&["-C", "wt2", "config", "set", "--worktree", "demo.where", "linked-tree"])
+            .step(&["config", "get", "--worktree", "demo.where"])
+            .step(&["-C", "wt2", "config", "get", "--worktree", "demo.where"])
+            .step(&["-C", "wt2", "config", "list", "--show-scope"])
+            .step(&["config", "get", "demo.where"])
+            .step(&["worktree", "remove", "--force", "wt2"])
+            .step(&["config", "get", "--worktree", "demo.where"])
+            .step(&["config", "list", "--show-scope"]),
+    );
+
+    // `core.hooksPath` moves the whole hook directory, and on [`Shape::HooksFail`]
+    // — where `pre-commit` exits 1 — moving it is the difference between a commit
+    // that cannot be made and one that can.
+    //
+    // Step 2 is the refusal with the hooks in place, step 4 is the identical
+    // commit with `core.hooksPath` pointing at a directory that does not exist,
+    // and step 8 is the refusal again after the key is withdrawn. A port that
+    // never reads the key refuses all three times; one that reads it once and
+    // caches the resolved path refuses at 2, allows 4, and allows 8.
+    //
+    // Step 6's `status` is the corroboration that the hook really ran at step 2
+    // and really did not at step 4: `hook-pre-commit.txt` is written by the hook
+    // itself, so it is present exactly once — a port that skips the hook at step
+    // 2 for some other reason produces the right exit code and no file.
+    //
+    // Step 5 is `log --oneline -2` rather than `-1` because the commit at step 4
+    // was made with `prepare-commit-msg` and `commit-msg` redirected away too, so
+    // its message is the one the argv gave it rather than the one the hook would
+    // have rewritten.
+    out.push(
+        Sequence::new("commit", "hooks-path-redirects-the-refusal-away-and-back", Shape::HooksFail)
+            .step(&["log", "--oneline", "-1"])
+            .step(&["commit", "--allow-empty", "-m", "hooked"])
+            .step(&["config", "set", "core.hooksPath", ".git/no-such-hooks"])
+            .step(&["commit", "--allow-empty", "-m", "unhooked"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["status", "--porcelain"])
+            .step(&["config", "unset", "core.hooksPath"])
+            .step(&["commit", "--allow-empty", "-m", "hooked-again"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["log", "-1", "--format=%B"]),
+    );
+
+    // `core.sparseCheckout` on a repository that has never been sparse. Setting
+    // it alone changes nothing — there is no `.git/info/sparse-checkout` for it
+    // to consult — and step 3's `read-tree -m -u HEAD` must therefore leave every
+    // entry present, which is the step a port fails if it treats the flag as
+    // "skip everything not listed" over an absent list.
+    //
+    // `sparse-checkout set src` at step 6 then writes the list *and* the flag
+    // together, and step 7's `ls-files -t` is where the `S` bit appears on
+    // `README.md`. Step 9's `disable` is the withdrawal, and step 11 is the part
+    // worth the sequence: stock leaves `core.sparseCheckout` in the config with
+    // the value `false` rather than removing the key, so `config get` is `false`
+    // at exit 0. A port that deletes the key answers exit 1 with no output, and
+    // no case can tell the two apart because no case can run `disable` first.
+    out.push(
+        Sequence::new("sparse-checkout", "config-first-then-set-and-disable", Shape::Branched)
+            .step(&["ls-files", "-t"])
+            .step(&["config", "set", "core.sparseCheckout", "true"])
+            .step(&["read-tree", "-m", "-u", "HEAD"])
+            .step(&["ls-files", "-t"])
+            .step(&["status", "--porcelain"])
+            .step(&["sparse-checkout", "set", "src"])
+            .step(&["ls-files", "-t"])
+            .step(&["status", "--porcelain"])
+            .step(&["sparse-checkout", "disable"])
+            .step(&["ls-files", "-t"])
+            .step(&["config", "get", "core.sparseCheckout"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `core.logAllRefUpdates` is only consulted when a reflog has to be
+    // *created*, never when one is appended to, and that asymmetry is the whole
+    // sequence. Step 2 creates `off-log` with the setting off and step 3's
+    // `reflog show` must be empty; step 5 creates `on-log` with it back on and
+    // step 6 must print the `branch: Created from main` line.
+    //
+    // Step 7 repeats the first lookup after the setting is back on, and it must
+    // *still* be empty: turning the setting on does not retroactively create a
+    // log. Step 8 then updates `off-log`, which does create one — with a single
+    // entry, not with the entry it would have had at creation. A port that
+    // decides "log or not" per invocation rather than per file gets step 7 or
+    // step 9 wrong, and `runner::probe_reflogs` compares `.git/logs/**` at every
+    // step, so the finding is attributed to the step that created the file.
+    out.push(
+        Sequence::new("branch", "log-all-ref-updates-off-creates-no-reflog", Shape::Branched)
+            .step(&["config", "set", "core.logAllRefUpdates", "false"])
+            .step(&["branch", "off-log"])
+            .step(&["reflog", "show", "off-log"])
+            .step(&["config", "set", "core.logAllRefUpdates", "true"])
+            .step(&["branch", "on-log"])
+            .step(&["reflog", "show", "on-log"])
+            .step(&["reflog", "show", "off-log"])
+            .step(&["update-ref", "refs/heads/off-log", "refs/heads/feature"])
+            .step(&["reflog", "show", "off-log"])
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// transactions, and the reads that must see all of one or none of it
+// ---------------------------------------------------------------------------
+//
+// One `update-ref --stdin` sequence is already here and it asks the base
+// question: does a failing transaction leave a half-updated repository. These
+// ask the three parts of the protocol that question does not reach — the
+// explicit `abort` after `prepare`, `symref-create` inside a transaction, and
+// `verify` as a precondition that fails *after* a legal update was accepted —
+// plus the `-z` grammar, which is a different parser rather than a different
+// format.
+
+fn update_ref_transactions(out: &mut Vec<Sequence>) {
+    // `prepare` takes every lock; `abort` releases them and applies nothing. So
+    // steps 1-2 are a transaction that reached the last moment before landing and
+    // then did not, and `for-each-ref` must show exactly the two branches the
+    // fixture started with.
+    //
+    // Steps 3-5 are the same transaction committed, which is what makes step 2
+    // meaningful: the payload is provably capable of creating both refs, so an
+    // empty listing at step 2 is `abort` working rather than the payload being
+    // rejected. Step 5's `symbolic-ref` is the half `for-each-ref` cannot see on
+    // its own — a `symref-create` written as an ordinary ref has the same
+    // `%(objectname)` and only fails here.
+    //
+    // Steps 6-7 are the precondition. `verify <ref> <zero-oid>` asserts that a
+    // ref does **not** exist; `refs/heads/main` does, so stock dies at exit 128
+    // with `cannot lock ref 'refs/heads/main': reference already exists` — and
+    // the `update refs/heads/txn-sym-a` that came *before* it in the same payload
+    // must not have landed. Step 8 runs the same update with the assertion
+    // inverted so it holds, and step 9 is where `txn-sym-a` finally moves, which
+    // is what says step 7 measured the transaction rather than a broken update.
+    out.push(
+        Sequence::new("update-ref", "aborted-transaction-then-symref-then-a-failing-verify", Shape::Branched)
+            .step_stdin(&["update-ref", "--stdin"], UPDATE_REF_TXN_ABORTED)
+            .step(&["for-each-ref", "--format=%(refname)", "refs/heads"])
+            .step_stdin(&["update-ref", "--stdin"], UPDATE_REF_TXN_SYMREF)
+            .step(&["for-each-ref", "--format=%(refname) %(objectname) %(symref)", "refs/heads"])
+            .step(&["symbolic-ref", "refs/heads/txn-sym"])
+            .step_stdin(&["update-ref", "--stdin"], UPDATE_REF_TXN_VERIFY_FAILS)
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])
+            .step_stdin(&["update-ref", "--stdin"], UPDATE_REF_TXN_VERIFY_HOLDS)
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])
+            .step(&["reflog", "show", "refs/heads/txn-sym-a"]),
+    );
+
+    // The `-z` grammar. It is not a formatting flag: the separator between a
+    // command, its ref and its value becomes NUL, and `delete` grows a trailing
+    // empty field where the line form has nothing after the ref name. A port that
+    // implements `--stdin` by splitting the payload on whitespace reads the
+    // NUL-delimited form as a single argument and creates either nothing or a ref
+    // whose name contains a NUL — and `for-each-ref` at step 2 is where that
+    // becomes a listing rather than an exit code.
+    //
+    // Step 3's payload opens with a legal `delete refs/heads/z-a` and then names
+    // a non-existent ref as a new value, so the whole transaction must fail with
+    // `z-a` intact. It is the same all-or-nothing property the line-form sequence
+    // asks, deliberately repeated here, because the `-z` parser is a different
+    // parser and a port can stage correctly in one and apply-as-it-reads in the
+    // other.
+    out.push(
+        Sequence::new("update-ref", "nul-delimited-transaction-then-one-that-must-not-land", Shape::Branched)
+            .step_stdin(&["update-ref", "--stdin", "-z"], UPDATE_REF_TXN_NUL)
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])
+            .step_stdin(&["update-ref", "--stdin", "-z"], UPDATE_REF_TXN_NUL_BAD)
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])
+            .step(&["rev-parse", "--verify", "refs/heads/z-a"])
+            .step(&["rev-parse", "--verify", "refs/heads/z-c"])
+            .step(&["log", "--oneline", "-1", "refs/heads/z-b"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `pack-refs` moves every ref out of `.git/refs/**` and into a single
+    // `.git/packed-refs` file, and from that moment every ref *read* has to
+    // consult a file it did not before and every ref *delete* has to rewrite it.
+    //
+    // Step 3 is the read: the identical `for-each-ref` from step 1, which must
+    // print the identical four lines from a completely different storage layout.
+    // A port whose reader only walks the directory tree answers with nothing
+    // there, having just made every ref in the repository invisible at exit 0.
+    //
+    // Steps 4 and 8 are the deletes, and they are the ones that lose data in the
+    // other direction. There is no loose file to unlink, so a port that
+    // implements deletion as `unlink` reports success and leaves the ref in
+    // `packed-refs` — where step 5's listing, step 7's `branch` and step 9's
+    // final listing all still find it. `tag -d` at step 8 is asked as well as
+    // `update-ref -d` at step 4 because they are different call sites onto the
+    // same file, and `v0.2.0` is an annotated tag, so its `packed-refs` entry has
+    // a `^`-peeled line beneath it that the rewrite has to carry.
+    out.push(
+        Sequence::new("pack-refs", "packed-then-deleted-must-rewrite-the-file", Shape::Branched)
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["pack-refs", "--all"])
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["update-ref", "-d", "refs/heads/feature"])
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["rev-parse", "--verify", "refs/tags/v0.1.0"])
+            .step(&["branch", "--format=%(refname:short)"])
+            .step(&["tag", "-d", "v0.1.0"])
+            .step(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["fsck", "--no-progress", "--no-dangling"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// three more records one command leaves for the next
+// ---------------------------------------------------------------------------
+//
+// A submodule's URL lives in two files at once and a third command copies
+// between them; a bundle is a repository serialized to a file that a later
+// `clone` has to read back; `restore --source=@{-1}` resolves a branch out of
+// the reflog and pulls one path out of it. None of the three is one invocation.
+
+fn side_records(out: &mut Vec<Sequence>) {
+    // A submodule URL is stored twice on purpose: `.gitmodules` is the *tracked*
+    // value, versioned with the superproject, and `submodule.<name>.url` in
+    // `.git/config` is the *local* value the fetch actually uses. `set-url`
+    // writes the first; `sync` copies it to the second, absolutizing a relative
+    // URL against the superproject as it goes.
+    //
+    // Step 3 reads `.gitmodules` back and must be the literal `./upstream-moved`
+    // — unresolved, because it is a tracked file and resolving it would make the
+    // superproject unclonable. Step 4 reads the local copy, which must be the
+    // *absolute* form. A port that writes one value to both files fails one of
+    // the two, and no case can ask, because a case sees only whichever state the
+    // fixture was built in.
+    //
+    // Step 7's `diff --name-only` is the consequence a port is likely to miss:
+    // `.gitmodules` is tracked, so rewriting it makes the superproject dirty.
+    // Step 9's `deinit` then unregisters the submodule while leaving the gitlink
+    // in the index, which step 12 is what proves — `160000 7c9f5d7…` still there
+    // after the working copy is gone.
+    out.push(
+        Sequence::new("submodule", "set-url-then-sync-then-deinit-keeps-the-gitlink", Shape::Submodule)
+            .step(&["submodule", "status"])
+            .step(&["submodule", "set-url", "sub", "./upstream-moved"])
+            .step(&["config", "get", "-f", ".gitmodules", "submodule.sub.url"])
+            .step(&["config", "get", "submodule.sub.url"])
+            .step(&["submodule", "sync"])
+            .step(&["config", "get", "submodule.sub.url"])
+            .step(&["diff", "--name-only"])
+            .step(&["submodule", "status"])
+            .step(&["submodule", "deinit", "-f", "sub"])
+            .step(&["submodule", "status"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "-s", "sub"]),
+    );
+
+    // A bundle is a repository in one file, and the only way to find out whether
+    // a port wrote a real one is to make something else read it. `bundle verify`
+    // is the cheap reader and `clone` is the expensive one, and they fail
+    // differently: a bundle with the right header and a malformed pack verifies
+    // and does not clone.
+    //
+    // Steps 5-7 are the clone and its read-back. `--no-local` forces the transport
+    // path rather than a directory copy, and the clone's ref listing at step 7 is
+    // where the bundle's `HEAD` line turns into `refs/remotes/origin/HEAD` — the
+    // detail a port that writes refs but no `HEAD` loses, while still verifying
+    // and still cloning.
+    //
+    // Step 8's incremental bundle is the other half of the format: a bundle with
+    // *prerequisites*, whose `verify` prints `The bundle requires this ref` and
+    // whose exit code depends on the repository doing the verifying. Step 9 runs
+    // it where the prerequisite is present and step 10 runs it inside the clone,
+    // where it is also present — so both must be `okay`, and a port that records
+    // no prerequisites at all prints `The bundle records a complete history`
+    // instead, at the same exit code.
+    out.push(
+        Sequence::new("bundle", "create-verify-clone-then-an-incremental-bundle", Shape::Branched)
+            .step(&["bundle", "create", "./all.bundle", "--all"])
+            .step(&["bundle", "verify", "./all.bundle"])
+            .step(&["bundle", "list-heads", "./all.bundle"])
+            .step(&["clone", "-q", "--no-local", "./all.bundle", "./from-bundle"])
+            .step(&["-C", "from-bundle", "log", "--oneline", "--all"])
+            .step(&["-C", "from-bundle", "for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["bundle", "create", "./inc.bundle", "main~1..main"])
+            .step(&["bundle", "verify", "./inc.bundle"])
+            .step(&["-C", "from-bundle", "bundle", "verify", "../inc.bundle"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `restore --source=@{-1}` is two features meeting: a reflog lookup for the
+    // previously-checked-out branch, and a path-restricted checkout out of the
+    // tree it names. Neither is reachable alone — `@{-1}` needs a switch to have
+    // happened, and `--source` needs something to restore *from* that is not
+    // `HEAD`.
+    //
+    // Steps 1-2 make `feature` the previous branch while standing on `main`.
+    // Step 4 then restores `feature.txt`, which exists only on `feature`, into
+    // both the index and the worktree — so step 5 must be `A  feature.txt` and
+    // step 6 must be `A\tfeature.txt`. A port that resolves `@{-1}` to `HEAD`
+    // fails with `pathspec 'feature.txt' did not match`; one that resolves it to
+    // the *commit* rather than the branch gets the same answer here and would
+    // diverge only on the name, which is why step 3 pins the clean start.
+    //
+    // Step 7's `switch -` is the closing symmetry: with `feature.txt` staged from
+    // `feature`'s tree, switching to `feature` is not a conflict — the staged
+    // content is already what that branch has — so step 8 must be clean and step
+    // 10 must be back on `feature`.
+    out.push(
+        Sequence::new("restore", "source-at-brace-minus-one-then-switch-back", Shape::Branched)
+            .step(&["switch", "feature"])
+            .step(&["switch", "main"])
+            .step(&["status", "--porcelain"])
+            .step(&["restore", "--source=@{-1}", "--staged", "--worktree", "--", "feature.txt"])
+            .step(&["status", "--porcelain"])
+            .step(&["diff", "--cached", "--name-status"])
+            .step(&["switch", "-"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["rev-parse", "--abbrev-ref", "HEAD"]),
     );
 }

@@ -23,13 +23,16 @@ mod diff_family;
 mod fetch_clone;
 mod fixture_gaps;
 mod fixture_gaps2;
+mod fixture_gaps3;
 mod env_layer;
 mod globals_layer;
 mod graft_partial;
+mod helpers_credentials;
 mod discovery;
 mod history_query;
 mod hooks_identity;
 mod index_plumbing;
+mod informational;
 mod history_rewrite;
 mod info_attrs;
 mod log_format;
@@ -107,6 +110,7 @@ pub fn cases() -> Vec<Case> {
     // The two repositories that are missing objects on purpose: a shallow
     // clone's graft boundary, and a partial clone's lazy fetch.
     graft_partial::cases(&mut c);
+    helpers_credentials::cases(&mut c);
 
     // Configuration that changes what a read prints: the colour slots, the
     // diff and core rendering keys, and the per-verb defaults.
@@ -467,10 +471,12 @@ pub fn cases() -> Vec<Case> {
     fetch_clone::cases(&mut c);
     fixture_gaps::cases(&mut c);
     fixture_gaps2::cases(&mut c);
+    fixture_gaps3::cases(&mut c);
     discovery::cases(&mut c);
     history_query::cases(&mut c);
     hooks_identity::cases(&mut c);
     index_plumbing::cases(&mut c);
+    informational::cases(&mut c);
     history_rewrite::cases(&mut c);
     info_attrs::cases(&mut c);
     log_format::cases(&mut c);

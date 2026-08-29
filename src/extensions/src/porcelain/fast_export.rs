@@ -117,20 +117,18 @@
 //! * accepted no-ops (as in git for a pathspec-less export): `--full-history`,
 //!   `--simplify-merges`, `--sparse`, `--dense`, `--boundary` (without negative
 //!   revisions)
-//! * the diffcore rename/copy/break-detection family that `setup_revisions`
-//!   forwards — `-M`/`-C`/`-B` and their `--find-renames`/`--find-copies`/
-//!   `--break-rewrites` long forms (with an optional `<n>`/`<n>%`/`<n>/<m>`
-//!   score), plus `--find-copies-harder`, `--irreversible-delete`/`-D`,
-//!   `--no-renames`, and `--rename-empty`/`--no-rename-empty`. git accepts these
-//!   and, on history that contains no rename or copy, emits the identical stream
-//!   (diffcore-rename finds nothing, so no `R`/`C` stanza appears); this port
-//!   accepts them the same way and validates a malformed score exactly as git's
-//!   `diff_scoreopt_parse` does — the bare `error: invalid argument to
-//!   find-renames` line, exit 129. Actual `R`/`C` emission on a rename is the one
-//!   piece not reproduced: gix-diff's rename detection is documented to differ
-//!   from git's diffcore-rename, so a repository whose history contains a rename
-//!   would export `M`/`D` pairs where git prints `R`/`C` — semantically the same
-//!   import, a different byte stream.
+//! * the diffcore rename/copy detection family that `setup_revisions` forwards —
+//!   `-M`/`-C` and their `--find-renames`/`--find-copies` long forms (with an
+//!   optional `<n>`/`<n>%`/`<n>/<m>` score), plus `--find-copies-harder`,
+//!   `--no-renames` and `--rename-empty`/`--no-rename-empty`. They run
+//!   [`super::diffcore_rename`] — git's own `diffcore_rename()` — over each
+//!   commit's change list, so a rename comes out as `R <old> <new>` and a copy as
+//!   `C <old> <new>`, including `show_filemodify`'s rule that a source the same
+//!   commit already rewrote falls back to a plain `M`. A malformed score is
+//!   validated exactly as `diff_scoreopt_parse` does — the bare `error: invalid
+//!   argument to find-renames` line, exit 129. `-B`/`--break-rewrites` is
+//!   accepted and validated but does not drive `diffcore_break()`, and
+//!   `--irreversible-delete`/`-D` only shortens a patch, which is never printed.
 //! * path limiting: a plain pathspec — whether after `--` or bare, since for
 //!   fast-export `--` only separates and never changes classification — filters
 //!   the export to commits whose diff touches it, with git's default history
@@ -175,6 +173,8 @@ use std::process::ExitCode;
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::objs::tree::{EntryKind, EntryMode};
+
+use super::diffcore_rename;
 
 /// git's `fast_export_usage` block, byte-for-byte, including the trailing blank
 /// line. Printed to stderr for both "no arguments" and "leftover arguments".
@@ -366,6 +366,10 @@ struct Opts {
     anonymize: bool,         // --anonymize
     reference_excluded_parents: bool, // --reference-excluded-parents
     refspecs: Vec<BString>,  // --refspec=<refspec> (applied to exported ref names)
+    /// `-M`/`-C`/`--find-renames`/`--find-copies` and friends, which
+    /// `setup_revisions()` forwards into `diff_scoreopt_parse` and which
+    /// `show_filemodify` then renders as `R`/`C` stanzas.
+    rename: diffcore_rename::Options,
 }
 
 /// The tagger git invents for a tag object that has none, when asked to.
@@ -404,6 +408,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         anonymize: false,
         reference_excluded_parents: false,
         refspecs: Vec::new(),
+        rename: diffcore_rename::Options::default(),
     };
 
     // Revision selection, in command-line order so `--not` scopes correctly.
@@ -592,7 +597,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         // stanzas this port does not emit (see the module note), so a well-formed
         // value is inert; a malformed score is the same usage error (exit 129, the
         // bare `error:` line with no option list) git's parser produces.
-        match classify_rename_opt(s) {
+        match classify_rename_opt(s, &mut opts.rename) {
             RenameOpt::Ok => continue,
             RenameOpt::Usage(msg) => return Ok(usage_error(msg)),
             RenameOpt::Other => {}
@@ -1144,7 +1149,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     let mut st = State {
         out: Vec::new(),
         marks: HashMap::new(),
-        commit_marks: Vec::new(),
+        decorated: Vec::new(),
         last_mark: 0,
         counter: 0,
         labels: std::collections::HashSet::new(),
@@ -1158,7 +1163,9 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     st.last_mark = imported_max;
     for (mark, id) in &imported_marks {
         st.marks.insert(*id, *mark);
-        st.commit_marks.push((*mark, *id));
+        // `insert_object_entry()` decorates each imported mark the same way, and
+        // every one of them names a commit.
+        st.decorated.push((*id, *mark, true));
     }
 
     if opts.use_done {
@@ -1249,16 +1256,94 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     stdout.flush()?;
 
     if let Some(path) = &opts.export_marks {
-        if !st.commit_marks.is_empty() {
-            let mut buf = String::new();
-            for (mark, id) in &st.commit_marks {
-                buf.push_str(&format!(":{mark} {id}\n"));
-            }
-            std::fs::write(path, buf)?;
+        let lines = export_marks(&st.decorated);
+        if !lines.is_empty() {
+            std::fs::write(path, lines)?;
         }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// git's `export_marks()` (builtin/fast-export.c:1185-1210): walk the `idnums`
+/// decoration table in **slot** order and print every commit it holds.
+///
+/// ```c
+/// for (i = 0; i < idnums.size; i++) {
+///         if (deco->base && deco->base->type == 1) {
+///                 mark = ptr_to_mark(deco->decoration);
+///                 fprintf(f, ":%"PRIu32" %s\n", mark, oid_to_hex(&deco->base->oid));
+///         }
+///         deco++;
+/// }
+/// ```
+///
+/// The order is neither insertion order nor sorted: it is the layout of an open
+/// hash table keyed on `oidhash(&obj->oid) % size` with linear probing
+/// (decorate.c:10-31), grown to `(size + 1000) * 3 / 2` whenever `nr + 1` passes
+/// two thirds of it. Blobs are decorated too and occupy slots even though the
+/// file never names them, so the whole insertion sequence has to be replayed to
+/// land the commits where git lands them.
+///
+/// `oidhash()` is the first four bytes of the id read as a native `unsigned int`
+/// (hash.h:444-453), which on every platform this builds for is little-endian.
+fn export_marks(decorated: &[(ObjectId, u32, bool)]) -> String {
+    // `struct decoration_entry` — `None` is git's null `base`.
+    let mut size = 0usize;
+    let mut table: Vec<Option<(ObjectId, u32, bool)>> = Vec::new();
+    let mut nr = 0usize;
+
+    let slot = |id: &ObjectId, size: usize| -> usize {
+        let bytes = id.as_bytes();
+        let mut head = [0u8; 4];
+        head.copy_from_slice(&bytes[..4]);
+        u32::from_le_bytes(head) as usize % size
+    };
+    let insert = |table: &mut Vec<Option<(ObjectId, u32, bool)>>,
+                  nr: &mut usize,
+                  size: usize,
+                  entry: (ObjectId, u32, bool)| {
+        let mut j = slot(&entry.0, size);
+        loop {
+            match &table[j] {
+                Some(existing) if existing.0 == entry.0 => {
+                    table[j] = Some(entry);
+                    return;
+                }
+                Some(_) => {
+                    j += 1;
+                    if j >= size {
+                        j = 0;
+                    }
+                }
+                None => break,
+            }
+        }
+        table[j] = Some(entry);
+        *nr += 1;
+    };
+
+    for entry in decorated {
+        // `if ((n->nr + 1) > n->size * 2 / 3) grow_decoration(n);`
+        if nr + 1 > size * 2 / 3 {
+            let old = std::mem::take(&mut table);
+            size = (size + 1000) * 3 / 2;
+            table = vec![None; size];
+            nr = 0;
+            for slot in old.into_iter().flatten() {
+                insert(&mut table, &mut nr, size, slot);
+            }
+        }
+        insert(&mut table, &mut nr, size, *entry);
+    }
+
+    let mut out = String::new();
+    for entry in table.into_iter().flatten() {
+        if entry.2 {
+            out.push_str(&format!(":{} {}\n", entry.1, entry.0));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,7 +1876,7 @@ fn parse_reencode(s: &str) -> Option<ReencodeMode> {
 enum RenameOpt {
     /// Not a rename/copy/break-detection option — fall through to the main parser.
     Other,
-    /// A well-formed member; accepted and inert (no `R`/`C` stanzas are emitted).
+    /// A well-formed member, recorded in the caller's [`diffcore_rename::Options`].
     Ok,
     /// A malformed score: git's `error: <msg>` on stderr, exit 129.
     Usage(&'static str),
@@ -1800,20 +1885,31 @@ enum RenameOpt {
 /// git's `diff_scoreopt_parse` reachable through `fast-export`'s `setup_revisions`.
 ///
 /// The rename/copy/break-detection options are diff options, so git parses them
-/// here rather than in `fast-export`'s own option table. This port emits none of
-/// the `R`/`C` stanzas they configure, but it must still classify each argument
-/// exactly as git does: accept the well-formed forms (they leave the stream
-/// unchanged on rename-free history) and reject a malformed score with git's own
-/// message and exit code.
-fn classify_rename_opt(s: &str) -> RenameOpt {
+/// here rather than in `fast-export`'s own option table. A malformed score is
+/// git's own message and exit code; a well-formed one lands in `out`, which
+/// [`detect_renames`] then hands to `diffcore_rename`.
+fn classify_rename_opt(s: &str, out: &mut diffcore_rename::Options) -> RenameOpt {
     // Value-less members: always accepted, never carry a score.
     match s {
-        "--find-copies-harder"
-        | "--irreversible-delete"
-        | "-D"
-        | "--no-renames"
-        | "--rename-empty"
-        | "--no-rename-empty" => return RenameOpt::Ok,
+        "--find-copies-harder" => {
+            out.find_copies_harder = true;
+            return RenameOpt::Ok;
+        }
+        "--no-renames" => {
+            out.detect_rename = 0;
+            return RenameOpt::Ok;
+        }
+        "--rename-empty" => {
+            out.rename_empty = true;
+            return RenameOpt::Ok;
+        }
+        "--no-rename-empty" => {
+            out.rename_empty = false;
+            return RenameOpt::Ok;
+        }
+        // `-D`/`--irreversible-delete` only shortens the *patch* of a deletion, which
+        // `fast-export` never prints.
+        "--irreversible-delete" | "-D" => return RenameOpt::Ok,
         _ => {}
     }
 
@@ -1836,6 +1932,26 @@ fn classify_rename_opt(s: &str) -> RenameOpt {
     };
 
     if valid_score(val, cmd == b'B') {
+        // `-C` twice is `--find-copies-harder` (diff.c's `DIFF_DETECT_COPY` already
+        // set), the same rule `diff-pairs` reproduces.
+        let (score, _) = diffcore_rename::parse_rename_score(val);
+        match cmd {
+            b'M' => {
+                out.rename_score = score;
+                out.detect_rename = diffcore_rename::DETECT_RENAME;
+            }
+            b'C' => {
+                out.rename_score = score;
+                if out.detect_rename == diffcore_rename::DETECT_COPY {
+                    out.find_copies_harder = true;
+                } else {
+                    out.detect_rename = diffcore_rename::DETECT_COPY;
+                }
+            }
+            // `-B` splits a rewrite into a delete plus an add before rename detection
+            // runs; `diffcore_break()` is not driven from here.
+            _ => {}
+        }
         RenameOpt::Ok
     } else {
         RenameOpt::Usage(match cmd {
@@ -2183,8 +2299,10 @@ struct State {
     /// Mark assigned to every already-exported blob, commit and (with
     /// `--mark-tags`) tag object.
     marks: HashMap<ObjectId, u32>,
-    /// Commit marks in assignment order — the only ones `--export-marks` dumps.
-    commit_marks: Vec<(u32, ObjectId)>,
+    /// Every object handed to `add_decoration()`, in that order, with the mark it
+    /// was given and whether it is a commit — everything [`export_marks`] needs to
+    /// rebuild git's decoration table and walk it in slot order.
+    decorated: Vec<(ObjectId, u32, bool)>,
     last_mark: u32,
     /// git's `show_progress` counter: one tick per exported blob and commit.
     counter: u64,
@@ -2200,7 +2318,19 @@ impl State {
     fn next_mark(&mut self, id: ObjectId) -> u32 {
         self.last_mark += 1;
         self.marks.insert(id, self.last_mark);
+        // `add_decoration(&idnums, object, mark)` — the object's *type* is what
+        // `export_marks()` filters on, and its position in the table is what decides
+        // the order the file comes out in.
+        self.decorated.push((id, self.last_mark, false));
         self.last_mark
+    }
+
+    /// The last mark handed out belongs to a commit, so `export_marks()` will
+    /// print it — git reads `deco->base->type == 1` off the object itself.
+    fn mark_is_commit(&mut self) {
+        if let Some(last) = self.decorated.last_mut() {
+            last.2 = true;
+        }
     }
 
     /// git's `show_progress`, called after each exported blob and commit.
@@ -2415,7 +2545,7 @@ fn emit_commit(
     let refname = st.anon_refname(opts, source.as_bstr());
 
     let mark = st.next_mark(id);
-    st.commit_marks.push((mark, id));
+    st.mark_is_commit();
 
     if parents.is_empty() {
         st.out.extend_from_slice(b"reset ");
@@ -2486,9 +2616,16 @@ fn emit_commit(
     // `show_filemodify` reorders the whole diff queue before rendering it
     // (`QSORT(q->queue, q->nr, depth_first)`, fast-export.c:445) — after the blob
     // export above, which is why the mark numbers still follow tree order.
+    // `diffcore_std()` runs before `show_filemodify` sees the queue, so
+    // `-M`/`-C` turn add/delete pairs into the `R`/`C` stanzas below.
+    detect_renames(repo, &mut changes, opts);
     changes.sort_by(depth_first);
+    // `struct string_list *changed` — the paths already written in this commit, which
+    // is what stops a rename from being declared against a source the same commit
+    // has already rewritten.
+    let mut changed: std::collections::BTreeSet<BString> = Default::default();
     for c in &changes {
-        render_change(c, opts, st)?;
+        render_change(c, opts, st, &mut changed)?;
     }
     st.out.push(b'\n');
     st.tick(opts);
@@ -2677,8 +2814,13 @@ struct Side {
 }
 
 struct Change {
+    /// The pre-image, when the path had one — what `q->queue[i]->one` holds.
+    old: Option<Side>,
     new: Option<Side>,
     path: BString,
+    /// Set on a pair `diffcore_rename()` matched: `(status, source path)`, i.e.
+    /// `R`/`C` and `ospec->path`.
+    rename: Option<(u8, BString)>,
 }
 
 /// A tree entry, materialised so the borrow on the tree buffer ends before we recurse.
@@ -2762,8 +2904,10 @@ fn walk(
                     walk(repo, Some(a.id), Some(b.id), path.as_bstr(), out)?;
                 } else {
                     out.push(Change {
+                        old: Some(side(a)),
                         new: Some(side(b)),
                         path,
+                        rename: None,
                     });
                 }
             }
@@ -2774,7 +2918,12 @@ fn walk(
                 if a.mode.is_tree() {
                     walk(repo, Some(a.id), None, path.as_bstr(), out)?;
                 } else {
-                    out.push(Change { new: None, path });
+                    out.push(Change {
+                        old: Some(side(a)),
+                        new: None,
+                        path,
+                        rename: None,
+                    });
                 }
             }
             Ordering::Greater => {
@@ -2785,8 +2934,10 @@ fn walk(
                     walk(repo, None, Some(b.id), path.as_bstr(), out)?;
                 } else {
                     out.push(Change {
+                        old: None,
                         new: Some(side(b)),
                         path,
+                        rename: None,
                     });
                 }
             }
@@ -2821,24 +2972,98 @@ fn join(prefix: &BStr, name: &BStr) -> BString {
 /// so it separates prefix-related siblings too: `C2`, `C3/x` and `C.a` all come
 /// out ahead of plain `C`.
 ///
-/// git's third leg breaks a remaining tie by moving `R`ename pairs last. This
-/// port emits no `R`/`C` stanzas (see the module note), so every pair here is an
-/// add/modify/delete and the leg is unreachable — and since a tree diff yields
-/// at most one pair per path, the two names can never be equal either, which is
-/// what makes a stable `sort_by` agree with git's unstable `qsort`.
+/// git's third leg breaks a remaining tie by moving `R`ename pairs last:
+///
+/// ```c
+/// /* Both are renames, or both are not renames; sort by path */
+/// if (!!DIFF_PAIR_RENAME(a) == !!DIFF_PAIR_RENAME(b))
+///         return 0;
+/// return DIFF_PAIR_RENAME(a) ? 1 : -1;
+/// ```
+///
+/// A tree diff yields at most one pair per path, so equal names can only arise
+/// once diffcore-rename has paired an add with a delete — which is exactly when
+/// the leg matters, and what makes a stable `sort_by` agree with git's unstable
+/// `qsort` everywhere else.
 fn depth_first(a: &Change, b: &Change) -> Ordering {
     let (x, y) = (a.path.as_slice(), b.path.as_slice());
     let common = x.len().min(y.len());
     match x[..common].cmp(&y[..common]) {
-        Ordering::Equal => y.len().cmp(&x.len()),
+        Ordering::Equal => match y.len().cmp(&x.len()) {
+            Ordering::Equal => a.rename.is_some().cmp(&b.rename.is_some()),
+            other => other,
+        },
         other => other,
     }
 }
 
-/// git's `show_filemodify`: `D <path>` for a removal, `M <mode> <ref> <path>`
-/// otherwise, where `<ref>` is a mark for exported blobs and a raw hash for
-/// gitlinks and `--no-data`.
-fn render_change(c: &Change, opts: &Opts, st: &mut State) -> Result<()> {
+/// `diffcore_rename()` over one commit's change list — the pass `diffcore_std()`
+/// runs before `show_filemodify` (builtin/fast-export.c) is handed the queue.
+///
+/// A matched pair keeps its destination entry and records the source path and the
+/// status letter on it; the source's own deletion entry drops out, exactly as it
+/// does from git's queue.
+fn detect_renames(repo: &gix::Repository, changes: &mut Vec<Change>, opts: &Opts) {
+    if opts.rename.detect_rename == 0 || changes.is_empty() {
+        return;
+    }
+    let mut q = diffcore_rename::Queue::default();
+    for c in changes.iter() {
+        let spec = |side: &Option<Side>| match side {
+            Some(side) => {
+                let mut spec = diffcore_rename::FileSpec::absent(c.path.clone());
+                spec.mode = side.mode.value() as u32;
+                spec.oid = side.id;
+                spec.oid_valid = true;
+                spec
+            }
+            None => diffcore_rename::FileSpec::absent(c.path.clone()),
+        };
+        let one = q.add_spec(spec(&c.old));
+        let two = q.add_spec(spec(&c.new));
+        q.add_pair(one, two);
+    }
+    let mut content = diffcore_rename::OdbContent { repo };
+    let mut rename = opts.rename;
+    rename.hash_kind = repo.object_hash();
+    diffcore_rename::diffcore_rename(&mut q, &rename, &mut content);
+    // `diff_resolve_rename_copy()` is what turns a paired-up queue into status
+    // letters; `show_filemodify` switches on `q->queue[i]->status`.
+    diffcore_rename::resolve_rename_copy(&mut q);
+
+    // The arena was filled two specs per change, in order, so a spec index still
+    // names the `Side` it came from — which keeps the `EntryMode` git's mode word
+    // cannot round-trip through.
+    let side_at = |k: usize| -> Option<Side> {
+        let c = changes.get(k / 2)?;
+        match k % 2 {
+            0 => c.old,
+            _ => c.new,
+        }
+    };
+    let mut out: Vec<Change> = Vec::with_capacity(q.pairs.len());
+    for pair in &q.pairs {
+        let renamed = matches!(pair.status, b'R' | b'C');
+        out.push(Change {
+            old: side_at(pair.one),
+            new: side_at(pair.two),
+            path: q.specs[pair.two].path.clone(),
+            rename: renamed.then(|| (pair.status, q.specs[pair.one].path.clone())),
+        });
+    }
+    *changes = out;
+}
+
+/// git's `show_filemodify`: `D <path>` for a removal, `R`/`C <old> <new>` for a
+/// pair diffcore-rename matched, and `M <mode> <ref> <path>` otherwise, where
+/// `<ref>` is a mark for exported blobs and a raw hash for gitlinks and
+/// `--no-data`.
+fn render_change(
+    c: &Change,
+    opts: &Opts,
+    st: &mut State,
+    changed: &mut std::collections::BTreeSet<BString>,
+) -> Result<()> {
     let path = if opts.anonymize {
         st.anon.path(c.path.as_bstr())
     } else {
@@ -2849,8 +3074,47 @@ fn render_change(c: &Change, opts: &Opts, st: &mut State) -> Result<()> {
             st.out.extend_from_slice(b"D ");
             print_path(&mut st.out, path.as_bstr());
             st.out.push(b'\n');
+            changed.insert(c.path.clone());
         }
         Some(new) => {
+            // ```c
+            // if (!string_list_has_string(changed, ospec->path)) {
+            //         printf("%c ", q->queue[i]->status);
+            //         print_path(ospec->path);
+            //         putchar(' ');
+            //         print_path(spec->path);
+            //         string_list_insert(changed, spec->path);
+            //         putchar('\n');
+            //
+            //         if (oideq(&ospec->oid, &spec->oid) && ospec->mode == spec->mode)
+            //                 break;
+            // }
+            // /* fallthrough */
+            // ```
+            //
+            // (builtin/fast-export.c:459-480.) A rename whose source this commit has
+            // already rewritten cannot be trusted — the diff was taken against the old
+            // contents — so it falls through and is written as a plain `M`. A pair whose
+            // two sides are identical needs nothing more than the `R`/`C` line.
+            if let Some((status, source)) = &c.rename {
+                if !changed.contains(source) {
+                    let source_path = if opts.anonymize {
+                        st.anon.path(source.as_bstr())
+                    } else {
+                        source.clone()
+                    };
+                    st.out.push(*status);
+                    st.out.push(b' ');
+                    print_path(&mut st.out, source_path.as_bstr());
+                    st.out.push(b' ');
+                    print_path(&mut st.out, path.as_bstr());
+                    st.out.push(b'\n');
+                    changed.insert(c.path.clone());
+                    if c.old.is_some_and(|old| old.id == new.id && old.mode == new.mode) {
+                        return Ok(());
+                    }
+                }
+            }
             let mode = new.mode.value();
             let reference: Vec<u8> = if opts.no_data || new.mode.kind() == EntryKind::Commit {
                 // git names the object by hash here; `--anonymize` substitutes its
@@ -2872,6 +3136,7 @@ fn render_change(c: &Change, opts: &Opts, st: &mut State) -> Result<()> {
             st.out.push(b' ');
             print_path(&mut st.out, path.as_bstr());
             st.out.push(b'\n');
+            changed.insert(c.path.clone());
         }
     }
     Ok(())

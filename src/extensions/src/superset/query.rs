@@ -50,8 +50,16 @@ where
 
 /// Select repos and print a "no repos matched" note when empty. Returns the
 /// selected repos, or `None` when there is nothing to do.
+///
+/// Every verb routed here takes no positional of its own (see [`select_repos`]),
+/// so a leftover bare token can only be a path pattern — the documented grammar
+/// (`git zheads cask`), and the same reading `zforeach` gives the half left of
+/// `--`. An unrecognized *flag* stays ignored rather than becoming a pattern
+/// that matches nothing, so a typo cannot silently empty the fleet.
 pub(crate) fn selected(args: &[String]) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
-    select_repos(&Selector::parse(args).0)
+    let (mut sel, rest) = Selector::parse(args);
+    sel.patterns.extend(rest.into_iter().filter(|a| !a.starts_with('-')));
+    select_repos(&sel)
 }
 
 /// Resolve a parsed selector to its repos, printing "no repos matched" and

@@ -215,14 +215,13 @@
 //! parse-options rejects, 128 for a `die()` (bad revision, bad `--ignore-submodules`
 //! word, a count that is `'not an integer'`).
 //!
+//! A binary pair renders as the base85 `GIT binary patch` payload
+//! ([`super::binary_patch`]) that format-patch's implied `--binary` calls for, with both
+//! blobs named in full in the `index` line (`fill_metainfo()` raises the abbreviation to
+//! `hexsz` there); `--no-binary` leaves `Binary files … differ` instead. Either way the
+//! stat row is `Bin <n> -> <m> bytes` and `--numstat` prints `-` for both counts.
+//!
 //! Not covered — these `bail!` rather than emit output that would diverge:
-//!   * binary files, unless `-a`/`--text` is given. format-patch implies
-//!     `--binary`, i.e. a base85 `GIT binary patch` payload. The payload itself is
-//!     available now — [`super::binary_patch`] emits it byte-for-byte, as
-//!     `git diff --binary` does — but this renderer does not carry the two raw
-//!     images down to its patch body yet, and `--no-binary`'s alternative
-//!     (`Binary files … differ` plus a `Bin <n> -> <m> bytes` stat row) is not
-//!     ported either, so that flag parses but changes nothing.
 //!   * pathspec-limited output. A pathspec is parsed and honoured to the extent
 //!     that it never becomes a bogus revision error, but limiting the walk and
 //!     the patch to it is not ported, so a pathspec that reaches a non-empty
@@ -7254,6 +7253,10 @@ struct StatEntry {
     /// present only under `--compact-summary`. It joins `print_name`, which the
     /// `--stat` row uses, and never the raw name `--numstat` prints.
     comment: Option<&'static str>,
+    /// `diffstat_file.is_binary`, with the two sizes `show_stats()` prints as
+    /// `Bin <old> -> <new> bytes`. A binary pair contributes no line counts, which is
+    /// why `--numstat` prints `-` for both and the shortstat counts the file alone.
+    binary: Option<(u64, u64)>,
 }
 
 /// The four `show_stats()` width knobs, as this verb records them.
@@ -7275,8 +7278,8 @@ fn stat_widths(o: &Opts) -> StatWidths {
 
 
 
-/// The rows [`super::diffstat::show_stats`] renders. Binary content is refused
-/// upstream of here, so no row is ever `Bin` and none is ever unmerged.
+/// The rows [`super::diffstat::show_stats`] renders. A binary pair becomes the `Bin <old>
+/// -> <new> bytes` row `show_stats()` prints for one; no row is ever unmerged.
 fn stat_rows(files: &[StatEntry]) -> Vec<diffstat::StatFile> {
     files
         .iter()
@@ -7287,7 +7290,16 @@ fn stat_rows(files: &[StatEntry]) -> Vec<diffstat::StatFile> {
             if let Some(comment) = f.comment {
                 print_name.extend_from_slice(format!(" ({comment})").as_bytes());
             }
-            diffstat::StatFile::text(print_name, f.added, f.deleted)
+            match f.binary {
+                Some((old_size, new_size)) => diffstat::StatFile {
+                    print_name,
+                    added: new_size,
+                    deleted: old_size,
+                    binary: true,
+                    is_unmerged: false,
+                },
+                None => diffstat::StatFile::text(print_name, f.added, f.deleted),
+            }
         })
         .collect()
 }
@@ -7316,7 +7328,12 @@ fn emit_stat_summary(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
 /// Port of `show_numstat()` (diff.c): tab-separated counts and the C-quoted path.
 fn emit_numstat(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
     for f in files {
-        writeln!(out, "{}\t{}\t{}", f.added, f.deleted, f.name)?;
+        // `show_numstat()`: a binary pair prints `-` for both counts, since there are no
+        // lines to count.
+        match f.binary {
+            Some(_) => writeln!(out, "-\t-\t{}", f.name)?,
+            None => writeln!(out, "{}\t{}\t{}", f.added, f.deleted, f.name)?,
+        }
     }
     Ok(())
 }
@@ -7886,6 +7903,25 @@ fn emit_change(
     dissimilarity: &HashMap<Vec<u8>, u32>,
 ) -> Result<(StatEntry, FilePaint)> {
     let mut counts = (0u64, 0u64);
+    // `diffstat_file.is_binary` plus the two sizes the `Bin <n> -> <m> bytes` row prints.
+    let mut binary: Option<(u64, u64)> = None;
+    // ```c
+    // if (o->flags.binary) {
+    //         mmfile_t mf;
+    //         if ((!fill_mmfile(o->repo, &mf, one) && diff_filespec_is_binary(o->repo, one)) ||
+    //             (!fill_mmfile(o->repo, &mf, two) && diff_filespec_is_binary(o->repo, two)))
+    //                 abbrev = hexsz;
+    // }
+    // ```
+    //
+    // (`fill_metainfo()`, diff.c.) A binary pair in a `--binary` diff names both blobs in
+    // full: the payload can only be applied against the exact pre-image, so the `index`
+    // line has to identify it unambiguously.
+    let hexsz = repo.object_hash().len_in_hex();
+    let index_abbrev = |binary: bool| match binary && !opts.no_binary {
+        true => Abbrev::Fixed(hexsz),
+        false => abbrev,
+    };
     // `ecbdata.blank_at_eof_in_preimage` / `_postimage`, left at zero for the pairs
     // that never reach a textual diff (a pure mode change, a rename that moved the
     // content untouched, `-D`'s discarded deletion body).
@@ -7902,10 +7938,12 @@ fn emit_change(
             writeln!(out, "new file mode {:o}", entry_mode.value())?;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
-            reject_binary(is_sub, &content, path, opts)?;
-            let short = short_oid(repo, *id, abbrev, is_sub)?;
+            binary = pair_is_binary(is_sub, &content, opts).then(|| (0, content.len() as u64));
+            let short = short_oid(repo, *id, index_abbrev(binary.is_some()), is_sub)?;
             writeln!(out, "index {}..{}", "0".repeat(short.len()), short)?;
-            counts = emit_body(out, None, Some(path), &[], &content, opts, &mut blank_at_eof)?;
+            counts = emit_body(
+                repo, out, None, Some(path), &[], &content, opts, binary.is_some(), &mut blank_at_eof,
+            )?;
         }
         ChangeDetached::Deletion {
             location,
@@ -7918,8 +7956,8 @@ fn emit_change(
             writeln!(out, "deleted file mode {:o}", entry_mode.value())?;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
-            reject_binary(is_sub, &content, path, opts)?;
-            let short = short_oid(repo, *id, abbrev, is_sub)?;
+            binary = pair_is_binary(is_sub, &content, opts).then(|| (content.len() as u64, 0));
+            let short = short_oid(repo, *id, index_abbrev(binary.is_some()), is_sub)?;
             writeln!(out, "index {}..{}", short, "0".repeat(short.len()))?;
             // `-D`/`--irreversible-delete`: `builtin_diff()` stops as soon as it
             // sees `/dev/null` on the post-image side, so a deletion carries no
@@ -7927,7 +7965,9 @@ fn emit_change(
             // so the removed lines are still counted here.
             let mut sink = Vec::new();
             let body = if opts.irreversible_delete { &mut sink } else { &mut *out };
-            counts = emit_body(body, Some(path), None, &content, &[], opts, &mut blank_at_eof)?;
+            counts = emit_body(
+                repo, body, Some(path), None, &content, &[], opts, binary.is_some(), &mut blank_at_eof,
+            )?;
         }
         ChangeDetached::Modification {
             location,
@@ -7957,10 +7997,12 @@ fn emit_change(
                 let new_is_sub = entry_mode.is_commit();
                 let old_content = content_of(repo, *previous_id, old_is_sub)?;
                 let new_content = content_of(repo, *id, new_is_sub)?;
-                reject_binary(old_is_sub, &old_content, path, opts)?;
-                reject_binary(new_is_sub, &new_content, path, opts)?;
-                let old_short = short_oid(repo, *previous_id, abbrev, old_is_sub)?;
-                let new_short = short_oid(repo, *id, abbrev, new_is_sub)?;
+                binary = (pair_is_binary(old_is_sub, &old_content, opts)
+                    || pair_is_binary(new_is_sub, &new_content, opts))
+                .then(|| (old_content.len() as u64, new_content.len() as u64));
+                let old_short =
+                    short_oid(repo, *previous_id, index_abbrev(binary.is_some()), old_is_sub)?;
+                let new_short = short_oid(repo, *id, index_abbrev(binary.is_some()), new_is_sub)?;
                 // The mode suffix is dropped when `old mode`/`new mode` said it.
                 if mode_changed {
                     writeln!(out, "index {old_short}..{new_short}")?;
@@ -7968,12 +8010,14 @@ fn emit_change(
                     writeln!(out, "index {old_short}..{new_short} {new_mode}")?;
                 }
                 counts = emit_body(
+                    repo,
                     out,
                     Some(path),
                     Some(path),
                     &old_content,
                     &new_content,
                     opts,
+                    binary.is_some(),
                     &mut blank_at_eof,
                 )?;
             }
@@ -8011,16 +8055,28 @@ fn emit_change(
                 let new_is_sub = entry_mode.is_commit();
                 let old_content = content_of(repo, *source_id, old_is_sub)?;
                 let new_content = content_of(repo, *id, new_is_sub)?;
-                reject_binary(old_is_sub, &old_content, from, opts)?;
-                reject_binary(new_is_sub, &new_content, to, opts)?;
-                let old_short = short_oid(repo, *source_id, abbrev, old_is_sub)?;
-                let new_short = short_oid(repo, *id, abbrev, new_is_sub)?;
+                binary = (pair_is_binary(old_is_sub, &old_content, opts)
+                    || pair_is_binary(new_is_sub, &new_content, opts))
+                .then(|| (old_content.len() as u64, new_content.len() as u64));
+                let old_short =
+                    short_oid(repo, *source_id, index_abbrev(binary.is_some()), old_is_sub)?;
+                let new_short = short_oid(repo, *id, index_abbrev(binary.is_some()), new_is_sub)?;
                 if old_mode != new_mode {
                     writeln!(out, "index {old_short}..{new_short}")?;
                 } else {
                     writeln!(out, "index {old_short}..{new_short} {new_mode}")?;
                 }
-                counts = emit_body(out, Some(from), Some(to), &old_content, &new_content, opts, &mut blank_at_eof)?;
+                counts = emit_body(
+                    repo,
+                    out,
+                    Some(from),
+                    Some(to),
+                    &old_content,
+                    &new_content,
+                    opts,
+                    binary.is_some(),
+                    &mut blank_at_eof,
+                )?;
             }
         }
     }
@@ -8057,6 +8113,7 @@ fn emit_change(
             added: counts.0,
             deleted: counts.1,
             comment: comment.flatten(),
+            binary,
         },
         FilePaint { ws_rule: opts.ws_rule, blank_at_eof },
     ))
@@ -8107,22 +8164,11 @@ fn emit_rename_header(out: &mut Vec<u8>, from: &[u8], to: &[u8], opts: &Opts) {
     out.push(b'\n');
 }
 
-/// format-patch implies `--binary`, and this renderer cannot produce that payload
-/// yet — not because the encoding is missing ([`super::binary_patch`] emits it
-/// byte-for-byte) but because this patch body never carries the two raw images the
-/// payload is built from. Refuse rather than emit a textual approximation.
-/// `-a`/`--text` asks for exactly that textual rendering, so it is honoured.
-/// `--no-binary` parses but does not change this: its `Binary files … differ` line
-/// comes with a `Bin <n> -> <m> bytes` stat row that this stat renderer does not
-/// produce either, so a binary file is still refused rather than half-rendered.
-fn reject_binary(is_submodule: bool, content: &[u8], path: &[u8], opts: &Opts) -> Result<()> {
-    if !opts.text && !is_submodule && content.iter().take(8000).any(|&b| b == 0) {
-        bail!(
-            "binary file {:?}: the GIT binary patch body is not wired up here",
-            path.as_bstr()
-        );
-    }
-    Ok(())
+/// `diff_filespec_is_binary()`: a NUL in the first 8000 bytes makes a blob binary, unless
+/// `-a`/`--text` asked for it to be treated as text. A gitlink is never binary — its
+/// "content" is the synthesized `Subproject commit …` line.
+fn pair_is_binary(is_submodule: bool, content: &[u8], opts: &Opts) -> bool {
+    !opts.text && !is_submodule && is_binary(content)
 }
 
 /// `diff --git a/<path> b/<path>` line, with git's `quote_two()` C-quoting.
@@ -8172,15 +8218,52 @@ fn prefixes(opts: &Opts) -> (&str, &str) {
 
 /// Emit the `---`/`+++` headers and hunks, returning `(added, deleted)` line
 /// counts. An add/delete of an empty file produces no header lines, like git.
+#[allow(clippy::too_many_arguments)]
 fn emit_body(
+    repo: &gix::Repository,
     out: &mut Vec<u8>,
     old: Option<&[u8]>,
     new: Option<&[u8]>,
     old_content: &[u8],
     new_content: &[u8],
     opts: &Opts,
+    binary: bool,
     blank_at_eof: &mut (usize, usize),
 ) -> Result<(u64, u64)> {
+    // ```c
+    // if (o->flags.binary)
+    //         emit_binary_diff(o, &mf1, &mf2);
+    // else {
+    //         [...]
+    //         emit_diff_symbol(o, DIFF_SYMBOL_BINARY_FILES, sb.buf, sb.len, 0);
+    // }
+    // ```
+    //
+    // (`builtin_diff()`, diff.c.) `format-patch` implies `--binary`, so a binary pair
+    // renders as the base85 payload; `--no-binary` leaves the one-line notice instead.
+    // Neither carries a `---`/`+++` pair or any hunk, and neither counts lines.
+    if binary {
+        if !opts.no_binary {
+            super::binary_patch::emit(
+                out,
+                old_content,
+                new_content,
+                super::binary_patch::loose_compression_level(repo),
+            );
+        } else {
+            let (a, b) = prefixes(opts);
+            let label = |side: Option<&[u8]>, prefix: &str| match side {
+                Some(p) => quote_two(prefix, strip_relative(p, opts)),
+                None => b"/dev/null".to_vec(),
+            };
+            out.extend_from_slice(b"Binary files ");
+            out.extend_from_slice(&label(old, a));
+            out.extend_from_slice(b" and ");
+            out.extend_from_slice(&label(new, b));
+            out.extend_from_slice(b" differ\n");
+        }
+        return Ok((0, 0));
+    }
     // `builtin_diff()` runs `check_blank_at_eof()` over the two whole images before
     // the hunks are produced (diff.c:4048-4049); the `WS_BLANK_AT_EOF` gate lives
     // downstream in `ws_check_emit()`, so the counts are taken unconditionally here

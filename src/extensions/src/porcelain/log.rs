@@ -10437,7 +10437,10 @@ fn similarity_score(old: &[u8], new: &[u8]) -> f64 {
     (copied as f64 * super::diffcore_rename::MAX_SCORE) / max
 }
 
-fn changes_match(
+/// Whether `commit` changed any path the pathspec selects, against `parent` (or against
+/// the empty tree for a root commit). This is the comparison `try_to_simplify_commit()`
+/// makes when a pathspec is in force, so `TREESAME` is its negation.
+pub(crate) fn changes_match(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parent: Option<ObjectId>,

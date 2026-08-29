@@ -97,6 +97,7 @@
 //!     message in the same situation.
 
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -947,7 +948,21 @@ fn start(args: &[String]) -> Result<ExitCode> {
         ctx.append_log(&format!("git bisect start {}\n", quoted.join(" ")))?;
     }
 
-    auto_next(&ctx, &terms, no_checkout)
+    // ```c
+    // res = bisect_auto_next(terms, NULL);
+    // if (!is_bisect_success(res))
+    //         bisect_clean_state();
+    // return res;
+    // ```
+    //
+    // (`bisect_start()`, builtin/bisect.c:903-906.) A `start` whose first step cannot be
+    // taken — the two ends inconsistent, or a pathspec no commit in the range touched —
+    // leaves no session behind at all, so the next `git bisect` starts from nothing.
+    let code = auto_next(&ctx, &terms, no_checkout)?;
+    if code != ExitCode::SUCCESS {
+        clean_state(&ctx)?;
+    }
+    Ok(code)
 }
 
 /// The whole contents of `BISECT_NAMES`, including its terminating newline.
@@ -1036,7 +1051,15 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
     };
 
     if !ctx.in_progress() {
-        eprintln!("You need to start by \"git bisect start\"");
+        // ```c
+        // fprintf_ln(stderr, _("You need to start by \"git bisect "
+        //                   "start\"\n"));
+        // ```
+        //
+        // (`bisect_autostart()`, builtin/bisect.c:922-923.) The string already ends in a
+        // newline and `fprintf_ln` adds another, so the blank line is git's. Without a
+        // terminal there is no prompt to offer and the command stops here.
+        eprint!("You need to start by \"git bisect start\"\n\n");
         return Ok(ExitCode::from(1));
     }
 
@@ -1337,14 +1360,23 @@ fn take_step(
 
     let first_parent = ctx.first_parent_only();
     let candidates = candidate_list(ctx, bad, &goods, first_parent)?;
-    let n = candidates.len();
+    // git's `all`: with a pathspec this counts only the commits that touched it.
+    let n = candidates.all;
     // `if (skipped_revs.nr) bisect_flags |= FIND_BISECTION_ALL` (bisect.c:1038):
     // with anything skipped the whole list is sorted and then filtered, so a
     // skipped best candidate can be stepped away from.
     let skipped = ctx.skipped()?;
     let (best, reaches, tried) = if skipped.is_empty() {
-        let (best, reaches) = find_bisection(ctx, &candidates, first_parent)?;
-        (Some(best), reaches, Vec::new())
+        match candidates.all {
+            // Every commit is TREESAME, so `find_bisection()` has nothing to weigh and
+            // `do_find_bisection()` would return the head of the list regardless. git's
+            // `if (!all)` below catches that case; the pick is never used.
+            0 => (Some(candidates.list[0]), 0, Vec::new()),
+            _ => {
+                let (best, reaches) = find_bisection(ctx, &candidates, first_parent)?;
+                (Some(best), reaches, Vec::new())
+            }
+        }
     } else {
         let (sorted, reaches) = find_bisection_all(ctx, &candidates, first_parent)?;
         let (best, tried) = managed_skipped(&sorted, &skipped, bad);
@@ -1354,17 +1386,35 @@ fn take_step(
     let Some(best) = best else {
         // `if (!revs.commits)`: nothing survived the filter, so every remaining
         // candidate was skipped.
-        if let Some(code) = error_if_skipped_commits(ctx, &tried, None, terms, &candidates)? {
+        if let Some(code) = error_if_skipped_commits(ctx, &tried, None, terms, &candidates.list)? {
             return Ok(code);
         }
         println!("{} was both {} and {}", bad.to_hex(), terms.good, terms.bad);
         return Ok(ExitCode::from(1));
     };
 
+    // ```c
+    // if (!all) {
+    //         fprintf(stderr, _("No testable commit found.\n"
+    //                 "Maybe you started with bad path arguments?\n"));
+    //
+    //         res = BISECT_NO_TESTABLE_COMMIT;
+    //         goto cleanup;
+    // }
+    // ```
+    //
+    // (`bisect_next_all()`, bisect.c:1102-1108.) A pathspec that no commit in the range
+    // touched leaves the whole candidate set TREESAME: there is nothing to test, and the
+    // exit code says so rather than naming a commit at random.
+    if candidates.all == 0 {
+        eprint!("No testable commit found.\nMaybe you started with bad path arguments?\n");
+        return Ok(ExitCode::from(4));
+    }
+
     if best == bad {
         // The bad end is all that is left, and skipped commits could still hide
         // the real culprit — git says so instead of naming one.
-        if let Some(code) = error_if_skipped_commits(ctx, &tried, Some(bad), terms, &candidates)? {
+        if let Some(code) = error_if_skipped_commits(ctx, &tried, Some(bad), terms, &candidates.list)? {
             return Ok(code);
         }
         return report_first_bad(ctx, bad, terms);
@@ -1493,14 +1543,40 @@ fn is_expected_rev(ctx: &Ctx, id: ObjectId) -> Result<bool> {
     Ok(read_ref(&ctx.file("BISECT_EXPECTED_REV"))? == Some(id))
 }
 
-/// The commits still under suspicion — reachable from `bad`, not from any good —
-/// in the order git's revision walk yields them (newest first, `list[0] == bad`).
+/// The commits still under suspicion — reachable from `bad`, not from any good — in the
+/// order git's revision walk yields them (newest first, `list[0] == bad`), together with
+/// what a pathspec makes of them.
+struct Candidates {
+    /// `revs.commits`.
+    list: Vec<ObjectId>,
+    /// `TREESAME` per list entry. Without a pathspec nothing is TREESAME, which is why the
+    /// weights below then count every commit.
+    treesame: Vec<bool>,
+    /// `try_to_simplify_commit()` prunes a TREESAME commit's parents in place to the one
+    /// parent it is TREESAME to (revision.c), so the ancestry the weights are counted over
+    /// is the simplified one.
+    pruned: HashMap<ObjectId, Vec<ObjectId>>,
+    /// git's `all`: how many commits are *not* TREESAME. `find_bisection()` counts only
+    /// those, and `bisect_next_all()` refuses the step when there are none.
+    all: usize,
+}
+
+/// Build the candidate set, applying the pathspec `bisect start` recorded.
+///
+/// ```c
+/// bisect_rev_setup(r, &revs, &rev_argv, prefix, "%s", "^%s", 1);
+/// ```
+///
+/// (`bisect_next_all()`, bisect.c:1075.) The trailing `1` is `read_paths`, so the
+/// `BISECT_NAMES` pathspec is appended to the revision arguments and the walk prunes
+/// exactly as `git log -- <paths>` does: a commit TREESAME to one of its parents keeps only
+/// that parent and stops counting towards the bisection.
 fn candidate_list(
     ctx: &Ctx,
     bad: ObjectId,
     goods: &[ObjectId],
     first_parent: bool,
-) -> Result<Vec<ObjectId>> {
+) -> Result<Candidates> {
     let mut list = Vec::new();
     let mut walk = ctx.repo.rev_walk(Some(bad)).with_hidden(goods.to_vec());
     // `bisect_rev_setup` sets `revs.first_parent_only` from BISECT_FIRST_PARENT,
@@ -1514,7 +1590,59 @@ fn candidate_list(
     if list.is_empty() {
         crate::git_fatal!("no testable commit found between the marked revisions");
     }
-    Ok(list)
+
+    let paths = bisect_paths(ctx)?;
+    let mut treesame = vec![false; list.len()];
+    let mut pruned: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    if !paths.is_empty() {
+        let mut matcher = super::log::PathspecMatcher::new(&ctx.repo, &paths)?;
+        for (i, id) in list.iter().enumerate() {
+            let commit = ctx.repo.find_object(*id)?.try_into_commit()?;
+            let parents: Vec<ObjectId> = match first_parent {
+                true => commit.parent_ids().take(1).map(|p| p.detach()).collect(),
+                false => commit.parent_ids().map(|p| p.detach()).collect(),
+            };
+            if parents.is_empty() {
+                // A root is compared against the empty tree, so it is TREESAME exactly when
+                // it introduced nothing the pathspec selects.
+                treesame[i] = !super::log::changes_match(&ctx.repo, &commit, None, &mut matcher)?;
+                continue;
+            }
+            let mut same = None;
+            for parent in &parents {
+                if !super::log::changes_match(&ctx.repo, &commit, Some(*parent), &mut matcher)? {
+                    same = Some(*parent);
+                    break;
+                }
+            }
+            if let Some(parent) = same {
+                treesame[i] = true;
+                pruned.insert(*id, vec![parent]);
+            }
+        }
+    }
+    let all = treesame.iter().filter(|same| !**same).count();
+    Ok(Candidates { list, treesame, pruned, all })
+}
+
+/// `read_bisect_paths()` (bisect.c:492-507): the pathspec `bisect start` sq-quoted into
+/// `BISECT_NAMES`, one shell-quoted argument per token.
+///
+/// git hands the whole tail to `setup_revisions()`, where the leading `--` is the
+/// revision/pathspec separator rather than a pathspec of its own.
+fn bisect_paths(ctx: &Ctx) -> Result<Vec<String>> {
+    let path = ctx.file("BISECT_NAMES");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<String> = Vec::new();
+    for line in content.lines() {
+        out.extend(super::am::sq_dequote(line.trim()));
+    }
+    if out.first().map(String::as_str) == Some("--") {
+        out.remove(0);
+    }
+    Ok(out)
 }
 
 /// `find_bisection()` (bisect.c:240-317): pick the commit that splits the
@@ -1531,10 +1659,9 @@ fn candidate_list(
 /// The weights here are computed by reachability over the candidate subgraph,
 /// oldest first, which is the same number git's propagation arrives at and is
 /// exact for a merge as well as for a chain.
-fn find_bisection(ctx: &Ctx, list: &[ObjectId], first_parent: bool) -> Result<(ObjectId, usize)> {
-    let nr = list.len();
-    let (parents, weights) = bisection_weights(ctx, list, first_parent)?;
-    find_bisection_from(list, &parents, &weights, nr)
+fn find_bisection(ctx: &Ctx, cand: &Candidates, first_parent: bool) -> Result<(ObjectId, usize)> {
+    let (parents, weights) = bisection_weights(ctx, cand, first_parent)?;
+    find_bisection_from(cand, &parents, &weights)
 }
 
 /// `find_bisection()` with `FIND_BISECTION_ALL`, which `bisect_next_all()` turns
@@ -1550,12 +1677,14 @@ fn find_bisection(ctx: &Ctx, list: &[ObjectId], first_parent: bool) -> Result<(O
 /// commit that actually gets checked out.
 fn find_bisection_all(
     ctx: &Ctx,
-    list: &[ObjectId],
+    cand: &Candidates,
     first_parent: bool,
 ) -> Result<(Vec<ObjectId>, usize)> {
-    let nr = list.len();
-    let (_parents, weights) = bisection_weights(ctx, list, first_parent)?;
-    let mut order: Vec<usize> = (0..nr).collect();
+    let nr = cand.all;
+    let (_parents, weights) = bisection_weights(ctx, cand, first_parent)?;
+    // `best_bisection_sorted()` skips TREESAME commits outright (bisect.c:238-239), so a
+    // pathspec-limited bisection never offers one as the next commit to test.
+    let mut order: Vec<usize> = (0..cand.list.len()).filter(|&i| !cand.treesame[i]).collect();
     let distance = |i: usize| {
         let w = weights[i] as i64;
         w.min(nr as i64 - w)
@@ -1564,19 +1693,20 @@ fn find_bisection_all(
     order.sort_by(|&a, &b| {
         distance(b)
             .cmp(&distance(a))
-            .then_with(|| list[a].as_bytes().cmp(list[b].as_bytes()))
+            .then_with(|| cand.list[a].as_bytes().cmp(cand.list[b].as_bytes()))
     });
     let reaches = order.first().map(|&i| weights[i]).unwrap_or(0);
-    Ok((order.into_iter().map(|i| list[i]).collect(), reaches))
+    Ok((order.into_iter().map(|i| cand.list[i]).collect(), reaches))
 }
 
 /// The candidate subgraph: each commit's candidate parents (by list position)
 /// and the number of candidates it reaches, itself included — git's `weight()`.
 fn bisection_weights(
     ctx: &Ctx,
-    list: &[ObjectId],
+    cand: &Candidates,
     first_parent: bool,
 ) -> Result<(Vec<Vec<usize>>, Vec<usize>)> {
+    let list = &cand.list;
     let nr = list.len();
     let index: std::collections::HashMap<ObjectId, usize> =
         list.iter().enumerate().map(|(i, id)| (*id, i)).collect();
@@ -1586,6 +1716,12 @@ fn bisection_weights(
     // both `count_distance` and the weight propagation (bisect.c:104, 338, 362).
     let mut parents: Vec<Vec<usize>> = Vec::with_capacity(nr);
     for id in list {
+        // A TREESAME commit was pruned to the single parent it is TREESAME to, which is the
+        // ancestry the walk followed and therefore the one the weights count over.
+        if let Some(pruned) = cand.pruned.get(id) {
+            parents.push(pruned.iter().filter_map(|p| index.get(p).copied()).collect());
+            continue;
+        }
         let commit = ctx.repo.find_object(*id)?.try_into_commit()?;
         let mut ps = commit.parent_ids();
         parents.push(if first_parent {
@@ -1643,8 +1779,16 @@ fn bisection_weights(
             done[i] = true;
         }
     }
+    // "zero or positive weight is the number of *interesting* commits it can reach,
+    // including itself" (bisect.c:268-272) — and a TREESAME commit is not interesting, so a
+    // pathspec-limited weight counts only the commits that touched the paths.
     let weights: Vec<usize> = (0..nr)
-        .map(|i| reach[i * words..(i + 1) * words].iter().map(|w| w.count_ones() as usize).sum())
+        .map(|i| {
+            let mine = &reach[i * words..(i + 1) * words];
+            (0..nr)
+                .filter(|&j| !cand.treesame[j] && mine[j / 64] & (1u64 << (j % 64)) != 0)
+                .count()
+        })
         .collect();
     Ok((parents, weights))
 }
@@ -1652,11 +1796,15 @@ fn bisection_weights(
 /// `do_find_bisection()` plus `best_bisection()`: the single commit git tests
 /// next when nothing has been skipped.
 fn find_bisection_from(
-    list: &[ObjectId],
+    cand: &Candidates,
     parents: &[Vec<usize>],
     weights: &[usize],
-    nr: usize,
 ) -> Result<(ObjectId, usize)> {
+    let list = &cand.list;
+    // `nr` is git's `all`: the number of commits that are not TREESAME. Everything below
+    // counts and compares against that, not against the length of the list.
+    let nr = cand.all;
+    let n = list.len();
     // `do_find_bisection()` (bisect.c:130-217), simulated in its own order because
     // the order decides which of several equally good candidates is returned.
     //
@@ -1669,20 +1817,35 @@ fn find_bisection_from(
     // middle commit rather than the oldest.
     const PENDING_ONE: i64 = -1;
     const PENDING_MERGE: i64 = -2;
-    let mut w: Vec<i64> = vec![0; nr];
+    let mut w: Vec<i64> = vec![0; n];
     let mut counted = 0usize;
-    let order: Vec<usize> = (0..nr).rev().collect();
+    let order: Vec<usize> = (0..n).rev().collect();
     for &i in &order {
         w[i] = match parents[i].len() {
-            0 => {
-                counted += 1;
-                1
-            }
+            // "otherwise, it is known not to reach any tree-changing commit and gets
+            // weight 0" (bisect.c:303-306): a TREESAME commit with no interesting parent
+            // is *known*, not pending, and does not count towards `nr`.
+            0 => match cand.treesame[i] {
+                true => 0,
+                false => {
+                    counted += 1;
+                    1
+                }
+            },
             1 => PENDING_ONE,
             _ => PENDING_MERGE,
         };
     }
-    let halfway = |weight: i64| (-1..=1).contains(&(2 * weight - nr as i64));
+    // `approx_halfway()` (bisect.c:110-140) refuses outright to shortcut on a TREESAME
+    // commit — "Don't short-cut something we are not going to return!" — and is lenient
+    // within ~0.1% once the set is large.
+    let halfway = |i: usize, weight: i64| {
+        if cand.treesame[i] {
+            return false;
+        }
+        let diff = 2 * weight - nr as i64;
+        (-1..=1).contains(&diff) || diff.abs() < (nr / 1024) as i64
+    };
     while counted < nr {
         let mut progress = false;
         for &i in &order {
@@ -1693,7 +1856,7 @@ fn find_bisection_from(
                     w[i] = weights[i] as i64;
                     counted += 1;
                     progress = true;
-                    if halfway(w[i]) {
+                    if halfway(i, w[i]) {
                         return Ok((list[i], weights[i]));
                     }
                 }
@@ -1702,10 +1865,17 @@ fn find_bisection_from(
                     if w[p] < 0 {
                         continue;
                     }
-                    w[i] = w[p] + 1;
-                    counted += 1;
+                    // "add one for p itself if p is to be counted, otherwise inherit it
+                    // from q directly" (bisect.c:371-383).
+                    match cand.treesame[i] {
+                        true => w[i] = w[p],
+                        false => {
+                            w[i] = w[p] + 1;
+                            counted += 1;
+                        }
+                    }
                     progress = true;
-                    if halfway(w[i]) {
+                    if halfway(i, w[i]) {
                         return Ok((list[i], w[i] as usize));
                     }
                 }
@@ -1718,10 +1888,15 @@ fn find_bisection_from(
     }
 
     // Nothing was halfway: the commit whose `min(weight, nr - weight)` is largest,
-    // scanned in the same reversed order.
+    // scanned in the same reversed order. `best_bisection()` skips TREESAME commits
+    // (bisect.c:197-198), so a pathspec-limited bisection only ever returns one that
+    // touched the paths.
     let mut best = (list[order[0]], weights[order[0]]);
     let mut best_distance = -1i64;
     for &i in &order {
+        if cand.treesame[i] {
+            continue;
+        }
         let weight = weights[i] as i64;
         let distance = weight.min(nr as i64 - weight);
         if distance > best_distance {

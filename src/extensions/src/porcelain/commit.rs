@@ -1106,6 +1106,51 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if let Err(code) = patch_opts.finish() {
         return Ok(code);
     }
+    // ```c
+    // die_for_incompatible_opt4(!!use_message, "-C", !!edit_message, "-c",
+    //                           !!logfile, "-F", !!fixup_message, "--fixup");
+    // die_for_incompatible_opt4(have_option_m, "-m", !!edit_message, "-c",
+    //                           !!use_message, "-C", !!logfile, "-F");
+    // ```
+    //
+    // (builtin/commit.c:1341-1348, inside `parse_and_validate_options()`.) The message *sources*
+    // are mutually exclusive, and the check runs before any of them is resolved — which is why
+    // `git commit -C nosuchref -m x` reports the option conflict rather than the missing ref.
+    // `die_for_incompatible_opt4()` names the first two that are set, in the order it was given
+    // them.
+    {
+        // `-c` and `-C` share one slot here (`reuse_arg`), told apart by `reedit`.
+        let use_message = reuse_arg.is_some() && !reedit;
+        let edit_message = reuse_arg.is_some() && reedit;
+        let logfile = !file_args.is_empty();
+        let have_option_m = !messages.is_empty();
+        let first_two = |set: &[(bool, &str)]| -> Option<(String, String)> {
+            let mut given = set.iter().filter(|(on, _)| *on).map(|(_, name)| *name);
+            match (given.next(), given.next()) {
+                (Some(a), Some(b)) => Some((a.to_string(), b.to_string())),
+                _ => None,
+            }
+        };
+        for set in [
+            [
+                (use_message, "-C"),
+                (edit_message, "-c"),
+                (logfile, "-F"),
+                (fixup_arg.is_some(), "--fixup"),
+            ],
+            [
+                (have_option_m, "-m"),
+                (edit_message, "-c"),
+                (use_message, "-C"),
+                (logfile, "-F"),
+            ],
+        ] {
+            if let Some((a, b)) = first_two(&set) {
+                crate::git_fatal!("options '{a}' and '{b}' cannot be used together");
+            }
+        }
+    }
+
     // `-p` implies `--interactive`, and the four ways of choosing what to stage
     // are mutually exclusive (git's `die_for_incompatible_opt4(also, only, all,
     // interactive)`, which names them in that order).

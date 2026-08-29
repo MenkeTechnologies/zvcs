@@ -602,6 +602,12 @@ pub(crate) enum Sparsity {
 }
 
 impl Sparsity {
+    /// `cfg->core_sparse_checkout_cone`: whether the definition is a cone, which
+    /// is the only shape some of git's sparse handling runs for.
+    pub(crate) fn is_cone(&self) -> bool {
+        matches!(self, Sparsity::Cone(_))
+    }
+
     pub(crate) fn includes(&self, path: &str) -> bool {
         match self {
             Sparsity::Full => true,
@@ -1188,7 +1194,7 @@ fn is_modified(repo: &gix::Repository, full: &Path, id: ObjectId, mode: Mode) ->
 
 /// Write every entry of `index` into the worktree (same helper shape the other
 /// worktree-mutating porcelain uses).
-fn checkout_subset(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
+pub(super) fn checkout_subset(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("bare repository has no worktree to update"))?

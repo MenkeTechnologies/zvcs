@@ -91,6 +91,10 @@ struct Plan {
     /// A directory source, whose entries are remapped without a sparse check
     /// (git reaches `act_on_entry` before the sparse gate for those).
     is_dir: bool,
+    /// git's `SPARSE` mode bit: the source is in the index with `skip-worktree`
+    /// and nothing of it is on disk, so `--sparse` moves the *index entry* and
+    /// there is no `rename()` to make (builtin/mv.c:335-344).
+    index_only: bool,
 }
 
 pub fn mv(args: &[String]) -> Result<ExitCode> {
@@ -238,24 +242,37 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     //
     //    `path_in_sparse_checkout()` is the very last gate git applies, after
     //    every other check has passed, so that it can point at `--sparse`.
-    let sparsity = if !ignore_sparse
-        && repo
-            .config_snapshot()
-            .boolean("core.sparseCheckout")
-            .unwrap_or(false)
+    let sparsity = if repo
+        .config_snapshot()
+        .boolean("core.sparseCheckout")
+        .unwrap_or(false)
     {
         Some(super::sparse_checkout::load_sparsity(&repo)?)
     } else {
         None
     };
+    // git's `ignore_case`, which `core.ignorecase` sets and `git init` records
+    // from what the filesystem turned out to be.
+    let ignore_case = repo.config_snapshot().boolean("core.ignorecase").unwrap_or(false);
     let mut only_match_skip_worktree: Vec<String> = Vec::new();
 
     let mut plans: Vec<Plan> = Vec::new();
     for s in sources {
-        match plan_source(&index, &workdir, &prefix, s, dir_mode, &dest_rel, force) {
-            Ok(plan) => {
+        match plan_source(
+            &index,
+            &workdir,
+            &prefix,
+            s,
+            dir_mode,
+            &dest_rel,
+            force,
+            ignore_sparse,
+            ignore_case,
+        ) {
+            Ok(Planned::SparseSkip(src)) => only_match_skip_worktree.push(src),
+            Ok(Planned::Move(plan)) => {
                 // Both ends are checked, and both are named in the report.
-                if let Some(sp) = sparsity.as_ref().filter(|_| !plan.is_dir) {
+                if let Some(sp) = sparsity.as_ref().filter(|_| !plan.is_dir && !ignore_sparse) {
                     let mut skip_sparse = false;
                     for end in [&plan.src_rel, &plan.dst_rel] {
                         if !sp.includes(end) {
@@ -291,6 +308,9 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     //    rename on disk and remap the index entries.
     let mut modified = false;
     let mut gitmodules_modified = false;
+    // Destinations a `--sparse` move brought back into the cone, checked out once
+    // the index that describes them has been written.
+    let mut materialize: Vec<String> = Vec::new();
     for plan in &plans {
         if dry_run {
             println!("Checking rename of '{}' to '{}'", plan.src_rel, plan.dst_rel);
@@ -313,12 +333,16 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             }
         }
         if !dry_run {
-            if let Err(e) = std::fs::rename(&plan.src_abs, &plan.dst_abs) {
-                return fatal(format!(
-                    "renaming '{}' failed: {}",
-                    plan.src_rel,
-                    super::config::errno_text(&e)
-                ));
+            // A `SPARSE` move has nothing on disk to rename; `act_on_entry` goes
+            // straight to the index remap for it (builtin/mv.c:507-515).
+            if !plan.index_only {
+                if let Err(e) = std::fs::rename(&plan.src_abs, &plan.dst_abs) {
+                    return fatal(format!(
+                        "renaming '{}' failed: {}",
+                        plan.src_rel,
+                        super::config::errno_text(&e)
+                    ));
+                }
             }
             if let Some(gitfile) = &plan.submodule {
                 // `update_path_in_gitmodules()` then, for a `.git`-file
@@ -332,6 +356,25 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             }
             apply_remaps(&mut index, &plan.remaps);
             modified = true;
+            // ```c
+            // if ((mode & SPARSE) &&
+            //     path_in_sparse_checkout(dst, the_repository->index)) {
+            //         /* from out-of-cone to in-cone */
+            //         dst_ce->ce_flags &= ~CE_SKIP_WORKTREE;
+            //         if (checkout_entry(dst_ce, &state, NULL, NULL))
+            //                 die(_("cannot checkout %s"), dst_ce->name);
+            // }
+            // ```
+            //
+            // (`builtin/mv.c:585-595`, under `ignore_sparse && cone`.) A path moved
+            // out of the excluded cone belongs in the worktree again, so the entry
+            // loses `skip-worktree` and the file is written out.
+            if plan.index_only
+                && sparsity.as_ref().is_some_and(|sp| sp.is_cone() && sp.includes(&plan.dst_rel))
+            {
+                clear_skip_worktree(&mut index, &plan.dst_rel);
+                materialize.push(plan.dst_rel.clone());
+            }
         }
     }
 
@@ -355,11 +398,38 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         crate::index_racy::write(&repo, &mut index)?;
     }
 
+    if !materialize.is_empty() {
+        // Re-open so the writer sees the cleared skip bits: an entry that still
+        // carries `SKIP_WORKTREE` is one it declines to write.
+        let mut subset = repo.open_index()?;
+        subset.remove_entries(|_, path, _| !materialize.iter().any(|p| p.as_bytes() == path));
+        super::sparse_checkout::checkout_subset(&repo, &mut subset)?;
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// `dst_ce->ce_flags &= ~CE_SKIP_WORKTREE` for the entry at `rel`.
+fn clear_skip_worktree(index: &mut gix::index::File, rel: &str) {
+    let backing = index.path_backing();
+    let at = index.entries().iter().position(|e| {
+        e.stage() == Stage::Unconflicted
+            && AsRef::<[u8]>::as_ref(e.path_in(&backing)) == rel.as_bytes()
+    });
+    if let Some(at) = at {
+        index.entries_mut()[at].flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
+    }
 }
 
 /// Validate a single source against the current index and worktree and return
 /// the resulting [`Plan`], or `bail!` with a git-compatible reason.
+/// What one `<source>` turned into: a move to make, or a path outside the
+/// sparse-checkout definition that `advise_on_updating_sparse_paths()` will name.
+enum Planned {
+    Move(Plan),
+    SparseSkip(String),
+}
+
 fn plan_source(
     index: &gix::index::File,
     workdir: &Path,
@@ -368,7 +438,9 @@ fn plan_source(
     dir_mode: bool,
     dest_rel: &str,
     force: bool,
-) -> Result<Plan> {
+    ignore_sparse: bool,
+    ignore_case: bool,
+) -> Result<Planned> {
     let src_rel = normalize_rel(workdir, prefix, src_arg)?;
     let src_abs = workdir.join(&src_rel);
 
@@ -387,11 +459,56 @@ fn plan_source(
         crate::git_fatal!("can not move directory into itself, source={src_rel}, destination={dst_rel}");
     }
 
-    // The source must exist on disk first (git lstat's it before consulting the
-    // index): a tracked-but-deleted path reports "bad source", not "not under
-    // version control".
-    let meta = std::fs::symlink_metadata(&src_abs)
-        .map_err(|_| anyhow!("bad source, source={src_rel}, destination={dst_rel}"))?;
+    // ```c
+    // if (lstat(src, &st) < 0) {
+    //         pos = index_name_pos(the_repository->index, src, length);
+    //         if (pos < 0) { … bad = _("bad source"); goto act_on_entry; }
+    //         ce = the_repository->index->cache[pos];
+    //         if (!ce_skip_worktree(ce)) { bad = _("bad source"); goto act_on_entry; }
+    //         if (!ignore_sparse) {
+    //                 string_list_append(&only_match_skip_worktree, src);
+    //                 goto act_on_entry;
+    //         }
+    //         /* Check if dst exists in index */
+    //         if (index_name_pos(the_repository->index, dst, strlen(dst)) < 0) {
+    //                 modes[i] |= SPARSE;
+    //                 goto act_on_entry;
+    //         }
+    //         if (!force) { bad = _("destination exists"); goto act_on_entry; }
+    //         modes[i] |= SPARSE;
+    //         goto act_on_entry;
+    // }
+    // ```
+    //
+    // (`builtin/mv.c:306-345`.) A source that is not on disk is only `bad source`
+    // when the index does not explain its absence. An entry carrying
+    // `skip-worktree` explains it: the path is outside the sparse-checkout
+    // definition, so without `--sparse` it is collected for the advice block, and
+    // with it the move happens in the index alone.
+    let meta = match std::fs::symlink_metadata(&src_abs) {
+        Ok(meta) => meta,
+        Err(_) => {
+            if !skip_worktree_entry(index, &src_rel) {
+                return Err(anyhow!("bad source, source={src_rel}, destination={dst_rel}"));
+            }
+            if !ignore_sparse {
+                return Ok(Planned::SparseSkip(src_rel));
+            }
+            if is_tracked(index, &dst_rel) && !force {
+                crate::git_fatal!("destination exists, source={src_rel}, destination={dst_rel}");
+            }
+            return Ok(Planned::Move(Plan {
+                src_abs,
+                dst_abs,
+                src_rel: src_rel.clone(),
+                dst_rel: dst_rel.clone(),
+                remaps: vec![(src_rel, dst_rel)],
+                submodule: None,
+                is_dir: false,
+                index_only: true,
+            }));
+        }
+    };
 
     let mut submodule = None;
     let remaps: Vec<(String, String)> = if meta.is_dir() {
@@ -417,7 +534,7 @@ fn plan_source(
                     "destination already exists, source={src_rel}, destination={dst_rel}"
                 );
             }
-            return Ok(Plan {
+            return Ok(Planned::Move(Plan {
                 src_abs,
                 dst_abs,
                 src_rel: src_rel.clone(),
@@ -425,7 +542,8 @@ fn plan_source(
                 remaps: vec![(src_rel, dst_rel)],
                 submodule,
                 is_dir: true,
-            });
+                index_only: false,
+            }));
         }
         // Directory: remap every stage-0 entry beneath `src_rel/`.
         let sub_prefix = format!("{src_rel}/");
@@ -473,9 +591,18 @@ fn plan_source(
             };
             crate::git_fatal!("{message}, source={src_rel}, destination={dst_rel}");
         }
-        // Refuse to clobber an existing destination (tracked or on disk) unless
-        // forced. `-f` relies on POSIX rename() replacing the destination file.
-        if !force && (dst_abs.exists() || is_tracked(index, &dst_rel)) {
+        // ```c
+        // if (lstat(dst, &st) == 0 &&
+        //     (!ignore_case || strcasecmp(src, dst))) {
+        //         bad = _("destination exists");
+        // ```
+        //
+        // (`builtin/mv.c:421-423`.) On a case-insensitive filesystem the
+        // destination of a case-only rename is the source itself, which is why the
+        // check stands down for it — without that, `git mv README.md readme.md`
+        // reports the file it is about to move as being in its own way.
+        let clobbers = dst_abs.exists() && !(ignore_case && src_rel.eq_ignore_ascii_case(&dst_rel));
+        if !force && (clobbers || is_tracked(index, &dst_rel)) {
             crate::git_fatal!("destination exists, source={src_rel}, destination={dst_rel}");
         }
         vec![(src_rel.clone(), dst_rel.clone())]
@@ -490,7 +617,7 @@ fn plan_source(
     }
 
     let is_dir = meta.is_dir();
-    Ok(Plan {
+    Ok(Planned::Move(Plan {
         src_abs,
         dst_abs,
         src_rel,
@@ -498,6 +625,18 @@ fn plan_source(
         remaps,
         submodule,
         is_dir,
+        index_only: false,
+    }))
+}
+
+/// Whether `rel` is in the index carrying `skip-worktree`, which is git's
+/// explanation for a tracked path that is not on disk.
+fn skip_worktree_entry(index: &gix::index::File, rel: &str) -> bool {
+    let backing = index.path_backing();
+    index.entries().iter().any(|e| {
+        e.stage() == Stage::Unconflicted
+            && e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE)
+            && AsRef::<[u8]>::as_ref(e.path_in(backing)) == rel.as_bytes()
     })
 }
 

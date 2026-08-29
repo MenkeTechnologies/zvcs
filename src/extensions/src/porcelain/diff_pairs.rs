@@ -140,7 +140,9 @@
 //!   `--textconv`-rewritten pair still render as text; `PatchSink` line-prefixes every
 //!   payload line, which is what `emit_diff_symbol(DIFF_SYMBOL_BINARY_DIFF_BODY)` does.
 //! * `-h` (usage on stdout, exit 129); running without `-z` (usage line on stderr, exit 129)
-//! * the fatal paths: `invalid raw diff input`, `unable to parse object id: ...`,
+//! * the fatal paths: `invalid raw diff input`, `got EOF while reading path`,
+//!   `got EOF while reading destination path`, `unknown diff status: <c>`,
+//!   `unable to parse object id: ...`,
 //!   `tree objects not supported`, `unable to read <oid>` — all exit 128
 //!
 //! ### Honest limitations (bailed on with a precise message, never silently ignored)
@@ -1810,13 +1812,17 @@ pub(crate) fn render_raw_stream(
     let mut cursor = 0usize;
 
     // Records are NUL-terminated fields; a zero-length header field closes a batch.
-    while cursor < input.len() {
-        let Some(end) = input[cursor..].iter().position(|&b| b == 0) else {
-            return Ok(fatal("invalid raw diff input"));
-        };
-        let header = &input[cursor..cursor + end];
-        cursor += end + 1;
-
+    //
+    // ```c
+    // if (strbuf_getwholeline(&meta, stdin, line_term) == EOF)
+    //         break;
+    // ```
+    //
+    // (builtin/diff-pairs.c:106-107.) `strbuf_getwholeline()` reports EOF only when it read
+    // nothing at all, so the last field of the stream may be unterminated and is still a
+    // field — which is why running out of input is not itself an error here.
+    while let Some(header) = getwholeline(&input, &mut cursor) {
+        let header = header.as_slice();
         if header.is_empty() {
             match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes, &mut has_changes)? {
                 Ok(()) => {}
@@ -1836,20 +1842,28 @@ pub(crate) fn render_raw_stream(
             Ok(p) => p,
             Err(msg) => return Ok(fatal(&msg)),
         };
-        let (old_path, rest) = match take_field(&input, cursor) {
-            Some(v) => v,
-            None => return Ok(fatal("invalid raw diff input")),
+        // ```c
+        // status = *p++;
+        //
+        // if (strbuf_getwholeline(&path, stdin, line_term) == EOF)
+        //         die(_("got EOF while reading path"));
+        // ```
+        //
+        // (builtin/diff-pairs.c:135-138.) The path is read *before* the status is dispatched
+        // on, so a record whose status git does not know still has to have its path — a
+        // truncated `:… X` reports the missing path, not the unknown status.
+        let Some(old_path) = getwholeline(&input, &mut cursor).map(BString::from) else {
+            return Ok(fatal("got EOF while reading path"));
         };
-        cursor = rest;
-        let new_path = if matches!(pair.0, b'R' | b'C') {
-            let (p, rest) = match take_field(&input, cursor) {
-                Some(v) => v,
-                None => return Ok(fatal("invalid raw diff input")),
-            };
-            cursor = rest;
-            p
-        } else {
-            old_path.clone()
+        let new_path = match pair.0 {
+            b'A' | b'D' | b'T' | b'M' => old_path.clone(),
+            b'R' | b'C' => match getwholeline(&input, &mut cursor).map(BString::from) {
+                Some(path) => path,
+                None => return Ok(fatal("got EOF while reading destination path")),
+            },
+            // `default: die(_("unknown diff status: %c"), status);` — one raw byte, whatever
+            // it was.
+            other => return Ok(unknown_status(other)),
         };
 
         let (_, mut pair) = pair;
@@ -2125,6 +2139,40 @@ fn take_field(input: &[u8], at: usize) -> Option<(BString, usize)> {
     Some((BString::from(&input[at..at + end]), at + end + 1))
 }
 
+/// `strbuf_getwholeline(buf, stdin, '\0')` over a buffer already in memory.
+///
+/// `None` is its `EOF`, which it reports only when there was nothing left to read; a final
+/// field that the producer did not terminate is returned like any other, minus a terminator
+/// it never had.
+fn getwholeline(input: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
+    if *cursor >= input.len() {
+        return None;
+    }
+    let rest = &input[*cursor..];
+    Some(match rest.iter().position(|&b| b == 0) {
+        Some(at) => {
+            *cursor += at + 1;
+            rest[..at].to_vec()
+        }
+        None => {
+            *cursor = input.len();
+            rest.to_vec()
+        }
+    })
+}
+
+/// `die(_("unknown diff status: %c"), status)`, which prints the byte it was given
+/// rather than a character — a status outside ASCII would come out as two bytes
+/// through Rust's `char`.
+fn unknown_status(status: u8) -> Status {
+    use std::io::Write;
+    let mut line = b"fatal: unknown diff status: ".to_vec();
+    line.push(status);
+    line.push(b'\n');
+    let _ = std::io::stderr().write_all(&line);
+    Status::from(128)
+}
+
 /// Parse `:<omode> <nmode> <ooid> <noid> <status>` into a pair with empty path fields.
 fn parse_header(header: &[u8], hexsz: usize, allow_trees: bool) -> Result<(u8, Pair), String> {
     let invalid = || "invalid raw diff input".to_string();
@@ -2150,14 +2198,10 @@ fn parse_header(header: &[u8], hexsz: usize, allow_trees: bool) -> Result<(u8, P
     let new_at = oid_at + hexsz + 1;
     let new_id = parse_oid(body, new_at, hexsz)?;
 
+    // `status = *p++`, over a buffer git NUL-terminates: a header that stops here yields the
+    // terminator, which the status dispatch then reports as an unknown status.
     let status_at = new_at + hexsz + 1;
-    if status_at >= body.len() {
-        return Err(invalid());
-    }
-    let status = BString::from(&body[status_at..]);
-    if !status[0].is_ascii_uppercase() {
-        return Err(invalid());
-    }
+    let status = BString::from(body.get(status_at..).unwrap_or(b"\0"));
 
     if !allow_trees && (old_mode & IFMT == 0o040000 || new_mode & IFMT == 0o040000) {
         return Err("tree objects not supported".to_string());

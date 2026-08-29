@@ -87,14 +87,25 @@
 //!     and the `git-submodule.sh` usage block (exit 1) for `git submodule add`.
 //!     Past those checks the work is the porcelain's.
 //!
-//! Not ported — each bails naming the missing substrate rather than guessing:
+//!   * **`push-check <superproject-head> <remote> [<refspec>...]`** is ported
+//!     whole: the operand count, `refs_resolve_refdup(..., "HEAD", 0, ...)` and
+//!     the detached-HEAD test it feeds, the "the remote must be configured" rule
+//!     that stops a submodule pushing to the superproject's own url, and the
+//!     per-refspec left-hand-side check — `count_refspec_match()` over every ref
+//!     under `refs/`, with `refname_match()`'s six rules and its weak/strong
+//!     distinction, and `HEAD`'s special case against the superproject's branch.
+//!
+//! Not ported — each bails naming the missing substrate rather than guessing,
+//! but only *after* reproducing the argument checks that come first:
 //!
 //!   * `clone` — needs transport plus worktree materialisation for a submodule
-//!     that `update` has not already planned.
-//!   * `push-check` — validates the push refspec against the submodule's
-//!     remote; needs the refspec/remote machinery.
+//!     that `update` has not already planned. `module_clone`'s option table and
+//!     its `if (argc || !clone_data.url || !clone_data.path ||
+//!     !*(clone_data.path)) usage_with_options(...)` are reproduced, so a bare
+//!     `submodule--helper clone` prints git's usage block and exits 129.
 //!   * `create-branch` — `git branch` inside a submodule with `--track`
-//!     bookkeeping.
+//!     bookkeeping. `if (argc != 3) usage_with_options(usage, options)` is
+//!     reproduced, usage block and exit 129 included.
 //!   * `migrate-gitdir-configs` — the `extensions.submodulePathConfig`
 //!     migration (rewrites `core.repositoryformatversion`, sets
 //!     `submodule.<name>.gitdir` per module, relocates git dirs).
@@ -209,15 +220,9 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
         // count here is `module_add`'s own `usage_with_options` (exit 129) while
         // the wrapper's is the `git-submodule.sh` usage block (exit 1).
         "add" => add(tail),
-        "clone" => anyhow::bail!(
-            "unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout"
-        ),
-        "push-check" => anyhow::bail!(
-            "unsupported subcommand \"push-check\": needs the remote/refspec machinery"
-        ),
-        "create-branch" => anyhow::bail!(
-            "unsupported subcommand \"create-branch\": creates a branch inside a submodule"
-        ),
+        "clone" => clone(tail),
+        "push-check" => push_check(tail),
+        "create-branch" => create_branch(tail),
         "migrate-gitdir-configs" => bail!(
             "unsupported subcommand \"migrate-gitdir-configs\": the extensions.submodulePathConfig migration is not ported"
         ),
@@ -599,6 +604,518 @@ fn writing_gitmodules_ok() -> Result<bool> {
         .and_then(|t| t.lookup_entry_by_path(".gitmodules").ok().flatten())
         .is_some();
     Ok(!in_index && !in_head)
+}
+
+/// The `usage_with_options` block `module_clone` prints, captured from git 2.55.0.
+const CLONE_USAGE: &str = "\
+usage: git submodule--helper clone [--prefix=<path>] [--quiet] [--reference <repository>] [--name <name>] [--depth <depth>] [--single-branch] [--filter <filter-spec>] --url <url> --path <path>
+
+    --[no-]prefix <path>  alternative anchor for relative paths
+    --[no-]path <path>    where the new submodule will be cloned to
+    --[no-]name <string>  name of the new submodule
+    --[no-]url <string>   url where to clone the submodule from
+    --[no-]reference <repo>
+                          reference repository
+    --[no-]ref-format <format>
+                          specify the reference format to use
+    --[no-]dissociate     use --reference only while cloning
+    --[no-]depth <n>      depth for shallow clones
+    -q, --[no-]quiet      suppress output for cloning a submodule
+    --[no-]progress       force cloning progress
+    --[no-]require-init   disallow cloning into non-empty directory
+    --[no-]single-branch  clone only one branch, HEAD or --branch
+    --[no-]filter <args>  object filtering
+
+";
+
+/// The `usage_with_options` block `module_create_branch` prints, captured from git 2.55.0.
+const CREATE_BRANCH_USAGE: &str = "\
+usage: git submodule--helper create-branch [-f|--force] [--create-reflog] [-q|--quiet] [-t|--track] [-n|--dry-run] <name> <start-oid> <start-name>
+
+    -q, --[no-]quiet      print only error messages
+    -f, --[no-]force      force creation
+    --[no-]create-reflog  create the branch's reflog
+    -t, --[no-]track[=(direct|inherit)]
+                          set branch tracking configuration
+    -n, --[no-]dry-run    show whether the branch would be created
+
+";
+
+// ----------------------------------------------------------------- clone ----
+
+/// `git submodule--helper clone` — validate the arguments `module_clone` validates.
+///
+/// ```c
+/// if (argc || !clone_data.url || !clone_data.path || !*(clone_data.path))
+///         usage_with_options(git_submodule_helper_usage, module_clone_options);
+/// ```
+///
+/// (builtin/submodule--helper.c:2097-2099.) Everything past that check is
+/// `clone_submodule()`, which needs transport plus worktree materialisation, so
+/// only the refusal is reproduced here — but it is reproduced exactly, because
+/// it is what a bare `git submodule--helper clone` prints.
+fn clone(args: &[String]) -> Result<ExitCode> {
+    /// `module_clone_options`' long options that take a value. `filter` comes
+    /// from `OPT_PARSE_LIST_OBJECTS_FILTER`.
+    const VALUED: &[&str] = &[
+        "prefix",
+        "path",
+        "name",
+        "url",
+        "reference",
+        "ref-format",
+        "depth",
+        "filter",
+    ];
+    /// …and its `OPT_BOOL`s, plus `OPT__QUIET`.
+    const FLAGS: &[&str] = &[
+        "dissociate",
+        "quiet",
+        "progress",
+        "require-init",
+        "single-branch",
+    ];
+
+    let usage = || {
+        eprint!("{CLONE_USAGE}");
+        Ok(ExitCode::from(129))
+    };
+
+    let mut operands = 0usize;
+    let mut url: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut end_of_options = false;
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        if end_of_options || !a.starts_with('-') || a == "-" {
+            operands += 1;
+            continue;
+        }
+        if a == "--" {
+            end_of_options = true;
+            continue;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            let (name, negated) = match name.strip_prefix("no-") {
+                Some(rest) => (rest, true),
+                None => (name, false),
+            };
+            if FLAGS.contains(&name) {
+                continue;
+            }
+            if VALUED.contains(&name) {
+                let value = match (negated, inline) {
+                    // `--no-<name>` clears the string rather than taking a value.
+                    (true, _) => None,
+                    (false, Some(v)) => Some(v),
+                    (false, None) => match args.get(i) {
+                        Some(next) => {
+                            i += 1;
+                            Some(next.clone())
+                        }
+                        None => {
+                            eprintln!("error: option `{name}' requires a value");
+                            return usage();
+                        }
+                    },
+                };
+                match name {
+                    "url" => url = value,
+                    "path" => path = value,
+                    _ => {}
+                }
+                continue;
+            }
+            eprintln!("error: unknown option `{long}'");
+            return usage();
+        }
+        // The only short option in the table is `-q`.
+        for c in a[1..].chars() {
+            if c != 'q' {
+                eprintln!("error: unknown switch `{c}'");
+                return usage();
+            }
+        }
+    }
+
+    if operands != 0 || url.is_none() || path.as_deref().unwrap_or("").is_empty() {
+        return usage();
+    }
+    bail!("unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout")
+}
+
+// --------------------------------------------------------- create-branch ----
+
+/// `git submodule--helper create-branch` — validate the operand count.
+///
+/// ```c
+/// if (argc != 3)
+///         usage_with_options(usage, options);
+/// ```
+///
+/// (builtin/submodule--helper.c:3347-3348.) `create_branches_recursively()` is
+/// the work, and it is not ported; the refusal above is, since that is what a
+/// bare `git submodule--helper create-branch` prints.
+fn create_branch(args: &[String]) -> Result<ExitCode> {
+    /// The four `OPT_BOOL`-shaped entries in `module_create_branch`'s table.
+    const FLAGS: &[&str] = &["quiet", "force", "create-reflog", "dry-run"];
+
+    let usage = || {
+        eprint!("{CREATE_BRANCH_USAGE}");
+        Ok(ExitCode::from(129))
+    };
+
+    let mut operands = 0usize;
+    let mut end_of_options = false;
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        if end_of_options || !a.starts_with('-') || a == "-" {
+            operands += 1;
+            continue;
+        }
+        if a == "--" {
+            end_of_options = true;
+            continue;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let name = match long.split_once('=') {
+                Some((n, _)) => n,
+                None => long,
+            };
+            let name = name.strip_prefix("no-").unwrap_or(name);
+            // `--track` is `PARSE_OPT_OPTARG`, so it never consumes the next
+            // argument; only `--track=<mode>` carries a value.
+            if FLAGS.contains(&name) || name == "track" {
+                continue;
+            }
+            eprintln!("error: unknown option `{long}'");
+            return usage();
+        }
+        for (at, c) in a[1..].char_indices() {
+            match c {
+                'q' | 'f' | 'n' => {}
+                // A short `PARSE_OPT_OPTARG` takes the rest of the cluster as
+                // its value when there is one, and never the next argument.
+                't' => {
+                    let _ = at;
+                    break;
+                }
+                other => {
+                    eprintln!("error: unknown switch `{other}'");
+                    return usage();
+                }
+            }
+        }
+    }
+
+    if operands != 3 {
+        return usage();
+    }
+    bail!("unsupported subcommand \"create-branch\": creates a branch inside a submodule")
+}
+
+// ------------------------------------------------------------ push-check ----
+
+/// `git submodule--helper push-check <superproject-head> <remote> [<refspec>...]`
+///
+/// Called by `git push --recurse-submodules=check`'s bookkeeping to refuse a
+/// push whose submodule side would not land anywhere sensible. The whole of
+/// `push_check()` (builtin/submodule--helper.c) is reproduced: the operand
+/// count, the `HEAD` resolution, the "remote must be configured" rule that
+/// stops a submodule pushing to the superproject's own url, and the per-refspec
+/// left-hand-side check.
+fn push_check(args: &[String]) -> Result<ExitCode> {
+    // ```c
+    // if (argc < 3)
+    //         die("submodule--helper push-check requires at least 2 arguments");
+    // ```
+    //
+    // `argc` counts the subcommand word, so this is "fewer than two operands".
+    if args.len() < 2 {
+        crate::git_fatal!("submodule--helper push-check requires at least 2 arguments");
+    }
+    let superproject_head = args[0].as_str();
+    let remote_name = args[1].as_str();
+
+    let repo = gix::discover(".")?;
+
+    // `refs_resolve_refdup(..., "HEAD", 0, ...)` hands back the name HEAD
+    // resolves to; a detached HEAD resolves to itself, which is how git tells
+    // the two apart. `flags` is 0, so an unborn branch still yields its name.
+    let head = match repo.head_ref() {
+        Ok(Some(r)) => r.name().as_bstr().to_str_lossy().into_owned(),
+        Ok(None) => "HEAD".to_string(),
+        Err(_) => match repo.find_reference("HEAD") {
+            // A symref into a branch that does not exist yet still resolves by
+            // name here; only a HEAD that cannot be read at all is the death.
+            Ok(r) => match r.target().try_name() {
+                Some(name) => name.as_bstr().to_str_lossy().into_owned(),
+                None => "HEAD".to_string(),
+            },
+            Err(_) => crate::git_fatal!("Failed to resolve HEAD as a valid ref."),
+        },
+    };
+    let detached_head = head == "HEAD";
+
+    // ```c
+    // remote = pushremote_get(argv[1]);
+    // if (!remote || remote->origin == REMOTE_UNCONFIGURED)
+    //         die("remote '%s' not configured", argv[1]);
+    // ```
+    //
+    // `remote_get_1()` will happily turn an unknown name into a url alias, so
+    // the `origin` field is what actually decides: `handle_config()` sets it to
+    // `REMOTE_CONFIG` for any `remote.<name>.<key>` it reads, and nothing else
+    // does. A bare name with no `remote.<name>.*` section is therefore
+    // unconfigured no matter how url-shaped it looks.
+    if !remote_is_configured(&repo, remote_name) {
+        crate::git_fatal!("remote '{remote_name}' not configured");
+    }
+
+    // `if (argc > 2)`: the refspecs start at the third operand.
+    if args.len() > 2 {
+        let local_refs = local_heads(&repo)?;
+        for spec in &args[2..] {
+            let Some(item) = parse_push_refspec(spec) else {
+                crate::git_fatal!("invalid refspec '{spec}'");
+            };
+            if item.pattern || item.matching {
+                continue;
+            }
+            match count_refspec_match(&item.src, &local_refs) {
+                1 => {}
+                0 if item.src == "HEAD" => {
+                    if detached_head || head != superproject_head {
+                        crate::git_fatal!(
+                            "HEAD does not match the named branch in the superproject"
+                        );
+                    }
+                }
+                _ => crate::git_fatal!("src refspec '{}' must name a ref", item.src),
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Is there a `remote.<name>.<anything>` in the configuration?
+///
+/// That is exactly what sets `remote->origin = REMOTE_CONFIG` in remote.c's
+/// `handle_config()`, and `push_check()` reads nothing else off the remote.
+fn remote_is_configured(repo: &gix::Repository, name: &str) -> bool {
+    let config = repo.config_snapshot();
+    let configured = config
+        .sections_by_name("remote")
+        .into_iter()
+        .flatten()
+        .any(|section| {
+            section
+                .header()
+                .subsection_name()
+                .is_some_and(|sub| sub == name)
+                && section.value_names().next().is_some()
+        });
+    configured
+}
+
+/// `get_local_heads()`: every ref under `refs/`, minus the ones whose name is
+/// malformed (`one_local_ref` drops those with `check_refname_format`).
+///
+/// The name is git's, not a description: `refs_for_each_ref()` walks all of
+/// `refs/`, so remote-tracking refs and tags are in the list too — which is the
+/// reason `count_refspec_match()` has a notion of a "weak" match at all.
+fn local_heads(repo: &gix::Repository) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for reference in repo.references()?.all()? {
+        let Ok(reference) = reference else { continue };
+        let name = reference.name().as_bstr().to_str_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("refs/") else {
+            continue;
+        };
+        if gix::validate::reference::name(rest.into()).is_err() {
+            continue;
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
+/// remote.c's `count_refspec_match()`, minus the matched-ref output parameter
+/// that `push_check()` passes as `NULL`.
+///
+/// A match is "weak" when it is with a ref outside `refs/heads/` and
+/// `refs/tags/` that the pattern did not name in full (or at least from
+/// `refs/`); one strong match with any number of weak ones is still unique.
+fn count_refspec_match(pattern: &str, refs: &[String]) -> usize {
+    let patlen = pattern.len();
+    let (mut weak_match, mut strong_match) = (0usize, 0usize);
+    let mut matched = false;
+    for name in refs {
+        if refname_match(pattern, name) == 0 {
+            continue;
+        }
+        let namelen = name.len();
+        if namelen != patlen
+            && patlen + 5 != namelen
+            && !name.starts_with("refs/heads/")
+            && !name.starts_with("refs/tags/")
+        {
+            weak_match += 1;
+        } else {
+            matched = true;
+            strong_match += 1;
+        }
+    }
+    match matched {
+        true => strong_match,
+        false => weak_match,
+    }
+}
+
+/// refs.c's `refname_match()`: could `abbrev_name` have meant `full_name`?
+///
+/// ```c
+/// static const char *ref_rev_parse_rules[] = {
+///         "%.*s", "refs/%.*s", "refs/tags/%.*s", "refs/heads/%.*s",
+///         "refs/remotes/%.*s", "refs/remotes/%.*s/HEAD", NULL
+/// };
+/// ```
+///
+/// (refs.c:622-630.) The return value is the rule's rank counted from the end,
+/// so an earlier rule scores higher; `count_refspec_match()` only asks whether
+/// it is non-zero.
+fn refname_match(abbrev_name: &str, full_name: &str) -> usize {
+    const RULES: [&str; 6] = [
+        "{}",
+        "refs/{}",
+        "refs/tags/{}",
+        "refs/heads/{}",
+        "refs/remotes/{}",
+        "refs/remotes/{}/HEAD",
+    ];
+    for (i, rule) in RULES.iter().enumerate() {
+        if full_name == rule.replace("{}", abbrev_name) {
+            return RULES.len() - i;
+        }
+    }
+    0
+}
+
+/// The three fields of a `struct refspec_item` that `push_check()` reads.
+struct PushRefspec {
+    src: String,
+    pattern: bool,
+    matching: bool,
+}
+
+/// refspec.c's `parse_refspec(item, refspec, /* fetch */ 0)`.
+///
+/// `None` is its `return 0`, which `refspec_append()` turns into
+/// `die("invalid refspec '%s'")`.
+fn parse_push_refspec(spec: &str) -> Option<PushRefspec> {
+    let mut lhs = spec;
+    let mut negative = false;
+    if let Some(rest) = lhs.strip_prefix('+') {
+        lhs = rest;
+    } else if let Some(rest) = lhs.strip_prefix('^') {
+        negative = true;
+        lhs = rest;
+    }
+
+    let colon = lhs.rfind(':');
+    if negative && colon.is_some() {
+        return None;
+    }
+    // `":"` (and `"+:"`) is the push-everything-matching spec.
+    if colon == Some(0) && lhs.len() == 1 {
+        return Some(PushRefspec {
+            src: String::new(),
+            pattern: false,
+            matching: true,
+        });
+    }
+
+    let (src, dst) = match colon {
+        Some(at) => (&lhs[..at], Some(&lhs[at + 1..])),
+        None => (lhs, None),
+    };
+    let mut is_glob = dst.is_some_and(|d| !d.is_empty() && d.contains('*'));
+    if !src.is_empty() && src.contains('*') {
+        if dst.is_some() && !is_glob {
+            return None;
+        }
+        is_glob = true;
+    } else if dst.is_some() && is_glob {
+        return None;
+    }
+
+    // `if (llen == 1 && *lhs == '@') item->src = "HEAD";`
+    let src = match src {
+        "@" => "HEAD".to_string(),
+        other => other.to_string(),
+    };
+
+    if negative {
+        if src.is_empty() || looks_like_oid(&src) || !refname_ok(&src, is_glob) {
+            return None;
+        }
+        return Some(PushRefspec {
+            src,
+            pattern: is_glob,
+            matching: false,
+        });
+    }
+
+    // Push LHS: empty means delete, a wildcard must still look like a ref, and
+    // anything else "goes, for now".
+    if is_glob && !src.is_empty() && !refname_ok(&src, true) {
+        return None;
+    }
+    match dst {
+        None => {
+            if !refname_ok(&src, is_glob) {
+                return None;
+            }
+        }
+        Some("") => return None,
+        Some(dst) => {
+            if !refname_ok(dst, is_glob) {
+                return None;
+            }
+        }
+    }
+    Some(PushRefspec {
+        src,
+        pattern: is_glob,
+        matching: false,
+    })
+}
+
+/// `check_refname_format(name, REFNAME_ALLOW_ONELEVEL | [REFNAME_REFSPEC_PATTERN])`
+/// as far as a refspec cares: one `*` is allowed under the pattern flag, and a
+/// single-level name is always allowed.
+fn refname_ok(name: &str, pattern: bool) -> bool {
+    let checked = match pattern {
+        // The `*` stands in for a whole component; validation only has to see
+        // that the rest of the name is well formed around it.
+        true => name.replacen('*', "star", 1),
+        false => name.to_string(),
+    };
+    if pattern && checked.contains('*') {
+        return false;
+    }
+    gix::validate::reference::name_partial(checked.as_str().into()).is_ok()
+}
+
+/// `llen == the_hash_algo->hexsz && !get_oid_hex(item->src, &unused)`.
+fn looks_like_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // ---------------------------------------------------------------- gitdir ----

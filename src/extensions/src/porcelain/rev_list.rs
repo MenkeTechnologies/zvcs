@@ -277,6 +277,10 @@ enum Missing {
     AllowAny,
     /// `MA_PRINT`: skipped, then listed as `?<oid>` in a section of its own.
     Print,
+    /// `MA_ALLOW_PROMISOR`: skipped when the object is one a promisor pack
+    /// promises, fatal otherwise — the shape a partial clone is expected to be
+    /// in, where every absence is explained by the remote that still has it.
+    AllowPromisor,
 }
 
 /// What the `--objects` walk lists, and what it does about objects the
@@ -433,6 +437,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut ancestry_path = false;
     // `revs->edge_hint`: print the uninteresting boundary as `-<id>` lines.
     let mut edge_hint = false;
+    // `revs->exclude_promisor_objects`.
+    let mut exclude_promisor = false;
     // `revs->ancestry_path_bottoms` as `--ancestry-path=<commit>` fills it.
     let mut ancestry_bottoms: Vec<ObjectId> = Vec::new();
     let mut simplify_by_decoration = false;
@@ -657,6 +663,18 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 cherry_mark = true;
                 max_parents = Some(1);
             }
+            // ```c
+            // if (revs->exclude_promisor_objects)
+            //         odb_for_each_object(revs->repo->objects, NULL, mark_uninteresting,
+            //                             revs, ODB_FOR_EACH_OBJECT_PROMISOR_ONLY);
+            // ```
+            //
+            // (`prepare_revision_walk()`, revision.c:4001-4003.) Every object a
+            // promisor pack holds is marked UNINTERESTING before the walk starts,
+            // so the traversal never crosses from the objects this repository
+            // realized into the ones the remote still owns. In a fresh partial
+            // clone that is *everything*, and the listing is empty.
+            "--exclude-promisor-objects" => exclude_promisor = true,
             "--ancestry-path" => ancestry_path = true,
             // ```c
             // } else if (skip_prefix(arg, "--ancestry-path=", &optarg)) {
@@ -1037,7 +1055,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 // `print-info` reports each missing object's path and type through
                 // `quote_path`, and `allow-promisor` consults the promisor remote;
                 // neither has plumbing here.
-                "print-info" | "allow-promisor" => {
+                "allow-promisor" => missing = Missing::AllowPromisor,
+                // `print-info` reports each missing object's path and type through
+                // `quote_path`, in the order git's `oidmap` iterates — a hash
+                // order this port does not reproduce.
+                "print-info" => {
                     return Ok(fatal(&format!("--missing={} is not supported", &s[10..])))
                 }
                 // git leaves an unrecognised value on the default action.
@@ -1297,6 +1319,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         .map(|s| s.id)
         .collect();
     let left = reachable_from(&left_tips, &parents_of);
+
+    // `mark_uninteresting` over the promisor packs (revision.c:4001-4003) runs
+    // before the walk, so a commit a promisor pack holds never enters the list at
+    // all — and neither does anything reachable only through it.
+    if exclude_promisor {
+        let promisor = promisor_pack_objects(&repo);
+        commits.retain(|id| !promisor.contains(id));
+    }
 
     // `cherry_pick_list()` (revision.c): with commits on both sides of a symmetric difference,
     // the two sides are compared by *patch id* and every commit whose change appears on the other
@@ -1628,7 +1658,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         pathspecs: object_specs.as_ref(),
     };
     let mut absent: Vec<ObjectId> = Vec::new();
-    let mut seen: HashSet<ObjectId> = HashSet::new();
+    // The same UNINTERESTING marking reaches the object walk: a tree or blob a
+    // promisor pack holds is already "seen" and is never listed.
+    let mut seen: HashSet<ObjectId> = match exclude_promisor {
+        true => promisor_pack_objects(&repo),
+        false => HashSet::new(),
+    };
     // `mark_edges_uninteresting()` (`list-objects.c:283-321`) walks `revs->commits`
     // — the list `prepare_revision_walk()` left behind — and marks the trees of
     // the uninteresting commits *in it*. An exclusion that leaves nothing to walk
@@ -3257,7 +3292,7 @@ fn walk_tree(
         return Ok(Ok(()));
     }
     let Some(object) = tree_object(repo, tree) else {
-        if let Some(code) = note_missing(tree, absent, walk.missing) {
+        if let Some(code) = note_missing(repo, tree, absent, walk.missing) {
             return Ok(Err(code));
         }
         return Ok(Ok(()));
@@ -3303,7 +3338,12 @@ fn walk_tree(
 
 /// git's `finish_object__ma`: record or reject an object the repository lacks.
 /// `Some(code)` means the walk must stop with that exit code.
-fn note_missing(id: ObjectId, absent: &mut Vec<ObjectId>, missing: Missing) -> Option<ExitCode> {
+fn note_missing(
+    repo: &gix::Repository,
+    id: ObjectId,
+    absent: &mut Vec<ObjectId>,
+    missing: Missing,
+) -> Option<ExitCode> {
     match missing {
         Missing::Error => Some(fatal(&format!("missing object '{id}'"))),
         Missing::AllowAny => None,
@@ -3313,7 +3353,88 @@ fn note_missing(id: ObjectId, absent: &mut Vec<ObjectId>, missing: Missing) -> O
             }
             None
         }
+        // ```c
+        // case MA_ALLOW_PROMISOR:
+        //         if (is_promisor_object(the_repository, &obj->oid))
+        //                 return;
+        //         die("unexpected missing %s object '%s'", …);
+        // ```
+        //
+        // (`finish_object__ma()`, builtin/rev-list.c:215-220.)
+        Missing::AllowPromisor => match promisor_objects(repo).contains(&id) {
+            true => None,
+            false => Some(fatal(&format!("unexpected missing object '{id}'"))),
+        },
     }
+}
+
+/// `is_promisor_object()` (packfile.c): every object a `.promisor` pack holds,
+/// plus every object those reference — which is what makes a blob the pack's
+/// trees point at "promised" even though it was never sent.
+///
+/// git builds the set once per process and keeps it; so does this, because the
+/// walk asks about one object at a time.
+fn promisor_objects(repo: &gix::Repository) -> &'static HashSet<ObjectId> {
+    static SET: std::sync::OnceLock<HashSet<ObjectId>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let mut set = promisor_pack_objects(repo);
+        // `add_promisor_object()` walks each packed object and adds what it
+        // names: a tree's entries, a commit's tree and parents, a tag's target.
+        for id in set.clone() {
+            let Ok(object) = repo.find_object(id) else { continue };
+            match object.kind {
+                gix::object::Kind::Tree => {
+                    if let Ok(tree) = object.try_into_tree() {
+                        if let Ok(iter) = tree.decode() {
+                            set.extend(iter.entries.iter().map(|e| e.oid.to_owned()));
+                        }
+                    }
+                }
+                gix::object::Kind::Commit => {
+                    if let Ok(commit) = object.try_into_commit() {
+                        if let Ok(decoded) = commit.decode() {
+                            set.insert(decoded.tree());
+                            set.extend(decoded.parents());
+                        }
+                    }
+                }
+                gix::object::Kind::Tag => {
+                    if let Ok(tag) = object.try_into_tag() {
+                        if let Ok(target) = tag.target_id() {
+                            set.insert(target.detach());
+                        }
+                    }
+                }
+                gix::object::Kind::Blob => {}
+            }
+        }
+        set
+    })
+}
+
+/// The objects held by every pack with a `.promisor` file beside it — git's
+/// `FOR_EACH_OBJECT_PROMISOR_ONLY` enumeration.
+fn promisor_pack_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
+    let mut set = HashSet::new();
+    let store = repo.objects.store_ref();
+    for dir in std::iter::once(store.path().to_path_buf())
+        .chain(store.alternate_db_paths().ok().into_iter().flatten())
+    {
+        let Ok(entries) = std::fs::read_dir(dir.join("pack")) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("idx")
+                || !path.with_extension("promisor").exists()
+            {
+                continue;
+            }
+            let Ok(index) = gix::odb::pack::index::File::at(&path, repo.object_hash()) else {
+                continue;
+            };
+            set.extend(index.iter().map(|entry| entry.oid));
+        }
+    }
+    set
 }
 
 /// git's `tree_entry_interesting`: an entry is listed when a pathspec names it or
@@ -3341,9 +3462,26 @@ fn blob_filtered(
     absent: &mut Vec<ObjectId>,
     walk: &ObjectWalk<'_>,
 ) -> Result<Result<bool, ExitCode>> {
+    // ```c
+    // if (ctx->filter_fn) {
+    //         r = ctx->filter_fn(ctx->revs->repo, LOFS_BLOB, obj, …);
+    //         if (r & LOFR_MARK_SEEN) obj->flags |= SEEN;
+    //         if (r & LOFR_DO_SHOW) ctx->show_object(obj, path->buf, ctx->show_data);
+    //         return;
+    // }
+    // ```
+    //
+    // (`process_blob()`, list-objects.c.) The filter runs *before* the show
+    // callback, and only the callback looks the object up — so a `blob:none`
+    // walk never touches a blob at all. That is what lets it list a partial
+    // clone whose blobs are not there; asking about them first turned the
+    // listing into `missing object '<oid>'`.
+    if matches!(walk.filter, Some(Filter::BlobNone)) {
+        return Ok(Ok(true));
+    }
     let header = repo.find_header(id).ok();
     let Some(header) = header else {
-        if let Some(code) = note_missing(id, absent, walk.missing) {
+        if let Some(code) = note_missing(repo, id, absent, walk.missing) {
             return Ok(Err(code));
         }
         // A missing object is skipped rather than listed.

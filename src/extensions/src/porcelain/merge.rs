@@ -2400,14 +2400,25 @@ fn ort_attempt(
     // (`strbuf_add_unique_abbrev(…, DEFAULT_ABBREV)`).
     let (base_tree, ancestor) = if ctx.bases.is_empty() {
         (gix::ObjectId::empty_tree(repo.object_hash()), "empty tree".to_string())
+    } else if ctx.bases.len() == 1 {
+        let base = ctx.bases[0];
+        (
+            repo.find_object(base)?.peel_to_tree()?.id,
+            base.attach(repo).shorten_or_id().to_string(),
+        )
     } else {
-        let base = repo.merge_base(ctx.local_id, target_id)?.detach();
-        let ancestor = if ctx.bases.len() > 1 {
-            "merged common ancestors".to_string()
-        } else {
-            base.attach(repo).shorten_or_id().to_string()
-        };
-        (repo.find_object(base)?.peel_to_tree()?.id, ancestor)
+        // ```c
+        // merged_merge_bases = pop_commit(&merge_bases);
+        // [...]
+        //         merge_ort_internal(opt, NULL, merged_merge_bases, commit2, result);
+        // ```
+        //
+        // (`merge_ort_recursive()`, merge-ort.c.) With more than one merge base git does not
+        // pick one: it merges them into each other, recursively, and merges the two sides
+        // against the *virtual* tree that comes out. Picking a single base instead resolves
+        // a criss-cross merge cleanly where git reports a conflict — the wrong answer, not
+        // just a different message.
+        (virtual_base_tree(repo, ctx.bases)?, "merged common ancestors".to_string())
     };
     let labels = gix::merge::blob::builtin_driver::text::Labels {
         ancestor: Some(BStr::new(ancestor.as_bytes())),
@@ -2452,6 +2463,40 @@ fn ort_attempt(
         });
     }
     Ok(Attempt::Conflicts(applied.conflicts))
+}
+
+/// The tree git merges against when a pair of commits has more than one merge base: the
+/// bases merged into each other, recursively.
+///
+/// ```c
+/// static struct commit *make_virtual_commit(struct repository *repo, struct tree *tree, const char *comment)
+/// {
+///         struct commit *commit = alloc_commit_node(repo);
+///         [...]
+/// }
+/// ```
+///
+/// (merge-ort.c.) git's virtual commits are allocated, never written: a criss-cross merge
+/// leaves the merged base *tree* and the blobs it needed in the object store, and no commit.
+/// gitoxide writes its virtual commits too, so the recursion runs against an in-memory
+/// object store and only the objects git would have written are persisted afterwards.
+fn virtual_base_tree(repo: &gix::Repository, bases: &[ObjectId]) -> Result<ObjectId> {
+    let mut mem = repo.clone();
+    mem.objects.enable_object_memory();
+    let out = mem.virtual_merge_base(bases.iter().copied(), mem.tree_merge_options()?)?;
+    let tree = out.tree_id.detach();
+    let written = mem
+        .objects
+        .take_object_memory()
+        .expect("object memory was just enabled");
+    for (_id, (kind, data)) in written.iter() {
+        if *kind == gix::object::Kind::Commit {
+            continue;
+        }
+        gix::objs::Write::write_buf(repo, *kind, data)
+            .map_err(|e| anyhow::anyhow!("failed to write merge-base object: {e}"))?;
+    }
+    Ok(tree)
 }
 
 /// `git-merge-ours`, run through `try_merge_command()` like any other

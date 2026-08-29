@@ -33,10 +33,7 @@ pub(super) mod function {
     use gix_object::FindExt;
 
     use super::Error;
-    use crate::{
-        blob::builtin_driver,
-        tree::{TreatAsUnresolved, treat_as_unresolved},
-    };
+    use crate::blob::builtin_driver;
 
     /// Create a single virtual merge-base by merging `first_commit`, `second_commit` and `others` into one.
     /// Note that `first_commit` and `second_commit` are expected to have been popped off `others`, so `first_commit`
@@ -62,7 +59,30 @@ pub(super) mod function {
 
         options.tree_conflicts = Some(crate::tree::ResolveWith::Ancestor);
         options.blob_merge.is_virtual_ancestor = true;
-        options.blob_merge.text.conflict = builtin_driver::text::Conflict::ResolveWithOurs;
+        // ```c
+        // if (opt->priv->call_depth) {
+        //         ll_opts.virtual_ancestor = 1;
+        //         ll_opts.variant = 0;
+        // }
+        // ```
+        //
+        // (`merge_3way()`, merge-ort.c.) A merge-base merge keeps its content conflicts:
+        // the blob written into the virtual ancestor is the one *with* the markers, drawn
+        // longer than the outer merge's so the two nest legibly. Resolving with one side
+        // instead hands the outer merge a base that agrees with that side, which turns a
+        // criss-cross conflict into a silent clean take of the other side. `variant = 0`
+        // is why the outer `-X ours`/`-X theirs` does not reach here either.
+        if !matches!(
+            options.blob_merge.text.conflict,
+            builtin_driver::text::Conflict::Keep { .. }
+        ) {
+            options.blob_merge.text.conflict = builtin_driver::text::Conflict::Keep {
+                style: Default::default(),
+                marker_size: builtin_driver::text::Conflict::DEFAULT_MARKER_SIZE
+                    .try_into()
+                    .expect("non-zero default"),
+            };
+        }
         let favor_ancestor = Some(builtin_driver::binary::ResolveWith::Ancestor);
         options.blob_merge.resolve_binary_with = favor_ancestor;
         options.symlink_conflicts = favor_ancestor;
@@ -90,11 +110,12 @@ pub(super) mod function {
                     use_first_merge_base: false,
                 },
             )?;
-            // This shouldn't happen, but if for some buggy reason it does, we rather bail.
-            if out.tree_merge.has_unresolved_conflicts(TreatAsUnresolved {
-                content_merge: treat_as_unresolved::ContentMerge::Markers,
-                tree_merge: treat_as_unresolved::TreeMerge::Undecidable,
-            }) {
+            // Content conflicts are expected here and are the point of the exercise — git
+            // records the marked-up blob and merges on. Only a tree-level conflict that
+            // even `ResolveWith::Ancestor` could not decide is a real failure, which is
+            // what a resolution *failure* is; `has_unresolved_conflicts()` cannot express
+            // that on its own, as both of its content modes count marker resolutions.
+            if out.tree_merge.conflicts.iter().any(|c| c.resolution.is_err()) {
                 return Err(Error::VirtualMergeBaseConflict.into());
             }
             let merged_tree_id = out

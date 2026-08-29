@@ -135,10 +135,67 @@ const SIZE_MAX: u64 = 0o77777777777;
 
 const ZEROS: [u8; RECORD] = [0; RECORD];
 
-/// The formats stock `git archive --list` reports. Only `tar` can be produced
-/// here; the others exist to keep `--list` byte-identical and are rejected with
-/// a precise message the moment one is actually requested.
+/// The formats stock `git archive --list` reports before configuration is read: `tar` and
+/// git's two pre-seeded tar filters, then `zip` — the registration order of
+/// `init_tar_archiver()` and `init_zip_archiver()` (archive.c), which is the order `--list`
+/// prints. A `tar.<name>.command` adds its own name to the list between the two groups; see
+/// [`configured_formats`].
 const FORMATS: &[&str] = &["tar", "tgz", "tar.gz", "zip"];
+
+/// ```c
+/// if (skip_prefix(var, "tar.", &name) && strip_suffix(name, ".command", &namelen)) {
+///         [...]
+///         ar = find_tar_filter(name, namelen);
+///         if (!ar) {
+///                 ar = xcalloc(1, sizeof(*ar));
+///                 ar->name = xmemdupz(name, namelen);
+///                 ar->next = tar_filters;
+///                 tar_filters = ar;
+///         }
+///         [...]
+///         ar->write_archive = write_tar_filter_archive;
+///         ar->flags = ARCHIVER_WANT_COMPRESSION_LEVELS | ARCHIVER_REMOTE;
+/// }
+/// ```
+///
+/// (`git_tar_config()`, archive-tar.c.) Every `tar.<name>.command` is an archive format of
+/// its own: the tar goes to the command's standard input and whatever it writes is the
+/// archive. `tgz` and `tar.gz` are registered the same way with `git archive gzip` as their
+/// command, so configuring one of *those* replaces the internal gzip.
+fn configured_formats(repo: Option<&gix::Repository>) -> Vec<String> {
+    let mut out: Vec<String> = FORMATS[..3].iter().map(|f| (*f).to_string()).collect();
+    if let Some(repo) = repo {
+        let snapshot = repo.config_snapshot();
+        for section in snapshot.plumbing().sections() {
+            let header = section.header();
+            if !header.name().to_string().eq_ignore_ascii_case("tar") {
+                continue;
+            }
+            // `tar.<name>.command` reaches the config callback as one flat key, so a
+            // dotted format name lands in the subsection (`tar "tar.gz"`) or in the value
+            // name (`tar.command` under a `tar.gz` subsection is not a thing) — either way
+            // the name is whatever sits between `tar.` and `.command`.
+            let Some(sub) = header.subsection_name() else {
+                continue;
+            };
+            let name = sub.to_string();
+            if section.body().values("command").is_empty() || out.contains(&name) {
+                continue;
+            }
+            out.push(name);
+        }
+    }
+    out.push("zip".to_string());
+    out
+}
+
+/// The command a `tar.<format>.command` configures for this format, if any.
+fn tar_filter_command(repo: &gix::Repository, format: &str) -> Option<String> {
+    repo.config_snapshot()
+        .plumbing()
+        .string_by("tar", Some(format.into()), "command")
+        .map(|v| v.to_string())
+}
 
 /// The formats carrying git's `ARCHIVER_WANT_COMPRESSION_LEVELS`. A `-<digits>`
 /// given for any other format is fatal, which is the only way a compression
@@ -397,8 +454,8 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         let mut out = String::new();
-        for f in FORMATS {
-            out.push_str(f);
+        for f in configured_formats(gix::discover(".").ok().as_ref()) {
+            out.push_str(&f);
             out.push('\n');
         }
         print!("{out}");
@@ -423,7 +480,11 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             .unwrap_or("tar")
             .to_string(),
     };
-    if !FORMATS.contains(&format.as_str()) {
+    // The registry is config-driven, so a `tar.<name>.command` makes `<name>` a format git
+    // knows — which is why this is checked against the configured list and not the built-in
+    // one.
+    let known = configured_formats(gix::discover(".").ok().as_ref());
+    if !known.iter().any(|f| f == &format) {
         eprintln!("fatal: Unknown archive format '{format}'");
         return Ok(ExitCode::from(128));
     }
@@ -436,7 +497,9 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     // `deflateInit2()` fails, which is after the tree walk (see below). The level
     // reported is the last `-<digits>` parsed, not the first one given.
     if let Some(level) = opts.level {
-        let reject = !LEVEL_FORMATS.contains(&format.as_str()) || (format == "zip" && level > 9);
+        let filter_format = !FORMATS.contains(&format.as_str());
+        let reject = (!LEVEL_FORMATS.contains(&format.as_str()) && !filter_format)
+            || (format == "zip" && level > 9);
         if reject {
             eprintln!("fatal: Argument not supported for format '{format}': -{level}");
             return Ok(ExitCode::from(128));
@@ -450,21 +513,11 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     // to be spawned, which it does not do. `tar.tgz.command` and
     // `tar.tar.gz.command` are pre-seeded with the internal name, so only a
     // value that differs from it is a problem.
+    // `tgz`/`tar.gz` are pre-seeded with `git archive gzip`; a configuration that repeats
+    // that value asks for the gzip this port produces in-process, and anything else is a
+    // filter to spawn.
     const INTERNAL_GZIP: &str = "git archive gzip";
-    {
-        let cfg = repo.config_snapshot();
-        for (key, internal) in [
-            ("tar.tar.command", None),
-            ("tar.tgz.command", Some(INTERNAL_GZIP)),
-            ("tar.tar.gz.command", Some(INTERNAL_GZIP)),
-        ] {
-            if let Some(raw) = cfg.string(key) {
-                if internal != Some(raw.to_str_lossy().as_ref()) {
-                    bail!("{key} is configured but piping through it is not supported");
-                }
-            }
-        }
-    }
+    let filter = tar_filter_command(&repo, &format).filter(|cmd| cmd != INTERNAL_GZIP);
     let umask = tar_umask(&repo)?;
 
     // `parse_treeish_arg()` (archive.c) resolves with `repo_get_oid()`, which
@@ -507,7 +560,9 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     // to fail with git's own exit code. Both checks are therefore deferred to
     // just before the first byte is written (see below); here we only compute the
     // format flags the writer needs.
-    let gzipped = matches!(format.as_str(), "tgz" | "tar.gz");
+    // A configured `tar.<format>.command` *replaces* the archiver, so a `tar.tar.gz.command`
+    // means the tar goes to that command rather than through the internal gzip.
+    let gzipped = matches!(format.as_str(), "tgz" | "tar.gz") && filter.is_none();
     let level = opts.level.unwrap_or(6);
     // Run from a subdirectory, git narrows the tree to that subdirectory and
     // makes every archived path relative to it.
@@ -587,23 +642,30 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         };
-        let hit = items.iter().any(|it| {
-            let mut no_attrs = |_: &gix::bstr::BStr,
-                                _: gix::pathspec::attributes::glob::pattern::Case,
-                                _: bool,
-                                _: &mut gix::pathspec::attributes::search::Outcome|
-             -> bool { false };
-            // Directory and submodule records carry a trailing slash; strip it
-            // and flag directory-ness for the matcher (a gitlink matches as a
-            // file, like git).
-            let (rel, is_dir) = match it.kind {
-                EntryKind::Tree => (&it.path[..it.path.len() - 1], true),
-                EntryKind::Commit => (&it.path[..it.path.len() - 1], false),
-                _ => (&it.path[..], false),
-            };
-            one.pattern_matching_relative_path(rel.as_bstr(), Some(is_dir), &mut no_attrs)
-                .is_some_and(|m| !m.is_excluded())
-        });
+        // ```c
+        // const char *paths[] = { path, NULL };
+        // [...]
+        // parse_pathspec(&ctx.pathspec, 0, 0, "", paths);
+        // ctx.pathspec.recursive = 1;
+        // ret = read_tree(args->repo, args->tree, &ctx.pathspec, reject_entry, &ctx);
+        // ```
+        //
+        // (`path_exists()`, archive.c.) The tree is re-read with *only* this one spec, so
+        // whether it matched is decided before any other spec has a say: `git archive HEAD
+        // src :!src/lib.rs` archives nothing and still accepts `src`, which matched the
+        // directory. Testing against the already-filtered entry list called that a miss.
+        let mut probe_pending: Vec<Item> = Vec::new();
+        let mut probe: Vec<Item> = Vec::new();
+        collect(
+            &repo,
+            tree.clone(),
+            b"",
+            Some(&mut one),
+            &mut conv,
+            &mut probe_pending,
+            &mut probe,
+        )?;
+        let hit = !probe.is_empty();
         if !hit {
             eprintln!(
                 "fatal: pathspec '{}' did not match any files",
@@ -623,7 +685,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: deflateInit2: stream consistency error (no message)");
         return Ok(ExitCode::from(128));
     }
-    if !gzipped && format != "tar" && format != "zip" {
+    if !gzipped && format != "tar" && format != "zip" && filter.is_none() {
         bail!("archive format {format:?} is not supported");
     }
 
@@ -633,9 +695,45 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     if format == "zip" {
         return write_zip(&repo, &tree, items, &opts, &base, commit_id, mtime, level as i32, &mut conv);
     }
-    let raw: Box<dyn Write> = match &opts.output {
-        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    // ```c
+    // strbuf_addstr(&cmd, ar->data);
+    // if (args->compression_level >= 0)
+    //         strbuf_addf(&cmd, " -%d", args->compression_level);
+    // strvec_push(&filter.args, cmd.buf);
+    // filter.use_shell = 1;
+    // filter.in = -1;
+    // [...]
+    // if (dup2(filter.in, 1) < 0) [...]
+    // r = write_tar_archive(ar, args);
+    // ```
+    //
+    // (`write_tar_filter_archive()`, archive-tar.c.) The command runs through a shell with
+    // the tar on its standard input and its own output going wherever this archive was
+    // going; a compression level is appended to the command line.
+    let mut child = None;
+    let raw: Box<dyn Write> = match &filter {
+        Some(command) => {
+            let mut line = command.clone();
+            if let Some(level) = opts.level {
+                line.push_str(&format!(" -{level}"));
+            }
+            let mut spawned = std::process::Command::new("sh");
+            spawned.arg("-c").arg(&line).stdin(std::process::Stdio::piped());
+            if let Some(path) = &opts.output {
+                spawned.stdout(std::fs::File::create(path)?);
+            }
+            let mut spawned = match spawned.spawn() {
+                Ok(child) => child,
+                Err(e) => crate::git_fatal!("cannot spawn {line}: {e}"),
+            };
+            let stdin = spawned.stdin.take().expect("stdin is piped");
+            child = Some((spawned, line));
+            Box::new(std::io::BufWriter::new(stdin))
+        }
+        None => match &opts.output {
+            Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+            None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+        },
     };
     let sink = if gzipped {
         Sink::Gz(Box::new(gzip::GzDeflate::new(raw, level as i32)))
@@ -704,6 +802,15 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     tar.finish()?;
     // The gzip stream's own trailer is only written once the tar is complete.
     tar.out.done()?;
+
+    // `close(1); if (finish_command(&filter) != 0) die("'%s' filter reported error", cmd.buf)`
+    // — the pipe has to be closed before the wait, or the filter never sees end of input.
+    if let Some((mut spawned, line)) = child {
+        match spawned.wait() {
+            Ok(status) if status.success() => {}
+            _ => crate::git_fatal!("'{line}' filter reported error"),
+        }
+    }
 
     Ok(ExitCode::SUCCESS)
 }

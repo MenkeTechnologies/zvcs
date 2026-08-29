@@ -133,11 +133,12 @@ impl PrepareFetch {
         };
 
         let mut repo = crate::ThreadSafeRepository::init_opts(path, kind, create_opts, open_opts)?.to_thread_local();
-        url.canonicalize(repo.options.current_dir_or_empty())
-            .map_err(|err| Error::CanonicalizeUrl {
-                url: url.clone(),
-                source: err,
-            })?;
+        // `builtin/clone.c:1057` records `absolute_pathdup(repo_name)`: the path made absolute
+        // against the current directory and nothing else. Resolving it instead — symlinks, `.`,
+        // `..` — writes a different string into `remote.<name>.url` and into the
+        // `clone: from <url>` reflog message than stock git leaves behind, so `git clone ./src`
+        // would record `<cwd>/src` where git records `<cwd>/./src`.
+        url.absolutize(repo.options.current_dir_or_empty());
         repo.committer_or_set_generic_fallback()?;
         Ok(PrepareFetch {
             url,

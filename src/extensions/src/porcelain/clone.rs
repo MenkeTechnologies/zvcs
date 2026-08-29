@@ -752,6 +752,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "destination path '{dir}' already exists and is not an empty directory."
         )));
     }
+    // `junk_work_tree` in `cmd_clone()`: git remembers the directory it made so `remove_junk()`
+    // can take it down again on any death below, and leaves a directory it found alone.
+    let created_destination = !dst.exists();
     std::fs::create_dir_all(dst)?;
 
     // Serialize the ref/index writes through the repo coordinator, matching the
@@ -812,6 +815,33 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     if let Err(e) = check_transport_allowed(&url) {
         eprintln!("fatal: {e}");
         return Ok(ExitCode::from(128));
+    }
+
+    // `get_repo_path_1()` reads a local source as a repository first and as a bundle second, so a
+    // path that is neither — a plain file, a loose pack — reaches the transport as a bundle
+    // candidate. git then prints three things: the bundle check that rejected it, the `die()` of
+    // the `upload-pack` child it fell back to (a file that is not a gitfile is
+    // `invalid gitfile format`), and the block `git_connect()` ends with. Exit 128.
+    if !url_str.contains("://") {
+        if let LocalSource::Bundle(path) = classify_local_source(url_str) {
+            let shown = absolute_pathdup(&path);
+            if created_destination {
+                let _ = std::fs::remove_dir_all(dst);
+            }
+            if !looks_like_bundle(&path) {
+                eprintln!("error: '{shown}' does not look like a v2 or v3 bundle file");
+                eprintln!("fatal: invalid gitfile format: {shown}");
+                eprintln!("fatal: Could not read from remote repository.");
+                eprintln!();
+                eprintln!("Please make sure you have the correct access rights");
+                eprintln!("and the repository exists.");
+                return Ok(ExitCode::from(128));
+            }
+            anyhow::bail!(
+                "cloning from a bundle is not ported: the vendored transport has no bundle \
+                 reader, so '{shown}' cannot be unbundled into a new repository"
+            );
+        }
     }
 
     // Build the clone platform. This already lays the repository down on disk, so
@@ -1131,6 +1161,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `update_remote_refs()` makes `refs/remotes/<name>/HEAD` a symbolic ref to.
     let mut remote_head_branch: Option<String> = None;
 
+    // git names the remote in the diagnostic a missing `--branch` dies with, and the name it uses
+    // is the one this clone is about to write: `-o`/`--origin`, else `clone.defaultRemoteName`,
+    // else `origin`.
+    let effective_remote_name = gix::open(&git_dir)
+        .map(|repo| resolve_remote_name(&repo, origin.as_deref()))
+        .unwrap_or_else(|_| origin.clone().unwrap_or_else(|| "origin".to_string()));
+
     // Run the clone, capturing the result so the renderer is always torn down
     // (cursor restored, thread joined) before any error is propagated.
     let result = (|| -> Result<()> {
@@ -1158,7 +1195,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // (and index) empty. Fetching is the whole job in both cases.
             let (_repo, outcome) = prepare
                 .fetch_only(op.add_child("fetch"), &should_interrupt)
-                .map_err(short_pack)?;
+                .map_err(|e| short_pack(e, branch.as_deref(), &effective_remote_name))?;
             remote_advertised_tracking_refs = outcome
                 .ref_map
                 .remote_refs
@@ -1170,7 +1207,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // `git clone 'url'...`
             let (mut checkout, outcome) = prepare
                 .fetch_then_checkout(op.add_child("fetch"), &should_interrupt)
-                .map_err(short_pack)?;
+                .map_err(|e| short_pack(e, branch.as_deref(), &effective_remote_name))?;
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
             // Check out the branch `HEAD` points to. This is a no-op for an empty
@@ -1802,15 +1839,26 @@ fn remove_remote_tracking_head(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Give the post-fetch connectivity check the wording `update_remote_refs()` uses on the clone side.
+/// Give the post-fetch connectivity check the wording `update_remote_refs()` uses on the clone side,
+/// and the `--branch` lookup the diagnostic git dies with.
 ///
 /// git's fetch says `<url> did not send all necessary objects`; its clone, which has no display state
 /// to name the URL from yet, says `remote did not send all necessary objects` and takes the whole
 /// clone directory down with it.
-fn short_pack(err: gix::clone::fetch::Error) -> anyhow::Error {
+///
+/// `--branch <name>` that the remote does not advertise is git's
+/// `die(_("Remote branch %s not found in upstream %s"), option_branch, remote_name)` — a `fatal:`
+/// naming the branch as it was typed and the remote it was looked for in, with exit 128. gitoxide
+/// reports the same condition as `RefNameMissing`, whose text names neither the remote nor the
+/// spelling the caller used, and would arrive as this binary's own error with exit 1.
+fn short_pack(err: gix::clone::fetch::Error, branch: Option<&str>, remote_name: &str) -> anyhow::Error {
     match err {
         gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::NotConnected) => {
             anyhow::anyhow!("remote did not send all necessary objects")
+        }
+        gix::clone::fetch::Error::RefNameMissing { ref wanted } => {
+            let wanted = branch.map_or_else(|| wanted.as_ref().as_bstr().to_string(), ToOwned::to_owned);
+            crate::fatal::die(format!("Remote branch {wanted} not found in upstream {remote_name}"))
         }
         other => other.into(),
     }
@@ -1913,6 +1961,77 @@ fn split_config_key(key: &str) -> Result<(String, Option<String>, String)> {
     }
     let subsection = (first != last).then(|| key[first + 1..last].to_string());
     Ok((section.to_string(), subsection, name.to_string()))
+}
+
+/// What `get_repo_path_1()` (`builtin/clone.c:97`) makes of a local source path.
+enum LocalSource {
+    /// One of `<path>/.git`, `<path>`, `<path>.git/.git`, `<path>.git` is a repository — the
+    /// ordinary local clone.
+    Repository,
+    /// None of those is, but the path (or `<path>.bundle`) is a regular file, which is git's
+    /// second reading of a local source: a bundle. Carries the path git would name.
+    Bundle(PathBuf),
+    /// Neither — git leaves `path` NULL and hands the raw URL to the transport.
+    Neither,
+}
+
+/// Classify a local source the way `get_repo_path_1()` does, in its order: the four repository
+/// spellings first, then the two bundle ones. A gitfile (`gitdir: …`) counts as a repository only
+/// when it is longer than its own signature, which is git's `st.st_size > 8` guard.
+fn classify_local_source(repo_name: &str) -> LocalSource {
+    let base = Path::new(repo_name);
+    for suffix in ["/.git", "", ".git/.git", ".git"] {
+        let candidate = PathBuf::from(format!("{}{suffix}", base.display()));
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if gix::open(&candidate).is_ok() {
+                return LocalSource::Repository;
+            }
+        } else if meta.is_file() && meta.len() > 8 {
+            let is_gitfile = std::fs::read(&candidate)
+                .map(|bytes| bytes.starts_with(b"gitdir: "))
+                .unwrap_or(false);
+            if is_gitfile {
+                return LocalSource::Repository;
+            }
+        }
+    }
+    for suffix in [".bundle", ""] {
+        let candidate = PathBuf::from(format!("{}{suffix}", base.display()));
+        if std::fs::metadata(&candidate).is_ok_and(|m| m.is_file()) {
+            return LocalSource::Bundle(candidate);
+        }
+    }
+    LocalSource::Neither
+}
+
+/// The spelling git names a local source with: `absolute_pathdup()` (`abspath.c:293`), which
+/// prefixes a relative path with the current directory and normalizes nothing. Shared with the
+/// clone url itself through [`gix::Url::absolutize`], so a diagnostic and `remote.<name>.url`
+/// cannot disagree about the same path.
+fn absolute_pathdup(path: &Path) -> String {
+    let bytes = gix::path::into_bstr(path);
+    match gix::url::parse(bytes.as_ref()) {
+        Ok(mut url) => {
+            url.absolutize(Path::new(""));
+            gix::path::from_bstr(url.path.as_bstr()).display().to_string()
+        }
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// A file git would read as a bundle really carrying a bundle header.
+///
+/// `read_bundle_header_fd()` (`bundle.c`) accepts `# v2 git bundle` and `# v3 git bundle`; anything
+/// else is `error: '%s' does not look like a v2 or v3 bundle file`, which `transport_get()` prints
+/// through `is_bundle(url, 1)` before the transport is chosen.
+fn looks_like_bundle(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.starts_with(b"# v2 git bundle\n") || bytes.starts_with(b"# v3 git bundle\n")
 }
 
 /// The local filesystem path a clone URL names, if any. `-s`/`--shared` only

@@ -362,6 +362,46 @@ fn looks_like_command_line_option(b: &[u8]) -> bool {
 
 /// Transformation
 impl Url {
+    /// Make a `file` url's path absolute exactly the way git's `absolute_pathdup()` does
+    /// (`abspath.c:293`, `strbuf_add_absolute_path()`): an already-absolute path is left alone, a
+    /// relative one is prefixed with the current directory, and *nothing* is normalized — no
+    /// `.`/`..` folding and no symlink resolution.
+    ///
+    /// That is what `git clone` records, so `git clone ./src` leaves `<cwd>/./src` in both
+    /// `remote.origin.url` and the `clone: from <url>` reflog message rather than the resolved
+    /// `<cwd>/src`. [`Url::canonicalize()`] resolves the path instead and cannot reproduce it.
+    ///
+    /// git prefers `$PWD` over `getcwd()` when the two name the same directory — that is how a
+    /// shell's logical path survives a symlinked working directory — so the same test is made
+    /// here, comparing device and inode.
+    pub fn absolutize(&mut self, current_dir: &std::path::Path) {
+        if self.scheme != Scheme::File {
+            return;
+        }
+        if gix_path::from_bstr(Cow::Borrowed(self.path.as_ref())).is_absolute() {
+            return;
+        }
+        let cwd = if current_dir.as_os_str().is_empty() {
+            match std::env::current_dir() {
+                Ok(dir) => dir,
+                // Without a current directory there is nothing to prefix with; leave the path
+                // relative rather than inventing a root for it.
+                Err(_) => return,
+            }
+        } else {
+            current_dir.to_owned()
+        };
+        let base = pwd_naming(&cwd).unwrap_or(cwd);
+
+        let mut absolute: BString = gix_path::into_bstr(base).into_owned();
+        if !absolute.is_empty() && !matches!(absolute.last(), Some(b'/') | Some(b'\\')) {
+            absolute.push(b'/');
+        }
+        absolute.extend_from_slice(&self.path);
+        self.path = absolute;
+    }
+
+
     /// Turn a file URL like `file://relative` into `file:///root/relative`, hence it assures the URL's path component is absolute, using
     /// `current_dir` if necessary.
     pub fn canonicalized(&self, current_dir: &std::path::Path) -> Result<Self, gix_path::realpath::Error> {
@@ -595,4 +635,34 @@ pub mod testing {
     }
 
     impl TestUrlExtension for Url {}
+}
+
+/// git's `strbuf_add_absolute_path()` prefers `$PWD` over `getcwd()` when the two name the same
+/// directory — same device, same inode — so a path typed inside a symlinked directory keeps the
+/// spelling the shell used (`abspath.c:301`). Returns `None` when `$PWD` is unset, names something
+/// else, or the platform cannot answer, which is git's `getcwd()` fallback.
+fn pwd_naming(cwd: &std::path::Path) -> Option<PathBuf> {
+    let pwd = PathBuf::from(std::env::var_os("PWD")?);
+    if pwd == cwd {
+        return None;
+    }
+    same_directory(&pwd, cwd).then_some(pwd)
+}
+
+#[cfg(unix)]
+fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    // git skips the comparison entirely on a filesystem that reports neither, since every
+    // directory would then look like every other one.
+    (b.dev() != 0 || b.ino() != 0) && a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_directory(_a: &std::path::Path, _b: &std::path::Path) -> bool {
+    // git's test is on `st_dev`/`st_ino`, which its Windows emulation leaves at zero — the
+    // `(cwd_stat.st_dev || cwd_stat.st_ino)` guard then rejects `$PWD` there.
+    false
 }

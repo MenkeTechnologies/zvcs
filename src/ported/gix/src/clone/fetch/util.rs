@@ -172,6 +172,26 @@ pub fn update_head(
                 head_ref_name: referent.to_owned(),
                 source: err,
             })?;
+            // git writes `HEAD` and the branch it points at in one transaction
+            // (`update_head()`, `builtin/clone.c:576`): updating `HEAD` dereferences to a branch
+            // that does not exist yet, so `lock_ref_for_update()` resolves no old value and both
+            // reflog lines record the null id. Logging `HEAD` here — before the branch is
+            // created — reproduces that; doing it afterwards, as this used to, resolves the
+            // branch that was just written and records `<new> <new>` on the `HEAD` line.
+            if let Some(head_peeled_id) = head_peeled_id {
+                let mut log = reflog_message();
+                log.mode = RefLog::Only;
+                repo.edit_reference(RefEdit {
+                    change: gix_ref::transaction::Change::Update {
+                        log,
+                        expected: PreviousValue::Any,
+                        new: Target::Object(head_peeled_id.to_owned()),
+                    },
+                    name: head.clone(),
+                    deref: false,
+                })?;
+            }
+
             repo.refs
                 .transaction()
                 .packed_refs(gix_ref::file::transaction::PackedRefs::DeletionsAndNonSymbolicUpdates(
@@ -211,20 +231,6 @@ pub fn update_head(
                         .map_err(|err| Error::HeadUpdate(crate::reference::edit::Error::ParseCommitterTime(err)))?,
                 )
                 .map_err(crate::reference::edit::Error::from)?;
-
-            if let Some(head_peeled_id) = head_peeled_id {
-                let mut log = reflog_message();
-                log.mode = RefLog::Only;
-                repo.edit_reference(RefEdit {
-                    change: gix_ref::transaction::Change::Update {
-                        log,
-                        expected: PreviousValue::Any,
-                        new: Target::Object(head_peeled_id.to_owned()),
-                    },
-                    name: head,
-                    deref: false,
-                })?;
-            }
 
             setup_branch_config(repo, referent.as_ref(), head_peeled_id, remote_name)?;
         }

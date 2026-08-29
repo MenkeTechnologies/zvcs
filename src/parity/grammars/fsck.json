@@ -34,7 +34,10 @@
     "refs/heads/dangling",
     "refs/heads/broken-symref",
     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-    "ab1234567890123456789012345678901234abcd"
+    "ab1234567890123456789012345678901234abcd",
+    "sh-side",
+    "pc-side",
+    "hist.txt"
   ],
   "shapes": [
     "linear",
@@ -51,6 +54,8 @@
     "behind-remote",
     "octopus",
     "patches",
-    "damaged"
+    "damaged",
+    "shallow",
+    "promisor"
   ]
 }

@@ -95,7 +95,9 @@
     "--write-commit-graph",
     "--no-write-commit-graph",
     "--stdin",
-    "--no-stdin"
+    "--no-stdin",
+    "--deepen=1",
+    "--deepen=0"
   ],
   "positionals": [
     "origin",
@@ -107,7 +109,11 @@
     "main",
     "div",
     "does-not-exist",
-    ""
+    "",
+    "sh-side",
+    "pc-side",
+    ["origin", "sh-side"],
+    ["origin", "pc-side"]
   ],
   "shapes": [
     "linear",
@@ -123,6 +129,8 @@
     "worktree",
     "octopus",
     "sparse",
-    "stashed"
+    "stashed",
+    "shallow",
+    "promisor"
   ]
 }

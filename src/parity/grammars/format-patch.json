@@ -189,7 +189,9 @@
     "--max-parents=1",
     "--topo-order",
     "--date-order",
-    "--author-date-order"
+    "--author-date-order",
+    "--notes=review",
+    "--notes=other"
   ],
   "positionals": [
     "",
@@ -265,6 +267,7 @@
     "attributes",
     "decomposed-paths",
     "cherry",
-    "unrelated"
+    "unrelated",
+    "notes-replace"
   ]
 }

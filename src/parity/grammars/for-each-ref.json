@@ -79,7 +79,10 @@
     "--start-after=refs/heads/main",
     "--start-after=refs/tags/v0.1.0",
     "--start-after=",
-    "--bogus-flag"
+    "--bogus-flag",
+    "--points-at=outermost",
+    "--merged=outermost",
+    "--format=%(objecttype) %(*objecttype) %(refname:short)"
   ],
   "positionals": [
     "",
@@ -104,7 +107,10 @@
     "refs/worktree/*",
     "refs/heads/oct-*",
     "refs/heads/dangling",
-    "refs/heads/broken-symref"
+    "refs/heads/broken-symref",
+    "refs/tags/outer*",
+    "refs/notes/*",
+    "refs/replace/*"
   ],
   "shapes": [
     "linear",
@@ -121,6 +127,8 @@
     "octopus",
     "packed",
     "attributes",
-    "damaged"
+    "damaged",
+    "tag-chain",
+    "notes-replace"
   ]
 }

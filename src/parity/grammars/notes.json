@@ -41,7 +41,10 @@
     "--commit",
     "--abort",
     "--bogus-flag",
-    "-Z"
+    "-Z",
+    "--ref=review",
+    "--ref=other",
+    "--ref=refs/notes/review"
   ],
   "positionals": [
     "",
@@ -63,7 +66,19 @@
     "oct-side",
     "HEAD^2",
     "HEAD^3",
-    "HEAD^4"
+    "HEAD^4",
+    "merge",
+    "prune",
+    "copy",
+    "remove",
+    "add",
+    ["merge", "other"],
+    ["merge", "review"],
+    ["show", "HEAD~1"],
+    ["copy", "HEAD~1", "HEAD"],
+    ["remove", "HEAD~2"],
+    "HEAD~2",
+    "note1.txt"
   ],
   "shapes": [
     "linear",
@@ -78,6 +93,7 @@
     "packed",
     "behind-remote",
     "worktree",
-    "stashed"
+    "stashed",
+    "notes-replace"
   ]
 }

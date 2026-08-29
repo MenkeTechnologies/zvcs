@@ -61,7 +61,12 @@
     "important.log",
     "notes.tmp",
     "é.txt",
-    "é-new.txt"
+    "é-new.txt",
+    "ita-new.txt",
+    "sub/ita-nested.txt",
+    "ita-gone.txt",
+    "both.txt",
+    "tracked.txt"
   ],
   "shapes": [
     "linear",
@@ -78,6 +83,7 @@
     "whitespace",
     "stashed",
     "patches",
-    "decomposed-paths"
+    "decomposed-paths",
+    "intent-to-add"
   ]
 }

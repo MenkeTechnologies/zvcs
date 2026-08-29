@@ -16,7 +16,8 @@
     "--exclude=main",
     "--exclude=v0.1.0",
     "--exclude=refs/heads/*",
-    "--no-exclude"
+    "--no-exclude",
+    "--refs=refs/tags/outer*"
   ],
   "positionals": [
     "",
@@ -47,7 +48,11 @@
     "div",
     "FETCH_HEAD",
     "refs/remotes/origin/main",
-    "./.remote.git"
+    "./.remote.git",
+    "inner",
+    "outer",
+    "outermost",
+    "light-to-tag"
   ],
   "shapes": [
     "linear",
@@ -59,6 +64,7 @@
     "octopus",
     "behind-remote",
     "packed",
-    "worktree"
+    "worktree",
+    "tag-chain"
   ]
 }

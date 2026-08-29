@@ -153,6 +153,59 @@ pub struct Grammar {
 ///    way — which is why `core.commitGraph` is in [`CONFIG_KEYS`], and why that
 ///    key would have been worth nothing until this shape was drawn.
 ///
+/// The four below *those* are the same argument again, made by four shapes that
+/// change what a walk is walking rather than what the history is: two substitute
+/// objects underneath it, one truncates it, and one leaves objects out of it.
+/// Each was measured on stock 2.55.0 on the shape itself before it was added.
+///
+///  * `NotesReplace` — `refs/replace/*` present before the case runs. Verified:
+///    `log --oneline` prints `0dc1e64 notes: replacement for commit 1` where
+///    `--no-replace-objects log --oneline` prints `0dc1e64 notes: commit 1` over
+///    the same four ids, and `cat-file -p HEAD:README.md` answers
+///    `# replaced readme` against the flag's `# fixture`. The substitution is
+///    invisible to a port that writes `refs/replace/*` and never reads it, and a
+///    corpus agent established that is exactly what the port does — which no
+///    *writing* case can show, because the write itself is correct. It also
+///    widens the ref store every reader here enumerates: `rev-parse --all`
+///    prints six ids on this shape (three `refs/notes/*`, two `refs/replace/*`,
+///    `main`) where `Linear` prints one.
+///  * `TagChain` — a tag object pointing at a tag object pointing at a tag
+///    object, plus tags on a blob and on a tree. It reaches a walk through
+///    `--all`/`--tags`/`--decorate` without any case having to name a tag:
+///    verified, `log --oneline --decorate --all` prints
+///    `7e36e3a (tag: outermost, tag: outer, tag: light-to-tag, tag: inner)` —
+///    four decorations on one commit, three of which are only found by peeling
+///    a tag whose target is another tag — `rev-list --tags` reaches the commit
+///    through the chain, and `rev-list --all --objects` lists five tag objects
+///    by name and carries `blobtag`'s blob and `treetag`'s tree behind them.
+///    (`cat-file --batch-all-objects --batch-check` on this shape counts
+///    5 blob / 4 commit / 5 tag / 5 tree.) Every other shape's tags peel in
+///    one step, so an implementation that peels once scored the same as one that
+///    peels to the end.
+///  * `Shallow` — a real `.git/shallow`, and the parents named in it genuinely
+///    absent from the object store. Verified: `log --oneline` prints **two**
+///    commits and stops at the graft (rc 0) where the same history unshallowed
+///    prints six, `rev-list --count --all` is `4`, and
+///    `rev-parse --is-shallow-repository` — a flag already in `rev-parse`'s pool
+///    that answers `false` on every other shape in this file — answers `true`.
+///    A walk that does not consult the graft list has to fail on a parent it
+///    cannot read, which is a whole class of answer no complete repository can
+///    ask for.
+///  * `Promisor` — objects missing on purpose, with a peer that can supply them.
+///    `rev-list`'s pool already carries `--missing=print`, `--missing=allow-any`,
+///    `--filter=`, `--filter-provided-objects` and
+///    `--exclude-promisor-objects`, and until this shape every one of them was
+///    argument parsing over a store with nothing absent. Verified:
+///    `rev-list --missing=print --objects --all` prints three `?`-prefixed ids
+///    (`?64055193…`, `?0880af1b…`, `?7eefafca…`) and `status --porcelain` is
+///    empty, which is the pairing that separates a partial clone from damage.
+///
+/// Nothing here can reach the network and nothing here can block. Both shapes
+/// with a peer name it `./.remote.git` *inside the fixture* (`remote.origin.url`
+/// verified to read exactly that), so a lazy fetch is a local path: timed
+/// against stock 2.55.0, `log -p --oneline` on `Promisor` fetches all three
+/// absent blobs and returns in 0.67s wall.
+///
 /// `Symlinks` and `Damaged` are deliberately **not** here. Neither changes what
 /// a walk answers — one differs in a file mode and one in a broken ref and a
 /// corrupt loose object — so both are drawn by [`STORE_SHAPES`] instead, which
@@ -168,6 +221,10 @@ const REV_SHAPES: &[Shape] = &[
     Shape::CrissCross,
     Shape::Cherry,
     Shape::CommitGraph,
+    Shape::NotesReplace,
+    Shape::TagChain,
+    Shape::Shallow,
+    Shape::Promisor,
 ];
 /// [`REV_SHAPES`] plus the two shapes whose *stores* are unusual rather than
 /// whose history is, for the three readers whose subject is a store.
@@ -222,9 +279,19 @@ const STORE_SHAPES: &[Shape] = &[
     Shape::CrissCross,
     Shape::Cherry,
     Shape::CommitGraph,
+    Shape::NotesReplace,
+    Shape::TagChain,
+    Shape::Shallow,
+    Shape::Promisor,
     Shape::Symlinks,
     Shape::Damaged,
 ];
+
+/// The shapes [`STORE_SHAPES`] carries that [`REV_SHAPES`] does not, named once
+/// so `store_shapes_extends_rev_shapes` can assert the containment *and* the
+/// size without a hard-coded count that a future addition would silently make
+/// meaningless.
+const STORE_ONLY_SHAPES: &[Shape] = &[Shape::Symlinks, Shape::Damaged];
 /// The shapes a command with no particular topology requirement is drawn
 /// against. Not `Shape::ALL`: several shapes exist for one verb apiece (a
 /// submodule, a sparse checkout, a decomposed path) and drawing every command
@@ -265,6 +332,89 @@ const ALL_SHAPES: &[Shape] = &[
     Shape::AwkwardPaths,
     Shape::Hooked,
     Shape::Symlinks,
+];
+
+/// [`ALL_SHAPES`] plus the three shapes whose **index** is in a state no other
+/// shape's is, for the three readers whose subject is the index and the worktree
+/// beside it: `status`, `diff` and `ls-files`.
+///
+/// The same judgement [`STORE_SHAPES`] documents, applied one layer down. None
+/// of the three says anything to a walking verb or to a ref-filter front end —
+/// they all descend from the same history everything else does — so membership
+/// in [`REV_SHAPES`] or in [`ALL_SHAPES`] would spend seven grammars' budgets on
+/// a repetition. What each one changes, verified against stock 2.55.0 on the
+/// shape:
+///
+///  * `IntentToAdd` — the third state between tracked and untracked.
+///    `status --short` prints ` A ita-new.txt` and ` A sub/ita-nested.txt`
+///    against `A  staged.txt` for a real staged add and `AM both.txt` for one
+///    that was edited after staging, and ` D ita-gone.txt` for an entry whose
+///    blob is the empty one and whose file is gone. `diff --name-status` reports
+///    the two intent-to-add paths as **additions in the worktree** (`A
+///    ita-new.txt`) while `diff --cached --name-status` hides them and names
+///    only `both.txt` and `staged.txt` — which is precisely what
+///    `--ita-visible-in-index`/`--ita-invisible-in-index` flip, and both flags
+///    were argument parsing until this shape. The bit itself never appears in a
+///    listing: `ls-files --stage -v ita-new.txt` is `H 100644 e69de29b… 0` for
+///    the path, the same line an ordinary staged add of an empty file prints,
+///    so `status` and `diff` are the only readers in this harness that can say
+///    an entry is an intent rather than a record.
+///  * `PendingRename` — the `2` record, half of `--porcelain=v2`'s grammar and
+///    never once produced by this corpus. Verified:
+///    `status --porcelain=v2` prints `2 R. … R100 pure-renamed.txt\tpure.txt`,
+///    `2 RM … R100 near-renamed.txt\tnear.txt` (a rename in the index column and
+///    a modification in the worktree column at once), `2 R. … R60
+///    far-renamed.txt\tfar.txt` and `2 .R … R100 wt-renamed.txt\twt.txt` — a
+///    rename that is not staged at all. Five pairs at four similarity indices is
+///    what makes `--find-renames=<n>`, `--no-renames` and `status.renames` sort
+///    something instead of agreeing with each other.
+///  * `Rerere` — a merge in progress whose worktree holds the **recorded
+///    resolution** while the index still holds stages 1/2/3. `diff` renders it
+///    `diff --cc other.txt` with `++resolved other`, which is a combined diff
+///    whose result side matches neither parent and carries no conflict markers.
+///    [`Shape::Conflicted`] can only ever produce the marker form, so `--cc` and
+///    `--combined-all-paths` had one input. Its `status` answer (`UU`, `AA`) is
+///    the same one `Conflicted` gives and is not why it is here; what every draw
+///    against it also buys is free, because `runner`'s op-state probe reads
+///    `MERGE_RR` and no other shape has one.
+const INDEX_SHAPES: &[Shape] = &[
+    Shape::Linear,
+    Shape::Branched,
+    Shape::Merged,
+    Shape::Dirty,
+    Shape::Conflicted,
+    Shape::Detached,
+    Shape::AwkwardPaths,
+    Shape::Hooked,
+    Shape::Symlinks,
+    Shape::IntentToAdd,
+    Shape::PendingRename,
+    Shape::Rerere,
+];
+
+/// [`ALL_SHAPES`] plus the one shape that has notes **before the case runs**.
+///
+/// Every `notes` subcommand that is not `add` reads a store, and on every other
+/// shape that store is empty — so `list`, `show`, `merge`, `prune`, `copy`,
+/// `get-ref` and the whole `--ref=` dimension were being measured on one answer
+/// ("no note found") that says nothing about which ref was selected. Verified
+/// against stock 2.55.0 on [`Shape::NotesReplace`]: `notes list` prints two
+/// `<note> <annotated>` pairs, and `notes merge other` — the third ref, which
+/// annotates the same commit as the default one with different text — is rc 1
+/// with `CONFLICT (add/add): Merge conflict in notes for object 7b6d7d59…` and
+/// parks `NOTES_MERGE_REF`/`NOTES_MERGE_WORKTREE`, a state `probe_op_state`
+/// reads by name and that no other shape can reach.
+const NOTES_SHAPES: &[Shape] = &[
+    Shape::Linear,
+    Shape::Branched,
+    Shape::Merged,
+    Shape::Dirty,
+    Shape::Conflicted,
+    Shape::Detached,
+    Shape::AwkwardPaths,
+    Shape::Hooked,
+    Shape::Symlinks,
+    Shape::NotesReplace,
 ];
 
 /// Rev-specs worth throwing at anything that resolves one. Includes forms that
@@ -1720,6 +1870,45 @@ fn shape_dirs(shape: Shape) -> &'static [&'static str] {
         // A port that takes its prefix from the logical path answers
         // `link-to-dir/` and is right about everything else.
         Shape::Symlinks => &["dir", "link-to-dir"],
+        // Three linked worktrees instead of one, and the third is the point:
+        // `.git/worktrees/wt-gone` is registered administrative state whose
+        // checkout no longer exists, so a case run from inside it is asking what
+        // a command answers when the *other* end of the pair it is standing in
+        // is gone. `wt-gone` itself is deliberately absent from this list for
+        // the reason the doc comment above gives — it does not exist, and a
+        // directory the runner conjured is a different discovery situation from
+        // one git found.
+        Shape::WorktreeLocked => &[
+            "wt",
+            "wt-open",
+            ".git/worktrees",
+            ".git/worktrees/wt",
+            ".git/worktrees/wt-open",
+            ".git/worktrees/wt-gone",
+        ],
+        // The subdirectory each of these tracks a path below, so the prefix half
+        // of a discovery answer is exercised on the shape whose index is the
+        // reason it is drawn at all: `sub/ita-nested.txt` is an intent-to-add
+        // entry below the top level, and `pkg/deep-renamed.txt` is a staged
+        // rename below it.
+        Shape::IntentToAdd => &["sub"],
+        Shape::PendingRename => &["pkg"],
+        // `.git/rr-cache`, which only this shape has: a directory *inside* the
+        // git dir holding the preimage/postimage pairs, so a case drawn here is
+        // both inside `.git` and inside a store no other shape carries.
+        Shape::Rerere => &[".git/rr-cache"],
+        // The three shapes that keep a bare peer inside the fixture, spelled the
+        // same way [`Shape::BehindRemote`] is. Standing in a bare repository is
+        // the discovery situation that separates `--is-bare-repository`,
+        // `--show-toplevel` and `--show-cdup` from their answers everywhere
+        // else, and each of these three peers differs from `BehindRemote`'s in
+        // what it holds — hooks, the shallow clone's source, the promisor's.
+        Shape::HooksFail => {
+            &[".remote.git", ".remote.git/refs", ".remote.git/objects", ".remote.git/hooks"]
+        }
+        Shape::Shallow | Shape::Promisor => {
+            &[".remote.git", ".remote.git/refs", ".remote.git/objects"]
+        }
         _ => &[],
     }
 }
@@ -2142,7 +2331,7 @@ pub fn grammars() -> Vec<Grammar> {
                 "--untracked-files", "--no-untracked-files",
             ],
             positionals: PATHS,
-            shapes: ALL_SHAPES,
+            shapes: INDEX_SHAPES,
         },
         // The flag list here described what `log` *prints*. What it selects — a
         // different engine each time — was almost entirely absent: history
@@ -2296,7 +2485,7 @@ pub fn grammars() -> Vec<Grammar> {
                 "--format=%(path) %(objectmode)", "--format=%(bogus)",
             ],
             positionals: PATHS,
-            shapes: ALL_SHAPES,
+            shapes: INDEX_SHAPES,
         },
         // The single most under-described grammar in this file, and the one whose
         // options are shared with `log`, `show`, `format-patch` and every other
@@ -2343,7 +2532,7 @@ pub fn grammars() -> Vec<Grammar> {
                 "--merge-base", "--cc", "--combined-all-paths", "--no-index",
             ],
             positionals: &["", "HEAD", "HEAD~1", "main", "main..HEAD", "README.md", "src"],
-            shapes: ALL_SHAPES,
+            shapes: INDEX_SHAPES,
         },
         // `show` dispatches on the *type* of what it is given — a commit, a tag,
         // a tree and a blob each take a different renderer — so the rev pool is
@@ -2406,8 +2595,22 @@ pub fn grammars() -> Vec<Grammar> {
                 "--sort=bogus", "--ignore-case", "-i", "--column", "--omit-empty",
                 "--format=%(objecttype) %(refname)", "--format=%(bogus)",
             ],
-            positionals: &["", "v0.*", "V0.*", "v0.1.0", "*", "no-such-tag"],
-            shapes: &[Shape::Branched, Shape::Linear],
+            positionals: &[
+                "", "v0.*", "V0.*", "v0.1.0", "*", "no-such-tag",
+                // The six names [`Shape::TagChain`] adds. Four of them do not
+                // peel to a commit in one step — `outer` and `outermost` point
+                // at another tag object, `blobtag` at a blob and `treetag` at a
+                // tree — which is a target this harness has never had.
+                // `%(objecttype) %(*objecttype)` separates them: verified
+                // against stock 2.55.0 on that shape,
+                // `tag --list --format='%(refname:short) %(objecttype)
+                // %(*objecttype)'` prints `blobtag tag blob`, `treetag tag
+                // tree` and `commit` for the other four, so the deref atom is
+                // answering about three different target types instead of
+                // printing `commit` six times.
+                "outermost", "outer", "inner", "light-to-tag", "blobtag", "treetag",
+            ],
+            shapes: &[Shape::Branched, Shape::Linear, Shape::TagChain],
         },
         // `describe` is a search with a budget, and the budget was not sampled.
         // `--candidates=` bounds how many tags it will consider — verified:
@@ -2425,8 +2628,21 @@ pub fn grammars() -> Vec<Grammar> {
                 "--candidates=0", "--candidates=1", "--candidates=99",
                 "--abbrev=0", "--abbrev=40", "--dirty=-X", "--broken=-B", "--debug",
             ],
-            positionals: &["", "HEAD", "main", "HEAD~1", "does-not-exist"],
-            shapes: &[Shape::Branched, Shape::Linear, Shape::Dirty],
+            positionals: &[
+                "", "HEAD", "main", "HEAD~1", "does-not-exist",
+                // `describe` peels whatever it is given before it searches, and
+                // on [`Shape::TagChain`] that peel is three deep and sometimes
+                // does not end at a commit at all. Verified against stock
+                // 2.55.0 on that shape: `describe` is `inner-2-g725c7d5` — the
+                // distance is counted from a tag reached through two other tag
+                // objects — `describe outermost` is `inner`, and
+                // `describe blobtag` is `fatal: blobtag is neither a commit nor
+                // blob` with rc 128, which is a refusal `describe`'s own
+                // documentation does not obviously predict for a tag that peels
+                // to a blob.
+                "outermost", "light-to-tag", "blobtag", "treetag",
+            ],
+            shapes: &[Shape::Branched, Shape::Linear, Shape::Dirty, Shape::TagChain],
         },
         // `config` is the one command in this file that *reads the thing the
         // whole configuration dimension writes*, so it is where a scope or a
@@ -2577,7 +2793,7 @@ pub fn grammars() -> Vec<Grammar> {
                 "HEAD", "HEAD~1", "main", "feature", "other", "refs/notes/other",
                 "does-not-exist", "",
             ],
-            shapes: ALL_SHAPES,
+            shapes: NOTES_SHAPES,
         },
         // `worktree` had exactly one reachable subcommand. The generated pool is
         // `list`, `wt`, `wt/README.md`, `linked`, `does-not-exist` and two
@@ -2614,14 +2830,32 @@ pub fn grammars() -> Vec<Grammar> {
             positionals: &[
                 "add", "list", "lock", "move", "prune", "remove", "repair", "unlock",
                 "wt", "wt-gen", "wt/README.md", "linked",
+                // The two names [`Shape::WorktreeLocked`] adds beside its `wt`:
+                // one registered and open, one registered with its directory
+                // deleted. They are what makes `lock`, `unlock`, `remove` and
+                // `prune` answer three different ways to the same argv instead
+                // of one, and no other shape can spell either.
+                "wt-open", "wt-gone",
                 "HEAD", "main", "feature", "does-not-exist", "",
             ],
+            // `WorktreeLocked` is the whole lock protocol, which
+            // [`Shape::Worktree`] cannot pose: a case is one argv and cannot
+            // lock a worktree before asking about one. Verified against stock
+            // 2.55.0 on that shape: `worktree list --porcelain` prints
+            // `locked held by the fixture` for `wt` and
+            // `prunable gitdir file points to non-existent location` for
+            // `wt-gone` — two lines this harness had never printed — `worktree
+            // unlock wt-open` is `fatal: 'wt-open' is not locked` (rc 128),
+            // `worktree unlock wt` is rc 0, and `worktree remove wt` refuses
+            // with `fatal: cannot remove a locked working tree, lock reason:
+            // held by the fixture` (rc 128).
             shapes: &[
                 Shape::Linear,
                 Shape::Branched,
                 Shape::Detached,
                 Shape::Dirty,
                 Shape::Worktree,
+                Shape::WorktreeLocked,
             ],
         },
         // `reflog` is two commands again: a `log` front end over `.git/logs`, and
@@ -3332,6 +3566,18 @@ struct Stopper {
 ///   `pick-already-applied`    an operation in progress over a *clean* index
 ///   `gc-damaged-store`        a maintenance verb told to rewrite a store it
 ///                             cannot read
+///
+/// Four more were added with the nine shapes after those, held to the same rule
+/// — each run against stock 2.55.0 first, each entry recording the exit codes
+/// and parked files that were observed — and each reaching a premise that has no
+/// other route into this file:
+///
+///   `merge-rerere-replay`     a conflict git has seen before, replayed out of
+///                             `.git/rr-cache` inside the case
+///   `commit-hook-refused`     a hook that refuses, and the flag that skips it
+///   `push-hook-refused`       the same over a transport, then the refusal that
+///                             happens in the *receiving* repository
+///   `shallow-deepen`          a truncated history extended, then read
 const STOPPERS: &[Stopper] = &[
     Stopper {
         cmd: "cherry-pick",
@@ -3614,6 +3860,156 @@ const STOPPERS: &[Stopper] = &[
         shape: Shape::Damaged,
         setup: &[],
         entry: &[&["gc", "--prune=now"]],
+        entry_stdin: None,
+    },
+    // A conflict git has **seen before**, replayed out of `.git/rr-cache`.
+    //
+    // Every other premise in this list produces its parked state from the
+    // objects alone. This one produces it from a side store the merge machinery
+    // writes and reads and nothing else in the repository refers to, and until
+    // [`Shape::Rerere`] existed no fixture had one: a case is one argv, so it
+    // cannot conflict, resolve, and then ask about the resolution. The setup
+    // step unwinds the merge the shape is parked in and the entry re-runs it, so
+    // the replay happens **inside the case** rather than at build time — which
+    // is the only way stdout can show it.
+    //
+    // Verified against stock 2.55.0 on the shape:
+    //
+    //   merge --abort        rc 0, `status --porcelain` empty
+    //   merge rr-side        rc 1, and on stdout:
+    //       `Recorded preimage for 'fresh.txt'`
+    //       `Resolved 'other.txt' using previous resolution.`
+    //       `Resolved 'rr.txt' using previous resolution.`
+    //   status --short       `AA fresh.txt`, `UU other.txt`, `UU rr.txt`
+    //   cat rr.txt           `resolved one` / `base two` / `resolved three`
+    //                        — the recorded text, with no conflict markers
+    //   cat fresh.txt        `<<<<<<< HEAD` … the markers, still there
+    //   rerere status        `fresh.txt`      rerere remaining   `fresh.txt`
+    //
+    // So one entry step reaches all three outcomes at once: a resolution
+    // replayed, a preimage recorded, and an index whose stages disagree with a
+    // worktree that is not conflicted. `runner`'s op-state probe reads
+    // `MERGE_RR` by name, so a port that resolves from the cache without
+    // updating it — or that updates it without resolving — is a state difference
+    // at this step. `rerere.enabled` is in the shape's repository config, so the
+    // replay does not depend on a drawn configuration key.
+    Stopper {
+        cmd: "merge",
+        name: "merge-rerere-replay",
+        shape: Shape::Rerere,
+        setup: &[&["merge", "--abort"]],
+        entry: &[&["merge", "rr-side"]],
+        entry_stdin: None,
+    },
+    // A hook that **refuses**, mid-workflow.
+    //
+    // [`Shape::Hooked`] installs hooks that all exit 0, deliberately, so until
+    // [`Shape::HooksFail`] existed `--no-verify` could not be measured at all:
+    // with no hook that refuses, skipping the hooks and running them are the
+    // same outcome. This is the premise that separates them, and the separation
+    // is drawn rather than fixed: a third of these walks decorate the entry from
+    // `commit`'s own flag pool, which carries `--no-verify`, `-n`, `--dry-run`
+    // and `--amend` — so a share of them turn the refusal into something else on
+    // purpose, which is the same gate every other stopper's entry is under.
+    //
+    // Verified against stock 2.55.0 on the shape, whose worktree is left dirty
+    // so `commit -a` has something to be refused over:
+    //
+    //   commit -a -m gen              rc 1, `pre-commit refuses` on stderr
+    //   status --short                ` M side-base.txt`, `?? hook-pre-commit.txt`
+    //                                 — the hook ran and wrote, and nothing
+    //                                 committed
+    //   log --oneline -1              unchanged
+    //   commit -a -m gen --no-verify  rc 0, `[main a53d299] gen`
+    //   log -1 --format=%B            `gen` **plus** `prepared-by-hook`
+    //   ls hook-*.txt                 pre-commit, prepare-commit-msg, post-commit
+    //
+    // The last two lines are the finding this premise exists for and neither is
+    // obvious: `--no-verify` does **not** skip `prepare-commit-msg`, so a commit
+    // that bypassed the gate still went through the message rewrite, and
+    // `post-commit` exits 1 while the commit stands, because git ignores that
+    // hook's status. A port that treats `--no-verify` as "run no hooks", or that
+    // propagates a `post-commit` failure, disagrees on exactly one of those and
+    // on nothing else.
+    Stopper {
+        cmd: "commit",
+        name: "commit-hook-refused",
+        shape: Shape::HooksFail,
+        setup: &[],
+        entry: &[&["commit", "-a", "-m", "gen"]],
+        entry_stdin: None,
+    },
+    // The same refusal over a transport, and then the one `--no-verify` cannot
+    // bypass.
+    //
+    // Two entry steps because the pair is the measurement. The first is refused
+    // on **this** side by `pre-push`; the second skips the local hooks and is
+    // refused on the **other** side by the peer's `update` hook, which no flag
+    // on this side can reach. Verified against stock 2.55.0 on the shape, whose
+    // peer is the bare `./.remote.git` inside the fixture:
+    //
+    //   push origin main                 rc 1, `pre-push refuses`,
+    //       `error: failed to push some refs to './.remote.git'`;
+    //       `hook-pre-push.txt` written, remote refs unmoved
+    //   push --dry-run origin main       rc 1 — the **same** refusal: a dry run
+    //       still runs the hook
+    //   push --no-verify origin main     rc 0, `91ddf90..f32913c  main -> main`
+    //   push --no-verify origin veto     rc 1,
+    //       `remote: error: hook declined to update refs/heads/veto`,
+    //       `! [remote rejected] veto -> veto (hook declined)`
+    //
+    // `--dry-run` and `--no-verify` are two flags a port is likely to wire to
+    // one "skip the side effects" branch, and stock says they do opposite
+    // things: one runs the hook and writes nothing, the other writes and runs no
+    // hook. Both are in `push`'s flag pool, so the decoration draw reaches that
+    // pairing on its own. `runner::probe_peer` takes the peer's ref list and
+    // object census after every step, so which of the two refusals moved the
+    // remote is answered rather than inferred.
+    //
+    // Nothing here can reach the network: the peer is a relative path inside the
+    // fixture and every copy resolves to its own.
+    Stopper {
+        cmd: "push",
+        name: "push-hook-refused",
+        shape: Shape::HooksFail,
+        setup: &[],
+        entry: &[&["push", "origin", "main"], &["push", "--no-verify", "origin", "veto"]],
+        entry_stdin: None,
+    },
+    // A shallow repository deepened, and then read.
+    //
+    // Not an interrupted operation — the same exception [`gc-damaged-store`]
+    // above is, and for the same reason: the machinery fits, and nothing else in
+    // this file can reach the premise. `fetch`'s generated grammar carries
+    // `--deepen=1`, `--depth=`, `--unshallow`, `--shallow-since=` and
+    // `--update-shallow`, and its shape list — which this file does not own —
+    // has no `Shallow`, so every one of those flags has only ever been drawn
+    // against a repository that had nothing to deepen.
+    //
+    // Verified against stock 2.55.0 on the shape:
+    //
+    //   log --oneline                 two commits, stopping at the graft
+    //   .git/shallow                  `bd1c76c6…`, `fc222945…`
+    //   fetch --deepen=1              rc 0, 0.12s wall
+    //   .git/shallow                  rewritten: `db3a7471…`, `edfab1b7…`
+    //   log --oneline                 three commits
+    //   rev-parse --is-shallow-repository   `true`
+    //   fsck                          rc 0, silent
+    //   fetch --unshallow             rc 0, 0.10s; `.git/shallow` **removed**,
+    //                                 `log --oneline` six commits
+    //
+    // `.git/shallow` is in `runner`'s op-state file list, so the graft boundary
+    // is compared after every step of the walk whatever the step was — which is
+    // what makes the observers worth their invocation here even though none of
+    // them prints the file. The transport is the fixture's own `./.remote.git`;
+    // no draw can block on a fetch that cannot complete, because the one it can
+    // make is a local directory read.
+    Stopper {
+        cmd: "fetch",
+        name: "shallow-deepen",
+        shape: Shape::Shallow,
+        setup: &[],
+        entry: &[&["fetch", "--deepen=1"]],
         entry_stdin: None,
     },
 ];
@@ -4192,6 +4588,180 @@ const ROUND_TRIPS: &[RoundTrip] = &[
     // `bisect reset` closes the pair whether or not `replay` already reset:
     // verified rc 0 both while bisecting and with no bisection in progress, so
     // the sequence ends on the same state it started from either way.
+    // ----------------------------------------------------------------------
+    // Five pairs on the shapes added for the states they move: an index bit, a
+    // staged rename, a worktree lock, a tag object in the middle of a chain, and
+    // an object that is not in the repository yet. Each is expressible on
+    // exactly one shape and on no other, which is why none of them could be
+    // written before those shapes existed — and each costs one entry point,
+    // which is `--fuzz-sequences` sequences of four to eight steps per side.
+    // ----------------------------------------------------------------------
+
+    // The intent-to-add bit, on and off. The bit is not in any listing: verified
+    // against stock 2.55.0, `ls-files --stage -v ita-new.txt` reads
+    // `H 100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0` at the start of this
+    // pair and the identical line at the end of it, which is also what an
+    // ordinary staged add of an empty file would print. So an inverse that
+    // restores the entry and forgets the intent leaves every listing right and
+    // one rendering wrong — `status` says `AM ita-new.txt` where ` A
+    // ita-new.txt` belongs, because the index would hold real content the
+    // worktree disagrees with rather than a placeholder it is allowed to.
+    //
+    // The inverse is two steps because git has no verb that clears the bit:
+    // `rm --cached` drops the entry and `add -N` re-creates it as an intent.
+    // Verified against stock 2.55.0 on [`Shape::IntentToAdd`], comparing
+    // `status --short` and `ls-files --stage` before and after the whole pair:
+    //
+    //   before                 ` A ita-new.txt`
+    //   add ita-new.txt        `A  ita-new.txt`   (rc 0)
+    //   rm --cached -f …       `rm 'ita-new.txt'` (rc 0)
+    //   add -N ita-new.txt     rc 0
+    //   after                  byte-identical to before, both probes
+    //
+    // A port whose `add -N` writes a real entry ends the pair with `A ` where
+    // ` A` belongs and every other reader agrees with stock; one whose plain
+    // `add` preserves the bit never leaves the start state at all, and the
+    // observer between the halves is what tells those two apart.
+    RoundTrip {
+        cmd: "add",
+        name: "intent-to-add-materialize",
+        shape: Shape::IntentToAdd,
+        forward: &[&["add", "ita-new.txt"]],
+        inverse: &[&["rm", "--cached", "-f", "ita-new.txt"], &["add", "-N", "ita-new.txt"]],
+        forward_stdin: None,
+    },
+    // A staged rename **cancelled**, and staged again. `mv-there-and-back` above
+    // renames a path that history knows; this one renames the destination half
+    // of a rename that is already sitting in the index, so the forward step has
+    // to collapse an existing pair rather than create one — and the record it
+    // removes is the one this corpus has never produced.
+    //
+    // Verified against stock 2.55.0 on [`Shape::PendingRename`], comparing
+    // `status --porcelain=v2` and `ls-files --stage` across the pair:
+    //
+    //   before   `2 R. N… R100 pure-renamed.txt<TAB>pure.txt` — the rename
+    //            record, beside `2 RM … R100 near-renamed.txt` (renamed in the
+    //            index and modified in the worktree at once), `2 R. … R60
+    //            far-renamed.txt` and `2 .R … R100 wt-renamed.txt` (a rename
+    //            that is not staged at all)
+    //   mv pure-renamed.txt pure.txt   rc 0; the `pure` record is **gone** from
+    //            `status --short`, which now lists six paths where it listed
+    //            seven
+    //   mv pure.txt pure-renamed.txt   rc 0
+    //   after    byte-identical to before, both probes
+    //
+    // The port cannot emit a `2` record at all, so the forward half is where it
+    // stops agreeing and the inverse is what proves the index came back rather
+    // than merely looking settled.
+    RoundTrip {
+        cmd: "mv",
+        name: "pending-rename-cancel",
+        shape: Shape::PendingRename,
+        forward: &[&["mv", "pure-renamed.txt", "pure.txt"]],
+        inverse: &[&["mv", "pure.txt", "pure-renamed.txt"]],
+        forward_stdin: None,
+    },
+    // A worktree lock released and re-taken **with its reason**.
+    // `worktree-lock-unlock` above starts from an unlocked worktree and locks it
+    // with no reason, which is the empty-file half of the protocol;
+    // [`Shape::WorktreeLocked`] starts from a locked one, so this pair runs the
+    // other way round and carries the string. The two are different files on
+    // disk and different answers from `worktree list --porcelain`.
+    //
+    // Verified against stock 2.55.0 on the shape:
+    //
+    //   .git/worktrees/wt/locked   `held by the fixture\n` (20 bytes, od -c)
+    //   worktree list --porcelain  `locked held by the fixture` for `wt`,
+    //                              `prunable gitdir file points to
+    //                              non-existent location` for `wt-gone`
+    //   worktree unlock wt         rc 0; `locked` gone from the admin directory
+    //   worktree lock --reason …   rc 0; `locked` back, byte for byte
+    //
+    // `worktree list` is already an observer, so the middle of the pair prints
+    // the state the forward half changed. A port that writes an empty `locked`
+    // for a `--reason` lock, or that reports `locked` without the reason, ends
+    // the round trip looking correct to a presence check and different to this
+    // one.
+    RoundTrip {
+        cmd: "worktree",
+        name: "worktree-unlock-relock",
+        shape: Shape::WorktreeLocked,
+        forward: &[&["worktree", "unlock", "wt"]],
+        inverse: &[&["worktree", "lock", "--reason", "held by the fixture", "wt"]],
+        forward_stdin: None,
+    },
+    // A tag object in the middle of a chain, deleted and rebuilt **to the same
+    // id**. `tag-add-delete` above creates a lightweight ref and removes it;
+    // this one destroys an object other refs point through and reconstructs it,
+    // which is only expressible on [`Shape::TagChain`] — no other shape has a
+    // tag whose target is a tag.
+    //
+    // The equality of the two ids is the assertion, and it holds because
+    // `env::harden` pins the tagger identity and `GIT_COMMITTER_DATE`, so a tag
+    // object is a function of its target, its name and its message alone.
+    // Verified against stock 2.55.0 on the shape:
+    //
+    //   rev-parse outermost   `5d511ffb740e87283f0693f2d6a2edffd050258e`
+    //   tag -d outermost      rc 0, `Deleted tag 'outermost' (was 5d511ff)`
+    //   tag -a outermost -m … outer   rc 0 (a nested-tag hint on stderr, which
+    //                         no case compares)
+    //   rev-parse outermost   `5d511ffb740e87283f0693f2d6a2edffd050258e` again
+    //   cat-file -p outermost `object 24b224a9…` / `type tag` / `tag outermost`
+    //   describe --tags outermost   `inner` — the peel still reaches the commit
+    //
+    // A port whose `tag -a` writes the header fields in a different order, or
+    // that resolves `outer` to the commit it eventually peels to rather than to
+    // the tag object, ends with a different id at the same refname and every
+    // observer that prints a name still agrees.
+    RoundTrip {
+        cmd: "tag",
+        name: "tag-chain-delete-recreate",
+        shape: Shape::TagChain,
+        forward: &[&["tag", "-d", "outermost"]],
+        inverse: &[&["tag", "-a", "outermost", "-m", "outermost tag, points at outer", "outer"]],
+        forward_stdin: None,
+    },
+    // A blob that is **not in the repository**, demanded by a step and supplied
+    // by the promisor remote.
+    //
+    // The one pair here whose halves are not object-store-neutral, and that is
+    // the point rather than a defect in it: the forward half checks out a branch
+    // whose content was filtered away at clone time, so git has to notice the
+    // absence, ask the promisor for it, and write what comes back. Every other
+    // shape in this harness has every object it references, which left
+    // `--filter=`, `rev-list --missing=`, `--exclude-promisor-objects` and the
+    // whole lazy-fetch path with no repository to be true of.
+    //
+    // Verified against stock 2.55.0 on [`Shape::Promisor`]:
+    //
+    //   rev-list --missing=print --objects --all | grep -c '^?'   `3`
+    //   .git/objects/pack       two promisor packs
+    //   checkout pc-side        rc 0, `Switched to a new branch 'pc-side'`,
+    //                           0.12s wall
+    //   cat hist.txt            `hist v1` — the filtered blob, now present
+    //   … | grep -c '^?'        `2`
+    //   .git/objects/pack       a **third** promisor pack
+    //   status --porcelain      empty, before and after
+    //   checkout main           rc 0, 0.02s
+    //
+    // `probe_storage` elides the checksum inside a pack filename and keeps
+    // duplicates, so the fetched pack shows up as one more `pack/pack-<hash>`
+    // line on both sides rather than as a name two implementations could not be
+    // expected to agree on. A port that treats a promisor absence as damage
+    // fails at the checkout; one that fetches more than it was asked for is a
+    // storage line the other side does not have.
+    //
+    // The remote is the fixture's own `./.remote.git` — verified,
+    // `config remote.origin.url` reads exactly that — so the fetch is a local
+    // directory read and cannot block or leave the machine.
+    RoundTrip {
+        cmd: "checkout",
+        name: "promisor-blob-on-demand",
+        shape: Shape::Promisor,
+        forward: &[&["checkout", "pc-side"]],
+        inverse: &[&["checkout", "main"]],
+        forward_stdin: None,
+    },
     RoundTrip {
         cmd: "bisect",
         name: "bisect-log-replay",
@@ -4520,13 +5090,17 @@ mod tests {
                 shape.name()
             );
         }
-        for shape in [Shape::Symlinks, Shape::Damaged] {
-            assert!(STORE_SHAPES.contains(&shape), "{} is what STORE_SHAPES is for", shape.name());
-            assert!(!REV_SHAPES.contains(&shape), "{} is not a history", shape.name());
+        for shape in STORE_ONLY_SHAPES {
+            assert!(STORE_SHAPES.contains(shape), "{} is what STORE_SHAPES is for", shape.name());
+            assert!(!REV_SHAPES.contains(shape), "{} is not a history", shape.name());
         }
         // The pool that decides what a *walk* reads must not silently become the
-        // pool that decides what a store reader reads.
-        assert_eq!(STORE_SHAPES.len(), REV_SHAPES.len() + 2);
+        // pool that decides what a store reader reads. Counted against
+        // [`STORE_ONLY_SHAPES`] rather than against a literal, so the assertion
+        // keeps its meaning when either pool grows: a shape added to
+        // `STORE_SHAPES` alone fails here unless it is also declared to be one
+        // of the store-only ones.
+        assert_eq!(STORE_SHAPES.len(), REV_SHAPES.len() + STORE_ONLY_SHAPES.len());
     }
 
     /// Every config key has values, and no value is an absolute path — config

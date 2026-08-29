@@ -104,7 +104,17 @@
     "link-to-dir",
     "dir/link-up",
     "empty.txt",
-    "stray-link"
+    "stray-link",
+    "outermost",
+    "light-to-tag",
+    "blobtag",
+    "a.txt",
+    "hf-side",
+    "veto",
+    "side-base.txt",
+    "pc-side",
+    "hist.txt",
+    "main~3"
   ],
   "shapes": [
     "linear",
@@ -125,6 +135,9 @@
     "mergeable-dirty",
     "mergeable-staged",
     "decomposed-paths",
-    "symlinks"
+    "symlinks",
+    "tag-chain",
+    "hooks-fail",
+    "promisor"
   ]
 }

@@ -177,7 +177,24 @@
     "outside/stray.txt",
     "root.txt",
     "é.txt",
-    "é-new.txt"
+    "é-new.txt",
+    "rr.txt",
+    "other.txt",
+    "fresh.txt",
+    "ita-new.txt",
+    "sub/ita-nested.txt",
+    "ita-gone.txt",
+    "both.txt",
+    "tracked.txt",
+    "pure-renamed.txt",
+    "near-renamed.txt",
+    "far-renamed.txt",
+    "wild-renamed.txt",
+    "wt-renamed.txt",
+    "copy-two.txt",
+    "pkg/deep-renamed.txt",
+    "copy.txt",
+    "pkg"
   ],
   "shapes": [
     "linear",
@@ -195,6 +212,9 @@
     "stashed",
     "mergeable-dirty",
     "mergeable-staged",
-    "decomposed-paths"
+    "decomposed-paths",
+    "rerere",
+    "intent-to-add",
+    "pending-rename"
   ]
 }

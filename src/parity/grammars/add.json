@@ -90,7 +90,12 @@
     "empty.txt",
     "link-to-file",
     "dir/link-up",
-    "patches"
+    "patches",
+    "ita-new.txt",
+    "sub/ita-nested.txt",
+    "ita-gone.txt",
+    "both.txt",
+    "tracked.txt"
   ],
   "shapes": [
     "linear",
@@ -111,6 +116,7 @@
     "decomposed-paths",
     "mergeable-dirty",
     "mergeable-staged",
-    "symlinks"
+    "symlinks",
+    "intent-to-add"
   ]
 }

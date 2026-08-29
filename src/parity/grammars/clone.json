@@ -114,6 +114,8 @@
     "worktree",
     "octopus",
     "renamed",
-    "attributes"
+    "attributes",
+    "shallow",
+    "promisor"
   ]
 }

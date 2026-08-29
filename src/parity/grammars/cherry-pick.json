@@ -84,7 +84,8 @@
     "topic~1",
     "main^",
     "main..topic",
-    "topic..main"
+    "topic..main",
+    "hf-side"
   ],
   "shapes": [
     "linear",
@@ -104,6 +105,8 @@
     "packed",
     "sparse",
     "decomposed-paths",
-    "cherry"
+    "cherry",
+    "hooks-fail",
+    "hooked"
   ]
 }

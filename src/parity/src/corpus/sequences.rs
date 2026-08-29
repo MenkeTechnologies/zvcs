@@ -27,6 +27,16 @@
 //!    property here — a `--abort` that half-cleans looks like success and is
 //!    only discovered later by whatever trips over the residue — so most
 //!    workflows below exist in an abort variant beside their continue variant.
+//!  * **The record one command leaves for the next.** Not every stateful thing
+//!    git writes is an operation in progress. A rerere resolution, a
+//!    `.git/shallow` graft, a pack's `.promisor` mark, a hook's own output, a
+//!    lock file under `.git/worktrees/`, a notes tree, an intent-to-add entry —
+//!    each is written by one invocation and consulted by a later one, and none
+//!    of them is reachable by a case, which is one argv against a pristine copy.
+//!    The families at the end of this file (hooks, rerere, shallow, promisor,
+//!    notes/replace, worktree locks, tag chains, intent-to-add and pending
+//!    renames) are all of that kind: the interesting step is never the first
+//!    one, because its premise has to be built and then agreed on.
 //!
 //! # Why the steps do their own setup
 //!
@@ -75,6 +85,14 @@ pub fn sequences() -> Vec<Sequence> {
     damaged(&mut s);
     symlinks(&mut s);
     commit_graph(&mut s);
+    hooks_fail(&mut s);
+    rerere_family(&mut s);
+    shallow(&mut s);
+    promisor(&mut s);
+    notes_replace(&mut s);
+    worktree_locked(&mut s);
+    tag_chain(&mut s);
+    intent_to_add(&mut s);
     s
 }
 
@@ -2731,5 +2749,1029 @@ fn commit_graph(out: &mut Vec<Sequence>) {
             .step(&["rev-list", "--all", "--count"])
             .step(&["log", "--oneline", "--all"])
             .step(&["fsck", "--no-progress", "--no-dangling"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// hooks that refuse: the control-flow edge `Shape::Hooked` deliberately omits
+// ---------------------------------------------------------------------------
+//
+// [`Shape::Hooked`] ships `exit 0` hooks, so "the hook ran" and "the hook was
+// skipped" produce the same repository and `--no-verify` was unmeasurable.
+// [`Shape::HooksFail`] ships hooks that *refuse* and hooks that *record their
+// arguments into the worktree*, which is what makes a sequence the right unit:
+// the refusal is one step, the bypass is the next, and the file the hook wrote
+// is read back by the step after that. `probe_worktree_content` enumerates
+// untracked files, so a `hook-<name>.txt` that one side wrote and the other did
+// not is a state difference at the step that ran the hook — no `status` needed.
+//
+// Which hooks refuse, verified against stock 2.55.0 in a copy of the shape:
+// `pre-commit`, `pre-push`, `pre-rebase` and `pre-auto-gc` exit 1;
+// `post-commit` exits 1 and git ignores it. `prepare-commit-msg` is **not**
+// skipped by `--no-verify` and `commit-msg` is, which is the pair that separates
+// "the gate was bypassed" from "the message rewrite still happened".
+
+fn hooks_fail(out: &mut Vec<Sequence>) {
+    // The `--no-verify` pair, over an index staged by hand at step 1 so the
+    // refusal at step 2 has nothing to roll back. Stock: step 2 exits 1 with
+    // empty stdout and writes `hook-pre-commit.txt`; step 4 commits, runs
+    // `prepare-commit-msg` (which `--no-verify` does not skip) and not
+    // `commit-msg`, so step 5's `%B` is `hooks: bypassed\n\nprepared-by-hook\n`.
+    //
+    // Step 5 is `log -1 --format=%B` rather than a `status`, because the whole
+    // question is *which* hooks a bypassed commit still went through, and the
+    // message body is the only place that shows up on stdout.
+    out.push(
+        Sequence::new("commit", "hooks-pre-commit-refuses-then-no-verify", Shape::HooksFail)
+            .step(&["add", "side-base.txt"])
+            .step(&["commit", "-m", "hooks: refused"])
+            .step(&["status", "--porcelain"])
+            .step(&["commit", "-m", "hooks: bypassed", "--no-verify"])
+            .step(&["log", "-1", "--format=%B"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // The same refusal reached through `commit -a`, which is a different
+    // question: `-a` stages the worktree *before* the hook runs, so a refused
+    // `commit -a` has to leave the index where it found it. Step 1 records the
+    // premise (` M side-base.txt`, unstaged) and step 3 re-asks it after the
+    // refusal — stock answers identically, because it rolls the implicit staging
+    // back.
+    out.push(
+        Sequence::new("commit", "hooks-commit-a-refused-leaves-the-index-alone", Shape::HooksFail)
+            .step(&["status", "--porcelain"])
+            .step(&["commit", "-am", "hooks: refused over -a"])
+            .step(&["status", "--porcelain"])
+            .step(&["diff", "--cached", "--name-status"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["commit", "-am", "hooks: bypassed over -a", "--no-verify"])
+            .step(&["log", "-1", "--format=%B"]),
+    );
+
+    // The merge hooks, which are a different set from the commit hooks: a
+    // `merge --no-ff` runs `pre-merge-commit`, `prepare-commit-msg`,
+    // `commit-msg` and `post-merge`, and never `pre-commit` — so this is the one
+    // path in the corpus where `commit-msg` runs at all (every `commit` here is
+    // stopped by `pre-commit` or bypassed with `--no-verify`, and `--no-verify`
+    // skips `commit-msg`).
+    //
+    // Step 1 is a read, so the merge at step 2 is compared against a premise both
+    // sides have already agreed on. Stock's step 3 prints
+    // `hooks: merge side\nprepared-by-hook\n\ncommit-msg-trailer\n`: two hooks
+    // rewrote the message in order, and the order is visible in the body.
+    out.push(
+        Sequence::new("merge", "hooks-no-ff-runs-the-merge-hooks", Shape::HooksFail)
+            .step(&["log", "--oneline", "-1"])
+            .step(&["merge", "--no-ff", "-m", "hooks: merge side", "hf-side"])
+            .step(&["log", "-1", "--format=%B"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "--graph", "-4"]),
+    );
+
+    // `pre-push` refuses, `push --no-verify` does not. The `ls-remote` on either
+    // side of each attempt is the assertion: a refusal that still moved the
+    // remote ref, or a bypass that did not, is invisible in the exit code.
+    //
+    // The port has `--no-verify` and `--dry-run` **inverted** on `push`, so step 3
+    // is expected to diverge: stock pushes `main` and the port runs the hook again
+    // and refuses. Steps 4-6 are written for the day that is fixed; step 1 and 2
+    // measure today — both sides run the hook, refuse, and write an identical
+    // `hook-pre-push.txt` naming the remote and the ref update it was handed.
+    out.push(
+        Sequence::new("push", "hooks-pre-push-refuses-then-no-verify", Shape::HooksFail)
+            .step(&["push", "origin", "main"])
+            .step(&["ls-remote", "origin"])
+            .step(&["push", "--no-verify", "origin", "main"])
+            .step(&["ls-remote", "origin"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // The refusal `--no-verify` cannot bypass, because it does not run on this
+    // side at all: the peer's `update` hook declines `refs/heads/veto` and
+    // accepts everything else. Stock's step 2 exits 1 with the remote's own
+    // `remote: update refuses …` prefix on stderr and leaves the peer untouched;
+    // step 3 must show `veto` absent from `ls-remote` while `main` moved.
+    //
+    // Parked behind the same `--no-verify` inversion as the sequence above — the
+    // port refuses at step 2 for the *local* hook's reason — and left in place
+    // rather than weakened, because the peer-side refusal is a kind of failure
+    // nothing else in this corpus reaches.
+    out.push(
+        Sequence::new("push", "hooks-peer-update-hook-vetoes-one-ref", Shape::HooksFail)
+            .step(&["ls-remote", "origin"])
+            .step(&["push", "--no-verify", "origin", "veto"])
+            .step(&["ls-remote", "origin"])
+            .step(&["push", "--no-verify", "origin", "main"])
+            .step(&["ls-remote", "origin"]),
+    );
+
+    // `pre-rebase`, which has no `--no-verify` to bypass it — `git rebase` has no
+    // such option — so the only thing to measure is that the refusal is total.
+    //
+    // The stash at step 1 exists because `rebase` checks the worktree *before* it
+    // runs the hook: the shape is dirty, and without the stash step 3 would be
+    // refused for being dirty and the hook would never run. Step 6 is
+    // `rebase --abort` and must find nothing in progress; step 7 restores the
+    // dirt, so the sequence ends where it started plus the hook's own record.
+    //
+    // No `strict`: the refusal at step 6 is mid-sequence, and comparing its
+    // message would stop the workflow before the `stash pop` that proves the
+    // refused rebase left the stash reachable.
+    out.push(
+        Sequence::new("rebase", "hooks-pre-rebase-refuses-and-nothing-moves", Shape::HooksFail)
+            .step(&["stash", "push", "-m", "hooks-rebase"])
+            .step(&["status", "--porcelain"])
+            .step(&["rebase", "hf-side"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["rebase", "--abort"])
+            .step(&["stash", "pop"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `pre-auto-gc`, the hook whose whole contract is that a *veto stops the
+    // collect*. Reaching it needs `gc --auto` to decide a collect is due, and
+    // the decision is `too_many_packs || too_many_loose_objects`; the loose-object
+    // estimate samples `objects/17` and cannot be steered by a fixture this size,
+    // so steps 1-3 manufacture the pack count instead: `gc` packs everything into
+    // one, `stash push` writes fresh loose objects, and `repack` puts those into a
+    // second pack. With `gc.autoPackLimit=1` two packs is over the limit.
+    //
+    // `stash push` rather than a `commit` for the loose objects, because every
+    // `commit` in this shape runs `prepare-commit-msg` and would put a hook
+    // marker into the worktree three steps before the step under test.
+    //
+    // Stock's step 5 runs the hook, is refused, and collects nothing — step 6 still
+    // reports two packs. A port that ignores `pre-auto-gc` repacks anyway, which
+    // is a write the user's hook forbade.
+    out.push(
+        Sequence::new("gc", "hooks-pre-auto-gc-vetoes-the-collect", Shape::HooksFail)
+            .with_config(&[("gc.autoPackLimit", "1")])
+            .step(&["gc"])
+            .step(&["stash", "push", "-m", "hooks-gc"])
+            .step(&["repack"])
+            .step(&["count-objects", "-v"])
+            .step(&["gc", "--auto"])
+            .step(&["count-objects", "-v"])
+            .step(&["status", "--porcelain"])
+            .step(&["stash", "list"]),
+    );
+
+    // `post-checkout`, whose arguments are the finding: git hands it the old HEAD,
+    // the new HEAD and a `1` for a branch switch, and the hook writes all three
+    // into `hook-post-checkout.txt`. That file is untracked, so the state probe
+    // reads it and step 3's `status` names it — which means a port that runs the
+    // hook with the *wrong* arguments is caught by content and one that does not
+    // run it at all by absence.
+    //
+    // Step 4 switches back, so the marker is overwritten with the reverse pair:
+    // the second checkout's arguments are not the first one's, and a hook invoked
+    // once for two checkouts scores a difference here.
+    out.push(
+        Sequence::new("checkout", "hooks-post-checkout-records-its-args", Shape::HooksFail)
+            .step(&["log", "--oneline", "-1"])
+            .step(&["checkout", "hf-side"])
+            .step(&["status", "--porcelain"])
+            .step(&["checkout", "main"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // `post-rewrite`, reached through `commit --amend` — the one rewrite in this
+    // shape that `pre-rebase` does not block. The hook reads its stdin, which git
+    // fills with `<old-sha> <new-sha>`, and appends it to its marker file, so the
+    // pair of ids the port believed it rewrote is compared rather than assumed.
+    //
+    // `--no-verify` to get past `pre-commit`; `--no-edit` because `GIT_EDITOR` is
+    // pinned to `true` and an amend that opened one would take the
+    // unchanged-message path anyway. Stock still runs `prepare-commit-msg` here —
+    // `--no-verify` does not skip it — so the amended message gains
+    // `prepared-by-hook` and the commit id moves.
+    out.push(
+        Sequence::new("commit", "hooks-amend-runs-post-rewrite", Shape::HooksFail)
+            .step(&["log", "--oneline", "-1"])
+            .step(&["commit", "--amend", "--no-verify", "--no-edit"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["log", "-1", "--format=%B"])
+            .step(&["status", "--porcelain"])
+            .step(&["reflog", "-3"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rerere: a resolution recorded by one merge and replayed by the next
+// ---------------------------------------------------------------------------
+//
+// [`Shape::Rerere`] is parked mid-merge with `rerere.enabled` in the repository
+// config, a populated `.git/rr-cache` and a `.git/MERGE_RR` — the only shape in
+// the corpus that has any of them. Two of its three conflicts (`rr.txt`,
+// `other.txt`) were resolved once at build time and have already been replayed
+// into the worktree, and the third (`fresh.txt`) has never been seen, so one
+// `rerere remaining` separates the replayed from the unreplayed.
+//
+// What no single case can ask is the *round trip*: resolve, commit, undo,
+// conflict again, and see the resolution come back. That needs four invocations
+// against one repository, and it is the only thing rerere is for.
+//
+// `probe_rr_cache` compares the cache byte for byte, so a step that records a
+// preimage or a postimage is measured at the step that recorded it rather than
+// at whatever later step happens to read it.
+
+fn rerere_family(out: &mut Vec<Sequence>) {
+    // The round trip. Steps 1-2 resolve the one conflict rerere has not seen
+    // (`checkout --theirs` is the only resolution a step can perform, since a
+    // step cannot write a file) and stage all three; step 4 commits, which is
+    // where stock records the resolution for `fresh.txt`. Step 6 undoes the merge
+    // commit and step 7 re-creates all three conflicts — and now every one of
+    // them is in the cache, so stock resolves all three from it and steps 9-10
+    // report nothing remaining and nothing to diff.
+    //
+    // The `Resolved '<path>' using previous resolution.` lines are stderr, so
+    // what stdout carries at step 7 is the ordinary `Auto-merging` / `CONFLICT`
+    // block: the replay is visible in the *worktree*, which the state probe
+    // compares, and in steps 9-10 being empty.
+    out.push(
+        Sequence::new("rerere", "replay-a-resolution-across-a-recreated-merge", Shape::Rerere)
+            .step(&["checkout", "--theirs", "--", "fresh.txt"])
+            .step(&["add", "fresh.txt", "rr.txt", "other.txt"])
+            .step(&["rerere", "remaining"])
+            .step(&["commit", "--no-edit"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["reset", "--hard", "HEAD~1"])
+            .step(&["merge", "rr-side"])
+            .step(&["status", "--porcelain"])
+            .step(&["rerere", "remaining"])
+            .step(&["rerere", "diff"]),
+    );
+
+    // `rerere forget`, which is the inverse of the replay: it drops one path's
+    // record *and puts the conflict markers back* in the worktree for it. Step 3
+    // must therefore name `fresh.txt` and `rr.txt` where the pristine shape names
+    // only `fresh.txt`, and step 4's `rerere diff` must print two hunks where the
+    // pristine shape prints one.
+    //
+    // Steps 5-7 abort and re-create the merge, which asks the harder half: a
+    // forget that only edited the worktree — and left the cache entry in place —
+    // is indistinguishable from a real one until the same conflict comes back and
+    // is silently resolved again. Stock's step 9 still names both.
+    out.push(
+        Sequence::new("rerere", "forget-then-recreate-does-not-replay", Shape::Rerere)
+            .step(&["rerere", "forget", "rr.txt"])
+            .step(&["status", "--porcelain"])
+            .step(&["rerere", "remaining"])
+            .step(&["rerere", "diff"])
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["merge", "rr-side"])
+            .step(&["status", "--porcelain"])
+            .step(&["rerere", "remaining"]),
+    );
+
+    // `merge --abort` over a repository with a populated cache. The contract is
+    // asymmetric and that is the whole point: `MERGE_RR` is operation state and
+    // goes, `rr-cache` is a *record* and stays — an abort that clears the cache
+    // throws away resolutions the user made in earlier merges, and nothing
+    // reports it until the next time one of those conflicts recurs.
+    //
+    // Steps 3-7 are that next time: the same merge, re-run, with the two recorded
+    // conflicts resolved from the cache and only `fresh.txt` left. Step 5 naming
+    // one path rather than three is the assertion that the cache survived.
+    out.push(
+        Sequence::new("rerere", "abort-keeps-the-cache-and-drops-merge-rr", Shape::Rerere)
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["merge", "rr-side"])
+            .step(&["status", "--porcelain"])
+            .step(&["rerere", "remaining"])
+            .step(&["rerere", "status"])
+            .step(&["rerere", "diff"]),
+    );
+
+    // `rerere gc`, which expires cache entries by age. `gc.rerereResolved=0` and
+    // `gc.rerereUnresolved=0` are days, so every entry the fixture wrote is past
+    // its cutoff and the collect has something to do — deterministic because the
+    // records are older than the run rather than because a clock was read.
+    //
+    // The measurement is at step 6, not step 3: a `gc` that deletes the directory
+    // and one that deletes only the postimages leave different repositories and
+    // the same silent exit. Re-creating the merge afterwards is what tells them
+    // apart — with the postimages gone, stock replays nothing and `rerere
+    // remaining` names all three paths where the pristine shape names one.
+    out.push(
+        Sequence::new("rerere", "gc-expires-the-cache-then-the-conflict-returns", Shape::Rerere)
+            .with_config(&[("gc.rerereResolved", "0"), ("gc.rerereUnresolved", "0")])
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["rerere", "gc"])
+            .step(&["merge", "rr-side"])
+            .step(&["status", "--porcelain"])
+            .step(&["rerere", "remaining"])
+            .step(&["merge", "--abort"])
+            .step(&["rerere", "clear"])
+            .step(&["status", "--porcelain"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// shallow: a repository whose history is grafted, and the verbs that ungraft it
+// ---------------------------------------------------------------------------
+//
+// [`Shape::Shallow`] is a `--depth=2 --no-single-branch` clone of a peer that
+// lives inside the fixture, so `.git/shallow` has two lines and every deepening
+// verb has somewhere real to fetch from without a network. The property that
+// makes it worth a sequence rather than a case is that `.git/shallow` is
+// *written by one command and obeyed by the next*: `fetch --deepen` rewrites it,
+// and whether the walk, `fsck` and `gc` afterwards honour the new boundary is a
+// second invocation's question.
+//
+// Deliberately not the first step of anything here: `rev-parse
+// --is-shallow-repository`, which the port answers with an empty stdout and exit
+// 1 where stock prints `true`. A sequence that opened with it would report that
+// one fact and stop.
+
+fn shallow(out: &mut Vec<Sequence>) {
+    // `--deepen=1` moves the graft one commit further back. Step 1 records the
+    // premise — four commits reachable across both branches — and step 3 must
+    // show two more; step 4's count goes 2 -> 3 and step 5's first-parent walk
+    // gains `shallow: deep 3`. Step 6 is the one that would catch a deepening
+    // that fetched the commit without rewriting `.git/shallow`: `fsck` over a
+    // grafted repository is silent only while the boundary matches the objects.
+    out.push(
+        Sequence::new("fetch", "shallow-deepen-then-the-walk-reaches-further", Shape::Shallow)
+            .step(&["log", "--oneline", "--all"])
+            .step(&["fetch", "--deepen=1"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["rev-list", "--count", "HEAD"])
+            .step(&["log", "--oneline"])
+            .step(&["fsck", "--no-progress"]),
+    );
+
+    // `--unshallow`, which is the same rewrite taken to the end: `.git/shallow`
+    // is *removed*, not shortened. Step 4's count is 6 rather than 3, and step 5's
+    // `fsck` is the assertion that matters — a repository that fetched the
+    // history but kept the graft file still walks correctly and is no longer
+    // consistent with its own boundary.
+    //
+    // Steps 6-8 collect afterwards, because `gc` is where a stale `shallow` does
+    // damage: the parents that were unreachable a moment ago are now reachable,
+    // and a `gc` that still believes the graft prunes them.
+    out.push(
+        Sequence::new("fetch", "shallow-unshallow-then-fsck-and-collect", Shape::Shallow)
+            .step(&["log", "--oneline", "--all"])
+            .step(&["fetch", "--unshallow"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["rev-list", "--count", "HEAD"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["gc"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["count-objects", "-v"]),
+    );
+
+    // Cloning *from* a shallow repository, which produces a second shallow
+    // repository with a graft of its own — `sh-copy/.git/shallow` holds one line
+    // where the parent holds two, because the copy cannot be deeper than what the
+    // parent could serve.
+    //
+    // The clone lands inside the worktree so both sides' copies stay self
+    // contained. `probe_worktree_content` walks into it — the destination is an
+    // ordinary directory, and only its `.git` is recorded as `<git directory>`
+    // and left unread — so the checked-out files are compared and the copy's own
+    // object store is not; what is compared about *that* is what the `-C sh-copy`
+    // steps print. Step 4 is the finding: `fsck` in the copy is silent under
+    // stock and names `missing commit …` under a port that does not read the
+    // copy's own graft file.
+    out.push(
+        Sequence::new("clone", "shallow-clone-of-a-shallow-repository", Shape::Shallow)
+            .step(&["clone", "--no-hardlinks", ".", "sh-copy"])
+            .step(&["-C", "sh-copy", "log", "--oneline", "--all"])
+            .step(&["-C", "sh-copy", "rev-list", "--count", "HEAD"])
+            .step(&["-C", "sh-copy", "fsck", "--no-progress"])
+            .step(&["-C", "sh-copy", "fetch", "--unshallow"])
+            .step(&["-C", "sh-copy", "log", "--oneline", "--all"])
+            .step(&["-C", "sh-copy", "rev-list", "--count", "HEAD"]),
+    );
+
+    // `repack -a -d` over a graft. `-a` means "pack everything reachable", and
+    // the whole question is whether "reachable" stops at `.git/shallow`: a
+    // repacker that walks past the boundary asks for the grafted parents and
+    // fails, and one that stops at it produces the same object set in one pack.
+    //
+    // Steps 3-5 re-read afterwards, so a repack that succeeded and dropped an
+    // object is separated from one that succeeded and kept them all.
+    out.push(
+        Sequence::new("repack", "shallow-repack-then-read-back", Shape::Shallow)
+            .step(&["log", "--oneline", "--all"])
+            .step(&["repack", "-a", "-d"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["rev-list", "--count", "HEAD"])
+            .step(&["count-objects", "-v"])
+            .step(&["fsck", "--no-progress"]),
+    );
+
+    // `gc --prune=now` over a graft, which is the same walk with a *delete* at the
+    // end of it. Steps 3-5 prove the collect kept the history it was allowed to
+    // keep, and step 6 then deepens — a deepening after a collect is where a `gc`
+    // that quietly dropped the boundary shows up, because the fetch negotiates
+    // against what the repository claims to have.
+    out.push(
+        Sequence::new("gc", "shallow-collect-then-deepen", Shape::Shallow)
+            .step(&["log", "--oneline", "--all"])
+            .step(&["gc", "--prune=now"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["rev-list", "--count", "HEAD"])
+            .step(&["count-objects", "-v"])
+            .step(&["fetch", "--deepen=1"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["fsck", "--no-progress"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// promisor: objects that are absent on purpose, and the verbs that must not
+// mistake that for damage
+// ---------------------------------------------------------------------------
+//
+// [`Shape::Promisor`] is a `--filter=blob:none` clone: three of `hist.txt`'s
+// four blobs are genuinely not in the object store, the packs that came from the
+// server carry `.promisor` marks, and `remote.origin.promisor=true` says where
+// the missing ones can be got. Everything here turns on that distinction — an
+// absence a promisor remote covers is not corruption, and every verb that walks
+// objects has to know which one it is looking at.
+//
+// A sequence is the unit because the *lazy fetch* is a side effect: the command
+// that needed the blob fetched it, and whether the repository is different
+// afterwards — one more pack, one fewer missing object, a reverse index written
+// or not — is only visible to the command after it.
+//
+// `promisor::blame` is recorded elsewhere as ZVCS-NONDETERMINISTIC, so nothing
+// below depends on the object set a `blame` leaves behind.
+
+fn promisor(out: &mut Vec<Sequence>) {
+    // The lazy fetch itself. Step 1 is a read that needs nothing missing, so the
+    // premise is agreed before step 2 asks for a blob that is not there. Stock's
+    // step 2 fetches it from the peer, prints `hist v1`, and leaves one more pack
+    // — with its `.idx`, its `.promisor` mark and its `.rev` reverse index — in
+    // `objects/pack`, which `probe_storage` enumerates.
+    //
+    // Step 3 is the same read again and must not fetch anything: the object is
+    // local now, and a port that re-fetches on every read is correct on stdout and
+    // wrong about the repository.
+    out.push(
+        Sequence::new("cat-file", "promisor-lazy-fetch-then-read-back", Shape::Promisor)
+            .step(&["log", "--oneline"])
+            .step(&["cat-file", "-p", "HEAD~3:hist.txt"])
+            .step(&["cat-file", "-p", "HEAD~3:hist.txt"])
+            .step(&["count-objects", "-v"])
+            .step(&["cat-file", "-t", "HEAD~3:hist.txt"])
+            .step(&["rev-list", "--missing=print", "--objects", "--all"]),
+    );
+
+    // A whole-history diff, which needs every one of the three missing blobs at
+    // once. `log -p -- hist.txt` walks four commits and reconstructs three
+    // diffs, so it is the densest lazy-fetch demand in the corpus, and step 4
+    // then asks what is still missing — the answer must be nothing.
+    //
+    // Step 5's `fsck` is the second half: once every blob has been backfilled the
+    // repository is complete, and a `fsck` that still reports the promisor
+    // absences is reading a stale list rather than the object store.
+    out.push(
+        Sequence::new("log", "promisor-history-diff-drives-the-lazy-fetch", Shape::Promisor)
+            .step(&["log", "--oneline"])
+            .step(&["log", "--oneline", "-p", "--", "hist.txt"])
+            .step(&["count-objects", "-v"])
+            .step(&["rev-list", "--missing=print", "--objects", "--all"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["diff", "HEAD~3", "HEAD", "--stat"]),
+    );
+
+    // `gc` over a partial clone, which is where the two ideas collide: a collect
+    // walks every reachable object, and three of them are deliberately absent. The
+    // contract is that `gc` repacks the promisor packs *as* promisor packs and
+    // fetches nothing — stock's step 3 reports one pack and 14 objects, the same
+    // 14 it started with.
+    //
+    // A port whose `gc` treats "missing" as "go and get it" backfills the whole
+    // history, which is not a smaller failure than losing an object: it is the
+    // partial clone silently becoming a full one, and the marker files that said
+    // otherwise being dropped along the way. Step 4 is what names that — after a
+    // faithful collect, three objects are still `?`-prefixed.
+    out.push(
+        Sequence::new("gc", "promisor-collect-must-not-backfill", Shape::Promisor)
+            .step(&["log", "--oneline", "--all"])
+            .step(&["gc", "--no-prune"])
+            .step(&["count-objects", "-v"])
+            .step(&["rev-list", "--missing=print", "--objects", "--all"])
+            .step(&["cat-file", "-p", "HEAD~3:hist.txt"])
+            .step(&["log", "--oneline", "--all"])
+            .step(&["fsck", "--no-progress"]),
+    );
+
+    // `repack --filter-to`, which re-filters an already-filtered repository:
+    // `-a -d --filter=blob:none` rewrites every pack into one and `--filter-to`
+    // names where the filtered-out objects go. With nothing left to filter out,
+    // stock writes no such directory at all — and, crucially, keeps the
+    // `.promisor` mark on the pack it wrote.
+    //
+    // Step 5 is the consequence and the reason this is a sequence: `fsck` is
+    // silent over a partial clone *because* the packs are marked, so a repack
+    // that produced a correct pack and forgot the mark turns a healthy repository
+    // into one that reports missing objects. That damage is invisible at the step
+    // that caused it and obvious at the next one.
+    out.push(
+        Sequence::new("repack", "promisor-refilter-keeps-the-promisor-mark", Shape::Promisor)
+            .step(&["log", "--oneline"])
+            .step(&["repack", "-a", "-d", "--filter=blob:none", "--filter-to=.filtered"])
+            .step(&["count-objects", "-v"])
+            .step(&["rev-list", "--missing=print", "--objects", "--all"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["cat-file", "-p", "HEAD~3:hist.txt"])
+            .step(&["status", "--porcelain"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// notes and replace over a repository that already has both
+// ---------------------------------------------------------------------------
+//
+// [`Shape::NotesReplace`] ships three notes refs and two `refs/replace/*`
+// entries, so every verb here changes how an *existing* record is read rather
+// than creating the first one. Two properties need more than one invocation.
+//
+// A replacement is a substitution the object layer performs on every read, and
+// the interesting question is what happens on the read *after* it is removed:
+// `replace -d` must change the next walk's answer and nothing else, because the
+// replacement and the original are both still in the object store and every id
+// in the repository is unchanged either way.
+//
+// `notes prune` drops notes whose annotated object is gone, which needs the
+// object to actually go — three invocations of setup (`reset --hard`, `reflog
+// expire`, `gc --prune=now`) that no case can perform.
+
+fn notes_replace(out: &mut Vec<Sequence>) {
+    // The substitution, switched off two ways and then removed. Steps 1-2 are the
+    // same walk with and without `--no-replace-objects`, and they differ in one
+    // subject line: stock prints `notes: replacement for commit 1` under the
+    // replacement and `notes: commit 1` without it. Steps 3-4 do the same through
+    // the blob replacement, which reaches the substitution by a different door —
+    // `cat-file -p HEAD:README.md` is `# replaced readme` and `# fixture`.
+    //
+    // Step 5 deletes the commit replacement, and steps 6-8 are the assertion:
+    // the walk now prints the original's subject *without* the flag, and the blob
+    // replacement — untouched — still applies. A `replace -d` that dropped both,
+    // or that dropped the ref and left the substitution cached, is caught there.
+    //
+    // `HEAD~2` rather than the id it resolves to, so the sequence does not carry
+    // a fixture hash that goes stale silently the day the shape's history moves.
+    out.push(
+        Sequence::new("replace", "read-with-and-without-then-delete-one", Shape::NotesReplace)
+            .step(&["log", "--oneline"])
+            .step(&["--no-replace-objects", "log", "--oneline"])
+            .step(&["cat-file", "-p", "HEAD:README.md"])
+            .step(&["--no-replace-objects", "cat-file", "-p", "HEAD:README.md"])
+            .step(&["replace", "-d", "HEAD~2"])
+            .step(&["log", "--oneline"])
+            .step(&["replace", "-l"])
+            .step(&["cat-file", "-p", "HEAD:README.md"]),
+    );
+
+    // `notes merge` between two refs that annotate the same commit with different
+    // text, driven twice with two different strategies. `-s theirs` takes the
+    // incoming note whole; `-s union` concatenates, so step 5's note is both
+    // paragraphs with a blank line between them and step 6 shows that the *other*
+    // commit `review` annotates was carried across untouched.
+    //
+    // Both strategies resolve without stopping, which is deliberate: the
+    // conflicted path is the sequence below, and this one exists to measure the
+    // notes tree a successful merge produces — step 7's `notes list` is three
+    // entries where the shape started with two.
+    out.push(
+        Sequence::new("notes", "merge-strategies-across-three-refs", Shape::NotesReplace)
+            .step(&["notes", "merge", "-s", "theirs", "other"])
+            .step(&["notes", "show", "HEAD"])
+            .step(&["notes", "list"])
+            .step(&["notes", "merge", "-s", "union", "review"])
+            .step(&["notes", "show", "HEAD"])
+            .step(&["notes", "show", "HEAD~2"])
+            .step(&["notes", "list"]),
+    );
+
+    // The conflicted `notes merge`, committed rather than aborted. Stock stops
+    // with `CONFLICT (add/add)` — both refs *add* a note to a commit the merge
+    // base has none for — and parks the half-merged tree in
+    // `.git/NOTES_MERGE_WORKTREE`; `notes merge --commit` then takes whatever is
+    // in that directory, conflict markers and all, and writes it as the note.
+    //
+    // Step 4 is what proves the commit read the worktree rather than re-running
+    // the merge: the note stock stores is the *marked-up* text, with
+    // `<<<<<<< refs/notes/commits` and `>>>>>>> refs/notes/other` around the two
+    // paragraphs, which is not something either input ref contains.
+    //
+    // The port labels the same stop `CONFLICT (content)`, so this diverges at
+    // step 2 today; steps 3-6 are written for the day the label is fixed and are
+    // not weakened to pass in the meantime.
+    out.push(
+        Sequence::new("notes", "merge-conflict-committed-keeps-the-markers", Shape::NotesReplace)
+            .step(&["notes", "list"])
+            .step(&["notes", "merge", "other"])
+            .step(&["notes", "merge", "--commit"])
+            .step(&["notes", "show", "HEAD"])
+            .step(&["notes", "list"])
+            .step(&["log", "--oneline"]),
+    );
+
+    // `notes prune`, which needs the annotated object to be *gone* rather than
+    // unreachable — a note is a tree entry whose name is the object's id, and
+    // nothing about it stops being valid when the commit becomes unreachable.
+    // Steps 1-4 are the three invocations that actually remove it: move `main`
+    // back, expire every reflog so nothing else holds it, and collect with
+    // `--prune=now`.
+    //
+    // Step 5 is the pointed one: after the commit is gone the note is *still
+    // listed*, because `notes list` reads the notes tree and never looks the
+    // object up. Step 6's `-n` names exactly what step 7 will remove, so a prune
+    // that removes more than it announced is caught between the two.
+    out.push(
+        Sequence::new("notes", "prune-after-the-annotated-commit-is-gone", Shape::NotesReplace)
+            .step(&["reset", "--hard", "HEAD~1"])
+            .step(&["notes", "list"])
+            .step(&["reflog", "expire", "--expire=now", "--all"])
+            .step(&["gc", "--prune=now"])
+            .step(&["notes", "list"])
+            .step(&["notes", "prune", "-n"])
+            .step(&["notes", "prune"])
+            .step(&["notes", "list"])
+            .step(&["log", "--oneline"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// linked worktrees that are locked, open and gone at once
+// ---------------------------------------------------------------------------
+//
+// [`Shape::WorktreeLocked`] registers three linked worktrees with
+// `--relative-paths`: `wt` locked with a reason, `wt-open` unlocked, and
+// `wt-gone` whose directory has been deleted. Every verb below is a *transition*
+// between those states, and a case cannot make one because a case is one argv
+// against a pristine copy — `unlock` could only ever be asked about "not
+// locked", `remove` about "nothing objects".
+//
+// `probe_worktrees` reads `.git/worktrees/**`, so the administrative files are
+// compared at the step that wrote them rather than inferred from a later `list`.
+
+fn worktree_locked(out: &mut Vec<Sequence>) {
+    // The lock protocol end to end: refuse, unlock, remove. Step 1 must fail with
+    // the tree intact — a `remove` that deletes the directory and *then* notices
+    // the lock passes an exit-code check and has already done the damage — and
+    // step 4 is what confirms `wt` is gone while `wt-open` and `wt-gone` are not.
+    //
+    // The tail refuses on purpose: `wt-open` was never locked, so `unlock` has
+    // nothing to do and says so. `strict` is on the sequence for that tail, where
+    // the message is the entire contract: exit 128 with empty stdout cannot tell
+    // `'wt-open' is not locked` from any other `die()`. The mid-sequence refusal
+    // at step 1 is covered by the same flag, and its message is stable on both
+    // sides (`cannot remove a locked working tree, lock reason: …`).
+    out.push(
+        Sequence::new("worktree", "locked-remove-refused-then-unlock-remove", Shape::WorktreeLocked)
+            .strict()
+            .step(&["worktree", "remove", "wt"])
+            .step(&["worktree", "unlock", "wt"])
+            .step(&["worktree", "remove", "wt"])
+            .step(&["worktree", "list"])
+            .step(&["worktree", "unlock", "wt-open"]),
+    );
+
+    // `prune` with a live locked tree, a live open tree and a registered-but-gone
+    // tree in the same repository — the only configuration where "prune what is
+    // prunable" and "prune everything" produce different repositories, and the
+    // shape registers with `--relative-paths` because that is the layout where a
+    // gitdir string resolved against the wrong directory makes every tree look
+    // absent.
+    //
+    // Step 1 is `-n`, so the decision is stated *before* the write: `prune` prints
+    // `Removing worktrees/wt-gone: gitdir file points to non-existent location` on
+    // **stderr** under `--verbose`, which `strict` compares, so a `prune` that
+    // names one tree and removes three is caught between steps 1 and 2 rather than
+    // discovered later. Step 3's `list` is the assertion that `wt` and `wt-open`
+    // survived.
+    //
+    // The tail is `branch -D` of a branch a live worktree holds, which must be
+    // refused; `strict`, because that refusal names the worktree holding it and
+    // an exit code alone would not.
+    out.push(
+        Sequence::new("worktree", "prune-the-gone-one-and-keep-the-live-ones", Shape::WorktreeLocked)
+            .strict()
+            .step(&["worktree", "prune", "-n", "--verbose"])
+            .step(&["worktree", "prune", "--verbose"])
+            .step(&["worktree", "list"])
+            .step(&["branch", "-D", "wt-open"])
+            .step(&["branch", "-D", "wt-held"]),
+    );
+
+    // `repair`, `lock` and `move` over the same three trees. `repair` is first
+    // because it is the verb that rewrites every administrative file it thinks is
+    // wrong: run against a healthy registration it must change nothing, and step 2
+    // — a full `--porcelain` listing including the `locked` reason and the
+    // `prunable` line — is where a repair that "fixed" a relative gitdir into an
+    // absolute one, or dropped a lock file, shows up.
+    //
+    // Step 3 locks an already-locked tree and is refused; step 4 locks the open
+    // one with a different reason, so step 5 prints two `locked` lines with
+    // different text and a port that stores the flag without the reason produces
+    // one. Steps 6-8 are the same refuse/unlock/act shape as `remove`, applied to
+    // `move`, which has its own copy of the lock check.
+    //
+    // No `strict`: both refusals are mid-sequence, and comparing them would stop
+    // the workflow before the move that is the point of it.
+    out.push(
+        Sequence::new("worktree", "repair-then-lock-and-move-a-locked-tree", Shape::WorktreeLocked)
+            .step(&["worktree", "repair"])
+            .step(&["worktree", "list", "--porcelain"])
+            .step(&["worktree", "lock", "wt"])
+            .step(&["worktree", "lock", "--reason", "second", "wt-open"])
+            .step(&["worktree", "list", "--porcelain"])
+            .step(&["worktree", "move", "wt", "wt-moved"])
+            .step(&["worktree", "unlock", "wt"])
+            .step(&["worktree", "move", "wt", "wt-moved"])
+            .step(&["worktree", "list"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a tag chain: peeling that is more than one step deep
+// ---------------------------------------------------------------------------
+//
+// [`Shape::TagChain`] has `outermost` -> `outer` -> `inner` -> commit, a
+// lightweight `light-to-tag` pointing at the same tag object as `inner`, and
+// tags whose targets are a blob and a tree. Every other tag in the corpus points
+// straight at a commit, so an implementation that peels once scored the same as
+// one that peels to the end.
+//
+// What a sequence adds is *deletion*: peeling a chain is one invocation, but
+// what the chain peels to after a link is removed — and what `describe` calls
+// the commit afterwards — is the next one's question, and the objects stay in
+// the store either way so nothing about the answer is forced by what exists.
+
+fn tag_chain(out: &mut Vec<Sequence>) {
+    // Deleting the outermost link. Steps 1-2 record the premise: `describe` says
+    // `inner-2-g<abbrev>` and `outermost^{}` peels three deep to the commit
+    // `inner` annotates. Step 3 removes `outermost`, and step 4 must now fail to
+    // resolve it at all — the tag object is still in the store, and only the ref
+    // is gone, so a port that peels through a cached object answers here.
+    //
+    // Step 5 re-asks `describe`, which must be unchanged: `describe` names the
+    // commit after the nearest *annotated* tag, and `inner` is still that tag.
+    // Step 7's `fsck` then reports `dangling tag <id>` for the orphaned object,
+    // which is the only place the deletion is visible in the object store.
+    //
+    // The refusal at step 4 is mid-sequence, so no `strict`: comparing its
+    // message would stop the workflow three steps before the `fsck`.
+    out.push(
+        Sequence::new("tag", "delete-the-outermost-link-then-peel-and-describe", Shape::TagChain)
+            .step(&["describe"])
+            .step(&["rev-parse", "outermost^{}"])
+            .step(&["tag", "-d", "outermost"])
+            .step(&["rev-parse", "outermost^{}"])
+            .step(&["describe"])
+            .step(&["tag", "-l"])
+            .step(&["fsck", "--no-progress"]),
+    );
+
+    // Deleting the link `describe` was *using*. `inner` is the annotated tag two
+    // commits back; `light-to-tag` is a lightweight ref at the same tag object.
+    // Once `refs/tags/inner` is gone, the tag object is still reachable through
+    // `light-to-tag`, and stock keeps calling it `inner` — the name is inside the
+    // tag object, not in the ref — while warning that
+    // `tag 'light-to-tag' is externally known as 'inner'`.
+    //
+    // That is the finding: a port that reads the name off the ref it found the
+    // object through answers `light-to-tag-2-g<abbrev>` and is self-consistent,
+    // correct about the commit, and wrong about what the tag is called.
+    //
+    // Steps 4-6 continue past it: `outer` still peels to the same commit and is
+    // still a tag object, and `fsck` is silent because nothing became unreachable.
+    out.push(
+        Sequence::new("describe", "delete-inner-and-describe-still-names-it", Shape::TagChain)
+            .step(&["describe"])
+            .step(&["tag", "-d", "inner"])
+            .step(&["describe"])
+            .step(&["rev-parse", "outer^{}"])
+            .step(&["cat-file", "-t", "outer"])
+            .step(&["fsck", "--no-progress"])
+            .step(&["show-ref", "-d"]),
+    );
+
+    // The chain over the wire. There is no peer in this shape, so steps 1-2 make
+    // one *inside the worktree* — `.remote.git` is where `probe_peer` looks, so
+    // the bare repository the push lands in is itself compared afterwards.
+    //
+    // Step 3 pushes with `--tags`, which sends all six tags including the two
+    // whose targets are not commits, and step 5's `ls-remote --tags` shows every
+    // one of them with its `^{}` peel line — the peer resolved the chain on its
+    // own side, so a port that pushed the tag objects without their targets, or
+    // peeled to the wrong thing, differs there rather than in the push report.
+    //
+    // Step 6 deletes one tag *on the remote*, which is the finding: stock removes
+    // `refs/tags/outermost` and the port answers `unable to delete 'outermost':
+    // remote ref does not exist`, having looked under `refs/heads/` only.
+    out.push(
+        Sequence::new("push", "tag-chain-pushed-to-a-fresh-peer-then-deleted", Shape::TagChain)
+            .step(&["init", "-q", "--bare", "-b", "main", ".remote.git"])
+            .step(&["remote", "add", "origin", "./.remote.git"])
+            .step(&["push", "--tags", "origin", "main"])
+            .step(&["ls-remote", "origin"])
+            .step(&["ls-remote", "--tags", "origin"])
+            .step(&["push", "origin", "--delete", "outermost"])
+            .step(&["ls-remote", "--tags", "origin"])
+            .step(&["tag", "-l"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// intent-to-add and pending renames: index entries with no content behind them
+// ---------------------------------------------------------------------------
+//
+// [`Shape::IntentToAdd`] carries three `add -N` entries — one with content, one
+// below the top level, one whose file was then deleted — beside a genuinely
+// staged add that was edited afterwards, which is the `AM` rendering an ITA is
+// most often confused with. [`Shape::PendingRename`] carries five staged renames
+// at four similarity indices plus one expressed *only* in the worktree, through
+// an intent-to-add on the destination.
+//
+// Both shapes describe an index that no commit could produce, and the sequences
+// below ask what survives a round trip through the verbs that rewrite it. Two of
+// them find that `stash` destroys what stock refuses to touch.
+
+fn intent_to_add(out: &mut Vec<Sequence>) {
+    // What a `commit` does with intent-to-add entries: nothing. Stock commits the
+    // two real staged paths and leaves all three ITA entries in the index, so
+    // step 2's `status` is the shape's own minus the two that landed, and step 4's
+    // `ls-files -s` still lists them against the empty blob.
+    //
+    // Steps 5-8 then finish the job: `add -A` turns every ITA entry into a real
+    // one, and the second commit's `--name-status` is where a port that committed
+    // an empty blob at step 1 — or dropped the entry entirely — differs, because
+    // the file's real content only reaches history here.
+    out.push(
+        Sequence::new("commit", "intent-to-add-committed-then-the-rest-added", Shape::IntentToAdd)
+            .step(&["commit", "-m", "ita: commit over intent-to-add entries"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1", "--name-status"])
+            .step(&["ls-files", "-s"])
+            .step(&["add", "-A"])
+            .step(&["status", "--porcelain"])
+            .step(&["commit", "-m", "ita: the rest"])
+            .step(&["log", "--oneline", "-1", "--name-status"]),
+    );
+
+    // The three verbs that take an entry back out of the index, applied to one
+    // that has no content behind it. `add -N` on the shape's untracked file makes
+    // a fourth ITA entry; `restore --staged` on one turns it back into `??`;
+    // `rm --cached -f` on the nested one removes it and leaves `?? sub/`, an
+    // untracked *directory* where there was a tracked path.
+    //
+    // `ls-files -s` at steps 3 and 8 is the assertion the `status` renderings
+    // cannot make: every ITA entry is stage 0 against `e69de29…`, the empty blob,
+    // so what separates them from real entries is not visible in the index without
+    // knowing which blob to look for.
+    out.push(
+        Sequence::new("add", "intent-to-add-marked-then-unstaged-and-removed", Shape::IntentToAdd)
+            .step(&["add", "-N", "untracked.txt"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "-s"])
+            .step(&["restore", "--staged", "ita-new.txt"])
+            .step(&["status", "--porcelain"])
+            .step(&["rm", "--cached", "-f", "sub/ita-nested.txt"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "-s"]),
+    );
+
+    // `stash` over intent-to-add entries, which stock **refuses**: an ITA entry is
+    // an index entry whose blob does not match the file, so the merge `stash`
+    // performs cannot proceed and it stops with `error: Entry 'ita-new.txt' not
+    // uptodate. Cannot merge.` / `Cannot save the current worktree state`, exit 1,
+    // having changed nothing. Step 3 is that "nothing" — the shape's own `status`,
+    // unchanged.
+    //
+    // A port that stashes anyway loses the entries: the pop at step 5 brings back
+    // an index in which the ITA paths are ordinary untracked files, `ita-gone.txt`
+    // — an ITA whose file was deleted — is absent from both the index and the
+    // worktree, and `both.txt`'s staged blob has been replaced by its worktree
+    // content, collapsing the staged/unstaged distinction the user had. Step 6's
+    // `ls-files -s` is where that is plainly visible: entries that were there
+    // before the stash are simply gone.
+    //
+    // Step 1 is a read so the refusal at step 2 is the first thing compared,
+    // rather than the sequence opening on it.
+    out.push(
+        Sequence::new("stash", "intent-to-add-stash-is-refused-and-nothing-moves", Shape::IntentToAdd)
+            .step(&["status", "--porcelain"])
+            .step(&["stash", "push", "-m", "ita"])
+            .step(&["status", "--porcelain"])
+            .step(&["stash", "list"])
+            .step(&["stash", "pop"])
+            .step(&["ls-files", "-s"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // A staged rename, committed, and then followed backwards. Step 1 is the
+    // index's own view (`R060 far.txt far-renamed.txt`, `R100` for the three that
+    // were not edited); step 2 commits it, and step 3 must produce the same
+    // pairing out of the *tree* diff rather than out of the index's rename
+    // records — the two are computed by different code and only a commit puts
+    // them side by side.
+    //
+    // Steps 4-5 are `log --follow`, which is the only reader that walks *through*
+    // a rename: two commits for a path that has existed under its new name for
+    // exactly one. `pkg/deep-renamed.txt` is the same question below the top
+    // level, where a follow that compares basenames rather than paths differs.
+    out.push(
+        Sequence::new("commit", "pending-rename-committed-then-followed", Shape::PendingRename)
+            .step(&["diff", "--cached", "--name-status", "-M"])
+            .step(&["commit", "-m", "pending-rename: land the staged renames"])
+            .step(&["log", "--oneline", "-1", "--name-status", "-M"])
+            .step(&["log", "--follow", "--oneline", "--", "pure-renamed.txt"])
+            .step(&["log", "--follow", "--oneline", "--", "pkg/deep-renamed.txt"])
+            .step(&["show", "--stat", "--oneline", "-M", "HEAD"]),
+    );
+
+    // Unstaging every rename and staging them again, which asks whether rename
+    // detection is a property of the index's records or of the content. It is the
+    // content: after `reset` and `add -A` stock reports the same pairs — and two
+    // *different* similarity indices, because the re-add takes the worktree's
+    // current bytes.
+    //
+    // `near.txt` moves `R100` -> `R096` (it was staged at R100 and then edited
+    // again in the worktree, and the re-add stages that edit), and `wt.txt` ->
+    // `wt-renamed.txt` appears for the first time — it was a worktree-only rename
+    // held together by an intent-to-add, and staging it makes it an index rename
+    // like the others. Step 6 asks the same question with `-C` so a copy
+    // candidate is in play, and must not change any of the pairs.
+    out.push(
+        Sequence::new("reset", "pending-rename-unstaged-then-re-added", Shape::PendingRename)
+            .step(&["diff", "--cached", "--name-status", "-M"])
+            .step(&["reset", "-q"])
+            .step(&["diff", "--cached", "--name-status", "-M"])
+            .step(&["add", "-A"])
+            .step(&["diff", "--cached", "--name-status", "-M"])
+            .step(&["diff", "--cached", "--name-status", "-M50", "-C"])
+            .step(&["commit", "-m", "pending-rename: re-added"])
+            .step(&["log", "--oneline", "-1", "--name-status", "-M"]),
+    );
+
+    // Renaming a rename, and un-staging one. Step 2 moves `pure-renamed.txt`
+    // again, and step 3 must report the pair against the *original* name —
+    // `R100 pure.txt pure-twice.txt` — because the index's source is HEAD and not
+    // the previous staging.
+    //
+    // Step 4 restores both halves of the `far` pair from HEAD, which is the
+    // asymmetric one: `far.txt` comes back to the index and the worktree does not
+    // have it, while `far-renamed.txt` leaves the index and stays on disk. Stock's
+    // step 6 therefore reports ` D far.txt` and `?? far-renamed.txt` at once, and
+    // the pair is gone from step 5's staged diff.
+    //
+    // The tail is `ls-files -s` and deliberately not a worktree-column reader.
+    // Both `status --porcelain` and plumbing `diff-files --name-status -M` were
+    // tried here and stock did not reproduce its own post-state at that step
+    // under load, so the harness excluded it and it measured nothing — the race
+    // is between when `restore` writes the index and the mtimes the fixture copy
+    // carries, and no argv from this corpus can settle it. The rendering those
+    // steps were reaching for (stock pairing `wt.txt` with the intent-to-add
+    // `wt-renamed.txt`, the port leaving them unpaired) is already measured by
+    // this shape's own single-invocation `status` cases and by step 5 of
+    // `pending-rename-unstaged-then-re-added`, which stages the pair and reads it
+    // out of the index instead.
+    out.push(
+        Sequence::new("mv", "pending-rename-moved-again-then-unstaged", Shape::PendingRename)
+            .step(&["diff", "--cached", "--name-status", "-M"])
+            .step(&["mv", "pure-renamed.txt", "pure-twice.txt"])
+            .step(&["diff", "--cached", "--name-status", "-M"])
+            .step(&["restore", "--staged", "far-renamed.txt", "far.txt"])
+            .step(&["diff", "--cached", "--name-status", "-M"])
+            .step(&["ls-files", "-s"]),
+    );
+
+    // `stash` over a pending rename, which stock refuses for the same reason as
+    // the intent-to-add sequence above — `wt-renamed.txt` is an ITA entry — and
+    // which therefore leaves five staged renames intact where a port that stashes
+    // anyway does not.
+    //
+    // What a stash/pop round trip costs, measured on the port: every rename is
+    // dissolved into an add and a delete, the sources are back in the index while
+    // the worktree no longer has them, `near-renamed.txt`'s staged blob becomes
+    // the worktree's edited one rather than the `R100` content that was staged,
+    // and `wt-renamed.txt` is demoted to untracked. Step 6's `ls-files -s` is the
+    // whole finding in one listing: eleven entries before, fifteen after, and not
+    // one of the staged renames among them.
+    out.push(
+        Sequence::new("stash", "pending-rename-stash-is-refused-and-the-index-survives", Shape::PendingRename)
+            .step(&["diff", "--cached", "--name-status", "-M"])
+            .step(&["stash", "push", "-m", "pending-rename"])
+            .step(&["stash", "list"])
+            .step(&["status", "--porcelain"])
+            .step(&["stash", "pop"])
+            .step(&["ls-files", "-s"])
+            .step(&["diff", "--cached", "--name-status", "-M"]),
     );
 }

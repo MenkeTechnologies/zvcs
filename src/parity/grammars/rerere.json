@@ -18,7 +18,13 @@
     "README.md",
     "src/lib.rs",
     "does-not-exist",
-    "bogus-subcommand"
+    "bogus-subcommand",
+    "rr.txt",
+    "other.txt",
+    "fresh.txt",
+    ["forget", "rr.txt"],
+    ["forget", "fresh.txt"],
+    ["forget", "."]
   ],
   "shapes": [
     "linear",
@@ -32,6 +38,7 @@
     "mergeable-dirty",
     "mergeable-staged",
     "whitespace",
-    "octopus"
+    "octopus",
+    "rerere"
   ]
 }

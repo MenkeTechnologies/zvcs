@@ -31,7 +31,9 @@
     "main...feature",
     "README.md",
     "src/lib.rs",
-    "does-not-exist"
+    "does-not-exist",
+    "hist.txt",
+    "pc-side"
   ],
   "shapes": [
     "linear",
@@ -44,6 +46,7 @@
     "packed",
     "behind-remote",
     "worktree",
-    "sparse"
+    "sparse",
+    "promisor"
   ]
 }

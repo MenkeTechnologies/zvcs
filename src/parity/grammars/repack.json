@@ -78,6 +78,8 @@
     "worktree",
     "behind-remote",
     "octopus",
-    "damaged"
+    "damaged",
+    "shallow",
+    "promisor"
   ]
 }

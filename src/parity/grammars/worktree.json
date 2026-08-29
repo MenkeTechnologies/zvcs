@@ -12,7 +12,10 @@
     "--expire=1.day.ago",
     "--expire=never",
     "-n",
-    "--dry-run"
+    "--dry-run",
+    "-f",
+    "--force",
+    "--reason=parity"
   ],
   "positionals": [
     "list",
@@ -21,7 +24,22 @@
     "--bogus-option",
     "wt",
     "wt/README.md",
-    "linked"
+    "linked",
+    "lock",
+    "unlock",
+    "remove",
+    "prune",
+    "move",
+    "repair",
+    "wt-open",
+    "wt-gone",
+    "wt-held",
+    ["remove", "wt"],
+    ["remove", "wt-open"],
+    ["unlock", "wt"],
+    ["unlock", "wt-open"],
+    ["lock", "wt-open"],
+    ["move", "wt-open", "wt-moved"]
   ],
   "shapes": [
     "linear",
@@ -37,6 +55,7 @@
     "sparse",
     "packed",
     "stashed",
-    "octopus"
+    "octopus",
+    "worktree-locked"
   ]
 }

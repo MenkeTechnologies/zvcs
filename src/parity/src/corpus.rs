@@ -18,6 +18,7 @@ mod archive_export;
 mod branch_remote;
 mod commit_family;
 mod config_cmd;
+mod config_reads;
 mod diff_family;
 mod fetch_clone;
 mod fixture_gaps;
@@ -25,6 +26,7 @@ mod fixture_gaps2;
 mod graft_partial;
 mod discovery;
 mod history_query;
+mod hooks_identity;
 mod index_plumbing;
 mod history_rewrite;
 mod info_attrs;
@@ -42,6 +44,7 @@ mod pathspec_stdin;
 mod plumbing_objects;
 mod plumbing_refs;
 mod reset_family;
+mod revision_syntax;
 mod sequences;
 mod shape_reach;
 mod stateful_side_files;
@@ -102,6 +105,10 @@ pub fn cases() -> Vec<Case> {
     // The two repositories that are missing objects on purpose: a shallow
     // clone's graft boundary, and a partial clone's lazy fetch.
     graft_partial::cases(&mut c);
+
+    // Configuration that changes what a read prints: the colour slots, the
+    // diff and core rendering keys, and the per-verb defaults.
+    config_reads::cases(&mut c);
 
     // ---- rev-parse: the most-called plumbing in any script ----
     read_only("rev-parse", &["rev-parse", "HEAD"], &mut c);
@@ -453,6 +460,7 @@ pub fn cases() -> Vec<Case> {
     fixture_gaps2::cases(&mut c);
     discovery::cases(&mut c);
     history_query::cases(&mut c);
+    hooks_identity::cases(&mut c);
     index_plumbing::cases(&mut c);
     history_rewrite::cases(&mut c);
     info_attrs::cases(&mut c);
@@ -469,6 +477,7 @@ pub fn cases() -> Vec<Case> {
     plumbing_objects::cases(&mut c);
     plumbing_refs::cases(&mut c);
     reset_family::cases(&mut c);
+    revision_syntax::cases(&mut c);
     shape_reach::cases(&mut c);
     stateful_side_files::cases(&mut c);
     stdin_plumbing::cases(&mut c);

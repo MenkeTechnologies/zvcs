@@ -44,7 +44,12 @@
     "nested/deep/path.txt",
     "conflict.txt",
     "sub",
-    "--"
+    "--",
+    "ita-new.txt",
+    "sub/ita-nested.txt",
+    "ita-gone.txt",
+    "both.txt",
+    "tracked.txt"
   ],
   "shapes": [
     "linear",
@@ -59,6 +64,7 @@
     "renamed",
     "attributes",
     "stashed",
-    "decomposed-paths"
+    "decomposed-paths",
+    "intent-to-add"
   ]
 }

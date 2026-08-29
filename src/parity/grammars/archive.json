@@ -74,7 +74,15 @@
     "dir/link-up",
     "empty.txt",
     "dir",
-    "patches/symlink.patch"
+    "patches/symlink.patch",
+    "outermost",
+    "light-to-tag",
+    "treetag",
+    "blobtag",
+    "a.txt",
+    "main~3",
+    "hist.txt",
+    "pc-side"
   ],
   "shapes": [
     "linear",
@@ -92,6 +100,8 @@
     "octopus",
     "worktree",
     "decomposed-paths",
-    "symlinks"
+    "symlinks",
+    "tag-chain",
+    "promisor"
   ]
 }

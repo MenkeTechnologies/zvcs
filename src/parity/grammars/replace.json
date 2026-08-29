@@ -23,7 +23,11 @@
     "feature",
     "v0.1.0",
     "v0.2.0",
-    "does-not-exist"
+    "does-not-exist",
+    "HEAD~2",
+    "HEAD~3",
+    "HEAD:README.md",
+    ["HEAD~2", "HEAD~3"]
   ],
   "shapes": [
     "linear",
@@ -33,6 +37,7 @@
     "dirty",
     "octopus",
     "packed",
-    "renamed"
+    "renamed",
+    "notes-replace"
   ]
 }

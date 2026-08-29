@@ -129,7 +129,13 @@
     "root.txt",
     "é.txt",
     "é-new.txt",
-    "conflict.txt"
+    "conflict.txt",
+    "hf-main.txt",
+    "side-base.txt",
+    "hf-ahead.txt",
+    "sub/nested.txt",
+    "top.txt",
+    "sub"
   ],
   "shapes": [
     "linear",
@@ -149,6 +155,8 @@
     "decomposed-paths",
     "mergeable-dirty",
     "mergeable-staged",
-    "octopus"
+    "octopus",
+    "hooks-fail",
+    "hooked"
   ]
 }

@@ -65,7 +65,10 @@
     "counter.txt",
     "--",
     "does-not-exist",
-    ""
+    "",
+    "ita-new.txt",
+    "ita-gone.txt",
+    "both.txt"
   ],
   "shapes": [
     "linear",
@@ -85,6 +88,7 @@
     "mergeable-staged",
     "decomposed-paths",
     "packed",
-    "worktree"
+    "worktree",
+    "intent-to-add"
   ]
 }

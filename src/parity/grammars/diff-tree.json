@@ -201,7 +201,12 @@
     ["main", "sym-pending"],
     ["main", "sym-pending", "--", "dir/target.txt"],
     "link-to-file",
-    "empty.txt"
+    "empty.txt",
+    "HEAD~2",
+    ["HEAD~3", "HEAD~2"],
+    "hist.txt",
+    ["main~3", "main"],
+    ["main~3", "main", "hist.txt"]
   ],
   "shapes": [
     "linear",
@@ -219,6 +224,8 @@
     "packed",
     "sparse",
     "decomposed-paths",
-    "symlinks"
+    "symlinks",
+    "notes-replace",
+    "promisor"
   ]
 }

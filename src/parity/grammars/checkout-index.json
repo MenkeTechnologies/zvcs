@@ -62,7 +62,12 @@
     "link-wt",
     "dir/link-up",
     "empty.txt",
-    "dir/empty-nested.txt"
+    "dir/empty-nested.txt",
+    "ita-new.txt",
+    "sub/ita-nested.txt",
+    "ita-gone.txt",
+    "both.txt",
+    "tracked.txt"
   ],
   "shapes": [
     "linear",
@@ -78,6 +83,7 @@
     "renamed",
     "decomposed-paths",
     "mergeable-dirty",
-    "symlinks"
+    "symlinks",
+    "intent-to-add"
   ]
 }

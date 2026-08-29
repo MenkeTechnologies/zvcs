@@ -83,7 +83,14 @@
     "HEAD:refs/heads/parity",
     ":refs/heads/div",
     "does-not-exist",
-    ""
+    "",
+    "veto",
+    "hf-side",
+    "refs/heads/veto",
+    ["origin", "veto"],
+    ["origin", "main"],
+    ["origin", "main", "veto"],
+    ["origin", "hf-side"]
   ],
   "shapes": [
     "linear",
@@ -99,6 +106,7 @@
     "worktree",
     "octopus",
     "sparse",
-    "stashed"
+    "stashed",
+    "hooks-fail"
   ]
 }

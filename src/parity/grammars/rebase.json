@@ -107,7 +107,8 @@
     "topic",
     ["main", "topic"],
     ["topic", "main"],
-    "main...topic"
+    "main...topic",
+    "hf-side"
   ],
   "shapes": [
     "linear",
@@ -127,6 +128,7 @@
     "stashed",
     "patches",
     "sparse",
-    "cherry"
+    "cherry",
+    "hooks-fail"
   ]
 }

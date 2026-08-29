@@ -76,6 +76,8 @@
     "packed",
     "octopus",
     "renamed",
-    "behind-remote"
+    "behind-remote",
+    "promisor",
+    "shallow"
   ]
 }

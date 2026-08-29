@@ -26,7 +26,18 @@
     "parity-unknown-hook",
     "does-not-exist",
     "--",
-    ""
+    "",
+    "prepare-commit-msg",
+    "commit-msg",
+    "pre-rebase",
+    "pre-auto-gc",
+    "post-checkout",
+    "post-merge",
+    "post-rewrite",
+    ["run", "pre-commit"],
+    ["run", "pre-push"],
+    ["run", "pre-rebase"],
+    ["run", "commit-msg"]
   ],
   "shapes": [
     "linear",
@@ -40,6 +51,8 @@
     "packed",
     "worktree",
     "behind-remote",
-    "sparse"
+    "sparse",
+    "hooks-fail",
+    "hooked"
   ]
 }

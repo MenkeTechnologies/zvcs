@@ -289,6 +289,9 @@ enum Missing {
 struct ObjectWalk<'a> {
     filter: Option<Filter>,
     missing: Missing,
+    /// `--filter-print-omitted`: whether an omit set is being collected, which
+    /// is what makes the walk descend into a tree the filter excluded.
+    collect_omits: bool,
     /// The `--` pathspecs, which restrict the listed trees and blobs the same
     /// way they restrict the commits. `None` means every object is listed.
     pathspecs: Option<&'a super::log::PathspecMatcher>,
@@ -439,6 +442,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut edge_hint = false;
     // `revs->exclude_promisor_objects`.
     let mut exclude_promisor = false;
+    // `arg_print_omitted`.
+    let mut print_omitted = false;
     // `revs->ancestry_path_bottoms` as `--ancestry-path=<commit>` fills it.
     let mut ancestry_bottoms: Vec<ObjectId> = Vec::new();
     let mut simplify_by_decoration = false;
@@ -675,6 +680,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // realized into the ones the remote still owns. In a fresh partial
             // clone that is *everything*, and the listing is empty.
             "--exclude-promisor-objects" => exclude_promisor = true,
+            // `--filter-print-omitted`: the objects the filter left out, as
+            // `~<oid>` lines after the listing (builtin/rev-list.c:817-818,
+            // 989-996).
+            "--filter-print-omitted" => print_omitted = true,
             "--ancestry-path" => ancestry_path = true,
             // ```c
             // } else if (skip_prefix(arg, "--ancestry-path=", &optarg)) {
@@ -1655,9 +1664,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let walk = ObjectWalk {
         filter,
         missing,
+        collect_omits: print_omitted,
         pathspecs: object_specs.as_ref(),
     };
     let mut absent: Vec<ObjectId> = Vec::new();
+    // `--filter-print-omitted`'s `omitted_objects` set, filled by the filter and
+    // printed once the walk is over.
+    let mut omitted: Vec<ObjectId> = Vec::new();
     // The same UNINTERESTING marking reaches the object walk: a tree or blob a
     // promisor pack holds is already "seen" and is never listed.
     let mut seen: HashSet<ObjectId> = match exclude_promisor {
@@ -1710,6 +1723,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                         &mut seen,
                         &mut object_lines,
                         &mut absent,
+                        &mut omitted,
                         &walk,
                     )? {
                         return Ok(code);
@@ -1839,6 +1853,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 &mut seen,
                 &mut object_lines,
                 &mut absent,
+                &mut omitted,
                 &walk,
             )? {
                 return Ok(code);
@@ -1870,6 +1885,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 &mut seen,
                 &mut object_lines,
                 &mut absent,
+                &mut omitted,
                 &walk,
             )? {
                 return Ok(code);
@@ -1926,8 +1942,29 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     } else {
         sink.write_all(&out)?;
     }
-    // `--missing=print` reports what the walk could not find, after the listing.
-    for id in &absent {
+    // ```c
+    // if (arg_print_omitted) {
+    //         oidset_iter_init(&omitted_objects, &iter);
+    //         while ((oid = oidset_iter_next(&iter)))
+    //                 printf("~%s\n", oid_to_hex(oid));
+    // }
+    // if (arg_missing_action == MA_PRINT || arg_missing_action == MA_PRINT_INFO) {
+    //         oidmap_iter_init(&missing_objects, &iter);
+    //         while ((entry = oidmap_iter_next(&iter)))
+    //                 print_missing_object(entry, …);
+    // }
+    // ```
+    //
+    // (`builtin/rev-list.c:989-1010`.) Both are hash tables rather than lists, so
+    // neither comes out in the order the walk found them — and the two use
+    // different tables, so the same ids order differently in the two blocks. See
+    // [`crate::oidhash`].
+    if print_omitted {
+        for id in crate::oidhash::khash_order(&omitted) {
+            writeln!(sink, "~{id}")?;
+        }
+    }
+    for id in crate::oidhash::hashmap_order(&absent) {
         writeln!(sink, "?{id}")?;
     }
     if disk_usage {
@@ -3133,6 +3170,7 @@ fn collect_commit_objects(
     seen: &mut HashSet<ObjectId>,
     lines: &mut Vec<(ObjectId, Vec<u8>)>,
     absent: &mut Vec<ObjectId>,
+    omitted: &mut Vec<ObjectId>,
     walk: &ObjectWalk<'_>,
 ) -> Result<Result<(), ExitCode>> {
     let Some(tree) = commit_tree(repo, commit) else {
@@ -3143,10 +3181,12 @@ fn collect_commit_objects(
     }
     // `tree:0` omits even the root tree; every other filter keeps it. A root tree
     // is reached through no path, so its name is empty.
-    if !matches!(walk.filter, Some(Filter::TreeDepth(0))) {
+    if matches!(walk.filter, Some(Filter::TreeDepth(0))) {
+        omitted.push(tree);
+    } else {
         lines.push((tree, Vec::new()));
     }
-    walk_tree(repo, tree, &[], 1, seen, lines, absent, walk)
+    walk_tree(repo, tree, &[], 1, seen, lines, absent, omitted, walk)
 }
 
 /// The tree a commit points at, or `None` if the object is missing or is not a
@@ -3285,10 +3325,30 @@ fn walk_tree(
     seen: &mut HashSet<ObjectId>,
     lines: &mut Vec<(ObjectId, Vec<u8>)>,
     absent: &mut Vec<ObjectId>,
+    omitted: &mut Vec<ObjectId>,
     walk: &ObjectWalk<'_>,
 ) -> Result<Result<(), ExitCode>> {
     // Nothing at this depth, or under it, survives the tree filter.
-    if matches!(walk.filter, Some(Filter::TreeDepth(max)) if depth >= max) {
+    //
+    // ```c
+    // if (include_it)
+    //         filter_res = LOFR_DO_SHOW;
+    // else if (omits && !been_omitted)
+    //         /*
+    //          * Must update omit information of children
+    //          * recursively; they have not been omitted yet.
+    //          */
+    //         filter_res = LOFR_ZERO;
+    // else
+    //         filter_res = LOFR_SKIP_TREE;
+    // ```
+    //
+    // (`filter_trees_depth()`, list-objects-filter.c:226-235.) An excluded tree
+    // is `LOFR_SKIP_TREE` — the subtree is never visited — *unless* an omit set
+    // is being collected, in which case the walk descends anyway with nothing
+    // shown, so every child is recorded as omitted too.
+    let excluded = matches!(walk.filter, Some(Filter::TreeDepth(max)) if depth >= max);
+    if excluded && !walk.collect_omits {
         return Ok(Ok(()));
     }
     let Some(object) = tree_object(repo, tree) else {
@@ -3320,14 +3380,30 @@ fn walk_tree(
             continue;
         }
         if mode.is_tree() {
-            lines.push((id, path.clone()));
-            if let Err(code) = walk_tree(repo, id, &path, depth + 1, seen, lines, absent, walk)? {
+            match excluded {
+                true => omitted.push(id),
+                false => lines.push((id, path.clone())),
+            }
+            if let Err(code) =
+                walk_tree(repo, id, &path, depth + 1, seen, lines, absent, omitted, walk)?
+            {
                 return Ok(Err(code));
             }
             continue;
         }
+        if excluded {
+            omitted.push(id);
+            continue;
+        }
         match blob_filtered(repo, id, absent, walk)? {
-            Ok(true) => continue,
+            Ok(true) => {
+                // A blob the *filter* omitted joins the omitted set; one that is
+                // simply missing does not — `finish_object__ma()` owns that one.
+                if walk.filter.is_some() && repo.find_header(id).is_ok() {
+                    omitted.push(id);
+                }
+                continue;
+            }
             Ok(false) => {}
             Err(code) => return Ok(Err(code)),
         }

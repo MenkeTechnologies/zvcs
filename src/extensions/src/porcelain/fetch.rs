@@ -527,6 +527,13 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     .map_err(|_| anyhow::anyhow!("--shallow-exclude expects a valid ref, got {v:?}"))?;
                 shallow_exclude.push(name);
             }
+            // Hidden, and set only by the parent fetch when it recurses: the path of the
+            // submodule being fetched, relative to the top-level superproject, with a
+            // trailing slash. It prefixes the `Fetching submodule …` announcement so a
+            // nested submodule reports its full path (submodule.c:1700-1701).
+            "--submodule-prefix" => opts.submodule_prefix = take_value!("--submodule-prefix"),
+            "--no-submodule-prefix" => opts.submodule_prefix.clear(),
+
             // The program to run instead of `git-upload-pack` on the other end. git passes it verbatim to
             // whatever spawns the service, so it can be a path or (over ssh) a whole command line.
             "--upload-pack" => opts.upload_pack = Some(take_value!("--upload-pack")),
@@ -585,9 +592,8 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 let _ = take_value!("--filter");
                 anyhow::bail!("--filter (partial clone) is not supported");
             }
-            "--set-upstream" => {
-                anyhow::bail!("--set-upstream is not supported");
-            }
+            "--set-upstream" => opts.set_upstream = true,
+            "--no-set-upstream" => opts.set_upstream = false,
             "--" => {
                 positionals.extend(args[i..].iter().map(String::as_str));
                 break;
@@ -1236,6 +1242,12 @@ struct FetchOpts {
     /// `GIT_REFLOG_ACTION`, or the whole command line as git composes it: `fetch` plus
     /// every argument, which is the prefix each stored ref's reflog line carries.
     reflog_action: String,
+    /// `--set-upstream`: after the fetch, point `branch.<current>.remote`/`.merge` at the
+    /// one branch that was fetched to `FETCH_HEAD`.
+    set_upstream: bool,
+    /// `--submodule-prefix`: what the recursing parent prepends to this fetch's own
+    /// submodule announcements. Empty in the top-level superproject.
+    submodule_prefix: String,
     dry_run: bool,
     verbose: bool,
     quiet: bool,
@@ -1337,6 +1349,8 @@ impl Default for FetchOpts {
             negotiate_only: false,
             atomic: false,
             refetch: false,
+            set_upstream: false,
+            submodule_prefix: String::new(),
             // "This is enabled by default."
             auto_maintenance: true,
             address_family: None,
@@ -2456,7 +2470,18 @@ fn fetch_one(
                     };
                     update_lines.push(Line {
                         flag: '*',
-                        summary: kind.to_string(),
+                        // ```c
+                        // ref_update_display_info_append(display_array, '*', '*',
+                        //                                *kind ? kind : "branch", ...
+                        // ```
+                        //
+                        // (builtin/fetch.c:1342-1345.) A remote `HEAD` has no kind of its
+                        // own — `store_updated_refs()` blanks both `kind` and `what` for it
+                        // — and the summary column falls back to `branch`.
+                        summary: match kind {
+                            "" => "branch".to_string(),
+                            k => k.to_string(),
+                        },
                         from,
                         to: "FETCH_HEAD".to_string(),
                         reason: "",
@@ -2698,6 +2723,87 @@ fn fetch_one(
     }
 
     fetch_head.write(if atomic_abort { &[] } else { &fetch_head_rows })?;
+
+    // ```c
+    // if (set_upstream) {
+    //         struct branch *branch = branch_get("HEAD");
+    //         struct ref *rm;
+    //         struct ref *source_ref = NULL;
+    //         [...]
+    //         for (rm = ref_map; rm; rm = rm->next) {
+    //                 if (!rm->peer_ref) {
+    //                         if (source_ref) {
+    //                                 warning(_("multiple branches detected, incompatible with --set-upstream"));
+    //                                 goto cleanup;
+    //                         } else {
+    //                                 source_ref = rm;
+    //                         }
+    //                 }
+    //         }
+    // ```
+    //
+    // (builtin/fetch.c:2076-2127.) The upstream it records is the branch that went to
+    // `FETCH_HEAD` — the ref-map entry with no local destination, of which there must be
+    // exactly one. `install_branch_config(0, …)` writes the three keys without the notice
+    // `git branch -u` prints, because the `BRANCH_CONFIG_VERBOSE` bit is not set here.
+    if opts.set_upstream {
+        let mut source: Option<String> = None;
+        let mut ambiguous = false;
+        for mapping in &ref_map.mappings {
+            if mapping.local.is_none() {
+                if source.is_some() {
+                    ambiguous = true;
+                    break;
+                }
+                source = Some(
+                    mapping
+                        .remote
+                        .as_name()
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        // git names the remote by `transport->remote->name`, which for a URL that was never
+        // configured is the URL exactly as it was typed.
+        let remote_display = remote_name
+            .clone()
+            .or_else(|| name_or_url.map(|n| n.to_string()))
+            .unwrap_or_default();
+        if ambiguous {
+            eprintln!("warning: multiple branches detected, incompatible with --set-upstream");
+        } else if let Some(name) = source {
+            let short = name.strip_prefix("refs/heads/").unwrap_or(&name).to_string();
+            match repo.head_name()? {
+                None => eprintln!(
+                    "warning: could not set upstream of HEAD to '{short}' from '{remote_display}'                      when it does not point to any branch."
+                ),
+                Some(head) => {
+                    let branch = head.shorten().to_string();
+                    if name == "HEAD" || name.starts_with("refs/heads/") {
+                        super::branch::install_tracking(
+                            repo,
+                            &branch,
+                            &(remote_display, name.clone(), short),
+                            true,
+                        )?;
+                    } else if name.starts_with("refs/remotes/") {
+                        eprintln!(
+                            "warning: not setting upstream for a remote remote-tracking branch"
+                        );
+                    } else if name.starts_with("refs/tags/") {
+                        eprintln!("warning: not setting upstream for a remote tag");
+                    } else {
+                        eprintln!("warning: unknown branch type");
+                    }
+                }
+            }
+        } else {
+            eprintln!(
+                "warning: no source branch found;\n                 you need to specify exactly one branch with the --set-upstream option"
+            );
+        }
+    }
 
     // --- print the summary ------------------------------------------------
     // ```c
@@ -3030,15 +3136,18 @@ fn fetch_submodules(repo: &gix::Repository, opts: &FetchOpts) -> Result<bool> {
     let Some(modules) = repo.submodules()? else {
         return Ok(false);
     };
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    // Each entry is the submodule's path as the index records it, which is what the
+    // announcement names, and the working directory the child fetch runs in.
+    let mut dirs: Vec<(String, std::path::PathBuf)> = Vec::new();
     for sm in modules {
         if !sm.is_active().unwrap_or(false) {
             continue;
         }
-        // An unpopulated submodule has no repository to fetch into; git skips it.
+        // An unpopulated submodule has no repository to fetch into; git skips it
+        // (`fetch_task_create()` returns a task without a `repo`, submodule.c:1556).
         if matches!(sm.open(), Ok(Some(_))) {
             if let Ok(dir) = sm.work_dir() {
-                dirs.push(dir);
+                dirs.push((sm.path()?.to_string(), dir));
             }
         }
     }
@@ -3078,13 +3187,27 @@ fn fetch_submodules(repo: &gix::Repository, opts: &FetchOpts) -> Result<bool> {
         for _ in 0..workers {
             let (next, failed, dirs, exe, forwarded) =
                 (&next, &failed, &dirs, &exe, &forwarded);
+            let (quiet, prefix) = (opts.quiet, opts.submodule_prefix.as_str());
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(dir) = dirs.get(i) else { break };
+                let Some((path, dir)) = dirs.get(i) else { break };
+                // ```c
+                // if (!spf->quiet)
+                //         strbuf_addf(err, _("Fetching submodule %s%s\n"),
+                //                     spf->prefix, ce->name);
+                // ```
+                //
+                // (`get_fetch_task_from_index()`, submodule.c:1582-1584.) It goes to stderr
+                // as the task starts, and names the submodule by its full path from the
+                // top-level superproject.
+                if !quiet {
+                    eprintln!("Fetching submodule {prefix}{path}");
+                }
                 let status = std::process::Command::new(exe)
                     .arg("-C")
                     .arg(dir)
                     .args(forwarded)
+                    .arg(format!("--submodule-prefix={prefix}{path}/"))
                     .status();
                 if !status.map(|s| s.success()).unwrap_or(false) {
                     failed.store(true, std::sync::atomic::Ordering::Relaxed);

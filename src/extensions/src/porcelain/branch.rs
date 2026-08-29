@@ -2099,7 +2099,12 @@ pub(crate) fn worktree_tracking(
     Ok(None)
 }
 
-fn install_tracking(
+/// `install_branch_config()` (branch.c): record `branch.<name>.remote`,
+/// `branch.<name>.merge` and, when `branch.autoSetupRebase` says so,
+/// `branch.<name>.rebase`. The notice is git's `BRANCH_CONFIG_VERBOSE` half, so a caller
+/// that passes `quiet` writes the three keys and says nothing — which is how
+/// `git fetch --set-upstream` calls it (`install_branch_config(0, …)`).
+pub(super) fn install_tracking(
     repo: &gix::Repository,
     branch: &str,
     upstream: &(String, String, String),

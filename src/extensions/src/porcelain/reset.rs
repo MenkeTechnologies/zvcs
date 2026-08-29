@@ -832,6 +832,23 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // Capture the pre-reset index (worktree stats + tracked set) before mutating.
     let old_index = repo.index_or_load_from_head_or_empty()?.into_owned();
 
+    // ```c
+    // if (reset_type == SOFT || reset_type == KEEP)
+    //         die_if_unmerged_cache(reset_type);
+    // ```
+    // (builtin/reset.c:486.) Neither mode can collapse the stages an unfinished merge left, so
+    // both refuse while `MERGE_HEAD` is there or the index still holds one — naming the mode.
+    if matches!(mode, ResetMode::Soft | ResetMode::Keep) {
+        let merging = repo.git_dir().join("MERGE_HEAD").exists();
+        let unmerged = old_index
+            .entries()
+            .iter()
+            .any(|e| e.stage() != gix::index::entry::Stage::Unconflicted);
+        if merging || unmerged {
+            crate::git_fatal!("Cannot do a {} reset in the middle of a merge.", mode.label());
+        }
+    }
+
     // ---- 3. Path form: reset the named index entries only; no HEAD move. ----
     if with_paths {
         let mut index = pathspec_index(&repo, &old_index, target_tree, &paths, intent_to_add)?;
@@ -881,6 +898,24 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             // to (`die(_("Could not reset index file to revision '%s'."), rev)`).
             eprintln!("fatal: Could not reset index file to revision '{reflog_spec}'.");
             return Ok(ExitCode::from(128));
+        }
+        // ```c
+        // err = reset_index(ref, &oid, reset_type, quiet);
+        // if (reset_type == KEEP && !err)
+        //         err = reset_index(ref, &oid, MIXED, quiet);
+        // ```
+        // (builtin/reset.c:522-524.) `--keep` resets the index a *second* time, as a plain
+        // one-way MIXED pass, so an entry in neither tree — a newly staged file — is unstaged
+        // rather than carried across by `twoway_merge`'s keep-the-current-entry case. Without it
+        // `git reset --keep` left `A staged.txt` staged where stock leaves it untracked.
+        if mode == ResetMode::Keep {
+            let current = repo.open_index()?;
+            let mut index = reset_index_to_tree(&repo, &current, target_tree, false)?;
+            // That second pass is `reset_index()`, not `read_from_tree()`, so it ends in
+            // `prime_cache_tree(the_repository, index, tree)` (builtin/reset.c:120-127): the
+            // index it writes carries a cache-tree built from the target tree itself.
+            index.prime_cache_tree(&repo.objects, &target_tree)?;
+            index.write(crate::config::index_write_options(&repo))?;
         }
         // `if (!pathspec.nr && !unborn)`: an unborn branch has no ref to move and
         // no previous HEAD to save, so `reset_refs()` is skipped outright.
@@ -1617,33 +1652,6 @@ fn pathspec_index(
     paths: &[String],
     intent_to_add: bool,
 ) -> Result<gix::index::File> {
-    // Pathspecs are given relative to the CWD; index paths are repo-root relative.
-    let prefix = repo
-        .prefix()?
-        .map(|p| p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
-        .filter(|p| !p.is_empty());
-    let specs: Vec<String> = paths
-        .iter()
-        .map(|raw| {
-            let cleaned = raw.trim_start_matches("./").trim_end_matches('/');
-            let cleaned = if cleaned == "." { "" } else { cleaned };
-            match (&prefix, cleaned.is_empty()) {
-                (Some(p), true) => p.clone(),
-                (Some(p), false) => format!("{p}/{cleaned}"),
-                (None, _) => cleaned.to_string(),
-            }
-        })
-        .collect();
-
-    let matches = |path: &BStr, s: &str| -> bool {
-        if s.is_empty() {
-            return true;
-        }
-        let pb: &[u8] = path.as_ref();
-        let sb = s.as_bytes();
-        pb == sb || (pb.len() > sb.len() && pb.starts_with(sb) && pb[sb.len()] == b'/')
-    };
-
     // Desired versions for every path in the target tree.
     let target = repo.index_from_tree(&tree)?;
     let mut target_map: HashMap<BString, (Stat, ObjectId, Flags, Mode)> =
@@ -1669,12 +1677,26 @@ fn pathspec_index(
         candidates.insert(p.clone());
     }
 
+    // `parse_pathspec()` + `ce_path_match()`: the real matcher, magic and all. A prefix test was
+    // enough for the plain `dir/file` shapes and silently ignored every other one — `:!nested/`
+    // and `:(exclude)…` matched nothing (so `reset` reset nothing), `:(glob)a/**/*.txt` matched
+    // only a literal path of that name, and `:(icase)` was case-sensitive. The pathspecs are also
+    // taken relative to the current directory, which the engine handles through the repository's
+    // own prefix.
+    let mut search = repo.pathspec(
+        true,
+        paths.iter().map(String::as_bytes),
+        false,
+        old,
+        gix::worktree::stack::state::attributes::Source::IdMapping,
+    )?;
     let mut ops: HashSet<BString> = HashSet::new();
-    for full in &specs {
-        for cand in &candidates {
-            if matches(BStr::new(cand), full) {
-                ops.insert(cand.clone());
-            }
+    for cand in &candidates {
+        let matched = search
+            .pattern_matching_relative_path(BStr::new(cand), Some(false))
+            .is_some_and(|m| !m.is_excluded());
+        if matched {
+            ops.insert(cand.clone());
         }
     }
 

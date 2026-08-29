@@ -795,7 +795,16 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // spelling that does go through the transport. Erroring instead (the server
     // "lacks" the `shallow` capability because there is no server) turns a
     // working `git clone --depth 1 ../repo` into a failure.
-    let local_path_clone = !url_str.contains("://") && Path::new(url_str).is_dir();
+    // ```c
+    // is_local = option_local != 0 && path && !is_bundle;
+    // if (is_local) {
+    //         if (option_depth)
+    //                 warning(_("--depth is ignored in local clones; use file:// instead."));
+    // ```
+    //
+    // (builtin/clone.c:1324-1331.) `--no-local` sets `option_local` to 0, so the clone runs
+    // the transport after all and the selectors are honoured rather than warned about.
+    let local_path_clone = !url_str.contains("://") && Path::new(url_str).is_dir() && !no_local;
     if local_path_clone && !quiet {
         for (given, flag) in [
             (shallow_depth_given, "--depth"),
@@ -863,9 +872,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
 
     // `-s`/`--shared` and `--reference`/`--reference-if-able`: record the object
     // stores to borrow from in `objects/info/alternates` *before* the fetch, which
-    // is where git writes them. `--dissociate` asks for a self-contained result, so
-    // nothing is recorded and the full pack is fetched instead.
-    if !dissociate {
+    // is where git writes them. `--dissociate` records them too — it borrows for the
+    // duration of the clone and only afterwards repacks and drops the file
+    // (`dissociate_from_references()`, builtin/clone.c:845-861).
+    {
         let mut alternates: Vec<PathBuf> = Vec::new();
         // git only shares "when the repository to clone is on the local machine",
         // so a URL that names no openable local repository leaves `-s` a no-op.
@@ -918,15 +928,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         prepare = prepare.with_in_memory_config_overrides(overrides);
     }
 
-    // git-clone(1) on `--depth`: "Implies `--single-branch` unless
-    // `--no-single-branch` is given" — `option_single_branch` defaults to whether
-    // any deepen selector was used, which is the `--depth` / `--shallow-since` /
-    // `--shallow-exclude` group as a whole (clone.c:1370). A local-path clone
-    // ignores the selectors entirely, so it must not inherit the implication.
+    // ```c
+    // if (option_depth || option_since || option_not.nr)
+    //         deepen = 1;
+    // if (option_single_branch == -1)
+    //         option_single_branch = deepen ? 1 : 0;
+    // ```
+    //
+    // (builtin/clone.c:1025-1028.) git-clone(1) on `--depth`: "Implies `--single-branch`
+    // unless `--no-single-branch` is given". The default is settled here, in argument
+    // handling, long before git works out whether the source is a local path — so a local
+    // clone that ignores the depth for the *transfer* still fetches one branch only.
     let single_branch = single_branch.or_else(|| {
-        (!local_path_source
-            && (shallow_depth_given || shallow_since_given || shallow_exclude_given))
-            .then_some(true)
+        (shallow_depth_given || shallow_since_given || shallow_exclude_given).then_some(true)
     });
 
     // Decide which refspec set this clone needs and, with it, which tag mode.
@@ -1175,6 +1189,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // there — a `--single-branch` clone follows that `HEAD`, and its refspec then matches
     // nothing. Either way the clone succeeds and checks nothing out.
     let mut cloned_empty = false;
+    // git's `transport_ls_refs_options.unborn_head_target`: protocol v2's `unborn`
+    // extension reports the branch the remote's own HEAD names even when that branch does
+    // not exist yet, and `update_head()` makes the clone's HEAD a symref to it
+    // (builtin/clone.c:1565-1572, 603-611).
+    let mut unborn_head: Option<String> = None;
     let mut warn_empty = |quiet: bool| {
         if !quiet {
             eprintln!("warning: You appear to have cloned an empty repository.");
@@ -1240,6 +1259,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 .any(|r| r.unpack().0 == tracking_head.as_bytes());
             if outcome.ref_map.mappings.is_empty() {
                 cloned_empty = true;
+                unborn_head = unborn_head_target(&outcome.ref_map);
                 warn_empty(quiet);
             }
             note_remote_head(&outcome.ref_map);
@@ -1263,6 +1283,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             };
             if outcome.ref_map.mappings.is_empty() {
                 cloned_empty = true;
+                unborn_head = unborn_head_target(&outcome.ref_map);
                 warn_empty(quiet);
             }
             note_remote_head(&outcome.ref_map);
@@ -1294,12 +1315,83 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         None => git_dir,
     };
 
+    // `update_remote_refs()` writes the refs a clone stores through
+    // `initial_ref_transaction_commit()`, which puts them straight into `packed-refs` — so
+    // the files backend creates that file even for a clone that stored no ref at all,
+    // leaving it with nothing but the header. gitoxide runs no transaction when there is
+    // nothing to write, so the empty file is written here.
+    if cloned_empty {
+        let packed = git_dir.join("packed-refs");
+        if !packed.exists() {
+            std::fs::write(&packed, "# pack-refs with: peeled fully-peeled sorted \n")?;
+        }
+        // ```c
+        // } else if (unborn && skip_prefix(unborn, "refs/heads/", &head)) {
+        //         /*
+        //          * Unborn head from remote; same as "our" case above except
+        //          * that we have no ref to update.
+        //          */
+        //         if (refs_update_symref(get_main_ref_store(the_repository), "HEAD", unborn, NULL) < 0)
+        //                 die(_("unable to update HEAD"));
+        //         if (!option_bare)
+        //                 install_branch_config(0, head, remote_name, unborn);
+        // }
+        // ```
+        //
+        // (`update_head()`, builtin/clone.c:603-611.) The clone adopts the remote's idea of
+        // the default branch even though no ref was fetched, so a later commit lands on the
+        // branch the remote is waiting for rather than on this machine's default.
+        // A single-branch plan already asked the remote what its HEAD names — including the
+        // `unborn` answer — while building its refspec, so that probe supplies the target
+        // when the fetch itself never got far enough to report one.
+        let unborn_head = unborn_head.or_else(|| {
+            single_outcome
+                .lock()
+                .expect("clone is single-threaded here")
+                .as_ref()
+                .and_then(|(_, head_target)| head_target.clone())
+        });
+        if let Some(target) = unborn_head.as_deref().filter(|t| t.starts_with("refs/heads/")) {
+            std::fs::write(git_dir.join("HEAD"), format!("ref: {target}\n"))?;
+            if !bare {
+                if let Ok(repo) = gix::open(&git_dir) {
+                    let head = target.trim_start_matches("refs/heads/").to_string();
+                    let remote = resolve_remote_name(&repo, origin.as_deref());
+                    super::branch::install_tracking(
+                        &repo,
+                        &head,
+                        &(remote, target.to_string(), head.clone()),
+                        true,
+                    )?;
+                }
+            }
+        }
+    }
+
     // `clone_local()`: with a local source, git never runs the transport at all — it
     // adopts the source object store, hardlinking each file where it can. Here the
     // local fetch has already produced a pack; the pack is dropped and the source's
     // objects are adopted in its place, so the clone ends up with the object layout git
     // leaves behind (loose objects stay loose, packs stay packs).
-    if local_path_source && !no_local && filter.is_none() {
+    // ```c
+    // static void clone_local(const char *src_repo, const char *dest_repo)
+    // {
+    //         if (option_shared) {
+    //                 [...]
+    //                 odb_add_to_alternates_file(the_repository->objects, alt.buf);
+    //         } else {
+    //                 [...]
+    //                 copy_or_link_directory(&src, &dest, src_repo);
+    //         }
+    // ```
+    //
+    // (builtin/clone.c:350-368.) The two halves are exclusive: `-s` borrows the source's
+    // object store through `objects/info/alternates` — recorded above, where git records
+    // the `--reference` ones — and copies nothing at all. The pack the local fetch left
+    // behind is dropped either way, since git's transport never ran.
+    if local_path_source && !no_local && filter.is_none() && shared {
+        drop_fetched_pack(&git_dir);
+    } else if local_path_source && !no_local && filter.is_none() {
         adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)?;
     } else if let Some(cloned) = gix::open(&git_dir)
         .ok()
@@ -1318,6 +1410,33 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             &git_dir.join("objects").join("pack"),
             cloned.object_hash(),
         );
+    }
+
+    // ```c
+    // if (!access(alternates, F_OK)) {
+    //         [...]
+    //         strvec_pushl(&cmd.args, "repack", "-a", "-d", NULL);
+    //         if (run_command(&cmd))
+    //                 die(_("cannot repack to clean up"));
+    //         if (unlink(alternates) && errno != ENOENT)
+    //                 die_errno(_("cannot unlink temporary alternates file"));
+    // }
+    // ```
+    //
+    // (`dissociate_from_references()`, builtin/clone.c:845-861.) The borrowed objects are
+    // pulled into a pack of this repository's own, and only then does the alternates line
+    // go away — which is also why a `--dissociate` clone ends with one pack and no loose
+    // objects, where the same clone without it keeps whatever layout it adopted.
+    if dissociate && git_dir.join("objects").join("info").join("alternates").exists() {
+        let code = run_self(&dir, &["repack", "-a", "-d"], false)?;
+        if code != 0 {
+            crate::git_fatal!("cannot repack to clean up");
+        }
+        match std::fs::remove_file(git_dir.join("objects").join("info").join("alternates")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => crate::git_fatal!("cannot unlink temporary alternates file: {e}"),
+        }
     }
 
     // `write_remote_refs()` commits the remote-tracking refs through
@@ -2269,6 +2388,35 @@ fn derive_dir_name(url: &str, bare: bool) -> Option<String> {
 /// so the destination holds exactly what the source holds rather than a re-packed
 /// equivalent. `objects/info/alternates` is not inherited: the borrowed stores it names
 /// are the source's business, and git resolves them into the copy instead.
+/// The `refs/heads/<name>` a protocol-v2 remote reported as its unborn HEAD, if it did.
+///
+/// The `unborn` extension answers `unborn HEAD symref-target:refs/heads/<name>` for a HEAD
+/// that names a branch with no commits, which is the only way a clone can learn the
+/// remote's default branch when there is nothing to fetch.
+fn unborn_head_target(ref_map: &gix::remote::fetch::RefMap) -> Option<String> {
+    ref_map.remote_refs.iter().find_map(|r| match r {
+        gix::protocol::handshake::Ref::Unborn { full_ref_name, target }
+            if full_ref_name.as_slice() == b"HEAD" =>
+        {
+            Some(target.to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Remove whatever the local fetch wrote into `objects/pack`.
+///
+/// git reaches `clone_local()` instead of the transport for a local source, so neither
+/// half of it — the alternates line or the copied object store — has a fetched pack to
+/// live beside.
+fn drop_fetched_pack(git_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(git_dir.join("objects").join("pack")) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result<()> {
     let src_objects = match source.join(".git").is_dir() {
         true => source.join(".git").join("objects"),
@@ -2280,11 +2428,7 @@ fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result
     let dst_objects = git_dir.join("objects");
 
     // The fetch's own pack is what the adoption replaces.
-    if let Ok(entries) = std::fs::read_dir(dst_objects.join("pack")) {
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    drop_fetched_pack(git_dir);
 
     let mut stack = vec![(src_objects.clone(), dst_objects.clone())];
     while let Some((from, to)) = stack.pop() {

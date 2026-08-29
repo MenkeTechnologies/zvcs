@@ -22,6 +22,7 @@ mod diff_family;
 mod fetch_clone;
 mod fixture_gaps;
 mod fixture_gaps2;
+mod graft_partial;
 mod discovery;
 mod history_query;
 mod index_plumbing;
@@ -35,6 +36,7 @@ mod maintenance_repack;
 mod merge_dirty;
 mod merge_family;
 mod misc_commands;
+mod no_index_diff;
 mod object_pack;
 mod pathspec_stdin;
 mod plumbing_objects;
@@ -92,6 +94,14 @@ pub fn cases() -> Vec<Case> {
     // [`crate::nested`]; those cases also compare stderr, because a refusal's
     // message is the whole behaviour being tested.
     crate::nested::cases(&mut c);
+
+    // `diff --no-index`: the mode with no repository behind it — its patch,
+    // stat, whitespace, binary, prefix and exit-code surfaces.
+    no_index_diff::cases(&mut c);
+
+    // The two repositories that are missing objects on purpose: a shallow
+    // clone's graft boundary, and a partial clone's lazy fetch.
+    graft_partial::cases(&mut c);
 
     // ---- rev-parse: the most-called plumbing in any script ----
     read_only("rev-parse", &["rev-parse", "HEAD"], &mut c);

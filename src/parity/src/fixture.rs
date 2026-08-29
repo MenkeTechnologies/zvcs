@@ -1330,6 +1330,46 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             write(dir, "ni/a.txt", "alpha\nbeta\ngamma\n")?;
             write(dir, "ni/b.txt", "alpha\nBETA\ngamma\n")?;
 
+            // A pair whose only difference is whitespace: leading indentation,
+            // an interior run, a trailing blank, and a blank line added. `-w`,
+            // `-b`, `--ignore-blank-lines`, `--ignore-space-at-eol` and
+            // `--check` all decide something here and nothing in the pairs
+            // above, where every difference survives every ignore rule.
+            write(dir, "ni/ws_a.txt", "one\ntwo three\nfour\n")?;
+            write(dir, "ni/ws_b.txt", "  one\ntwo   three\n\nfour   \n")?;
+
+            // A pair git calls binary. Without a NUL in reach, `--binary`,
+            // `--text` and the "Binary files differ" line were unreachable on
+            // the no-index path, where there is no `.gitattributes` to say so
+            // instead.
+            write_bytes(dir, "ni/bin_a.bin", b"\x00\x01binary one\x00\xff")?;
+            write_bytes(dir, "ni/bin_b.bin", b"\x00\x01binary two\x00\xfe")?;
+
+            // A final line with no newline on one side only, which is the whole
+            // of the `\ No newline at end of file` marker — and it has to be
+            // emitted for the right side.
+            write(dir, "ni/eol_a.txt", "last line\n")?;
+            write_bytes(dir, "ni/eol_b.txt", b"last line")?;
+
+            // Identical content under two names, one per directory: the only
+            // input where rename detection on a no-index queue has a rename to
+            // find rather than a modification to leave alone.
+            write(dir, "ni/ra/moved.txt", "carried across unchanged\nsecond line\n")?;
+            write(dir, "ni/rb/moved-elsewhere.txt", "carried across unchanged\nsecond line\n")?;
+
+            // Function bodies, so `--function-context` has a hunk header to
+            // extend to and `-U<n>` has more than three lines to widen past.
+            write(
+                dir,
+                "ni/fn_a.c",
+                "int first(void)\n{\n\treturn 1;\n}\n\nint second(void)\n{\n\tint x = 2;\n\treturn x;\n}\n",
+            )?;
+            write(
+                dir,
+                "ni/fn_b.c",
+                "int first(void)\n{\n\treturn 1;\n}\n\nint second(void)\n{\n\tint x = 3;\n\treturn x;\n}\n",
+            )?;
+
             // Tracked, so the state probe's `status` stays quiet and the shape
             // reports only what a case did. The empty directories cannot be
             // tracked and are invisible to `status` for the same reason.

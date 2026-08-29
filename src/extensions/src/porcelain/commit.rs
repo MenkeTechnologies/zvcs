@@ -1555,7 +1555,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // paths are added to the real index up front and the commit is a normal,
     // whole-index commit afterward.
     if include_flag {
-        let mut index = open_or_empty_index(&repo)?;
+        let mut index = crate::index_open::or_empty(&repo)?;
         include_stage(&repo, &pathspecs, &index)?.apply_to(&mut index);
         // `-i` writes the real index through `write_locked_index()`
         // (builtin/commit.c:454-465), so the repository's index-write settings apply:
@@ -1568,7 +1568,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // A freshly-init'd repo has no index file yet, which is an empty index — git's
     // root empty commit (`commit --allow-empty` on a fresh repo) then produces the
     // empty tree instead of failing to open a file that isn't there.
-    let mut index = open_or_empty_index(&repo)?;
+    let mut index = crate::index_open::or_empty(&repo)?;
 
     // Refuse while conflicts are staged, exactly as git does — `refresh_cache_or_die()`
     // reports every unmerged path and then `die_resolve_conflict("commit")`.
@@ -1671,7 +1671,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if hook.invoked {
             match &mut partial {
                 Some(p) => p.reread(&repo)?,
-                None => index = open_or_empty_index(&repo)?,
+                None => index = crate::index_open::or_empty(&repo)?,
             }
         }
     }
@@ -2568,22 +2568,6 @@ fn unquote_c_style(line: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Open the on-disk index, or an empty one when the repo has never had a file
-/// (a freshly-`init`'d repository).
-///
-/// `open_index`'s Err variant is large; boxing it would churn every call site.
-#[allow(clippy::result_large_err)]
-fn open_or_empty_index(repo: &gix::Repository) -> Result<gix::index::File> {
-    if repo.index_path().exists() {
-        Ok(repo.open_index()?)
-    } else {
-        Ok(gix::index::File::from_state(
-            gix::index::State::new(repo.object_hash()),
-            repo.index_path(),
-        ))
-    }
-}
-
 /// The (path → id, mode) view of an index, used to decide which pathspec-matched
 /// paths are modifications and which have vanished from the worktree.
 fn tracked_map(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode)> {
@@ -2617,11 +2601,11 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     // named paths to the real index, and a pathspec-limited commit builds the
     // "false index" from HEAD's tree plus those paths.
     let prepared: Option<gix::index::File> = if o.all {
-        let mut index = open_or_empty_index(repo)?;
+        let mut index = crate::index_open::or_empty(repo)?;
         collect_tracked_changes(repo, &index)?.apply_to(&mut index);
         Some(index)
     } else if o.include {
-        let mut index = open_or_empty_index(repo)?;
+        let mut index = crate::index_open::or_empty(repo)?;
         include_stage(repo, &o.pathspecs, &index)?.apply_to(&mut index);
         Some(index)
     } else if !o.pathspecs.is_empty() {
@@ -2635,7 +2619,7 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
         // `rollback_index_files()` that follows the report only rolls back locks
         // that were never committed, which is why `-a` and `-i` — whose prepared
         // index lives in a lock file — leave the real one alone while this does not.
-        let mut real = open_or_empty_index(repo)?;
+        let mut real = crate::index_open::or_empty(repo)?;
         super::write_tree::update_cache_tree_if_stale(repo, &mut real)?;
         None
     };
@@ -2733,7 +2717,7 @@ fn index_differs_from_reference(
     let index = match index {
         Some(i) => i,
         None => {
-            owned = open_or_empty_index(repo)?;
+            owned = crate::index_open::or_empty(repo)?;
             &owned
         }
     };
@@ -3389,7 +3373,7 @@ impl PartialIndex {
         // behaviour and follows from the false index being the lock git rolls back
         // (`rollback_lock_file(&false_lock)`, builtin/commit.c:244) while the real
         // one is committed.
-        let mut real = open_or_empty_index(repo)?;
+        let mut real = crate::index_open::or_empty(repo)?;
         self.staged.apply_to(&mut real);
         super::write_tree::update_cache_tree_quietly(repo, &mut real);
         crate::index_racy::write(repo, &mut real)?;
@@ -3449,7 +3433,7 @@ fn only_mode_stage(
     let mut temp = repo.index_from_tree(&head_tree_id)?;
     let tracked = tracked_map(&temp);
     let mut known: HashSet<BString> = tracked.keys().cloned().collect();
-    let real = open_or_empty_index(repo)?;
+    let real = crate::index_open::or_empty(repo)?;
     let backing = real.path_backing();
     known.extend(real.entries().iter().map(|e| e.path_in(backing).to_owned()));
     let staged = stage_pathspecs(repo, pathspecs, &tracked, &known)?;

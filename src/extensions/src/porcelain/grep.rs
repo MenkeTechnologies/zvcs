@@ -1205,16 +1205,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             gix::index::State::new(gix::hash::Kind::Sha1),
             std::path::PathBuf::new(),
         ),
-        Some(repo) => match repo.open_index() {
-            Ok(index) => index,
-            Err(gix::worktree::open_index::Error::IndexFile(
-                gix::index::file::init::Error::Io(err),
-            )) if err.kind() == std::io::ErrorKind::NotFound => gix::index::File::from_state(
-                gix::index::State::new(repo.object_hash()),
-                repo.index_path(),
-            ),
-            Err(err) => return Err(err.into()),
-        },
+        Some(repo) => crate::index_open::or_empty(repo)?,
     };
 
     // `--textconv` can only change what is searched when there is a converter to

@@ -1012,7 +1012,7 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
         .to_owned();
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    let mut index = repo.open_index()?;
+    let mut index = crate::index_open::or_empty(repo)?;
 
     let snapshot: Vec<Snapshot> = {
         let backing = index.path_backing();

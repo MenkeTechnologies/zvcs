@@ -1147,11 +1147,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         prodash::render::line::render(std::io::stderr(), root.downgrade(), opts)
     });
 
-    // Whether the remote advertised any `refs/remotes/*` of its own. gitoxide always
-    // fetches `HEAD:refs/remotes/<name>/HEAD`, so for a bare or mirrored clone —
-    // where git creates no remote-tracking refs at all — that ref has to be removed
-    // again, unless a mirror refspec legitimately copied the remote's own ones over.
-    let mut remote_advertised_tracking_refs = false;
+    // Whether the remote advertised a `refs/remotes/<name>/HEAD` of its own. gitoxide
+    // always fetches `HEAD:refs/remotes/<name>/HEAD`, so for a bare or mirrored clone —
+    // where git creates no remote-tracking refs at all — that ref has to be removed again.
+    // The one way it may legitimately survive is a `--mirror`, whose `+refs/*:refs/*`
+    // copies the source's own ref of that exact name; the source's `HEAD` is not under
+    // `refs/` and so maps to nothing.
+    let mut remote_advertised_tracking_head = false;
 
     // Whether the server accepted `--filter`. git keeps going when it did not, warning that the
     // filter was ignored, so the warning is emitted from what the handshake advertised.
@@ -1160,6 +1162,24 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // git's `remote_head_points_at`: the branch the remote's `HEAD` names, which
     // `update_remote_refs()` makes `refs/remotes/<name>/HEAD` a symbolic ref to.
     let mut remote_head_branch: Option<String> = None;
+
+    // ```c
+    // if (!mapped_refs) {
+    //         warning(_("You appear to have cloned an empty repository."));
+    //         option_no_checkout = 1;
+    // }
+    // ```
+    //
+    // (builtin/clone.c:1560-1563.) `mapped_refs` is what the clone's refspec selected, so
+    // this covers both an empty remote and one whose `HEAD` names a branch that is not
+    // there — a `--single-branch` clone follows that `HEAD`, and its refspec then matches
+    // nothing. Either way the clone succeeds and checks nothing out.
+    let mut cloned_empty = false;
+    let mut warn_empty = |quiet: bool| {
+        if !quiet {
+            eprintln!("warning: You appear to have cloned an empty repository.");
+        }
+    };
 
     // git names the remote in the diagnostic a missing `--branch` dies with, and the name it uses
     // is the one this clone is about to write: `-o`/`--origin`, else `clone.defaultRemoteName`,
@@ -1193,21 +1213,58 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // A bare clone never checks out a worktree; `--no-checkout` likewise
             // fetches the pack and writes the refs/`HEAD` but leaves the worktree
             // (and index) empty. Fetching is the whole job in both cases.
-            let (_repo, outcome) = prepare
-                .fetch_only(op.add_child("fetch"), &should_interrupt)
-                .map_err(|e| short_pack(e, branch.as_deref(), &effective_remote_name))?;
-            remote_advertised_tracking_refs = outcome
+            let fetched = prepare.fetch_only(op.add_child("fetch"), &should_interrupt);
+            let outcome = match fetched {
+                Ok((_repo, outcome)) => outcome,
+                // gitoxide refuses a fetch whose refspecs matched nothing; git calls that an
+                // empty clone and carries on, so the refusal is turned back into one. The
+                // repository has to be kept explicitly: `PrepareFetch` deletes the
+                // destination it created when it is dropped after a failed fetch.
+                Err(gix::clone::fetch::Error::Fetch(
+                    gix::remote::fetch::Error::NoMapping { .. },
+                )) if branch.is_none() => {
+                    cloned_empty = true;
+                    warn_empty(quiet);
+                    prepare.persist();
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
+                }
+            };
+            let tracking_head = format!("refs/remotes/{effective_remote_name}/HEAD");
+            remote_advertised_tracking_head = outcome
                 .ref_map
                 .remote_refs
                 .iter()
-                .any(|r| r.unpack().0.starts_with(b"refs/remotes/"));
+                .any(|r| r.unpack().0 == tracking_head.as_bytes());
+            if outcome.ref_map.mappings.is_empty() {
+                cloned_empty = true;
+                warn_empty(quiet);
+            }
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
         } else {
             // `git clone 'url'...`
-            let (mut checkout, outcome) = prepare
-                .fetch_then_checkout(op.add_child("fetch"), &should_interrupt)
-                .map_err(|e| short_pack(e, branch.as_deref(), &effective_remote_name))?;
+            let fetched = prepare.fetch_then_checkout(op.add_child("fetch"), &should_interrupt);
+            let (mut checkout, outcome) = match fetched {
+                Ok(pair) => pair,
+                Err(gix::clone::fetch::Error::Fetch(
+                    gix::remote::fetch::Error::NoMapping { .. },
+                )) if branch.is_none() => {
+                    cloned_empty = true;
+                    warn_empty(quiet);
+                    prepare.persist();
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
+                }
+            };
+            if outcome.ref_map.mappings.is_empty() {
+                cloned_empty = true;
+                warn_empty(quiet);
+            }
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
             // Check out the branch `HEAD` points to. This is a no-op for an empty
@@ -1320,7 +1377,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // all, and a `--single-branch` clone only gets the symbolic head when the branch
     // the remote's `HEAD` points at is the one that was fetched.
     let drop_head_tracking = if bare {
-        !remote_advertised_tracking_refs
+        !(mirror && remote_advertised_tracking_head)
     } else {
         match &*single_outcome.lock().expect("clone is single-threaded here") {
             Some((fetched, head_target)) => head_target.as_deref() != fetched.as_deref(),
@@ -1368,6 +1425,30 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         let code = run_self(&dir, &["sparse-checkout", "set", "--cone"], true)?;
         if code != 0 {
             return Ok(ExitCode::from(code));
+        }
+    }
+
+    // ```c
+    // head = refs_resolve_refdup(get_main_ref_store(the_repository), "HEAD",
+    //                            RESOLVE_REF_READING, &oid, NULL);
+    // if (!head) {
+    //         warning(_("remote HEAD refers to nonexistent ref, "
+    //                   "unable to checkout"));
+    //         return 0;
+    // }
+    // ```
+    //
+    // (`checkout()`, builtin/clone.c:655-661.) `update_head()` points HEAD at whatever the
+    // remote's own HEAD named even when that branch was not among the refs fetched, so the
+    // first thing the checkout does is find HEAD unresolvable and give up — without failing
+    // the clone. An empty clone never gets here: it set `option_no_checkout` above.
+    if !bare && !no_checkout && !cloned_empty {
+        let unborn = gix::open(&git_dir)
+            .ok()
+            .map(|repo| repo.head().map(|head| head.id().is_none()).unwrap_or(true))
+            .unwrap_or(false);
+        if unborn {
+            eprintln!("warning: remote HEAD refers to nonexistent ref, unable to checkout");
         }
     }
 

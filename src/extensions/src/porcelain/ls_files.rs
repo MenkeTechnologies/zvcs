@@ -648,18 +648,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // `read_index_from`'s `must_exist == 0` path, so a missing index is an
     // initialized-but-empty one. A repository that has never staged anything
     // therefore prints nothing and exits 0 instead of erroring.
-    let mut index = match repo.open_index() {
-        Ok(index) => index,
-        Err(gix::worktree::open_index::Error::IndexFile(gix::index::file::init::Error::Io(err)))
-            if err.kind() == std::io::ErrorKind::NotFound =>
-        {
-            gix::index::File::from_state(
-                gix::index::State::new(repo.object_hash()),
-                repo.index_path(),
-            )
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let mut index = crate::index_open::or_empty(&repo)?;
 
     // git's lazy `ensure_full_index`: unless `--sparse` was asked for, a sparse
     // directory entry is replaced by the blobs of the tree it stands for, each

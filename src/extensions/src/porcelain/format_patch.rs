@@ -9415,6 +9415,9 @@ mod tests {
             added,
             deleted,
             comment: None,
+            // A text pair: the counts above are the whole story, and
+            // `binary` is what tells `--numstat` to print `-` instead.
+            binary: None,
         }
     }
 

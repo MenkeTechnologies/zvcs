@@ -123,11 +123,19 @@ const USAGE: &str = r"usage: git reflog [show] [<log-options>] [<ref>]
 ///     keep the ids they recorded unless `--rewrite` closes the chain up, and the ref
 ///     only moves under `--updateref`. A selector past the end of a log is ignored.
 ///   * `git reflog expire [--expire=<t>] [--expire-unreachable=<t>] [--rewrite]
-///     [--updateref] [--dry-run] [--all | <ref>…]` — `should_expire_reflog_ent()`'s
-///     two tests: an entry goes when it is older than the total cutoff, and also when
-///     it is unreachable from the ref and older than the unreachable cutoff. Without
-///     the options git's 90-day / 30-day defaults apply. An emptied log is left as an
-///     empty file, as git leaves it.
+///     [--updateref] [--dry-run] [--verbose] [--all [--single-worktree] | <ref>…]` —
+///     `should_expire_reflog_ent()`'s two tests: an entry goes when it is older than the
+///     total cutoff, and also when it is older than the unreachable cutoff and neither of
+///     its ids is reachable. What "reachable" means is
+///     `reflog_expiry_prepare()`'s three regimes: every ref is a tip for `HEAD`
+///     (`UE_HEAD`), the ref's own tip for anything else (`UE_NORMAL`), and nothing at all
+///     once the unreachable cutoff is at or before the total one (`UE_ALWAYS`). The
+///     cutoffs come from `--expire`/`--expire-unreachable`, then the first matching
+///     `gc.<pattern>.reflogExpire[Unreachable]`, then `refs/stash`'s never-expire rule,
+///     then `gc.reflogExpire[Unreachable]` and git's 90-day / 30-day defaults.
+///     `--verbose` prints `keep`/`prune`/`would prune` per entry. `--all` covers every
+///     worktree's logs unless `--single-worktree` narrows it. An emptied log is left as
+///     an empty file, as git leaves it.
 ///   * `write` and `drop` bail — not ported.
 ///
 /// # Argument grammar for `show`
@@ -4151,9 +4159,174 @@ fn parse_raw_line(line: &[u8]) -> Option<RawLine> {
     })
 }
 
+/// The `message` half of a reflog line, which is what
+/// `should_expire_reflog_ent_verbose()` prints.
+///
+/// git's `message` still carries the line's own newline (the reflog file's
+/// records are newline-terminated and it prints `"%s"` with no separator);
+/// [`read_raw_log`] strips it, so it is put back here.
+fn raw_line_message(line: &RawLine) -> Vec<u8> {
+    let mut out = match line.bytes.iter().position(|b| *b == b'\t') {
+        Some(tab) => line.bytes[tab + 1..].to_vec(),
+        None => Vec::new(),
+    };
+    out.push(b'\n');
+    out
+}
+
+/// `reflog_expire_config()` (reflog.c:35-83): the `gc.reflogExpire` /
+/// `gc.reflogExpireUnreachable` defaults plus the `gc.<pattern>.reflog*` entries.
+struct ExpireConfig {
+    /// `opts->default_expire_total`.
+    default_total: i64,
+    /// `opts->default_expire_unreachable`.
+    default_unreachable: i64,
+    /// `opts->entries`, in configuration order — the first matching pattern wins.
+    entries: Vec<(String, Option<i64>, Option<i64>)>,
+}
+
+impl ExpireConfig {
+    fn read(repo: &gix::Repository, default_total: i64, default_unreachable: i64) -> Self {
+        let mut out = ExpireConfig {
+            default_total,
+            default_unreachable,
+            entries: Vec::new(),
+        };
+        let config = repo.config_snapshot();
+        let Some(sections) = config.sections_by_name("gc") else {
+            return out;
+        };
+        for section in sections {
+            // `parse_config_key(var, "gc", &pattern, &pattern_len, &key)`: the subsection
+            // is the pattern, and its absence names the defaults.
+            let pattern = section
+                .header()
+                .subsection_name()
+                .map(|s| s.to_str_lossy().into_owned());
+            for (name, value) in [
+                ("reflogExpire", REFLOG_EXPIRE_TOTAL),
+                ("reflogExpireUnreachable", REFLOG_EXPIRE_UNREACH),
+            ] {
+                let Some(raw) = section.value(name) else { continue };
+                // `git_config_expiry_date()` is `parse_expiry_date()` again.
+                // `git_config_expiry_date()` failing makes `reflog_expire_config()`
+                // return -1, which `repo_config()` reports through its own
+                // `die()`; a value this port cannot read is left to the defaults
+                // rather than invented.
+                let Some(when) = expiry_date(&raw.to_str_lossy()) else {
+                    continue;
+                };
+                match &pattern {
+                    None => match value {
+                        REFLOG_EXPIRE_TOTAL => out.default_total = when,
+                        _ => out.default_unreachable = when,
+                    },
+                    Some(pattern) => {
+                        let slot = match out.entries.iter().position(|(p, _, _)| p == pattern) {
+                            Some(at) => at,
+                            None => {
+                                out.entries.push((pattern.clone(), None, None));
+                                out.entries.len() - 1
+                            }
+                        };
+                        match value {
+                            REFLOG_EXPIRE_TOTAL => out.entries[slot].1 = Some(when),
+                            _ => out.entries[slot].2 = Some(when),
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `reflog_expire_options_set_refname()` (reflog.c:99-133) for one ref: what the
+    /// command line did not pin is filled from the first matching pattern, from
+    /// `refs/stash`'s never-expire rule, or from the defaults.
+    fn for_ref(&self, refname: &str, cli_total: Option<i64>, cli_unreach: Option<i64>) -> (i64, i64) {
+        if let (Some(total), Some(unreach)) = (cli_total, cli_unreach) {
+            return (total, unreach);
+        }
+        let (total, unreach) = match self
+            .entries
+            .iter()
+            .find(|(pattern, _, _)| glob_matches(pattern, refname))
+        {
+            Some((_, total, unreach)) => (total.unwrap_or(0), unreach.unwrap_or(0)),
+            // `if (!strcmp(ref, "refs/stash")) { … = 0; … = 0; return; }` — the stash log
+            // never expires unless the caller says otherwise.
+            None if refname == "refs/stash" => (0, 0),
+            None => (self.default_total, self.default_unreachable),
+        };
+        (cli_total.unwrap_or(total), cli_unreach.unwrap_or(unreach))
+    }
+}
+
+/// `REFLOG_EXPIRE_TOTAL` / `REFLOG_EXPIRE_UNREACH`, as the two slots
+/// `reflog_expire_config()` writes.
+const REFLOG_EXPIRE_TOTAL: u8 = 1;
+const REFLOG_EXPIRE_UNREACH: u8 = 2;
+
+/// `parse_expiry_date()` (date.c) for a configuration value.
+fn expiry_date(value: &str) -> Option<i64> {
+    match value {
+        "now" | "all" => Some(i64::MAX),
+        "never" | "false" => Some(0),
+        _ => {
+            let (timestamp, error) = crate::date::approxidate_careful(value);
+            (!error).then_some(timestamp)
+        }
+    }
+}
+
+/// `wildmatch(ent->pattern, ref, 0)`.
+fn glob_matches(pattern: &str, refname: &str) -> bool {
+    gix::glob::wildmatch(
+        pattern.into(),
+        refname.into(),
+        gix::glob::wildmatch::Mode::empty(),
+    )
+}
+
+/// The per-worktree `logs` directory of every linked worktree, with the id that
+/// prefixes the ref names inside it.
+///
+/// A linked worktree's refs live at `$GIT_COMMON_DIR/worktrees/<id>/logs/<ref>`
+/// and are named `worktrees/<id>/<ref>`, which is what `strbuf_worktree_ref()`
+/// builds in `collect_reflog()`.
+fn linked_worktree_log_roots(repo: &gix::Repository) -> Vec<(String, PathBuf)> {
+    let dir = repo.common_dir().join("worktrees");
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf)> = read
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let id = e.file_name().to_string_lossy().into_owned();
+            // The current worktree's own logs were already collected by name.
+            (e.path() != repo.git_dir()).then(|| (id, e.path().join("logs")))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The file a ref's reflog lives in. `HEAD` (and the other per-worktree
 /// pseudo-refs) belong to this worktree; everything else is shared.
 pub(crate) fn log_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
+    // `worktrees/<id>/<ref>` is another worktree's private ref, whose store is
+    // `$GIT_COMMON_DIR/worktrees/<id>` — the `logs/` goes *inside* it, not in front.
+    if let Some(rest) = full_name.strip_prefix("worktrees/") {
+        if let Some((id, ref_name)) = rest.split_once('/') {
+            return repo
+                .common_dir()
+                .join("worktrees")
+                .join(id)
+                .join("logs")
+                .join(ref_name);
+        }
+    }
     let root = if full_name.starts_with("refs/") {
         repo.common_dir()
     } else {
@@ -4439,18 +4612,29 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         .unwrap_or(0);
 
     let mut all = false;
+    let mut single_worktree = false;
     let mut dry_run = false;
+    let mut verbose = false;
     let mut rewrite = false;
     let mut updateref = false;
     let mut expire: Option<i64> = None;
     let mut expire_unreachable: Option<i64> = None;
     let mut refs: Vec<String> = Vec::new();
-    // `now` is "everything is older", `never` is "nothing is"; anything else is an
-    // approxidate the same parser `--expire` takes elsewhere reads.
+    // ```c
+    // if (!strcmp(date, "never") || !strcmp(date, "false"))
+    //         *timestamp = 0;
+    // else if (!strcmp(date, "all") || !strcmp(date, "now"))
+    //         *timestamp = TIME_MAX;
+    // else
+    //         *timestamp = approxidate_careful(date, &errors);
+    // ```
+    //
+    // (`parse_expiry_date()`, date.c.) `never` is *zero*, not a floor — which matters
+    // because `reflog_expiry_prepare()` compares the two cutoffs against each other.
     let cutoff = |value: &str| -> Option<i64> {
         match value {
             "now" | "all" => Some(i64::MAX),
-            "never" | "false" => Some(i64::MIN),
+            "never" | "false" => Some(0),
             _ => {
                 let (timestamp, error) = crate::date::approxidate_careful(value);
                 (!error).then_some(timestamp)
@@ -4470,23 +4654,31 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             // `parse_short_opt()` consumes before the `h` test that answers help.
             _ if super::asks_for_help(s, "n") => return Ok(super::show_usage(EXPIRE_USAGE)),
             "--all" => all = true,
-            "--single-worktree" => {}
+            "--single-worktree" => single_worktree = true,
             "-n" | "--dry-run" => dry_run = true,
             "--rewrite" => rewrite = true,
             "--updateref" => updateref = true,
-            "--stale-fix" | "--verbose" => {}
+            "--stale-fix" => {}
+            "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
             _ if s.starts_with("--expire-unreachable=") => {
                 let v = &s["--expire-unreachable=".len()..];
                 match cutoff(v) {
                     Some(t) => expire_unreachable = Some(t),
-                    None => crate::git_fatal!("'{v}' is not a valid timestamp"),
+                    // `parse_opt_expiry_date_cb()` reports through
+                    // `error(_("invalid timestamp '%s' given to '--%s'"), arg, opt->long_name)`
+                    // (parse-options-cb.c), which `parse_options()` turns into exit 128
+                    // via the `die` its callers install.
+                    None => crate::git_fatal!(
+                        "invalid timestamp '{v}' given to '--expire-unreachable'"
+                    ),
                 }
             }
             _ if s.starts_with("--expire=") => {
                 let v = &s["--expire=".len()..];
                 match cutoff(v) {
                     Some(t) => expire = Some(t),
-                    None => crate::git_fatal!("'{v}' is not a valid timestamp"),
+                    None => crate::git_fatal!("invalid timestamp '{v}' given to '--expire'"),
                 }
             }
             _ if s.starts_with('-') && s != "-" => {
@@ -4496,13 +4688,40 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let expire = expire.unwrap_or(now - 90 * DAY);
-    let expire_unreachable = expire_unreachable.unwrap_or(now - 30 * DAY);
+    // `repo_config(the_repository, reflog_expire_config, &opts)` (builtin/reflog.c:216).
+    let config = ExpireConfig::read(repo, now - 90 * DAY, now - 30 * DAY);
 
     let targets: Vec<String> = if all {
+        // ```c
+        // worktrees = get_worktrees();
+        // for (p = worktrees; *p; p++) {
+        //         if (single_worktree && !(*p)->is_current)
+        //                 continue;
+        //         collected.worktree = *p;
+        //         refs_for_each_reflog(get_worktree_ref_store(*p), collect_reflog, &collected);
+        // }
+        // ```
+        //
+        // (builtin/reflog.c:253-260.) `--all` covers every worktree, not just this one —
+        // a linked worktree contributes its per-worktree logs under
+        // `worktrees/<id>/<ref>` (`collect_reflog()` drops the shared refs it would
+        // otherwise report a second time).
         let mut names = Vec::new();
         for root in reflog_roots(repo) {
             collect_logs(&root, "", &mut names)?;
+        }
+        if !single_worktree {
+            for (id, root) in linked_worktree_log_roots(repo) {
+                let mut own = Vec::new();
+                collect_logs(&root, "", &mut own)?;
+                names.extend(
+                    own.into_iter()
+                        // The shared half of a linked worktree's store is the same
+                        // `refs/…` this worktree already listed.
+                        .filter(|name| !name.starts_with("refs/"))
+                        .map(|name| format!("worktrees/{id}/{name}")),
+                );
+            }
         }
         names.sort();
         names.dedup();
@@ -4517,28 +4736,84 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     };
 
     for full in targets {
+        // `reflog_expire_options_set_refname(&cb.opts, ref)` before each expiry: the
+        // command line wins, then the first `gc.<pattern>.reflog*` whose pattern matches,
+        // then `refs/stash`'s never-expire rule, then the `gc.reflog*` defaults.
+        let (expire, expire_unreachable) = config.for_ref(&full, expire, expire_unreachable);
         let path = log_file(repo, &full);
         let Some(lines) = read_raw_log(&path)? else {
             continue;
         };
-        // `should_expire_reflog_ent()`: an entry goes when it is older than the total
-        // cutoff, and separately when it is unreachable and older than that cutoff. The
-        // reachable set is only needed for the second test.
-        let reachable = (expire_unreachable != i64::MIN)
-            .then(|| reachable_from_ref(repo, &full))
-            .transpose()?;
+        // ```c
+        // if (!cb->opts.expire_unreachable || is_head(refname)) {
+        //         cb->unreachable_expire_kind = UE_HEAD;
+        // } else {
+        //         commit = lookup_commit_reference_gently(the_repository, oid, 1);
+        //         …
+        //         cb->unreachable_expire_kind = commit ? UE_NORMAL : UE_ALWAYS;
+        // }
+        //
+        // if (cb->opts.expire_unreachable <= cb->opts.expire_total)
+        //         cb->unreachable_expire_kind = UE_ALWAYS;
+        //
+        // switch (cb->unreachable_expire_kind) {
+        // case UE_ALWAYS:  return;
+        // case UE_HEAD:    refs_for_each_ref(…, push_tip_to_list, &cb->tips); …
+        // case UE_NORMAL:  commit_list_insert(commit, &cb->mark_list);
+        // }
+        // ```
+        //
+        // (`reflog_expiry_prepare()`, reflog.c:446-483.) `HEAD`'s reachability set is
+        // built from *every ref*, not from HEAD's own tip — which is what keeps a `HEAD`
+        // entry naming a commit that some branch still holds. `UE_ALWAYS` skips the
+        // reachability question entirely and expires on age alone.
+        let kind = if expire_unreachable == 0 || is_head_log(&full) {
+            Unreachable::Head
+        } else if ref_tip_commit(repo, &full).is_some() {
+            Unreachable::Normal
+        } else {
+            Unreachable::Always
+        };
+        let kind = match expire_unreachable <= expire {
+            true => Unreachable::Always,
+            false => kind,
+        };
+        let reachable = match kind {
+            Unreachable::Always => None,
+            Unreachable::Head => Some(reachable_from_all_refs(repo)?),
+            Unreachable::Normal => Some(reachable_from_ref(repo, &full)?),
+        };
         let mut kept: Vec<RawLine> = Vec::new();
         for line in lines {
-            if line.time < expire {
-                continue;
+            // `is_unreachable()` answers "keep" for a null id and for anything that is
+            // not a commit, and it is asked about *both* ends of the entry.
+            let unreachable = |id: &ObjectId| {
+                reachable.as_ref().is_some_and(|set| {
+                    !id.is_null() && repo.find_commit(*id).is_ok() && !set.contains(id)
+                })
+            };
+            let expired = line.time < expire
+                || (line.time < expire_unreachable
+                    && match kind {
+                        Unreachable::Always => true,
+                        _ => unreachable(&line.old) || unreachable(&line.new),
+                    });
+            if verbose {
+                // `should_expire_reflog_ent_verbose()` (reflog.c:404-424). `message`
+                // carries its own newline.
+                let what = match (expired, dry_run) {
+                    (false, _) => "keep",
+                    (true, true) => "would prune",
+                    (true, false) => "prune",
+                };
+                let mut out = Vec::from(what.as_bytes());
+                out.push(b' ');
+                out.extend_from_slice(&raw_line_message(&line));
+                let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
             }
-            let unreachable = reachable
-                .as_ref()
-                .is_some_and(|set| !line.new.is_null() && !set.contains(&line.new));
-            if unreachable && line.time < expire_unreachable {
-                continue;
+            if !expired {
+                kept.push(line);
             }
-            kept.push(line);
         }
         if dry_run {
             continue;
@@ -4918,6 +5193,67 @@ fn normalize_reflog_message(msg: &str) -> String {
 
 /// Every commit reachable from a ref's current tip, which is what decides whether an
 /// entry counts as unreachable for `--expire-unreachable`.
+/// `reflog_expiry_prepare()`'s three reachability regimes.
+#[derive(Clone, Copy, PartialEq)]
+enum Unreachable {
+    /// `UE_ALWAYS`: nothing is consulted; age alone decides.
+    Always,
+    /// `UE_HEAD`: every ref is a tip.
+    Head,
+    /// `UE_NORMAL`: the ref's own tip is the only one.
+    Normal,
+}
+
+/// `is_head()` (reflog.c:439-444): the ref name with any worktree prefix stripped
+/// is exactly `HEAD`.
+fn is_head_log(full_name: &str) -> bool {
+    full_name == "HEAD"
+        || full_name
+            .rsplit_once('/')
+            .is_some_and(|(head, tail)| tail == "HEAD" && head.starts_with("worktrees/"))
+}
+
+/// `lookup_commit_reference_gently(the_repository, oid, 1)` on a ref's target: the
+/// commit it names, or `None` when it names none.
+fn ref_tip_commit(repo: &gix::Repository, full_name: &str) -> Option<ObjectId> {
+    repo.try_find_reference(full_name)
+        .ok()
+        .flatten()
+        .and_then(|mut r| r.peel_to_id_in_place().ok())
+        .filter(|id| repo.find_commit(id.detach()).is_ok())
+        .map(|id| id.detach())
+}
+
+/// `push_tip_to_list()` over `refs_for_each_ref()`, closed over: the commits every
+/// non-symbolic ref reaches, which is `UE_HEAD`'s notion of reachable.
+fn reachable_from_all_refs(
+    repo: &gix::Repository,
+) -> Result<std::collections::HashSet<ObjectId>> {
+    let mut tips: Vec<ObjectId> = Vec::new();
+    if let Ok(platform) = repo.references() {
+        if let Ok(iter) = platform.all() {
+            for reference in iter.flatten() {
+                let mut reference = reference;
+                if reference.target().try_id().is_none() {
+                    continue; // `if (ref->flags & REF_ISSYMREF) return 0;`
+                }
+                if let Ok(id) = reference.peel_to_id_in_place() {
+                    if repo.find_commit(id.detach()).is_ok() {
+                        tips.push(id.detach());
+                    }
+                }
+            }
+        }
+    }
+    let mut set = std::collections::HashSet::new();
+    if let Ok(walk) = repo.rev_walk(tips).all() {
+        for info in walk.flatten() {
+            set.insert(info.id);
+        }
+    }
+    Ok(set)
+}
+
 fn reachable_from_ref(
     repo: &gix::Repository,
     full_name: &str,

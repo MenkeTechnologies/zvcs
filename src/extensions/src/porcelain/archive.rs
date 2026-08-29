@@ -88,11 +88,15 @@
 //!     after any `path` / `linkpath` record. Reproduced here on the very pax path
 //!     the over-100-byte `path` overflow already drives.
 //!
+//! `--remote` drives the `git-upload-archive` protocol itself: the command line
+//! travels to the far side as `argument` pkt-lines, the archive comes back on
+//! sideband 1 and the server's diagnostics on bands 2 and 3. Only a local
+//! repository is reached that way — git's other transports connect the same
+//! stream over ssh or the daemon, which this port does not open; `--exec` names
+//! the program to run for a local one, as it does for git.
+//!
 //! Not covered — every one of these fails loudly rather than emitting an
 //! archive that would silently differ from git's:
-//!   * `--remote` / `--exec`: the `git-upload-archive` protocol against another
-//!     repository — a live transport handshake (or a spawned `git-upload-archive`
-//!     subprocess even for a local `--remote=.`), which this port does not drive.
 //!   * `export-subst`. `args->convert` makes `object_file_to_archive()` run
 //!     `format_subst()` over the blob, expanding `$Format:<pretty>$` against the
 //!     archived commit; the `--pretty` formatter is not wired into this command,
@@ -320,6 +324,20 @@ struct Item {
 
 /// `git archive` — write a `tar` archive of `<tree-ish>` to stdout or `-o`.
 pub fn archive(args: &[String]) -> Result<ExitCode> {
+    // `cmd_archive()` parses `-o`/`--remote`/`--exec` first, with
+    // `PARSE_OPT_KEEP_ALL`, and hands the rest of the command line to the far side
+    // when a `--remote` came out of it (builtin/archive.c:97-108). Without one
+    // this pass has nothing to say and the ordinary parse below owns every token.
+    if args.iter().any(|a| a == "--remote" || a.starts_with("--remote=") || a.starts_with("--rem")) {
+        let outer = match parse_outer(args) {
+            Ok(outer) => outer,
+            Err(code) => return Ok(code),
+        };
+        if outer.remote.is_some() {
+            return run_remote_archiver(&outer);
+        }
+    }
+
     let mut opts = Opts::default();
     let mut list = false;
     let mut literal = false;
@@ -417,21 +435,17 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             },
-            // `--remote` / `--exec` are real git options, so this is not an
-            // "unknown option" — but honouring them means driving the
-            // `git-upload-archive` protocol (a transport handshake, or a spawned
-            // `git-upload-archive` even for a local `--remote=.`), which this port
-            // does not do. Consume any separate value so the bail is terse.
-            "--remote" | "--exec" => {
+            // `cmd_archive()` took `--remote` for itself before this parse ran, so
+            // reaching one here means the outer pass did not (an abbreviation this
+            // table resolves differently, say). `--exec` without it is swallowed
+            // there and never mentioned again, which is why `archive --exec=x HEAD`
+            // writes an ordinary archive rather than complaining.
+            "--exec" => {
                 let _ = value_of(args, &mut i, a)?;
-                bail!("{a} drives the git-upload-archive protocol, which is not supported here");
             }
-            _ if a.starts_with("--remote=") || a.starts_with("--exec=") => {
-                bail!("{a} drives the git-upload-archive protocol, which is not supported here");
-            }
+            _ if a.starts_with("--exec=") => {}
             // Both are `OPT_STRING`s, so their unset writes NULL over the slot
-            // (parse-options.c:200-202) — asking for the local archive this port
-            // already produces, rather than for the protocol it cannot drive.
+            // (parse-options.c:200-202) — asking for the local archive.
             "--no-remote" | "--no-exec" => {}
             _ if compression_level(a).is_some() => opts.level = compression_level(a),
             // git's `parse_options()` rejects any other dashed token with the
@@ -871,6 +885,314 @@ impl Sink {
 fn value_of(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
     *i += 1;
     Ok(super::value_at(args, *i, flag)?.to_string())
+}
+
+/// What `cmd_archive()` keeps for itself (builtin/archive.c:86-94) before the
+/// rest of the command line goes on to `write_archive()` — or, with `--remote`,
+/// to the server verbatim.
+struct Outer {
+    remote: Option<String>,
+    /// `--exec`, the program to run on the far side.
+    exec: String,
+    output: Option<String>,
+    /// argv as the server will see it: every token the outer parse did not take,
+    /// `--` and unknown options included.
+    rest: Vec<String>,
+}
+
+/// The outer option table. `PARSE_OPT_KEEP_ALL` keeps everything it does not
+/// recognize, so an abbreviation is resolved against *these three* names only —
+/// which is how `--rem=.` reaches `--remote` before the inner parse can see it.
+const OUTER_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "output", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "remote", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "exec", neg: false, arg: super::Arg::Required },
+];
+
+/// `parse_options(argc, argv, prefix, local_opts, NULL, PARSE_OPT_KEEP_ALL)`
+/// (builtin/archive.c:97-98).
+///
+/// Only consulted when the command line names a `--remote`; without one the
+/// ordinary parse below owns every token, `-o` and `--exec` included.
+fn parse_outer(args: &[String]) -> std::result::Result<Outer, ExitCode> {
+    let mut out = Outer {
+        remote: None,
+        exec: "git-upload-archive".to_string(),
+        output: None,
+        rest: Vec::new(),
+    };
+    let mut i = 0;
+    let mut literal = false;
+    while i < args.len() {
+        let a = args[i].as_str();
+        // `PARSE_OPT_KEEP_DASHDASH`: the `--` stays in argv, and option parsing
+        // stops there.
+        if literal || a == "--" {
+            literal = true;
+            out.rest.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        // `-o<file>` and `-o <file>`, the only short option in the table.
+        if let Some(sticky) = a.strip_prefix("-o").filter(|_| !a.starts_with("--")) {
+            let value = match sticky.is_empty() {
+                false => sticky.to_string(),
+                true => match args.get(i + 1) {
+                    Some(v) => {
+                        i += 1;
+                        v.clone()
+                    }
+                    None => return Err(super::missing_option_value("-o")),
+                },
+            };
+            out.output = Some(value);
+            i += 1;
+            continue;
+        }
+        let (name, inline) = match a.strip_prefix("--") {
+            Some(body) => match body.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (body, None),
+            },
+            None => ("", None),
+        };
+        let slot = match super::resolve_long(OUTER_OPTS, name) {
+            super::Resolved::One(opt, _) => opt.name,
+            // Unknown or ambiguous here is not an error: it belongs to the far
+            // side, or to the inner parse.
+            _ => {
+                out.rest.push(args[i].clone());
+                i += 1;
+                continue;
+            }
+        };
+        let value = match inline {
+            Some(v) => v,
+            None => match args.get(i + 1) {
+                Some(v) => {
+                    i += 1;
+                    v.clone()
+                }
+                None => return Err(super::missing_option_value(a)),
+            },
+        };
+        match slot {
+            "output" => out.output = Some(value),
+            "remote" => out.remote = Some(value),
+            _ => out.exec = value,
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// `run_remote_archiver()` (builtin/archive.c:23-71): hand the whole command line
+/// to `git upload-archive` on the far side and copy back what it sends.
+///
+/// ```c
+/// if (name_hint) {
+///         const char *format = archive_format_from_filename(name_hint);
+///         if (format)
+///                 packet_write_fmt(fd[1], "argument --format=%s\n", format);
+/// }
+/// for (i = 1; i < argc; i++)
+///         packet_write_fmt(fd[1], "argument %s\n", argv[i]);
+/// packet_flush(fd[1]);
+/// ```
+///
+/// The `--format` inferred from `-o`'s filename goes first *so that an explicit
+/// `--format` later on the command line overrides it* — the server keeps the last
+/// one it is given. Then `ACK`, a flush, and the archive itself on sideband 1.
+fn run_remote_archiver(outer: &Outer) -> Result<ExitCode> {
+    let remote = outer.remote.as_deref().unwrap_or_default();
+    // Every transport carries the same stream; only the way it is opened differs,
+    // and the only opener here is a local child process. Refuse the others rather
+    // than hand a URL to `upload-archive` as though it were a path, which would
+    // report the repository missing instead of the transport.
+    if let Some(kind) = non_local_transport(remote) {
+        bail!("archive --remote over {kind} is not supported here: only a local repository is served");
+    }
+    let mut child = match spawn_upload_archive(&outer.exec, remote) {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("fatal: cannot run {}: {err}", outer.exec);
+            return Ok(ExitCode::from(128));
+        }
+    };
+    let mut to_server = child.stdin.take().expect("piped stdin");
+    let mut request: Vec<u8> = Vec::new();
+    if let Some(format) = outer.output.as_deref().and_then(format_from_filename) {
+        pkt_line(&mut request, format!("argument --format={format}\n").as_bytes());
+    }
+    for arg in &outer.rest {
+        pkt_line(&mut request, format!("argument {arg}\n").as_bytes());
+    }
+    request.extend_from_slice(b"0000");
+    // A server that died before reading the whole request leaves this write to
+    // fail on a closed pipe; the handshake below reports that as the disconnect
+    // it is, so the error here is not the one to print.
+    let _ = to_server.write_all(&request);
+    let _ = to_server.flush();
+    drop(to_server);
+
+    let mut from_server = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    match read_pkt_line(&mut from_server) {
+        // `PACKET_READ_DIE_ON_ERR_PACKET` reaches `die_initial_contact()` for a
+        // server that never spoke.
+        Err(_) => {
+            let _ = child.wait();
+            eprintln!("fatal: the remote end hung up unexpectedly");
+            return Ok(ExitCode::from(128));
+        }
+        Ok(None) => {
+            let _ = child.wait();
+            eprintln!("fatal: git archive: expected ACK/NAK, got a flush packet");
+            return Ok(ExitCode::from(128));
+        }
+        Ok(Some(line)) => {
+            let line = String::from_utf8_lossy(&line).trim_end_matches('\n').to_string();
+            if line != "ACK" {
+                let _ = child.wait();
+                match line.strip_prefix("NACK ") {
+                    Some(reason) => eprintln!("fatal: git archive: NACK {reason}"),
+                    None => eprintln!("fatal: git archive: protocol error"),
+                }
+                return Ok(ExitCode::from(128));
+            }
+        }
+    }
+    if !matches!(read_pkt_line(&mut from_server), Ok(None)) {
+        let _ = child.wait();
+        eprintln!("fatal: git archive: expected a flush");
+        return Ok(ExitCode::from(128));
+    }
+
+    // `create_output_file()` (builtin/archive.c:12-21) has already put `-o`'s file
+    // on fd 1 by this point, so the primary band goes wherever stdout now is.
+    let mut sink: Box<dyn Write> = match outer.output.as_deref() {
+        Some(path) => Box::new(std::fs::File::create(path)?),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let failed = recv_sideband(&mut from_server, &mut sink)?;
+    sink.flush()?;
+    // `rv |= transport_disconnect(transport)`: a server that exited non-zero makes
+    // the whole thing a failure even when the sideband ended cleanly.
+    let status = child.wait().map(|s| !s.success()).unwrap_or(true);
+    Ok(match failed || status {
+        true => ExitCode::from(1),
+        false => ExitCode::SUCCESS,
+    })
+}
+
+/// `transport_connect(transport, GIT_CONNECT_UPLOAD_ARCHIVE, exec, fd)` for the
+/// one transport this reaches: a local path, which git serves by running the
+/// program named by `--exec` with the repository as its only argument.
+///
+/// The default `git-upload-archive` is git's own helper, found through the exec
+/// path it prepends to `PATH` for its children; the same repository served by
+/// this port has to be served by *this* binary, so the default runs it directly
+/// as `upload-archive`. A `--exec` the caller chose is run through the shell the
+/// way `git_connect()` does, which is why `--exec=nosuch` reports
+/// `nosuch: command not found` and not an `execvp` failure.
+fn spawn_upload_archive(exec: &str, path: &str) -> std::io::Result<std::process::Child> {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    let mut command = match exec == "git-upload-archive" {
+        true => {
+            let mut c = std::process::Command::new(std::env::current_exe()?);
+            c.arg("upload-archive").arg(path);
+            c
+        }
+        false => {
+            let mut c = std::process::Command::new("sh");
+            c.arg("-c").arg(format!("{exec} '{path}'"));
+            c
+        }
+    };
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+}
+
+/// `recv_sideband()` (pkt-line.c:578-604) driving `demultiplex_sideband()`
+/// (sideband.c:301-433): band 1 is the archive, band 2 progress, band 3 an error,
+/// and the stream ends at a flush. Returns whether it ended as anything but that
+/// clean flush, which is `!!rv` in the caller.
+fn recv_sideband(from: &mut impl std::io::BufRead, out: &mut impl Write) -> Result<bool> {
+    // The `remote: ` prefixing and the keyword colours are the same ones `push`
+    // uses. `--remote` runs outside a repository too, and there is then nothing
+    // to read `color.remote` from.
+    let mut sideband = match gix::discover(".") {
+        Ok(repo) => super::push_proto::Sideband::new(&repo),
+        Err(_) => super::push_proto::Sideband::plain(),
+    };
+    loop {
+        match read_pkt_line(from) {
+            Err(_) => {
+                sideband.finish();
+                eprintln!("fatal: archive: unexpected disconnect while reading sideband packet");
+                return Ok(true);
+            }
+            Ok(None) => {
+                sideband.finish();
+                return Ok(false);
+            }
+            Ok(Some(packet)) => match packet.split_first() {
+                Some((1, payload)) => out.write_all(payload)?,
+                Some((2, text)) => sideband.progress(text),
+                Some((3, text)) => {
+                    sideband.remote_error(text);
+                    sideband.finish();
+                    return Ok(true);
+                }
+                _ => {
+                    sideband.finish();
+                    eprintln!("fatal: archive: protocol error: bad band");
+                    return Ok(true);
+                }
+            },
+        }
+    }
+}
+
+/// The transport `git_connect()` would open for `remote`, when it is not the
+/// local one: a `<scheme>://` URL other than `file:`, or the scp-like
+/// `[user@]host:path` (a colon before any slash). `None` means a plain path.
+fn non_local_transport(remote: &str) -> Option<&'static str> {
+    if let Some((scheme, _)) = remote.split_once("://") {
+        return match scheme {
+            "file" => None,
+            "ssh" => Some("ssh"),
+            "git" => Some("the git daemon"),
+            _ => Some("that transport"),
+        };
+    }
+    match remote.split_once(':') {
+        Some((host, _)) if !host.contains('/') && !host.is_empty() => Some("ssh"),
+        _ => None,
+    }
+}
+
+/// A pkt-line carrying `payload`.
+fn pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
+    out.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// One pkt-line, or `None` for the flush that ends a stream. `Err` is a
+/// disconnect or a malformed length.
+fn read_pkt_line(r: &mut impl std::io::Read) -> Result<Option<Vec<u8>>> {
+    let mut header = [0u8; 4];
+    r.read_exact(&mut header)?;
+    let len = usize::from_str_radix(std::str::from_utf8(&header)?, 16)?;
+    match len {
+        0..=4 => Ok(None),
+        _ => {
+            let mut payload = vec![0u8; len - 4];
+            r.read_exact(&mut payload)?;
+            Ok(Some(payload))
+        }
+    }
 }
 
 /// git's `add_file_cb` for `--add-virtual-file <path:content>`, which runs

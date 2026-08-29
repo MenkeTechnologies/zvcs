@@ -1072,7 +1072,7 @@ fn demultiplex_sideband(
 /// prefix and clear-to-eol suffix it picked once from stderr's terminal-ness, the
 /// `scratch` buffer holding a line that straddles a packet boundary, and the
 /// colors `maybe_colorize_sideband()` paints keywords with.
-struct Sideband {
+pub(super) struct Sideband {
     /// `prefix` — `"\033[K" "remote: "` on a real terminal, plain `"remote: "` otherwise.
     prefix: &'static str,
     /// `suffix` — empty on a terminal (the ANSI prefix already clears the line),
@@ -1166,7 +1166,31 @@ fn terminal_is_dumb() -> bool {
 }
 
 impl Sideband {
-    fn new(repo: &gix::Repository) -> Self {
+    /// [`Sideband::new`] with no repository to read `color.remote` from, which
+    /// is `git archive --remote` run outside one. The prefix and the clear-to-eol
+    /// suffix are unchanged; only the keyword colouring is off.
+    pub(super) fn plain() -> Self {
+        Sideband {
+            prefix: match std::io::stderr().is_terminal() && !terminal_is_dumb() {
+                true => "\x1b[Kremote: ",
+                false => "remote: ",
+            },
+            suffix: match std::io::stderr().is_terminal() && !terminal_is_dumb() {
+                true => "",
+                false => "        ",
+            },
+            scratch: String::new(),
+            colors: SidebandColors {
+                enabled: false,
+                hint: String::new(),
+                warning: String::new(),
+                success: String::new(),
+                error: String::new(),
+            },
+        }
+    }
+
+    pub(super) fn new(repo: &gix::Repository) -> Self {
         // `if (isatty(2) && !is_terminal_dumb())` — decided once per process in git,
         // and once per demultiplexed stream here.
         let tty = std::io::stderr().is_terminal() && !terminal_is_dumb();
@@ -1180,7 +1204,7 @@ impl Sideband {
 
     /// `case 3:` — a remote error. git prints the whole packet as one `remote: `
     /// line; there is no line splitting on this band.
-    fn remote_error(&mut self, text: &[u8]) {
+    pub(super) fn remote_error(&mut self, text: &[u8]) {
         if !self.scratch.is_empty() {
             self.scratch.push('\n');
         }
@@ -1195,7 +1219,7 @@ impl Sideband {
     /// append the clear-to-eol suffix to the nonempty ones, and write it out as
     /// soon as it is complete so a hook's output appears while it is still running.
     /// A trailing partial line stays in `scratch` for the next packet.
-    fn progress(&mut self, text: &[u8]) {
+    pub(super) fn progress(&mut self, text: &[u8]) {
         let text = String::from_utf8_lossy(text);
         let mut rest = text.as_ref();
         while let Some(at) = rest.find(['\n', '\r']) {
@@ -1233,7 +1257,7 @@ impl Sideband {
 
     /// The `cleanup:` tail of `demultiplex_sideband()`: whatever is still buffered
     /// gets a newline and goes out.
-    fn finish(&mut self) {
+    pub(super) fn finish(&mut self) {
         if !self.scratch.is_empty() {
             self.scratch.push('\n');
             self.flush_scratch(false);

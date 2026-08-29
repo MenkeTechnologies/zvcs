@@ -150,3 +150,40 @@ fn a_virtual_files_name_is_c_unquoted_and_takes_the_cwd_prefix_not_the_archive_p
     let from_sub = ok(&sub, &["archive", "--format=tar", "--prefix=p/", "--add-virtual-file=v.txt:body", "--add-file=lib.rs", "HEAD"]);
     assert_eq!(names(&from_sub.stdout), ["p/", "p/lib.rs", "src/v.txt", "p/lib.rs"]);
 }
+
+/// `--remote` hands the whole command line to `git upload-archive` on the far
+/// side and copies back what it sends: `ACK`, a flush, then the archive on
+/// sideband 1. A server that failed reports on band 2 and band 3, and the client
+/// exits 1 without writing an archive.
+#[test]
+fn a_remote_archive_is_fetched_over_the_upload_archive_protocol() {
+    let dir = fixture("remote");
+
+    let local = ok(&dir, &["archive", "--format=tar", "HEAD"]);
+    let remote = ok(&dir, &["archive", "--remote=.", "--format=tar", "HEAD"]);
+    assert_eq!(remote.stdout, local.stdout, "the same archive, over the protocol");
+
+    // Options travel verbatim, so `--prefix` is applied by the far side.
+    let prefixed = ok(&dir, &["archive", "--remote=.", "--format=tar", "--prefix=r/", "HEAD"]);
+    assert_eq!(names(&prefixed.stdout), ["r/", "r/README.md", "r/src/", "r/src/lib.rs"]);
+
+    // `-o` names the file the archive lands in, and its extension is sent ahead
+    // of the rest as a `--format` the far side may still be told to override.
+    let out = dir.join("out.tgz");
+    let written = ok(&dir, &["archive", "--remote=.", "-o", out.to_str().expect("utf-8"), "HEAD"]);
+    assert!(written.stdout.is_empty(), "the archive went to the file, not to stdout");
+    let bytes = std::fs::read(&out).expect("read out.tgz");
+    assert_eq!(&bytes[..3], b"\x1f\x8b\x08", "gzip magic: the .tgz suffix picked the format");
+
+    // A repository the server cannot open: band 2 carries its diagnostic as a
+    // `remote:` line, band 3 the archiver's death, and nothing reaches stdout.
+    let missing = run(&dir, &["archive", "--remote=nosuchdir", "HEAD"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty(), "no archive on a failed fetch");
+    let err = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        err.contains("remote: fatal: 'nosuchdir' does not appear to be a git repository"),
+        "{err}"
+    );
+    assert!(err.contains("remote: git upload-archive: archiver died with error"), "{err}");
+}

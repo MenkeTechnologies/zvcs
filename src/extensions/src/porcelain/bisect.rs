@@ -550,7 +550,12 @@ fn skip_cmd(args: &[String]) -> Result<ExitCode> {
 
     let mut verify_expected = read_ref(&ctx.file("BISECT_EXPECTED_REV"))?;
     for id in &ids {
-        write_skip(&ctx, *id)?;
+        // `bisect_skip()` resolves each operand and hands `oid_to_hex(&oid)` to
+        // `bisect_write()`, so the ref and the log line name the hex — unlike `replay`,
+        // which passes the log's own word through untouched.
+        if !write_skip(&ctx, &id.to_hex().to_string(), *id)? {
+            return Ok(ExitCode::from(1));
+        }
         // `bisect_state()`: marking anything other than the commit the last step
         // asked for invalidates both cached answers, once.
         if verify_expected.is_some_and(|expected| expected != *id) {
@@ -566,15 +571,36 @@ fn skip_cmd(args: &[String]) -> Result<ExitCode> {
 /// `bisect_write("skip", …)`: the `refs/bisect/skip-<oid>` ref plus the two
 /// `BISECT_LOG` lines, without taking a step — which is what `replay` needs and
 /// what [`skip_cmd`] does once per operand.
-fn write_skip(ctx: &Ctx, id: ObjectId) -> Result<()> {
-    write_ref(&ctx.refs_dir().join(format!("skip-{}", id.to_hex())), id)?;
+fn write_skip(ctx: &Ctx, rev: &str, id: ObjectId) -> Result<bool> {
+    if !update_bisect_ref(ctx, &format!("skip-{rev}"), id)? {
+        return Ok(false);
+    }
     ctx.append_log(&format!(
         "# skip: [{}] {}\n",
         id.to_hex(),
         subject(&ctx.repo, id)?
     ))?;
-    ctx.append_log(&format!("git bisect skip {}\n", id.to_hex()))?;
-    Ok(())
+    ctx.append_log(&format!("git bisect skip {rev}\n"))?;
+    Ok(true)
+}
+
+/// `refs_update_ref(..., tag.buf, &oid, NULL, 0, UPDATE_REFS_MSG_ON_ERR)` for one
+/// `refs/bisect/<leaf>`.
+///
+/// `UPDATE_REFS_MSG_ON_ERR` is what wraps the refusal in `update_ref failed for ref
+/// '%s': %s`, and the inner half is `refs.c`'s `refusing to update ref with bad name
+/// '%s'` — which is what a replayed `git bisect good main~2` gets, since `~` cannot
+/// appear in a ref name. `false` means the update failed and was reported.
+fn update_bisect_ref(ctx: &Ctx, leaf: &str, id: ObjectId) -> Result<bool> {
+    let full = format!("refs/bisect/{leaf}");
+    if gix::validate::reference::name(full.as_str().into()).is_err() {
+        eprintln!(
+            "error: update_ref failed for ref '{full}': refusing to update ref with bad name '{full}'"
+        );
+        return Ok(false);
+    }
+    write_ref(&ctx.refs_dir().join(leaf), id)?;
+    Ok(true)
 }
 
 /// `git bisect visualize|view`: `bisect_next_check(terms, NULL)` first, then the
@@ -1129,21 +1155,36 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
 /// Record one marking (`refs/bisect/<side>` plus the two `BISECT_LOG` lines) the
 /// way `mark` does, but without advancing the bisection — used by `replay`, which
 /// applies every logged mark and only then takes a single step.
-fn write_mark(ctx: &Ctx, term: &str, side: Side, id: ObjectId) -> Result<()> {
-    // `bisect_write`: `refs/bisect/<state>` for the bad side, and
-    // `refs/bisect/<state>-<rev>` for the good side — `<state>` being the term.
-    let path = match side {
-        Side::Bad => ctx.refs_dir().join(term),
-        Side::Good => ctx.refs_dir().join(format!("{term}-{}", id.to_hex())),
+fn write_mark(ctx: &Ctx, term: &str, side: Side, rev: &str, id: ObjectId) -> Result<bool> {
+    // ```c
+    // if (!strcmp(state, terms->term_bad)) {
+    //         strbuf_addf(&tag, "refs/bisect/%s", state);
+    // } else if (one_of(state, terms->term_good, "skip", NULL)) {
+    //         strbuf_addf(&tag, "refs/bisect/%s-%s", state, rev);
+    // }
+    // …
+    // fprintf(fp, "git bisect %s %s\n", state, rev);
+    // ```
+    //
+    // (`bisect_write()`, builtin/bisect.c:300-330.) `rev` is a *string*, not an id:
+    // `bisect_state()` hands it `oid_to_hex()` of what it resolved, while
+    // `process_replay_line()` hands it the word the log wrote — which is why replaying a
+    // log that says `git bisect good oct-a` recreates `refs/bisect/good-oct-a` and writes
+    // the same line back out.
+    let leaf = match side {
+        Side::Bad => term.to_string(),
+        Side::Good => format!("{term}-{rev}"),
     };
-    write_ref(&path, id)?;
+    if !update_bisect_ref(ctx, &leaf, id)? {
+        return Ok(false);
+    }
     ctx.append_log(&format!(
         "# {term}: [{}] {}\n",
         id.to_hex(),
         subject(&ctx.repo, id)?
     ))?;
-    ctx.append_log(&format!("git bisect {term} {}\n", id.to_hex()))?;
-    Ok(())
+    ctx.append_log(&format!("git bisect {term} {rev}\n"))?;
+    Ok(true)
 }
 
 // --- subcommand: next --------------------------------------------------------
@@ -1212,8 +1253,6 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         let Some(cmd) = toks.next() else {
             continue;
         };
-        let cmd_args: Vec<String> = toks.map(str::to_owned).collect();
-
         if cmd == "start" {
             // `process_replay_line()` hands the rest of the line to
             // `sq_dequote_to_strvec()`, because `bisect_start()` wrote those
@@ -1234,10 +1273,22 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         // its own copy of the two log lines. Only the final `bisect_auto_next()`
         // below takes a step, which is why replaying prints far fewer
         // `Bisecting:` blocks than the original session did.
+        // ```c
+        // word_end = (char *)p + strcspn(p, " \t");
+        // rev = word_end + strspn(word_end, " \t");
+        // *word_end = '\0'; /* NUL-terminate the word */
+        // ```
+        //
+        // (builtin/bisect.c:1049-1051.) Everything after the state word is one `rev`
+        // string — git never splits it — and it reaches `bisect_write()` unresolved.
+        let rev = rest[cmd.len()..].trim_start();
         if cmd == "skip" {
-            for spec in &cmd_args {
-                let id = resolve(&ctx.repo, spec)?;
-                write_skip(&ctx, id)?;
+            let Some(id) = resolve(&ctx.repo, rev).ok() else {
+                eprintln!("error: couldn't get the oid of the rev '{rev}'");
+                return Ok(ExitCode::from(1));
+            };
+            if !write_skip(&ctx, rev, id)? {
+                return Ok(ExitCode::from(1));
             }
             continue;
         }
@@ -1261,9 +1312,17 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
             Side::Bad => &terms.bad,
             Side::Good => &terms.good,
         };
-        for spec in &cmd_args {
-            let id = resolve(&ctx.repo, spec)?;
-            write_mark(&ctx, term, side, id)?;
+        // `if (repo_get_oid(the_repository, rev, &oid)) { res = error(_("couldn't get the
+        // oid of the rev '%s'"), rev); … }` (builtin/bisect.c:309-312), and
+        // `bisect_replay()` stops on the first line that fails.
+        let Some(id) = resolve(&ctx.repo, rev).ok() else {
+            eprintln!("error: couldn't get the oid of the rev '{rev}'");
+            return Ok(ExitCode::from(1));
+        };
+        // `bisect_replay()`'s loop stops at the first line whose `process_replay_line()`
+        // failed, and the whole command is then `BISECT_FAILED`.
+        if !write_mark(&ctx, term, side, rev, id)? {
+            return Ok(ExitCode::from(1));
         }
     }
 
@@ -1348,10 +1407,8 @@ fn take_step(
     goods: Vec<ObjectId>,
     no_checkout: bool,
 ) -> Result<ExitCode> {
-    if !goods.is_empty() {
-        if let Some(code) = check_merge_bases(ctx, bad, &goods, terms, no_checkout)? {
-            return Ok(code);
-        }
+    if let Some(code) = check_good_are_ancestors_of_bad(ctx, bad, &goods, terms, no_checkout)? {
+        return Ok(code);
     }
 
     let first_parent = ctx.first_parent_only();
@@ -1362,7 +1419,9 @@ fn take_step(
     // with anything skipped the whole list is sorted and then filtered, so a
     // skipped best candidate can be stepped away from.
     let skipped = ctx.skipped()?;
-    let (best, reaches, tried) = if skipped.is_empty() {
+    let (best, reaches, tried) = if candidates.list.is_empty() {
+        (None, 0, Vec::new())
+    } else if skipped.is_empty() {
         match candidates.all {
             // Every commit is TREESAME, so `find_bisection()` has nothing to weigh and
             // `do_find_bisection()` would return the head of the list regardless. git's
@@ -1385,7 +1444,9 @@ fn take_step(
         if let Some(code) = error_if_skipped_commits(ctx, &tried, None, terms, &candidates.list)? {
             return Ok(code);
         }
-        println!("{} was both {} and {}", bad.to_hex(), terms.good, terms.bad);
+        // `printf(_("%s was both '%s' and '%s'\n"), …)` (bisect.c:1093-1096) — the terms
+        // are quoted here, unlike in the status lines above.
+        println!("{} was both '{}' and '{}'", bad.to_hex(), terms.good, terms.bad);
         return Ok(ExitCode::from(1));
     };
 
@@ -1457,9 +1518,6 @@ fn check_merge_bases(
     terms: &Terms,
     no_checkout: bool,
 ) -> Result<Option<ExitCode>> {
-    if ctx.file("BISECT_ANCESTORS_OK").exists() {
-        return Ok(None);
-    }
     let bases: Vec<ObjectId> = ctx
         .repo
         .merge_bases_many(bad, goods)?
@@ -1488,8 +1546,69 @@ fn check_merge_bases(
         println!("[{hex}] {}", subject(&ctx.repo, mb)?);
         return Ok(Some(ExitCode::SUCCESS));
     }
+    Ok(None)
+}
+
+/// git's `check_good_are_ancestors_of_bad` (bisect.c:919), which is what actually
+/// decides whether the merge bases have to be resolved.
+///
+/// ```c
+/// /* Check if file BISECT_ANCESTORS_OK exists. */
+/// if (!stat(filename, &st) && S_ISREG(st.st_mode))
+///         goto done;
+///
+/// /* Bisecting with no good rev is ok. */
+/// if (!good_revs.nr)
+///         goto done;
+///
+/// rev = get_bad_and_good_commits(r, &rev_nr);
+/// if (check_ancestors(r, rev_nr, rev, prefix))
+///         res = check_merge_bases(rev_nr, rev, no_checkout);
+/// ```
+///
+/// The gate matters: `check_merge_bases()` is only reached when some good end is
+/// *not* an ancestor of the bad one. `git bisect start <c> <c>` names the same
+/// commit twice, whose merge base is that commit — which `check_merge_bases()`
+/// would call an inconsistent pair, where git falls straight through to the
+/// bisection and reports `<oid> was both 'good' and 'bad'` instead.
+fn check_good_are_ancestors_of_bad(
+    ctx: &Ctx,
+    bad: ObjectId,
+    goods: &[ObjectId],
+    terms: &Terms,
+    no_checkout: bool,
+) -> Result<Option<ExitCode>> {
+    if ctx.file("BISECT_ANCESTORS_OK").exists() || goods.is_empty() {
+        return Ok(None);
+    }
+    if check_ancestors(ctx, bad, goods)? {
+        if let Some(code) = check_merge_bases(ctx, bad, goods, terms, no_checkout)? {
+            return Ok(Some(code));
+        }
+    }
+    // `if (!res) { /* Create file BISECT_ANCESTORS_OK. */ … }` — recorded only when the
+    // range came out clear, so a checked-out merge base leaves the check to run again.
     std::fs::write(ctx.file("BISECT_ANCESTORS_OK"), "")?;
     Ok(None)
+}
+
+/// git's `check_ancestors`: walk `<good>... ^<bad>` and report whether anything
+/// came out of it — i.e. whether some good end is not an ancestor of the bad one.
+///
+/// The walk is empty exactly when every good is `bad` itself or reachable from it,
+/// which is what the merge base of the pair being the good end says.
+fn check_ancestors(ctx: &Ctx, bad: ObjectId, goods: &[ObjectId]) -> Result<bool> {
+    for good in goods {
+        let is_ancestor = ctx
+            .repo
+            .merge_base(*good, bad)
+            .map(|base| base.detach() == *good)
+            .unwrap_or(false);
+        if !is_ancestor {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// git's `handle_bad_merge_base`: the merge base itself is the bad rev. When it is
@@ -1583,9 +1702,9 @@ fn candidate_list(
     for info in walk.all()? {
         list.push(info?.id);
     }
-    if list.is_empty() {
-        crate::git_fatal!("no testable commit found between the marked revisions");
-    }
+    // An empty list is not an error: `bisect_next_all()` runs `find_bisection()` over it,
+    // gets nothing back and reports `<oid> was both '<good>' and '<bad>'`
+    // (bisect.c:1085-1099). That is the case `git bisect start <c> <c>` lands in.
 
     let paths = bisect_paths(ctx)?;
     let mut treesame = vec![false; list.len()];

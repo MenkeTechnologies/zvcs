@@ -811,6 +811,17 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // can take it down again on any death below, and leaves a directory it found alone.
     let created_destination = !dst.exists();
     std::fs::create_dir_all(dst)?;
+    // ```c
+    // atexit(remove_junk);
+    // sigchain_push_common(remove_junk_on_signal);
+    // ```
+    //
+    // (builtin/clone.c:1106-1107.) Everything between here and the checkout is covered: a
+    // transport the policy forbids, an unreachable remote, a refused ref — each one is a
+    // `die()` that takes the half-built clone down with it. The git dir it would also remove
+    // lives inside `dst` until `--separate-git-dir` relocates it, which happens after the
+    // fetch, so the one path covers both.
+    let junk = JunkDir::arm(created_destination.then(|| dst.to_path_buf()));
 
     // Serialize the ref/index writes through the repo coordinator, matching the
     // other write commands. On a freshly created clone no daemon is listening, so
@@ -1304,6 +1315,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 )) if branch.is_none() => {
                     cloned_empty = true;
                     warn_empty(quiet);
+                    // An empty clone is a *successful* clone in git — `checkout()` runs and
+                    // returns, `junk_mode` moves on, and the repository stays.
+                    junk.leave();
                     prepare.persist();
                     return Ok(());
                 }
@@ -1324,6 +1338,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             }
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
+            // `checkout()` is still called for a bare or `--no-checkout` clone; it returns
+            // before touching the worktree, but `junk_mode` has already moved on.
+            junk.leave();
         } else {
             // `git clone 'url'...`
             let fetched = prepare.fetch_then_checkout(op.add_child("fetch"), &should_interrupt);
@@ -1334,6 +1351,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 )) if branch.is_none() => {
                     cloned_empty = true;
                     warn_empty(quiet);
+                    // An empty clone is a *successful* clone in git — `checkout()` runs and
+                    // returns, `junk_mode` moves on, and the repository stays.
+                    junk.leave();
                     prepare.persist();
                     return Ok(());
                 }
@@ -1348,6 +1368,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             }
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
+            // `junk_mode = JUNK_LEAVE_REPO;` (builtin/clone.c:1629), immediately before
+            // `checkout()`: from here on a failure keeps the repository and only warns.
+            junk.leave();
             // Check out the branch `HEAD` points to. This is a no-op for an empty
             // remote, leaving an empty repository exactly like git does.
             checkout.main_worktree(op.add_child("checkout"), &should_interrupt)?;
@@ -1683,6 +1706,45 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+
+/// builtin/clone.c's `remove_junk()`, as a guard rather than an `atexit()` hook.
+///
+/// ```c
+/// if (dest_exists)
+///         junk_work_tree_flags |= REMOVE_DIR_KEEP_TOPLEVEL;
+/// else if (mkdir(work_tree, 0777))
+///         die_errno(_("could not create work tree dir '%s'"), work_tree);
+/// junk_work_tree = work_tree;
+/// ```
+///
+/// (builtin/clone.c:1113-1118.) A directory the clone created is the clone's to take back
+/// when it dies; one it found is left where it was. [`JunkDir::leave`] is `junk_mode =
+/// JUNK_LEAVE_REPO`, after which git keeps what it built.
+struct JunkDir {
+    path: std::cell::RefCell<Option<PathBuf>>,
+}
+
+impl JunkDir {
+    fn arm(path: Option<PathBuf>) -> Self {
+        JunkDir {
+            path: std::cell::RefCell::new(path),
+        }
+    }
+
+    /// Stop removing on drop — the repository is far enough along to keep.
+    fn leave(&self) {
+        self.path.borrow_mut().take();
+    }
+}
+
+impl Drop for JunkDir {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.borrow_mut().take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 /// The refspec set a clone needs, chosen from the option combination. gitoxide

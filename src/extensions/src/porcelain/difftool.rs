@@ -365,6 +365,31 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // ```c
+    // if (use_gui_tool == 1)
+    //         setenv("GIT_MERGETOOL_GUI", "true", 1);
+    // else if (use_gui_tool == 0)
+    //         setenv("GIT_MERGETOOL_GUI", "false", 1);
+    // if (difftool_cmd) { … setenv("GIT_DIFF_TOOL", difftool_cmd, 1); … }
+    // if (extcmd) { … setenv("GIT_DIFFTOOL_EXTCMD", extcmd, 1); … }
+    // ```
+    //
+    // (`builtin/difftool.c:780-802`.) `--tool`, `--extcmd` and `--gui` reach the
+    // helper through the environment, because in file-diff mode the helper is one
+    // process per changed path and in dir-diff mode it is one process for the
+    // pair — neither gets the command line. Without them the dir-diff run
+    // resolved `diff.tool` from scratch and launched whatever the user's config
+    // named instead of the tool that was asked for.
+    if let Some(gui) = opts.gui {
+        std::env::set_var("GIT_MERGETOOL_GUI", if gui { "true" } else { "false" });
+    }
+    if let Some(tool) = opts.tool.as_deref() {
+        std::env::set_var("GIT_DIFF_TOOL", tool);
+    }
+    if let Some(extcmd) = opts.extcmd.as_deref() {
+        std::env::set_var("GIT_DIFFTOOL_EXTCMD", extcmd);
+    }
+
     // Phase 4 — the launch.
     if opts.dir_diff {
         run_dir_diff(&repo, &opts)

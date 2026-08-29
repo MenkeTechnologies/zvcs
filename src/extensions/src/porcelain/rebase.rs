@@ -3560,7 +3560,7 @@ fn restore_worktree_to_tree(
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    new_index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut new_index)?;
     Ok(())
 }
 
@@ -5011,7 +5011,7 @@ impl<'r> Sequencer<'r> {
             }
         }
         self.index = applied.index;
-        self.index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut self.index)?;
 
         if !applied.conflicts.is_empty() {
             // `merge_switch_to_result()` records the merged tree as `AUTO_MERGE`
@@ -5419,7 +5419,7 @@ impl<'r> Sequencer<'r> {
             }
         }
         self.index = applied.index;
-        self.index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut self.index)?;
 
         let commit = repo.find_commit(original)?;
         let message: BString = commit.message_raw()?.to_owned();
@@ -6438,12 +6438,15 @@ fn update_clean_worktree(
         }
     }
 
-    // Fresh stats produced by the checkout for the changed entries.
-    let mut subset_stats: HashMap<BString, Stat> = HashMap::with_capacity(subset.entries().len());
+    // Fresh stats produced by the checkout for the changed entries, carrying the content they
+    // were measured from: a stat stamped on an entry naming a *different* blob claims the
+    // worktree matches when it does not, which hides the difference from `status` and `add`.
+    let mut subset_stats: HashMap<BString, (ObjectId, gix::index::entry::Mode, Stat)> =
+        HashMap::with_capacity(subset.entries().len());
     {
         let backing = subset.path_backing();
         for e in subset.entries() {
-            subset_stats.insert(e.path_in(backing).to_owned(), e.stat);
+            subset_stats.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
         }
     }
 
@@ -6452,7 +6455,9 @@ fn update_clean_worktree(
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
             let path = e.path_in(&backing).to_owned();
-            if let Some(stat) = subset_stats.get(&path) {
+            if let Some((_, _, stat)) =
+                subset_stats.get(&path).filter(|(id, mode, _)| *id == e.id && *mode == e.mode)
+            {
                 e.stat = *stat;
             } else if let Some((oid, mode, stat)) = old_map.get(&path) {
                 if *oid == e.id && *mode == e.mode {
@@ -6466,7 +6471,7 @@ fn update_clean_worktree(
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    new_index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut new_index)?;
 
     Ok(())
 }

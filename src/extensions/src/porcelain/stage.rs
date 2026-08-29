@@ -1152,7 +1152,7 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // allowed to come out with fewer extensions than a staged one — same
         // `IEOT` decision, same place in the write.
         super::write_tree::prepare_offset_table(repo, &mut index);
-        index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut index)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1942,7 +1942,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // the repository rather than to the verb. See [`super::add`]'s write for the
     // full note.
     super::write_tree::prepare_offset_table(repo, &mut index);
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
     super::add::record_stage_event(repo, staged.len() + deletions.len());
 
     if o.verbose {

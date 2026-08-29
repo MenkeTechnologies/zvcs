@@ -2128,7 +2128,7 @@ fn restore_stash_commit(
         // git leaves the conflicted worktree in place and fails the apply; the
         // caller keeps the stash and reports it.
         if let Some(applied) = applied.as_mut() {
-            applied.index.write(crate::config::index_write_options(repo))?;
+            crate::index_racy::write(repo, &mut applied.index)?;
         }
         if restore_index {
             eprintln!("Index was not unstashed.");
@@ -2140,13 +2140,13 @@ fn restore_stash_commit(
     // stash's own staged tree. Worktree stats come from the merge's own index so
     // a following `status` does not re-hash every file.
     if let Some(applied) = applied.filter(|_| merged_cleanly) {
-        let fresh: HashMap<BString, Stat> = {
+        let fresh: HashMap<BString, (ObjectId, Mode, Stat)> = {
             let backing = applied.index.path_backing();
             applied
                 .index
                 .entries()
                 .iter()
-                .map(|e| (e.path_in(backing).to_owned(), e.stat))
+                .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
                 .collect()
         };
     //
@@ -2324,7 +2324,7 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         // the stash never reached still names its tree. Repairing here instead produced a
         // fully valid extension 19 bytes longer than git's on every `pull --autostash`.
         super::write_tree::carry_cache_tree_invalidating_changes(repo, &applied.index, &mut head_index);
-        head_index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut head_index)?;
         if !quiet {
             // `apply_save_autostash_oid()` reports this on **stderr**, alongside
             // every other line the autostash machinery prints.
@@ -2334,7 +2334,7 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         // Keep the conflicted index (stages 1/2/3) so the user can resolve, exactly
         // as a conflicting `git stash apply` leaves it.
         let mut index = applied.index;
-        index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut index)?;
         if !quiet {
             // git keeps the changes recoverable in the stash on a conflicting apply.
             eprintln!("Applying autostash resulted in conflicts.");
@@ -2409,7 +2409,7 @@ fn sync_worktree(
     affected: &HashSet<BString>,
     target_map: &HashMap<BString, (ObjectId, Mode)>,
     should_interrupt: &AtomicBool,
-) -> Result<HashMap<BString, Stat>> {
+) -> Result<HashMap<BString, (ObjectId, Mode, Stat)>> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("bare repository has no worktree to update"))?
@@ -2433,11 +2433,13 @@ fn sync_worktree(
         opts,
     )?;
 
+    // The id and mode travel with the stat: it describes the file this checkout just wrote, and
+    // is only valid for an index entry naming that same content.
     let mut fresh = HashMap::with_capacity(subset.entries().len());
     {
         let backing = subset.path_backing();
         for e in subset.entries() {
-            fresh.insert(e.path_in(backing).to_owned(), e.stat);
+            fresh.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
         }
     }
 
@@ -2652,11 +2654,17 @@ enum CacheTree<'a> {
 /// Write the on-disk index to the state of `tree_id`, reusing `fresh` stats for
 /// just-written files and the previous index stats for entries that didn't move,
 /// so the next status check stays cheap.
+///
+/// A stat may only be adopted by the entry that names the content it was measured from — `fresh`
+/// therefore carries the id and mode alongside it. Stamping a stat on an entry that names a
+/// *different* blob asserts "the worktree matches the index" about a file that does not, and every
+/// later `status`, `diff` and `add` believes it: the change becomes invisible, and a commit made in
+/// that state silently omits it.
 fn write_target_index(
     repo: &gix::Repository,
     tree_id: ObjectId,
     old_index: &gix::index::File,
-    fresh: &HashMap<BString, Stat>,
+    fresh: &HashMap<BString, (ObjectId, Mode, Stat)>,
     cache_tree: CacheTree<'_>,
 ) -> Result<()> {
     let mut new_index = repo.index_from_tree(&tree_id)?;
@@ -2674,7 +2682,9 @@ fn write_target_index(
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
             let path = e.path_in(&backing).to_owned();
-            if let Some(stat) = fresh.get(&path) {
+            if let Some((_, _, stat)) =
+                fresh.get(&path).filter(|(id, mode, _)| *id == e.id && *mode == e.mode)
+            {
                 e.stat = *stat;
             } else if let Some((id, mode, stat, _)) = old_map.get(&path) {
                 if *id == e.id && *mode == e.mode {
@@ -2748,7 +2758,7 @@ fn write_target_index(
     // `index.skipHash=true` leaves twenty zero bytes at the end of `.git/index`
     // after `git stash apply`; writing the real hash instead made the next
     // `fsck`/`git status` see a differently-shaped file than git wrote.
-    new_index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut new_index)?;
     Ok(())
 }
 

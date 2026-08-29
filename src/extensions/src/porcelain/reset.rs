@@ -915,7 +915,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             // `prime_cache_tree(the_repository, index, tree)` (builtin/reset.c:120-127): the
             // index it writes carries a cache-tree built from the target tree itself.
             index.prime_cache_tree(&repo.objects, &target_tree)?;
-            index.write(crate::config::index_write_options(&repo))?;
+            crate::index_racy::write(&repo, &mut index)?;
         }
         // `if (!pathspec.nr && !unborn)`: an unborn branch has no ref to move and
         // no previous HEAD to save, so `reset_refs()` is skipped outright.
@@ -1074,7 +1074,7 @@ fn finish_mixed(
     // `read_from_tree()` (builtin/reset.c:494), which stages the differences entry by
     // entry and so invalidates only the paths that actually moved.
     super::write_tree::carry_cache_tree_invalidating_changes(repo, old_index, index);
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, index)?;
     Ok(())
 }
 
@@ -1303,7 +1303,7 @@ fn reset_worktree_hard(
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    new_index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut new_index)?;
     Ok(())
 }
 
@@ -1521,16 +1521,23 @@ fn reset_two_tree(
         )?;
         // Copy the fresh stats back onto the persisted index so the just-written
         // files are not reported modified before the next refresh.
-        let stat_map: HashMap<BString, Stat> = {
+        // The id and mode ride with the stat: a stat is only true of the entry naming the content
+        // it was measured from. Stamping one on an entry that names a different blob claims the
+        // worktree matches the index when it does not, and the difference then disappears from
+        // `status`, `diff` and `add`.
+        let stat_map: HashMap<BString, (ObjectId, Mode, Stat)> = {
             let backing = wt.path_backing();
             wt.entries()
                 .iter()
-                .map(|e| (e.path_in(backing).to_owned(), e.stat))
+                .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
                 .collect()
         };
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
-            if let Some(stat) = stat_map.get(e.path_in(&backing)) {
+            if let Some((_, _, stat)) = stat_map
+                .get(e.path_in(&backing))
+                .filter(|(id, mode, _)| *id == e.id && *mode == e.mode)
+            {
                 e.stat = *stat;
             }
         }
@@ -1547,7 +1554,7 @@ fn reset_two_tree(
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    new_index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut new_index)?;
     Ok(true)
 }
 

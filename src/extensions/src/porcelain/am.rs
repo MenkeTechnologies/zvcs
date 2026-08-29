@@ -2348,7 +2348,7 @@ fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]
         !ld.quiet,
     )?;
     let mut index = applied.index;
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
     // `merge_switch_to_result()` records the result either way (merge-ort.c:4950).
     crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
 

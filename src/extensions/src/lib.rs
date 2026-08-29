@@ -28,6 +28,7 @@ pub mod gitsig;
 pub mod hooks;
 pub mod hosted;
 pub mod index_commit;
+pub mod index_racy;
 pub mod jobpool;
 pub mod jobrun;
 pub mod listcmds;

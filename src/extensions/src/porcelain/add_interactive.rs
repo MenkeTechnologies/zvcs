@@ -736,7 +736,7 @@ impl State<'_> {
         index.remove_tree();
         // The interactive `revert` command writes the real index; options come
         // from the repository as they do for every writer (read-cache.c:2830-2831).
-        index.write(crate::config::index_write_options(self.repo))?;
+        crate::index_racy::write(self.repo, &mut index)?;
         Ok(())
     }
 

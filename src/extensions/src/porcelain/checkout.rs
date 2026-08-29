@@ -2275,7 +2275,7 @@ fn restore_from_index(
     for path in &stale {
         index.invalidate_path_in_tree(path.as_bstr());
     }
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
 
     if bare && !quiet {
         eprintln!(
@@ -2455,7 +2455,7 @@ fn restore_from_tree(
     for path in &stale {
         index.invalidate_path_in_tree(path.as_bstr());
     }
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
 
     if bare && !quiet {
         eprintln!(
@@ -2736,7 +2736,7 @@ pub(super) fn apply_switch_autostash(
         eprintln!("Applied autostash.");
     } else {
         let mut index = applied.index;
-        index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut index)?;
         super::stash::store_commit(
             repo,
             stash,
@@ -2841,6 +2841,10 @@ pub(super) fn update_worktree_to_tree(
             let path = e.path_in(&backing).to_owned();
             let stat = subset_stats
                 .get(&path)
+                // Only the entry naming the content that was written may take its stat: a stat
+                // stamped on an entry naming a different blob says the worktree matches the index
+                // when it does not, and `status`, `diff` and `add` all believe it.
+                .filter(|(oid, mode, _)| *oid == e.id && *mode == e.mode)
                 .map(|(_, _, stat)| *stat)
                 .or_else(|| {
                     old_stats
@@ -2856,7 +2860,7 @@ pub(super) fn update_worktree_to_tree(
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
     super::write_tree::rebuild_cache_tree(repo, &mut index);
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
     Ok(())
 }
 
@@ -2950,7 +2954,9 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
             let path = e.path_in(&backing).to_owned();
-            if let Some((_, _, stat)) = subset_stats.get(&path) {
+            if let Some((_, _, stat)) =
+                subset_stats.get(&path).filter(|(oid, mode, _)| *oid == e.id && *mode == e.mode)
+            {
                 e.stat = *stat;
             } else if let Some((oid, mode, stat, _)) = old_map.get(&path) {
                 if *oid == e.id && *mode == e.mode {
@@ -2962,7 +2968,7 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    new_index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut new_index)?;
     // `remove_branch_state()`: a forced switch abandons any in-progress merge,
     // cherry-pick or revert, exactly as git's `switch_branches` does after the
     // worktree is reconciled.

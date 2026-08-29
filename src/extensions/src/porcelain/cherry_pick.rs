@@ -1407,7 +1407,7 @@ fn pick_one(
         // `merge_apply::three_way_merge()`; the conflicted pick was the one path that
         // wrote its index without it.
         super::write_tree::carry_and_repair_cache_tree(&repo, &state.index, &mut new_index);
-        new_index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut new_index)?;
 
         let git_dir = repo.git_dir();
         // `AUTO_MERGE` — the merge result with its conflict markers — was
@@ -2431,7 +2431,7 @@ fn update_clean_worktree(
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    new_index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut new_index)?;
     Ok(new_index)
 }
 

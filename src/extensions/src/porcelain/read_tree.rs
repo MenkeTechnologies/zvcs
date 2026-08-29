@@ -829,7 +829,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
         }
         _ => super::write_tree::rebuild_cache_tree(&repo, &mut new_index),
     }
-    new_index.write(crate::config::index_write_options(&repo))?;
+    crate::index_racy::write(&repo, &mut new_index)?;
     // `core.fsync=index` (or an aggregate that contains it) hardens the index git
     // has just rewritten; the default set does not, so this is normally a no-op.
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
@@ -1106,7 +1106,7 @@ fn multi_tree_read(
     // repository already has keep an id, everything else — including every node above
     // an unmerged path — comes out invalid.
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    new_index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut new_index)?;
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
     Ok(ExitCode::SUCCESS)
 }
@@ -1760,17 +1760,23 @@ fn checkout_subset(
         opts,
     )?;
 
-    let fresh: HashMap<BString, Stat> = {
+    // The stat of a file that was just written belongs to the blob it was written from, and to no
+    // other: stamping it on an entry that names different content tells every later `status`,
+    // `diff` and `add` that the worktree matches the index when it does not.
+    let fresh: HashMap<BString, (gix::ObjectId, gix::index::entry::Mode, Stat)> = {
         let backing = subset.path_backing();
         subset
             .entries()
             .iter()
-            .map(|e| (e.path_in(backing).to_owned(), e.stat))
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
             .collect()
     };
     let backing = index.path_backing().to_owned();
     for e in index.entries_mut() {
-        if let Some(stat) = fresh.get(&e.path_in(&backing).to_owned()) {
+        if let Some((_, _, stat)) = fresh
+            .get(&e.path_in(&backing).to_owned())
+            .filter(|(id, mode, _)| *id == e.id && *mode == e.mode)
+        {
             e.stat = *stat;
         }
     }

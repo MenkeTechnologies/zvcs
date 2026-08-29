@@ -1093,7 +1093,7 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
     super::write_tree::rebuild_cache_tree(repo, &mut index);
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
 
     // Cone mode alone refreshes the cache tree: git finishes
     // `update_working_directory()` with `clean_tracked_sparse_directories()`,

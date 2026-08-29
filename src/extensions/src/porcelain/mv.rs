@@ -334,7 +334,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         // come from the repository, not from this call site
         // (read-cache.c:2830-2831, :2874-2904).
         super::write_tree::prepare_offset_table(&repo, &mut index);
-        index.write(crate::config::index_write_options(&repo))?;
+        crate::index_racy::write(&repo, &mut index)?;
     }
 
     Ok(ExitCode::SUCCESS)

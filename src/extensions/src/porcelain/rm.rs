@@ -665,7 +665,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     // this index gets the same trailer and the same extensions any other verb
     // would have written in this repository.
     super::write_tree::prepare_offset_table(&repo, &mut index);
-    index.write(crate::config::index_write_options(&repo))?;
+    crate::index_racy::write(&repo, &mut index)?;
 
     Ok(ret)
 }

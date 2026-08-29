@@ -513,19 +513,26 @@ fn update_worktree_to_tree(
 
     // Backfill stats: from the just-checked-out subset for changed paths, or from
     // the old index for entries left unchanged.
-    let subset_stats: HashMap<BString, Stat> = {
+    // The id and mode ride along with the stat: a stat may only be stamped on an entry that
+    // records the *same content that was written*. Stamping it unconditionally is how an entry
+    // ends up naming one blob while carrying another file's stat, which makes a real difference
+    // invisible to `status`, `diff` and `add` — git's own rule is the same (`ce_mark_uptodate()`
+    // is reached only for the entry `checkout_entry()` just wrote).
+    let subset_stats: HashMap<BString, (ObjectId, Mode, Stat)> = {
         let backing = subset.path_backing();
         subset
             .entries()
             .iter()
-            .map(|e| (e.path_in(backing).to_owned(), e.stat))
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
             .collect()
     };
     {
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
             let path = e.path_in(&backing).to_owned();
-            if let Some(stat) = subset_stats.get(&path) {
+            if let Some((_, _, stat)) =
+                subset_stats.get(&path).filter(|(id, mode, _)| *id == e.id && *mode == e.mode)
+            {
                 e.stat = *stat;
             } else if let Some((oid, mode, stat)) = old_map.get(&path) {
                 if *oid == e.id && *mode == e.mode {

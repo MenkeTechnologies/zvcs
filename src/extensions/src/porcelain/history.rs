@@ -545,7 +545,7 @@ pub(super) fn write_ondisk_index(
     // through the same `write_locked_index()` -> `do_write_index()` pair, which
     // reads `skip_hash` off the repository regardless of where the file lands
     // (read-cache.c:2830-2831).
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
     Ok(())
 }
 

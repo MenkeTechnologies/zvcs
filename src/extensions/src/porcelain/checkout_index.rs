@@ -377,7 +377,7 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
         // `-u` rewrites the index with the refreshed stat cache
         // (builtin/checkout-index.c:341-347, `write_locked_index()`), and that
         // write honours `index.skipHash` like any other (read-cache.c:2830-2831).
-        index.write(crate::config::index_write_options(ctx.repo))?;
+        crate::index_racy::write(ctx.repo, &mut index)?;
     }
 
     Ok(if errs {

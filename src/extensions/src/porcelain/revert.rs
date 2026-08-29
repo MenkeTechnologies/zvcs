@@ -1267,7 +1267,7 @@ fn revert_one(
         for path in &conflicted_paths {
             new_index.invalidate_path_in_tree(path.as_ref());
         }
-        new_index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut new_index)?;
 
         let git_dir = repo.git_dir();
         std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
@@ -1660,7 +1660,7 @@ fn apply(
     // carries one. The caller may still add conflict stages on top; it invalidates those paths
     // itself, because a node validated here would otherwise outlive the entries it describes.
     super::write_tree::carry_and_repair_cache_tree(repo, &before, &mut index);
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
     Ok(index)
 }
 

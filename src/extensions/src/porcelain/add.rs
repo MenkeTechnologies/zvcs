@@ -1259,7 +1259,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // it — and without this line `add` was the verb that dropped `IEOT`, and
         // with it `EOIE`, which gix only emits alongside another extension.
         super::write_tree::prepare_offset_table(&repo, &mut index);
-        index.write(crate::config::index_write_options(&repo))?;
+        crate::index_racy::write(&repo, &mut index)?;
         record_stage_event(&repo, staged.len() + deletions.len());
 
         if verbose {
@@ -1305,7 +1305,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // repository, not of the verb that wrote it (read-cache.c:2830-2831 for the
     // trailer, `:2877-2904` for the offset table).
     super::write_tree::prepare_offset_table(&repo, &mut index);
-    index.write(crate::config::index_write_options(&repo))?;
+    crate::index_racy::write(&repo, &mut index)?;
     record_stage_event(&repo, staged.len() + deletions.len());
 
     if verbose {

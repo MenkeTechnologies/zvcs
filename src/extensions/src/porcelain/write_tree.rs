@@ -341,7 +341,7 @@ pub(super) fn refresh_cache_tree(
     ) {
         Ok(id) => {
             prepare_offset_table(repo, index);
-            index.write(crate::config::index_write_options(repo))?;
+            crate::index_racy::write(repo, index)?;
             Ok(Ok(id))
         }
         Err(err) => Ok(Err(err)),

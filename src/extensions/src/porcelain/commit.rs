@@ -1516,7 +1516,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // (builtin/commit.c:454-465), so the repository's index-write settings apply:
         // `do_write_index()` takes `skip_hash` from the settings block for every
         // index it serialises (read-cache.c:2830-2831).
-        index.write(crate::config::index_write_options(&repo))?;
+        crate::index_racy::write(&repo, &mut index)?;
     }
 
     // --- build a tree object from the index ------------------------------
@@ -3288,7 +3288,7 @@ impl PartialIndex {
         // A valid cache-tree in the false index is what makes the tree build below
         // cheap and what a hook's own `git add` extends rather than rebuilds.
         super::write_tree::update_cache_tree_quietly(repo, &mut index);
-        index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut index)?;
         Ok(Self { path, index, staged })
     }
 
@@ -3347,7 +3347,7 @@ impl PartialIndex {
         let mut real = open_or_empty_index(repo)?;
         self.staged.apply_to(&mut real);
         super::write_tree::update_cache_tree_quietly(repo, &mut real);
-        real.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut real)?;
 
         Ok(tree_id)
     }
@@ -3668,7 +3668,7 @@ fn stage_tracked_changes(repo: &gix::Repository) -> Result<()> {
     // `add_files_to_cache()` + `write_locked_index()` (builtin/commit.c:454-465):
     // an ordinary index write, with the repository's options
     // (read-cache.c:2830-2831).
-    index.write(crate::config::index_write_options(repo))?;
+    crate::index_racy::write(repo, &mut index)?;
     Ok(())
 }
 

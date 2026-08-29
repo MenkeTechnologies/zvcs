@@ -868,7 +868,7 @@ impl Ctx {
         let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
         let mut index = repo.index_from_tree(&tree)?;
         index.set_path(&self.index_file);
-        index.write(crate::config::index_write_options(repo))?;
+        crate::index_racy::write(repo, &mut index)?;
         Ok(())
     }
 

@@ -504,7 +504,7 @@ fn is_synthetic(source: Source) -> bool {
 /// not, so `No such file or directory (os error 2)` has to become
 /// `No such file or directory` to match messages like
 /// `fatal: unable to read config file 'x': No such file or directory`.
-fn errno_text(err: &std::io::Error) -> String {
+pub(super) fn errno_text(err: &std::io::Error) -> String {
     let text = err.to_string();
     match text.find(" (os error ") {
         Some(cut) => text[..cut].to_owned(),

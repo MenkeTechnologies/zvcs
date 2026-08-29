@@ -296,11 +296,29 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             println!("Checking rename of '{}' to '{}'", plan.src_rel, plan.dst_rel);
         }
         if verbose || dry_run {
+            // ```c
+            // if (show_only || verbose)
+            //         printf(_("Renaming %s to %s\n"), src, dst);
+            // ```
+            //
+            // (builtin/mv.c:543-544.) A directory source stays in the list *and* every
+            // index entry under it is appended as an entry of its own
+            // (`MOVE_VIA_PARENT_DIR`, builtin/mv.c:394-407), so the report names the
+            // directory and then each file that moved with it.
             println!("Renaming {} to {}", plan.src_rel, plan.dst_rel);
+            if plan.is_dir {
+                for (old, new) in &plan.remaps {
+                    println!("Renaming {old} to {new}");
+                }
+            }
         }
         if !dry_run {
             if let Err(e) = std::fs::rename(&plan.src_abs, &plan.dst_abs) {
-                return fatal(format!("renaming '{}' failed: {e}", plan.src_rel));
+                return fatal(format!(
+                    "renaming '{}' failed: {}",
+                    plan.src_rel,
+                    super::config::errno_text(&e)
+                ));
             }
             if let Some(gitfile) = &plan.submodule {
                 // `update_path_in_gitmodules()` then, for a `.git`-file
@@ -434,9 +452,26 @@ fn plan_source(
         }
         remaps
     } else {
-        // Regular file / symlink: it must be tracked at stage 0.
+        // ```c
+        // if (!(ce = index_file_exists(the_repository->index, src, length, 0))) {
+        //         bad = _("not under version control");
+        //         goto act_on_entry;
+        // }
+        // if (ce_stage(ce)) {
+        //         bad = _("conflicted");
+        //         goto act_on_entry;
+        // }
+        // ```
+        //
+        // (`cmd_mv()`, builtin/mv.c:413-420.) The lookup finds the entry whatever stage it
+        // sits at, so an unmerged path is `conflicted` and not `not under version control`
+        // — the difference between "resolve this first" and "this is not a tracked file".
         if !is_tracked(index, &src_rel) {
-            crate::git_fatal!("not under version control, source={src_rel}, destination={dst_rel}");
+            let message = match is_unmerged(index, &src_rel) {
+                true => "conflicted",
+                false => "not under version control",
+            };
+            crate::git_fatal!("{message}, source={src_rel}, destination={dst_rel}");
         }
         // Refuse to clobber an existing destination (tracked or on disk) unless
         // forced. `-f` relies on POSIX rename() replacing the destination file.
@@ -469,6 +504,15 @@ fn plan_source(
 /// Whether a stage-0 index entry exists at exactly `rel`.
 fn is_tracked(index: &gix::index::File, rel: &str) -> bool {
     tracked_mode(index, rel).is_some()
+}
+
+/// Whether `rel` is in the index at a conflicted stage.
+fn is_unmerged(index: &gix::index::File, rel: &str) -> bool {
+    let backing = index.path_backing();
+    index.entries().iter().any(|e| {
+        e.stage() != Stage::Unconflicted
+            && AsRef::<[u8]>::as_ref(e.path_in(backing)) == rel.as_bytes()
+    })
 }
 
 /// The mode of the stage-0 index entry at exactly `rel`, if there is one.

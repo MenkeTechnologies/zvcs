@@ -922,6 +922,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let decorations_for_simplify: Option<Decorations>;
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
+    /// `revs->left_right` / `cherry_mark` / `cherry_pick` / `left_only` / `right_only`: the
+    /// symmetric-difference marking `cherry_pick_list()` feeds.
+    let mut left_right = false;
+    let mut cherry_mark = false;
+    let mut cherry_pick = false;
+    let mut left_only = false;
+    let mut right_only = false;
     let mut date_mode = cfg_date_mode;
     let mut show_root = cfg_show_root;
     let mut color = ColorWhen::Auto;
@@ -2142,6 +2149,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // Accepted and inert: each of these sets a `diff_options` field to the
                 // value this port already runs at, so there is nothing to plumb and
                 // nothing that could come out wrong. See the list's own documentation.
+            } else if a == "--left-right" {
+                left_right = true;
+            } else if a == "--cherry-mark" {
+                cherry_mark = true;
+            } else if a == "--cherry-pick" {
+                cherry_pick = true;
+            } else if a == "--left-only" {
+                left_only = true;
+            } else if a == "--right-only" {
+                right_only = true;
+            } else if a == "--cherry" {
+                // `--cherry` is the shorthand `--right-only --cherry-mark --no-merges`.
+                right_only = true;
+                cherry_mark = true;
+                max_parents = Some(1);
             } else if !git_log_knows(a) {
                 // git has no such option, so this is git's own refusal rather than
                 // an unported feature: `parse_options()` and `setup_revisions()`
@@ -2266,6 +2288,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // Parallel to `tips`: the argument or refname each was named by, which is what
     // `check_single_commit`'s "More than one commit to dig from" reports under `-L`.
     let mut tip_names: Vec<String> = Vec::new();
+    // Parallel to `tips`: whether each was pended with `SYMMETRIC_LEFT`.
+    let mut tip_left: Vec<bool> = Vec::new();
     // Split each revision arg into positive tips and negative (excluded) tips to
     // support git's range forms: `A..B` (= `^A B`), `A...B` (symmetric difference —
     // exclude the merge-base), and a leading `^A`. An empty endpoint means `HEAD`
@@ -2307,7 +2331,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         }
     }
-    let mut pos_specs: Vec<(usize, String, String)> = Vec::new();
+    // The fourth field is git's `SYMMETRIC_LEFT`: the left endpoint of an `A...B` carries it,
+    // every other pended tip does not. It is what `--left-right` prints and what
+    // `cherry_pick_list()` splits the difference on.
+    let mut pos_specs: Vec<(usize, String, String, bool)> = Vec::new();
     let mut neg_ids: Vec<ObjectId> = Vec::new();
     // Commits whose parent list the command line has already caused to be read.
     // Only `--no-walk` cares (see [`no_walk_uninteresting`]); it is collected
@@ -2351,23 +2378,28 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // path — which the pathspec layer then rejects for leaving the
         // repository. See [`crate::objname::is_parent_directory_pathspec`].
         if crate::objname::is_parent_directory_pathspec(spec, seen_dashdash) {
-            pos_specs.push((at, spec.to_string(), spec.to_string()));
+            pos_specs.push((at, spec.to_string(), spec.to_string(), false));
         } else if let Some((a, b)) = spec.split_once("...") {
             let a = if a.is_empty() { "HEAD" } else { a };
             let b = if b.is_empty() { "HEAD" } else { b };
             parsed.extend(navigation_path(&repo, a));
             parsed.extend(navigation_path(&repo, b));
-            pos_specs.push((at, a.to_string(), a.to_string()));
-            pos_specs.push((at, b.to_string(), b.to_string()));
-            // `A...B` hides what both endpoints can reach: their merge-base.
+            pos_specs.push((at, a.to_string(), a.to_string(), true));
+            pos_specs.push((at, b.to_string(), b.to_string(), false));
+            // `A...B` hides what both endpoints can reach: *every* merge base, not just one.
+            // `get_merge_bases()` returns the whole set and `handle_dotdot_1()` pends each of
+            // them `UNINTERESTING`, which is what keeps a criss-cross history's second base — and
+            // its ancestry — out of the symmetric difference.
             if let (Ok(ia), Ok(ib)) = (resolve_rev(&repo, a), resolve_rev(&repo, b)) {
-                if let Ok(base) = repo.merge_base(ia, ib) {
-                    let base = base.detach();
-                    neg_ids.push(base);
-                    // `paint_down_to_common()` parses its way from both endpoints
-                    // down past the bases, so a merge base's whole ancestry is
-                    // loaded by the time `mark_parents_uninteresting()` runs.
-                    parsed.extend(ancestor_closure(&repo, &[base])?);
+                if let Ok(bases) = repo.merge_bases_many(ia, &[ib]) {
+                    for base in bases {
+                        let base = base.detach();
+                        neg_ids.push(base);
+                        // `paint_down_to_common()` parses its way from both endpoints
+                        // down past the bases, so a merge base's whole ancestry is
+                        // loaded by the time `mark_parents_uninteresting()` runs.
+                        parsed.extend(ancestor_closure(&repo, &[base])?);
+                    }
                 }
             }
         } else if let Some((a, b)) = spec.split_once("..") {
@@ -2380,7 +2412,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             if let Some(code) = resolve_neg(excluded, spec, &mut neg_ids) {
                 return Ok(code);
             }
-            pos_specs.push((at, kept.to_string(), kept.to_string()));
+            pos_specs.push((at, kept.to_string(), kept.to_string(), false));
         } else {
             // `handle_revision_arg_1()`'s parent-mark block (revision.c:2178-2207),
             // decoded once for every verb by [`crate::objname::parents_only`]:
@@ -2436,7 +2468,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                                 if not {
                                     neg_ids.push(id);
                                 } else {
-                                    pos_specs.push((at, id.to_string(), name));
+                                    pos_specs.push((at, id.to_string(), name, false));
                                 }
                             }
                             // `if (add_parents_only(…)) { ret = 0; goto out; }` —
@@ -2468,7 +2500,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // nothing rather than falling back to `revs->def`.
                 rev_input_given = true;
             } else {
-                pos_specs.push((at, bare.to_string(), bare.to_string()));
+                pos_specs.push((at, bare.to_string(), bare.to_string(), false));
             }
         }
     }
@@ -2518,6 +2550,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // carried out and reported by the caller.
     let mut push_ref_tips = |at: usize,
                              tips: &mut Vec<ObjectId>,
+                             tip_left: &mut Vec<bool>,
                              tip_names: &mut Vec<String>,
                              tip_sources: &mut Vec<String>,
                              neg_ids: &mut Vec<ObjectId>,
@@ -2530,6 +2563,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             let mut pend = |oid: ObjectId,
                             name: &str,
                             tips: &mut Vec<ObjectId>,
+                            tip_left: &mut Vec<bool>,
                             tip_names: &mut Vec<String>,
                             tip_sources: &mut Vec<String>,
                             neg_ids: &mut Vec<ObjectId>| {
@@ -2538,6 +2572,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     return;
                 }
                 tips.push(oid);
+                // A ref-selecting pseudo-option never pends `SYMMETRIC_LEFT`.
+                tip_left.push(false);
                 tip_names.push(name.to_string());
                 if source_mode {
                     tip_sources.push(name.to_string());
@@ -2574,7 +2610,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 if object.kind != gix::objs::Kind::Commit {
                     continue;
                 }
-                pend(oid, name, tips, tip_names, tip_sources, neg_ids);
+                pend(oid, name, tips, tip_left, tip_names, tip_sources, neg_ids);
             }
             // `handle_refs(refs, revs, flags, refs_head_ref)`: `--all` pends
             // `HEAD` too, after the ref list and under that literal name — which
@@ -2582,7 +2618,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             if sel.head && !sel.excluded("HEAD") {
                 if let Some(id) = repo.head().ok().and_then(|mut h| h.try_peel_to_id().ok().flatten())
                 {
-                    pend(id.detach(), "HEAD", tips, tip_names, tip_sources, neg_ids);
+                    pend(id.detach(), "HEAD", tips, tip_left, tip_names, tip_sources, neg_ids);
                 }
             }
         }
@@ -2614,7 +2650,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut specs = pos_specs.iter().peekable();
     for at in 0..=revs.len() {
         let mut bad_object: Option<String> = None;
-        push_ref_tips(at, &mut tips, &mut tip_names, &mut tip_sources, &mut neg_ids, &mut bad_object);
+        push_ref_tips(
+            at,
+            &mut tips,
+            &mut tip_left,
+            &mut tip_names,
+            &mut tip_sources,
+            &mut neg_ids,
+            &mut bad_object,
+        );
         if let Some(name) = bad_object.take() {
             eprintln!("fatal: bad object {name}");
             return Ok(ExitCode::from(128));
@@ -2640,7 +2684,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 pathspecs.push(token.clone());
             }
         };
-        while let Some((_, spec, name)) = specs.next_if(|(i, _, _)| *i == at) {
+        while let Some((_, spec, name, sym_left)) = specs.next_if(|(i, _, _, _)| *i == at) {
             if in_paths {
                 prune(&mut pathspecs, spec);
                 continue;
@@ -2685,6 +2729,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         continue;
                     };
                     tips.push(commit);
+                    tip_left.push(*sym_left);
                     tip_names.push(name.clone());
                     if source_mode {
                         tip_sources.push(name.clone());
@@ -2835,6 +2880,74 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     } else {
         walk_reporting(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?
     };
+    // `cherry_pick_list()` (revision.c) and the flags that read what it marks. The left side of
+    // an `A...B` is everything reachable from the endpoints pended with `SYMMETRIC_LEFT`; git
+    // paints the flag down the ancestry, and the merge-base exclusion has already removed the
+    // commits both sides share, so membership is unambiguous.
+    if left_right || cherry_mark || cherry_pick || left_only || right_only {
+        let left_tips: Vec<ObjectId> = tips
+            .iter()
+            .zip(tip_left.iter())
+            .filter(|(_, is_left)| **is_left)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut left: HashSet<ObjectId> = left_tips.iter().copied().collect();
+        left.extend(ancestor_closure(&repo, &left_tips)?);
+        for node in &mut nodes {
+            node.symmetric_left = left.contains(&node.id);
+        }
+
+        if cherry_mark || cherry_pick {
+            // git computes patch ids for the smaller side and probes with the larger one, which
+            // is the side whose diffs it would otherwise have to hold all at once.
+            let (mut lefts, mut rights): (Vec<ObjectId>, Vec<ObjectId>) = (Vec::new(), Vec::new());
+            for node in &nodes {
+                match node.symmetric_left {
+                    true => lefts.push(node.id),
+                    false => rights.push(node.id),
+                }
+            }
+            if !lefts.is_empty() && !rights.is_empty() {
+                let (table, probe) = match lefts.len() < rights.len() {
+                    true => (&lefts, &rights),
+                    false => (&rights, &lefts),
+                };
+                let mut ids: HashMap<ObjectId, ObjectId> = HashMap::new();
+                for id in table {
+                    if let Some(pid) = super::cherry::commit_patch_id(&repo, *id)? {
+                        ids.entry(pid).or_insert(*id);
+                    }
+                }
+                let mut same: HashSet<ObjectId> = HashSet::new();
+                for id in probe {
+                    let Some(pid) = super::cherry::commit_patch_id(&repo, *id)? else {
+                        continue;
+                    };
+                    // git flags both commits of the pair.
+                    if let Some(other) = ids.get(&pid) {
+                        same.insert(*id);
+                        same.insert(*other);
+                    }
+                }
+                for node in &mut nodes {
+                    node.patch_same = same.contains(&node.id);
+                }
+            }
+        }
+
+        // `if (revs->cherry_pick && (commit->object.flags & PATCHSAME)) continue;` — without
+        // `--cherry-mark` the equivalent commits are dropped rather than marked.
+        if cherry_pick && !cherry_mark {
+            nodes.retain(|n| !n.patch_same);
+        }
+        if left_only {
+            nodes.retain(|n| n.symmetric_left);
+        }
+        if right_only {
+            nodes.retain(|n| !n.symmetric_left);
+        }
+    }
+
     // `-L` sets `revs->topo_order = 1` without touching `sort_order`, so it walks
     // topologically unless `--date-order` asked for the date-ordered variant.
     let effective_order = match (order, graph || line_level) {
@@ -3815,6 +3928,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     super::diff_pairs::set_anchor_texts(anchors);
 
     let mut entries = EntryWindow::new(EntryParams {
+        left_right,
+        cherry_mark,
         abbrev_commit,
         show_signature,
         show_parents,
@@ -5161,6 +5276,10 @@ pub(super) enum NoWalk {
 /// Everything a commit's record needs beyond the commit itself: the flags and
 /// lookup tables that are fixed for the whole command.
 struct EntryParams<'a> {
+    /// `revs->left_right`: print `<`/`>` in front of each object name.
+    left_right: bool,
+    /// `revs->cherry_mark`: print `+`, and `=` for a patch-equivalent commit.
+    cherry_mark: bool,
     abbrev_commit: bool,
     /// `--show-signature` / `--no-show-signature`.
     show_signature: bool,
@@ -5404,7 +5523,23 @@ fn entry_block_from(
         identity_mailmap: p.identity_mailmap,
         notes: p.notes,
         repo,
-        mark: if node.boundary && !p.graph { "- " } else { "" },
+        // `get_revision_mark()` (revision.c): boundary, then patch-equivalent, then the
+        // symmetric side, then `--cherry-mark`'s plain `+`. `put_revision_mark()` follows the
+        // mark with a space in the oneline formats, which is the shape this field carries.
+        mark: match () {
+            _ if p.graph => "",
+            _ if node.boundary => "- ",
+            _ if node.patch_same => "= ",
+            _ if p.left_right => {
+                if node.symmetric_left {
+                    "< "
+                } else {
+                    "> "
+                }
+            }
+            _ if p.cherry_mark => "+ ",
+            _ => "",
+        },
         parents: &node.parents,
         graph_width: node.graph_width,
         expand_tabs: p.expand_tabs,
@@ -5626,6 +5761,12 @@ pub(crate) struct Node {
     /// `--boundary`: an excluded commit that a shown commit descends from, which
     /// git prints with a `-` mark after the rest of the walk.
     pub(crate) boundary: bool,
+    /// `SYMMETRIC_LEFT`: reachable from the left endpoint of an `A...B`, which is what
+    /// `--left-right` prints as `<` and what `cherry_pick_list()` splits the difference on.
+    pub(crate) symmetric_left: bool,
+    /// `PATCHSAME`: `cherry_pick_list()` found this commit's change on the other side of the
+    /// symmetric difference. Printed as `=`, or dropped outright by `--cherry-pick`.
+    pub(crate) patch_same: bool,
     /// `--follow`: the name the tracked file had *at this commit*, which is what
     /// its diff and name formats are limited to. `None` when not following.
     pub(crate) follow_path: Option<gix::bstr::BString>,
@@ -6515,6 +6656,8 @@ pub(super) fn ancestor_closure(repo: &gix::Repository, roots: &[ObjectId]) -> Re
 fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
     let commit = repo.find_object(id)?.try_into_commit()?;
     Ok(Node {
+        symmetric_left: false,
+        patch_same: false,
         id,
         parents: commit.parent_ids().map(|p| p.detach()).collect(),
         time: commit.time()?.seconds,
@@ -6555,6 +6698,8 @@ impl NodeReader {
                     .map(|pos| graph.commit_at(pos).id().to_owned())
                     .collect();
                 return Ok(Node {
+                    symmetric_left: false,
+                    patch_same: false,
                     id,
                     parents,
                     time: commit.committer_timestamp() as i64,

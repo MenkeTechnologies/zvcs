@@ -584,40 +584,34 @@ fn resolve_outcome<'repo>(
             eprintln!("fatal: refusing to merge unrelated histories");
             return Ok(Err(ExitCode::from(128)));
         }
-        if strategy.subtree.is_some() {
-            // git shifts inside `merge_ort_nonrecursive_internal()`, i.e. once the
-            // merge base is already settled, so the base has to be materialized
-            // here rather than left to `merge_commits()` — which would merge the
-            // unshifted trees. The base is chosen exactly as `gix_merge::commit()`
-            // chooses it, including the ancestor label the diff3 styles print.
-            let options = strategy.apply(repo.tree_merge_options()?)?;
-            let base = match bases.len() {
-                0 => {
-                    ancestor_name = "empty tree".into();
-                    ObjectId::empty_tree(repo.object_hash())
-                }
-                1 => {
-                    ancestor_name = bases[0].shorten_or_id().to_string();
-                    repo.find_commit(bases[0])?.tree_id()?.detach()
-                }
-                _ => {
-                    ancestor_name = "merged common ancestors".into();
-                    let bases: Vec<ObjectId> = bases.iter().map(|id| id.detach()).collect();
-                    repo.virtual_merge_base(bases, options.clone())?.tree_id.detach()
-                }
-            };
-            labels.ancestor = Some(BStr::new(ancestor_name.as_bytes()));
-            let ours_tree = repo.find_commit(ours)?.tree_id()?.detach();
-            let theirs_tree = repo.find_commit(theirs)?.tree_id()?.detach();
-            let (base, theirs_tree) = strategy.shift(repo, ours_tree, base, theirs_tree)?;
-            repo.merge_trees(base, ours_tree, theirs_tree, labels, options)?
-        } else {
-            let commit_options =
-                gix::merge::commit::Options::from(strategy.apply(repo.tree_merge_options()?)?)
-                    .with_allow_missing_merge_base(allow_unrelated);
-            repo.merge_commits(ours, theirs, labels, commit_options)?
-                .tree_merge
-        }
+        // The base is materialized here rather than left to `merge_commits()`, for two
+        // reasons: `-s subtree` shifts inside `merge_ort_nonrecursive_internal()`, i.e. once
+        // the merge base is already settled, so `merge_commits()` would merge the unshifted
+        // trees; and git's virtual merge commits are allocated, never written
+        // (`make_virtual_commit()`, merge-ort.c), which `merge_commits()` cannot express.
+        // It is chosen exactly as `gix_merge::commit()` chooses it, including the ancestor
+        // label the diff3 styles print.
+        let options = strategy.apply(repo.tree_merge_options()?)?;
+        let base = match bases.len() {
+            0 => {
+                ancestor_name = "empty tree".into();
+                ObjectId::empty_tree(repo.object_hash())
+            }
+            1 => {
+                ancestor_name = bases[0].shorten_or_id().to_string();
+                repo.find_commit(bases[0])?.tree_id()?.detach()
+            }
+            _ => {
+                ancestor_name = "merged common ancestors".into();
+                let bases: Vec<ObjectId> = bases.iter().map(|id| id.detach()).collect();
+                super::merge::virtual_base_tree(repo, &bases)?
+            }
+        };
+        labels.ancestor = Some(BStr::new(ancestor_name.as_bytes()));
+        let ours_tree = repo.find_commit(ours)?.tree_id()?.detach();
+        let theirs_tree = repo.find_commit(theirs)?.tree_id()?.detach();
+        let (base, theirs_tree) = strategy.shift(repo, ours_tree, base, theirs_tree)?;
+        repo.merge_trees(base, ours_tree, theirs_tree, labels, options)?
     };
     Ok(Ok(outcome))
 }
@@ -1396,6 +1390,16 @@ fn merge_result(repo: &gix::Repository, item: &[MergeEntry]) -> Option<Vec<u8>> 
 /// whichever side still has content — unless the path existed in the base, in
 /// which case the merge produces nothing at all. Two present sides go through
 /// `ll_merge()` with the `.our`/`.their` labels and no ancestor label.
+///
+/// ```c
+/// if (git_xmerge_style >= 0)
+///         xmp.style = git_xmerge_style;
+/// ```
+///
+/// (`ll_xdl_merge()`, ll-merge.c.) `git_xmerge_style` is `merge.conflictStyle`, read by
+/// `git_xmerge_config()` for every command that merges content — the deprecated
+/// three-tree mode included, which is why a `diff3` conflict here carries the `|||||||`
+/// section even though the mode names no ancestor label to put after it.
 fn merge_blobs(
     repo: &gix::Repository,
     base: Option<ObjectId>,
@@ -1418,6 +1422,7 @@ fn merge_blobs(
         return Some(our);
     }
 
+    let style = super::merge_file::conflict_style_config(Some(repo)).unwrap_or(ConflictStyle::Merge);
     let mut merged = Vec::new();
     let mut input = InternedInput::default();
     // `Merge::new` takes the operands in `git merge-file` order —
@@ -1438,10 +1443,10 @@ fn merge_blobs(
         },
         Rendering {
             conflict: MergeConflict::Keep {
-                style: ConflictStyle::Merge,
+                style,
                 marker_size: std::num::NonZeroU8::new(7).expect("nonzero"),
             },
-            style: Some(ConflictStyle::Merge),
+            style: Some(style),
             // `ll_xdl_merge()` sets `xmp.level = XDL_MERGE_ZEALOUS`.
             level: Level::Zealous,
             marker_size: Some(7),

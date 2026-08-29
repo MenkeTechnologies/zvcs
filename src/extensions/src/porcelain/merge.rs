@@ -2480,7 +2480,7 @@ fn ort_attempt(
 /// leaves the merged base *tree* and the blobs it needed in the object store, and no commit.
 /// gitoxide writes its virtual commits too, so the recursion runs against an in-memory
 /// object store and only the objects git would have written are persisted afterwards.
-fn virtual_base_tree(repo: &gix::Repository, bases: &[ObjectId]) -> Result<ObjectId> {
+pub(super) fn virtual_base_tree(repo: &gix::Repository, bases: &[ObjectId]) -> Result<ObjectId> {
     let mut mem = repo.clone();
     mem.objects.enable_object_memory();
     let out = mem.virtual_merge_base(bases.iter().copied(), mem.tree_merge_options()?)?;

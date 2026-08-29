@@ -842,8 +842,12 @@ fn repack_all(
     // the repository does not have — and `gc` adds its own line when the child fails
     // (`fatal: failed to run repack`, builtin/gc.c). The repack stops here, before a pack
     // is written from a reachability set that ref could not contribute to.
+    //
+    // `pack-objects` prints only the death: the
+    // `error: <ref> does not point to a valid object!` a `git gc` run also shows comes
+    // from the `pack-refs --all --prune` child that ran before it (confirmed under
+    // `GIT_TRACE=1` on git 2.55.0), and this port runs that same step above.
     if let Some(name) = super::prune::bad_object_ref(repo) {
-        eprintln!("error: {name} does not point to a valid object!");
         eprintln!("fatal: bad object {name}");
         eprintln!("fatal: failed to run repack");
         return Err(anyhow::Error::new(crate::fatal::Silent(128)));

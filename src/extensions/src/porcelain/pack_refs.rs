@@ -141,8 +141,9 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
             "--include" | "--exclude" => {
                 let name = &a[2..];
                 let Some(value) = args.get(i + 1) else {
+                    // `case PARSE_OPT_ERROR: exit(129);` in `parse_options()` — the usage
+                    // block belongs to `PARSE_OPT_HELP`, not to a missing value.
                     eprintln!("error: option `{name}' requires a value");
-                    eprint!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 };
                 i += 1;
@@ -192,11 +193,28 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         let Some(oid) = reference.target.try_id().map(ObjectId::from) else {
             continue;
         };
-        if !selected(reference.name.as_bstr(), &includes, &opts.excludes) {
+        // ```c
+        // /* Do not pack broken refs: */
+        // if (!ref_resolves_to_object(refname, refs->base.repo, oid, ref_flags))
+        //         return 0;
+        //
+        // if (ref_excluded(opts->exclusions, refname))
+        //         return 0;
+        //
+        // for_each_string_list_item(item, opts->includes)
+        //         if (!wildmatch(item->string, refname, 0))
+        //                 return 1;
+        // ```
+        //
+        // (`should_pack_ref()`, refs/files-backend.c.) The object check comes *before* the
+        // include/exclude filter, so a dangling ref is reported —
+        // `ref_resolves_to_object()`'s `error(_("%s does not point to a valid object!"))`
+        // — whether or not the patterns would have selected it.
+        if !repo.has_object(oid) {
+            eprintln!("error: {} does not point to a valid object!", reference.name.as_bstr());
             continue;
         }
-        // A ref pointing at a missing object is broken and is left alone.
-        if !repo.has_object(oid) {
+        if !selected(reference.name.as_bstr(), &includes, &opts.excludes) {
             continue;
         }
         edits.push(RefEdit {

@@ -52,6 +52,12 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     git(&repo, &home, &["init", "-q", "-b", "main"]);
     git(&repo, &home, &["config", "user.email", "t@e.x"]);
     git(&repo, &home, &["config", "user.name", "t"]);
+    // `push.default=current`, so a bare push has a refspec whatever the remote turns out to
+    // be: under the default `simple`, stock git refuses a branch with no upstream
+    // (`The current branch main has no upstream branch.`, builtin/push.c:212-220) and there
+    // is no `To <url>` line to read the resolved remote from. The resolution order this
+    // test is about is the same either way.
+    git(&repo, &home, &["config", "push.default", "current"]);
     std::fs::write(repo.join("f"), "x\n").unwrap();
     git(&repo, &home, &["add", "f"]);
     git(&repo, &home, &["commit", "-q", "-m", "c0"]);

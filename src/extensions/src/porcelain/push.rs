@@ -472,9 +472,58 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // ```c
+    // if (!push_refspec->nr && !(flags & TRANSPORT_PUSH_ALL)) {
+    //         if (remote->push.nr) {
+    //                 push_refspec = &remote->push;
+    //         } else if (!(flags & TRANSPORT_PUSH_MIRROR))
+    //                 setup_default_push_refspecs(&flags, remote);
+    // }
+    // ```
+    //
+    // (`do_push()`, builtin/push.c:431-436.) With nothing on the command line,
+    // `remote.<name>.push` decides what is pushed, and only when that is unset does
+    // `push.default` get a say. `--tags` has already put `refs/tags/*` in the list by this
+    // point (builtin/push.c:825-826), which is why it takes neither.
+    let specs: Vec<String> = if specs.is_empty() && !f.all && !f.mirror && !f.tags && !f.delete {
+        let configured = configured_push_refspecs(&repo, remote_name.as_str());
+        match configured.is_empty() {
+            false => configured,
+            true => match default_push_refspec(&repo, &remote, remote_name.as_str(), &f)? {
+                Ok(specs) => specs,
+                Err(code) => return Ok(code),
+            },
+        }
+    } else {
+        specs
+    };
+
     // Build the concrete updates, plus the (local-branch, remote-ref) pairs that
     // `--set-upstream` records after a successful push.
-    let (mut requests, upstreams) = build_requests(&repo, &f, &specs)?;
+    //
+    // ```c
+    // error(_("src refspec %s does not match any"), rs->src);
+    // ```
+    //
+    // (`match_explicit()`, remote.c.) It is an `error()`, not a `die()`: the refspec is
+    // dropped, `match_push_refs()` returns non-zero, and `push_with_options()` closes with
+    // its own `failed to push some refs` line at exit 1.
+    let (mut requests, upstreams) = match build_requests(&repo, &f, &specs) {
+        Ok(pair) => pair,
+        Err(e) => match e.downcast_ref::<SrcRefspecMissing>() {
+            Some(missing) => {
+                let url = remote
+                    .url(Direction::Push)
+                    .or_else(|| remote.url(Direction::Fetch))
+                    .map(|u| u.to_bstring().to_string())
+                    .unwrap_or_else(|| remote_name.to_string());
+                eprintln!("error: src refspec {} does not match any", missing.0);
+                eprintln!("error: failed to push some refs to '{url}'");
+                return Ok(ExitCode::from(1));
+            }
+            None => return Err(e),
+        },
+    };
 
     // Resolve `--force-with-lease` into each request's expected old value.
     if !matches!(f.lease, Lease::None) {
@@ -503,9 +552,11 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if requests.is_empty() {
-        crate::git_fatal!("no refspec to push");
-    }
+    // A refspec that matches nothing is not an error: `git push --tags` in a repository
+    // with no tags, or a `--prune` whose pattern covers no local ref, reaches the transport
+    // with an empty update list and comes back `Everything up-to-date` — after the prune
+    // deletions the advertisement still calls for. Only `setup_default_push_refspecs()`
+    // refuses to invent a refspec, and it does so with its own messages.
 
     // `pre-push` runs before contacting the remote, receiving `<remote> <url>` as
     // arguments and one `<local-ref> <local-sha> <remote-ref> <remote-sha>` line
@@ -1071,7 +1122,7 @@ fn parse_refspec(
         null(repo) // `:dst` deletes the remote ref.
     } else {
         repo.rev_parse_single(src)
-            .map_err(|_| anyhow!("src refspec {src} does not match any"))?
+            .map_err(|_| anyhow::Error::new(SrcRefspecMissing(src.to_string())))?
             .detach()
     };
 
@@ -1188,6 +1239,154 @@ fn resolve_bare_dst(repo: &gix::Repository, name: &str) -> Result<String> {
     Ok(resolved)
 }
 
+/// A refspec source that names no local ref, which git reports as an `error()` and turns
+/// into a failed push rather than a `fatal:` — carried as its own type so the caller can
+/// tell it apart from the errors that really are fatal.
+#[derive(Debug)]
+struct SrcRefspecMissing(String);
+
+impl std::fmt::Display for SrcRefspecMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "src refspec {} does not match any", self.0)
+    }
+}
+
+impl std::error::Error for SrcRefspecMissing {}
+
+/// `remote.<name>.push`, the refspecs a bare `git push <name>` uses in place of the
+/// `push.default` machinery (builtin/push.c:432-433).
+fn configured_push_refspecs(repo: &gix::Repository, name: &str) -> Vec<String> {
+    repo.config_snapshot()
+        .plumbing()
+        .strings_by("remote", Some(name.into()), "push")
+        .map(|values| values.iter().map(|v| v.to_str_lossy().into_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// `setup_default_push_refspecs()` (builtin/push.c:229-287): what a bare `git push` pushes
+/// when the remote configures no `push` refspec of its own.
+///
+/// Returns the single `<src>:<dst>` refspec git appends, or the exit code of one of the
+/// `die()`s along the way. `matching` is the one mode this port cannot express as a
+/// refspec — git's `:` needs the remote's advertisement to pair branches up — and is left
+/// to the `current`-shaped fallback below.
+fn default_push_refspec(
+    repo: &gix::Repository,
+    remote: &gix::Remote<'_>,
+    remote_name: &str,
+    f: &Flags,
+) -> Result<std::result::Result<Vec<String>, ExitCode>> {
+    let snap = repo.config_snapshot();
+    let push_default = snap
+        .string("push.default")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "simple".to_string());
+
+    if push_default == "nothing" {
+        eprintln!(
+            "fatal: You didn't specify any refspecs to push, and push.default is \"nothing\"."
+        );
+        return Ok(Err(ExitCode::from(128)));
+    }
+    if push_default == "matching" {
+        return Ok(Ok(Vec::new()));
+    }
+
+    let Some(branch) = repo.head()?.referent_name().map(|n| n.shorten().to_string()) else {
+        // `message_detached_head_die` (builtin/push.c:189-194).
+        eprintln!(
+            "fatal: You are not currently on a branch.\n\
+             To push the history leading to the current (detached HEAD)\n\
+             state now, use\n\n    git push {remote_name} HEAD:<name-of-remote-branch>\n"
+        );
+        return Ok(Err(ExitCode::from(128)));
+    };
+    let refname = format!("refs/heads/{branch}");
+
+    // `same_remote = !strcmp(remote->name, remote_for_branch(branch, NULL))`: whether this
+    // push is going to the branch's own remote.
+    let branch_remote = snap
+        .string(&format!("branch.{branch}.remote"))
+        .map(|v| v.to_string())
+        .or_else(|| snap.string("remote.pushDefault").map(|v| v.to_string()))
+        .unwrap_or_else(|| "origin".to_string());
+    let same_remote = remote.name().map(|n| n.as_bstr().to_string()).as_deref()
+        == Some(branch_remote.as_str());
+
+    // `get_upstream_ref()` (builtin/push.c:196-227), which dies when the branch has no
+    // `branch.<name>.merge` — unless `push.autoSetupRemote` armed the auto-upstream flag,
+    // in which case the branch pushes to its own name and the upstream is set afterwards.
+    let upstream = |f: &Flags| -> std::result::Result<String, ExitCode> {
+        let merge = snap.string(&format!("branch.{branch}.merge")).map(|v| v.to_string());
+        match merge {
+            Some(merge) => Ok(merge),
+            None if f.set_upstream => Ok(refname.clone()),
+            None => {
+                let advice = match f.set_upstream {
+                    true => String::new(),
+                    false => "\nTo have this happen automatically for branches without a tracking\n\
+                              upstream, see 'push.autoSetupRemote' in 'git help config'.\n"
+                        .to_string(),
+                };
+                eprintln!(
+                    "fatal: The current branch {branch} has no upstream branch.\n\
+                     To push the current branch and set the remote as upstream, use\n\n    \
+git push --set-upstream {remote_name} {branch}\n{advice}"
+                );
+                Err(ExitCode::from(128))
+            }
+        }
+    };
+
+    let dst = match push_default.as_str() {
+        "current" => refname.clone(),
+        "upstream" | "tracking" => {
+            if !same_remote {
+                eprintln!(
+                    "fatal: You are pushing to remote '{remote_name}', which is not the upstream of\n\
+                     your current branch '{branch}', without telling me what to push\n\
+                     to update which remote branch."
+                );
+                return Ok(Err(ExitCode::from(128)));
+            }
+            match upstream(f) {
+                Ok(dst) => dst,
+                Err(code) => return Ok(Err(code)),
+            }
+        }
+        // `simple` and the unspecified default: the branch pushes to its own name, and the
+        // upstream only has to *agree* with that name when this is the branch's own remote.
+        _ => {
+            if same_remote {
+                match upstream(f) {
+                    Ok(dst) if dst != refname => {
+                        return Ok(Err(die_push_simple(&branch, remote_name, &dst)));
+                    }
+                    Ok(_) => {}
+                    Err(code) => return Ok(Err(code)),
+                }
+            }
+            refname.clone()
+        }
+    };
+
+    Ok(Ok(vec![format!("{refname}:{dst}")]))
+}
+
+/// `die_push_simple()` (builtin/push.c): the upstream of the current branch is a
+/// differently-named branch, so `simple` refuses rather than guess which one was meant.
+fn die_push_simple(branch: &str, remote_name: &str, upstream: &str) -> ExitCode {
+    let short = upstream.strip_prefix("refs/heads/").unwrap_or(upstream);
+    eprintln!(
+        "fatal: The upstream branch of your current branch does not match\n\
+         the name of your current branch.  To push to the upstream branch\n\
+         on the remote, use\n\n    git push {remote_name} HEAD:{short}\n\n\
+         To push to the branch of the same name on the remote, use\n\n    \
+git push {remote_name} HEAD\n"
+    );
+    ExitCode::from(128)
+}
+
 /// The update for a bare `git push`: the current branch to a same-named remote
 /// branch. Rejects a detached HEAD and an unborn branch exactly as git does.
 fn current_branch_request(repo: &gix::Repository, force: bool) -> Result<(Request, Upstream)> {
@@ -1199,7 +1398,7 @@ fn current_branch_request(repo: &gix::Repository, force: bool) -> Result<(Reques
         .to_string();
     let new = repo
         .head_id()
-        .map_err(|_| anyhow!("src refspec {branch} does not match any"))?
+        .map_err(|_| anyhow::Error::new(SrcRefspecMissing(branch.clone())))?
         .detach();
     let name = format!("refs/heads/{branch}");
     Ok((
@@ -1636,6 +1835,7 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
 /// framed by `To <url>` and a trailing `Done`, on stdout.
 fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
     let mut any_failed = outcome.unpack.is_err();
+    let mut rejected: Vec<(&str, &str)> = Vec::new();
     println!("To {}", outcome.url);
     for s in &outcome.statuses {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
@@ -1657,10 +1857,15 @@ fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
             Ok(()) => {
                 let flag = if s.forced { "+" } else { " " };
                 let sep = if s.forced { "..." } else { ".." };
-                println!("{flag}\t{refpair}\t{}{sep}{}", short(&s.old), short(&s.new));
+                // `print_ref_status()` prints the summary and then, when the update carried
+                // a reason, ` (<reason>)` — and a forced update carries `forced update`
+                // whether or not anything went wrong (transport.c).
+                let reason = if s.forced { " (forced update)" } else { "" };
+                println!("{flag}\t{refpair}\t{}{sep}{}{reason}", short(&s.old), short(&s.new));
             }
             Err(reason) => {
                 any_failed = true;
+                rejected.push((s.name.as_str(), reason.as_str()));
                 let label = if s.remote_rejected { "[remote rejected]" } else { "[rejected]" };
                 println!("!\t{refpair}\t{label} ({reason})");
             }
@@ -1668,6 +1873,11 @@ fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
     }
     println!("Done");
     if any_failed {
+        // `push_with_options()` reports the failure whatever the output format is: the
+        // machine-readable block is on stdout, and this stays on stderr next to the advice
+        // (builtin/push.c).
+        eprintln!("error: failed to push some refs to '{}'", outcome.url);
+        advise_rejections(&rejected);
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)

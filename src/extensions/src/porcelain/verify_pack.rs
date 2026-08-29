@@ -269,20 +269,19 @@ fn verify_one(path: &str, verbose: bool, stat_only: bool, choice: &HashChoice) -
         }
     };
 
-    // `add_packed_git()` needs both halves; a missing or unreadable one yields the
-    // same message for either, keyed on the `.idx` path git was asked to open.
-    let opened = pack::index::File::at(&idx_path, hash)
-        .ok()
-        .zip(pack::data::File::at(&pack_path, hash).ok());
-    let Some((idx, data)) = opened else {
-        eprintln!(
-            "fatal: Cannot open existing pack file '{}'",
-            idx_path.display()
-        );
-        if verbose || stat_only {
-            println!("{pack_name}: bad");
+    // `verify_one_pack()` is an `index-pack --verify <pack>` child
+    // (builtin/verify-pack.c:13-57), so the two `read_idx_option()` deaths — and the
+    // `error: wrong index v2 file size in …` that can precede the second — are
+    // `index-pack`'s, shared rather than written a second time.
+    let (idx, data, _) = match super::index_pack::open_idx_and_pack(&idx_path, hash) {
+        Ok(triple) => triple,
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            if verbose || stat_only {
+                println!("{pack_name}: bad");
+            }
+            return false;
         }
-        return false;
     };
 
     if !stat_only {

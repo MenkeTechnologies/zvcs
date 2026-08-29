@@ -638,36 +638,11 @@ fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Res
 /// either fails it dies naming the index path.
 fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
     let name = index_path.to_string_lossy().into_owned();
-    let cannot_open_pack = || fatal(format!("Cannot open existing pack file '{name}'"));
-
-    // ```c
-    // if (!p)
-    //         die(_("Cannot open existing pack file '%s'"), pack_name);
-    // if (open_pack_index(p))
-    //         die(_("Cannot open existing pack idx file for '%s'"), pack_name);
-    // ```
-    //
-    // (builtin/index-pack.c:1747-1750, in `read_idx_option()`, called with `index_name`.) The two
-    // deaths are not interchangeable and both name the *index* path, because that is the argument
-    // `read_idx_option()` was handed. `add_packed_git()` — the `!p` arm — fails when the name does
-    // not end in `.idx` or when the sibling `.pack` cannot be `stat`ed as a regular file
-    // (packfile.c); the idx itself is only opened afterwards, by `open_pack_index()`.
-    let Some(stem) = name.strip_suffix(".idx").filter(|s| !s.is_empty()) else {
-        return Ok(cannot_open_pack());
-    };
-    let pack_path = PathBuf::from(format!("{stem}.pack"));
-    if !fs::metadata(&pack_path).map(|m| m.is_file()).unwrap_or(false) {
-        return Ok(cannot_open_pack());
-    }
-
+    // `read_idx_option()`'s two deaths; see [`open_idx_and_pack`].
     let hash = opts.object_hash();
-    let Ok(index) = pack::index::File::at(index_path, hash) else {
-        return Ok(fatal(format!(
-            "Cannot open existing pack idx file for '{name}'"
-        )));
-    };
-    let Ok(data) = pack::data::File::at(&pack_path, hash) else {
-        return Ok(cannot_open_pack());
+    let (index, data, pack_path) = match open_idx_and_pack(index_path, hash) {
+        Ok(triple) => triple,
+        Err(message) => return Ok(fatal(message)),
     };
 
     reject_unported(opts)?;
@@ -702,6 +677,87 @@ fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
         fsck_pack(&pack_path, index_path, opts.strict, hash)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `read_idx_option()` (builtin/index-pack.c:1742-1767): open the pack a `.idx`
+/// belongs to and then the `.idx` itself, with the two distinct deaths git uses.
+///
+/// ```c
+/// if (!p)
+///         die(_("Cannot open existing pack file '%s'"), pack_name);
+/// if (open_pack_index(p))
+///         die(_("Cannot open existing pack idx file for '%s'"), pack_name);
+/// ```
+///
+/// Both name the *index* path, because that is the argument `read_idx_option()` was
+/// handed. `add_packed_git()` — the `!p` arm — fails when the name does not end in
+/// `.idx` or when the sibling `.pack` cannot be `stat`ed as a regular file
+/// (packfile.c); the idx itself is only opened afterwards. `Err` is the whole
+/// `fatal:` text, `error:` lines already printed.
+///
+/// Shared with `verify-pack`, which git implements as an `index-pack --verify` child.
+pub(super) fn open_idx_and_pack(
+    index_path: &Path,
+    hash: Kind,
+) -> std::result::Result<(pack::index::File, pack::data::File, PathBuf), String> {
+    let name = index_path.to_string_lossy().into_owned();
+    let cannot_open_pack = format!("Cannot open existing pack file '{name}'");
+
+    let Some(stem) = name.strip_suffix(".idx").filter(|s| !s.is_empty()) else {
+        return Err(cannot_open_pack);
+    };
+    let pack_path = PathBuf::from(format!("{stem}.pack"));
+    if !fs::metadata(&pack_path).map(|m| m.is_file()).unwrap_or(false) {
+        return Err(cannot_open_pack);
+    }
+
+    match pack::index::File::at(index_path, hash) {
+        Ok(index) => match pack::data::File::at(&pack_path, hash) {
+            Ok(data) => Ok((index, data, pack_path)),
+            Err(_) => Err(cannot_open_pack),
+        },
+        Err(_) => {
+            report_bad_idx_size(index_path, hash);
+            Err(format!("Cannot open existing pack idx file for '{name}'"))
+        }
+    }
+}
+
+/// `load_idx()`'s size arithmetic (packfile.c:232-251), which reports before
+/// `open_pack_index()` fails.
+///
+/// ```c
+/// size_t min_size = st_add(8 + 4*256 + hashsz + hashsz, st_mult(nr, hashsz + 4 + 4));
+/// size_t max_size = min_size;
+/// if (nr)
+///         max_size = st_add(max_size, st_mult(nr - 1, 8));
+/// if (idx_size < min_size || idx_size > max_size)
+///         return error("wrong index v2 file size in %s", path);
+/// ```
+///
+/// The bounds depend on the *hash* the reader was told to use, which is why
+/// `--object-format=sha256` over a sha1 index reports this and then refuses to
+/// open it. Only the v2 case is reported: gitoxide writes and reads no v1 index,
+/// so a file this port could produce is never measured against the v1 rule.
+fn report_bad_idx_size(index_path: &Path, hash: Kind) {
+    let Ok(data) = fs::read(index_path) else { return };
+    // The v2 header is `\377tOc` plus a version word; anything else is a v1 index.
+    if data.len() < 8 + 4 * 256 || &data[..4] != b"\xfftOc" {
+        return;
+    }
+    let fanout_at = 8 + 4 * 255;
+    let nr = u32::from_be_bytes([
+        data[fanout_at],
+        data[fanout_at + 1],
+        data[fanout_at + 2],
+        data[fanout_at + 3],
+    ]) as usize;
+    let hashsz = hash.len_in_bytes();
+    let min_size = 8 + 4 * 256 + hashsz + hashsz + nr * (hashsz + 4 + 4);
+    let max_size = min_size + nr.saturating_sub(1) * 8;
+    if data.len() < min_size || data.len() > max_size {
+        eprintln!("error: wrong index v2 file size in {}", index_path.display());
+    }
 }
 
 /// Stream a pack from stdin, then report it git's way.

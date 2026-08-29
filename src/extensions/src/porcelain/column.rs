@@ -20,10 +20,12 @@
 //! Two deliberate, documented divergences from stock git:
 //!
 //!   * Cell width counts Unicode scalar values, after stripping SGR escape
-//!     sequences exactly as git's `display_mode_esc_sequence_len` does. git
-//!     additionally applies `wcwidth()`, so lines containing combining marks or
-//!     wide (CJK) characters lay out differently. This matches the convention
-//!     already used by `shortlog` and `request-pull` in this crate.
+//!     sequences exactly as git's `display_mode_esc_sequence_len` does, and
+//!     after dropping the glyphs `git_wcwidth()` scores at or below zero by its
+//!     own first test — NUL and the control ranges. git additionally applies the
+//!     `unicode-width.h` tables, so lines containing combining marks or wide
+//!     (CJK) characters lay out differently. This matches the convention already
+//!     used by `shortlog` and `request-pull` in this crate.
 //!   * [`crate::pager::term_columns`] (used only when `--width` is absent or
 //!     zero) reads `COLUMNS` with C's `atoi` and otherwise falls back to 80; the
 //!     `TIOCGWINSZ` probe is not performed, so an unset `COLUMNS` on a terminal
@@ -523,16 +525,26 @@ fn split_lines(input: &[u8]) -> Vec<Vec<u8>> {
                 if end > start && input[end - 1] == b'\r' {
                     end -= 1;
                 }
-                list.push(input[start..end].to_vec());
+                list.push(truncate_at_nul(&input[start..end]));
                 start += offset + 1;
             }
             None => {
-                list.push(input[start..].to_vec());
+                list.push(truncate_at_nul(&input[start..]));
                 break;
             }
         }
     }
     list
+}
+
+/// `string_list_append(&list, sb.buf)`: the item is a C string, so a line
+/// carrying an embedded NUL is kept only up to it.
+///
+/// `git column` has no `-z`, so NUL-separated input arrives as one long line and
+/// everything past the first separator is dropped — which is what stock prints.
+fn truncate_at_nul(line: &[u8]) -> Vec<u8> {
+    let end = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+    line[..end].to_vec()
 }
 
 /// Port of `print_columns`: default the options, then dispatch on the layout.
@@ -725,11 +737,23 @@ fn div_round_up(a: i64, b: i64) -> i64 {
     (a + b - 1) / b
 }
 
-/// git's `item_length`: display width with SGR escape sequences skipped.
+/// git's `item_length`, i.e. `utf8_strnwidth(s, strlen(s), 1)`: display width
+/// with SGR escape sequences skipped.
 ///
-/// Counted in Unicode scalar values rather than `wcwidth()` — see the module
-/// header. Bytes that are not valid UTF-8 count as one column each, matching
-/// git's fallback for undecodable input.
+/// ```c
+/// glyph_width = utf8_width(&string, NULL);
+/// if (glyph_width > 0)
+///         width += glyph_width;
+/// ```
+///
+/// (utf8.c:224-227.) A glyph `git_wcwidth()` scores at or below zero adds
+/// nothing — which covers NUL (0) and every control character, `if (ch < 32 ||
+/// (ch >= 0x7f && ch < 0xa0)) return -1` (utf8.c:96-97). A tab in a cell
+/// therefore costs no columns at all.
+///
+/// Everything else counts as one column rather than `git_wcwidth()`'s answer —
+/// see the module header. Bytes that are not valid UTF-8 count as one column
+/// each, matching git's fallback for undecodable input.
 fn item_length(s: &[u8]) -> i64 {
     let mut width = 0i64;
     let mut i = 0;
@@ -741,9 +765,20 @@ fn item_length(s: &[u8]) -> i64 {
         }
         // Decode one UTF-8 scalar, or consume a single invalid byte.
         let take = utf8_len(s[i]).min(s.len() - i).max(1);
-        let decoded = std::str::from_utf8(&s[i..i + take]).is_ok();
-        i += if decoded { take } else { 1 };
-        width += 1;
+        let scalar = std::str::from_utf8(&s[i..i + take])
+            .ok()
+            .and_then(|text| text.chars().next());
+        i += match scalar {
+            Some(_) => take,
+            None => 1,
+        };
+        let zero_or_less = scalar.is_some_and(|c| {
+            let ch = c as u32;
+            ch < 32 || (0x7f..0xa0).contains(&ch)
+        });
+        if !zero_or_less {
+            width += 1;
+        }
     }
     width
 }

@@ -431,6 +431,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut left_only = false;
     let mut right_only = false;
     let mut ancestry_path = false;
+    // `revs->edge_hint`: print the uninteresting boundary as `-<id>` lines.
+    let mut edge_hint = false;
     // `revs->ancestry_path_bottoms` as `--ancestry-path=<commit>` fills it.
     let mut ancestry_bottoms: Vec<ObjectId> = Vec::new();
     let mut simplify_by_decoration = false;
@@ -620,6 +622,23 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--reverse" => reverse = !reverse,
             "--first-parent" => first_parent = true,
             "--objects" => objects = true,
+            // ```c
+            // } else if (!strcmp(arg, "--objects-edge")) {
+            //         revs->tag_objects = 1;
+            //         revs->tree_objects = 1;
+            //         revs->blob_objects = 1;
+            //         revs->edge_hint = 1;
+            // ```
+            //
+            // (`revision.c`.) The object listing plus `mark_edges_uninteresting()`,
+            // whose `show_edge` callback prints `-<id>` for every *uninteresting*
+            // parent of a shown commit — which is how `pack-objects` learns the
+            // boundary to delta against. The `-aggressive` spelling widens which
+            // trees are marked, not which commits are printed.
+            "--objects-edge" | "--objects-edge-aggressive" => {
+                objects = true;
+                edge_hint = true;
+            }
             "--object-names" => object_names = true,
             "--no-object-names" => object_names = false,
             "--in-commit-order" => in_commit_order = true,
@@ -1533,7 +1552,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // runs over the emission order, so it has to happen before `--reverse` — which
     // `get_revision()` applies to the *whole* sequence, boundary commits included
     // (revision.c:4673-4692), putting them in front and reversing their own order.
-    let boundary_commits = if boundary {
+    let mut boundary_commits = if boundary {
         boundary_list(&repo, &commits, &mut parents_of, order == Order::DateTopo)
     } else {
         Vec::new()
@@ -1562,6 +1581,35 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut out: Vec<u8> = Vec::new();
+    // `mark_edges_uninteresting()` (list-objects.c:283-321) runs before
+    // `traverse_commit_list()`, so every `-<id>` precedes the listing itself. The
+    // edges are the *uninteresting* parents of the shown commits — a parent left
+    // unwalked by `--max-count` is not one, which is why `--objects-edge -n 1`
+    // prints no edge at all.
+    if edge_hint && !hidden.is_empty() {
+        let uninteresting = reachable_from(&hidden, &parents_of);
+        let shown: HashSet<ObjectId> = commits.iter().copied().collect();
+        let mut edges: Vec<ObjectId> = Vec::new();
+        let mut seen_edge: HashSet<ObjectId> = HashSet::new();
+        for id in &commits {
+            for parent in parents_of.get(id).into_iter().flatten() {
+                if !shown.contains(parent)
+                    && uninteresting.contains(parent)
+                    && seen_edge.insert(*parent)
+                {
+                    edges.push(*parent);
+                }
+            }
+        }
+        for id in &edges {
+            out.extend_from_slice(format!("-{id}\n").as_bytes());
+        }
+        // `parent->object.flags |= SHOWN` right before `show_edge(parent)`
+        // (list-objects.c), and `create_boundary_commit_list()` skips a commit
+        // that carries `SHOWN` (revision.c) — so `--objects-edge --boundary`
+        // prints the shared commit once, here, rather than twice.
+        boundary_commits.retain(|id| !edges.contains(id));
+    }
     let mut count_left = 0usize;
     let mut count_right = 0usize;
     let mut count_same = 0usize;
@@ -3319,12 +3367,16 @@ fn object_disk_size(repo: &gix::Repository, id: ObjectId) -> Option<u64> {
     for dir in std::iter::once(store.path().to_path_buf())
         .chain(store.alternate_db_paths().ok().into_iter().flatten())
     {
+        // `do_oid_object_info_extended()` asks `find_pack_entry()` first and only
+        // falls back to `loose_object_info()` when no pack has the object
+        // (object-file.c). `repack` without `-d` leaves the loose copies behind,
+        // so an object can be both — and the packed entry is the one git measures.
+        if let Some(size) = packed_entry_size(&dir.join("pack"), id) {
+            return Some(size);
+        }
         let loose = dir.join(&hex[..2]).join(&hex[2..]);
         if let Ok(md) = std::fs::metadata(&loose) {
             return Some(md.len());
-        }
-        if let Some(size) = packed_entry_size(&dir.join("pack"), id) {
-            return Some(size);
         }
     }
     None
@@ -3333,12 +3385,24 @@ fn object_disk_size(repo: &gix::Repository, id: ObjectId) -> Option<u64> {
 /// The length of `id`'s entry inside a pack: the gap to the next entry in
 /// offset order, which is what git's reverse index computes.
 fn packed_entry_size(pack_dir: &std::path::Path, id: ObjectId) -> Option<u64> {
-    let entries = std::fs::read_dir(pack_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("idx") {
-            continue;
-        }
+    // `sort_pack()` (packfile.c) puts local packs first and, among them, the
+    // youngest first — "younger packs tend to contain more recent objects" — and
+    // `find_pack_entry()` takes the first hit, so two packs holding the same
+    // object are not interchangeable.
+    let mut indexes: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(pack_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("idx"))
+        .map(|path| {
+            let mtime = std::fs::metadata(&path)
+                .and_then(|md| md.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (mtime, path)
+        })
+        .collect();
+    indexes.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, path) in indexes {
         let Ok(index) = gix::odb::pack::index::File::at(&path, id.kind()) else {
             continue;
         };

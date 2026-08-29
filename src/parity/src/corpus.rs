@@ -23,6 +23,7 @@ mod diff_family;
 mod fetch_clone;
 mod fixture_gaps;
 mod fixture_gaps2;
+mod env_layer;
 mod globals_layer;
 mod graft_partial;
 mod discovery;
@@ -114,6 +115,9 @@ pub fn cases() -> Vec<Case> {
     // The option layer that runs before the verb: `-C`, `--bare`, the
     // pathspec-magic switches, `--namespace`, `--config-env`, `--shallow-file`.
     globals_layer::cases(&mut c);
+
+    // The other half of that layer: the environment git reads.
+    env_layer::cases(&mut c);
 
     // ---- rev-parse: the most-called plumbing in any script ----
     read_only("rev-parse", &["rev-parse", "HEAD"], &mut c);

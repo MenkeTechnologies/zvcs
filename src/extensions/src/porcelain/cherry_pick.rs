@@ -1313,6 +1313,32 @@ fn pick_one(
                 if !conflict.is_unresolved(unresolved) {
                     continue;
                 }
+                // A path one side modified and the other deleted is merge-ort's
+                // own message naming both operands, not the generic content
+                // notice — and the picked commit is named the way the sequencer
+                // names it everywhere else, `<short> (<subject>)`.
+                //
+                // gix reports `modification|deletion` and `deletion|modification`
+                // as one failure, so the direction comes from the entries rather
+                // than from the variant: `entries()` has already compensated for
+                // any swap, and the side that deleted the path is the one with no
+                // entry.
+                if matches!(
+                    conflict.resolution,
+                    Err(gix::merge::tree::ResolutionFailure::OursModifiedTheirsDeleted)
+                ) {
+                    let entries = conflict.entries();
+                    let (modify, delete) = match entries[1].is_none() {
+                        true => (other_label.as_str(), "HEAD"),
+                        false => ("HEAD", other_label.as_str()),
+                    };
+                    println!(
+                        "CONFLICT (modify/delete): {path} deleted in {delete} and modified in \
+                         {modify}.  Version {modify} of {path} left in tree."
+                    );
+                    conflicted.push(path);
+                    continue;
+                }
                 // merge-ort's `filemask == 6`: no ancestor stage means both
                 // sides added the path, which it reports as `add/add` rather
                 // than `content`.
@@ -1975,6 +2001,20 @@ fn continue_single_pick(
         .map_err(|_| anyhow::anyhow!("HEAD does not point to a commit"))?
         .detach();
 
+    // The child is `git commit`, and that command refuses a commit with nothing
+    // in it: `!committable && !allow_empty` prints the status and the
+    // empty-cherry-pick advice and returns 1 (builtin/commit.c:1078-1095). So a
+    // `--continue` over a pick that went empty stops again rather than recording
+    // it — only `git commit --allow-empty` or `--skip` moves past that.
+    let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
+    if tree_id == head_tree {
+        let whence = match std::fs::read_to_string(git_dir.join("REBASE_HEAD")).is_ok() {
+            true => super::commit::Whence::RebasePick,
+            false => super::commit::Whence::CherryPick,
+        };
+        return Ok(Err(super::commit::refuse_nothing_to_commit(None, false, whence)?));
+    }
+
     // The message git commits is `MERGE_MSG` with the default cleanup applied
     // (comment lines dropped) — which is the picked message the stop recorded,
     // carrying any `-x`/`-s` trailer, plus whatever the user edited in.
@@ -2087,9 +2127,15 @@ fn stop_empty(
         "You are currently cherry-picking commit {}.",
         pick_id.attach(repo).shorten_or_id()
     );
-    println!("  (all conflicts fixed: run \"git cherry-pick --continue\")");
-    println!("  (use \"git cherry-pick --skip\" to skip this patch)");
-    println!("  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)");
+    // `wt_status_prepare()`: `s->hints = advice_enabled(ADVICE_STATUS_HINTS)`, so
+    // every parenthesized direction under the in-progress line hangs off that one
+    // flag — `--no-advice` and `advice.statusHints=false` alike take all three
+    // away and leave the state line itself.
+    if crate::advice::Advice::StatusHints.enabled_in(repo) {
+        println!("  (all conflicts fixed: run \"git cherry-pick --continue\")");
+        println!("  (use \"git cherry-pick --skip\" to skip this patch)");
+        println!("  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)");
+    }
     println!();
     println!("nothing to commit, working tree clean");
 

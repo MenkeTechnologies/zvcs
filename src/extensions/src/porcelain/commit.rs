@@ -334,7 +334,7 @@ struct DryRun {
 /// from the `if/else` immediately below, so in git 2.55.0 the value can never
 /// reach `cmd_commit`. Porting the dead store would only add an unreachable arm.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Whence {
+pub(super) enum Whence {
     /// `FROM_COMMIT` — an ordinary commit.
     Commit,
     /// `FROM_MERGE` — `MERGE_HEAD` exists; this commit concludes a merge.
@@ -1846,44 +1846,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // The long format is the only one reachable: a `--short`/`--porcelain`/
         // `-z` request has already turned the command into a dry run
         // (builtin/commit.c:1422-1423) and returned far above.
-        report_nothing_to_commit(
-            untracked_arg.as_deref(),
-            match amend {
-                true => super::status::Reference::AmendParent,
-                false => super::status::Reference::Commit,
-            },
-        )?;
-        if amend {
-            // `fputs(_(empty_amend_advice), stderr)` (builtin/commit.c:1086-1087),
-            // whose text is a single trailing-newline-terminated block.
-            eprint!(
-                "You asked to amend the most recent commit, but doing so would make\n\
-                 it empty. You can repeat your command with --allow-empty, or you can\n\
-                 remove the commit entirely with \"git reset HEAD^\".\n"
-            );
-            return Ok(ExitCode::from(1));
-        }
-        // A cherry-pick or rebase pick whose conflict resolution left nothing to
-        // record is a distinct situation from "you staged nothing": the pick has
-        // to be either recorded empty or skipped, and git says which.
-        if whence.is_cherry_pick() || whence.is_rebase() {
-            eprint!(
-                "The previous cherry-pick is now empty, possibly due to conflict resolution.\n\
-                 If you wish to commit it anyway, use:\n\
-                 \n    \
-                 git commit --allow-empty\n\
-                 \n"
-            );
-            if whence.is_rebase() {
-                eprintln!("Otherwise, please use 'git rebase --skip'");
-            } else {
-                eprintln!("Otherwise, please use 'git cherry-pick --skip'");
-            }
-            return Ok(ExitCode::from(1));
-        }
-        // `prepare_to_commit()` returns 0, which `cmd_commit()` turns into
-        // `ret = 1` — an exit code and not a word of its own on stderr.
-        return Ok(ExitCode::from(1));
+        return refuse_nothing_to_commit(untracked_arg.as_deref(), amend, whence);
     }
 
     // --- message: `prepare_to_commit()` -----------------------------------
@@ -2773,6 +2736,58 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
 /// `-u<mode>` reaches `wt_status` through `handle_untracked_files_arg()` before
 /// the refusal, so it is forwarded. `-v` is not: git's `wt_longstatus_print()`
 /// would append the staged diff, and there is by definition nothing staged.
+/// The whole of git's refusal when there is nothing to commit: the status report
+/// on stdout, then whichever advice the situation calls for on stderr, then exit
+/// 1 — never a `die()`, so there is no `fatal:` in front of any of it.
+///
+/// `continue_single_pick()` (sequencer.c:5240-5256) runs `git commit
+/// --no-edit --cleanup=strip`, so a `cherry-pick --continue` over a pick that
+/// went empty lands here too and says exactly what the bare command would.
+pub(super) fn refuse_nothing_to_commit(
+    untracked: Option<&str>,
+    amend: bool,
+    whence: Whence,
+) -> Result<ExitCode> {
+    report_nothing_to_commit(
+        untracked,
+        match amend {
+            true => super::status::Reference::AmendParent,
+            false => super::status::Reference::Commit,
+        },
+    )?;
+    if amend {
+        // `fputs(_(empty_amend_advice), stderr)` (builtin/commit.c:1086-1087),
+        // whose text is a single trailing-newline-terminated block.
+        eprint!(
+            "You asked to amend the most recent commit, but doing so would make\n\
+             it empty. You can repeat your command with --allow-empty, or you can\n\
+             remove the commit entirely with \"git reset HEAD^\".\n"
+        );
+        return Ok(ExitCode::from(1));
+    }
+    // A cherry-pick or rebase pick whose conflict resolution left nothing to
+    // record is a distinct situation from "you staged nothing": the pick has
+    // to be either recorded empty or skipped, and git says which.
+    if whence.is_cherry_pick() || whence.is_rebase() {
+        eprint!(
+            "The previous cherry-pick is now empty, possibly due to conflict resolution.\n\
+             If you wish to commit it anyway, use:\n\
+             \n    \
+             git commit --allow-empty\n\
+             \n"
+        );
+        if whence.is_rebase() {
+            eprintln!("Otherwise, please use 'git rebase --skip'");
+        } else {
+            eprintln!("Otherwise, please use 'git cherry-pick --skip'");
+        }
+        return Ok(ExitCode::from(1));
+    }
+    // `prepare_to_commit()` returns 0, which `cmd_commit()` turns into
+    // `ret = 1` — an exit code and not a word of its own on stderr.
+    Ok(ExitCode::from(1))
+}
+
 fn report_nothing_to_commit(
     untracked: Option<&str>,
     reference: super::status::Reference,

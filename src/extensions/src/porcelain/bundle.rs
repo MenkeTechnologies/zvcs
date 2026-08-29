@@ -1016,12 +1016,23 @@ fn resolve_revisions(
                 if sel.selects(&full).is_none() {
                     continue;
                 }
-                if let Some(id) = r.try_id() {
+                // `for_each_ref()` resolves a symbolic ref before handing the
+                // callback an object id, so `refs/remotes/origin/HEAD` is a
+                // pending object like any other — and a bundle names it in its
+                // header. `try_id()` answers only for a direct ref, so following
+                // is this port's half of that resolution. The follow stops at the
+                // object: a tag tip stays the tag's own id, which is what the
+                // header has to carry.
+                let mut r = r;
+                let resolved = r.try_id().map(|id| id.detach()).or_else(|| {
+                    r.follow_to_object().ok().map(|id| id.detach())
+                });
+                if let Some(id) = resolved {
                     // `write_bundle_refs()` re-dwims each pending name through
                     // `repo_dwim_ref()`, so a `--branches` entry named `topic`
                     // comes back out as `refs/heads/topic`.
                     pending.push(Pending {
-                        id: id.detach(),
+                        id,
                         display_ref: Some(full),
                         uninteresting: negate,
                     });

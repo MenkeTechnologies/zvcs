@@ -124,7 +124,7 @@ pub fn pack_redundant(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let hash_kind = repo.object_hash();
     let hexsz = hash_kind.len_in_hex();
 

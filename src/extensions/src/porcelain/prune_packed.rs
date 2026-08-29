@@ -131,7 +131,7 @@ pub fn prune_packed(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_error("fatal: too many arguments\n\n"));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let hash = repo.object_hash();
     let objdir = repo.objects.store_ref().path().to_path_buf();
     let shown_objdir = display_objdir(&repo, &objdir);

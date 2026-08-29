@@ -311,7 +311,7 @@ static COLORS: std::sync::OnceLock<super::color::GrepColors> = std::sync::OnceLo
 
 /// The resolved slot table, reading the config on first use.
 fn colors() -> &'static super::color::GrepColors {
-    COLORS.get_or_init(|| match gix::discover(".") {
+    COLORS.get_or_init(|| match crate::setup::discover() {
         Ok(repo) => super::color::GrepColors::resolve(&repo),
         Err(_) => super::color::GrepColors::defaults(),
     })
@@ -470,7 +470,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // git's `grep_config`: config-provided defaults, applied before the CLI loop
     // below overrides them (`--[no-]line-number`, `-E`/`-F`/`-G`/`-P`, …). Done
     // via a cheap early discover so it also works ahead of the main repo open.
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         let snap = repo.config_snapshot();
         // `color.grep`, falling back to `color.ui`, is git's default for whether
         // the output is colored at all; an explicit `--color`/`--no-color` below
@@ -947,7 +947,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // `--no-index` one rather than letting `setup_git_directory()` die. The
     // config is read from the global cascade, which is all git has to read it
     // from here either.
-    let mut repo = match gix::discover(".") {
+    let mut repo = match crate::setup::discover() {
         Ok(repo) => Some(repo),
         Err(err) => {
             if !opts.no_index {

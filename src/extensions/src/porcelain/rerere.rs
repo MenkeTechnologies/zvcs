@@ -141,7 +141,7 @@ pub fn rerere(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // git's parse-options collects non-options and keeps scanning, so flags may
     // appear before or after the verb; `--` ends option parsing.

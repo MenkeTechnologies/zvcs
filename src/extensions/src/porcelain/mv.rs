@@ -184,7 +184,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
 
     // 2. Repository + worktree context. All paths are resolved relative to the
     //    current directory via the repo prefix, then made repo-relative.
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(r) => r,
         Err(_) => return fatal("not a git repository (or any of the parent directories): .git"),
     };

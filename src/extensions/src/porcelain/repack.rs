@@ -491,7 +491,7 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
     // keys `repack_config()` reads (`builtin/repack.c:97-110`), which is why they
     // are loaded here rather than next to the MIDX write they steer.
     let mut midx_cfg = MidxConfig::DEFAULT;
-    let pack_size_limit_cfg = match gix::discover(".") {
+    let pack_size_limit_cfg = match crate::setup::discover() {
         Ok(repo) => {
             let limit = match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
                 Ok(limit) => limit,
@@ -611,7 +611,7 @@ impl MidxConfig {
 /// git reaches the object database only after every check above, so this is also
 /// where "not a git repository" is diagnosed.
 fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };

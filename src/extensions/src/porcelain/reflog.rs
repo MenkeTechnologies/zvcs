@@ -336,7 +336,7 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
         _ => ("show", args),
     };
 
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     match sub {
         "show" => {
             // `cmd_reflog_show`'s table is empty, so no token is ever a value and
@@ -385,7 +385,7 @@ pub fn reflog_show_as_log(args: &[String]) -> Result<ExitCode> {
 /// `git stash show --zzbogus` still exits 129. `std::process::ExitCode` cannot be
 /// read back, so `list_stash()`'s caller needs the number rather than the code.
 pub fn reflog_show_as_log_status(args: &[String]) -> Result<u8> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     show(&repo, args, Tweak::Log)
 }
 

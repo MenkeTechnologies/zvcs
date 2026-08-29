@@ -552,7 +552,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return run_textconv(&positional, path.as_deref(), use_mailmap);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // Mode-less `<type> <object>` form and the arity rules for the cmdmode form.
     let Some(mode) = mode else {
@@ -701,7 +701,7 @@ fn run_filters(positional: &[&str], path: Option<&str>) -> Result<ExitCode> {
     let spec = positional[0];
 
     // git resolves the object first, then insists on a path for it.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let id = match resolve_transform_spec(&repo, spec) {
         Ok(id) => id,
         Err(code) => return Ok(code),
@@ -999,7 +999,7 @@ fn run_textconv(positional: &[&str], path: Option<&str>, use_mailmap: bool) -> R
     }
     let spec = positional[0];
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let oid = match resolve_transform_spec(&repo, spec) {
         Ok(id) => id,
         Err(code) => return Ok(code),
@@ -1446,7 +1446,7 @@ fn run_batch(
         None => None,
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let mailmap = if use_mailmap {
         Some(repo.open_mailmap())
     } else {

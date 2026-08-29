@@ -178,7 +178,7 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
         return usage_error(None);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // `core.preferSymlinkRefs` is read when the files ref store is created
     // (refs/files-backend.c:129), which every form of this command does — so an

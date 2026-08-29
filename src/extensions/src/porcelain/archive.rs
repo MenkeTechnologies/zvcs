@@ -477,7 +477,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         let mut out = String::new();
-        for f in configured_formats(gix::discover(".").ok().as_ref()) {
+        for f in configured_formats(crate::setup::discover().ok().as_ref()) {
             out.push_str(&f);
             out.push('\n');
         }
@@ -506,7 +506,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     // The registry is config-driven, so a `tar.<name>.command` makes `<name>` a format git
     // knows — which is why this is checked against the configured list and not the built-in
     // one.
-    let known = configured_formats(gix::discover(".").ok().as_ref());
+    let known = configured_formats(crate::setup::discover().ok().as_ref());
     if !known.iter().any(|f| f == &format) {
         eprintln!("fatal: Unknown archive format '{format}'");
         return Ok(ExitCode::from(128));
@@ -529,7 +529,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // git lets `tar.<fmt>.command` replace an archiver with an external filter.
     // The internal gzip is what this port reproduces; anything else would have
@@ -1122,7 +1122,7 @@ fn recv_sideband(from: &mut impl std::io::BufRead, out: &mut impl Write) -> Resu
     // The `remote: ` prefixing and the keyword colours are the same ones `push`
     // uses. `--remote` runs outside a repository too, and there is then nothing
     // to read `color.remote` from.
-    let mut sideband = match gix::discover(".") {
+    let mut sideband = match crate::setup::discover() {
         Ok(repo) => super::push_proto::Sideband::new(&repo),
         Err(_) => super::push_proto::Sideband::plain(),
     };

@@ -681,7 +681,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: '--ignore-unmerged' cannot be used with updating paths");
             return Ok(ExitCode::from(128));
         }
-        let repo = gix::discover(".")?;
+        let repo = crate::setup::discover()?;
         let revision = match source.as_deref() {
             None | Some("HEAD") => source.clone(),
             Some(r) => Some(repo.rev_parse_single(r)?.detach().to_string()),
@@ -706,7 +706,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- Repository + lock --------------------------------------------------
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| crate::fatal::need_work_tree())?

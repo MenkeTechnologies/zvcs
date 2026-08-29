@@ -34,7 +34,7 @@ fn read_config(repo: &gix::Repository) -> bool {
 /// it, which costs one discovery per process and only on the first byte >= 0x80 that
 /// is actually rendered. Outside a repository the answer is git's default, true.
 pub fn quote_path_fully() -> bool {
-    *QUOTE_PATH_FULLY.get_or_init(|| gix::discover(".").as_ref().map_or(true, read_config))
+    *QUOTE_PATH_FULLY.get_or_init(|| crate::setup::discover().as_ref().map_or(true, read_config))
 }
 
 /// The escape character for `b`, or `None` if it can be emitted verbatim.

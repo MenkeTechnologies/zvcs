@@ -146,7 +146,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // Split positionals into `<revision>` and pathspecs the way `setup_revisions`
     // does: a leading argument that names an object is the revision, everything

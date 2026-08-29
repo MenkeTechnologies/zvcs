@@ -112,7 +112,7 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // The positional scan. `end` ends up at the index of the `--` that stopped
     // it, or at args.len() when no `--` was seen — mirroring C's `i` shifted by

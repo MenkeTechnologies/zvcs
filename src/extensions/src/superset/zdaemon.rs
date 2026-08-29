@@ -420,7 +420,7 @@ fn start_detached() -> Result<ExitCode> {
         eprintln!("zvcs: daemon already running");
         return Ok(ExitCode::SUCCESS);
     }
-    let workdir = gix::discover(".")
+    let workdir = crate::setup::discover()
         .ok()
         .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
         .or_else(|| std::env::current_dir().ok())
@@ -978,7 +978,7 @@ fn restart() -> Result<ExitCode> {
     }
     let _ = std::fs::remove_file(&path);
 
-    let workdir = gix::discover(".")
+    let workdir = crate::setup::discover()
         .ok()
         .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
         .or_else(|| std::env::current_dir().ok())
@@ -1076,7 +1076,7 @@ fn info() -> Result<ExitCode> {
     if let Some(state) = query(&sock, "STATUS") {
         println!("state:   {state}");
     }
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         let cfg = crate::config::ZvcsConfig::load(&repo);
         println!(
             "config:  autoreconcile={} autobump={} autocrawl={} autostatus={} hook={} interval={}s",

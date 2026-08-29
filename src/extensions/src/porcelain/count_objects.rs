@@ -136,7 +136,7 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let hash = repo.object_hash();
     let objdir = repo.objects.store_ref().path().to_path_buf();
     // git prints garbage paths relative to the top-level it chdir'd into.

@@ -358,7 +358,7 @@ pub fn fast_import(args: &[String]) -> Result<ExitCode> {
 fn run(args: &[String]) -> Result<ExitCode> {
     // git runs `setup_git_directory()` before it looks at argv, so even a usage
     // error outside a repository comes out as "not a git repository".
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // Serialize object and ref writes through the repo coordinator, as the other
     // writing porcelain does, so concurrent zvcs writers queue instead of racing.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());

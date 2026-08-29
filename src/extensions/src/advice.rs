@@ -175,7 +175,7 @@ impl Advice {
     /// configuration. Outside a repository only `GIT_ADVICE` applies, matching
     /// git, which reads advice settings from whatever config it managed to load.
     pub fn enabled(self) -> bool {
-        match gix::discover(".") {
+        match crate::setup::discover() {
             Ok(repo) => self.enabled_in(&repo),
             Err(_) => globally_enabled(),
         }
@@ -207,7 +207,7 @@ impl Advice {
     /// (a blank line becomes a bare `hint:`), if this slot is enabled.
     /// Returns whether anything was printed.
     pub fn advise(self, body: &str) -> bool {
-        match gix::discover(".") {
+        match crate::setup::discover() {
             Ok(repo) => self.advise_in(&repo, body),
             Err(_) => {
                 if !globally_enabled() {
@@ -223,7 +223,7 @@ impl Advice {
     /// `Disable this message with …` trailer, for the sites git spells as an
     /// `advice_enabled()` check followed by a plain `advise()`.
     pub fn advise_plain(self, body: &str) -> bool {
-        match gix::discover(".") {
+        match crate::setup::discover() {
             Ok(repo) => self.advise_plain_in(&repo, body),
             Err(_) => {
                 if !globally_enabled() {
@@ -387,7 +387,7 @@ pub(crate) fn print_hint(body: &str) {
 /// or the empty string when `color.advice` (which, unlike the stdout slots, has no
 /// `color.ui` fallback and is `auto` against stderr) says not to color.
 fn hint_color() -> String {
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     if !crate::porcelain::color::want_color_stderr(repo.as_ref(), "advice") {
         return String::new();
     }
@@ -406,7 +406,7 @@ pub fn enabled(slot: &str) -> bool {
     if !globally_enabled() {
         return false;
     }
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().boolean(&format!("advice.{slot}")) != Some(false),
         Err(_) => true,
     }

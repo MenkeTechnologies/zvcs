@@ -181,7 +181,7 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // `verify_ref_format` runs once, up front, and its failure is this verb's own
     // usage error rather than a per-tag one:

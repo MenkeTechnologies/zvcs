@@ -176,7 +176,7 @@ pub fn jump(args: &[String]) -> Result<ExitCode> {
 fn mode_auto(args: &[String]) -> Result<Option<Vec<u8>>> {
     // `test "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true"` —
     // false both outside a repository and inside its git directory.
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return Ok(None);
     };
     if !is_inside_work_tree(&repo) {
@@ -320,7 +320,7 @@ fn hunk_new_start(rest: &[u8]) -> Option<u64> {
 fn mode_merge(args: &[String]) -> Result<Vec<u8>> {
     // Outside a repository `git ls-files` prints its own fatal and the script
     // ignores the status, so the run still ends at exit 0 with no elements.
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(Vec::new());
     };
@@ -346,7 +346,7 @@ fn mode_merge(args: &[String]) -> Result<Vec<u8>> {
 /// lookup would find: the script's `git` is the installation it ships with, and
 /// this port is that installation.
 fn mode_grep(args: &[String]) -> Result<Vec<u8>> {
-    let configured = gix::discover(".")
+    let configured = crate::setup::discover()
         .ok()
         .and_then(|repo| {
             repo.config_snapshot()

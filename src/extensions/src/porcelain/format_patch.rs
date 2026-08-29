@@ -936,7 +936,7 @@ struct Opts {
 }
 
 pub fn format_patch(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     let mut opts = match parse(&repo, args)? {
         Parsed::Ready(opts) => *opts,

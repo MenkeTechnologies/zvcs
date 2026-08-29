@@ -268,7 +268,7 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             .collect()
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // git compares user-supplied absolute paths against the resolved worktree
     // root, and names it in the "outside repository" message.

@@ -770,7 +770,7 @@ pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
     // The order matters: `pack.useSparse=bogus pack.packSizeLimit=bogus` reports
     // the boolean, because settings are prepared first.
     let mut settings = None;
-    let pack_size_limit_cfg = match gix::discover(".") {
+    let pack_size_limit_cfg = match crate::setup::discover() {
         Ok(repo) => {
             let loaded = match crate::repo_settings::RepoSettings::load(&repo) {
                 Ok(s) => s,
@@ -862,7 +862,7 @@ fn st_max_pack_size(st: &State) -> Option<u64> {
 /// git reaches the object database only after the checks above, so this is also
 /// where "not a git repository" is diagnosed.
 fn execute(st: &State) -> Result<ExitCode> {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };

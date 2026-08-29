@@ -280,7 +280,7 @@ impl Ctx {
 type Step = std::result::Result<(), Die>;
 
 pub fn update_index(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // git's `core.ignorestat` sets the global `assume_unchanged`, which makes
     // every entry this command writes carry the `CE_VALID` bit.

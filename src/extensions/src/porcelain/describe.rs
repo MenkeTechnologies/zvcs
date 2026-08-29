@@ -229,7 +229,7 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     let filter = Filter { all, match_pats, exclude_pats };
 
     // An object cache saves ~40% of walk time and is otherwise harmless.
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
 
     // ```c
@@ -1005,7 +1005,7 @@ fn run_contains(
     match_pats: &[BString],
     exclude_pats: &[BString],
 ) -> Result<ExitCode> {
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
 
     // git delegates only `refs/tags/`-prefixed patterns to name-rev, and only when

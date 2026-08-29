@@ -44,7 +44,7 @@ use gix::prelude::ObjectIdExt;
 ///     `gix_date`'s parser rather than git's `approxidate`, which accepts a
 ///     wider set of fuzzy spellings
 pub fn show_branch(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // `cmd_show_branch`: with no argument at all, `showbranch.default` supplies argv.
     let mut argv: Vec<String> = args.to_vec();

@@ -151,7 +151,7 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // Pass one: parse-options over the whole argv, stopping at `--`, which it
     // leaves in place for `setup_revisions`. Its errors precede every revision

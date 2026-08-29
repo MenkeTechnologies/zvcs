@@ -89,7 +89,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
     // git reads and validates config at the very start of `cmd_merge_file`,
     // before option parsing, `-h`, or the operand count check, so an invalid
     // `merge.conflictStyle` is fatal (exit 128) regardless of the command line.
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let config_style = match conflict_style_config(repo.as_ref()) {
         Ok(style) => style,
         Err(code) => return Ok(code),

@@ -640,7 +640,7 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
 
     // git runs the deprecation check inside `cmd_whatchanged`, i.e. after repository
     // setup, so a missing repository is still reported first.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     super::diff_files::init_quote_path(&repo);
 
     // git reads `log.*` display config in `git_log_config`, before `setup_revisions` and

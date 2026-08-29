@@ -148,7 +148,7 @@ pub fn correct(cmd: &str) -> Correction {
 
 /// Read and parse `help.autocorrect` (`0` when unset or outside a repository).
 fn read_autocorrect() -> i32 {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return 0;
     };
     match repo.config_snapshot().string("help.autocorrect") {
@@ -215,7 +215,7 @@ fn candidate_names() -> Vec<String> {
 /// The names of every configured `alias.<name>` across all config scopes, in
 /// both the `alias.name = …` and `[alias "name"] command = …` forms.
 fn alias_names() -> Vec<String> {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return Vec::new();
     };
     let file = repo.config_snapshot().plumbing().clone();

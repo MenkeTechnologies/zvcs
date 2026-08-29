@@ -98,7 +98,7 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // `init_basic_merge_options(&o, …)`. The `-subtree` alias's
     // `o.subtree_shift = ""` is not seeded here: that name has its own driver

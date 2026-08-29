@@ -147,7 +147,7 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // Serialize against other zvcs writers: this appends tree objects to the odb
     // while reading the index, exactly like the tree-build phase of `commit`.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());

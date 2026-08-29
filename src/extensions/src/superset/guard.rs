@@ -201,12 +201,12 @@ fn predicate_holds(pred: Pred, args: &[String]) -> bool {
             Some(signed) => !signed,
             // No sign flag on the command line → the config decides.
             None => {
-                let Ok(repo) = gix::discover(".") else { return false };
+                let Ok(repo) = crate::setup::discover() else { return false };
                 !repo.config_snapshot().boolean("commit.gpgsign").unwrap_or(false)
             }
         };
     }
-    let Ok(repo) = gix::discover(".") else { return false };
+    let Ok(repo) = crate::setup::discover() else { return false };
     match pred {
         Pred::Detached => repo.head_name().ok().flatten().is_none(),
         Pred::Dirty => repo.is_dirty().unwrap_or(false),

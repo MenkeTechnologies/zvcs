@@ -371,7 +371,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     // `line_termination = '\0'` for the *output*: every record separator is a
     // NUL and the message block uses the `-z` shape, so `-z` is a no-op here.
     if use_stdin {
-        let repo = gix::discover(".")?;
+        let repo = crate::setup::discover()?;
         let sep = b'\0';
         let stdin = std::io::stdin();
         let mut input = stdin.lock();
@@ -462,7 +462,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     if mode == Mode::Trivial {
         // git's trivial merge peels each of the three operands to a tree before

@@ -309,7 +309,7 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // `repo_config(git_default_config)`: seeds `quote_path_fully` from
     // `core.quotePath` before the first path is rendered.
     crate::quote::init(&repo);

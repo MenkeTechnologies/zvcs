@@ -31,7 +31,7 @@ fn set(args: &[String]) -> Result<ExitCode> {
     crate::superset::hooks::set_hook(&workdir, &cmd)?;
     println!("hook set: {cmd}");
     // Auto-enable firing so no raw `git config` is ever needed.
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         if !crate::config::ZvcsConfig::load(&repo).hooks_enabled() {
             crate::superset::hooks::enable_autohook()?;
             crate::superset::hooks::reload_daemon();
@@ -50,7 +50,7 @@ fn unset() -> Result<ExitCode> {
 
 /// `git zhook show` — the current repo's effective (merged) hook.
 fn show() -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     match repo.config_snapshot().string("zvcs.hook") {
         Some(c) => println!("{c}"),
         None => {
@@ -74,7 +74,7 @@ fn list() -> Result<ExitCode> {
 /// `git zhook test` — fire the current repo's hook once (typed event from the
 /// latest reflog), for testing.
 fn test() -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let git_dir = repo.git_dir().to_path_buf();
     let workdir = repo
         .workdir()

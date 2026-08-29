@@ -512,7 +512,7 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
     // malformed `am.*` boolean is a config-time fatal (exit 128) that precedes
     // any CLI usage error (exit 129), and the config values become the option
     // defaults the command line then overrides.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let defaults = match am_config(&repo) {
         Ok(d) => d,
         Err(msg) => {

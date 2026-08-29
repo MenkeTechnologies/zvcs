@@ -348,7 +348,7 @@ pub(crate) struct Setup {
 impl Setup {
     pub(crate) fn enter() -> Self {
         let mut prefix = String::new();
-        if let Ok(repo) = gix::discover(".") {
+        if let Ok(repo) = crate::setup::discover() {
             if let Some(workdir) = repo.workdir() {
                 if let (Ok(root), Ok(cwd)) = (workdir.canonicalize(), std::env::current_dir()) {
                     if let Ok(rel) = cwd.strip_prefix(&root) {
@@ -397,7 +397,7 @@ pub(crate) fn version_info(out: &mut String) {
 /// and the suffix in its own file name come from the same instant, as they do
 /// in `cmd_diagnose()` and `cmd_bugreport()`.
 pub(crate) fn create_diagnostics_archive(zip_path: &str, mode: Mode, now: &LocalTime) -> Result<()> {
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
 
     // git opens (and truncates) the archive before it collects anything, so a
     // path that cannot be created fails before any work is done.

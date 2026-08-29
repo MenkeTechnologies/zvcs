@@ -375,7 +375,7 @@ fn complete_lines(text: &str) -> Vec<&str> {
 /// repository, refuse to run below its top level, and return the absolute
 /// `$GIT_DIR`.
 fn git_dir_init() -> Result<PathBuf, ExitCode> {
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
@@ -501,7 +501,7 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
     // exactly as the script's does). `commit` is rebound to each new commit as
     // the import chains them.
     let mut commit = String::from("HEAD");
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         match repo.head_id() {
             Ok(id) => commit = id.detach().to_string(),
             Err(_) => {

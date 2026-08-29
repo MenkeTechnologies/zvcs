@@ -1217,7 +1217,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         spec_negated.push(false);
     }
 
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     let hex_len = repo.object_hash().len_in_hex();
 
     // `--word-diff`/`--color-moved` layered over `diff.wordRegex` / `diff.colorMoved`.

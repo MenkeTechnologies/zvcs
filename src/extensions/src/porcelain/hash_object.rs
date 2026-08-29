@@ -314,7 +314,7 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
 
     // The repository is required only for `-w`; hashing alone works anywhere,
     // falling back to SHA-1 when there is no repository to ask.
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(repo) => Some(repo),
         Err(err) => {
             if opts.write {

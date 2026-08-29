@@ -56,7 +56,7 @@ pub fn merge_ours(args: &[String]) -> Result<ExitCode> {
     }
     // Every other argument is ignored, exactly as the C builtin ignores argv.
 
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };

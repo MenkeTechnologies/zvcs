@@ -363,7 +363,7 @@ fn comment_string() -> Result<Result<Vec<u8>, ExitCode>> {
     // Like `setup_git_directory_gently()`: a repository is preferred, but the
     // command is legal outside one, where git reads the global set plus the
     // `GIT_CONFIG_*` overrides.
-    let config = match gix::discover(".") {
+    let config = match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().plumbing().clone(),
         Err(_) => {
             let mut file = ConfigFile::from_globals()?;

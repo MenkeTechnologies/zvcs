@@ -306,7 +306,7 @@ fn token_matches_item(tok: &[u8], item: &ConfInfo, tok_len: usize) -> bool {
 pub(crate) fn load_config() -> Result<TrailerConfig> {
     // `setup_git_directory_gently()`: a repository is preferred, but the command
     // is legal outside one, where git reads the global set plus `GIT_CONFIG_*`.
-    let config = match gix::discover(".") {
+    let config = match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().plumbing().clone(),
         Err(_) => {
             let mut file = ConfigFile::from_globals()?;

@@ -407,7 +407,7 @@ const COLUMN_UI: &str = "column.ui";
 fn apply_config_keys(colopts: &mut u32, keys: &[String]) -> Result<(), String> {
     // git reads config whether or not there is a repository; fall back to the
     // global/system files when discovery fails.
-    let values = match gix::discover(".") {
+    let values = match crate::setup::discover() {
         Ok(repo) => read_values(repo.config_snapshot().plumbing(), keys),
         Err(_) => match gix::config::File::from_globals() {
             Ok(file) => read_values(&file, keys),

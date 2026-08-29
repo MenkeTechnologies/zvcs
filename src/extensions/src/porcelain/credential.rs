@@ -137,7 +137,7 @@ fn run(op: Op) -> Result<ExitCode> {
 
     // `git credential` is `RUN_SETUP_GENTLY`: outside a repository it still runs,
     // against whatever configuration `git config` would see there.
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let cfg: gix::config::File = match &repo {
         Some(repo) => repo.config_snapshot().plumbing().clone(),
         None => crate::config::global_config(),

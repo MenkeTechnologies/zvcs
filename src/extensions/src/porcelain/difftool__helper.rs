@@ -65,7 +65,7 @@ pub fn difftool__helper(args: &[String]) -> Result<ExitCode> {
 
     // The helper also runs outside a repository, where `git config` still reads
     // the global, system and `GIT_CONFIG_*` files.
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let snapshot = repo.as_ref().map(|r| r.config_snapshot());
     let config = match &snapshot {
         Some(s) => s.plumbing().clone(),

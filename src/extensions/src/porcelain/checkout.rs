@@ -219,7 +219,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // `commit` with nothing determinable is refused. Without this a bare runner,
     // a container or a `sudo` shell cannot switch branches at all, and a
     // recursive submodule walk aborts on the first one it reaches.
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     crate::ensure_reflog_identity(&mut repo);
 
     // `cmd_checkout()` special-cases the exact command line `git checkout -b

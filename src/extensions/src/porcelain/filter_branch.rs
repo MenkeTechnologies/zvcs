@@ -595,7 +595,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let git_dir = repo.path().canonicalize()?;
 
     // `git_dir_init` with `SUBDIRECTORY_OK` unset: `git rev-parse --show-cdup`

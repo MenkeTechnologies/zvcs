@@ -202,7 +202,7 @@ pub fn show_index(args: &[String]) -> Result<ExitCode> {
         },
         // No explicit format: take the repository's, or warn and assume SHA-1
         // when we are not inside one, exactly as git's setup does.
-        None => match gix::discover(".") {
+        None => match crate::setup::discover() {
             Ok(repo) => repo.object_hash().len_in_bytes(),
             Err(_) => {
                 eprintln!("warning: assuming SHA-1; use --object-format to override");

@@ -140,7 +140,7 @@ pub fn maybe_setup(cmd: &str, forced: Option<bool>) {
 
     // Resolve config from the repo when we are in one (honors repo-scoped
     // `core.pager` / `pager.<cmd>`); fall back to global+env otherwise.
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let cfg = repo.as_ref().map(|r| r.config_snapshot());
 
     let want = match forced {
@@ -314,6 +314,16 @@ pub fn finish() {
 }
 
 /// An environment variable read as a git boolean flag (`true`/`1`/`yes`/`on`).
+/// `pager_in_use()` (pager.c): whether an ancestor already set up a pager that
+/// this process is writing into.
+///
+/// Read by more than the pager itself — git's `auto_decoration_style()` is
+/// `isatty(1) || pager_in_use()`, so `git log`'s decorations appear when the
+/// output is going to a pager even though stdout is a pipe.
+pub fn in_use() -> bool {
+    env_flag("GIT_PAGER_IN_USE")
+}
+
 fn env_flag(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),

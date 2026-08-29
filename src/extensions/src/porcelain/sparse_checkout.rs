@@ -138,7 +138,7 @@ fn opt_error(arg: &str, usage: &str) -> ExitCode {
 // --- subcommands -----------------------------------------------------------
 
 fn cmd_list(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // `sparse_checkout_list()` calls `setup_work_tree()` before it looks at sparsity, so a bare
     // repository or a cwd inside the git dir reports the missing work tree, not the missing
     // sparsity.
@@ -177,7 +177,7 @@ fn cmd_list(args: &[String]) -> Result<ExitCode> {
 /// `set` (`add == true` merges into the existing sparsity instead of replacing
 /// it, and accepts the smaller option set git gives `add`).
 fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // `add` demands an existing sparse-checkout before it looks at options.
     if add && !is_sparse(&repo)? {
         eprintln!("fatal: no sparse-checkout to add to");
@@ -266,7 +266,7 @@ fn cmd_init(args: &[String]) -> Result<ExitCode> {
             _ => {}
         }
     }
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let cone = cone.unwrap_or(is_cone(&repo)?);
 
     // `init` keeps an existing pattern file (that is how a `disable`d sparsity
@@ -287,7 +287,7 @@ fn cmd_init(args: &[String]) -> Result<ExitCode> {
 }
 
 fn cmd_reapply(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     if !is_sparse(&repo)? {
         eprintln!("fatal: must be in a sparse-checkout to reapply sparsity patterns");
         return Ok(ExitCode::from(128));
@@ -323,7 +323,7 @@ fn cmd_disable(args: &[String]) -> Result<ExitCode> {
             return Ok(opt_error(a, USAGE_DISABLE));
         }
     }
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // git leaves the pattern file in place so a later `init` can restore it.
     apply(&repo, &Sparsity::Full)?;
     disable_config(&repo)?;
@@ -379,7 +379,7 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
             }
         }
         None => {
-            let repo = gix::discover(".")?;
+            let repo = crate::setup::discover()?;
             if !pattern_path(&repo).exists() {
                 eprintln!("fatal: unable to load existing sparse-checkout patterns");
                 return Ok(ExitCode::from(128));
@@ -424,7 +424,7 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
 /// Cone mode is a hard precondition — git's directory candidates *are* the
 /// sparse-index directory entries, which only exist in cone mode.
 fn cmd_clean(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     if !is_sparse(&repo)? {
         eprintln!("fatal: must be in a sparse-checkout to clean directories");
         return Ok(ExitCode::from(128));

@@ -225,7 +225,7 @@ extern "C" fn host_eprint(_host: *const HostApi, text: *const c_char) {
 
 extern "C" fn host_config_get(_host: *const HostApi, name: *const c_char) -> *mut c_char {
     let Some(name) = arg(name) else { return std::ptr::null_mut() };
-    let Ok(repo) = gix::discover(".") else { return std::ptr::null_mut() };
+    let Ok(repo) = crate::setup::discover() else { return std::ptr::null_mut() };
     // The same last-value-wins read the porcelain uses, so a plugin sees the
     // value `git config <name>` would print.
     match crate::config::last_value_with_origin(&repo, &name) {
@@ -254,7 +254,7 @@ extern "C" fn host_free_cstring(_host: *const HostApi, s: *mut c_char) {
 
 extern "C" fn host_repo_info(_host: *const HostApi, field: *const c_char) -> *mut c_char {
     let Some(field) = arg(field) else { return std::ptr::null_mut() };
-    let Ok(repo) = gix::discover(".") else { return std::ptr::null_mut() };
+    let Ok(repo) = crate::setup::discover() else { return std::ptr::null_mut() };
     let value = match field.as_str() {
         "gitdir" => Some(repo.git_dir().display().to_string()),
         "workdir" => repo.workdir().map(|p| p.display().to_string()),
@@ -271,7 +271,7 @@ extern "C" fn host_repo_info(_host: *const HostApi, field: *const c_char) -> *mu
 
 extern "C" fn host_resolve_rev(_host: *const HostApi, spec: *const c_char) -> *mut c_char {
     let Some(spec) = arg(spec) else { return std::ptr::null_mut() };
-    let Ok(repo) = gix::discover(".") else { return std::ptr::null_mut() };
+    let Ok(repo) = crate::setup::discover() else { return std::ptr::null_mut() };
     match repo.rev_parse_single(spec.as_str()) {
         Ok(id) => out_string(id.to_string()),
         Err(_) => std::ptr::null_mut(),
@@ -287,7 +287,7 @@ extern "C" fn host_object_read(
         return 1;
     }
     let Some(spec) = arg(spec) else { return 1 };
-    let Ok(repo) = gix::discover(".") else { return 1 };
+    let Ok(repo) = crate::setup::discover() else { return 1 };
     let Ok(id) = repo.rev_parse_single(spec.as_str()) else { return 1 };
     let Ok(object) = id.object() else { return 1 };
     let kind = match object.kind {
@@ -318,7 +318,7 @@ extern "C" fn host_object_write(
     };
     let bytes: &[u8] =
         if data.is_null() || len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(data, len) } };
-    let Ok(repo) = gix::discover(".") else { return std::ptr::null_mut() };
+    let Ok(repo) = crate::setup::discover() else { return std::ptr::null_mut() };
     use gix::objs::Write as _;
     match repo.objects.write_buf(kind, bytes) {
         Ok(id) => out_string(id.to_string()),

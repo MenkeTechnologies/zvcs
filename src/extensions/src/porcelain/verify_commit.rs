@@ -147,7 +147,7 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
 
     // git runs the builtin under RUN_SETUP, so a missing repository is fatal
     // before any commit is looked at.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     let mut had_error = false;
     for name in names {

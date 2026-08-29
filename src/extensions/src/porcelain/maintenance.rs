@@ -550,7 +550,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };
@@ -1065,7 +1065,7 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
 
     // git checks the repository only after parse-options has had its say, so
     // `is-needed --task=bogus` outside a repository still reports the bad task.
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };
@@ -1758,7 +1758,7 @@ fn register_sub(args: &[String]) -> Result<ExitCode> {
         Parsed::Ok { config_file, .. } => config_file,
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let maintpath = maintpath(&repo)?;
 
     // Repository-local config first, matching git's ordering: `auto` is set
@@ -1816,7 +1816,7 @@ fn unregister_sub(args: &[String]) -> Result<ExitCode> {
         Parsed::Ok { config_file, force } => (config_file, force),
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let maintpath = maintpath(&repo)?;
 
     let target = match config_file {

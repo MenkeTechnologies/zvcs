@@ -418,11 +418,14 @@ pub fn handle_options(
                 *envchanged = true;
                 idx += 1;
             }
-            // `--shallow-file <path>` overrides the repository's shallow list for
-            // this process only — git sets it on `the_repository` rather than in
-            // the environment, so there is nothing to hand a child. The argument
-            // is consumed the way the C consumes it so the verb after it is still
-            // found; the override itself is not honored yet.
+            // `--shallow-file <path>` overrides the repository's shallow list.
+            // git sets it on `the_repository`; this port has no such object to
+            // set it on, so it goes through the same bridge every other global
+            // uses to reach the engine — the environment. `GIT_SHALLOW_FILE` is
+            // the name the vendored `gix` already honours
+            // (`gix/src/config/tree/sections/gitoxide.rs`), which is why the
+            // environment spelling of this setting worked while the flag did
+            // not: the flag was consumed and dropped.
             //
             // The C takes the next token without checking that there is one:
             // `git --shallow-file` alone reads past the end of `argv` and stock
@@ -431,6 +434,9 @@ pub fn handle_options(
             // behaviour to reproduce — and leaves the command line empty, which
             // `cmd_main` answers with the usage block and exit 1.
             "--shallow-file" => {
+                if let Some(path) = argv.get(idx + 1) {
+                    std::env::set_var("GIT_SHALLOW_FILE", path);
+                }
                 *envchanged = true;
                 idx += if idx + 1 < argv.len() { 2 } else { 1 };
             }
@@ -602,6 +608,10 @@ fn run_command(argv: &[String]) -> ExitCode {
     // `unknown option: <x>` + usage, exit 129.
     let mut pager_forced: Option<bool> = None;
     let mut config_overrides: Vec<ConfigOverride> = Vec::new();
+    // The configuration a parent git handed down. Read before `handle_options`
+    // so this process's own `-c` is pushed after it and therefore wins, which is
+    // the order `git_config_from_parameters()` produces in the C.
+    inherit_config_parameters(&mut config_overrides);
     // Only the alias caller looks at this; on the command line an option that
     // changes the environment is exactly what the user asked for.
     let mut envchanged = false;
@@ -609,6 +619,11 @@ fn run_command(argv: &[String]) -> ExitCode {
         Handled::Consumed(n) => n,
         Handled::Exit(code) => return code,
     };
+    // Hand the overrides to `setup::discover`, which applies them to every
+    // repository this process opens. The environment triple below carries the
+    // valued ones to children; this carries all of them, including the
+    // valueless keys that channel cannot express.
+    setup::set_cli_overrides(&config_overrides);
     let args = &raw[idx..];
 
     // `cmd_main`'s `if (!argc)` — nothing left after the option layer, so the
@@ -981,7 +996,7 @@ fn disallowed_bare_repository(sub: &str) -> Option<ExitCode> {
     if std::env::var_os("GIT_DIR").is_some() {
         return None;
     }
-    let repo = gix::discover(".").ok()?;
+    let repo = crate::setup::discover().ok()?;
     if repo.workdir().is_some() {
         return None;
     }
@@ -1258,15 +1273,203 @@ pub(crate) fn exec_path() -> String {
 ///
 /// The `overrides` list is kept for [`validate_config_overrides`], which is
 /// where git's own diagnostics for a malformed key are produced.
+///
+/// **A bare key does not survive this encoding, and cannot.** The comment above
+/// used to claim the empty value reads back as true; measured against stock
+/// 2.55.0 it does not, and neither implementation can express what git means by
+/// it:
+///
+/// ```text
+/// git -c user.useConfigOnly config --type=bool user.useConfigOnly   -> true
+/// GIT_CONFIG_COUNT=1 KEY_0=user.useConfigOnly VALUE_0=  …           -> false   (stock)
+/// GIT_CONFIG_COUNT=1 KEY_0=user.useConfigOnly           …           -> error: missing config value
+/// ```
+///
+/// git holds `value = NULL` in memory; the environment channel has no spelling
+/// for absent, so an empty string is the closest available and it means false.
+/// Fixing it means applying overrides to the config the process builds instead
+/// of round-tripping them through the environment — a change to how
+/// configuration reaches `gix`, not to this function.
 fn push_config_override(overrides: &mut Vec<ConfigOverride>, over: ConfigOverride) {
-    let count: usize = std::env::var("GIT_CONFIG_COUNT")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    std::env::set_var(format!("GIT_CONFIG_KEY_{count}"), &over.key);
-    std::env::set_var(format!("GIT_CONFIG_VALUE_{count}"), over.value.as_deref().unwrap_or(""));
-    std::env::set_var("GIT_CONFIG_COUNT", (count + 1).to_string());
+    match over.value.as_deref() {
+        Some(value) => {
+            let count: usize = std::env::var("GIT_CONFIG_COUNT")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            std::env::set_var(format!("GIT_CONFIG_KEY_{count}"), &over.key);
+            std::env::set_var(format!("GIT_CONFIG_VALUE_{count}"), value);
+            std::env::set_var("GIT_CONFIG_COUNT", (count + 1).to_string());
+        }
+        // A valueless key is deliberately kept OUT of the triple. Writing an
+        // empty `GIT_CONFIG_VALUE_N` for it is not a neutral encoding: it sets
+        // the key to the empty string, which reads as *false* and prints as
+        // `key=` where git prints `key`. It reaches the configuration through
+        // `setup::discover`'s CLI overrides instead, and children through
+        // `GIT_CONFIG_PARAMETERS` below.
+        None => {}
+    }
+    export_config_parameter(&over);
     overrides.push(over);
+}
+
+/// Append one override to `GIT_CONFIG_PARAMETERS`, the channel git itself
+/// exports so children inherit what the parent was run with
+/// (`git_config_push_split_parameter`, config.c).
+///
+/// The port reads this on startup ([`inherit_config_parameters`]) and now
+/// writes it too, which is what carries a valueless `-c` across a process
+/// boundary — the environment triple cannot hold one. The spelling is git's:
+/// each entry single-quoted, `'\''` for an embedded quote, entries separated by
+/// a space, and a key with no value written as `'key'`.
+fn export_config_parameter(over: &ConfigOverride) {
+    let mut out = std::env::var("GIT_CONFIG_PARAMETERS").unwrap_or_default();
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(&sq_quote(&over.key));
+    // git writes the `=` either way: `'a.b'='c'` for a value, `'d.e'=` for a
+    // bare key. Both spellings read back the same (a trailing `=` with nothing
+    // after it is still "no value"), but this is the one stock produces.
+    out.push('=');
+    if let Some(value) = &over.value {
+        out.push_str(&sq_quote(value));
+    }
+    std::env::set_var("GIT_CONFIG_PARAMETERS", out);
+}
+
+/// `sq_quote()` (quote.c): wrap in single quotes, and spell an embedded quote
+/// as `'\''` — close the run, an escaped quote, reopen.
+fn sq_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Apply the configuration a parent process handed down in
+/// `GIT_CONFIG_PARAMETERS`.
+///
+/// This is git's *other* command-line-config channel and the one it exports:
+/// `git -c a.b=c <verb>` re-exports `'a.b'='c'` to every child, so a hook, a
+/// filter, an `!`-alias or a `submodule foreach` body inherits the settings the
+/// parent was run with. The port pushes its own `-c` through the
+/// `GIT_CONFIG_COUNT` / `_KEY_N` / `_VALUE_N` sequence instead, because that is
+/// what `gix-config` reads — and it never read this one, so every setting
+/// arriving from a parent git was silently dropped.
+///
+/// The grammar is `sq_dequote_step()` applied in a loop
+/// (`parse_config_env_list`, config.c). Each entry is a single-quoted key,
+/// optionally followed by `=` and a single-quoted value; `'\''` inside a quoted
+/// run is a literal quote. Measured against stock 2.55.0, all four spellings
+/// below are accepted and the first three mean the same thing:
+///
+/// ```text
+/// 'user.useConfigOnly'            -> true
+/// 'user.useConfigOnly'=           -> true   (a bare `=` is still no value)
+/// 'user.useConfigOnly'='true'     -> true
+/// 'user.useConfigOnly=true'       -> true   (the whole pair inside one run)
+/// ```
+///
+/// A malformed list is git's `error: bogus format in GIT_CONFIG_PARAMETERS`.
+/// Everything parsed before the malformed entry is kept, as in the C, which
+/// pushes each parameter as it reads it.
+fn inherit_config_parameters(overrides: &mut Vec<ConfigOverride>) {
+    let Ok(raw) = std::env::var("GIT_CONFIG_PARAMETERS") else { return };
+    let mut rest = raw.as_str();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return;
+        }
+        let Some((key, after)) = sq_dequote_step(rest) else {
+            eprintln!("error: bogus format in GIT_CONFIG_PARAMETERS");
+            return;
+        };
+        // `'key'` or `'key'=` — git's boolean true, which it holds as a NULL
+        // value. It is encoded here exactly as `push_config_override` encodes a
+        // bare `-c name`, and inherits that encoding's one known gap: the
+        // environment channel cannot say "no value", so this reads back as
+        // false rather than true. Consistent with the `-c` path rather than
+        // adding a second behaviour; see `push_config_override`.
+        let (key, value, next) = match after.strip_prefix('=') {
+            None => (key, None, after),
+            Some(tail) if tail.is_empty() || tail.starts_with(char::is_whitespace) => {
+                (key, None, tail)
+            }
+            Some(tail) => {
+                let Some((value, next)) = sq_dequote_step(tail) else {
+                    eprintln!("error: bogus format in GIT_CONFIG_PARAMETERS");
+                    return;
+                };
+                (key, Some(value), next)
+            }
+        };
+        // The older spelling puts the whole pair inside one quoted run.
+        let (key, value) = match value {
+            None => match key.split_once('=') {
+                Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                None => (key, None),
+            },
+            some => (key, some),
+        };
+        push_config_override(overrides, ConfigOverride { key, value });
+        rest = next;
+    }
+}
+
+/// One single-quoted run, dequoted: `sq_dequote_step()` (quote.c). Returns the
+/// unquoted text and the rest of the input, or `None` when the run does not
+/// start with a quote or is never closed. Inside a run, `'\''` is a literal
+/// quote — the only escape the format has.
+fn sq_dequote_step(src: &str) -> Option<(String, &str)> {
+    let mut rest = src.strip_prefix('\'')?;
+    let mut out = String::new();
+    loop {
+        let end = rest.find('\'')?;
+        out.push_str(&rest[..end]);
+        rest = &rest[end + 1..];
+        // A closing quote followed by `\''` re-opens the run with a literal
+        // quote; anything else ends it.
+        match rest.strip_prefix("\\''") {
+            Some(reopened) => {
+                out.push('\'');
+                rest = reopened;
+            }
+            None => return Some((out, rest)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_parameters_tests {
+    use super::sq_dequote_step;
+
+    /// The one escape the format has: `'\''` is a literal quote inside a run.
+    #[test]
+    fn dequotes_a_run_and_its_escapes() {
+        assert_eq!(sq_dequote_step("'plain' rest"), Some(("plain".into(), " rest")));
+        assert_eq!(sq_dequote_step("'has space'"), Some(("has space".into(), "")));
+        // `it's me`, as git writes it.
+        assert_eq!(sq_dequote_step(r"'it'\''s me'"), Some(("it's me".into(), "")));
+        // The trailing text is handed back so the caller can read `=` after it.
+        assert_eq!(sq_dequote_step("'a.b'='c'"), Some(("a.b".into(), "='c'")));
+    }
+
+    /// A run that never opens or never closes is the `bogus format` case.
+    #[test]
+    fn refuses_an_unquoted_or_unterminated_run() {
+        assert_eq!(sq_dequote_step("bare.key=1"), None);
+        assert_eq!(sq_dequote_step("'never closed"), None);
+        assert_eq!(sq_dequote_step(""), None);
+    }
 }
 
 /// The current session key for attributing operations to an agent: `ZVCS_SESSION`
@@ -1289,7 +1492,7 @@ fn surface_pending_failures() {
     if !db::db_path().exists() {
         return;
     }
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return;
     };
     let git_dir = match repo.git_dir().canonicalize() {

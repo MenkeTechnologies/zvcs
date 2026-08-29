@@ -803,7 +803,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         return Ok(usage());
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // ```c
     // if (!strcmp(k, "commit.gpgsign")) {
     //         free(opts->gpg_sign);
@@ -1707,7 +1707,7 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
         return Ok(usage());
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let git_dir = repo.git_dir().to_owned();
 
     match verb {

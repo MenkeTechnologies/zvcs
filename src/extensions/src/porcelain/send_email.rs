@@ -583,7 +583,7 @@ impl Known {
 /// is one, otherwise the global and system files alone. `send-email` runs
 /// happily outside a repository, so both cases matter.
 fn load_config() -> (Option<ConfigFile>, bool) {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => (Some(repo.config_snapshot().plumbing().clone()), true),
         Err(_) => {
             let file = ConfigFile::from_globals().ok().map(|mut f| {
@@ -3618,7 +3618,7 @@ fn run(args: &[String], known: &Known, in_repo: bool, last_child: &LastChild) ->
         return Ok(ExitCode::SUCCESS);
     }
 
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let mut m = Mailer {
         repo,
         s,

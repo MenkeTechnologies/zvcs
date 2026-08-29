@@ -788,7 +788,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // end of the function is only reachable once that has been ruled out. Any
     // setup failure counts, not just an empty search: a `$GIT_DIR` that names no
     // repository leaves `nongit` set too.
-    let mut repo = match gix::discover(".") {
+    let mut repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => return super::diff_no_index::run_implicit(args),
     };

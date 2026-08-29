@@ -107,7 +107,7 @@ fn exec_spec(argv: Vec<String>) -> Value {
     let workdir = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let git_dir = gix::discover(".").ok().map(|r| {
+    let git_dir = crate::setup::discover().ok().map(|r| {
         r.git_dir()
             .canonicalize()
             .unwrap_or_else(|_| r.git_dir().to_path_buf())
@@ -151,7 +151,7 @@ pub fn queue_verb(sub: &str, args: &[String]) -> Result<ExitCode> {
 
 /// Canonical `(git_dir, workdir)` of the repo at cwd.
 fn here() -> Result<(String, String)> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let git_dir = repo
         .git_dir()
         .canonicalize()
@@ -214,7 +214,7 @@ enum Verdict {
 /// current tip); fall back to the network-free remote-tracking comparison when
 /// the remote can't be reached. Refuse a non-fast-forward before enqueue.
 fn preflight_push() -> Result<()> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let verdict = match lsrefs_verdict(&repo) {
         Verdict::Unknown => local_verdict(&repo),
         v => v,

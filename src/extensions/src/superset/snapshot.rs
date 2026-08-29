@@ -52,7 +52,7 @@ pub fn zsnapshot(args: &[String]) -> Result<ExitCode> {
         .iter()
         .find(|a| !a.starts_with('-'))
         .ok_or_else(|| anyhow!("usage: git zsnapshot <name>"))?;
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let mut entries = Vec::new();
     collect(&repo, &mut entries);
     if entries.is_empty() {

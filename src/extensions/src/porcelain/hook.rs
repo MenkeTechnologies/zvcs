@@ -217,7 +217,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let cfg = match parse_config(&repo)? {
         Ok(cfg) => cfg,
         Err(code) => return Ok(code),
@@ -346,7 +346,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let cfg = match parse_config(&repo)? {
         Ok(cfg) => cfg,
         Err(code) => return Ok(code),

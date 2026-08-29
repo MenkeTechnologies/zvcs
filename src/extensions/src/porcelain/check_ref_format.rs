@@ -164,7 +164,7 @@ fn usage_error() -> ExitCode {
 /// with `refs/heads/`, and validated. Rejection is git's `die()`: the message on
 /// stderr and exit 128. Acceptance prints the expanded shorthand.
 fn check_ref_format_branch(arg: &str) -> Result<ExitCode> {
-    let expanded = match gix::discover(".") {
+    let expanded = match crate::setup::discover() {
         Ok(repo) => branchname(&repo, arg),
         Err(_) => arg.as_bytes().to_vec(),
     };

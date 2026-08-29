@@ -276,7 +276,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };

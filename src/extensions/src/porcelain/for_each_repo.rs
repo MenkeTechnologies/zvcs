@@ -257,7 +257,7 @@ fn lookup_paths(key: &str) -> Result<Lookup> {
         return Ok(Lookup::Bad);
     };
 
-    let config = match gix::discover(".") {
+    let config = match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().plumbing().clone(),
         Err(_) => {
             let mut file = gix::config::File::from_globals()?;

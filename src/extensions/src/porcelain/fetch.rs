@@ -266,7 +266,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         print!("{USAGE_ALL}");
         return Ok(ExitCode::from(129));
     }
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
 
     // Remote-tracking ref updates write reflogs; without a configured identity, seed
     // a synthesized system default so the reflog write can't fail (git does the same).
@@ -798,7 +798,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         // handle's object database was opened before they existed, so the
         // negotiation below would look up a `refs/bundles/*` tip and not find
         // it; re-open so the fetch sees exactly what is on disk.
-        repo = gix::discover(".")?;
+        repo = crate::setup::discover()?;
     }
 
     let all = all_flag.unwrap_or(false);
@@ -3027,7 +3027,7 @@ fn report_set_head_warn(remote: &str, head_name: &str, previous: Option<&str>, w
         "will disable the warning until the remote changes HEAD to something else.".to_string(),
     ];
     // `advise_if_enabled()`'s trailer, which git appends only while the slot is unconfigured.
-    let unconfigured = gix::discover(".")
+    let unconfigured = crate::setup::discover()
         .map(|repo| {
             repo.config_snapshot()
                 .boolean("advice.fetchRemoteHEADWarn")

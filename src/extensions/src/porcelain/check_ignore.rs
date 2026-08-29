@@ -229,7 +229,7 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         cli_paths
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
         return Ok(fatal("this operation must be run in a work tree"));
     };

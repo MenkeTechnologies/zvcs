@@ -909,7 +909,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     // git resolves `--points-at` / `--contains` / `--merged` operands *while*
     // parsing options, so a bad one is reported before the format is verified.
     // That ordering is observable, so the repository has to be open first.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // What `--no-format` restores, and the one place this port deliberately does
     // *not* reproduce stock byte for byte.

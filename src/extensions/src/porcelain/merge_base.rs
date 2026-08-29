@@ -147,7 +147,7 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
         mode_flag = a.to_string();
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     match mode {
         Mode::IsAncestor => {

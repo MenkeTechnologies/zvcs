@@ -287,7 +287,7 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
         opts.refresh_cache = false;
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
         return die("this operation must be run in a work tree");
     };

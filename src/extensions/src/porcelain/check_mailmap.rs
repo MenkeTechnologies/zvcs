@@ -171,7 +171,7 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
 
     // git runs repository setup before the contact check, so an invocation with
     // no contacts outside a repository reports the missing repository first.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     if opts.contacts.is_empty() && !opts.stdin {
         eprintln!("fatal: no contacts specified");

@@ -68,7 +68,7 @@ fn validate_name(name: &str) -> Result<()> {
 
 /// Worktree base dir: `zvcs.worktreebase` else `~/.zvcs/worktrees`.
 fn base_dir() -> PathBuf {
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         if let Some(b) = repo.config_snapshot().string("zvcs.worktreebase") {
             let s = b.to_string();
             if !s.trim().is_empty() {
@@ -101,7 +101,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
         bail!("{} already exists", dest.display());
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let mut count = 0usize;
     provision(&repo, &dest, name, &mut count)?;
 

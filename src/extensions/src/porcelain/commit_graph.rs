@@ -370,7 +370,7 @@ fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitC
         i += 1;
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let objects = match object_directory(&repo, object_dir.as_deref()) {
         Ok(p) => p,
         Err(code) => return Ok(code),
@@ -590,7 +590,7 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         ));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // `commitGraph.generationVersion` selects the generation-number version.
     // Version 2 (git's default) additionally records the corrected commit date

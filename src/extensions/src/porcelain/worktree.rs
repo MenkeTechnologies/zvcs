@@ -545,7 +545,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
         return die("options '--verbose' and '--porcelain' cannot be used together");
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let worktrees = collect(&repo, expire)?;
 
     let out = if porcelain {
@@ -740,7 +740,7 @@ fn lock(args: &[String]) -> Result<ExitCode> {
         return usage(None, LOCK_USAGE);
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let worktrees = collect(&repo, u64::MAX)?;
     let Some(wt) = find_worktree(&worktrees, arg) else {
         return die(&format!("'{arg}' is not a working tree"));
@@ -787,7 +787,7 @@ fn unlock(args: &[String]) -> Result<ExitCode> {
         return usage(None, UNLOCK_USAGE);
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let worktrees = collect(&repo, u64::MAX)?;
     let Some(wt) = find_worktree(&worktrees, arg) else {
         return die(&format!("'{arg}' is not a working tree"));
@@ -1001,7 +1001,7 @@ fn prune(args: &[String]) -> Result<ExitCode> {
         return usage(None, PRUNE_USAGE);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     prune_worktrees(&repo, show_only, verbose, expire);
     Ok(ExitCode::SUCCESS)
 }
@@ -1252,7 +1252,7 @@ fn repair(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let common = repo.common_dir().to_path_buf();
     // `git_worktree_config()`: `worktree.useRelativePaths` is the default the
     // `--relative-paths` option overrides.
@@ -1893,7 +1893,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
     };
     let commit_ish = positional.get(1).copied();
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let common = gix::path::realpath(repo.common_dir())?;
     let path = PathBuf::from(path_arg);
 
@@ -2699,7 +2699,7 @@ fn remove(args: &[String]) -> Result<ExitCode> {
         return usage(None, REMOVE_USAGE);
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let worktrees = collect(&repo, u64::MAX)?;
     let Some(wt) = find_worktree(&worktrees, arg) else {
         return die(&format!("'{arg}' is not a working tree"));
@@ -2783,7 +2783,7 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
     }
     let (arg, dest_arg) = (positionals[0], positionals[1]);
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let worktrees = collect(&repo, u64::MAX)?;
     let Some(wt) = find_worktree(&worktrees, arg) else {
         return die(&format!("'{arg}' is not a working tree"));

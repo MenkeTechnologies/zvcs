@@ -189,7 +189,7 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
     };
 
     // git runs its repository setup before touching the revision.
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");

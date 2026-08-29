@@ -586,7 +586,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
 /// git's `is_writing_gitmodules_ok` (submodule.c): the worktree copy exists, or
 /// there is no `.gitmodules` in the index nor in `HEAD` to be shadowed by one.
 fn writing_gitmodules_ok() -> Result<bool> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     if let Some(workdir) = repo.workdir() {
         if workdir.join(".gitmodules").exists() {
             return Ok(true);
@@ -843,7 +843,7 @@ fn push_check(args: &[String]) -> Result<ExitCode> {
     let superproject_head = args[0].as_str();
     let remote_name = args[1].as_str();
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // `refs_resolve_refdup(..., "HEAD", 0, ...)` hands back the name HEAD
     // resolves to; a detached HEAD resolves to itself, which is how git tells
@@ -1129,7 +1129,7 @@ fn gitdir(args: &[String]) -> Result<ExitCode> {
     }
     let name = args[0].as_str();
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     if repo
         .config_snapshot()
         .boolean("extensions.submodulePathConfig")
@@ -1219,7 +1219,7 @@ fn get_default_remote(args: &[String]) -> Result<ExitCode> {
     // `gix::open` does not walk upwards, matching `repo_submodule_init`, which
     // fails outright when `<path>` is not itself a repository.
     let Ok(sub) = gix::open(path) else {
-        let repo = gix::discover(".")?;
+        let repo = crate::setup::discover()?;
         let display = prefixed_path(&repo, path)?;
         eprintln!("fatal: could not get a repository handle for submodule '{display}'");
         return Ok(ExitCode::from(128));

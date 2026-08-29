@@ -343,7 +343,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
     }
 
     // Phase 2 — repository setup. Both diagnostics are git's own, exit 128.
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => {
             eprintln!("fatal: difftool requires worktree or --no-index");

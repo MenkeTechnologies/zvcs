@@ -363,6 +363,20 @@ pub(crate) enum DecorateStyle {
 /// git's `parse_decoration_style`: a maybe-bool (`true`/`false`/`yes`/`no`/
 /// `on`/`off`/integer), or the words `short`/`full`/`auto`. `auto` resolves to
 /// `Short` when stdout is a terminal and `Off` otherwise, matching git's
+/// `auto_decoration_style()` (builtin/log.c):
+///
+/// ```c
+/// return (isatty(1) || pager_in_use()) ? DECORATE_SHORT_REFS : 0;
+/// ```
+///
+/// The second half was missing, and it is the half that fires in practice:
+/// when git pages its own output, stdout is a pipe into the pager, so an
+/// `isatty(1)`-only test decides "not a terminal" and drops the decorations a
+/// user sees every day. `GIT_PAGER_IN_USE` is how the paging parent says so.
+fn auto_decoration_style() -> bool {
+    std::io::stdout().is_terminal() || crate::pager::in_use()
+}
+
 /// `auto_decoration_style`. Returns `None` for a value git rejects — config
 /// treats that as `Off`, while `--decorate=<value>` makes it fatal.
 pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
@@ -372,7 +386,7 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
         "false" | "no" | "off" | "" => return Some(DecorateStyle::Off),
         "full" => return Some(DecorateStyle::Full),
         "auto" => {
-            return Some(if std::io::stdout().is_terminal() {
+            return Some(if auto_decoration_style() {
                 DecorateStyle::Short
             } else {
                 DecorateStyle::Off
@@ -651,7 +665,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // without a cache; gix ships one and simply does not enable it by default.
     // A few MB turns `log` on a deep history from thousands of decompressions
     // into a warm-cache walk.
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     // Rendering re-reads every walked commit for its message; without gix's
     // object cache each read re-inflates from the pack. Enabling it is the
     // difference between one decompression per commit and one per cache miss.
@@ -856,11 +870,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // git's built-in default is `auto` (short refs when interactive, none when
     // piped); `log.decorate` overrides it, and the `--decorate` flags override
     // that in turn.
-    let builtin_decorate = if std::io::stdout().is_terminal() {
-        DecorateStyle::Short
-    } else {
-        DecorateStyle::Off
-    };
+    let builtin_decorate =
+        if auto_decoration_style() { DecorateStyle::Short } else { DecorateStyle::Off };
     let mut decorate = cfg_decorate.unwrap_or(builtin_decorate);
     // `--decorate-refs=<pattern>` / `--decorate-refs-exclude=<pattern>` (both
     // repeatable) and `--clear-decorations`, which empties them again and drops

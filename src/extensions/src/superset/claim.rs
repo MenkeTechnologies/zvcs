@@ -15,7 +15,7 @@ fn target(args: &[String]) -> Result<(PathBuf, PathBuf)> {
     let at = args.iter().find(|a| !a.starts_with('-')).map(PathBuf::from);
     let repo = match at {
         Some(p) => gix::discover(p)?,
-        None => gix::discover(".")?,
+        None => crate::setup::discover()?,
     };
     let git_dir = repo.git_dir().canonicalize().unwrap_or_else(|_| repo.git_dir().to_path_buf());
     let workdir = repo

@@ -442,7 +442,7 @@ fn parse_quoted_cr_action(action: &str) -> Option<QuotedCr> {
 /// The configuration git reads, from the repository when there is one and from
 /// the global set plus `GIT_CONFIG_*` overrides otherwise.
 fn config() -> Result<gix::config::File> {
-    Ok(match gix::discover(".") {
+    Ok(match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().plumbing().clone(),
         Err(_) => {
             let mut file = gix::config::File::from_globals()?;

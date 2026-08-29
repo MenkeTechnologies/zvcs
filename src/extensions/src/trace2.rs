@@ -962,7 +962,7 @@ fn list_config(ev: &Event) {
     // The repository's merged snapshot when we are in one, else the global
     // cascade, so `def_param` reports something outside a repo exactly as
     // git's `read_early_config` does.
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => emit_matching(ev, &repo.config_snapshot(), &patterns),
         Err(_) => emit_matching(ev, &crate::config::global_config(), &patterns),
     }

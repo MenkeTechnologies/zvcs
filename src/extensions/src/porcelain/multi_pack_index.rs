@@ -1284,7 +1284,7 @@ fn midx_chain_layers(pack_dir: &Path) -> Vec<String> {
 
 /// The repository and its `<objdir>/pack` directory, honouring `--object-dir`.
 fn object_store(object_dir: Option<PathBuf>) -> Result<(gix::Repository, PathBuf)> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let objdir = object_dir.unwrap_or_else(|| repo.objects.store_ref().path().to_path_buf());
     let pack_dir = objdir.join("pack");
     Ok((repo, pack_dir))

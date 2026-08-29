@@ -106,7 +106,7 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let hexsz = repo.object_hash().len_in_hex();
 
     let mut verbose = false;

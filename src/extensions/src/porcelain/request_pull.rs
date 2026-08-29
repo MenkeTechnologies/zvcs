@@ -140,7 +140,7 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
     };
     let end = positional.get(2).copied().unwrap_or("");
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // baserev=$(git rev-parse --verify --quiet "$base"^0)
     let Some(baserev) = peel_to_commit(&repo, base) else {

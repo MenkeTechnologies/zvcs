@@ -2092,7 +2092,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// The expansion is carried as the string list's `util` there and never
 /// printed, so it is dropped here too.
 pub(crate) fn alias_names() -> Vec<String> {
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let snapshot = repo.as_ref().map(|r| r.config_snapshot());
     let globals;
     let file = match snapshot.as_ref() {
@@ -2125,7 +2125,7 @@ pub(crate) fn alias_names() -> Vec<String> {
 /// global files outside one — git reaches it after
 /// `setup_git_directory_gently()` for exactly that reason (git.c:83-87).
 pub(crate) fn completion_commands() -> Option<String> {
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let snapshot = repo.as_ref().map(|r| r.config_snapshot());
     let globals;
     let file = match snapshot.as_ref() {
@@ -2177,7 +2177,7 @@ pub(crate) fn common_group(section: &str) -> Option<Vec<String>> {
 fn alias_list() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
 
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let snapshot = repo.as_ref().map(|r| r.config_snapshot());
     let globals;
     let file = match snapshot.as_ref() {
@@ -2234,7 +2234,7 @@ fn show_help_for(topic: &str) -> Result<ExitCode> {
 /// runs after `setup_git_directory_gently()`, so the global files apply outside
 /// a repository just as [`help_config`] resolves them.
 fn viewer_config() -> gix::config::File {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().plumbing().clone(),
         Err(_) => gix::config::File::from_globals().unwrap_or_default(),
     }
@@ -2330,7 +2330,7 @@ fn parse_help_format(format: &str) -> Result<Format, ExitCode> {
 /// a repository — which is why the lookup falls back to them rather than
 /// yielding nothing.
 fn help_config() -> Result<HelpConfig, ExitCode> {
-    let file = match gix::discover(".") {
+    let file = match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().plumbing().clone(),
         Err(_) => match gix::config::File::from_globals() {
             Ok(f) => f,

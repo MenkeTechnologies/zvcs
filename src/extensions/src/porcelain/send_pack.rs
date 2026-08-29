@@ -239,7 +239,7 @@ pub fn send_pack(args: &[String]) -> Result<ExitCode> {
 /// refs, run the push, and print the status block.
 fn push(st: &State) -> Result<ExitCode> {
     let dest = st.dest.as_deref().unwrap_or_default();
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // `if (remote_name) { remote = remote_get(...); if (!remote_has_url(...)) die(...) }`
     // (send-pack.c:259-265). Only a named remote gets its tracking refs updated
@@ -808,7 +808,7 @@ fn parse_int(v: &str) -> Option<i32> {
 /// `repo_get_oid` would have succeeded. Failing to open a repository at all
 /// counts as "unresolvable", matching git's own outcome there.
 fn resolve_rev(spec: &str) -> bool {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return false;
     };
     repo.rev_parse_single(spec).is_ok()

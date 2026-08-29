@@ -159,7 +159,7 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     }
     let pathspecs = &rest[i..];
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // `require_work_tree`. git's wording embeds the script's own absolute path,
     // which cannot be reproduced, so this states the condition instead.
     if repo.workdir().is_none() {
@@ -1494,7 +1494,7 @@ fn show_tool_help(mode: &str) {
 
     // `git config --get-regexp` reads global and system config too, and this arm
     // runs before any repository setup — so fall back to the globals outside one.
-    let config = match gix::discover(".") {
+    let config = match crate::setup::discover() {
         Ok(repo) => Some(repo.config_snapshot().plumbing().clone()),
         Err(_) => gix::config::File::from_globals().ok(),
     };

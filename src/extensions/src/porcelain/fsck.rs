@@ -243,7 +243,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         opt.include_reflogs = false;
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // Running *from* a linked worktree would make the main worktree's index a
     // head that this port does not reconstruct (its HEAD is covered by the shared

@@ -106,7 +106,7 @@ pub fn zlog(args: &[String]) -> Result<ExitCode> {
     // Scope: every indexed repo; fall back to the cwd repo if none indexed.
     let repos = indexed_repos().unwrap_or_default();
     let repos = if repos.is_empty() {
-        match gix::discover(".") {
+        match crate::setup::discover() {
             Ok(r) => vec![(
                 r.git_dir().to_path_buf(),
                 r.workdir().unwrap_or_else(|| r.git_dir()).to_path_buf(),
@@ -152,7 +152,7 @@ pub fn zundo(args: &[String]) -> Result<ExitCode> {
     let at = args.iter().find(|a| !a.starts_with('-')).map(PathBuf::from);
     let repo = match at {
         Some(p) => gix::discover(p)?,
-        None => gix::discover(".")?,
+        None => crate::setup::discover()?,
     };
     if repo.is_dirty()? {
         anyhow::bail!("worktree is dirty; commit or stash before undo");

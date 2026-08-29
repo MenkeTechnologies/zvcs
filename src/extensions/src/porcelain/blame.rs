@@ -506,7 +506,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
 /// `cmd` is `argv[0]` as `parse_options` sees it, which only affects the `usage:`
 /// line.
 pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     // Object-heavy path: give gix the caches it does not enable by default —
     // a decoded-object cache and a git-sized delta-base cache (gix ships a
     // 64-entry linked list; git's core.deltaBaseCacheLimit default is 96MB).

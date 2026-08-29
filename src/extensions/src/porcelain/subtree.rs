@@ -767,7 +767,7 @@ fn process_subtree_split_trailer(
         Some(repository) => {
             git_run(ctx, &["fetch", repository, split])?;
             // Re-open so the pack the child just wrote is visible to this process.
-            ctx.repo = gix::discover(".")?;
+            ctx.repo = crate::setup::discover()?;
             match rev_parse_commit(&ctx.repo, &format!("{split}^{{commit}}")) {
                 Some(id) => Ok(id),
                 None => die(&fail),
@@ -1315,7 +1315,7 @@ fn cmd_add_repository(ctx: &mut Ctx, repository: &str, refspec: &str) -> Result<
     println!("git fetch {repository} {refspec}");
     git_run(ctx, &["fetch", repository, refspec])?;
     // Re-open so the pack and `FETCH_HEAD` the child just wrote are visible.
-    ctx.repo = gix::discover(".")?;
+    ctx.repo = crate::setup::discover()?;
     if rev_parse_commit(&ctx.repo, "FETCH_HEAD^{commit}").is_some() {
         return cmd_add_commit(ctx, "FETCH_HEAD");
     }
@@ -1632,7 +1632,7 @@ fn cmd_pull(ctx: &mut Ctx, args: &[String]) -> Result<()> {
     ensure_valid_ref_format(ctx, &refname)?;
     git_run(ctx, &["fetch", &repository, &refname])?;
     // Re-open so the pack and `FETCH_HEAD` the child just wrote are visible.
-    ctx.repo = gix::discover(".")?;
+    ctx.repo = crate::setup::discover()?;
     cmd_merge(ctx, &["FETCH_HEAD".to_string(), repository])
 }
 
@@ -1666,7 +1666,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
     };
     let (opts, positionals) = parseopt(&argv)?;
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // `. git-sh-setup` with `SUBDIRECTORY_OK` unset: refuse a bare repository,
     // then run from the top of the work tree, since `<prefix>` and every
     // index/worktree child command are relative to it.
@@ -1678,7 +1678,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         ));
     };
     std::env::set_current_dir(&workdir)?;
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // First pass: only `--rejoin`, so the real pass can tell a caller that
     // `--squash` on a plain `split` is a mistake but on `split --rejoin` is not.

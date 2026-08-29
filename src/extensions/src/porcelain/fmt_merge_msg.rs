@@ -193,7 +193,7 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
     // Everything else needs the repository first: `git_config()` runs before
     // `parse_options()`, so a bad flag outside a repository still reports the
     // missing repository.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // What `parse_options()` leaves in `argv`; `fmt-merge-msg` accepts none.
     let mut positional = false;

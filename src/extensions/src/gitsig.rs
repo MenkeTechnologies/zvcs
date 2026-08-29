@@ -449,7 +449,7 @@ pub fn gpg_programs(repo: &gix::Repository) -> [String; 3] {
 /// against the repository this one is running in.
 fn verify_program(format: SigFormat) -> String {
     static PROGRAMS: OnceLock<[String; 3]> = OnceLock::new();
-    let programs = PROGRAMS.get_or_init(|| match gix::discover(".") {
+    let programs = PROGRAMS.get_or_init(|| match crate::setup::discover() {
         Ok(repo) => gpg_programs(&repo),
         Err(_) => [
             SigFormat::OpenPgp.default_program().to_owned(),
@@ -483,7 +483,7 @@ struct SshConfig {
 fn ssh_config() -> &'static SshConfig {
     static CFG: OnceLock<SshConfig> = OnceLock::new();
     CFG.get_or_init(|| {
-        let Ok(repo) = gix::discover(".") else {
+        let Ok(repo) = crate::setup::discover() else {
             return SshConfig {
                 program: "ssh-keygen".into(),
                 allowed_signers: None,

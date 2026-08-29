@@ -276,7 +276,7 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
 /// reproduce when discovery fails, so discovery failing here stands down and
 /// lets them do it.
 fn outside_work_tree() -> bool {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => !crate::setup::is_inside_work_tree(&repo),
         Err(_) => false,
     }
@@ -383,7 +383,7 @@ fn status(args: &[String], mut quiet: bool, mut cached: bool) -> Result<ExitCode
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let prefix = repo_prefix(&repo)?;
 
     let stdout = std::io::stdout();
@@ -546,7 +546,7 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     Ok(ExitCode::from(init_repo(&repo, &patterns, quiet)?))
 }
 
@@ -786,7 +786,7 @@ fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let index = repo.index_or_empty()?;
 
     // `module_summary()` resolves the `[commit]` slot before it looks at
@@ -1353,7 +1353,7 @@ pub(super) fn foreach_parsed(
     recursive: bool,
     super_prefix: Option<&str>,
 ) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let prefix = repo_prefix(&repo)?;
     let code = foreach_repo(&repo, cmd, quiet, recursive, super_prefix, prefix.as_ref())?;
     Ok(ExitCode::from(code))
@@ -1559,7 +1559,7 @@ fn sync(args: &[String], mut quiet: bool) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let prefix = repo_prefix(&repo)?;
     let code = sync_repo(&repo, &patterns, quiet, recursive, None, prefix.as_ref())?;
     Ok(ExitCode::from(code))
@@ -2005,7 +2005,7 @@ fn set_url(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     }
     let (path, newurl) = (BString::from(operands[0].as_str()), operands[1].clone());
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let prefix = repo_prefix(&repo)?;
     let submodules = submodules(&repo)?;
     let Some(sub) = find_submodule(&submodules, &path) else {
@@ -2116,7 +2116,7 @@ fn deinit(args: &[String], mut quiet: bool) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let prefix = repo_prefix(&repo)?;
     let index = repo.index_or_empty()?;
     let entries = match module_list(&repo, &index, &patterns)? {
@@ -2328,7 +2328,7 @@ fn absorbgitdirs(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let code = absorb_repo(&repo, &patterns, super_prefix.as_deref())?;
     Ok(ExitCode::from(code))
 }
@@ -2654,7 +2654,7 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // `update_clone_config_from_gitmodules()` then `git_update_clone_config()`: `.gitmodules`
     // supplies the default and the repository configuration overrides it, both before the
     // command line is parsed — so an explicit `-j` still wins.
@@ -3871,7 +3871,7 @@ fn set_branch(args: &[String], _quiet: bool) -> Result<ExitCode> {
 /// returns `!!ret`, so a `--default` that removes nothing exits 1 with no output.
 fn set_branch_apply(branch: Option<String>, path: String) -> Result<ExitCode> {
     let path = BString::from(path.as_str());
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let submodules = submodules(&repo)?;
 
     // `module_set_branch` hands `argv[0]` to `submodule_from_path` verbatim, and
@@ -4405,7 +4405,7 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         crate::git_fatal!("'{url}' does not name a submodule path");
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("a working tree is required"))?

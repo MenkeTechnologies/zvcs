@@ -250,7 +250,7 @@ fn publish(conn: &Option<rusqlite::Connection>, job: Option<i64>, workers: usize
 /// `zvcs.statusinterval`: any non-zero value (or unset) enables the continuous
 /// maintainer; `0` disables it. Default enabled.
 fn interval_secs() -> u64 {
-    gix::discover(".")
+    crate::setup::discover()
         .ok()
         .and_then(|r| r.config_snapshot().integer("zvcs.statusinterval"))
         .filter(|n| *n >= 0)

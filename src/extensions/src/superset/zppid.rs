@@ -39,7 +39,7 @@ pub fn is_commit_verb(sub: &str) -> bool {
 /// (not a repo, detached read failure) collapses to `None` — a `None → Some`
 /// transition is the first commit on an unborn branch and still counts.
 pub fn head_commit() -> Option<gix::ObjectId> {
-    let repo = gix::discover(".").ok()?;
+    let repo = crate::setup::discover().ok()?;
     repo.head().ok()?.try_peel_to_id().ok().flatten().map(|id| id.detach())
 }
 

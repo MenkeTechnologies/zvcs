@@ -15,14 +15,14 @@ use std::process::{Command, Stdio};
 pub fn ensure_if_configured() {
     // Directory triggers (`git ztrigger <DIR>`) need the daemon even when the cwd
     // is not a repo and no `[zvcs]` autonomy/hook/status is set.
-    let watch_wanted = match gix::discover(".") {
+    let watch_wanted = match crate::setup::discover() {
         Ok(repo) => crate::config::ZvcsConfig::load(&repo).should_watch(),
         Err(_) => false,
     };
     if !watch_wanted && !crate::db::has_triggers() {
         return;
     }
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     // A manual `git zdaemon stop` disables autostart until an explicit
     // `start`/`restart`. Without this the daemon would respawn on the very next
     // `git` command, making a manual stop impossible under the autonomy config.

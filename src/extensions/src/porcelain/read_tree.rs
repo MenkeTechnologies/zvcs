@@ -584,7 +584,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // Resolve every tree-ish before any other check, exactly like git's read loop.
     let mut tree_ids: Vec<ObjectId> = Vec::with_capacity(o.trees.len());

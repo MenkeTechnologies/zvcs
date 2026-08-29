@@ -862,7 +862,7 @@ pub fn diff_files(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     init_quote_path(&repo);
     match parse(&repo, args) {
         Ok(Parsed::Run { opts, paths }) => run(&repo, opts, paths),

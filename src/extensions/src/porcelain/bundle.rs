@@ -512,7 +512,7 @@ fn verify(args: &[String]) -> Result<ExitCode> {
         Err(e) => return report(file, e),
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     if !report_missing_prereqs(&repo, &header, quiet) {
         return Ok(ExitCode::from(1));
@@ -703,7 +703,7 @@ fn create(args: &[String]) -> Result<ExitCode> {
         return Ok(need_file(CREATE_USAGE));
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let (pending, pathspecs) = match resolve_revisions(&repo, &rev_args)? {
         Ok(p) => p,
         Err(code) => return Ok(code),
@@ -1572,7 +1572,7 @@ fn unbundle(args: &[String]) -> Result<ExitCode> {
     };
 
     // git's `if (!startup_info->have_repository) die(...)`, which exits 128.
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: Need a repository to unbundle.");
         return Ok(ExitCode::from(128));
     };
@@ -1618,7 +1618,7 @@ pub(crate) fn index_pack(
     // The child must index into *this* repository even when the caller was
     // invoked from elsewhere — the bundle-URI client runs from the directory
     // `git clone` was started in, not from inside the new repository.
-    // `index-pack` resolves the repository with `gix::discover(".")`
+    // `index-pack` resolves the repository with `crate::setup::discover()`
     // (`index_pack.rs:286`), which walks *upwards* and so does not recognise a
     // `.git` directory it is standing inside; the work tree is the directory to
     // hand it, falling back to the git dir itself for a bare repository.

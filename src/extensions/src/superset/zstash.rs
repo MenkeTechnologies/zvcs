@@ -26,7 +26,7 @@ fn stash_name(args: &[String]) -> String {
 /// `git zstash [<name>]` — stash every dirty repo in the tree under `<name>`.
 pub fn zstash(args: &[String]) -> Result<ExitCode> {
     let name = stash_name(args);
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let conn = crate::db::open_rw()?;
     // Refuse to reuse a live name: `stash_begin` clears the db rows, but the
     // per-repo `git stash` entries the previous run pushed would be orphaned

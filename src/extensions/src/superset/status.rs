@@ -79,7 +79,7 @@ pub fn zstatus(args: &[String]) -> Result<ExitCode> {
     }
 
     // Live status for the current repo (and cache it under canonical paths).
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let (dirty, detached, sync, head, head_sha) = compute(&repo);
     let git_dir = repo
         .git_dir()

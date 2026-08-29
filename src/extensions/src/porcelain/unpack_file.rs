@@ -84,7 +84,7 @@ pub fn unpack_file(args: &[String]) -> Result<ExitCode> {
     }
     let spec = args[0].as_str();
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // git's `get_oid` takes a *full-length* hex string verbatim and never checks
     // that the object exists, so a well-formed but bogus id survives resolution

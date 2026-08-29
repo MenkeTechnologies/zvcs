@@ -264,7 +264,7 @@ pub(super) fn prologue(args: &[String]) -> Prologue {
 /// string handed to the credential parser is the configured one verbatim —
 /// parsing and re-serialising could normalise it and change the diagnostics.
 fn remote_url(name: &str) -> Vec<u8> {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return name.as_bytes().to_vec();
     };
     let config = repo.config_snapshot();
@@ -487,7 +487,7 @@ fn http_get_file(url: &str, filename: &Path) -> Result<(), ()> {
     let posn = file.metadata().map(|m| m.len()).unwrap_or(0);
 
     let mut http = Remote::default();
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         if let Ok(Some(options)) = repo.transport_options(url, None) {
             http.configure(&*options).ok();
         }
@@ -608,7 +608,7 @@ fn boolean(value: &BStr) -> SetOption {
 fn list(url: &str, options: &Options) -> Result<Option<ExitCode>> {
     // gix resolves transport, credential and `insteadOf` configuration through a
     // Repository; there is no repository-less remote in the vendored crates.
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         bail!("'list' outside a repository is not supported (no repository found)");
     };
 

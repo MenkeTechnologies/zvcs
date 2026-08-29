@@ -29,6 +29,72 @@ fn work_tree(repo: &gix::Repository) -> Option<PathBuf> {
 /// `setup_git_directory()` chdirs to the top of the work tree and hands the
 /// command this string, so anything a command prints relative to *its* cwd has
 /// to be spelled relative to the top level instead.
+/// The command-line configuration overrides this process was started with, in
+/// the `key=value` / bare-`key` spelling `gix::open::Options::cli_overrides`
+/// takes. Captured once, after `handle_options` has parsed the command line.
+static CLI_OVERRIDES: std::sync::OnceLock<Vec<gix::bstr::BString>> = std::sync::OnceLock::new();
+
+/// Record the `-c` overrides for [`discover`]. Called once from the entry point;
+/// later calls are ignored, which is what makes the value stable for the whole
+/// process.
+pub fn set_cli_overrides(overrides: &[crate::ConfigOverride]) {
+    let rendered: Vec<gix::bstr::BString> = overrides
+        .iter()
+        .map(|o| match &o.value {
+            // `-c key=value`.
+            Some(v) => format!("{}={}", o.key, v).into(),
+            // `-c key` — git's implicit true, which gix spells as a bare key
+            // (`core.bool-implicit-true` in its own documentation). This is the
+            // form the `GIT_CONFIG_COUNT`/`_VALUE_N` channel cannot carry: an
+            // empty value there means false in git as well as here, and an
+            // absent one is an error in both.
+            None => o.key.clone().into(),
+        })
+        .collect();
+    let _ = CLI_OVERRIDES.set(rendered);
+}
+
+/// `gix::discover(".")`, with this process's `-c` overrides applied to the
+/// repository's configuration.
+///
+/// Every command-line override reaches `gix` twice: valued ones through the
+/// `GIT_CONFIG_COUNT` / `_KEY_N` / `_VALUE_N` environment triple (which children
+/// inherit), and all of them through this open option. The second channel is
+/// what a valueless key needs, because the first has no spelling for "no
+/// value" — measured against stock 2.55.0, an empty `GIT_CONFIG_VALUE_N` reads
+/// as *false* there too, and omitting it is an error in both implementations.
+/// Without this, `git -c user.useConfigOnly …` set the key to the empty string:
+/// `config --list` printed `user.useconfigonly=` where git prints
+/// `user.useconfigonly`, and `--type=bool` answered false where git answers
+/// true.
+///
+/// Overrides are applied with `Source::Cli`, which outranks `Source::Env` in
+/// `gix_config`'s override order, so the two channels agree when both carry the
+/// same key.
+pub fn discover() -> Result<gix::Repository, gix::discover::Error> {
+    let overrides = CLI_OVERRIDES.get();
+    if overrides.is_none_or(Vec::is_empty) {
+        return gix::discover(".");
+    }
+    let overrides = overrides.unwrap();
+    // Start from the default mapping and add the overrides to each side rather
+    // than building one option set and cloning it into both. The two levels are
+    // NOT the same options: `Trust::Reduced` caps the object-store slots and
+    // marks the git dir untrusted (`gix/src/open/options.rs`,
+    // `DefaultForLevel`), so a single cloned set would open a repository the
+    // security layer distrusts — one owned by another user — with full-trust
+    // settings.
+    let mut trust: gix::sec::trust::Mapping<gix::open::Options> = Default::default();
+    trust.full = trust.full.cli_overrides(overrides.iter().cloned());
+    trust.reduced = trust.reduced.cli_overrides(overrides.iter().cloned());
+    gix::ThreadSafeRepository::discover_with_environment_overrides_opts(
+        ".",
+        Default::default(),
+        trust,
+    )
+    .map(Into::into)
+}
+
 pub fn prefix(repo: &gix::Repository) -> Option<PathBuf> {
     let top = work_tree(repo)?;
     let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok())?;

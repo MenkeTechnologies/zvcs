@@ -171,7 +171,7 @@ pub fn crawl_into_db(roots: &[PathBuf]) -> Result<(usize, usize)> {
 /// The re-read uses the absolute git dir captured here, never `discover(".")`, so
 /// it is independent of the daemon's working directory.
 pub fn spawn_if_configured() {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return;
     };
     let git_dir = repo.git_dir();
@@ -281,7 +281,7 @@ fn log_line(msg: &str) {
 /// The configured crawl roots: `[zvcs] crawlroots` (whitespace/comma separated),
 /// else `$HOME`, else the current directory.
 pub fn configured_roots() -> Vec<PathBuf> {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => roots_from_config(&crate::config::ZvcsConfig::load(&repo)),
         // No repo → the `$HOME`/`.` fallback `roots_from_config` would apply anyway.
         Err(_) => roots_from_config(&crate::config::ZvcsConfig::default()),

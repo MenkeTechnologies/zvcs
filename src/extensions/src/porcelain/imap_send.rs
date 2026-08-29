@@ -357,7 +357,7 @@ struct ServerConf {
 /// is one, otherwise the global and system files alone. `imap-send` runs
 /// `setup_git_directory_gently()`, so it works outside a repository.
 fn load_config() -> Option<ConfigFile> {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => Some(repo.config_snapshot().plumbing().clone()),
         Err(_) => {
             let mut file = ConfigFile::from_globals().ok()?;

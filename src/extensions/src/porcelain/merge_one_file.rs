@@ -112,7 +112,7 @@ pub fn merge_one_file(args: &[String]) -> Result<ExitCode> {
 
     // cd_to_toplevel + require_work_tree, both of which run before the argument
     // count is checked.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
         // `git rev-parse --show-toplevel` fails in a bare repository, so
         // cd_to_toplevel's `||` arm reports the failure — with `$cdup` literal.

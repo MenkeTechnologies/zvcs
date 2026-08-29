@@ -33,7 +33,7 @@ pub fn zbump(args: &[String]) -> Result<ExitCode> {
 /// [`BumpOutcome`] so callers (the watcher) can surface refusals.
 pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
     // 1. Parent repo.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // Serialize the whole index read-modify-write through the repo coordinator,
     // so concurrent zvcs writers queue FCFS instead of racing `index.lock`. Held

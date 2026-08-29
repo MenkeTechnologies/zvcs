@@ -208,7 +208,7 @@ pub fn bugreport(args: &[String]) -> Result<ExitCode> {
 
     // A repository is optional here: git sets this command up gently and only
     // uses the repo for the hook scan and `core.editor`.
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
 
     let mut buffer = String::from(TEMPLATE);
     buffer.push_str("\n\n[System Info]\n");

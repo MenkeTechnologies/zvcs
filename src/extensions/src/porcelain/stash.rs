@@ -455,7 +455,7 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
 
     // `git stash` writes commits, but not under the strict identity check —
     // it saves fine with `user.useConfigOnly` set and nothing configured.
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     crate::ensure_reflog_identity(&mut repo);
 
     match args.first().map(String::as_str) {
@@ -1874,7 +1874,7 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // `branch_stash` calls `do_apply_stash(..., 1, ...)`: the index is always
     // restored here, whatever `stash.index` says, so the staged state a stash
     // captured comes back staged on the new branch.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let restored = match restore_stash_commit(&repo, commit_id, true, &ConflictLabels::default())? {
         Ok(restored) => restored,
         Err(code) => return Ok(code),

@@ -202,7 +202,7 @@ pub fn http_fetch(args: &[String]) -> Result<ExitCode> {
     };
     let base = url.trim_end_matches('/').to_string();
 
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository");
         return Ok(ExitCode::from(128));
     };

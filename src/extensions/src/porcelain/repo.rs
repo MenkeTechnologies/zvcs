@@ -220,7 +220,7 @@ fn info(args: &[String]) -> Result<ExitCode> {
 
     if keys_only {
         // `--keys` still requires a repository, matching git's RUN_SETUP.
-        gix::discover(".")?;
+        crate::setup::discover()?;
         for key in KEYS {
             match format {
                 Format::Nul => write!(out, "{key}\0")?,
@@ -242,7 +242,7 @@ fn info(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     for key in wanted {
         let Some(value) = value_of(&repo, key) else {
             // Values already written stay on stdout; git returns -1 here, which
@@ -381,7 +381,7 @@ fn structure(args: &[String]) -> Result<ExitCode> {
     }
 
     let format = format.unwrap_or(Format::Table);
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let stats = collect(&repo)?;
 
     let stdout = std::io::stdout();

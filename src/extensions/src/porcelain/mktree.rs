@@ -74,7 +74,7 @@ pub fn mktree(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     let mut nul_term_line = false;
     let mut allow_missing = false;

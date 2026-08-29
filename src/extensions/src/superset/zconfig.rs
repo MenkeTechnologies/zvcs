@@ -209,7 +209,7 @@ fn display_value(s: &Setting, normalized: &str) -> String {
 /// Read an integer `[zvcs]` key with the same repo-then-global cascade as
 /// [`crate::config::config_bool`].
 fn config_int(key: &str) -> Option<i64> {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().integer(key),
         Err(_) => crate::config::global_config().integer(key).ok().flatten(),
     }

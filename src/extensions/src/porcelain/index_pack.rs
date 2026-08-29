@@ -196,7 +196,7 @@ impl Opts {
                 return kind;
             }
         }
-        gix::discover(".")
+        crate::setup::discover()
             .map(|repo| repo.object_hash())
             .unwrap_or(Kind::Sha1)
     }
@@ -331,7 +331,7 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal("--promisor cannot be used with a pack name"));
     }
     if opts.stdin {
-        if gix::discover(".").is_err() {
+        if crate::setup::discover().is_err() {
             return Ok(fatal("--stdin requires a git repository"));
         }
         if opts.object_format.is_some() {
@@ -773,7 +773,7 @@ fn index_from_stdin(
     target_pack: Option<&Path>,
     target_index: Option<&Path>,
 ) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // git opens a named output pack with O_CREAT|O_EXCL before reading stdin, so
     // a path that already exists is fatal with xopen's create-mode wording.
@@ -1078,7 +1078,7 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
     }
     // `repo_settings_get_big_file_threshold()`. `index-pack` can run outside a
     // repository, where git falls back to the same built-in default.
-    let threshold = gix::discover(".")
+    let threshold = crate::setup::discover()
         .map(|repo| super::fsck::big_file_threshold(&repo))
         .unwrap_or(512 * 1024 * 1024);
 
@@ -1170,7 +1170,7 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
     // `FLAG_CHECKED` and is skipped; anything else has to be in the object
     // database with the type the link gave it.
     if strict && !links.is_empty() {
-        let repo = gix::discover(".")?;
+        let repo = crate::setup::discover()?;
         use gix::odb::HeaderExt;
         for (id, expected) in &links {
             if in_pack.contains(id) {
@@ -1192,7 +1192,7 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
     // a queued blob is looked up across the whole database — here the pack is
     // still only a pair of files, so it is consulted directly first.
     if !queued.is_empty() {
-        let repo = gix::discover(".")?;
+        let repo = crate::setup::discover()?;
         let mut finish_error = false;
         let mut done: Vec<ObjectId> = Vec::new();
         for (id, as_modules, as_attrs) in &queued {
@@ -1346,7 +1346,7 @@ fn want_rev_index(opts: &Opts) -> bool {
     if let Some(explicit) = opts.rev_index {
         return explicit;
     }
-    gix::discover(".")
+    crate::setup::discover()
         .ok()
         .and_then(|repo| repo.config_snapshot().boolean("pack.writeReverseIndex"))
         .unwrap_or(true)

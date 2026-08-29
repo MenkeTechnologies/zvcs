@@ -97,7 +97,7 @@ pub(super) const LONG_OPTS: &[LongOpt] = &[
 ];
 
 pub fn add(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     if repo.workdir().is_none() {
         crate::git_fatal!("this operation must be run in a work tree");
     }

@@ -234,7 +234,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 fn list(spec: &str, opts: &Options) -> Result<String> {
     // gitoxide resolves transport, credential, `http.*` and `insteadOf`
     // configuration through a Repository; there is no repository-less remote.
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         bail!("remote-curl outside a repository is not supported (no repository found)")
     };
 

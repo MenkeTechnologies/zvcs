@@ -319,7 +319,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("--all can't be combined with --tags");
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     let remote_name: String = match f.repo.clone().or_else(|| positionals.first().cloned()) {
         Some(r) => r,
@@ -815,7 +815,7 @@ fn parse_lease(value: Option<String>) -> Result<Lease> {
     };
     let (ref_name, expect) = match v.split_once(':') {
         Some((r, e)) if !e.is_empty() => {
-            let repo = gix::discover(".")?;
+            let repo = crate::setup::discover()?;
             let id = repo
                 .rev_parse_single(e)
                 .map_err(|_| anyhow!("cannot parse expected object name '{e}'"))?
@@ -1599,7 +1599,7 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
     // git's two independent switches over this block: `color.transport` for the
     // per-ref summary field and `color.push` for the trailing error line. Both are
     // `auto` against stderr and neither consults `color.ui`.
-    let colors = super::color::PushColors::resolve(gix::discover(".").ok().as_ref());
+    let colors = super::color::PushColors::resolve(crate::setup::discover().ok().as_ref());
     let mut any_failed = outcome.unpack.is_err();
     if let Err(reason) = &outcome.unpack {
         // `receive_status()` (`send-pack.c:160`): `error(_("remote unpack failed:
@@ -1755,7 +1755,7 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
     if rejected.is_empty() {
         return;
     }
-    let Ok(repo) = gix::discover(".") else { return };
+    let Ok(repo) = crate::setup::discover() else { return };
     if !Advice::PushUpdateRejected.enabled_in(&repo) {
         return;
     }

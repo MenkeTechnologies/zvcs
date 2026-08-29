@@ -728,7 +728,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         crate::revfilter::Origin::Header,
     )?;
 
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let mailmap = repo
         .as_ref()
         .map(gix::Repository::open_mailmap)

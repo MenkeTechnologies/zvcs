@@ -282,7 +282,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     }
 
     // 3. Open the repository and require a working tree.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let workdir = match repo.workdir() {
         Some(w) => w.to_owned(),
         None => return Ok(fatal("this operation must be run in a work tree")),

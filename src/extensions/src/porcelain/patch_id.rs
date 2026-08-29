@@ -229,7 +229,7 @@ fn resolve_long(rest: &str) -> Long {
 /// `the_hash_algo`. Outside one, git still reads the global configuration, and
 /// falls back to SHA-1 (`GIT_HASH_DEFAULT`).
 fn load_defaults() -> (bool, bool, Kind) {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => {
             let snapshot = repo.config_snapshot();
             let stable = snapshot.boolean("patchid.stable").unwrap_or(false);

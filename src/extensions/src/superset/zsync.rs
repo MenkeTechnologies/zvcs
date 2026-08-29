@@ -635,7 +635,7 @@ fn update_clean_worktree(
 /// is reported and does not abort the others; the command exits non-zero if any
 /// target errored.
 pub fn zsync(args: &[String]) -> Result<ExitCode> {
-    let parent = gix::discover(".")?;
+    let parent = crate::setup::discover()?;
 
     // Fan this repo's HEAD out to all its LOCAL dups — other checkouts of the same
     // repo (same `origin` URL) indexed on the machine — in parallel, entirely

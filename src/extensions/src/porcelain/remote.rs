@@ -74,7 +74,7 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
     }
     let rest = &args[idx..];
 
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => {
             return fatal("not a git repository (or any of the parent directories): .git");

@@ -219,7 +219,7 @@ pub(crate) fn commit_formats(repo: Option<&gix::Repository>) -> Vec<CmtFmtMap> {
     // repository does not have to outlive the snapshot.
     let file: gix::config::File = match repo {
         Some(r) => r.config_snapshot().plumbing().clone(),
-        None => match gix::discover(".") {
+        None => match crate::setup::discover() {
             Ok(r) => r.config_snapshot().plumbing().clone(),
             Err(_) => crate::config::global_config(),
         },

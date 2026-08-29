@@ -218,7 +218,7 @@ struct Ctx {
 
 impl Ctx {
     fn open() -> Result<Self> {
-        let repo = gix::discover(".")?;
+        let repo = crate::setup::discover()?;
         let git_dir = repo.git_dir().to_path_buf();
         Ok(Ctx { repo, git_dir })
     }

@@ -95,7 +95,7 @@ pub fn checkout__worker(args: &[String]) -> Result<ExitCode> {
 
     // RUN_SETUP: discovery precedes option parsing, so even a bogus flag
     // outside a repository reports the missing repository first.
-    if gix::discover(".").is_err() {
+    if crate::setup::discover().is_err() {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     }

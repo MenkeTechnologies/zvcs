@@ -947,7 +947,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // valid `--whitespace` on the command line, which git parses only afterward.
     // Every action it can name is honoured here on the same terms as the flag, so a
     // `--whitespace` on the command line simply replaces it.
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         if let Some(v) = repo.config_snapshot().string("apply.whitespace") {
             let v = v.to_str_lossy();
             match classify_whitespace(&v) {
@@ -988,12 +988,12 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: options '--reject' and '--3way' cannot be used together");
         return Ok(ExitCode::from(128));
     }
-    if o.three_way && gix::discover(".").is_err() {
+    if o.three_way && crate::setup::discover().is_err() {
         eprintln!("error: '--3way' outside a repository");
         return Ok(ExitCode::from(128));
     }
     let check_index = o.index || o.cached || o.three_way;
-    if check_index && gix::discover(".").is_err() {
+    if check_index && crate::setup::discover().is_err() {
         let flag = if o.index { "--index" } else { "--cached" };
         eprintln!("error: '{flag}' outside a repository");
         return Ok(ExitCode::from(128));
@@ -1009,7 +1009,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             o.verbosity = 1;
         }
     }
-    if o.ita_only && (check_index || gix::discover(".").is_err()) {
+    if o.ita_only && (check_index || crate::setup::discover().is_err()) {
         o.ita_only = false;
     }
     // apply.c:180-181 — the last line of `check_apply_state()`: reading pre-images
@@ -1149,7 +1149,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // comes from `core.whitespace`; a `whitespace` attribute would refine it per path,
     // which this pass does not read.
     if !patches.is_empty() && !matches!(o.ws, WsAction::Invalid) {
-        let rule = gix::discover(".")
+        let rule = crate::setup::discover()
             .map(|repo| super::diff_color::whitespace_rule_cfg(&repo))
             .unwrap_or(super::diff_color::WS_DEFAULT_RULE);
         // `--whitespace=fix` reports the offending lines exactly as `warn` does, then
@@ -1256,7 +1256,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // pre-images from is the same one we mutate and write — no concurrent writer can
     // slip in between, mirroring how git holds `lock_file` for the operation.
     let (idx_repo, mut idx_index, _idx_lock) = if check_index || o.ita_only {
-        let repo = gix::discover(".")?;
+        let repo = crate::setup::discover()?;
         let lock = crate::lock::RepoLock::acquire(repo.git_dir());
         let index = if repo.index_path().exists() {
             repo.open_index()?
@@ -3588,7 +3588,7 @@ fn verify_path(path: &str, mode: u32) -> bool {
 /// git's entries carry the stat `refresh_cache_entry()` fills in; these are zeroed,
 /// which no reader of a fake ancestor consults — `git am -3` uses it as a tree.
 fn build_fake_ancestor(patches: &[Patch], path: &str, quiet: bool) -> Result<bool> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let mut result = gix::index::File::from_state(
         gix::index::State::new(repo.object_hash()),
         std::path::PathBuf::from(path),
@@ -3701,7 +3701,7 @@ fn prefix_patch(p: &mut Patch, prefix: &str) {
 /// repository is bare, or when there is no repository at all — the three cases where
 /// git leaves `state->prefix` NULL and every path in the patch is taken as given.
 fn worktree_prefix() -> Result<String> {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return Ok(String::new());
     };
     let Some(workdir) = repo.workdir() else {
@@ -4618,7 +4618,7 @@ fn rebuild_binary(p: &Patch, pre: &[u8], reverse: bool) -> std::result::Result<V
 /// `None` outside a repository, which is what `odb_has_object()` reports there.
 fn read_blob_by_hex(hex: &str) -> Option<Vec<u8>> {
     let id = gix::ObjectId::from_hex(hex.as_bytes()).ok()?;
-    let repo = gix::discover(".").ok()?;
+    let repo = crate::setup::discover().ok()?;
     let obj = repo.try_find_object(id).ok()??;
     (obj.kind == gix::object::Kind::Blob).then(|| obj.data.clone())
 }

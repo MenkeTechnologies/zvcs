@@ -442,7 +442,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => {
             eprintln!(
@@ -599,7 +599,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
 
     // Re-discovered because `pack-refs` rewrote the ref store underneath the
     // handle opened above, and the reachability walk has to see the packed refs.
-    let repo = gix::discover(".").unwrap_or(repo);
+    let repo = crate::setup::discover().unwrap_or(repo);
 
     // `reflog expire --all`, a foreground task git runs before the repack so an
     // expired entry no longer keeps its object alive. Skipped only when both

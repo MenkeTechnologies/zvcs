@@ -267,7 +267,7 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         pathspecs,
     } = p;
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // git checks the force refusal before anything else it could diagnose, so
     // `git clean ../outside-repo` reports the refusal rather than the pathspec.

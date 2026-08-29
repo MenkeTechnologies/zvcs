@@ -825,7 +825,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     // A pull moves `HEAD` and the remote-tracking refs, and both write reflogs.
     // Without a configured identity the write fails, and by then the fast-forward
     // has already updated the worktree — a half-applied pull. git synthesizes an

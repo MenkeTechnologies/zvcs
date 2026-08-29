@@ -136,7 +136,7 @@ pub fn update_server_info(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let objdir = repo.objects.store_ref().path().to_path_buf();
 
     // `update_server_info()` runs both updaters unconditionally and ORs their

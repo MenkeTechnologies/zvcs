@@ -1301,7 +1301,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // and system config with no repo present), while writes target the local
     // scope and still require a repo. Discovery failure is therefore not fatal
     // here — only an attempted write without a repo is.
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     d.prefix = repo.as_ref().and_then(crate::setup::prefix).map(|p| format!("{}/", p.display()));
     d.blob = match &scope {
         Scope::Blob(spec) => Some(spec.clone()),
@@ -2834,7 +2834,7 @@ fn edit_config(target: &WriteTarget) -> Result<ExitCode> {
     let editor = std::env::var("GIT_EDITOR")
         .ok()
         .or_else(|| {
-            gix::discover(".")
+            crate::setup::discover()
                 .ok()
                 .and_then(|r| r.config_snapshot().string("core.editor").map(|v| v.to_string()))
         })

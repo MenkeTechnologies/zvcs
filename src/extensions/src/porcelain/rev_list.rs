@@ -403,7 +403,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let mut repo = match gix::discover(".") {
+    let mut repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => {
             return Ok(fatal(

@@ -432,7 +432,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     super::diff_files::init_quote_path(&repo);
     let hash = repo.object_hash();
 

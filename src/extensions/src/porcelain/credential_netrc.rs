@@ -287,7 +287,7 @@ fn resolve_gpg_program(opts: &Opts) -> String {
     if let Some(g) = &opts.gpg {
         return g.clone();
     }
-    let from_repo = gix::discover(".")
+    let from_repo = crate::setup::discover()
         .ok()
         .and_then(|repo| repo.config_snapshot().string("gpg.program"));
     let configured = match from_repo {

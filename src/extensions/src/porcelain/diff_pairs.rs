@@ -1679,7 +1679,7 @@ pub(crate) fn render_raw_stream(
         opts.formats.or_patch();
     }
 
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(r) => r,
         Err(_) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");

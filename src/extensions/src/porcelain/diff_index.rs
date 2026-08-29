@@ -1683,7 +1683,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     super::diff_files::init_quote_path(&repo);
     if !wseh_explicit {
         if let Ok(v) = diff_color::ws_error_highlight_default(&repo) {

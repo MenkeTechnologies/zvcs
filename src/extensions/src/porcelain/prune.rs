@@ -269,7 +269,7 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // Both of these would make a prune here delete objects stock git keeps; see
     // the module documentation.

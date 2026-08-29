@@ -202,7 +202,7 @@ fn usage(msg: Option<&str>) -> ExitCode {
 /// there is one (system + global + local + environment), otherwise the global
 /// and system files alone, which is what `git config --get` falls back to.
 fn load_config() -> Option<ConfigFile> {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => Some(repo.config_snapshot().plumbing().clone()),
         Err(_) => {
             let mut file = ConfigFile::from_globals().ok()?;

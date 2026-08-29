@@ -228,7 +228,7 @@ fn parse_options(args: &[String]) -> Result<(bool, Vec<String>), ParseFailure> {
 /// The builtin runs without repository setup, so a repository here is a
 /// convenience: fall back to the system/global files when there is none.
 fn ignore_sighup_configured() -> bool {
-    let from_repo = gix::discover(".")
+    let from_repo = crate::setup::discover()
         .ok()
         .and_then(|repo| repo.config_snapshot().boolean("credentialcache.ignoreSIGHUP"));
     match from_repo {

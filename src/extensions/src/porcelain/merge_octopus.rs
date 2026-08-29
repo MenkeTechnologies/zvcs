@@ -144,7 +144,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
     }
 
     // `git_dir_init`, which every non-`-h` invocation reaches first.
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };

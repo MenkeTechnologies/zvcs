@@ -316,7 +316,7 @@ pub fn replace(args: &[String]) -> Result<ExitCode> {
             if positionals.is_empty() {
                 return usage_msg_opt("-g needs at least one argument");
             }
-            let repo = gix::discover(".")?;
+            let repo = crate::setup::discover()?;
             // The lock is held for the whole graft: `create_graft` writes an
             // object and then a ref, and `RepoLock` is not reentrant.
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -376,7 +376,7 @@ fn err(msg: &str) -> Result<ExitCode> {
 /// not a tree object's on-disk form. An unchanged object is git's
 /// `new object is the same as the old one` error (255), not a no-op success.
 fn edit_and_replace(object_ref: &str, force: bool, raw: bool) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     let Some(old) = objname::resolve(&repo, object_ref) else {
         return err(&format!("not a valid object name: '{object_ref}'"));
@@ -569,7 +569,7 @@ fn read_replace_ref(repo: &gix::Repository, name: &str) -> Result<Option<ObjectI
 
 /// `git replace <object> <replacement>` — write one `refs/replace/<hex>` ref.
 fn replace_object(object_ref: &str, replace_ref: &str, force: bool) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     let Some(object) = objname::resolve(&repo, object_ref) else {
         return err(&format!("failed to resolve '{object_ref}' as a valid ref"));
@@ -673,7 +673,7 @@ fn replace_object_oid(
 /// Every name is attempted; a failure on one only sets the exit status, exactly
 /// as git's `had_error` accumulator does.
 fn delete_replace_refs(names: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let mut had_error = false;
 
@@ -733,7 +733,7 @@ fn list_replace_refs(pattern: Option<&str>, format: Option<&str>) -> Result<Exit
     // git defaults the pattern to `*`, which matches every short name.
     let pattern = pattern.unwrap_or("*");
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // Collect first so the output is ordered by ref name, as git's ref iteration is.
     let mut refs: Vec<(String, ObjectId)> = Vec::new();
@@ -921,7 +921,7 @@ fn convert_graft_file(force: bool) -> Result<ExitCode> {
     // deprecation this command exists to resolve. It must come before the first
     // commit is looked at, because that is what triggers `prepare_commit_graft()`.
     gix::graft::suppress_deprecation_advice();
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let graft_file = graft_file_path(&repo);
     let Ok(contents) = std::fs::read(&graft_file) else {
         return Ok(ExitCode::from(1));

@@ -863,7 +863,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // git's `startup_info->have_repository`, which `diff_abbrev_oid()` branches
     // on: `--no-index` runs either way, but an id is only sized against an object
     // database when there is one.
-    let repo = gix::discover(".").ok();
+    let repo = crate::setup::discover().ok();
     let colors = match (want_color, &repo) {
         (true, Some(repo)) => diff_color::DiffColors::resolve(repo, true),
         _ => diff_color::DiffColors::disabled(),

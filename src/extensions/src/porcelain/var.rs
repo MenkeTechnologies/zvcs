@@ -163,7 +163,7 @@ fn usage_error() -> ExitCode {
 /// the global set plus the `GIT_CONFIG_*` overrides, which is what git falls back
 /// to when there is no repository.
 fn load_config() -> Result<ConfigFile> {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => Ok(repo.config_snapshot().plumbing().clone()),
         Err(_) => {
             let mut file = ConfigFile::from_globals()?;

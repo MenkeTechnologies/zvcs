@@ -208,7 +208,7 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
 
     // gitoxide resolves URL rewriting, transport and credential configuration
     // through a Repository; there is no repository-less remote to fall back on.
-    let repo = match gix::discover(".") {
+    let repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => bail!("ls-remote outside a repository is not supported (no repository found)"),
     };

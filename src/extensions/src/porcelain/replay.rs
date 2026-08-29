@@ -332,7 +332,7 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // --- get_ref_action_mode ---------------------------------------------
     let configured = repo

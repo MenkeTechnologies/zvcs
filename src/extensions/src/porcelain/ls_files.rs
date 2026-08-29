@@ -568,7 +568,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // git's setup runs before `cmd_ls_files()` is entered at all, so a missing
     // repository outranks every check above; here it can only outrank the ones
     // below. Opening it this early is also what the work-tree gate needs.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // git's `require_work_tree` (builtin/ls-files.c:707-708, 720-721): the five
     // selectors that read the filesystem need one, and `setup_work_tree()` dies

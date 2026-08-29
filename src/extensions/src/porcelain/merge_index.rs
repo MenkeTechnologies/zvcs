@@ -132,7 +132,7 @@ pub fn merge_index(args: &[String]) -> Result<ExitCode> {
     };
     i += 1;
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // A missing index is an empty index, as in repo_read_index().
     let index = repo.index_or_empty()?;
     let state: &gix::index::State = &index;

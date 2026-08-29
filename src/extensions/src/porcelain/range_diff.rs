@@ -1289,7 +1289,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 // has already died with `not a git repository` — which is what
                 // this discovery failure reports too.
                 if repo.is_none() {
-                    repo = Some(gix::discover(".")?);
+                    repo = Some(crate::setup::discover()?);
                 }
                 // `repo_get_oid()`, which decodes a full-length hex without
                 // consulting the object database (see [`crate::objname`]) — so
@@ -1620,7 +1620,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
 
     let repo = match repo {
         Some(r) => r,
-        None => gix::discover(".")?,
+        None => crate::setup::discover()?,
     };
 
     // builtin/range-diff.c:89 — "force color when --dual-color was used", applied after

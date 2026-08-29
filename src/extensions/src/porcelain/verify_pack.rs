@@ -190,7 +190,7 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
             // git falls back to the repository's algorithm; verify-pack also runs
             // outside a repository, where SHA-1 is the only thing it can assume.
             HashChoice::Kind(
-                gix::discover(".")
+                crate::setup::discover()
                     .map(|r| r.object_hash())
                     .unwrap_or(gix::hash::Kind::Sha1),
             )

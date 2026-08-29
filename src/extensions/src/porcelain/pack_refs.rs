@@ -178,7 +178,7 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         includes.push("refs/tags/*".to_string());
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let store = &repo.refs;
 
     // Only loose refs need an edit: refs that already live in `packed-refs` and

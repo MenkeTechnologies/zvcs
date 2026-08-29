@@ -567,7 +567,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     // ---- Stage 2: `setup_revisions` over what `parse_options` kept. ----
     // Before its own sweep, `setup_revisions` searches the argv it was handed for

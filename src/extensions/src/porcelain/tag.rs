@@ -626,7 +626,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut config_sign_tag: Option<bool> = None;
     let mut force_sign_annotate = false;
     let mut config_sorts: Vec<String> = Vec::new();
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         config_sorts = repo
             .config_snapshot()
             .plumbing()
@@ -725,7 +725,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     // The object this writes carries an identity, and git fills the halves
     // the user did not give rather than refusing — except under
     // `user.useConfigOnly`, which is the one case it says so.
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     if let Some(code) = crate::ensure_object_identity(&mut repo, "Committer") {
         return Ok(code);
     }

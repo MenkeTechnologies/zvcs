@@ -72,7 +72,7 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
 
     // git runs setup before parse_options (RUN_SETUP), so repository discovery
     // failures win over option errors.
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
 
     let mut ipc_threads: i64 = 8; // fsmonitor__ipc_threads default
     let mut positional: Vec<&str> = Vec::new();

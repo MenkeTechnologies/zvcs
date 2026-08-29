@@ -358,7 +358,7 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let hex_len = repo.object_hash().len_in_hex();
     // Built once: `%aN`/`%aE`/`%cN`/`%cE` always resolve through the mailmap,
     // regardless of `log.mailmap`. An absent `.mailmap` yields an empty snapshot

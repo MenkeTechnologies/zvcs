@@ -236,7 +236,7 @@ fn die(msg: &str) -> ExitCode {
 /// `NONGIT_OK=Yes`, so outside a repository the global set plus the
 /// `GIT_CONFIG_*` overrides still apply.
 fn config() -> Result<gix::config::File> {
-    Ok(match gix::discover(".") {
+    Ok(match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().plumbing().clone(),
         Err(_) => {
             let mut file = gix::config::File::from_globals()?;

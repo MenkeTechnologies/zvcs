@@ -30,7 +30,7 @@ pub fn zrewind(args: &[String]) -> Result<ExitCode> {
     let secs = parse_duration(&spec).ok_or_else(|| anyhow!("`{spec}` is not a duration (2h/30m/1d/90s)"))?;
     let cutoff = now_secs() - secs;
 
-    let top = gix::discover(".")?;
+    let top = crate::setup::discover()?;
     let exe = crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
 
     // The tree = the top repo + every initialized submodule.

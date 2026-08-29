@@ -199,7 +199,7 @@ pub fn global_config() -> gix::config::File {
 /// the [`global_config`] cascade. Used by verbs (e.g. `git zrepl`) that must
 /// honor settings even when run outside a repo. `None` if the key is unset.
 pub fn config_bool(key: &str) -> Option<bool> {
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().boolean(key),
         Err(_) => global_config().boolean(key).ok().flatten(),
     }

@@ -652,7 +652,7 @@ fn strategy_config(repo: &gix::Repository) -> StrategyConfig {
 /// `die()` format string hard-codes regardless of how the key was written in the
 /// file.
 fn branch_merge_options() -> std::result::Result<Vec<String>, String> {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return Ok(Vec::new());
     };
     let branch = match repo.head_ref() {
@@ -690,7 +690,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
     // The `git_merge_config()` defaults, applied before the CLI options below
     // override them. merge.suppressDest is consulted later, in `dest_suppressed`,
     // when the default merge message's title is composed.
-    if let Ok(repo) = gix::discover(".") {
+    if let Ok(repo) = crate::setup::discover() {
         let snap = repo.config_snapshot();
         match snap.string("merge.ff").map(|v| v.to_string().to_ascii_lowercase()).as_deref() {
             Some("only") => opts.ff = Ff::Only,
@@ -1530,7 +1530,7 @@ fn remove_merge_state(git_dir: &Path, and_branch_state: bool) {
 /// `git merge --quit`: forget the in-progress merge, leaving index and worktree
 /// exactly as they are.
 fn quit() -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     remove_merge_state(repo.git_dir(), false);
     Ok(ExitCode::SUCCESS)
@@ -1542,7 +1542,7 @@ fn quit() -> Result<ExitCode> {
 /// conflicted stage, or whose index entry disagrees with `HEAD` — so unrelated
 /// local modifications and untracked files survive, as they do under git.
 fn abort() -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     if !repo.git_dir().join("MERGE_HEAD").exists() {
         eprintln!("fatal: There is no merge to abort (MERGE_HEAD missing).");
         return Ok(ExitCode::from(128));
@@ -1692,7 +1692,7 @@ fn setup_with_upstream(repo: &gix::Repository) -> std::result::Result<Vec<String
 }
 
 fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     // Moving `HEAD` writes a reflog, and a fast-forward has already touched the
     // worktree by then — a failure there would leave the merge half-applied. git
     // synthesizes an identity for reflog purposes rather than failing.
@@ -4092,7 +4092,7 @@ fn reflog_action(spec: &str) -> String {
 /// staged, writing the merge commit from the current index and clearing the
 /// in-progress state, exactly as `git commit` does when `MERGE_HEAD` is present.
 fn continue_merge(opts: &Opts) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let git_dir = repo.git_dir().to_owned();
     if !git_dir.join("MERGE_HEAD").exists() {
         eprintln!("fatal: There is no merge in progress (MERGE_HEAD missing).");

@@ -17,7 +17,7 @@ pub fn zup(args: &[String]) -> Result<ExitCode> {
     let at = args.iter().find(|a| !a.starts_with('-')).map(PathBuf::from);
     let repo = match at {
         Some(p) => gix::discover(p)?,
-        None => gix::discover(".")?,
+        None => crate::setup::discover()?,
     };
     let mut out: Vec<(String, String)> = Vec::new();
     up(&repo, &mut out);

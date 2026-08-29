@@ -622,7 +622,7 @@ fn status_report(
     // stdout leaves them off, so the default one-per-line output is unchanged.
     super::column::finalize(&mut colopts);
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     // git.c runs `status` with `RUN_SETUP | NEED_WORK_TREE`, so a setup that found no work tree —
     // a bare repository, or a cwd inside the git directory — dies here rather than in the walk.
     if repo.workdir().is_none() {

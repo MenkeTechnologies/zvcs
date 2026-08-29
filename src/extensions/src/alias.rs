@@ -200,7 +200,7 @@ fn loop_detected(cmd_list: &[String], repeated: usize) -> String {
 fn lookup(name: &str) -> Option<String> {
     use gix::bstr::ByteSlice;
 
-    let repo = gix::discover(".").ok()?;
+    let repo = crate::setup::discover().ok()?;
     let snapshot = repo.config_snapshot();
     let sections = snapshot.plumbing().sections_by_name("alias")?;
 

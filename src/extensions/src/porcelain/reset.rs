@@ -442,7 +442,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // of dying. Only object-writing commands pass `IDENT_STRICT` and refuse.
     // `checkout`/`branch`/`fetch`/… already fill this gap; `reset` did not, so
     // it failed on any machine with no `user.name`/`user.email`.
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     crate::ensure_reflog_identity(&mut repo);
     let repo = repo;
 

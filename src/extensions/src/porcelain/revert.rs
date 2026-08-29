@@ -454,7 +454,7 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         },
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     if repo.workdir().is_none() {
         eprintln!("fatal: this operation must be run in a work tree");
         return Ok(ExitCode::from(128));

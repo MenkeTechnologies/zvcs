@@ -1023,7 +1023,7 @@ fn repository_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
 /// readings read as the two questions they are.
 fn format_refusal(sub: &str) -> Option<String> {
     if REPO_FORMAT_GATE_VERBS.contains(&sub) {
-        let discovered = gix::discover(".").err();
+        let discovered = crate::setup::discover().err();
         if let Some(gix::discover::Error::Open(gix::open::Error::Config(config))) = &discovered {
             if let Some(msg) = crate::config::repository_format_message(config) {
                 return Some(msg);
@@ -1164,7 +1164,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // repository", which each command still reports for itself.
     let help_only = args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all");
     if !help_only && NEED_WORK_TREE.contains(&sub) {
-        if let Ok(repo) = gix::discover(".") {
+        if let Ok(repo) = crate::setup::discover() {
             // `setup_work_tree()` dies the same way for a work tree that is not
             // configured and for one it cannot `chdir()` into (setup.c:503-505).
             if !repo.workdir().is_some_and(|wt| wt.is_dir()) {
@@ -1202,7 +1202,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         && !rev_parse_no_setup;
     let in_parallel_checkout = !help_only && updates_worktree(sub, args);
     if in_repo_settings || in_default_config || in_parallel_checkout {
-        if let Ok(repo) = gix::discover(".") {
+        if let Ok(repo) = crate::setup::discover() {
             // Settings block first, because that is the order the two diagnostics
             // come out of stock git for a command that reaches both: with
             // `-c core.createObject=bogus -c core.packedGitLimit=bogus`, git 2.55.0's
@@ -1305,7 +1305,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     let is_lock_verb = LOCK_VERBS.contains(&sub) && !is_help && !is_interactive_patch;
     let queued_rerun = std::env::var_os("ZVCS_QUEUED").is_some();
     let _queue_guard = if is_lock_verb && !queued_rerun {
-        match gix::discover(".") {
+        match crate::setup::discover() {
             Ok(repo) => match crate::lock::RepoLock::try_acquire(repo.git_dir()) {
                 crate::lock::TryLock::Held(g) => Some(g),
                 crate::lock::TryLock::Busy { owner_resolved } if queueing_would_swallow_work() => {
@@ -1353,7 +1353,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // becomes a wait rather than the error it used to be. A queued job's re-run
     // waits too — by then it owns the lane, and only a foreign holder is left.
     if is_lock_verb {
-        if let Ok(repo) = gix::discover(".") {
+        if let Ok(repo) = crate::setup::discover() {
             crate::lock::wait_for_foreign_index_lock(repo.git_dir());
         }
     }

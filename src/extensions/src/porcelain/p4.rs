@@ -706,7 +706,7 @@ fn locate_repo(explicit: Option<&str>) -> std::result::Result<gix::Repository, E
     if let Ok(repo) = gix::open(".git") {
         return Ok(repo);
     }
-    match gix::discover(".") {
+    match crate::setup::discover() {
         Ok(repo) => Ok(repo),
         Err(_) => {
             // `read_pipe`'s die: the failed command, then git's stderr verbatim

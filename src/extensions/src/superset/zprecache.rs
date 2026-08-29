@@ -45,7 +45,7 @@ pub fn zprecache(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let warmed = crate::porcelain::warm_log_caches(&repo, limit);
     if !quiet {
         println!("{warmed}");

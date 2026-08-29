@@ -88,7 +88,7 @@ const MAX_WATCHED: usize = 5120;
 /// directory trigger exists. Directory triggers don't require the daemon to be
 /// inside a repository.
 pub fn spawn_if_configured() {
-    let cfg = match gix::discover(".") {
+    let cfg = match crate::setup::discover() {
         Ok(repo) => ZvcsConfig::load(&repo),
         Err(_) => ZvcsConfig::default(),
     };
@@ -423,7 +423,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
 
     // 2. Working-repo submodules — autonomy is keyed off their HEAD moves.
     if cfg.any_autonomous() {
-        if let Ok(repo) = gix::discover(".") {
+        if let Ok(repo) = crate::setup::discover() {
             if let Ok(Some(subs)) = repo.submodules() {
                 for sm in subs {
                     if let Ok(Some(sub)) = sm.open() {
@@ -481,7 +481,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
 /// How many most-recently-used repos to watch for status: `zvcs.watchmru`,
 /// default 512, `0` disables the MRU watch (the `statusd` sweep still covers all).
 fn watch_mru_count() -> usize {
-    gix::discover(".")
+    crate::setup::discover()
         .ok()
         .and_then(|r| r.config_snapshot().integer("zvcs.watchmru"))
         .filter(|n| *n >= 0)
@@ -528,7 +528,7 @@ fn add_target(
 /// One coalesced autonomy reaction: attach, then (config-gated) reconcile-local
 /// and autobump. Re-opens the repo so it always sees current state.
 fn react(cfg: &ZvcsConfig) {
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         return;
     };
 

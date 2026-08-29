@@ -1274,7 +1274,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // The object this writes carries an identity, and git fills the halves
     // the user did not give rather than refusing — except under
     // `user.useConfigOnly`, which is the one case it says so.
-    let mut repo = gix::discover(".")?;
+    let mut repo = crate::setup::discover()?;
     if let Some(code) = crate::ensure_object_identity(&mut repo, "Author") {
         return Ok(code);
     }

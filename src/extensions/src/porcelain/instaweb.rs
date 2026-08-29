@@ -260,7 +260,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
     // `git_dir_init`: `GIT_DIR=$(git rev-parse --git-dir) || exit`, then
     // `GIT_DIR=$(cd "$GIT_DIR" && pwd)` to make it absolute. Still part of
     // sourcing `git-sh-setup`, so it precedes the config reads and the loop.
-    let Ok(repo) = gix::discover(".") else {
+    let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Err(Exit(128).into());
     };

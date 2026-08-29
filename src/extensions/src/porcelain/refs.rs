@@ -230,7 +230,7 @@ fn exists(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     };
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     match lookup(&repo, name) {
         Ok(true) => Ok(ExitCode::SUCCESS),
         Ok(false) => {
@@ -329,7 +329,7 @@ fn verify(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     let config = match super::fsck::MsgConfig::new(&repo, super::fsck::MsgSource::Fsck { strict }) {
         Ok(config) => config,
         // `git_fsck_config()` dies before any checking starts.
@@ -433,7 +433,7 @@ fn migrate(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
-    let repo = gix::discover(".")?;
+    let repo = crate::setup::discover()?;
     if current_ref_format(&repo) == format_str {
         eprintln!("error: repository already uses '{format_str}' format");
         return Ok(ExitCode::from(255));

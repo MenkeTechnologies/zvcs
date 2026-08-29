@@ -297,6 +297,13 @@ impl<'file> SectionRef<'file> {
         self.data.body.values_in(self.backing, value_name)
     }
 
+    /// [`values()`][Self::values()] with one entry per *occurrence*, where a name written with no
+    /// `=` is `None` rather than being skipped — the distinction `git config --list` prints.
+    #[must_use]
+    pub fn values_implicit(&self, value_name: &str) -> Vec<Option<BString>> {
+        self.data.body.values_implicit_in(self.backing, value_name)
+    }
+
     /// Returns an iterator visiting all value names in order.
     pub fn value_names(&self) -> impl Iterator<Item = String> + '_ {
         self.data.body.as_ref().iter().filter_map(move |e| match e {

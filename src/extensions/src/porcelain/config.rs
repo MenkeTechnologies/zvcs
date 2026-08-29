@@ -298,6 +298,9 @@ fn usage_error(msg: &str) -> Result<ExitCode> {
 struct Display {
     show_origin: bool,
     show_scope: bool,
+    /// `--show-names` (`display_opts.show_keys`, builtin/config.c:118): a `get` prints the key
+    /// ahead of the value, which is what `list` and `--get-regexp` do unconditionally.
+    show_names: bool,
     null: bool,
     name_only: bool,
     ty: Option<ValueType>,
@@ -551,7 +554,279 @@ fn errno_text(err: &std::io::Error) -> String {
 /// argument count) report `error: …` on stderr and exit 129, as git's
 /// parse-options layer does; they never travel as `anyhow` errors, which would
 /// collapse to exit 1.
+/// The subcommand spellings `cmd_config()` dispatches on (builtin/config.c:1631-1637). Each has
+/// its own option table and its own usage line, but every one of them ends up in the same
+/// `get_value()` / `set_multivar()` machinery the legacy options reach — so this rewrites the
+/// subcommand form into the legacy form and lets one implementation answer both.
+///
+/// The rewrite is exact, not approximate: `git config get --all <name>` *is*
+/// `git config --get-all <name>` (`GET_VALUE_ALL`), `set --append` *is* `--add`
+/// (`value_pattern = CONFIG_REGEX_NONE`), `set --all` *is* `--replace-all`
+/// (`CONFIG_FLAGS_MULTI_REPLACE`), and `unset --all` *is* `--unset-all`. What the subcommands do
+/// **not** share with the legacy form is their argument checking, which is why the refusals below
+/// are spelled here rather than left to the legacy parser.
+fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>, ExitCode>> {
+    let sub = args.first()?.as_str();
+    if !matches!(
+        sub,
+        "list" | "get" | "set" | "unset" | "rename-section" | "remove-section" | "edit"
+    ) {
+        return None;
+    }
+    let rest = &args[1..];
+
+    // `parse_options(..., PARSE_OPT_STOP_AT_NON_OPTION)`: option scanning stops at the first
+    // operand, and `--` is consumed.
+    let mut opts: Vec<String> = Vec::new();
+    let mut operands: Vec<String> = Vec::new();
+    let mut all = false;
+    let mut regexp = false;
+    let mut append = false;
+    let mut value_pattern: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if !operands.is_empty() {
+            operands.push(a.to_string());
+            i += 1;
+            continue;
+        }
+        match a {
+            "--" => {
+                operands.extend(rest[i + 1..].iter().cloned());
+                break;
+            }
+            "--all" => all = true,
+            "--no-all" => all = false,
+            "--regexp" => regexp = true,
+            "--no-regexp" => regexp = false,
+            "--append" => append = true,
+            "--no-append" => append = false,
+            "-h" | "--help-all" => return Some(Err(super::show_usage(subcommand_usage(sub)))),
+            _ if a.starts_with("--value=") => value_pattern = Some(a["--value=".len()..].to_string()),
+            "--value" => {
+                let Some(v) = rest.get(i + 1) else {
+                    return Some(Err(super::missing_option_value(a)));
+                };
+                value_pattern = Some(v.clone());
+                i += 1;
+            }
+            _ if a.starts_with("--url=") => url = Some(a["--url=".len()..].to_string()),
+            "--url" => {
+                let Some(v) = rest.get(i + 1) else {
+                    return Some(Err(super::missing_option_value(a)));
+                };
+                url = Some(v.clone());
+                i += 1;
+            }
+            // Location, display and type options are the legacy ones verbatim; hand them on and
+            // let the one parser answer for them. `-f`/`--file`, `--blob`, `--type`, `--default`
+            // and `--comment` take a separate argument.
+            "-f" | "--file" | "--blob" | "-t" | "--type" | "--default" | "--comment" => {
+                let Some(v) = rest.get(i + 1) else {
+                    return Some(Err(super::missing_option_value(a)));
+                };
+                opts.push(a.to_string());
+                opts.push(v.clone());
+                i += 1;
+            }
+            _ if a.starts_with('-') && a != "-" => opts.push(a.to_string()),
+            _ => operands.push(a.to_string()),
+        }
+        i += 1;
+    }
+
+    // `check_argc()` (builtin/config.c:202): `error()` then exit 129, with no usage block.
+    let wrong_argc = |want: usize| -> Option<std::result::Result<Vec<String>, ExitCode>> {
+        eprintln!("error: wrong number of arguments, should be {want}");
+        Some(Err(ExitCode::from(129)))
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    match sub {
+        "list" => {
+            if !operands.is_empty() {
+                return wrong_argc(0);
+            }
+            out.push("--list".into());
+        }
+        "get" => {
+            if operands.len() != 1 {
+                return wrong_argc(1);
+            }
+            // The three refusals `cmd_config_get()` owns, in its order (:1104-1112).
+            if opts.iter().any(|o| o == "--fixed-value") && value_pattern.is_none() {
+                return Some(Err(fatal("--fixed-value only applies with 'value-pattern'")));
+            }
+            if opts.windows(2).any(|w| w[0] == "--default") && (all || url.is_some()) {
+                return Some(Err(fatal("--default= cannot be used with --all or --url=")));
+            }
+            if url.is_some() && (all || regexp || value_pattern.is_some()) {
+                return Some(Err(fatal("--url= cannot be used with --all, --regexp or --value")));
+            }
+            match (&url, regexp, all) {
+                (Some(u), _, _) => {
+                    out.push("--get-urlmatch".into());
+                    out.push(operands[0].clone());
+                    out.push(u.clone());
+                }
+                (None, true, _) => {
+                    out.push("--get-regexp".into());
+                    out.push(operands[0].clone());
+                    out.extend(value_pattern.clone());
+                }
+                (None, false, true) => {
+                    out.push("--get-all".into());
+                    out.push(operands[0].clone());
+                    out.extend(value_pattern.clone());
+                }
+                (None, false, false) => {
+                    out.push("--get".into());
+                    out.push(operands[0].clone());
+                    out.extend(value_pattern.clone());
+                }
+            }
+        }
+        "set" => {
+            if operands.len() == 1 {
+                return Some(Err(missing_set_value(&operands[0])));
+            }
+            if operands.len() != 2 {
+                return wrong_argc(2);
+            }
+            if opts.iter().any(|o| o == "--fixed-value") && value_pattern.is_none() {
+                return Some(Err(fatal("--fixed-value only applies with --value=<pattern>")));
+            }
+            if append && value_pattern.is_some() {
+                return Some(Err(fatal("--append cannot be used with --value=<pattern>")));
+            }
+            if append {
+                out.push("--add".into());
+                out.extend(operands.iter().cloned());
+            } else if all {
+                out.push("--replace-all".into());
+                out.extend(operands.iter().cloned());
+                out.extend(value_pattern.clone());
+            } else {
+                // No `--all` and no pattern is `repo_config_set_in_file_gently()`, the plain
+                // two-operand legacy write; a pattern alone replaces just what it matches, which
+                // is the three-operand one.
+                out.extend(operands.iter().cloned());
+                out.extend(value_pattern.clone());
+            }
+        }
+        "unset" => {
+            if operands.len() != 1 {
+                return wrong_argc(1);
+            }
+            if opts.iter().any(|o| o == "--fixed-value") && value_pattern.is_none() {
+                return Some(Err(fatal("--fixed-value only applies with 'value-pattern'")));
+            }
+            out.push(if all { "--unset-all".into() } else { "--unset".into() });
+            out.push(operands[0].clone());
+            out.extend(value_pattern.clone());
+        }
+        "rename-section" => {
+            if operands.len() != 2 {
+                return wrong_argc(2);
+            }
+            out.push("--rename-section".into());
+            out.extend(operands.iter().cloned());
+        }
+        "remove-section" => {
+            if operands.len() != 1 {
+                return wrong_argc(1);
+            }
+            out.push("--remove-section".into());
+            out.push(operands[0].clone());
+        }
+        "edit" => {
+            if !operands.is_empty() {
+                return wrong_argc(0);
+            }
+            out.push("--edit".into());
+        }
+        _ => unreachable!("checked above"),
+    }
+
+    // The location/display/type options go first, so the legacy parser sees them before the
+    // action's own operands — `PARSE_OPT_STOP_AT_NON_OPTION` would otherwise read them as data.
+    let mut rewritten = opts;
+    rewritten.extend(out);
+    Some(Ok(rewritten))
+}
+
+/// The usage line `-h` prints for each subcommand (builtin/config.c:32-65).
+fn subcommand_usage(sub: &str) -> &'static str {
+    match sub {
+        "list" => "usage: git config list [<file-option>] [<display-option>] [--includes]\n\n",
+        "get" => "usage: git config get [<file-option>] [<display-option>] [--includes] [--all] [--regexp=<regexp>] [--value=<pattern>] [--fixed-value] [--default=<default>] <name>\n\n",
+        "set" => "usage: git config set [<file-option>] [--type=<type>] [--comment=<message>] [--all] [--value=<pattern>] [--fixed-value] <name> <value>\n\n",
+        "unset" => "usage: git config unset [<file-option>] [--all] [--value=<pattern>] [--fixed-value] <name>\n\n",
+        "rename-section" => "usage: git config rename-section [<file-option>] <old-name> <new-name>\n\n",
+        "remove-section" => "usage: git config remove-section [<file-option>] <name>\n\n",
+        _ => "usage: git config edit [<file-option>]\n\n",
+    }
+}
+
+/// `die()` from inside a subcommand: `fatal: <message>`, exit 128.
+fn fatal(message: &str) -> ExitCode {
+    eprintln!("fatal: {message}");
+    ExitCode::from(128)
+}
+
+/// `die_missing_set_value()` (builtin/config.c:214): `git config set <name>` with no value names
+/// the variable, and an `<key>=<value>` spelling earns the hint that says how it was meant.
+fn missing_set_value(arg: &str) -> ExitCode {
+    let eq = arg.rfind('.').and_then(|dot| arg[dot + 1..].find('=').map(|e| dot + 1 + e));
+    match eq {
+        Some(at) if valid_config_key(&arg[..at]) => {
+            eprintln!("error: missing value to set to the variable '{arg}'");
+            eprintln!(
+                "hint: did you mean \"git config set {} {}\"?",
+                &arg[..at],
+                &arg[at + 1..]
+            );
+        }
+        _ if valid_config_key(arg) => {
+            eprintln!("error: missing value to set to the variable '{arg}'");
+        }
+        _ => {
+            eprintln!("error: missing value to set to a variable with an invalid name '{arg}'");
+        }
+    }
+    ExitCode::from(129)
+}
+
+/// `git_config_key_is_valid()`: a key is `<section>.<name>` (with an optional subsection), the
+/// section and name are non-empty, and the name is alphanumeric-or-dash.
+fn valid_config_key(key: &str) -> bool {
+    let Some(dot) = key.find('.') else { return false };
+    let last = key.rfind('.').expect("a first dot implies a last dot");
+    let section = &key[..dot];
+    let name = &key[last + 1..];
+    !section.is_empty()
+        && !name.is_empty()
+        && section.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 pub fn config(args: &[String]) -> Result<ExitCode> {
+    // `cmd_config()`'s outer `parse_options()` is nothing but `OPT_SUBCOMMAND`s: a leading `list`,
+    // `get`, `set`, `unset`, `rename-section`, `remove-section` or `edit` selects a subcommand
+    // with its own table, and anything else falls through to `cmd_config_actions()` — the legacy
+    // option form this file already implements.
+    let rewritten;
+    let args = match rewrite_subcommand(args) {
+        Some(Ok(argv)) => {
+            rewritten = argv;
+            &rewritten[..]
+        }
+        Some(Err(code)) => return Ok(code),
+        None => args,
+    };
+
     let mut mode = Mode::Auto;
     let mut scope = Scope::Default;
     let mut name_only = false;
@@ -754,6 +1029,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 }
             }
             "--name-only" => name_only = true,
+            "--show-names" => d.show_names = true,
             // The unset sense of every display/type entry. `option_parse_type()`
             // stores `TYPE_NONE` when `unset` (builtin/config.c:156-159) and the
             // four `OPT_BOOL`s clear their int, so each of these is the option's
@@ -763,7 +1039,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "--no-name-only" => name_only = false,
             "--no-show-origin" => d.show_origin = false,
             "--no-show-scope" => d.show_scope = false,
-            "--no-show-names" => {}
+            "--no-show-names" => d.show_names = false,
             "--no-type" => ty_name = None,
             // `--no-<location>` clears the corresponding `use_*_config` int (or
             // NULLs the `--file`/`--blob` string), which is exactly "unpin the
@@ -1135,10 +1411,10 @@ fn get(
     // in file order, and git's `--get` is the LAST value that survives the
     // filter.
     let wanted = key_of(&key);
-    let mut selected: Vec<(Vec<u8>, gix::config::file::Metadata)> = Vec::new();
-    for_each_entry(file, |k, value, meta| {
+    let mut selected: Vec<(Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
+    for_each_entry(file, |k, value, implicit, meta| {
         if k == wanted && filter.as_ref().is_none_or(|f| f.matches(value)) {
-            selected.push((value.to_vec(), meta.clone()));
+            selected.push((value.to_vec(), implicit, meta.clone()));
         }
         Ok(())
     })?;
@@ -1167,7 +1443,7 @@ fn get(
         };
         return match formatted {
             Ok(value) => {
-                emit_kv(&mut out, d, name, &value, &param_metadata(), b'\n', false)?;
+                emit_kv(&mut out, d, name, &value, &param_metadata(), b' ', d.show_names)?;
                 Ok(ExitCode::SUCCESS)
             }
             // A `format_config()` that returns < 0 is the `die()` above rather than
@@ -1185,17 +1461,20 @@ fn get(
     // git canonicalizes in file order and dies on the first value that does not
     // parse as the requested type — even when `--get` would have returned a
     // later one, so the error names the same value stock git names.
-    let mut canonical: Vec<(Vec<u8>, gix::config::file::Metadata)> = Vec::new();
-    for (v, meta) in &selected {
+    let mut canonical: Vec<(Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
+    for (v, implicit, meta) in &selected {
         match typed(d, name, v, meta) {
-            Ok(v) => canonical.push((v, meta.clone())),
+            Ok(v) => canonical.push((v, *implicit, meta.clone())),
             Err(code) => return Ok(code),
         }
     }
 
     let emit: &[_] = if all { &canonical } else { &canonical[canonical.len() - 1..] };
-    for (v, meta) in emit {
-        emit_kv(&mut out, d, name, v, meta, b'\n', false)?;
+    for (v, implicit, meta) in emit {
+        // A key with no `=` prints as its name alone under `--show-names`, and as an empty line
+        // without it — `format_config()` backs the delimiter out (builtin/config.c:454-461).
+        let shown = (!implicit || d.ty.is_some()).then_some(v.as_slice());
+        emit_kv_opt(&mut out, d, name, shown, meta, b' ', d.show_names)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1229,23 +1508,43 @@ fn emit_kv(
     sep: u8,
     with_key: bool,
 ) -> Result<()> {
+    emit_kv_opt(out, d, key, Some(value), meta, sep, with_key)
+}
+
+/// [`emit_kv`] for an entry that may have no value at all — a name written with no `=`.
+///
+/// `format_config()`'s `TYPE_NONE` arm adds the key delimiter first and then takes it back when
+/// the value is NULL (builtin/config.c:454-461), so `flag` prints as its key alone while
+/// `empty =` prints the key, the delimiter and nothing else.
+fn emit_kv_opt(
+    out: &mut impl Write,
+    d: &Display,
+    key: &str,
+    value: Option<&[u8]>,
+    meta: &gix::config::file::Metadata,
+    sep: u8,
+    with_key: bool,
+) -> Result<()> {
+    let Some(value) = value else {
+        if d.show_scope {
+            out.write_all(scope_word(meta.source).as_bytes())?;
+            out.write_all(b"\t")?;
+        }
+        if d.show_origin {
+            write_origin(out, meta)?;
+        }
+        if with_key {
+            out.write_all(key.as_bytes())?;
+        }
+        out.write_all(if d.null { b"\0" } else { b"\n" })?;
+        return Ok(());
+    };
     if d.show_scope {
         out.write_all(scope_word(meta.source).as_bytes())?;
         out.write_all(b"\t")?;
     }
     if d.show_origin {
-        match &meta.path {
-            Some(path) => {
-                // git prints the path as it resolved it, without the `./` a
-                // relative discovery leaves on the front.
-                let text = path.to_string_lossy();
-                let text = text.strip_prefix("./").unwrap_or(&text);
-                out.write_all(b"file:")?;
-                out.write_all(text.as_bytes())?;
-            }
-            None => out.write_all(origin_word(meta.source).as_bytes())?,
-        }
-        out.write_all(b"\t")?;
+        write_origin(out, meta)?;
     }
     if with_key {
         out.write_all(key.as_bytes())?;
@@ -1258,6 +1557,24 @@ fn emit_kv(
         out.write_all(value)?;
     }
     out.write_all(if d.null { b"\0" } else { b"\n" })?;
+    Ok(())
+}
+
+/// The `--show-origin` column: `file:<path>` for a real file, else the source's own word, then a
+/// tab.
+fn write_origin(out: &mut impl Write, meta: &gix::config::file::Metadata) -> Result<()> {
+    match &meta.path {
+        Some(path) => {
+            // git prints the path as it resolved it, without the `./` a relative discovery leaves
+            // on the front.
+            let text = path.to_string_lossy();
+            let text = text.strip_prefix("./").unwrap_or(&text);
+            out.write_all(b"file:")?;
+            out.write_all(text.as_bytes())?;
+        }
+        None => out.write_all(origin_word(meta.source).as_bytes())?,
+    }
+    out.write_all(b"\t")?;
     Ok(())
 }
 
@@ -1460,8 +1777,8 @@ fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
     // `gently = 1` to `format_config()` and prints only when it returns `>= 0`, so
     // a `--list --type=<t>` quietly drops every entry the type cannot read rather
     // than dying on the first one.
-    for_each_entry(file, |key, value, meta| {
-        let _ = meta;
+    for_each_entry(file, |key, value, implicit, meta| {
+        let _ = (meta, implicit);
         let canonical = match d.ty {
             None => value.to_vec(),
             Some(t) => match t.canonicalize(key, value) {
@@ -1509,9 +1826,9 @@ fn get_regexp(
     // and writes the list only once the whole walk succeeded, so a value that will
     // not canonicalize suppresses the matches found *before* it as well as the
     // ones after. Collecting here rather than streaming reproduces that.
-    let mut collected: Vec<(String, Vec<u8>, gix::config::file::Metadata)> = Vec::new();
+    let mut collected: Vec<(String, Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
     let mut failed: Option<ExitCode> = None;
-    for_each_entry(file, |key, value, meta| {
+    for_each_entry(file, |key, value, implicit, meta| {
         if failed.is_some() || !re.is_match(key.as_bytes()) {
             return Ok(());
         }
@@ -1519,7 +1836,7 @@ fn get_regexp(
             return Ok(());
         }
         match typed(d, key, value, meta) {
-            Ok(v) => collected.push((key.to_owned(), v, meta.clone())),
+            Ok(v) => collected.push((key.to_owned(), v, implicit, meta.clone())),
             Err(code) => failed = Some(code),
         }
         Ok(())
@@ -1530,8 +1847,8 @@ fn get_regexp(
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for (key, value, meta) in &collected {
-        emit_kv(&mut out, d, key, value, meta, b' ', true)?;
+    for (key, value, implicit, meta) in &collected {
+        emit_kv_opt(&mut out, d, key, (!implicit).then_some(value.as_slice()), meta, b' ', true)?;
     }
 
     Ok(if collected.is_empty() { ExitCode::from(1) } else { ExitCode::SUCCESS })
@@ -1547,7 +1864,7 @@ fn get_regexp(
 /// case is preserved.
 fn for_each_entry(
     file: &gix::config::File,
-    mut emit: impl FnMut(&str, &[u8], &gix::config::file::Metadata) -> Result<()>,
+    mut emit: impl FnMut(&str, &[u8], bool, &gix::config::file::Metadata) -> Result<()>,
 ) -> Result<()> {
     for section in file.sections() {
         if is_synthetic(section.meta().source) {
@@ -1565,14 +1882,20 @@ fn for_each_entry(
         }
 
         for (value_name, nth) in &occurrence {
-            let Some(value) = section.values(value_name).into_iter().nth(*nth) else {
+            // A name written with no `=` has *no* value, which is not the same as an empty one:
+            // `format_config()` backs the delimiter out again for the first and keeps it for the
+            // second (builtin/config.c:454-461). The empty slice stands for both here, so the
+            // implicit ones are recorded separately.
+            let Some(value) = section.values_implicit(value_name).into_iter().nth(*nth) else {
                 continue;
             };
+            let implicit = value.is_none();
+            let value = value.unwrap_or_default();
             let key = match &subsection {
                 Some(sub) => format!("{section_name}.{sub}.{value_name}"),
                 None => format!("{section_name}.{value_name}"),
             };
-            emit(&key, &value, section.meta())?;
+            emit(&key, &value, implicit, section.meta())?;
         }
     }
     Ok(())
@@ -1821,7 +2144,7 @@ fn get_color(file: &gix::config::File, slot: &str, def_color: Option<&str>) -> R
 
     let mut parsed: Option<String> = None;
     let mut failure: Option<(Vec<u8>, Option<std::path::PathBuf>)> = None;
-    for_each_entry(file, |k, value, meta| {
+    for_each_entry(file, |k, value, _implicit, meta| {
         if k != wanted || failure.is_some() {
             return Ok(());
         }
@@ -1938,7 +2261,7 @@ fn get_colorbool(file: &gix::config::File, positional: &[&str]) -> Result<ExitCo
     // `color.diff = red`, say — is `git_config_bool()`'s `die()`, and it fires
     // while the config is being walked rather than at the end.
     let mut bad: Option<(String, String)> = None;
-    for_each_entry(file, |k, value, _| {
+    for_each_entry(file, |k, value, _implicit, _| {
         if k != wanted && k != "diff.color" && k != "color.ui" {
             return Ok(());
         }

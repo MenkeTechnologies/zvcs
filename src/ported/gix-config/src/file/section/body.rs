@@ -44,6 +44,18 @@ impl BodyRef<'_> {
         self.body.values_in(self.backing, value_name)
     }
 
+    /// [`values()`][Self::values()] with one entry per *occurrence* of `value_name`, where an
+    /// implicit value — a name written with no `=` — is `None` rather than being skipped.
+    ///
+    /// `git config --list` tells the two apart: a valueless `flag` prints as the key alone, while
+    /// `empty =` prints the key, the delimiter and nothing after it (`format_config()`,
+    /// builtin/config.c:454-461). Collapsing them loses that distinction for every occurrence of a
+    /// multivar, which [`value_implicit()`][Self::value_implicit()] can only answer for the last.
+    #[must_use]
+    pub fn values_implicit(&self, value_name: &str) -> Vec<Option<BString>> {
+        self.body.values_implicit_in(self.backing, value_name)
+    }
+
     /// Returns an iterator visiting all value names in order.
     pub fn value_names(&self) -> impl Iterator<Item = String> + '_ {
         self.body.0.iter().filter_map(move |e| match e {
@@ -105,6 +117,45 @@ impl BodyData {
             }
         }
         None
+    }
+
+    pub(crate) fn values_implicit_in(&self, backing: &[u8], value_name: &str) -> Vec<Option<BString>> {
+        let key = &ValueName::from_str_unchecked(value_name);
+        let mut values = Vec::new();
+        // `Some(saw_separator)` while a matching name is waiting for its value. A name written
+        // with no `=` still emits an empty `Value` event (`config_value()` in the parser), so the
+        // `KeyValueSeparator` before it is the only thing that tells an implicit key from an
+        // explicitly empty one.
+        let mut pending: Option<bool> = None;
+        let mut concatenated_value = BString::default();
+
+        for event in &self.0 {
+            match event {
+                Event::SectionValueName(event_key) => {
+                    pending = event_key
+                        .as_bstr_in(backing)
+                        .eq_ignore_ascii_case(key.0.as_slice())
+                        .then_some(false);
+                }
+                Event::KeyValueSeparator if pending.is_some() => pending = Some(true),
+                Event::Value(v) if pending.is_some() => {
+                    let explicit = pending.take() == Some(true);
+                    values.push(explicit.then(|| normalize(v.as_slice_in(backing)).into_owned()));
+                }
+                Event::ValueNotDone(v) if pending.is_some() => {
+                    concatenated_value.push_str(v.as_slice_in(backing));
+                }
+                Event::ValueDone(v) if pending.is_some() => {
+                    pending = None;
+                    concatenated_value.push_str(v.as_slice_in(backing));
+                    let concatenated_value = std::mem::take(&mut concatenated_value);
+                    values.push(Some(normalize(&concatenated_value).into_owned()));
+                }
+                _ => (),
+            }
+        }
+
+        values
     }
 
     pub(crate) fn values_in(&self, backing: &[u8], value_name: &str) -> Vec<BString> {

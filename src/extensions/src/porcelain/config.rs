@@ -320,6 +320,10 @@ struct Display {
     /// through the *same* `format_config()` the real values do, so `--type` applies
     /// to it and a default the type rejects is a fatal error.
     default_value: Option<String>,
+    /// git's `startup_info->prefix` (slash-terminated), which `--show-origin`
+    /// needs because git prints its paths from the top of the work tree and the
+    /// port never moved there. See [`write_origin`].
+    prefix: Option<String>,
 }
 
 /// `--type=<t>` and its legacy spellings (`--bool`, `--int`, `--bool-or-int`,
@@ -1256,6 +1260,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // scope and still require a repo. Discovery failure is therefore not fatal
     // here — only an attempted write without a repo is.
     let repo = gix::discover(".").ok();
+    d.prefix = repo.as_ref().and_then(crate::setup::prefix).map(|p| format!("{}/", p.display()));
 
     // ```c
     // if (opts->respect_includes_opt == -1)
@@ -1783,7 +1788,7 @@ fn emit_kv_opt(
             out.write_all(b"\t")?;
         }
         if d.show_origin {
-            write_origin(out, meta)?;
+            write_origin(out, d, meta)?;
         }
         if with_key {
             out.write_all(key.as_bytes())?;
@@ -1796,7 +1801,7 @@ fn emit_kv_opt(
         out.write_all(b"\t")?;
     }
     if d.show_origin {
-        write_origin(out, meta)?;
+        write_origin(out, d, meta)?;
     }
     if with_key {
         out.write_all(key.as_bytes())?;
@@ -1814,20 +1819,49 @@ fn emit_kv_opt(
 
 /// The `--show-origin` column: `file:<path>` for a real file, else the source's own word, then a
 /// tab.
-fn write_origin(out: &mut impl Write, meta: &gix::config::file::Metadata) -> Result<()> {
+fn write_origin(out: &mut impl Write, d: &Display, meta: &gix::config::file::Metadata) -> Result<()> {
     match &meta.path {
         Some(path) => {
-            // git prints the path as it resolved it, without the `./` a relative discovery leaves
-            // on the front.
-            let text = path.to_string_lossy();
-            let text = text.strip_prefix("./").unwrap_or(&text);
             out.write_all(b"file:")?;
-            out.write_all(text.as_bytes())?;
+            out.write_all(origin_path(d, meta.source, &path.to_string_lossy()).as_bytes())?;
         }
         None => out.write_all(origin_word(meta.source).as_bytes())?,
     }
     out.write_all(b"\t")?;
     Ok(())
+}
+
+/// The path `--show-origin` prints, respelled from the top of the work tree.
+///
+/// `setup_git_directory()` has already chdir'd there by the time any of these
+/// strings is built, so every relative path git prints is relative to the top
+/// level; the port stays in the directory the command was typed in, so the same
+/// file comes out one `../` per prefix component too long. Both spellings are
+/// otherwise textual — neither git nor this normalizes them, which is why an
+/// include shows as `.git/../extra.cfg` — so the respelling is textual as well:
+/// drop exactly the climb that leads back to the top.
+///
+/// A path that came from `--file` goes the other way. `OPT_FILENAME` runs
+/// `prefix_filename()` over it during option parsing, which prepends the prefix
+/// to the string as typed and leaves an absolute one alone, so `-f ../up.cfg`
+/// from `src/` prints as `src/../up.cfg`.
+fn origin_path<'a>(d: &Display, source: Source, path: &'a str) -> std::borrow::Cow<'a, str> {
+    // A `--file` path is printed as it was typed, `./` and all, once the prefix
+    // is on the front. Everywhere else the path came from discovery, and gix
+    // leaves a `./` on the front of one it opened relative to the cwd where git
+    // has none.
+    if source == Source::Cli {
+        return match (&d.prefix, std::path::Path::new(path).is_absolute()) {
+            (Some(prefix), false) => format!("{prefix}{path}").into(),
+            _ => path.into(),
+        };
+    }
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let Some(prefix) = d.prefix.as_deref() else {
+        return path.into();
+    };
+    let climb: String = std::path::Path::new(prefix).components().map(|_| "../").collect();
+    path.strip_prefix(&climb).unwrap_or(path).into()
 }
 
 /// git's `--show-origin` word for a source with no file behind it.

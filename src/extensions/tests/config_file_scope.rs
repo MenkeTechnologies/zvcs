@@ -169,6 +169,40 @@ fn the_repository_cascade_follows_includes_unless_told_not_to() {
     assert!(!stdout_of(&listed).contains("inc.k"), "but what it points at is not read");
 }
 
+/// `--show-origin` prints its paths from the top of the work tree, because
+/// `setup_git_directory()` has chdir'd there before the first one is built. Run
+/// from a subdirectory the local config is still `.git/config`, while a
+/// `--file` path has instead been through `prefix_filename()` and carries the
+/// subdirectory on its front — as typed, unnormalized.
+#[test]
+fn show_origin_paths_are_spelled_from_the_top_of_the_work_tree() {
+    let dir = scratch("origin-prefix");
+    assert!(zvcs(&dir, &["init", "-q", "-b", "main"]).status.success(), "init failed");
+    assert!(zvcs(&dir, &["config", "demo.one", "1"]).status.success(), "set failed");
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).expect("mkdir sub");
+    std::fs::write(sub.join("f.cfg"), "[a]\n\tb = c\n").expect("write f.cfg");
+
+    let top = zvcs(&dir, &["config", "--show-origin", "--get", "demo.one"]);
+    assert_eq!(stdout_of(&top), "file:.git/config\t1\n");
+
+    let from_sub = zvcs(&sub, &["config", "--show-origin", "--get", "demo.one"]);
+    assert_eq!(stdout_of(&from_sub), "file:.git/config\t1\n", "not ../.git/config");
+
+    let named = zvcs(&sub, &["config", "--show-origin", "-f", "f.cfg", "--get", "a.b"]);
+    assert_eq!(stdout_of(&named), "file:sub/f.cfg\tc\n", "--file carries the prefix");
+
+    // `prefix_filename()` concatenates; it does not normalize what it is given.
+    let dotted = zvcs(&sub, &["config", "--show-origin", "-f", "./f.cfg", "--get", "a.b"]);
+    assert_eq!(stdout_of(&dotted), "file:sub/./f.cfg\tc\n");
+
+    // An absolute path is left alone, prefix or no prefix.
+    let abs = sub.join("f.cfg");
+    let abs = abs.to_str().expect("utf-8 fixture path");
+    let absolute = zvcs(&sub, &["config", "--show-origin", "-f", abs, "--get", "a.b"]);
+    assert_eq!(stdout_of(&absolute), format!("file:{abs}\tc\n"));
+}
+
 #[test]
 fn missing_file_is_exit_1_to_read_but_fatal_to_list() {
     let dir = scratch("missing");

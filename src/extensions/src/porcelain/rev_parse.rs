@@ -1375,18 +1375,9 @@ fn git_dir_display(repo: &gix::Repository) -> std::path::PathBuf {
     }
 }
 
-/// git's `prefix`: the path from the top of the work tree down to the cwd, or `None` when there is
-/// no work tree or the cwd sits outside of it.
-fn prefix(repo: &gix::Repository) -> Option<std::path::PathBuf> {
-    let top = toplevel(repo)?;
-    let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok())?;
-    let rel = cwd.strip_prefix(&top).ok()?;
-    (!rel.as_os_str().is_empty()).then(|| rel.to_owned())
-}
-
 // `is_inside_git_dir()` and `is_inside_work_tree()` are shared with the other commands that ask
 // setup the same questions — see [`crate::setup`].
-use crate::setup::{is_inside_git_dir, is_inside_work_tree};
+use crate::setup::{is_inside_git_dir, is_inside_work_tree, prefix};
 
 /// `builtin_rev_parse_usage` — the bare synopsis `show_usage_if_asked()`
 /// and `usage()` both print. rev-parse has no parse-options table of its own.

@@ -21,6 +21,21 @@ fn work_tree(repo: &gix::Repository) -> Option<PathBuf> {
     std::fs::canonicalize(repo.workdir()?).ok()
 }
 
+/// git's `startup_info->prefix`: the path from the top of the work tree down to
+/// the current directory, or `None` at the top itself, outside the work tree, or
+/// where there is no work tree at all. git leaves the field NULL in all of those
+/// cases, and `prefix_path()` treats NULL and `""` alike.
+///
+/// `setup_git_directory()` chdirs to the top of the work tree and hands the
+/// command this string, so anything a command prints relative to *its* cwd has
+/// to be spelled relative to the top level instead.
+pub fn prefix(repo: &gix::Repository) -> Option<PathBuf> {
+    let top = work_tree(repo)?;
+    let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok())?;
+    let rel = cwd.strip_prefix(&top).ok()?;
+    (!rel.as_os_str().is_empty()).then(|| rel.to_owned())
+}
+
 /// `is_inside_dir()`: whether the current directory is `dir` or below it.
 fn is_inside_dir(dir: &Path) -> bool {
     std::env::current_dir()

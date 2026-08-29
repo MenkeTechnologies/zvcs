@@ -35,17 +35,9 @@ fn exists_at_root(repo: &gix::Repository, path: &str) -> bool {
     }
 }
 
-/// git's `startup_info->prefix`: the path from the top of the work tree down to
-/// the current directory, slash-terminated, or `None` at the top (git leaves the
-/// field NULL there, and `prefix_path()` treats NULL and `""` alike).
+/// [`crate::setup::prefix`], slash-terminated the way `prefix_path()` wants it.
 fn prefix(repo: &gix::Repository) -> Option<String> {
-    let top = std::fs::canonicalize(repo.workdir()?).ok()?;
-    let cwd = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
-    let rel = cwd.strip_prefix(&top).ok()?;
-    if rel.as_os_str().is_empty() {
-        return None;
-    }
-    Some(format!("{}/", rel.to_str()?))
+    Some(format!("{}/", crate::setup::prefix(repo)?.to_str()?))
 }
 
 /// `normalize_path_copy()` (`path.c`): collapse `.` and `..` textually, without

@@ -977,6 +977,47 @@ pub(super) fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>) -> HashSe
     seen
 }
 
+/// Every object this repository's own store holds, loose or packed.
+///
+/// This is what `pack-objects --keep-unreachable` / `--pack-loose-unreachable` enumerate
+/// beyond the traversal: the objects that exist but nothing reaches. Alternates are not
+/// included — a repack rewrites this repository's store and must not absorb one it merely
+/// borrows from.
+pub(super) fn all_object_ids(repo: &gix::Repository, objdir: &Path) -> Vec<ObjectId> {
+    let mut out = Vec::new();
+    let name_len = repo.object_hash().len_in_hex() - 2;
+    for fanout in 0u16..256 {
+        let prefix = format!("{fanout:02x}");
+        let Some(names) = read_dir_raw(&objdir.join(&prefix)) else {
+            continue;
+        };
+        for name in names {
+            let name = name.to_string_lossy().into_owned();
+            if !is_object_name(&name, name_len) {
+                continue;
+            }
+            if let Ok(id) = ObjectId::from_hex(format!("{prefix}{name}").as_bytes()) {
+                out.push(id);
+            }
+        }
+    }
+    let pack_dir = objdir.join("pack");
+    if let Some(names) = read_dir_raw(&pack_dir) {
+        for name in names {
+            let name = name.to_string_lossy().into_owned();
+            if !name.ends_with(".idx") {
+                continue;
+            }
+            if let Ok(index) = pack::index::File::at(pack_dir.join(&name), repo.object_hash()) {
+                out.extend(index.iter().map(|e| e.oid));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Every readable pack index reachable from this repository — local packs and
 /// those of each alternate — which together define `has_object_pack()`, the test
 /// `prune-packed` uses. A pack whose `.pack` is missing or whose index cannot be

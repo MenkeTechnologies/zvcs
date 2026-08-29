@@ -425,6 +425,10 @@ struct State {
     /// single `multi-pack-index`. Tracked separately so it can be refused.
     write_midx_incremental: bool,
     geometric: bool,
+    /// `geometric_factor` itself: `--geometric=0` parses but is *falsy*, and
+    /// `if (geometric_factor)` (builtin/repack.c) is what gates the whole geometric path —
+    /// including the `--pack-loose-unreachable` it hands `pack-objects`.
+    geometric_factor: f64,
     filter: bool,
     filter_to: bool,
     /// The scaled value of the last `--name-hash-version`; 0 when unset or
@@ -648,6 +652,14 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
             .boolean("repack.updateServerInfo")
             .unwrap_or(true);
 
+    // The `pack-objects --all` child dies on a ref naming an object the repository does not
+    // have — `get_reference()`'s `die("bad object %s", name)` (revision.c) — and `repack`
+    // reports that failure and nothing else, since the child's `error:` line is the ref
+    // store's and `-q` is passed to the child, not to the ref walk.
+    if let Some(name) = super::prune::bad_object_ref(&repo) {
+        crate::git_fatal!("bad object {name}");
+    }
+
     // git's `--all --reflog --indexed-objects`, which `prune` already builds.
     let mut roots = Vec::new();
     super::prune::collect_roots(&repo, &mut roots)?;
@@ -684,8 +696,33 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
         .into_iter()
         .filter(|id| indexed.contains(id) || keeps_object(st, id, &repo))
         .collect();
+    // ```c
+    // if (keep_unreachable)
+    //         strvec_push(&cmd.args, "--keep-unreachable");
+    // [...]
+    // if (geometric_factor) {
+    //         [...]
+    //         if (!keep_unreachable)
+    //                 strvec_push(&cmd.args, "--pack-loose-unreachable");
+    // ```
+    //
+    // (`cmd_repack()`, builtin/repack.c.) Both flags tell `pack-objects` to carry the
+    // objects the traversal did *not* reach into the new pack instead of leaving them
+    // where they are — which matters because `-d` then runs `prune_packed_objects()`, and a
+    // loose object that made it into the pack is deleted while one that did not stays
+    // loose. `--cruft` is deliberately not here: it writes the unreachable objects to a
+    // cruft pack of its own.
+    if (st.keep_unreachable || st.geometric_factor != 0.0) && !st.cruft {
+        let packed: HashSet<ObjectId> = to_pack.iter().copied().collect();
+        for id in super::prune::all_object_ids(&repo, &objdir) {
+            if !packed.contains(&id) {
+                to_pack.push(id);
+            }
+        }
+    }
     // The pack's entry order is ours to choose; sorting makes a run reproducible.
     to_pack.sort();
+    to_pack.dedup();
 
     // `if (!names.nr)` (`builtin/repack.c:460-462`): git says so and carries on,
     // and it says so about the *first* `pack-objects` alone — the notice sits
@@ -1721,7 +1758,13 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
             st.write_midx = on;
             st.write_midx_incremental = on && value == Some("incremental");
         }
-        "geometric" => st.geometric = on,
+        "geometric" => {
+            st.geometric = on;
+            st.geometric_factor = match on {
+                true => value.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0),
+                false => 0.0,
+            };
+        }
         "filter" => {
             st.filter = on;
             st.filter_spec = if on { value.map(str::to_string) } else { None };

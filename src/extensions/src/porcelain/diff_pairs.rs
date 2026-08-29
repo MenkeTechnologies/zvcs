@@ -2780,7 +2780,7 @@ fn flush(
 }
 
 /// `prepare_order`: one glob per line, skipping empty lines and `#` comments.
-fn parse_orderfile(data: &[u8]) -> Vec<BString> {
+pub(super) fn parse_orderfile(data: &[u8]) -> Vec<BString> {
     data.split(|&b| b == b'\n')
         .filter(|line| !line.is_empty() && line[0] != b'#')
         .map(BString::from)
@@ -2789,7 +2789,7 @@ fn parse_orderfile(data: &[u8]) -> Vec<BString> {
 
 /// `match_order`: the index of the first glob matching `path` or any of its directory
 /// prefixes, or `patterns.len()` for a path no glob claims (which sorts last).
-fn match_order(patterns: &[BString], path: &BString) -> usize {
+pub(super) fn match_order(patterns: &[BString], path: &BString) -> usize {
     for (i, pat) in patterns.iter().enumerate() {
         let mut p: &[u8] = path.as_slice();
         while !p.is_empty() {

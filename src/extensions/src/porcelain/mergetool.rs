@@ -83,10 +83,9 @@ const USAGE: &str = "usage: git mergetool [--tool=tool] [--tool-help] [-y|--no-p
 ///
 /// Options parsed exactly as the script does: `-t <tool>` / `--tool=<tool>`,
 /// `-y` / `--no-prompt`, `--prompt`, `-g` / `--gui`, `--no-gui`, `-O<orderfile>`,
-/// `--`, and trailing pathspecs. The tool-selection, prompt and order options only
-/// steer the backend-invocation loop, which is unported, so they are accepted and
-/// have no effect on the paths that are — matching stock git, which also ignores
-/// them entirely when nothing needs merging.
+/// `--`, and trailing pathspecs. `-O<orderfile>` is the listing `diff`'s own
+/// `--orderfile`, so it reorders the paths (and an unreadable one empties the
+/// listing); the tool-selection and prompt options steer the per-path loop.
 ///
 /// Exit codes: 0 for `-h` and for `No files need merging`, 1 for a usage error.
 pub fn mergetool(args: &[String]) -> Result<ExitCode> {
@@ -111,6 +110,7 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     // pin it, and an unset value defers to `mergetool.guiDefault` in `gui_mode`.
     let mut gui: Option<bool> = None;
     let mut prompt_flag: Option<bool> = None;
+    let mut orderfile: Option<String> = None;
     let mut i = 0usize;
     while i < rest.len() {
         let a = rest[i].as_str();
@@ -142,8 +142,10 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
                 "--prompt" => prompt_flag = Some(true),
                 _ => {}
             }
-        } else if a.starts_with("-O") {
-            // Orders the unported backend-invocation loop; never observable here.
+        } else if let Some(file) = a.strip_prefix("-O") {
+            // `-O*) orderfile="${1#-O}" ;;` (git-mergetool.sh:492-493). A bare `-O`
+            // leaves it empty, and `${orderfile:+"-O$orderfile"}` then passes nothing.
+            orderfile = (!file.is_empty()).then(|| file.to_string());
         } else if a == "--" {
             i += 1;
             break;
@@ -208,6 +210,34 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
             .filter(|p| specs.iter().any(|s| pathspec_matches(s, p)))
             .collect()
     };
+
+    // ```sh
+    // files=$(git -c core.quotePath=false \
+    //         diff --name-only --diff-filter=U \
+    //         ${orderfile:+"-O$orderfile"} -- "$@")
+    // ```
+    //
+    // (git-mergetool.sh:551-553.) The listing is a `diff`, so `-O` is that diff's
+    // `--orderfile` and its `diffcore_order` pass reorders the paths. An orderfile git
+    // cannot read is fatal *to the child*; the command substitution keeps the death off
+    // this script's exit status and leaves `$files` empty, which is why stock prints the
+    // `fatal:` line and then `No files need merging` with status 0.
+    let mut files = files;
+    if let Some(path) = &orderfile {
+        match std::fs::read(path) {
+            Ok(data) => {
+                let patterns = super::diff_pairs::parse_orderfile(&data);
+                files.sort_by_key(|p| super::diff_pairs::match_order(&patterns, p));
+            }
+            Err(e) => {
+                eprintln!(
+                    "fatal: failed to read orderfile '{path}': {}",
+                    super::diff_pairs::io_reason(&e)
+                );
+                files.clear();
+            }
+        }
+    }
 
     if files.is_empty() {
         // `print_noop_and_exit`.
@@ -616,8 +646,15 @@ pub(crate) fn gui_default(config: &gix::config::File, key: &str) -> bool {
 /// `check_unchanged`: success when `MERGED` is newer than `BACKUP` (`test -nt`),
 /// otherwise the interactive `Was the merge successful` loop.
 fn check_unchanged(merged: &str, backup: &Path, out: &mut impl Write) -> Result<bool> {
-    let mtime = std::fs::metadata(merged).and_then(|m| m.modified()).ok();
-    let btime = std::fs::metadata(backup).and_then(|m| m.modified()).ok();
+    // `test A -nt B` compares `st_mtime` — whole seconds, not the sub-second part the
+    // filesystem also records. A tool that rewrites `$MERGED` within the same second as
+    // the `touch "$BACKUP"` before it is therefore *not* newer, and the script asks
+    // whether the merge succeeded even though the file did change. Comparing at the
+    // resolution the filesystem offers would answer "changed" where every shell answers
+    // "unchanged".
+    use std::os::unix::fs::MetadataExt;
+    let mtime = std::fs::metadata(merged).map(|m| m.mtime()).ok();
+    let btime = std::fs::metadata(backup).map(|m| m.mtime()).ok();
     // `test A -nt B`: true if A exists and (B is missing or A is strictly newer).
     let newer = match (mtime, btime) {
         (Some(_), None) => true,

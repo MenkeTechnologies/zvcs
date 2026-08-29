@@ -362,6 +362,9 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     let mut synthetic_seen: u8 = 0;
     let mut selected: Vec<Target> = Vec::new();
     let mut selected_paths: HashSet<BString> = HashSet::new();
+    // Which pathspec items have already matched a path letter for letter — git's
+    // `seen[i] == MATCHED_EXACTLY`.
+    let mut matched_verbatim: HashSet<usize> = HashSet::new();
 
     for t in &targets_all {
         let Some(m) = ps.pattern_matching_relative_path(t.path.as_bstr(), Some(false)) else {
@@ -394,15 +397,42 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         } else if synthetic_seen < rank {
             synthetic_seen = rank;
         }
-        if selected_paths.insert(t.path.clone()) {
-            selected.push(Target {
-                path: t.path.clone(),
-                id: t.id,
-                mode: t.mode,
-                stage: t.stage,
-                sparse: t.sparse,
-            });
+        // ```c
+        // for (unsigned int i = 0; i < the_repository->index->cache_nr; i++) {
+        //         const struct cache_entry *ce = the_repository->index->cache[i];
+        //         …
+        //         list.entry[list.nr].name = xstrdup(ce->name);
+        // ```
+        //
+        // (builtin/rm.c:315-326.) The list is built per *cache entry*, not per path, so an
+        // unmerged path with three stages is listed — and reported — three times.
+        //
+        // Except when a *literal* pathspec named it. `do_match_pathspec()` skips an item
+        // that has already matched exactly:
+        //
+        // ```c
+        // if ((!(ps->items[i].magic & PATHSPEC_EXCLUDE) && seen && seen[i] == MATCHED_EXACTLY))
+        //         continue;
+        // ```
+        //
+        // so `git rm conflict.txt` lists the path once while `git rm -r .` — which matches
+        // recursively, never exactly — lists it once per stage. gix's `MatchKind::Verbatim`
+        // is that `MATCHED_EXACTLY`. (git would then let a *different* item pick the entry
+        // up; selecting per item is not something the vendored matcher exposes, and no
+        // spec set that would distinguish the two is reachable from `rm`'s own arguments.)
+        if m.kind == gix::pathspec::search::MatchKind::Verbatim
+            && !matched_verbatim.insert(m.sequence_number)
+        {
+            continue;
         }
+        selected_paths.insert(t.path.clone());
+        selected.push(Target {
+            path: t.path.clone(),
+            id: t.id,
+            mode: t.mode,
+            stage: t.stage,
+            sparse: t.sparse,
+        });
     }
 
     // 7. Per-spec validation loop, in argument order, exactly like git: excludes
@@ -525,42 +555,55 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             }
         }
 
-        // Assemble the refusal exactly along git's categories (exit 1).
-        let mut blocks: Vec<String> = Vec::new();
+        // ```c
+        // print_error_files(&files_staged, …, _("\n(use -f to force removal)"), &errs);
+        // print_error_files(&files_cached, …,
+        //                   _("\n(use --cached to keep the file, or -f to force removal)"), &errs);
+        // print_error_files(&files_local,  …,
+        //                   _("\n(use --cached to keep the file, or -f to force removal)"), &errs);
+        // ```
+        //
+        // (builtin/rm.c:215-241.) Three separate `error()` calls, each carrying its own
+        // hint under `advice.rmHints` — not one block with a single trailing hint. The
+        // first category's hint is `-f` alone, because `--cached` is what put those files
+        // in it.
+        let advice = crate::advice::Advice::RmHints.enabled();
         let plural = |v: &[String]| if v.len() == 1 { ("file", "has") } else { ("files", "have") };
-        if !both.is_empty() {
-            let (f, h) = plural(&both);
-            blocks.push(format!(
-                "the following {f} {h} staged content different from both the file and the HEAD:\n    {}",
-                both.join("\n    ")
-            ));
-        }
-        if !opts.cached && !staged_only.is_empty() {
-            let (f, h) = plural(&staged_only);
-            blocks.push(format!(
-                "the following {f} {h} changes staged in the index:\n    {}",
-                staged_only.join("\n    ")
-            ));
-        }
-        if !opts.cached && !local_only.is_empty() {
-            let (f, h) = plural(&local_only);
-            blocks.push(format!(
-                "the following {f} {h} local modifications:\n    {}",
-                local_only.join("\n    ")
-            ));
-        }
-        if !blocks.is_empty() {
-            let joined = blocks.join("\nerror: ");
-            if crate::advice::Advice::RmHints.enabled() {
-                let hint = if opts.cached {
-                    "(use -f to force removal)"
-                } else {
-                    "(use --cached to keep the file, or -f to force removal)"
-                };
-                eprintln!("error: {joined}\n{hint}");
-            } else {
-                eprintln!("error: {joined}");
+        let mut errs = false;
+        let mut report = |files: &[String], main: String, hint: &str| {
+            if files.is_empty() {
+                return;
             }
+            errs = true;
+            let body = format!("{main}\n    {}", files.join("\n    "));
+            match advice {
+                true => eprintln!("error: {body}\n{hint}"),
+                false => eprintln!("error: {body}"),
+            }
+        };
+        {
+            let (f, h) = plural(&both);
+            report(
+                &both,
+                format!("the following {f} {h} staged content different from both the\nfile and the HEAD:"),
+                "(use -f to force removal)",
+            );
+        }
+        if !opts.cached {
+            let (f, h) = plural(&staged_only);
+            report(
+                &staged_only,
+                format!("the following {f} {h} changes staged in the index:"),
+                "(use --cached to keep the file, or -f to force removal)",
+            );
+            let (f, h) = plural(&local_only);
+            report(
+                &local_only,
+                format!("the following {f} {h} local modifications:"),
+                "(use --cached to keep the file, or -f to force removal)",
+            );
+        }
+        if errs {
             return Ok(ExitCode::from(1));
         }
     }
@@ -603,14 +646,11 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => crate::git_fatal!("failed to remove {}: {e}", t.path.to_str_lossy()),
             }
-            // Prune now-empty parent directories up to (never including) workdir.
-            let mut cur = abs.parent().map(|p| p.to_owned());
-            while let Some(dir) = cur {
-                if dir == workdir || std::fs::remove_dir(&dir).is_err() {
-                    break;
-                }
-                cur = dir.parent().map(|p| p.to_owned());
-            }
+            // `remove_path()` (dir.c:3520-3540) walks the parents up, `rmdir`ing each
+            // until one is not empty — and stopping at `startup_info->original_cwd`, so a
+            // `git rm -r .` run from inside a directory does not delete the directory the
+            // caller is standing in. That guard is [`crate::worktree::prune_empty_dirs`]'s.
+            crate::worktree::prune_empty_dirs(&workdir, &abs);
         }
     }
 

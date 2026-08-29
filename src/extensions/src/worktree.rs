@@ -125,9 +125,26 @@ where
 /// directory with it — `remove_scheduled_dirs()` walks back up as far as the emptiness
 /// goes — so a checkout that drops `nested/deep/path.txt` leaves no `nested/` behind.
 pub fn prune_empty_dirs(workdir: &std::path::Path, full: &std::path::Path) {
+    let original: Option<&std::path::Path> = original_cwd();
     let mut cur = full.parent();
     while let Some(dir) = cur {
         if dir == workdir || !dir.starts_with(workdir) {
+            break;
+        }
+        // ```c
+        // if ((startup_info->original_cwd &&
+        //      !strcmp(removal.buf, startup_info->original_cwd)) ||
+        //     rmdir(removal.buf))
+        //         break;
+        // ```
+        //
+        // (`do_remove_scheduled_dirs()`, symlinks.c:288-291, and the same guard in
+        // `remove_path()`, dir.c:3533-3535.) git never removes the directory the process
+        // was started in — pulling the ground out from under the caller's shell is worse
+        // than leaving one empty directory behind.
+        // The caller's path may be relative (`../src` from inside it), so both sides are
+        // resolved before they are compared.
+        if original.is_some() && original == gix::path::realpath(dir).ok().as_deref() {
             break;
         }
         if std::fs::remove_dir(dir).is_err() {
@@ -135,4 +152,19 @@ pub fn prune_empty_dirs(workdir: &std::path::Path, full: &std::path::Path) {
         }
         cur = dir.parent();
     }
+}
+
+/// `startup_info->original_cwd`: the directory this process was started in,
+/// captured before anything can `chdir` away from it.
+///
+/// git normalises it against the work tree and drops it when it *is* the work
+/// tree root (which is protected anyway); the comparison in
+/// [`prune_empty_dirs`] is against an absolute path, so only the realpath is
+/// needed here.
+pub fn original_cwd() -> Option<&'static std::path::Path> {
+    static ORIGINAL_CWD: std::sync::OnceLock<Option<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    ORIGINAL_CWD
+        .get_or_init(|| std::env::current_dir().ok().map(|dir| gix::path::realpath(&dir).unwrap_or(dir)))
+        .as_deref()
 }

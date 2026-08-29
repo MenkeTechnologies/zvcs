@@ -557,6 +557,11 @@ fn run_command(argv: &[String]) -> ExitCode {
     // validate.
     let _ = setup::git_env_bool("GIT_CONFIG_NOSYSTEM", false);
 
+    // `setup_original_cwd()` (setup.c:515) records the directory the process was started
+    // in so that nothing later removes it. It has to be captured before any command can
+    // `chdir` away, which is why it is taken here rather than where it is read.
+    let _ = worktree::original_cwd();
+
     // `init_git()` (common-init.c:53-83) runs before `cmd_main()` ever sees the
     // command line, and one of the things it runs is `trace2_initialize()`, whose
     // `tr2_sysenv_load()` calls `read_very_early_config()`. That reads the system,

@@ -297,6 +297,12 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // single `Shallow` value after parsing.
     let mut shallow_exclude: Vec<gix::refs::PartialName> = Vec::new();
     let mut shallow_since: Option<gix::date::Time> = None;
+    // git keeps `--depth`, `--deepen` and `--unshallow` in three separate variables and
+    // cross-checks them after parsing (builtin/fetch.c:2666-2684), so these track which
+    // of the three were given rather than only the boundary they collapse to.
+    let mut depth_given = false;
+    let mut deepen_relative: Option<i64> = None;
+    let mut unshallow = false;
 
     // `--stdin`: git appends the refspecs read from standard input to the ones
     // named on the command line, so the read is deferred until parsing is done.
@@ -389,7 +395,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 opts.prune_tags_from_cli = true;
             }
             "--no-force" => opts.force = false,
-            "--unshallow" => opts.shallow = Some(Shallow::undo()),
+            "--unshallow" => {
+                opts.shallow = Some(Shallow::undo());
+                unshallow = true;
+            }
 
             // Accept the new shallow roots a shallow remote asks us to adopt instead of
             // rejecting the refs that need them - git's `--update-shallow`.
@@ -489,6 +498,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 };
                 opts.shallow = Some(Shallow::DepthAtRemote(n));
+                depth_given = true;
             }
             "--deepen" => {
                 let v = take_value!("--deepen");
@@ -501,6 +511,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     }
                 };
                 opts.shallow = Some(Shallow::Deepen(n.max(0) as u32));
+                deepen_relative = Some(n as i64);
             }
             // Shallow boundary at a cutoff date (git's `deepen_since`). `fetch-pack.c:439` runs
             // the value through `approxidate()`, which never fails — an unreadable date is the
@@ -619,6 +630,44 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     } else {
         Vec::new()
     };
+
+    // ```c
+    // if (deepen_relative) {
+    //         if (deepen_relative < 0)
+    //                 die(_("negative depth in --deepen is not supported"));
+    //         if (depth)
+    //                 die(_("options '%s' and '%s' cannot be used together"), "--deepen", "--depth");
+    //         depth = xstrfmt("%d", deepen_relative);
+    // }
+    // if (unshallow) {
+    //         if (depth)
+    //                 die(_("options '%s' and '%s' cannot be used together"), "--depth", "--unshallow");
+    //         else if (!is_repository_shallow(the_repository))
+    //                 die(_("--unshallow on a complete repository does not make sense"));
+    //         else
+    //                 depth = xstrfmt("%d", INFINITE_DEPTH);
+    // }
+    // ```
+    //
+    // (builtin/fetch.c:2666-2680.) The three selectors are one variable by the time the
+    // transport sees them, which is why `--deepen` rules out a later `--depth` in either
+    // order, and why `--unshallow` is refused next to *either* of them.
+    if let Some(n) = deepen_relative {
+        if n < 0 {
+            crate::git_fatal!("negative depth in --deepen is not supported");
+        }
+        if depth_given {
+            crate::git_fatal!("options '--deepen' and '--depth' cannot be used together");
+        }
+    }
+    if unshallow {
+        if depth_given || deepen_relative.is_some() {
+            crate::git_fatal!("options '--depth' and '--unshallow' cannot be used together");
+        }
+        if !repo.is_shallow() {
+            crate::git_fatal!("--unshallow on a complete repository does not make sense");
+        }
+    }
 
     // Resolve the accumulated shallow-boundary selectors. `--shallow-exclude`
     // (repeatable) may be combined with `--shallow-since`, mirroring git's
@@ -919,6 +968,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             // which prints nothing. `-q` silences the announcement either way.
             let names = repo.remote_names();
             let announce = names.len() > 1 && !opts.quiet;
+            fetch_head.truncate_now()?;
             for name in names {
                 let n = name.as_bstr();
                 if announce {
@@ -945,10 +995,14 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-        } else if multiple {
+        } else if multiple && !positionals.is_empty() {
             // `--multiple` reads every positional as a remote *name* or group
             // (`add_remote_or_group()`), so a URL or path is refused before anything is
             // fetched — `git fetch --multiple .` never contacts `.` at all.
+            //
+            // `cmd_fetch` tests `argc == 0` *before* `multiple`, so a bare `git fetch
+            // --multiple` is not an empty fan-out but an ordinary fetch from the default
+            // remote — hence the `!positionals.is_empty()` guard on this arm.
             for name in &positionals {
                 let known = repo
                     .remote_names()
@@ -967,6 +1021,13 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             if fatal {
                 return Ok(());
             }
+            // `string_list_remove_duplicates(&list, 0)` (builtin/fetch.c:2742) drops all but
+            // the first of each run of equal entries — the list is unsorted, so only
+            // *adjacent* repeats collapse, which is what `git fetch --multiple origin origin`
+            // relies on to fetch once.
+            let mut positionals = positionals.clone();
+            positionals.dedup();
+            fetch_head.truncate_now()?;
             for name in &positionals {
                 if !opts.quiet {
                     println!("Fetching {name}");
@@ -1008,6 +1069,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 if read_stdin {
                     crate::git_fatal!("--stdin can only be used when fetching from one remote");
                 }
+                fetch_head.truncate_now()?;
                 return Ok(());
             }
             let mut refspecs: Vec<&str> = positional_specs.iter().map(String::as_str).collect();
@@ -1283,24 +1345,17 @@ impl Default for FetchOpts {
 }
 
 /// One line of the git-style per-ref summary.
-/// Move the row for the checked-out branch's own update to the front, which is
-/// where git's ref map puts it. A detached HEAD has no such row and nothing moves.
-fn hoist_current_branch(repo: &gix::Repository, lines: &mut [Line]) {
-    let Some(head) = repo.head_name().ok().flatten() else {
-        return;
-    };
-    let short = head.shorten().to_string();
-    if let Some(pos) = lines.iter().position(|l| l.from == short) {
-        lines[..=pos].rotate_right(1);
-    }
-}
-
 struct Line {
     flag: char,
     summary: String,
     from: String,
     to: String,
     reason: &'static str,
+    /// git's `enum fetch_head_status` as an ordering key: `FETCH_HEAD_MERGE` (0),
+    /// `FETCH_HEAD_NOT_FOR_MERGE` (1), `FETCH_HEAD_IGNORE` (2). `store_updated_refs()`
+    /// walks the ref map once per value in enum order and both writes `FETCH_HEAD` and
+    /// collects the summary rows inside that loop, so the key orders the summary too.
+    status: u8,
     /// Value the ref held before the fetch, for `--porcelain`'s second column.
     old: gix::ObjectId,
     /// Value it holds afterwards, for `--porcelain`'s third column.
@@ -1323,6 +1378,33 @@ struct FetchHead {
 }
 
 impl FetchHead {
+    /// git's `truncate_fetch_head()`, called from the two places that begin a
+    /// fetch:
+    ///
+    /// ```c
+    /// /* if not appending, truncate FETCH_HEAD */
+    /// if (!append && write_fetch_head) {
+    ///         retcode = truncate_fetch_head();
+    ///         if (retcode)
+    ///                 goto cleanup;
+    /// }
+    /// ```
+    ///
+    /// (`do_fetch()`, builtin/fetch.c:1912-1917, and the same guard at the head of
+    /// `fetch_multiple()`, builtin/fetch.c:2292-2296.) It runs *before* the refs are
+    /// advertised, so a fetch that then fails — an unreachable remote, a refspec
+    /// naming nothing — still leaves `FETCH_HEAD` behind as an empty file rather
+    /// than with the previous fetch's rows in it. Writing the rows lazily would
+    /// keep the stale content in exactly those cases.
+    fn truncate_now(&mut self) -> Result<()> {
+        if !self.enabled || !self.truncate {
+            return Ok(());
+        }
+        std::fs::File::create(&self.path)?;
+        self.truncate = false;
+        Ok(())
+    }
+
     /// Write one remote's rows, merge candidates first, exactly as git's two
     /// passes over `store_updated_refs` do.
     fn write(&mut self, rows: &[(String, bool)]) -> Result<()> {
@@ -1823,6 +1905,7 @@ fn fetch_one(
         let spec = spec.to_string();
         if repo.try_find_remote(spec.as_str()).is_none() {
             if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(&spec) {
+                fetch_head.truncate_now()?;
                 eprintln!("fatal: '{bad}' does not appear to be a git repository");
                 eprintln!(
                     "fatal: Could not read from remote repository.\n\n\
@@ -1873,6 +1956,10 @@ fn fetch_one(
             return Ok(Verdict::Fatal);
         }
     }
+
+    // `do_fetch()` starts here as far as `FETCH_HEAD` is concerned: everything above is
+    // `prepare_transport()`, which git runs in `fetch_one()` before it calls `do_fetch()`.
+    fetch_head.truncate_now()?;
 
     // The configured fetch refspecs, captured before command-line refspecs replace them: with explicit
     // refspecs they become git's *opportunistic* second stage, mapping the refs the command line selected onto
@@ -2271,6 +2358,19 @@ fn fetch_one(
     let mut update_lines: Vec<Line> = Vec::new();
     let mut fetch_head_rows: Vec<(String, bool)> = Vec::new();
     let mut rejected = false;
+    // ```c
+    // for (rm = *head; rm; rm = rm->next) {
+    //         if (branch_merge_matches(branch, i, rm->name)) {
+    //                 rm->fetch_head_status = FETCH_HEAD_MERGE;
+    //                 break;
+    //         }
+    // }
+    // ```
+    //
+    // (`add_merge_config()`, builtin/fetch.c:223-228.) The `break` is the whole point: the
+    // *first* ref-map entry naming `branch.<name>.merge` becomes the merge candidate, and a
+    // second refspec that maps the same remote ref somewhere else does not.
+    let mut merge_marked = false;
     // Set when a refspec would overwrite a ref some worktree has checked out and
     // `--update-head-ok` was not given: git turns that into a fatal for the whole
     // command rather than a per-ref rejection.
@@ -2299,6 +2399,29 @@ fn fetch_one(
                 gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)
             );
 
+        // git's `enum fetch_head_status` for this entry: the opportunistic second stage is
+        // `FETCH_HEAD_IGNORE` (builtin/fetch.c:596), everything a command-line refspec
+        // produced is `FETCH_HEAD_MERGE` ("Merge everything on the command line",
+        // builtin/fetch.c:513-515), and with no command-line refspec the single entry
+        // `add_merge_config()` picks out is the merge candidate. The rest are
+        // `FETCH_HEAD_NOT_FOR_MERGE`.
+        let status: u8 = if opportunistic {
+            2
+        } else if from_command_line {
+            0
+        } else if !explicit_refspecs
+            && !merge_marked
+            && upstream.is_some_and(|(r, m)| {
+                Some(r.as_str()) == remote_name.as_deref() && *m == remote_full
+            })
+        {
+            merge_marked = true;
+            0
+        } else {
+            1
+        };
+        let for_merge = status == 0;
+
         let from = mapping
             .remote
             .as_name()
@@ -2321,11 +2444,6 @@ fn fetch_one(
                     continue;
                 }
                 if let Some(id) = remote_id {
-                    let for_merge = from_command_line
-                        || (!explicit_refspecs
-                            && upstream.is_some_and(|(r, m)| {
-                                Some(r.as_str()) == remote_name.as_deref() && *m == remote_full
-                            }));
                     fetch_head_rows.push((
                         fetch_head_note(id, for_merge, &remote_full, &url),
                         for_merge,
@@ -2345,6 +2463,7 @@ fn fetch_one(
                         old: null,
                         new: id,
                         full: "FETCH_HEAD".to_string(),
+                        status,
                     });
                 }
                 continue;
@@ -2366,11 +2485,6 @@ fn fetch_one(
         // Every mapping with a local destination contributes a FETCH_HEAD row,
         // whether or not the tracking ref actually moved.
         if let (Some(id), false) = (remote_id, opportunistic) {
-            let for_merge = from_command_line
-                || (!explicit_refspecs
-                    && upstream.is_some_and(|(r, m)| {
-                        Some(r.as_str()) == remote_name.as_deref() && *m == remote_full
-                    }));
             fetch_head_rows.push((
                 fetch_head_note(id, for_merge, &remote_full, &url),
                 for_merge,
@@ -2484,6 +2598,7 @@ fn fetch_one(
             old: porcelain_old,
             new: porcelain_new,
             full: local_full.as_bstr().to_string(),
+            status,
         });
     }
 
@@ -2575,6 +2690,9 @@ fn fetch_one(
                 old: id,
                 new: null,
                 full: name.as_bstr().to_string(),
+                // Prune rows are not ref-map entries at all: `prune_refs()` reports them
+                // before the walk, and they are prepended to the summary below.
+                status: 0,
             });
         }
     }
@@ -2582,14 +2700,24 @@ fn fetch_one(
     fetch_head.write(if atomic_abort { &[] } else { &fetch_head_rows })?;
 
     // --- print the summary ------------------------------------------------
-    // `store_updated_refs()` walks the ref map, which git builds with the *current
-    // branch's* upstream first (`get_ref_map()` resolves it ahead of the rest), so
-    // that row heads the summary and the others follow in ref-map order. gitoxide's
-    // mappings come back in advertisement order alone, which puts the current
-    // branch wherever its name happens to sort — measured against stock: on `main`
-    // with branches `aaa`/`mmm`/`zzz`, git prints `main` first and this printed
-    // `aaa`.
-    hoist_current_branch(repo, &mut update_lines);
+    // ```c
+    // /*
+    //  * We do a pass for each fetch_head_status type in their enum order, so
+    //  * merged entries are written before not-for-merge. [...]
+    //  */
+    // for (want_status = FETCH_HEAD_MERGE;
+    //      want_status <= FETCH_HEAD_IGNORE;
+    //      want_status++) {
+    //         for (rm = ref_map; rm; rm = rm->next) {
+    // ```
+    //
+    // (`store_updated_refs()`, builtin/fetch.c:1241-1249.) The summary rows are appended
+    // inside that same double loop, so the order git prints is status-major and ref-map
+    // order within each status — the merge candidate first, then the ordinary updates in
+    // the order the remote advertised them, then the opportunistic tracking-ref updates.
+    // A stable sort on the key reproduces it, because the walk above already visits the
+    // mappings in ref-map order.
+    update_lines.sort_by_key(|l| l.status);
 
     // Pruned refs are reported first, mirroring git's prune-before-fetch order.
     let mut lines = prune_lines;

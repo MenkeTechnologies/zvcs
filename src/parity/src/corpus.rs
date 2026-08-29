@@ -15,11 +15,13 @@ use crate::runner::{Case, Sequence};
 
 mod add_rm_mv_clean;
 mod archive_export;
+mod attributes_filters;
 mod branch_remote;
 mod commit_family;
 mod config_cmd;
 mod config_reads;
 mod diff_family;
+mod exit_codes;
 mod fetch_clone;
 mod fixture_gaps;
 mod fixture_gaps2;
@@ -33,6 +35,7 @@ mod history_query;
 mod hooks_identity;
 mod index_plumbing;
 mod informational;
+mod init_family;
 mod history_rewrite;
 mod info_attrs;
 mod log_format;
@@ -41,6 +44,7 @@ mod mail_patch;
 mod maintenance;
 mod maintenance_repack;
 mod merge_dirty;
+mod merge_strategies;
 mod merge_family;
 mod misc_commands;
 mod no_index_diff;
@@ -464,10 +468,12 @@ pub fn cases() -> Vec<Case> {
     // ---- per-subsystem corpora, one module each ----
     add_rm_mv_clean::cases(&mut c);
     archive_export::cases(&mut c);
+    attributes_filters::cases(&mut c);
     branch_remote::cases(&mut c);
     commit_family::cases(&mut c);
     config_cmd::cases(&mut c);
     diff_family::cases(&mut c);
+    exit_codes::cases(&mut c);
     fetch_clone::cases(&mut c);
     fixture_gaps::cases(&mut c);
     fixture_gaps2::cases(&mut c);
@@ -477,6 +483,7 @@ pub fn cases() -> Vec<Case> {
     hooks_identity::cases(&mut c);
     index_plumbing::cases(&mut c);
     informational::cases(&mut c);
+    init_family::cases(&mut c);
     history_rewrite::cases(&mut c);
     info_attrs::cases(&mut c);
     log_format::cases(&mut c);
@@ -485,6 +492,7 @@ pub fn cases() -> Vec<Case> {
     maintenance::cases(&mut c);
     maintenance_repack::cases(&mut c);
     merge_dirty::cases(&mut c);
+    merge_strategies::cases(&mut c);
     merge_family::cases(&mut c);
     misc_commands::cases(&mut c);
     object_pack::cases(&mut c);

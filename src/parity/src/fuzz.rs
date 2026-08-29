@@ -266,6 +266,47 @@ const REV_SHAPES: &[Shape] = &[
 /// generated grammars whose shape lists this file does not own — so the walk
 /// [`STOPPERS`] gains for `gc` is how a generated case reaches one.
 ///
+/// The three below `Damaged` are the same judgement again, made by the three
+/// shapes whose *stores* are unusual in a way a history cannot express. Each was
+/// measured against stock 2.55.0 before it was placed, and each is here and
+/// nowhere else for the reason `Damaged` is: what it changes is what a store
+/// reader answers, and a walking verb drawn against it would spend a share of
+/// ten grammars' budgets on a history it already has.
+///
+///  * `AmbiguousRef` — one name, several refs, which is the half of git's
+///    resolver no complete-and-unambiguous repository can ask about. Every
+///    diagnostic is on stderr and a generated case does not compare stderr, so
+///    the placement is only worth anything where the *stdout* differs, and it
+///    does: measured on a replica built to this shape's recipe (a branch at
+///    `HEAD~1` and a tag at `HEAD` for one name, `refs/top`/`refs/heads/top`/
+///    `refs/tags/top` for another, `refs/heads/rem/ambi` beside
+///    `refs/remotes/rem/ambi`), `rev-parse ambi` prints the **tag's** commit and
+///    not the branch's, `rev-parse top` prints `refs/top`'s id and not the other
+///    two, `rev-parse rem/ambi` prints the branch's, `cat-file -t ambi-ann`
+///    prints `tag` where the branch would have made it `commit`, and
+///    `rev-parse --symbolic-full-name ambi` prints **nothing** and exits 128
+///    (`error: refname 'ambi' is ambiguous`) where every unambiguous name prints
+///    a refname at rc 0. A port that stops at the first matching rule, or that
+///    walks the table in a different order, differs on stdout at four names.
+///  * `PrefixCollision` — two objects at one four-character prefix, twice.
+///    Measured on a replica carrying the same two blob bodies this shape bakes
+///    in (`collide 105` and `collide 215`, whose ids were re-derived here as
+///    `a36664d0…` and `a3660f2d…`, confirming the recipe):
+///    `rev-parse --disambiguate=a366` prints **two ids on stdout** at rc 0 where
+///    it prints one or none anywhere else, `rev-parse --short=4` on a colliding
+///    object prints **five** characters (`a3666`) because four are no longer
+///    unique, and `rev-parse a366` is rc 128 with an empty stdout. The first two
+///    are stdout differences a generated case scores; the flag that produces
+///    them is already in `rev-parse`'s pool and had, until this shape was drawn,
+///    exactly one candidate to disambiguate between.
+///  * `SplitIndex` — the entries parked in `.git/sharedindex.<sha>`. Measured:
+///    `rev-parse --shared-index-path` prints `.git/sharedindex.<sha>` here and
+///    prints **nothing** (rc 0 either way) on a repository whose index is whole,
+///    which is the only answer that flag has ever had in this file. Every index
+///    reader drawn against it has to follow the link to answer at all, and
+///    `crate::runner`'s index probe reports a shared index that no fixture had
+///    ever produced.
+///
 /// Written out rather than derived because `&[Shape]` cannot be concatenated in
 /// a const; `store_shapes_extends_rev_shapes` fails `cargo test` if the two ever
 /// drift.
@@ -285,13 +326,22 @@ const STORE_SHAPES: &[Shape] = &[
     Shape::Promisor,
     Shape::Symlinks,
     Shape::Damaged,
+    Shape::AmbiguousRef,
+    Shape::PrefixCollision,
+    Shape::SplitIndex,
 ];
 
 /// The shapes [`STORE_SHAPES`] carries that [`REV_SHAPES`] does not, named once
 /// so `store_shapes_extends_rev_shapes` can assert the containment *and* the
 /// size without a hard-coded count that a future addition would silently make
 /// meaningless.
-const STORE_ONLY_SHAPES: &[Shape] = &[Shape::Symlinks, Shape::Damaged];
+const STORE_ONLY_SHAPES: &[Shape] = &[
+    Shape::Symlinks,
+    Shape::Damaged,
+    Shape::AmbiguousRef,
+    Shape::PrefixCollision,
+    Shape::SplitIndex,
+];
 /// The shapes a command with no particular topology requirement is drawn
 /// against. Not `Shape::ALL`: several shapes exist for one verb apiece (a
 /// submodule, a sparse checkout, a decomposed path) and drawing every command
@@ -377,6 +427,18 @@ const ALL_SHAPES: &[Shape] = &[
 ///    the same one `Conflicted` gives and is not why it is here; what every draw
 ///    against it also buys is free, because `runner`'s op-state probe reads
 ///    `MERGE_RR` and no other shape has one.
+///  * `SplitIndex` — the same entries, stored somewhere else. The other three
+///    change *what* the index holds; this one changes what has to be read to
+///    find out, and it is the only shape in this file where the answer to
+///    `ls-files --stage` is not in `.git/index` at all. Verified on a split
+///    index built the way this shape builds one (`read-tree HEAD` then
+///    `update-index --split-index`, then a second commit so the outer index is
+///    not empty): `ls-files --stage` prints the same three entries it prints on
+///    a whole index — which is the point, because a reader that stops at the
+///    `link` extension prints none of them and one that reads the shared file
+///    and forgets the outer one prints two. Neither failure is expressible on a
+///    shape whose entries are all in one file, and `rev-parse
+///    --shared-index-path` names the file this pool's readers have to follow.
 const INDEX_SHAPES: &[Shape] = &[
     Shape::Linear,
     Shape::Branched,
@@ -390,6 +452,42 @@ const INDEX_SHAPES: &[Shape] = &[
     Shape::IntentToAdd,
     Shape::PendingRename,
     Shape::Rerere,
+    Shape::SplitIndex,
+];
+
+/// The shapes `init` is drawn against.
+///
+/// Its own pool rather than [`ALL_SHAPES`], because what an `init` case measures
+/// is *what it is being run on top of*, and the axis that decides that is where
+/// the repository keeps its administrative files — not what its history looks
+/// like or what is dirty. Six shapes, one per arrangement this harness can build:
+///
+///  * `Linear` — the plain case, `.git` a directory at the root.
+///  * `Branched` — the same arrangement with more refs, so a reinit that
+///    rewrites `HEAD` or `refs/` has something to damage.
+///  * `Worktree` — a linked worktree, where `.git` is a **file** and
+///    `--separate-git-dir` is being asked to relocate something that is already
+///    a pointer. `shape_dirs` puts a case's cwd inside the linked worktree, so
+///    the reinit can happen from either end of the link.
+///  * `Submodule` — the second arrangement with a `.git` file, and the only one
+///    whose real git directory lives under `.git/modules/`.
+///  * `Sparse` — a reinit must leave `core.sparseCheckout` and
+///    `.git/info/sparse-checkout` alone; the `sparse-checkout list` observer and
+///    the local-config half of `probe_state` are what notice if it does not.
+///  * `SplitIndex` — the index is a link to `.git/sharedindex.<sha>`, and a
+///    reinit that rewrites or discards either file leaves a repository whose
+///    `ls-files` answers differently afterwards.
+///
+/// `Damaged` is left out for the reason its own comment gives, and the
+/// history-shaped shapes for the reason [`ALL_SHAPES`] gives: `init` does not
+/// walk anything, so a second topology is a second copy of the same case.
+const INIT_SHAPES: &[Shape] = &[
+    Shape::Linear,
+    Shape::Branched,
+    Shape::Worktree,
+    Shape::Submodule,
+    Shape::Sparse,
+    Shape::SplitIndex,
 ];
 
 /// [`ALL_SHAPES`] plus the one shape that has notes **before the case runs**.
@@ -503,6 +601,69 @@ const REVS: &[&str] = &[
     // Four more spellings of one refusal is four more draws that cannot
     // disagree; `core.abbrev` and `core.disambiguate` are reached from the
     // `abbrev-disambiguate` group against revs that do resolve.
+];
+
+/// [`REVS`] plus the names that only exist in an unusual **store**, for the
+/// three grammars drawn against [`STORE_SHAPES`].
+///
+/// Kept out of [`REVS`] itself on the same reasoning [`STORE_ONLY_SHAPES`] is
+/// kept out of [`REV_SHAPES`]. Ten grammars draw from `REVS`, and on nine of
+/// them every name below is `fatal: ambiguous argument` on both sides — a
+/// matched refusal that costs each existing entry a share of a pool it has to
+/// win draws out of. The three grammars here are the ones whose shape list
+/// *contains* the shapes these names live on, so the dilution is paid exactly
+/// where it buys something.
+///
+/// The abbreviations answer the paragraph [`REVS`] ends with directly. That
+/// paragraph refuses short oids because "a static pool cannot name one" — every
+/// fixture id is a function of the fixture — and [`Shape::PrefixCollision`] is
+/// the exception, because `fixture.rs` **asserts** both prefixes at build time
+/// (`--disambiguate=edfa` must list a commit and a blob, `--disambiguate=a366`
+/// two blobs) and fails the build rather than quietly resolving to something
+/// else. Measured on a replica carrying the same two blob bodies, whose ids
+/// re-derived to the values that shape bakes in:
+///
+///   `rev-parse a366`                rc 128, **empty stdout**
+///   `rev-parse --disambiguate=a366` two ids on stdout, rc 0
+///   `rev-parse --short=4 <blob>`    `a3666` — five characters, widened
+///   `cat-file -t a366`              rc 128
+///
+/// `edfa` is the other half of that shape and is a different question rather
+/// than the same one twice: it collides a *commit* with a blob, so it is the
+/// prefix `core.disambiguate=commit`/`=blob` can separate and `a366` cannot.
+/// It is also the one name here that resolves on **every** shape — the `initial`
+/// commit is the root of all of them — so it is an abbreviation that names a
+/// real object everywhere and is ambiguous in exactly one place.
+///
+/// The four ref names are [`Shape::AmbiguousRef`]'s, one per adjacent pair of
+/// rules in `refs.c:ref_rev_parse_rules`, plus `dual`. Measured on a replica
+/// built to that shape's recipe: `ambi` answers the **tag's** commit and not the
+/// branch's, `ambi-ann` answers a tag object (`cat-file -t` says `tag`), `top`
+/// answers `refs/top` and not `refs/tags/top` or `refs/heads/top`, `rem/ambi`
+/// answers the branch and not the remote-tracking ref, and `dual` — a branch and
+/// a tracked file of one name — resolves silently under `rev-parse` and
+/// `cat-file` and is `fatal: ambiguous argument 'dual': both revision and
+/// filename` (rc 128) under any verb that takes `<rev> [--] <path>`.
+const STORE_REVS: &[&str] = &[
+    "HEAD", "HEAD^", "HEAD^^", "HEAD^2", "HEAD~1", "HEAD~2", "HEAD~3",
+    "HEAD^0", "HEAD^{}", "HEAD^{tree}", "HEAD^{commit}", "HEAD^{tag}",
+    "main", "@", "@~1", "@{-1}", "HEAD@{0}", "HEAD@{1}", "HEAD@{now}",
+    "main..HEAD", "main...HEAD", "HEAD~2..HEAD", "^HEAD",
+    "HEAD:README.md", ":/fixture", ":0:src/lib.rs", "refs/heads/main",
+    "0000000000000000000000000000000000000000", "deadbeef",
+    "does-not-exist", "@{999}", "HEAD~999", "",
+    "HEAD^@", "HEAD^!", "HEAD^-", "HEAD^-1",
+    "..HEAD", "HEAD..", "...HEAD",
+    "@{u}", "@{push}", "main@{upstream}", "origin/main", "refs/remotes/origin/main",
+    "refs/tags/v0.1.0", "heads/main", "tags/v0.2.0",
+    "feature",
+    "v0.1.0^{tree}", "HEAD^{blob}",
+    "main^{/two}", ":/nomatchhere",
+    "refs/heads/dangling", "refs/heads/broken-symref",
+    ":README.md", ":1:README.md",
+    // The store-only names. Everything above this line is [`REVS`] verbatim;
+    // `store_revs_extends_revs` fails `cargo test` if the two ever drift.
+    "edfa", "a366", "edfab", "ambi", "ambi-ann", "top", "rem/ambi", "dual",
 ];
 
 /// Path arguments including magic pathspecs, which have their own parser in git
@@ -2635,10 +2796,19 @@ pub fn grammars() -> Vec<Grammar> {
                 "--path-format=relative", "--path-format=absolute",
                 "--sq", "--sq-quote", "--end-of-options", "--local-env-vars",
                 "--disambiguate=e69de29", "--disambiguate=dead", "--default=HEAD",
+                // The two prefixes [`Shape::PrefixCollision`] asserts at build time. Every
+                // other `--disambiguate=` value in this pool names a prefix no fixture
+                // object carries, so the flag could only ever print an empty list;
+                // these two print two ids each on stdout (measured on a replica:
+                // `--disambiguate=a366` -> `a3660f2dc25d8d30ea9d1ae52b12eed1d2cd3bd7`
+                // and `a36664d0c037c06c0ee81cfcfb3af000a19a60ed`, rc 0) and are the
+                // only draws in this file where the short-oid walk has more than one
+                // candidate to walk.
+                "--disambiguate=a366", "--disambiguate=edfa",
                 "--glob=refs/heads/*", "--exclude=refs/tags/*", "--remotes",
                 "--no-revs", "--revs-only", "--flags",
             ],
-            positionals: REVS,
+            positionals: STORE_REVS,
             shapes: STORE_SHAPES,
         },
         // `--porcelain=v2` is a different serializer from v1, not a variant of
@@ -2762,7 +2932,7 @@ pub fn grammars() -> Vec<Grammar> {
                 "--allow-unknown-type", "--textconv", "--filters", "--path=README.md",
                 "--use-mailmap", "--follow-symlinks",
             ],
-            positionals: REVS,
+            positionals: STORE_REVS,
             shapes: STORE_SHAPES,
         },
         // `ls-tree` takes `<tree> [<path>…]`, and the path half was missing: the
@@ -2789,6 +2959,14 @@ pub fn grammars() -> Vec<Grammar> {
                 // in this pool produces, because the name resolved and the
                 // *lookup* is what failed.
                 "refs/heads/dangling",
+                // Two of [`Shape::AmbiguousRef`]'s names, spelled short so the
+                // resolver's table decides which tree is listed. Verified on a
+                // replica built to that shape's recipe: `ls-tree ambi` warns
+                // `refname 'ambi' is ambiguous.` on stderr and lists the **tag's**
+                // tree on stdout at rc 0 — a different tree from the branch's, so
+                // a port that prefers `refs/heads/` prints the right number of
+                // entries with the wrong ids in them.
+                "ambi", "top",
             ],
             shapes: STORE_SHAPES,
         },
@@ -3305,6 +3483,175 @@ pub fn grammars() -> Vec<Grammar> {
             ],
             shapes: ALL_SHAPES,
         },
+        // `init` is the one verb here that *creates a repository*, and what the
+        // harness does with the one it creates decides what this grammar can be
+        // worth. Read before it was written, and worth recording:
+        //
+        //  * `runner::collect_worktree` stops at any directory that looks like a
+        //    git directory and emits one line — `newrepo -: <repository>` — for
+        //    it. So everything `init` writes *inside* a new repository (the
+        //    template hooks, `config`, `HEAD`, `description`) is invisible to the
+        //    state comparison. The probe records that a repository now exists at
+        //    a path, and nothing about what is in it.
+        //  * `runner::mask_paths` replaces the side's own fixture root in stdout
+        //    and in the state digest. That is what makes this grammar safe at
+        //    all: `init` prints an **absolute** path
+        //    (`Initialized empty Git repository in <REPO>/newrepo/.git/`), and
+        //    `--separate-git-dir=<rel>` writes an absolute `gitdir:` pointer into
+        //    the `.git` file it leaves behind. Both are masked to `<REPO>/…` and
+        //    compare equal across two roots — provided the operand stays inside
+        //    the fixture, which is why every positional here is relative and
+        //    none of them is `..`.
+        //
+        // Together those say what to draw. The flags whose whole effect is
+        // inside the new repository (`--template=`, `--object-format=`,
+        // `--ref-format=`) are measured on their **refusals** and on the one
+        // stdout line; the flags that act on the repository the case is already
+        // in are measured on state as well, and those are the interesting half:
+        //
+        //   `init` (no operand)              `Reinitialized existing Git
+        //                                    repository in <REPO>/.git/`, rc 0
+        //   `init --bare` in a worktree      writes a **bare repository into the
+        //                                    worktree root** — `status
+        //                                    --porcelain` afterwards is `?? HEAD`
+        //                                    / `?? config`, rc 0
+        //   `init --shared=group`            `Reinitialized existing shared …`
+        //                                    and `core.sharedrepository=1`,
+        //                                    `receive.denynonfastforwards=true`
+        //                                    added to the local config
+        //   `init --object-format=sha256`    `fatal: attempt to reinitialize
+        //                                    repository with different hash`
+        //   `init --ref-format=reftable`     `fatal: … different reference
+        //                                    storage format`
+        //   `init -b other`                  `warning: re-init: ignored
+        //                                    --initial-branch= other`, rc 0
+        //   `init README.md`                 `fatal: cannot mkdir README.md:
+        //                                    File exists`
+        //   `init --shared=bogus`            `fatal: bad boolean config value
+        //                                    'bogus' for 'arg'`
+        //   `init --ref-format=bogus`        `fatal: unknown ref storage format`
+        //   `init --object-format=bogus`     `fatal: unknown hash algorithm`
+        //
+        // All measured against stock 2.55.0. The generated grammar for this verb
+        // carries five flags — `-q`, `--quiet`, `--bare`, `--initial-branch=trunk`,
+        // `--object-format=sha1` — and three operands, so none of the ten rows
+        // above except the first two was reachable, and the crossings this pool
+        // exists for (a `--shared` value against `--bare`, a format against a
+        // reinit) were not expressible at all.
+        Grammar {
+            cmd: "init",
+            flags: &[
+                "-q", "--quiet", "--no-quiet", "--bare",
+                "-b", "--initial-branch=trunk", "--initial-branch=", "--initial-branch=bad name",
+                "--initial-branch=refs/heads/x",
+                "--template=src", "--template=does-not-exist", "--template=",
+                "--separate-git-dir=gen-gitdir", "--separate-git-dir=nested/gen-gitdir",
+                "--shared", "--shared=umask", "--shared=group", "--shared=all",
+                "--shared=world", "--shared=everybody", "--shared=0640", "--shared=0777",
+                "--shared=false", "--shared=1", "--shared=bogus",
+                "--object-format=sha1", "--object-format=sha256", "--object-format=bogus",
+                "--ref-format=files", "--ref-format=reftable", "--ref-format=bogus",
+                "--", "--bogus-flag",
+            ],
+            positionals: &[
+                "", "newrepo", "nested/dir", "src", "README.md", ".",
+            ],
+            shapes: INIT_SHAPES,
+        },
+        // The `-s`/`-X` cross, which is the one thing the generated `merge`
+        // grammar cannot produce even though it holds both halves: its flag pool
+        // is 84 entries wide, so a six-flag draw lands two strategy tokens
+        // together about one draw in fifty and lands the *pair that disagrees*
+        // far less often than that. This pool is strategies and strategy options
+        // and almost nothing else, so nearly every draw is the cross.
+        //
+        // It is worth crossing because the answer is not one answer. Measured
+        // against stock 2.55.0 over a real three-way conflict:
+        //
+        //   `-s resolve -Xours`   `error: unknown option `ours'` followed by
+        //                         `git read-tree`'s **usage text** — the script
+        //                         strategies pass `-X` straight through to
+        //                         `read-tree`, which has never heard of it
+        //   `-s octopus -Xours`   `Merge with strategy octopus failed.`
+        //   `-s ours -Xours`      `Merge made by the 'ours' strategy.` — accepted
+        //                         and ignored
+        //   `-s ort -Xbogus`      `fatal: unknown strategy option: -Xbogus`
+        //   `-s recursive -Xbogus` the same fatal, from the same table
+        //   `-s subtree -Xsubtree=src`  a real content conflict
+        //   `-s ort -Xours -Xtheirs`    both accepted, merge completes
+        //   `-s ours -s theirs`   `Could not find merge strategy 'theirs'.` and
+        //                         `Available strategies are: octopus ours
+        //                         recursive resolve subtree.`
+        //
+        // **The strategy name is a command.** `git merge -s <name>` execs
+        // `git-merge-<name>` from `PATH` when `<name>` is not built in — verified
+        // by planting an executable `git-merge-evil` on `PATH`, after which
+        // `merge -s evil` answered `Merge made by the 'evil' strategy.` and the
+        // script's side effect had happened. So the names below are a closed
+        // literal pool and are never drawn from [`REVS`], [`PATHS`] or any other
+        // general pool, and every one of them is spelled **glued** (`-sort`,
+        // not `--strategy=ort`) so that [`mutate_value`] — which rewrites the
+        // `=value` half of any flag from [`VALUES`] — cannot substitute one.
+        // `values_cannot_name_a_merge_strategy_helper` holds the other end of
+        // that: it fails `cargo test` if a future [`VALUES`] entry ever spells
+        // the suffix of a `git-merge-*` helper git ships (`file`, `index`,
+        // `one-file`, `tree`, `base`), which is the one way the generated
+        // grammar's `--strategy=` entries could reach an unintended exec.
+        //
+        // The four flags that are not strategy tokens are here because they
+        // decide whether the strategy is reached at all: `--no-ff` forces a real
+        // merge where the draw would have fast-forwarded, `--squash` and
+        // `--no-commit` stop before the commit, and
+        // `--allow-unrelated-histories` is what lets a draw on `Unrelated` get
+        // past the refusal into the strategy.
+        //
+        // **One side effect, stated rather than discovered.** [`grammar_for`]
+        // returns the *first* grammar with a given `cmd`, and the hand-written
+        // ones come first in [`all_grammars`] — so from here on the six `merge`
+        // entries in [`STOPPERS`] decorate their entry from this pool, and the
+        // `merge` member of [`MUTATORS`] draws its mutation step from it, where
+        // both used to read the 86-flag generated pool. Nothing is removed: the
+        // generated grammar still produces its own full share of single cases
+        // (measured, `--fuzz 20` goes from 20 `merge` ids to 40, twenty from each
+        // pool). What changes is which flags a *walk* hangs on a conflicted merge,
+        // and a premise decorated `-sresolve -Xours` is a better question than one
+        // decorated `--no-column`. Five verbs — `notes`, `reflog`,
+        // `sparse-checkout`, `symbolic-ref`, `worktree` — already shadow their
+        // generated grammar this way for the same families.
+        Grammar {
+            cmd: "merge",
+            flags: &[
+                "-sort", "-srecursive", "-sresolve", "-soctopus", "-sours", "-ssubtree",
+                "-sbogus", "-stheirs", "--no-strategy",
+                "-Xours", "-Xtheirs", "-Xno-renames", "-Xfind-renames=50",
+                "-Xrename-threshold=75", "-Xignore-space-change", "-Xignore-all-space",
+                "-Xignore-space-at-eol", "-Xignore-cr-at-eol", "-Xrenormalize",
+                "-Xno-renormalize", "-Xdiff-algorithm=histogram", "-Xdiff-algorithm=minimal",
+                "-Xdiff-algorithm=patience", "-Xdiff-algorithm=bogus", "-Xpatience",
+                "-Xhistogram", "-Xsubtree", "-Xsubtree=src", "-Xbogus",
+                "--no-strategy-option",
+                "--no-ff", "--squash", "--no-commit", "--allow-unrelated-histories",
+            ],
+            positionals: &[
+                "main", "feature", "side", "theirs", "HEAD", "HEAD^", "@{-1}",
+                "ff-cold", "ff-hot", "ff-squat", "div-cold", "div-hot", "div-squat",
+                "div-other", "oct-a", "oct-b", "oct-c", "oct-side",
+                "cc-left", "cc-right", "alien", "alien-clash", "does-not-exist", "",
+            ],
+            shapes: &[
+                Shape::Branched,
+                Shape::MergeableDirty,
+                Shape::MergeableStaged,
+                Shape::Octopus,
+                Shape::CrissCross,
+                Shape::Unrelated,
+                Shape::Renamed,
+                Shape::Whitespace,
+                Shape::Attributes,
+                Shape::Merged,
+                Shape::Linear,
+            ],
+        },
     ]
 }
 
@@ -3598,6 +3945,85 @@ fn split_tokens(args: Vec<String>) -> Vec<String> {
     args.iter().flat_map(|a| a.split(TOKEN_SEP).map(str::to_string)).collect()
 }
 
+/// Option pairs a verb refuses, per verb.
+///
+/// # Why this is a table beside [`Grammar`] and not a field on it
+///
+/// The obvious shape is `Grammar { …, conflicts: &[(&str, &str)] }`, and it does
+/// not compile. `grammars_generated.rs` builds 130 `Grammar` literals with four
+/// fields each and none of them uses struct-update syntax, so a fifth field is a
+/// build break in a file this wave does not own — a `Default` impl does not help,
+/// because a literal that names four of five fields is an error whatever the
+/// fifth one's default is.
+///
+/// The side table is the better shape anyway, and not only as a workaround. The
+/// pairs worth drawing live overwhelmingly in the *generated* pools — `commit`'s
+/// `-mparity`/`-FREADME.md`, `checkout`'s `-bparity-new`/`--orphan=…`, `add`'s
+/// `--all`/`--update` are all entries this file cannot edit — so a field would
+/// have described the hand-written grammars and left the generated ones, which
+/// is where the flags actually are, without any. Keyed on `cmd`, one entry
+/// reaches every grammar that verb has, hand-written and generated alike.
+///
+/// `requires:` — "this flag is only legal after that one" — is **not** here, and
+/// the reason is that the sampler has nowhere to put the answer. A requirement is
+/// a statement about argv *order* and about which operand a flag consumes, and
+/// [`sample_argv`]'s interleaving branch deliberately shuffles flags and operands
+/// together; a `requires` that the interleaver could reorder into illegality
+/// would be a rule the generator states and then breaks. Conflicts have no such
+/// problem — verified in both orders, `worktree add --orphan --detach` and
+/// `worktree add --detach --orphan` are the identical refusal — which is why the
+/// half that survives the existing sampler is the half that is here.
+///
+/// # Membership rule
+///
+/// Every token below appears in the flag pool of some grammar for its verb;
+/// `conflicting_pairs_are_drawable` fails `cargo test` otherwise. That is what
+/// keeps the table from rotting into a list of flags no grammar has, and it is
+/// also the honest statement of what the table adds: not new flags, but the
+/// *combination* the flat draw reaches about once in fifty.
+///
+/// Each pair was run against stock 2.55.0 and is recorded with what it answered.
+/// A pair that does not actually refuse is not here — `commit --reset-author
+/// --author=Someone` was written and removed, because `Someone` is not
+/// `Name <email>` and the author parser refuses it before the conflict check is
+/// ever reached, so the case would have measured a value parser under a name
+/// claiming it measured a pair.
+const CONFLICTS: &[(&str, &[(&str, &str)])] = &[
+    // `fatal: options '-m' and '-F' cannot be used together`
+    ("commit", &[("-mparity", "-FREADME.md")]),
+    // `fatal: options '-b', '-B', and '--orphan' cannot be used together`
+    ("checkout", &[("-bparity-new", "--orphan=parity-orphan")]),
+    // `fatal: options '-A' and '-u' cannot be used together` — note that git
+    // names the short spellings in a message the long ones produced.
+    ("add", &[("--all", "--update")]),
+    // `fatal: options '--orphan' and '--detach' cannot be used together`,
+    // identical in both orders.
+    ("worktree", &[("--orphan", "--detach")]),
+    // `fatal: options '--column' and '-n' cannot be used together`
+    ("tag", &[("--column", "-n1")]),
+    // Two of them, from different checks: `fatal: options '--reverse' and
+    // '--walk-reflogs' cannot be used together` and `fatal: options '--graph'
+    // and '--reverse' cannot be used together`.
+    ("log", &[("--reverse", "--walk-reflogs"), ("--graph", "--reverse")]),
+    // `fatal: options '--squash' and '--no-ff.' cannot be used together` — the
+    // stray period is git's own, and a port that renders the message correctly
+    // renders that too.
+    ("merge", &[("--squash", "--no-ff"), ("-sours", "-stheirs")]),
+    // Not a `cannot be used together` at all: `--no-index` swaps in a different
+    // option parser, so the other flag comes back as `error: unknown option
+    // `cached'` with `usage: git diff --no-index …` under it, rc 129. A distinct
+    // failure mode from the rest of this table and the reason `diff` is in it.
+    ("diff", &[("--cached", "--no-index")]),
+    // `fatal: options '--separate-git-dir' and '--bare' cannot be used together`,
+    // in both orders and with or without an operand after them.
+    ("init", &[("--bare", "--separate-git-dir=gen-gitdir")]),
+];
+
+/// The conflicting pairs for one verb, or an empty slice.
+fn conflicts_for(cmd: &str) -> &'static [(&'static str, &'static str)] {
+    CONFLICTS.iter().find(|(c, _)| *c == cmd).map_or(&[][..], |(_, pairs)| *pairs)
+}
+
 fn sample_argv(rng: &mut Rng, g: &Grammar, max_flags: usize, max_pos: usize) -> Vec<String> {
     // Up to `max_flags` flags, WITH repetition allowed. Repeats are not
     // dilution: a re-declared flag is exactly what surfaces last-wins and
@@ -3608,6 +4034,31 @@ fn sample_argv(rng: &mut Rng, g: &Grammar, max_flags: usize, max_pos: usize) -> 
             let flag = *rng.pick(g.flags);
             flag_tokens.push(mutate_value(rng, flag));
         }
+    }
+
+    // A pair the verb refuses, placed deliberately rather than waited for.
+    //
+    // All three rolls are taken unconditionally — before the membership test and
+    // whatever `pairs` holds — so a verb with no table entry consumes exactly as
+    // much of the stream as one with a dozen. A draw whose stream position
+    // depended on the command would make an id irreproducible from its seed,
+    // which is the same rule [`sample_scope`] states for configuration keys.
+    let take_pair = rng.chance(1, 5);
+    let pairs = conflicts_for(g.cmd);
+    let which = rng.below(pairs.len().max(1));
+    let swap = rng.chance(1, 2);
+    if take_pair && !pairs.is_empty() {
+        let (a, b) = pairs[which];
+        let (a, b) = if swap { (b, a) } else { (a, b) };
+        // Not passed through [`mutate_value`]: rewriting the `=value` half of
+        // `--orphan=parity-orphan` or `--separate-git-dir=gen-gitdir` would still
+        // be a conflicting pair, but a `VALUES` draw of `""` turns
+        // `--separate-git-dir=` into an operand error that happens *before* the
+        // pair is looked at, and the case would then measure the value parser
+        // instead of the pair. The ordinary flag draws above are where value
+        // mutation belongs.
+        flag_tokens.push(a.to_string());
+        flag_tokens.push(b.to_string());
     }
 
     // Up to `max_pos` positionals, repetition allowed (`git log HEAD HEAD` is
@@ -4312,6 +4763,55 @@ const STOPPERS: &[Stopper] = &[
         setup: &[],
         entry: &[&["am"], &["am"]],
         entry_stdin: Some(crate::corpus::MBOX),
+    },
+    // The two `am` stops a **hook** causes, which is the only route this file has
+    // to [`Shape::AmHooks`] and the reason that shape exists.
+    //
+    // `applypatch-msg`, `pre-applypatch` and `post-applypatch` are installed by
+    // no other shape, so every `am` case in this harness has run with the three
+    // of them absent — which makes `--no-verify` and its siblings flags that
+    // parse and do nothing. The shape also carries `pre-commit` and `commit-msg`
+    // present and **not executable**, a branch git takes deliberately and that
+    // `install_hooks` (which chmods 0755) cannot produce.
+    //
+    // Both premises were measured on a replica built to this shape's recipe —
+    // the same three hooks, the same three mailboxes produced by `format-patch
+    // --no-signature` — against stock 2.55.0:
+    //
+    //   `am mail/reject.mbox`   rc 1, **empty stdout**; `.git/rebase-apply` holds
+    //                           19 entries (`0001`, `applying`, `author-script`,
+    //                           `final-commit`, `next`, `patch`, …);
+    //                           `hook-applypatch-msg.txt` is untracked in the
+    //                           worktree and no commit was made. The hook refuses
+    //                           on the *message*, so `am` stops before the patch
+    //                           reaches the index at all.
+    //   `am mail/preveto.mbox`  `Applying: am-hooks: trips pre-applypatch` on
+    //                           stdout, rc 1; the index holds
+    //                           `A  veto-preapply.txt` and `HEAD` has not moved;
+    //                           both `hook-applypatch-msg.txt` and
+    //                           `hook-pre-applypatch.txt` are present.
+    //
+    // Those are two different parked states, not one twice. The first stops with
+    // a clean index and the second with a staged change and no commit — a
+    // combination no other premise in this table reaches — so a resumption verb
+    // drawn after them is answering two different questions. `am --skip` on the
+    // second answered rc 0 and left the worktree files behind, which is what the
+    // walk's second reading of the parked record is for.
+    Stopper {
+        cmd: "am",
+        name: "am-hook-refuses-message",
+        shape: Shape::AmHooks,
+        setup: &[],
+        entry: &[&["am", "mail/reject.mbox"]],
+        entry_stdin: None,
+    },
+    Stopper {
+        cmd: "am",
+        name: "am-hook-refuses-preapply",
+        shape: Shape::AmHooks,
+        setup: &[],
+        entry: &[&["am", "mail/preveto.mbox"]],
+        entry_stdin: None,
     },
     // A conflicting `stash pop`: unmerged index, `AUTO_MERGE` written, and the
     // entry *kept*. `stash` has no resumption verbs of its own, which is the
@@ -5419,6 +5919,64 @@ const ROUND_TRIPS: &[RoundTrip] = &[
         ],
         forward_stdin: None,
     },
+    // A submodule **registered** and unregistered, on the one shape that has a
+    // submodule inside a submodule.
+    //
+    // `submodule init` is the half of the family that touches no network and
+    // spawns no clone: it copies the `url` out of the tracked `.gitmodules` into
+    // `.git/config` and marks the module active, and `deinit` takes both back
+    // out. Verified against stock 2.55.0 on a replica built to this shape's
+    // recipe (both upstreams bare and inside the fixture, both registrations
+    // written by hand rather than by `submodule add`):
+    //
+    //   before          `submodule status --recursive` is
+    //                   `-54b5878… mid` — the leading `-` is "not initialised"
+    //                   — and `config --get submodule.mid.url` is rc 1, silent
+    //   `submodule init`  rc 0, `Submodule 'mid' (<REPO>/.mid.git) registered
+    //                   for path 'mid'`; `config --list --local` gains
+    //                   `submodule.mid.active=true` and
+    //                   `submodule.mid.url=<REPO>/.mid.git`
+    //   `submodule deinit -f mid`  rc 0, `Cleared directory 'mid'` and
+    //                   `Submodule 'mid' (./.mid.git) unregistered for path
+    //                   'mid'`; both keys gone, `submodule status --recursive`
+    //                   back to `-54b5878… mid`
+    //
+    // The url is where this pair pays. `.gitmodules` records the **relative**
+    // `./.mid.git` and `init` writes the **resolved absolute** path into
+    // `.git/config`, which `runner::mask_paths` renders `<REPO>/.mid.git` on both
+    // sides — so a port that stores the relative string verbatim, or that
+    // resolves it against the wrong directory, differs at the step that wrote it
+    // rather than at some later clone. The two `reads` are the value-then-refusal
+    // pair [`RoundTrip::reads`] describes: an id and a url between the halves, rc
+    // 1 and silence after.
+    //
+    // **`submodule update --init --recursive` is deliberately not the forward
+    // half**, even though the recursion is what this shape was built for, and the
+    // reason is cost rather than reachability. It does need a premise this
+    // family does not draw: `protocol.file.allow` defaults to `user` and
+    // `crate::env::harden` does not set it, so an undecorated submodule clone is
+    // `fatal: transport 'file' not allowed` — verified, and verified again under
+    // `-c protocol.file.allow=always`, where the same command clones both levels
+    // and `submodule status --recursive` prints two initialised lines. That
+    // premise is expressible ([`crate::runner::Sequence::with_config`] puts a
+    // `-c` in front of every step, which is exactly how the curated
+    // `submodule_family` cases reach it). It is simply expensive: measured at
+    // 2505 ms for the recursive update and 3027 ms for the `deinit` after it, per
+    // side, against 538 ms and 672 ms for the pair below — eleven seconds a draw,
+    // for a clone the curated corpus already runs on this shape. The pair below
+    // is the half of the family that has *no* curated cover and costs nothing.
+    RoundTrip {
+        cmd: "submodule",
+        name: "submodule-init-deinit",
+        shape: Shape::NestedSubmodule,
+        forward: &[&["submodule", "init"]],
+        inverse: &[&["submodule", "deinit", "-f", "mid"]],
+        reads: &[
+            &["submodule", "status", "--recursive"],
+            &["config", "--get", "submodule.mid.url"],
+        ],
+        forward_stdin: None,
+    },
     RoundTrip {
         cmd: "bisect",
         name: "bisect-log-replay",
@@ -5845,6 +6403,127 @@ mod tests {
         // `STORE_SHAPES` alone fails here unless it is also declared to be one
         // of the store-only ones.
         assert_eq!(STORE_SHAPES.len(), REV_SHAPES.len() + STORE_ONLY_SHAPES.len());
+    }
+
+    /// [`STORE_REVS`] is [`REVS`] plus store-only names, in that order.
+    ///
+    /// Written out rather than concatenated for the reason [`STORE_SHAPES`] is —
+    /// `&[&str]` cannot be joined in a const — so the containment has to be
+    /// asserted or it will silently drift the first time a rev is added to one
+    /// pool and not the other. The prefix check is the strong half: a name
+    /// *removed* from the middle of `REVS` would still pass a subset test and
+    /// fails this one.
+    #[test]
+    fn store_revs_extends_revs() {
+        assert!(
+            STORE_REVS.len() > REVS.len(),
+            "STORE_REVS adds nothing to REVS and should not exist"
+        );
+        assert_eq!(&STORE_REVS[..REVS.len()], REVS, "STORE_REVS no longer starts with REVS");
+        for extra in &STORE_REVS[REVS.len()..] {
+            assert!(!REVS.contains(extra), "{extra} is in both pools");
+        }
+    }
+
+    /// Every shape `fixture.rs` can build is drawn by something in this file or
+    /// in the generated grammars.
+    ///
+    /// The guard that was missing. Membership in a pool makes a shape
+    /// *spellable*; it does not make it *reached*, and five shapes —
+    /// `ambiguous-ref`, `prefix-collision`, `am-hooks`, `nested-submodule` and
+    /// `split-index` — were built by every fixture and drawn by no grammar, no
+    /// stopper and no round trip from the day they landed. A fixture nothing
+    /// draws is a shape that is built, hashed and thrown away.
+    ///
+    /// Checked against `Shape::ALL` rather than against a count, so a shape added
+    /// to `fixture.rs` tomorrow fails here until something in this file decides
+    /// where it changes an answer. The failure message names the shapes, which is
+    /// the whole point: the reader needs to know *which*, not how many.
+    #[test]
+    fn every_fixture_shape_is_drawn_by_something() {
+        let grammars = all_grammars();
+        let mut drawn: Vec<Shape> = Vec::new();
+        for g in &grammars {
+            for s in g.shapes {
+                if !drawn.contains(s) {
+                    drawn.push(*s);
+                }
+            }
+        }
+        for s in STOPPERS.iter().map(|s| s.shape).chain(ROUND_TRIPS.iter().map(|rt| rt.shape)) {
+            if !drawn.contains(&s) {
+                drawn.push(s);
+            }
+        }
+        let missing: Vec<&str> =
+            Shape::ALL.iter().filter(|s| !drawn.contains(s)).map(|s| s.name()).collect();
+        assert!(
+            missing.is_empty(),
+            "{} shape(s) fixture.rs builds are drawn by nothing: {}",
+            missing.len(),
+            missing.join(" ")
+        );
+    }
+
+    /// Every token in [`CONFLICTS`] is a flag some grammar for that verb draws.
+    ///
+    /// Without this the table is a second, invisible flag pool: a pair naming
+    /// `--orphan` would keep producing cases after the grammar that carried
+    /// `--orphan` was regenerated without it, and the id would say the case
+    /// tested a conflict when it tested an unknown option. The pairs also have to
+    /// be pairs — two distinct tokens — and the verb has to exist.
+    #[test]
+    fn conflicting_pairs_are_drawable() {
+        let grammars = all_grammars();
+        for (cmd, pairs) in CONFLICTS {
+            let pools: Vec<&&[&str]> =
+                grammars.iter().filter(|g| g.cmd == *cmd).map(|g| &g.flags).collect();
+            assert!(!pools.is_empty(), "CONFLICTS names {cmd}, which has no grammar");
+            assert!(!pairs.is_empty(), "{cmd} has an empty conflict list");
+            for (a, b) in *pairs {
+                assert_ne!(a, b, "{cmd} conflicts a flag with itself");
+                for tok in [a, b] {
+                    assert!(
+                        pools.iter().any(|f| f.contains(tok)),
+                        "{cmd}'s conflict token {tok} is in no grammar's flag pool"
+                    );
+                }
+            }
+        }
+    }
+
+    /// No [`VALUES`] entry spells the suffix of a merge-strategy helper.
+    ///
+    /// `git merge -s <name>` **execs** `git-merge-<name>` from `PATH` when the
+    /// name is not built in — verified against stock 2.55.0 by planting an
+    /// executable `git-merge-evil` on `PATH`, after which `merge -s evil`
+    /// answered `Merge made by the 'evil' strategy.` and the script's side effect
+    /// had happened. Nothing in this file draws a strategy name from a general
+    /// pool, and the hand-written `merge` grammar spells every strategy glued
+    /// (`-sort`) so [`mutate_value`] cannot touch it — but the *generated* merge
+    /// grammar carries `--strategy=ort` and friends, and `mutate_value` rewrites
+    /// the `=value` half of any such flag from [`VALUES`].
+    ///
+    /// So the safety of that rewrite is a property of [`VALUES`], not of the
+    /// grammar, and it holds today only because none of its 21 entries happens to
+    /// name a helper git ships. The list below is what `git --exec-path` holds on
+    /// stock 2.55.0 (`git-merge-base`, `-file`, `-index`, `-octopus`,
+    /// `-one-file`, `-ours`, `-recursive`, `-resolve`, `-subtree`, `-tree`) with
+    /// its `git-merge-` prefix removed; a future edge value of `"tree"` or
+    /// `"index"` would turn a value-mutation case into an unintended `exec` and
+    /// fails here instead.
+    #[test]
+    fn values_cannot_name_a_merge_strategy_helper() {
+        const HELPERS: &[&str] = &[
+            "base", "file", "index", "octopus", "one-file", "ours", "recursive", "resolve",
+            "subtree", "tree",
+        ];
+        for v in VALUES {
+            assert!(
+                !HELPERS.contains(v),
+                "VALUES entry {v:?} names git-merge-{v}, which `merge --strategy={v}` would exec"
+            );
+        }
     }
 
     /// Every config key has values, and no value is an absolute path — config
@@ -6364,7 +7043,12 @@ mod tests {
             assert_eq!(asked[0], entry_end, "{name} does not read the record right after the entry");
             assert!(asked[1] > asked[0], "{name} reads the record twice in the same place");
         }
-        assert_eq!(reached, 16, "the set of stoppers with a parked record changed");
+        // 16 before the two [`Shape::AmHooks`] entries; `am`'s parked record is
+        // `.git/rebase-apply`, so both of them are read on both sides like every
+        // other `am` walk. The literal is a canary, not the assertion — the
+        // per-stopper checks above run over all of them either way — and it moves
+        // only when a stopper whose verb has a parked record is added or removed.
+        assert_eq!(reached, 18, "the set of stoppers with a parked record changed");
     }
 
     /// A pair's named read is asked on **both** sides of the inverse.

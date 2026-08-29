@@ -1201,6 +1201,8 @@ fn reset_index_to_tree(
         }
     }
 
+    carry_skip_worktree(old, &mut new_index);
+
     let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> =
         HashMap::with_capacity(old.entries().len());
     {
@@ -1259,6 +1261,37 @@ fn reset_index_to_tree(
     Ok(new_index)
 }
 
+/// Carry `CE_SKIP_WORKTREE` from the index being replaced onto the one built from
+/// the target tree.
+///
+/// `unpack_trees()`'s sparse-checkout loops run over `o->internal.result`, which is
+/// seeded from `src_index`, so a path the sparse checkout had left out of the work
+/// tree stays out of it across a reset. Without the carry the next `status` reports
+/// every file outside the cone as deleted, and a `--hard` writes them all back.
+///
+/// `CE_EXTENDED` rides along because it is what makes `ce_write_entry()` choose
+/// index version 3, without which the bit has nowhere to go on disk.
+fn carry_skip_worktree(old: &gix::index::File, new_index: &mut gix::index::File) {
+    let skipped: HashSet<BString> = {
+        let backing = old.path_backing();
+        old.entries()
+            .iter()
+            .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
+    if skipped.is_empty() {
+        return;
+    }
+    let backing = new_index.path_backing().to_owned();
+    for e in new_index.entries_mut() {
+        if skipped.contains(&e.path_in(&backing).to_owned()) {
+            e.flags |=
+                gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED;
+        }
+    }
+}
+
 /// `--hard`: overwrite the worktree and index from `tree`, discarding local changes
 /// to tracked files and deleting files the reset removes. Untracked files are left
 /// untouched, matching `git reset --hard`.
@@ -1277,6 +1310,10 @@ fn reset_worktree_hard(
     // the tree version (thus discarding worktree modifications) and back-fills fresh
     // stats onto the entries, yielding a clean index after the write.
     let mut new_index = repo.index_from_tree(&tree)?;
+    // Carried before the checkout, not after: the worktree writer skips a
+    // `SKIP_WORKTREE` entry, which is what keeps a `--hard` from materialising the
+    // paths the sparse checkout deliberately left out.
+    carry_skip_worktree(old, &mut new_index);
 
     let mut opts =
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
@@ -1310,7 +1347,10 @@ fn reset_worktree_hard(
             let path = e.path_in(backing);
             if !new_paths.contains(&path.to_owned()) {
                 if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(full);
+                    let _ = std::fs::remove_file(&full);
+                    // `unlink_entry()`'s `schedule_dir_for_removal()`: the directory
+                    // whose last file just went goes with it.
+                    crate::worktree::prune_empty_dirs(&workdir, &full);
                 }
             }
         }
@@ -1499,6 +1539,10 @@ fn reset_two_tree(
         new_index.dangerously_push_entry(Stat::default(), *oid, Flags::empty(), *mode, BStr::new(p));
     }
     new_index.sort_entries();
+    // The entries just pushed lost whatever the old index said about them; a path the
+    // sparse checkout had left out of the work tree has to keep saying so. The
+    // `checkout_subset` below then skips it, as `unpack_trees()` does.
+    carry_skip_worktree(old, &mut new_index);
 
     // `--merge` and `--keep` are both `unpack_trees()` in git, and it opens with
     // `resolve_undo_clear_index()` (unpack-trees.c) — a two-tree reset discards
@@ -1563,7 +1607,9 @@ fn reset_two_tree(
 
     for p in &deletes {
         if let Some(full) = repo.workdir_path(BStr::new(p)) {
-            let _ = std::fs::remove_file(full);
+            let _ = std::fs::remove_file(&full);
+            // `unlink_entry()`'s `schedule_dir_for_removal()`.
+            crate::worktree::prune_empty_dirs(&workdir, &full);
         }
     }
 

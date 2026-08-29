@@ -333,7 +333,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 }
             };
             if !matches!(val.as_str(), "merge" | "diff3" | "zdiff3") {
-                eprintln!("error: unknown style '{val}' given for '--conflict'");
+                eprintln!("error: unknown conflict style '{val}'");
                 return Ok(ExitCode::from(129));
             }
             conflict_style = Some(val);
@@ -1544,7 +1544,13 @@ fn create_and_switch(
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: format!("branch: Created from {start}").into(),
+                // `create_branch()` (branch.c:615-631): the validation that finds the branch
+                // already there sets `forcing`, and a forced creation logs `Reset to`.
+                message: match existed {
+                    true => format!("branch: Reset to {start}"),
+                    false => format!("branch: Created from {start}"),
+                }
+                .into(),
             },
             expected: if existed {
                 PreviousValue::Any
@@ -2196,19 +2202,28 @@ fn restore_from_index(
     // stage-0 entry to refresh and its worktree file is a conflicted merge, so
     // it is left out.
     let fresh = stats_by_path(&subset);
+    // The pathspec form never runs `unpack_trees()`: `checkout_paths()` rewrites the entries it
+    // takes from the source tree through `add_index_entry()`, and each of those invalidates the
+    // path in the cache-tree. `update_some()` (builtin/checkout.c:219-229) leaves an entry alone
+    // when its mode and id already match, so an unchanged path invalidates nothing — which is why
+    // this compares before it writes rather than invalidating everything the pathspec matched.
+    let mut stale: Vec<BString> = Vec::new();
     for path in matched.iter().filter(|p| !unmerged.contains_key(p.as_bstr())) {
         if let Ok(idx) = index.entry_index_by_path(BStr::new(path)) {
             if let Some((id, mode, stat)) = fresh.get(path) {
                 let e = &mut index.entries_mut()[idx];
+                if e.id != *id || e.mode != *mode {
+                    stale.push(path.clone());
+                }
                 e.id = *id;
                 e.mode = *mode;
                 e.stat = *stat;
             }
         }
     }
-    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
-    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
-    super::write_tree::rebuild_cache_tree(repo, &mut index);
+    for path in &stale {
+        index.invalidate_path_in_tree(path.as_bstr());
+    }
     index.write(crate::config::index_write_options(repo))?;
 
     if bare && !quiet {
@@ -2328,6 +2343,10 @@ fn restore_from_tree(
     let fresh = stats_by_path(&subset);
     let mut index = repo.open_index()?;
     let mut pushed = false;
+    // `update_some()` (builtin/checkout.c:219-229) replaces an entry only when its mode or id
+    // differs, and `add_index_entry()` invalidates the cache-tree along that path; an entry the
+    // tree already agrees with is left in place and invalidates nothing.
+    let mut stale: Vec<BString> = Vec::new();
     for path in &matched {
         let Some((id, mode, stat)) = fresh.get(path) else {
             continue;
@@ -2335,6 +2354,9 @@ fn restore_from_tree(
         match index.entry_index_by_path(BStr::new(path)) {
             Ok(idx) => {
                 let e = &mut index.entries_mut()[idx];
+                if e.id != *id || e.mode != *mode {
+                    stale.push(path.clone());
+                }
                 e.id = *id;
                 e.mode = *mode;
                 e.stat = *stat;
@@ -2347,6 +2369,7 @@ fn restore_from_tree(
                     *mode,
                     BStr::new(path),
                 );
+                stale.push(path.clone());
                 pushed = true;
             }
         }
@@ -2360,15 +2383,19 @@ fn restore_from_tree(
             }
         }
         let rmset: HashSet<BString> = to_remove.into_iter().collect();
+        stale.extend(rmset.iter().cloned());
         index.remove_entries(|_, path, _| rmset.contains(&path.to_owned()));
     }
 
     if pushed {
         index.sort_entries();
     }
-    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
-    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
-    super::write_tree::rebuild_cache_tree(repo, &mut index);
+    // The pathspec form leaves the cache-tree invalidated along each path it rewrote — it never
+    // reaches the `cache_tree_update()` that ends `unpack_trees()`, because it never runs one.
+    // `remove_marked_cache_entries()` (read-cache.c:610) invalidates the removals the same way.
+    for path in &stale {
+        index.invalidate_path_in_tree(path.as_bstr());
+    }
     index.write(crate::config::index_write_options(repo))?;
 
     if bare && !quiet {

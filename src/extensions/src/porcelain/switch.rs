@@ -175,6 +175,9 @@ struct Parsed<'a> {
     quiet: bool,
     /// `None` default, `Some(true)` for `--track`, `Some(false)` for `--no-track`.
     track: Option<bool>,
+    /// `--track=inherit`: `BRANCH_TRACK_INHERIT`, which copies the start-point branch's own
+    /// upstream rather than making the start-point itself the upstream (branch.c:217).
+    track_inherit: bool,
     /// `None` = unset on the CLI (fall back to `checkout.guess`, default on);
     /// `Some(true)` for `--guess`, `Some(false)` for `--no-guess`.
     guess: Option<bool>,
@@ -201,6 +204,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         conflict_style: None,
         quiet: false,
         track: None,
+        track_inherit: false,
         guess: None,
         positionals: Vec::new(),
     };
@@ -306,6 +310,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                             .map(Parse::Failed);
                         }
                     }
+                    p.track_inherit = attached == Some("inherit");
                     p.track = Some(true);
                 }
                 "no-track" => p.track = Some(false),
@@ -512,6 +517,30 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         None
     };
 
+    // `cmd_switch` checks its own arguments and then hands over to `checkout_branch()`, whose
+    // first act is `die_if_some_operation_in_progress()` — `switch` clears
+    // `can_switch_when_in_progress`, so an unfinished merge, am, rebase, cherry-pick or revert
+    // stops every form of it here, before the worktree is looked at (builtin/checkout.c:1721).
+    // A bisect only earns a warning.
+    let plain_form = p.orphan.is_none()
+        && p.create.is_none()
+        && p.force_create.is_none()
+        && create_from_track.is_none()
+        && !p.detach;
+    if plain_form && p.positionals.is_empty() {
+        return fatal("missing branch or commit argument");
+    }
+    match super::status::switch_blocked_by_operation(&repo) {
+        Some(super::status::SwitchBlocker::Die(message)) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+        Some(super::status::SwitchBlocker::WarnBisecting) => {
+            eprintln!("warning: you are switching branch while bisecting");
+        }
+        None => {}
+    }
+
     if let Some(name) = p.orphan {
         if p.track.is_some() {
             return fatal("'--orphan' cannot be used with '-t'");
@@ -526,7 +555,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
     }
     if let Some(name) = p.force_create {
         return switch_create(&repo, name, true, &p.positionals, p.quiet, discard, p.track,
-            merge_style);
+            p.track_inherit, merge_style);
     }
     if let Some(name) = p.create.map(str::to_string).or(create_from_track) {
         return switch_create(
@@ -537,6 +566,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
             p.quiet,
             discard,
             p.track,
+            p.track_inherit,
             merge_style,
         );
     }
@@ -603,7 +633,19 @@ fn switch_existing(
             .as_ref()
             .map(|n| n.as_bstr())
     {
-        if !force {
+        // `merge_working_tree()` runs here too, and with `--discard-changes`/`-f` that is
+        // `reset_tree()` — the worktree and index are rewritten from the target tree even when
+        // the branch does not move, which is how `git switch -f <current>` throws local changes
+        // away. The listing is skipped on that path (builtin/checkout.c:930).
+        if force {
+            let target = repo
+                .try_find_reference(full.as_str())?
+                .expect("just matched HEAD's own branch")
+                .into_fully_peeled_id()?
+                .detach();
+            let target_tree = repo.find_object(target)?.peel_to_commit()?.tree_id()?.detach();
+            super::checkout::reset_worktree_to_tree(repo, target_tree)?;
+        } else {
             super::checkout::show_local_changes(branch, quiet)?;
         }
         if let Ok(name) = FullName::try_from(full.as_str()) {
@@ -628,7 +670,7 @@ fn switch_existing(
                 Dwim::One(remote_short) => {
                     let sp = [remote_short.as_str()];
                     return switch_create(
-                        repo, branch, false, &sp, quiet, force, None, merge_style,
+                        repo, branch, false, &sp, quiet, force, None, false, merge_style,
                     );
                 }
                 Dwim::Many { count } => {
@@ -650,6 +692,8 @@ fn switch_existing(
         .detach();
 
     let from_desc = describe_head(repo)?;
+    // The commit a detached `HEAD` is about to leave, read before the ref moves.
+    let leaving_detached = detached_head_id(repo);
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -674,6 +718,13 @@ fn switch_existing(
 
     attach_head(repo, &full_name, &from_desc, branch)?;
     if !quiet {
+        // `orphaned_commit_warning()` (builtin/checkout.c:1150): leaving a detached `HEAD` for a
+        // branch reports the position being abandoned, exactly as leaving it for another commit
+        // does. `checkout` already did this; `switch` said nothing.
+        if let Some(id) = leaving_detached.filter(|id| *id != target) {
+            let (abbrev, summary) = describe(repo, id)?;
+            eprintln!("Previous HEAD position was {abbrev} {summary}");
+        }
         eprintln!("Switched to branch '{branch}'");
         // `report_tracking()`, which `cmd_switch` reaches through the same
         // `update_refs_for_switch()` `checkout` does.
@@ -695,6 +746,8 @@ fn switch_create(
     quiet: bool,
     force: bool,
     track: Option<bool>,
+    // `--track=inherit`: take the start-point branch's upstream, not the start-point itself.
+    track_inherit: bool,
     merge_style: Option<&str>,
 ) -> Result<ExitCode> {
     if positionals.len() > 1 {
@@ -759,7 +812,7 @@ fn switch_create(
     let from_desc = describe_head(repo)?;
 
     // Determine the upstream ref this branch should track, if any.
-    let upstream = tracking_upstream(repo, start, track, branch);
+    let upstream = tracking_upstream(repo, start, track, track_inherit, branch);
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -824,8 +877,14 @@ fn switch_create(
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
                 // `create_branch()` logs the start-point as the caller spelled it, and
-                // `HEAD` when none was given — not the branch `HEAD` happens to be on.
-                message: format!("branch: Created from {}", start.unwrap_or("HEAD")).into(),
+                // `HEAD` when none was given — not the branch `HEAD` happens to be on. A `-C`
+                // over a branch that is already there is `forcing` (branch.c:615-631), which
+                // logs `Reset to` instead of `Created from`.
+                message: match existed {
+                    true => format!("branch: Reset to {}", start.unwrap_or("HEAD")),
+                    false => format!("branch: Created from {}", start.unwrap_or("HEAD")),
+                }
+                .into(),
             },
             expected: if existed {
                 PreviousValue::Any
@@ -837,10 +896,6 @@ fn switch_create(
         name: full_name.clone(),
         deref: false,
     })?;
-
-    if let Some(up) = &upstream {
-        install_tracking(repo, branch, up)?;
-    }
 
     if let Some((cur_tree, target_tree)) = trees {
         let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name: branch });
@@ -856,6 +911,14 @@ fn switch_create(
             Err(code) => return Ok(code),
             Ok(stashed) => autostashed = stashed,
         }
+    }
+
+    // `install_branch_config()` runs inside `update_refs_for_switch()`, *after*
+    // `merge_working_tree()` has printed its listing (builtin/checkout.c:1215-1272). Announcing
+    // the upstream before the worktree moved put `branch '<b>' set up to track '<u>'.` above the
+    // `M <path>` lines on the same stream.
+    if let Some(up) = &upstream {
+        install_tracking(repo, branch, up)?;
     }
 
     attach_head(repo, &full_name, &from_desc, branch)?;
@@ -1121,6 +1184,7 @@ fn tracking_upstream(
     repo: &gix::Repository,
     start: Option<&str>,
     track: Option<bool>,
+    track_inherit: bool,
     new_branch: &str,
 ) -> Option<(String, String, String)> {
     if track == Some(false) {
@@ -1166,16 +1230,10 @@ fn tracking_upstream(
 
     if let Some(branch) = s.strip_prefix("refs/heads/") {
         // Local branch start-point.
-        if explicit || mode == Some("always") {
-            // Track the local branch itself (the "." remote).
-            return Some((
-                ".".to_string(),
-                format!("refs/heads/{branch}"),
-                branch.to_string(),
-            ));
-        }
-        if mode == Some("inherit") {
-            // Copy the start branch's own upstream, if it has one.
+        if track_inherit || mode == Some("inherit") {
+            // `inherit_tracking()` (branch.c:217): the new branch takes the start branch's own
+            // `remote`/`merge` pair, so a branch started from a local branch that tracks
+            // `origin/main` tracks `origin/main` too — not the local branch itself.
             let remote = snap.string(&format!("branch.{branch}.remote"))?.to_str_lossy().into_owned();
             let merge = snap.string(&format!("branch.{branch}.merge"))?.to_str_lossy().into_owned();
             let short = match merge.strip_prefix("refs/heads/") {
@@ -1184,6 +1242,14 @@ fn tracking_upstream(
                 None => merge.clone(),
             };
             return Some((remote, merge, short));
+        }
+        if explicit || mode == Some("always") {
+            // Track the local branch itself (the "." remote).
+            return Some((
+                ".".to_string(),
+                format!("refs/heads/{branch}"),
+                branch.to_string(),
+            ));
         }
     }
     None
@@ -1448,7 +1514,13 @@ fn attach_head(
         .find_reference(branch_ref.as_ref())
         .ok()
         .and_then(|mut r| r.peel_to_id_in_place().ok().map(|id| id.detach()));
-    super::checkout::append_head_log(repo, from, to, &message);
+    // `parse_and_write_reflog()` (refs/files-backend.c:3101-3115) resolves the new symref target
+    // and *returns without logging* when it does not resolve: "currently we skip creating
+    // reflogs for dangling symref updates". `switch --orphan` is exactly that, and logging it
+    // left a `<old> <null>` line in `logs/HEAD` that stock never writes.
+    if let Some(to) = to {
+        super::checkout::append_head_log(repo, from, Some(to), &message);
+    }
     Ok(())
 }
 
@@ -1490,9 +1562,20 @@ fn describe_head(repo: &gix::Repository) -> Result<String> {
     }
     let mut head = repo.head()?;
     match head.try_peel_to_id()? {
-        Some(id) => Ok(id.shorten_or_id().to_string()),
+        // `update_refs_for_switch()` (builtin/checkout.c:993-995): with no branch name to use,
+        // `old_desc` is `oid_to_hex()` — the full id, not an abbreviation. The reflog line has to
+        // carry it in full, since that is what the entry is read back as.
+        Some(id) => Ok(id.detach().to_hex().to_string()),
         None => Ok("HEAD".to_string()),
     }
+}
+
+/// The commit a detached `HEAD` names, or `None` when `HEAD` is on a branch.
+fn detached_head_id(repo: &gix::Repository) -> Option<ObjectId> {
+    if repo.head_name().ok().flatten().is_some() {
+        return None;
+    }
+    repo.head().ok()?.try_peel_to_id().ok().flatten().map(|id| id.detach())
 }
 
 /// Abbreviated hash + commit summary for `HEAD is now at …` / `Previous HEAD …`.

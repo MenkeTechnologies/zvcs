@@ -3070,6 +3070,46 @@ struct ProgressState {
     bisecting_from: Option<String>,
 }
 
+/// What `die_if_some_operation_in_progress()` (builtin/checkout.c:1602) found: the message
+/// `git switch` dies with, or the bisect it only warns about.
+pub(super) enum SwitchBlocker {
+    Die(String),
+    WarnBisecting,
+}
+
+/// `die_if_some_operation_in_progress()`, in git's order. `git switch` refuses to move `HEAD`
+/// while an operation is unfinished — `git checkout` does not, which is the whole of
+/// `opts->can_switch_when_in_progress` (builtin/checkout.c:2116, :2166).
+pub(super) fn switch_blocked_by_operation(repo: &gix::Repository) -> Option<SwitchBlocker> {
+    let merging = repo.git_dir().join("MERGE_HEAD").exists();
+    let state = ProgressState::detect(repo, merging);
+    let die = |what: &str, quit: &str| {
+        Some(SwitchBlocker::Die(format!(
+            "cannot switch branch {what}\nConsider \"git {quit} --quit\" or \"git worktree add\"."
+        )))
+    };
+    if state.merge {
+        return die("while merging", "merge");
+    }
+    if state.am {
+        return Some(SwitchBlocker::Die(
+            "cannot switch branch in the middle of an am session\n\
+             Consider \"git am --quit\" or \"git worktree add\"."
+                .to_string(),
+        ));
+    }
+    if state.rebase_interactive || state.rebase {
+        return die("while rebasing", "rebase");
+    }
+    if state.cherry_pick.is_some() {
+        return die("while cherry-picking", "cherry-pick");
+    }
+    if state.revert.is_some() {
+        return die("while reverting", "revert");
+    }
+    state.bisect.then_some(SwitchBlocker::WarnBisecting)
+}
+
 impl ProgressState {
     fn detect(repo: &gix::Repository, merging: bool) -> Self {
         let git_dir = repo.git_dir();

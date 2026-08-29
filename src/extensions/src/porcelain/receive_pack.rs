@@ -88,7 +88,11 @@
 //!     `receive.denyDeletes`, `receive.denyNonFastForwards`** are checked per
 //!     command in `update()`'s order, each producing git's own band-2 message
 //!     and `ng` reason, including the two advice blocks the unconfigured
-//!     defaults print.
+//!     defaults print. `denyCurrentBranch=updateInstead` runs `update_worktree()`
+//!     after the last check: the `push-to-checkout` hook when there is one,
+//!     otherwise `push_to_deploy()`'s four children, whose refusals
+//!     (`Working directory has unstaged changes` and the rest) become the `ng`
+//!     reason.
 //!   * **`receive.updateServerInfo`** refreshes `info/refs` and
 //!     `objects/info/packs` after the refs move.
 //!   * **`receive.autogc`** hands the repository to
@@ -145,10 +149,7 @@
 //!      migrates it only once `pre-receive` has passed; this port writes
 //!      straight into the object store, so a declined push leaves its objects
 //!      behind for the next `gc` rather than discarding them at once.
-//!   3. **`receive.denyCurrentBranch=updateInstead`** would have to check the
-//!      remote work tree out at the pushed tip (git's `push-to-checkout` hook
-//!      path); the command is rejected instead of pretending to have done it.
-//!   4. **Shallow pushes.** The `shallow <oid>` lines a shallow client sends are
+//!   3. **Shallow pushes.** The `shallow <oid>` lines a shallow client sends are
 //!      consumed and dropped, and the shallow-update switch that governs them is
 //!      deliberately left unread rather than named here: grafting
 //!      the pushed history onto the receiving repository's shallow boundary is
@@ -836,6 +837,7 @@ impl Config {
         zero: gix::ObjectId,
         head: Option<&str>,
         band: &mut Band,
+        update_worktree: &mut bool,
     ) -> Option<String> {
         let name = cmd.name.as_str();
         let deleting = cmd.new == zero;
@@ -853,14 +855,11 @@ impl Config {
                     }
                     return Some("branch is currently checked out".into());
                 }
-                DenyAction::UpdateInstead => {
-                    // Would have to check the work tree out at the new tip.
-                    band.error(
-                        "receive.denyCurrentBranch=updateInstead is not supported \
-                         (the work tree would have to be updated to the pushed tip)",
-                    );
-                    return Some("branch is currently checked out".into());
-                }
+                // `case DENY_UPDATE_INSTEAD: /* pass -- let other checks intervene
+                // first */ do_update_worktree = 1;` (receive-pack.c:1537-1539). The
+                // work tree is brought to the pushed tip only once every later check
+                // — including the `update` hook — has passed.
+                DenyAction::UpdateInstead => *update_worktree = true,
             }
         }
 
@@ -1342,7 +1341,8 @@ fn check_command(
         band.error(&format!("refusing to update funny ref '{}' remotely", cmd.name));
         return Err("funny refname".into());
     }
-    if let Some(reason) = config.refuse(repo, cmd, zero, head, band) {
+    let mut update_worktree = false;
+    if let Some(reason) = config.refuse(repo, cmd, zero, head, band, &mut update_worktree) {
         return Err(reason);
     }
     // The `update` hook is the last of `update()`'s checks, and a non-zero exit
@@ -1350,6 +1350,14 @@ fn check_command(
     if run_update_hook(repo, cmd, band) {
         band.error(&format!("hook declined to update {}", cmd.name));
         return Err("hook declined".into());
+    }
+    // `if (do_update_worktree) { ret = update_worktree(new_oid->hash, worktree); … }`
+    // (receive-pack.c:1617-1621), after the hook and before the ref is queued: a work
+    // tree that cannot be moved is a rejection, not a half-done update.
+    if update_worktree {
+        if let Some(reason) = update_worktree_to(repo, cmd.new) {
+            return Err(reason);
+        }
     }
     // `update()`: a delete of a ref this repository does not have is allowed and
     // reported `ok`, but it is worth saying so — the pusher asked to remove
@@ -2411,6 +2419,124 @@ fn run_receive_hook(
         return false;
     }
     spawn_hook(repo, name, &[], Some(&payload), env, band).unwrap_or(false)
+}
+
+/// `update_worktree()` (receive-pack.c:1472): bring the pushed-to work tree to
+/// `new`, which is what `receive.denyCurrentBranch=updateInstead` asks for.
+///
+/// ```c
+/// if (worktree->is_bare)
+///         return "denyCurrentBranch = updateInstead needs a worktree";
+/// …
+/// retval = push_to_checkout(sha1, &invoked_hook, &env, worktree->path);
+/// if (!invoked_hook)
+///         retval = push_to_deploy(sha1, &env, worktree);
+/// ```
+///
+/// `Some(reason)` is the `ng <ref> <reason>` the client reports; nothing goes to
+/// band 2, which is why the pusher sees only the summary line.
+fn update_worktree_to(repo: &gix::Repository, new: gix::ObjectId) -> Option<String> {
+    let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
+        return Some("denyCurrentBranch = updateInstead needs a worktree".into());
+    };
+
+    // `push_to_checkout()`: the hook takes over the whole job when it exists, and a
+    // non-zero exit is the refusal. `invoked_hook` is false when there is no hook.
+    let hook = repo.common_dir().join("hooks").join("push-to-checkout");
+    if is_executable(&hook) {
+        let ok = std::process::Command::new(&hook)
+            .arg(new.to_hex().to_string())
+            .current_dir(&workdir)
+            .env("GIT_DIR", repo.common_dir())
+            .env("GIT_WORK_TREE", &workdir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        return (!ok).then(|| "push-to-checkout hook declined".to_string());
+    }
+    push_to_deploy(repo, &workdir, new)
+}
+
+/// `push_to_deploy()` (receive-pack.c:1388): four `git` children in the work tree,
+/// each with its own refusal.
+///
+/// ```c
+/// "update-index", "-q", "--ignore-submodules", "--refresh"   -> "Up-to-date check failed"
+/// "diff-files", "--quiet", "--ignore-submodules", "--"       -> "Working directory has unstaged changes"
+/// "diff-index", "--quiet", "--cached", "--ignore-submodules", -> "Working directory has staged changes"
+///         <HEAD or the empty tree>, "--"
+/// "read-tree", "-u", "-m", <new>                             -> "Could not update working tree to new HEAD"
+/// ```
+///
+/// The `diff-index` argument is `HEAD` unless the work tree's HEAD is unborn, in
+/// which case git compares against the empty tree instead.
+fn push_to_deploy(
+    repo: &gix::Repository,
+    workdir: &std::path::Path,
+    new: gix::ObjectId,
+) -> Option<String> {
+    let head = match repo.head_id() {
+        Ok(_) => "HEAD".to_string(),
+        Err(_) => gix::ObjectId::empty_tree(repo.object_hash()).to_string(),
+    };
+    let new = new.to_hex().to_string();
+    let steps: [(&[&str], &str); 4] = [
+        (
+            &["update-index", "-q", "--ignore-submodules", "--refresh"],
+            "Up-to-date check failed",
+        ),
+        (
+            &["diff-files", "--quiet", "--ignore-submodules", "--"],
+            "Working directory has unstaged changes",
+        ),
+        (
+            &["diff-index", "--quiet", "--cached", "--ignore-submodules"],
+            "Working directory has staged changes",
+        ),
+        (&["read-tree", "-u", "-m"], "Could not update working tree to new HEAD"),
+    ];
+    let Ok(exe) = crate::hosted::git_exe() else {
+        return Some("Up-to-date check failed".into());
+    };
+    for (at, (args, reason)) in steps.into_iter().enumerate() {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(args);
+        match at {
+            2 => {
+                cmd.arg(&head).arg("--");
+            }
+            3 => {
+                cmd.arg(&new);
+            }
+            _ => {}
+        }
+        let ok = cmd
+            .current_dir(workdir)
+            .env("GIT_DIR", repo.common_dir())
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_PREFIX")
+            // `child.no_stdout = 1` / `stdout_to_stderr = 1`: nothing these print
+            // belongs on the pusher's stdout.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return Some(reason.to_string());
+        }
+    }
+    None
+}
+
+/// Whether `path` is a file this process could run, which is what
+/// `run_hooks_opt()` requires before it counts the hook as invoked.
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// `run_update_hook()`: `update <ref> <old> <new>`, one run per ref.

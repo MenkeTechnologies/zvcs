@@ -475,7 +475,16 @@ fn print_push_status(repo: &gix::Repository, outcome: &push_proto::Outcome, verb
             let to = s.report_name.as_deref().unwrap_or(&s.name);
             let from = s.src.as_deref();
             match &s.result {
-                Err(reason) => emit('!', "[rejected]".into(), from, to, Some(reason)),
+                // `case REF_STATUS_REMOTE_REJECT: print_ref_status('!', "[remote
+                // rejected]", …)` (transport.c) — a refusal the server sent back as an
+                // `ng` line is not the same summary as one this side decided.
+                Err(reason) => {
+                    let summary = match s.remote_rejected {
+                        true => "[remote rejected]",
+                        false => "[rejected]",
+                    };
+                    emit('!', summary.into(), from, to, Some(reason))
+                }
                 Ok(()) if up_to_date => emit('=', "[up to date]".into(), from, to, None),
                 Ok(()) if s.new.is_null() => emit('-', "[deleted]".into(), None, to, None),
                 Ok(()) if s.old.is_null() => {

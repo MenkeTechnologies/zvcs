@@ -838,6 +838,17 @@ fn repack_all(
         return Ok(());
     }
 
+    // `repack` runs `pack-objects --all`, whose ref walk dies on a ref naming an object
+    // the repository does not have — and `gc` adds its own line when the child fails
+    // (`fatal: failed to run repack`, builtin/gc.c). The repack stops here, before a pack
+    // is written from a reachability set that ref could not contribute to.
+    if let Some(name) = super::prune::bad_object_ref(repo) {
+        eprintln!("error: {name} does not point to a valid object!");
+        eprintln!("fatal: bad object {name}");
+        eprintln!("fatal: failed to run repack");
+        return Err(anyhow::Error::new(crate::fatal::Silent(128)));
+    }
+
     let mut roots = Vec::new();
     super::prune::collect_roots(repo, &mut roots)?;
     let reachable = super::prune::close_over(repo, roots);

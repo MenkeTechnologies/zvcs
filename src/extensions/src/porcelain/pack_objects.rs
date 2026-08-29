@@ -3340,6 +3340,22 @@ fn rev_list_objects(
                 for reference in all {
                     let Ok(mut reference) = reference else { continue };
                     if let Ok(id) = reference.follow_to_object() {
+                        // ```c
+                        // if (!repo_has_object_file(repo, oid)) {
+                        //         error(_("%s does not point to a valid object!"), refname);
+                        //         return 0;
+                        // }
+                        // ```
+                        //
+                        // (`ref_resolves_to_object()`, refs.c) and then, because the ref was
+                        // still pended, `die("bad object %s", name)` from `get_reference()`
+                        // (revision.c). A pack built from a ref list that quietly dropped
+                        // one would be missing whatever only that ref reaches.
+                        if repo.find_object(id).is_err() {
+                            let name = reference.name().as_bstr().to_string();
+                            eprintln!("error: {name} does not point to a valid object!");
+                            return Err(format!("bad object {name}"));
+                        }
                         pending.push(id.detach());
                     }
                 }

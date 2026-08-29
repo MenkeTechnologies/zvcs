@@ -726,6 +726,33 @@ fn display_objdir(repo: &gix::Repository, objdir: &Path) -> PathBuf {
 
 /// Seed `roots` the way `mark_reachable_objects()` does: index entries and
 /// cache-tree ids, every ref under `refs/`, `HEAD`, and every reflog entry.
+/// The first ref whose object the repository does not have, if any.
+///
+/// ```c
+/// if (!repo_has_object_file(repo, oid)) {
+///         error(_("%s does not point to a valid object!"), refname);
+///         return 0;
+/// }
+/// ```
+///
+/// (`ref_resolves_to_object()`, refs.c.) Every command that walks all refs to build a
+/// reachability set stops on one — `prune` as `unable to parse object`, `repack` through
+/// `pack-objects` as `bad object` — because a set built from a ref that could not be read
+/// would call reachable objects unreachable.
+pub(super) fn bad_object_ref(repo: &gix::Repository) -> Option<String> {
+    let platform = repo.references().ok()?;
+    for reference in platform.all().ok()? {
+        let Ok(mut reference) = reference else { continue };
+        let Ok(id) = reference.follow_to_object() else {
+            continue;
+        };
+        if repo.find_object(id).is_err() {
+            return Some(reference.name().as_bstr().to_string());
+        }
+    }
+    None
+}
+
 pub(super) fn collect_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) -> Result<()> {
     // Index blobs (gitlinks excluded, as `do_add_index_objects_to_pending()`
     // skips `S_ISGITLINK`) plus the cache-tree, whose invalid sections git skips
@@ -746,6 +773,18 @@ pub(super) fn collect_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) -
     for reference in repo.references()?.all()? {
         let Ok(mut reference) = reference else { continue };
         if let Ok(id) = reference.follow_to_object() {
+            // ```c
+            // if ((flag & REF_ISSYMREF) && (flag & REF_ISBROKEN)) { ... }
+            // object = parse_object_or_die(oid, path);
+            // ```
+            //
+            // (`add_one_ref()`, reachable.c.) A ref that names an object the repository does
+            // not have stops the whole walk — pruning against a reachability set built from
+            // a ref it could not read would delete objects that are reachable in fact.
+            if repo.find_object(id).is_err() {
+                let name = reference.name().as_bstr().to_string();
+                crate::git_fatal!("unable to parse object: {name}");
+            }
             roots.push(id.detach());
         }
     }

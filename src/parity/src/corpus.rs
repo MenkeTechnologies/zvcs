@@ -28,6 +28,7 @@ mod fixture_gaps2;
 mod fixture_gaps3;
 mod env_layer;
 mod globals_layer;
+mod gitignore_precedence;
 mod graft_partial;
 mod helpers_credentials;
 mod discovery;
@@ -56,6 +57,7 @@ mod reset_family;
 mod revision_syntax;
 mod sequences;
 mod shape_reach;
+mod stash_deep;
 mod stateful_side_files;
 mod stdin_plumbing;
 mod submodule_family;
@@ -113,6 +115,7 @@ pub fn cases() -> Vec<Case> {
 
     // The two repositories that are missing objects on purpose: a shallow
     // clone's graft boundary, and a partial clone's lazy fetch.
+    gitignore_precedence::cases(&mut c);
     graft_partial::cases(&mut c);
     helpers_credentials::cases(&mut c);
 
@@ -502,6 +505,7 @@ pub fn cases() -> Vec<Case> {
     reset_family::cases(&mut c);
     revision_syntax::cases(&mut c);
     shape_reach::cases(&mut c);
+    stash_deep::cases(&mut c);
     stateful_side_files::cases(&mut c);
     stdin_plumbing::cases(&mut c);
     submodule_family::cases(&mut c);

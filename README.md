@@ -292,7 +292,10 @@ killed process or a concurrent `pack-refs` would have left, and assert only the
 indefensible direction — *whatever stock completes with the lock held, the port
 must complete too*. Doing more than git under contention is the feature; doing
 less is an availability failure. When both refuse, their exit codes must match,
-which is the one axis the queue cannot excuse.
+which is the one axis the queue cannot excuse. A lock that is *released* part way
+through the wait is its own case: it is the only shape that measures the queue
+succeeding rather than merely expiring, and it is where the port's differentiator
+is either real or it is not.
 
 Writers within one case are heterogeneous where the interesting races are: a
 case names one or more **roles**, writer *i* takes role *i mod roles*, and each

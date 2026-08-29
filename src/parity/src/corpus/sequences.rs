@@ -99,6 +99,16 @@ pub fn sequences() -> Vec<Sequence> {
     config_drives_the_next_step(&mut s);
     update_ref_transactions(&mut s);
     side_records(&mut s);
+    init_first(&mut s);
+    strategy_backends(&mut s);
+    filters_and_attributes(&mut s);
+    bisect_run(&mut s);
+    worktree_with_submodules(&mut s);
+    split_index(&mut s);
+    nested_submodules(&mut s);
+    ambiguous_names(&mut s);
+    prefix_collisions(&mut s);
+    am_hooks(&mut s);
     s
 }
 
@@ -1876,7 +1886,22 @@ fn criss_cross(out: &mut Vec<Sequence>) {
             .step(&["merge", "--abort"])
             .step(&["merge", "-X", "ours", "--no-edit", "cc-right"])
             .step(&["show", "HEAD:clash.txt"])
-            .step(&["log", "--oneline", "--graph", "-3"]),
+            .step(&["log", "--oneline", "--graph", "-3"])
+            // Steps 9-13 were unreachable while the port stopped at step 3 for
+            // want of a virtual base, so they were never written; the base is
+            // built now and the merge *commit* is what is left to cross-examine.
+            // `cc.txt` merged cleanly through the same virtual base and carries
+            // three separate edits — line 2 from `cc-a`, line 5 from `cc-left`,
+            // line 8 from `cc-right`, line 11 from `cc-b` — so step 9 is the one
+            // place the whole three-way result is on stdout rather than inferred
+            // from a tree id. `-X ours` applies only to the conflicted path, and
+            // a port that read it as `-s ours` prints `cc line 8` unedited here
+            // while still passing step 7.
+            .step(&["show", "HEAD:cc.txt"])
+            .step(&["diff", "--name-status", "HEAD^1", "HEAD"])
+            .step(&["diff", "--name-status", "HEAD^2", "HEAD"])
+            .step(&["rev-list", "--count", "HEAD"])
+            .step(&["merge", "--abort"]),
     );
 
     // The abort, cross-examined. `merge --abort` has to put `cc-left` back and
@@ -1899,7 +1924,17 @@ fn criss_cross(out: &mut Vec<Sequence>) {
             .step(&["status", "--porcelain"])
             .step(&["log", "--oneline", "-1"])
             .step(&["merge", "--abort"])
-            .step(&["merge", "--continue"]),
+            .step(&["merge", "--continue"])
+            // Steps 7-9, added once the merge at step 1 actually reached a
+            // conflict on both sides. `rev-parse -q --verify MERGE_HEAD` is the
+            // machine-readable form of the two sentences above — exit 1, empty
+            // stdout, no diagnostic — and separates a port that removed the file
+            // from one that only stopped mentioning it. Step 8 re-asks the base
+            // enumeration *after* the abort: the two merge bases are a property
+            // of the graph and an abort that rewrote history would change them.
+            .step(&["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .step(&["merge-base", "--all", "cc-left", "cc-right"])
+            .step(&["status", "--porcelain"]),
     );
 
     // `--quit` over the criss-cross stop. The state files go and the unmerged
@@ -1919,7 +1954,18 @@ fn criss_cross(out: &mut Vec<Sequence>) {
             .step(&["log", "--oneline", "-1"])
             .step(&["merge", "--abort"])
             .step(&["merge", "--continue"])
-            .step(&["commit", "-m", "nope"]),
+            .step(&["commit", "-m", "nope"])
+            // Steps 8-11, written now that step 1 conflicts on both sides. The
+            // question they close is what `--quit` left *behind*: the index is
+            // still unmerged (step 8 must print all three stages, including the
+            // virtual base at stage 1), and resolving it and committing produces
+            // a commit with **one** parent — because `MERGE_HEAD` is gone. Step
+            // 11's `--graph` is where that shows: a port that kept `MERGE_HEAD`
+            // through `--quit` draws a merge here and passed every earlier step.
+            .step(&["ls-files", "-u"])
+            .step(&["add", "clash.txt"])
+            .step(&["commit", "-m", "resolved after quit"])
+            .step(&["log", "--oneline", "--graph", "-2"]),
     );
 
     // rerere over a conflict whose preimage came out of a *virtual* base. The
@@ -1947,7 +1993,20 @@ fn criss_cross(out: &mut Vec<Sequence>) {
             .step(&["merge", "cc-right"])
             .step(&["status", "--porcelain"])
             .step(&["rerere", "forget", "clash.txt"])
-            .step(&["status", "--porcelain"]),
+            .step(&["status", "--porcelain"])
+            // Steps 12-16, reachable only since the virtual base was built. The
+            // `forget` at step 10 has to do two things — put the markers back in
+            // the worktree and drop the postimage — and steps 12-13 are the pair
+            // that tells them apart: `remaining` must name `clash.txt` again and
+            // `rerere diff` must print the conflict *against the virtual base*,
+            // which is the one hunk in this corpus whose left-hand side no real
+            // commit contains. Step 14 then aborts with the cache half-emptied,
+            // which is the state a later merge would read.
+            .step(&["rerere", "remaining"])
+            .step(&["rerere", "diff"])
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"]),
     );
 
     // Rebasing across the criss-cross. `rebase cc-b` linearises `cc-left` onto
@@ -2004,7 +2063,18 @@ fn criss_cross(out: &mut Vec<Sequence>) {
             .step(&["rebase", "--abort"])
             .step(&["status", "--porcelain"])
             .step(&["log", "--oneline", "--graph", "-5"])
-            .step(&["rebase", "--continue"]),
+            .step(&["rebase", "--continue"])
+            // Steps 7-9, written now the rebase at step 1 stops on both sides.
+            // `log --format=%p HEAD~1` prints the restored merge's two parents on
+            // **stdout** — the `--graph` above draws them, but a port that put a
+            // single-parent commit back can still draw a plausible lane — and the
+            // reflog is where `rebase (abort): returning to refs/heads/cc-left`
+            // has to appear beside the `rebase (start)` entry that preceded it.
+            // Step 9 asks the other half: `ORIG_HEAD` must name where the rebase
+            // began, so the diff against `HEAD` is empty after a clean abort.
+            .step(&["log", "--format=%p", "-1", "HEAD~1"])
+            .step(&["reflog", "-3"])
+            .step(&["diff", "--stat", "ORIG_HEAD", "HEAD"]),
     );
 
     // Cherry-picking the criss-cross *merge* onto the branch that already
@@ -2029,7 +2099,18 @@ fn criss_cross(out: &mut Vec<Sequence>) {
             .step(&["cherry-pick", "--skip"])
             .step(&["log", "--oneline", "-2"])
             .step(&["status", "--porcelain"])
-            .step(&["cherry-pick", "--abort"]),
+            .step(&["cherry-pick", "--abort"])
+            // Steps 9-12. The `--skip` at step 5 ended the sequencer, so the
+            // `--abort` at step 8 is a refusal and steps 9-11 are what proves it
+            // refused *without* touching anything: same worktree, same two
+            // commits, and no `CHERRY_PICK_HEAD` — the last of which a port that
+            // reports "nothing in progress" off the index alone would still have
+            // on disk. Step 12's `--quit` must be silent and exit 0 where
+            // `--abort` exited 128, which is the pair the two verbs differ on.
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"])
+            .step(&["cherry-pick", "--quit"]),
     );
 
     // Picking the far tip instead, which merges cleanly through the same two
@@ -4743,5 +4824,962 @@ fn side_records(out: &mut Vec<Sequence>) {
             .step(&["status", "--porcelain"])
             .step(&["log", "--oneline", "-1"])
             .step(&["rev-parse", "--abbrev-ref", "HEAD"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// init as a first step: the repository a workflow makes for itself
+// ---------------------------------------------------------------------------
+//
+// Every other sequence in this file starts inside a repository a fixture built.
+// `init` is the one verb whose whole output is a repository, and a single case
+// can only ask whether it exits 0 — what it *wrote* is only readable by the
+// command that comes next. The three shapes below are the three `init` writes
+// that differ: a bare directory with no worktree, a `.git` **file** pointing at
+// a git directory somewhere else, and a second repository nested inside the
+// first one's worktree.
+
+fn init_first(out: &mut Vec<Sequence>) {
+    // The round trip: make a bare peer, push into it, clone back out, and read
+    // the clone. Nothing here needs a network — `init --bare` writes the peer
+    // into the fixture's own worktree — and every step reads what the one before
+    // it wrote, which is the property no case can reach.
+    //
+    // `--no-local` on the clone is deliberate: a local clone is a directory copy
+    // with hardlinks and never opens the transport, so it would pass on a peer
+    // whose refs were written but whose `HEAD` was not. Step 4 is where that
+    // shows — `refs/remotes/origin/HEAD` only exists because the peer answered
+    // the ref advertisement with a symref, and a bare `init` that left `HEAD`
+    // dangling still pushes, still lists and still clones without it.
+    out.push(
+        Sequence::new("init", "bare-peer-pushed-into-then-cloned-back-out", Shape::Branched)
+            .step(&["init", "--bare", "--initial-branch=main", "./peer.git"])
+            .step(&["push", "./peer.git", "main:refs/heads/main"])
+            .step(&["ls-remote", "./peer.git"])
+            .step(&["clone", "-q", "--no-local", "./peer.git", "./back"])
+            .step(&["-C", "back", "for-each-ref", "--format=%(refname) %(objectname)"])
+            .step(&["-C", "back", "log", "--oneline", "--all"])
+            .step(&["-C", "back", "config", "get", "remote.origin.url"])
+            .step(&["-C", "back", "rev-parse", "--is-bare-repository"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `--separate-git-dir` on a **new** repository: the worktree gets a `.git`
+    // *file* holding `gitdir: <path>` and the git directory lives elsewhere.
+    // Every later step has to follow that pointer, which is a different code
+    // path from opening `.git/` as a directory — step 2 reads it back, step 4
+    // writes an object and a ref through it, and step 6 asks the reverse
+    // question, whether the worktree root is still the directory that holds the
+    // gitfile rather than the one that holds the objects.
+    out.push(
+        Sequence::new("init", "separate-git-dir-then-commit-through-the-gitfile", Shape::Linear)
+            .step(&["init", "-q", "-b", "main", "--separate-git-dir=./elsewhere.git", "./work"])
+            .step(&["-C", "work", "rev-parse", "--git-dir"])
+            .step(&["-C", "work", "status", "--porcelain"])
+            .step(&["-C", "work", "commit", "--allow-empty", "-m", "sep: first"])
+            .step(&["-C", "work", "log", "--oneline", "-1"])
+            .step(&["-C", "work", "rev-parse", "--show-toplevel"])
+            .step(&["-C", "work", "rev-parse", "--git-common-dir"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // The same flag over a repository that already exists, which is not a
+    // creation but a **migration**: git moves `.git/` to the named directory and
+    // leaves a gitfile in its place. Step 1 pins the premise on both sides
+    // before anything moves.
+    //
+    // The port does not migrate. Measured by hand: stock answers
+    // `Reinitialized existing Git repository in <REPO>/moved.git/` and every
+    // later `rev-parse --git-dir` says `<REPO>/moved.git`, while the port prints
+    // `<REPO>/.git`, leaves the directory where it was, and answers `.git` —
+    // an `init` that reports success and performed none of the move. Steps 3-7
+    // are written for the day that is fixed; step 2 is the finding today, and it
+    // is a finding a case cannot state, because "the git directory moved" is
+    // only visible to the command that comes after.
+    out.push(
+        Sequence::new("init", "separate-git-dir-migrates-an-existing-repository", Shape::Branched)
+            .step(&["rev-parse", "--git-dir"])
+            .step(&["init", "--separate-git-dir=./moved.git", "."])
+            .step(&["rev-parse", "--git-dir"])
+            .step(&["rev-parse", "--git-common-dir"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-2"])
+            .step(&["branch", "--show-current"]),
+    );
+
+    // `init` in a subdirectory of a worktree, then the parent's verbs over it.
+    // The nested repository is not a submodule and git says so at step 4 —
+    // `warning: adding embedded git repository` with the whole `hint:` block —
+    // and then stages it as a **gitlink** anyway, which step 5's `160000` mode is
+    // what pins. Step 7 commits that gitlink into a tree with no `.gitmodules`
+    // beside it, and step 9 is the consequence: `submodule status` refuses with
+    // `no submodule mapping found in .gitmodules for path 'nested'`, a
+    // repository state only two `init`-and-`add` invocations can build.
+    out.push(
+        Sequence::new("init", "in-a-subdirectory-then-embedded-from-the-parent", Shape::Branched)
+            .step(&["init", "-q", "-b", "main", "nested"])
+            .step(&["status", "--porcelain"])
+            .step(&["-C", "nested", "commit", "--allow-empty", "-m", "nested: one"])
+            .step(&["add", "nested"])
+            .step(&["ls-files", "-s", "nested"])
+            .step(&["status", "--porcelain"])
+            .step(&["commit", "-m", "embed the nested repository"])
+            .step(&["ls-tree", "-r", "HEAD", "--", "nested"])
+            .step(&["submodule", "status"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the strategy backends, across a workflow rather than in one invocation
+// ---------------------------------------------------------------------------
+//
+// `-s` and `-X` pick which merge engine runs and how it breaks ties, and the
+// answer to "did the right one run" is almost never in the invocation's own
+// output: `ours`, `recursive`, `resolve`, `octopus` and `ort` all print a line
+// saying which strategy was used and then leave differently-shaped repositories
+// behind. What separates them is the *next* command — which parents the commit
+// has, which blob is at a path, which index stages survive, whether `--abort`
+// has anything to abort.
+
+fn strategy_backends(out: &mut Vec<Sequence>) {
+    // `-s ours`, whose contract is "take my tree, record their commit". Both
+    // halves are invisible in the merge's own output (`Merge made by the 'ours'
+    // strategy.` and nothing else), and both are read here: step 3 must be empty
+    // — the merge changed nothing against the first parent — and step 4 must
+    // report `feature.txt` **deleted** against the second, which is the
+    // asymmetry that separates `-s ours` from a fast-forward and from `--squash`.
+    //
+    // Step 8's refusal is the last thing left to ask: `-s ours` commits in the
+    // one invocation, so no merge is in progress afterwards.
+    out.push(
+        Sequence::new("merge", "strategy-ours-keeps-our-tree-and-records-their-commit", Shape::Branched)
+            .step(&["merge", "-s", "ours", "-m", "strategy: ours keeps our tree", "feature"])
+            .step(&["log", "--graph", "--oneline"])
+            .step(&["diff", "--name-status", "HEAD^1", "HEAD"])
+            .step(&["diff", "--name-status", "HEAD^2", "HEAD"])
+            .step(&["rev-parse", "HEAD^2"])
+            .step(&["ls-tree", "--name-only", "HEAD"])
+            .step(&["status", "--porcelain"])
+            .step(&["merge", "--abort"]),
+    );
+
+    // `-X theirs` over the criss-cross. The option only decides the *conflicted
+    // hunks*, so the merge still has to build the virtual base first and still
+    // has to merge `cc.txt` three ways — step 1's two `Auto-merging` lines and
+    // the `2 files changed` summary are that, and a port that answered `-X
+    // theirs` by checking their tree out wholesale prints one file there.
+    //
+    // Step 3 is the tie-break itself, on stdout: `b`, theirs. Step 7 re-asks the
+    // base question after the merge exists, where `HEAD^1`/`HEAD^2` now have two
+    // merge bases of their own — the same pair step 6 could not see, because
+    // `merge-base cc-left cc-right` walks a graph the merge has since changed.
+    out.push(
+        Sequence::new("merge", "strategy-x-theirs-over-a-criss-cross", Shape::CrissCross)
+            .step(&["merge", "-X", "theirs", "-m", "strategy: -X theirs over a criss-cross", "cc-right"])
+            .step(&["status", "--porcelain"])
+            .step(&["cat-file", "blob", "HEAD:clash.txt"])
+            .step(&["log", "--graph", "--oneline", "-6"])
+            .step(&["show", "--stat", "--format=%s", "HEAD"])
+            .step(&["merge-base", "cc-left", "cc-right"])
+            .step(&["merge-base", "--all", "HEAD^1", "HEAD^2"]),
+    );
+
+    // The stopped criss-cross read stage by stage, with `:3:` **last**. Steps
+    // 2-5 are the whole index — `ls-files -u` names three stages and
+    // `cat-file -s` gives the virtual base's size, 84 bytes of conflict markers
+    // that no commit in the repository contains.
+    //
+    // Step 7 is the finding, and it is at the tail on purpose: `show :3:<path>`
+    // exits 128 on the port with `path 'clash.txt' is in the index, but not at
+    // stage 3` while `:1:` and `:2:` both resolve and `ls-files -u` has just
+    // printed the stage-3 row. Putting it first would have cost steps 2-6, which
+    // are the proof that the index really does hold what the lookup denies.
+    out.push(
+        Sequence::new("merge", "criss-cross-no-commit-read-stage-by-stage", Shape::CrissCross)
+            .step(&["merge", "--no-commit", "cc-right"])
+            .step(&["ls-files", "-u"])
+            .step(&["show", ":1:clash.txt"])
+            .step(&["show", ":2:clash.txt"])
+            .step(&["cat-file", "-s", ":1:clash.txt"])
+            .step(&["status", "--porcelain"])
+            .step(&["show", ":3:clash.txt"])
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"]),
+    );
+
+    // `-s resolve`, the pre-`ort` backend, which does *not* build a virtual base:
+    // it picks one of the two and reports `Added clash.txt in both, but
+    // differently.` Step 3 is where that shows against every other merge in this
+    // file — the index has stages **2 and 3 only**, no stage 1 — and step 4 is
+    // the refusal that follows from it, `path 'clash.txt' is in the index, but
+    // not at stage 1`, which is the same sentence the port produces wrongly for
+    // `:3:` after an `ort` merge and correctly here.
+    //
+    // Not `strict`: stock's step 1 writes `ERROR: content conflict in clash.txt`
+    // and two lines about an unreadable empty blob to stderr, and a stderr
+    // comparison would stop the sequence before the index is ever read.
+    out.push(
+        Sequence::new("merge", "strategy-resolve-leaves-no-stage-one", Shape::CrissCross)
+            .step(&["merge", "-s", "resolve", "cc-right"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "-u"])
+            .step(&["show", ":1:clash.txt"])
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // An octopus stopped before its commit, aborted, and remade. `--no-commit`
+    // over three branches is the one way to get a `MERGE_HEAD` with **three**
+    // entries, which is what step 5's `--abort` has to unwind: a port that reads
+    // only the first line of `MERGE_HEAD` restores the same worktree and leaves
+    // two heads' worth of state behind, and step 6 is where the difference is.
+    //
+    // Step 1 resets to the octopus's first parent, because [`Shape::Octopus`] is
+    // already checked out *on* the merge and a sequence has to make its own
+    // premise. Step 9's `%p` prints all four parents on one line — the only
+    // place in this corpus where a commit's full parent list is compared as
+    // text.
+    out.push(
+        Sequence::new("merge", "octopus-no-commit-aborted-then-remade", Shape::Octopus)
+            .step(&["reset", "--hard", "HEAD^"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["merge", "--no-commit", "oct-a", "oct-b", "oct-c"])
+            .step(&["status", "--porcelain"])
+            .step(&["rev-parse", "MERGE_HEAD"])
+            .step(&["merge", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["merge", "-m", "octopus: remade", "oct-a", "oct-b", "oct-c"])
+            .step(&["log", "--format=%p", "-1"]),
+    );
+
+    // `-s octopus` named explicitly over **two** heads, which git accepts — the
+    // strategy is not reserved for three or more — and which produces a merge
+    // whose subject is `Merge branches 'oct-a' and 'oct-side'`, a spelling `ort`
+    // never writes. Step 5 is the refusal that says the merge committed in one
+    // invocation, and step 6 reads the three parents back.
+    out.push(
+        Sequence::new("merge", "strategy-octopus-named-over-two-heads", Shape::Octopus)
+            .step(&["reset", "--hard", "HEAD^"])
+            .step(&["merge", "-s", "octopus", "oct-a", "oct-side"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["merge", "--abort"])
+            .step(&["log", "--format=%p", "-1"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// filters and attributes, written by one step and obeyed by the next
+// ---------------------------------------------------------------------------
+//
+// A `clean`/`smudge` filter is the only place git hands a file's bytes to an
+// external program and stores what comes back, and none of it is reachable from
+// a single invocation: the filter needs a `.gitattributes` rule *and* a
+// `filter.<driver>.*` configuration *and* a path to apply to, and the thing
+// worth measuring is the round trip — worktree cleaned into the object store,
+// object store smudged back into the worktree.
+//
+// A step cannot write a file, so the attribute file arrives as a patch on
+// stdin: `apply` is the one verb that turns a payload into a worktree path, and
+// the payload is delivered byte-identically to both sides.
+
+/// The `.gitattributes` that puts `README.md` under the `up` filter driver.
+///
+/// A creation patch rather than a modification: no shape here ships a
+/// `.gitattributes` that a workflow could edit, and `Shape::Attributes`, which
+/// does, has eight other rules whose interaction would be measured alongside.
+const ATTR_FILTER_UP: &[u8] = b"diff --git a/.gitattributes b/.gitattributes\n\
+new file mode 100644\n\
+index 0000000..d158585\n\
+--- /dev/null\n\
++++ b/.gitattributes\n\
+@@ -0,0 +1 @@\n\
++README.md filter=up\n";
+
+/// The same rule naming a driver whose `clean` is `false` and which is
+/// **required**, so every failure is fatal rather than a warning.
+const ATTR_FILTER_BAD: &[u8] = b"diff --git a/.gitattributes b/.gitattributes\n\
+new file mode 100644\n\
+index 0000000..1510044\n\
+--- /dev/null\n\
++++ b/.gitattributes\n\
+@@ -0,0 +1 @@\n\
++README.md filter=bad\n";
+
+/// A file carrying an unexpanded `$Id$`, for the `ident` rule
+/// [`Shape::Attributes`] already has in `.git/info/attributes` (`*.info ident`).
+const IDENT_STAMP: &[u8] = b"diff --git a/stamp.info b/stamp.info\n\
+new file mode 100644\n\
+index 0000000..2d81910\n\
+--- /dev/null\n\
++++ b/stamp.info\n\
+@@ -0,0 +1,2 @@\n\
++$Id$\n\
++ident line\n";
+
+fn filters_and_attributes(out: &mut Vec<Sequence>) {
+    // The round trip. `tr` is the filter because it is a pure function of its
+    // input with no clock, no locale and no filesystem: `clean` upper-cases on
+    // the way into the object store and `smudge` lower-cases on the way out.
+    //
+    // Step 3 is where the filter first *changes an answer* — `README.md` has not
+    // been touched, and `status` reports it modified because `clean(worktree)`
+    // no longer equals the indexed blob. Step 5 reads the stored bytes and must
+    // be `# FIXTURE`; step 7 asks `hash-object --path`, which applies the same
+    // filter without writing anything and must produce the id the index already
+    // holds. Step 10 is the reverse direction, and step 11 is the property that
+    // makes a filter pair *correct* rather than merely present: after the
+    // smudge, cleaning the worktree gives the blob back, so step 11's id must be
+    // the same one step 7 printed.
+    //
+    // Step 11 is `hash-object --path` and **not** a `status`, which is what it
+    // was first written as. `status` decides whether to re-run the filter from
+    // the index's cached `stat` data, and after step 10 has just rewritten the
+    // file that decision is a race: the harness scored the `status` form
+    // `NONDETERMINISTIC` — stock did not reproduce its own answer between two
+    // runs of the same step. `hash-object --path` filters unconditionally and
+    // has no such door.
+    out.push(
+        Sequence::new("add", "clean-filter-stored-then-smudged-back-out", Shape::Linear)
+            .with_config(&[("filter.up.clean", "tr a-z A-Z"), ("filter.up.smudge", "tr A-Z a-z")])
+            .step_stdin(&["apply"], ATTR_FILTER_UP)
+            .step(&["check-attr", "filter", "--", "README.md"])
+            .step(&["status", "--porcelain"])
+            .step(&["add", "README.md"])
+            .step(&["cat-file", "blob", ":README.md"])
+            .step(&["diff", "--cached", "--name-status"])
+            .step(&["hash-object", "--path", "README.md", "README.md"])
+            .step(&["commit", "-m", "filter: the cleaned blob"])
+            .step(&["cat-file", "blob", "HEAD:README.md"])
+            .step(&["restore", "--worktree", "--", "README.md"])
+            .step(&["hash-object", "--path", "README.md", "README.md"])
+            .step(&["ls-files", "--eol", "README.md"]),
+    );
+
+    // A **required** filter that fails. `filter.bad.required=true` turns every
+    // failure into a fatal error, and the contract is that no path under that
+    // driver can be read or written at all — so `add`, `status` and `checkout`
+    // must all refuse rather than silently fall back to the raw bytes.
+    //
+    // Every step agrees today, and each one is a claim: `hash-object --path` and
+    // `add` both exit 128 rather than storing the raw bytes, and steps 5-8 prove
+    // nothing was stored — the index and `HEAD` still hold the *pre-filter*
+    // blob, which is the failure mode a port that treats `required` as advisory
+    // would show as a new object.
+    //
+    // Every step is also deliberately **stat-independent**, and that took two
+    // rewrites. `status`, `diff` against the worktree and `checkout -- <path>`
+    // all decide whether to run the filter by consulting the index's cached
+    // `stat` data first, so what they do here is a function of the clock:
+    // measured directly, two harness runs of a `status`-bearing form of this
+    // sequence scored stock exit 0 on one and exit 128 on the other.
+    // `hash-object --path` filters unconditionally and has no such door.
+    //
+    // The one honest limit, recorded so nobody re-derives it: **`checkout-index
+    // -f` at step 9 diverges outside this harness and not inside it.** Walked by
+    // hand under `crate::env::harden` — three consecutive runs — stock exits 128
+    // with `fatal: README.md: clean filter 'bad' failed` and the port exits 1.
+    // Inside the harness both exit 0, because `probe_interop` runs stock's own
+    // `write-tree` against each copy after *every* step and that refreshes the
+    // index, so by step 9 `README.md` is stat-clean on both sides and neither
+    // checkout has to filter anything to decide it can skip the write. The step
+    // stays because it is a real read of the same premise; the divergence is
+    // recorded here rather than claimed as a case this corpus catches.
+    out.push(
+        Sequence::new("add", "required-clean-filter-fails-and-blocks-every-path", Shape::Linear)
+            .with_config(&[("filter.bad.clean", "false"), ("filter.bad.required", "true")])
+            .step_stdin(&["apply"], ATTR_FILTER_BAD)
+            .step(&["check-attr", "filter", "--", "README.md"])
+            .step(&["hash-object", "--path", "README.md", "README.md"])
+            .step(&["add", "README.md"])
+            .step(&["cat-file", "blob", ":README.md"])
+            .step(&["diff", "--cached", "--name-status"])
+            .step(&["cat-file", "blob", "HEAD:README.md"])
+            .step(&["ls-files", "-s", "README.md"])
+            .step(&["checkout-index", "-f", "--", "README.md"]),
+    );
+
+    // `ident`, the filter git implements itself. The rule is already in
+    // `.git/info/attributes` on [`Shape::Attributes`] (`*.info ident`), so this
+    // sequence only has to supply a file that carries `$Id$` and then walk it
+    // through the store and back.
+    //
+    // Both directions are measured, and only one of them is on stdout: steps 3
+    // and 6 must print `$Id$` **unexpanded**, because the stored blob never
+    // holds the id. The other direction is the checkout at step 7, and it is the
+    // state probe that reads it — stock writes `$Id: <sha> $` into the worktree
+    // and the port writes `$Id: <sha>$`, one byte short of git's format, which
+    // is invisible to every command in this sequence and visible to a `diff`
+    // against a `.gitattributes`-less clone. Step 8 is the consistency check
+    // that hides it: `clean` strips whatever `smudge` wrote, so both sides
+    // report a clean tree over two different files.
+    //
+    // `apply --cached` rather than a plain `apply`, and the reason is itself the
+    // second half of the finding: `apply` writes the worktree, so it runs the
+    // *smudge* — measured directly, stock's plain `apply` puts `$Id: <sha> $` on
+    // disk and the port puts `$Id$`, which would stop this sequence at step 1
+    // and leave the round trip unmeasured. `--cached` writes the blob and the
+    // index and touches no file, so both sides agree until the checkout that
+    // this sequence exists to ask about.
+    out.push(
+        Sequence::new("checkout", "ident-expanded-on-the-way-out-and-stripped-on-the-way-in", Shape::Attributes)
+            .step(&["check-attr", "ident", "--", "stamp.info"])
+            .step_stdin(&["apply", "--cached"], IDENT_STAMP)
+            .step(&["cat-file", "blob", ":stamp.info"])
+            .step(&["status", "--porcelain"])
+            .step(&["commit", "-m", "ident: a stamped file"])
+            .step(&["cat-file", "blob", "HEAD:stamp.info"])
+            .step(&["checkout", "HEAD", "--", "stamp.info"])
+            .step(&["diff", "--name-only"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "--eol", "stamp.info"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// bisect run: the session a driver leaves behind
+// ---------------------------------------------------------------------------
+//
+// `bisect run` is the only git verb that spawns a caller-supplied command in a
+// loop and turns its exit status into repository state. The port refuses it
+// outright, so the two sequences here are written the way a parked case is: the
+// steps before the refusal establish a real session on both sides, and the steps
+// after it read the session `run` was supposed to have advanced.
+
+fn bisect_run(out: &mut Vec<Sequence>) {
+    // `run false`, which is the half the corpus has never asked — every revision
+    // is "bad", so the search collapses toward the *oldest* commit in the
+    // interval and the transcript ends with a `is the first 'bad' commit` block
+    // and a full `show` of that commit. [`Shape::Octopus`] rather than `Renamed`
+    // so the interval crosses a four-parent merge, where "halve the range" has
+    // to walk more than a straight line.
+    //
+    // Steps 1-2 pass on both sides: the session starts, `bisect log` replays it.
+    // Step 3 is the finding — `zvcs: bisect: 'bisect run' is not supported` at
+    // exit 1 — and steps 4-7 are what a fixed port would then have to agree on:
+    // the `# bad:` line `run` appended, the clean worktree it left, and a
+    // `reset` that puts `main` back.
+    out.push(
+        Sequence::new("bisect", "run-false-collapses-onto-the-oldest-commit", Shape::Octopus)
+            .step(&["bisect", "start", "HEAD", "HEAD~2"])
+            .step(&["bisect", "log"])
+            .step(&["bisect", "run", "false"])
+            .step(&["bisect", "log"])
+            .step(&["status", "--porcelain"])
+            .step(&["bisect", "reset"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // `run` under **renamed terms**, which is two features meeting: the driver
+    // has to read `.git/BISECT_TERMS` to know what to call the verdict it is
+    // recording, so a port that implemented `run` against hard-coded good/bad
+    // would pass the sequence above and write `# good:` lines here.
+    //
+    // Steps 1-5 all pass today, including `bisect broken` and `bisect fine` —
+    // verbs that exist only because step 1 named them — so the session is fully
+    // built and agreed on before step 6 asks for the driver.
+    out.push(
+        Sequence::new("bisect", "run-true-under-renamed-terms", Shape::Octopus)
+            .step(&["bisect", "start", "--term-new=broken", "--term-old=fine"])
+            .step(&["bisect", "terms"])
+            .step(&["bisect", "broken", "HEAD"])
+            .step(&["bisect", "fine", "HEAD~2"])
+            .step(&["bisect", "log"])
+            .step(&["bisect", "run", "true"])
+            .step(&["bisect", "log"])
+            .step(&["bisect", "reset"])
+            .step(&["status", "--porcelain"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a worktree of a repository that has a submodule
+// ---------------------------------------------------------------------------
+//
+// Two mechanisms that each have their own sequences here and have never been
+// asked to work at once. A linked worktree has its own `HEAD`, its own index and
+// its own root, and shares the object store and `.git/modules/` with the main
+// tree; a submodule is registered in a tracked `.gitmodules` and initialised
+// into `.git/config`. `submodule update` inside a linked worktree therefore has
+// to resolve a relative URL against a root that is *not* the superproject's
+// original one, and write a module directory into the shared common directory.
+
+fn worktree_with_submodules(out: &mut Vec<Sequence>) {
+    // The absolute-URL half, on the shape whose upstream lives outside the
+    // fixture. `submodule update --init` inside the linked worktree must clone
+    // into `wt2/sub` while registering under the *common* directory, so step 8
+    // — asked from the main worktree — must still report `sub` uninitialised
+    // there: two worktrees of one repository have separate submodule working
+    // copies and one shared module store.
+    //
+    // Step 9's `deinit` from inside the linked tree and step 10's `remove
+    // --force` are the unwind, and the order matters: `worktree remove` refuses
+    // over a tree with a populated submodule, so a port that ignored the
+    // `deinit` fails at step 10 rather than at step 9.
+    out.push(
+        Sequence::new("worktree", "a-worktree-initialises-its-own-submodule-copy", Shape::Submodule)
+            .with_config(&[("protocol.file.allow", "always")])
+            .step(&["submodule", "status"])
+            .step(&["worktree", "add", "--detach", "wt2", "HEAD"])
+            .step(&["-C", "wt2", "submodule", "status"])
+            .step(&["-C", "wt2", "submodule", "update", "--init"])
+            .step(&["-C", "wt2", "submodule", "status"])
+            .step(&["-C", "wt2", "ls-files", "-s", "sub"])
+            .step(&["-C", "wt2", "status", "--porcelain"])
+            .step(&["submodule", "status"])
+            .step(&["-C", "wt2", "submodule", "deinit", "-f", "sub"])
+            .step(&["worktree", "remove", "--force", "wt2"])
+            .step(&["worktree", "list"]),
+    );
+
+    // The relative-URL half, where the answer is a *refusal* and the refusal is
+    // the measurement. [`Shape::NestedSubmodule`] records `url = ./.mid.git`,
+    // read from the superproject's root — and a linked worktree's root has no
+    // `.mid.git` in it, so `submodule update` inside `wt2` resolves the URL
+    // against the wrong directory and fails to clone, twice, with a retry in
+    // between. Both sides must agree on that, including the exit code and the
+    // fact that step 6 still reports the submodule unregistered.
+    //
+    // This is the case a port is most likely to get accidentally right by
+    // absolutizing the URL against the *superproject* rather than against the
+    // worktree — which would succeed where stock fails.
+    out.push(
+        Sequence::new("worktree", "a-relative-submodule-url-does-not-follow-the-worktree", Shape::NestedSubmodule)
+            .with_config(&[("protocol.file.allow", "always")])
+            .step(&["submodule", "status"])
+            .step(&["worktree", "add", "--detach", "wt2", "HEAD"])
+            .step(&["worktree", "list"])
+            .step(&["-C", "wt2", "submodule", "status"])
+            .step(&["-C", "wt2", "submodule", "update", "--init"])
+            .step(&["-C", "wt2", "submodule", "status"])
+            .step(&["submodule", "status"])
+            .step(&["-C", "wt2", "status", "--porcelain"])
+            .step(&["worktree", "remove", "--force", "wt2"])
+            .step(&["worktree", "list"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the split index, across the commands that rewrite it
+// ---------------------------------------------------------------------------
+//
+// [`Shape::SplitIndex`] parks a repository whose `.git/index` is a `link`
+// extension over a `.git/sharedindex.<sha>`. Every verb that writes the index
+// has to decide whether to append to the small half, rewrite the shared half, or
+// collapse the two — and none of that is visible in any command's output. It is
+// visible to the *next* command, and to the runner's index probe, which is why
+// these are sequences and not cases.
+
+fn split_index(out: &mut Vec<Sequence>) {
+    // Split, unsplit, split again. `ls-files -s` must print the same six rows at
+    // every stage — the entries are the same whichever file holds them — so
+    // stdout is deliberately constant and the whole finding is in the state: how
+    // many `sharedindex.*` files are left, whether the `link` extension is
+    // present, and whether the small half re-shares.
+    //
+    // Step 9's `--really-refresh` is the one that rewrites every `stat` entry,
+    // which on a split index means deciding all over again which half each row
+    // lives in; step 10 then asks a question that only reads the result.
+    out.push(
+        Sequence::new("update-index", "split-then-unsplit-then-split-again", Shape::SplitIndex)
+            .step(&["ls-files", "-s"])
+            .step(&["status", "--porcelain"])
+            .step(&["update-index", "--no-split-index"])
+            .step(&["ls-files", "-s"])
+            .step(&["status", "--porcelain"])
+            .step(&["update-index", "--split-index"])
+            .step(&["ls-files", "-s"])
+            .step(&["status", "--porcelain"])
+            .step(&["update-index", "--really-refresh"])
+            .step(&["diff", "--name-only"]),
+    );
+
+    // The ordinary porcelain over a split index: a rename, a delete, a commit, a
+    // path checked out of an older tree, and a hard reset. Each of the five
+    // rewrites the index, and on a split index a rename is the awkward one — the
+    // old entry lives in the shared half and cannot be deleted there, so git
+    // records a *replacement* in the small half and the shared half keeps a row
+    // nothing reads.
+    //
+    // Step 12 is the read-back that a port implementing deletion by truncation
+    // fails: `si-b.txt` is checked out of `HEAD~1` after having been removed, so
+    // its entry has to come back at the same path the shared half still names.
+    //
+    // Steps 1-2 are reads, and they are load-bearing rather than decoration: the
+    // rename at step 3 is where the port **collapses the split index** — stock
+    // leaves `link:68(base=set bitmaps=yes del=0:[] rep=6:[0 1 2 4 5])` beside a
+    // six-entry `sharedindex.<hash>`, the port writes six entries into
+    // `.git/index` with no `link` extension and the shared file gone — so
+    // without a read in front of it this sequence would stop at its own first
+    // step and prove only that one command discards the shape.
+    out.push(
+        Sequence::new("mv", "rename-and-delete-over-a-shared-index", Shape::SplitIndex)
+            .step(&["ls-files", "-s"])
+            .step(&["status", "--porcelain"])
+            .step(&["mv", "si-a.txt", "si-moved.txt"])
+            .step(&["status", "--porcelain"])
+            .step(&["rm", "-f", "si-b.txt"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "-s"])
+            .step(&["commit", "-m", "split-index: moved and removed"])
+            .step(&["ls-tree", "--name-only", "HEAD"])
+            .step(&["status", "--porcelain"])
+            .step(&["checkout", "HEAD~1", "--", "si-b.txt"])
+            .step(&["ls-files", "-s", "si-b.txt"])
+            .step(&["reset", "--hard", "HEAD~1"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "-s"]),
+    );
+
+    // `core.splitIndex=true`, and the `--no-split-index` that contradicts it.
+    // Step 4 is git's documented collision: the flag un-splits, the setting says
+    // stay split, and git resolves it by doing what the flag said and warning
+    // `core.splitIndex is set to true; remove or change it` on stderr. Step 6
+    // then writes the index again under the setting, and steps 3/5/7 read the
+    // same six entries back across all of it — constant on stdout on purpose,
+    // because the whole finding is whether `.git/index` still carries a `link`
+    // extension and a `sharedindex.<hash>` beside it.
+    //
+    // **Every index write here is `read-tree`**, and that is a determinism
+    // requirement rather than a stylistic choice. Measured over three stock runs
+    // recording the shared-index files after every step: `mv`, `commit` and
+    // `status` under `core.splitIndex=true` each rewrite the shared half with
+    // live `stat` data and produce a *differently named* `sharedindex.<hash>`
+    // per run — the first spelling of this sequence used `mv` and the harness
+    // excluded it with `stock git does not reproduce these itself`, which
+    // measures nothing. `read-tree` rewrites the entries from the tree with the
+    // `stat` fields zeroed, which is exactly why [`Shape::SplitIndex`] is built
+    // through it, and under that ordering all three runs agreed byte for byte.
+    out.push(
+        Sequence::new("update-index", "core-split-index-against-a-contradicting-unsplit", Shape::SplitIndex)
+            .with_config(&[("core.splitIndex", "true")])
+            .step(&["ls-files", "-s"])
+            .step(&["read-tree", "HEAD"])
+            .step(&["ls-files", "-s"])
+            .step(&["update-index", "--no-split-index"])
+            .step(&["ls-files", "-s"])
+            .step(&["read-tree", "HEAD"])
+            .step(&["ls-files", "-s"])
+            .step(&["ls-tree", "--name-only", "HEAD"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a submodule that carries a submodule
+// ---------------------------------------------------------------------------
+//
+// On [`Shape::NestedSubmodule`], `--recursive` stops being a synonym for its own
+// absence: `--init` alone populates `mid` and leaves `mid/leaf` empty, and only
+// the recursive spelling descends. The difference is a *repository*, not a flag
+// parse, and it takes two invocations to see because the first one has to leave
+// the intermediate state for the second to find.
+
+fn nested_submodules(out: &mut Vec<Sequence>) {
+    // The two spellings, in order, over one repository. Step 3 is the state
+    // `--init` alone leaves — `mid` populated, `mid/leaf` still prefixed `-` —
+    // and step 4 asks the same question from *inside* `mid`, where the leaf is
+    // registered under its own name rather than the parent's path. Step 5 then
+    // descends, and step 6 is the two-row listing that separates a port that
+    // recursed from one that reported success.
+    //
+    // Step 7's `foreach --recursive` is the other traversal: `$name` and
+    // `$sm_path` differ for the leaf (`leaf` against `leaf`, entered as
+    // `mid/leaf`), and the `Entering '<path>'` lines are the traversal order on
+    // stdout.
+    out.push(
+        Sequence::new("submodule", "init-one-level-then-recurse-into-the-leaf", Shape::NestedSubmodule)
+            .with_config(&[("protocol.file.allow", "always")])
+            .step(&["submodule", "status", "--recursive"])
+            .step(&["submodule", "update", "--init"])
+            .step(&["submodule", "status", "--recursive"])
+            .step(&["-C", "mid", "submodule", "status"])
+            .step(&["submodule", "update", "--init", "--recursive"])
+            .step(&["submodule", "status", "--recursive"])
+            .step(&["submodule", "foreach", "--recursive", "echo $name $sm_path"])
+            .step(&["status", "--porcelain"])
+            .step(&["-C", "mid/leaf", "log", "--oneline"]),
+    );
+
+    // The unwind, which has to walk the same two levels backwards. `sync
+    // --recursive` rewrites `submodule.<name>.url` in both `.git/config`s from
+    // the two tracked `.gitmodules`, and `deinit --all -f` has to empty the
+    // working copies while leaving both gitlinks in the index — step 8's
+    // `160000` row is that, and it is the line a port that removed the entry
+    // along with the directory loses.
+    //
+    // Step 6 reads the local URL back after the sync: it is the *absolutized*
+    // form of `./.mid.git`, where the tracked file keeps the relative one, which
+    // step 2 pins before anything is cloned.
+    //
+    // Steps 1-3 are reads, and they are there because the recursive update at
+    // step 4 diverges on the *template* a submodule clone lays down — the port
+    // writes its own `description` text and its own sample hooks, none of them
+    // executable, where git writes git's — so without them this sequence would
+    // stop at its first step and the tracked-versus-local URL question below
+    // would never be asked at all.
+    out.push(
+        Sequence::new("submodule", "sync-and-deinit-walk-both-levels-back", Shape::NestedSubmodule)
+            .with_config(&[("protocol.file.allow", "always")])
+            .step(&["submodule", "status", "--recursive"])
+            .step(&["config", "get", "-f", ".gitmodules", "submodule.mid.url"])
+            .step(&["ls-files", "-s", "mid"])
+            .step(&["submodule", "update", "--init", "--recursive"])
+            .step(&["submodule", "status", "--recursive"])
+            .step(&["submodule", "sync", "--recursive"])
+            .step(&["config", "get", "submodule.mid.url"])
+            .step(&["submodule", "deinit", "--all", "-f"])
+            .step(&["submodule", "status", "--recursive"])
+            .step(&["status", "--porcelain"])
+            .step(&["ls-files", "-s", "mid"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// names that are more than one thing
+// ---------------------------------------------------------------------------
+//
+// [`Shape::AmbiguousRef`] carries one name held by a branch *and* a tag, one
+// held by all three of `refs/<name>`, a branch and a tag, one held by a branch
+// and a remote-tracking ref, and one held by a branch and a tracked **path**.
+// Which of them wins is git's six-rule lookup, and a case can only ask the
+// question once. What a case cannot do is *delete* the winner and ask again,
+// which is the only way to see the whole order rather than its first element.
+
+fn ambiguous_names(out: &mut Vec<Sequence>) {
+    // The lookup peeled one rule at a time. `ambi` is a branch and a tag: the
+    // tag wins (`refs/tags/<name>` outranks `refs/heads/<name>`), so step 2
+    // deletes the *branch* and step 3 must print the same id it printed at step
+    // 1 — an answer that only means something because step 1 warned
+    // `refname 'ambi' is ambiguous` and step 3 does not.
+    //
+    // `top` is the harder half: `refs/top`, `refs/heads/top` and `refs/tags/top`
+    // all exist and hold three different commits, and the winner is the bare
+    // `refs/<name>` rule that no porcelain can create. Steps 6-12 delete the
+    // three in the order that keeps changing the answer, ending with
+    // `update-ref -d refs/top` and a name that resolves to nothing.
+    out.push(
+        Sequence::new("rev-parse", "the-lookup-order-peeled-one-ref-at-a-time", Shape::AmbiguousRef)
+            .step(&["rev-parse", "ambi"])
+            .step(&["branch", "-D", "ambi"])
+            .step(&["rev-parse", "ambi"])
+            .step(&["tag", "-d", "ambi"])
+            .step(&["rev-parse", "ambi"])
+            .step(&["rev-parse", "top"])
+            .step(&["branch", "-D", "top"])
+            .step(&["rev-parse", "top"])
+            .step(&["tag", "-d", "top"])
+            .step(&["rev-parse", "top"])
+            .step(&["update-ref", "-d", "refs/top"])
+            .step(&["rev-parse", "top"])
+            .step(&["for-each-ref", "--format=%(refname)"]),
+    );
+
+    // `dual`, a branch whose name is also a tracked path. The refusal it exists
+    // for — `fatal: ambiguous argument 'dual': both revision and filename` —
+    // needs a *revision-or-path* position, and the shape can only supply the
+    // collision; the sequence supplies the position and then removes one half of
+    // it.
+    //
+    // Steps 1-9 pass on both sides, including the two disambiguated spellings
+    // and a checkout of the branch. Step 10 is the finding: the port resolves
+    // `log dual` as a revision and prints a commit where stock refuses to guess.
+    // Steps 11-13 are the day after: with the path deleted and committed, the
+    // name is unambiguous again and both sides must answer.
+    out.push(
+        Sequence::new("log", "a-name-that-is-both-a-branch-and-a-path", Shape::AmbiguousRef)
+            .step(&["rev-parse", "dual"])
+            .step(&["ls-files", "--", "dual"])
+            .step(&["log", "--oneline", "-1", "dual", "--"])
+            .step(&["log", "--oneline", "--", "dual"])
+            .step(&["checkout", "dual"])
+            .step(&["branch", "--show-current"])
+            .step(&["status", "--porcelain"])
+            .step(&["switch", "-"])
+            .step(&["branch", "--show-current"])
+            .step(&["log", "--oneline", "-1", "dual"])
+            .step(&["rm", "-f", "dual"])
+            .step(&["commit", "-m", "ambiguous: the path is gone"])
+            .step(&["log", "--oneline", "-1", "dual"]),
+    );
+
+    // `rem/ambi`, held by a branch and by a remote-tracking ref. The branch wins
+    // and `--symbolic-full-name` refuses to name it at all — `error: refname
+    // 'rem/ambi' is ambiguous` at exit 0 with **empty stdout**, which is the one
+    // shape of answer in this family that is neither a value nor a failure.
+    //
+    // Step 5 deletes the branch and steps 6-7 are the same two questions with
+    // one candidate left: now the id changes *and* the full name resolves, which
+    // is what proves the empty answer at step 4 was the ambiguity rather than a
+    // missing feature.
+    out.push(
+        Sequence::new("rev-parse", "a-branch-and-a-remote-tracking-ref-at-one-name", Shape::AmbiguousRef)
+            .step(&["rev-parse", "rem/ambi"])
+            .step(&["rev-parse", "refs/heads/rem/ambi"])
+            .step(&["rev-parse", "refs/remotes/rem/ambi"])
+            .step(&["rev-parse", "--symbolic-full-name", "rem/ambi"])
+            .step(&["branch", "-D", "rem/ambi"])
+            .step(&["rev-parse", "rem/ambi"])
+            .step(&["rev-parse", "--symbolic-full-name", "rem/ambi"])
+            .step(&["for-each-ref", "--format=%(refname)"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// two objects at one abbreviation
+// ---------------------------------------------------------------------------
+//
+// [`Shape::PrefixCollision`] holds a commit and a blob sharing `edfa`, and two
+// blobs sharing `a366`. What a case cannot do is *change* the object set and ask
+// again — remove the colliding blob from the tip, collect, and see whether the
+// abbreviation is still ambiguous — which is the only way to tell an
+// implementation that counts candidates from one that memoized an answer.
+
+fn prefix_collisions(out: &mut Vec<Sequence>) {
+    // The collision outliving the commit that introduced it. Step 4 removes
+    // `commit-mate.txt` and step 5 commits the removal, so the blob is no longer
+    // in any tree the tip reaches — and steps 6-10 are the point: it is still
+    // reachable from the two commits *behind* the tip, so `--disambiguate` must
+    // still list two objects and `rev-parse edfa` must still refuse, before and
+    // after a pruning collect that had nothing to prune.
+    //
+    // Step 11 is where the abbreviation width answers back: with the tip moved,
+    // `log --oneline --abbrev=4 -3` no longer reaches the `initial` commit, so
+    // the five-character row that the collision forces is out of the window and
+    // every row is four characters — the same command printing a different width
+    // because the *history* moved, not because the setting did.
+    out.push(
+        Sequence::new("rev-parse", "a-collision-that-outlives-the-tree-that-held-it", Shape::PrefixCollision)
+            .step(&["rev-parse", "--disambiguate=edfa"])
+            .step(&["log", "--oneline", "--abbrev=4", "-3"])
+            .step(&["rev-parse", "edfa"])
+            .step(&["rm", "-f", "commit-mate.txt"])
+            .step(&["commit", "-m", "collision: drop the colliding blob"])
+            .step(&["rev-parse", "--disambiguate=edfa"])
+            .step(&["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"])
+            .step(&["gc", "--prune=now"])
+            .step(&["rev-parse", "--disambiguate=edfa"])
+            .step(&["rev-parse", "edfa"])
+            .step(&["log", "--oneline", "--abbrev=4", "-3"]),
+    );
+
+    // `core.disambiguate`, which resolves the commit-and-blob collision and
+    // cannot resolve the blob-and-blob one. The three settings are given as
+    // per-step globals rather than as sequence configuration precisely because
+    // they must differ between steps: `=blob` answers the blob, `=commit` and
+    // `=committish` answer the commit, and the same argument produces three
+    // answers over one repository.
+    //
+    // `strict`, because the tail is the refusal and the refusal's *body* is the
+    // finding: stock prints `error: short object ID a366 is ambiguous` followed
+    // by a `hint: The candidates are:` block naming both blobs, and the port
+    // prints only the generic `fatal: ambiguous argument`. Steps 1-6 leave
+    // stderr empty on both sides, which is what makes the strict comparison
+    // reach the tail rather than stopping at step 1.
+    out.push(
+        Sequence::new("rev-parse", "core-disambiguate-cannot-split-two-blobs", Shape::PrefixCollision)
+            .strict()
+            .step(&["rev-parse", "--disambiguate=a366"])
+            .step(&["-c", "core.disambiguate=blob", "rev-parse", "edfa"])
+            .step(&["-c", "core.disambiguate=commit", "rev-parse", "edfa"])
+            .step(&["-c", "core.disambiguate=committish", "rev-parse", "edfa"])
+            .step(&["cat-file", "-t", "edfaaf1"])
+            .step(&["cat-file", "blob", "edfaaf1"])
+            .step(&["rev-parse", "a366"]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the am hooks, and the hooks that are present and do not run
+// ---------------------------------------------------------------------------
+//
+// [`Shape::AmHooks`] is the only shape carrying `applypatch-msg`,
+// `pre-applypatch` and `post-applypatch`, and the only one carrying hooks that
+// are **not executable**. Both are workflow properties: which hook ran is
+// readable in the commit message and in the marker files it left, and both of
+// those are written by one invocation and read by the next.
+
+fn am_hooks(out: &mut Vec<Sequence>) {
+    // The mailbox that applies. Two patches, so `applypatch-msg` runs twice and
+    // both messages gain `applypatch-trailer` — step 3's `%B` over the last two
+    // commits is where the *order* shows, and a port that ran the hook once for
+    // the mailbox rather than once per patch prints one trailer.
+    //
+    // Step 5 names all three marker files, which is the `post-applypatch`
+    // finding in disguise: that hook exits **1** and git ignores it, so its
+    // marker must be there and the `am` must still have exited 0.
+    //
+    // `strict`, because the tail is the refusal — `fatal: Resolve operation not
+    // in progress, we are not resuming.` — and stock leaves stderr empty on
+    // steps 1-5.
+    out.push(
+        Sequence::new("am", "the-three-applypatch-hooks-over-a-two-patch-mailbox", Shape::AmHooks)
+            .strict()
+            .step(&["log", "--oneline", "-1"])
+            .step(&["am", "mail/ok.mbox"])
+            .step(&["log", "-2", "--format=%B"])
+            .step(&["log", "--oneline", "-3"])
+            .step(&["status", "--porcelain"])
+            .step(&["am", "--abort"]),
+    );
+
+    // `applypatch-msg` refusing. It is handed the message file and nothing else,
+    // so the refusal happens **before** the patch reaches the index: step 3 must
+    // name only `hook-applypatch-msg.txt` — no `hook-pre-applypatch.txt`, no
+    // staged path — and step 4 must show `HEAD` unmoved.
+    //
+    // Steps 5-7 are the recovery, and the asymmetry is the finding: `am --abort`
+    // succeeds (there *is* a session, `am` stopped inside it) and leaves the
+    // hook's marker behind, because a hook's own output is not operation state
+    // and an abort has no business removing it.
+    out.push(
+        Sequence::new("am", "applypatch-msg-refuses-before-the-patch-is-applied", Shape::AmHooks)
+            .step(&["log", "--oneline", "-1"])
+            .step(&["am", "mail/reject.mbox"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["am", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // `pre-applypatch` refusing, which stops in a place nothing else in this
+    // corpus reaches: the hook runs *after* the patch is in the index and before
+    // the commit, so step 2 must report `A  veto-preapply.txt` — a staged add
+    // with no commit behind it and an `am` still in progress — while step 3
+    // shows `HEAD` where it was.
+    //
+    // Step 4's abort has to unstage that add as well as clear the session, and
+    // step 5 is what says it did: the two hook markers stay, the staged path
+    // goes.
+    out.push(
+        Sequence::new("am", "pre-applypatch-refuses-with-the-change-already-staged", Shape::AmHooks)
+            .step(&["am", "mail/preveto.mbox"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"])
+            .step(&["am", "--abort"])
+            .step(&["status", "--porcelain"])
+            .step(&["log", "--oneline", "-1"]),
+    );
+
+    // The two hooks that are present and not executable. Their whole contract is
+    // that git stats the file, sees no execute bit, and *skips* it — so step 1's
+    // commit must succeed, step 2's message must carry no
+    // `not-executable-trailer`, and step 3 must report no
+    // `hook-pre-commit.txt`. A port that runs a hook by handing it to a shell
+    // never consults the mode and fails all three at once.
+    //
+    // Step 4 asks git's own question about the same file: `hook run pre-commit`
+    // answers `error: cannot find a hook named pre-commit` at exit 1 — *cannot
+    // find*, over a file that exists — and steps 5-6 prove the repository was
+    // left able to commit again.
+    out.push(
+        Sequence::new("commit", "hooks-present-and-not-executable-are-skipped", Shape::AmHooks)
+            .step(&["commit", "--allow-empty", "-m", "inert: hooks that are not executable"])
+            .step(&["log", "-1", "--format=%B"])
+            .step(&["status", "--porcelain"])
+            .step(&["hook", "run", "pre-commit"])
+            .step(&["commit", "--allow-empty", "-m", "inert: a second one"])
+            .step(&["log", "--oneline", "-2"]),
     );
 }

@@ -51,12 +51,27 @@
 //!   `show-ref`, `for-each-ref`, `symbolic-ref`, `config --list` all complete on
 //!   stock with every lock in this file held, because none of them writes.
 //!
+//! * **The holder that lets go.** Every case above plants a lock nobody releases,
+//!   which is a killed process's leftovers and measures only what the port does
+//!   when its wait *expires*. The port's own differentiator is the other half —
+//!   `zvcs: <verb>: index is locked by another writer — queueing` — so two cases
+//!   plant a holder that disappears 100ms in, inside the wait budget, and ask
+//!   whether the queue actually comes back and does the work. Measured by hand
+//!   on both binaries: stock exits 128 and stages nothing, the port exits 0 and
+//!   the path is staged. See [`ForeignLockCase::release_after_ms`].
+//!
 //! Exit codes are asserted whenever both sides refuse, and they are not uniform
 //! even within one lock: measured on git 2.55.0, `index.lock` makes `commit`,
 //! `rm --cached`, `checkout` and `reset --hard` exit **128** while `stash push`
-//! exits **1**, and `config --add` under `config.lock` exits **255**. A port that
-//! spells every lock failure the same way passes a "does it refuse" check and
-//! still breaks the `&&` chain of any script that reads `$?`.
+//! exits **1**. `config.lock` is worse — one lock, one diagnostic (`error: could
+//! not lock config file .git/config: File exists`) and **three** exit codes:
+//! **255** for `config --add` and `config --unset`, **128** for `remote add`, and
+//! **1** for `branch --set-upstream-to`. And `refs/heads/main.lock` gives a third
+//! spread again: **128** for `merge`, `cherry-pick`, `revert`, `commit` and
+//! `commit --amend`, **1** for `rebase`, `reset --hard` and `stash push` — so
+//! `reset --hard` says 128 under one lock and 1 under another. A port that spells
+//! every lock failure the same way passes a "does it refuse" check and still
+//! breaks the `&&` chain of any script that reads `$?`.
 //!
 //! # Bounded, because a lock nobody releases is a lock a port may wait on
 //!
@@ -119,12 +134,45 @@ pub struct ForeignLockCase {
     /// measures the absence of work rather than the presence of the lock.
     pub setup: &'static [&'static [&'static str]],
     pub argv: &'static [&'static str],
+    /// Release the planted lock this many milliseconds after the run starts.
+    ///
+    /// `None` — every case but two — is a holder that never lets go, which is the
+    /// state a killed writer leaves behind and the one this file was built for.
+    ///
+    /// `Some(ms)` is the other half of the port's differentiator, and the half
+    /// nothing measured. `zvcs: <verb>: index is locked by another writer —
+    /// queueing` is a real message: the port waits on a lock stock git dies on,
+    /// up to `ZVCS_INDEX_LOCK_WAIT_MS` (300ms here, 2s by default per
+    /// `extensions/src/lock.rs:596`). A holder that never releases only ever
+    /// measures what the port does when the wait *expires*. A holder that
+    /// releases inside the budget measures whether the wait is a wait at all —
+    /// whether the port comes back and does the work, or merely sleeps and then
+    /// fails anyway.
+    ///
+    /// Stock git cannot benefit either way: its lockfile is `O_EXCL` with no
+    /// retry, so it has already failed by the time the file disappears. The
+    /// verdict is therefore [`Verdict::PortDidMore`] when the queue works, which
+    /// is recorded and not scored — the same treatment every other superset gets
+    /// here. What it must never be is [`Verdict::PortRefusedWhatGitDid`], and the
+    /// scoring needs no special case to say so.
+    ///
+    /// Bounded by construction: the release thread sleeps a fixed span and is
+    /// joined, and the run it overlaps is still capped by [`RUN_DEADLINE`].
+    pub release_after_ms: Option<u64>,
 }
 
 impl ForeignLockCase {
     pub fn id(&self) -> String {
+        // The holder's lifetime is part of the reproduction recipe: the same
+        // argv against the same lock is a different measurement depending on
+        // whether the lock ever goes away, and two ids that did not say so would
+        // be indistinguishable in a report.
+        let held = match self.release_after_ms {
+            None => "held".to_string(),
+            Some(ms) => format!("released-after-{ms}ms"),
+        };
         format!(
-            "foreign-lock::{}::{}::{}::[{}]",
+            "foreign-lock::{}::{}::{}::{held}::[{}]",
             self.shape.name(),
             self.name,
             self.lock,
@@ -251,6 +299,45 @@ fn run_one(bin: &Path, repo: &Path, home: &Path, argv: &[String], logs: &Path) -
     run_bounded(cmd, logs, &format!("{} {}", bin.display(), argv.join(" ")))
 }
 
+/// Run one side, and let go of the planted lock partway through if the case says
+/// the holder is a transient one.
+///
+/// The release is a thread rather than a pre-armed `at`-style timer because it
+/// has to start when *this side's* run starts: the two sides run sequentially
+/// against two repositories, and a timer armed once would release the stock
+/// side's lock while the port was still being measured.
+fn run_side(
+    case: &ForeignLockCase,
+    bin: &Path,
+    repo: &Path,
+    home: &Path,
+    argv: &[String],
+    logs: &Path,
+) -> Result<SideRun> {
+    let Some(ms) = case.release_after_ms else {
+        return run_one(bin, repo, home, argv, logs);
+    };
+    // Re-planted rather than assumed present: `prepare` put it there before
+    // either side ran, and this side must start from the same state the other
+    // one did.
+    let lock = repo.join(".git").join(case.lock);
+    if let Some(parent) = lock.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&lock, b"held by the parity harness, briefly\n")
+        .with_context(|| format!("re-plant {}", lock.display()))?;
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(ms));
+        let _ = std::fs::remove_file(&lock);
+    });
+    let out = run_one(bin, repo, home, argv, logs);
+    // Joined, never detached. A release thread outliving its case would delete a
+    // path the next case has already rebuilt under the same name, and the next
+    // case would then be measuring a lock nobody was holding.
+    let _ = releaser.join();
+    out
+}
+
 fn prepare(
     bin: &Path,
     repo: &Path,
@@ -316,8 +403,8 @@ pub fn run_foreign_lock_case(
 
     let argv: Vec<String> = case.argv.iter().map(|s| (*s).to_string()).collect();
     match (
-        run_one(zvcs_bin, &zvcs_repo, home, &argv, &logs),
-        run_one(stock, &stock_repo, home, &argv, &logs),
+        run_side(case, zvcs_bin, &zvcs_repo, home, &argv, &logs),
+        run_side(case, stock, &stock_repo, home, &argv, &logs),
     ) {
         (Ok(z), Ok(s)) => {
             let verdict = match (s.succeeded(), z.succeeded()) {
@@ -347,6 +434,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "packed-refs.lock",
             setup: &[],
             argv: &["update-ref", "refs/heads/fl-new", "HEAD"],
+            release_after_ms: None,
         },
         // The same claim through the porcelain a person actually types.
         ForeignLockCase {
@@ -356,6 +444,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "packed-refs.lock",
             setup: &[],
             argv: &["branch", "fl-branch"],
+            release_after_ms: None,
         },
         // A tag is a third ref namespace reaching the same backend.
         ForeignLockCase {
@@ -365,6 +454,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "packed-refs.lock",
             setup: &[],
             argv: &["tag", "fl-tag"],
+            release_after_ms: None,
         },
         // `pack-refs` genuinely needs the lock, so both sides must refuse. This is
         // the case that keeps a fix for the three above from being "stop taking
@@ -378,6 +468,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             setup: &[&["branch", "fl-topack"]],
             lock: "packed-refs.lock",
             argv: &["pack-refs", "--all"],
+            release_after_ms: None,
         },
         // The index side of the same question. The port may queue or wait here
         // and still succeed — that is the fair-queue feature, recorded as
@@ -389,6 +480,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["add", "README.md"],
+            release_after_ms: None,
         },
         // Reading must never be blocked by a writer's lock, on either side.
         ForeignLockCase {
@@ -398,6 +490,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["status", "--porcelain"],
+            release_after_ms: None,
         },
 
         // ---- index.lock, the rest of the verbs that meet it -------------------
@@ -416,6 +509,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["commit", "-q", "-m", "fl-commit"],
+            release_after_ms: None,
         },
         // Measured: 128. The removal direction of the same lock — a port that
         // guards writes but not un-writes would pass the `add` case and fail here.
@@ -426,6 +520,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["rm", "--cached", "-q", "staged.txt"],
+            release_after_ms: None,
         },
         // Measured: 128. `checkout` rewrites the index wholesale rather than
         // editing entries, which is a different path to the same lock.
@@ -436,6 +531,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["checkout", "-q", "feature"],
+            release_after_ms: None,
         },
         // Measured: 128. The destructive one: a `reset --hard` that reports
         // success without taking the lock has thrown work away and said it did
@@ -447,6 +543,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["reset", "-q", "--hard"],
+            release_after_ms: None,
         },
         // Measured: **1**, not 128 — `stash push` reports the lock failure as an
         // `error:` and exits 1 where every verb above it here exits 128. The case
@@ -459,6 +556,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["stash", "push", "-q", "-m", "fl-stash"],
+            release_after_ms: None,
         },
         // Two more readers that must not be blocked. Measured: both 0, with the
         // lock held, on stock.
@@ -469,6 +567,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["ls-files"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "diff-reads-under-a-held-index-lock",
@@ -477,6 +576,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "index.lock",
             setup: &[],
             argv: &["diff", "--name-only"],
+            release_after_ms: None,
         },
 
         // ---- HEAD.lock --------------------------------------------------------
@@ -492,6 +592,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "HEAD.lock",
             setup: &[],
             argv: &["commit", "-q", "-m", "fl-head"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "checkout-under-a-held-head-lock",
@@ -500,6 +601,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "HEAD.lock",
             setup: &[],
             argv: &["checkout", "-q", "feature"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "status-reads-under-a-held-head-lock",
@@ -508,6 +610,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "HEAD.lock",
             setup: &[],
             argv: &["status", "--porcelain"],
+            release_after_ms: None,
         },
         // Resolving `HEAD` while `HEAD.lock` is held is the narrowest form of the
         // reader question: the lock names the very file being read.
@@ -518,6 +621,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "HEAD.lock",
             setup: &[],
             argv: &["symbolic-ref", "HEAD"],
+            release_after_ms: None,
         },
 
         // ---- a single ref's own lock -----------------------------------------
@@ -539,6 +643,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "refs/heads/main.lock",
             setup: &[],
             argv: &["update-ref", "refs/heads/main", "HEAD"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "commit-under-its-branch-lock",
@@ -547,6 +652,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "refs/heads/main.lock",
             setup: &[],
             argv: &["commit", "-q", "-m", "fl-branchlock"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "update-ref-other-ref-under-a-held-ref-lock",
@@ -555,6 +661,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "refs/heads/main.lock",
             setup: &[],
             argv: &["update-ref", "refs/heads/fl-other", "HEAD"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "branch-under-a-held-ref-lock",
@@ -563,6 +670,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "refs/heads/main.lock",
             setup: &[],
             argv: &["branch", "fl-newb"],
+            release_after_ms: None,
         },
         // Reading the very ref whose lock is held. Measured: 0, with the object
         // id printed — the lock reserves the right to *replace* `refs/heads/main`
@@ -575,6 +683,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "refs/heads/main.lock",
             setup: &[],
             argv: &["show-ref", "--verify", "refs/heads/main"],
+            release_after_ms: None,
         },
 
         // ---- packed-refs.lock, the deletion half ------------------------------
@@ -591,6 +700,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "packed-refs.lock",
             setup: &[],
             argv: &["update-ref", "-d", "refs/heads/feature"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "branch-delete-under-a-held-packed-refs-lock",
@@ -599,6 +709,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "packed-refs.lock",
             setup: &[],
             argv: &["branch", "-D", "feature"],
+            release_after_ms: None,
         },
         // The ref readers. `packed-refs` is the file a reader is most likely to
         // catch mid-rewrite, and neither of these may refuse because of it.
@@ -610,6 +721,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "packed-refs.lock",
             setup: &[],
             argv: &["for-each-ref", "--format=%(refname)"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "show-ref-reads-under-a-held-packed-refs-lock",
@@ -618,6 +730,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "packed-refs.lock",
             setup: &[],
             argv: &["show-ref"],
+            release_after_ms: None,
         },
 
         // ---- config.lock ------------------------------------------------------
@@ -635,6 +748,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "config.lock",
             setup: &[],
             argv: &["config", "--add", "fl.key", "flvalue"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "config-reads-under-a-held-config-lock",
@@ -643,6 +757,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "config.lock",
             setup: &[],
             argv: &["config", "--list"],
+            release_after_ms: None,
         },
 
         // ---- shallow.lock -----------------------------------------------------
@@ -664,6 +779,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "shallow.lock",
             setup: &[],
             argv: &["fetch", "-q", "--depth=1", "origin", "main"],
+            release_after_ms: None,
         },
         // The same lock, the same failure, through the porcelain a person types —
         // and a *third* exit code for it: measured **1**, because `pull` reports
@@ -678,6 +794,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "shallow.lock",
             setup: &[],
             argv: &["pull", "-q", "--depth=1", "origin", "main"],
+            release_after_ms: None,
         },
         ForeignLockCase {
             name: "plain-fetch-ignores-a-held-shallow-lock",
@@ -686,6 +803,7 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "shallow.lock",
             setup: &[],
             argv: &["fetch", "-q", "origin"],
+            release_after_ms: None,
         },
 
         // ---- a lock file git does not actually use ----------------------------
@@ -708,6 +826,470 @@ pub fn cases() -> Vec<ForeignLockCase> {
             lock: "MERGE_HEAD.lock",
             setup: &[],
             argv: &["merge", "--no-edit", "-m", "fl-merge", "div-cold"],
+            release_after_ms: None,
+        },
+
+        // ---- the branch lock, and the rest of the verbs that publish a commit --
+        //
+        // `commit-under-its-branch-lock` is the sharpest case in this file: with
+        // `.git/refs/heads/main.lock` held, stock exits 128 in milliseconds and
+        // the port never returns. Every verb below reaches the same lock through
+        // the same shape — build something, then move the current branch to it —
+        // and each one is a separate implementation of that second half, so a
+        // fix for `commit` alone would leave the rest of them wherever they are.
+        //
+        // Measured on git 2.55.0 with `.git/refs/heads/main.lock` held, over a
+        // repository with `main`, a `feature` branch one commit ahead, and two
+        // tags:
+        //
+        //   merge --no-edit feature      128  fatal: update_ref failed for ref 'HEAD'
+        //   cherry-pick feature          128  error: cannot lock ref 'HEAD'
+        //   revert --no-edit HEAD        128  error: cannot lock ref 'HEAD'
+        //   commit --amend               128  fatal: cannot lock ref 'HEAD'
+        //   rebase feature                 1  error: update_ref failed for ref 'refs/heads/main'
+        //   reset --hard                   1  error: update_ref failed for ref 'HEAD'
+        //   stash push                     1  error: update_ref failed for ref 'HEAD'
+        //
+        // Three numbers for one lock, and the split is not where a reader would
+        // guess: `reset --hard` says 128 under `index.lock` and 1 under this one.
+        ForeignLockCase {
+            name: "merge-under-a-held-branch-lock",
+            cmd: "merge",
+            shape: Shape::Branched,
+            lock: "refs/heads/main.lock",
+            setup: &[],
+            argv: &["merge", "--no-edit", "-m", "fl-brmerge", "feature"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "cherry-pick-under-a-held-branch-lock",
+            cmd: "cherry-pick",
+            shape: Shape::Branched,
+            lock: "refs/heads/main.lock",
+            setup: &[],
+            argv: &["cherry-pick", "feature"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "revert-under-a-held-branch-lock",
+            cmd: "revert",
+            shape: Shape::Branched,
+            lock: "refs/heads/main.lock",
+            setup: &[],
+            argv: &["revert", "--no-edit", "HEAD"],
+            release_after_ms: None,
+        },
+        // `commit --amend` is the one that rewrites rather than extends, and it
+        // is the spelling a person runs most often in a worktree somebody else is
+        // also writing — the second-thoughts command.
+        ForeignLockCase {
+            name: "commit-amend-under-a-held-branch-lock",
+            cmd: "commit",
+            shape: Shape::Branched,
+            lock: "refs/heads/main.lock",
+            setup: &[],
+            argv: &["commit", "--amend", "--no-edit", "-q"],
+            release_after_ms: None,
+        },
+        // The two that stock spells **1**. Worth their own cases precisely
+        // because a port that normalises every lock failure to one number cannot
+        // be right about both these and the four above at once.
+        ForeignLockCase {
+            name: "rebase-under-a-held-branch-lock",
+            cmd: "rebase",
+            shape: Shape::Branched,
+            lock: "refs/heads/main.lock",
+            setup: &[],
+            argv: &["rebase", "feature"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "reset-hard-under-a-held-branch-lock",
+            cmd: "reset",
+            shape: Shape::Dirty,
+            lock: "refs/heads/main.lock",
+            setup: &[],
+            argv: &["reset", "-q", "--hard"],
+            release_after_ms: None,
+        },
+        // `stash push` takes `index.lock`, writes two commits, moves `refs/stash`
+        // — and moves `HEAD`'s branch back to where it was, which is the step this
+        // lock stops. Its `index.lock` twin already exists above; the pair is what
+        // separates "refuses when the index is busy" from "refuses when the branch
+        // is busy", and a port can do one and not the other.
+        ForeignLockCase {
+            name: "stash-push-under-a-held-branch-lock",
+            cmd: "stash",
+            shape: Shape::Stashed,
+            lock: "refs/heads/main.lock",
+            setup: &[],
+            argv: &["stash", "push", "-q", "-m", "fl-brstash"],
+            release_after_ms: None,
+        },
+
+        // ---- refs/stash.lock --------------------------------------------------
+        //
+        // The stash's own ref, which is neither a branch nor a tag and is reached
+        // by exactly one porcelain. Measured on git 2.55.0 over a repository with
+        // an existing entry and more to save: `stash push` and `stash drop` both
+        // exit **1** (`error: cannot lock ref 'refs/stash'`), and `stash list`
+        // answers normally with 0 — the stack is readable while somebody else is
+        // pushing onto it, which it must be, because `stash list` is how a person
+        // finds out what is going on.
+        ForeignLockCase {
+            name: "stash-push-under-a-held-stash-lock",
+            cmd: "stash",
+            shape: Shape::Stashed,
+            lock: "refs/stash.lock",
+            setup: &[],
+            argv: &["stash", "push", "-q", "-m", "fl-stashlock"],
+            release_after_ms: None,
+        },
+        // Deletion through the same ref, which is the direction that loses work:
+        // a `drop` that reports success without holding the lock has thrown away
+        // an entry it may not have removed, and the reflog it lives in has no
+        // second copy.
+        ForeignLockCase {
+            name: "stash-drop-under-a-held-stash-lock",
+            cmd: "stash",
+            shape: Shape::Stashed,
+            lock: "refs/stash.lock",
+            setup: &[],
+            argv: &["stash", "drop"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "stash-list-reads-under-a-held-stash-lock",
+            cmd: "stash",
+            shape: Shape::Stashed,
+            lock: "refs/stash.lock",
+            setup: &[],
+            argv: &["stash", "list"],
+            release_after_ms: None,
+        },
+        // And the reader that is not part of the stash family at all. Measured 0
+        // on stock: a held `refs/stash.lock` says nothing about the worktree, and
+        // a port that let it block `status` would freeze a prompt.
+        ForeignLockCase {
+            name: "status-reads-under-a-held-stash-lock",
+            cmd: "status",
+            shape: Shape::Stashed,
+            lock: "refs/stash.lock",
+            setup: &[],
+            argv: &["status", "--porcelain"],
+            release_after_ms: None,
+        },
+
+        // ---- a ref inside refs/notes/ -----------------------------------------
+        //
+        // A third ref namespace, and the one whose writes are a read-modify-write
+        // of a *tree* rather than of a file. Measured on git 2.55.0 with
+        // `.git/refs/notes/commits.lock` held:
+        //
+        //   notes add -f HEAD                 128  fatal: update_ref failed for ref 'refs/notes/commits'
+        //   notes remove HEAD                 128  same
+        //   notes --ref=other add -f HEAD       0  a different notes ref, untouched
+        //   for-each-ref refs/notes             0  the reader
+        //
+        // The narrowness half is the one that matters on a machine with sixteen
+        // panes: a stale lock on one notes ref must not stop the others, and
+        // `refs/notes/other` is a ref this shape already carries.
+        ForeignLockCase {
+            name: "notes-add-under-its-own-ref-lock",
+            cmd: "notes",
+            shape: Shape::NotesReplace,
+            lock: "refs/notes/commits.lock",
+            setup: &[],
+            argv: &["notes", "add", "-f", "-m", "fl-note", "HEAD"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "notes-remove-under-a-held-notes-ref-lock",
+            cmd: "notes",
+            shape: Shape::NotesReplace,
+            lock: "refs/notes/commits.lock",
+            setup: &[],
+            argv: &["notes", "remove", "HEAD"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "notes-add-other-ref-under-a-held-notes-ref-lock",
+            cmd: "notes",
+            shape: Shape::NotesReplace,
+            lock: "refs/notes/commits.lock",
+            setup: &[],
+            argv: &["notes", "--ref=other", "add", "-f", "-m", "fl-othernote", "HEAD"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "for-each-ref-reads-under-a-held-notes-ref-lock",
+            cmd: "for-each-ref",
+            shape: Shape::NotesReplace,
+            lock: "refs/notes/commits.lock",
+            setup: &[],
+            argv: &["for-each-ref", "--format=%(refname)", "refs/notes"],
+            release_after_ms: None,
+        },
+
+        // ---- MERGE_RR.lock ----------------------------------------------------
+        //
+        // rerere's own lock, over the file that records which paths are still
+        // conflicted. No shape could reach it before [`Shape::Rerere`] existed:
+        // `.git/MERGE_RR` only exists while a merge is unresolved and a case is
+        // one argv against a pristine copy.
+        //
+        // Measured on git 2.55.0 mid-merge with `.git/MERGE_RR.lock` held:
+        //
+        //   rerere                128  fatal: Unable to create '…/MERGE_RR.lock'
+        //   rerere forget <path>  128  same
+        //   commit (resolved)     128  same — the lock a commit takes THIRD
+        //   rerere status           0  the reader, and it reads MERGE_RR itself
+        //   add <path>              0  resolving a path does not touch it
+        //   status --porcelain      0
+        //
+        // `commit` reaching this lock is the multi-lock shape in its purest form:
+        // the index lock, then the branch lock, then this one, and a writer
+        // interrupted between any two of them has done part of the work.
+        ForeignLockCase {
+            name: "rerere-under-a-held-merge-rr-lock",
+            cmd: "rerere",
+            shape: Shape::Rerere,
+            lock: "MERGE_RR.lock",
+            setup: &[],
+            argv: &["rerere"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "rerere-forget-under-a-held-merge-rr-lock",
+            cmd: "rerere",
+            shape: Shape::Rerere,
+            lock: "MERGE_RR.lock",
+            setup: &[],
+            argv: &["rerere", "forget", "fresh.txt"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "rerere-status-reads-under-a-held-merge-rr-lock",
+            cmd: "rerere",
+            shape: Shape::Rerere,
+            lock: "MERGE_RR.lock",
+            setup: &[],
+            argv: &["rerere", "status"],
+            release_after_ms: None,
+        },
+        // The narrowness half: `add` is what a person runs to resolve a conflicted
+        // path, it runs while the merge is in progress, and it must not be stopped
+        // by rerere's lock.
+        ForeignLockCase {
+            name: "add-ignores-a-held-merge-rr-lock",
+            cmd: "add",
+            shape: Shape::Rerere,
+            lock: "MERGE_RR.lock",
+            setup: &[],
+            argv: &["add", "rr.txt"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "status-reads-under-a-held-merge-rr-lock",
+            cmd: "status",
+            shape: Shape::Rerere,
+            lock: "MERGE_RR.lock",
+            setup: &[],
+            argv: &["status", "--porcelain"],
+            release_after_ms: None,
+        },
+
+        // ---- shallow.lock, over a repository that is actually shallow ----------
+        //
+        // The three `shallow.lock` cases above run on [`Shape::BehindRemote`],
+        // which is a complete repository: `.git/shallow` does not exist there, so
+        // they measure the lock a fetch would take to *create* it. This shape has
+        // the file, which is the other half — the lock a verb takes to rewrite a
+        // graft list that is already there, and the half `gc` reaches.
+        //
+        // Measured on git 2.55.0 over a depth-2 clone with `.git/shallow.lock`
+        // held:
+        //
+        //   fetch --unshallow origin  128  fatal: Unable to create '…/shallow.lock'
+        //   fetch --deepen=1 origin   128  same
+        //   gc --quiet                128  same — gc rewrites the graft list too
+        //   status --porcelain          0  the reader
+        //
+        // `gc` is the one worth the case: nothing about the words "garbage
+        // collect" says "takes the shallow lock", and a port that reasons about
+        // which locks a verb needs from the verb's name will not have it.
+        ForeignLockCase {
+            name: "fetch-unshallow-under-a-held-shallow-lock",
+            cmd: "fetch",
+            shape: Shape::Shallow,
+            lock: "shallow.lock",
+            setup: &[],
+            argv: &["fetch", "-q", "--unshallow", "origin"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "fetch-deepen-under-a-held-shallow-lock",
+            cmd: "fetch",
+            shape: Shape::Shallow,
+            lock: "shallow.lock",
+            setup: &[],
+            argv: &["fetch", "-q", "--deepen=1", "origin"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "gc-under-a-held-shallow-lock",
+            cmd: "gc",
+            shape: Shape::Shallow,
+            lock: "shallow.lock",
+            setup: &[],
+            argv: &["gc", "--quiet"],
+            release_after_ms: None,
+        },
+        // And the same verb on a repository that is *not* shallow, where the same
+        // file name means nothing at all: measured 0 on stock. The pair is what
+        // separates "knows why it takes the lock" from "refuses on sight of a
+        // name", and without the second half a port that refuses every `gc` in
+        // every repository with a stray `shallow.lock` would score perfectly.
+        ForeignLockCase {
+            name: "gc-ignores-a-held-shallow-lock",
+            cmd: "gc",
+            shape: Shape::Linear,
+            lock: "shallow.lock",
+            setup: &[],
+            argv: &["gc", "--quiet"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "status-reads-under-a-held-shallow-lock",
+            cmd: "status",
+            shape: Shape::Shallow,
+            lock: "shallow.lock",
+            setup: &[],
+            argv: &["status", "--porcelain"],
+            release_after_ms: None,
+        },
+
+        // ---- config.lock, the verbs that write config without saying so --------
+        //
+        // `config --add` is the obvious writer and it is already above. These are
+        // the ones a person does not think of as config writes at all, and they
+        // are where the exit codes come apart. Measured on git 2.55.0 with
+        // `.git/config.lock` held, all three printing `error: could not lock
+        // config file .git/config: File exists`:
+        //
+        //   config --add fl.key v               255
+        //   config --unset core.repositoryformatversion  255
+        //   remote add flr ./peer               128
+        //   branch --set-upstream-to=feature main 1
+        //
+        // One lock, one diagnostic, **three** exit codes. A caller that branches
+        // on `$?` gets a different answer depending on which spelling it used, and
+        // a port that maps lock failures to a single number cannot reproduce that
+        // however carefully it takes the lock.
+        ForeignLockCase {
+            name: "config-unset-under-a-held-config-lock",
+            cmd: "config",
+            shape: Shape::Linear,
+            lock: "config.lock",
+            setup: &[],
+            argv: &["config", "--unset", "core.repositoryformatversion"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "remote-add-under-a-held-config-lock",
+            cmd: "remote",
+            shape: Shape::Linear,
+            lock: "config.lock",
+            setup: &[],
+            argv: &["remote", "add", "flr", "./peer"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "branch-upstream-under-a-held-config-lock",
+            cmd: "branch",
+            shape: Shape::Branched,
+            lock: "config.lock",
+            setup: &[],
+            argv: &["branch", "--set-upstream-to=feature", "main"],
+            release_after_ms: None,
+        },
+
+        // ---- two more readers against packed-refs.lock -------------------------
+        //
+        // `for-each-ref` and `show-ref` are the plumbing readers and they are
+        // already here. These two are the ones every prompt and every script runs
+        // in a loop, and they resolve a name rather than list one — a different
+        // path into the same file. Measured 0 on stock with the lock held.
+        ForeignLockCase {
+            name: "rev-parse-reads-under-a-held-packed-refs-lock",
+            cmd: "rev-parse",
+            shape: Shape::Branched,
+            lock: "packed-refs.lock",
+            setup: &[],
+            argv: &["rev-parse", "HEAD"],
+            release_after_ms: None,
+        },
+        ForeignLockCase {
+            name: "describe-reads-under-a-held-packed-refs-lock",
+            cmd: "describe",
+            shape: Shape::Branched,
+            lock: "packed-refs.lock",
+            setup: &[],
+            argv: &["describe", "--tags"],
+            release_after_ms: None,
+        },
+
+        // ---- a holder that lets go ---------------------------------------------
+        //
+        // Every case above plants a lock nobody ever releases, which measures what
+        // the port does when its wait *expires*. The port's whole differentiator
+        // is the other case — `zvcs: <verb>: index is locked by another writer —
+        // queueing` — and nothing in this harness had ever released a lock to find
+        // out whether the queue is a queue or only a sleep.
+        //
+        // Measured by hand before these cases were written, with `.git/index.lock`
+        // planted and removed 100ms later, against a repository holding an
+        // untracked `n.txt`:
+        //
+        //   stock  git add n.txt   rc=128, `Unable to create '…/index.lock'`,
+        //                          `ls-files` afterwards does not list n.txt
+        //   zvcs   git add n.txt   rc=0, `ls-files` afterwards lists n.txt
+        //
+        // So the wait is a real wait and the work really lands. That is
+        // [`Verdict::PortDidMore`] — recorded, never scored — and the reason it
+        // belongs here anyway is the direction it rules out: if the port ever
+        // starts *failing* a write whose lock was released inside its budget, this
+        // case is the only one that would notice, and it would notice as
+        // [`Verdict::Agree`] going quiet rather than as a new failure. The pair to
+        // read it against is `add-under-a-held-index-lock`, three sections up,
+        // which is the same argv against a holder that never lets go.
+        //
+        // 100ms against the 300ms budget `run_one` sets: comfortably inside it,
+        // and short enough that a case which finds nothing costs a tenth of a
+        // second rather than a wait.
+        ForeignLockCase {
+            name: "add-under-an-index-lock-released-mid-wait",
+            cmd: "add",
+            shape: Shape::Dirty,
+            lock: "index.lock",
+            setup: &[],
+            argv: &["add", "untracked.txt"],
+            release_after_ms: Some(100),
+        },
+        // The same holder against the verb whose failure is expensive twice over.
+        // `commit` under a held `index.lock` is already measured; this asks
+        // whether a commit that waited out a transient holder goes on to make the
+        // commit, or reports success for a commit that was never made — which is
+        // the one outcome the concurrent corpus exists to catch and the one a
+        // caller cannot detect.
+        ForeignLockCase {
+            name: "commit-under-an-index-lock-released-mid-wait",
+            cmd: "commit",
+            shape: Shape::Dirty,
+            lock: "index.lock",
+            setup: &[],
+            argv: &["commit", "-q", "-m", "fl-released"],
+            release_after_ms: Some(100),
         },
     ]
 }
@@ -782,11 +1364,15 @@ mod tests {
             &["status", "ls-files", "diff", "show-ref", "for-each-ref", "symbolic-ref", "config"];
         let mut locks: std::collections::BTreeSet<&str> =
             cases().iter().map(|c| c.lock).collect();
-        // `shallow.lock` and `MERGE_HEAD.lock` are met by a *writer* that must
-        // still succeed (a plain fetch, a merge), which answers the same question
-        // — the lock must not become a blanket refusal — through the only verbs
-        // that reach those files at all. No reader touches either one.
-        locks.remove("shallow.lock");
+        // `MERGE_HEAD.lock` is met by a *writer* that must still succeed (a
+        // merge), which answers the same question — the lock must not become a
+        // blanket refusal — through the only verb that reaches the file at all.
+        // No reader touches it.
+        //
+        // `shallow.lock` used to be exempt for the same reason and no longer is:
+        // `status-reads-under-a-held-shallow-lock` measures a real reader against
+        // it (0 on stock 2.55.0 over a depth-2 clone), so the exemption would now
+        // be hiding a case rather than admitting a gap.
         locks.remove("MERGE_HEAD.lock");
         for lock in locks {
             assert!(
@@ -804,10 +1390,73 @@ mod tests {
     /// locking. Both halves, per lock, or the lock proves nothing.
     #[test]
     fn contested_locks_have_both_halves() {
-        for lock in ["index.lock", "packed-refs.lock", "refs/heads/main.lock", "config.lock"] {
+        for lock in [
+            "index.lock",
+            "packed-refs.lock",
+            "refs/heads/main.lock",
+            "config.lock",
+            "refs/stash.lock",
+            "refs/notes/commits.lock",
+            "MERGE_RR.lock",
+            "shallow.lock",
+        ] {
             let n = cases().iter().filter(|c| c.lock == lock).count();
             assert!(n >= 2, "{lock} has {n} case(s), too few to say anything");
         }
+    }
+
+    /// The branch lock is where this file's worst outcome lives, and it is worth
+    /// nothing measured against one verb. Every porcelain that publishes a commit
+    /// reaches it through its own code, so the corpus has to keep asking all of
+    /// them — a fix that bounds `commit`'s retry and leaves `merge`'s alone would
+    /// otherwise read as the defect being gone.
+    #[test]
+    fn the_branch_lock_is_met_by_every_verb_that_publishes_a_commit() {
+        let names: Vec<&str> = cases()
+            .iter()
+            .filter(|c| c.lock == "refs/heads/main.lock")
+            .map(|c| c.name)
+            .collect();
+        for wanted in [
+            "commit-under-its-branch-lock",
+            "merge-under-a-held-branch-lock",
+            "cherry-pick-under-a-held-branch-lock",
+            "revert-under-a-held-branch-lock",
+            "commit-amend-under-a-held-branch-lock",
+            "rebase-under-a-held-branch-lock",
+            "reset-hard-under-a-held-branch-lock",
+        ] {
+            assert!(names.contains(&wanted), "the branch-lock family lost {wanted}");
+        }
+    }
+
+    /// A holder that never lets go and a holder that does are two different
+    /// measurements, and the corpus needs both: the first says what the port does
+    /// when its wait expires, the second says whether the wait was a wait at all.
+    /// They must be the same argv, or the pair compares two things.
+    #[test]
+    fn the_corpus_keeps_a_holder_that_releases_beside_one_that_does_not() {
+        let released: Vec<ForeignLockCase> =
+            cases().into_iter().filter(|c| c.release_after_ms.is_some()).collect();
+        assert!(
+            released.len() >= 2,
+            "no case measures a lock that is released while the verb waits"
+        );
+        // The release must be inside the port's wait budget, or the case is a
+        // second copy of the never-released one wearing a different name.
+        for case in &released {
+            let ms = case.release_after_ms.unwrap();
+            assert!(ms > 0 && ms < 300, "{}: {ms}ms is not inside the 300ms budget", case.name);
+        }
+        let held: Vec<&str> = cases()
+            .iter()
+            .filter(|c| c.release_after_ms.is_none() && c.lock == "index.lock")
+            .map(|c| c.name)
+            .collect();
+        assert!(
+            held.contains(&"add-under-a-held-index-lock"),
+            "the never-released twin of the released `add` case is gone: {held:?}"
+        );
     }
 
     /// A killed run has no exit code, and `succeeded()` has to read that as "did

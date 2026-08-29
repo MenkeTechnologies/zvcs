@@ -68,6 +68,22 @@
 //! an `add` and a `commit` have finished different work and asking one question
 //! about both would have to be the weaker of the two.
 //!
+//! # Writers that hold more than one lock
+//!
+//! A case whose script is one command measures one lock. The verbs that a
+//! repository is actually lost to take several in sequence — `commit` takes
+//! `index.lock`, releases it, and then goes for a ref lock; `fetch` takes a lock
+//! per remote-tracking ref, `FETCH_HEAD.lock`, and `shallow.lock` when the
+//! repository is shallow; a resolved merge takes the index, then the branch, then
+//! `MERGE_RR.lock` — and a writer interrupted *between* two of them is in a state
+//! no single-lock case can reach: it holds nothing, and half its work is done.
+//!
+//! That shape is where the sharpest defect in this dimension came from, so the
+//! corpus keeps writers whose script chains three and four verbs with `&&`
+//! between them, and each such case asserts its effect on the **last** link. A
+//! writer that stopped between two locks and exited 0 is then a lost update
+//! rather than a success, which is exactly what it is.
+//!
 //! # Nothing here may wedge the run
 //!
 //! A concurrency case is the only place in this harness where a child can be
@@ -234,6 +250,25 @@ pub enum Effect {
     /// exactly one of N however many landed and would report every other writer
     /// as lost. `stash list` is the only view of the stack.
     StashEntry(&'static str),
+    /// The note text appears in `git log --all --notes=<ref> --format=%N`.
+    ///
+    /// A fifth lock, and the only one in this corpus that is a read-modify-write
+    /// of a *tree* rather than of a file. Adding a note rewrites the notes ref's
+    /// tree — read the old tree, insert one entry, write a new tree, move the ref
+    /// — so two writers annotating two different commits on one notes ref are a
+    /// textbook lost update: both trees are valid, both refs are written, and the
+    /// loser's entry is simply not in the tree the winner published.
+    ///
+    /// Read through `log --notes` rather than `notes list`, because `notes list`
+    /// prints object ids and would make every case carry a hash. Verified on
+    /// stock 2.55.0: four notes added under `--ref=conc` come back as four bare
+    /// lines from `log --all --notes=refs/notes/conc --format=%N`, one per note.
+    Note {
+        /// The fully-qualified notes ref the writers share.
+        r#ref: &'static str,
+        /// The note's whole text, which is one line.
+        text: &'static str,
+    },
     /// `git worktree list` reports a worktree whose directory has this name.
     ///
     /// Registration lives in `.git/worktrees/<name>`, which `worktree prune`
@@ -261,6 +296,9 @@ impl Effect {
             Effect::ConfigValue { key, value } => {
                 ResolvedEffect::ConfigValue { key: sub(key), value: sub(value) }
             }
+            Effect::Note { r#ref, text } => {
+                ResolvedEffect::Note { r#ref: sub(r#ref), text: sub(text) }
+            }
             Effect::StashEntry(m) => ResolvedEffect::StashEntry(sub(m)),
             Effect::WorktreeRegistered(n) => ResolvedEffect::WorktreeRegistered(sub(n)),
         }
@@ -277,6 +315,7 @@ enum ResolvedEffect {
     RefAbsent(String),
     RefMirrors { refname: String, of: String },
     ConfigValue { key: String, value: String },
+    Note { r#ref: String, text: String },
     StashEntry(String),
     WorktreeRegistered(String),
 }
@@ -355,6 +394,12 @@ impl ResolvedEffect {
             ResolvedEffect::ConfigValue { key, value } => {
                 listed(&["config", "--get-all", key], value)
             }
+            // `--all`, like `LoggedMessage`: the question is whether the note
+            // reached the notes tree the repository ends up with, not which
+            // branch the annotated commit happens to be on.
+            ResolvedEffect::Note { r#ref, text } => {
+                listed(&["log", "--all", &format!("--notes={ref}", ref = r#ref), "--format=%N"], text)
+            }
             // `%gs` is the reflog subject, which is where a stash message lives;
             // the entry reads `On <branch>: <message>`, so the branch name would
             // have to be baked into every case if this matched whole lines.
@@ -380,6 +425,7 @@ impl ResolvedEffect {
             ResolvedEffect::RefAbsent(r) => format!("{r} deleted"),
             ResolvedEffect::RefMirrors { refname, of } => format!("{refname} points at {of}"),
             ResolvedEffect::ConfigValue { key, value } => format!("{key}={value} in config"),
+            ResolvedEffect::Note { r#ref, text } => format!("note {text} on {ref}", ref = r#ref),
             ResolvedEffect::StashEntry(m) => format!("stash entry {m}"),
             ResolvedEffect::WorktreeRegistered(n) => format!("worktree {n} registered"),
         }
@@ -1305,6 +1351,268 @@ pub fn cases() -> Vec<ConcurrentCase> {
             }],
             no_daemon: false,
         },
+        // ---- writers that hold more than one lock at a time ---------------------
+        //
+        // Every case above takes one lock per step. The shape that found this
+        // dimension's sharpest defect — `commit` never returning under a held
+        // `refs/heads/main.lock` — is the other one: a verb that takes
+        // `index.lock`, writes, releases it, and then goes for a *ref* lock, so
+        // there is an instant where it holds neither and its work is half done.
+        // A writer interrupted there is in a state no single-lock case reaches.
+        //
+        // The whole chain in one writer: `add` takes `index.lock`, `commit` takes
+        // it again and then `refs/heads/main`, `tag` takes `refs/tags/<name>`,
+        // `branch` takes `refs/heads/<name>`. Four locks, three of them different
+        // files, and `&&` between every pair — so the effect is asserted on the
+        // *last* link, and a writer that exits 0 having stopped at any earlier one
+        // is exactly the lost update this module scores. Single-writer on stock
+        // 2.55.0 the chain completes and leaves `refs/heads/concchainb<i>`.
+        ConcurrentCase {
+            name: "commit-then-tag-then-branch",
+            cmd: "commit",
+            shape: Shape::Linear,
+            writers: 6,
+            steps: &[
+                &["add", "conc{i}.txt"],
+                &["commit", "-q", "-m", "concchain{i}"],
+                &["tag", "concchain{i}"],
+                &["branch", "concchainb{i}"],
+            ],
+            prepare: &["conc{i}.txt"],
+            effect: Effect::RefExists("refs/heads/concchainb{i}"),
+            also: &[],
+            no_daemon: false,
+        },
+        // `checkout -b` and `commit` in one window, which is the pair that meets
+        // on `HEAD` rather than on the index. `checkout -b` writes a ref, then
+        // rewrites `HEAD` to point at it; `commit` reads `HEAD`, writes an object,
+        // then moves whatever branch `HEAD` named. A `commit` that resolved `HEAD`
+        // before a concurrent `checkout` moved it and then updated the branch it
+        // *had* read is a commit on the wrong branch, and no ref is missing
+        // afterwards — which is why each role asserts its own effect rather than a
+        // shared one.
+        ConcurrentCase {
+            name: "checkout-branch-vs-commit",
+            cmd: "checkout",
+            shape: Shape::Branched,
+            writers: 6,
+            steps: &[&["checkout", "-q", "-b", "conccb{i}"]],
+            prepare: &[],
+            effect: Effect::RefExists("refs/heads/conccb{i}"),
+            also: &[Role {
+                steps: &[&["commit", "-q", "--allow-empty", "-m", "conccb{i}"]],
+                effect: Effect::LoggedMessage("conccb{i}"),
+            }],
+            no_daemon: false,
+        },
+        // The refs backend's *other* read-modify-write, and the one no case here
+        // reached: a notes ref. `notes add` reads the notes tree, inserts one
+        // entry, writes a new tree and moves `refs/notes/conc` — so N writers
+        // annotating N different commits on one notes ref all read the same tree
+        // and four of them can publish a tree missing the other three's entries,
+        // with every ref written and every tree valid.
+        //
+        // `--ref=conc` rather than the shape's existing `refs/notes/commits`, so
+        // the contention starts from an empty tree and a writer's entry can only
+        // have come from this case. `-f` because two of the annotated commits
+        // already carry a note on the default ref and the flag costs nothing where
+        // they do not. Verified single-writer on stock 2.55.0: four `notes
+        // --ref=conc add` on `HEAD~0..HEAD~3` come back as four lines from
+        // `log --all --notes=refs/notes/conc --format=%N`.
+        ConcurrentCase {
+            name: "notes-add-same-notes-ref",
+            cmd: "notes",
+            shape: Shape::NotesReplace,
+            writers: 4,
+            steps: &[&["notes", "--ref=conc", "add", "-f", "-m", "concnote{i}", "HEAD~{i}"]],
+            prepare: &[],
+            effect: Effect::Note { r#ref: "refs/notes/conc", text: "concnote{i}" },
+            also: &[],
+            no_daemon: false,
+        },
+        // The same tree rewrite with `pack-refs` folding `refs/notes/*` away
+        // underneath it. A notes ref is an ordinary ref to the packing backend, so
+        // half the writers move a ref the other half are packing — the notes tree
+        // and the ref file are two different read-modify-writes racing in one
+        // window, which is the pair a port that serializes each one separately can
+        // still lose.
+        ConcurrentCase {
+            name: "notes-add-while-packing-refs",
+            cmd: "notes",
+            shape: Shape::NotesReplace,
+            writers: 4,
+            steps: &[&["notes", "--ref=conc", "add", "-f", "-m", "concpk{i}", "HEAD~{i}"]],
+            prepare: &[],
+            effect: Effect::Note { r#ref: "refs/notes/conc", text: "concpk{i}" },
+            also: &[Role {
+                steps: &[
+                    &["pack-refs", "--all"],
+                    &["notes", "--ref=conc", "add", "-f", "-m", "concpk{i}", "HEAD~{i}"],
+                ],
+                effect: Effect::Note { r#ref: "refs/notes/conc", text: "concpk{i}" },
+            }],
+            no_daemon: false,
+        },
+        // A reader against the *deletion* rewrite of `packed-refs`, which
+        // `mirror-main-while-packing` cannot reach: that case races a reader
+        // against a fold that only ever adds lines, and this one races it against
+        // a rewrite that removes them. A resolve that catches the file with its
+        // header written and its body not yet flushed comes back with the wrong
+        // object, still exits 0 and still creates a ref — so the assertion is
+        // object identity again, against `refs/heads/main`, which nothing in this
+        // case moves.
+        ConcurrentCase {
+            name: "mirror-main-while-deleting-packed-refs",
+            cmd: "pack-refs",
+            shape: Shape::Branched,
+            writers: 6,
+            steps: &[
+                &["update-ref", "refs/heads/concpd{i}", "HEAD"],
+                &["pack-refs", "--all"],
+                &["update-ref", "-d", "refs/heads/concpd{i}"],
+            ],
+            prepare: &[],
+            effect: Effect::RefAbsent("refs/heads/concpd{i}"),
+            also: &[Role {
+                steps: &[&["update-ref", "refs/heads/concpm{i}", "refs/heads/main"]],
+                effect: Effect::RefMirrors {
+                    refname: "refs/heads/concpm{i}",
+                    of: "refs/heads/main",
+                },
+            }],
+            no_daemon: false,
+        },
+        // `fetch` against itself. It is the multi-lock verb a user runs most
+        // often without thinking about it: a ref lock per remote-tracking branch,
+        // `FETCH_HEAD.lock` for the summary, and `shallow.lock` whenever the
+        // repository is shallow — several locks in one invocation, taken and
+        // released in an order the caller never sees. `fetch-vs-gc` puts one
+        // fetch beside a different verb; this puts four of them beside each other,
+        // which is the only way `FETCH_HEAD` is contended at all.
+        //
+        // The `update-ref` after each fetch is what makes success checkable: a
+        // fetch that exits 0 without having written `refs/remotes/origin/main`
+        // leaves the second step nothing to copy, so it fails and the writer never
+        // claims success it did not earn.
+        ConcurrentCase {
+            name: "fetch-vs-fetch",
+            cmd: "fetch",
+            shape: Shape::BehindRemote,
+            writers: 4,
+            steps: &[
+                &["fetch", "-q", "origin"],
+                &["update-ref", "refs/heads/concff{i}", "refs/remotes/origin/main"],
+            ],
+            prepare: &[],
+            effect: Effect::RefExists("refs/heads/concff{i}"),
+            also: &[],
+            no_daemon: false,
+        },
+        // `.git/shallow` is a lock target no case in this corpus ever touched, and
+        // it is the one a deepening fetch rewrites wholesale: read every grafted
+        // id, ask the peer for more history, write the shorter list back. Four
+        // writers deepening at once are four whole-file read-modify-writes of it,
+        // and a lost one leaves the repository claiming a graft whose parent it
+        // has already fetched — which `fsck --strict`, an invariant here, is what
+        // sees.
+        //
+        // Verified on stock 2.55.0 against this shape's own layout: a shallow
+        // clone whose `remote.origin.url` is a plain local path answers
+        // `fetch --deepen=1 origin` with 0, so the verb reaches the lock rather
+        // than dying on the transport.
+        ConcurrentCase {
+            name: "deepen-shallow-concurrently",
+            cmd: "fetch",
+            shape: Shape::Shallow,
+            writers: 4,
+            steps: &[
+                &["fetch", "-q", "--deepen=1", "origin"],
+                &["update-ref", "refs/heads/concsh{i}", "HEAD"],
+            ],
+            prepare: &[],
+            effect: Effect::RefExists("refs/heads/concsh{i}"),
+            also: &[],
+            no_daemon: false,
+        },
+        // A lazy fetch racing a `gc`. In a partial clone, reading a blob that is
+        // not present starts a fetch from the promisor remote *inside* the reading
+        // process — so `cat-file` is a writer, which is the whole point — while
+        // `gc` next to it is repacking the object store the fetch is writing into.
+        // A `gc` that treats a promisor pack as ordinary garbage, or a lazy fetch
+        // that writes into a pack directory being replaced, both end with an
+        // object the repository references and does not have; `fsck --strict` is
+        // the invariant that catches it, and the per-writer ref is what says
+        // whether the writer that claimed success actually got its blob.
+        //
+        // Verified on stock 2.55.0 against a partial clone of the same shape:
+        // `cat-file -p main~2:hist.txt` prints the blob and drops the missing
+        // count from three to two, `gc --quiet` exits 0, and `fsck --strict` is
+        // clean before and after — so an unclean `fsck` here is the race and not
+        // the fixture.
+        ConcurrentCase {
+            name: "lazy-fetch-vs-gc",
+            cmd: "gc",
+            shape: Shape::Promisor,
+            writers: 4,
+            steps: &[
+                &["cat-file", "-p", "main~{i}:hist.txt"],
+                &["update-ref", "refs/heads/conclz{i}", "HEAD"],
+            ],
+            prepare: &[],
+            effect: Effect::RefExists("refs/heads/conclz{i}"),
+            also: &[Role {
+                steps: &[&["gc", "--quiet"], &["update-ref", "refs/heads/conclz{i}", "HEAD"]],
+                effect: Effect::RefExists("refs/heads/conclz{i}"),
+            }],
+            no_daemon: false,
+        },
+        // `worktree-add-vs-prune` runs on a shape where `prune` has nothing to
+        // prune, so its `prune` walks an empty list and the race is only ever
+        // against the new registration. This shape carries a genuinely prunable
+        // entry — `wt-gone`, registered with its directory deleted — so `prune`
+        // actually rewrites `.git/worktrees` while an `add` is creating a
+        // directory in it, and a half-written registration is indistinguishable
+        // from the stale one `prune` came to remove.
+        ConcurrentCase {
+            name: "worktree-add-vs-prune-with-a-prunable-entry",
+            cmd: "worktree",
+            shape: Shape::WorktreeLocked,
+            writers: 4,
+            steps: &[&["worktree", "add", "-q", "concwl{i}"], &["worktree", "prune"]],
+            prepare: &[],
+            effect: Effect::WorktreeRegistered("concwl{i}"),
+            also: &[],
+            no_daemon: false,
+        },
+        // Two different writers of one config file. `config --add` appends a value
+        // to a key; `remote add` writes a whole `[remote]` section — both are
+        // read-modify-writes of `.git/config` behind `config.lock`, and they are
+        // the pair a port that serializes one and not the other loses work on.
+        //
+        // The exit codes are already known not to match, which is what makes the
+        // pair worth running rather than either alone: measured on stock 2.55.0
+        // with `.git/config.lock` held, `config --add` exits **255** and `remote
+        // add` exits **128**, both saying `could not lock config file
+        // .git/config: File exists`. Two spellings of one lock failure inside one
+        // file, and a caller reading `$?` cannot be given one number for both.
+        // Readback verified too: after `remote add concr0 ./peer0`,
+        // `config --get-all remote.concr0.url` prints `./peer0`.
+        ConcurrentCase {
+            name: "config-add-vs-remote-add",
+            cmd: "config",
+            shape: Shape::Linear,
+            writers: 6,
+            steps: &[&["config", "--add", "concmix.key", "concmix{i}"]],
+            prepare: &[],
+            effect: Effect::ConfigValue { key: "concmix.key", value: "concmix{i}" },
+            also: &[Role {
+                steps: &[&["remote", "add", "concr{i}", "./peer{i}"],
+                ],
+                effect: Effect::ConfigValue { key: "remote.concr{i}.url", value: "./peer{i}" },
+            }],
+            no_daemon: false,
+        },
+
         // ---- the same races with no daemon to queue through --------------------
         //
         // Everything above lets the port pick whichever of its two serialization
@@ -1344,6 +1652,50 @@ pub fn cases() -> Vec<ConcurrentCase> {
                 steps: &[&["commit", "-q", "--allow-empty", "-m", "concnd{i}"]],
                 effect: Effect::LoggedMessage("concnd{i}"),
             }],
+            no_daemon: true,
+        },
+        // The fallback against the lock that has already produced this dimension's
+        // worst outcome. `commit` under a *held* `refs/heads/main.lock` never
+        // returned on this port — killed at the deadline in every trial, 3/3
+        // standalone — and the corpus's own `commit-same-branch` runs whichever
+        // serialization path the machine offers. This pins the other one: six
+        // writers contending over one branch with no daemon to queue through, so
+        // the ref path is entered through the fallback rather than through the
+        // FIFO.
+        //
+        // Bounded like everything else here. If the ref path can wedge with a
+        // daemon out of reach, this case's writers are killed at
+        // [`WRITER_DEADLINE`] and scored as the availability failure they are,
+        // which is the whole reason the deadline exists.
+        ConcurrentCase {
+            name: "commit-same-branch-no-daemon",
+            cmd: "commit",
+            shape: Shape::Linear,
+            writers: 6,
+            steps: &[&["commit", "-q", "--allow-empty", "-m", "concndref{i}"]],
+            prepare: &[],
+            effect: Effect::LoggedMessage("concndref{i}"),
+            also: &[],
+            no_daemon: true,
+        },
+        // And the multi-lock chain through the fallback, which is the shape the
+        // fallback has the least reason to get right: four locks in sequence, and
+        // a writer that serializes by re-reading has to notice each of the three
+        // *previous* steps landed before the next one is entitled to run.
+        ConcurrentCase {
+            name: "commit-then-tag-then-branch-no-daemon",
+            cmd: "commit",
+            shape: Shape::Linear,
+            writers: 6,
+            steps: &[
+                &["add", "conc{i}.txt"],
+                &["commit", "-q", "-m", "concndchain{i}"],
+                &["tag", "concndchain{i}"],
+                &["branch", "concndchainb{i}"],
+            ],
+            prepare: &["conc{i}.txt"],
+            effect: Effect::RefExists("refs/heads/concndchainb{i}"),
+            also: &[],
             no_daemon: true,
         },
     ]
@@ -1413,6 +1765,20 @@ mod tests {
                         assert!(
                             !value.is_empty(),
                             "{}: an empty value cannot be told from an absent one",
+                            case.name
+                        );
+                    }
+                    Effect::Note { r#ref, text } => {
+                        assert!(
+                            r#ref.starts_with("refs/notes/"),
+                            "{}: {ref} is not a notes ref, and `log --notes=` would \
+                             silently fall back to the default one",
+                            case.name,
+                            ref = r#ref
+                        );
+                        assert!(
+                            !text.is_empty(),
+                            "{}: an empty note is indistinguishable from an absent one",
                             case.name
                         );
                     }
@@ -1627,8 +1993,42 @@ mod tests {
             "checkout-new-branch",            // HEAD.lock
             "stash-push-distinct-paths",      // refs/stash
             "worktree-add-vs-prune",          // .git/worktrees registration
+            "notes-add-same-notes-ref",       // a notes ref, and its tree
+            "deepen-shallow-concurrently",    // .git/shallow
+            "fetch-vs-fetch",                 // FETCH_HEAD.lock and the tracking refs
         ] {
             assert!(names.contains(&wanted), "the corpus lost {wanted}");
+        }
+    }
+
+    /// A writer that holds one lock at a time is the easy half. The cases that
+    /// found this dimension's worst outcome are the ones that take a lock, release
+    /// it, and go for a second — so the corpus must keep at least a few writers
+    /// whose script chains several verbs, and each of them must assert its effect
+    /// on the LAST link, or a writer that stopped between two locks scores as
+    /// having finished.
+    #[test]
+    fn the_corpus_keeps_writers_that_take_several_locks_in_sequence() {
+        let chained: Vec<&str> = cases()
+            .iter()
+            .filter(|c| c.roles().iter().any(|r| r.steps.len() >= 3))
+            .map(|c| c.name)
+            .collect();
+        assert!(
+            chained.len() >= 3,
+            "only {chained:?} put more than two locks in one writer's sequence"
+        );
+        let chain = cases()
+            .into_iter()
+            .find(|c| c.name == "commit-then-tag-then-branch")
+            .expect("the four-lock chain is the floor case for this shape");
+        // The effect names the branch the *last* step creates. Asserting on
+        // anything the commit or the tag left would call a writer that stopped
+        // halfway a success.
+        assert_eq!(chain.steps.last().unwrap()[0], "branch");
+        match chain.effect {
+            Effect::RefExists(r) => assert!(r.starts_with("refs/heads/concchainb")),
+            other => panic!("the chain must assert its last link, not {other:?}"),
         }
     }
 

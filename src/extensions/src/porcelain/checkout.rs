@@ -2375,7 +2375,16 @@ fn restore_from_tree(
     } else {
         let (tree_matched, tree_hit) = matches_in(&src, paths);
         let cur = repo.open_index()?;
-        let (idx_matched, idx_hit) = matches_in(&cur, paths);
+        // ```c
+        // if (!opts->ignore_skip_worktree_bits && ce_skip_worktree(ce))
+        //         continue;
+        // ```
+        //
+        // (`mark_ce_for_checkout_no_overlay()`, builtin/checkout.c:426.) The index side
+        // of the union is filtered the same way the tree side is: a path the
+        // sparse-checkout definition keeps out of the work tree is not a path
+        // `--no-overlay` may delete.
+        let (idx_matched, idx_hit) = matches_in_excluding(&cur, paths, &sparse);
         // A pathspec must match in the tree or the index; else git's "did not match".
         if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !idx_hit[si]) {
             bail!(
@@ -2451,7 +2460,13 @@ fn restore_from_tree(
     if !to_remove.is_empty() {
         for path in &to_remove {
             if let Some(full) = repo.workdir_path(BStr::new(path)) {
-                let _ = std::fs::remove_file(full);
+                let _ = std::fs::remove_file(&full);
+                // `unlink_entry()`'s `schedule_dir_for_removal()`, which
+                // `remove_scheduled_dirs()` then acts on: the directory whose last file
+                // just went goes with it.
+                if let Some(workdir) = repo.workdir() {
+                    crate::worktree::prune_empty_dirs(workdir, &full);
+                }
             }
         }
         let rmset: HashSet<BString> = to_remove.into_iter().collect();
@@ -2836,10 +2851,14 @@ pub(super) fn update_worktree_to_tree(
     subset.remove_entries(|_, path, _| !touched.contains(&path.to_owned()));
     checkout_subset(repo, &mut subset, &should_interrupt)?;
 
-    // `deleted_entry()`: the touched paths it does not have are removed.
+    // `deleted_entry()`: the touched paths it does not have are removed — through
+    // `unlink_entry()`, which schedules the directory each removal empties.
     for path in touched.iter().filter(|p| !new_flat.contains_key(*p)) {
         if let Some(full) = repo.workdir_path(path.as_bstr()) {
-            let _ = std::fs::remove_file(full);
+            let _ = std::fs::remove_file(&full);
+            if let Some(workdir) = repo.workdir() {
+                crate::worktree::prune_empty_dirs(workdir, &full);
+            }
         }
     }
 
@@ -2954,7 +2973,11 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
             let path = e.path_in(backing);
             if !new_paths.contains(&path.to_owned()) {
                 if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(full);
+                    let _ = std::fs::remove_file(&full);
+                    // `unlink_entry()`'s `schedule_dir_for_removal()`.
+                    if let Some(workdir) = repo.workdir() {
+                        crate::worktree::prune_empty_dirs(workdir, &full);
+                    }
                 }
             }
         }

@@ -52,7 +52,7 @@ const LONG_OPTS: &[LongOpt] = &[
 ///   * `--long`                          — always emit the long form
 ///   * `--always`                        — fall back to the abbreviated hash
 ///   * `--first-parent`                  — only follow the first parent
-///   * `--dirty[=<mark>]`                — append `-dirty` (or `-<mark>`) if the worktree is dirty
+///   * `--dirty[=<mark>]`                — append `-dirty` (or `<mark>`, verbatim) if the worktree is dirty
 ///   * `--abbrev=<n>`                    — hex digits for the hash (`0` prints the tag only)
 ///   * `--candidates=<n>`                — number of candidate tags to weigh
 ///   * `--exact-match`                   — only print when a tag points directly at the commit
@@ -62,8 +62,10 @@ const LONG_OPTS: &[LongOpt] = &[
 ///                                         (git's `name-rev` reverse-ancestry walk)
 ///   * `git describe <blob>`             — name the commit that introduced the blob,
 ///                                         suffixed with `:<path>`
-///   * `--broken[=<mark>]`               — accepted; the mark is only appended when the
-///                                         worktree diff itself fails, which cannot happen here
+///   * `--broken[=<mark>]`               — like `--dirty` (git runs the same `diff-index`
+///                                         and appends the *dirty* mark for a dirty tree);
+///                                         `<mark>` itself is for a `diff-index` that could
+///                                         not finish, which cannot happen here
 /// ```
 ///
 /// `--match`/`--exclude` are ports of `builtin/describe.c:get_name()`: the candidate
@@ -88,8 +90,12 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     let mut max_candidates: usize = 10;
     // Raw `--abbrev` value, still signed: git clamps it late and treats 0 specially.
     let mut abbrev: Option<i64> = None;
-    // Outer Option: was --dirty given? Inner Option: the custom mark, if any.
-    let mut dirty: Option<Option<String>> = None;
+    // `.defval = (intptr_t) "-dirty"` / `"-broken"` on two `PARSE_OPT_OPTARG`
+    // `OPTION_STRING`s (builtin/describe.c:667-684): the mark is appended *verbatim*,
+    // leading dash included, so `--dirty=-modified` is `<name>-modified` and
+    // `--dirty=X` is `<name>X`.
+    let mut dirty: Option<String> = None;
+    let mut broken: Option<String> = None;
     // OPT_STRING_LIST accumulators: patterns are OR-ed, excludes are AND-ed.
     let mut match_pats: Vec<BString> = Vec::new();
     let mut exclude_pats: Vec<BString> = Vec::new();
@@ -128,10 +134,10 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             "--no-contains" => contains = false,
             "--exact-match" => max_candidates = 0,
             "--no-exact-match" => max_candidates = 10,
-            "--dirty" => dirty = Some(None),
+            "--dirty" => dirty = Some("-dirty".to_string()),
             "--no-dirty" => dirty = None,
-            // A healthy worktree never earns the broken mark, so the flag is inert here.
-            "--broken" | "--no-broken" => {}
+            "--broken" => broken = Some("-broken".to_string()),
+            "--no-broken" => broken = None,
             // A bare `--abbrev` restores the repo-sized default; `--no-abbrev` is 0.
             "--abbrev" => abbrev = None,
             "--no-abbrev" => abbrev = Some(0),
@@ -157,8 +163,8 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
                 None => return missing_value_error("exclude"),
             },
             "--no-exclude" => exclude_pats.clear(),
-            _ if a.starts_with("--dirty=") => dirty = Some(Some(a["--dirty=".len()..].to_string())),
-            _ if a.starts_with("--broken=") => {}
+            _ if a.starts_with("--dirty=") => dirty = Some(a["--dirty=".len()..].to_string()),
+            _ if a.starts_with("--broken=") => broken = Some(a["--broken=".len()..].to_string()),
             // git parses `--abbrev`'s value with C `strtol` into an `int`
             // (`parse_opt_abbrev_cb`): it errors only on missing digits or
             // trailing garbage, silently saturates on overflow, then truncates
@@ -200,8 +206,16 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
         return run_contains(&revs, all, always, &match_pats, &exclude_pats);
     }
 
-    if dirty.is_some() && !revs.is_empty() {
-        return fatal("option '--dirty' and commit-ishes cannot be used together");
+    // `} else if (dirty) { die(…, "--dirty"); } else if (broken) { die(…, "--broken"); }`
+    // (builtin/describe.c:824-827): both are about the work tree, so neither can name a
+    // commit to describe.
+    if !revs.is_empty() {
+        if dirty.is_some() {
+            return fatal("option '--dirty' and commit-ishes cannot be used together");
+        }
+        if broken.is_some() {
+            return fatal("option '--broken' and commit-ishes cannot be used together");
+        }
     }
 
     // `--all` wins the ref selection; `--tags` only widens tags to unannotated ones.
@@ -218,17 +232,28 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     let mut repo = gix::discover(".")?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
 
-    // Resolve the dirty mark once; the check is over tracked changes only,
-    // matching git (untracked files never make describe report `-dirty`).
-    let dirty_mark = match &dirty {
-        Some(mark) => {
-            if repo.is_dirty()? {
-                Some(mark.clone().unwrap_or_else(|| "dirty".to_string()))
-            } else {
-                None
-            }
+    // ```c
+    // if (!dirty)
+    //         dirty = "-dirty";
+    //
+    // switch (run_command(&cp)) {
+    // case 0:  suffix = NULL;   break;
+    // case 1:  suffix = dirty;  break;
+    // default: suffix = broken;         /* diff-index aborted abnormally */
+    // }
+    // ```
+    //
+    // (builtin/describe.c:780-793.) `--broken` runs the same `diff-index` the plain
+    // `--dirty` path runs, so a dirty work tree earns the *dirty* mark either way —
+    // `--broken`'s own mark is only for a `diff-index` that could not finish, which is
+    // not a failure mode this port has. The check is over tracked changes only:
+    // untracked files never make describe report dirty.
+    let dirty_mark = match (&dirty, &broken) {
+        (None, None) => None,
+        (mark, _) => {
+            let mark = mark.clone().unwrap_or_else(|| "-dirty".to_string());
+            repo.is_dirty()?.then_some(mark)
         }
-        None => None,
     };
 
     // git's first bail: with nothing to name from and no hash fallback, stop before
@@ -309,14 +334,14 @@ fn describe_blob(
     filter: &Filter,
 ) -> Result<Option<ExitCode>> {
     let head = repo.head_commit()?;
-    let walk = repo
-        .rev_walk(Some(head.id))
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(
-            gix::traverse::commit::simple::CommitTimeOrder::OldestFirst,
-        ))
-        .all()?;
-    for info in walk {
-        let oid = info?.id;
+    // `--objects --in-commit-order --reverse HEAD`: the *default* walk, reversed. Taking
+    // the walk oldest-first instead is not the same order when commits share a timestamp,
+    // and it named a different commit for a blob every one of them carries.
+    let mut order: Vec<ObjectId> = Vec::new();
+    for info in repo.rev_walk(Some(head.id)).all()? {
+        order.push(info?.id);
+    }
+    for oid in order.into_iter().rev() {
         let commit = repo.find_object(oid)?.try_into_commit()?;
         let entries = commit.tree()?.traverse().breadthfirst.files()?;
         if let Some(entry) = entries.into_iter().find(|e| e.oid == blob) {
@@ -652,13 +677,24 @@ fn build_names(
                 }
                 let target_id = r.target().try_id().map(ToOwned::to_owned);
                 let peeled = r.peel_to_id().ok()?.detach();
+                // ```c
+                // if (is_annotated)      prio = 2;
+                // else if (is_tag)       prio = 1;
+                // else                   prio = 0;
+                // ```
+                //
+                // (builtin/describe.c:224-229, with `is_tag` being `refs/tags/`.) Under
+                // `--all` a lightweight tag still outranks a branch pointing at the same
+                // commit, which is what `add_to_known_names()`' `e->prio < prio` keeps.
+                let is_tag = r.name().as_bstr().starts_with(b"refs/tags/");
                 let (prio, tag_time): (u8, i64) = match target_id {
                     Some(tid) if peeled != tid => {
                         let tag = repo.find_object(tid).ok()?.try_into_tag().ok()?;
                         let tag_time =
                             tag.tagger().ok().and_then(|s| s.map(|s| s.seconds())).unwrap_or(0);
-                        (1, tag_time)
+                        (2, tag_time)
                     }
+                    _ if is_tag => (1, 0),
                     _ => (0, 0),
                 };
                 let name: Cow<'static, BStr> = Cow::Owned(r.name().shorten().to_owned());
@@ -714,7 +750,6 @@ fn format_outcome(
     };
 
     if let Some(mark) = &opts.dirty_mark {
-        out.push('-');
         out.push_str(mark);
     }
 

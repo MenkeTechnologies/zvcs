@@ -752,7 +752,25 @@ const EVENT_SELECT: &str = "SELECT e.id, e.ts, e.kind, r.git_dir, r.workdir, e.d
      FROM events e LEFT JOIN repos r ON r.id = e.repo_id \
     WHERE e.id > ?1 \
       AND (?2 IS NULL OR e.kind = ?2) \
-      AND (?3 IS NULL OR r.git_dir LIKE ?3 OR r.workdir LIKE ?3)";
+      AND (?3 IS NULL OR r.git_dir LIKE ?3 ESCAPE '\\' OR r.workdir LIKE ?3 ESCAPE '\\')";
+
+/// A `LIKE` operand matching every path that *contains* `p` as a literal. `%`
+/// and `_` are LIKE metacharacters, so an unescaped `my_repo` would also match
+/// `myXrepo` and a bare `%` would match the whole tree — the feed filters are
+/// documented as substrings (`--repo <substr>`), and the fleet selectors already
+/// read them that way. Every query pairing with this uses `ESCAPE '\'`.
+fn like_contains(p: &str) -> String {
+    let mut out = String::with_capacity(p.len() + 2);
+    out.push('%');
+    for c in p.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
 
 fn row_to_event(r: &rusqlite::Row) -> rusqlite::Result<EventRow> {
     Ok(EventRow {
@@ -775,7 +793,7 @@ pub fn events_recent(
     kind: Option<&str>,
     repo_like: Option<&str>,
 ) -> Result<Vec<EventRow>> {
-    let like = repo_like.map(|p| format!("%{p}%"));
+    let like = repo_like.map(|p| like_contains(p));
     let sql = format!("{EVENT_SELECT} ORDER BY e.id DESC LIMIT ?4");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -791,7 +809,7 @@ pub fn events_since(
     kind: Option<&str>,
     repo_like: Option<&str>,
 ) -> Result<Vec<EventRow>> {
-    let like = repo_like.map(|p| format!("%{p}%"));
+    let like = repo_like.map(|p| like_contains(p));
     let sql = format!("{EVENT_SELECT} ORDER BY e.id ASC LIMIT 500");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -1273,13 +1291,13 @@ pub fn events_after_ts(
     kind: Option<&str>,
     repo_like: Option<&str>,
 ) -> Result<Vec<EventRow>> {
-    let like = repo_like.map(|p| format!("%{p}%"));
+    let like = repo_like.map(|p| like_contains(p));
     let mut stmt = conn.prepare(
         "SELECT e.id, e.ts, e.kind, r.git_dir, r.workdir, e.detail, e.sha_before, e.sha_after \
            FROM events e LEFT JOIN repos r ON r.id = e.repo_id \
           WHERE e.ts >= ?1 \
             AND (?2 IS NULL OR e.kind = ?2) \
-            AND (?3 IS NULL OR r.git_dir LIKE ?3 OR r.workdir LIKE ?3) \
+            AND (?3 IS NULL OR r.git_dir LIKE ?3 ESCAPE '\\' OR r.workdir LIKE ?3 ESCAPE '\\') \
           ORDER BY e.id ASC",
     )?;
     let rows = stmt

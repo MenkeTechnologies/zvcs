@@ -114,10 +114,9 @@ pub fn spawn_daemon_loop() {
                 last = Some(cursor.max(e.id).max(last.unwrap_or(0)));
                 for (_sid, kind, repo_like, command) in &subs {
                     let kind_ok = kind.as_deref().is_none_or(|k| k == e.kind);
-                    let repo_ok = repo_like.as_deref().is_none_or(|p| {
-                        e.workdir.as_deref().is_some_and(|w| w.contains(p))
-                            || e.git_dir.as_deref().is_some_and(|g| g.contains(p))
-                    });
+                    let repo_ok = repo_like
+                        .as_deref()
+                        .is_none_or(|p| repo_matches(p, e.workdir.as_deref(), e.git_dir.as_deref()));
                     if kind_ok && repo_ok {
                         run_command(command, e);
                     }
@@ -125,6 +124,18 @@ pub fn spawn_daemon_loop() {
             }
         }
     });
+}
+
+/// Does an event's repo match a subscription's `--repo` pattern? The feed
+/// filters are documented as case-insensitive path substrings, and the SQL feed
+/// queries read them that way (`db::like_contains` plus a case-insensitive
+/// `LIKE`). A subscription that fired on a different set than `git zevents
+/// --repo` previews would make `zon` impossible to check by inspection, so this
+/// is kept in step with those queries.
+pub(crate) fn repo_matches(pattern: &str, workdir: Option<&str>, git_dir: Option<&str>) -> bool {
+    let pattern = pattern.to_lowercase();
+    let hit = |s: Option<&str>| s.is_some_and(|v| v.to_lowercase().contains(&pattern));
+    hit(workdir) || hit(git_dir)
 }
 
 fn run_command(command: &str, e: &crate::db::EventRow) {
@@ -147,5 +158,33 @@ fn run_command(command: &str, e: &crate::db::EventRow) {
             let mut child = child;
             let _ = child.wait();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repo_matches;
+
+    #[test]
+    fn subscription_repo_pattern_is_a_case_insensitive_substring() {
+        // The documented reading, matching what `git zevents --repo` shows: a
+        // fold-case substring of either path, never an anchored or exact match.
+        assert!(repo_matches("cask", Some("/src/Alpha-Cask"), None));
+        assert!(repo_matches("ALPHA", Some("/src/alpha"), None));
+        assert!(repo_matches("bare", None, Some("/src/bare.git")));
+        assert!(!repo_matches("gamma", Some("/src/alpha"), Some("/src/alpha/.git")));
+        // No repo path at all cannot match — an event whose repo row was pruned
+        // must not fire every subscription.
+        assert!(!repo_matches("alpha", None, None));
+    }
+
+    #[test]
+    fn subscription_repo_pattern_has_no_wildcards() {
+        // `_` and `%` are literals here. They are LIKE metacharacters in the SQL
+        // feed queries, which escape them for exactly this agreement — a command
+        // must not fire on repos the equivalent `git zevents --repo` never lists.
+        assert!(repo_matches("my_repo", Some("/src/my_repo"), None));
+        assert!(!repo_matches("my_repo", Some("/src/myXrepo"), None));
+        assert!(!repo_matches("%", Some("/src/alpha"), None));
     }
 }

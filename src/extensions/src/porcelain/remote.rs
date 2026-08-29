@@ -657,8 +657,21 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     {
         let mut section = file.section_mut_or_create_new("remote", Some(BStr::new(name)))?;
         section.push("url", url)?;
+        // ```c
+        // if (!mirror || mirror & MIRROR_FETCH) {
+        //         [...]
+        //         for (size_t i = 0; i < track.nr; i++)
+        //                 add_branch(buf.buf, track.items[i].string, name, mirror, &buf2);
+        // }
+        // ```
+        //
+        // (`add()`, builtin/remote.c:232-241.) A push-only mirror gets no fetch refspec at
+        // all — the remote exists to be pushed to, and `git fetch up` on it fetches nothing
+        // rather than the whole branch namespace.
         if mirror.fetches() {
             section.push("fetch", "+refs/*:refs/*")?;
+        } else if mirror.pushes() {
+            // No fetch refspec.
         } else if tracks.is_empty() {
             let spec = format!("+refs/heads/*:refs/remotes/{name}/*");
             section.push("fetch", spec.as_str())?;
@@ -676,24 +689,6 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         }
     }
     persist(&path, &file)?;
-
-    if let Some(branch) = &master {
-        let head = full_name(&format!("refs/remotes/{name}/HEAD"))?;
-        let target = full_name(&format!("refs/remotes/{name}/{branch}"))?;
-        repo.edit_reference(RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: false,
-                    message: format!("remote add {name}").into(),
-                },
-                expected: PreviousValue::Any,
-                new: Target::Symbolic(target),
-            },
-            name: head,
-            deref: false,
-        })?;
-    }
 
     if do_fetch {
         // `Updating %s` is `printf`, not `fprintf(stderr, …)`
@@ -719,7 +714,61 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // ```c
+    // if (refs_update_symref(get_main_ref_store(the_repository), buf.buf, buf2.buf, "remote add"))
+    //         result = error(_("Could not setup master '%s'"), master);
+    // ```
+    //
+    // (`add()`, builtin/remote.c:261-270.) It runs *after* the `-f` fetch, so the branch the
+    // symref names is already there and the reflog line records the object it resolves to.
+    if let Some(branch) = &master {
+        let head = format!("refs/remotes/{name}/HEAD");
+        let target = format!("refs/remotes/{name}/{branch}");
+        let previous = resolved_id(repo, head.as_str())?;
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "remote add".into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Symbolic(full_name(&target)?),
+            },
+            name: full_name(&head)?,
+            deref: false,
+        })?;
+        log_symref_update(repo, &head, previous, "remote add")?;
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// `refs_update_symref()` appends a reflog line for the symbolic ref itself, holding the
+/// object its new target resolves to — which is how `refs/remotes/<name>/HEAD` ends up with
+/// a `remote set-head` / `remote add` entry. gitoxide writes no log at all for a symbolic
+/// edit, so the line is appended here, after the edit that resolved the target.
+///
+/// `previous` is what the ref resolved to *before* the edit, so the caller reads it first.
+fn log_symref_update(
+    repo: &gix::Repository,
+    name: &str,
+    previous: Option<gix::ObjectId>,
+    message: &str,
+) -> Result<()> {
+    let full = full_name(name)?;
+    let Some(new) = resolved_id(repo, name)? else {
+        return Ok(());
+    };
+    super::symbolic_ref::append_reflog(repo, full.as_ref(), previous, &new, message)
+}
+
+/// The object a ref resolves to, or `None` when it does not exist or does not peel.
+fn resolved_id(repo: &gix::Repository, name: &str) -> Result<Option<gix::ObjectId>> {
+    let Some(mut reference) = repo.try_find_reference(name)? else {
+        return Ok(None);
+    };
+    Ok(reference.peel_to_id_in_place().ok().map(|id| id.detach()))
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +873,17 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         std::fs::rename(&from, &to)?;
     }
 
+    // ```c
+    // if (refs_rename_ref(get_main_ref_store(the_repository), item->string, buf.buf, buf2.buf))
+    // ```
+    //
+    // (`mv()`, builtin/remote.c.) A rename keeps the ref's value, so the log line it appends
+    // opens with that value rather than with the null id a freshly created ref would show.
+    // gitoxide has no rename — the ref is created and the old one deleted — so its own
+    // logging is switched off for the edit and the line is written by hand.
+    let mut silent = repo.clone();
+    silent.refs.write_reflog = gix::refs::store::WriteReflog::Disable;
+
     for (old_name, old_text, dst, target) in moves {
         let new_name = full_name(&dst)?;
         let new_target = match target {
@@ -838,19 +898,27 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
                 }
             }
         };
-        repo.edit_reference(RefEdit {
+        let message = format!("remote: renamed {old_text} to {dst}");
+        let logged = match &new_target {
+            Target::Object(id) => Some(*id),
+            Target::Symbolic(_) => None,
+        };
+        silent.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
                     mode: RefLog::AndReference,
                     force_create_reflog: false,
-                    message: format!("remote: renamed {old_text} to {dst}").into(),
+                    message: message.clone().into(),
                 },
                 expected: PreviousValue::Any,
                 new: new_target,
             },
-            name: new_name,
+            name: new_name.clone(),
             deref: false,
         })?;
+        if let Some(id) = logged {
+            super::symbolic_ref::append_reflog(repo, new_name.as_ref(), Some(id), &id, &message)?;
+        }
         delete_ref(repo, old_name)?;
     }
 
@@ -1056,6 +1124,7 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             return error(format!("Not a valid ref: {target}"), 1);
         }
         let (prev, was_detached) = symref_prev(repo, head.as_str())?;
+        let previous = resolved_id(repo, head.as_str())?;
         repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
@@ -1069,6 +1138,7 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             name: full_name(&head)?,
             deref: false,
         })?;
+        log_symref_update(repo, head.as_str(), previous, "remote set-head")?;
         report_set_head_auto(name, head_name, &prev, was_detached);
         return Ok(ExitCode::SUCCESS);
     }
@@ -1078,6 +1148,7 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     if repo.try_find_reference(target.as_str())?.is_none() {
         return error(format!("Not a valid ref: {target}"), 1);
     }
+    let previous = resolved_id(repo, head.as_str())?;
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1091,6 +1162,7 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         name: full_name(&head)?,
         deref: false,
     })?;
+    log_symref_update(repo, head.as_str(), previous, "remote set-head")?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1276,16 +1348,18 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             .collect();
 
         let updated: Vec<String> = if append {
-            let mut v = current;
+            let mut v = current.clone();
             v.push(value.to_string());
             v
         } else if let Some(re) = delete_re.as_ref() {
             current
+                .clone()
                 .into_iter()
                 .filter(|u| !re.is_match(u.as_bytes()))
                 .collect()
         } else if let Some(old) = pos.get(2) {
             current
+                .clone()
                 .into_iter()
                 .map(|u| {
                     if u.as_str() == *old {
@@ -1299,15 +1373,39 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             vec![value.to_string()]
         } else {
             // Replace the last configured URL, leaving any earlier ones alone.
-            let mut v = current;
+            let mut v = current.clone();
             let last = v.len() - 1;
             v[last] = value.to_string();
             v
         };
 
-        while section.remove(key).is_some() {}
-        for url in &updated {
-            section.push(key, url.as_str())?;
+        // git writes through `repo_config_set*`, which edits the value where it already
+        // stands (config.c) — so `remote.<name>.url` keeps its place ahead of the `fetch`
+        // line the remote was created with. Rebuilding the key from scratch moved it to
+        // the end of the section.
+        if append {
+            // `repo_config_set_multivar(name, newurl, "^$", 0)`: a pattern no existing
+            // value matches, which is git's way of spelling "append".
+            section.push(key, value)?;
+        } else if updated == current {
+            // Nothing matched, so there is nothing to write.
+        } else if updated.len() == current.len() && current.len() == 1 {
+            // `repo_config_set()`: replace the one value in place.
+            section.set(key, updated[0].as_str())?;
+        } else {
+            while section.remove(key).is_some() {}
+            for url in &updated {
+                section.push(key, url.as_str())?;
+            }
+        }
+
+        // `repo_config_set_multivar()` is the non-gently form, so a delete that matched
+        // nothing is `die(_("could not unset '%s'"), key)` — which is what
+        // `git remote set-url --push --delete <name> <url>` hits on a remote that never
+        // had a `pushurl`.
+        if delete && updated.len() == current.len() {
+            drop(section);
+            return fatal(format!("could not unset 'remote.{name}.{key}'"));
         }
     }
     persist(&path, &file)?;
@@ -2114,22 +2212,45 @@ fn stale_tracking_refs(repo: &gix::Repository, name: &str) -> Result<Vec<String>
         .map(|l| l.to_str_lossy().into_owned())
         .collect();
 
+    // ```c
+    // memset(&query, 0, sizeof(struct refspec_item));
+    // query.dst = (char *)refname;
+    //
+    // query_refspecs_multiple(info->rs, &query, &matches);
+    // if (matches.nr == 0)
+    //         goto clean_exit; /* No matches */
+    // ```
+    //
+    // (`get_stale_heads_cb()`, remote.c.) The candidates are the refs the *refspec
+    // destinations* cover, not the ones under `refs/remotes/<name>/`: a remote configured
+    // with `+refs/heads/nosuch/*:refs/remotes/origin/*` prunes under `refs/remotes/origin/`,
+    // where its own name never appears.
     let dsts = fetch_refspec_dsts(repo, name);
-    let prefix = format!("refs/remotes/{name}/");
     let mut stale = Vec::new();
-    for (ref_name, _) in tracking_refs(repo, name)? {
-        let full = ref_name.as_bstr().to_str_lossy().into_owned();
-        if !full.starts_with(&prefix) || full == format!("{prefix}HEAD") {
-            continue;
+    let platform = repo.references()?;
+    for dst in &dsts {
+        let prefix = match dst.split_once('*') {
+            Some((head, _)) => head.to_string(),
+            None => dst.clone(),
+        };
+        for reference in platform.prefixed(prefix.as_bytes())? {
+            let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let full = reference.name().as_bstr().to_str_lossy().into_owned();
+            // The tracking `HEAD` is a symref into the namespace rather than a branch of
+            // its own, and git leaves it alone.
+            if full.ends_with("/HEAD") {
+                continue;
+            }
+            if live.contains(&full) || stale.contains(&full) {
+                continue;
+            }
+            if !refspec_dst_matches(dst, &full) {
+                continue;
+            }
+            stale.push(full);
         }
-        if live.contains(&full) {
-            continue;
-        }
-        if !dsts.iter().any(|d| refspec_dst_matches(d, &full)) {
-            continue;
-        }
-        stale.push(full);
     }
+    stale.sort();
     Ok(stale)
 }
 

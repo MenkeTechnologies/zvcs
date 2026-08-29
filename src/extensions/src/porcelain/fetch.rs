@@ -1971,9 +1971,6 @@ fn fetch_one(
         }
     }
 
-    // `do_fetch()` starts here as far as `FETCH_HEAD` is concerned: everything above is
-    // `prepare_transport()`, which git runs in `fetch_one()` before it calls `do_fetch()`.
-    fetch_head.truncate_now()?;
 
     // The configured fetch refspecs, captured before command-line refspecs replace them: with explicit
     // refspecs they become git's *opportunistic* second stage, mapping the refs the command line selected onto
@@ -2167,6 +2164,12 @@ fn fetch_one(
         let _ = reject_foreign_vcs(repo, remote_name.as_deref());
         return Ok(Verdict::Fatal);
     }
+
+    // `do_fetch()` starts here as far as `FETCH_HEAD` is concerned: everything above is
+    // `prepare_transport()`, which git runs in `fetch_one()` before it calls `do_fetch()` —
+    // including the transport choice this port refuses to make for a `remote.<name>.vcs`
+    // helper.
+    fetch_head.truncate_now()?;
 
     let raw_url = remote
         .url(gix::remote::Direction::Fetch)

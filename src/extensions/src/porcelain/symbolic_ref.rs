@@ -567,7 +567,11 @@ fn shorten_unambiguous(repo: &gix::Repository, refname: &BStr) -> BString {
 
 /// Append one reflog line for `name`, following git's rules for which refs get a
 /// log auto-created.
-fn append_reflog(
+///
+/// Shared with `remote rename`, which has to write the line itself: git renames the ref in
+/// place and logs `<id> <id> … remote: renamed …`, while gitoxide can only create the ref
+/// anew and would open the line with the null id.
+pub(super) fn append_reflog(
     repo: &gix::Repository,
     name: &FullNameRef,
     previous: Option<ObjectId>,

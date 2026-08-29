@@ -178,17 +178,21 @@ mod with_fetch {
         /// Use this before negotiation or reference updates when callers need to reject a fetch early instead of proceeding
         /// with an empty or purely implicit mapping set.
         ///
-        /// This is the case if the server advertised refs but none matched at all, or if only implicit mappings were produced
-        /// while at least one explicit refspec required an actual ref match, as is the case for exact ref names like `HEAD`
-        /// or `refs/heads/main`.
+        /// This is the case if only implicit mappings were produced while at least one explicit refspec required an actual
+        /// ref match, as is the case for exact ref names like `HEAD` or `refs/heads/main`.
+        ///
+        /// A pattern refspec is allowed to match nothing, whatever the server advertised: git treats
+        /// `get_fetch_map()`'s pattern arm as `missing_ok`, and only an exact source it cannot find is
+        /// `couldn't find remote ref <name>`. A configured `+refs/heads/nosuch/*:refs/remotes/x/*` therefore
+        /// fetches nothing and succeeds — which is what lets `git fetch --prune` on such a remote delete the
+        /// stale tracking refs instead of failing.
         pub fn is_missing_required_mapping(&self) -> bool {
             let has_explicit_mapping = self
                 .mappings
                 .iter()
                 .any(|mapping| matches!(mapping.spec_index, crate::fetch::refmap::SpecIndex::ExplicitInRemote(_)));
 
-            (self.mappings.is_empty() && !self.remote_refs.is_empty())
-                || (!has_explicit_mapping && explicit_fetch_refspecs_require_a_match(&self.refspecs))
+            !has_explicit_mapping && explicit_fetch_refspecs_require_a_match(&self.refspecs)
         }
     }
 

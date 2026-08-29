@@ -294,6 +294,18 @@ must complete too*. Doing more than git under contention is the feature; doing
 less is an availability failure. When both refuse, their exit codes must match,
 which is the one axis the queue cannot excuse.
 
+Writers within one case are heterogeneous where the interesting races are: a
+case names one or more **roles**, writer *i* takes role *i mod roles*, and each
+role carries its own effect, because an `add` and a `commit` have finished
+different work. A case may also pin the port's **daemon-less fallback** by
+pointing `ZVCS_SOCK` at a path that cannot exist, so the run measures that path
+deliberately rather than whichever one the machine happened to offer. Every
+writer is bounded: its side has a deadline, its output goes to a file rather
+than a pipe nobody drains, and expiry kills the whole process group, so the
+`git` a writer forked dies with it. A killed writer is scored as a failure, not
+skipped — which is how a `commit` that never returns under a held branch lock
+became a finding instead of a wedged run.
+
 Both are opt-in, and the only dimensions that are: a case costs seconds rather
 than milliseconds, and its result is a distribution rather than a fact, since a
 race reproduces on some runs and not others. A defect either finds still fails

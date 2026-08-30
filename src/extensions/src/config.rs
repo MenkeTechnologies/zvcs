@@ -2198,3 +2198,76 @@ fn config_error_message(err: &gix::config::Error) -> Option<String> {
         other => repository_format_message(other),
     }
 }
+
+#[cfg(test)]
+mod watch_gate_tests {
+    use super::ZvcsConfig;
+    use crate::superset::zconfig::{setting_names, value_hints};
+
+    /// A scratch repository whose `[zvcs]` section is exactly `body`.
+    fn repo_with(tag: &str, body: &str) -> (std::path::PathBuf, gix::Repository) {
+        let dir = std::env::temp_dir().join(format!("zvcs-watchgate-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = gix::init(&dir).expect("init scratch repo");
+        if !body.is_empty() {
+            let cfg = repo.git_dir().join("config");
+            let mut text = std::fs::read_to_string(&cfg).unwrap_or_default();
+            text.push_str("\n[zvcs]\n");
+            text.push_str(body);
+            std::fs::write(&cfg, text).unwrap();
+        }
+        let repo = gix::open(&dir).expect("reopen with the written config");
+        (dir, repo)
+    }
+
+    #[test]
+    fn a_repository_with_no_zvcs_section_does_not_make_the_daemon_watch() {
+        // Every autonomy switch must default off. A new one defaulting on would
+        // make the daemon work in a repository that never asked for it — and
+        // `git zconfig all off` could not take it back, because "off" is written
+        // from the settings table and a key that is not in the table is not
+        // written at all.
+        let (dir, repo) = repo_with("default", "");
+        let cfg = ZvcsConfig::load(&repo);
+        assert!(!cfg.should_watch(), "an unconfigured repository must not start the watch loop");
+        assert!(!cfg.any_autonomous(), "an unconfigured repository must have no autonomy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_settings_tables_off_state_stops_the_watch_loop() {
+        // The off state is derived from `git zconfig`'s own table rather than
+        // typed here: booleans go false, counts go 0, which is exactly what
+        // `git zconfig all off` writes. If a future input to `should_watch` is
+        // not in that table, this is where it shows up — the daemon would keep
+        // watching after the user turned everything off.
+        let mut body = String::new();
+        for name in setting_names() {
+            if name == "all" {
+                continue;
+            }
+            let off = if value_hints(name).contains(&"on") { "false" } else { "0" };
+            body.push_str(&format!("\t{name} = {off}\n"));
+        }
+        let (dir, repo) = repo_with("alloff", &body);
+        let cfg = ZvcsConfig::load(&repo);
+        assert!(
+            !cfg.should_watch(),
+            "`zconfig all off` left the daemon watching; a watch input is missing from the settings table"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_switch_alone_is_enough_to_start_the_watch_loop() {
+        // The converse, so the case above cannot pass because nothing can ever
+        // start the loop. Each of these is one of `should_watch`'s inputs.
+        for key in ["autoreconcile", "autobump", "autostatus", "autodups", "autohook"] {
+            let (dir, repo) = repo_with(key, &format!("\t{key} = true\n"));
+            let cfg = ZvcsConfig::load(&repo);
+            assert!(cfg.should_watch(), "`zvcs.{key} = true` must start the watch loop");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}

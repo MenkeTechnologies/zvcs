@@ -104,11 +104,40 @@ pub fn zprune(args: &[String]) -> Result<ExitCode> {
     Ok(fan_out(&repos, "zprune", |_gd, wd| git_in(wd, "prune", &[])))
 }
 
+/// Peel a verb's own leading positional (a branch, a tag) off the selector's
+/// leftovers, folding every other bare token into the repo patterns.
+///
+/// These verbs mutate, so an ignored pattern is not a cosmetic bug: `git ztagall
+/// v9 alpha` tagged every indexed repository, and `git zclean -f alpha` deleted
+/// untracked files across all of them. A bare token is a path pattern in the
+/// shared grammar, and the verbs that take a positional of their own take
+/// exactly one.
+fn positional_and_patterns(sel: &mut Selector, rest: Vec<String>) -> Option<String> {
+    let mut positional = None;
+    for a in rest {
+        if a.starts_with('-') {
+            continue; // an unknown flag stays ignored, never a pattern
+        }
+        if positional.is_none() {
+            positional = Some(a);
+        } else {
+            sel.patterns.push(a);
+        }
+    }
+    positional
+}
+
+/// Every bare token in the leftovers is a repo pattern — for the verbs that have
+/// no positional of their own. Flags are left alone.
+fn patterns_only(sel: &mut Selector, rest: Vec<String>) {
+    sel.patterns.extend(rest.into_iter().filter(|a| !a.starts_with('-')));
+}
+
 /// `git zcheckout [selectors] <branch>` — check out `<branch>` in every indexed
 /// repo that has it (repos without the branch are skipped, never created).
 pub fn zcheckout(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
-    let Some(branch) = rest.into_iter().next() else {
+    let (mut sel, rest) = Selector::parse(args);
+    let Some(branch) = positional_and_patterns(&mut sel, rest) else {
         bail!("usage: git zcheckout [selectors] <branch>");
     };
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
@@ -128,8 +157,8 @@ pub fn zcheckout(args: &[String]) -> Result<ExitCode> {
 /// `git ztagall [selectors] <tag>` — create tag `<tag>` at HEAD in every indexed
 /// repo (a repo that already has the tag reports the failure).
 pub fn ztagall(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
-    let Some(tag) = rest.into_iter().next() else {
+    let (mut sel, rest) = Selector::parse(args);
+    let Some(tag) = positional_and_patterns(&mut sel, rest) else {
         bail!("usage: git ztagall [selectors] <tag>");
     };
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
@@ -140,11 +169,20 @@ pub fn ztagall(args: &[String]) -> Result<ExitCode> {
 /// `git zcommitall [selectors] -m <msg>` — commit tracked changes (`commit -a`)
 /// in every dirty indexed repo with `<msg>`; clean repos are skipped.
 pub fn zcommitall(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
+    let (mut sel, rest) = Selector::parse(args);
+    // `-m <msg>` is the verb's own option; every other bare token is a pattern.
     let msg = rest.windows(2).find(|w| w[0] == "-m").map(|w| w[1].clone());
     let Some(msg) = msg else {
         bail!("usage: git zcommitall [selectors] -m <msg>");
     };
+    let mut it = rest.into_iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "-m" {
+            it.next(); // the message
+        } else if !a.starts_with('-') {
+            sel.patterns.push(a);
+        }
+    }
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let msg = &msg;
     Ok(fan_out(&repos, "zcommitall", |gd, wd| {
@@ -216,10 +254,11 @@ fn in_progress_op(git_dir: &Path) -> Option<&'static str> {
 /// `git zclean -f [selectors]` — remove untracked files and directories
 /// (`git clean -fd`) in every indexed repo. Destructive, so `-f` is required.
 pub fn zclean(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
+    let (mut sel, rest) = Selector::parse(args);
     if !rest.iter().any(|a| a == "-f" || a == "--force") {
         bail!("git zclean deletes untracked files across every repo; pass -f to confirm");
     }
+    patterns_only(&mut sel, rest);
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     Ok(fan_out(&repos, "zclean", |_gd, wd| git_in(wd, "clean", &["-fd"])))
 }

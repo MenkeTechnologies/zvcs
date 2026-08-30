@@ -75,9 +75,10 @@ pub fn set_cli_overrides(overrides: &[crate::ConfigOverride]) {
 /// *is* affected is anything that walks the snapshot counting occurrences: git
 /// runs its config callback once per configured value, and `git config --list`
 /// prints one line per configured value, so one `-c` must be counted once. This
-/// is the list such a walk discounts — an environment-sourced occurrence that
-/// matches one of these pairs is this port's second delivery of a command-line
-/// override, not a second setting.
+/// is the list such a walk discounts — an occurrence matching one of these
+/// pairs is this port's second delivery of a command-line override, not a
+/// second setting. `crate::config::CliEcho` is that walk's side of it, and says
+/// which of the two copies survives and why.
 ///
 /// A bare `-c key` is absent by construction: it never reaches the environment
 /// channel, so it is delivered once and needs no discounting. An override an

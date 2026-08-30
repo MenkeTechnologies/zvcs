@@ -1051,8 +1051,8 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
                 None => format!("{section}.{name}"),
             };
             // One `-c key=value` arrives on two sources; git's callback runs
-            // once per configured value, so the environment echo of it is not a
-            // second occurrence. See [`CliEcho`].
+            // once per configured value, so the second copy is not a second
+            // occurrence. See [`CliEcho`].
             if echoes.is_echo(meta.source, &key, value.as_deref()) {
                 continue;
             }
@@ -1081,9 +1081,9 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
     out
 }
 
-/// The environment echo of a `-c key=value`, discounted once per override.
+/// The second copy of a `-c key=value`, discounted once per override.
 ///
-/// `crate::setup::double_delivered` explains why the echo exists: a valued
+/// `crate::setup::double_delivered` explains why there are two: a valued
 /// command-line override is handed to `gix` on `Source::Cli` *and* written into
 /// the `GIT_CONFIG_KEY_<n>` / `_VALUE_<n>` triple, so the merged snapshot holds
 /// two sections carrying one setting. Resolution is unharmed — `Source::Cli`
@@ -1091,21 +1091,31 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
 /// git counts one: `git_config()` calls the callback once per configured value
 /// and `git config --list` prints one line per configured value.
 ///
-/// Each override is discounted **once**. A `GIT_CONFIG_KEY_<n>` the user set
-/// themselves is a configured value in its own right and keeps its occurrence,
-/// unless it happens to spell the same key and value as a `-c` on the same
-/// command line — the one shape this cannot tell apart, since the environment
-/// channel records no provenance.
+/// **The environment copy is the one that survives**, and the command-line copy
+/// is the echo — the opposite of what the origin label would suggest. `gix`
+/// parses a `cli_overrides` entry with its config-file parser, which drops
+/// unquoted trailing blanks: `-c 'test.v=12 '` reaches the snapshot as `12` on
+/// `Source::Cli`, and as `12 ` — byte for byte what argv held — through the
+/// environment. git keeps the blank and refuses the value
+/// (`bad numeric config value '12 ' for 'test.v': invalid unit`), so discounting
+/// the environment copy silently made the port *accept* it. The cost is the
+/// origin `--show-origin` prints for such a value, `environment:` where stock
+/// says `command line:`. A wrong label is visible to whoever reads it; a
+/// silently different value is not.
 ///
-/// `Source::Env` sections are visited before `Source::Cli` ones, so the surviving
-/// occurrence is the command-line one, which is the order git applies it in.
+/// Both copies sort after every file, so keeping the environment one leaves the
+/// last-one-wins order over file configuration exactly where it was.
+///
+/// Each override is discounted **once**, matched on the key and on the value
+/// with surrounding blanks removed — the trailing blank is precisely what the
+/// command-line channel dropped, so an exact comparison would never match.
 pub(crate) struct CliEcho(std::collections::HashMap<(String, String), usize>);
 
 impl CliEcho {
     pub(crate) fn new() -> Self {
         let mut pending: std::collections::HashMap<(String, String), usize> = Default::default();
         for (key, value) in crate::setup::double_delivered() {
-            *pending.entry((normalize_key(key), value.clone())).or_default() += 1;
+            *pending.entry((normalize_key(key), value.trim().to_owned())).or_default() += 1;
         }
         CliEcho(pending)
     }
@@ -1119,11 +1129,13 @@ impl CliEcho {
         key: &str,
         value: Option<&str>,
     ) -> bool {
-        if self.0.is_empty() || source != gix::config::Source::Env {
+        if self.0.is_empty() || source != gix::config::Source::Cli {
             return false;
         }
+        // A bare `-c key` never reached the environment channel, so it has no
+        // second copy and must keep its occurrence.
         let Some(value) = value else { return false };
-        let entry = (normalize_key(key), value.to_owned());
+        let entry = (normalize_key(key), value.trim().to_owned());
         match self.0.get_mut(&entry) {
             Some(count) if *count > 0 => {
                 *count -= 1;

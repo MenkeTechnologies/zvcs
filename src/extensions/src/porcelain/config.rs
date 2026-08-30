@@ -2387,8 +2387,8 @@ fn for_each_entry(
                 Some(sub) => format!("{section_name}.{sub}.{value_name}"),
                 None => format!("{section_name}.{value_name}"),
             };
-            // The environment copy of a `-c key=value` is the same configured
-            // value, not a second one; git prints it once. See `CliEcho`.
+            // The two copies of a `-c key=value` are one configured value, not
+            // two; git prints it once. See `crate::config::CliEcho`.
             let echoed = !implicit
                 && echoes.is_echo(
                     section.meta().source,

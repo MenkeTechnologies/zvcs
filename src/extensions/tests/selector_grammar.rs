@@ -134,33 +134,76 @@ fn verbs_owning_a_positional_keep_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Verbs spanning every module that routes through the shared helper — reads
-/// (`query.rs`), analytics (`analytics.rs`), and fleet mutations (`pmutate.rs`)
-/// — so a verb that parses its own args and bypasses the grammar is caught.
-const UNIFORM: &[&str] = &[
-    "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize", "zage", "zlast", "zfiles",
-    "zcommits", "zpristine", "zauthors", "zconflicts", "zdivergent", "zorphans", "zgc", "zfsck",
-    "zabort", "zreview",
-    // These two own a positional (`<days>`, `<n>`) and peel it from the same
-    // leftovers the patterns come from, so they exercise a second parser.
-    "zstale", "zbig",
-];
+/// `SELECTOR_VERBS` as `select.rs` declares it — read from the source at compile
+/// time so this sweep cannot fall behind the list it is meant to cover. The
+/// hand-written list it replaced held 21 of the 38, and every verb missing from
+/// it (`zclean`, `zcommitall`, `ztagall`, `zcheckout`, `zgrep`, `zhot`, `zidle`)
+/// turned out to ignore a bare pattern.
+const SELECT_RS: &str = include_str!("../src/superset/select.rs");
+
+fn selector_verbs() -> Vec<String> {
+    let block = SELECT_RS
+        .split_once("SELECTOR_VERBS: &[&str] = &[")
+        .and_then(|(_, rest)| rest.split_once("];"))
+        .map(|(list, _)| list)
+        .expect("SELECTOR_VERBS list not found in select.rs");
+    let verbs: Vec<String> = block
+        .split(',')
+        .filter_map(|t| t.trim().trim_matches('"').trim().to_string().into())
+        .filter(|t: &String| t.starts_with('z'))
+        .collect();
+    assert!(verbs.len() >= 38, "expected the whole selector list, got {}", verbs.len());
+    verbs
+}
+
+/// What a verb needs before its selector is even reached: its own positional,
+/// its confirmation flag, or the `--` that ends `zforeach`'s selector half.
+fn required_args(verb: &str) -> Vec<&'static str> {
+    match verb {
+        "zcheckout" => vec!["main"],
+        "ztagall" => vec!["sweep-tag"],
+        "zcommitall" => vec!["-m", "swept"],
+        "zgrep" => vec!["needle"],
+        "zclean" => vec!["-f"],
+        "ztop" => vec!["--once", "--mono"],
+        _ => vec![],
+    }
+}
 
 #[test]
 fn every_selector_verb_honors_the_same_grammar() {
     let (root, home) = fixture("uniform");
 
-    for verb in UNIFORM {
-        // A pattern no path contains selects nothing, in every verb.
-        let miss = zvcs(&home, &root, &[verb, "zzz-no-such-repo"]);
-        assert!(miss.contains("no repos matched"),
-            "`git {verb} zzz-no-such-repo` ignored the pattern and ran over the fleet:\n{miss}");
+    for verb in selector_verbs() {
+        // A pattern no path contains must select nothing, in every verb. This is
+        // the safe direction to sweep across mutating verbs too: nothing is
+        // selected, so nothing is changed.
+        //
+        // `zreset` is excluded by design — its leftovers are documented to pass
+        // through to `git reset`, where a bare token is a ref, not a path.
+        // `zforeach` puts its command after `--`, and `ztop` prints a monitor
+        // rather than the shared "no repos matched" note; both are covered by
+        // their own cases above and in select_filters.rs.
+        if matches!(verb.as_str(), "zreset" | "zforeach" | "ztop") {
+            continue;
+        }
+        let mut args: Vec<&str> = vec![verb.as_str()];
+        args.extend(required_args(&verb));
+        args.push("zzz-no-such-repo");
+        let out = zvcs(&home, &root, &args);
+        assert!(
+            out.contains("no repos matched"),
+            "`git {}` ignored the pattern and ran over the fleet:\n{out}",
+            args.join(" ")
+        );
+    }
 
-        // A pattern one path contains selects something, in every verb — a verb
-        // that answered the line above by always reporting empty is caught here.
+    // The positive direction on the read verbs: a pattern one path contains must
+    // select something, so a verb answering the sweep above by always reporting
+    // empty is caught.
+    for verb in ["zheads", "zdirty", "zbranches", "ztags", "zsize", "zage", "zlast", "zfiles", "zcommits", "zidle", "zhot"] {
         let hit = zvcs(&home, &root, &[verb, "gamma"]);
-        assert!(!hit.contains("no repos matched"),
-            "`git {verb} gamma` matched nothing though gamma is indexed:\n{hit}");
+        assert!(!hit.contains("no repos matched"), "`git {verb} gamma` matched nothing though gamma is indexed:\n{hit}");
     }
 
     let _ = std::fs::remove_dir_all(&root);

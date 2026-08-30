@@ -402,7 +402,7 @@ pub fn zattach(args: &[String]) -> Result<ExitCode> {
 /// a positional (`git zstale 30 cask` — repos untouched for 30 days, among
 /// those whose path contains "cask"). Unknown flags stay ignored rather than
 /// becoming patterns that match nothing.
-fn threshold_and_patterns<T: std::str::FromStr>(sel: &mut Selector, rest: Vec<String>, default: T) -> T {
+pub(crate) fn threshold_and_patterns<T: std::str::FromStr>(sel: &mut Selector, rest: Vec<String>, default: T) -> T {
     let mut value = default;
     let mut taken = false;
     for a in rest {

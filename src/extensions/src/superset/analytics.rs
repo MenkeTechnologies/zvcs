@@ -21,16 +21,23 @@ use crate::superset::select::Selector;
 /// print `path:line:text` for each match. `-i` is case-insensitive.
 pub fn zgrep(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
-    let (sel, rest) = Selector::parse(&args);
+    let (mut sel, rest) = Selector::parse(&args);
     let mut icase = false;
-    let mut pattern: Option<&str> = None;
-    for a in &rest {
+    let mut pattern: Option<String> = None;
+    for a in rest {
         if a == "-i" {
             icase = true;
+        } else if a.starts_with('-') {
+            continue; // an unknown flag is not a pattern
         } else if pattern.is_none() {
             pattern = Some(a);
+        } else {
+            // The search pattern is the first bare token; the rest narrow the
+            // repositories, as the shared grammar says.
+            sel.patterns.push(a);
         }
     }
+    let pattern = pattern.as_deref();
     let Some(pattern) = pattern else {
         bail!("usage: git zgrep [selectors] [-i] <pattern>");
     };
@@ -257,8 +264,8 @@ fn author_counts(repo: &gix::Repository) -> HashMap<String, usize> {
 /// last `<days>` (default 30), most active first.
 pub fn zhot(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
-    let (sel, rest) = Selector::parse(&args);
-    let days: i64 = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(30);
+    let (mut sel, rest) = Selector::parse(&args);
+    let days: i64 = crate::superset::query::threshold_and_patterns(&mut sel, rest, 30);
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let cutoff = crate::date::now_seconds() - days * 86_400;
     let counts = parallel_map(&repos, |gd, _| probe(gd, |r| recent_commits(r, cutoff), |_| 0usize));

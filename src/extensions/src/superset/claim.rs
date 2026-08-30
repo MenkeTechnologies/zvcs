@@ -130,7 +130,9 @@ pub fn zsessions(args: &[String]) -> Result<ExitCode> {
 /// `git zidle [selectors]` — indexed repos with no active claim: the ones free
 /// for an agent to pick up. Selectors narrow the candidate set as in `zforeach`.
 pub fn zidle(args: &[String]) -> Result<ExitCode> {
-    let (sel, _rest) = crate::superset::select::Selector::parse(args);
+    let (mut sel, rest) = crate::superset::select::Selector::parse(args);
+    // A bare token narrows the repositories, the same as everywhere else.
+    sel.patterns.extend(rest.into_iter().filter(|a| !a.starts_with('-')));
     let repos = sel.select()?;
     if repos.is_empty() {
         println!("no repos matched");

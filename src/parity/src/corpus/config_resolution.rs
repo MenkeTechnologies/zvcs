@@ -20,28 +20,30 @@
 //!   layouts a read runs from. Where it enters this file's territory it takes
 //!   **one representative** of each question and stops: one `--type=` per
 //!   conversion (`t.yes`, `t.kilo`, `t.big`, `t.one`, `t.rel`, `t.stamp`,
-//!   `t.color`, `t.rgb`), one three-scope stack (`system`/`global`/`repo`) plus
-//!   one `env`+`cmdline` pair, one `[include]` and two `includeIf` conditions
-//!   (`gitdir:**`, `onbranch:main`), four `--get-urlmatch` rows over a
-//!   three-stanza `[http]`, and eight file-parsing lines. This module takes the
-//!   rest of each: the *whole* boolean spelling table rather than `yes`, the
-//!   *whole* documented exit-code table rather than the eight cells its refusals
-//!   happen to land on, the include graph rather than one edge, and the
-//!   `urlmatch.c` ranking rules — user, port, scheme, case — rather than the
-//!   host-vs-path axis alone. Nothing here repeats an argv or a premise from
-//!   there.
+//!   `t.color`, `t.rgb`), one three-scope stack (`system`/`global`/`repo`), one
+//!   `env`+`cmdline` pair and one `repo`+`worktree` pair, one `[include]` and
+//!   two `includeIf` conditions (`gitdir:**`, `onbranch:main`), four
+//!   `--get-urlmatch` rows over a three-stanza `[http]`, and eight file-parsing
+//!   lines. This module takes the rest of each: the *whole* boolean spelling
+//!   table rather than `yes`, the *whole* documented exit-code table rather than
+//!   the cells its own refusals happen to land on, the include graph rather than
+//!   one edge, and the `urlmatch.c` ranking rules — user, port, scheme, case —
+//!   rather than the host-vs-path axis alone. Nothing here repeats an argv or a
+//!   premise from there, which the corpus-wide
+//!   `no_case_id_appears_twice_in_the_corpus` test enforces: a case id carries
+//!   its whole premise, so a duplicated pair fails `cargo test`.
 //! * **`config_reads.rs`** owns "a setting changes what some *other* verb
 //!   prints" — 90-odd `color.*`, `diff.*`, `status.*`, `log.*` keys read back
 //!   through `diff`, `status`, `log`, `grep`, `blame`. Its `scoped` group is the
 //!   only place it touches precedence, and it does so with two scopes and two
 //!   keys. Every case here runs `config` itself, so no verb's rendering is in
 //!   the way of the value.
-//! * **`exit_codes.rs`** owns twelve `config` refusals as part of a corpus-wide
+//! * **`exit_codes.rs`** owns fifteen `config` refusals as part of a corpus-wide
 //!   exit-code sweep: `--file` with no operand, `--get-all --unset`,
 //!   `--list --local --global`, `--file src` read and write, `--file
 //!   nosuchfile.cfg`, `--blob HEAD:README.md`, `--get-regexp ^nosuch`,
 //!   `--unset`/`--unset-all nosuch.key`, `--get a`, `--get a.`,
-//!   `--rename-section nosuch`, `--get-urlmatch http nosuchurl`,
+//!   `--rename-section nosuch other`, `--get-urlmatch http nosuchurl` and
 //!   `--get-color nosuch.color`. [`exit_code_table`] below is the *rest* of the
 //!   table — the cells none of those reach — and the module header records the
 //!   measured table in full, including the two documented codes that turn out

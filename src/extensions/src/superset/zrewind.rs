@@ -1,11 +1,13 @@
 //! `git zrewind <duration> [--dry-run]` — restore the whole tree to a wall-clock
 //! time.
 //!
-//! For the repo at the cwd and every nested submodule, find the HEAD the reflog
-//! shows it had `<duration>` ago and `reset --hard` to it (reusing the faithful
-//! porcelain reset, reflogged so the rewind is itself undoable). Refuses a dirty
-//! repo — uncommitted work is never clobbered — and reports repos whose reflog
-//! doesn't reach that far back. `zsnapshot` is manual named restore points; this
+//! For the repo at the cwd and every nested submodule at any depth, find the
+//! HEAD the reflog shows it had `<duration>` ago and `reset --hard` to it
+//! (reusing the faithful porcelain reset, reflogged so the rewind is itself
+//! undoable). Refuses a repo holding uncommitted work of its own — that is never
+//! clobbered — while a submodule pointer a child moved does not count, since
+//! that is the state being undone and the child is rewound in the same pass.
+//! Reports repos whose reflog doesn't reach that far back. `zsnapshot` is manual named restore points; this
 //! is any timestamp, no prior setup.
 //!
 //!   git zrewind 2h            rewind the tree to 2 hours ago
@@ -33,15 +35,12 @@ pub fn zrewind(args: &[String]) -> Result<ExitCode> {
     let top = crate::setup::discover()?;
     let exe = crate::hosted::git_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
 
-    // The tree = the top repo + every initialized submodule.
+    // The tree = the top repo and every initialized submodule *at any depth*.
+    // A submodule that itself has submodules is the normal shape here, and
+    // stopping at the first level left the deepest repos at their current HEAD
+    // while their parents moved — a tree rewound only part of the way down.
     let mut repos = vec![top.clone()];
-    if let Ok(Some(subs)) = top.submodules() {
-        for sm in subs {
-            if let Ok(Some(sub)) = sm.open() {
-                repos.push(sub);
-            }
-        }
-    }
+    collect_submodules(&top, &mut repos);
 
     let (mut rewound, mut skipped) = (0, 0);
     for repo in &repos {
@@ -51,7 +50,7 @@ pub fn zrewind(args: &[String]) -> Result<ExitCode> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| workdir.display().to_string());
 
-        if repo.is_dirty().unwrap_or(false) {
+        if has_local_work(&exe, workdir) {
             println!("skip {name}: dirty (uncommitted work — never clobbered)");
             skipped += 1;
             continue;
@@ -83,6 +82,40 @@ pub fn zrewind(args: &[String]) -> Result<ExitCode> {
     }
     println!("\n{rewound} {}, {skipped} skipped (tree → {secs}s ago)", if dry { "would rewind" } else { "rewound" });
     Ok(ExitCode::SUCCESS)
+}
+
+/// Every initialized submodule under `repo`, at any depth, in parent-first
+/// order. Mirrors `snapshot.rs`'s collect: the tree a tree-wide verb acts on is
+/// the whole tree, not its first level.
+fn collect_submodules(repo: &gix::Repository, out: &mut Vec<gix::Repository>) {
+    let Ok(Some(subs)) = repo.submodules() else { return };
+    for sm in subs {
+        if let Ok(Some(sub)) = sm.open() {
+            collect_submodules(&sub, out);
+            out.push(sub);
+        }
+    }
+}
+
+/// Does this repository hold uncommitted work of its own?
+///
+/// Not `repo.is_dirty()`: a superproject reads as dirty the moment one of its
+/// submodules moves, which is exactly the state a tree-wide rewind exists to
+/// undo — so the blanket check refused every repo in a submodule tree and
+/// rewound nothing. A moved gitlink is not local work; the child repo is rewound
+/// in the same pass. Asked through the porcelain (`--ignore-submodules=all`
+/// covers the staged gitlink as well as the worktree one) so this agrees with
+/// what `git status` reports, and `-uno` because a `reset --hard` leaves
+/// untracked files alone.
+fn has_local_work(exe: &Path, workdir: &Path) -> bool {
+    let Ok(out) = Command::new(exe)
+        .args(["status", "--porcelain", "--ignore-submodules=all", "--untracked-files=no"])
+        .current_dir(workdir)
+        .output()
+    else {
+        return true; // cannot tell → refuse, never clobber
+    };
+    !out.stdout.is_empty()
 }
 
 /// The sha HEAD pointed at, at epoch `cutoff`: the NEW sha of the latest

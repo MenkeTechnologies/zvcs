@@ -870,7 +870,7 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zrewind <duration> [--dry-run]",
         desc: &[
             "Rewinds the tree \\(em the repository at the current directory and every nested submodule \\(em to the state it was in a given duration ago (2h, 30m, 1d). For each repository it finds the HEAD the reflog shows it had at that time and resets hard to it, reusing the faithful porcelain reset (itself reflogged, so the rewind is undoable). Where `git zsnapshot` is a manual named restore point, this is any timestamp with no prior setup.",
-            "A dirty repository is refused so uncommitted work is never clobbered, and a repository whose reflog does not reach that far back is reported and skipped (the reflog's default 90-day expiry bounds how far back it can go). --dry-run shows exactly what would move without changing anything.",
+            "A repository holding uncommitted work of its own is refused so that work is never clobbered. A submodule pointer moved by a child is not such work \\(em a superproject reads as modified the moment a submodule moves, which is the very state a tree-wide rewind undoes \\(em so it does not stop the parent from being rewound; the child is rewound in the same pass. A repository whose reflog does not reach that far back is reported and skipped (the reflog's default 90-day expiry bounds how far back it can go). --dry-run shows exactly what would move without changing anything.",
         ],
     },
     Doc {

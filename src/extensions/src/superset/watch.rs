@@ -424,13 +424,9 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
     // 2. Working-repo submodules — autonomy is keyed off their HEAD moves.
     if cfg.any_autonomous() {
         if let Ok(repo) = crate::setup::discover() {
-            if let Ok(Some(subs)) = repo.submodules() {
-                for sm in subs {
-                    if let Ok(Some(sub)) = sm.open() {
-                        if let Some(wd) = sub.workdir() {
-                            add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), false, None, 0);
-                        }
-                    }
+            for sub in crate::superset::tree_repos(&repo).into_iter().skip(1) {
+                if let Some(wd) = sub.workdir() {
+                    add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), false, None, 0);
                 }
             }
         }
@@ -558,21 +554,13 @@ fn react(cfg: &ZvcsConfig) {
                 let _ = crate::db::record_failure(repo.git_dir(), "reconcile", &format!("{e:#}"));
             }
         }
-        if let Ok(Some(subs)) = repo.submodules() {
-            for sm in subs {
-                if let Ok(Some(sub)) = sm.open() {
-                    match crate::superset::reconcile_repo_local(&sub) {
-                        Ok(msg) => record_reconcile_event(&sub, &msg),
-                        Err(e) => {
-                            let path = sm.path().map(|p| p.to_string()).unwrap_or_default();
-                            note!("[zvcs reconcile] {path}: error: {e:#}");
-                            let _ = crate::db::record_failure(
-                                sub.git_dir(),
-                                "reconcile",
-                                &format!("{path}: {e:#}"),
-                            );
-                        }
-                    }
+        for sub in crate::superset::tree_repos(&repo).into_iter().skip(1) {
+            match crate::superset::reconcile_repo_local(&sub) {
+                Ok(msg) => record_reconcile_event(&sub, &msg),
+                Err(e) => {
+                    let path = sub.workdir().map(|w| w.display().to_string()).unwrap_or_default();
+                    note!("[zvcs reconcile] {path}: error: {e:#}");
+                    let _ = crate::db::record_failure(sub.git_dir(), "reconcile", &format!("{path}: {e:#}"));
                 }
             }
         }
@@ -610,15 +598,12 @@ fn record_reconcile_event(repo: &gix::Repository, msg: &str) {
     }
 }
 
-/// Attach the top repo and every initialized submodule off any detached HEAD.
+/// Attach the top repo and every initialized submodule, at any depth, off a
+/// detached HEAD. A submodule nested inside a submodule detaches exactly as
+/// often as a first-level one, so the walk has to reach it.
 fn attach_all(repo: &gix::Repository) {
-    let _ = crate::superset::ensure_attached(repo);
-    if let Ok(Some(subs)) = repo.submodules() {
-        for sm in subs {
-            if let Ok(Some(sub)) = sm.open() {
-                let _ = crate::superset::ensure_attached(&sub);
-            }
-        }
+    for r in crate::superset::tree_repos(repo) {
+        let _ = crate::superset::ensure_attached(&r);
     }
 }
 

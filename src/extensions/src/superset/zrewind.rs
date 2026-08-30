@@ -39,8 +39,7 @@ pub fn zrewind(args: &[String]) -> Result<ExitCode> {
     // A submodule that itself has submodules is the normal shape here, and
     // stopping at the first level left the deepest repos at their current HEAD
     // while their parents moved — a tree rewound only part of the way down.
-    let mut repos = vec![top.clone()];
-    collect_submodules(&top, &mut repos);
+    let repos = crate::superset::tree_repos(&top);
 
     let (mut rewound, mut skipped) = (0, 0);
     for repo in &repos {
@@ -82,19 +81,6 @@ pub fn zrewind(args: &[String]) -> Result<ExitCode> {
     }
     println!("\n{rewound} {}, {skipped} skipped (tree → {secs}s ago)", if dry { "would rewind" } else { "rewound" });
     Ok(ExitCode::SUCCESS)
-}
-
-/// Every initialized submodule under `repo`, at any depth, in parent-first
-/// order. Mirrors `snapshot.rs`'s collect: the tree a tree-wide verb acts on is
-/// the whole tree, not its first level.
-fn collect_submodules(repo: &gix::Repository, out: &mut Vec<gix::Repository>) {
-    let Ok(Some(subs)) = repo.submodules() else { return };
-    for sm in subs {
-        if let Ok(Some(sub)) = sm.open() {
-            collect_submodules(&sub, out);
-            out.push(sub);
-        }
-    }
 }
 
 /// Does this repository hold uncommitted work of its own?

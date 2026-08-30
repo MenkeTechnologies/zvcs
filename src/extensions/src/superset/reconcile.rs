@@ -11,6 +11,33 @@ use super::reconcile_repo;
 
 /// Reconcile the top-level repo and all initialized submodules.
 ///
+/// The whole working tree as repositories: `top` first, then every initialized
+/// submodule at any depth, parents before their children.
+///
+/// Tree-wide verbs kept hand-rolling this walk, and the hand-rolled ones
+/// disagreed: `zsnapshot`, `zstash`, `zup` and `zworktree` recursed while
+/// `zrewind` and the daemon's autonomy pass stopped at the first level, so a
+/// submodule that itself has submodules was invisible to half the tree-wide
+/// features. Recursion is the behaviour the docs describe ("every nested
+/// submodule"), and this is the one place that implements it.
+pub fn tree_repos(top: &gix::Repository) -> Vec<gix::Repository> {
+    let mut out = vec![top.clone()];
+    push_submodules(top, &mut out);
+    out
+}
+
+fn push_submodules(repo: &gix::Repository, out: &mut Vec<gix::Repository>) {
+    let Ok(Some(subs)) = repo.submodules() else { return };
+    for sm in subs {
+        // An uninitialized submodule has no repository to act on; callers that
+        // report on those read the submodule list themselves.
+        if let Ok(Some(sub)) = sm.open() {
+            out.push(sub.clone());
+            push_submodules(&sub, out);
+        }
+    }
+}
+
 /// Returns one `(label, status)` per repo — `"."` for the top-level, the
 /// submodule path otherwise. Never errors: per-repo failures are captured as a
 /// status string so the caller (CLI or daemon) sees the whole picture.
@@ -22,24 +49,19 @@ pub fn reconcile_tree(top: &gix::Repository) -> Vec<(String, String)> {
         Err(e) => out.push((".".to_string(), format!("error: {e:#}"))),
     }
 
-    if let Ok(Some(submodules)) = top.submodules() {
-        for sm in submodules {
-            let label = sm
-                .path()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|_| "<submodule>".to_string());
-            match sm.open() {
-                Ok(Some(sub_repo)) => {
-                    let status = match reconcile_repo(&sub_repo) {
-                        Ok(s) => s,
-                        Err(e) => format!("error: {e:#}"),
-                    };
-                    out.push((label, status));
-                }
-                Ok(None) => out.push((label, "not initialized, skipped".to_string())),
-                Err(e) => out.push((label, format!("open error: {e:#}"))),
-            }
-        }
+    // Every submodule at any depth: a submodule that has submodules of its own
+    // is the normal shape here, and stopping at the first level left them out of
+    // a walk documented as covering the entire working tree.
+    for sub in tree_repos(top).into_iter().skip(1) {
+        let label = sub
+            .workdir()
+            .map(|w| w.display().to_string())
+            .unwrap_or_else(|| "<submodule>".to_string());
+        let status = match reconcile_repo(&sub) {
+            Ok(s) => s,
+            Err(e) => format!("error: {e:#}"),
+        };
+        out.push((label, status));
     }
 
     out

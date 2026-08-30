@@ -110,7 +110,7 @@ pub use query::{
 };
 pub use queue::{zcommit, zpush, zsubmit};
 pub use repl::zrepl;
-pub use reconcile::reconcile_tree;
+pub use reconcile::{reconcile_tree, tree_repos};
 pub use guard::zguard;
 pub use zppid::{zppid, zprocs};
 pub use zbroadcast::{zbroadcast, zhandoff};

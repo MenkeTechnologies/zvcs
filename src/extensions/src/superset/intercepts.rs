@@ -320,7 +320,8 @@ fn register(kind_str: &str, rest: &[String]) -> Result<ExitCode> {
     }
 
     let mut list = load();
-    let id = list.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+    let highest = list.iter().map(|i| i.id).max().unwrap_or(0);
+    let id = crate::superset::registry_id::next_id("intercepts", u64::from(highest)) as u32;
     list.push(Intercept { pattern: pattern.clone(), kind, code: code.clone(), id });
     save(&list)?;
     let preview = if code.len() > 50 { format!("{}...", &code[..47]) } else { code };

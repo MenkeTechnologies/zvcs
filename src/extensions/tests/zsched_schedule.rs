@@ -113,29 +113,26 @@ fn durations_are_parsed_and_a_bad_one_writes_nothing() {
 }
 
 #[test]
-fn an_id_is_the_highest_in_use_plus_one_and_is_reused_after_a_removal() {
-    // Measured, not assumed, and recorded here because it is a sharp edge: the
-    // id is `max(remaining) + 1`, so removing the highest schedule hands its
-    // number to the next one added. `zguard` and `zintercept` number their
-    // registries the same way (`guard.rs:next_id`, `intercepts.rs:323`), so
-    // this is the project's convention rather than a slip in one verb — but it
-    // means a note or a script holding "rm 2" can delete something else
-    // entirely once #2 has been removed and re-added. Pinned so that changing
-    // it is a decision rather than an accident.
+fn an_id_is_never_reused_after_a_removal() {
+    // This case used to record the opposite, because the id was
+    // `max(remaining) + 1`: removing the highest schedule handed its number to
+    // the next one added, so a note or a script holding "rm 2" deleted something
+    // else once #2 had been removed and re-added. `zguard` and `zintercept`
+    // numbered their registries the same way, and all three now take their ids
+    // from a high-water mark that is not lowered by a removal.
     let (dir, home) = fixture("ids");
     ok(&run(&dir, &home, &["zsched", "add", "1m", "--", "one"]), "add 1");
     ok(&run(&dir, &home, &["zsched", "add", "1m", "--", "two"]), "add 2");
     ok(&run(&dir, &home, &["zsched", "rm", "2"]), "rm 2");
 
     let out = ok(&run(&dir, &home, &["zsched", "add", "1m", "--", "three"]), "add after rm");
-    assert!(out.contains("#2"), "the id scheme changed — see this test's comment:\n{out}");
+    assert!(!out.contains("#2"), "the id of the removed schedule came back:\n{out}");
     let lines = schedules(&home);
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines.iter().any(|l| l.starts_with("1\t")), "{lines:?}");
-    // #2 now names the third command, which is the hazard being recorded.
     assert!(
-        lines.iter().any(|l| l.starts_with("2\t") && l.ends_with("three")),
-        "{lines:?}"
+        lines.iter().any(|l| l.starts_with("3\t") && l.ends_with("three")),
+        "the new schedule should be numbered past the retired id: {lines:?}"
     );
 
     // Removing an id that is not there is an error, not a silent no-op.

@@ -126,7 +126,8 @@ fn save(list: &[Guard]) -> Result<()> {
 }
 
 fn next_id(list: &[Guard]) -> u64 {
-    list.iter().map(|g| g.id).max().unwrap_or(0) + 1
+    let highest = list.iter().map(|g| g.id).max().unwrap_or(0);
+    crate::superset::registry_id::next_id("guards", highest)
 }
 
 /// The dispatcher's verdict for a command.

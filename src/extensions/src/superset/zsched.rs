@@ -150,7 +150,7 @@ fn add(rest: &[String]) -> Result<ExitCode> {
         bail!("usage: git zsched add <duration> -- <command>");
     }
     let mut scheds = read_schedules();
-    let id = scheds.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+    let id = crate::superset::registry_id::next_id("schedule", scheds.iter().map(|s| s.id).max().unwrap_or(0));
     scheds.push(Sched { id, interval: interval.max(1) as u64, command: command.clone() });
     write_schedules(&scheds)?;
     println!("scheduled #{id}: every {} — {command}", human(interval.max(1) as u64));

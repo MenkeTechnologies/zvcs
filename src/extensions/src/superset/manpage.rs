@@ -852,7 +852,7 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zwaitfor <clean|idle|synced|<repo> <sha>> [--timeout <secs>]",
         desc: &[
             "Blocks until a condition over the whole tree becomes true, then exits 0 (or 1 on timeout) \\(em a cross-repo barrier on state, where `git zbarrier` and `git zwait` are job-scoped. clean waits until every indexed repo is clean; idle until no daemon jobs are queued or running; synced until every repo is up-to-date with its upstream; `<substr> <sha>` until the repo whose path contains the substring is at the given commit (prefix).",
-            "Conditions are read from the daemon's cached status, so the daemon must be maintaining status for the wait to observe changes. --timeout bounds the wait (default 60 seconds).",
+            "Conditions are read from the daemon's cached status, so the daemon must be maintaining status for the wait to observe changes. An indexed repository that has not been reported on yet is not counted as meeting the condition \\(em a tree nothing is reporting waits and then times out, rather than passing on an empty cache. --timeout bounds the wait (default 60 seconds).",
         ],
     },
     Doc {

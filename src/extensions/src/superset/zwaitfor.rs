@@ -59,9 +59,9 @@ fn check(pos: &[String]) -> Result<bool> {
     // treat both as "not met yet" and keep polling.
     let Ok(conn) = crate::db::open_ro() else { return Ok(false) };
     let met = match pos[0].as_str() {
-        "clean" => crate::db::all_status(&conn)?.iter().all(|(_, dirty, _, _)| !dirty),
+        "clean" => tree_reported(&conn, |(_, dirty, _, _)| !*dirty)?,
         "idle" => crate::db::contention(&conn)?.is_empty(),
-        "synced" => crate::db::all_status(&conn)?.iter().all(|(_, _, sync, _)| is_synced(sync)),
+        "synced" => tree_reported(&conn, |(_, _, sync, _)| is_synced(sync))?,
         repo => {
             let sha = want_sha.unwrap();
             crate::db::all_status(&conn)?
@@ -70,6 +70,38 @@ fn check(pos: &[String]) -> Result<bool> {
         }
     };
     Ok(met)
+}
+
+/// Does every *indexed* repository have a cached status, and does `holds` hold
+/// for all of them?
+///
+/// The condition used to be `all_status(..).iter().all(..)`, and `all()` over an
+/// empty iterator is true: on a machine where nothing maintains the status cache
+/// — no daemon, or one that has not reached these repositories yet — `git
+/// zwaitfor clean` returned success immediately and reported the whole tree
+/// clean while knowing nothing about it. A barrier that cannot observe its
+/// condition must not claim the condition holds; it waits, and the timeout is
+/// what tells the caller nothing is reporting.
+///
+/// The man page states the condition as "every indexed repo", so an indexed
+/// repository with no status row is a repository not yet reported on, not one
+/// that passes by absence. An empty index is unobservable for the same reason
+/// and is likewise not met.
+fn tree_reported(
+    conn: &rusqlite::Connection,
+    holds: impl Fn(&(String, bool, String, String)) -> bool,
+) -> Result<bool> {
+    let indexed = crate::db::list_repos(conn)?;
+    if indexed.is_empty() {
+        return Ok(false);
+    }
+    let status = crate::db::all_status(conn)?;
+    let reported: std::collections::HashSet<&str> = status.iter().map(|(p, ..)| p.as_str()).collect();
+    let every_repo_reported = indexed.iter().all(|r| {
+        let path = r.workdir.as_deref().unwrap_or(r.git_dir.as_str());
+        reported.contains(path)
+    });
+    Ok(every_repo_reported && status.iter().all(holds))
 }
 
 /// A repo is "in sync" if it has nothing to push or pull — up-to-date, or simply

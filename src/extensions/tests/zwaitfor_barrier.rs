@@ -1,25 +1,25 @@
 //! `git zwaitfor` — the cross-repo barrier on *state*.
 //!
-//! A barrier is a gate that scripts hang deployments on ("wait until the tree
-//! is clean, then ship"), so its failure modes are the expensive kind: waiting
-//! forever, or passing when it should not. Two of the three cases here are
-//! about the second.
+//! A barrier is a gate that scripts hang deployments on ("wait until the tree is
+//! clean, then ship"), so its failure modes are the expensive kind: waiting
+//! forever, or passing when it should not.
 //!
-//! **The condition reads the daemon's cached `repo_status`, and nothing else
-//! writes that table.** With no daemon maintaining it the table is empty, and
-//! `clean` / `synced` are `all()` over an empty set — vacuously true. So
-//! `git zwaitfor clean` returns 0 *immediately* against a tree of dirty repos
-//! whenever the daemon is not running. That is measured below, not asserted
-//! from reading the code, and it is pinned as behaviour rather than quietly
-//! accepted: a barrier that answers "condition met" when it has no information
-//! is the one shape a gate must not have, and a script cannot tell that answer
-//! from a real one. Changing it — failing closed, or distinguishing "no data" —
-//! is a decision about the verb's contract, so the test records today's answer
-//! and says what it costs.
+//! It used to pass when it should not, and this file recorded that as a hazard.
+//! The condition reads the daemon's cached `repo_status`, and `clean`/`synced`
+//! were `all()` over those rows — `all()` over an empty set is true, so on a
+//! machine where nothing maintains the cache the barrier returned 0 immediately
+//! over a visibly dirty tree. A script could not tell that answer from a real
+//! one.
 //!
-//! The two properties that *are* determinate without a daemon are worth as
-//! much: a usage error is reported before the poll loop rather than after the
-//! timeout, and the timeout is honoured.
+//! The condition now says what the man page always said: *every indexed repo*.
+//! An indexed repository with no status row is one nothing has reported on, not
+//! one that passes by absence, and an empty index is unobservable for the same
+//! reason. Both wait, and the timeout is what tells the caller nothing is
+//! reporting — an answer a script can act on.
+//!
+//! The two properties that were always determinate are kept: a usage error is
+//! reported before the poll loop rather than after the timeout, and the timeout
+//! is honoured.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -104,26 +104,66 @@ fn an_unmet_condition_times_out_at_one_and_says_so() {
 }
 
 #[test]
-fn a_tree_wide_condition_passes_vacuously_when_no_daemon_maintains_the_status_cache() {
-    // Measured, and recorded as a hazard rather than as a virtue.
-    //
-    // `clean` is `all()` over `repo_status`, and only the daemon's status
-    // sweeper writes that table — `zreindex` records the repositories but not
-    // their state. So with no daemon, the set is empty, `all()` is true, and
-    // the barrier passes instantly over a tree that is visibly dirty. The
-    // fixture's only repo has uncommitted work; stock `status` reports it.
-    let (work, home, repo) = fixture("vacuous");
+fn a_tree_nothing_has_reported_on_is_not_treated_as_clean() {
+    // The fixture's repository has uncommitted work and no status row, which is
+    // the state of any tree on a machine where the daemon is not maintaining the
+    // cache. The barrier must wait rather than answer from an empty table.
+    let (work, home, repo) = fixture("unreported");
     let dirty = both(&run(&repo, &home, &["status", "--porcelain"]));
     assert!(dirty.contains("a.txt"), "the fixture is not dirty:\n{dirty}");
 
-    let start = Instant::now();
-    let out = run(&work, &home, &["zwaitfor", "clean", "--timeout", "5"]);
+    let out = run(&work, &home, &["zwaitfor", "clean", "--timeout", "3"]);
     assert!(
-        out.status.success() && start.elapsed().as_secs() < 3,
-        "the vacuous pass documented here no longer happens — if `zwaitfor` learned to \
-         distinguish an empty status cache from a clean tree, that is an improvement and \
-         this test should be rewritten to assert the new contract"
+        !out.status.success(),
+        "the barrier passed over a tree nothing has reported on:\n{}",
+        both(&out)
     );
 
     let _ = std::fs::remove_dir_all(work.parent().unwrap());
+}
+
+#[test]
+fn the_condition_holds_only_once_every_indexed_repo_has_reported() {
+    // Two repositories, both clean on disk. Reporting one of them is not the
+    // tree: a barrier that answered from the reported subset would pass while
+    // the other repository's state is still unknown.
+    let root = std::env::temp_dir().join(format!("zvcs-zwait-partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let work = root.join("work");
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join("zvcs")).unwrap();
+    for name in ["r1", "r2"] {
+        let r = work.join(name);
+        std::fs::create_dir_all(&r).unwrap();
+        assert!(run(&r, &home, &["init", "-q", "-b", "main", "."]).status.success());
+        std::fs::write(r.join("a.txt"), b"one\n").unwrap();
+        assert!(run(&r, &home, &["add", "a.txt"]).status.success());
+        assert!(run(&r, &home, &["commit", "-q", "-m", "first"]).status.success());
+    }
+    let idx = both(&run(&work, &home, &["zreindex", "--sync", work.to_str().unwrap()]));
+    assert!(idx.contains("indexed 2"), "{idx}");
+
+    // One reported: not enough.
+    assert!(run(&work.join("r1"), &home, &["zstatus"]).status.success());
+    let partial = run(&work, &home, &["zwaitfor", "clean", "--timeout", "3"]);
+    assert!(
+        !partial.status.success(),
+        "the barrier passed with only one of two repositories reported:\n{}",
+        both(&partial)
+    );
+
+    // Both reported and both clean: met, and without burning the timeout.
+    assert!(run(&work.join("r2"), &home, &["zstatus"]).status.success());
+    let start = Instant::now();
+    let full = run(&work, &home, &["zwaitfor", "clean", "--timeout", "10"]);
+    assert!(full.status.success(), "a fully reported clean tree must pass:\n{}", both(&full));
+    assert!(start.elapsed().as_secs() < 5, "a met condition must return at once, not at the timeout");
+
+    // And a repository that is reported dirty holds the barrier closed.
+    std::fs::write(work.join("r2/a.txt"), b"dirty\n").unwrap();
+    assert!(run(&work.join("r2"), &home, &["zstatus"]).status.success());
+    let dirty = run(&work, &home, &["zwaitfor", "clean", "--timeout", "3"]);
+    assert!(!dirty.status.success(), "a reported-dirty repository must hold the barrier:\n{}", both(&dirty));
+
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -8,6 +8,12 @@
 //! offending commit prints as `<code> <repo> <sha> <subject>`; the run exits
 //! non-zero if any offender is found, so it gates a push / CI the way an
 //! unsigned-commit policy needs.
+//!
+//! Each repository is judged under its own config cascade
+//! ([`crate::gitsig::with_repo_config`]): `gpg.format`, the program slots and
+//! `gpg.ssh.allowedSignersFile` are usually per-repository, and a gate whose
+//! verdict depended on the directory the command was typed in would answer
+//! differently for the same repo depending on how it was reached.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -51,7 +57,9 @@ fn check_repo(git_dir: &Path, workdir: &Path, n: usize) -> RepoResult {
     let Ok(mut commit) = repo.head_commit() else { return res };
     for _ in 0..n {
         res.checked += 1;
-        let (status, _key) = evaluate(&commit.data);
+        // Under this repository's own config: the fleet walks many repos in one
+        // process, where git would have read the config of exactly one.
+        let (status, _key) = crate::gitsig::with_repo_config(&repo, || evaluate(&commit.data));
         if !status.is_good() {
             res.offenders.push(Offender {
                 code: status.code(),

@@ -33,6 +33,7 @@
 //! gpg/gpgsm/ssh-keygen, which is what git itself does (git has no in-process
 //! crypto either).
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -448,6 +449,11 @@ pub fn gpg_programs(repo: &gix::Repository) -> [String; 3] {
 /// that `git_gpg_config()` filled at startup, so it is resolved once per process
 /// against the repository this one is running in.
 fn verify_program(format: SigFormat) -> String {
+    // A fleet verb's installed repository wins, so the program a verification
+    // runs is the one that repository configures.
+    if let Some(p) = REPO_CONFIG.with(|c| c.borrow().as_ref().map(|v| v.programs[format as usize].clone())) {
+        return p;
+    }
     static PROGRAMS: OnceLock<[String; 3]> = OnceLock::new();
     let programs = PROGRAMS.get_or_init(|| match crate::setup::discover() {
         Ok(repo) => gpg_programs(&repo),
@@ -466,6 +472,7 @@ fn verify_program(format: SigFormat) -> String {
 
 /// git's `gpg_format` entry for `ssh` plus the two statics
 /// `gpg_interface_config()` fills for it.
+#[derive(Clone)]
 struct SshConfig {
     /// `gpg.ssh.program`, defaulting to git's `"ssh-keygen"`.
     program: String,
@@ -473,6 +480,71 @@ struct SshConfig {
     allowed_signers: Option<PathBuf>,
     /// `gpg.ssh.revocationFile`, passed to `ssh-keygen -Y verify -r`.
     revocation_file: Option<PathBuf>,
+}
+
+/// The verification config of one repository: the three `gpg_format[]` program
+/// slots plus the ssh backend's settings.
+#[derive(Clone)]
+struct VerifyConfig {
+    programs: [String; 3],
+    ssh: SshConfig,
+}
+
+thread_local! {
+    /// The repository whose config the *current thread* verifies under, when a
+    /// fleet verb installed one.
+    ///
+    /// git resolves gpg config into file-scope statics at startup because a git
+    /// process serves exactly one repository. `git zsigs` walks the whole
+    /// indexed tree inside a single process, so the statics would answer for the
+    /// directory the command was typed in: a signed commit in a repo whose
+    /// `gpg.ssh.allowedSignersFile` lives in that repo's own config verified
+    /// when the verb ran inside it and came back unverifiable when the same verb
+    /// ran over the fleet. A gate whose verdict depends on the caller's cwd
+    /// cannot gate anything, so fleet verbs install each repository's config
+    /// here for the commits they check on that thread.
+    static REPO_CONFIG: RefCell<Option<VerifyConfig>> = const { RefCell::new(None) };
+}
+
+/// Restores the previous thread-local config, panic or not.
+struct ConfigGuard(Option<VerifyConfig>);
+
+impl Drop for ConfigGuard {
+    fn drop(&mut self) {
+        REPO_CONFIG.with(|c| *c.borrow_mut() = self.0.take());
+    }
+}
+
+/// Run `f` with signature verification reading `repo`'s config cascade instead
+/// of the process-wide one — the verdict the same check would give if it ran
+/// inside that repository. Nests and restores; scoped to the calling thread, so
+/// the fleet verbs' worker threads do not disturb each other.
+pub fn with_repo_config<R>(repo: &gix::Repository, f: impl FnOnce() -> R) -> R {
+    let cfg = VerifyConfig { programs: gpg_programs(repo), ssh: ssh_config_of(repo) };
+    let previous = REPO_CONFIG.with(|c| c.borrow_mut().replace(cfg));
+    let _guard = ConfigGuard(previous);
+    f()
+}
+
+/// The ssh backend's settings as `repo` spells them.
+fn ssh_config_of(repo: &gix::Repository) -> SshConfig {
+    let snapshot = repo.config_snapshot();
+    // `git_config_pathname()`: `~`/`~user` expansion, which `trusted_path`
+    // performs while resolving the value.
+    let path = |key: &str| -> Option<PathBuf> { snapshot.trusted_path(key).ok().flatten() };
+    SshConfig {
+        program: gpg_programs(repo)[SigFormat::Ssh as usize].clone(),
+        allowed_signers: path("gpg.ssh.allowedSignersFile"),
+        revocation_file: path("gpg.ssh.revocationFile"),
+    }
+}
+
+/// The ssh config a verification runs under: the repository a fleet verb
+/// installed, else the process-wide read.
+fn current_ssh_config() -> SshConfig {
+    REPO_CONFIG
+        .with(|c| c.borrow().as_ref().map(|v| v.ssh.clone()))
+        .unwrap_or_else(|| ssh_config().clone())
 }
 
 /// The ssh backend's configuration, read once per process.
@@ -515,7 +587,7 @@ fn verify_ssh(sig: &[u8], payload: &[u8]) -> SigCheck {
     // The `goto out` endings leave `sigc->output` NULL, so nothing is printed and
     // nothing is claimed — `SigCheck::default()` is that state.
     let unchecked = SigCheck::default;
-    let cfg = ssh_config();
+    let cfg = current_ssh_config();
     let Some(allowed) = cfg.allowed_signers.as_deref() else {
         eprintln!(
             "error: gpg.ssh.allowedSignersFile needs to be configured and exist \

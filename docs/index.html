@@ -840,6 +840,7 @@ git rev-parse HEAD</pre>
         <h2>Repository &amp; links</h2>
         <ul>
           <li><strong>Engineering report</strong> — <a href="report.html">report.html</a> (architecture, the superset layer, value posture, roadmap)</li>
+          <li><strong>Parity report</strong> — <a href="port_report.html">port_report.html</a> (per-subcommand parity against stock git, measured by the <code>zvcs-parity</code> harness at generation time &mdash; regenerate with <code>cargo run -p zvcs-parity -- --bin $PWD/target/debug/git --html docs/port_report.html</code>)</li>
           <li><strong>Plugin system</strong> — <a href="https://github.com/MenkeTechnologies/zvcs/blob/main/ZNATIVE.md">ZNATIVE.md</a> (<code>git znative</code>, the plugin store, and the C ABI a native plugin is written against)</li>
           <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/zvcs">github.com/MenkeTechnologies/zvcs</a></li>
           <li><strong>Issues</strong> — <a href="https://github.com/MenkeTechnologies/zvcs/issues">github.com/MenkeTechnologies/zvcs/issues</a></li>

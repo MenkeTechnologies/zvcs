@@ -32,7 +32,7 @@ superset coordination layer: a fair FIFO index-lock daemon, a
 reconcile-to-mainline attacher, and forward-only gitlink bumps, served from the
 same binary that answers `rev-parse`.
 
-### [`Read the Docs`](https://menketechnologies.github.io/zvcs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/zvcs/report.html) &middot; [`gitoxide`](https://github.com/GitoxideLabs/gitoxide)
+### [`Read the Docs`](https://menketechnologies.github.io/zvcs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/zvcs/report.html) &middot; [`Parity Report`](https://menketechnologies.github.io/zvcs/port_report.html) &middot; [`gitoxide`](https://github.com/GitoxideLabs/gitoxide)
 
 ---
 
@@ -144,6 +144,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Security | `zscan [selectors]` | parallel **secret scan** of tracked content across the fleet — AWS/GitHub/Slack/Google/JWT/PEM keys + high-entropy `key = "…"` assignments, `path:line:pattern` per hit; **exits non-zero** when any found, so it drops straight into a pre-push / CI gate |
 | Signatures | `zsigs [selectors] [-n <count>]` | fleet **commit-signature check** — flags unsigned/bad/unverifiable HEAD commits (git's `%G?` codes) across the tree; signature + payload reconstructed natively, verified via gpg (the tool git itself uses), **exits non-zero** if any found. Also adds the `%G?` / `%GK` pretty-format placeholders to `git log` |
 | Parallel mutations | `zfetch` `zgc` `zfsck` `zprune` `zreset` `zabort` `zcheckout <branch>` `ztagall <tag>` `zcommitall -m <msg>` `zpushall` `zclean -f` | run a git operation across every indexed repo in parallel (via this binary's own porcelain + fair lane); `zreset` parallel-resets, `zabort` aborts an in-progress merge/rebase/cherry-pick/revert in mid-op repos; ops that don't apply are skipped, not forced |
+| Re-attach | `zattach [selectors]` | put every **detached-HEAD** indexed repo back on its mainline branch — the state `git submodule update` leaves a tree in, and the state in which a commit is written unreachable. The same local, no-clobber attach `zsync` applies to submodules (`ensure_attached`): never contacts a remote, never moves the checked-out commit, never touches the worktree or index, so it is safe on a dirty repo. A repo whose local mainline is ahead of or diverged from HEAD is **refused**, one with no `main`/`master` is skipped, and the tally reports each class |
 | Remotes | `zremote set <old> <new> [selectors] [-n]` | fleet-wide **remote-URL rewrite** — replace substring `<old>` with `<new>` in every matching remote across the tree (org move / host change / ssh↔https); `-n` / `--dry-run` previews without applying |
 | Rollback | `zrollback [selectors] [--steps <n>] [--apply] [--force]` | fleet-wide **undo of the last mutating op** — resolve `HEAD@{n}` from the reflog and `reset --hard` to it (the multi-repo `zundo`); **dry-run unless `--apply`**, and skips dirty / mid-op / would-diverge-from-remote repos unless `--force` |
 | Live monitor | `ztop [selectors]` | full-screen htop-style fleet monitor — every indexed repo, sorted by churn, read from the daemon status cache each frame (scales to thousands). 31 htoprs colorschemes with a live picker (`c`) + palette editor (`~`), F1 help, F6 sort-by-column, `/` search, `p` full-path toggle |
@@ -168,7 +169,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
 | Setup | `zshadow [<dir>] [-n\|--print] [--all]` | install the whole `~/.zvcs` shadow — `git` shim + `git-<verb>` dashed links in `~/.zvcs/bin`, man pages in `~/.zvcs/man`, the HTML doc set in `~/.zvcs/share/doc/git-doc`, the forked zsh `_git` in `~/.zvcs/completions` — then print the `PATH`, `MANPATH`, and `fpath` lines on stdout (shell code only, so `eval "$(git zshadow)"` works; a line the environment already satisfies is printed commented out) |
 | Health | `zdoctor` | environment health check — git shadow on PATH, daemon, ledger, man pages, MANPATH, dashed forms, installed completion (OK/WARN/FAIL, exits non-zero on FAIL) |
-| git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
+| git-compat | every stock subcommand | dispatched natively; depth varies — see the [parity report](https://menketechnologies.github.io/zvcs/port_report.html) |
 
 **Scripting output.** Every read verb — the query, analytics, discovery, and
 coordination views (`zheads`, `zdirty`, `zrepos`, `ztags`, `zstatus --all`,

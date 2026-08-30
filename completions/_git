@@ -6866,6 +6866,7 @@ _git_commands () {
     ztop:'zvcs: live htop-style fleet monitor, most churn on top'
     zppid:'zvcs: per-process commit tally (each invoking ppid and commits landed)'
     zprocs:'zvcs: per-process command breakdown (mutating verbs run by each process)'
+    zprecache:'zvcs: precompute the log caches (abbreviations, --stat tallies) for recent commits'
     zpin:'zvcs: freeze a repo from daemon autonomy (no autobump/reconcile)'
     zunpin:'zvcs: unfreeze pinned repos'
     zbroadcast:'zvcs: post or read inter-agent messages'

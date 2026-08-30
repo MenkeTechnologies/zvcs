@@ -853,7 +853,7 @@ function and both a single `stat` when inactive:
   (atomic O_APPEND), and the verb tails it live. The `ppid` records which
   agent/shell ran each command.
 - **`zintercept`** — aspect-oriented interception, ported from zshrs
-  (`src/extensions/intercepts.rs`). `AdviceKind` (before/after/around),
+  (`src/extensions/src/superset/intercepts.rs`). `AdviceKind` (before/after/around),
   `Intercept`, and `intercept_matches` (exact/glob/`all`) are ported faithfully;
   adapted to zvcs's per-process model, the registry persists to
   `$ZVCS_HOME/intercepts.tsv` and advice is a shell command run with

@@ -822,6 +822,28 @@ pub enum Shape {
     /// first and refuses where it does not trust it. A shape carrying the flag
     /// and not the cache would look built and measure nothing.
     SplitIndex,
+    /// Six independent branch pairs, one per conflict class the corpus could
+    /// not previously build: modify/delete, rename/rename, directory rename,
+    /// mode-only, file-becomes-directory and symlink-vs-file.
+    ///
+    /// Every other shape with divergent tips conflicts only on *content*. The
+    /// census in `merge_ort.rs` established that the whole corpus held two
+    /// deletions and two renames, all on [`Shape::Renamed`], which has no two
+    /// divergent tips — so none of these classes could be merged at all.
+    MergeMatrix,
+    /// Author dates that differ from committer dates, and from each other.
+    ///
+    /// `env::harden` pins both dates, so every commit in every other shape
+    /// carries `1700000000` in both fields. That makes `--date-order` and
+    /// `--author-date-order` byte-identical everywhere, and a port that
+    /// swapped them would score full marks. Here the author dates are skewed
+    /// against topological order, so the two flags disagree.
+    SkewedDates,
+    /// Refs under `refs/namespaces/`, which no other shape carries.
+    ///
+    /// `GIT_NAMESPACE` was inert in every case that set it because there was
+    /// nothing in the namespace to find.
+    Namespaced,
 }
 
 impl Shape {
@@ -869,6 +891,9 @@ impl Shape {
         Shape::AmHooks,
         Shape::NestedSubmodule,
         Shape::SplitIndex,
+        Shape::MergeMatrix,
+        Shape::SkewedDates,
+        Shape::Namespaced,
     ];
 
     pub fn name(self) -> &'static str {
@@ -916,6 +941,9 @@ impl Shape {
             Shape::AmHooks => "am-hooks",
             Shape::NestedSubmodule => "nested-submodule",
             Shape::SplitIndex => "split-index",
+            Shape::MergeMatrix => "merge-matrix",
+            Shape::SkewedDates => "skewed-dates",
+            Shape::Namespaced => "namespaced",
         }
     }
 }
@@ -2427,6 +2455,123 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             if shared != 1 {
                 bail!("fixture: split-index: {shared} shared index files, wanted exactly 1");
             }
+        }
+
+        Shape::MergeMatrix => {
+            // One pair of tips per conflict class, rather than one merge that
+            // conflicts six ways at once: a case has to be able to ask about
+            // rename/rename without also answering modify/delete.
+            write(dir, "mm/md.txt", "base md\n")?;
+            write(dir, "mm/rr.txt", "base rr\nsecond line\nthird line\n")?;
+            write(dir, "mm/old/a.txt", "a\n")?;
+            write(dir, "mm/old/b.txt", "b\n")?;
+            write(dir, "mm/mode.sh", "#!/bin/sh\necho mode\n")?;
+            write(dir, "mm/fd", "a file today, a directory on one side\n")?;
+            symlink(dir, "mm/slink", "md.txt")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: base"])?;
+            let base = rev(dir, home, "HEAD")?;
+
+            // modify/delete
+            git(dir, home, &["checkout", "-q", "-b", "mm-mod", &base])?;
+            write(dir, "mm/md.txt", "modified on mm-mod\n")?;
+            git(dir, home, &["commit", "-qam", "merge-matrix: modify md.txt"])?;
+            git(dir, home, &["checkout", "-q", "-b", "mm-del", &base])?;
+            git(dir, home, &["rm", "-q", "mm/md.txt"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: delete md.txt"])?;
+
+            // rename/rename: one path, two destinations.
+            git(dir, home, &["checkout", "-q", "-b", "mm-ren-a", &base])?;
+            git(dir, home, &["mv", "mm/rr.txt", "mm/rr-a.txt"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: rename rr.txt to rr-a.txt"])?;
+            git(dir, home, &["checkout", "-q", "-b", "mm-ren-b", &base])?;
+            git(dir, home, &["mv", "mm/rr.txt", "mm/rr-b.txt"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: rename rr.txt to rr-b.txt"])?;
+
+            // directory rename: one side moves the directory, the other adds
+            // into the old name.
+            git(dir, home, &["checkout", "-q", "-b", "mm-dir", &base])?;
+            git(dir, home, &["mv", "mm/old", "mm/new"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: rename old/ to new/"])?;
+            git(dir, home, &["checkout", "-q", "-b", "mm-add", &base])?;
+            write(dir, "mm/old/c.txt", "c\n")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: add old/c.txt"])?;
+
+            // mode-only: the corpus had no 100755 blob in any tree anywhere.
+            git(dir, home, &["checkout", "-q", "-b", "mm-mode", &base])?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let path = dir.join("mm/mode.sh");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            git(dir, home, &["add", "mm/mode.sh"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: chmod +x mode.sh"])?;
+
+            // file becomes a directory on one side, edited on the other.
+            git(dir, home, &["checkout", "-q", "-b", "mm-fd", &base])?;
+            std::fs::remove_file(dir.join("mm/fd"))?;
+            write(dir, "mm/fd/inside.txt", "now a directory\n")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: fd becomes a directory"])?;
+            git(dir, home, &["checkout", "-q", "-b", "mm-file", &base])?;
+            write(dir, "mm/fd", "still a file, edited\n")?;
+            git(dir, home, &["commit", "-qam", "merge-matrix: edit fd"])?;
+
+            // symlink on one side, regular file on the other.
+            git(dir, home, &["checkout", "-q", "-b", "mm-reg", &base])?;
+            std::fs::remove_file(dir.join("mm/slink"))?;
+            write(dir, "mm/slink", "a regular file now\n")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: slink becomes a file"])?;
+            git(dir, home, &["checkout", "-q", "-b", "mm-link", &base])?;
+            std::fs::remove_file(dir.join("mm/slink"))?;
+            symlink(dir, "mm/slink", "rr.txt")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: slink repointed"])?;
+
+            git(dir, home, &["checkout", "-q", "main"])?;
+        }
+
+        Shape::SkewedDates => {
+            // `--date` moves the *author* date only; `env::harden` keeps every
+            // committer date at the pinned value. That is exactly what
+            // separates `--author-date-order` from `--date-order`, and it needs
+            // no clock: the epochs below are literals.
+            //
+            // Authored newest-first down the chain, so author order is the
+            // reverse of topological order rather than a permutation of it.
+            for (n, epoch) in [("sd-1", "@1600000400 +0000"), ("sd-2", "@1600000300 +0000")] {
+                write(dir, &format!("{n}.txt"), &format!("{n}\n"))?;
+                git(dir, home, &["add", "-A"])?;
+                git(dir, home, &["commit", "-qm", n, "--date", epoch])?;
+            }
+            // A branch whose commits interleave, by author date, with main's.
+            git(dir, home, &["checkout", "-q", "-b", "sd-side", "HEAD~1"])?;
+            write(dir, "sd-3.txt", "sd-3\n")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "sd-3", "--date", "@1600000350 +0000"])?;
+            git(dir, home, &["checkout", "-q", "main"])?;
+
+            // Annotated tags take their tagger date from the committer ident,
+            // which stays pinned — so `--sort=taggerdate` is still a tie here.
+            // Recorded rather than papered over: this shape separates the two
+            // *commit* date orders and nothing else.
+            git(dir, home, &["tag", "-a", "sd-tag", "-m", "skewed-dates: tag"])?;
+        }
+
+        Shape::Namespaced => {
+            write(dir, "ns.txt", "namespaced\n")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "namespaced: seed"])?;
+            let tip = rev(dir, home, "HEAD")?;
+            let root = rev(dir, home, "HEAD~1")?;
+            // Two refs inside the namespace and one outside it, so a namespaced
+            // read has both something to find and something to hide.
+            git(dir, home, &["update-ref", "refs/namespaces/ns/refs/heads/inside", &tip])?;
+            git(dir, home, &["update-ref", "refs/namespaces/ns/refs/tags/inside-tag", &root])?;
+            git(dir, home, &["update-ref", "refs/namespaces/other/refs/heads/elsewhere", &root])?;
+            git(dir, home, &["branch", "ns-outside", &root])?;
         }
     }
     Ok(())

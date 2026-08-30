@@ -212,6 +212,14 @@ pub struct Grammar {
 /// is the pool for the readers that answer about the stores rather than about
 /// the history.
 const REV_SHAPES: &[Shape] = &[
+    // `SkewedDates` is the only shape whose author dates differ from its
+    // committer dates, so it is the only one where `--author-date-order` and
+    // `--date-order` can disagree; every other fixture carries 1700000000 in
+    // both fields. `Namespaced` is the only one with anything under
+    // `refs/namespaces/`, which is what makes `--all`, `--branches` and
+    // `--reflog` answerable about a namespace at all.
+    Shape::SkewedDates,
+    Shape::Namespaced,
     Shape::Linear,
     Shape::Branched,
     Shape::Merged,
@@ -311,6 +319,9 @@ const REV_SHAPES: &[Shape] = &[
 /// a const; `store_shapes_extends_rev_shapes` fails `cargo test` if the two ever
 /// drift.
 const STORE_SHAPES: &[Shape] = &[
+    // Kept in step with `REV_SHAPES` by `store_shapes_extends_rev_shapes`.
+    Shape::SkewedDates,
+    Shape::Namespaced,
     Shape::Linear,
     Shape::Branched,
     Shape::Merged,
@@ -3637,6 +3648,12 @@ pub fn grammars() -> Vec<Grammar> {
                 "ff-cold", "ff-hot", "ff-squat", "div-cold", "div-hot", "div-squat",
                 "div-other", "oct-a", "oct-b", "oct-c", "oct-side",
                 "cc-left", "cc-right", "alien", "alien-clash", "does-not-exist", "",
+                // `Shape::MergeMatrix`'s six pairs. Drawn against every shape,
+                // so most of these resolve nowhere and exercise the refusal;
+                // on `MergeMatrix` each names a real tip and the merge reaches
+                // a conflict class no other fixture can build.
+                "mm-mod", "mm-del", "mm-ren-a", "mm-ren-b", "mm-dir", "mm-add",
+                "mm-mode", "mm-fd", "mm-file", "mm-reg", "mm-link",
             ],
             shapes: &[
                 Shape::Branched,
@@ -3650,6 +3667,7 @@ pub fn grammars() -> Vec<Grammar> {
                 Shape::Attributes,
                 Shape::Merged,
                 Shape::Linear,
+                Shape::MergeMatrix,
             ],
         },
     ]

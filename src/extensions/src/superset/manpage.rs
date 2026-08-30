@@ -350,7 +350,8 @@ pub const DOCS: &[Doc] = &[
         summary: "health check of the zvcs environment",
         synopsis: "git zdoctor",
         desc: &[
-            "Runs a set of environment checks and prints each as OK, WARN, or FAIL: whether this binary is the git on PATH, whether $ZVCS_HOME exists, whether the coordinator daemon is running, whether a ledger exists, how many man pages are installed, whether ~/.zvcs/man is on MANPATH, and whether the dashed git-<verb> symlinks are installed.",
+            "Runs a set of environment checks and prints each as OK, WARN, or FAIL: whether this binary is the git on PATH, whether $ZVCS_HOME exists and can be written, whether the coordinator daemon is running, whether the ledger opens and answers a query, how many man pages are installed, whether ~/.zvcs/man is on MANPATH, and whether the dashed git-<verb> symlinks are installed.",
+            "The two states that stop zvcs working are FAIL: a home that exists but cannot be written, and a ledger that exists but cannot be read \\(em a corrupt or unreadable store leaves the file in place while every verb that reads it exits non-zero, so a check that only looked for the path reported OK straight through it. Everything else is advisory and reports WARN, which keeps a non-zero exit meaningful.",
             "The process exits non-zero only when a hard FAIL is found, so it is usable in scripts and CI.",
         ],
     },

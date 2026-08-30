@@ -20,9 +20,20 @@ use crate::superset::{manpage, zdaemon};
 enum Level {
     Ok,
     Warn,
-    // No check currently emits FAIL, but marker()/any_fail handle it as a real severity.
-    #[allow(dead_code)]
+    /// A state that stops zvcs working, not one that merely wants attention: a
+    /// ledger the tool cannot read, a home it cannot write. `zdoctor` exits
+    /// non-zero on any of these, so a setup check can gate a script.
     Fail,
+}
+
+
+/// Can this directory be written? Answered by writing, since the permission bits
+/// alone do not account for ownership, an ACL, or a read-only mount.
+fn writability(dir: &std::path::Path) -> std::io::Result<()> {
+    let probe = dir.join(".zvcs-doctor-write-probe");
+    std::fs::write(&probe, b"")?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// `git zdoctor` — run every check, print a report, exit non-zero on any FAIL.
@@ -58,7 +69,14 @@ pub fn zdoctor(_args: &[String]) -> Result<ExitCode> {
     // ZVCS_HOME.
     let home = zdaemon::zvcs_home();
     if home.is_dir() {
-        report(Level::Ok, "home", home.display().to_string());
+        // Writability, not just presence: every verb that records anything —
+        // a pin, a claim, a snapshot — writes here, and each fails loudly when
+        // it cannot. A health check that says OK while all of them fail is
+        // worse than no health check.
+        match writability(&home) {
+            Ok(()) => report(Level::Ok, "home", home.display().to_string()),
+            Err(e) => report(Level::Fail, "home", format!("{} is not writable: {e}", home.display())),
+        }
     } else {
         report(Level::Warn, "home", format!("{} does not exist yet (created on demand)", home.display()));
     }
@@ -73,7 +91,14 @@ pub fn zdoctor(_args: &[String]) -> Result<ExitCode> {
     // Ledger db.
     let db = db::db_path();
     if db.exists() {
-        report(Level::Ok, "ledger", db.display().to_string());
+        // Opened and queried, not merely stat-ed. A corrupt or unreadable ledger
+        // leaves the file exactly where it was while every read verb exits 1
+        // with "file is not a database" — and the check that only looked for the
+        // path reported OK right through it.
+        match db::open_ro().and_then(|c| db::list_repos(&c).map(|r| r.len())) {
+            Ok(n) => report(Level::Ok, "ledger", format!("{} ({n} repo(s) indexed)", db.display())),
+            Err(e) => report(Level::Fail, "ledger", format!("{} is unusable: {e}", db.display())),
+        }
     } else {
         report(Level::Warn, "ledger", "no ledger yet (created by the daemon / first zreindex)".to_string());
     }

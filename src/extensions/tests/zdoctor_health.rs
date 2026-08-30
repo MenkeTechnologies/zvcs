@@ -12,14 +12,12 @@
 //! `CARGO_PKG_VERSION` — the same constant the binary compiles in — so a
 //! hand-maintained version string in the report cannot drift from the crate.
 //!
-//! One thing is pinned as it is rather than as it reads: **`zdoctor` cannot
-//! currently fail.** Its contract is "exits non-zero only if a hard FAIL is
-//! found", and no check emits `Level::Fail` — the source says so at
-//! `doctor.rs:23`. So the scriptable exit code exists but nothing can trip it,
-//! and a script gating on `git zdoctor` is gating on a constant. That is a
-//! contract decision (which conditions deserve to be hard failures), not a
-//! defect to patch from a test, so the case records today's answer and says
-//! what it costs.
+//! The **exit code** is the third. It used to be a constant: no check emitted
+//! `Level::Fail`, so a script gating on `git zdoctor` was gating on nothing, and
+//! this file recorded that. The two states that actually stop zvcs working — a
+//! ledger it cannot read, a home it cannot write — are failures now, and the
+//! cases below assert both the marker and the exit code, with an advisory
+//! environment still exiting 0 so a non-zero exit keeps meaning something.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -146,21 +144,85 @@ fn zshadow_turns_the_installation_checks_from_warn_to_ok() {
 }
 
 #[test]
-fn the_exit_code_is_zero_because_no_check_can_currently_fail() {
-    // Recorded, not endorsed. `zdoctor` exits non-zero "only if a hard FAIL is
-    // found" and no check emits `Level::Fail` (doctor.rs:23), so the exit code
-    // is a constant and a script gating on it is gating on nothing. Which
-    // conditions deserve to be hard failures is a decision about the verb's
-    // contract; if that changes, this case should be rewritten to assert the
-    // new one rather than deleted.
-    let (repo, home) = fixture("exit");
+fn warnings_alone_do_not_fail_the_report() {
+    // An environment that is merely unconfigured — no git on PATH, nothing
+    // installed, no daemon — is not a broken one. Every check here is advisory,
+    // so the report warns and still exits 0, which is what makes a non-zero exit
+    // mean something when it does happen.
+    let (repo, home) = fixture("warnings");
 
-    // Deliberately unhealthy: no git on PATH, nothing installed, no daemon.
     let bare = doctor(&repo, &home, false);
-    assert!(bare.status.success(), "zdoctor learned to fail — rewrite this case");
     let report = text(&bare);
     assert!(report.contains("[WARN]"), "an unconfigured environment reported no warnings:\n{report}");
-    assert!(!report.contains("[FAIL]"), "a check emitted FAIL — rewrite this case:\n{report}");
+    assert!(!report.contains("[FAIL]"), "an unconfigured environment must not be reported as broken:\n{report}");
+    assert!(bare.status.success(), "warnings alone must not fail the report:\n{report}");
 
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn a_ledger_the_tool_cannot_read_is_a_failure_not_an_ok() {
+    // The check used to be `db_path().exists()`, so a corrupt ledger reported
+    // `[ OK ]` and exit 0 while every read verb exited 1 with "file is not a
+    // database". A health check that passes over the state that breaks the tool
+    // is worse than none: it is the answer people trust instead of looking.
+    let (repo, home) = fixture("ledger");
+    assert!(run(&repo, &home, &["zreindex", "--sync", repo.to_str().unwrap()]).status.success());
+    let db = home.join("zvcs").join("db.sqlite");
+    assert!(db.exists(), "precondition: the ledger was created");
+
+    // Healthy: OK, and the detail carries what it learned by asking.
+    let healthy = doctor(&repo, &home, false);
+    assert_eq!(status_of(&text(&healthy), "ledger"), "OK");
+    assert!(healthy.status.success());
+
+    // Corrupt: the file is still exactly where it was, and unusable.
+    std::fs::write(&db, vec![0u8; 4096]).unwrap();
+    let corrupt = doctor(&repo, &home, false);
+    let report = text(&corrupt);
+    assert_eq!(status_of(&report, "ledger"), "FAIL", "a corrupt ledger must be a failure:\n{report}");
+    assert!(!corrupt.status.success(), "a failing check must make the report exit non-zero:\n{report}");
+    // The verbs agree with the diagnosis.
+    assert!(!run(&repo, &home, &["zrepos"]).status.success(), "precondition: the ledger really is unusable");
+
+    // Absent is not broken: it is created on demand, and stays a warning.
+    std::fs::remove_file(&db).unwrap();
+    let absent = doctor(&repo, &home, false);
+    assert_eq!(status_of(&text(&absent), "ledger"), "WARN", "an absent ledger is not a failure");
+    assert!(absent.status.success());
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn a_home_that_cannot_be_written_is_a_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let (repo, home) = fixture("home");
+
+    let zhome = home.join("zvcs");
+    let before = doctor(&repo, &home, false);
+    assert_eq!(status_of(&text(&before), "home"), "OK");
+
+    std::fs::set_permissions(&zhome, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let probe = zhome.join(".probe-can-i-write");
+    let enforced = std::fs::write(&probe, b"").is_err();
+    let _ = std::fs::remove_file(&probe);
+    if !enforced {
+        // A process that ignores permissions (root in a container) cannot run
+        // this case; say so rather than pass on nothing.
+        eprintln!("skipping: this process can write into a 0o500 directory (running as root?)");
+        let _ = std::fs::set_permissions(&zhome, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+        return;
+    }
+
+    // Everything that records anything writes here, and each of those verbs
+    // fails when it cannot. The report has to say so too.
+    let out = doctor(&repo, &home, false);
+    let report = text(&out);
+    assert_eq!(status_of(&report, "home"), "FAIL", "an unwritable home must be a failure:\n{report}");
+    assert!(!out.status.success(), "a failing check must make the report exit non-zero:\n{report}");
+
+    let _ = std::fs::set_permissions(&zhome, std::fs::Permissions::from_mode(0o755));
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }

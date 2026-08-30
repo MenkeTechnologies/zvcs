@@ -34,6 +34,10 @@ fn work_tree(repo: &gix::Repository) -> Option<PathBuf> {
 /// takes. Captured once, after `handle_options` has parsed the command line.
 static CLI_OVERRIDES: std::sync::OnceLock<Vec<gix::bstr::BString>> = std::sync::OnceLock::new();
 
+/// The valued half of the recorded overrides, as `(key, value)` — the ones that
+/// reach the configuration through *both* channels. See [`double_delivered`].
+static DOUBLE_DELIVERED: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
 /// Record the `-c` overrides for [`discover`]. Called once from the entry point;
 /// later calls are ignored, which is what makes the value stable for the whole
 /// process.
@@ -52,6 +56,36 @@ pub fn set_cli_overrides(overrides: &[crate::ConfigOverride]) {
         })
         .collect();
     let _ = CLI_OVERRIDES.set(rendered);
+    let valued: Vec<(String, String)> = overrides
+        .iter()
+        .filter_map(|o| o.value.as_ref().map(|v| (o.key.clone(), v.clone())))
+        .collect();
+    let _ = DOUBLE_DELIVERED.set(valued);
+}
+
+/// The `-c key=value` overrides this process hands to `gix` **twice**.
+///
+/// `push_config_override` writes every valued override into the
+/// `GIT_CONFIG_KEY_<n>` / `_VALUE_<n>` triple so that the repositories opened
+/// without [`discover`]'s options — and every child process — still see it, and
+/// [`set_cli_overrides`] hands the same list to [`discover`] as `Source::Cli`.
+/// Both copies survive into the merged snapshot as separate sections.
+///
+/// Resolution is unaffected, because `Source::Cli` outranks `Source::Env`. What
+/// *is* affected is anything that walks the snapshot counting occurrences: git
+/// runs its config callback once per configured value, and `git config --list`
+/// prints one line per configured value, so one `-c` must be counted once. This
+/// is the list such a walk discounts — an environment-sourced occurrence that
+/// matches one of these pairs is this port's second delivery of a command-line
+/// override, not a second setting.
+///
+/// A bare `-c key` is absent by construction: it never reaches the environment
+/// channel, so it is delivered once and needs no discounting. An override an
+/// alias contributed is absent too — `set_cli_overrides` has already run by the
+/// time `alias::resolve` appends to the list, so those reach `gix` through the
+/// environment alone.
+pub fn double_delivered() -> &'static [(String, String)] {
+    DOUBLE_DELIVERED.get().map_or(&[], Vec::as_slice)
 }
 
 /// `gix::discover(".")`, with this process's `-c` overrides applied to the

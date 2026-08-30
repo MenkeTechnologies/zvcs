@@ -521,6 +521,7 @@ fn is_synthetic(source: Source) -> bool {
 /// subsection case preserved. Verified byte-identical to `git config --list`,
 /// which is what `builtin/var.c` delegates this half to.
 fn list_config(cfg: &ConfigFile, out: &mut impl Write) -> Result<()> {
+    let mut echoes = crate::config::CliEcho::new();
     for section in cfg.sections() {
         if is_synthetic(section.meta().source) {
             continue;
@@ -544,10 +545,16 @@ fn list_config(cfg: &ConfigFile, out: &mut impl Write) -> Result<()> {
             let Some(value) = section.values(value_name).into_iter().nth(*nth) else {
                 continue;
             };
-            match &subsection {
-                Some(sub) => write!(out, "{section_name}.{sub}.{value_name}=")?,
-                None => write!(out, "{section_name}.{value_name}=")?,
+            let key = match &subsection {
+                Some(sub) => format!("{section_name}.{sub}.{value_name}"),
+                None => format!("{section_name}.{value_name}"),
+            };
+            // One `-c key=value` is one printed line, however many sources this
+            // port delivered it on. See `crate::config::CliEcho`.
+            if echoes.is_echo(section.meta().source, &key, std::str::from_utf8(&value).ok()) {
+                continue;
             }
+            write!(out, "{key}=")?;
             out.write_all(&value)?;
             out.write_all(b"\n")?;
         }

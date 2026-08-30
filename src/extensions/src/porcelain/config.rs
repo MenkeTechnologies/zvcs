@@ -2357,6 +2357,7 @@ fn for_each_entry(
     file: &gix::config::File,
     mut emit: impl FnMut(&str, &[u8], bool, &gix::config::file::Metadata) -> Result<()>,
 ) -> Result<()> {
+    let mut echoes = crate::config::CliEcho::new();
     for section in file.sections() {
         if is_synthetic(section.meta().source) {
             continue;
@@ -2386,6 +2387,17 @@ fn for_each_entry(
                 Some(sub) => format!("{section_name}.{sub}.{value_name}"),
                 None => format!("{section_name}.{value_name}"),
             };
+            // The environment copy of a `-c key=value` is the same configured
+            // value, not a second one; git prints it once. See `CliEcho`.
+            let echoed = !implicit
+                && echoes.is_echo(
+                    section.meta().source,
+                    &key,
+                    std::str::from_utf8(&value).ok(),
+                );
+            if echoed {
+                continue;
+            }
             emit(&key, &value, implicit, section.meta())?;
         }
     }

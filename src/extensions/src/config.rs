@@ -1016,6 +1016,7 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
 
     let config = repo.config_snapshot().plumbing().clone();
     let mut lines: HashMap<PathBuf, FileLines> = HashMap::new();
+    let mut echoes = CliEcho::new();
     let mut out = Vec::new();
 
     for sec in config.sections() {
@@ -1049,6 +1050,12 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
                 Some(sub) => format!("{section}.{sub}.{name}"),
                 None => format!("{section}.{name}"),
             };
+            // One `-c key=value` arrives on two sources; git's callback runs
+            // once per configured value, so the environment echo of it is not a
+            // second occurrence. See [`CliEcho`].
+            if echoes.is_echo(meta.source, &key, value.as_deref()) {
+                continue;
+            }
             let origin = match &path {
                 None => ValueOrigin::CommandLine,
                 Some(p) => {
@@ -1072,6 +1079,75 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
         }
     }
     out
+}
+
+/// The environment echo of a `-c key=value`, discounted once per override.
+///
+/// `crate::setup::double_delivered` explains why the echo exists: a valued
+/// command-line override is handed to `gix` on `Source::Cli` *and* written into
+/// the `GIT_CONFIG_KEY_<n>` / `_VALUE_<n>` triple, so the merged snapshot holds
+/// two sections carrying one setting. Resolution is unharmed — `Source::Cli`
+/// outranks `Source::Env` — but a walk that counts occurrences sees double, and
+/// git counts one: `git_config()` calls the callback once per configured value
+/// and `git config --list` prints one line per configured value.
+///
+/// Each override is discounted **once**. A `GIT_CONFIG_KEY_<n>` the user set
+/// themselves is a configured value in its own right and keeps its occurrence,
+/// unless it happens to spell the same key and value as a `-c` on the same
+/// command line — the one shape this cannot tell apart, since the environment
+/// channel records no provenance.
+///
+/// `Source::Env` sections are visited before `Source::Cli` ones, so the surviving
+/// occurrence is the command-line one, which is the order git applies it in.
+pub(crate) struct CliEcho(std::collections::HashMap<(String, String), usize>);
+
+impl CliEcho {
+    pub(crate) fn new() -> Self {
+        let mut pending: std::collections::HashMap<(String, String), usize> = Default::default();
+        for (key, value) in crate::setup::double_delivered() {
+            *pending.entry((normalize_key(key), value.clone())).or_default() += 1;
+        }
+        CliEcho(pending)
+    }
+
+    /// Whether this occurrence is the echo rather than a setting of its own.
+    /// Consumes the pending discount, so a repeated `-c` of one key still yields
+    /// one occurrence per `-c`.
+    pub(crate) fn is_echo(
+        &mut self,
+        source: gix::config::Source,
+        key: &str,
+        value: Option<&str>,
+    ) -> bool {
+        if self.0.is_empty() || source != gix::config::Source::Env {
+            return false;
+        }
+        let Some(value) = value else { return false };
+        let entry = (normalize_key(key), value.to_owned());
+        match self.0.get_mut(&entry) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A config key in the spelling the snapshot walk produces: section and value
+/// name lower-cased, subsection left alone (`git_config_parse_key`).
+fn normalize_key(key: &str) -> String {
+    let Some((section, rest)) = key.split_once('.') else {
+        return key.to_ascii_lowercase();
+    };
+    match rest.rsplit_once('.') {
+        Some((subsection, name)) => format!(
+            "{}.{subsection}.{}",
+            section.to_ascii_lowercase(),
+            name.to_ascii_lowercase()
+        ),
+        None => format!("{}.{}", section.to_ascii_lowercase(), rest.to_ascii_lowercase()),
+    }
 }
 
 /// The file behind a section, or `None` for the `-c`/environment sources git

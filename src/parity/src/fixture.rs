@@ -3253,6 +3253,22 @@ mod tests {
     /// state and cannot match between two directories. The index's *logical*
     /// contents are covered by the `ls-files -v` probe in [`digest`] instead.
     ///
+    /// `*.lock` is the other exclusion, and it is about a different thing: git's
+    /// lockfile protocol writes `X.lock` and renames it over `X`, so such a file
+    /// exists only for the duration of some git process and is never durable
+    /// repository content. The builds are not the only git running — `git
+    /// commit`/`git fetch` hand off to a **detached background maintenance**
+    /// process, which takes `.git/objects/maintenance.lock` on its way in. It
+    /// outlives the build that spawned it, so whether the second build's tree
+    /// happens to contain that lock is a matter of scheduling: `promisor` failed
+    /// with `a: f .git/objects/maintenance.lock … 0` against `b: d
+    /// .git/objects/pack`, an empty lock in one tree and not the other. Hashing
+    /// it made the test measure the runner's timing rather than the fixture. No
+    /// shape authors a `.lock` of its own, and a `.lock` that ever did become
+    /// tracked content would still be named by the `ls-files -v` and `status
+    /// --porcelain=v1 --untracked-files=all` probes in [`digest`]; every real
+    /// file is still hashed.
+    ///
     /// Nothing is normalized. A shape that records its own absolute path
     /// anywhere will hash differently at the two build locations, and failing
     /// on that is the point.
@@ -3265,6 +3281,13 @@ mod tests {
         for name in entries {
             let child = rel.join(&name);
             if child == Path::new(".git/index") {
+                continue;
+            }
+            // Skipped on the *name*, before the metadata read: a lock can also be
+            // released between this directory listing and the `symlink_metadata`
+            // below, and that race would fail the walk with ENOENT rather than a
+            // mismatch — the same flake wearing a different hat.
+            if Path::new(&name).extension().is_some_and(|e| e == "lock") {
                 continue;
             }
             let abs = root.join(&child);

@@ -238,15 +238,51 @@ fn splitting_the_same_index_gives_the_same_bytes_as_stock_git() {
 /// Recursively copy `from` to `to`, preserving nothing but the bytes — enough for
 /// a git directory, whose only mode that matters is the executable bit no fixture
 /// here uses.
+///
+/// The source is not quiescent, which is why this walk skips two things.
+///
+/// [`populated`] ends in `git commit`, and a commit's last act is to spawn `git
+/// maintenance run --auto --quiet --detach` — `maintenance.auto` and
+/// `maintenance.autoDetach` both default to true, and `GIT_TRACE=2` on a commit
+/// shows the `start_command` for it. That process outlives the commit that
+/// returned, and takes `.git/objects/maintenance.lock` on its way in. So:
+///
+/// * **`*.lock` is skipped.** git's lockfile protocol writes `X.lock` and renames
+///   it over `X`, so such a file belongs to whoever currently holds it and is
+///   never repository content. Copying one forward would plant a stale lock in
+///   the destination, and the `update-index --split-index` that follows would
+///   refuse with `Unable to create '.git/index.lock': File exists`.
+/// * **A source that disappears between the listing and the copy is skipped.**
+///   `read_dir` named it and the open found nothing, which is the definition of
+///   transient — it cannot be part of a tree that no longer contains it. This is
+///   the ENOENT this file failed on: on `ubuntu-latest`, `copy_tree` raised
+///   `Os { code: 2, kind: NotFound }` on a name maintenance had just released.
+///   Only `NotFound` is tolerated; every other error still panics.
+///
+/// Nothing about what the tests *compare* changes — the copies are still
+/// byte-for-byte the repository, and every real file is still copied.
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let (src, dst) = (entry.path(), to.join(entry.file_name()));
-        if entry.file_type().unwrap().is_dir() {
+        if src.extension().is_some_and(|e| e == "lock") {
+            continue;
+        }
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("file type of {}: {e}", src.display()),
+        };
+        if kind.is_dir() {
             copy_tree(&src, &dst);
-        } else {
-            std::fs::copy(&src, &dst).unwrap();
+        } else if let Err(e) = std::fs::copy(&src, &dst) {
+            assert!(
+                e.kind() == std::io::ErrorKind::NotFound,
+                "copy {} -> {}: {e}",
+                src.display(),
+                dst.display()
+            );
         }
     }
 }

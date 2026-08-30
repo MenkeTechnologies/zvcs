@@ -2519,18 +2519,28 @@ fn pend_non_commit(
     if !matches!(object.kind, gix::object::Kind::Tree | gix::object::Kind::Blob) {
         return false;
     }
-    // `oc.path`, which `get_oid_with_context()` fills in only for the path arm.
-    let name = match crate::objpath::canonical_paths(repo, bare) {
-        Ok(canonical) => match crate::objpath::split(canonical.as_ref()) {
-            crate::objpath::Split::Index { path, .. } | crate::objpath::Split::Tree { path, .. } => {
-                path.as_bytes().to_vec()
-            }
-            _ => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-    };
+    let name = operand_path(repo, bare);
     pending.push(Pending { id, name, kind: object.kind, uninteresting: negate });
     true
+}
+
+/// `oc.path`, which `get_oid_with_context()` fills in only for the path arm — the
+/// path the object was reached through, and empty for every other spelling.
+///
+/// `handle_commit()` carries it into `add_pending_object_with_path()`, and
+/// `traverse_non_commits()` uses it as the base for everything under a tree, so
+/// `git rev-list --objects main:sub` names its entries `sub` and `sub/s.txt`
+/// rather than `` and `s.txt`.
+fn operand_path(repo: &gix::Repository, spec: &str) -> Vec<u8> {
+    let Ok(canonical) = crate::objpath::canonical_paths(repo, spec) else {
+        return Vec::new();
+    };
+    match crate::objpath::split(canonical.as_ref()) {
+        crate::objpath::Split::Index { path, .. } | crate::objpath::Split::Tree { path, .. } => {
+            path.as_bytes().to_vec()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// git's `--bisect` pseudo-option: seed from the bisect refs.
@@ -3018,14 +3028,20 @@ fn resolve(
     // The test is on the *reduced* name: a `^{…}`, `~<n>` or `:<path>` suffix is
     // applied to what the reader answered, never folded into the selector. See
     // [`crate::objname::reflog_spec_oid`].
+    // The operand's `oc.path` travels with it: `handle_revision_arg()` reads it
+    // out of `get_oid_with_context()` and hands it to `handle_commit()`, whose
+    // tree and blob arms pend under it. Without it a `<rev>:<path>` operand
+    // reached its tree arm with an empty path and the walk under that tree was
+    // named from the root — `s.txt` where git says `sub/s.txt`.
+    let path = operand_path(repo, spec);
     if crate::objname::resolves_through_reflog(spec) {
         return crate::objname::reflog_spec_oid(repo, spec)
-            .and_then(|id| peel_recording_tags(repo, id, pending));
+            .and_then(|id| peel_recording_tags_at(repo, id, &path, pending));
     }
     // `at_mark()` compares with `strncasecmp`, so `main@{PUSH}` is the same
     // operand as `main@{push}`; gitoxide's parser is case-sensitive.
     let id = repo.rev_parse_single(crate::objname::canonical_spec(repo, spec).as_ref()).ok()?.detach();
-    peel_recording_tags(repo, id, pending)
+    peel_recording_tags_at(repo, id, &path, pending)
 }
 
 /// Peel `id` down to a commit, pushing every tag object passed through onto
@@ -3058,7 +3074,24 @@ fn peel_recording_tags(
     id: ObjectId,
     pending: &mut Vec<Pending>,
 ) -> Option<ObjectId> {
+    peel_recording_tags_at(repo, id, &[], pending)
+}
+
+/// [`peel_recording_tags`] for an operand that carries an `oc.path`.
+///
+/// `path` is what `handle_revision_arg()` read out of `get_oid_with_context()`
+/// and is the base a pended tree's contents are named from. The C resets it in
+/// the tag loop — "Do not propagate path data from the tag's pending entry",
+/// `path = NULL` — so a chain that peels through a tag lands on its tree with no
+/// path, exactly as if the tree had been named on its own.
+fn peel_recording_tags_at(
+    repo: &gix::Repository,
+    id: ObjectId,
+    path: &[u8],
+    pending: &mut Vec<Pending>,
+) -> Option<ObjectId> {
     let mut id = id;
+    let mut path = path.to_vec();
     loop {
         let object = repo.find_object(id).ok()?;
         let kind = object.kind;
@@ -3067,7 +3100,7 @@ fn peel_recording_tags(
             gix::object::Kind::Tree | gix::object::Kind::Blob => {
                 pending.push(Pending {
                     id,
-                    name: Vec::new(),
+                    name: std::mem::take(&mut path),
                     kind,
                     uninteresting: false,
                 });
@@ -3086,6 +3119,9 @@ fn peel_recording_tags(
                     kind: gix::object::Kind::Tag,
                     uninteresting: false,
                 });
+                // `path = NULL; mode = 0;` — the tagged object is not reached
+                // through the operand's path arm.
+                path.clear();
                 id = target;
             }
         }

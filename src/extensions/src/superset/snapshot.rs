@@ -104,10 +104,9 @@ pub fn zrestore(args: &[String]) -> Result<ExitCode> {
 
 /// `git zsnapshots` — list snapshot names and their repo counts.
 pub fn zsnapshots(_args: &[String]) -> Result<ExitCode> {
-    let conn = match crate::db::open_ro() {
-        Ok(c) => c,
-        Err(_) => return Ok(ExitCode::SUCCESS),
-    };
+    // An absent ledger means no snapshots; an unreadable one is an error, not an
+    // empty list (`db::open_ro_if_present`).
+    let Some(conn) = crate::db::open_ro_if_present()? else { return Ok(ExitCode::SUCCESS) };
     let interactive = std::io::stdout().is_terminal();
     let rows = crate::db::list_snapshots(&conn)?;
     for (name, count) in &rows {

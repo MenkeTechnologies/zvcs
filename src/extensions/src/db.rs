@@ -403,6 +403,22 @@ pub fn open_ro() -> Result<Connection> {
     Ok(conn)
 }
 
+/// The ledger for a read-only query, or `None` when there is no ledger *yet*.
+///
+/// "No ledger" means the file is not there — a machine that has never indexed
+/// anything, where an empty answer is the truth. A file that exists and cannot
+/// be opened is a different thing entirely, and the callers that treated both as
+/// "empty" answered `git zsnapshots`, `git zstashes` and `git zrepos` with
+/// nothing at all when the store was merely unreadable. Someone checking whether
+/// they have a restore point before doing something destructive is told they
+/// have none, which is the worst possible way to be wrong.
+pub fn open_ro_if_present() -> Result<Option<Connection>> {
+    if !db_path().exists() {
+        return Ok(None);
+    }
+    open_ro().map(Some)
+}
+
 /// How many indexed repos justify a stat thread in [`prune_missing`]. Each check
 /// is one `stat(2)`, so a small index is cheaper to walk on the calling thread
 /// than to split; a machine-wide index is tens of thousands of stats and fans out.

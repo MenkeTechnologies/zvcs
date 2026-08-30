@@ -114,10 +114,10 @@ impl Selector {
 
     /// Resolve the selection to `(git_dir, workdir)` pairs from the ledger.
     pub fn select(&self) -> Result<Vec<(PathBuf, PathBuf)>> {
-        let conn = match crate::db::open_ro() {
-            Ok(c) => c,
-            Err(_) => return Ok(Vec::new()), // no ledger → nothing indexed
-        };
+        // No ledger → nothing indexed. An unreadable one is an error: every
+        // fleet verb would otherwise report "no repos matched" over a tree it
+        // simply could not read.
+        let Some(conn) = crate::db::open_ro_if_present()? else { return Ok(Vec::new()) };
 
         // Status filter set (by workdir path), if any status filter is active.
         let status_set: Option<HashSet<String>> = if self.dirty || self.ahead || self.behind {

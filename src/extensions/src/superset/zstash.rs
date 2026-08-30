@@ -111,10 +111,7 @@ pub fn zunstash(args: &[String]) -> Result<ExitCode> {
 
 /// `git zstashes` — list tree-wide stashes and their repo counts.
 pub fn zstashes(_args: &[String]) -> Result<ExitCode> {
-    let conn = match crate::db::open_ro() {
-        Ok(c) => c,
-        Err(_) => return Ok(ExitCode::SUCCESS),
-    };
+    let Some(conn) = crate::db::open_ro_if_present()? else { return Ok(ExitCode::SUCCESS) };
     for (name, count) in crate::db::list_stashes(&conn)? {
         println!("{name}\t{count}");
     }

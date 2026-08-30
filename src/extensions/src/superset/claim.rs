@@ -78,10 +78,9 @@ pub fn zunclaim(args: &[String]) -> Result<ExitCode> {
 /// `git zwho` — list active claims (who is working what).
 pub fn zwho(args: &[String]) -> Result<ExitCode> {
     let json = args.iter().any(|a| a == "--json");
-    let conn = match crate::db::open_ro() {
-        Ok(c) => c,
-        Err(_) => return Ok(ExitCode::SUCCESS), // no ledger → no claims
-    };
+    // No ledger → no claims; an unreadable one is reported rather than shown as
+    // an empty roster.
+    let Some(conn) = crate::db::open_ro_if_present()? else { return Ok(ExitCode::SUCCESS) };
     for (path, session, _ts) in crate::db::list_claims(&conn)? {
         if json {
             println!("{}", serde_json::json!({"session": session, "repo": path}));
@@ -96,9 +95,9 @@ pub fn zwho(args: &[String]) -> Result<ExitCode> {
 /// is clear which agent is working the most of the tree.
 pub fn zsessions(args: &[String]) -> Result<ExitCode> {
     let json = args.iter().any(|a| a == "--json");
-    let conn = match crate::db::open_ro() {
-        Ok(c) => c,
-        Err(_) => {
+    let conn = match crate::db::open_ro_if_present()? {
+        Some(c) => c,
+        None => {
             if !json {
                 println!("no active claims");
             }

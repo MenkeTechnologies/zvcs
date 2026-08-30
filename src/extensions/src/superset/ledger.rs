@@ -24,9 +24,9 @@ pub fn zrepos(args: &[String]) -> Result<ExitCode> {
     // and any hints go to stderr, and only when interactive, so scripts see just
     // the list.
     let interactive = std::io::stdout().is_terminal();
-    let conn = match crate::db::open_ro() {
-        Ok(c) => c,
-        Err(_) => {
+    let conn = match crate::db::open_ro_if_present()? {
+        Some(c) => c,
+        None => {
             if interactive {
                 eprintln!("zvcs: no repo index yet (run `git zreindex`)");
             }
@@ -130,9 +130,9 @@ pub fn zjobs(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    let conn = match crate::db::open_ro() {
-        Ok(c) => c,
-        Err(_) => {
+    let conn = match crate::db::open_ro_if_present()? {
+        Some(c) => c,
+        None => {
             if !json {
                 println!("no jobs yet");
             }

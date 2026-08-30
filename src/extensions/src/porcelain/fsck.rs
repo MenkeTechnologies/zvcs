@@ -3186,12 +3186,34 @@ fn value_names(
     let Some(sections) = config.plumbing().sections_by_name(section) else {
         return out;
     };
+    // A `-c fetch.fsck.noSuchId=warn` reaches the snapshot on two sources, so
+    // the name appeared twice here and the unknown-id warning was printed twice
+    // where git prints it once. See `crate::config::CliEcho`.
+    let mut echoes = crate::config::CliEcho::new();
     for s in sections {
         let sub = s.header().subsection_name().map(|n| n.to_string());
         if sub.as_deref() != subsection {
             continue;
         }
-        out.extend(s.body().value_names());
+        let source = s.meta().source;
+        let body = s.body();
+        let mut seen: std::collections::HashMap<String, usize> = Default::default();
+        for raw in body.value_names() {
+            let name = raw.to_string();
+            let nth = seen.entry(name.to_lowercase()).or_default();
+            let index = *nth;
+            *nth += 1;
+            let value = body.values(&name).into_iter().nth(index);
+            let value = value.as_ref().and_then(|v| std::str::from_utf8(v).ok());
+            let key = match subsection {
+                Some(sub) => format!("{section}.{sub}.{name}"),
+                None => format!("{section}.{name}"),
+            };
+            if echoes.is_echo(source, &key, value) {
+                continue;
+            }
+            out.push(name);
+        }
     }
     out
 }

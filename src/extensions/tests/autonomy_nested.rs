@@ -9,6 +9,16 @@
 //!
 //! Shape follows `autonomy.rs`: an isolated socket and home, the daemon in the
 //! foreground with its log captured, and a poll rather than a sleep.
+//!
+//! The isolation is handed to each child through [`Command::env`] rather than
+//! `std::env::set_var`. `ZVCS_SOCK`/`ZVCS_HOME` are process-wide, and the two
+//! tests here run on parallel threads of one binary: whichever set them last won
+//! for *both* daemons, so one of them bound the other's socket and its
+//! `wait_for` timed out on a path nothing was ever going to create. That is the
+//! `daemon socket never appeared at …` this file used to fail with on a loaded
+//! runner while passing on an idle laptop. Per-child environment removes the
+//! shared mutable state instead of serialising around it — the same shape
+//! `daemon_ctl.rs` and `watch_rescan.rs` already use.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -16,32 +26,65 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
-fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    let out = Command::new(BIN)
-        .args([
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "user.name=zvcs-test",
-            "-c",
-            "protocol.file.allow=always",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-    assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-    out
+/// The daemon isolation one test runs under: its own socket, home and root.
+struct Isolation {
+    root: std::path::PathBuf,
+    sock: std::path::PathBuf,
+    home: std::path::PathBuf,
 }
 
-/// Is this repository on a branch (symbolic HEAD) rather than detached?
-fn attached(dir: &Path) -> bool {
-    Command::new(BIN)
-        .args(["symbolic-ref", "-q", "HEAD"])
-        .current_dir(dir)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+impl Isolation {
+    /// A `git` invocation carrying this test's isolation, and nothing of the
+    /// developer's own daemon or configuration.
+    ///
+    /// The global and system config are pinned empty as well as the socket and
+    /// home. `[zvcs] autohook` in a developer's `~/.gitconfig` makes
+    /// `should_watch()` true for *every* repository, so the setup commands
+    /// autostart a detached daemon rooted at whichever scratch repo ran first —
+    /// which then wins the singleton and watches the wrong tree, and the daemon
+    /// this test starts on purpose reports `daemon already running`. A CI runner
+    /// has no global config and never sees it; a laptop does.
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(BIN);
+        cmd.env("ZVCS_SOCK", &self.sock)
+            .env("ZVCS_HOME", &self.home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        cmd
+    }
+
+    fn git(&self, dir: &Path, args: &[&str]) -> std::process::Output {
+        let out = self
+            .cmd()
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=zvcs-test",
+                "-c",
+                "protocol.file.allow=always",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    /// Is this repository on a branch (symbolic HEAD) rather than detached?
+    fn attached(&self, dir: &Path) -> bool {
+        self.cmd()
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 }
 
 fn wait_for(path: &Path, timeout: Duration) {
@@ -89,51 +132,56 @@ fn nested_autonomy_heals_the_deepest_repo(switch: &str) {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
+    let iso = Isolation {
+        sock: root.join("s"),
+        home: root.join("h"),
+        root,
+    };
+    let root = &iso.root;
 
     // deep ← sub ← parent, each a real local repository.
     let deep_src = root.join("deep_src");
     std::fs::create_dir_all(&deep_src).unwrap();
-    git(&deep_src, &["init", "-q", "-b", "main"]);
-    git(&deep_src, &["commit", "--allow-empty", "-q", "-m", "deep root"]);
+    iso.git(&deep_src, &["init", "-q", "-b", "main"]);
+    iso.git(&deep_src, &["commit", "--allow-empty", "-q", "-m", "deep root"]);
 
     let sub_src = root.join("sub_src");
     std::fs::create_dir_all(&sub_src).unwrap();
-    git(&sub_src, &["init", "-q", "-b", "main"]);
-    git(&sub_src, &["commit", "--allow-empty", "-q", "-m", "sub root"]);
-    git(&sub_src, &["submodule", "add", "-q", deep_src.to_str().unwrap(), "deep"]);
-    git(&sub_src, &["commit", "-q", "-m", "add deep"]);
+    iso.git(&sub_src, &["init", "-q", "-b", "main"]);
+    iso.git(&sub_src, &["commit", "--allow-empty", "-q", "-m", "sub root"]);
+    iso.git(&sub_src, &["submodule", "add", "-q", deep_src.to_str().unwrap(), "deep"]);
+    iso.git(&sub_src, &["commit", "-q", "-m", "add deep"]);
 
     let parent = root.join("parent");
     std::fs::create_dir_all(&parent).unwrap();
-    git(&parent, &["init", "-q", "-b", "main"]);
-    git(&parent, &["commit", "--allow-empty", "-q", "-m", "parent root"]);
-    git(&parent, &["submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
-    git(&parent, &["commit", "-q", "-m", "add submodule"]);
-    git(&parent, &["submodule", "update", "--init", "--recursive"]);
+    iso.git(&parent, &["init", "-q", "-b", "main"]);
+    iso.git(&parent, &["commit", "--allow-empty", "-q", "-m", "parent root"]);
+    iso.git(&parent, &["submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    iso.git(&parent, &["commit", "-q", "-m", "add submodule"]);
+    iso.git(&parent, &["submodule", "update", "--init", "--recursive"]);
 
     let deep = parent.join("sub").join("deep");
     assert!(deep.join(".git").exists(), "precondition: the nested submodule is checked out");
 
     // Detach the nested repo's HEAD — the state the autonomy pass exists to heal.
-    git(&deep, &["checkout", "-q", "--detach"]);
-    assert!(!attached(&deep), "precondition: the nested submodule is detached");
+    iso.git(&deep, &["checkout", "-q", "--detach"]);
+    assert!(!iso.attached(&deep), "precondition: the nested submodule is detached");
 
-    git(&parent, &["config", switch, "true"]);
-    git(&parent, &["config", "zvcs.interval", "1"]);
+    iso.git(&parent, &["config", switch, "true"]);
+    iso.git(&parent, &["config", "zvcs.interval", "1"]);
 
-    let sock = root.join("s");
-    std::env::set_var("ZVCS_SOCK", &sock);
-    std::env::set_var("ZVCS_HOME", root.join("h"));
+    let sock = &iso.sock;
     let daemon_log = root.join("daemon.log");
     let logf = std::fs::File::create(&daemon_log).unwrap();
-    let mut daemon: Child = Command::new(BIN)
+    let mut daemon: Child = iso
+        .cmd()
         .args(["zdaemon", "start", "--foreground"])
         .current_dir(&parent)
         .stdout(Stdio::from(logf.try_clone().unwrap()))
         .stderr(Stdio::from(logf))
         .spawn()
         .expect("spawn zdaemon");
-    wait_for(&sock, Duration::from_secs(5));
+    wait_for(sock, Duration::from_secs(5));
     wait_for_log(&daemon_log, "[zvcs watch] watching", Duration::from_secs(10));
 
     // Any change in the watched tree coalesces into one reaction, which heals
@@ -143,18 +191,18 @@ fn nested_autonomy_heals_the_deepest_repo(switch: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut healed = false;
     while Instant::now() < deadline {
-        if attached(&deep) {
+        if iso.attached(&deep) {
             healed = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    let _ = Command::new(BIN).args(["zdaemon", "stop"]).current_dir(&parent).status();
+    let _ = iso.cmd().args(["zdaemon", "stop"]).current_dir(&parent).status();
     let _ = daemon.kill();
     let _ = daemon.wait();
     let log = std::fs::read_to_string(&daemon_log).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(root);
 
     assert!(
         healed,

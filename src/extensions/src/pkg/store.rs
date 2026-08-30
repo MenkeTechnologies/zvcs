@@ -306,6 +306,52 @@ mod tests {
     }
 
     #[test]
+    fn two_indexes_loaded_at_once_lose_one_of_the_plugins() {
+        // The index is read-modify-write: `load_from`, `upsert`, `save_to`
+        // rewrites `installed.toml` and both derived tables from what was in
+        // memory. Two callers that load before either saves therefore cannot
+        // both survive — the second save writes a list that never contained the
+        // first plugin, and neither call fails.
+        //
+        // This is the shape, made deterministic. `pkg::commands` is what stops
+        // real installs reaching it, by holding the registry lock across the
+        // load and the save; without that the loss is a matter of timing rather
+        // than of possibility, which is why the end-to-end suite cannot prove it
+        // and this can.
+        let store = Store::at(tmp().join("pkg"));
+        store.ensure_layout().unwrap();
+
+        let plugin = |name: &str, verb: &str| InstalledPlugin {
+            name: name.into(),
+            version: "0.1.0".into(),
+            source: format!("path+file:///{name}"),
+            kind: "native".into(),
+            verbs: vec![verb.into()],
+            ..Default::default()
+        };
+
+        // Both callers read the same empty index...
+        let mut first = InstalledIndex::load_from(&store).unwrap();
+        let mut second = InstalledIndex::load_from(&store).unwrap();
+
+        // ...each adds its own plugin and writes the whole thing back.
+        first.upsert(plugin("alpha", "alpha"));
+        first.save_to(&store).unwrap();
+        second.upsert(plugin("beta", "beta"));
+        second.save_to(&store).unwrap();
+
+        let back = InstalledIndex::load_from(&store).unwrap();
+        assert_eq!(back.packages.len(), 1, "the shape changed — see this test's comment");
+        assert!(back.find("beta").is_some(), "the later writer should be the survivor");
+        assert!(back.find("alpha").is_none(), "the earlier writer survived a whole-file rewrite?");
+
+        // And the derived table dispatch reads has lost the same plugin, which
+        // is what makes the loss invisible: `git alpha` simply stops resolving.
+        let verbs = std::fs::read_to_string(store.verbs_file()).unwrap_or_default();
+        assert!(!verbs.contains("alpha"), "verbs.tsv kept a plugin the index dropped:\n{verbs}");
+    }
+
+    #[test]
     fn install_dir_skips_git_and_target() {
         let src = tmp();
         std::fs::write(src.join("git-hi"), b"#!/bin/sh\necho hi").unwrap();

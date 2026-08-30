@@ -97,6 +97,12 @@ pub fn add(spec: &str) -> PkgResult<()> {
         }
     }
 
+    // The index and its two derived tables are rewritten whole, so two installs
+    // in flight at once leave only the later one's plugin: six concurrent
+    // installs left one plugin installed and reported success six times. The
+    // lock covers the conflict check too — two plugins claiming one verb must
+    // not both pass it.
+    let _lock = crate::superset::registry::lock("pkg");
     let mut index = InstalledIndex::load_from(&store)?;
     reject_verb_conflicts(&index, &entry)?;
     index.upsert(entry.clone());
@@ -164,6 +170,9 @@ fn verb_summary(entry: &InstalledPlugin) -> String {
 /// `git znative remove <NAME>` — drop the store copy and the index row.
 pub fn remove(name: &str) -> PkgResult<()> {
     let store = Store::user_default();
+    // Held across load and save, as in `add`: a removal that races an install
+    // would otherwise write back an index that never saw the new plugin.
+    let _lock = crate::superset::registry::lock("pkg");
     let mut index = InstalledIndex::load_from(&store)?;
     let Some(entry) = index.remove(name) else {
         return Err(PkgError::Other(format!("{name} is not installed")));

@@ -127,7 +127,7 @@ fn save(list: &[Guard]) -> Result<()> {
 
 fn next_id(list: &[Guard]) -> u64 {
     let highest = list.iter().map(|g| g.id).max().unwrap_or(0);
-    crate::superset::registry_id::next_id("guards", highest)
+    crate::superset::registry::next_id("guards", highest)
 }
 
 /// The dispatcher's verdict for a command.
@@ -225,6 +225,15 @@ fn predicate_holds(pred: Pred, args: &[String]) -> bool {
 }
 
 pub fn zguard(args: &[String]) -> Result<ExitCode> {
+    // Held for the whole of any subcommand that rewrites the file: load, change,
+    // save. Without it two concurrent writers each save the list they read, and
+    // the later save drops the earlier writer's rule.
+    let _lock = match args.first().map(String::as_str) {
+        Some("deny") | Some("warn") | Some("rm") | Some("remove") | Some("clear") => {
+            crate::superset::registry::lock("guards")
+        }
+        _ => None,
+    };
     match args.first().map(String::as_str).unwrap_or("list") {
         "list" => list(),
         "clear" => {

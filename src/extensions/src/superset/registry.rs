@@ -1,5 +1,6 @@
-//! Ids for the `$ZVCS_HOME` registries (`zguard`, `zintercept`, `zsched`) that
-//! are never handed out twice.
+//! The `$ZVCS_HOME` registries (`zguard`, `zintercept`, `zsched`): ids that are
+//! never handed out twice, and a lock that keeps two writers from losing each
+//! other's entries.
 //!
 //! Each registry used to number a new entry `max(existing) + 1`. That reuses an
 //! id as soon as the entry holding the highest one is removed: with rules #1 and
@@ -13,7 +14,53 @@
 //! has no mark: numbering continues from its highest entry and is monotonic from
 //! then on, which is exactly what those installations already believed.
 
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+
+/// An exclusive hold on one registry, for the whole of a read-modify-write.
+///
+/// These registries are rewritten whole: a verb loads every entry, changes one,
+/// and writes the file back. Two of those in flight at once lose an entry — with
+/// twelve concurrent `git zguard deny`, eleven rules survived and all twelve
+/// commands reported success. A dropped `deny` rule is a policy the user
+/// believes is in force, and this project expects sixteen agents working at
+/// once, so the race is the normal case rather than the exotic one.
+///
+/// `flock` is released by the kernel when the holder exits, so a crash cannot
+/// wedge a registry. A filesystem without `flock` yields `None`: no exclusion is
+/// available there and the write proceeds as it always did, rather than failing.
+pub(crate) struct RegistryLock(std::fs::File);
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is owned by this value and still open.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// Take the lock for registry `name`, blocking until it is ours.
+pub(crate) fn lock(name: &str) -> Option<RegistryLock> {
+    lock_in(&crate::superset::zdaemon::zvcs_home(), name)
+}
+
+/// [`lock`] against an explicit home, so tests need not touch `ZVCS_HOME`.
+pub(crate) fn lock_in(home: &Path, name: &str) -> Option<RegistryLock> {
+    let _ = std::fs::create_dir_all(home);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.join(format!("{name}.lock")))
+        .ok()?;
+    // SAFETY: `file` owns the descriptor for the whole call and `flock` only
+    // reads it. Blocking is what we want: these holds are one small file write,
+    // and a queue of writers is exactly what must not turn into lost entries.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return None;
+    }
+    Some(RegistryLock(file))
+}
 
 fn mark_path(home: &Path, name: &str) -> PathBuf {
     home.join(format!("{name}.next"))
@@ -66,8 +113,16 @@ mod tests {
         // highest in-use id falls back to 1, and the next id must still be 3.
         assert_eq!(next_id_in(&h, "t", 0), 1);
         assert_eq!(next_id_in(&h, "t", 1), 2);
-        assert_eq!(next_id_in(&h, "t", 1), 3, "the id freed by a removal must not come back");
-        assert_eq!(next_id_in(&h, "t", 0), 4, "an emptied registry must not restart from 1");
+        assert_eq!(
+            next_id_in(&h, "t", 1),
+            3,
+            "the id freed by a removal must not come back"
+        );
+        assert_eq!(
+            next_id_in(&h, "t", 0),
+            4,
+            "an emptied registry must not restart from 1"
+        );
         let _ = std::fs::remove_dir_all(&h);
     }
 
@@ -85,7 +140,11 @@ mod tests {
     fn registries_do_not_share_a_counter() {
         let h = home("separate");
         assert_eq!(next_id_in(&h, "a", 0), 1);
-        assert_eq!(next_id_in(&h, "b", 0), 1, "each registry numbers its own entries");
+        assert_eq!(
+            next_id_in(&h, "b", 0),
+            1,
+            "each registry numbers its own entries"
+        );
         assert_eq!(next_id_in(&h, "a", 1), 2);
         let _ = std::fs::remove_dir_all(&h);
     }

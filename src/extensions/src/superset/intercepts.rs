@@ -266,6 +266,12 @@ pub fn zintercept(args: &[String]) -> Result<ExitCode> {
         println!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
     };
+    // As in `zguard`: the whole read-modify-write is one holder's, or a
+    // concurrent registration silently replaces another.
+    let _lock = match args.first().map(String::as_str) {
+        Some("list") | None => None,
+        _ => crate::superset::registry::lock("intercepts"),
+    };
     match action {
         "list" => list(),
         "clear" => {
@@ -321,7 +327,7 @@ fn register(kind_str: &str, rest: &[String]) -> Result<ExitCode> {
 
     let mut list = load();
     let highest = list.iter().map(|i| i.id).max().unwrap_or(0);
-    let id = crate::superset::registry_id::next_id("intercepts", u64::from(highest)) as u32;
+    let id = crate::superset::registry::next_id("intercepts", u64::from(highest)) as u32;
     list.push(Intercept { pattern: pattern.clone(), kind, code: code.clone(), id });
     save(&list)?;
     let preview = if code.len() > 50 { format!("{}...", &code[..47]) } else { code };

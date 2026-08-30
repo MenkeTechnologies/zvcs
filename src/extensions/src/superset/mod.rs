@@ -13,7 +13,7 @@
 //!   * [`zbump`]   — forward-only submodule gitlink bumps: stage a submodule
 //!     pointer only when the new SHA is a descendant of the recorded one.
 
-mod registry_id;
+mod registry;
 pub mod analytics;
 pub mod attach;
 pub mod banner;

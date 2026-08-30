@@ -111,6 +111,11 @@ fn fire(s: &Sched) {
 // ---- CLI side ------------------------------------------------------------
 
 pub fn zsched(args: &[String]) -> Result<ExitCode> {
+    // The same read-modify-write, and the same lock.
+    let _lock = match args.first().map(String::as_str) {
+        Some("add") | Some("rm") | Some("clear") => crate::superset::registry::lock("schedule"),
+        _ => None,
+    };
     match args.first().map(String::as_str) {
         None | Some("list") => list(),
         Some("add") => add(&args[1..]),
@@ -150,7 +155,7 @@ fn add(rest: &[String]) -> Result<ExitCode> {
         bail!("usage: git zsched add <duration> -- <command>");
     }
     let mut scheds = read_schedules();
-    let id = crate::superset::registry_id::next_id("schedule", scheds.iter().map(|s| s.id).max().unwrap_or(0));
+    let id = crate::superset::registry::next_id("schedule", scheds.iter().map(|s| s.id).max().unwrap_or(0));
     scheds.push(Sched { id, interval: interval.max(1) as u64, command: command.clone() });
     write_schedules(&scheds)?;
     println!("scheduled #{id}: every {} — {command}", human(interval.max(1) as u64));

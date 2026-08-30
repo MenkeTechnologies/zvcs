@@ -9099,8 +9099,19 @@ mod tests {
         assert!(meta.contains("UNTR:"), "stock wrote no untracked cache to read:\n{meta}");
         // The two directory blocks, depth-first: the root holds one untracked
         // file and one sub-directory, and the sub-directory holds one file.
+        //
+        // Their ORDER inside the block is the order the filesystem handed git's
+        // directory walk, and nothing git decides — measured with stock git on
+        // APFS, three files created `zzz`, `aaa`, `mmm` come back
+        // `[mmm.txt aaa.txt zzz.txt]`, which is neither creation order nor
+        // sorted order. ext4 walks `sub/` before `untracked.txt` and APFS after,
+        // so naming one of the two spellings pinned the author's filesystem and
+        // failed on every Linux runner. Both names and both counts are still
+        // required: they only come out at all if the two `stat_data` records
+        // were stepped over by the right width, which is what this test is for.
         assert!(
-            meta.contains("<root>=2/1[untracked.txt sub/]"),
+            meta.contains("<root>=2/1[untracked.txt sub/]")
+                || meta.contains("<root>=2/1[sub/ untracked.txt]"),
             "the root block names what is untracked in it:\n{meta}"
         );
         assert!(

@@ -4322,7 +4322,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zvcs"
-version = "0.22.3"
+version = "0.22.4"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "zvcs-native"
-version = "0.22.3"
+version = "0.22.4"
 
 [[package]]
 name = "zvcs-parity"

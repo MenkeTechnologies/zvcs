@@ -1,129 +1,193 @@
 //! Differential corpus cases for the merge **engine** as `git merge` drives it:
-//! the strategy the default backend is reached by (`-s ort`, which 395 existing
-//! `merge` cases spell exactly once), the `-X` grammar, the message machinery
-//! that turns a finished merge into a commit or a `MERGE_MSG`, and the option
-//! table `builtin/merge.c` parses before any of that runs.
+//! the strategy the default backend is reached by (`-s ort`), the `-X` grammar,
+//! the message machinery that turns a finished merge into a commit or a
+//! `MERGE_MSG`, and the option table `builtin/merge.c` parses before any of that
+//! runs.
+//!
+//! Every count and every behavioural claim below was measured on this machine
+//! and is reproducible by the recipe given beside it. Where a claim the first
+//! draft of this module made turned out to be wrong, the corrected fact is here
+//! and the case that depended on the wrong one was deleted — see
+//! [`merge_config_values`] and [`message_machinery`].
 //!
 //! # How this divides the merge surface with the modules already here
 //!
-//! Eight modules touch a merge. Each of the sentences below was checked against
-//! the module named, and every case in this file sits outside all of them.
-//!
-//! * [`super::merge_strategies`] — the nearest neighbour, and the one to read
-//!   first. It owns *which program the trees are handed to*: `-s recursive`,
-//!   `-s resolve`, `-s subtree`, `-s ours`, `-s octopus`, the `-s a -s b` retry
-//!   loop, the six backend binaries invoked directly (`merge-recursive`,
-//!   `merge-recursive-ours/-theirs`, `merge-subtree`, `merge-resolve`,
-//!   `merge-ours`, `merge-octopus`), and the `-X` set as it stands on
-//!   [`Shape::CrissCross`]. What it does **not** contain is `-s ort` — the
-//!   default since 2.34 and the strategy every one of its cases actually runs
-//!   under — anywhere except one bare `merge -s ort cc-right`. The `-s ort`
-//!   sweep below completes its five-strategy grid to six on every shape it uses,
-//!   which is what makes "does the port alias `ort` to `recursive`, and does it
-//!   alias either to `resolve`" answerable rather than assumed.
+//! * [`super::merge_strategies`] — the nearest neighbour. It owns *which
+//!   program the trees are handed to*: `-s recursive`, `-s resolve`,
+//!   `-s subtree`, `-s ours`, `-s octopus`, the `-s a -s b` retry loop, the
+//!   backend binaries invoked directly, and the `-X` set as it stands on
+//!   [`Shape::CrissCross`]. What it does **not** contain is `-s ort`.
 //! * [`super::merge_family`] owns the *bytes* a three-way text merge produces —
 //!   `merge-file`, `merge-index`, `merge-one-file`, `mergetool`, and the ll-merge
 //!   driver — plus `merge --abort`/`--continue` on [`Shape::Conflicted`].
 //! * [`super::merge_dirty`] owns the dirty-worktree gates on
-//!   [`Shape::MergeableDirty`]/[`Shape::MergeableStaged`]: which of index-vs-HEAD
-//!   and this-path-on-the-way-past refused, and in whose words.
-//! * [`super::patch_equivalence`] owns `merge-tree` in both its modes, and the
-//!   patch-identity questions (`cherry`, `patch-id`, `range-diff`) that ask
-//!   whether two commits carry the same change. Nothing here runs `merge-tree`:
-//!   the split is *engine driven from a worktree* here, *engine driven from bare
-//!   trees* there, and the two write to different places (an index and a
-//!   worktree versus stdout).
+//!   [`Shape::MergeableDirty`]/[`Shape::MergeableStaged`].
+//! * [`super::patch_equivalence`] owns `merge-tree` in both its modes. Nothing
+//!   here runs `merge-tree`: the split is *engine driven from a worktree* here,
+//!   *engine driven from bare trees* there.
 //! * [`super::rebase_engine`] owns the same engine reached through
 //!   `rebase`/`cherry-pick`/`revert`; [`super::sequences`] owns everything
-//!   needing a second invocation (`--continue`, `--abort`, resolve-then-commit);
-//!   [`super::rerere_engine`] owns `rerere.*` over a merge; and
-//!   [`super::attributes_filters`] owns `merge.<driver>.driver` and the
-//!   `.gitattributes` `merge=`/`conflict-marker-size` rules.
+//!   needing a second invocation; [`super::rerere_engine`] owns `rerere.*` over
+//!   a merge; [`super::attributes_filters`] owns `merge.<driver>.driver`.
 //!
 //! # What is here that is in none of them
 //!
-//! Four surfaces, none of which any existing `merge` case reaches. Measured by
-//! listing every `merge` invocation in the corpus (`--list-cases`, 395 of them)
-//! and grepping it for each token:
+//! Measured by listing every case id the corpus generates with and without this
+//! module (`--list-cases` against a copy of the crate with the
+//! `merge_ort::cases` call commented out), reducing each id to the *invocation*
+//! it names, and counting. Without this module the corpus holds **395 `merge`
+//! case ids**, which reduce to **244 distinct `merge` invocations** (the rest
+//! are steps of other commands inside sequences whose entry point is `merge`),
+//! and **26 `merge-recursive` ids / 25 invocations**. Across those 244
+//! invocations:
 //!
-//! 1. **`-s ort` and `--strategy=`** — one occurrence between them, and the long
-//!    `--strategy=`/`--strategy-option=` spellings zero.
+//! 1. **`-s ort`** appears exactly **once**, and `--strategy=` /
+//!    `--strategy-option` **zero** times.
 //! 2. **The merge-message machinery** — `--log`, `--cleanup=`, `--signoff`,
-//!    `-F <path>`, `--into-name=`, `-m` twice: zero occurrences each. `merge.log`
-//!    was set from config, so the *flag's* own parsing and its `=<n>` form had
-//!    never run, and `--cleanup` had never run at all in any mode.
+//!    `-F <path>`, `--into-name`, and `-m` given twice: **zero** each.
 //! 3. **The report knobs** — `-n`, `--stat`, `--no-stat`, `--summary`,
 //!    `--compact-summary`, `-e`, `--verbose`, `--progress`, `--autostash`,
-//!    `--overwrite-ignore`, `--verify-signatures`: zero occurrences each.
+//!    `--overwrite-ignore`, `--verify-signatures`: **zero** each. (Grepping the
+//!    raw id listing instead reports 12 for `--stat`; every one of those is a
+//!    `diff --cached --stat` or `show --stat` *step* inside a sequence filed
+//!    under `merge`, not a `merge --stat`. The invocation-level count is the
+//!    one this list is about.)
 //! 4. **The `--no-` half of the option table.** `parse_options` generates a
-//!    negation for all but a handful of `merge`'s options, and a port that
-//!    hand-rolls the parser has to enumerate them; the ones it forgets fall
-//!    through to `git merge`'s "treat it as a rev" branch and the merge silently
-//!    does not happen. Five of them do exactly that in the port under test.
+//!    negation for all but a handful of `merge`'s options; the ones a
+//!    hand-written parser forgets fall through to `cmd_merge`'s "then it must be
+//!    a rev" branch and the merge silently does not happen. **Five of them do
+//!    exactly that in the port under test** — `--no-abort`, `--no-quit`,
+//!    `--no-continue`, `--no-strategy-option`, `--no-overwrite-ignore` — each
+//!    answering `merge: <opt> - not something we can merge` at exit 1 where
+//!    stock fast-forwards at exit 0.
 //!
-//! Plus two dimensions no `merge` case in the corpus carries at all: a working
-//! directory below the root ([`Case::in_dir`], used by four cases here so the
-//! conflict paths a merge prints are asked for from a subdirectory), and
-//! `merge-recursive`'s own long-option spellings on a **single**-base history,
-//! where the result is a plain three-way text merge rather than the virtual base
-//! [`super::merge_strategies`] measures them against.
+//! Two further dimensions are **thin** rather than absent, which is what the
+//! first draft got wrong:
+//!
+//! * A working directory below the root is *not* unused by `merge`: eight
+//!   pre-existing `merge` ids and one `merge-recursive` id carry a `cwd`. They
+//!   are one bare-repository `cwd[.remote.git]` on [`Shape::BehindRemote`] and
+//!   one seven-step [`Shape::Conflicted`] sequence run from `src`. The four
+//!   cases in [`from_a_subdirectory`] are on four other shapes.
+//! * `merge-recursive` is *not* run only on [`Shape::CrissCross`]: its 25
+//!   pre-existing invocations span twelve shapes. What none of them carries is
+//!   the option set [`recursive_options_over_one_base`] names — those spellings
+//!   appear on **no** `merge-recursive` invocation in the corpus, though most
+//!   of them do appear elsewhere (under `merge -X`, `diff`, `merge-file`).
 //!
 //! # Which conflict types are reachable at all, and which are not
 //!
-//! The brief for this module named thirteen conflict types. Most of them cannot
-//! be produced by any invocation against any fixture in this corpus, and saying
-//! which is more useful than writing cases that measure something easier and
-//! calling them conflict coverage. Measured over every commit reachable from
-//! every ref of all 44 shapes (`ls-tree -r` per commit, `log --all
-//! --no-renames --diff-filter=D`):
+//! The brief for this module named thirteen conflict types. Most cannot be
+//! produced by any invocation against any fixture, and saying which is more
+//! useful than writing cases that measure something easier. Census run over
+//! **every commit reachable from every ref of all 43 shapes**, built by the
+//! crate's own [`crate::fixture::build`]: `ls-tree -r` and `ls-tree -r -t` per
+//! commit for modes and blob-versus-tree, `log --all` with
+//! `--diff-filter=D`/`T`/`R`, and a `merge-base --is-ancestor` sweep over each
+//! shape's branch tips to find which shapes can be merged at all.
 //!
-//! * **Reachable.** *Content* conflict — [`Shape::CrissCross`]'s `clash.txt`,
-//!   the only path in the corpus two branches edit differently. *Add/add with no
-//!   merge base* — [`Shape::Unrelated`]'s `README.md` across two orphan roots.
-//!   A *type change applied cleanly* — [`Shape::Symlinks`]' `dir/target.txt`,
-//!   a regular file on `main` and a symlink on `sym-pending`.
-//! * **Unreachable, and why.** There are **two deletions in the whole corpus**
-//!   (`orig/alpha.txt` and `orig/beta.txt` on [`Shape::Renamed`]), both halves of
-//!   a rename, both in a strictly linear history — so *modify/delete*,
-//!   *delete/modify*, *rename/delete* and *rename/add* have no second line of
-//!   development to fall on. Both renames are the same rename on every branch
-//!   that has them, so *rename/rename* has no divergent target. `orig/` keeps two
-//!   of its four files, so no *directory rename* is even a candidate. **No tree
-//!   in any shape contains a `100755` blob**, so a *mode-only* conflict cannot be
-//!   expressed. `dir/target.txt` is the *only* path anywhere whose entry mode
-//!   changes between two commits, and only one side changes it, so a
-//!   *symlink/file* conflict has no opposing edit; no path is a blob in one
-//!   commit and a tree in another, so *file becomes directory* has none either.
-//!   The two `160000` gitlinks ([`Shape::Submodule`], [`Shape::NestedSubmodule`])
-//!   each exist on one branch of a one-branch repository, so a *gitlink*
-//!   conflict has nothing to disagree with. `app/data.bin` has exactly two
-//!   revisions on one line of history, so a *binary* conflict would need a third.
-//!   Every one of these needs a fixture shape, and a corpus module cannot add
-//!   one.
+//! * **Reachable.** *Content* conflict — [`Shape::CrissCross`]'s `clash.txt`.
+//!   *Add/add* in both its forms — with a base on [`Shape::Conflicted`]
+//!   (`conflict.txt`, added independently on `ours` and `theirs`) and with **no**
+//!   base on [`Shape::Unrelated`] (`README.md`, across two orphan roots). A
+//!   *type change applied cleanly* — [`Shape::Symlinks`]' `dir/target.txt`.
+//! * **Unreachable, and why.**
+//!   * *modify/delete*, *delete/modify*, *rename/delete*, *rename/add*,
+//!     *rename/rename*, *directory rename*: the census finds **two deletions and
+//!     two renames in the entire corpus**, all four on [`Shape::Renamed`]
+//!     (`orig/alpha.txt` `R100`, `orig/beta.txt` `R072`), and `renamed` has **no
+//!     two divergent branch tips at all** — it is strictly linear, so no merge
+//!     can be run on it. `orig/` also keeps two of its four files, so a
+//!     directory rename would not be detected even if there were a second line
+//!     of development.
+//!   * *mode-only*: **no tree in any commit of any shape contains a `100755`
+//!     blob.** Every `0o755` in `fixture.rs` is a hook script under `.git`.
+//!   * *symlink/file*: `dir/target.txt` on [`Shape::Symlinks`] is the corpus's
+//!     **only** typechange, and only `sym-pending` changes it — `main` leaves it
+//!     alone, so the merge applies the typechange and there is nothing to
+//!     disagree with.
+//!   * *file becomes directory*: **no path is a blob in one commit and a tree in
+//!     another** anywhere in the corpus.
+//!   * *gitlink*: the two `160000` entries ([`Shape::Submodule`]'s `sub`,
+//!     [`Shape::NestedSubmodule`]'s `mid`) are on shapes with no divergent
+//!     branch tips, so no merge can be run there either.
+//!   * *binary*: `app/data.bin` on [`Shape::Patches`] has two revisions, one on
+//!     `main` and one on `pending`, so a merge of the two is a fast-forward of
+//!     that path rather than a conflict.
 //!
-//! So the conflict *types* below are the three reachable ones, and the value is
-//! in what is asked **about** them: what the engine leaves behind (`MERGE_MSG`
-//! under each `--cleanup` mode, `SQUASH_MSG` when the squashed range contains a
-//! merge commit, `AUTO_MERGE`, the stages) rather than which category the
-//! conflict falls in.
+//! Every one of those needs a fixture shape, and a corpus module cannot add one.
+//! So the conflict *types* below are the reachable ones, and the value is in
+//! what is asked **about** them: what the engine leaves behind (`MERGE_MSG` under
+//! each `--cleanup` mode, `SQUASH_MSG` when the squashed range contains a merge
+//! commit, `AUTO_MERGE`, the stages, the HEAD reflog) rather than which category
+//! the conflict falls in.
+//!
+//! **Defects this corpus therefore cannot see, recorded here rather than papered
+//! over.** Outside the fixtures, in a scratch repository where one side
+//! renames a directory and the other adds a file into the old one, the port
+//! diverges three ways from stock 2.55.0 and git 2.50.1: at the default
+//! `merge.directoryRenames=conflict` it exits 0 and **commits** where both gits
+//! raise `CONFLICT (file location)` and exit 1; at `=true` it omits the
+//! `Path updated: …` line; and at `=false` it moves the file anyway, committing
+//! a tree neither git produces. Two further divergences show up on a
+//! nine-conflict scratch repository: the port omits stock's
+//! `CONFLICT (file/directory): directory in the way of …` line, and for a
+//! symlink-versus-file conflict it records stages 1 and 3 at the original path
+//! instead of at the `~<branch>` path stock renames the file side to. None of
+//! the five is expressible against any shape in this corpus.
+//!
+//! # What the module currently finds
+//!
+//! 184 cases, **157 matching (85.3%)**, measured with
+//! `--only merge,merge-recursive --verbose` against
+//! `target/debug/git` with `/usr/bin/git` (2.50.1) as the second oracle. Every
+//! one of the 27 failures was reproduced by hand in a scratch copy of its shape
+//! and none is a version difference — the second oracle corroborates all of
+//! them. They are eight distinct defects, not 27:
+//!
+//! | defect | cases |
+//! |---|---|
+//! | negations fall through to the "must be a rev" branch | 6 |
+//! | `SQUASH_MSG` drops merge commits from the `HEAD..MERGE_HEAD` walk | 5 |
+//! | `--cleanup=scissors` writes no scissors block into `MERGE_MSG` | 3 |
+//! | (`--cleanup=scissors --squash cc-right` is in both rows above, which is why the column sums to 28 over 27 cases) | |
+//! | `merge.renameLimit=<non-numeric>` not validated, so the merge runs | 2 |
+//! | the state verbs' argument check and its usage block | 4 |
+//! | `-s ort` over >2 heads writes no `HEAD` reflog entry | 2 |
+//! | `merge.autoStash` hint line omitted from the failure path | 2 |
+//! | one each: `--cleanup=verbatim` trailing newline, `-F` missing file exit code, `-s resolve` leaves `REUC` where stock leaves `TREE`, `merge-recursive --subtree=` with two bases | 4 |
+//!
+//! Only two of the eight can lose data or produce a wrong result rather than a
+//! wrong message: `merge.renameLimit` (the port commits where stock refuses)
+//! and `-s resolve` on [`Shape::Cherry`] (the port hands stock an index it has
+//! to repair). Both are called out where their cases are defined.
 //!
 //! # Determinism
 //!
-//! Twenty-nine of these cases end in a commit, so their object ids are part of
-//! what is compared. Every one was run **twice against stock 2.55.0** in two
-//! fresh copies of its shape under [`crate::env::harden`], and the two runs
-//! compared on refs, `HEAD`, the full object list, the index, the operation-state
-//! files and `log -1 --format=%B%n%T%n%P`; all agreed. The copies were made with
-//! `cp -Rp` on purpose — [`crate::fixture::copy_tree`] carries mtimes across and
-//! the shapes set `core.checkStat=minimal`, and a copy that drops the timestamps
-//! produces a stat-dirty index that makes `builtin/merge.c`'s trivial in-index
-//! path fail. Under a timestamp-dropping copy the port and stock disagree on
-//! `patches merge -s resolve`; under the harness's own copy they agree, so that
-//! difference is an artefact of the copy and is deliberately **not** a case here.
+//! Many of these cases end in a commit, so their object ids are part of what is
+//! compared. Two separate pieces of evidence, and they are different strengths:
+//!
+//! * **The seven cases this pass added, and the one it moved,** were each run
+//!   **twice against stock 2.55.0** by hand, in two `cp -Rp` copies of their
+//!   shape under [`crate::env::harden`], and the two runs compared on exit code,
+//!   stdout,
+//!   stderr, `for-each-ref`, `ls-files --stage`, `cat-file --batch-check
+//!   --batch-all-objects`, the operation-state files and
+//!   `log -1 --format=%B%n%T%n%P`. All eight agreed.
+//! * **The rest** rest on the harness's own stock repeat rather than on a hand
+//!   run: a `--only merge,merge-recursive` pass reports `NONDETERMINISTIC` = 0
+//!   and `zvcs-flaky` = 0 across every id it ran, which is what those verdicts
+//!   are for.
+//!
+//! `cp -Rp` is deliberate —
+//! [`crate::fixture::copy_tree`] carries mtimes across and the shapes set
+//! `core.checkStat=minimal`, and a copy that drops the timestamps produces a
+//! stat-dirty index that makes `builtin/merge.c`'s trivial in-index path fail.
 //!
 //! `GIT_EDITOR` is pinned to `true` by [`crate::env::harden`], so `-e` commits
 //! git's own default message unedited, and `--cleanup=verbatim` is what makes
 //! the exact bytes of that message observable — see [`message_machinery`].
+
 
 use crate::fixture::Shape;
 use crate::runner::Case;
@@ -131,6 +195,7 @@ use crate::runner::Case;
 /// Append this subsystem's cases to the corpus.
 pub fn cases(out: &mut Vec<Case>) {
     ort_the_default_strategy(out);
+    strategies_over_one_base(out);
     strategy_option_grammar(out);
     message_machinery(out);
     report_knobs(out);
@@ -161,32 +226,49 @@ fn each_strict(shape: Shape, cmd: &'static str, argvs: &[&[&str]], out: &mut Vec
 // `-s ort`: the strategy every merge runs under and almost nothing names
 // ---------------------------------------------------------------------------
 
-/// The default backend, spelled, on every shape [`super::merge_strategies`]
-/// runs the other five strategies against.
+/// The default backend, spelled, on the shapes the corpus can merge.
 ///
 /// The point is not that `-s ort` works — it is the default, so every unadorned
 /// `merge` in the corpus already exercises the backend. The point is the
 /// **name**: `cmd_merge` looks a strategy up in `builtin/merge.c`'s table, and a
 /// port that resolves `ort` to a different entry than the empty default, or that
 /// aliases `ort` and `recursive` to two different implementations, is invisible
-/// until the name is written down. Pairing each `-s ort` here with the
-/// `-s recursive` on the same shape and rev in `merge_strategies` is what turns
-/// "are these the same backend" into a comparison rather than a claim.
+/// until the name is written down. Where [`super::merge_strategies`] already has
+/// `-s recursive` on the same shape and rev — [`Shape::Branched`]'s `feature`
+/// and [`Shape::CrissCross`]'s `cc-right` — the pair turns "are these the same
+/// backend" into a comparison rather than a claim.
 ///
-/// Measured on stock 2.55.0, and the reason the grid is worth completing: on
-/// [`Shape::CrissCross`] `ort`, `recursive` and `subtree` all leave the same
-/// index (`ls-files --stage` digest `34dc9ed69178`, `clash.txt` at stages 1/2/3),
-/// `resolve` leaves a *different* one (`ac4bf0d87546` — no stage 1, because
-/// `read-tree -m` resolved against one base rather than a virtual one), `ours`
-/// leaves `HEAD`'s tree untouched, and `octopus` refuses. So the six names are
-/// four distinct behaviours on stock, and a port that collapsed any two of the
-/// four would be caught.
+/// Measured on stock 2.55.0 by running `merge -s <name> cc-right` on
+/// [`Shape::CrissCross`] six times and reading `ls-files --stage` after each.
+/// The six names are **four** distinct index outcomes:
+///
+/// * `ort`, `recursive`, `subtree` — `clash.txt` at stages **1/2/3**, `cc.txt`
+///   merged to `b6f80f6368e7`, exit 1.
+/// * `resolve` — `clash.txt` at stages **2 and 3 only**, no stage 1, because
+///   `read-tree -m` resolved against one base rather than a virtual one; same
+///   merged `cc.txt`, exit 1.
+/// * `ours` — index untouched (`cc.txt` still `530844c6079c`, `clash.txt` at
+///   stage 0), exit 0, commits.
+/// * `octopus` — index untouched, exit 2.
+///
+/// A port that collapsed any two of the four would be caught. **The port under
+/// test does not collapse any of them**: run side by side on this shape it
+/// reproduces all four outcomes, and on [`Shape::Cherry`] (see
+/// [`strategies_over_one_base`]) it reproduces the three that shape separates.
+/// `ort` and `recursive` are *not* two engines on stock either — they produce
+/// byte-identical stdout, index and tree on every input tried, including a
+/// scratch repository carrying nine simultaneous conflicts — so a port that
+/// answers identically to both is matching stock, not aliasing past a test.
 ///
 /// `-s ort` over more than two heads is here strict: `merge-ort` is a two-head
 /// engine and refuses with `error: Not handling anything other than two heads
 /// merge.` followed by `Merge with strategy ort failed.` — a different refusal
 /// from `git-merge-octopus`'s, from a different program, and the corpus had
-/// neither for `ort`.
+/// neither for `ort`. Both those cases fail against the port, and **not on the
+/// message**: the two sides agree on stdout, stderr and exit code, and diverge
+/// on the `HEAD` reflog. Stock writes a no-op entry
+/// `<oid> <oid> ... merge div-cold div-other: updating HEAD` even though the
+/// head-count check refused before any tree was touched; the port writes none.
 fn ort_the_default_strategy(out: &mut Vec<Case>) {
     each(
         Shape::Branched,
@@ -216,9 +298,15 @@ fn ort_the_default_strategy(out: &mut Vec<Case>) {
             // The long spelling of the same option, which nothing in the corpus
             // used for any strategy.
             &["merge", "--strategy=ort", "cc-right"],
-            // The retry loop with `ort` on each side of it. The two orders
-            // disagree on stdout: `resolve` first fails through
-            // `git-merge-one-file` and only then is `ort` tried.
+            // The retry loop with `ort` on each side of it, and the two orders
+            // print different things. `-s resolve -s ort` runs `resolve`
+            // (which dies inside `git-merge-one-file`), rewinds, runs `ort`
+            // (which conflicts), rewinds again, and then runs `resolve` a
+            // *third* time under `Using the resolve strategy to prepare
+            // resolving by hand.` — the best-of-the-failures replay.
+            // `-s ort -s resolve` runs `ort`, rewinds, runs `resolve`, and
+            // stops: `resolve` was last, so it is already the prepared tree.
+            // Both exit 1.
             &["merge", "-s", "resolve", "-s", "ort", "cc-right"],
             &["merge", "-s", "ort", "-s", "resolve", "cc-right"],
             // A strategy option delivered to the named strategy rather than to
@@ -256,6 +344,75 @@ fn ort_the_default_strategy(out: &mut Vec<Case>) {
 }
 
 // ---------------------------------------------------------------------------
+// The six strategy names over one merge base, on the shape that separates them
+// ---------------------------------------------------------------------------
+
+/// The whole strategy table run against **one** merge and compared on the
+/// resulting tree — the grid that answers "does this port implement these
+/// distinctly, or alias them".
+///
+/// [`super::merge_strategies`] already has the grid on [`Shape::Branched`] (a
+/// fast-forwardable merge) and on [`Shape::CrissCross`] (two merge bases). What
+/// neither of those is, is an ordinary three-way *text* merge over a single
+/// base — and that is the case where `resolve` and `ort` are most likely to
+/// agree and a port could get away with running one for the other.
+/// [`Shape::Cherry`] is exactly that shape: `topic` (checked out) and `main`
+/// have one merge base, `cherry: seed`, and `app.txt` is edited on both sides —
+/// the same hunk on one line, different hunks on two others.
+///
+/// Measured on stock 2.55.0 and corroborated on git 2.50.1, `merge -s <name>
+/// --no-ff -m x main` here is **three** distinct outcomes, not six:
+///
+/// * `ort`, `recursive`, `resolve`, `subtree` — exit 0, all four committing the
+///   *same* tree `4c77efd4c6f6`.
+/// * `ours` — exit 0, committing `HEAD`'s tree `69389d709760`.
+/// * `octopus` — exit 2, `error: Merge requires file-level merging` /
+///   `Merge with strategy octopus failed.`, nothing committed.
+///
+/// So this grid does not separate `ort` from `resolve` on the *tree*;
+/// [`Shape::CrissCross`] does that. What it separates is what they leave in the
+/// **index**, and that is where it found something no existing case could see.
+///
+/// **`merge -s resolve --no-ff -m x main` is a real divergence.** Refs, `HEAD`,
+/// the commit, the committed tree, stdout, stderr and exit code all agree
+/// between the port and both gits; the index extensions do not. Stock writes a
+/// `TREE` cache-tree extension (`<root>=4/1:4c77efd4c6f6…`, 397 bytes); the
+/// port writes a `REUC` resolve-undo record for `app.txt` instead and no `TREE`
+/// at all (433 bytes), so stock has to rebuild the cache tree on the next
+/// command that needs one — the harness's `probe_interop` reports
+/// `index-repaired: yes` and the index growing to 494 bytes on the port's side
+/// and `no` on stock's. This is the [`crate::runner::Verdict::InteropDiff`]
+/// class of defect reached through a strategy name, and it is why this grid
+/// compares the index and not only the tree. The other five strategies match
+/// stock exactly, index extensions included.
+///
+/// [`Shape::Unrelated`] deliberately gets nothing here: its grid over a
+/// **baseless** add/add is already complete — `octopus`, `ours`, `recursive`,
+/// `resolve` and `subtree` on `alien` from [`super::merge_strategies`], plus
+/// `-s ort` from [`ort_the_default_strategy`] above. Adding to it produced two
+/// duplicate ids, which `no_case_id_appears_twice_in_the_corpus` caught.
+fn strategies_over_one_base(out: &mut Vec<Case>) {
+    each(
+        Shape::Cherry,
+        "merge",
+        &[
+            &["merge", "-s", "recursive", "--no-ff", "-m", "x", "main"],
+            &["merge", "-s", "resolve", "--no-ff", "-m", "x", "main"],
+            &["merge", "-s", "subtree", "--no-ff", "-m", "x", "main"],
+            &["merge", "-s", "ours", "--no-ff", "-m", "x", "main"],
+        ],
+        out,
+    );
+    each_strict(
+        Shape::Cherry,
+        "merge",
+        // The one refusal in the grid, so the sentence is compared too.
+        &[&["merge", "-s", "octopus", "--no-ff", "-m", "x", "main"]],
+        out,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The `-X` grammar
 // ---------------------------------------------------------------------------
 
@@ -275,9 +432,12 @@ fn ort_the_default_strategy(out: &mut Vec<Case>) {
 /// The valueless forms are the other half. `merge-ort` accepts
 /// `-X find-renames` (no `=`) and `-X subtree` (no `=<path>`) and rejects
 /// `-X rename-threshold` with no value; a hand-written option parser gets the
-/// three apart only by having been asked. Measured: `find-renames` and `subtree`
-/// exit 1 with the ordinary conflict, `rename-threshold` exits 128 — so the
-/// three are separated by exit code and the last is strict.
+/// three apart only by having been asked. Measured on stock 2.55.0:
+/// `find-renames` and `subtree` exit 1 with the ordinary
+/// `CONFLICT (content): Merge conflict in clash.txt`, `rename-threshold` exits
+/// **128** with `fatal: unknown strategy option: -Xrename-threshold` — so the
+/// three are separated by exit code and the last is strict. The port matches
+/// stock on all three.
 ///
 /// `-s resolve -X ours` and `-s octopus -X ours` are strict for the reason
 /// [`super::merge_strategies`] gives for the backend refusals: the two shell
@@ -322,10 +482,16 @@ fn strategy_option_grammar(out: &mut Vec<Case>) {
         Shape::CrissCross,
         "merge",
         &[
-            // An algorithm name that does not exist: `fatal`, exit 128, before
-            // any tree is touched.
+            // An algorithm name that does not exist. Rejected by
+            // `parse_merge_opt` rather than by the algorithm-name table, so the
+            // sentence names the whole option:
+            // `fatal: unknown strategy option: -Xdiff-algorithm=nonsense`,
+            // exit 128, before any tree is touched.
             &["merge", "-X", "diff-algorithm=nonsense", "cc-right"],
-            // A threshold option with no value at all.
+            // A threshold option with no value at all —
+            // `fatal: unknown strategy option: -Xrename-threshold`, also 128,
+            // which is what separates it from the valueless forms above that
+            // *are* accepted and reach the ordinary conflict at exit 1.
             &["merge", "-X", "rename-threshold", "cc-right"],
             // The two strategies that accept no options.
             &["merge", "-s", "resolve", "-X", "ours", "cc-right"],
@@ -393,20 +559,31 @@ fn strategy_option_grammar(out: &mut Vec<Case>) {
 /// generated `Merge branch 'feature'` is committed exactly as generated. Stock
 /// 2.55.0 and git 2.50.1 both write a 290-byte commit whose message has **no**
 /// trailing newline; a port that appends one writes 291 bytes and a different
-/// object id for the same tree and the same parents. That is why this case is
-/// here rather than only the strip modes.
+/// object id for the same tree and the same parents. **The port under test
+/// appends one** — verified by hexdump: stock's commit object ends
+/// `…Merge branch 'feature'` at 290 bytes, the port's ends
+/// `…Merge branch 'feature'\n` at 291, and the two commit ids differ. That is
+/// why this case is here rather than only the strip modes.
 ///
-/// `--cleanup=scissors` on a *conflicted* merge is the other half: git writes
-/// the `# ------------------------ >8 ------------------------` block into
-/// `MERGE_MSG` above the `# Conflicts:` list, and the block is what tells the
-/// editor where the message ends. Both a criss-cross content conflict and a
-/// baseless add/add are here because the two write `MERGE_MSG` from different
-/// code paths.
+/// `--cleanup=scissors` is only observable on a **conflicted** merge, which is
+/// the second thing the first draft got wrong. On a clean merge git commits
+/// `Merge branch 'feature'` and the scissors block never appears — verified with
+/// and without `-e`. On a conflicted one git writes the
+/// `# ------------------------ >8 ------------------------` block into
+/// `MERGE_MSG` above the `# Conflicts:` list, and that is what tells the editor
+/// where the message ends. Both a criss-cross content conflict and a baseless
+/// add/add are here because the two write `MERGE_MSG` from different code paths,
+/// and **the port omits the whole block on both**, writing
+/// `Merge branch 'cc-right' into cc-left\n\n# Conflicts:\n#\tclash.txt\n`
+/// where stock writes the four scissors lines in between.
 ///
-/// `-F no-such-file` is strict: stock exits **129** with
-/// `error: could not read file 'no-such-file'` and the usage block, which is
-/// `parse_options`'s own failure rather than a `die()`, and 129-versus-128 is
-/// exactly the distinction a hand-rolled parser loses.
+/// `-F no-such-file` is strict, and the first draft of this comment overstated
+/// it: stock 2.55.0 and git 2.50.1 exit **129** with exactly one line,
+/// `error: could not read file 'no-such-file'`, and **no usage block** — that
+/// is `parse_options`'s own failure path rather than a `die()`. The port
+/// answers `fatal: could not open 'no-such-file' for reading: No such file or
+/// directory` at **128**. 129-versus-128 is the distinction a hand-rolled
+/// parser loses.
 fn message_machinery(out: &mut Vec<Case>) {
     each(
         Shape::Branched,
@@ -465,9 +642,13 @@ fn message_machinery(out: &mut Vec<Case>) {
             &["merge", "--log", "--no-ff", "cc-right"],
             // `-m` twice: `builtin/merge.c` joins the two with a blank line.
             &["merge", "-m", "one", "-m", "two", "cc-right"],
-            // A fast-forwardable merge under scissors, so the block is written
-            // into a message that then becomes a commit.
-            &["merge", "--cleanup=scissors", "--no-ff", "-m", "x", "cc-a"],
+            // Scissors over a squash: the block goes into `MERGE_MSG` while
+            // `SQUASH_MSG` is written from the other code path, so one case
+            // reads both files. Replaces a
+            // `--cleanup=scissors --no-ff -m x cc-a` case the first draft had,
+            // which measured nothing: `cc-a` is an ancestor of `cc-left`, so
+            // stock answers `Already up to date.` and writes no message at all.
+            &["merge", "--cleanup=scissors", "--squash", "cc-right"],
         ],
         out,
     );
@@ -506,13 +687,18 @@ fn message_machinery(out: &mut Vec<Case>) {
 /// its four spellings, the editor flag, verbosity, progress, autostash, the
 /// ignored-file gate and signature verification.
 ///
-/// Every one of these had zero occurrences across the corpus's 395 `merge`
-/// invocations. Most cannot change this merge's *result*, and that is the
-/// contract being pinned: the option parses, reaches the right field, and
+/// Every one of these had zero occurrences across the corpus's 244 pre-existing
+/// `merge` invocations. Most cannot change this merge's *result*, and that is
+/// the contract being pinned: the option parses, reaches the right field, and
 /// leaves the tree alone. `--stat`/`--summary`/`-n` are three names for two
 /// settings of one field and `--compact-summary` is a fourth rendering of it;
 /// an implementation that maps `--summary` to the wrong one prints a different
-/// stdout for the same merge.
+/// stdout for the same merge. `--compact-summary` is only *distinguishable*
+/// from `--stat` where the merge creates, deletes or chmods a path: on
+/// [`Shape::Branched`] it prints `feature.txt (new) | 1 +` and drops the
+/// `create mode` line, while on [`Shape::Patches`], where nothing is created,
+/// the two are byte-identical. Both are kept — the Patches pair is there for
+/// the binary row, not for the rendering.
 ///
 /// `-e` is worth its line because [`crate::env::harden`] pins `GIT_EDITOR` to
 /// `true`: the editor is spawned, exits 0 without touching the file, and the
@@ -522,12 +708,13 @@ fn message_machinery(out: &mut Vec<Case>) {
 /// object id rather than on stdout.
 ///
 /// `--verify-signatures` is strict: no commit in any shape is signed, so stock
-/// dies at 128 naming the unsigned commit, and the refusal is the whole
-/// behaviour of the flag on this corpus.
+/// dies at 128 with `fatal: Commit 07e86d1 does not have a GPG signature.`, and
+/// the refusal is the whole behaviour of the flag on this corpus. The port
+/// matches, abbreviation included.
 ///
 /// [`Shape::Patches`] appears here for one reason: `app/data.bin` is a binary
-/// blob, and `Bin 1024 -> 1024 bytes` is a diffstat row no other merge in the
-/// corpus can produce.
+/// blob, and ` app/data.bin | Bin 1024 -> 1024 bytes` — verified verbatim on
+/// stock — is a diffstat row no other merge in the corpus can produce.
 fn report_knobs(out: &mut Vec<Case>) {
     each(
         Shape::Branched,
@@ -612,10 +799,21 @@ fn report_knobs(out: &mut Vec<Case>) {
 /// not happen. That failure mode is invisible to every other case in the corpus,
 /// because no other case writes a negation down.
 ///
+/// **Five of the thirteen negations below do exactly that in the port under
+/// test**, verified by hand against both gits: `--no-abort`, `--no-quit`,
+/// `--no-continue`, `--no-strategy-option` and `--no-overwrite-ignore` each
+/// answer `merge: <opt> - not something we can merge` at exit 1 and leave
+/// `main` where it was, while stock fast-forwards to `feature` at exit 0. The
+/// other eight — `--no-into-name`, `--no-cleanup`, `--no-compact-summary`,
+/// `--no-strategy`, `--no-message`, `--no-verify`,
+/// `--no-allow-unrelated-histories`, and `-s ort --no-strategy` — pass, which
+/// is what makes the five a parser gap rather than "negations are unported".
+///
 /// One option that is genuinely *not* negatable is here too, and strict, so the
-/// set is measured from both sides: `--no-file` exits 129 with the usage block,
-/// because `-F` is `PARSE_OPT_NONEG`. (`--no-ff-only`, the other one, is already
-/// in [`super::merge_family`] and is not repeated.)
+/// set is measured from both sides: `--no-file` exits 129 with
+/// `error: unknown option `no-file'` followed by the usage block, because `-F`
+/// is `PARSE_OPT_NONEG`. The port matches. (`--no-ff-only`, the other one, is
+/// already in [`super::merge_family`] and is not repeated.)
 fn option_table_negations(out: &mut Vec<Case>) {
     each(
         Shape::Branched,
@@ -672,6 +870,22 @@ fn option_table_negations(out: &mut Vec<Case>) {
 ///
 /// The shape is [`Shape::CrissCross`], where no merge is in progress, so the
 /// argument check is reached and the "there is no merge to abort" path is not.
+///
+/// Verified by hand on all three binaries. `merge --abort cc-right`: stock and
+/// the port both say `fatal: --abort expects no arguments` at exit 129, and the
+/// port stops there while stock prints the usage block after it.
+/// `merge --abort -s ort`: stock still refuses at 129, the port consumes
+/// `-s ort`, passes its own argument check, and runs the abort, failing at
+/// **128** with `fatal: There is no merge to abort (MERGE_HEAD missing).`;
+/// `--continue -s ort` is the same shape of mistake with
+/// `fatal: There is no merge in progress (MERGE_HEAD missing).`
+///
+/// All four land in the harness's `gits-disagree` bucket, and the reason is
+/// worth knowing before reading that bucket: the *content* of git's usage block
+/// changed between 2.50.1 and 2.55.0 (`--[no-]compact-summary` is new, and the
+/// option order moved), so the two oracles differ on these bytes. The finding
+/// being pinned — the block is absent, and the argument check is passed by an
+/// option — is the same against both.
 fn state_verbs_reject_arguments(out: &mut Vec<Case>) {
     each_strict(
         Shape::CrissCross,
@@ -693,37 +907,55 @@ fn state_verbs_reject_arguments(out: &mut Vec<Case>) {
 /// The `merge.*` keys and values no case delivered, including the ones that make
 /// git **refuse to start**.
 ///
-/// `merge.verbosity` was measured at 0 and 5, the two ends; the four levels
-/// between them each gate a different set of lines in `merge-ort` and
-/// `builtin/merge.c` and were unmeasured. `merge.directoryRenames` was measured
-/// at `conflict` only, `merge.renames` at `false` only, and
-/// `merge.renameLimit` not at all — the last two matter here even though
-/// [`Shape::CrissCross`] has no rename for them to find, because what is being
-/// pinned is that the key is *read and validated*, not that detection changes.
+/// **What most of these keys can and cannot show, measured rather than
+/// assumed.** Each key below was run against `merge cc-right` on
+/// [`Shape::CrissCross`] twice — once with the key set and once without — and
+/// the two runs compared on exit code, stdout, stderr, refs, `ls-files --stage`
+/// and the operation-state files. Only five changed anything: `merge.log=true`,
+/// `merge.suppressDest=cc-left`, `merge.ff=false`, `merge.autoStash=true` and
+/// `merge.conflictStyle` at `diff3`/`zdiff3`. `merge.verbosity` at **1, 2, 3
+/// and 4 changes nothing** (on a clean [`Shape::Branched`] merge either — only
+/// 5 does, and that case is already in the corpus), and neither do
+/// `merge.directoryRenames`, `merge.renames`, `merge.renameLimit=0`,
+/// `merge.stat=false`, `merge.branchdesc` or `merge.tool` on a shape with no
+/// rename, no diffstat, no branch description and no mergetool invocation.
+///
+/// They are kept anyway, and the claim is the smaller one: the key is **read
+/// and accepted** rather than rejected or ignored into a `die`. `verbosity=2`
+/// was dropped, because 2 is the default and that case was a byte-for-byte
+/// duplicate of the corpus's plain `merge cc-right`; the id-uniqueness test
+/// cannot see a duplicate that differs only in a config segment.
 ///
 /// **`merge.renameLimit=nonsense` is the case that matters most in this
 /// function, and it is strict.** It is not a rename question at all: it is
 /// `git_config_int()` refusing a non-numeric value. Stock 2.55.0 and git 2.50.1
 /// both die with `fatal: bad numeric config value 'nonsense' for
 /// 'merge.renamelimit': invalid unit` at exit 128 **before touching anything**.
-/// A port that shrugs the value off does not merely print differently — it
-/// performs the merge, and on the clean `alien` merge below it *creates a commit*
-/// where both gits created nothing. Both a conflicting and a committing merge
-/// are here for exactly that reason: the failure is only visible as a written
-/// object on the second.
+/// **The port shrugs the value off, and this is the worst failure in the
+/// module** — verified by hand on all three binaries. It does not merely print
+/// differently: it performs the merge. On `merge cc-right` it conflicts at exit
+/// 1 and leaves `clash.txt` at stages 1/2/3 where both gits left the index
+/// untouched at 128; on the clean `alien` merge below it exits **0 and creates
+/// a commit** (`refs/heads/main` moves) where both gits created nothing. Both a
+/// conflicting and a committing merge are here for exactly that reason: the
+/// failure is only visible as a written object on the second.
 ///
 /// `merge.autoStash=true` over a **clean** worktree is the other one worth
 /// naming. No stash is created (verified: `stash list` is empty afterwards on
 /// both gits), and both gits still print `When finished, apply stashed changes
 /// with \`git stash pop\`` when the merge fails — the hint is emitted from the
-/// failure path unconditionally, not from the stash. A port that prints it only
-/// when it actually stashed omits a line.
+/// failure path unconditionally, not from the stash. **The port omits exactly
+/// that line**, on both cases here — the criss-cross content conflict and the
+/// baseless add/add — and agrees on everything else.
 ///
 /// `merge.ff=only` over a merge that cannot fast-forward is strict: the refusal
 /// is the whole meaning of the value, and it comes from a different place than
 /// `--ff-only`'s.
 fn merge_config_values(out: &mut Vec<Case>) {
-    for level in ["1", "2", "3", "4"] {
+    // 2 is the default, so a case setting it would duplicate the corpus's
+    // plain `merge cc-right`; 1, 3 and 4 pin that the key is accepted at each
+    // end of the non-debug range. None of them changes stock's output.
+    for level in ["1", "3", "4"] {
         out.push(
             Case::new("merge", &["merge", "cc-right"], Shape::CrissCross)
                 .with_config(&[("merge.verbosity", level)]),
@@ -794,14 +1026,22 @@ fn merge_config_values(out: &mut Vec<Case>) {
             .with_config(&[("merge.conflictStyle", style)]),
         );
     }
-    // The width every object id in the diffstat prints at, over a merge.
+    // The width every object id `merge` prints at. Attached to a
+    // **fast-forward**, which is the only merge that prints an id at all:
+    // `Updating 5915d79..07e86d1` becomes `Updating 5915d79de18d..07e86d1fedb7`
+    // under `core.abbrev=12`. The first draft attached this to
+    // `merge cc-right`, which prints no object id anywhere, so the setting had
+    // nothing to act on.
+    //
+    // A `diff.statGraphWidth=10` case sat beside it and is deleted rather than
+    // moved: it was written against `merge --stat --no-ff -m x cc-a`, where
+    // `cc-a` is an ancestor of `cc-left` and stock answers `Already up to
+    // date.` with no diffstat at all — and no merge anywhere in this corpus
+    // produces a stat bar wider than the ten columns the key would cap, so
+    // there is no invocation to move it to.
     out.push(
-        Case::new("merge", &["merge", "cc-right"], Shape::CrissCross)
+        Case::new("merge", &["merge", "feature"], Shape::Branched)
             .with_config(&[("core.abbrev", "12")]),
-    );
-    out.push(
-        Case::new("merge", &["merge", "--stat", "--no-ff", "-m", "x", "cc-a"], Shape::CrissCross)
-            .with_config(&[("diff.statGraphWidth", "10")]),
     );
 }
 
@@ -816,10 +1056,18 @@ fn merge_config_values(out: &mut Vec<Case>) {
 /// pasting each commit in — merge commits included, with their `Merge:` line.
 /// [`Shape::CrissCross`] is the only shape whose `HEAD..<other tip>` range
 /// contains one: `cc-right` is `criss-cross: cc-right tip` on top of
-/// `criss-cross: cc-right merge`, and the second is a two-parent commit. Stock
-/// 2.55.0 writes both into `SQUASH_MSG`; a port that filters merges out of the
-/// walk writes one, and the difference is invisible in stdout — `--squash` prints
-/// only `Squash commit -- not updating HEAD` and the conflict lines.
+/// `criss-cross: cc-right merge`, and the second is a two-parent commit.
+///
+/// **This is a finding, verified by hand on all three binaries.** Stock 2.55.0
+/// and git 2.50.1 write both commits into `SQUASH_MSG`, the merge one carrying
+/// its `Merge: 27e7a99 0a24ba3` line. The port writes only
+/// `criss-cross: cc-right tip` — it filters merge commits out of the
+/// `HEAD..MERGE_HEAD` walk. The difference is invisible in stdout (`--squash`
+/// prints only the conflict lines and
+/// `Squash commit -- not updating HEAD`) and invisible in the refs, so nothing
+/// short of reading `SQUASH_MSG` catches it. All four cases on
+/// [`Shape::CrissCross`] below fail this way, including `-s ours --squash`,
+/// which reaches the same file down a different path at exit 0.
 ///
 /// The three controls are the point of the group as much as the finding is:
 /// [`Shape::Unrelated`]'s `alien` (two commits, no merge), [`Shape::Octopus`]'s
@@ -867,14 +1115,18 @@ fn squash_over_a_merge(out: &mut Vec<Case>) {
 
 /// The same merges, run from a directory below the worktree root.
 ///
-/// No `merge` case in the corpus carries [`Case::in_dir`]. The engine prints
-/// every path it touches — `Auto-merging <path>`, `CONFLICT (content): Merge
-/// conflict in <path>`, the diffstat rows, and the `# Conflicts:` list in
-/// `MERGE_MSG` — and git prints all of them **relative to the worktree root**
-/// regardless of where the command was run. An implementation that renders any
-/// of them relative to the current directory produces `../README.md` for a
-/// conflict two levels up, and nothing in the corpus could see it because every
-/// merge ran from the root.
+/// Nine pre-existing ids under `merge`/`merge-recursive` carry a `cwd`, and
+/// they are two things: `merge main` in a bare repository on
+/// [`Shape::BehindRemote`], and a seven-step [`Shape::Conflicted`] sequence run
+/// from `src`. The first is not a worktree merge and the second is one shape.
+///
+/// The engine prints every path it touches — `Auto-merging <path>`,
+/// `CONFLICT (content): Merge conflict in <path>`, the diffstat rows, and the
+/// `# Conflicts:` list in `MERGE_MSG` — and git prints all of them **relative to
+/// the worktree root** regardless of where the command was run. An
+/// implementation that renders any of them relative to the current directory
+/// produces `../README.md` for a conflict two levels up. These four cases put
+/// that question on four shapes the existing `cwd` cases do not touch.
 ///
 /// Four directories that exist in their shapes: `src/` and `app/` hold files the
 /// merge writes, `dir/` holds the path whose *type* changes.
@@ -911,12 +1163,12 @@ fn from_a_subdirectory(out: &mut Vec<Case>) {
 /// The backend invoked directly, with the long options `-X` feeds, over a
 /// history with **one** merge base.
 ///
-/// [`super::merge_strategies`] runs `merge-recursive` only on
-/// [`Shape::CrissCross`], where two explicit bases are given and the backend has
-/// to build a virtual one first. That is the harder path and the right one to
-/// have, but it means every option there is measured through a recursion, and
-/// its own header records that the shape cannot separate rename thresholds at
-/// all. [`Shape::Cherry`] is the complement: `topic` and `main` have exactly one
+/// The corpus's 25 pre-existing `merge-recursive` invocations span twelve
+/// shapes, but eleven of them are on [`Shape::CrissCross`], where two explicit
+/// bases are given and the backend has to build a virtual one first — and every
+/// one of the *option*-carrying invocations is there. That is the harder path
+/// and the right one to have, but it means every option is measured through a
+/// recursion. [`Shape::Cherry`] is the complement: `topic` and `main` have exactly one
 /// merge base (`cherry: seed`), `app.txt` is edited on both sides — the same
 /// hunk on one line, different hunks on two others — and the result is an
 /// ordinary three-way text merge. So these cases measure the option's effect on
@@ -924,21 +1176,31 @@ fn from_a_subdirectory(out: &mut Vec<Case>) {
 /// is `topic`, which is what `Shape::Cherry` has checked out (the backend writes
 /// through `unpack_trees` and fails the up-to-date check against any other).
 ///
-/// Six of the option names below appear nowhere in the corpus in any spelling:
-/// `--ignore-space-change`, `--ignore-all-space`, `--ignore-space-at-eol`,
-/// `--ignore-cr-at-eol`, `--renormalize`/`--no-renormalize`, and
-/// `--rename-threshold=`/`--subtree=` — `merge_strategies` reaches
-/// `--ours`, `--theirs`, `--patience`, `--diff-algorithm=histogram` and
-/// `--no-renames` and stops there.
+/// Seven of the option names below appear on **no `merge-recursive`
+/// invocation** in the corpus: `--ignore-space-change`, `--ignore-all-space`,
+/// `--ignore-space-at-eol`, `--ignore-cr-at-eol`,
+/// `--renormalize`/`--no-renormalize`, `--rename-threshold=` and `--subtree=`.
+/// The whole pre-existing option set on that command is `--ours`, `--theirs`,
+/// `--patience`, `--diff-algorithm=histogram`, `--no-renames` and one
+/// `--find-renames=90`. (Most of the seven do appear elsewhere in the corpus —
+/// under `merge -X`, `diff`, `merge-file` — so this is a claim about the
+/// backend's own parser, not about the tokens being unseen.)
 ///
 /// The one case that is not on `Cherry` is the one that cannot be:
 /// `--subtree=<path>` **with two explicit merge bases**. The shift has to be
 /// threaded through the recursion that builds the virtual base, and that is a
 /// distinct code path from either `-X subtree=` on a two-base merge (which
 /// `merge` reaches through its own base computation and which the port handles)
-/// or `--subtree=` on a one-base merge. Both gits merge and conflict at exit 1;
-/// the port under test refuses at 128 with a sentence naming the recursion it
-/// cannot thread the shift through. Strict, because that sentence is the finding.
+/// or `--subtree=` on a one-base merge. Verified by hand: both gits merge
+/// (`Auto-merging cc.txt` / `Auto-merging clash.txt` /
+/// `CONFLICT (content): Merge conflict in clash.txt`), conflict at exit 1, and
+/// leave `clash.txt` at stages 1/2/3 with `AUTO_MERGE` written. The port
+/// refuses at **128** with `fatal: merge-recursive --subtree cannot be
+/// performed: 2 explicit merge bases require a virtual merge base built by
+/// recursively merging them with the subtree shift applied at each level;
+/// Repository::virtual_merge_base cannot thread the shift through its
+/// recursion`, leaving a stage-0 index and no `AUTO_MERGE`. Strict, because
+/// that sentence is the finding.
 fn recursive_options_over_one_base(out: &mut Vec<Case>) {
     each(
         Shape::Cherry,

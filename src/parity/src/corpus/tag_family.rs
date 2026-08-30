@@ -81,11 +81,26 @@
 //! oid.
 //!
 //! **The default cleanup mode for a tag message is `strip`, not `whitespace`.**
-//! Measured on stock 2.55.0 over this fixture: `tag -a v -m $'body\n# comment\n'`
-//! and the same with `--cleanup=strip` produce the identical object body
-//! `body\n`, while `--cleanup=whitespace` keeps `# comment`. The three modes are
-//! therefore separable on one message, which is what the `--cleanup` group here
-//! is built on.
+//! Measured on stock 2.55.0 over [`Shape::Branched`], on the exact message the
+//! cases below pass (`body\n# comment\n\n\n`): `--cleanup=strip` and the bare
+//! `-m` form both store the body `\nbody\n` (tag objects
+//! `24d4972b318ae1d5ef90f1bddf23b3cb4d7a0d4d` and
+//! `1f2263d9805d313b1e0f057d5544313066c8a0c0` — different only because the tag
+//! names differ), while `--cleanup=whitespace` stores `\nbody\n# comment\n`
+//! (`ef5636ab92330e1ea2662699a4fe932184f9ddec`). Two rules separate the modes and
+//! only one of them is about comments: **`whitespace` already drops the trailing
+//! blank lines and the trailing spaces**, so a message with no comment line in it
+//! cannot tell `strip` from `whitespace` at all — checked on `\n\n  body  \n\n`,
+//! where both store `\n  body\n`. `verbatim` is the only mode that keeps that
+//! input whole, and the `vleadstrip`/`vverb` pair below is built on exactly that
+//! difference rather than on a comment.
+//!
+//! **`-F` runs the same cleanup as `-m`.** `tag -F README.md vempty` — a file
+//! whose whole content is `# fixture\n` — writes a tag with an *empty* message
+//! under the default mode (`0ad6b3bc8702145ecf37145ca6bdf2134833740e`, 133 bytes,
+//! ending `+0000\n\n`), and the same file with `--cleanup=verbatim` keeps the
+//! line. So the byte-level cleanup rules are reachable from both message sources
+//! and the `-F` half is not a restatement of the `-m` half.
 //!
 //! **Signing is unreachable and nothing here pretends otherwise.** There is no
 //! gpg key in the harness and `harden` gives the child a fresh `HOME`. The one
@@ -114,10 +129,26 @@
 //!   may not add a shape. Deleting a packed tag — the case where the ref file
 //!   never existed and the `packed-refs` line has to be rewritten — therefore
 //!   stays unmeasured, and belongs to `ref_storage.rs`, which owns that store.
-//! * **`--create-reflog` is pinned only as far as the probe reaches.**
-//!   `probe_state` does not read reflogs, so the case here fixes the flag's
-//!   parse and the ref it must still write, and cannot see the log it created.
-//!   Recorded, not claimed.
+//! * **Two reachability filters cannot be told apart from one on any shape this
+//!   file may use.** Measured on stock over [`Shape::Branched`]: `--points-at
+//!   HEAD`, `--contains HEAD~1`, `--contains HEAD`, `--merged feature` and
+//!   `--merged HEAD` each answer `v0.1.0 v0.2.0`, while `--contains feature`,
+//!   `--no-contains HEAD` and `--no-merged feature` each answer nothing. Over
+//!   [`Shape::TagChain`] the same all-or-nothing split holds: every
+//!   commit-reachability filter answers either `inner light-to-tag outer
+//!   outermost` or nothing, because `blobtag` and `treetag` peel to a blob and a
+//!   tree and are excluded from all of them. So for any pair `A`, `B` of these
+//!   flags, `A ∩ B` equals `A` or equals `B`, and a case can separate **AND from
+//!   OR** (when one half is empty and the other is not) but never AND from
+//!   "the last flag wins". The pairs below are labelled with which of the two
+//!   questions each one actually answers; none claims the second.
+//! * **`--create-reflog` is fully measured, contrary to an earlier note here.**
+//!   `probe_state` calls `probe_reflogs`, which walks `.git/logs` and prints
+//!   every file verbatim, so the log line the flag creates is compared as well
+//!   as the ref and the object. Checked on stock: the case leaves
+//!   `.git/logs/refs/tags/vreflog-ann` holding a single line ending
+//!   `tag: tagging 5915d79 (add two, 2023-11-14)`, and the date in it is
+//!   `env::FIXED_DATE`'s, so the line is reproducible.
 
 use crate::fixture::Shape;
 use crate::runner::Case;
@@ -210,6 +241,51 @@ fn creation_messages(out: &mut Vec<Case>) {
     // exactly one blank line before the block and none between its lines.
     // `tag_describe.rs` passes one trailer, which cannot show either rule.
     b(&["tag", "-a", "vtrailers", "-m", "body", "--trailer", "Acked-by=A", "--trailer", "Reviewed-by=B"], out);
+    // A trailer added to a message that *already ends in a trailer block*. The
+    // rule is different from the one above: no second blank line is inserted, the
+    // new line joins the existing block. Measured on stock, the stored body is
+    // `\nbody\n\nAcked-by: A\nReviewed-by: B\n`
+    // (`071eabd16c9b50a116f3f54b1b61a1b27948a2d3`); a port that always prefixes a
+    // blank line before the block writes a different object.
+    b(&["tag", "-a", "vtrail2", "-m", "body\n\nAcked-by: A\n", "--trailer", "Reviewed-by=B"], out);
+
+    // The blank-line half of cleanup, on a message with no comment in it at all.
+    // `strip` and `whitespace` agree here (see the module header), so the pair
+    // that separates is default-versus-`verbatim`: stock stores `\n  body\n` for
+    // the first and `\n\n\n  body  \n\n` for the second
+    // (`4d4503d3d6a94febfd1951e1ccfa97d1f1ca2fb7` and
+    // `6852159f0bb17ec369a4dd05d27cdaec17da379d`). Leading *spaces* survive both;
+    // only the leading and trailing blank lines and the trailing spaces go.
+    b(&["tag", "-a", "vleadstrip", "-m", "\n\n  body  \n\n"], out);
+    b(&["tag", "-a", "vverb", "-m", "\n\n  body  \n\n", "--cleanup=verbatim"], out);
+
+    // `strip` removes a comment line, not a comment *character*. Measured: the
+    // body is stored whole as `\nbody # not a comment\n`, so a port that strips
+    // from the first comment character rather than from the start of a line
+    // truncates it.
+    b(&["tag", "-a", "vmid", "-m", "body # not a comment"], out);
+
+    // An empty second `-m`. The blank-line join is not applied to it: stock
+    // stores `\nfirst\n` (`dfe8d1cf9e18c4b80f96dcd906603cde5d638040`), the same
+    // body a single `-m first` gives, rather than `first\n\n`. The pair with
+    // `vmulti` above is what separates "joins with a blank line" from "joins with
+    // a blank line per operand".
+    b(&["tag", "-a", "vmempty", "-m", "first", "-m", ""], out);
+
+    // `core.commentChar=auto` is accepted by the config parser and, measured on
+    // stock, changes nothing about a *tag* message: with `body\n# hash\n` the
+    // stored body is `\nbody\n` — `#` is still the comment character and the line
+    // is still stripped. Two ports fail here in opposite directions: one that
+    // rejects `auto` as not a single character, and one that implements the
+    // auto-selection (which would keep `# hash`, because `#` occurs in the
+    // message). `core.commentChar=auto` does appear elsewhere — `informational.rs`
+    // aims it at `stripspace -c` — and `commit_family.rs`'s header leaves it out
+    // of `commit` because 2.55 warns there; measured on `tag` it is silent, both
+    // streams empty at rc 0, which is why this is strict.
+    out.push(
+        Case::strict("tag", &["tag", "-a", "vauto", "-m", "body\n# hash\n"], Shape::Branched)
+            .with_config(&[("core.commentChar", "auto")]),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -382,18 +458,35 @@ fn listing_sort(out: &mut Vec<Case>) {
 
 /// Filters, and — the part no single-flag case can reach — two of them at once.
 ///
-/// The four reachability flags are ANDed, and the pairs below are chosen so the
-/// two halves disagree about at least one tag: on [`Shape::Branched`],
-/// `--contains HEAD~1` admits both tags and `--merged feature` admits both,
-/// while `--points-at HEAD` admits only `v0.1.0` and `--contains feature`
-/// admits neither. A port that ORs them, or that lets the last flag win, prints
-/// a different list for at least one pair.
+/// The four reachability flags are ANDed. What a pair of them can *show* on the
+/// shapes available here is bounded, and the bound was measured rather than
+/// assumed — see the module header: on [`Shape::Branched`] every one of these
+/// flags answers either both tags or neither, so a pair can separate an AND from
+/// an OR and cannot separate an AND from "the last flag wins". Each case below
+/// says which of those it is.
 fn listing_filters(out: &mut Vec<Case>) {
+    // Both halves admit both tags (measured: `--contains HEAD~1` → `v0.1.0
+    // v0.2.0`, `--merged feature` → `v0.1.0 v0.2.0`). Every combining rule gives
+    // the same answer, so this separates nothing about the combination; what it
+    // does measure is that a second reachability flag is *accepted* beside the
+    // first rather than rejected or ignored — a port that ignored either one
+    // would still print both tags, but a port that rejected the pair, or that
+    // dropped to the unfiltered list, disagrees.
     b(&["tag", "--contains", "HEAD~1", "--merged", "feature"], out);
+    // The AND-versus-OR case. `--points-at HEAD` admits both tags, `--contains
+    // feature` admits neither, so stock prints nothing; a port that ORs the two
+    // prints both.
     b(&["tag", "--points-at", "HEAD", "--contains", "feature"], out);
+    // Two *negative* filters. Both halves are empty on this shape (both tags
+    // contain `HEAD` and neither is unmerged into `feature`), so stock prints
+    // nothing and the combining rule is again invisible. It measures that
+    // neither negation is dropped: a port that ignores both prints two tags.
+    // `tag_describe.rs` has `--no-contains HEAD~1` and `--no-merged feature`
+    // singly; this is the only place the two appear together.
     b(&["tag", "--no-contains", "HEAD", "--no-merged", "feature"], out);
-    // A filter beside a pattern: the pattern narrows the name, the filter
-    // narrows the reachability, and both have to apply.
+    // A filter beside a pattern, which *is* a strict narrowing: the filter
+    // admits `v0.1.0 v0.2.0` and the pattern admits `v0.2.0`, so stock prints
+    // one line and a port that ORs the two prints two.
     b(&["tag", "--points-at", "HEAD", "-l", "v0.2*"], out);
     // A bracket class in the pattern, which `wildmatch` handles and a port that
     // reaches for `fnmatch`'s defaults or for a plain prefix test does not.

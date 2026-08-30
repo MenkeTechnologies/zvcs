@@ -69,24 +69,85 @@
 //! are the same bytes.
 //!
 //! **Two `--date` spellings, excluded as unmeasurable after being run.** Both
-//! were run twice against stock 2.55.0 in identical fixtures and compared, per
-//! the rule that a case must be deterministic on stock *alone* before it is
-//! worth comparing sides:
+//! were run twice against stock 2.55.0 in identical fresh copies of
+//! `Shape::Dirty` and compared on `rev-parse HEAD`, per the rule that a case
+//! must be deterministic on stock *alone* before it is worth comparing sides:
 //!
-//! * `--date=now` — the wall clock, by definition. The two stock runs agreed
-//!   only because they landed in the same second.
+//! * `--date=now` — the wall clock, by definition. Two stock runs a second
+//!   apart gave `b7436c3bae…` and `30e07e3fdc…`.
 //! * `--date=2017-07-14` — a date with no time. Git fills the time of day in
-//!   from the wall clock, so the two stock runs produced *different commit
-//!   ids* (`f08ac60fd4…` and `63b8fde50e…`). It looks absolute and is not.
+//!   from the wall clock, so two stock runs gave `0a98e8e7c4…` and
+//!   `6848db1bc0…`. It looks absolute and is not. The four ids above are not
+//!   reproducible values to check against; they are two pairs that disagree,
+//!   and a fresh pair of runs produces two new ids that disagree again.
 //!
 //! `--amend --reset-author` is measurable and is already `commit_family.rs`'s
-//! row: `env::harden` pins `GIT_AUTHOR_DATE`, and reset-author takes the
-//! author date from there rather than from the clock — confirmed by the
-//! `--amend --reset-author --date=` row below, which comes back identical on
-//! two stock runs.
+//! row: `env::harden` pins `GIT_AUTHOR_DATE`, and reset-author takes the author
+//! date from there rather than from the clock. Confirmed directly rather than
+//! inferred — `commit --amend --no-edit --reset-author` with **no** `--date` at
+//! all, on `Shape::Linear`, rewrites `edfab1b716…` into `edfab1b716…`: the
+//! replacement is byte-identical to the commit it replaces, twice, in two runs
+//! a second apart. It could only be identical if the replaced author line
+//! carried the pinned date, and it could only be identical *twice* if no clock
+//! were read.
 //!
 //! `-S`/`--gpg-sign` is unusable here for the reason `commit_family.rs` gives:
 //! the hermetic `HOME` has no key, so both sides only ever reach the refusal.
+//!
+//! # What the port does differently, reproduced by hand
+//!
+//! Every row below was re-run outside the harness, stock and port side by side
+//! in fresh copies of the same shape under `env::harden`'s environment, and the
+//! commit objects compared with `od -c`. The first is the one this module was
+//! written to find: the only row where both sides exit 0, print the same
+//! summary line, and commit different objects whose messages differ by
+//! whitespace alone.
+//!
+//! * **`--cleanup=verbatim -F -` over a message with no final newline** — the
+//!   difference is one byte and both sides exit 0 with a plausible
+//!   `[main …] no trailing newline` summary. Stock's object ends
+//!   `… n e w l i n e` (`756a48e511…`); the port's ends `… n e w l i n e \n`
+//!   (`0f4e1882a4…`), which is byte for byte the object stock produces under
+//!   the *default* cleanup. The port's `verbatim` does not suppress the
+//!   terminator. Nothing renders this: `git log` shows the same subject on both
+//!   sides, and two repositories that should converge never do.
+//! * **`--cleanup=verbatim -F -` over a message that is whitespace and nothing
+//!   else** — stock writes the six bytes and lands `edcecd4d3e…`; the port
+//!   answers `Aborting commit due to empty commit message.` and exits 1 with
+//!   `HEAD` unmoved. The emptiness test runs before cleanup rather than after
+//!   it. `commit-tree` over the identical payload writes `432765fcc2…` on
+//!   **both** sides, so the writer is right and the test is in the wrong place.
+//! * **A `NUL` in the message** — stock refuses
+//!   (`error: a NUL byte in commit log message not allowed.` then
+//!   `fatal: failed to write commit object`, exit 128); the port exits 0 and
+//!   writes `23a106de4d…`, whose message really does contain the `\0`. The same
+//!   payload through `commit-tree` is refused by *both* sides with the one
+//!   `error:` line and exit 1 — so the check exists in one of the port's two
+//!   commit writers and not in the other, which is exactly what pairing the two
+//!   verbs over one payload was for.
+//! * **`-C <annotated tag>`** — stock peels the tag and reuses the commit's
+//!   message, landing `fd02a19099…` (`add two`). The port reads the tag object
+//!   itself: `error: object d7277ea…is a tag, not a commit` /
+//!   `fatal: could not lookup commit 'v0.2.0'`, exit 128. The lightweight tag
+//!   row, which needs no peeling, agrees on both sides.
+//! * **`-F` on something unreadable** — stock exits **128** with
+//!   `fatal: could not read log file '<path>': <strerror>`; the port exits
+//!   **1** with ``zvcs: commit: could not read message file `<path>`:
+//!   <strerror> (os error <n>)``. Both spellings, missing file and directory.
+//! * **`trailer.<token>.cmd`** — stock runs the command and commits
+//!   `Acked-by: tester A` (`e4faf827b7…`). The port refuses:
+//!   `zvcs: commit: unsupported config trailer.<key-alias>.cmd/.command (needs
+//!   shell execution)`, exit 1, preceded by two
+//!   `warning: more than one trailer.ack.key` / `…cmd` lines that are wrong on
+//!   their own terms — one of each key was set.
+//! * **`--date=not a date`** — the one row here where the two sides agree on
+//!   *everything a user sees* and still leave different repositories. Identical
+//!   stderr (`fatal: invalid date format: not a date`) and exit 128, but stock
+//!   has already written the index tree `5f9e862135…` (105 bytes) and a
+//!   cache-tree extension into `.git/index` (325 bytes) before it parses the
+//!   date, while the port validates first and writes neither (index 306 bytes).
+//!   `pull --cleanup=bogus` in `pull_family.rs` is the same ordering question
+//!   answered the other way round, with the port doing the extra work.
 
 use crate::fixture::Shape;
 use crate::runner::{Case, ConfigEntry, ConfigScope};
@@ -109,8 +170,11 @@ const MSG_CRLF: &[u8] = b"subject\r\n\r\nbody with cr\r\n";
 /// end. `verbatim` keeps all three runs; `whitespace` and `strip` drop the
 /// leading and trailing ones and collapse the interior run to a single blank.
 const MSG_BLANKS: &[u8] = b"\n\n\nsubject after blanks\n\n\nbody\n\n\n";
-/// Whitespace and nothing else. Empty to every mode that trims, and *not* empty
-/// to `verbatim` — which is the whole point of the pair below.
+/// Whitespace and nothing else — six bytes. Empty to every mode that trims, and
+/// *not* empty to `verbatim`, which is the whole point of the pair below. Stock
+/// commits those six bytes under `verbatim`; the port refuses to, and its
+/// `commit-tree` writes them, so the check is in the wrong place rather than
+/// missing from the writer.
 const MSG_WS_ONLY: &[u8] = b"   \n\t\n";
 /// No trailing newline. `verbatim` writes the message without one, so the commit
 /// object's last byte is `e`; every other mode terminates the line.
@@ -121,8 +185,11 @@ const MSG_NO_NEWLINE: &[u8] = b"no trailing newline";
 const MSG_COMMENT_ONLY: &[u8] = b"# only a comment\n# another\n";
 /// Zero bytes.
 const MSG_EMPTY: &[u8] = b"";
-/// A `NUL` in the subject. Git refuses to write the object at all
-/// (`error: a NUL byte in commit log message not allowed.`).
+/// A `NUL` in the subject. Stock refuses to write the object at all, from both
+/// `commit` (`error: a NUL byte in commit log message not allowed.` then
+/// `fatal: failed to write commit object`, exit 128) and `commit-tree` (the
+/// `error:` line alone, exit 1). The port refuses it from `commit-tree` and
+/// **writes it** from `commit`.
 const MSG_NUL: &[u8] = b"sub\0ject\nbody\n";
 /// Multi-byte UTF-8 in both the subject and the body, so `i18n.commitEncoding`
 /// has something whose bytes are worth *not* transcoding.
@@ -137,6 +204,12 @@ const MSG_SCISSORS: &[u8] =
 /// a *file* (stdin) rather than through `-m`, which is what makes the
 /// editor/no-editor split in `default` visible.
 const MSG_MESSY: &[u8] = b"subject\n\n# a comment\nbody   \n\n\n";
+/// Trailing whitespace on the **subject** line and a tab at the end of the body
+/// — the position `MSG_MESSY` does not reach, since its trailing spaces are on a
+/// body line and a subject is the one line every renderer shows. `verbatim`
+/// keeps both (`d7c67ccc69…`); `whitespace`, `strip` and `default` all trim to
+/// `subject\n\nbody\n` and share one id (`e96753c76b…`).
+const MSG_TRAILING_WS: &[u8] = b"subject   \n\nbody\t\n";
 
 /// A fixed instant, spelled six ways. Chosen inside git's supported range, with
 /// an explicit zone in every spelling that has one, so nothing here resolves
@@ -221,20 +294,28 @@ fn sources_combined(out: &mut Vec<Case>) {
 
     // `-C <tag>`. Both spellings have to peel to the commit and take *its*
     // message: an annotated tag is an object with a message of its own, and
-    // reusing that one instead would be silently plausible. The two rows must
-    // land on the same id as each other.
+    // reusing that one instead would be silently plausible. Stock lands
+    // `fd02a19099…` for both. The port peels the lightweight tag and not the
+    // annotated one, which is the first row's divergence.
     commit(out, Shape::Branched, &["commit", "--allow-empty", "-C", "v0.2.0"]);
     commit(out, Shape::Branched, &["commit", "--allow-empty", "-C", "v0.1.0"]);
 
     // `-C` with `--reset-author`, one of the three places `--reset-author` is
-    // legal. The message is borrowed and the identity is not, so the result
-    // differs from a plain `-C HEAD` by the author line alone.
+    // legal — and a **negative** pin rather than the difference it looks like.
+    // `-C` borrows the author identity along with the message, `env::harden`
+    // pins that identity to the same values the borrowed commit already
+    // carries, and so the replacement replaces nothing: this row, a plain
+    // `-C HEAD` and the `--cleanup=verbatim` row below all land on
+    // `ad8247e1ed…`. What it measures is that `--reset-author` is honoured and
+    // consults the pinned environment rather than the clock; a port that took
+    // the author date from the wall clock would fail it every second.
     commit(out, Shape::Dirty, &["commit", "-C", "HEAD", "--reset-author"]);
     // `-C` takes the message without an editor and `-c` runs one over it, so
-    // under `verbatim` the two diverge by the whole status block — including the
-    // `# Date:` line git adds when the borrowed author date differs from the
-    // committer date, which is deterministic here only because `env::harden`
-    // pins both.
+    // under `verbatim` the two diverge by the whole status block —
+    // `ad8247e1ed…` against `9ab7dceeec…`. `-c`'s buffer also carries a
+    // `# Date:` line, which git writes whenever the author date was supplied by
+    // the borrowed commit at all: both dates here are `1700000000 +0000` and the
+    // line still appears, so it is not a difference between them.
     commit(out, Shape::Dirty, &["commit", "-C", "HEAD", "--cleanup=verbatim"]);
     commit(out, Shape::Dirty, &["commit", "-c", "HEAD", "--cleanup=verbatim"]);
 
@@ -285,10 +366,11 @@ fn cleanup_bytes(out: &mut Vec<Case>) {
     }
 
     // A message that is whitespace and nothing else. Under the default it is
-    // empty and the commit is refused; under `verbatim` it is four bytes and the
-    // commit is written with them. The pair is the sharpest statement of what
-    // `verbatim` means: the emptiness test runs on the message *after* cleanup,
-    // so a port that trims before testing refuses a commit stock writes.
+    // empty and the commit is refused; under `verbatim` it is six bytes and the
+    // commit is written with them (`edcecd4d3e…`). The pair is the sharpest
+    // statement of what `verbatim` means: the emptiness test runs on the message
+    // *after* cleanup, so a port that trims before testing refuses a commit
+    // stock writes — which is what the port does.
     piped_refusal(out, Shape::Dirty, &["commit", "-F", "-"], MSG_WS_ONLY);
     piped(out, Shape::Dirty, &["commit", "--cleanup=verbatim", "-F", "-"], MSG_WS_ONLY);
     // ...and `--allow-empty-message` lets the trimmed version through, which is
@@ -302,9 +384,36 @@ fn cleanup_bytes(out: &mut Vec<Case>) {
 
     // A message with no final newline. Under `verbatim` the object ends in `e`;
     // under the default git terminates the line. This is the whole difference
-    // between the two ids — one byte, in a position no renderer shows.
+    // between the two ids — one byte, in a position no renderer shows, and it
+    // is where the port diverges (`756a48e511…` against `0f4e1882a4…`).
     piped(out, Shape::Dirty, &["commit", "--cleanup=verbatim", "-F", "-"], MSG_NO_NEWLINE);
     piped(out, Shape::Dirty, &["commit", "-F", "-"], MSG_NO_NEWLINE);
+    // The two controls that localise that byte, both of which the port passes.
+    //
+    // `-m` under the same mode: git terminates an argument-supplied message
+    // before cleanup ever sees it, so `verbatim` has no final newline to
+    // suppress and the port agrees (`5404311323…`). The defect is reachable
+    // only when the message arrives from a file.
+    commit(out, Shape::Dirty, &["commit", "--cleanup=verbatim", "-m", "one line"]);
+    // Trailing spaces on an argument-supplied subject, which `verbatim` *does*
+    // have to keep — so the port's `verbatim` is not simply ignored, it is
+    // wrong about the terminator specifically.
+    commit(out, Shape::Dirty, &["commit", "--cleanup=verbatim", "-m", "subj   "]);
+    // Adding a trailer re-terminates the message whatever the mode says: `-s`
+    // over the unterminated payload lands `5999315849…` under `verbatim` and
+    // under the default alike. That is why the byte above survives in practice
+    // — every signed-off commit takes the other path.
+    piped(out, Shape::Dirty, &["commit", "-s", "--cleanup=verbatim", "-F", "-"], MSG_NO_NEWLINE);
+    piped(out, Shape::Dirty, &["commit", "-s", "-F", "-"], MSG_NO_NEWLINE);
+
+    // Trailing whitespace on the subject line, across the four modes. Three of
+    // them collapse to `subject\n\nbody\n`; `verbatim` keeps `subject   ` and
+    // the tab. The port agrees on all four, which is what makes the
+    // final-newline row above a defect in one rule rather than in the mode.
+    for mode in ["verbatim", "whitespace", "strip", "default"] {
+        let flag = format!("--cleanup={mode}");
+        piped(out, Shape::Dirty, &["commit", &flag, "-F", "-"], MSG_TRAILING_WS);
+    }
 
     // Comment lines with no editor: the default cleanup for a *supplied*
     // message is `whitespace`, not `strip`, so both lines survive and the commit
@@ -393,16 +502,22 @@ fn scissors_and_editor(out: &mut Vec<Case>) {
         MSG_COMMENT_ONLY,
     );
 
+    // The anchor for the three rows below: the prepared buffer with nothing
+    // added to it, committed verbatim. `b9205de8ad…`, whose message is
+    // `buffer`, a blank line, and the fifteen comment lines of the status
+    // block. Without this row in the corpus the equivalence the `-v` rows
+    // assert has nothing to be equal *to*.
+    commit(out, Shape::Dirty, &["commit", "-m", "buffer", "-e", "--cleanup=verbatim"]);
     // `--status`/`--no-status` as *flags*. `commit_family.rs` reaches the same
     // decision through `commit.status` and only alongside a template; these are
     // the argv spelling, and under `verbatim` the difference is the whole
-    // seventeen-line status block, so the two ids are far apart.
+    // fifteen-line status block, so this id (`d02fc7280e…`) is far from the
+    // anchor's.
     commit(out, Shape::Dirty, &["commit", "-m", "buffer", "-e", "--cleanup=verbatim", "--no-status"]);
     // `-v` and `-vv` append a diff below a cut line that git removes *whatever*
-    // the cleanup mode says. So both of these must land on the same id as the
-    // plain `-e --cleanup=verbatim` buffer — a port that let the patch through
-    // would commit a message containing one, and would still print a plausible
-    // summary line.
+    // the cleanup mode says. Both land on the anchor's `b9205de8ad…` — measured,
+    // not assumed — so a port that let the patch through would commit a message
+    // containing one while still printing a plausible summary line.
     commit(out, Shape::Dirty, &["commit", "-m", "buffer", "-e", "--cleanup=verbatim", "-v"]);
     commit(out, Shape::Dirty, &["commit", "-m", "buffer", "-e", "--cleanup=verbatim", "-v", "-v"]);
 }
@@ -636,10 +751,12 @@ fn author_date(out: &mut Vec<Case>) {
 ///
 /// `commit-tree` writes the message it is given, byte for byte, with no cleanup
 /// stage and no editor — it does not even append a final newline. So the same
-/// four payloads that separate the cleanup modes in `commit` must **all** pass
-/// through unchanged here, and the pairing is what localises a defect: a port
-/// whose `commit-tree` keeps a `NUL` out and whose `commit` lets one in has the
-/// check in one writer and not the other, which no single-verb case could say.
+/// payloads that separate the cleanup modes in `commit` must **all** pass
+/// through unchanged here, and the pairing is what localises a defect. Both
+/// halves of that turned out to be real: the port's `commit-tree` keeps a `NUL`
+/// out while its `commit` lets one in, and its `commit-tree` writes a
+/// whitespace-only message while its `commit --cleanup=verbatim` refuses one.
+/// Neither could be said by a single-verb case.
 ///
 /// `commit_family.rs` owns `commit-tree`'s tree spellings, parent list,
 /// `-m`/stdin equivalence and `i18n.commitEncoding`; none of its payloads
@@ -655,8 +772,17 @@ fn commit_tree_bytes(out: &mut Vec<Case>) {
     ct(out, &["commit-tree", "HEAD^{tree}"], MSG_CRLF);
     // Comment line, trailing spaces and trailing blanks, all kept.
     ct(out, &["commit-tree", "HEAD^{tree}"], MSG_MESSY);
+    // Whitespace and nothing else, which `commit-tree` has no emptiness test to
+    // apply: both sides write `432765fcc2…`. Paired with the `commit
+    // --cleanup=verbatim` row above, which the port refuses, this says the
+    // port's object writer is right and its emptiness test runs too early.
+    ct(out, &["commit-tree", "HEAD^{tree}"], MSG_WS_ONLY);
     // The one payload `commit-tree` refuses, with the same `error:` line
-    // `commit` uses and exit 1 rather than 128.
+    // `commit` uses and exit 1 rather than 128 — and with no
+    // `fatal: failed to write commit object` after it, which `commit` adds.
+    // **Both sides refuse here**, while the port's `commit` accepts the same
+    // bytes, so the pairing localises the missing check to one of the port's
+    // two commit writers.
     out.push(Case {
         compare_stderr: true,
         ..Case::with_stdin("commit-tree", &["commit-tree", "HEAD^{tree}"], Shape::Linear, MSG_NUL)

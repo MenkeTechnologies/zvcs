@@ -3,21 +3,34 @@
 //!
 //! # The support question, answered first
 //!
-//! **The port supports SHA-256 completely, and byte-identically.** That was
-//! established before a case was written, because the whole shape of this file
-//! depends on it. Measured by hand against stock 2.55.0 and
-//! `target/debug/git`, in two repositories built the same way:
+//! **The port creates, writes and reads a SHA-256 repository, byte-identically to
+//! stock, across the whole create-hash-add-commit-read-fsck path.** It does not
+//! refuse `--object-format=sha256` and it does not produce different ids. That
+//! is the premise the whole shape of this file rests on, so it is the first
+//! thing re-measured by hand, against stock 2.55.0 and `target/debug/git`, in
+//! two repositories built by the same script under this crate's hermetic
+//! environment:
 //!
 //! ```text
-//! $ git init --object-format=sha256 r && cd r
+//! $ git init --object-format=sha256 r && cd r        # rc 0 on both sides
 //! $ git rev-parse --show-object-format
 //! sha256                                                    # both sides
-//! $ printf 'hi\n' | git hash-object -w --stdin
+//! $ cat .git/config
+//! [extensions] objectformat = sha256 / [core] repositoryformatversion = 1  # both
+//! $ printf 'hi\n' > f.txt; printf 'hi\n' | git hash-object -w --stdin
 //! 96c18f0297e38d01f4b2dacddea4259aea6b2961eb0822bd2c0c3f6029030045   # both
-//! $ git add f.txt && git commit -m x && git rev-parse HEAD
-//! a1299389c9311ede9197acb029ce2f818d4fef355a08e9248cd706251857ef7d   # both
-//! $ git ls-tree HEAD && git fsck                            # identical, clean
+//! $ git add f.txt && git commit -q -m x && git rev-parse HEAD
+//! c56fc38f92e3ca8fe5bc383626414e5289a101e69f6050f3dc60fb1e779f90f7   # both
+//! $ git ls-tree HEAD
+//! 100644 blob 96c18f0297e38d…30045	f.txt                  # both
+//! $ git fsck                                        # silent, rc 0 on both
 //! ```
+//!
+//! That commit id is a property of that transcript — the file content, the
+//! `master` branch name `init` chose, and this crate's pinned identity and clock
+//! — and it is quoted only so the run can be repeated. Nothing in this file
+//! depends on it. [`FOREIGN_COMMIT_SHA256`], which several groups do depend on,
+//! is a different SHA-256 commit id and has its own provenance below.
 //!
 //! So this is not a "does it refuse cleanly" file. Both implementations write
 //! and read SHA-256 objects, and the interesting surface is the *boundary*:
@@ -69,10 +82,28 @@
 //! * **`misc_commands.rs`** owns one case, `init-db --object-format=bogus`.
 //!
 //! And the structural sibling: **`ref_storage.rs`** asks what a repository
-//! declaring `extensions.refStorage = reftable` over a files backend does, and
-//! found the declaration ignored rather than refused. [`declared_sha256`] is
-//! the same experiment on the other extension, and the answer is different and
-//! worse — see defect 1.
+//! declaring `extensions.refStorage = reftable` over a files backend does.
+//! [`declared_sha256`] is the same experiment on the other extension, and the
+//! two answers are not the same shape — re-measured side by side on a
+//! `Shape::Linear` replica:
+//!
+//! ```text
+//! extensions.refStorage = reftable  (over a files store)
+//!   rev-parse --show-ref-format     stock: reftable    port: files
+//!   for-each-ref                    stock: (empty, 0)  port: the loose refs, 0
+//!   → stock honours the declaration and finds an empty reftable;
+//!     the PORT ignores it and serves the files backend anyway.
+//!
+//! extensions.objectFormat = sha256  (over a SHA-1 store)
+//!   rev-parse --show-object-format  stock: sha256      port: sha256
+//!   for-each-ref                    stock: 0 + warning port: 1
+//!   → BOTH honour the declaration, both then fail to read the 40-hex refs,
+//!     and they disagree about how to fail — and about `gc`, see defect 3.
+//! ```
+//!
+//! So the extension namespace is not handled uniformly by the port: one member
+//! of it is ignored, the other is obeyed. That contrast is why running the
+//! experiment twice on two extensions was worth the cases.
 //!
 //! # What a single invocation can and cannot reach here
 //!
@@ -110,13 +141,18 @@
 //! $ git init --object-format=sha256 r && cd r && ...commit...
 //! $ git update-ref refs/heads/n 4b825dc642cb6eb9a060e54bf8d69288fbee4904
 //! stock: fatal: 4b825dc642cb6eb9a060e54bf8d69288fbee4904: not a valid SHA1   (rc 128)
+//!        .git/refs/heads/n does not exist
 //! port : (silent)                                                            (rc 0)
 //! $ cat .git/refs/heads/n
 //! port : 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+//! $ cat .git/logs/refs/heads/n
+//! port : 0000000000000000000000000000000000000000 4b825dc642cb…e4904 zvcs parity …
 //! ```
 //!
-//! A 40-hex value now sits in a 64-hex repository, with a reflog entry to
-//! match, and **neither implementation can read it afterwards.** This is the
+//! A 40-hex value now sits in a 64-hex repository, with a reflog entry whose
+//! *old* value is a 40-zero null oid rather than the 64-zero one that
+//! repository's format calls for, and **neither implementation can read it
+//! afterwards.** This is the
 //! one failure mode the corpus should care about most: a refusal that becomes
 //! an acceptance produces a repository that is not a repository. The trigger is
 //! narrow — `4b825dc6…` is the SHA-1 empty tree, which the port's object
@@ -139,28 +175,40 @@
 //!         right: Sha256                                                      (rc 101)
 //! ```
 //!
-//! The same panic fires from `update-ref --stdin`, from `cat-file -t/-p/-s`,
-//! from `ls-tree`, from `rev-list`, from `log`, from `diff` and from `cat-file
-//! --batch-check` reading the oid off stdin, and it fires **in both
-//! directions** (`left: Sha256 / right: Sha1` when a 40-hex oid reaches a
-//! declared-SHA-256 repository). [`wrong_width_oid`] is that surface. Note the
-//! contrast the group is built to show: `mktree`, `mktag`, `commit-tree`,
-//! `read-tree`, `branch`, `tag`, `notes`, `replace`, `reset` and `cherry-pick`
-//! all reject the same oid identically on both sides, so the defect is in one
-//! lookup path and not in width validation generally.
+//! The same panic fires from `update-ref --stdin` in all three of its
+//! grammars, from `cat-file -t/-p/-s`, from `ls-tree`, from `rev-list`, from
+//! `log` and from `cat-file --batch`/`--batch-check` reading the oid off stdin,
+//! and it fires **in both directions** (`left: Sha256 / right: Sha1` when a
+//! 40-hex oid reaches a declared-SHA-256 repository). [`wrong_width_oid`] is
+//! that surface. Two contrasts the group is built to show, both re-measured:
+//!
+//! * `mktree`, `mktag`, `commit-tree`, `read-tree`, `branch`, `tag`, `notes`,
+//!   `replace`, `reset`, `checkout`, `diff`, `show`, `merge-base`, `cherry-pick`
+//!   and `rev-parse --verify` all reject the identical 64-hex oid at the
+//!   identical exit code with byte-identical stderr, so the defect is in one
+//!   lookup path and not in width validation generally.
+//! * The **same `update-ref`** given a 40-hex oid that is simply absent refuses
+//!   cleanly on both sides (`fatal: update_ref failed for ref 'refs/heads/n':
+//!   trying to write ref 'refs/heads/n' with nonexistent object <oid>`, rc 128,
+//!   byte-identical). So the trigger is the *width*, not the absence — that pair
+//!   is the group's floor and it passes.
 //!
 //! **3. A repository declaring a format its objects are not is not refused —
 //! it is half-read, differently.** Stock treats the SHA-1 object store as
 //! corruption of a SHA-256 repository and dies at 128 with a message naming
-//! what it choked on (`fatal: unknown index entry format 0xb7fd0000`, `fatal:
-//! your current branch appears to be broken`, `error: bad index file sha1
-//! signature`). The port reports a gitoxide parse failure and exits 1. The
-//! exit codes disagree on `status`, `log`, `ls-files`, `diff`, `fsck`,
-//! `branch`, `symbolic-ref`, `for-each-ref` (stock exits **0** there, with
-//! `warning: ignoring broken ref`), `write-tree`, `repack`, `prune` and `gc` —
-//! and `gc` is a third acceptance-where-git-refuses: stock exits 128 with
-//! `fatal: failed to run repack`, the port exits **0** and writes
-//! `.git/info/refs` and `.git/objects/info/packs` into the broken repository.
+//! what it choked on (`fatal: unknown index entry format 0x0f3c0000`, `fatal:
+//! your current branch appears to be broken`, `fatal: bad object
+//! refs/heads/main`). The port reports a gitoxide parse or checksum failure and
+//! exits 1. The exit codes disagree on `status`, `log`, `ls-files`, `diff`,
+//! `fsck`, `branch`, `symbolic-ref` (read *and* write), `show-ref`,
+//! `for-each-ref` (stock exits **0** there, with `warning: ignoring broken
+//! ref`), `write-tree`, `add --dry-run`, `update-index --refresh`, `repack`,
+//! `prune` and `gc` — and `gc` is a third acceptance-where-git-refuses: stock
+//! exits 128 with `fatal: bad object refs/heads/main` / `fatal: failed to run
+//! repack` and writes nothing, the port exits **0** and creates
+//! `.git/info/refs` and `.git/objects/info/packs` in the broken repository.
+//! Two more cells diverge on stdout alone, at equal exit codes — `worktree list`
+//! and `bundle create -` — and are described in [`declared_sha256`].
 //!
 //! **4. `clone` does not filter the format extensions out of `-c`, so one
 //! setting produces a repository neither implementation can read.** The
@@ -205,11 +253,16 @@
 //! '<x>'`, `fatal: repo version is 0, but v1-only extension found`, and the
 //! agreeing half of [`wrong_width_oid`], where the message names the oid.
 //!
-//! The reader groups on a declared-SHA-256 repository use [`Case::new`]: there
-//! the question is the exit code and what was left on disk, both of which
-//! already diverge, and adding stderr would only restate a difference in prose
-//! that the harness's standing policy does not treat as a compatibility
-//! surface.
+//! The `update-ref` 40-hex floor is strict for the same reason. The reader groups
+//! on a declared-SHA-256 repository are **not** strict, and here the reason is
+//! stronger than policy: **their stderr is not reproducible on either side.**
+//! Stock's `status`/`ls-files`/`diff`/`write-tree` message is `fatal: unknown
+//! index entry format 0x…`, and those four bytes are stat data read out of the
+//! index, so three runs of one command gave `0x0f3c0000`, `0x0f450000` and
+//! `0x0f460000`. The port's is `Shared index checksum mismatch: Hash was <64
+//! hex>, but should have been <64 hex>`, which moves for the same reason. A
+//! strict case there would fail against itself. Exit code and post-state are
+//! what those cases measure, and both already diverge.
 //!
 //! Every case carrying stdin is [`Case::new`] whether or not its message is the
 //! answer, and not by choice: `Case::with_stdin` is the only constructor that
@@ -234,10 +287,19 @@
 //! * **`bundle create --version=3` recording `@object-format=sha256`.** It
 //!   would need a SHA-256 fixture to create from. [`BUNDLE_SHA256`] measures
 //!   the *reading* half only.
-//! * **`bundle verify -`'s stderr.** Stock names the stream `<stdin>` and the
-//!   port names it `-`. That is a bundle-naming difference, not a hash one, and
-//!   it belongs to `interchange.rs`; the case here is not strict so it does not
-//!   silently absorb someone else's finding.
+//! * **`bundle verify -`'s stderr.** Stock writes `<stdin> is okay` and the port
+//!   writes `- is okay`, both on stderr, with byte-identical stdout and exit 0
+//!   on both sides — measured. That is a bundle-naming difference, not a hash
+//!   one, and it belongs to `interchange.rs`; the case here is not strict so it
+//!   does not silently absorb someone else's finding.
+//! * **Whether the port's *reading* of a genuine SHA-256 repository stays
+//!   correct as it is edited.** The support check at the top of this header is
+//!   one linear transcript: `init`, `hash-object -w`, `add`, `commit`,
+//!   `rev-parse`, `ls-tree`, `fsck`, identical on both sides. Everything past a
+//!   single invocation in that repository — a second commit, a merge, a rebase,
+//!   a `gc` — is a sequence and is not measured anywhere in this file. The claim
+//!   made here is exactly the transcript, not "SHA-256 is fully supported under
+//!   every workflow".
 
 use crate::fixture::Shape;
 use crate::runner::{Case, ConfigEntry, ConfigScope};
@@ -259,11 +321,18 @@ const EMPTY_BLOB_SHA1: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 const EMPTY_BLOB_SHA256: &str =
     "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813";
 
-/// A 64-hex oid that is a real SHA-256 commit id — of the single commit in an
-/// `init --object-format=sha256` repository built under this harness's pinned
-/// identity and clock — and is therefore *not* one of the special constants
-/// above. Used to separate "the port mishandles any wrong-width oid" from "the
-/// port mishandles the empty-tree constant", which are different defects.
+/// A 64-hex oid that is a real SHA-256 commit id, and therefore *not* one of the
+/// special constants above. Used to separate "the port mishandles any
+/// wrong-width oid" from "the port mishandles the empty-tree constant", which
+/// are different defects.
+///
+/// Its provenance is checkable rather than remembered: it is the commit
+/// [`BUNDLE_SHA256`] names for both `refs/heads/master` and `HEAD`, and that
+/// bundle was fed to stock inside a genuine `init --object-format=sha256`
+/// repository, where `bundle verify -` answered `The bundle records a complete
+/// history. / The bundle uses this hash algorithm: sha256` at exit 0 and
+/// `index-pack --stdin` accepted the pack behind it. `tests::foreign_commit_is_the_bundle_head`
+/// pins the two against each other so the constant cannot drift from the bytes.
 const FOREIGN_COMMIT_SHA256: &str =
     "a1299389c9311ede9197acb029ce2f818d4fef355a08e9248cd706251857ef7d";
 
@@ -324,22 +393,29 @@ pub fn cases(out: &mut Vec<Case>) {
 /// --show-object-format: <x>` is the only place the parser says what it read,
 /// and the empty one is not the same token as the bogus one.
 ///
-/// Run across four shapes because the answer must be a property of the
-/// repository and not of the command: `Packed` has packfiles, `BehindRemote`
-/// has a second repository inside it, and `Merged` has a multi-parent history —
-/// none of which may change the answer.
+/// The **mode** is a property of the command and the **answer** is a property of
+/// the repository, so the two are varied separately rather than crossed: all
+/// four modes on `Shape::Linear`, and the bare flag on the three shapes that
+/// could plausibly disturb the answer — `Packed` has packfiles, `Branched` has
+/// tags and a second branch, `Merged` has a multi-parent history. The full
+/// four-by-four cross was here and was cut: twelve of its sixteen cells repeat a
+/// measurement another cell already makes, and nothing in git makes the mode
+/// parser depend on the shape.
 ///
-/// Measured on stock 2.55.0: all four modes print `sha1` and exit 0, and every
-/// invalid spelling — `bogus`, the empty string, `SHA1` in the wrong case and
-/// `sha-256` with a hyphen — exits 128 with the message above. The port agreed
-/// on each one, including from `.git` and from a subdirectory and alongside
-/// `--show-ref-format` in either order.
+/// Measured on stock 2.55.0 and reproduced against `target/debug/git`: all four
+/// modes print `sha1` and exit 0, and every invalid spelling — `bogus`, the
+/// empty string, `SHA1` in the wrong case and `sha-256` with a hyphen — exits
+/// 128 with `fatal: unknown mode for --show-object-format: <x>` on stderr,
+/// byte-identically on both sides. The port also agreed from inside `.git`, from
+/// a subdirectory, and alongside `--show-ref-format` in either order (`sha1`
+/// then `files`, and `files` then `sha1`).
 fn show_object_format(out: &mut Vec<Case>) {
     for mode in ["", "=storage", "=input", "=output"] {
         let flag = format!("--show-object-format{mode}");
-        for shape in [Shape::Linear, Shape::Branched, Shape::Packed, Shape::Merged] {
-            out.push(Case::new("rev-parse", &["rev-parse", &flag], shape));
-        }
+        out.push(Case::new("rev-parse", &["rev-parse", &flag], Shape::Linear));
+    }
+    for shape in [Shape::Branched, Shape::Packed, Shape::Merged] {
+        out.push(Case::new("rev-parse", &["rev-parse", "--show-object-format"], shape));
     }
 
     // The refusal names the mode it could not parse, so the message is the
@@ -386,14 +462,30 @@ fn show_object_format(out: &mut Vec<Case>) {
 /// $ GIT_DEFAULT_HASH=bogus git init sub
 /// fatal: unknown hash algorithm 'bogus'                             (rc 128)
 /// $ git -c init.defaultObjectFormat=bogus init sub
+/// warning: unknown hash algorithm 'bogus'
 /// Initialized empty Git repository in .../sub/.git/                 (rc 0)
-/// $ grep -i objectformat sub/.git/config      # nothing: silently ignored
+/// $ grep -i objectformat sub/.git/config      # nothing: the value is dropped
 /// ```
 ///
-/// Both sides agreed on every cell of that, including the silent ignore. The
-/// one difference the group did surface is a **state** one: with
-/// `GIT_DEFAULT_HASH=bogus`, stock creates the `sub` directory before dying and
-/// the port does not.
+/// So the same unusable value is fatal from the environment and a *warning* from
+/// the configuration key, and the repository is created anyway with the default
+/// algorithm. Both sides reproduce both halves, warning included.
+///
+/// The one difference the group surfaces is a **state** one, and it is not
+/// specific to `bogus`: on every value the environment variable rejects —
+/// `bogus`, the empty string, and `SHA256` in the wrong case — stock creates the
+/// `sub` directory before dying and the port does not.
+///
+/// **The repository-scoped spelling is a negative control and nothing else.**
+/// `init.defaultObjectFormat` written into the *current* repository's
+/// `.git/config` has no effect on `git init sub` at all: `sha256`, `sha1` and
+/// `bogus` all produce a plain SHA-1 `sub` with no `objectformat` key and no
+/// warning, on both sides, because `init` does not consult the config of the
+/// repository it happens to be standing in. Two of those three cases are kept —
+/// `sha256`, whose effect would be visible if the key were read, and `bogus`,
+/// whose *warning* would be visible if the key were read and validated. The
+/// `sha1` spelling was dropped: its outcome is the default outcome, so no
+/// implementation can pass the other two and fail it.
 ///
 /// `GIT_DEFAULT_HASH` is safe to set from a case — [`crate::env::harden`] does
 /// not pin it, and `harden` starts from `env_clear`, so setting it is purely
@@ -433,13 +525,20 @@ fn default_hash_env(out: &mut Vec<Case>) {
             .with_env(&[("GIT_DEFAULT_HASH", "sha1")]),
     );
 
-    // The configuration key, from the command line and from the repository
-    // file. `bogus` is kept because being *ignored* is the finding.
+    // The configuration key from the command line, where it is the real lever:
+    // `sha256` creates a SHA-256 repository, `sha1` a SHA-1 one, and `bogus`
+    // warns and falls back — all three on both sides.
     for value in ["sha256", "sha1", "bogus"] {
         out.push(
             Case::new("init", &["init", "sub"], Shape::Linear)
                 .with_config(&[("init.defaultObjectFormat", value)]),
         );
+    }
+    // And from the repository the command is standing in, where it is not a
+    // lever at all — see the header. Two values rather than three: `sha256`
+    // would show the key being read, `bogus` would show it being read and
+    // validated, and `sha1` would show nothing either way.
+    for value in ["sha256", "bogus"] {
         out.push(
             Case::new("init", &["init", "sub"], Shape::Linear).with_scoped_config(vec![
                 ConfigEntry::set(ConfigScope::Repo, "init.defaultObjectFormat", value),
@@ -468,13 +567,16 @@ fn default_hash_env(out: &mut Vec<Case>) {
 /// `--object-format` handed to the verbs that **do not have it**.
 ///
 /// Git 2.55 accepts `--object-format` on `init`, `init-db`, `index-pack`,
-/// `verify-pack` and `show-index`, and on no other verb — checked by handing
-/// `--object-format=sha1` to nineteen of them and reading which answered
-/// `unknown option`. (`rev-parse` is the one that does not, and it is not an
-/// acceptance: `rev-parse` passes anything it does not recognise through as a
-/// revision.) It is not an option of `clone`, of `hash-object` or of
-/// `cat-file`, and the refusal is the full `usage:` block — twenty-odd lines of
-/// option list that a port either reproduces or does not.
+/// `verify-pack` and `show-index`, and on no other verb — re-checked by handing
+/// `--object-format=sha1` to twenty-seven of them and reading the first line
+/// back. Twenty answered `error: unknown option \`object-format=sha1'`;
+/// `log` and `diff` refuse in their own words (`fatal: unrecognized argument:`
+/// and `error: invalid option:`); and `rev-parse` is the one that neither
+/// accepts nor refuses, because it passes anything it does not recognise
+/// through as a revision and echoes it. So it is not an option of `clone`, of
+/// `hash-object` or of `cat-file` — the three this group uses — and there the
+/// refusal is the full `usage:` block, twenty-odd lines of option list that a
+/// port either reproduces or does not.
 ///
 /// This is here because it is the cheapest possible way for a port to be wrong
 /// in the most damaging direction: *inventing* `--object-format` on
@@ -524,31 +626,69 @@ fn format_flag_where_git_has_none(out: &mut Vec<Case>) {
 /// This is the structural mirror of `ref_storage.rs`'s
 /// `extensions.refStorage = reftable` experiment, and the reason it is worth
 /// running twice on two different extensions is that the two answers are not
-/// the same. `refStorage` is *ignored*: the declaration changes nothing and the
-/// files backend keeps working. `objectFormat` is not ignored — it changes the
-/// width of every oid the reader expects, so the whole object store and the
-/// index become unreadable at once, and the two implementations disagree about
-/// what to do next.
+/// the same — the module header sets the two transcripts side by side. In one
+/// sentence: the port *ignores* `refStorage` and *obeys* `objectFormat`. And
+/// obeying it is the harder case, because it changes the width of every oid the
+/// reader expects, so the whole object store and the index become unreadable at
+/// once and the two implementations then disagree about what to do next.
 ///
-/// Stock's answers, all measured by hand in a copy of `Shape::Linear` with the
-/// two keys appended to `.git/config`:
+/// Stock's answers, all measured by hand in a replica of `Shape::Linear` with
+/// the two keys appended to `.git/config`:
 ///
 /// ```text
 /// rev-parse --show-object-format  sha256                                    (rc 0)
-/// status --porcelain              fatal: unknown index entry format 0xb7fd0000    (128)
+/// status --porcelain              fatal: unknown index entry format 0x0f3c0000    (128)
 /// log --oneline                   fatal: your current branch appears to be broken (128)
 /// for-each-ref                    warning: ignoring broken ref refs/heads/main    (0)
 /// branch --list                   fatal: failed to resolve HEAD as a valid ref    (128)
 /// symbolic-ref HEAD               fatal: No such ref: HEAD                        (128)
-/// gc --quiet                      fatal: failed to run repack                     (128)
-/// count-objects -v                garbage: 5                                      (0)
+/// symbolic-ref HEAD refs/heads/x  (silent — and HEAD is rewritten)              (0)
+/// gc --quiet                      fatal: bad object refs/heads/main
+///                                 fatal: failed to run repack                     (128)
+/// count-objects -v                warning: garbage found: .git/objects/…          (0)
 /// cat-file -t HEAD                fatal: Not a valid object name HEAD             (128)
+/// fsck                            error: refs/heads/main: badRefContent: …        (128)
 /// ```
+///
+/// **The `0x…` in the `status` line is not reproducible and no case compares
+/// it.** It is four bytes of stat data read out of the index as a format word,
+/// so it moves with the fixture: three runs of that one command gave
+/// `0x0f3c0000`, `0x0f450000` and `0x0f460000`. The port's messages carry a
+/// rolling hash for the same reason (`Shared index checksum mismatch: Hash was
+/// <64 hex>…`). Every case in this group is therefore [`Case::new`] and scored on
+/// stdout, exit code and post-state; the stderr above is quoted to identify the
+/// behaviour, never asserted.
 ///
 /// The port answers exit 1 with a gitoxide message wherever stock answers 128,
 /// and — the finding that matters — exit **0** where stock answers 128 for
 /// `gc`, having written `.git/info/refs` and `.git/objects/info/packs` into the
-/// repository. The `for-each-ref` cell is the reverse: stock 0, port 1.
+/// repository while stock wrote neither. Three cells run the other way, stock
+/// succeeding where the port refuses: `for-each-ref` (stock 0 with a warning,
+/// port 1), `symbolic-ref HEAD refs/heads/other` (stock 0 and `HEAD` becomes
+/// `ref: refs/heads/other`, port 1 and `HEAD` is untouched), and `remote show
+/// -n origin` in [`cross_format_transport`]. The `symbolic-ref` *write* is the
+/// one of those three with a post-state to compare, which is why it is here
+/// beside the read.
+///
+/// Two cells diverge on **stdout** rather than on status, and both are easy to
+/// miss because the exit codes agree.
+///
+/// `worktree list` exits 0 on both sides and prints one line, and the line is
+/// not the same: stock renders the broken checkout as
+/// `<path> edfab1b (error)` — the abbreviated 40-hex commit it cannot resolve —
+/// where the port renders `<path> 0000000 (error)`. Same width, same `(error)`
+/// suffix, different id. A reader diffing exit codes sees nothing.
+///
+/// `bundle create - --all` is the other, and it is the one to read twice. Both
+/// sides exit 128. Stock writes
+/// nothing at all (`fatal: bad object refs/heads/main`). The port writes
+/// thirty-nine bytes to stdout first —
+/// `# v3 git bundle\n@object-format=sha256\n\n` — and then refuses with
+/// `fatal: Refusing to create empty bundle.` So a caller redirecting that
+/// stdout to a file is left holding a bundle header that declares SHA-256 over
+/// a store that is SHA-1, with no pack behind it. It is the smallest
+/// cross-format artefact in this file and the only one produced on the way out
+/// of a refusal.
 ///
 /// The group is deliberately wide rather than deep. A port could plausibly get
 /// any one verb right by accident; what it cannot do by accident is agree with
@@ -581,6 +721,13 @@ fn declared_sha256(out: &mut Vec<Case>) {
         &["branch", "--list"][..],
         &["branch", "-a", "-v"][..],
         &["symbolic-ref", "HEAD"][..],
+        // The write, not the read. Stock rewrites `HEAD` to `ref:
+        // refs/heads/other` and exits 0 without ever looking at an object; the
+        // port refuses at 1 because it resolves `refs/heads/main` first and
+        // cannot parse a 40-hex value in a repository declaring 64. The
+        // divergence is a file on disk, which is what makes it worth a case of
+        // its own beside the read above.
+        &["symbolic-ref", "HEAD", "refs/heads/other"][..],
         &["rev-list", "--all"][..],
         &["describe", "--always"][..],
         &["reflog"][..],
@@ -739,11 +886,24 @@ fn wrong_width_oid(out: &mut Vec<Case>) {
         out.push(Case::strict(args[0], args, Shape::Linear));
     }
 
+    // The floor. A **40-hex** oid that is simply absent, handed to the same
+    // `update-ref` in the same SHA-1 repository: both sides refuse at 128 with
+    // `fatal: update_ref failed for ref 'refs/heads/n': trying to write ref
+    // 'refs/heads/n' with nonexistent object <oid>`, byte for byte. Without this
+    // pair the panic above would be indistinguishable from "the port panics on
+    // any oid it cannot find", and it is not — it panics on an oid of the wrong
+    // *width*, which is a different bug with a different fix.
+    for oid in [ABSENT_SHA1, "1234567890123456789012345678901234567890"] {
+        out.push(Case::strict("update-ref", &["update-ref", "refs/heads/n", oid], Shape::Linear));
+    }
+
     // `symbolic-ref` takes a *ref name*, not an oid, and 64 hex characters are
-    // a legal ref name. Stock creates the symref and exits 0; the port refuses
-    // at 1 with `Standalone references must be all uppercased`. That is a ref
-    // naming disagreement reached through this file's input, not a hash one,
-    // and it is here because the same argument reaches it.
+    // a legal ref name. Stock creates the symref and exits 0, leaving
+    // `ref: a1299389…57ef7d` in `.git/refs/heads/x`; the port refuses at 1 with
+    // `zvcs: symbolic-ref: cannot address reference "a1299389…" through
+    // gitoxide: Standalone references must be all uppercased, like 'HEAD'`.
+    // That is a ref naming disagreement reached through this file's input, not a
+    // hash one, and it is here because the same argument reaches it.
     out.push(Case::new("symbolic-ref", &["symbolic-ref", "refs/heads/x", foreign], Shape::Linear));
 
     // stdin-driven object construction with the foreign oid embedded: mktree
@@ -802,25 +962,34 @@ fn wrong_width_oid(out: &mut Vec<Case>) {
 /// stock: fatal: Needed a single revision                                (rc 128)
 /// port : 6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321 (rc 0)
 /// $ git cat-file -e 6ef19b41…                    stock 128 / port 0
-/// $ git cat-file -t 6ef19b41…                    stock 128 / port 101 (panic)
+/// $ git cat-file -t|-s|-p 6ef19b41…              stock 128 / port 101 (panic)
+/// $ git ls-tree|rev-list|log 6ef19b41…           stock 128 / port 101 (panic)
 /// $ git update-ref refs/heads/n 6ef19b41…        stock 128 / port 0
 ///
-/// # And the control, four f-filled 64-hex characters wide:
+/// # And the control, 64 f's — well-formed, certainly absent, memorised by nobody:
 /// $ git rev-parse --verify ffff…ffff             stock 128 / port 128  — agree
-/// $ git cat-file -t ffff…ffff                    stock 128 / port 128  — agree
+/// $ git cat-file -t|-e|-s|-p ffff…ffff           stock 128 / port 128  — agree
+/// $ git ls-tree|rev-list|log ffff…ffff           stock 128 / port 128  — agree
+/// $ git update-ref refs/heads/n ffff…ffff        stock 128 / port 101 (panic)
 /// ```
 ///
-/// The control pair is what turns this from an anecdote into a measurement: a
-/// well-formed 64-hex oid that is *not* a recognised constant is refused
-/// identically by both. So the port is not accepting foreign-width oids in
-/// general; it is accepting the two it has memorised, and defect 1 — the ref
-/// write into a genuine SHA-256 repository — is reached through exactly this
-/// door with the constants swapped.
+/// The control is what turns this from an anecdote into a measurement, and its
+/// last row is why it has to be read carefully rather than summarised. On every
+/// verb that *looks an oid up*, a well-formed 64-hex oid that is not a
+/// recognised constant is refused identically by both sides: the port is not
+/// accepting foreign-width oids in general, it is accepting the one it has
+/// memorised, and defect 1 — the ref write into a genuine SHA-256 repository —
+/// is reached through exactly that door with the constants swapped. On
+/// `update-ref` the control *does* diverge, and that is defect 2 rather than
+/// defect 1: [`wrong_width_oid`] shows the same panic from a plain SHA-256
+/// commit id, and its own 40-hex floor shows the trigger is the width and not
+/// the absence.
 ///
 /// The empty **blob** is included in both widths for the same reason and is
-/// the negative result worth recording: `cat-file -e 473a0f4c…` (SHA-256 empty
-/// blob, SHA-1 repository) agrees at 128 on both sides. Only the tree is
-/// short-circuited.
+/// the negative result worth recording: `cat-file -e|-t|-s|-p 473a0f4c…` (the
+/// SHA-256 empty blob, in a SHA-1 repository) agrees at 128 on both sides, and
+/// so do `ls-tree`, `rev-list` and `log`. Only the empty *tree* is
+/// short-circuited. Its `update-ref` row panics like every other 64-hex one.
 fn empty_tree_constants(out: &mut Vec<Case>) {
     // SHA-256 constants in a SHA-1 repository.
     for oid in [EMPTY_TREE_SHA256, EMPTY_BLOB_SHA256, ABSENT_SHA256] {
@@ -999,7 +1168,16 @@ fn cross_format_streams(out: &mut Vec<Case>) {
 
     // The bundle read *by* a repository that declares SHA-256 over SHA-1
     // objects: now the container and the declaration agree with each other and
-    // disagree with the store, which is the third corner of the square.
+    // disagree with the store, which is the third corner of the square — and it
+    // is the corner where the import **succeeds**. With the declaration in
+    // place the reader expects a 32-byte trailer, the checksum that failed above
+    // verifies, and `unbundle` exits 0 on both sides having installed
+    // `pack-1eb93f6b…0757.{pack,idx,rev}` beside the repository's five SHA-1
+    // loose objects. Both sides landed the identical three files and the
+    // identical stdout; that agreement is the case. It is also the sharpest
+    // statement in this file of what the `extensions.objectFormat` declaration
+    // actually is — not a label but the reader's whole idea of how wide a hash
+    // is, enough to let a foreign pack in.
     out.push(
         Case::with_stdin("bundle", &["bundle", "list-heads", "-"], Shape::Linear, BUNDLE_SHA256)
             .with_scoped_config(declare_sha256()),
@@ -1029,13 +1207,25 @@ fn cross_format_streams(out: &mut Vec<Case>) {
 /// ```text
 /// $ git ls-remote origin
 ///   <40-hex>  refs/heads/main                                      both, rc 0
-/// $ git fetch origin
+/// $ git fetch origin                     # and --all, --dry-run, origin main
 ///   stock: fatal: unknown index entry format 0x…                       (rc 128)
 ///   port : zvcs: fetch: The reference at "refs/heads/main" …            (rc 1)
-/// $ git push origin main
+/// $ git push origin main                 # and --dry-run
 ///   stock: fatal: refs/heads/main cannot be resolved to branch          (rc 128)
 ///   port : error: src refspec main does not match any                   (rc 1)
+/// $ git remote show -n origin
+///   both print the same four lines of stdout
+///   stock: rc 0                                port: rc 1
 /// ```
+///
+/// The `remote show -n` row is the one to notice: stock prints six lines of
+/// remote description and exits 0, and the port refuses at 1 — a verb that never
+/// needed to open an object, stopped by a declaration about objects. The three
+/// `submodule` cases below behave identically (stock 0 and silent, port 1 with
+/// `Shared index checksum mismatch`). Together with `for-each-ref` and the
+/// `symbolic-ref` write in [`declared_sha256`], that is six cells in this file
+/// where stock succeeds and the port refuses — the mirror image of `gc`, where
+/// the port succeeds and stock refuses.
 ///
 /// Two things follow, and both are recorded rather than fixed here. First,
 /// **neither side refuses at the format boundary**: `ls-remote` succeeds on
@@ -1052,6 +1242,12 @@ fn cross_format_streams(out: &mut Vec<Case>) {
 /// whether the port would push SHA-1 objects into a peer while claiming
 /// SHA-256. If the reader-side defects above are fixed, this case becomes the
 /// one that asks that question, and it is here so that it does.
+///
+/// The three `ls-remote` rows are the group's agreement half and they pass:
+/// both sides read the peer's advertisement, print its 40-hex oids into a
+/// repository that believes in 64-hex ones, and exit 0. Nothing about the local
+/// declaration reaches the wire, which is the fact the rest of the group is read
+/// against.
 fn cross_format_transport(out: &mut Vec<Case>) {
     for args in [
         &["fetch", "origin"][..],
@@ -1086,7 +1282,14 @@ fn cross_format_transport(out: &mut Vec<Case>) {
 
     // A submodule host declaring SHA-256 over SHA-1 objects: `submodule` is the
     // verb that would have to reconcile two repositories' formats, and this is
-    // the closest a single invocation gets to asking it to.
+    // the closest a single invocation gets to asking it to. All three diverge
+    // the same way and it is the direction worth noticing: **stock exits 0**
+    // with nothing on stdout — it never opens an object, so the host's lie about
+    // its own format costs it nothing — and the port exits 1 having tried to
+    // read the index (`Shared index checksum mismatch: Hash was <64 hex>…`). So
+    // a declaration the submodule machinery does not need still stops the port,
+    // which is the same over-eagerness `for-each-ref`, `remote show -n` and the
+    // `symbolic-ref` write show elsewhere in this file.
     for args in [&["submodule", "status"][..], &["submodule", "summary"][..], &["submodule"][..]] {
         out.push(
             Case::new(args[0], args, Shape::Submodule).with_scoped_config(declare_sha256()),
@@ -1446,6 +1649,24 @@ mod tests {
         assert_eq!(&BUNDLE_SHA256[split + 2..], PACK_SHA256);
     }
 
+    /// [`FOREIGN_COMMIT_SHA256`] is the commit the SHA-256 bundle literal names,
+    /// which is the whole of its provenance: a reader who wants to know where the
+    /// constant came from can index-pack the bundle into a `sha256` repository
+    /// and see it. Pinned here so an edit to either can never leave the doc
+    /// comment describing bytes that are no longer there.
+    #[test]
+    fn foreign_commit_is_the_bundle_head() {
+        let header = String::from_utf8_lossy(&BUNDLE_SHA256[..200]).into_owned();
+        assert!(
+            header.contains(&format!("{FOREIGN_COMMIT_SHA256} refs/heads/master")),
+            "bundle does not name FOREIGN_COMMIT_SHA256 as refs/heads/master"
+        );
+        assert!(
+            header.contains(&format!("{FOREIGN_COMMIT_SHA256} HEAD")),
+            "bundle does not name FOREIGN_COMMIT_SHA256 as HEAD"
+        );
+    }
+
     /// Every oid constant is the width its name claims, so a typo cannot make a
     /// "SHA-256" case quietly test a 40-hex string.
     #[test]
@@ -1478,5 +1699,6 @@ mod tests {
         }
     }
 }
+
 
 

@@ -72,21 +72,25 @@
 //!    `branch`'s argument errors, and `push`'s message and pathspec *spellings*
 //!    (`--message=`, an empty `-m`, a bare pathspec with no `--`, pathspec
 //!    magic, a pathspec file inside the repository).
-//! 6. **`stash` from a subdirectory.** The corpus runs `stash list` from `sub`
-//!    in [`Shape::Hooked`] and nothing else; `push` from a subdirectory is where
-//!    the pathspec prefix lives and `show` from one is where it must *not* be
-//!    applied.
+//! 6. **`stash` from a subdirectory.** Checked against `--list-cases`: before
+//!    this module the whole corpus had two `stash` cases with a `cwd`, `stash
+//!    list` from `sub` in [`Shape::Hooked`] and a bare `stash` from
+//!    `.remote.git` in [`Shape::BehindRemote`]. `push` from a subdirectory is
+//!    where the pathspec prefix lives and `show` from one is where it must
+//!    *not* be applied, and neither had ever been asked.
 //!
 //! # Determinism
 //!
-//! `push` and `create` mint commits at case run time, so their ids are part of
-//! what is compared. Each group below was run twice against stock 2.55.0 in
-//! identical fresh copies of a hand-built [`Shape::Stashed`] replica and the
-//! full output plus a five-probe digest (`stash list`, `status --porcelain`,
-//! `for-each-ref`, `reflog show stash`, `cat-file --batch-all-objects`) diffed
-//! clean — `stash push -p`, `stash push -m` and `stash create -u` are recorded
-//! as identical across runs. That holds only because [`crate::env`] pins both
-//! dates and both identities.
+//! `push`, `create` and `store` mint commits at case run time, so their ids are
+//! part of what is compared. Two separate checks back that up rather than one
+//! claim. The harness itself re-runs any failing case a second time and reports
+//! a side that did not reproduce itself as `zvcs-flaky`, having first confirmed
+//! that stock reproduced its own stdout and post-state; over the whole `stash`
+//! corpus that count is zero. On top of that, every case *added* here was run
+//! twice by hand against stock in identical fresh copies of a
+//! [`Shape::Stashed`] replica and the output plus a digest (`cat-file
+//! --batch-all-objects`, `stash list`, `reflog show stash`) diffed clean. That
+//! holds only because [`crate::env`] pins both dates and both identities.
 //!
 //! Two things are therefore **not** here, and are not measurable rather than
 //! merely omitted:
@@ -149,7 +153,16 @@ pub fn cases(out: &mut Vec<Case>) {
 ///   y y         both hunks stashed, entry has two parents, worktree keeps `MM notes.txt`
 ///   n y         only `notes.txt` stashed; `counter.txt` stays ` M`
 ///   q           quits at the first prompt: same result as EOF, rc 1
-///   d y         `d` skips the rest of *that file*, so the second hunk is still offered
+///   d y         `d` skips the rest of *that file*, so the second hunk is still
+///               offered — and because `counter.txt` has exactly one hunk, the
+///               entry this builds is byte-identical to the `n y` one
+///               (`320ed5a3494c73341f34c638563e623156b7af9f` both times). The
+///               case is kept for the *answer*, not for a distinct entry: a port
+///               that does not implement `d` reprompts instead of proceeding.
+///   a           `a` takes the rest of that file, then EOF at `notes.txt`'s
+///               prompt still commits what was selected (rc 0, entry
+///               `de086f0936dffc4361ce65ca6f5fc3edfb7f2ae7`) — EOF is only
+///               "No changes selected" when nothing was selected at all
 /// ```
 ///
 /// The refusals are [`Case::strict`] because "No changes selected" is on
@@ -220,7 +233,23 @@ fn patch_loop(out: &mut Vec<Case>) {
 /// `stash.showPatch=true` prints the stat **and** the patch; `stash.showStat=false`
 /// alone prints **nothing at all** and still exits 0 — which is the value a port
 /// that hardcodes the stat cannot produce. An explicit flag wins over the key in
-/// both directions, and a non-boolean value is fatal.
+/// both directions, and a non-boolean value is `fatal: bad boolean config value
+/// 'bogus' for 'stash.showstat'` at 128.
+///
+/// The untracked keys do **not** mirror their flags, which was measured rather
+/// than assumed and is what the last three cases here are for:
+///
+/// ```text
+///   -c stash.showOnlyUntracked=true  show stash@{1}   prints nothing
+///   --only-untracked                 show stash@{1}   prints extra.txt
+///   -c stash.showOnlyUntracked=true  show stash@{2}   prints the tracked stat
+///   --only-untracked                 show stash@{2}   prints nothing
+/// ```
+///
+/// `stash@{1}` is the entry with an untracked parent and `stash@{2}` the one
+/// without, so on both entries the key and the flag answer *differently*, and in
+/// opposite directions. A port that implements the key by setting the flag gets
+/// both of the config rows wrong.
 fn show_configuration(out: &mut Vec<Case>) {
     for (key, value) in [
         ("stash.showPatch", "true"),
@@ -273,13 +302,26 @@ fn show_configuration(out: &mut Vec<Case>) {
         Case::new("stash", &["stash", "show", "--only-untracked", "stash@{1}"], Shape::Stashed)
             .with_config(&[("stash.showPatch", "true")]),
     );
-    // The key on an entry that has *no* untracked parent: it must not invent one.
+    // `showIncludeUntracked` on the default entry, which has no untracked parent:
+    // measured, it adds nothing and the ordinary `notes.txt` stat is printed, so
+    // the key must not invent a parent that is not there.
     out.push(
         Case::new("stash", &["stash", "show"], Shape::Stashed)
             .with_config(&[("stash.showIncludeUntracked", "true")]),
     );
+    // The two `showOnlyUntracked` rows of the table above. On `stash@{2}` — no
+    // untracked parent — the key is measurably *ignored* and the tracked stat is
+    // printed, while the `--only-untracked` flag on the same entry prints
+    // nothing (that flag case lives in `show_option_surface` below). On
+    // `stash@{1}` — which does have one — the key prints nothing while the flag
+    // prints `extra.txt`. Both rows are needed: either one alone is consistent
+    // with "the key is the flag".
     out.push(
         Case::new("stash", &["stash", "show", "stash@{2}"], Shape::Stashed)
+            .with_config(&[("stash.showOnlyUntracked", "true")]),
+    );
+    out.push(
+        Case::new("stash", &["stash", "show", "stash@{1}"], Shape::Stashed)
             .with_config(&[("stash.showOnlyUntracked", "true")]),
     );
 
@@ -304,11 +346,18 @@ fn show_configuration(out: &mut Vec<Case>) {
 ///   refs/stash^{/untracked}   same pair of refusals
 ///   :/untracked               "is not a valid reference", rc 1
 ///   stash@{-1}                "is not a valid reference", rc 1
-///   stash@{+1}                accepted, resolves, rc 0
+///   stash@{+1}                accepted, rc 0
 ///   stash                     accepted — the bare ref name works
 ///   stash@{0}^{/staged}       accepted — `^{/text}` searches *from* the entry
 ///   stash@{0}^2               "is not a stash-like commit", rc 128
 /// ```
+///
+/// All three accepted spellings resolve to the **same** entry — `rev-parse` on
+/// `stash@{0}`, `stash@{+1}`, `stash` and `stash@{0}^{/staged}` all print
+/// `25920b7814e06917634853e7fc52ea4ebf6075c9` — so the three `show` cases below
+/// print identical bytes on stock. That is the point rather than a defect in the
+/// group: they are three different resolution paths to one answer, and a port
+/// that implements two of them prints two matching lines and one empty one.
 ///
 /// Every one is [`Case::strict`] where it fails, because the whole content of
 /// the case is which of those three refusals git chose and at which exit code.
@@ -350,8 +399,11 @@ fn entry_spellings(out: &mut Vec<Case>) {
 /// `--format`s; these are the rest of the rendering and selection surface.
 ///
 /// `--date=relative` and `--date=human` are deliberately absent — see the module
-/// header. The formats below all render the pinned `1700000000 +0000` and were
-/// checked to be byte-identical across two stock runs.
+/// header. Every format below renders [`crate::env::FIXED_DATE`] through a fixed
+/// `TZ=UTC`, so none of them reads a clock: `--date=format:%Y-%m-%d` prints
+/// `2023-11-14` and rebuilds the selector as `stash@{2023-11-14}`, which is the
+/// clearest demonstration that `%gd` is *derived* from the date rather than
+/// stored. All were checked byte-identical across two stock runs.
 fn list_is_a_log(out: &mut Vec<Case>) {
     // The selector `stash@{…}` is rebuilt from the date in every one of these,
     // so the format is measured twice per line: once in `%gd` and once in `%ad`.
@@ -415,8 +467,12 @@ fn show_option_surface(out: &mut Vec<Case>) {
     out.push(Case::new("stash", &["stash", "show", "--stat=200", "stash@{2}"], Shape::Stashed));
     out.push(Case::new("stash", &["stash", "show", "-p", "--word-diff=porcelain"], Shape::Stashed));
     out.push(Case::new("stash", &["stash", "show", "--no-patch", "--stat"], Shape::Stashed));
-    // `--only-untracked` on the entry that has no untracked parent: the flag is
-    // valid, the parent is absent, and what git does with that is the case.
+    // `--only-untracked` on the entry that has no untracked parent. Measured on
+    // stock: the flag is valid, the parent is absent, and git prints **nothing**
+    // and exits 0 — it neither errors nor falls back to the tracked diff. Strict
+    // because "prints nothing" is only a measurement if stderr is compared too,
+    // and it is the flag half of the table in `show_configuration`'s doc: the
+    // *config* key on this same entry prints the tracked stat instead.
     out.push(Case::strict("stash", &["stash", "show", "--only-untracked", "stash@{2}"], Shape::Stashed));
 
     // Two revisions. `show` takes one, and the refusal quotes both back.
@@ -450,6 +506,14 @@ fn argument_contracts(out: &mut Vec<Case>) {
     // that proves the message came from `-m` and not from the commit.
     out.push(Case::new("stash", &["stash", "store", "--message=lifted", "stash@{2}"], Shape::Stashed));
 
+    // A message with a newline in it, which is the one place a stash entry's
+    // *commit message* and its *reflog line* have to disagree. Measured on
+    // stock: the commit keeps the newline, the reflog collapses it to a space,
+    // so `stash list` prints `stash@{0}: two lines` on one line while
+    // `cat-file commit` holds two. A port that writes one representation into
+    // both places is caught by exactly one of the two probes.
+    out.push(Case::new("stash", &["stash", "store", "--message=two\nlines", "stash@{2}"], Shape::Stashed));
+
     out.push(Case::strict("stash", &["stash", "branch"], Shape::Stashed));
     out.push(Case::strict("stash", &["stash", "branch", "bad..name"], Shape::Stashed));
     out.push(Case::strict("stash", &["stash", "branch", "off", "stash@{9}"], Shape::Stashed));
@@ -481,12 +545,50 @@ fn argument_contracts(out: &mut Vec<Case>) {
 fn push_spellings(out: &mut Vec<Case>) {
     out.push(Case::new("stash", &["stash", "push", "--message=inline"], Shape::Stashed));
     out.push(Case::new("stash", &["stash", "push", "-m", ""], Shape::Stashed));
+    // The same newline split as `store --message=` above, reached through the
+    // verb that also has to print the message back. Measured on stock: stdout is
+    // `Saved working directory and index state On main: two\nlines` — two lines
+    // — while `stash list` shows the single line `stash@{0}: On main: two lines`.
+    out.push(Case::new("stash", &["stash", "push", "-m", "two\nlines"], Shape::Stashed));
+    // Trailing whitespace: kept in the commit message, trimmed in the reflog
+    // line. The narrowest form of the same rule, and the one a port that trims
+    // once and reuses the result cannot reproduce.
+    out.push(Case::new("stash", &["stash", "push", "-m", "trailing space "], Shape::Stashed));
+    // `create` is the only spelling that prints the entry's **object id** on
+    // stdout, so a message that differs by one byte is a *stdout* difference and
+    // not only a state one. Two facts about it were measured here rather than
+    // assumed, and both are surprising enough to be worth pinning:
+    //
+    //  * **`create` has no options at all — every argument is message text.**
+    //    `stash create -m two<newline>lines` stores the message
+    //    `On main: -m two\nlines`, flag spelling and all, and still builds a
+    //    two-parent entry. (So do the corpus's existing `create -u` and
+    //    `create --include-untracked` cases, which store `On main: -u` and
+    //    `On main: --include-untracked`; a three-parent entry is not reachable
+    //    through `create` at any spelling, and the one this module does mint is
+    //    `push -u --message=inline-u` below, whose entry has parents
+    //    HEAD + index + untracked.)
+    //  * **An empty message argument falls back to the default.**
+    //    `stash create ''` prints exactly the id bare `stash create` prints
+    //    (`73a881c0587e19b407e6ca8fa611d639aef0e679`, message
+    //    `WIP on main: d810229 ignore ignored.txt`) rather than storing
+    //    `On main: `. It is the `create`-side mirror of `push -m ''` above, and
+    //    the only place that fallback is visible in *stdout*.
+    out.push(Case::new("stash", &["stash", "create", "-m", "two\nlines"], Shape::Stashed));
+    out.push(Case::new("stash", &["stash", "create", ""], Shape::Stashed));
     out.push(Case::new("stash", &["stash", "push", "-u", "--message=inline-u"], Shape::Stashed));
 
     // A bare pathspec, with and without the flag that changes what it may match.
     out.push(Case::new("stash", &["stash", "push", "notes.txt"], Shape::Stashed));
     out.push(Case::strict("stash", &["stash", "push", "fresh.txt"], Shape::Stashed));
     out.push(Case::new("stash", &["stash", "push", "-u", "fresh.txt"], Shape::Stashed));
+
+    // Two pathspecs at once, both matching. Checked against `--list-cases`:
+    // every other `stash` case in the corpus passes one path or one magic word
+    // after `--`, so this is the only place the pathspec list has more than one
+    // entry, and it is what a port that reads the first operand after `--` and
+    // stops gets wrong.
+    out.push(Case::new("stash", &["stash", "push", "--", "counter.txt", "notes.txt"], Shape::Stashed));
 
     // Pathspec magic, which is parsed by the pathspec machinery rather than by
     // `stash`'s option parser and so is a different code path from `-- <path>`.
@@ -533,9 +635,12 @@ fn from_a_subdirectory(out: &mut Vec<Case>) {
 ///
 /// The corpus reaches it with `create`, `pop`, `drop` and `store`. Left over are
 /// the verbs that have to distinguish "the stack is empty" (an error) from "the
-/// worktree is clean" (not one): `push` prints "No local changes to save" and
-/// exits **0**, while `show` and `branch` print "No stash entries found." and
-/// exit 1.
+/// worktree is clean" (not one). Measured on stock: `push` prints "No local
+/// changes to save" and exits **0** for every flag spelling below, while `show`,
+/// `apply` and `branch` all print "No stash entries found." and exit 1 —
+/// `branch` was already the only one of the three the corpus asked, so `show`
+/// and `apply` are added here to pin that the sentence and the code come from
+/// the empty *stack* and not from the branch-name argument.
 fn empty_stack_and_clean_tree(out: &mut Vec<Case>) {
     out.push(Case::strict("stash", &["stash", "push"], Shape::Linear));
     out.push(Case::strict("stash", &["stash", "push", "-u"], Shape::Linear));
@@ -543,6 +648,8 @@ fn empty_stack_and_clean_tree(out: &mut Vec<Case>) {
     out.push(Case::strict("stash", &["stash", "push", "-m", "nothing"], Shape::Linear));
     out.push(Case::strict("stash", &["stash", "push", "--", "README.md"], Shape::Linear));
     out.push(Case::strict("stash", &["stash", "branch", "recovered"], Shape::Linear));
+    out.push(Case::strict("stash", &["stash", "show"], Shape::Linear));
+    out.push(Case::strict("stash", &["stash", "apply"], Shape::Linear));
     // An empty stack is not an error to *list*, at any format.
     out.push(Case::new("stash", &["stash", "list", "--format=%gd %gs"], Shape::Linear));
     out.push(Case::new("stash", &["stash", "list", "--all"], Shape::Linear));

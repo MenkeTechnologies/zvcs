@@ -183,7 +183,11 @@ pub const DOCS: &[Doc] = &[
         verb: "zrestore",
         summary: "reset the whole tree back to a snapshot",
         synopsis: "git zrestore <name>",
-        desc: &["Resets the whole tree \\(em the repository and every nested submodule \\(em back to a named snapshot."],
+        desc: &[
+            "Resets the whole tree \\(em the repository and every nested submodule \\(em back to a named snapshot.",
+            "Each repository is reset hard to its recorded commit, so tracked changes are discarded and untracked files are left alone. A snapshot records commit ids, not branch names: the branch checked out at restore time is the one moved onto the recorded commit, and whatever it pointed at is reachable afterwards only through its reflog.",
+            "A repository that cannot be reset \\(em moved, removed, or missing the recorded commit \\(em is named on stdout and counted in the summary, and the run exits non-zero rather than reporting a half-restored tree as a success.",
+        ],
     },
     Doc {
         verb: "zsnapshots",

@@ -490,7 +490,9 @@ change takes effect at once.
 
 **Snapshots.** `git zsnapshot <name>` records the HEAD of the repo + every nested
 submodule as one restore point; `git zrestore <name>` resets the whole tree back
-to it; `git zsnapshots` lists them.
+to it; `git zsnapshots` lists them. A restore discards tracked changes and keeps
+untracked files, and because a snapshot holds commit ids rather than branch
+names it moves whichever branch is checked out when it runs.
 
 **Worktrees.** `git zworktree add <name>` provisions a complete, object-sharing,
 isolated worktree of the repo + all nested submodules (each on a `zwt/<name>`

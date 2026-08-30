@@ -10,6 +10,11 @@
 //! "restore" means) but `reset --hard` preserves untracked files. A per-repo
 //! dirty-skip is not used: a parent always reads as "dirty" once a submodule has
 //! moved, so skipping would leave the tree half-restored.
+//!
+//! A snapshot records commit ids, not branch names, so `zrestore` moves the
+//! branch that is checked out when it runs — snapshot on `main`, branch off,
+//! restore, and the new branch is reset onto the recorded commit with its own
+//! tip left only in the reflog.
 
 use anyhow::{anyhow, Result};
 use std::io::IsTerminal;

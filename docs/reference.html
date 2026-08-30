@@ -346,6 +346,8 @@
         <h3><span class="doc-sigil">git</span> zrestore <span class="doc-summary">reset the whole tree back to a snapshot</span></h3>
         <pre class="doc-synopsis"><code>git zrestore &lt;name&gt;</code></pre>
         <p>Resets the whole tree — the repository and every nested submodule — back to a named snapshot.</p>
+        <p>Each repository is reset hard to its recorded commit, so tracked changes are discarded and untracked files are left alone. A snapshot records commit ids, not branch names: the branch checked out at restore time is the one moved onto the recorded commit, and whatever it pointed at is reachable afterwards only through its reflog.</p>
+        <p>A repository that cannot be reset — moved, removed, or missing the recorded commit — is named on stdout and counted in the summary, and the run exits non-zero rather than reporting a half-restored tree as a success.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>
       <article class="doc-entry" id="zsnapshots">

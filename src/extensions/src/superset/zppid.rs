@@ -490,9 +490,7 @@ pub fn zppid(args: &[String]) -> Result<ExitCode> {
     let json = args.iter().any(|a| a == "--json");
 
     let Ok(conn) = crate::db::open_ro() else {
-        if json {
-            println!("[]");
-        } else {
+        if !json {
             println!("no processes recorded yet");
         }
         return Ok(ExitCode::SUCCESS);
@@ -515,7 +513,7 @@ pub fn zppid(args: &[String]) -> Result<ExitCode> {
                 })
             })
             .collect();
-        println!("{}", serde_json::json!(arr));
+        crate::superset::query::emit_json(arr);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -551,9 +549,7 @@ pub fn zprocs(args: &[String]) -> Result<ExitCode> {
     let json = args.iter().any(|a| a == "--json");
 
     let Ok(conn) = crate::db::open_ro() else {
-        if json {
-            println!("[]");
-        } else {
+        if !json {
             println!("no process activity recorded yet");
         }
         return Ok(ExitCode::SUCCESS);
@@ -598,7 +594,7 @@ pub fn zprocs(args: &[String]) -> Result<ExitCode> {
                 })
             })
             .collect();
-        println!("{}", serde_json::json!(arr));
+        crate::superset::query::emit_json(arr);
         return Ok(ExitCode::SUCCESS);
     }
 

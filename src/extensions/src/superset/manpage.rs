@@ -893,7 +893,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zppid",
         summary: "per-process commit tally, attributed to the durable process",
-        synopsis: "git zppid",
+        synopsis: "git zppid [--json]",
         desc: &[
             "Reports which process is responsible for each recorded commit, found by walking up past the throwaway per-command shells to the durable agent, program, or login shell that drove them.",
             "Each row carries the pid, its command and working directory, whether it is still alive, and how many commits it landed.",
@@ -902,8 +902,8 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zprocs",
         summary: "per-process breakdown of mutating commands",
-        synopsis: "git zprocs",
-        desc: &["Reports how many of each mutating verb \\(em commit, push, add, merge, rebase and the rest \\(em every recorded process has run, attributed the same way as `git zppid`."],
+        synopsis: "git zprocs [--json]",
+        desc: &["Reports how many of each mutating verb \\(em commit, push, add, merge, rebase and the rest \\(em every recorded process has run, attributed the same way as `git zppid`.", "With --json the rows are emitted as NDJSON \\(em one object per line \\(em like every other machine-readable listing."],
     },
     Doc {
         verb: "zprecache",

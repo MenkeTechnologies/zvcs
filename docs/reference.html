@@ -977,15 +977,16 @@
       </article>
       <article class="doc-entry" id="zppid">
         <h3><span class="doc-sigil">git</span> zppid <span class="doc-summary">per-process commit tally, attributed to the durable process</span></h3>
-        <pre class="doc-synopsis"><code>git zppid</code></pre>
+        <pre class="doc-synopsis"><code>git zppid [--json]</code></pre>
         <p>Reports which process is responsible for each recorded commit, found by walking up past the throwaway per-command shells to the durable agent, program, or login shell that drove them.</p>
         <p>Each row carries the pid, its command and working directory, whether it is still alive, and how many commits it landed.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>
       <article class="doc-entry" id="zprocs">
         <h3><span class="doc-sigil">git</span> zprocs <span class="doc-summary">per-process breakdown of mutating commands</span></h3>
-        <pre class="doc-synopsis"><code>git zprocs</code></pre>
+        <pre class="doc-synopsis"><code>git zprocs [--json]</code></pre>
         <p>Reports how many of each mutating verb — commit, push, add, merge, rebase and the rest — every recorded process has run, attributed the same way as <code>git zppid</code>.</p>
+        <p>With --json the rows are emitted as NDJSON — one object per line — like every other machine-readable listing.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>
       <article class="doc-entry" id="zprecache">

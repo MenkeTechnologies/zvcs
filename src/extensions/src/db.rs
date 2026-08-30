@@ -1668,6 +1668,45 @@ mod snapshot_atomic_tests {
     }
 
     #[test]
+    fn a_second_claim_on_one_repo_cannot_be_inserted() {
+        // `claim()` checks who holds the lease and then inserts, so two callers
+        // can both pass the check before either inserts. What stops the lease
+        // being granted twice in that window is the primary key on `repo_id`,
+        // which makes the second insert fail — the function catches that and
+        // reports the winner.
+        //
+        // The end-to-end race (`concurrent_agents.rs`) almost never reaches this
+        // window, because the check catches contenders first. So the backstop is
+        // pinned here, where it is deterministic: if the key ever stops being
+        // unique, the insert below starts succeeding and a contested lease starts
+        // being handed to two agents at once.
+        let dir = std::env::temp_dir().join(format!("zvcs-claimpk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let repo_id = upsert_repo(&conn, Path::new("/x/repo/.git"), Some(Path::new("/x/repo"))).unwrap();
+
+        assert!(matches!(claim(&conn, repo_id, "first", None).unwrap(), super::ClaimResult::Acquired));
+
+        // The raw insert the second caller would reach, having passed the check.
+        let second = conn.execute(
+            "INSERT INTO claims (repo_id, session, workdir, claimed_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![repo_id, "second", None::<String>, super::now()],
+        );
+        assert!(second.is_err(), "a second lease was inserted for the same repository");
+
+        // And the holder is unchanged, so the loser is told the truth.
+        match claim(&conn, repo_id, "second", None).unwrap() {
+            super::ClaimResult::HeldBy(s) => assert_eq!(s, "first"),
+            super::ClaimResult::Acquired => panic!("the lease was granted a second time"),
+            super::ClaimResult::AlreadyMine => panic!("the loser was told the lease was already its own"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pins_messages_subscriptions_roundtrip() {
         let dir = std::env::temp_dir().join(format!("zvcs-coord-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

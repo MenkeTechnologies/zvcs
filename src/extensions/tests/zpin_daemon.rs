@@ -12,25 +12,80 @@
 //! Both directions are asserted in one daemon lifetime, because "it did not
 //! move" proves nothing unless the same fixture moves once the pin is lifted.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
-fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    let out = Command::new(BIN)
-        .args(["-c", "user.email=test@example.com", "-c", "user.name=zvcs-test", "-c", "protocol.file.allow=always"])
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-    assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-    out
+/// The daemon isolation one case runs under: its own socket, home and root.
+///
+/// Handed to each child through [`Command::env`] rather than
+/// `std::env::set_var`. `ZVCS_SOCK`/`ZVCS_HOME` are process-wide and the two
+/// tests in this file run on parallel threads of one binary, so whichever set
+/// them last won for *both* daemons: one bound the other's socket and the loser
+/// polled a path nothing would ever create — `daemon socket never appeared at
+/// /tmp/zv-pinn<pid>/s`, on a loaded runner, while an idle laptop passed.
+///
+/// The global and system config are pinned empty for the same reason
+/// `autonomy_nested.rs` pins them: a `[zvcs] autohook` in a developer's own
+/// `~/.gitconfig` makes `should_watch()` true for these scratch repositories, so
+/// the setup commands autostart a detached daemon before the test has built the
+/// state it wants to measure — and this test has to own the daemon's lifetime.
+struct Isolation {
+    root: PathBuf,
+    sock: PathBuf,
+    home: PathBuf,
 }
 
-fn head(dir: &Path) -> String {
-    String::from_utf8_lossy(&git(dir, &["rev-parse", "HEAD"]).stdout).trim().to_string()
+impl Isolation {
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(BIN);
+        cmd.env("ZVCS_SOCK", &self.sock)
+            .env("ZVCS_HOME", &self.home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        cmd
+    }
+
+    fn git(&self, dir: &Path, args: &[&str]) -> std::process::Output {
+        let out = self
+            .cmd()
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=zvcs-test",
+                "-c",
+                "protocol.file.allow=always",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    fn head(&self, dir: &Path) -> String {
+        String::from_utf8_lossy(&self.git(dir, &["rev-parse", "HEAD"]).stdout).trim().to_string()
+    }
+
+    /// Poll until `dir`'s HEAD equals `want`, or the timeout elapses.
+    fn moved_to(&self, dir: &Path, want: &str, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if self.head(dir) == want {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    }
 }
 
 fn wait_for(path: &Path, timeout: Duration) {
@@ -52,18 +107,6 @@ fn wait_for_log(log: &Path, needle: &str, timeout: Duration) {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// Poll until `dir`'s HEAD equals `want`, or the timeout elapses.
-fn moved_to(dir: &Path, want: &str, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if head(dir) == want {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
 }
 
 /// The control: the same fixture with no pin at all must reconcile, or the
@@ -104,35 +147,40 @@ fn reconciles_with(pin: Pin) -> bool {
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
 
-    // Before ANY command runs: `git zpin` writes to the database named by
-    // ZVCS_HOME, and the daemon reads the one named when it starts. Setting these
+    // Built before ANY command runs: `git zpin` writes to the database named by
+    // ZVCS_HOME, and the daemon reads the one named when it starts. Naming these
     // late puts the pin in one database and the reader on another, and the pin
     // then looks ignored when it was simply never seen.
-    let sock = root.join("s");
-    std::env::set_var("ZVCS_SOCK", &sock);
-    std::env::set_var("ZVCS_HOME", root.join("h"));
+    let iso = Isolation {
+        sock: root.join("s"),
+        home: root.join("h"),
+        root,
+    };
+    let root = &iso.root;
+    let sock = &iso.sock;
 
     // A submodule source two commits deep, so its checkout can sit one behind.
     let sub_src = root.join("sub_src");
     std::fs::create_dir_all(&sub_src).unwrap();
-    git(&sub_src, &["init", "-q", "-b", "main"]);
-    git(&sub_src, &["commit", "--allow-empty", "-q", "-m", "s0"]);
-    git(&sub_src, &["commit", "--allow-empty", "-q", "-m", "s1"]);
+    iso.git(&sub_src, &["init", "-q", "-b", "main"]);
+    iso.git(&sub_src, &["commit", "--allow-empty", "-q", "-m", "s0"]);
+    iso.git(&sub_src, &["commit", "--allow-empty", "-q", "-m", "s1"]);
 
     let parent = root.join("parent");
     std::fs::create_dir_all(&parent).unwrap();
-    git(&parent, &["init", "-q", "-b", "main"]);
-    git(&parent, &["commit", "--allow-empty", "-q", "-m", "p0"]);
-    git(&parent, &["submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
-    git(&parent, &["commit", "-q", "-m", "add sub"]);
+    iso.git(&parent, &["init", "-q", "-b", "main"]);
+    iso.git(&parent, &["commit", "--allow-empty", "-q", "-m", "p0"]);
+    iso.git(&parent, &["submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"]);
+    iso.git(&parent, &["commit", "-q", "-m", "add sub"]);
 
     // Put the submodule one commit behind its already-fetched origin/main, which
     // is exactly what the fetch-free reconcile fast-forwards.
     let sub = parent.join("sub");
-    git(&sub, &["fetch", "-q", "origin"]);
-    let target = String::from_utf8_lossy(&git(&sub, &["rev-parse", "origin/main"]).stdout).trim().to_string();
-    git(&sub, &["reset", "-q", "--hard", "HEAD~1"]);
-    let behind = head(&sub);
+    iso.git(&sub, &["fetch", "-q", "origin"]);
+    let target =
+        String::from_utf8_lossy(&iso.git(&sub, &["rev-parse", "origin/main"]).stdout).trim().to_string();
+    iso.git(&sub, &["reset", "-q", "--hard", "HEAD~1"]);
+    let behind = iso.head(&sub);
     assert_ne!(behind, target, "precondition: the submodule is behind origin/main");
 
     // Pin BEFORE autonomy is switched on. The daemon runs one reaction the
@@ -141,7 +189,7 @@ fn reconciles_with(pin: Pin) -> bool {
     // autostarts a daemon once autonomy is configured, which is the other reason
     // this has to come first.
     if pin == Pin::Yes {
-        git(&parent, &["zpin", sub.to_str().unwrap()]);
+        iso.git(&parent, &["zpin", sub.to_str().unwrap()]);
     }
 
     // Written directly rather than through `git config`: every zvcs command
@@ -153,22 +201,23 @@ fn reconciles_with(pin: Pin) -> bool {
 
     let log_path = root.join("daemon.log");
     let logf = std::fs::File::create(&log_path).unwrap();
-    let mut daemon: Child = Command::new(BIN)
+    let mut daemon: Child = iso
+        .cmd()
         .args(["zdaemon", "start", "--foreground"])
         .current_dir(&parent)
         .stdout(Stdio::from(logf.try_clone().unwrap()))
         .stderr(Stdio::from(logf))
         .spawn()
         .expect("spawn zdaemon");
-    wait_for(&sock, Duration::from_secs(5));
+    wait_for(sock, Duration::from_secs(5));
     wait_for_log(&log_path, "[zvcs watch] watching", Duration::from_secs(10));
 
     std::fs::write(parent.join("poke.txt"), b"one\n").unwrap();
-    let moved = moved_to(&sub, &target, Duration::from_secs(20));
+    let moved = iso.moved_to(&sub, &target, Duration::from_secs(20));
 
-    let _ = Command::new(BIN).args(["zdaemon", "stop"]).current_dir(&parent).status();
+    let _ = iso.cmd().args(["zdaemon", "stop"]).current_dir(&parent).status();
     let _ = daemon.kill();
     let _ = daemon.wait();
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(root);
     moved
 }

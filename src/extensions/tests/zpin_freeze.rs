@@ -8,9 +8,9 @@
 //!
 //! Nothing here needs a daemon: the flag is a row in the shared database, and
 //! these cases assert that the row is written, survives the process that wrote
-//! it, and is cleared exactly when asked. What they cannot assert is the
-//! daemon's half — that `react()` honours the flag — which stays with the
-//! daemon's own tests.
+//! it, and is cleared exactly when asked. The daemon's half — that `react()`
+//! honours the flag, for a submodule as well as for the top-level repo — is
+//! covered by `zpin_daemon.rs`, which runs one.
 //!
 //! The partial-failure case is the one worth reading twice: `zpin a b` where
 //! `a` is not a repository must still pin `b`. A loop that aborts on the first

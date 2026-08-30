@@ -533,13 +533,22 @@ fn react(cfg: &ZvcsConfig) {
     // A pinned repo is frozen from pointer autonomy (`git zpin`): no reconcile, no
     // autobump. Attach still ran above — re-attaching a detached HEAD doesn't move
     // the pointer, it only heals it.
-    let pinned = crate::db::open_rw()
-        .map(|c| {
-            let gd = repo.git_dir().canonicalize().unwrap_or_else(|_| repo.git_dir().to_path_buf());
-            crate::db::is_pinned(&c, &gd)
-        })
-        .unwrap_or(false);
-    if pinned {
+    //
+    // The flag is per repository, and so is this check. It used to be read once,
+    // for the top-level repo, while the reconcile below walked the whole tree:
+    // `git zpin <submodule>` wrote a row that nothing consulted, and the daemon
+    // fast-forwarded the pinned repo on the next reaction. A pin that does not
+    // hold is worse than no pin, because it was believed.
+    let conn = crate::db::open_rw().ok();
+    let pinned = |r: &gix::Repository| -> bool {
+        conn.as_ref()
+            .map(|c| {
+                let gd = r.git_dir().canonicalize().unwrap_or_else(|_| r.git_dir().to_path_buf());
+                crate::db::is_pinned(c, &gd)
+            })
+            .unwrap_or(false)
+    };
+    if pinned(&repo) {
         return;
     }
 
@@ -555,6 +564,9 @@ fn react(cfg: &ZvcsConfig) {
             }
         }
         for sub in crate::superset::tree_repos(&repo).into_iter().skip(1) {
+            if pinned(&sub) {
+                continue; // frozen by `git zpin <path>`
+            }
             match crate::superset::reconcile_repo_local(&sub) {
                 Ok(msg) => record_reconcile_event(&sub, &msg),
                 Err(e) => {

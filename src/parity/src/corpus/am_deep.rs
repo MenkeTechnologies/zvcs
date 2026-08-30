@@ -502,12 +502,22 @@ HcmV?d00001
 /// [`MB_BINARY`] with the terminating blank line removed, so the reverse base85
 /// block runs off the end of the message.
 ///
-/// Stock 2.55.0 refuses it — `error: corrupt binary patch at
-/// .git/rebase-apply/patch:15:` then `error: No valid patches in input (allow
-/// with "--allow-empty")`, exit 128, session parked. Written as its own payload
-/// because an unterminated base85 block is the one binary-patch malformation a
-/// reader is most likely to introduce by hand, and because the port disagrees
-/// about it (see this module's report).
+/// Both installed gits refuse it and agree on exit code and post-state; only
+/// the wording moved between them, which is why the cases using it are not
+/// stderr-strict:
+///
+/// ```text
+/// 2.55.0  error: corrupt binary patch at .git/rebase-apply/patch:15:
+/// 2.50.1  error: corrupt binary patch at line 15:
+/// both    error: No valid patches in input (allow with "--allow-empty")
+/// both    exit 128, nothing committed, session parked
+/// ```
+///
+/// Written as its own payload because an unterminated base85 block is the one
+/// binary-patch malformation a reader is most likely to introduce by hand — this
+/// file's own [`MB_BINARY`] lost that line once during editing — and because it
+/// separates a reader that validates the block's terminator from one that stops
+/// at the last line it could decode.
 const MB_BINARY_TRUNCATED: &[u8] = b"From bbbb0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c Mon Sep 17 00:00:00 2001
 From: A U Thor <author@example.invalid>
 Date: Tue, 14 Nov 2023 22:13:20 +0000
@@ -971,10 +981,17 @@ fn mailbox_forms(out: &mut Vec<Case>) {
     si(&["am", "--reject"], Shape::Linear, MB_BINARY, out);
     si(&["am", "--keep-cr"], Shape::Linear, MB_BINARY, out);
     // The same patch with its terminating blank line gone: one byte shorter,
-    // and a refusal rather than a commit.
-    sx(&["am"], Shape::Linear, MB_BINARY_TRUNCATED, out);
-    sx(&["am", "--3way"], Shape::Linear, MB_BINARY_TRUNCATED, out);
-    sx(&["am", "--reject"], Shape::Linear, MB_BINARY_TRUNCATED, out);
+    // and a refusal rather than a commit. **Not** stderr-strict, and the reason
+    // is the same one `corpus/mail_series.rs` gives for `--no-signature`: the
+    // wording of this one diagnostic moved between releases (2.55.0 writes
+    // `corrupt binary patch at .git/rebase-apply/patch:15:`, 2.50.1 writes
+    // `corrupt binary patch at line 15:`) while the refusal itself did not, so a
+    // strict case here makes the second oracle report `gits-disagree` about a
+    // release's prose instead of `corroborated-defect` about the behaviour. Exit
+    // code and post-state carry the whole difference without it.
+    si(&["am"], Shape::Linear, MB_BINARY_TRUNCATED, out);
+    si(&["am", "--3way"], Shape::Linear, MB_BINARY_TRUNCATED, out);
+    si(&["am", "--reject"], Shape::Linear, MB_BINARY_TRUNCATED, out);
     // An in-body Date that is neither the envelope's nor the pinned clock.
     si(&["am"], Shape::Linear, MB_INBODY_DATE, out);
     si(&["am", "--committer-date-is-author-date"], Shape::Linear, MB_INBODY_DATE, out);

@@ -60,13 +60,17 @@
 //!    not reorder a one-element list" — they are kept because a port that rejects
 //!    the option fails them, and they are *not* presented as parallelism cases.
 //!  * **[`Shape::Submodule`]'s submodule is clean and already at the recorded
-//!    commit.** `--recurse-submodules` on `checkout`, `switch`, `reset`,
-//!    `restore` and `read-tree` therefore has nothing to do: stock recurses into
-//!    a submodule that is already correct and prints nothing. Those rows measure
-//!    the flag's *acceptance and its effect on the superproject*, not recursion.
-//!    Real recursion on this shape exists in exactly one verb — `grep`, whose
-//!    `sub/mod.txt:submodule content` line is present with the flag and absent
-//!    without it — and that is why `grep` carries the config half of this file.
+//!    commit, so recursion into it prints nothing.** It is *not* a no-op, which is
+//!    the trap this bullet exists to close. Measured on stock 2.55.0, `read-tree
+//!    --recurse-submodules -m -u HEAD` leaves the submodule's `HEAD` **detached**
+//!    at the recorded oid where it was `ref: refs/heads/main` before, and both it
+//!    and `restore --recurse-submodules` append a second line to
+//!    `.git/modules/sub/logs/HEAD`. Neither shows on stdout; both are in the
+//!    runner's `probe_modules` digest, and they are the whole reason these rows
+//!    are worth writing. On stdout, real recursion on this shape exists in exactly
+//!    one verb — `grep`, whose `sub/mod.txt:submodule content` line is present
+//!    with the flag and absent without it — and that is why `grep` carries the
+//!    config half of this file.
 //!  * **[`Shape::NestedSubmodule`]'s `mid` is registered and not populated.** So
 //!    `--recurse-submodules` on the worktree verbs finds nothing there either;
 //!    only the two verbs that *populate* — `clone --recurse-submodules` and
@@ -281,14 +285,28 @@ fn value_grammar(out: &mut Vec<Case>) {
 
 /// `--recurse-submodules` on the verbs that rewrite the worktree.
 ///
-/// Stated honestly: on [`Shape::Submodule`] the submodule is clean and already at
-/// the recorded commit, so stock recurses into it and finds nothing to do. These
-/// rows measure that the flag is accepted in every one of its spellings and that
-/// the *superproject* half of the command still happens — the branch is created,
-/// the index is rewritten, the prefix is applied — not that recursion moved
-/// anything. `corpus/reset_family.rs:475-499` is the one place in the corpus
-/// where `--recurse-submodules` changes what is left on disk (a `reset --hard
-/// HEAD~1` across the commit that added the submodule), and it is not repeated.
+/// The submodule is clean and already at the recorded commit, so nothing here
+/// prints a submodule line. It does not follow that nothing happens, and the
+/// state probe is where the difference is. Measured on stock 2.55.0 against this
+/// fixture, `read-tree --recurse-submodules -m -u HEAD` leaves:
+///
+/// ```text
+/// .git/modules/sub/HEAD:      7c9f5d7e12e0b209b88dea5b678f0584186b8b28
+///                             (it was `ref: refs/heads/main`)
+/// .git/modules/sub/logs/HEAD: <clone line>
+///                             7c9f5d7e… 7c9f5d7e… <ident> 1700000000 +0000
+/// ```
+///
+/// Recursing into an already-correct submodule still **detaches its HEAD** at the
+/// recorded oid and still writes the reflog entry for that checkout. `restore
+/// --recurse-submodules --source=HEAD sub` writes the reflog line without moving
+/// `HEAD`. Both are invisible on stdout and both are read by
+/// `runner::probe_modules`, so these rows separate "parsed the flag" from
+/// "descended" without needing a submodule that is out of date.
+///
+/// `corpus/reset_family.rs:475-499` covers the other half — `reset --hard HEAD~1`
+/// across the commit that added the submodule, where the flag decides what is left
+/// in the *worktree* — and is not repeated.
 ///
 /// What is new here is coverage of the three verbs no curated case reaches at
 /// all: `checkout` (only `switch` was covered, and they are separate
@@ -380,8 +398,9 @@ fn submodule_recurse_config(out: &mut Vec<Case>) {
     out.push(Case::new("ls-files", &["ls-files"], s).with_config(on));
     out.push(Case::new("ls-files", &["ls-files", "--stage"], s).with_config(on));
 
-    // The verbs it does reach, where the submodule is already correct and the
-    // measurement is that the superproject half still happened.
+    // The verbs it does reach. Same measurement as
+    // `§ recurse_on_the_worktree_verbs`: for `read-tree` and `restore` the effect
+    // is the submodule's detached `HEAD` and its reflog line, not stdout.
     out.push(Case::new("checkout", &["checkout", "main"], s).with_config(on));
     out.push(Case::new("checkout", &["checkout", "-b", "topic"], s).with_config(on));
     out.push(Case::new("read-tree", &["read-tree", "-m", "-u", "HEAD"], s).with_config(on));

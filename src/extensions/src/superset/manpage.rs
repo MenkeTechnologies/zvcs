@@ -124,6 +124,7 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zrepl",
         desc: &[
             "Opens an interactive line console. Each line is run exactly as `git <line>` would be, so it drives every dispatchable command \\(em the z* superset verbs and every git-compat porcelain command alike (the latter operating on the current repository), doubling as a live daemon/ledger console.",
+            "A line is word-split the way git splits an alias value: single and double quotes group their contents and a backslash escapes the next character, so `commit -m \"two words\"` reaches the verb as one argument. Nothing else is expanded \\(em no variables, no globs \\(em and an unclosed quote is reported without ending the session.",
             "On a terminal it opens with a stats banner and full line editing: Tab completes the command word against every verb (superset + porcelain), with command history persisted across sessions. Piped stdin falls back to a raw line reader so scripts and heredocs stay usable. Type exit or quit, or press Ctrl-D, to leave.",
         ],
     },

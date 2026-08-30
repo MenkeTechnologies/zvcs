@@ -289,6 +289,7 @@
         <h3><span class="doc-sigil">git</span> zrepl <span class="doc-summary">interactive console over every zvcs command</span></h3>
         <pre class="doc-synopsis"><code>git zrepl</code></pre>
         <p>Opens an interactive line console. Each line is run exactly as <code>git &lt;line&gt;</code> would be, so it drives every dispatchable command — the z* superset verbs and every git-compat porcelain command alike (the latter operating on the current repository), doubling as a live daemon/ledger console.</p>
+        <p>A line is word-split the way git splits an alias value: single and double quotes group their contents and a backslash escapes the next character, so <code>commit -m "two words"</code> reaches the verb as one argument. Nothing else is expanded — no variables, no globs — and an unclosed quote is reported without ending the session.</p>
         <p>On a terminal it opens with a stats banner and full line editing: Tab completes the command word against every verb (superset + porcelain), with command history persisted across sessions. Piped stdin falls back to a raw line reader so scripts and heredocs stay usable. Type exit or quit, or press Ctrl-D, to leave.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>

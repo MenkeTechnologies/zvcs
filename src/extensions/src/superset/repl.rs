@@ -5,6 +5,10 @@
 //! `zjobs`, `zjob 3`, `zrepos`, `zreindex`, `zdaemon status`, `zsync`, … Type
 //! `quit`/`exit` (or press Ctrl-D) to leave.
 //!
+//! A line is word-split by [`crate::alias::split_cmdline`], git's own alias
+//! splitting: quotes group, a backslash escapes the next byte, nothing is
+//! expanded, and an unclosed quote is reported without ending the session.
+//!
 //! On a terminal it opens with a stats banner (logo + live verb/repo counts,
 //! [`crate::superset::banner`]) and edits the line with [`reedline`]: real cursor
 //! motion, Tab completion of the command word against every dispatchable verb
@@ -52,8 +56,23 @@ fn run_one(line: &str) -> bool {
         return false;
     }
 
-    let parts: Vec<String> = line.split_whitespace().map(String::from).collect();
-    let (sub, rest) = parts.split_first().expect("non-empty checked above");
+    // git's own word splitting (`alias.c:split_cmdline`, ported in
+    // [`crate::alias::split_cmdline`]), so a console line tokenizes the way the
+    // same text does when git expands it from an alias: quotes group, a
+    // backslash escapes the next byte, and nothing else is expanded. Splitting
+    // on whitespace alone made every quoted argument unusable — `commit -m "two
+    // words"` reached the verb as three tokens with the quotes still attached.
+    let parts: Vec<String> = match crate::alias::split_cmdline(line) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("zvcs: zrepl: {e}");
+            return true;
+        }
+    };
+    let Some((sub, rest)) = parts.split_first() else { return true };
+    if sub.is_empty() {
+        return true;
+    }
     if let Err(e) = crate::dispatch::run(sub, rest) {
         eprintln!("zvcs: {sub}: {e:#}");
     }

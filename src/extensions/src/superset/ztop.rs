@@ -57,7 +57,7 @@ const LIVE_WINDOW: usize = 80;
 
 /// `git ztop [selectors] [--interval <secs>] [--once] [--mono]`.
 pub fn ztop(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
+    let (mut sel, rest) = Selector::parse(args);
     let mut interval = 2.0f64;
     let mut once = false;
     let mut force_mono = std::env::var_os("NO_COLOR").is_some();
@@ -72,7 +72,14 @@ pub fn ztop(args: &[String]) -> Result<ExitCode> {
                     interval = v.clamp(0.2, 60.0);
                 }
             }
-            _ => {}
+            // A bare token is a repo pattern, the same reading every other
+            // selector verb gives it; an unknown flag stays ignored so a typo
+            // cannot silently empty the monitor.
+            other => {
+                if !other.starts_with('-') {
+                    sel.patterns.push(other.to_string());
+                }
+            }
         }
         i += 1;
     }

@@ -394,6 +394,32 @@ pub fn zattach(args: &[String]) -> Result<ExitCode> {
     Ok(if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }
 
+/// The threshold a verb like `zstale`/`zbig` takes as a bare positional, and
+/// the repo patterns sharing the same leftovers.
+///
+/// The first bare number is the threshold; every other bare token is a path
+/// pattern, which is what the shared grammar promises for verbs that also take
+/// a positional (`git zstale 30 cask` — repos untouched for 30 days, among
+/// those whose path contains "cask"). Unknown flags stay ignored rather than
+/// becoming patterns that match nothing.
+fn threshold_and_patterns<T: std::str::FromStr>(sel: &mut Selector, rest: Vec<String>, default: T) -> T {
+    let mut value = default;
+    let mut taken = false;
+    for a in rest {
+        if !taken {
+            if let Ok(n) = a.parse::<T>() {
+                value = n;
+                taken = true;
+                continue;
+            }
+        }
+        if !a.starts_with('-') {
+            sel.patterns.push(a);
+        }
+    }
+    value
+}
+
 /// HEAD commit time (unix seconds) of a repo, or `None` when unborn.
 fn head_seconds(repo: &gix::Repository) -> Option<i64> {
     repo.head_commit().ok().and_then(|c| c.time().ok()).map(|t| t.seconds)
@@ -403,8 +429,8 @@ fn head_seconds(repo: &gix::Repository) -> Option<i64> {
 /// than `<days>` (default 90), with how long ago \(em find abandoned repos.
 pub fn zstale(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
-    let (sel, rest) = Selector::parse(&args);
-    let days: i64 = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(90);
+    let (mut sel, rest) = Selector::parse(&args);
+    let days: i64 = threshold_and_patterns(&mut sel, rest, 90);
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let now = crate::date::now_seconds();
     let cutoff = now - days * 86_400;
@@ -562,8 +588,8 @@ fn commit_count(repo: &gix::Repository) -> usize {
 /// repo, top `<n>` (default 20).
 pub fn zbig(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
-    let (sel, rest) = Selector::parse(&args);
-    let n: usize = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(20);
+    let (mut sel, rest) = Selector::parse(&args);
+    let n: usize = threshold_and_patterns(&mut sel, rest, 20);
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let per = parallel_map(&repos, big_files);
     let mut all: Vec<(u64, String)> = per.into_iter().flatten().collect();

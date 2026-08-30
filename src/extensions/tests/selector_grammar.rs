@@ -141,6 +141,9 @@ const UNIFORM: &[&str] = &[
     "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize", "zage", "zlast", "zfiles",
     "zcommits", "zpristine", "zauthors", "zconflicts", "zdivergent", "zorphans", "zgc", "zfsck",
     "zabort", "zreview",
+    // These two own a positional (`<days>`, `<n>`) and peel it from the same
+    // leftovers the patterns come from, so they exercise a second parser.
+    "zstale", "zbig",
 ];
 
 #[test]
@@ -159,6 +162,61 @@ fn every_selector_verb_honors_the_same_grammar() {
         assert!(!hit.contains("no repos matched"),
             "`git {verb} gamma` matched nothing though gamma is indexed:\n{hit}");
     }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_positional_and_a_pattern_coexist() {
+    let (root, home) = fixture("mixed");
+
+    // `zstale <days> <pattern>`: the number is the threshold, the word is the
+    // repo filter. Both must land — dropping the pattern reports on the whole
+    // fleet, dropping the number changes which repos qualify.
+    // Its summary reports both halves: the denominator is how many repos were
+    // selected, and the day count is the threshold it read.
+    let all = zvcs(&home, &root, &["zstale", "0"]);
+    assert!(all.contains("of 3"), "precondition: three repos indexed:\n{all}");
+    let scoped = zvcs(&home, &root, &["zstale", "0", "gamma"]);
+    assert!(scoped.contains("of 1"), "`zstale 0 gamma` must narrow to gamma (pattern dropped):\n{scoped}");
+    assert!(scoped.contains("0 day(s)"), "`zstale 0 gamma` must still read 0 as the threshold:\n{scoped}");
+    // A lone pattern narrows and leaves the default threshold in place.
+    let defaulted = zvcs(&home, &root, &["zstale", "gamma"]);
+    assert!(defaulted.contains("of 1") && defaulted.contains("90 day(s)"),
+        "a lone pattern must narrow and keep the default days:\n{defaulted}");
+
+    // `zbig <n> <pattern>` the same way: one repo searched, not three.
+    let big = zvcs(&home, &root, &["zbig", "5", "gamma"]);
+    assert!(big.contains("across 1 repos"), "`zbig 5 gamma` must search only gamma:\n{big}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_monitor_honors_the_grammar_too() {
+    let (root, home) = fixture("ztop");
+    // ztop lists repos whose status is cached, so cache all three first.
+    for name in ["Alpha-cask", "beta-cask", "gamma"] {
+        zvcs(&home, &root.join(name), &["zstatus"]);
+    }
+
+    let rows = |out: &str| -> usize {
+        out.lines().filter(|l| l.contains("zvcs-selgram-ztop-")).count()
+    };
+    let all = zvcs(&home, &root, &["ztop", "--once", "--mono"]);
+    assert_eq!(rows(&all), 3, "precondition: every repo has cached status:\n{all}");
+
+    // Bare pattern and `--repo` must narrow the monitor identically.
+    let bare = zvcs(&home, &root, &["ztop", "--once", "--mono", "gamma"]);
+    let flag = zvcs(&home, &root, &["ztop", "--once", "--mono", "--repo", "gamma"]);
+    assert_eq!(rows(&bare), 1, "a bare pattern must narrow the monitor:\n{bare}");
+    assert_eq!(rows(&flag), 1, "--repo must narrow the monitor:\n{flag}");
+    assert!(bare.contains("/gamma") && !bare.contains("/beta-cask"), "the wrong repo was shown:\n{bare}");
+
+    // The interval's value is consumed by its flag, never read as a pattern —
+    // otherwise `--interval 2` would filter to repos with "2" in their path.
+    let with_interval = zvcs(&home, &root, &["ztop", "--once", "--mono", "--interval", "2"]);
+    assert_eq!(rows(&with_interval), 3, "`--interval 2` must not be read as a pattern:\n{with_interval}");
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -550,6 +550,10 @@ pub fn index_write_options(repo: &gix::Repository) -> gix::index::write::Options
         .unwrap_or(threads_enabled);
 
     gix::index::write::Options {
+        // `do_write_index()` only chooses a version for a state that has none;
+        // an index read off disk and rewritten keeps its own. The commands that
+        // build a state from scratch say so with [`index_write_options_fresh`].
+        version: None,
         extensions: gix::index::write::Extensions::Given {
             // The tree-cache is written whenever the caller left one in place;
             // only `EOIE` is under config control here.
@@ -564,6 +568,160 @@ pub fn index_write_options(repo: &gix::Repository) -> gix::index::write::Options
         skip_hash: crate::repo_settings::RepoSettings::load(repo)
             .map(|s| s.index_skip_hash)
             .unwrap_or(false),
+    }
+}
+
+/// [`index_write_options`] for an index state git would have built from scratch,
+/// so the version has to be chosen rather than carried over.
+///
+/// `unpack_trees()` hands `do_write_index()` a result state whose `version` is
+/// zero whenever the command never read the index it replaces — plain
+/// `read-tree <tree-ish>` and `read-tree --empty` are exactly that, while
+/// `--reset` / `-m` / `--prefix` read the index first (builtin/read-tree.c:236)
+/// and so carry its version through. Only the zero case reaches
+/// [`index_format_default`].
+pub fn index_write_options_fresh(repo: &gix::Repository) -> gix::index::write::Options {
+    gix::index::write::Options {
+        version: Some(index_format_default(repo)),
+        ..index_write_options(repo)
+    }
+}
+
+/// `INDEX_FORMAT_LB` / `INDEX_FORMAT_UB` / `INDEX_FORMAT_DEFAULT`
+/// (`read-cache.h:9-11`): the supported range, and the version git falls back to
+/// when a request lands outside it.
+const INDEX_FORMAT_LB: i64 = 2;
+const INDEX_FORMAT_UB: i64 = 4;
+const INDEX_FORMAT_DEFAULT: i64 = 3;
+
+/// `get_index_format_default()` (read-cache.c:2830-2861): the version git writes
+/// for a state that carries none of its own.
+///
+/// ```c
+/// char *envversion = getenv("GIT_INDEX_VERSION");
+/// unsigned int version = INDEX_FORMAT_DEFAULT;
+///
+/// if (!envversion) {
+///         prepare_repo_settings(r);
+///         if (r->settings.index_version >= 0)
+///                 version = r->settings.index_version;
+///         if (version < INDEX_FORMAT_LB || INDEX_FORMAT_UB < version) {
+///                 warning(_("index.version set, but the value is invalid.\n"
+///                           "Using version %i"), INDEX_FORMAT_DEFAULT);
+///                 return INDEX_FORMAT_DEFAULT;
+///         }
+///         return version;
+/// }
+///
+/// version = strtoul(envversion, &endp, 10);
+/// if (*endp || version < INDEX_FORMAT_LB || INDEX_FORMAT_UB < version) {
+///         warning(_("GIT_INDEX_VERSION set, but the value is invalid.\n"
+///                   "Using version %i"), INDEX_FORMAT_DEFAULT);
+///         return INDEX_FORMAT_DEFAULT;
+/// }
+/// return version;
+/// ```
+///
+/// Two things follow from the shape of that function and are reproduced here:
+/// the environment variable is consulted *instead of* the configuration rather
+/// than before it — a `GIT_INDEX_VERSION` that is set decides the answer even
+/// when it is nonsense — and version 3 is what an invalid request lands on,
+/// which the writer then demotes to 2 unless an entry needs the extended flags.
+///
+/// `r->settings.index_version` is `-1` until `feature.manyFiles` sets it to 4
+/// (`repo-settings.c:59`) and `index.version` overrides whatever it holds.
+pub fn index_format_default(repo: &gix::Repository) -> gix::index::Version {
+    let version = match std::env::var("GIT_INDEX_VERSION") {
+        Ok(raw) => match raw.parse::<i64>() {
+            Ok(n) if (INDEX_FORMAT_LB..=INDEX_FORMAT_UB).contains(&n) => n,
+            _ => {
+                eprintln!(
+                    "warning: GIT_INDEX_VERSION set, but the value is invalid.\nUsing version {INDEX_FORMAT_DEFAULT}"
+                );
+                INDEX_FORMAT_DEFAULT
+            }
+        },
+        Err(_) => {
+            // The `feature.manyFiles` cascade, then the key that overrides it.
+            // A `feature.*` value git would have died on has already stopped the
+            // command in the dispatcher's settings gate, so an unreadable one
+            // here can only mean the key is absent.
+            let cascaded = crate::repo_settings::RepoSettings::load(repo)
+                .map(|s| s.many_files)
+                .unwrap_or(false)
+                .then_some(4);
+            let configured = config_int_named(repo, "index.version", "index.version")
+                .ok()
+                .flatten()
+                .or(cascaded);
+            match configured {
+                None => INDEX_FORMAT_DEFAULT,
+                Some(n) if (INDEX_FORMAT_LB..=INDEX_FORMAT_UB).contains(&n) => n,
+                Some(_) => {
+                    eprintln!(
+                        "warning: index.version set, but the value is invalid.\nUsing version {INDEX_FORMAT_DEFAULT}"
+                    );
+                    INDEX_FORMAT_DEFAULT
+                }
+            }
+        }
+    };
+    index_version(version)
+}
+
+/// One of git's three index versions as `gix` spells it. Anything outside the
+/// supported range has already been mapped onto [`INDEX_FORMAT_DEFAULT`].
+pub fn index_version(version: i64) -> gix::index::Version {
+    match version {
+        2 => gix::index::Version::V2,
+        4 => gix::index::Version::V4,
+        _ => gix::index::Version::V3,
+    }
+}
+
+/// `add_patterns_from_file()` (dir.c:1013), the `core.excludesFile` half of
+/// `setup_standard_excludes()`:
+///
+/// ```c
+/// void add_patterns_from_file(struct dir_struct *dir, const char *fname)
+/// {
+///         if (add_patterns(fname, "", 0, &dir->exclude_list_group[EXC_FILE].pl[0],
+///                          NULL, 0, NULL) < 0)
+///                 die(_("cannot use %s as an exclude file"), fname);
+/// }
+/// ```
+///
+/// `add_patterns()` answers `-1` for a path it cannot read, and a *missing* file
+/// is not one of those: `warn_on_fopen_errors()` stays silent for `ENOENT` and
+/// git carries on with no exclude file at all. A **directory** is one — the
+/// `open()` succeeds and the read does not — which is why
+/// `git -c core.excludesFile=<dir> status` dies before it prints a line, with no
+/// `--ignored` needed to provoke it.
+///
+/// Returns the `fatal:` line to print, or `None` when the exclude file is usable
+/// (or absent). The path is named as configured, which is what git's `fname`
+/// holds after `expand_user_path()` leaves a relative path alone.
+pub fn excludes_file_fatal(repo: &gix::Repository) -> Option<String> {
+    use gix::bstr::ByteSlice;
+    let snapshot = repo.config_snapshot();
+    let raw = snapshot.string("core.excludesFile")?;
+    let shown = raw.to_str_lossy().into_owned();
+    if shown.is_empty() {
+        return None;
+    }
+    let path = gix::path::from_bstr(gix::bstr::BStr::new(&raw)).into_owned();
+    let path = match path.strip_prefix("~") {
+        Ok(rest) => match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(rest),
+            None => path,
+        },
+        Err(_) => path,
+    };
+    match std::fs::read(&path) {
+        Ok(_) => None,
+        // `ENOENT` is git's silent case: no exclude file, no diagnostic.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(format!("cannot use {shown} as an exclude file")),
     }
 }
 
@@ -1010,6 +1168,23 @@ pub struct ConfigValue {
 /// line. So each distinct file is re-parsed once through
 /// [`gix::config::parse::Events`] to build [`FileLines`], and the walk asks it for
 /// the line of the next occurrence of a given `(section, subsection, name)`.
+/// Every configured value of `key`, in configuration order, with this port's
+/// second delivery of a `-c key=value` discounted.
+///
+/// The plain `snapshot.values(key)` reader sees a valued command-line override
+/// *twice* — see [`crate::setup::double_delivered`] — which is invisible to a
+/// last-one-wins reader and wrong for every multi-valued key: `git -c
+/// format.to=a format-patch` must write one `To:` header, not two. This is the
+/// multi-value reader those keys need.
+pub fn multi_values(repo: &gix::Repository, key: &str) -> Vec<String> {
+    let wanted = normalize_key(key);
+    walk_config(repo)
+        .into_iter()
+        .filter(|v| normalize_key(&v.key) == wanted)
+        .filter_map(|v| v.value)
+        .collect()
+}
+
 pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
     use gix::bstr::ByteSlice as _;
     use std::collections::HashMap;

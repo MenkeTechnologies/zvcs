@@ -107,6 +107,9 @@ impl Outcome {
 
         Some(index.write(crate::index::write::Options {
             extensions: Default::default(),
+            // A refresh rewrites the index it just read, so it keeps that
+            // index's own version — git's `istate->version` is already set.
+            version: None,
             skip_hash: self.skip_hash,
         }))
     }

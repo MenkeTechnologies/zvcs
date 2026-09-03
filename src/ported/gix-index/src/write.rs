@@ -56,6 +56,21 @@ impl Extensions {
 pub struct Options {
     /// Configures which extensions to write.
     pub extensions: Extensions,
+    /// git's `istate->version`: the version to write, when the caller has one to
+    /// impose.
+    ///
+    /// `do_write_index()` (read-cache.c:2872) writes the version the index state
+    /// already carries and only consults `GIT_INDEX_VERSION` / `index.version`
+    /// when that version is unset — which is to say, when the writer built the
+    /// state from scratch instead of reading one off disk. `None` is that
+    /// "carries its own version" case and leaves the choice to the entries;
+    /// `Some` is the caller having resolved git's default for a state that has
+    /// none, or `update-index --index-version <n>` naming one outright.
+    ///
+    /// Version 2 and 3 are interchangeable requests: git demotes 3 to 2 whenever
+    /// no entry needs the extended flags, and promotes 2 to 3 whenever one does.
+    /// Only version 4 is a request the entry encoding honors literally.
+    pub version: Option<Version>,
     /// Set the trailing hash of the produced index to all zeroes to save some time.
     ///
     /// This value is typically controlled by `index.skipHash` and is respected when the index is written
@@ -75,11 +90,26 @@ impl State {
         out: impl std::io::Write,
         Options {
             extensions,
+            version: requested_version,
             skip_hash: _,
         }: Options,
     ) -> Result<Version, gix_hash::io::Error> {
         let _span = gix_features::trace::detail!("gix_index::State::write()");
-        let version = self.detect_required_version();
+        // ```c
+        // if (!istate->version)
+        //         istate->version = get_index_format_default(the_repository);
+        //
+        // /* demote version 3 to version 2 when the latter suffices */
+        // if (istate->version == 3 || istate->version == 2)
+        //         istate->version = extended ? 3 : 2;
+        // ```
+        //
+        // (read-cache.c:2865-2872.) Version 4 is the only one that survives the
+        // demotion, so it is the only one a request can pin.
+        let version = match requested_version.unwrap_or(self.version) {
+            Version::V4 => Version::V4,
+            Version::V2 | Version::V3 => self.detect_required_version(),
+        };
 
         let mut write = CountBytes::new(out);
         let num_entries: u32 = self
@@ -102,13 +132,17 @@ impl State {
         let entries_per_block = self
             .offset_table_threads
             .and_then(|threads| extension::index_entry_offset_table::entries_per_block(threads, num_entries));
-        let (offset_to_extensions, offsets) = entries(&mut write, self, offset_to_entries, entries_per_block)?;
+        let (offset_to_extensions, offsets) = entries(&mut write, self, offset_to_entries, entries_per_block, version)?;
         let (extension_toc, out) = self.write_extensions(write, offset_to_extensions, extensions, &offsets)?;
 
-        if num_entries > 0
-            && extensions
-                .should_write(extension::end_of_index_entry::SIGNATURE)
-                .is_some()
+        // `if (!strip_extensions && offset && record_eoie())` (read-cache.c:2998):
+        // `offset` is where the extensions begin and is never zero, so an index
+        // with no entries at all still gets the extension — what gates it is
+        // whether any *other* extension was written, since `EOIE` exists to say
+        // where those start.
+        if extensions
+            .should_write(extension::end_of_index_entry::SIGNATURE)
+            .is_some()
             && !extension_toc.is_empty()
         {
             extension::end_of_index_entry::write_to(out, self.object_hash, offset_to_extensions, extension_toc)?;
@@ -241,10 +275,15 @@ fn entries<T: std::io::Write>(
     state: &State,
     header_size: u32,
     entries_per_block: Option<u32>,
+    version: Version,
 ) -> Result<(u32, Vec<extension::index_entry_offset_table::Offset>), std::io::Error> {
     use extension::index_entry_offset_table::Offset;
 
     let mut offsets = Vec::new();
+    // git's `previous_name`, the strbuf `ce_write_entry()` compresses the next
+    // path against. Version 4 alone keeps one — and version 4 alone writes no
+    // padding, because a compressed name has no fixed width to pad to.
+    let mut previous_name: Option<Vec<u8>> = (version == Version::V4).then(Vec::new);
     // `offset = hashfile_total(f);` right after the header (read-cache.c:2906) — the first
     // block starts at the first entry.
     let mut block_offset = out.count;
@@ -265,12 +304,14 @@ fn entries<T: std::io::Write>(
                 block_offset = out.count;
             }
         }
-        entry.write_to(&mut *out, state)?;
-        match (out.count - header_size) % 8 {
-            0 => {}
-            n => {
-                let eight_null_bytes = [0u8; 8];
-                out.write_all(&eight_null_bytes[n as usize..])?;
+        entry.write_to_version(&mut *out, state, previous_name.as_mut())?;
+        if previous_name.is_none() {
+            match (out.count - header_size) % 8 {
+                0 => {}
+                n => {
+                    let eight_null_bytes = [0u8; 8];
+                    out.write_all(&eight_null_bytes[n as usize..])?;
+                }
             }
         }
         block_entries += 1;

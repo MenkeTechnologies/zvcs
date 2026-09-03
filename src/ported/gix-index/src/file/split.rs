@@ -125,6 +125,10 @@ fn write_shared(file: &File, git_dir: &Path) -> Result<gix_hash::ObjectId, Error
         &mut buf,
         write::Options {
             extensions: write::Extensions::None,
+            // `do_write_index(si->base, …)` writes the shared half at whatever
+            // version the base state carries, which is the version the caller
+            // already settled for the index as a whole.
+            version: None,
             skip_hash: false,
         },
     )?;

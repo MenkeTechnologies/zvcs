@@ -354,6 +354,9 @@ struct Deferred {
     /// Records that `--recurse-submodules` was requested, for the `--untracked`
     /// incompatibility check; the flag is otherwise a no-op here.
     set_changing: Option<String>,
+    /// Whether `--no-recurse-submodules` was the last word on the subject, which
+    /// is what keeps a `submodule.recurse = true` from turning it back on.
+    recurse_off: bool,
     all_match: bool,
 }
 
@@ -693,7 +696,11 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 "no-break" => opts.brk = false,
                 "no-show-function" => opts.show_function = false,
                 "no-function-context" => opts.funcbody = false,
-                "no-recurse-submodules" | "no-all-match" => {}
+                "no-recurse-submodules" => {
+                    deferred.set_changing = None;
+                    deferred.recurse_off = true;
+                }
+                "no-all-match" => {}
                 "color" => match color_wanted(inline.as_deref()) {
                     Ok(v) => opts.color = v,
                     // The callback's `error()` is the whole diagnostic; parse-options
@@ -762,7 +769,16 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 "no-context" => {}
                 "all-match" => deferred.all_match = true,
                 "recurse-submodules" => {
+                    // `OPT_BOOL_F(0, "recurse-submodules", ...)` takes no value, so
+                    // `do_get_value()` refuses an `=<value>` by name: one `error:`
+                    // line, no usage block, exit 129.
+                    if inline.is_some() {
+                        return Ok(crate::parseopt::takes_no_value(
+                            crate::parseopt::OptName::Long("recurse-submodules"),
+                        ));
+                    }
                     deferred.set_changing.get_or_insert_with(|| a.to_string());
+                    deferred.recurse_off = false;
                 }
                 // The name resolved against git's table but no arm here
                 // implements it, so this is an honest gap rather than an
@@ -1070,7 +1086,19 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // When it survives, every gitlink the index or tree walk reaches is handed to
     // `grep_submodule()`, which opens the submodule and greps it with the same
     // options and pathspec — see [`collect_submodule`].
-    let recurse_submodules = deferred.set_changing.is_some() && !opts.no_index;
+    //
+    // `grep_cmd_config()` seeds the same flag from `submodule.recurse`
+    // (`if (!strcmp(var, "submodule.recurse")) recurse_submodules =
+    // git_config_bool(var, value);`), so the config turns the descent on for a
+    // command line that says nothing — and an explicit
+    // `--no-recurse-submodules` still turns it back off.
+    let recurse_config = !deferred.recurse_off
+        && repo
+            .as_ref()
+            .and_then(|repo| repo.config_snapshot().boolean("submodule.recurse"))
+            .unwrap_or(false);
+    let recurse_submodules =
+        (deferred.set_changing.is_some() || recurse_config) && !opts.no_index;
     if recurse_submodules && opts.untracked {
         eprintln!("fatal: --untracked not supported with --recurse-submodules");
         return Ok(ExitCode::from(128));
@@ -1179,6 +1207,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         atoms: &atom_matchers,
         invert: opts.invert,
         column: opts.column,
+        perl: dialect == Dialect::Perl,
     };
 
     // builtin/grep.c:1416-1418. `grep` is not a `NEED_WORK_TREE` command, so only
@@ -1216,14 +1245,14 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // file whose `.gitattributes` entry would have converted it inside a repo.
     let textconv_active = textconv && repo.as_ref().is_some_and(has_textconv_driver);
 
-    // The `diff` attribute resolver, shared by `--textconv` and the
-    // function-context renderers; built lazily since both are uncommon, and not
-    // at all without a repository to resolve attributes against.
+    // The `diff` attribute resolver, shared by `--textconv`, the function-context
+    // renderers and the binary decision. `grep_source_is_binary()` consults the
+    // path's diff driver for *every* file, so this is built whenever there is a
+    // repository to resolve attributes against; outside one git reads no
+    // attributes at all and every file falls through to `buffer_is_binary()`.
     let mut diff_attrs = match repo.as_ref() {
-        Some(repo) if textconv_active || opts.show_function || opts.funcbody => {
-            Some(DiffAttrs::new(repo, &index)?)
-        }
-        _ => None,
+        Some(repo) => Some(DiffAttrs::new(repo, &index)?),
+        None => None,
     };
 
     let specs: Vec<BString> = positionals
@@ -1243,6 +1272,9 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         None => gix::pathspec::Defaults::from_environment(&mut |name| std::env::var_os(name))
             .unwrap_or_default(),
     };
+    if let Some(msg) = crate::pathspec::global_magic_fatal() {
+        return Err(crate::fatal::die(msg));
+    }
     if let Some(msg) = crate::pathspec::first_magic_fatal(&specs, pathspec_defaults) {
         return Err(crate::fatal::die(msg));
     }
@@ -1314,7 +1346,14 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
 
     if revs.is_empty() {
         let mut files: Vec<(BString, Option<gix::hash::ObjectId>)> = Vec::new();
-        if opts.no_index {
+        // `cmd_grep`'s first branch is `if (!use_index || untracked)`: both
+        // `--no-index` and `--untracked` are answered by `grep_directory()`, a
+        // plain `read_directory()` over the working tree, and **not** by
+        // `grep_cache()`. The distinction matters for a file that is tracked and
+        // ignored at once — the index would list it, the directory walk excludes
+        // it — and for `.gitignore`d directories, which the walk descends only
+        // when there is no exclude list to stop it.
+        if opts.no_index || opts.untracked {
             // gitoxide's dirwalk is a *worktree* walk, and there is none to run in
             // a bare repository or outside one entirely; git's `read_directory()`
             // has no such requirement, so both fall back to the plain directory
@@ -1389,15 +1428,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     }
                     files.push((path.to_owned(), Some(entry.id)));
                 }
-            }
-
-            if opts.untracked {
-                if repo.workdir().is_some() {
-                    collect_untracked(repo, &index, &specs, &opts, &mut files)?;
-                } else {
-                    collect_directory_no_worktree(Some(repo), &index, &specs, &opts, &mut files)?;
-                }
-            }
+            };
         }
 
         // The index walk is already ordered, but both directory walks emit in
@@ -1485,7 +1516,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             if !passes_gate(&content) {
                 continue;
             }
-            let binary = !opts.text && is_binary(&content);
+            let binary = !opts.text && binary_of(&mut diff_attrs, rela.as_bstr(), &content)?;
             if binary {
                 continue; // git shapes no function context around a binary hit
             }
@@ -1514,7 +1545,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             if !passes_gate(&content) {
                 continue;
             }
-            let binary = !opts.text && is_binary(&content);
+            let binary = !opts.text && binary_of(&mut diff_attrs, rela.as_bstr(), &content)?;
             if binary && opts.no_binary {
                 continue;
             }
@@ -1576,7 +1607,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             if !passes_gate(&content) {
                 continue;
             }
-            let binary = !opts.text && is_binary(&content);
+            let binary = !opts.text && binary_of(&mut diff_attrs, rela.as_bstr(), &content)?;
             if binary && opts.no_binary {
                 continue;
             }
@@ -1621,7 +1652,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         if !passes_gate(&content) {
             continue;
         }
-        let binary = !opts.text && is_binary(&content);
+        let binary = !opts.text && binary_of(&mut diff_attrs, rela.as_bstr(), &content)?;
         if binary && opts.no_binary {
             continue;
         }
@@ -1785,7 +1816,17 @@ fn bad_numeric_config(raw: &str, key: &str) -> ExitCode {
 /// the exact stderr wording is not a compatibility surface, only the code and the
 /// empty stdout are.
 fn read_pattern_file(path: &str) -> Result<Vec<String>, ExitCode> {
-    match std::fs::read(path) {
+    // `file_callback()` (`builtin/grep.c`): `from_stdin = !strcmp(arg, "-");
+    // patterns = from_stdin ? stdin : fopen(arg, "r");`
+    let read = |path: &str| -> std::io::Result<Vec<u8>> {
+        if path == "-" {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
+            return Ok(buf);
+        }
+        std::fs::read(path)
+    };
+    match read(path) {
         Ok(bytes) => Ok(bytes
             .split(|&b| b == b'\n')
             .filter(|line| !line.is_empty())
@@ -1820,7 +1861,23 @@ fn collect_trees(
         BTreeMap::new()
     };
     for rev in revs {
-        let tree = repo.rev_parse_single(rev.as_str())?.object()?.peel_to_tree()?;
+        let object = repo.rev_parse_single(rev.as_str())?.object()?;
+        // `grep_object()` dispatches on the object's own type, and a blob is
+        // grepped straight away — `grep_oid(opt, &obj->oid, name, 0, path)` —
+        // under the name the user spelled and with the pathspec never consulted.
+        // That is what makes `git grep fn HEAD:src/lib.rs` search one file.
+        if object.kind == gix::object::Kind::Blob {
+            // `oc.path` from `get_oid_with_context(…, GET_OID_RECORD_PATH, …)`:
+            // the path half of the `<rev>:<path>` spelling, which is what the
+            // attribute lookups for this blob are keyed on.
+            let rela = rev
+                .split_once(':')
+                .map(|(_, path)| BString::from(path))
+                .unwrap_or_default();
+            cands.push((rev.as_bytes().to_vec(), rela, Source::Blob(object.id)));
+            continue;
+        }
+        let tree = object.peel_to_tree()?;
         let mut entries = tree.traverse().breadthfirst.files()?;
         // git prints tree matches in path order; the breadth-first walk yields
         // files-before-directories per level, so re-sort by the full path.
@@ -2332,10 +2389,27 @@ fn collect_no_index(
         .emit_untracked(gix::dir::walk::EmissionMode::Matching)
         .emit_ignored(
             (!opts.exclude_standard).then_some(gix::dir::walk::EmissionMode::Matching),
-        );
+        )
+        // With no exclude list there is nothing to stop the walk at an ignored
+        // directory, so `build/output.o` is a file the walk reaches rather than a
+        // `build/` it stops in front of. This is git's `read_directory()` with an
+        // empty `dir->exclude_list_group`.
+        .recurse_ignored_directories(!opts.exclude_standard);
     let mut collect = gix::dir::walk::delegate::Collect::default();
     let should_interrupt = std::sync::atomic::AtomicBool::default();
     repo.dirwalk(index, specs, &should_interrupt, options, &mut collect)?;
+
+    // `treat_path()` asks `is_excluded()` before it asks anything else, so being
+    // tracked is no defence against an ignore rule on this path: `logs/keep.log`
+    // is in the index *and* matched by `*.log`, and the walk drops it. gitoxide
+    // classifies it as `Tracked` and never as `Ignored`, so the rule is applied
+    // here instead of read off the status.
+    let mut excludes = opts
+        .exclude_standard
+        .then(|| {
+            repo.excludes(index, None, gix::worktree::stack::state::ignore::Source::IdMapping)
+        })
+        .transpose()?;
 
     for (entry, _) in collect.unorded_entries {
         if entry.disk_kind != Some(gix::dir::entry::Kind::File) {
@@ -2346,45 +2420,17 @@ fn collect_no_index(
             gix::dir::entry::Status::Ignored(_) if !opts.exclude_standard => {}
             _ => continue,
         }
+        if let Some(stack) = excludes.as_mut() {
+            let mode = Some(gix::index::entry::Mode::FILE);
+            if stack
+                .at_entry(entry.rela_path.as_bstr(), mode)
+                .map(|p| p.is_excluded())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
         // `None` for the id: with `--cached` ruled out, content comes from disk.
-        files.push((entry.rela_path, None));
-    }
-    Ok(())
-}
-
-/// Add the untracked files under `specs` to `files`, as `--untracked` asks.
-///
-/// `--exclude-standard` is on by default, matching git, so ignored files stay
-/// out unless `--no-exclude-standard` was given. Only regular files are added:
-/// directories, symlinks and nested repositories are not searchable content,
-/// exactly as on the index path.
-fn collect_untracked(
-    repo: &gix::Repository,
-    index: &gix::index::File,
-    specs: &[BString],
-    opts: &Opts,
-    files: &mut Vec<(BString, Option<gix::hash::ObjectId>)>,
-) -> Result<()> {
-    let options = repo
-        .dirwalk_options()?
-        .empty_patterns_match_prefix(true)
-        .emit_untracked(gix::dir::walk::EmissionMode::Matching)
-        .emit_ignored(
-            (!opts.exclude_standard).then_some(gix::dir::walk::EmissionMode::Matching),
-        );
-    let mut collect = gix::dir::walk::delegate::Collect::default();
-    let should_interrupt = std::sync::atomic::AtomicBool::default();
-    repo.dirwalk(index, specs, &should_interrupt, options, &mut collect)?;
-
-    for (entry, _) in collect.unorded_entries {
-        if entry.disk_kind != Some(gix::dir::entry::Kind::File) {
-            continue;
-        }
-        match entry.status {
-            gix::dir::entry::Status::Untracked => {}
-            gix::dir::entry::Status::Ignored(_) if !opts.exclude_standard => {}
-            _ => continue,
-        }
         files.push((entry.rela_path, None));
     }
     Ok(())
@@ -2413,38 +2459,72 @@ fn apply_max_depth(
         return;
     }
 
-    // The directory each pathspec descends from; a spec naming a file exactly
-    // sits at depth zero, which the `== spec` test below covers.
+    // The repository-root-relative literal each pathspec names, which is what
+    // git's `do_match_pathspec()` measures the depth from: it skips
+    // `ps->items[i].len` bytes of the matched name, steps over the `/` that
+    // follows when there is one, and counts the slashes left in the remainder
+    // (`within_depth()`, `dir.c`). A spec of `.` normalises to the empty string,
+    // so the count runs over the whole path — which is why `--max-depth 0` at the
+    // top of a repository keeps only the files that have no slash at all.
     let bases: Vec<Vec<u8>> = if specs.is_empty() {
-        vec![cwd_prefix.to_vec()]
+        vec![strip_trailing_slash(cwd_prefix)]
     } else {
-        specs
-            .iter()
-            .map(|s| {
-                let bytes: &[u8] = s;
-                let mut b = bytes.to_vec();
-                if !b.is_empty() && b.last() != Some(&b'/') {
-                    b.push(b'/');
-                }
-                b
-            })
-            .collect()
+        specs.iter().map(|s| spec_base(s.as_bstr(), cwd_prefix)).collect()
     };
 
     files.retain(|(path, _)| {
         let path: &[u8] = path;
-        if specs.iter().any(|s| {
-            let spec: &[u8] = s;
-            spec == path
-        }) {
-            return true;
-        }
         bases.iter().any(|base| {
-            path.len() >= base.len()
+            let rest = if base.is_empty() {
+                path
+            } else if path == base.as_slice() {
+                // A spec naming a file exactly leaves nothing to descend into.
+                return true;
+            } else if path.len() > base.len()
                 && &path[..base.len()] == base.as_slice()
-                && path[base.len()..].iter().filter(|&&b| b == b'/').count() <= max_depth
+                && path[base.len()] == b'/'
+            {
+                &path[base.len() + 1..]
+            } else {
+                // This spec did not match the path; another one may.
+                return false;
+            };
+            rest.iter().filter(|&&b| b == b'/').count() <= max_depth
         })
     });
+}
+
+/// `bytes` without a trailing `/`, which is how git stores a pathspec literal.
+fn strip_trailing_slash(bytes: &[u8]) -> Vec<u8> {
+    let mut b = bytes.to_vec();
+    while b.last() == Some(&b'/') {
+        b.pop();
+    }
+    b
+}
+
+/// The repository-root-relative literal a pathspec names, the way
+/// `prefix_path()` builds `pathspec_item::match`: the current directory's prefix
+/// joined with the spec, with `.` and `..` resolved away and no trailing slash.
+fn spec_base(spec: &BStr, cwd_prefix: &[u8]) -> Vec<u8> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let joined: Vec<u8> = if spec.starts_with(b"/") {
+        spec[1..].to_vec()
+    } else {
+        let mut j = cwd_prefix.to_vec();
+        j.extend_from_slice(spec);
+        j
+    };
+    for part in joined.split(|&b| b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                out.pop();
+            }
+            other => out.push(other.to_vec()),
+        }
+    }
+    out.join(&b'/')
 }
 
 /// Whether colourised output was asked for, following `parse_opt_color_flag_cb()`
@@ -2524,6 +2604,12 @@ struct LineEval<'a> {
     /// `--column`: git disables the AND/OR short-circuit so the earliest atom on a
     /// line is found even when a later branch would have satisfied the match first.
     column: bool,
+    /// Whether the patterns were compiled by PCRE2 rather than `regcomp`. The two
+    /// engines disagree about the position just past a trailing newline: with
+    /// `REG_NEWLINE` a `^` matches there, while `PCRE2_MULTILINE` explicitly does
+    /// not match "after a newline that ends the string" — so `grep -E '^$'`
+    /// reports a line past the end of a file and `grep -P '^$'` reports nothing.
+    perl: bool,
 }
 
 impl LineEval<'_> {
@@ -2773,6 +2859,41 @@ impl<'r> DiffAttrs<'r> {
             }
         }
         Ok(None)
+    }
+
+    /// Whether the path's diff driver settles the binary question, following
+    /// `userdiff_find_by_path()` (`userdiff.c`) as `grep_source_is_binary()`
+    /// consults it: a set `diff` attribute selects `driver_true` (`binary = 0`),
+    /// an unset one (`-diff`) selects `driver_false` (`binary = 1`), and a value
+    /// names a driver whose `diff.<name>.binary` setting decides. `None` is
+    /// git's `binary = -1`, the "no opinion" that falls through to
+    /// `buffer_is_binary()` on the contents.
+    fn binary_attr(&mut self, rela: &BStr) -> Result<Option<bool>> {
+        let mode = Some(gix::index::entry::Mode::FILE);
+        let _ = self.stack.at_entry(rela, mode)?;
+        self.outcome
+            .initialize_with_selection(self.stack.attributes_collection(), ["diff"]);
+        let platform = self.stack.at_entry(rela, mode)?;
+        platform.matching_attributes(&mut self.outcome);
+        let mut named: Option<String> = None;
+        for m in self.outcome.iter_selected() {
+            match m.assignment.state {
+                gix::attrs::StateRef::Set => return Ok(Some(false)),
+                gix::attrs::StateRef::Unset => return Ok(Some(true)),
+                gix::attrs::StateRef::Value(v) => {
+                    named = Some(String::from_utf8_lossy(v.as_bstr().as_bytes()).into_owned());
+                    break;
+                }
+                gix::attrs::StateRef::Unspecified => {}
+            }
+        }
+        let Some(drv) = named else {
+            return Ok(None);
+        };
+        Ok(self
+            .repo
+            .config_snapshot()
+            .boolean(format!("diff.{drv}.binary").as_str()))
     }
 
     /// The `diff.<driver>.textconv` command configured for the path, if any.
@@ -3235,39 +3356,57 @@ fn render_context(
         }
     }
 
-    // Walk the shown lines in order; a gap starts a new hunk. Across files git's
-    // `--` separator precedes every hunk except the first printed anywhere —
-    // except that at a file's *first* hunk `--break` substitutes a blank line and
-    // `--heading` adds the file's name line (intra-file hunks keep the `--`).
-    let mut prev_shown: Option<usize> = None;
-    let mut first_hunk_of_file = true;
+    // git does not walk hunks: `show_line()` decides on every line it is handed,
+    // from `opt->last_shown` — the line number of the last *header* it printed.
+    //
+    // ```c
+    // if (opt->file_break && opt->last_shown == 0) {
+    //         if (opt->show_hunk_mark) opt->output(opt, "\n", 1);
+    // } else if (opt->pre_context || opt->post_context || opt->funcbody) {
+    //         if (opt->last_shown == 0) {
+    //                 if (opt->show_hunk_mark) { output "--" }
+    //         } else if (lno > opt->last_shown + 1) { output "--" }
+    // }
+    // ```
+    //
+    // and `show_line_header()` is what sets `opt->last_shown = lno`. Under `-o`
+    // that header is printed once per *match*, so a context line — which has no
+    // match to show — prints nothing and leaves `last_shown` behind. The next
+    // line is then more than one past it and gets its own `--`, which is why
+    // `grep -o -B1` emits two separators in a row where a context line and the
+    // line after it both qualify. Modelling this as "gaps between shown lines"
+    // instead loses those.
+    let mut last_shown = 0usize;
     for idx in 0..n {
         if !show[idx] {
             continue;
         }
-        let new_hunk = prev_shown.is_none_or(|p| idx > p + 1);
-        if new_hunk {
-            if first_hunk_of_file {
-                if opts.brk {
-                    if *printed_any {
-                        out.write_all(b"\n")?;
-                    }
-                } else if *printed_any {
-                    out.write_all(b"--\n")?;
-                }
-                if opts.heading {
+        let lno = idx + 1;
+        if opts.brk && last_shown == 0 {
+            if *printed_any {
+                out.write_all(b"\n")?;
+            }
+        } else if last_shown == 0 {
+            if *printed_any {
+                out.write_all(b"--\n")?;
+            }
+        } else if lno > last_shown + 1 {
+            out.write_all(b"--\n")?;
+        }
+
+        let line = lines[idx];
+        // `show_line_header()`: the `--heading` file name is printed by the first
+        // header of the file, and every header advances `last_shown`.
+        macro_rules! header {
+            () => {{
+                if opts.heading && last_shown == 0 {
                     write_field(out, name, c_filename(), opts.color)?;
                     out.write_all(b"\n")?;
                 }
-                first_hunk_of_file = false;
-            } else {
-                out.write_all(b"--\n")?;
-            }
-            *printed_any = true;
+                last_shown = lno;
+                *printed_any = true;
+            }};
         }
-        prev_shown = Some(idx);
-
-        let line = lines[idx];
         if is_match[idx] {
             if opts.only_matching && !opts.invert {
                 let mut at = 0usize;
@@ -3275,29 +3414,28 @@ fn render_context(
                     if len == 0 {
                         break;
                     }
-                    write_prefix(out, name, idx + 1, start + 1, opts)?;
+                    header!();
+                    write_prefix(out, name, lno, start + 1, opts)?;
                     write_field(out, &line[start..start + len], c_match(), opts.color)?;
                     out.write_all(b"\n")?;
                     at = start + len;
                 }
             } else {
+                header!();
                 let col = ev.test(line).1;
-                write_prefix(out, name, idx + 1, col, opts)?;
+                write_prefix(out, name, lno, col, opts)?;
                 // A `-v` line is not itself a match, so it is never highlighted.
                 write_body(out, line, ev.matcher, opts.color, Body::Selected, !opts.invert)?;
                 out.write_all(b"\n")?;
             }
         } else if !(opts.only_matching && !opts.invert) {
-            write_context_prefix(out, name, idx + 1, opts)?;
+            header!();
+            write_context_prefix(out, name, lno, opts)?;
             // Context lines carry `color.grep.context`; under `-v` they are the
             // lines that matched, so their matches take `color.grep.matchContext`.
             write_body(out, line, ev.matcher, opts.color, Body::Context, opts.invert)?;
             out.write_all(b"\n")?;
         }
-        // Under `-o` a context line has no matched substring to show, so it emits
-        // nothing (its hunk still contributes the leading `--`); this matches
-        // git's `-o -A` exactly. git's `-o -B`/`-o -C` additionally double some
-        // separators — a documented quirk this port does not reproduce.
     }
     Ok(true)
 }
@@ -3344,7 +3482,32 @@ fn search_file(
     // Whether this file's `--break`/`--heading` prelude has been emitted yet.
     let mut fired = false;
 
-    for (lno, line) in lines(content).enumerate() {
+    // git's `look_ahead()` (grep.c) matches each pattern against the *whole*
+    // remaining buffer to skip ahead to the line that could hold the next hit,
+    // and one of the offsets it can land on is the one just past the final
+    // newline — a zero-length line the ordinary walk never produces. A pattern
+    // that matches there and nowhere in the last real line is therefore reported
+    // on a line number one past the end of the file:
+    //
+    // ```text
+    // $ printf '# fixture\n' >README.md && git grep -n '^$' -- README.md
+    // README.md:2:
+    // ```
+    //
+    // The jump only happens while the walk still has bytes left and only when no
+    // remaining real line matches, which reduces to "the last line does not
+    // match". `should_lookahead()` turns the whole mechanism off for `-v` and for
+    // the boolean grammar, and the loop skips `look_ahead()` inside a
+    // post-context window and for the function-context modes — which is why this
+    // is confined to the plain renderer, where those windows are empty.
+    let phantom_tail = !opts.invert
+        && !ev.perl
+        && ev.expr.is_none()
+        && content.ends_with(b"\n")
+        && ev.test(b"").0
+        && !lines(content).last().is_some_and(|last| ev.test(last).0);
+
+    for (lno, line) in lines(content).chain(phantom_tail.then_some(&b""[..])).enumerate() {
         if count >= limit {
             break;
         }
@@ -3629,9 +3792,188 @@ impl Matcher {
 fn translate_pattern(pattern: &str, dialect: Dialect) -> Result<String> {
     Ok(match dialect {
         Dialect::Fixed => regex::escape(pattern),
-        Dialect::Extended | Dialect::Perl => pattern.to_string(),
+        Dialect::Extended => ere_to_regex(pattern)?,
+        Dialect::Perl => pattern.to_string(),
         Dialect::Basic => bre_to_regex(pattern),
     })
+}
+
+/// POSIX ERE → `regex`-crate syntax.
+///
+/// `-E` compiles through `regcomp(…, REG_EXTENDED)`, and two of that grammar's
+/// rules are the opposite of this crate's. Both are observable through
+/// `git grep -E` and were measured against git 2.55.0:
+///
+///   * **`\<char>` is the literal character, always.** POSIX leaves `\` before an
+///     ordinary character undefined and the implementation yields the character
+///     itself, so `\d`, `\w`, `\b`, `\t` and `\1` mean `d`, `w`, `b`, `t` and `1`
+///     — not a digit class, a word class, a word boundary, a tab or a
+///     backreference. `-E '\bint\b'` finds nothing in a file full of `int`s;
+///     `-E '(int) .*\1'` matches the line ending `= 1;` rather than the one that
+///     says `int` twice.
+///   * **Inside a bracket expression `\` is an ordinary member**, so `[\d]` is
+///     the two-character set `\` and `d`.
+///
+/// And one rule has no equivalent at all: a repetition operator with nothing to
+/// repeat is *rejected* here rather than read as a literal the way BRE reads it.
+/// `regcomp` answers `REG_BADRPT` and git renders it through
+/// `compile_regexp_failed()`:
+///
+/// ```text
+/// fatal: command line, '(?i)INT ADD': repetition-operator operand invalid
+/// ```
+///
+/// which is how a Perl-style inline flag group reaches the user: `(` opens a
+/// group and the `?` that follows has no operand. Both anchors leave nothing to
+/// repeat either (`^*` and `a$*` are both `REG_BADRPT`), while `{` is an operator
+/// only when a well-formed interval follows it — `{x}` is three literal
+/// characters and `{2}` at the start of a pattern is the error.
+fn ere_to_regex(p: &str) -> Result<String> {
+    let cs: Vec<char> = p.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    // Whether an expression precedes this position for a quantifier to bind to.
+    let mut repeatable = false;
+    let badrpt = || {
+        crate::fatal::die(format!(
+            "command line, '{p}': repetition-operator operand invalid"
+        ))
+    };
+    while i < cs.len() {
+        match cs[i] {
+            '[' => {
+                i = copy_bracket(&cs, i, &mut out);
+                repeatable = true;
+            }
+            '\\' if i + 1 < cs.len() => {
+                push_literal(&mut out, cs[i + 1]);
+                repeatable = true;
+                i += 2;
+            }
+            c @ ('*' | '+' | '?') => {
+                if !repeatable {
+                    return Err(badrpt());
+                }
+                out.push(c);
+                repeatable = false;
+                i += 1;
+            }
+            '{' if interval_len(&cs, i).is_some() => {
+                if !repeatable {
+                    return Err(badrpt());
+                }
+                let end = i + interval_len(&cs, i).expect("checked just above");
+                out.extend(&cs[i..end]);
+                repeatable = false;
+                i = end;
+            }
+            '(' | '|' => {
+                out.push(cs[i]);
+                repeatable = false;
+                i += 1;
+            }
+            ')' => {
+                out.push(')');
+                repeatable = true;
+                i += 1;
+            }
+            '^' | '$' => {
+                out.push(cs[i]);
+                repeatable = false;
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                repeatable = true;
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `c` as a one-character literal in `regex`-crate syntax.
+fn push_literal(out: &mut String, c: char) {
+    if "\\.+*?()|[]{}^$".contains(c) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// Copy the bracket expression starting at `cs[at]` (a `[`) into `out`, returning
+/// the index just past it.
+///
+/// POSIX's rules are preserved on the way through: a `]` in the first position
+/// (after an optional `^`) is a member rather than the terminator, and
+/// `[:class:]` / `[.coll.]` / `[=equiv=]` run to their own closing pair. A `\` is
+/// an ordinary member and is doubled, since the crate would otherwise read it as
+/// an escape.
+fn copy_bracket(cs: &[char], at: usize, out: &mut String) -> usize {
+    let mut i = at + 1;
+    out.push('[');
+    if cs.get(i) == Some(&'^') {
+        out.push('^');
+        i += 1;
+    }
+    if cs.get(i) == Some(&']') {
+        out.push_str("\\]");
+        i += 1;
+    }
+    while i < cs.len() {
+        match cs[i] {
+            '[' if matches!(cs.get(i + 1), Some(':' | '.' | '=')) => {
+                let kind = cs[i + 1];
+                out.push('[');
+                out.push(kind);
+                i += 2;
+                while i + 1 < cs.len() && !(cs[i] == kind && cs[i + 1] == ']') {
+                    out.push(cs[i]);
+                    i += 1;
+                }
+                if i + 1 < cs.len() {
+                    out.push(kind);
+                    out.push(']');
+                    i += 2;
+                }
+            }
+            ']' => {
+                out.push(']');
+                return i + 1;
+            }
+            '\\' => {
+                out.push_str("\\\\");
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    // Unterminated: hand the crate what there is and let it report the error.
+    i
+}
+
+/// The length of the interval expression at `cs[at]` (a `{`), or `None` when what
+/// follows is not one — `{n}`, `{n,}` and `{n,m}` are operators, `{x}` is three
+/// ordinary characters.
+fn interval_len(cs: &[char], at: usize) -> Option<usize> {
+    let mut i = at + 1;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while cs.get(*i).is_some_and(char::is_ascii_digit) {
+            *i += 1;
+        }
+        *i > start
+    };
+    if !digits(&mut i) {
+        return None;
+    }
+    if cs.get(i) == Some(&',') {
+        i += 1;
+        digits(&mut i);
+    }
+    (cs.get(i) == Some(&'}')).then_some(i + 1 - at)
 }
 
 /// GNU BRE → `regex`-crate syntax. In BRE the grouping/quantifier operators are
@@ -3760,6 +4102,22 @@ fn word_bounded(hay: &[u8], start: usize, end: usize) -> bool {
     (start == 0 || !is_word(hay[start - 1])) && (end == hay.len() || !is_word(hay[end]))
 }
 
+/// git's `grep_source_is_binary()` (`grep.c`): the path's diff driver answers
+/// first, and only a driver with no opinion (`binary == -1`) falls through to
+/// `buffer_is_binary()` on the contents.
+fn binary_of(
+    diff_attrs: &mut Option<DiffAttrs<'_>>,
+    rela: &BStr,
+    content: &[u8],
+) -> Result<bool> {
+    if let Some(da) = diff_attrs.as_mut() {
+        if let Some(decided) = da.binary_attr(rela)? {
+            return Ok(decided);
+        }
+    }
+    Ok(is_binary(content))
+}
+
 /// git's `buffer_is_binary()`: a NUL within the first 8000 bytes.
 fn is_binary(content: &[u8]) -> bool {
     let head = &content[..content.len().min(FIRST_FEW_BYTES)];
@@ -3795,14 +4153,19 @@ fn literal_of(pattern: &str, dialect: Dialect) -> Result<Vec<u8>> {
 /// prefix stripped, C-quoted unless `-z` asked for verbatim bytes.
 fn display_name(path: &BStr, prefix: Option<&[u8]>, opts: &Opts) -> Vec<u8> {
     let bytes = path.as_bytes();
+    // `show_name()` prints through `quote_path()`, whose relative form is
+    // `relative_path()` — a *climb*, not a prefix strip. Only a pathspec that
+    // reaches outside the current directory (`:(top)`, `:/`) can produce a name
+    // the prefix does not cover, and git names those `../README.md` rather than
+    // from the repository root.
     let rel = match prefix {
-        Some(p) if bytes.starts_with(p) => &bytes[p.len()..],
-        _ => bytes,
+        Some(p) => crate::objpath::relative_path(bytes, p),
+        None => bytes.to_vec(),
     };
     if opts.nul {
-        rel.to_vec()
+        rel
     } else {
-        quote_path(rel).into_bytes()
+        quote_path(&rel).into_bytes()
     }
 }
 

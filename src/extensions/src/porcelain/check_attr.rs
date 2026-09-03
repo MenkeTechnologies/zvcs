@@ -250,14 +250,24 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
         let mut paths = Vec::with_capacity(records.len());
         for r in records {
             // git only unquotes in the line-oriented mode; `-z` records are literal.
+            // `check_attr()` takes the strbuf as a `const char *`, so a NUL
+            // inside a line ends the name there: a NUL-separated stream fed to a
+            // `--stdin` without `-z` is one line, and only the first name in it
+            // is looked up and echoed.
+            let truncate = |b: &[u8]| -> BString {
+                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                BString::from(&b[..end])
+            };
             if !nul && r.first() == Some(&b'"') {
                 let Some(unquoted) = unquote_c_style(r) else {
                     eprintln!("fatal: line is badly quoted");
                     return Ok(ExitCode::from(128));
                 };
-                paths.push(unquoted);
-            } else {
+                paths.push(truncate(&unquoted));
+            } else if nul {
                 paths.push(BString::from(r));
+            } else {
+                paths.push(truncate(r));
             }
         }
         paths

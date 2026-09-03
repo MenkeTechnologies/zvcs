@@ -145,6 +145,52 @@ pub fn first_magic_fatal<S: AsRef<[u8]>>(
     })
 }
 
+/// `init_pathspec_magic()`'s two `die()`s (`pathspec.c`), which fire before any
+/// element is looked at.
+///
+/// ```c
+/// literal_global = git_env_bool(GIT_LITERAL_PATHSPECS_ENVIRONMENT, 0);
+/// glob_global    = git_env_bool(GIT_GLOB_PATHSPECS_ENVIRONMENT, 0);
+/// noglob_global  = git_env_bool(GIT_NOGLOB_PATHSPECS_ENVIRONMENT, 0);
+/// icase_global   = git_env_bool(GIT_ICASE_PATHSPECS_ENVIRONMENT, 0);
+/// if (literal_global && (glob_global || noglob_global || icase_global))
+///         die(_("global 'literal' pathspec setting is incompatible "
+///               "with all other global pathspec settings"));
+/// if (glob_global && noglob_global)
+///         die(_("global 'glob' and 'noglob' pathspec settings are incompatible"));
+/// ```
+///
+/// The four variables are how git carries `--literal-pathspecs`,
+/// `--glob-pathspecs`, `--noglob-pathspecs` and `--icase-pathspecs` from the
+/// command line as well, so this gate covers both spellings. `git_env_bool` reads
+/// the *value*, so a variable set to `0`, `false` or the empty string is off and
+/// conflicts with nothing.
+///
+/// Returns the `fatal:` body, in git's order, or `None`. Callers print
+/// `fatal: {msg}` and exit 128.
+pub fn global_magic_fatal() -> Option<String> {
+    let env_bool = |name: &str| -> bool {
+        std::env::var_os(name).is_some_and(|v| {
+            gix::config::Boolean::try_from(v).map(|b| b.0).unwrap_or(false)
+        })
+    };
+    let literal = env_bool("GIT_LITERAL_PATHSPECS");
+    let glob = env_bool("GIT_GLOB_PATHSPECS");
+    let noglob = env_bool("GIT_NOGLOB_PATHSPECS");
+    let icase = env_bool("GIT_ICASE_PATHSPECS");
+    if literal && (glob || noglob || icase) {
+        return Some(
+            "global 'literal' pathspec setting is incompatible with all other global pathspec \
+             settings"
+                .into(),
+        );
+    }
+    if glob && noglob {
+        return Some("global 'glob' and 'noglob' pathspec settings are incompatible".into());
+    }
+    None
+}
+
 /// `init_pathspec_item()`'s *other* `die()` — the one that fires after the magic
 /// parsed cleanly and the path itself turned out to point out of the repository
 /// (`pathspec.c:489-502`):

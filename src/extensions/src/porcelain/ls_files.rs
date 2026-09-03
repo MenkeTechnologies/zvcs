@@ -168,6 +168,29 @@ impl Opts {
 
 /// Print `msg` followed by git's usage block and return git's usage exit code.
 /// This is parse-options' own diagnostic for a malformed command line.
+/// `add_patterns_from_file()`'s refusal (`dir.c`), raised by `-X`/`--exclude-from`
+/// from inside its option callback — so it fires during argument parsing, before
+/// the command has listed anything:
+///
+/// ```c
+/// void add_patterns_from_file(struct dir_struct *dir, const char *fname)
+/// {
+///         if (add_patterns(fname, "", 0, &dir->exclude_list_group[EXC_FILE].pl[0],
+///                          NULL, 0, NULL) < 0)
+///                 die(_("cannot use %s as an exclude file"), fname);
+/// }
+/// ```
+///
+/// `add_patterns()` opens the path and requires a regular file (`!S_ISREG(st) →
+/// goto err`), so a missing path and a directory both land here.
+fn reject_exclude_file(path: &str) -> Option<ExitCode> {
+    if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    eprintln!("fatal: cannot use {path} as an exclude file");
+    Some(ExitCode::from(128))
+}
+
 fn usage_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
     eprint!("{USAGE}");
@@ -224,6 +247,12 @@ fn check_pathspecs(
     patterns: &[BString],
     raw_patterns: &[String],
 ) -> Result<Option<ExitCode>> {
+    // `init_pathspec_magic()` runs first and looks only at the four global
+    // settings, so a contradictory pair is fatal before any element is read.
+    if let Some(msg) = crate::pathspec::global_magic_fatal() {
+        eprintln!("fatal: {msg}");
+        return Ok(Some(ExitCode::from(128)));
+    }
     if patterns.is_empty() {
         return Ok(None);
     }
@@ -349,6 +378,27 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             }
         };
         let s = resolved.as_ref();
+        // `do_get_value()` (parse-options.c:138-143): an `=<value>` written on an
+        // option the table declares `PARSE_OPT_NOARG` is refused by *name*, with
+        // the `error:` line alone and no usage block — not as an unknown option.
+        if let Some((head, _)) = s.split_once('=') {
+            let bare = head.trim_start_matches('-');
+            let (stem, negated) = match bare.strip_prefix("no-") {
+                Some(stem) => (stem, true),
+                None => (bare, false),
+            };
+            if LONG_OPTS
+                .iter()
+                .any(|o| o.name == stem && matches!(o.arg, super::Arg::None))
+            {
+                let name = if negated {
+                    crate::parseopt::OptName::Unset(stem)
+                } else {
+                    crate::parseopt::OptName::Long(stem)
+                };
+                return Ok(crate::parseopt::takes_no_value(name));
+            }
+        }
         match s {
             "--" => no_more_flags = true,
             "--cached" => opts.cached = true,
@@ -427,6 +477,9 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             }
             "--exclude-from" => match args.get(i + 1) {
                 Some(v) => {
+                    if let Some(code) = reject_exclude_file(v) {
+                        return Ok(code);
+                    }
                     opts.exclude_from.push(v.clone());
                     opts.exc_given = true;
                     i += 1;
@@ -434,7 +487,11 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                 None => return Ok(option_error("option `exclude-from' requires a value")),
             },
             _ if s.starts_with("--exclude-from=") => {
-                opts.exclude_from.push(s["--exclude-from=".len()..].to_string());
+                let file = s["--exclude-from=".len()..].to_string();
+                if let Some(code) = reject_exclude_file(&file) {
+                    return Ok(code);
+                }
+                opts.exclude_from.push(file);
                 opts.exc_given = true;
             }
             "--format" => match args.get(i + 1) {
@@ -519,6 +576,9 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                             if c == 'x' {
                                 opts.exclude.push(val);
                             } else {
+                                if let Some(code) = reject_exclude_file(&val) {
+                                    return Ok(code);
+                                }
                                 opts.exclude_from.push(val);
                             }
                             break;
@@ -930,6 +990,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
 
         let stage = entry.stage_raw();
         let display = strip_prefix(path, prefix.as_ref());
+        let display = display.as_slice();
 
         if opts.shows_index_entries() && !(opts.unmerged && stage == 0) {
             // git's `show_ce` replaces an active submodule's own line with the
@@ -1017,6 +1078,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                 }
                 matched.insert(m.sequence_number);
                 let display = strip_prefix(name, prefix.as_ref());
+                let display = display.as_slice();
                 let path_bytes = if quote {
                     quote_path(display).into_bytes()
                 } else {
@@ -1037,16 +1099,13 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if opts.error_unmatch {
-        if let Some(raw) = raw_patterns
-            .iter()
-            .enumerate()
-            .find(|(i, _)| !matched.contains(i))
-            .map(|(_, raw)| raw)
-        {
-            eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
-            eprintln!("Did you forget to 'git add'?");
-            return Ok(ExitCode::from(1));
+    // `expand_show_index()` (`builtin/ls-files.c`) dies on an atom it does not
+    // know, while expanding the *first* entry — so the refusal lands before any
+    // output, and a run with nothing to show never reaches it.
+    if !lines.is_empty() {
+        if let Some(atom) = opts.format.as_deref().and_then(unknown_format_atom) {
+            eprintln!("fatal: bad ls-files format: {atom}");
+            return Ok(ExitCode::from(128));
         }
     }
 
@@ -1064,7 +1123,123 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         previous = Some(line);
     }
     out.flush()?;
+
+    // `cmd_ls_files` calls `show_files()` first and only then hands `ps_matched`
+    // to `report_path_error()`, so the entries that *did* match are already on
+    // stdout when the diagnostic is written. It reports every unmatched element,
+    // one `error:` line each, and prints the hint once afterwards.
+    //
+    // An `:(exclude)` element is never among them: `parse_pathspec()` appends an
+    // implicit empty positive item when every element is an exclude, and
+    // `do_match_pathspec()` marks an exclude item seen as soon as it excludes
+    // something — verified against git 2.55.0, where `ls-files --error-unmatch --
+    // :!nosuch.txt` exits 0 and says nothing.
+    if opts.error_unmatch {
+        let mut bad = 0usize;
+        for (i, raw) in raw_patterns.iter().enumerate() {
+            if matched.contains(&i) || is_exclude_pathspec(raw) {
+                continue;
+            }
+            eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
+            bad += 1;
+        }
+        if bad > 0 {
+            eprintln!("Did you forget to 'git add'?");
+            return Ok(ExitCode::from(1));
+        }
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The first `%(<atom>)` in `fmt` that `expand_show_index()` does not recognise,
+/// rendered the way its `die()` renders it — `%(<atom>)`, the whole element
+/// including the parentheses, which is what `die(_("bad ls-files format: %%%.*s"))`
+/// produces.
+///
+/// The atom list is [`expand_format`]'s; the two must stay in step, since an atom
+/// this accepts and that one ignores would print empty instead of dying.
+fn unknown_format_atom(fmt: &str) -> Option<String> {
+    const ATOMS: [&str; 10] = [
+        "objectmode",
+        "objecttype",
+        "objectname",
+        "objectsize",
+        "objectsize:padded",
+        "stage",
+        "path",
+        "eolinfo:index",
+        "eolinfo:worktree",
+        "eolattr",
+    ];
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            i += 1;
+            continue;
+        }
+        match chars.get(i + 1) {
+            None => break,
+            Some('%') => {
+                i += 2;
+                continue;
+            }
+            // `strbuf_expand_literal` consumes `%xNN` before the `(` check.
+            Some('x') if i + 3 < chars.len() => {
+                let hex: String = chars[i + 2..i + 4].iter().collect();
+                if u8::from_str_radix(&hex, 16).is_ok() {
+                    i += 4;
+                    continue;
+                }
+            }
+            Some(_) => {}
+        }
+        if chars.get(i + 1) == Some(&'(') {
+            if let Some(close) = chars[i + 2..].iter().position(|&c| c == ')') {
+                let atom: String = chars[i + 2..i + 2 + close].iter().collect();
+                if !ATOMS.contains(&atom.as_str()) {
+                    return Some(format!("%({atom})"));
+                }
+                i += 2 + close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `pattern` with its trailing spaces escaped, so a parser that strips
+/// unescaped ones leaves it alone. Patterns with no trailing space come back
+/// unchanged.
+fn keep_trailing_spaces(pattern: &str) -> String {
+    let trimmed = pattern.trim_end_matches(' ');
+    if trimmed.len() == pattern.len() {
+        return pattern.to_string();
+    }
+    let mut out = trimmed.to_string();
+    for _ in 0..pattern.len() - trimmed.len() {
+        out.push_str("\\ ");
+    }
+    out
+}
+
+/// Whether a pathspec element carries `exclude` magic, in either spelling —
+/// the `:!`/`:^` short form or the long `:(exclude)` / `:(…,exclude,…)` one.
+fn is_exclude_pathspec(raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix(':') else {
+        return false;
+    };
+    if rest.starts_with('!') || rest.starts_with('^') {
+        return true;
+    }
+    let Some(long) = rest.strip_prefix('(') else {
+        return false;
+    };
+    let Some((keywords, _)) = long.split_once(')') else {
+        return false;
+    };
+    keywords.split(',').any(|k| k.trim() == "exclude")
 }
 
 /// git's `ADVICE_MSG` from `sparse-index.c`, printed once through the `hint:`
@@ -1186,7 +1361,16 @@ impl<'repo> Excludes<'repo> {
             support_precious: false,
         };
         // `-x` patterns first (git's `EXC_CMDL`), then each `-X` file appended.
-        let mut search = gix::ignore::Search::from_overrides(opts.exclude.iter().cloned(), parse);
+        //
+        // A command-line pattern keeps its trailing spaces: `trim_trailing_spaces()`
+        // runs in `add_patterns_from_buffer()`, over the bytes of a *file*, and
+        // `add_pattern()` — which is what `-x` reaches — does not call it. So
+        // `-x 'name.txt '` matches a file whose name ends in a space and nothing
+        // else. gitoxide parses an override through the same line parser as a
+        // file and would trim it, so the trailing run is escaped here, which is
+        // the spelling that parser preserves.
+        let cmdline = opts.exclude.iter().map(|p| keep_trailing_spaces(p));
+        let mut search = gix::ignore::Search::from_overrides(cmdline, parse);
         for file in &opts.exclude_from {
             if let Ok(bytes) = std::fs::read(file) {
                 search.add_patterns_buffer(&bytes, file.clone(), None, parse);
@@ -2242,14 +2426,17 @@ fn format_objectsize(entry: Option<&gix::index::Entry>, repo: &gix::Repository) 
     }
 }
 
-/// Drop the repository-to-cwd prefix so paths print relative to the caller.
-fn strip_prefix<'a>(path: &'a BStr, prefix: Option<&BString>) -> &'a [u8] {
+/// Name `path` from the caller's directory, which is `write_name_quoted_relative()`
+/// — `relative_path()` and not a prefix strip.
+///
+/// The two agree for everything inside the current directory, and only a pathspec
+/// that reaches outside it (`:(top)`, `:/`) can produce a name that does not start
+/// with the prefix. git climbs out of the prefix for those (`../README.md`) rather
+/// than printing them from the repository root.
+fn strip_prefix(path: &BStr, prefix: Option<&BString>) -> Vec<u8> {
     match prefix {
-        Some(pref) => path
-            .as_bytes()
-            .strip_prefix(pref.as_bytes())
-            .unwrap_or_else(|| path.as_bytes()),
-        None => path.as_bytes(),
+        Some(pref) => crate::objpath::relative_path(path.as_bytes(), pref.as_bytes()),
+        None => path.as_bytes().to_vec(),
     }
 }
 

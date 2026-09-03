@@ -170,7 +170,7 @@ pub fn upload_archive__writer(args: &[String]) -> Result<ExitCode> {
     let workdir = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
     std::env::set_current_dir(&workdir)?;
 
-    super::archive::archive(&sent)
+    super::archive::archive_remote(&sent)
 }
 
 /// Report a git `die` verbatim and hand back git's exit code for one.

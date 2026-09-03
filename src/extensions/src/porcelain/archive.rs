@@ -147,20 +147,20 @@ const ZEROS: [u8; RECORD] = [0; RECORD];
 const FORMATS: &[&str] = &["tar", "tgz", "tar.gz", "zip"];
 
 /// ```c
-/// if (skip_prefix(var, "tar.", &name) && strip_suffix(name, ".command", &namelen)) {
-///         [...]
-///         ar = find_tar_filter(name, namelen);
-///         if (!ar) {
-///                 ar = xcalloc(1, sizeof(*ar));
-///                 ar->name = xmemdupz(name, namelen);
-///                 ar->next = tar_filters;
-///                 tar_filters = ar;
-///         }
-///         [...]
+/// ar = find_tar_filter(name, namelen);
+/// if (!ar) {
+///         CALLOC_ARRAY(ar, 1);
+///         ar->name = xmemdupz(name, namelen);
 ///         ar->write_archive = write_tar_filter_archive;
-///         ar->flags = ARCHIVER_WANT_COMPRESSION_LEVELS | ARCHIVER_REMOTE;
+///         ar->flags = ARCHIVER_WANT_COMPRESSION_LEVELS |
+///                     ARCHIVER_HIGH_COMPRESSION_LEVELS;
+///         ALLOC_GROW(tar_filters, nr_tar_filters + 1, alloc_tar_filters);
+///         tar_filters[nr_tar_filters++] = ar;
 /// }
 /// ```
+///
+/// A filter is *not* born remotely available — `ARCHIVER_REMOTE` is granted only
+/// by a `tar.<name>.remote`, which [`remote_allowed`] reads.
 ///
 /// (`git_tar_config()`, archive-tar.c.) Every `tar.<name>.command` is an archive format of
 /// its own: the tar goes to the command's standard input and whatever it writes is the
@@ -191,6 +191,42 @@ fn configured_formats(repo: Option<&gix::Repository>) -> Vec<String> {
     }
     out.push("zip".to_string());
     out
+}
+
+/// Whether `format` carries `ARCHIVER_REMOTE` — the flag that decides what
+/// `git upload-archive` will serve, and so what a `git archive --remote` client
+/// can ask for.
+///
+/// `tar` and `zip` are static archivers declared with the flag
+/// (`archive-tar.c:526`, `archive-zip.c`). Everything else is a tar filter, and
+/// `tar_filter_config()` grants the flag only through `tar.<name>.remote`:
+///
+/// ```c
+/// ar->flags = ARCHIVER_WANT_COMPRESSION_LEVELS | ARCHIVER_HIGH_COMPRESSION_LEVELS;
+/// [...]
+/// if (!strcmp(type, "remote")) {
+///         if (git_config_bool(var, value))  ar->flags |=  ARCHIVER_REMOTE;
+///         else                              ar->flags &= ~ARCHIVER_REMOTE;
+/// }
+/// ```
+///
+/// `init_tar_archiver()` pre-seeds `tar.tgz.remote=true` and
+/// `tar.tar.gz.remote=true` *before* reading the repository's configuration, so
+/// those two default to remotely available and a user `tar.tgz.remote=false`
+/// takes it back — while a filter the user invents is not remotely available
+/// unless they say so.
+fn remote_allowed(repo: Option<&gix::Repository>, format: &str) -> bool {
+    if format == "tar" || format == "zip" {
+        return true;
+    }
+    let configured = repo.and_then(|repo| {
+        repo.config_snapshot()
+            .plumbing()
+            .boolean_by("tar", Some(gix::bstr::BStr::new(format)), "remote")
+            .ok()
+            .flatten()
+    });
+    configured.unwrap_or(matches!(format, "tgz" | "tar.gz"))
 }
 
 /// The command a `tar.<format>.command` configures for this format, if any.
@@ -324,6 +360,20 @@ struct Item {
 
 /// `git archive` — write a `tar` archive of `<tree-ish>` to stdout or `-o`.
 pub fn archive(args: &[String]) -> Result<ExitCode> {
+    archive_impl(args, false)
+}
+
+/// `write_archive(..., remote = 1)`, which is how `upload-archive--writer` runs
+/// the archiver on behalf of a `git archive --remote` client.
+///
+/// The only difference is the `ARCHIVER_REMOTE` gate: `--list` reports just the
+/// formats that carry the flag, and a format without it is `Unknown archive
+/// format` even though the same name works locally.
+pub fn archive_remote(args: &[String]) -> Result<ExitCode> {
+    archive_impl(args, true)
+}
+
+fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     // `cmd_archive()` parses `-o`/`--remote`/`--exec` first, with
     // `PARSE_OPT_KEEP_ALL`, and hands the rest of the command line to the far side
     // when a `--remote` came out of it (builtin/archive.c:97-108). Without one
@@ -469,6 +519,16 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // `if (is_remote && args->extra_files.nr) die(_("options '%s' and '%s' cannot
+    // be used together"), "--add-file", "--remote");` (`parse_archive_args`,
+    // archive.c:705). Raised on the *serving* side, ahead of `--list` and ahead of
+    // the tree-ish check, and named for `--add-file` whichever of the two
+    // spellings put the file there.
+    if is_remote && !opts.added.is_empty() {
+        eprintln!("fatal: options '--add-file' and '--remote' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+
     // `--list` short-circuits everything else, but git rejects any leftover
     // positional first — it never lists formats *and* takes a tree-ish.
     if list {
@@ -476,8 +536,14 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: extra command line parameter '{extra}'");
             return Ok(ExitCode::from(128));
         }
+        let repo = crate::setup::discover().ok();
         let mut out = String::new();
-        for f in configured_formats(crate::setup::discover().ok().as_ref()) {
+        for f in configured_formats(repo.as_ref()) {
+            // `if (!is_remote || archivers[i]->flags & ARCHIVER_REMOTE)`
+            // (`parse_archive_args`, archive.c).
+            if is_remote && !remote_allowed(repo.as_ref(), &f) {
+                continue;
+            }
             out.push_str(&f);
             out.push('\n');
         }
@@ -506,8 +572,14 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     // The registry is config-driven, so a `tar.<name>.command` makes `<name>` a format git
     // knows — which is why this is checked against the configured list and not the built-in
     // one.
-    let known = configured_formats(crate::setup::discover().ok().as_ref());
-    if !known.iter().any(|f| f == &format) {
+    let known_repo = crate::setup::discover().ok();
+    let known = configured_formats(known_repo.as_ref());
+    // `if (!*ar || (is_remote && !((*ar)->flags & ARCHIVER_REMOTE)))
+    //         die(_("Unknown archive format '%s'"), format);` — a format the
+    // remote side is not allowed to serve is reported as unknown, not as denied.
+    if !known.iter().any(|f| f == &format)
+        || (is_remote && !remote_allowed(known_repo.as_ref(), &format))
+    {
         eprintln!("fatal: Unknown archive format '{format}'");
         return Ok(ExitCode::from(128));
     }
@@ -768,7 +840,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         written: 0,
         mtime,
         umask,
-        verbose: opts.verbose,
+        block: Vec::with_capacity(BLOCK as usize),
     };
 
     if let Some(cid) = commit_id {
@@ -782,6 +854,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         while len > 1 && base.as_bytes()[len - 2] == b'/' {
             len -= 1;
         }
+        report(opts.verbose, &base.as_bytes()[..len]);
         tar.entry(&base.as_bytes()[..len], EntryKind::Tree, &tree.id, &[])?;
     }
 
@@ -789,6 +862,7 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         let mut path = base.clone().into_bytes();
         path.extend_from_slice(&item.path);
         let data = entry_data(&repo, &mut conv, &item)?;
+        report(opts.verbose, &path);
         tar.entry(&path, item.kind, &item.oid, &data)?;
     }
 
@@ -1108,11 +1182,41 @@ fn spawn_upload_archive(exec: &str, path: &str) -> std::io::Result<std::process:
             c
         }
     };
+    // `git_connect()` clears `local_repo_env` from the child's environment
+    // (connect.c: `strvec_pushv(&conn->env, local_repo_env)` with each name
+    // unset), because a repository-local setting of *this* process must not
+    // follow the connection into a different repository. `GIT_CONFIG_PARAMETERS`
+    // is on that list, which is why `git -c tar.tgz.remote=false archive
+    // --remote=. --format=tgz` still succeeds: the `-c` never reaches the server.
+    for name in LOCAL_REPO_ENV {
+        command.env_remove(name);
+    }
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
 }
+
+/// `local_repo_env[]` (environment.c): the variables that describe *this*
+/// repository and must not leak into a child talking to another one.
+const LOCAL_REPO_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
 
 /// `recv_sideband()` (pkt-line.c:578-604) driving `demultiplex_sideband()`
 /// (sideband.c:301-433): band 1 is the archive, band 2 progress, band 3 an error,
@@ -1320,12 +1424,17 @@ fn tar_umask(repo: &gix::Repository) -> Result<u32> {
         // ABI leaves in the high bits of the narrower `mode_t` on some targets.
         return Ok(process_umask() & 0o7777);
     }
-    let (digits, radix) = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        Some(rest) => (rest, 16),
-        None if text.len() > 1 && text.starts_with('0') => (&text[1..], 8),
-        None => (text.as_str(), 10),
-    };
-    u32::from_str_radix(digits, radix).map_err(|_| anyhow::anyhow!("invalid tar.umask {text:?}"))
+    // Everything else is `git_config_int()`, whose grammar is `strtoimax()` base
+    // 0 plus a `k`/`m`/`g` scale suffix: `1k` is 1024, `-1` is negative, and an
+    // empty value is `die()`'s "invalid unit" rather than a zero. The result is
+    // stored in git's `static unsigned int tar_umask`, so a negative value wraps
+    // — `-1` becomes all-ones, `~tar_umask` becomes zero, and every archived mode
+    // comes out as 0. Truncating to `u32` here reproduces that assignment.
+    match crate::config::config_int(repo, "tar.umask") {
+        Ok(Some(v)) => Ok(v as u32),
+        Ok(None) => Ok(0o002),
+        Err(msg) => Err(crate::fatal::Fatal(msg).into()),
+    }
 }
 
 /// The process umask, read the way git reads it for `tar.umask=user`: set it to
@@ -1642,6 +1751,17 @@ fn flush_pending(pending: &mut Vec<Item>, path: &[u8], out: &mut Vec<Item>) {
 ///   * an entry is deflated only when that makes it *smaller* — `archive-zip.c`
 ///     compresses into a buffer and falls back to stored when it did not shrink.
 #[allow(clippy::too_many_arguments)]
+/// git's `-v` reporting, which lives in `write_archive_entry()` and in the
+/// `--prefix` directory record above it (`archive.c:206,322`) — the tree walk,
+/// and only the tree walk. The `--add-file` / `--add-virtual-file` records are
+/// written by `write_extra_entries()`, which has no such line, so those paths are
+/// never reported however many `-v`s are given.
+fn report(verbose: bool, path: &[u8]) {
+    if verbose {
+        eprintln!("{}", String::from_utf8_lossy(path));
+    }
+}
+
 fn write_zip(
     repo: &gix::Repository,
     tree: &gix::Tree<'_>,
@@ -1665,6 +1785,7 @@ fn write_zip(
         while len > 1 && base.as_bytes()[len - 2] == b'/' {
             len -= 1;
         }
+        report(opts.verbose, &base.as_bytes()[..len]);
         zip.entry(&base.as_bytes()[..len], EntryKind::Tree, &[], level, false)?;
     }
     for item in items {
@@ -1674,6 +1795,7 @@ fn write_zip(
         // `entry_is_binary()` is asked about `path_without_prefix`, and about the
         // converted buffer — which is what `item.path` and `data` already are.
         let binary = conv.is_binary(&item.path, &data)?;
+        report(opts.verbose, &path);
         zip.entry(&path, item.kind, &data, level, binary)?;
     }
     for added in &opts.added {
@@ -1890,13 +2012,35 @@ struct Tar<W: Write> {
     written: u64,
     mtime: i64,
     umask: u32,
-    verbose: bool,
+    /// The partial 10 KiB block `write_blocked()` is filling; see [`Tar::raw`].
+    block: Vec<u8>,
 }
 
 impl<W: Write> Tar<W> {
+    /// git's `write_blocked()` (archive-tar.c): headers and payloads are
+    /// accumulated into a 10 KiB `block` and handed to the sink one whole block
+    /// per call, never in the pieces they arrived in.
+    ///
+    /// This is observable, not just tidy. `git upload-archive` frames one
+    /// sideband packet per `read()` of the archiver's stdout, so the archiver's
+    /// write boundaries become packet boundaries on the wire. Writing through an
+    /// 8 KiB `BufWriter` instead split a 10240-byte archive into an 8192-byte
+    /// write and a 2048-byte one, and whether the reader coalesced them was a
+    /// scheduling race — the same request answered `00002805…` on one run and
+    /// `00002005…` on the next. One block, one write, one packet.
     fn raw(&mut self, bytes: &[u8]) -> Result<()> {
-        self.out.write_all(bytes)?;
         self.written += bytes.len() as u64;
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let room = BLOCK as usize - self.block.len();
+            let take = room.min(rest.len());
+            self.block.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.block.len() == BLOCK as usize {
+                self.out.write_all(&self.block)?;
+                self.block.clear();
+            }
+        }
         Ok(())
     }
 
@@ -1929,10 +2073,6 @@ impl<W: Write> Tar<W> {
     /// One archive entry, including the `<oid>.paxheader` record when the path
     /// or symlink target does not fit the `ustar` fields.
     fn entry(&mut self, path: &[u8], kind: EntryKind, oid: &ObjectId, data: &[u8]) -> Result<()> {
-        if self.verbose {
-            eprintln!("{}", String::from_utf8_lossy(path));
-        }
-
         // git's mode mangling: directories and submodules get 0777 masked by
         // tar.umask, symlinks an unmasked 0777, regular files 0777 or 0666
         // depending on the executable bit, masked.
@@ -1943,7 +2083,13 @@ impl<W: Write> Tar<W> {
             EntryKind::BlobExecutable => (b'0', (0o100755 | 0o777) & !self.umask),
             EntryKind::Blob => (b'0', (0o100644 | 0o666) & !self.umask),
         };
-        let is_regular = typeflag == b'0';
+        // `write_tar_entry` sets the typeflag from the *original* mode but every
+        // later `S_ISREG()` test — `prepare_header`'s size field, the pax `size`
+        // spill, and the payload write — looks at the mode the umask left behind.
+        // A `tar.umask` that clears the file-type bits (git stores the value in an
+        // `unsigned int`, so `-1` is all ones and `~tar_umask` is zero) therefore
+        // still emits a `0` typeflag header, but with size 0 and no contents.
+        let is_regular = mode & 0o170000 == 0o100000;
 
         let mut ext: Vec<u8> = Vec::new();
         let mut name: Vec<u8> = Vec::new();
@@ -2017,6 +2163,12 @@ impl<W: Write> Tar<W> {
         self.zeros(tail)?;
         if tail < 2 * RECORD as u64 {
             self.zeros(BLOCK)?;
+        }
+        // The trailer always lands on a block boundary, so this is normally
+        // empty; a short tail would still have to reach the sink.
+        if !self.block.is_empty() {
+            let pending = std::mem::take(&mut self.block);
+            self.out.write_all(&pending)?;
         }
         self.out.flush()?;
         Ok(())

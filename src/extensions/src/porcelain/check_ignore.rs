@@ -257,17 +257,34 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
     let mut num_ignored = 0usize;
 
     for orig in &originals {
-        if orig.starts_with(b":") {
-            return Ok(fatal(&format!(
-                "{orig}: pathspec magic is not supported by check-ignore"
-            )));
+        // `init_pathspec_item()`'s first refusal, before any magic is read.
+        if orig.is_empty() {
+            return Ok(fatal(&crate::pathspec::empty_pathspec()));
+        }
+        // `cmd_check_ignore` calls `parse_pathspec()` with a magic mask of
+        // `PATHSPEC_ALL_MAGIC & ~PATHSPEC_FROMTOP`, so `:(top)`/`:/` is the one
+        // form it accepts and everything else is `unsupported_magic()`.
+        let (fromtop, path) = match split_magic(orig.as_bstr()) {
+            Ok(split) => split,
+            Err(unsupported) => {
+                return Ok(fatal(&format!(
+                    "{orig}: pathspec magic not supported by this command: {unsupported}"
+                )))
+            }
+        };
+        if path.is_empty() {
+            return Ok(fatal(&crate::pathspec::empty_pathspec()));
         }
 
-        let rel = match to_repo_relative(orig.as_bstr(), prefix_b.as_bstr(), root_b.as_bstr()) {
+        // `:(top)` measures the path from the repository root rather than from
+        // the current directory, which is what `prefix_pathspec()` does by
+        // skipping the prefix for a `FROMTOP` element.
+        let from = if fromtop { BStr::new(b"") } else { prefix_b.as_bstr() };
+        let rel = match to_repo_relative(path.as_bstr(), from, root_b.as_bstr()) {
             Some(rel) => rel,
             None => {
                 return Ok(fatal(&format!(
-                    "{orig}: '{orig}' is outside repository at '{root_b}'"
+                    "{orig}: '{path}' is outside repository at '{root_b}'"
                 )))
             }
         };
@@ -283,8 +300,8 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         } else {
             // Trailing `/` forces directory semantics; otherwise git lstat()s the
             // path, so a symlink-to-directory is *not* a directory here.
-            let on_disk = gix::path::from_bstr(orig.as_bstr());
-            let is_dir = orig.ends_with(b"/")
+            let on_disk = gix::path::from_bstr(path.as_bstr());
+            let is_dir = path.ends_with(b"/")
                 || std::fs::symlink_metadata(&*on_disk)
                     .map(|m| m.is_dir())
                     .unwrap_or(false);
@@ -393,24 +410,36 @@ fn read_stdin_paths(nul: bool) -> Result<Option<Vec<BString>>> {
 
     let mut paths = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        let mut line: &[u8] = chunk;
+        let line: &[u8] = chunk;
         if !nul {
-            if let Some(stripped) = line.strip_suffix(b"\r") {
-                line = stripped;
-            }
             if line.starts_with(b"\"") {
                 match unquote_c_style(line) {
                     Some(p) => {
-                        paths.push(p);
+                        paths.push(as_c_string(&p));
                         continue;
                     }
                     None => return Ok(None),
                 }
             }
         }
-        paths.push(BString::from(line));
+        paths.push(as_c_string(line));
     }
     Ok(Some(paths))
+}
+
+/// The record as the C code that consumes it sees it.
+///
+/// `check_ignore()` takes the strbuf's `buf` as a `const char *`, so a NUL inside
+/// a line ends the name there — and the whole line is echoed back through
+/// `write_name_quoted()`, which stops at the same byte. Feeding a NUL-separated
+/// stream to a `--stdin` that was not given `-z` therefore reports the *first*
+/// name in it and nothing else, which is what stock does.
+///
+/// The line terminator is `\n` alone: `strbuf_getline_lf()` strips no carriage
+/// return, so `path\r` stays `path\r` and is quoted as such on output.
+fn as_c_string(line: &[u8]) -> BString {
+    let end = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+    BString::from(&line[..end])
 }
 
 /// Decode a `"…"`-wrapped C-quoted path (git's `unquote_c_style`).
@@ -464,6 +493,73 @@ fn unquote_c_style(quoted: &[u8]) -> Option<BString> {
 /// escapes the repository root (git's "is outside repository" fatal).
 ///
 /// Both branches normalise lexically — `.` and `..` are folded without touching
+
+/// Split a pathspec element into "was `top` magic given" and the path after the
+/// magic, or the `unsupported_magic()` rendering of the magic this command does
+/// not take.
+///
+/// ```c
+/// static struct pathspec_magic {
+///         unsigned bit;
+///         char mnemonic; /* this cannot be ':'! */
+///         const char *name;
+/// } pathspec_magic[] = {
+///         { PATHSPEC_FROMTOP,  '/', "top" },
+///         { PATHSPEC_LITERAL,   0,  "literal" },
+///         { PATHSPEC_GLOB,     '\0', "glob" },
+///         { PATHSPEC_ICASE,    '\0', "icase" },
+///         { PATHSPEC_EXCLUDE,  '!', "exclude" },
+///         { PATHSPEC_ATTR,     '\0', "attr" },
+/// };
+/// ```
+///
+/// and `unsupported_magic()` renders each unsupported bit as `'<name>'`, or
+/// `'<name>' (mnemonic: '<c>')` when the table gives it one, joined with `", "`.
+fn split_magic(elt: &BStr) -> Result<(bool, BString), String> {
+    let Some(rest) = elt.strip_prefix(b":") else {
+        return Ok((false, BString::from(elt.to_vec())));
+    };
+    let mut fromtop = false;
+    let mut bad: Vec<String> = Vec::new();
+    let path: &[u8];
+    if let Some(long) = rest.strip_prefix(b"(") {
+        let Some(end) = long.iter().position(|&b| b == b')') else {
+            // `missing ')' at the end of pathspec magic in '%s'` is a different
+            // die; leave it to the matcher rather than guessing at it here.
+            return Ok((false, BString::from(elt.to_vec())));
+        };
+        for kw in long[..end].split(|&b| b == b',') {
+            match kw {
+                b"top" => fromtop = true,
+                b"" => {}
+                other => bad.push(match other {
+                    b"exclude" => "'exclude' (mnemonic: '!')".to_string(),
+                    b"literal" => "'literal'".to_string(),
+                    other => format!("'{}'", String::from_utf8_lossy(other)),
+                }),
+            }
+        }
+        path = &long[end + 1..];
+    } else {
+        // Short form: a run of mnemonics, optionally closed by another `:`.
+        let mut i = 0;
+        while i < rest.len() && rest[i] != b':' {
+            match rest[i] {
+                b'/' => fromtop = true,
+                b'!' | b'^' => bad.push("'exclude' (mnemonic: '!')".to_string()),
+                _ => break,
+            }
+            i += 1;
+        }
+        path = if rest.get(i) == Some(&b':') { &rest[i + 1..] } else { &rest[i..] };
+    }
+    if bad.is_empty() {
+        Ok((fromtop, BString::from(path.to_vec())))
+    } else {
+        Err(bad.join(", "))
+    }
+}
+
 /// the filesystem, which is what git's pathspec normalisation does too.
 fn to_repo_relative(orig: &BStr, prefix: &BStr, root: &BStr) -> Option<BString> {
     if orig.starts_with(b"/") {

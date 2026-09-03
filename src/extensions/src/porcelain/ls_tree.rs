@@ -926,10 +926,20 @@ fn git_type(mode: EntryMode) -> &'static str {
 }
 
 /// The object id column, full or abbreviated per `--abbrev`.
+///
+/// `--abbrev=<n>` is a *floor*, not a width: git prints
+/// `repo_find_unique_abbrev()`, which starts at `n` hex digits and keeps
+/// extending while another object in the database shares the prefix. Two blobs
+/// that agree in their first four nibbles are therefore printed with five, which
+/// a plain truncation renders identically and wrongly.
 fn object_id_str(repo: &gix::Repository, oid: &ObjectId, opts: &Opts) -> Result<String> {
     Ok(match opts.abbrev {
         Abbrev::Full => oid.to_hex().to_string(),
-        Abbrev::Len(n) => oid.to_hex_with_len(n.min(oid.kind().len_in_hex())).to_string(),
+        Abbrev::Len(n) if n >= oid.kind().len_in_hex() => oid.to_hex().to_string(),
+        Abbrev::Len(n) => gix::odb::store::prefix::disambiguate::Candidate::new(*oid, n)
+            .ok()
+            .and_then(|c| repo.objects.disambiguate_prefix(c).ok().flatten())
+            .map_or_else(|| oid.to_hex_with_len(n).to_string(), |p| p.to_string()),
         Abbrev::Auto => oid.attach(repo).shorten_or_id().to_string(),
     })
 }

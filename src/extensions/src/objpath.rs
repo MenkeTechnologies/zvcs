@@ -397,3 +397,122 @@ pub fn relative_path_fatal(repo: &gix::Repository, spec: &str) -> Option<String>
     };
     resolve_relative_path(repo, path).err()
 }
+
+/// `relative_path()` (`path.c`), the renderer behind
+/// `write_name_quoted_relative()`: `name` seen from the directory `prefix`
+/// names, with `../` for every level that has to be climbed.
+///
+/// Both operands are repository-root-relative and `prefix` carries its trailing
+/// `/` — git's own `prefix`. A name inside the prefix loses it (`src/lib.rs`
+/// under `src/` is `lib.rs`); a name outside it gains the climb
+/// (`README.md` under `src/` is `../README.md`, and under `nested/deep/` it is
+/// `../../README.md`). An empty `prefix` returns the name unchanged, and an
+/// empty `name` is git's `"./"`.
+///
+/// This is what separates `ls-files -- :(top)` run from a subdirectory from a
+/// plain prefix strip: the pathspec reaches outside the current directory, and
+/// git names those entries relative to where the user is standing rather than
+/// from the repository root.
+pub fn relative_path(name: &[u8], prefix: &[u8]) -> Vec<u8> {
+    if name.is_empty() {
+        return b"./".to_vec();
+    }
+    if prefix.is_empty() {
+        return name.to_vec();
+    }
+    let is_sep = |b: u8| b == b'/';
+
+    // The shared leading directories, counted in whole components: `i`/`j` walk
+    // in step and the `*_off` marks trail the last component boundary crossed.
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut prefix_off, mut in_off) = (0usize, 0usize);
+    while i < prefix.len() && j < name.len() && prefix[i] == name[j] {
+        if is_sep(prefix[i]) {
+            while i < prefix.len() && is_sep(prefix[i]) {
+                i += 1;
+            }
+            while j < name.len() && is_sep(name[j]) {
+                j += 1;
+            }
+            prefix_off = i;
+            in_off = j;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+
+    if i >= prefix.len() && prefix_off < prefix.len() {
+        // `prefix` is a prefix of `name` and does not end in a separator.
+        if j >= name.len() {
+            in_off = name.len();
+        } else if is_sep(name[j]) {
+            while j < name.len() && is_sep(name[j]) {
+                j += 1;
+            }
+            in_off = j;
+        } else {
+            // `name` only *starts* like the prefix: `a/bbb` under `a/b`.
+            i = prefix_off;
+        }
+    } else if j >= name.len() || (i < prefix.len() && is_sep(prefix[i])) {
+        while i < prefix.len() && is_sep(prefix[i]) {
+            i += 1;
+        }
+    } else {
+        i = prefix_off;
+    }
+
+    let rest = &name[in_off..];
+    if i >= prefix.len() {
+        return if rest.is_empty() { b"./".to_vec() } else { rest.to_vec() };
+    }
+
+    let mut out = Vec::with_capacity(rest.len() + 8);
+    while i < prefix.len() {
+        if is_sep(prefix[i]) {
+            out.extend_from_slice(b"../");
+            while i < prefix.len() && is_sep(prefix[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    if !is_sep(prefix[prefix.len() - 1]) {
+        out.extend_from_slice(b"../");
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+#[cfg(test)]
+mod relative_path_tests {
+    use super::relative_path;
+
+    /// The four shapes `ls-files -- :(top)` produces from a subdirectory, each
+    /// measured against git 2.55.0 in the `awkward-paths` fixture.
+    #[test]
+    fn names_are_written_relative_to_the_prefix() {
+        assert_eq!(relative_path(b"src/lib.rs", b"src/"), b"lib.rs");
+        assert_eq!(relative_path(b"README.md", b"src/"), b"../README.md");
+        assert_eq!(relative_path(b"nested/deep/path.txt", b"src/"), b"../nested/deep/path.txt");
+        assert_eq!(relative_path(b"src/lib.rs", b"nested/deep/"), b"../../src/lib.rs");
+    }
+
+    /// No prefix leaves the name alone, an empty name is `"./"`, and a name that
+    /// diverges from the prefix mid-component keeps only the components the two
+    /// agreed on.
+    ///
+    /// That last one is `relative_path()`'s own quirk and is asserted as the C
+    /// computes it, not as a climb: with `prefix = "a/b/"` and `in = "a/bbb/c"`
+    /// the comparison loop stops at `b` vs `bb` having already crossed `a/`, the
+    /// `is_dir_sep(prefix[i])` branch skips the rest of the prefix, and what is
+    /// returned is `in + in_off` — `bbb/c`.
+    #[test]
+    fn edges() {
+        assert_eq!(relative_path(b"a/b", b""), b"a/b");
+        assert_eq!(relative_path(b"", b"src/"), b"./");
+        assert_eq!(relative_path(b"a/bbb/c", b"a/b/"), b"bbb/c");
+    }
+}

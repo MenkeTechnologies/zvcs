@@ -2,7 +2,7 @@ use std::{
     any::Any,
     borrow::Cow,
     error::Error,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::Write,
     process::{self, Stdio},
 };
@@ -189,8 +189,24 @@ impl SpawnProcessOnDemand {
             });
         }
         let repo_path = if self.ssh_cmd.is_some() {
-            cmd.args.push(program);
-            gix_quote::single(self.path.as_ref()).to_os_str_lossy().into_owned()
+            // Over ssh the service and its path travel as ONE argument — the remote
+            // shell has to receive a single command line to run:
+            //
+            // ```c
+            // strbuf_addstr(&cmd, prog);
+            // strbuf_addch(&cmd, ' ');
+            // sq_quote_buf(&cmd, path);
+            // …
+            // strvec_push(&conn->args, cmd.buf);
+            // ```
+            //
+            // (`git_connect()`, connect.c.) Pushing them as two arguments hands the
+            // ssh client `git-upload-pack` and `'/x.git'` separately, which the far
+            // end then runs as `git-upload-pack` with no repository at all.
+            let mut one = program;
+            one.push(OsStr::new(" "));
+            one.push(gix_quote::single(self.path.as_ref()).to_os_str_lossy().into_owned());
+            one
         } else {
             self.path.to_os_str_lossy().into_owned()
         };

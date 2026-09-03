@@ -32,7 +32,14 @@ impl ProgramKind {
         disallow_shell: bool,
         address_family: Option<crate::AddressFamily>,
     ) -> Result<gix_command::Prepare, ssh::invocation::Error> {
-        let mut prepare = gix_command::prepare(ssh_cmd).command_may_be_shell_script();
+        // `.with_forced_dollar_at_args()` is git's `prepare_shell_cmd()` rule: when there are
+        // arguments — and there always are here, the host and the remote command — the shell
+        // script gets `"$@"` appended whether or not it already mentions `$@` itself. A
+        // `GIT_SSH_COMMAND` that wraps its work in a shell function (`f() { … "$@" … }; f`)
+        // otherwise receives no arguments at all.
+        let mut prepare = gix_command::prepare(ssh_cmd)
+            .command_may_be_shell_script()
+            .with_forced_dollar_at_args();
         if disallow_shell {
             prepare.use_shell = false;
         }

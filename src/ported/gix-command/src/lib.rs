@@ -61,6 +61,25 @@ pub struct Prepare {
     /// Only effective if `use_shell` is `true` as well, as the shell will be used as a fallback if
     /// it's not possible to split arguments as the command-line contains 'scripting'.
     pub allow_manual_arg_splitting: bool,
+    /// If `true`, append `"$@"` to a shell command even when the command text already mentions
+    /// `$@` somewhere.
+    ///
+    /// The default heuristic — leave the command alone if `$@` appears anywhere in it — exists for
+    /// credential helpers, which really do receive their operation glued onto the command string
+    /// rather than as positional parameters. Every other caller matches git's
+    /// `prepare_shell_cmd()`, which appends unconditionally whenever there is an argument:
+    ///
+    /// ```c
+    /// if (!argv[1])
+    ///         strvec_push(out, argv[0]);
+    /// else
+    ///         strvec_pushf(out, "%s \"$@\"", argv[0]);
+    /// ```
+    ///
+    /// A `GIT_SSH_COMMAND` that defines and calls a shell function — `f() { ...\"$@\"... }; f` — is
+    /// the case where the two rules disagree: git passes the host and the remote command as `$1`
+    /// and `$2`, the heuristic passes nothing at all.
+    pub force_dollar_at_args: bool,
 }
 
 /// Additional information that is relevant to spawned processes, which typically receive
@@ -198,6 +217,15 @@ mod prepare {
             self
         }
 
+        /// Always append `"$@"` to a shell command, even when the command text already mentions
+        /// `$@` somewhere — git's `prepare_shell_cmd()` rule.
+        ///
+        /// See [`Prepare::force_dollar_at_args`] for why the default is the other way around.
+        pub fn with_forced_dollar_at_args(mut self) -> Self {
+            self.force_dollar_at_args = true;
+            self
+        }
+
         /// Set additional `ctx` to be used when spawning the process.
         ///
         /// Note that this is a must for most kind of commands that `git` usually spawns, as at
@@ -317,7 +345,9 @@ mod prepare {
                         let mut cmd = Command::new(shell);
                         cmd.arg("-c");
                         if !prep.args.is_empty() {
-                            if prep.command.to_str().is_none_or(|cmd| !cmd.contains("$@")) {
+                            if prep.force_dollar_at_args
+                                || prep.command.to_str().is_none_or(|cmd| !cmd.contains("$@"))
+                            {
                                 if prep.quote_command {
                                     if let Ok(command) = gix_path::os_str_into_bstr(&prep.command) {
                                         prep.command = gix_path::from_bstring(gix_quote::single(command)).into();
@@ -547,6 +577,7 @@ pub fn prepare(cmd: impl Into<OsString>) -> Prepare {
         use_shell: false,
         quote_command: false,
         allow_manual_arg_splitting: cfg!(windows),
+        force_dollar_at_args: false,
     }
 }
 

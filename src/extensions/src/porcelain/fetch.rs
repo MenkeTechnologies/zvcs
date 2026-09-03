@@ -467,8 +467,11 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                         "unsupported option \"--recurse-submodules=on-demand\" (it needs the \
                          superproject's old/new submodule gitlinks to decide what to fetch)"
                     ),
+                    // `parse_fetch_recurse_submodules_arg()` (submodule-config.c)
+                    // ends on `die("bad %s argument: %s", opt, arg)`, and the
+                    // option name it is given is the long name without dashes.
                     Some(other) => {
-                        crate::git_fatal!("--recurse-submodules expects yes/on-demand/no, got {other:?}")
+                        crate::git_fatal!("bad recurse-submodules argument: {other}")
                     }
                 });
             }
@@ -828,7 +831,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         .chain(refmap.iter().map(String::as_str))
         .filter(|s| !s.is_empty())
     {
-        if !refspec_globs_agree(spec) {
+        if !refspec_globs_agree(spec) || !refspec_is_valid(spec) {
             eprintln!("fatal: invalid refspec '{spec}'");
             return Ok(ExitCode::from(128));
         }
@@ -1611,6 +1614,91 @@ fn refspec_globs_agree(spec: &str) -> bool {
     true
 }
 
+/// git's wording for two remote refs mapped onto one local ref, when the vendored
+/// ref-map validation reports that collision.
+///
+/// `store_updated_refs()` (`builtin/fetch.c`) keeps a hash of the local names it
+/// is about to write and dies on the second claim to one:
+///
+/// ```c
+/// die(_("Cannot fetch both %s and %s to %s"),
+///     old->name, rm->name, rm->peer_ref->name);
+/// ```
+///
+/// The vendored parser finds the same collision but describes it as a refspec
+/// mapping issue and names the specs rather than the refs, so the error is
+/// re-rendered here — the two colliding sources in the order the validator
+/// recorded them, and the destination they both wanted.
+///
+/// Returns `None` when `err` is about something else.
+fn refspec_collision(validate: &gix::refspec::match_group::validate::Error) -> Option<String> {
+    let gix::refspec::match_group::validate::Issue::Conflict {
+        destination_full_ref_name,
+        sources,
+        ..
+    } = validate.issues.first()?;
+    let first = sources.first()?;
+    let second = sources.get(1)?;
+    Some(format!("Cannot fetch both {first} and {second} to {destination_full_ref_name}"))
+}
+
+/// The protocol version this repository's configuration selects.
+///
+/// `protocol.version` with git's default of 2 when the key is unset, and 2 again
+/// for a value outside the three git knows — the commands that care validate the
+/// value themselves and refuse before they reach this.
+fn protocol_version(repo: &gix::Repository) -> u8 {
+    repo.config_snapshot()
+        .string("protocol.version")
+        .and_then(|v| v.to_str().ok().and_then(|v| v.parse::<u8>().ok()))
+        .filter(|v| matches!(v, 0 | 1 | 2))
+        .unwrap_or(2)
+}
+
+/// Whether a negative refspec is one git accepts and this port can safely drop.
+///
+/// `parse_refspec()` (refspec.c) validates a negative spec's source with
+/// `check_refname_format(src, REFNAME_ALLOW_ONELEVEL | …)`, so `^main` is a legal
+/// refspec — but `omit_name_by_refspec()` then compares it to the *advertised*
+/// names, which are `HEAD` or `refs/…` and nothing else. A source that is neither
+/// therefore excludes nothing, and dropping the spec is indistinguishable from
+/// keeping it. Sources that begin with `refs/` (or are `HEAD`) really can match,
+/// so they are kept and parsed as usual.
+///
+/// Returns `false` for anything that is not a negative refspec, so the caller can
+/// use it as a plain filter.
+fn negative_spec_is_inert(spec: &str) -> bool {
+    let Some(src) = spec.strip_prefix('^') else {
+        return false;
+    };
+    !src.is_empty()
+        && !src.contains(':')
+        && !src.starts_with("refs/")
+        && src != "HEAD"
+        && gix::refspec::parse(
+            format!("^refs/{src}").as_str().into(),
+            gix::refspec::parse::Operation::Fetch,
+        )
+        .is_ok()
+}
+
+/// Whether the vendored parser accepts `spec`, with git's one documented
+/// exception folded back in.
+///
+/// `refspec_item_init_or_die()` ends on `die("invalid refspec '%s'", refspec)` for
+/// everything it cannot parse — a second `*` on either side, a negative spec with
+/// a destination, an empty source next to an empty destination. This port reports
+/// the same sentence at the same exit code rather than surfacing the parser's own
+/// wording, which names the internal rule rather than the argument.
+///
+/// The exception is [`negative_spec_is_inert`]: git's negative sources may be
+/// one-level names and the vendored parser's may not, so those are checked with a
+/// `refs/` prefix bolted on and accepted here.
+fn refspec_is_valid(spec: &str) -> bool {
+    negative_spec_is_inert(spec)
+        || gix::refspec::parse(spec.into(), gix::refspec::parse::Operation::Fetch).is_ok()
+}
+
 /// `remote.<name>.vcs` — the foreign-SCM helper a remote is reached through.
 ///
 /// `remote_get_1()` records it as `remote->foreign_vcs` (remote.c:571-573), and
@@ -2016,8 +2104,17 @@ fn fetch_one(
     // `get_ref_map` does when `refspec_count > 0`.
     let explicit_refspecs = !refspecs.is_empty();
     if explicit_refspecs {
+        // A negative refspec whose source is not a full ref name is *valid* to git
+        // and *inert*: `omit_name_by_refspec()` compares it to advertised names
+        // with `strcmp` (or the single-glob matcher), and every advertised name is
+        // either `HEAD` or begins with `refs/`, so `^main` can never exclude
+        // anything. The vendored parser refuses the spelling outright, so it is
+        // dropped here instead — after `explicit_refspecs` has been decided, which
+        // is what keeps `git fetch origin ^main` from falling back to the
+        // configured refspecs and fetching everything.
         let specs: Vec<BString> = refspecs
             .iter()
+            .filter(|r| !negative_spec_is_inert(r))
             .map(|r| {
                 let s = BString::from(*r);
                 if opts.force {
@@ -2133,9 +2230,35 @@ fn fetch_one(
     // literal prefix onto the ls-refs list so `set_head()` has something to guess from.
     // `remote.<name>.followRemoteHEAD` is parsed once, as git parses it once into `struct remote`.
     let follow_head = remote_name.as_deref().map(|name| follow_remote_head(repo, name));
-    let want_head = !explicit_refspecs
-        && has_configured_refspecs
-        && follow_head.as_ref().is_some_and(|mode| *mode != FollowRemoteHead::Never);
+    // Whether the remote's own `HEAD` is what this fetch is asking for.
+    //
+    // `get_ref_map()` (`builtin/fetch.c`) reaches `HEAD` two ways, and both die
+    // when the remote has none:
+    //
+    // ```c
+    // const char *name = refspec->src[0] ? refspec->src : "HEAD";
+    // …
+    // /* no refspec at all */
+    // ref_map = get_remote_ref(remote_refs, "HEAD");
+    // if (!ref_map)
+    //         die(_("couldn't find remote ref HEAD"));
+    // ```
+    //
+    // So `fetch <url>` with nothing else, `fetch origin HEAD`, `fetch origin +` and
+    // `fetch origin :refs/heads/x` all name `HEAD`, and a peer whose `HEAD` dangles
+    // does not advertise one. `HEAD` is added to the ls-refs prefixes for these too,
+    // or the advertisement could not answer the question either way.
+    let head_is_the_source = {
+        let specs = remote.refspecs(gix::remote::Direction::Fetch);
+        specs.is_empty()
+            || specs
+                .iter()
+                .any(|s| s.to_ref().source().is_none_or(|src| src == "HEAD"))
+    };
+    let want_head = head_is_the_source
+        || (!explicit_refspecs
+            && has_configured_refspecs
+            && follow_head.as_ref().is_some_and(|mode| *mode != FollowRemoteHead::Never));
     let map_options = gix::remote::ref_map::Options {
         extra_refspecs,
         opportunistic_refspecs,
@@ -2158,6 +2281,15 @@ fn fetch_one(
     // including the transport choice this port refuses to make for a `remote.<name>.vcs`
     // helper.
     fetch_head.truncate_now()?;
+
+    // Every command-line refspec was an inert negative (`git fetch origin ^main`),
+    // so the positive list is empty. git reaches the transport, matches nothing and
+    // reports nothing; the only observable result is the `FETCH_HEAD` truncation
+    // above. Stopping here produces the same result without asking the vendored
+    // remote to fetch with no refspecs, which it refuses outright.
+    if explicit_refspecs && remote.refspecs(gix::remote::Direction::Fetch).is_empty() {
+        return Ok(Verdict::Ok);
+    }
 
     // `transport_check_allowed()`, which `git_connect()` reaches for every scheme it opens
     // itself and `transport_helper_init()` for the rest. It matters most here: a fetch is
@@ -2230,12 +2362,48 @@ fn fetch_one(
         )) => {
             eprintln!("hint: see protocol.version in 'git help config' for more details");
             eprintln!("fatal: {e}");
+            // The third line is version-dependent, measured against git 2.55.0 and
+            // 2.50.1, which agree:
+            //
+            // ```text
+            // $ git -c protocol.version=0 fetch --server-option=x origin
+            // hint: see protocol.version in 'git help config' for more details
+            // fatal: server options require protocol version 2 or later
+            // fatal: the remote end hung up unexpectedly
+            //
+            // $ git -c protocol.version=1 fetch --server-option=x origin
+            // hint: see protocol.version in 'git help config' for more details
+            // fatal: server options require protocol version 2 or later
+            // ```
+            //
+            // Under v1 the refusal lands right after the `version 1` packet, at a
+            // packet boundary; under v0 there is no such packet and the reader is
+            // left mid-advertisement, which is the truncation it reports.
+            if protocol_version(repo) == 0 {
+                eprintln!("fatal: the remote end hung up unexpectedly");
+            }
             return Ok(Verdict::Fatal);
         }
         Err(gix::remote::fetch::prepare::Error::RefMap(
             e @ gix::remote::ref_map::Error::ServerOptionsUnsupported,
         )) => {
             eprintln!("fatal: {e}");
+            return Ok(Verdict::Fatal);
+        }
+        // Two remote refs mapped onto one local ref. The vendored validation calls
+        // it a refspec mapping issue and names the specs; git names the refs and
+        // dies. Matched on the variant rather than searched for in the error chain
+        // because every wrapper between here and it is `#[error(transparent)]`,
+        // which forwards `source()` past the inner error instead of to it.
+        Err(gix::remote::fetch::prepare::Error::RefMap(
+            gix::remote::ref_map::Error::InitRefMap(
+                gix::protocol::fetch::refmap::init::Error::MappingValidation(e),
+            ),
+        )) => {
+            match refspec_collision(&e) {
+                Some(msg) => eprintln!("fatal: {msg}"),
+                None => eprintln!("fatal: {e}"),
+            }
             return Ok(Verdict::Fatal);
         }
         Err(e) => {
@@ -2257,6 +2425,23 @@ fn fetch_one(
     // `get_fetch_map()` in `remote.c` is called with `missing_ok == 0` for every refspec that came
     // from the command line or from `remote.<name>.fetch`, so a refspec that names one exact ref the
     // remote does not have is a `fatal:` before a single object moves - not a summary at the end.
+    // The peer has no usable `HEAD` and the refspec named one, which is
+    // `get_remote_ref(remote_refs, "HEAD")` coming back NULL:
+    // `die(_("couldn't find remote ref HEAD"))`.
+    //
+    // `Ref::Unborn` is what protocol v2 reports for a `HEAD` that points at a ref
+    // which does not exist. git's advertisement omits such a `HEAD` entirely — the
+    // `unborn` extension is opt-in and `fetch` never asks for it — so it counts as
+    // no `HEAD` here. Without this the fetch runs on a mapping whose source has no
+    // object and writes a ref full of zeroes.
+    if head_is_the_source
+        && !prepared.ref_map().remote_refs.iter().any(|r| {
+            !matches!(r, gix::protocol::handshake::Ref::Unborn { .. }) && r.unpack().0 == "HEAD"
+        })
+    {
+        eprintln!("fatal: couldn't find remote ref HEAD");
+        return Ok(Verdict::Fatal);
+    }
     if let Some(missing) = missing_remote_ref(prepared.ref_map()) {
         eprintln!("fatal: couldn't find remote ref {missing}");
         return Ok(Verdict::Fatal);
@@ -2547,7 +2732,28 @@ fn fetch_one(
 
         let (flag, summary, reason): (char, String, &'static str) = match &update.mode {
             Mode::New => {
-                let s = if is_tag { "[new tag]" } else { "[new branch]" };
+                // `store_updated_refs()` (`builtin/fetch.c`) reads the *remote*
+                // name, not the local one it is being written to:
+                //
+                // ```c
+                // if (starts_with(rm->name, "refs/tags/"))
+                //         what = _("[new tag]");
+                // else if (starts_with(rm->name, "refs/heads/"))
+                //         what = _("[new branch]");
+                // else
+                //         what = _("[new ref]");
+                // ```
+                //
+                // So `fetch . tags/ambi:refs/heads/pick` is a new *tag* even though
+                // it lands under `refs/heads/`, and `fetch . refs/top:refs/heads/pick`
+                // is a new *ref* because `refs/top` is in neither namespace.
+                let s = if remote_full.starts_with("refs/tags/") {
+                    "[new tag]"
+                } else if remote_full.starts_with("refs/heads/") {
+                    "[new branch]"
+                } else {
+                    "[new ref]"
+                };
                 ('*', s.to_string(), "")
             }
             Mode::FastForward => (' ', range(".."), ""),

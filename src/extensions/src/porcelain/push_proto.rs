@@ -464,7 +464,11 @@ pub fn send_pack(
     }
     if !opts.push_options.is_empty() {
         if !caps.contains("push-options") {
-            crate::git_fatal!("the receiving end does not support push options");
+            // `send_pack()` dies with the first line; the connection is then torn
+            // down half-open and `transport_push()` reports that as the hang-up.
+            // Two `fatal:` lines, in this order, exit 128.
+            eprintln!("fatal: the receiving end does not support push options");
+            return Err(crate::fatal::die("the remote end hung up unexpectedly"));
         }
         cap_buf.push_str(" push-options");
     }

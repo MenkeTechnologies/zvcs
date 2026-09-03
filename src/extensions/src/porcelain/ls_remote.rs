@@ -280,8 +280,36 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         ..Default::default()
     };
     let server_options = super::fetch::server_options_for(&repo, remote_name.as_deref(), &opts.server_options);
+    // `git_config_get_protocol_version()` (protocol.c) parses the configured
+    // version while the transport is being built and refuses anything that is not
+    // one of the three it knows:
+    //
+    // ```c
+    // version = parse_protocol_version(value);
+    // if (version == protocol_unknown_version)
+    //         die(_("unknown value for config 'protocol.version': %s"), value);
+    // ```
+    //
+    // The vendored connect reports the same condition in its own words ("Choose
+    // between 1 and 2"), which is both a different sentence and a different set —
+    // `0` is legal to git.
+    if let Some(v) = repo.config_snapshot().string("protocol.version") {
+        let v = v.to_string();
+        if !matches!(v.as_str(), "0" | "1" | "2") {
+            eprintln!("fatal: unknown value for config 'protocol.version': {v}");
+            return Ok(ExitCode::from(128));
+        }
+    }
     let connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
         Ok(c) => c.with_server_options(server_options),
+        // A local path that is not a repository is `enter_repo()` coming back
+        // NULL in `git_connect()`, which names the path and then adds the same
+        // block an unreachable host produces.
+        Err(gix::remote::connect::Error::FileUrl { url, .. }) => {
+            return Ok(crate::transport_err::not_a_repository_fatal(
+                &url.to_bstring().to_string(),
+            ));
+        }
         Err(e) => {
             eprintln!("fatal: {e}");
             return Ok(ExitCode::from(128));
@@ -295,6 +323,15 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         },
     ) {
         Ok((map, _handshake)) => map,
+        // `die_if_server_options()` (transport.c) prints the advice line ahead of
+        // its refusal, and the transport the caller then tears down reports the
+        // half-open connection — three lines, in this order, exit 128.
+        Err(e @ gix::remote::ref_map::Error::ServerOptionsRequireV2) => {
+            eprintln!("hint: see protocol.version in 'git help config' for more details");
+            eprintln!("fatal: {e}");
+            eprintln!("fatal: the remote end hung up unexpectedly");
+            return Ok(ExitCode::from(128));
+        }
         Err(e) => {
             // An ssh transport that never connected is git's own `die()`: the
             // child's stderr, then the fixed block.

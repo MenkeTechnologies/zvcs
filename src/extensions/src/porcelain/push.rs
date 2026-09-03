@@ -77,8 +77,10 @@ const USAGE: &str = "usage: git push [<options>] [<repository> [<refspec>...]]\n
 /// `--mirror`, `--prune`, `--atomic`, `--signed[=<mode>]` and `-o/--push-option`
 /// are negotiated by [`super::push_proto`], which refuses the push when the
 /// receiving end lacks the matching capability rather than downgrading it
-/// silently; inert or already-matched flags (`--thin`, `-4/-6`, `--verify`, …)
-/// are accepted. `--receive-pack=<path>` / `--exec=<path>` (else
+/// silently; inert or already-matched flags (`--thin`, `-4/-6`, …) are accepted.
+/// `--no-verify`/`--verify` drive the `pre-push` hook alone — git's
+/// `TRANSPORT_PUSH_NO_HOOK` — and `--dry-run` does not suppress it: a hook that
+/// refuses fails a dry run exactly as it fails a real push. `--receive-pack=<path>` / `--exec=<path>` (else
 /// `remote.<name>.receivepack`) reaches the transport, which runs it in place of
 /// `git-receive-pack` on the other end.
 ///
@@ -194,8 +196,14 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" => f.quiet = true,
             "--progress" | "--no-progress"
             | "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6"
-            | "--verify" | "--no-verify"
             => {}
+            // `--no-verify` sets `TRANSPORT_PUSH_NO_HOOK`, which is the only
+            // thing that suppresses the `pre-push` hook in `transport_push()`
+            // (transport.c): `if (!(flags & TRANSPORT_PUSH_NO_HOOK)) run_pre_push_hook(…)`.
+            // `--dry-run` does *not* skip it — git runs the hook and lets it veto
+            // a dry run just as it vetoes a real one.
+            "--no-verify" => f.no_verify = true,
+            "--verify" => f.no_verify = false,
             // `--force-if-includes` only ever does anything alongside a
             // `--force-with-lease` that takes its expected value from the
             // remote-tracking ref (`apply_cas()` sets `check_reachable` exactly
@@ -331,6 +339,30 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     } else {
         positionals.into_iter().skip(1).collect()
     };
+
+    // `parse_refspec()` (refspec.c) rejects a push refspec whose destination is
+    // present but empty:
+    //
+    // ```c
+    // if (!item->dst)
+    //         ;                       /* no colon at all: dst is the src */
+    // else if (!*item->dst)
+    //         return 0;               /* "src:" — invalid */
+    // ```
+    //
+    // and `refspec_item_init_or_die()` turns that into
+    // `die("invalid refspec '%s'", refspec)`. The one spelling that survives is
+    // `:` (or `+:`) on its own, which the function special-cases above that block
+    // as the *matching* refspec.
+    for spec in &specs {
+        let body = spec.strip_prefix('+').unwrap_or(spec);
+        if body == ":" {
+            continue;
+        }
+        if body.rsplit_once(':').is_some_and(|(_, dst)| dst.is_empty()) {
+            crate::git_fatal!("invalid refspec '{spec}'");
+        }
+    }
 
     // Honor the `push.*` config defaults for flags not given explicitly. An
     // explicit command-line flag always wins: git reads config in `git_push_config`
@@ -561,7 +593,11 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // `pre-push` runs before contacting the remote, receiving `<remote> <url>` as
     // arguments and one `<local-ref> <local-sha> <remote-ref> <remote-sha>` line
     // per update on stdin. A non-zero exit aborts the push (git behavior).
-    if !f.dry_run {
+    //
+    // Gated on `--no-verify` alone (`TRANSPORT_PUSH_NO_HOOK` in `transport_push()`),
+    // never on `--dry-run`: git runs the hook for a dry run too, so a hook that
+    // refuses makes `push --dry-run` fail exactly as a real push would.
+    if !f.no_verify {
         let url = remote
             .url(Direction::Push)
             .or_else(|| remote.url(Direction::Fetch))
@@ -577,6 +613,10 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             ));
         }
         if !crate::hooks::run(&repo, "pre-push", &[&remote_name, &url], Some(payload.as_bytes()))? {
+            // `transport_push()` returns -1, and `push_with_options()` closes with
+            // the same summary line every other push failure ends on:
+            // `error(_("failed to push some refs to '%s'"), transport->url)`.
+            eprintln!("error: failed to push some refs to '{url}'");
             return Ok(ExitCode::from(1));
         }
     }
@@ -711,6 +751,9 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
 struct Flags {
     force: bool,
     dry_run: bool,
+    /// `--no-verify`, git's `TRANSPORT_PUSH_NO_HOOK`: skip the `pre-push` hook.
+    /// Independent of `dry_run` — a dry run still runs the hook.
+    no_verify: bool,
     delete: bool,
     all: bool,
     tags: bool,
@@ -1117,6 +1160,18 @@ fn parse_refspec(
         Some((s, d)) => (s, Some(d)),
         None => (spec, None),
     };
+    // `parse_refspec()` (refspec.c) rewrites a bare `@` source as `HEAD` while it
+    // parses, before anything looks at the text:
+    //
+    // ```c
+    // if (!strcmp(item->src, "@"))
+    //         item->src = xstrdup("HEAD");
+    // ```
+    //
+    // So `push origin @:refs/heads/x` reports `HEAD -> x`, not `@ -> x`, and
+    // `--set-upstream` follows the symref from `HEAD` rather than failing to
+    // resolve `@` as a ref name.
+    let src = if src == "@" { "HEAD" } else { src };
 
     let new = if src.is_empty() {
         null(repo) // `:dst` deletes the remote ref.

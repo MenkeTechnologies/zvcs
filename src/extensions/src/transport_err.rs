@@ -98,6 +98,27 @@ pub fn ssh_fatal(url: &str, err: &anyhow::Error) -> Option<ExitCode> {
     Some(ExitCode::from(128))
 }
 
+/// git's refusal when the other end is a local path that is not a repository.
+///
+/// `git_connect()` runs `enter_repo()` on a local path and dies when it comes
+/// back NULL:
+///
+/// ```c
+/// die(_("'%s' does not appear to be a git repository"), path);
+/// ```
+///
+/// The caller — `transport_get_remote_refs()` — then adds the same four-line
+/// block an unreachable ssh host produces, because both are "the other end never
+/// answered". Exit 128.
+pub fn not_a_repository_fatal(path: &str) -> ExitCode {
+    eprintln!("fatal: '{path}' does not appear to be a git repository");
+    eprintln!("fatal: Could not read from remote repository.");
+    eprintln!();
+    eprintln!("Please make sure you have the correct access rights");
+    eprintln!("and the repository exists.");
+    ExitCode::from(128)
+}
+
 /// The one line the stderr supervisor swallowed, or `None` when it swallowed
 /// none and the child's words already reached the terminal on their own.
 ///

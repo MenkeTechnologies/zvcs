@@ -381,6 +381,32 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             _ => (a, None),
         };
 
+        // `parse_long_opt()`'s refusal for an `=<value>` on an entry that takes
+        // none (`OPT_BOOL` and friends):
+        //
+        // ```c
+        // if (!rest)
+        //         ...
+        // return error(_("%s takes no value"), optname(options, flags));
+        // ```
+        //
+        // `optname()` renders it as ``option `<name>'``, and the caller answers
+        // `PARSE_OPT_ERROR`, which is `exit(129)` with no usage block.
+        if inline_val.is_some() {
+            if let Some(stem) = key.strip_prefix("--") {
+                let takes_none = LONG_OPTS.iter().any(|o| {
+                    o.arg == super::Arg::None
+                        && (o.name == stem
+                            || (o.neg
+                                && stem.strip_prefix("no-").is_some_and(|s| s == o.name)))
+                });
+                if takes_none {
+                    eprintln!("error: option `{stem}' takes no value");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+        }
+
         // Fetch the value for a value-taking option (inline `=v` or next arg).
         // Kept as a plain expression (not a closure) so the `i` cursor stays
         // freely borrowable in the other match arms.
@@ -437,7 +463,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-branch" => branch = None,
             "-c" | "--config" => {
                 let raw = take_value!();
-                config_pairs.push(parse_config_pair(&raw)?);
+                config_pairs.push(parse_config_pair(&raw));
             }
             "--no-tags" => tags = Some(Tags::None),
             // `--tags` resets to git's default (all tags fetched).
@@ -492,7 +518,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // network; `Filter::from_str` reproduces both the grammar and the messages.
             "--filter" => {
                 let raw = take_value!();
-                filter = Some(raw.parse().map_err(|e| anyhow::anyhow!("{e}"))?);
+                // `parse_list_objects_filter()` (list-objects-filter-options.c) ends on
+                // `die(_("invalid filter-spec '%s'"), arg)` — git's words at 128, not this
+                // port's at 1.
+                filter = Some(raw.parse().map_err(|e| crate::fatal::die(format!("{e}")))?);
             }
             "--no-filter" => filter = None,
             // `--also-filter-submodules`: apply the same filter to the submodules the clone recurses
@@ -503,13 +532,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-bundle-uri" => bundle_uri = None,
             "--depth" => {
                 let v = take_value!();
+                // `die(_("depth %s is not a positive number"), option_depth)`
+                // (builtin/clone.c) — the value is interpolated bare, without quotes,
+                // and the refusal is a `die()` at 128.
                 let n: u32 = v
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("depth {v:?} is not a positive number"))?;
-                depth = Some(
-                    NonZeroU32::new(n)
-                        .ok_or_else(|| anyhow::anyhow!("depth {v:?} is not a positive number"))?,
-                );
+                    .map_err(|_| crate::fatal::die(format!("depth {v} is not a positive number")))?;
+                depth = Some(NonZeroU32::new(n).ok_or_else(|| {
+                    crate::fatal::die(format!("depth {v} is not a positive number"))
+                })?);
             }
             // Shallow boundary at a cutoff date (git's `deepen_since`). `fetch-pack.c:439` runs
             // the value through `approxidate()`, which never fails — an unreadable date is the
@@ -556,7 +587,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 branch = Some(other[2..].to_string());
             }
             other if other.starts_with("-c") && other.len() > 2 => {
-                config_pairs.push(parse_config_pair(&other[2..])?);
+                config_pairs.push(parse_config_pair(&other[2..]));
             }
             // A long name no table entry claims is `parse_options()`' own refusal —
             // the `error:` line and the block, both on stderr, exit 129 — not a gap
@@ -619,7 +650,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                                 'o' => origin = Some(v),
                                 'b' => branch = Some(v),
                                 'u' => upload_pack = Some(v),
-                                'c' => config_pairs.push(parse_config_pair(&v)?),
+                                'c' => config_pairs.push(parse_config_pair(&v)),
                                 _ => jobs = Some(v),
                             }
                             break;
@@ -846,6 +877,44 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `write_config()` (builtin/clone.c) replays every `-c <key>=<value>` into the
+    // new repository through `git_config_parse_parameter()`. A key that cannot be
+    // split is an `error()` there and the caller ends the clone:
+    //
+    // ```c
+    // if (git_config_parse_parameter(config->items[i].string,
+    //                                write_one_config, NULL) < 0)
+    //         die(_("unable to write parameters to config file"));
+    // ```
+    //
+    // It runs after `init_db()`, which is why both lines sit *below* the banner.
+    if let Some(msg) = config_pairs.iter().find_map(|(k, _)| config_key_error(k)) {
+        eprintln!("error: {msg}");
+        crate::git_fatal!("unable to write parameters to config file");
+    }
+
+    // `initialize_repository_version()` follows `write_config()` and sets
+    // `core.repositoryformatversion` with `git_config_set()`. `init_db()` has
+    // already written that key once, so a `-c` that writes it a second time leaves
+    // two values in the file and the set cannot pick one:
+    //
+    // ```text
+    // warning: core.repositoryformatversion has multiple values
+    // fatal: could not set 'core.repositoryformatversion' to '0'
+    // ```
+    //
+    // The value named is the version the *new* repository would get, not the one
+    // `-c` supplied. It is `0` here because a clone this port performs is always
+    // sha1 with `files` ref storage; `--ref-format=reftable` and a sha256 source
+    // are refused earlier, so no path reaches this line wanting `1`.
+    if config_pairs
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("core.repositoryformatversion"))
+    {
+        eprintln!("warning: core.repositoryformatversion has multiple values");
+        crate::git_fatal!("could not set 'core.repositoryformatversion' to '0'");
+    }
+
     // `transport_check_allowed()`, here rather than at the top of the command
     // because git reaches it inside `transport_get()`/`git_connect()` — after the
     // banner. `git clone <path>` under `$GIT_PROTOCOL_FROM_USER=0` therefore
@@ -973,7 +1042,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     if let Some(name) = &origin {
         prepare = prepare
             .with_remote_name(name.as_str())
-            .map_err(|_| anyhow::anyhow!("{name:?} is not a valid remote name"))?;
+            // `die(_("'%s' is not a valid remote name"), option_origin)`
+            // (builtin/clone.c) — single quotes, and 128.
+            .map_err(|_| crate::fatal::die(format!("'{name}' is not a valid remote name")))?;
     }
     if let Some(name) = &branch {
         prepare = prepare
@@ -2274,13 +2345,32 @@ fn prune_empty_dirs(dir: &Path) {
 ///
 /// Validation happens here, during parsing, so a bad key fails before the
 /// destination directory is created — exactly where git rejects it.
-fn parse_config_pair(raw: &str) -> Result<(String, String)> {
+fn parse_config_pair(raw: &str) -> (String, String) {
     let (key, value) = match raw.split_once('=') {
         Some((k, v)) => (k, v.to_string()),
         None => (raw, "true".to_string()),
     };
-    split_config_key(key)?;
-    Ok((key.to_string(), value))
+    (key.to_string(), value)
+}
+
+/// The complaint `git_config_parse_parameter()` makes about a `-c` key it cannot
+/// split, or `None` when the key is usable.
+///
+/// This is deliberately *not* raised where the argument is parsed. git collects
+/// every `-c` into `option_config` during option parsing and only replays them in
+/// `write_config()`, which runs after `init_db()` — so the diagnostic lands under
+/// the `Cloning into '<dir>'...` banner, not above it, and the caller turns it
+/// into `die(_("unable to write parameters to config file"))` rather than
+/// reporting the key itself as fatal.
+fn config_key_error(key: &str) -> Option<String> {
+    let Some(first) = key.find('.') else {
+        return Some(format!("key does not contain a section: {key}"));
+    };
+    let last = key.rfind('.').expect("a first dot implies a last dot");
+    if key[..first].is_empty() || key[last + 1..].is_empty() {
+        return Some(format!("key does not contain variable name: {key}"));
+    }
+    None
 }
 
 /// Split a config key into `(section, subsection, name)`. git splits at the first

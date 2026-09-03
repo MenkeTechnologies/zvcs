@@ -111,10 +111,13 @@
 //!     normally becomes rather than reproducing a `SIGABRT`.
 //!
 //! Two further deliberate gaps, so this doc claims no more than the code does:
-//! a v3 bundle carrying any capability other than `@object-format` is rejected
-//! (git's `The bundle uses this filter: …` line is not reproduced from a
-//! verified source), and a header that parses as neither is surfaced as a plain
-//! error rather than git's `unrecognized header:` text.
+//! a v3 bundle's `@filter` capability is read and kept but never reported (git's
+//! `The bundle uses this filter: …` line is not reproduced from a verified
+//! source, and the spec is not re-parsed), and a header that parses as neither a
+//! capability nor a ref line is surfaced as a plain error rather than git's
+//! `unrecognized header:` text. A capability that is neither `@object-format`
+//! nor `@filter` is `error: unknown capability '<cap>'` at exit 1, which is what
+//! `parse_capability()` (bundle.c) reports.
 //!
 //! `args` excludes the `bundle` verb itself: `dispatch::run` is handed
 //! `&argv[2..]` (see `lib.rs`), so `args[0]` is the subcommand.
@@ -225,6 +228,9 @@ pub(crate) struct Header {
     /// `(object id, ref name)` pairs. Ref names are kept as raw bytes because
     /// they are echoed verbatim and are not required to be UTF-8.
     pub(crate) refs: Vec<(ObjectId, Vec<u8>)>,
+    /// The `@filter` capability's value, when the bundle carries one. Recorded
+    /// because the header has to round-trip; none of the reading verbs use it.
+    filter: Option<String>,
 }
 
 /// The failures git reports itself, with its own wording and exit code 1.
@@ -237,6 +243,10 @@ pub(crate) enum HeaderError {
     /// `unrecognized header:` text for this; it is not reproduced here, so the
     /// reason is surfaced as a plain error instead of a wrong-looking match.
     Malformed(String),
+    /// `error: unknown capability '<cap>'` — `parse_capability()` (bundle.c) on a
+    /// `@`-line it does not know. It is an `error()`, so the command reports it
+    /// and exits 1 rather than dying at 128.
+    UnknownCapability(String),
 }
 
 /// Report a [`HeaderError`] the way git does and yield its exit code, except
@@ -248,6 +258,7 @@ fn report(path: &str, err: HeaderError) -> Result<ExitCode> {
             eprintln!("error: '{path}' does not look like a v2 or v3 bundle file");
         }
         HeaderError::Malformed(why) => crate::git_fatal!("malformed bundle header in {path:?}: {why}"),
+        HeaderError::UnknownCapability(cap) => eprintln!("error: unknown capability '{cap}'"),
     }
     Ok(ExitCode::from(1))
 }
@@ -342,6 +353,7 @@ fn read_header_from(input: &mut BundleSource) -> Result<Header, HeaderError> {
         hash: "sha1".into(),
         prereqs: Vec::new(),
         refs: Vec::new(),
+        filter: None,
     };
     let mut hexsz = 40usize;
 
@@ -372,11 +384,24 @@ fn read_header_from(input: &mut BundleSource) -> Result<Header, HeaderError> {
                     "unknown object format {other:?}"
                 )))
             }
-            None => {
-                return Err(HeaderError::Malformed(format!(
-                    "capability {cap:?} is not supported"
-                )))
+            // `@filter=<spec>`: a v3 bundle written with `--filter`, recording
+            // which objects were deliberately left out.
+            //
+            // ```c
+            // if (skip_prefix(capability, "filter=", &arg)) {
+            //         parse_list_objects_filter(&header->filter, arg);
+            //         return 0;
+            // }
+            // ```
+            //
+            // (`parse_capability()`, bundle.c.) `verify`, `list-heads` and
+            // `unbundle` read the header and never consult the filter, so the spec
+            // is recorded and not re-parsed; a spec git would have rejected here
+            // cannot come out of this port's own `bundle create`.
+            None if cap.starts_with("filter=") => {
+                header.filter = Some(cap["filter=".len()..].to_string());
             }
+            None => return Err(HeaderError::UnknownCapability(cap)),
         }
     }
 

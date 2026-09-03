@@ -692,10 +692,19 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     }
 
     // `gc.writeCommitGraph` defaults to true.
+    //
+    // `gc` reaches `write_commit_graph_reachable()` *without* having called
+    // `disable_replace_refs()`, so the replace half of `commit_graph_compatible()`
+    // is live here in a way it never is for the `commit-graph` command: a
+    // repository holding a `refs/replace/*` entry gets no graph out of `gc`,
+    // while `git commit-graph write --reachable` in the same repository writes
+    // one. Both were measured on git 2.55.0. Grafts and shallowness are checked
+    // inside the write itself, which is where git checks them too.
     if repo
         .config_snapshot()
         .boolean("gc.writeCommitGraph")
         .unwrap_or(true)
+        && !super::commit_graph::replacements_in_use(&repo)
     {
         super::commit_graph::commit_graph(&["write".to_string(), "--reachable".to_string()])?;
     }
@@ -899,12 +908,28 @@ fn repack_all(
         return Err(anyhow::Error::new(crate::fatal::Silent(128)));
     }
 
+    // `gc` reaches its packing through `repack -d -l -a|-A`, and `cmd_repack()`
+    // adds `--exclude-promisor-objects` in a partial clone — then puts every
+    // object the `.promisor` packs held into a promisor pack of its own
+    // (`repack_promisor_objects()`, gated on `ALL_INTO_ONE`, which `gc`'s
+    // `-a`/`-A` always sets). Without both halves the marker file disappears
+    // with the pack `-d` deletes, and the repository stops excusing the objects
+    // the promisor remote still owes: stock git reads the result as
+    // `broken link from tree … to blob …`.
+    let promisor_held = match super::rev_list::has_promisor_remote(repo) {
+        true => super::rev_list::promisor_pack_objects(repo),
+        false => HashSet::new(),
+    };
+
     let mut roots = Vec::new();
     super::prune::collect_roots(repo, &mut roots)?;
-    let reachable = super::prune::close_over(repo, roots);
+    let reachable = super::prune::close_over_excluding(repo, roots, &promisor_held);
 
     // `existing` is already sorted and deduplicated, so both halves come out in
-    // the oid order a pack index wants.
+    // the oid order a pack index wants. A promisor-held object belongs to
+    // neither: it is written back out by the promisor pass below, so it must not
+    // reach the main pack (`keep`) nor be treated as unreachable cruft (`rest`).
+    existing.retain(|id| !promisor_held.contains(id));
     let (keep, rest): (Vec<ObjectId>, Vec<ObjectId>) =
         existing.into_iter().partition(|id| reachable.contains(id));
 
@@ -920,6 +945,18 @@ fn repack_all(
     // The new pack has to be written before anything is removed: every object in
     // it is read back out of the very packs and loose files being replaced.
     let mut written = Vec::new();
+    // `repack_promisor_objects()` runs *before* the main `pack-objects`, and
+    // finishes with `write_promisor_file(promisor_name, NULL, 0)` — an empty
+    // file named for the pack it marks — so what `-d` deletes below is replaced
+    // in kind.
+    if !promisor_held.is_empty() {
+        let mut ids: Vec<ObjectId> = promisor_held.iter().copied().collect();
+        ids.sort_unstable();
+        if let Some(base) = write_bundle(repo, &pack_dir, &ids, None, delta)? {
+            std::fs::write(pack_dir.join(format!("{base}.promisor")), b"")?;
+            written.push(base);
+        }
+    }
     if let Some(base) = write_bundle(repo, &pack_dir, &keep, None, delta)? {
         written.push(base);
     }

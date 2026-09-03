@@ -1326,6 +1326,23 @@ fn write_pack(
     use crate::progress::Meter;
     use pack::data::output::delta;
 
+    // `cmd_pack_objects()` opens with `disable_replace_refs()`, and it has to:
+    // the packer writes each object *under its own name*, so reading it through
+    // `refs/replace/<oid>` would store the replacement's bytes at the original's
+    // id and produce a pack whose entries do not hash to their names. Stock git
+    // reads such a pack back as `packed <oid> from <pack> is corrupt`, which is
+    // exactly what `gc` on a repository with a `refs/replace/*` entry used to
+    // leave behind here.
+    //
+    // The handle carries the flag, so a clone of the repository with it set is
+    // the whole of the substitution — no caller has to remember to pass an
+    // unreplaced repository in.
+    let repo = &{
+        let mut plain = repo.clone();
+        plain.objects.ignore_replacements = true;
+        plain
+    };
+
     // Entries are encoded before the header is written, because the header
     // carries the entry *count*, which is known only once every object in the
     // set has been shown to be readable.

@@ -35,6 +35,12 @@
 //! ORs `create_reflog_flag` into its `update_ref()` call only, never into `delete_ref()`, so
 //! a deletion force-creates nothing.
 //!
+//! `option no-deref` reaches the `symref-*` verbs exactly as it reaches the oid
+//! verbs: in the default (deref) mode `symref-update`/`symref-create` are split
+//! onto what the named symref points at, and `symref-delete`/`symref-verify`
+//! refuse to run at all (`<cmd>: cannot operate with deref mode`). See
+//! [`stage_symref_command`].
+//!
 //! One-level lowercase ref names such as `foo` are served too, even though
 //! `gix-validate` refuses them: `ref_transaction_update()` validates an update
 //! with `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)`, so
@@ -505,8 +511,19 @@ fn parse_slot(
         return Ok(Val::Zero);
     }
     // git's `get_oid_hex` fast path: a full-length hex string is taken verbatim.
-    if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
-        return Ok(Val::Oid(id));
+    //
+    // "Full-length" is the *repository's* hash length — `get_oid_hex()` is
+    // `get_oid_hex_algop(hex, oid, the_hash_algo)`, which reads exactly
+    // `algop->hexsz` characters. A 64-character hex handed to a SHA-1
+    // repository is therefore not an object name at all; it falls through to
+    // `get_oid_basic()`, fails there, and comes back as `fatal: <hex>: not a
+    // valid SHA1`. Taking it verbatim instead mints an `ObjectId` of the wrong
+    // kind, which the loose store asserts on
+    // (`gix-odb/src/store_impls/loose/find.rs:34`) rather than reporting.
+    if spec.len() == repo.object_hash().len_in_hex() {
+        if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
+            return Ok(Val::Oid(id));
+        }
     }
     // One `repo_get_oid_with_flags()` per slot, so one trip through
     // `get_oid_basic()` and one chance at each of the four things it raises —
@@ -525,6 +542,19 @@ fn parse_slot(
         spec,
         crate::objname::OidFlags { skip_ambiguity_check: true, ..Default::default() },
     )
+    // `get_short_oid()` opens with
+    // `if (len < MINIMUM_ABBREV || len > the_hash_algo->hexsz) return -1;`, so a
+    // hex operand longer than the repository's own hash can never be an object
+    // name — only a ref of that spelling, which no fixture has. gitoxide's
+    // rev-spec parser mints an id of the foreign kind instead, and the ref then
+    // gets written pointing at an object that cannot exist (`warning: ignoring
+    // broken ref …`). An id that came back *equal to the operand* is exactly
+    // that mint; a real ref by that name would answer with its own target.
+    .filter(|id| {
+        spec.len() <= repo.object_hash().len_in_hex()
+            || !spec.bytes().all(|b| b.is_ascii_hexdigit())
+            || !id.to_hex().to_string().eq_ignore_ascii_case(spec)
+    })
     .ok_or_else(|| match slot {
         Slot::New => anyhow!("{spec}: not a valid SHA1"),
         Slot::Old => anyhow!("{spec}: not a valid old SHA1"),
@@ -972,7 +1002,16 @@ fn run_stdin(
                 }
             }
             "symref-update" | "symref-create" | "symref-delete" | "symref-verify" => {
-                match stage_symref_command(repo, &mut batch, cmd, args, nul, create_reflog, msg) {
+                match stage_symref_command(
+                    repo,
+                    &mut batch,
+                    cmd,
+                    args,
+                    nul,
+                    edit_deref,
+                    create_reflog,
+                    msg,
+                ) {
                     Ok(()) => {}
                     Err(e) => return fatal(e),
                 }
@@ -1153,18 +1192,37 @@ fn stage_oid_command(
     Ok(())
 }
 
-/// Stage the `symref-*` commands. These always operate on the named ref itself
-/// (never through it), which is the only mode git allows for `symref-verify`.
+/// Stage the `symref-*` commands.
+///
+/// `option no-deref` reaches these verbs exactly as it reaches the oid verbs:
+/// git's `parse_cmd_symref_*` all pass the shared `update_flags` straight into
+/// the transaction, so the default (deref) mode makes `ref_transaction_prepare`
+/// split a symbolic ref and apply the change to *what it points at*. So
+/// `symref-update HEAD <target>` without `no-deref` rewrites the branch `HEAD`
+/// names into a symref, not `HEAD` itself.
+///
+/// Two of the four refuse to run in deref mode at all — `parse_cmd_symref_delete`
+/// and `parse_cmd_symref_verify` both open with
+/// `if (!(update_flags & REF_NO_DEREF)) die("<cmd>: cannot operate with deref
+/// mode")` — because deleting or verifying "the symref" is only meaningful when
+/// the transaction is not going to follow it first.
 fn stage_symref_command(
     repo: &gix::Repository,
     batch: &mut Batch,
     cmd: &str,
     args: &[String],
     nul: bool,
+    deref: bool,
     create_reflog: bool,
     msg: Option<&str>,
 ) -> Result<()> {
     let slot = |n: usize| -> Option<&str> { args.get(n).map(String::as_str) };
+    // The refusal precedes argument parsing in git: the `die` is the first
+    // statement of both parsers, so a deref-mode `symref-delete` with no ref at
+    // all still reports the mode rather than the missing argument.
+    if deref && matches!(cmd, "symref-delete" | "symref-verify") {
+        crate::git_fatal!("{cmd}: cannot operate with deref mode");
+    }
     let name = slot(0).ok_or_else(|| anyhow!("{cmd}: missing <ref>"))?;
 
     match cmd {
@@ -1177,7 +1235,7 @@ fn stage_symref_command(
                     new: Target::Symbolic(refname(target)?),
                 },
                 name: refname(name)?,
-                deref: false,
+                deref,
             });
         }
         "symref-update" => {
@@ -1203,7 +1261,7 @@ fn stage_symref_command(
                     new: Target::Symbolic(refname(target)?),
                 },
                 name: refname(name)?,
-                deref: false,
+                deref,
             });
         }
         "symref-delete" => {

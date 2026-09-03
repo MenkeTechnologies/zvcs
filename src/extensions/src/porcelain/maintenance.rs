@@ -52,6 +52,12 @@
 //! tree â see [`run_tasks`] for the task set, the ordering, and the two tasks
 //! that are deliberately no-ops.
 //!
+//! `run`'s quiet flag starts at `!isatty(2)`, not at `false`: `maintenance_run()`
+//! opens with `opts.quiet = !isatty(2);` and `--quiet`/`--no-quiet` only move it
+//! from there. That is what keeps a piped `git maintenance run
+//! --task=loose-objects` silent, since the `pack-objects` it would otherwise
+//! spawn as `--no-quiet` reports its progress meter into the pipe.
+//!
 //! Everything else validates its arguments exactly as git's parse-options does
 //! â `-h` (usage on stdout, exit 129), unknown option/switch, missing option
 //! value, stray positional, invalid `--task`/`--schedule`/`--scheduler` value â
@@ -457,7 +463,12 @@ fn option_name(arg: &str) -> Option<String> {
 /// `git maintenance run` â validate arguments, then run the selected tasks.
 fn run_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
-    let mut quiet = false;
+    // `maintenance_run()` opens with `opts.quiet = !isatty(2);`, so a run whose
+    // stderr is not a terminal is quiet before a single option is read. That is
+    // what keeps `git maintenance run --task=loose-objects | cat` silent while
+    // the `git pack-objects --no-quiet` it would otherwise spawn reports six
+    // lines of progress into the pipe (checked against git 2.55.0).
+    let mut quiet = !std::io::IsTerminal::is_terminal(&std::io::stderr());
     let mut scheduled: Option<Schedule> = None;
     let mut selected: Vec<String> = Vec::new();
     // The `--task` arguments as typed, which is what git tests for a repeat.

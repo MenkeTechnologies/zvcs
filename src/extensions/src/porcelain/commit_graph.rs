@@ -590,7 +590,15 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         ));
     }
 
-    let repo = crate::setup::discover()?;
+    // `cmd_commit_graph()` calls `disable_replace_refs()` before anything else,
+    // so the graph records the parents each commit's own bytes name rather than
+    // the ones `refs/replace/*` would substitute — and, as a side effect, makes
+    // `commit_graph_compatible()`'s replace test unreachable for this command.
+    let repo = {
+        let mut repo = crate::setup::discover()?;
+        repo.objects.ignore_replacements = true;
+        repo
+    };
 
     // `commitGraph.generationVersion` selects the generation-number version.
     // Version 2 (git's default) additionally records the corrected commit date
@@ -757,6 +765,16 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         bloom_settings.hash_version = if hash_version == 2 { 2 } else { 1 };
     }
 
+    // `write_commit_graph()` opens with `if (!commit_graph_compatible(r)) return 0;`
+    // — nothing written, no diagnostic, exit 0. `cmd_commit_graph()` has already
+    // called `disable_replace_refs()` by then, so the replace half of that test
+    // can never trip *here*; a graft file or a shallow boundary still can, and
+    // both do (checked against git 2.55.0: a `--depth 2` clone writes no graph
+    // for either `commit-graph write --reachable` or `gc`).
+    if commit_graph_incompatible(&repo) {
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let source = if reachable {
         Source::Reachable
     } else if stdin_packs {
@@ -825,6 +843,64 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         install(&objects, &bytes)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The half of git's `commit_graph_compatible()` that no `disable_replace_refs()`
+/// can clear: a graft file or a shallow boundary.
+///
+/// ```c
+/// static int commit_graph_compatible(struct repository *r)
+/// {
+///         if (replace_refs_enabled(r)) {
+///                 prepare_replace_object(r);
+///                 if (hashmap_get_size(&r->objects->replace_map->map))
+///                         return 0;
+///         }
+///         prepare_commit_graft(r);
+///         if (r->parsed_objects &&
+///             (r->parsed_objects->grafts_nr || r->parsed_objects->substituted_parent))
+///                 return 0;
+///         if (is_repository_shallow(r))
+///                 return 0;
+///         return 1;
+/// }
+/// ```
+///
+/// The reason is the same for all three: the graph stores each commit's parents
+/// as positions in the file, so a parent list that the object's own bytes do not
+/// carry — grafted, replaced, or cut off by `.git/shallow` — would be baked in
+/// and then read back by commands that had those substitutions switched off.
+///
+/// The replace test is left to callers, because it is the one that differs
+/// between them: `git commit-graph write` disables replacement first and so
+/// always passes it, while `gc` does not and so must ask
+/// [`replacements_in_use`] itself.
+pub(crate) fn commit_graph_incompatible(repo: &gix::Repository) -> bool {
+    let git_dir = repo.common_dir();
+    let nonempty = |p: std::path::PathBuf| {
+        std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false)
+    };
+    nonempty(git_dir.join("info").join("grafts")) || nonempty(git_dir.join("shallow"))
+}
+
+/// Whether `refs/replace/*` is both enabled and non-empty, which is git's
+/// `replace_refs_enabled(r) && hashmap_get_size(&r->objects->replace_map->map)`.
+///
+/// The enable half is `setup_git_env()`'s: `GIT_NO_REPLACE_OBJECTS` in the
+/// environment (tested for presence, so an empty value still disables) or
+/// `core.useReplaceRefs=false`. The non-empty half is the ref namespace, which
+/// is where the map is built from.
+pub(crate) fn replacements_in_use(repo: &gix::Repository) -> bool {
+    if std::env::var_os("GIT_NO_REPLACE_OBJECTS").is_some() {
+        return false;
+    }
+    if repo.config_snapshot().boolean("core.useReplaceRefs") == Some(false) {
+        return false;
+    }
+    repo.references()
+        .ok()
+        .and_then(|p| p.prefixed("refs/replace/").ok().map(|mut it| it.next().is_some()))
+        .unwrap_or(false)
 }
 
 /// The `BDAT` header of the graph being replaced, which decides whether this

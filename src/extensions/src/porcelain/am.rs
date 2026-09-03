@@ -102,14 +102,21 @@
 //!     `split_mail()` (builtin/am.c:966-971) rather than in `git_am_config` —
 //!     because it is what `--keep-cr` / `--no-keep-cr` override.
 //!
+//! `-i`/`--interactive` is served: `do_interactive()`'s prompt loop reads its
+//! answer from **stdin**, not from a terminal, so `y`/`n`/`a`/`e`/`v` and every
+//! unrecognised answer behave as they do under stock git even when stdin is a
+//! pipe. `a` clears the flag for the rest of the run, `e` re-reads
+//! `rebase-apply/final-commit` after `$GIT_EDITOR`, `v` pages
+//! `rebase-apply/patch`, and end of input is
+//! `fatal: unable to read from stdin; aborting` with the state directory left in
+//! place. See [`do_interactive`].
+//!
 //! ## What is not served, and why
 //!
 //! These reshape the commit or the flow in ways this port cannot reproduce
 //! faithfully through the ported subcommands, so each refuses *before* it could
 //! write a wrong object or worktree rather than emit a guess:
 //!
-//!   * **`-i`/`--interactive`.** The per-patch tty prompt loop cannot run
-//!     unattended.
 //!   * **`-S`.** Signing the commit needs a path `git commit-tree` does not expose
 //!     here. `--ignore-date` and `--committer-date-is-author-date` are honoured:
 //!     the first drops the mail's author date, the second dates the committer by it.
@@ -1889,6 +1896,12 @@ fn run_am_loop(
     let mut cur = read_count(state_dir, "next")?;
     let last = read_count(state_dir, "last")?;
 
+    // `state->interactive` is a field, not a constant: answering `a` at the
+    // prompt clears it, so every later patch in the same run is applied without
+    // asking. A `--continue` re-enters here with the flag as the command line
+    // set it, which is what git does too — the bit is never persisted.
+    let mut interactive = cli.interactive;
+
     while cur <= last {
         let mail = state_dir.join(format!("{cur:04}"));
         if !mail.exists() {
@@ -1943,11 +1956,23 @@ fn run_am_loop(
         };
         let mut info = info;
 
-        if cli.interactive {
-            bail!(
-                "`git am -i` interactive mode is not ported: it drives a per-patch \
-                 [y]es/[n]o/[e]dit/[v] tty prompt loop that cannot run unattended"
-            );
+        // `if (state->interactive && do_interactive(state)) goto next;`
+        // (builtin/am.c) — between the parse and the empty-patch decision, so
+        // the body the prompt shows is the message `final-commit` already holds
+        // and a refused patch is skipped before `applypatch-msg` ever runs.
+        if interactive {
+            match do_interactive(repo, state_dir, &mut info, &mut interactive)? {
+                Interactive::Apply => {}
+                Interactive::Skip => {
+                    am_next(repo, state_dir, &mut cur)?;
+                    resume = false;
+                    continue;
+                }
+                Interactive::EndOfInput => {
+                    eprintln!("fatal: unable to read from stdin; aborting");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         }
 
         let first = first_line(&info.msg);
@@ -2046,6 +2071,108 @@ fn run_am_loop(
     }
 
     finish_am_run(repo, state_dir, &ld)
+}
+
+/// What one turn of the `-i` prompt decided about the patch in hand.
+enum Interactive {
+    /// `y`, or `a` (which also clears the flag for the rest of the run).
+    Apply,
+    /// `n` — git's `return 1`, which is a `goto next` in the caller.
+    Skip,
+    /// `fgets()` came back `NULL`: `die("unable to read from stdin; aborting")`.
+    EndOfInput,
+}
+
+/// git's `do_interactive()`: ask what to do with the patch in hand.
+///
+/// The loop prints the commit body between two rules and then the one-line
+/// prompt *without* a newline, so the `Applying: …` that follows a `y` lands on
+/// the same line — which is why stdout is flushed before every read and before
+/// every child process.
+///
+/// Only the first byte of the answer is looked at, and only five of them mean
+/// anything:
+///
+///   * `y`/`Y` — apply this patch;
+///   * `a`/`A` — apply it and clear `state->interactive`, so nothing later asks;
+///   * `n`/`N` — skip it;
+///   * `e`/`E` — `launch_editor(am_path(state, "final-commit"), &msg, NULL)`,
+///     which runs `$GIT_EDITOR` on the stored message and reads the file back
+///     into `state->msg`, then asks again;
+///   * `v`/`V` — page `am_path(state, "patch")`, then ask again.
+///
+/// Anything else, the empty line included, falls through to another ask. End of
+/// input is fatal, and the `.git/rebase-apply/` the run had already built is
+/// left where it is (checked against git 2.55.0 with stdin closed).
+fn do_interactive(
+    repo: &gix::Repository,
+    state_dir: &Path,
+    info: &mut CommitInfo,
+    interactive: &mut bool,
+) -> Result<Interactive> {
+    use std::io::{BufRead, Write};
+
+    loop {
+        let mut out = std::io::stdout();
+        out.write_all(b"Commit Body is:\n--------------------------\n")?;
+        out.write_all(&info.msg)?;
+        out.write_all(b"--------------------------\n")?;
+        // `printf()` with no newline: the answer, and whatever the run prints
+        // next, continue this line.
+        out.write_all(b"Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: ")?;
+        out.flush()?;
+
+        let mut reply = String::new();
+        if std::io::stdin().lock().read_line(&mut reply)? == 0 {
+            return Ok(Interactive::EndOfInput);
+        }
+        match reply.as_bytes().first().copied() {
+            Some(b'y' | b'Y') => return Ok(Interactive::Apply),
+            Some(b'a' | b'A') => {
+                *interactive = false;
+                return Ok(Interactive::Apply);
+            }
+            Some(b'n' | b'N') => return Ok(Interactive::Skip),
+            Some(b'e' | b'E') => {
+                let path = state_dir.join("final-commit");
+                let _ = out.flush();
+                let _ = super::commit::launch_editor(&repo.config_snapshot(), &path);
+                // `launch_specified_editor()` reads the file back whatever the
+                // editor did, so a message the editor left alone reloads
+                // unchanged and a rewritten one replaces `state->msg`.
+                if let Ok(edited) = std::fs::read(&path) {
+                    info.msg = edited;
+                }
+            }
+            Some(b'v' | b'V') => page_file(repo, &state_dir.join("patch"))?,
+            _ => {}
+        }
+    }
+}
+
+/// `prepare_pager_args(&cp, pager); strvec_push(&cp.args, <file>); run_command(&cp)`
+/// — the `v` answer's viewer. `git_pager(1)` resolves `$GIT_PAGER`, `core.pager`,
+/// `$PAGER`, then the built-in default, and treats `cat` (and an empty value) as
+/// "no pager", which `do_interactive` then spells as `cat` anyway.
+fn page_file(repo: &gix::Repository, path: &Path) -> Result<()> {
+    use std::io::Write;
+
+    let _ = std::io::stdout().flush();
+    let mut pager = crate::pager::resolve_pager(Some(&repo.config_snapshot()));
+    if pager.is_empty() || pager == "cat" {
+        pager = "cat".to_owned();
+    }
+    let mut cmd = crate::external::prepare_shell_cmd_str(&pager, [path.as_os_str()]);
+    if std::env::var_os("LESS").is_none() {
+        cmd.env("LESS", "FRX");
+    }
+    if std::env::var_os("LV").is_none() {
+        cmd.env("LV", "-c");
+    }
+    if let Ok(mut child) = cmd.spawn() {
+        let _ = child.wait();
+    }
+    Ok(())
 }
 
 /// `am_run`'s tail (builtin/am.c:1930-1946): the `rewritten` list is replayed to
@@ -2753,12 +2880,10 @@ fn am_resolve(
         return die_user_resolve(repo, state_dir, cli);
     }
 
-    if cli.interactive {
-        bail!(
-            "`git am -i --continue` interactive mode is not ported: it re-drives the \
-             per-patch tty prompt loop"
-        );
-    }
+    // `--continue` itself never prompts: `am_resolve()` commits the patch the
+    // user just staged and then hands back to `am_run()`, which is where
+    // `state->interactive` is consulted again — so a `-i --continue` asks about
+    // the *next* patch and not about this one.
     if cli.gpg_sign {
         bail!(
             "`git am --continue -S` is not ported: signing the commit needs the signing path \

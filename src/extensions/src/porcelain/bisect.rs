@@ -902,6 +902,63 @@ fn start(args: &[String]) -> Result<ExitCode> {
         must_write_terms = true;
     }
 
+    // Restarting a live session first returns the worktree to where it began.
+    if ctx.in_progress() {
+        let start_head = std::fs::read_to_string(ctx.file("BISECT_START"))?
+            .trim()
+            .to_owned();
+        checkout_and_report(&ctx, &start_head)?;
+        clean_state(&ctx)?;
+    }
+
+    let start_head = head_label(&ctx.repo)?;
+    std::fs::create_dir_all(ctx.refs_dir())?;
+    std::fs::write(ctx.file("BISECT_START"), format!("{start_head}\n"))?;
+    std::fs::write(ctx.file("BISECT_NAMES"), bisect_names(args, pathspec_pos))?;
+    if first_parent {
+        std::fs::write(ctx.file("BISECT_FIRST_PARENT"), "\n")?;
+    }
+    if no_checkout {
+        let head_oid = ctx.repo.head_id()?.detach();
+        write_ref(&ctx.file("BISECT_HEAD"), head_oid)?;
+    }
+
+    // `bisect_write()` per revision, then `write_terms()` — in that order, which
+    // is what makes a rejected `--term-*` value leave a half-opened session
+    // behind. git validates a term nowhere in its argument scan: the only two
+    // gates are `check_refname_format("refs/bisect/<term>")` inside
+    // `update_ref()` (so an unnameable term fails when the first ref is written,
+    // with `BISECT_START` and `BISECT_NAMES` already on disk and no
+    // `BISECT_LOG`) and `write_terms()` at the end (so `--term-new=log` gets its
+    // refs and its log lines first, and only then `error: can't use the builtin
+    // command 'log' as a term`). Checked against git 2.55.0 for the empty,
+    // `..`, `has space`, duplicate and builtin-name spellings.
+    //
+    // `bisect_write()` picks the ref name by comparing the state against
+    // `term_bad` rather than by position, so a session whose two terms are the
+    // same word writes both revisions to `refs/bisect/<term>`.
+    for (idx, id) in resolved.iter().enumerate() {
+        let term = if idx == 0 { &terms.bad } else { &terms.good };
+        let path = if *term == terms.bad {
+            ctx.refs_dir().join(term)
+        } else {
+            ctx.refs_dir().join(format!("{term}-{}", id.to_hex()))
+        };
+        let tag = format!("refs/bisect/{term}");
+        if gix::validate::reference::name(tag.as_bytes().as_bstr()).is_err() {
+            eprintln!(
+                "error: update_ref failed for ref '{tag}': refusing to update ref with bad name '{tag}'"
+            );
+            return Ok(ExitCode::from(1));
+        }
+        write_ref(&path, *id)?;
+        ctx.append_log(&format!(
+            "# {term}: [{}] {}\n",
+            id.to_hex(),
+            subject(&ctx.repo, *id)?
+        ))?;
+    }
+
     // git's `write_terms` gate, in its order: equality first, then the format
     // of each side (bad before good). Each is a plain `error:` line, exit 1.
     if must_write_terms {
@@ -917,50 +974,7 @@ fn start(args: &[String]) -> Result<ExitCode> {
             eprintln!("{msg}");
             return Ok(ExitCode::from(1));
         }
-    }
-
-    // Restarting a live session first returns the worktree to where it began.
-    if ctx.in_progress() {
-        let start_head = std::fs::read_to_string(ctx.file("BISECT_START"))?
-            .trim()
-            .to_owned();
-        checkout_and_report(&ctx, &start_head)?;
-        clean_state(&ctx)?;
-    }
-
-    let start_head = head_label(&ctx.repo)?;
-    std::fs::create_dir_all(ctx.refs_dir())?;
-    std::fs::write(ctx.file("BISECT_START"), format!("{start_head}\n"))?;
-    std::fs::write(ctx.file("BISECT_NAMES"), bisect_names(args, pathspec_pos))?;
-    std::fs::write(ctx.file("BISECT_LOG"), "")?;
-    if first_parent {
-        std::fs::write(ctx.file("BISECT_FIRST_PARENT"), "\n")?;
-    }
-    if no_checkout {
-        let head_oid = ctx.repo.head_id()?.detach();
-        write_ref(&ctx.file("BISECT_HEAD"), head_oid)?;
-    }
-
-    if must_write_terms {
         write_terms(&ctx, &terms)?;
-    }
-
-    // The first revision is the bad one; the rest are good.
-    for (idx, id) in resolved.iter().enumerate() {
-        let (term, path) = if idx == 0 {
-            (&terms.bad, ctx.refs_dir().join(&terms.bad))
-        } else {
-            (
-                &terms.good,
-                ctx.refs_dir().join(format!("{}-{}", terms.good, id.to_hex())),
-            )
-        };
-        write_ref(&path, *id)?;
-        ctx.append_log(&format!(
-            "# {term}: [{}] {}\n",
-            id.to_hex(),
-            subject(&ctx.repo, *id)?
-        ))?;
     }
 
     let quoted: Vec<String> = args.iter().map(|a| sq_quote(a)).collect();
@@ -1226,6 +1240,72 @@ fn next_cmd() -> Result<ExitCode> {
 
 // --- subcommand: replay ------------------------------------------------------
 
+/// git's `BISECT_INTERNAL_SUCCESS_MERGE_BASE` / `BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND`,
+/// as a bit the caller can read.
+///
+/// Both are *success* to `cmd_bisect` — `is_bisect_success()` folds them to exit
+/// 0 — and both are *non-zero* to `bisect_replay()`, whose `if (res) goto finish`
+/// stops the replay on them. This port collapses every terminal state into an
+/// `ExitCode`, which loses that distinction: a replayed `start` that answers
+/// `Bisecting: a merge base must be tested` comes back as `SUCCESS` and the
+/// replay runs its trailing `bisect_auto_next()`, printing the block a second
+/// time and exiting 0 where stock exits 1. The flag carries the distinction back
+/// without giving every step's return type a second dimension.
+static STEP_COMPLETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// git's `sq_dequote_to_strvec()`: split an sq-quoted argument list.
+///
+/// Strict where [`super::am::sq_dequote`] is lax, because `bisect_replay()`
+/// depends on the strictness — a token that does not open with `'` ends the
+/// parse, and the caller ignores the failure, so the operands after it are
+/// dropped rather than passed through. That is the whole difference between
+/// `git bisect start 'a' 'b'` (a session over `a..b`) and
+/// `git bisect start a b` (a bare `start`).
+fn sq_dequote_argv(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return out;
+        }
+        if bytes[i] != b'\'' {
+            return out;
+        }
+        i += 1;
+        let mut token = String::new();
+        loop {
+            match bytes.get(i) {
+                // Unterminated quote: `sq_dequote_step()` fails and the caller
+                // keeps what it had.
+                None => return out,
+                Some(b'\'') => {
+                    i += 1;
+                    // `'\''` is the escaped quote; anything else ends the token.
+                    if matches!(bytes.get(i..i + 3), Some(b"\\''")) {
+                        token.push('\'');
+                        i += 3;
+                        continue;
+                    }
+                    break;
+                }
+                Some(&b) => {
+                    token.push(b as char);
+                    i += 1;
+                }
+            }
+        }
+        // A token must be followed by whitespace or the end of the string.
+        if !matches!(bytes.get(i), None | Some(b' ') | Some(b'\t')) {
+            return out;
+        }
+        out.push(token);
+    }
+}
+
 /// git's `bisect_replay`: re-drive a session from a saved `bisect log`. Each
 /// `git bisect …` line is applied — `start` resets and reseeds, every marking
 /// writes its ref/log without stepping — and a single `bisect_auto_next` runs at
@@ -1235,6 +1315,24 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: no logfile given");
         return Ok(ExitCode::from(1));
     };
+    // `bisect_replay()` opens with `if (is_empty_or_missing_file(filename))`,
+    // which is a `stat()` and a `!st.st_size` — so a zero-length log is refused
+    // exactly like a missing one, before the file is ever opened. `/dev/null` is
+    // the reachable case: it reads as an empty log rather than as an error
+    // without the size test. A `stat()` that fails for any reason other than
+    // `ENOENT` is `die_errno("could not stat '%s'")` instead.
+    match std::fs::metadata(file) {
+        Ok(md) if md.len() == 0 => {
+            eprintln!("error: cannot read file '{file}' for replaying");
+            return Ok(ExitCode::from(1));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("error: cannot read file '{file}' for replaying");
+            return Ok(ExitCode::from(1));
+        }
+        Err(e) => crate::git_fatal!("could not stat '{file}': {}", crate::errno_text(&e)),
+    }
     let Ok(content) = std::fs::read_to_string(file) else {
         eprintln!("error: cannot read file '{file}' for replaying");
         return Ok(ExitCode::from(1));
@@ -1260,12 +1358,50 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
             // whitespace alone kept the quotes and started a session on branch
             // `'c15'`, which resolves to nothing.
             //
-            // [`super::am::sq_dequote`] is the shared inverse; it is laxer than
-            // git's, which *fails* on a token that does not open with a quote —
-            // so a hand-written log with bare operands replays here and starts an
-            // argument-less bisection upstream.
+            // [`sq_dequote_argv`] is git's own inverse, and its strictness is
+            // load-bearing: a token that does not open with a quote ends the
+            // dequote, and `bisect_replay()` ignores the failure, so a
+            // hand-written `git bisect start <bad> <good>` replays as a *bare*
+            // `start` with the operands dropped.
             let text = rest[cmd.len()..].trim_start();
-            start(&super::am::sq_dequote(text))?;
+            // ```c
+            // res = bisect_start(terms, argv.v, argv.nr);
+            // strvec_clear(&argv);
+            // if (res)
+            //         goto finish;
+            // ```
+            //
+            // (`bisect_replay()`.) `bisect_start()` ends in `bisect_auto_next()`,
+            // so a `start` line that already steps the search — two revisions
+            // with no ancestry between them, which answers `Bisecting: a merge base
+            // must be tested` at exit 1 — ends the replay right there. Running
+            // on to the trailing `bisect_auto_next()` prints the same block a
+            // second time and turns the exit code into 0.
+            STEP_COMPLETED.store(false, std::sync::atomic::Ordering::Relaxed);
+            let code = start(&sq_dequote_argv(text))?;
+            if code != ExitCode::SUCCESS
+                || STEP_COMPLETED.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(ExitCode::from(1));
+            }
+            continue;
+        }
+        // ```c
+        // res = bisect_terms(terms, argv.nr == 1 ? argv.v[0] : NULL);
+        // ```
+        //
+        // `terms` is a replayable line of its own, dispatched before the state
+        // words — which is why `git bisect terms --term-good` in a log with no
+        // `BISECT_TERMS` yet answers `error: no terms defined` rather than the
+        // unknown-verb message. The operand goes through the same strict
+        // dequote, so the unquoted spelling reaches `bisect_terms` as no
+        // argument at all.
+        if cmd == "terms" {
+            let argv = sq_dequote_argv(rest[cmd.len()..].trim_start());
+            let code = terms_cmd(if argv.len() == 1 { &argv } else { &[] })?;
+            if code != ExitCode::SUCCESS {
+                return Ok(code);
+            }
             continue;
         }
         // `process_replay_line()` routes `skip` through `bisect_skip()` like any
@@ -1282,6 +1418,49 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         // (builtin/bisect.c:1049-1051.) Everything after the state word is one `rev`
         // string — git never splits it — and it reaches `bisect_write()` unresolved.
         let rev = rest[cmd.len()..].trim_start();
+
+        // ```c
+        // if (check_and_set_terms(terms, word.buf) ||
+        //     !one_of(word.buf, terms->term_good, terms->term_bad, "skip", NULL))
+        //         goto finish;
+        // ```
+        //
+        // Two refusals, in this order, and both end the replay at exit 1 with
+        // whatever the earlier lines already wrote left on disk.
+        // `check_and_set_terms()` is the one that establishes the pair on the
+        // first marking of a fresh session (`bad`/`good` or `new`/`old`, written
+        // to `BISECT_TERMS`), and the one that refuses a word from the *other*
+        // built-in pair once a session has terms — `old` inside a `bad`/`good`
+        // bisect is `Invalid command: …`, not `'old'?? …`. Everything else that
+        // is not a state word or `skip` gets the second message, `reset`
+        // included when terms are already recorded.
+        let terms = match read_terms(&ctx)? {
+            Some(t) => {
+                if cmd != "skip" && cmd != t.good && cmd != t.bad {
+                    eprintln!(
+                        "error: Invalid command: you're currently in a {}/{} bisect",
+                        t.bad, t.good
+                    );
+                    return Ok(ExitCode::from(1));
+                }
+                t
+            }
+            None => match terms_for_first_marking(cmd) {
+                Some(t) => {
+                    write_terms(&ctx, &t)?;
+                    t
+                }
+                // `bisect_replay()` opens with `set_terms(terms, "bad", "good")`,
+                // so a session with no `BISECT_TERMS` yet still measures the word
+                // against that pair before giving up on it.
+                None => Terms { bad: "bad".into(), good: "good".into() },
+            },
+        };
+        if cmd != "skip" && cmd != terms.good && cmd != terms.bad {
+            eprintln!("error: '{cmd}'?? what are you talking about?");
+            return Ok(ExitCode::from(1));
+        }
+
         if cmd == "skip" {
             let Some(id) = resolve(&ctx.repo, rev).ok() else {
                 eprintln!("error: couldn't get the oid of the rev '{rev}'");
@@ -1293,18 +1472,6 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        // Every other keyword is a marking word. Establish terms the way `mark`
-        // does on the first marking of a fresh session.
-        let terms = match read_terms(&ctx)? {
-            Some(t) => t,
-            None => match terms_for_first_marking(cmd) {
-                Some(t) => {
-                    write_terms(&ctx, &t)?;
-                    t
-                }
-                None => continue, // an unrecognized line; git ignores it
-            },
-        };
         let Some(side) = side_of(cmd, &terms) else {
             continue;
         };
@@ -1544,6 +1711,8 @@ fn check_merge_bases(
             super::checkout::checkout(&["-q".to_string(), hex.clone()])?;
         }
         println!("[{hex}] {}", subject(&ctx.repo, mb)?);
+        // `BISECT_INTERNAL_SUCCESS_MERGE_BASE`; see [`STEP_COMPLETED`].
+        STEP_COMPLETED.store(true, std::sync::atomic::Ordering::Relaxed);
         return Ok(Some(ExitCode::SUCCESS));
     }
     Ok(None)
@@ -2187,6 +2356,8 @@ fn report_first_bad(ctx: &Ctx, bad: ObjectId, terms: &Terms) -> Result<ExitCode>
     ctx.append_log(&format!("# first '{}' commit: [{hex}] {subj}\n", terms.bad))?;
     println!("{hex} is the first '{}' commit", terms.bad);
     std::io::stdout().write_all(&report)?;
+    // `BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND`; see [`STEP_COMPLETED`].
+    STEP_COMPLETED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(ExitCode::SUCCESS)
 }
 

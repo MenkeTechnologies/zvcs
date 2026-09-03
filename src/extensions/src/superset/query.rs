@@ -105,6 +105,35 @@ pub(crate) fn emit_json(rows: impl IntoIterator<Item = serde_json::Value>) {
     }
 }
 
+/// Open a repo by its git dir and answer `None` when it cannot be opened.
+///
+/// [`probe`]'s callers map that failure to a value, and a value is an answer: a
+/// repository nobody can read was reported as clean by `zdirty`, as `0
+/// commit(s)` by `zcommits`, and counted in both totals. Measured on a fleet of
+/// three with two made unreadable, `zcommits` said "1 commits across 3 repos"
+/// with no sign that two of them were never read.
+///
+/// Callers that use this count the `None`s and say so, so a number that could
+/// not be complete does not read as though it were.
+pub(crate) fn probe_opt<T>(git_dir: &Path, f: impl FnOnce(&gix::Repository) -> T) -> Option<T> {
+    gix::open(git_dir).ok().map(|repo| f(&repo))
+}
+
+/// How many of `values` are `None` — repositories the verb could not open.
+pub(crate) fn unreadable(values: &[Option<impl Sized>]) -> usize {
+    values.iter().filter(|v| v.is_none()).count()
+}
+
+/// A trailing note for a summary line: `" (2 unreadable)"`, or nothing at all
+/// when every repository was read.
+pub(crate) fn unreadable_note(n: usize) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!(" ({n} unreadable)")
+    }
+}
+
 /// Open a repo by its git dir, mapping the error to a short display string.
 pub(crate) fn probe<T>(git_dir: &Path, f: impl FnOnce(&gix::Repository) -> T, on_err: impl FnOnce(String) -> T) -> T {
     match gix::open(git_dir) {
@@ -151,21 +180,25 @@ fn head_line(repo: &gix::Repository) -> String {
 pub fn zdirty(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
     let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
-    let dirty = parallel_map(&repos, |gd, _| probe(gd, |r| r.is_dirty().unwrap_or(false), |_| false));
+    let dirty = parallel_map(&repos, |gd, _| probe_opt(gd, |r| r.is_dirty().unwrap_or(false)));
     if json {
-        emit_json(repos.iter().zip(&dirty).filter(|(_, d)| **d).map(|((_, wd), _)| {
+        emit_json(repos.iter().zip(&dirty).filter(|(_, d)| **d == Some(true)).map(|((_, wd), _)| {
             serde_json::json!({"repo": wd.to_string_lossy()})
         }));
         return Ok(ExitCode::SUCCESS);
     }
     let mut shown = 0usize;
     for ((_, wd), d) in repos.iter().zip(&dirty) {
-        if *d {
+        if *d == Some(true) {
             println!("{}", wd.display());
             shown += 1;
         }
     }
-    eprintln!("zdirty: {shown} dirty of {} indexed", repos.len());
+    eprintln!(
+        "zdirty: {shown} dirty of {} indexed{}",
+        repos.len(),
+        unreadable_note(unreadable(&dirty))
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -203,7 +236,7 @@ fn ref_names_branches(repo: &gix::Repository) -> String {
 pub fn ztags(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
     let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
-    let counts = parallel_map(&repos, |gd, _| probe(gd, tag_count, |_| 0usize));
+    let counts = parallel_map(&repos, |gd, _| probe_opt(gd, tag_count));
     if json {
         emit_json(repos.iter().zip(&counts).map(|((_, wd), n)| {
             serde_json::json!({"repo": wd.to_string_lossy(), "tags": n})
@@ -212,7 +245,13 @@ pub fn ztags(args: &[String]) -> Result<ExitCode> {
     }
     let width = repos.iter().map(|(_, w)| w.display().to_string().len()).max().unwrap_or(0);
     for ((_, wd), n) in repos.iter().zip(&counts) {
-        println!("{:<width$}  {n} tag(s)", wd.display().to_string());
+        match n {
+            Some(n) => println!("{:<width$}  {n} tag(s)", wd.display().to_string()),
+            None => println!("{:<width$}  (unreadable)", wd.display().to_string()),
+        }
+    }
+    if unreadable(&counts) > 0 {
+        eprintln!("ztags:{}", unreadable_note(unreadable(&counts)));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -555,8 +594,8 @@ fn is_pristine(repo: &gix::Repository) -> bool {
 pub fn zcommits(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
     let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
-    let counts = parallel_map(&repos, |gd, _| probe(gd, commit_count, |_| 0usize));
-    let mut rows: Vec<(usize, String)> = repos
+    let counts = parallel_map(&repos, |gd, _| probe_opt(gd, commit_count));
+    let mut rows: Vec<(Option<usize>, String)> = repos
         .iter()
         .zip(&counts)
         .map(|((_, wd), c)| (*c, wd.display().to_string()))
@@ -568,10 +607,19 @@ pub fn zcommits(args: &[String]) -> Result<ExitCode> {
     }
     let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
     for (c, p) in &rows {
-        println!("{p:<width$}  {c} commit(s)");
+        match c {
+            Some(c) => println!("{p:<width$}  {c} commit(s)"),
+            None => println!("{p:<width$}  (unreadable)"),
+        }
     }
-    let total: usize = counts.iter().sum();
-    eprintln!("zcommits: {total} commits across {} repos", repos.len());
+    // Only repositories that were read contribute to the total; the ones that
+    // were not are counted separately rather than as zero.
+    let total: usize = counts.iter().flatten().sum();
+    eprintln!(
+        "zcommits: {total} commits across {} repos{}",
+        repos.len(),
+        unreadable_note(unreadable(&counts))
+    );
     Ok(ExitCode::SUCCESS)
 }
 

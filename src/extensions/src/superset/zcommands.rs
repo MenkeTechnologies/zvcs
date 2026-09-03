@@ -83,6 +83,15 @@ pub fn log_invocation(sub: &str, args: &[String]) {
     let line = format!("{ts}\t{pid}\t{ppid}\t{cwd}\t{argv}\n");
 
     let path = log_path();
+    // The append and the trim share the log's lock. An `O_APPEND` write lands
+    // whole on its own, but `trim` reads the file and writes back what it kept,
+    // so a line appended between those two steps is erased by a rewrite that
+    // never saw it. Measured: sixteen commands run at once across a trim, three
+    // of their entries gone from the audit trail, every command exit 0.
+    //
+    // The cost is one `flock` pair per command, and only while logging is on:
+    // the hot path when it is off is still the single failed `stat` above.
+    let _lock = crate::superset::registry::lock("commands");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }

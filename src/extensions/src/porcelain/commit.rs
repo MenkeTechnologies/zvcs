@@ -2518,6 +2518,15 @@ pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
     if !raw.is_empty() {
         for chunk in body.split(|&b| b == sep) {
             let line = if nul { chunk } else { chunk.strip_suffix(b"\r").unwrap_or(chunk) };
+            // `strvec_push(&parsed_file, buf.buf)` takes the record as a C string,
+            // so in the newline form an embedded NUL ends it. That is what makes
+            // `ls-files -z | git … --pathspec-from-file=-` (without
+            // `--pathspec-file-nul`) act on the *first* path alone rather than on
+            // one impossible pathspec spelled with NULs in it.
+            let line = match line.iter().position(|&b| b == 0) {
+                Some(end) if !nul => &line[..end],
+                _ => line,
+            };
             if !nul && line.first() == Some(&b'"') {
                 match unquote_c_style(line) {
                     Some(v) => out.push(String::from_utf8_lossy(&v).into_owned()),

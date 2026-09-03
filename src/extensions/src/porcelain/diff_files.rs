@@ -2005,8 +2005,10 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     // matches an earlier pattern in the order file come first. This runs on the
     // repository-root relative path, before `--relative` strips anything and before
     // `--rotate-to`/`--skip-to` re-anchor, matching git's `diff_flush` order.
-    if let Some(of) = &opts.order_file {
-        let order = read_order_file(of);
+    // `diffcore_order()` opens with `if (!q->nr) return;`, so an order file that
+    // cannot be read is only fatal when there is a queue to reorder.
+    if let (Some(of), false) = (&opts.order_file, deltas.is_empty() && combined.is_empty()) {
+        let order = read_order_file(of)?;
         deltas.sort_by_cached_key(|d| match_order(&order, d.path.as_slice()));
         combined.sort_by_cached_key(|c| match_order(&order, c.path.as_slice()));
     }
@@ -2580,8 +2582,20 @@ fn pickaxe_hit(px: &Pickaxe, d: &Delta, an: &Analysis) -> bool {
 /// `prepare_order()`: read the order file into a list of glob patterns. Blank lines
 /// and lines beginning with `#` are skipped; a leading `\#` is an escaped literal `#`.
 /// git silently proceeds with no patterns when the file cannot be read.
-pub(crate) fn read_order_file(path: &str) -> Vec<Vec<u8>> {
-    let data = std::fs::read(path).unwrap_or_default();
+pub(crate) fn read_order_file(path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+    // `prepare_order()`'s `die_errno(_("failed to read orderfile '%s'"), orderfile)`:
+    // an order file that cannot be opened ends the run at 128 rather than leaving
+    // the queue in its original order.
+    let data = std::fs::read(path).map_err(|e| {
+        // `die_errno`'s `: <strerror>` tail. `std::io::Error`'s Display appends
+        // ` (os error N)`, which git does not print.
+        let text = e.to_string();
+        let reason = match text.find(" (os error ") {
+            Some(i) => &text[..i],
+            None => text.as_str(),
+        };
+        crate::fatal::die(format!("failed to read orderfile '{path}': {reason}"))
+    })?;
     let mut order = Vec::new();
     for line in data.split(|&b| b == b'\n') {
         if line.is_empty() || line[0] == b'#' {
@@ -2590,7 +2604,7 @@ pub(crate) fn read_order_file(path: &str) -> Vec<Vec<u8>> {
         let pat = if line.starts_with(b"\\#") { &line[1..] } else { line };
         order.push(pat.to_vec());
     }
-    order
+    Ok(order)
 }
 
 /// `match_order()`: the index of the first order-file pattern that matches `path`,

@@ -455,13 +455,22 @@ impl DiffColors {
     /// Read every slot from `repo`'s config. `enabled` is the already-decided
     /// `want_color()` answer; when it is false this is [`DiffColors::disabled`].
     pub(crate) fn resolve(repo: &gix::Repository, enabled: bool) -> Self {
+        Self::resolve_config(repo.config_snapshot().plumbing(), enabled)
+    }
+
+    /// The same, read from a bare configuration cascade.
+    ///
+    /// `git_diff_ui_config()` runs whether or not repository discovery found
+    /// anything, so `git diff --no-index --color=always` outside a repository is
+    /// coloured from the system + `~/.gitconfig` + `GIT_CONFIG_*` cascade —
+    /// which is what [`crate::config::global_config`] assembles.
+    pub(crate) fn resolve_config(file: &gix::config::File, enabled: bool) -> Self {
         if !enabled {
             return Self::disabled();
         }
-        let snapshot = repo.config_snapshot();
         let slots = std::array::from_fn(|i| {
             let def = &SLOT_DEFS[i];
-            let spec = last_set(&snapshot, def.names).unwrap_or_else(|| def.default_spec.to_string());
+            let spec = last_set(file, def.names).unwrap_or_else(|| def.default_spec.to_string());
             // A spec git accepts but this port cannot render falls back to the
             // built-in default rather than to no color at all.
             parse_color_spec(&spec)
@@ -504,8 +513,7 @@ pub(crate) fn paint(out: &mut Vec<u8>, colors: &DiffColors, slot: DiffSlot, text
 /// spellings write the same slot the last occurrence wins. Walk the merged
 /// snapshot in that order and return the value of the last name in `names` to
 /// appear anywhere in it.
-fn last_set(snapshot: &gix::config::Snapshot<'_>, names: &[&'static str]) -> Option<String> {
-    let file = snapshot.plumbing();
+fn last_set(file: &gix::config::File, names: &[&'static str]) -> Option<String> {
     let mut winner: Option<&'static str> = None;
     for section in file.sections() {
         let header = section.header();
@@ -533,7 +541,7 @@ fn last_set(snapshot: &gix::config::Snapshot<'_>, names: &[&'static str]) -> Opt
             }
         }
     }
-    snapshot.string(winner?).map(|v| v.to_string())
+    file.string(winner?).map(|v| v.to_string())
 }
 
 /// git's `want_color()` for the diff commands: `color.diff`, its `diff.color`
@@ -542,7 +550,7 @@ fn last_set(snapshot: &gix::config::Snapshot<'_>, names: &[&'static str]) -> Opt
 /// decides, because git simply overwrites `diff_use_color_default` each time.
 pub(crate) fn want_diff_color(repo: &gix::Repository) -> bool {
     let snapshot = repo.config_snapshot();
-    let raw = last_set(&snapshot, &["color.diff", "diff.color"])
+    let raw = last_set(snapshot.plumbing(), &["color.diff", "diff.color"])
         .or_else(|| snapshot.string("color.ui").map(|v| v.to_string()));
     want_color_stdout_raw(repo, raw.as_deref())
 }
@@ -633,15 +641,15 @@ pub(crate) fn parse_color_moved_ws(arg: &str) -> u32 {
 /// `diff.colorMoved` (`git_diff_ui_config()`), which seeds `--color-moved`'s
 /// argument-less form. An unparsable value is git's `-1` return, reported by the
 /// caller; `None` means the key is unset.
-pub(crate) fn color_moved_cfg(repo: &gix::Repository) -> Option<Result<ColorMoved, String>> {
-    let raw = repo.config_snapshot().string("diff.colorMoved")?.to_string();
+pub(crate) fn color_moved_cfg(cfg: &gix::config::File) -> Option<Result<ColorMoved, String>> {
+    let raw = cfg.string("diff.colorMoved")?.to_string();
     Some(parse_color_moved(&raw).ok_or(raw))
 }
 
 /// `diff.colorMovedWS` (`git_diff_ui_config()`). `Err` carries the value git
 /// rejects, which it reports before failing the whole run.
-pub(crate) fn color_moved_ws_cfg(repo: &gix::Repository) -> Option<Result<u32, String>> {
-    let raw = repo.config_snapshot().string("diff.colorMovedWS")?.to_string();
+pub(crate) fn color_moved_ws_cfg(cfg: &gix::config::File) -> Option<Result<u32, String>> {
+    let raw = cfg.string("diff.colorMovedWS")?.to_string();
     let v = parse_color_moved_ws(&raw);
     Some(if (v & COLOR_MOVED_WS_ERROR) != 0 { Err(raw) } else { Ok(v) })
 }
@@ -708,8 +716,8 @@ impl WordStyle {
 
 /// `diff.wordRegex` — the last fallback `init_diff_words_data()` consults once the
 /// command line and the userdiff driver have both come up empty.
-pub(crate) fn word_regex_cfg(repo: &gix::Repository) -> Option<String> {
-    repo.config_snapshot().string("diff.wordRegex").map(|v| v.to_string())
+pub(crate) fn word_regex_cfg(cfg: &gix::config::File) -> Option<String> {
+    cfg.string("diff.wordRegex").map(|v| v.to_string())
 }
 
 /// Compile a word regex the way git's `regcomp(..., REG_EXTENDED | REG_NEWLINE)`
@@ -897,10 +905,20 @@ impl MoveWordOpts {
     /// Layer the flags over `diff.colorMoved`, `diff.colorMovedWS` and
     /// `diff.wordRegex`. `Err` carries the message git writes before exiting 128.
     pub(crate) fn resolve(&self, repo: &gix::Repository) -> Result<ExtraPaint, String> {
+        self.resolve_config(repo.config_snapshot().plumbing())
+    }
+
+    /// The same, over a bare configuration cascade.
+    ///
+    /// `git_diff_ui_config()` runs before repository discovery is known to have
+    /// succeeded, so `diff.colorMoved`, `diff.colorMovedWS` and `diff.wordRegex`
+    /// reach `git diff --no-index` from outside a repository exactly as they reach
+    /// a tracked diff from inside one.
+    pub(crate) fn resolve_config(&self, cfg: &gix::config::File) -> Result<ExtraPaint, String> {
         // An unparsable configured default is git's `-1` return from
         // `git_diff_ui_config()`; this port has no fatal-config path in the diff
         // commands, so it falls back the way `diff.wsErrorHighlight` already does.
-        let cfg_moved = match color_moved_cfg(repo) {
+        let cfg_moved = match color_moved_cfg(cfg) {
             Some(Ok(m)) => m,
             Some(Err(_)) | None => ColorMoved::No,
         };
@@ -916,7 +934,7 @@ impl MoveWordOpts {
                 }
             }
         };
-        let cfg_ws = match color_moved_ws_cfg(repo) {
+        let cfg_ws = match color_moved_ws_cfg(cfg) {
             Some(Ok(v)) => v,
             Some(Err(_)) | None => 0,
         };
@@ -925,7 +943,7 @@ impl MoveWordOpts {
         // `init_diff_words_data()`: the command line first, then the userdiff
         // driver — which is the `default` driver with no word regex for every path
         // this port resolves — and only then `diff.wordRegex`.
-        let regex_src = self.word_regex.clone().or_else(|| word_regex_cfg(repo));
+        let regex_src = self.word_regex.clone().or_else(|| word_regex_cfg(cfg));
         let word_regex = match regex_src {
             Some(pat) => Some(
                 compile_word_regex(&pat)

@@ -31,7 +31,10 @@
 //! The option table is `add_diff_options(no_index_options, &revs->diffopt)`
 //! (diff-no-index.c:372) — the *whole* `diff_opts` table, not a subset — so this is
 //! a hand-written implementation of a table `git diff` shares, and a name missing
-//! here is a gap rather than a name git rejects. Algorithm selection is on it:
+//! here is a gap rather than a name git rejects. The exceptions are collected in
+//! [`NOT_IN_NO_INDEX`]: `--cached`/`--staged`/`--merge-base` belong to `cmd_diff()`
+//! and `--expand-tabs`/`--no-expand-tabs` to `builtin/log.c`, so all five are
+//! `unknown option` here. Algorithm selection is on it:
 //! `--diff-algorithm=<v>`, the separated `--diff-algorithm <v>`, `--minimal`,
 //! `--patience`, `--histogram`, and the `diff.algorithm` default when the
 //! comparison happens to be run from inside a repository. So are
@@ -59,6 +62,10 @@ use super::diff_color;
 /// `/dev/null` as an operand: git's `DIFF_FILE_VALID` for the side is false, and
 /// the pair takes the other side's name.
 const DEV_NULL: &str = "/dev/null";
+
+/// `file_from_standard_input` (diff-no-index.c:264-271): the operand `-` names
+/// standard input, and a real path spelled `-` has to be written `./-`.
+const STDIN_NAME: &str = "-";
 
 /// `the_hash_algo` for a comparison that has no repository to take one from.
 const HASH_KIND: gix::hash::Kind = gix::hash::Kind::Sha1;
@@ -205,8 +212,12 @@ fn side_of(spec: &super::diffcore_rename::FileSpec, content: &DiskContent) -> Si
 fn queue(lhs: &str, rhs: &str) -> Result<Vec<(Side, Side)>, String> {
     let l_null = lhs == DEV_NULL;
     let r_null = rhs == DEV_NULL;
-    let l_meta = (!l_null).then(|| std::fs::symlink_metadata(lhs));
-    let r_meta = (!r_null).then(|| std::fs::symlink_metadata(rhs));
+    // `get_mode()` answers for standard input without touching the filesystem:
+    // `create_ce_mode(0666)`, which is `100644`.
+    let l_in = lhs == STDIN_NAME;
+    let r_in = rhs == STDIN_NAME;
+    let l_meta = (!l_null && !l_in).then(|| std::fs::symlink_metadata(lhs));
+    let r_meta = (!r_null && !r_in).then(|| std::fs::symlink_metadata(rhs));
 
     // `error("Could not access '%s'", …)` — one message per unreachable operand,
     // and nothing is compared.
@@ -222,15 +233,51 @@ fn queue(lhs: &str, rhs: &str) -> Result<Vec<(Side, Side)>, String> {
         return Ok(queue_dirs(lhs, rhs, l_dir, r_dir));
     }
 
-    let side = |name: &str, is_null: bool| -> Result<Side, String> {
+    // `queue_diff()`'s `if (!mode1 && !mode2) return 0;` — two operands that are
+    // both `/dev/null` name nothing to compare, so the queue stays empty and the
+    // command exits 0.
+    if l_null && r_null {
+        return Ok(Vec::new());
+    }
+
+    let side = |name: &str, is_null: bool, is_stdin: bool| -> Result<Side, String> {
         if is_null {
             return Ok(Side::absent(BString::from(name)));
+        }
+        if is_stdin {
+            return Ok(Side {
+                name: BString::from(name),
+                file: Some(PathBuf::from(name)),
+                mode: 0o100644,
+            });
         }
         let path = PathBuf::from(name);
         let mode = mode_of(&path).map_err(|_| format!("Could not access '{name}'"))?;
         Ok(Side { name: BString::from(name), file: Some(path), mode })
     };
-    Ok(vec![(side(lhs, l_null)?, side(rhs, r_null)?)])
+    Ok(vec![(side(lhs, l_null, l_in)?, side(rhs, r_null, r_in)?)])
+}
+
+/// `fixup_paths()` (diff-no-index.c): when exactly one operand is a directory, the
+/// other's basename is appended to it, so `git diff --no-index dir file` compares
+/// `dir/file` against `file` — and says `Could not access 'dir/file'` when that
+/// name does not exist. Neither operand may be standard input, which the caller
+/// has already excluded.
+fn fixup_paths(paths: &mut [String; 2]) {
+    let isdir =
+        |p: &str| std::fs::symlink_metadata(p).map(|m| m.is_dir()).unwrap_or(false);
+    let (d0, d1) = (isdir(&paths[0]), isdir(&paths[1]));
+    if d0 == d1 {
+        return;
+    }
+    let (dir_i, file_i) = if d0 { (0, 1) } else { (1, 0) };
+    // `append_basename()`: everything past the last `/` of the file operand, and
+    // no doubled separator when the directory operand already ends in one.
+    let file = paths[file_i].clone();
+    let base = file.rsplit_once('/').map(|(_, b)| b).unwrap_or(file.as_str());
+    let dir = paths[dir_i].clone();
+    let sep = if dir.ends_with('/') { "" } else { "/" };
+    paths[dir_i] = format!("{dir}{sep}{base}");
 }
 
 /// The directory half of `queue_diff()`: the union of both trees' relative names,
@@ -308,6 +355,16 @@ struct Row {
     status: u8,
     /// The similarity `R`/`C` was matched at, in `MAX_SCORE` units.
     score: u32,
+    /// `show_dirstat()`'s content damage for the pair: the pre-image bytes that did
+    /// not survive plus the bytes the post-image gained. Zero unless `--dirstat`
+    /// asked for it, since it costs a second content pass.
+    damage: u64,
+    /// `builtin_diff()`'s `must_show_header`, widened by "the comparison produced a
+    /// body": whether this pair has anything at all to say. Under
+    /// `diff_from_contents` it is also what `diff_flush_patch_quietly()` answers,
+    /// so a pair whose only difference the ignore rules swallowed drops out of the
+    /// raw and name listings and out of the exit status.
+    shown: bool,
 }
 
 impl Row {
@@ -336,6 +393,15 @@ struct Format {
     /// `-s`/`--no-patch`, git's `DIFF_FORMAT_NO_OUTPUT` bit: an assignment made where
     /// it stands, so a format flag after it survives.
     no_output: bool,
+    /// `DIFF_FORMAT_DIRSTAT`, set by `--dirstat[=<p>]`, `--dirstat-by-file[=<p>]`,
+    /// `--cumulative` and `-X` (`diff_opt_dirstat()`).
+    dirstat: bool,
+    /// `options->flags.stat_with_summary` (`--compact-summary`): not a format bit
+    /// of its own — it turns `--stat` on and annotates its names — so the
+    /// exclusive-format clearing reaches it through `stat`.
+    compact_summary: bool,
+    /// `DIFF_FORMAT_CHECKDIFF` (`--check`): one of the four exclusive formats.
+    check: bool,
 }
 
 impl Format {
@@ -371,21 +437,26 @@ impl Format {
         // `-s` is not in this list: it is an assignment made where it stands, so by
         // the time the clearing runs there is nothing of its own left to clear and a
         // format that came after it survives.
-        if me.name_only || me.name_status {
+        if me.name_only || me.name_status || me.check {
             me.raw = false;
             me.numstat = false;
             me.stat = false;
             me.shortstat = false;
             me.summary = false;
             me.patch = false;
+            me.dirstat = false;
         }
         me.defaulted()
     }
 
     /// `HAS_MULTI_BITS(...)`: the four exclusive formats, one of which must stand
-    /// alone. `--check` is not accepted by this parser, so three of them can arise.
+    /// alone.
     fn exclusive_conflict(&self) -> bool {
-        u32::from(self.name_only) + u32::from(self.name_status) + u32::from(self.no_output) > 1
+        u32::from(self.name_only)
+            + u32::from(self.name_status)
+            + u32::from(self.check)
+            + u32::from(self.no_output)
+            > 1
     }
 
     /// The second step on its own: `if (!options->output_format) ... DIFF_FORMAT_PATCH`.
@@ -398,6 +469,8 @@ impl Format {
             || self.name_status
             || self.raw
             || self.summary
+            || self.dirstat
+            || self.check
             || self.quiet
             || self.no_output)
         {
@@ -445,6 +518,31 @@ struct Opts {
     /// `core.compression`, else `Z_BEST_SPEED`. A comparison run outside any
     /// repository has no config to read and takes the default.
     compression_level: i32,
+    /// `options->stat_width` / `stat_name_width` / `stat_graph_width` /
+    /// `stat_count`, in [`super::diffstat::StatWidths`]' sentinel encoding.
+    /// `builtin_diff_no_index()` runs `init_diffstat_widths()` like every other
+    /// `builtin/diff.c` entry point, so the default is the terminal-scaled one.
+    stat_widths: super::diffstat::StatWidths,
+    /// `-z`: `options->line_termination = 0`, which the raw, name and numstat
+    /// formats — and `DIFF_SYMBOL_SEPARATOR` — write instead of a newline.
+    z: bool,
+    /// `--line-prefix=<s>`: `diff_line_prefix()`, prepended to every emitted line.
+    line_prefix: Vec<u8>,
+    /// `--dirstat`'s parameter block, shared with the tracked path so the two
+    /// cannot disagree about `changes`/`lines`/`files` or the cut-off permille.
+    dirstat: super::diff_files::DirStat,
+    /// `--ignore-blank-lines`: `XDF_IGNORE_BLANK_LINES`, which
+    /// `xdl_mark_ignorable_lines()` turns into an `ignore` bit on an all-blank
+    /// change group. Not one of `XDF_WHITESPACE_FLAGS`, so it stacks with `-w`
+    /// rather than replacing it.
+    ignore_blank_lines: bool,
+    /// `--diff-filter=<v>`: `diffcore_apply_filter()`'s letter set.
+    filter: super::diff_filter::Filter,
+    /// `o->ws_error_highlight` and `o->output_indicators[]`, for the re-emission
+    /// pass that paints the assembled patch.
+    paint: diff_color::PaintOptions,
+    /// `o->word_diff` / `o->word_regex` / `o->color_moved`, likewise.
+    extra: diff_color::ExtraPaint,
 }
 
 /// git's `diff_no_index_usage[]`, over the block every `add_diff_options()`
@@ -462,7 +560,18 @@ fn usage() -> Result<ExitCode> {
 /// diff` options *and* unknown to the no-index parser, which is why `git diff
 /// --cached` outside a repository is a parse error rather than a complaint about
 /// the missing repository.
-const NOT_IN_NO_INDEX: &[&str] = &["--cached", "--staged", "--merge-base"];
+const NOT_IN_NO_INDEX: &[&str] = &[
+    "--cached",
+    "--staged",
+    "--merge-base",
+    // `--expand-tabs` / `--no-expand-tabs` / `--expand-tabs=<n>` are `builtin/log.c`
+    // options (`OPT_EXPAND_TABS`), not entries on the `add_diff_options()` table, so
+    // the no-index parser has never heard of them. Verified against 2.55.0:
+    // `git diff --no-index --expand-tabs a b` is `error: unknown option
+    // `expand-tabs'` followed by the usage block, exit 129.
+    "--expand-tabs",
+    "--no-expand-tabs",
+];
 
 /// `git diff --no-index <a> <b>`.
 pub(crate) fn run(args: &[String]) -> Result<ExitCode> {
@@ -509,6 +618,8 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut detect_rename: Option<u8> = None;
     let mut rename_score: u32 = 0;
     let mut find_copies_harder = false;
+    // `options->break_opt`, `-1` when `-B` was not given.
+    let mut break_opt: i64 = -1;
     // `add_diff_options()` (diff-no-index.c:372) hands the no-index parser the
     // *whole* `diff_opts` table, algorithm selection included, so every spelling
     // `git diff` takes is taken here too. `None` leaves the `diff.algorithm`
@@ -534,6 +645,17 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // `--output=<file>`: `diff_opt_output`'s `xfopen(arg, "w")`, which runs during
     // the option scan.
     let mut output_file: Option<std::fs::File> = None;
+    // `options->stat_*_width`, `-z`, `--line-prefix`, `--dirstat`'s parameters,
+    // `--ignore-blank-lines`, `--diff-filter` and the two paint families, all of
+    // them entries on the same `add_diff_options()` table.
+    let mut stat_widths = super::diffstat::StatWidths::default();
+    let mut z = false;
+    let mut line_prefix: Vec<u8> = Vec::new();
+    let mut dirstat = super::diff_files::DirStat::default();
+    let mut ignore_blank_lines = false;
+    let mut filter = super::diff_filter::Filter::default();
+    let mut ws_error_highlight: u32 = diff_color::WSEH_NEW;
+    let mut move_word = diff_color::MoveWordOpts::default();
     // The other `OPT_STRING`/`OPT_INTEGER` entries whose value may stand as the next
     // argument instead of being glued on with `=`.
     let mut pending: Option<String> = None;
@@ -548,6 +670,41 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                     Ok(f) => output_file = Some(f),
                     Err(code) => return Ok(code),
                 },
+                "--line-prefix" => line_prefix = a.as_bytes().to_vec(),
+                "--diff-filter" => {
+                    if let Err(bad) = filter.accumulate(a) {
+                        eprintln!("error: unknown change class '{bad}' in --diff-filter={a}");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+                "--ws-error-highlight" => match diff_color::parse_ws_error_highlight(a) {
+                    Ok(v) => ws_error_highlight = v,
+                    Err(accepted) => {
+                        eprintln!(
+                            "error: unknown value after ws-error-highlight={}",
+                            &a[..accepted]
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                },
+                "--color-moved-ws" | "--word-diff-regex" => {
+                    let glued = format!("{flag}={a}");
+                    if let Some(Err(msg)) = move_word.parse_flag(&glued, &mut color_when) {
+                        eprintln!("{msg}");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+                f if super::diff::is_stat_width_flag(f) => {
+                    let slot = super::diff::stat_width_slot_of(&mut stat_widths, f)
+                        .expect("matched above");
+                    match a.parse::<i64>() {
+                        Ok(n) => *slot = n,
+                        Err(_) => {
+                            eprintln!("error: {} expects a numerical value", &f[2..]);
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
+                }
                 _ => match super::diff::parse_inter_hunk_context(a) {
                     Ok(n) => inter_hunk_ctx = n,
                     Err(msg) => {
@@ -558,7 +715,18 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             }
             continue;
         }
-        if matches!(a.as_str(), "--skip-to" | "--rotate-to" | "--output" | "--inter-hunk-context") {
+        if matches!(
+            a.as_str(),
+            "--skip-to"
+                | "--rotate-to"
+                | "--output"
+                | "--inter-hunk-context"
+                | "--line-prefix"
+                | "--diff-filter"
+                | "--ws-error-highlight"
+        ) || diff_color::needs_separate_value(a)
+            || super::diff::is_stat_width_flag(a)
+        {
             pending = Some(a.clone());
             continue;
         }
@@ -589,6 +757,19 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             operands.push(a.clone());
             continue;
         }
+        // `--color-words[=<re>]`, `--word-diff[=<mode>]`, `--word-diff-regex=<re>`
+        // and the `--color-moved` family are all on the shared `add_diff_options()`
+        // table, so the no-index parser takes them through the same reader `git
+        // diff` uses. The two that imply colour set `use_color = GIT_COLOR_ALWAYS`
+        // by writing `color_when`, which is why it is threaded in.
+        match move_word.parse_flag(a, &mut color_when) {
+            Some(Ok(())) => continue,
+            Some(Err(msg)) => {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(129));
+            }
+            None => {}
+        }
         match a.as_str() {
             "--" => after_dashdash = true,
             "--no-index" => {}
@@ -600,6 +781,106 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "--name-status" => fmt.name_status = true,
             "--raw" => fmt.raw = true,
             "--summary" => fmt.summary = true,
+            // `OPT_BIT_F(0, "patch-with-raw", …, DIFF_FORMAT_PATCH | DIFF_FORMAT_RAW)`
+            // and its `--patch-with-stat` neighbour (diff.c:6021-6031): one flag,
+            // two format bits.
+            "--patch-with-raw" => {
+                fmt.patch = true;
+                fmt.raw = true;
+            }
+            "--patch-with-stat" => {
+                fmt.patch = true;
+                fmt.stat = true;
+            }
+            // `diff_opt_compact_summary()` (diff.c:5602): the summary flag *and*
+            // `DIFF_FORMAT_DIFFSTAT`; `--no-compact-summary` clears only the flag.
+            "--compact-summary" => {
+                fmt.compact_summary = true;
+                fmt.stat = true;
+            }
+            "--no-compact-summary" => fmt.compact_summary = false,
+            // `OPT_SET_INT('z', NULL, &options->line_termination, …, 0)`: not a
+            // format bit, so it never satisfies the "nothing selected" default.
+            "-z" => z = true,
+            // `diff_opt_dirstat()` (diff.c:5490), in its four spellings.
+            "--dirstat" | "-X" => fmt.dirstat = true,
+            "--dirstat-by-file" => {
+                fmt.dirstat = true;
+                dirstat.by_file = true;
+            }
+            "--cumulative" => {
+                fmt.dirstat = true;
+                dirstat.cumulative = true;
+            }
+            s if s.starts_with("--dirstat=")
+                || s.starts_with("--dirstat-by-file=")
+                || s.starts_with("-X") =>
+            {
+                let by_file = s.starts_with("--dirstat-by-file=");
+                let params = s
+                    .strip_prefix("--dirstat-by-file=")
+                    .or_else(|| s.strip_prefix("--dirstat="))
+                    .unwrap_or(&s[2..]);
+                let errors = super::diff_files::parse_dirstat_params(params, &mut dirstat);
+                if !errors.is_empty() {
+                    eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
+                    return Ok(ExitCode::from(128));
+                }
+                if by_file {
+                    dirstat.by_file = true;
+                }
+                fmt.dirstat = true;
+            }
+            // `diff_opt_stat()` (diff.c:5636): the geometry ride-along on `--stat`.
+            s if s.starts_with("--stat=") => {
+                fmt.stat = true;
+                super::diffstat::parse_stat_geometry(&mut stat_widths, &s["--stat=".len()..]);
+            }
+            s if s.split_once('=').is_some_and(|(k, _)| super::diff::is_stat_width_flag(k)) => {
+                fmt.stat = true;
+                let (k, v) = s.split_once('=').expect("matched above");
+                match v.parse::<i64>() {
+                    Ok(n) => {
+                        *super::diff::stat_width_slot_of(&mut stat_widths, k)
+                            .expect("matched above") = n
+                    }
+                    Err(_) => {
+                        eprintln!("error: {} expects a numerical value", &k[2..]);
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            // `--line-prefix=<s>` (`OPT_STRING_F(0, "line-prefix", …)`).
+            s if s.starts_with("--line-prefix=") => {
+                line_prefix = s.as_bytes()["--line-prefix=".len()..].to_vec();
+            }
+            // `diff_opt_diff_filter()` (diff.c:5581): the letters accumulate across
+            // repeats and an unknown one is a parse error.
+            s if s.starts_with("--diff-filter=") => {
+                let v = &s["--diff-filter=".len()..];
+                if let Err(bad) = filter.accumulate(v) {
+                    eprintln!("error: unknown change class '{bad}' in --diff-filter={v}");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+            s if s.starts_with("--ws-error-highlight=") => {
+                match diff_color::parse_ws_error_highlight(&s["--ws-error-highlight=".len()..]) {
+                    Ok(v) => ws_error_highlight = v,
+                    Err(accepted) => {
+                        eprintln!(
+                            "error: unknown value after ws-error-highlight={}",
+                            &s["--ws-error-highlight=".len()..][..accepted]
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            // `--ignore-blank-lines` is `XDF_IGNORE_BLANK_LINES`, which is outside
+            // `XDF_WHITESPACE_FLAGS` and therefore stacks with `-w`/`-b` instead of
+            // replacing them.
+            "--check" => fmt.check = true,
+            "--ignore-blank-lines" => ignore_blank_lines = true,
+            "--ignore-cr-at-eol" => ws = super::diff::Whitespace::IgnoreCrAtEol,
             // `OPT_SET_INT_F('s', "no-patch", ..., DIFF_FORMAT_NO_OUTPUT)`: an
             // assignment, so it wipes the formats already chosen and a later one still
             // counts. Measured against 2.55.0: `--stat -s` prints nothing, `-s --stat`
@@ -645,6 +926,21 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                     find_copies_harder = true;
                 } else {
                     detect_rename = Some(super::diffcore_rename::DETECT_COPY);
+                }
+            }
+            // `diff_opt_break_rewrites()`: `-B[<n>][/<m>]`, packed as `n | (m << 16)`.
+            // `diffcore_std()` runs `diffcore_break()` ahead of rename detection and
+            // `diffcore_merge_broken()` after it, which [`diffcore_rename::run`]
+            // already does for both callers.
+            "-B" | "--break-rewrites" => break_opt = 0,
+            s if s.starts_with("--break-rewrites=") || (s.starts_with("-B") && s.len() > 2) => {
+                let raw = s.strip_prefix("--break-rewrites=").unwrap_or(&s[2..]);
+                match super::diffcore_rename::parse_break_opt(raw) {
+                    Ok(v) => break_opt = v,
+                    Err(()) => {
+                        eprintln!("error: break-rewrites expects <n>/<m> form");
+                        return Ok(ExitCode::from(129));
+                    }
                 }
             }
             "--find-copies-harder" => find_copies_harder = true,
@@ -852,6 +1148,32 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         return usage();
     }
 
+    // `diff_no_index()` (diff-no-index.c:264-271) rewrites a bare `-` operand to
+    // its standard-input marker before `fixup_paths()` runs, and `fixup_paths()`
+    // returns untouched when either side is that marker.
+    let mut pair: [String; 2] = [operands[0].clone(), operands[1].clone()];
+    let l_stdin = pair[0] == STDIN_NAME;
+    let r_stdin = pair[1] == STDIN_NAME;
+    if l_stdin || r_stdin {
+        // `queue_diff()` refuses to walk a directory against a stream.
+        let other = if l_stdin { &pair[1] } else { &pair[0] };
+        if std::fs::symlink_metadata(other).map(|m| m.is_dir()).unwrap_or(false) {
+            eprintln!("fatal: cannot compare stdin to a directory");
+            return Ok(ExitCode::from(128));
+        }
+    } else {
+        fixup_paths(&mut pair);
+    }
+    // `populate_from_stdin()`: the stream is read once, whichever side names it.
+    let stdin_data = if l_stdin || r_stdin {
+        let mut buf = Vec::new();
+        use std::io::Read as _;
+        std::io::stdin().lock().read_to_end(&mut buf)?;
+        Some(buf)
+    } else {
+        None
+    };
+
     // Colour needs a repository to read `color.diff.*` out of. `--no-index` may run
     // without one, in which case the output is left uncoloured — the piped case,
     // which is the one parity is measured on, is uncoloured either way.
@@ -864,9 +1186,14 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // on: `--no-index` runs either way, but an id is only sized against an object
     // database when there is one.
     let repo = crate::setup::discover().ok();
-    let colors = match (want_color, &repo) {
-        (true, Some(repo)) => diff_color::DiffColors::resolve(repo, true),
-        _ => diff_color::DiffColors::disabled(),
+    // `git_diff_ui_config()` has already run whether or not discovery found a
+    // repository, so `color.diff.*` reaches a no-index comparison from the system
+    // + `~/.gitconfig` + `GIT_CONFIG_*` cascade even outside one. Reading only the
+    // repository's snapshot left `git diff --no-index --color=always a b`
+    // uncoloured, which stock 2.55.0 colours.
+    let colors = match &repo {
+        Some(repo) => diff_color::DiffColors::resolve(repo, want_color),
+        None => diff_color::DiffColors::resolve_config(&crate::config::global_config(), want_color),
     };
     let hexsz = HASH_KIND.len_in_hex();
     let default_abbrev = match &repo {
@@ -983,6 +1310,31 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             Some(repo) => super::binary_patch::loose_compression_level(repo),
             None => 1,
         },
+        stat_widths,
+        z,
+        line_prefix,
+        dirstat,
+        ignore_blank_lines,
+        filter,
+        paint: diff_color::PaintOptions { ws_error_highlight, ..Default::default() },
+        extra: match &repo {
+            Some(repo) => match move_word.resolve(repo) {
+                Ok(extra) => extra,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return Ok(ExitCode::from(128));
+                }
+            },
+            // `init_diff_words_data()` reads `diff.wordRegex` off the same cascade
+            // the colours came from, which outside a repository is the global one.
+            None => match move_word.resolve_config(&crate::config::global_config()) {
+                Ok(extra) => extra,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return Ok(ExitCode::from(128));
+                }
+            },
+        },
     };
 
     // `diff_setup_done()`: `--find-copies-harder` implies copy detection
@@ -1012,26 +1364,40 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         rename_limit: -1,
         find_copies_harder,
         rename_empty: true,
-        break_opt: -1,
+        break_opt,
         hash_kind: HASH_KIND,
     };
 
-    let (out, changed) = match compare(&operands[0], &operands[1], reverse, &opts, &rename_opts) {
-        Ok(result) => result,
-        Err(message) => {
-            eprintln!("error: {message}");
-            return Ok(ExitCode::from(1));
-        }
+    // `whitespace_rule()` for a path with no `.gitattributes` behind it, which is
+    // every no-index path: `core.whitespace`, else `WS_DEFAULT_RULE`.
+    let ws_rule = match &repo {
+        Some(repo) => diff_color::whitespace_rule_cfg(repo),
+        None => match crate::config::global_config().string("core.whitespace") {
+            Some(v) => diff_color::parse_whitespace_rule(&v.to_string()),
+            None => diff_color::WS_DEFAULT_RULE,
+        },
     };
+    let (out, changed, paints, check_failed) =
+        match compare(&pair[0], &pair[1], reverse, &opts, &rename_opts, ws_rule, stdin_data) {
+            Ok(result) => result,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return Ok(ExitCode::from(1));
+            }
+        };
 
     if !opts.fmt.quiet {
-        let painted = diff_color::colorize_patch(
+        let painted = diff_color::colorize_patch_ex(
             &out,
             &opts.colors,
-            &diff_color::PaintOptions::default(),
-            &[],
-            diff_color::FilePaint::new(0),
+            &opts.paint,
+            &paints,
+            diff_color::FilePaint::new(ws_rule),
+            &opts.extra,
         );
+        // `--line-prefix`: `emit_line_0()` writes `diff_line_prefix(o)` in front of
+        // every line it emits, which is every line of the finished stream.
+        let painted = super::diff::apply_line_prefix(painted, &opts.line_prefix);
         use std::io::Write;
         // `--output=<file>` swapped the diff stream for a file back at parse time.
         match output_file {
@@ -1046,8 +1412,10 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             }
         }
     }
-    // git-diff(1): "this option implies --exit-code".
-    Ok(if changed { ExitCode::from(1) } else { ExitCode::SUCCESS })
+    // `diff_result_code()`: `01` for a difference — git-diff(1): "this option
+    // implies --exit-code" — and `02` for `--check`'s `check_failed`.
+    let code = u8::from(changed) | (u8::from(check_failed) << 1);
+    Ok(ExitCode::from(code))
 }
 
 /// The comparison itself: `queue_diff()`, then `diffcore_std()`'s passes, then
@@ -1058,7 +1426,9 @@ fn compare(
     reverse: bool,
     opts: &Opts,
     rename_opts: &super::diffcore_rename::Options,
-) -> std::result::Result<(Vec<u8>, bool), String> {
+    ws_rule: u32,
+    stdin_data: Option<Vec<u8>>,
+) -> std::result::Result<(Vec<u8>, bool, Vec<diff_color::FilePaint>, bool), String> {
     let mut pairs = queue(lhs, rhs)?;
     // `queue_diff()`'s `SWAP(mode1, mode2); SWAP(name1, name2); SWAP(special1,
     // special2)` (diff-no-index.c:279-283). It sits at the leaf of the walk, past
@@ -1073,6 +1443,10 @@ fn compare(
     // Every blob the rest of this function reads, from one cache: `diffcore_rename`
     // asks for the same file repeatedly and the emitters ask again afterwards.
     let mut content = DiskContent::default();
+    // The stream stands in for the file the `-` side would have been read from.
+    if let Some(data) = stdin_data {
+        content.cache.insert(BString::from(STDIN_NAME), Some(data));
+    }
     for (a, b) in &pairs {
         content.register(a);
         content.register(b);
@@ -1094,8 +1468,8 @@ fn compare(
 
     // `diffcore_std()`'s rename slice (diff.c:7507-7516) over the queue
     // `queue_diff()` left, then `diff_resolve_rename_copy()` (diff.c:7525) to turn
-    // each surviving pair into its status letter. `-B` is not accepted here, so
-    // `break_opt` stays `-1` and the break/merge-broken passes are no-ops.
+    // each surviving pair into its status letter. `-B`'s break and merge-broken
+    // passes bracket rename detection inside [`super::diffcore_rename::run`].
     let mut q = super::diffcore_rename::Queue::default();
     for (a, b) in &pairs {
         let one = q.add_spec(spec_of(a));
@@ -1126,14 +1500,42 @@ fn compare(
         }
     }
 
+    // `diffcore_apply_filter()` is the last pass in `diffcore_std()` — after
+    // `diff_resolve_rename_copy()` has given every pair its status letter, which is
+    // what the letter set is matched against.
+    {
+        let classes: Vec<(u8, Option<u32>)> = q
+            .pairs
+            .iter()
+            .map(|p| (p.status, (p.status == b'M' && p.score != 0).then_some(p.score)))
+            .collect();
+        let keep = super::diff_filter::apply(opts.filter, &classes);
+        let mut it = keep.into_iter();
+        q.pairs.retain(|_| it.next().unwrap_or(true));
+    }
+
     // `diff_flush()` (diff.c:6828) writes the non-patch formats first, then a blank
     // separator line, then the patch — so the two streams are built apart and joined
     // below. `--binary` is what makes the combination reachable without `-p`: it
     // turns the patch on by itself while a `--stat` on the same line stays selected.
     let mut out: Vec<u8> = Vec::new();
     let mut patch: Vec<u8> = Vec::new();
+    // `--check`'s stream and `o->flags.check_failed`.
+    let mut check_out: Vec<u8> = Vec::new();
+    let mut check_failed = false;
     let mut changed = false;
+    // `diff_setup_done()` (diff.c:4899): the whitespace family makes "is there a
+    // change?" a question only the rendered content can answer, so it raises
+    // `flags.diff_from_contents`, and `diff_flush()` then reports `found_changes`
+    // instead of "the queue was not empty" and runs the raw and name formats
+    // through `diff_flush_patch_quietly()` first. `--ignore-blank-lines` is
+    // deliberately not on that list.
+    let from_contents = opts.ws != super::diff::Whitespace::Keep;
     let mut stats: Vec<Row> = Vec::new();
+    // One entry per `diff --git` section, in the order they are written, which is
+    // what `colorize_patch_ex()` indexes to reproduce `emit_line_ws_markup()`'s
+    // per-file whitespace state.
+    let mut paints: Vec<diff_color::FilePaint> = Vec::new();
     for pi in 0..q.pairs.len() {
         let pair = q.pairs[pi].clone();
         let a = side_of(&q.specs[pair.one], &content);
@@ -1145,9 +1547,12 @@ fn compare(
         // rename or copy the detection just made; the stat-unmatch pass above
         // already dropped every same-name pair whose content never changed.
         let same_content = a.file.is_some() == b.file.is_some() && old_data == new_data;
-        changed = true;
-        let binary = !opts.text
-            && (super::diff::looks_binary(&old_data) || super::diff::looks_binary(&new_data));
+        // `builtin_diffstat()` asks `diff_filespec_is_binary()` directly, which never
+        // sees `DIFF_OPT_TEXT` — so `--text` renders a patch for a pair the stat
+        // formats still report as `Bin <old> -> <new> bytes`.
+        let stat_binary =
+            super::diff::looks_binary(&old_data) || super::diff::looks_binary(&new_data);
+        let binary = !opts.text && stat_binary;
         let (added, deleted, body) =
         super::diff::no_index_body(
             &old_data,
@@ -1156,6 +1561,7 @@ fn compare(
             opts.ws,
             binary,
             opts.algorithm,
+            opts.ignore_blank_lines,
         );
         // `hash_filespec()` (diffcore-rename.c) is what leaves an object id on a
         // filespec `queue_diff()` created with the null one, and it runs only
@@ -1180,9 +1586,9 @@ fn compare(
             // so the two fields carry *sizes* instead, which is what `show_stats()`
             // prints as `Bin <old> -> <new> bytes`. Every consumer that counts lines
             // — `--numstat`'s `-\t-`, `--shortstat`'s totals — skips a binary row.
-            added: if binary { new_data.len() as u32 } else { added },
-            deleted: if binary { old_data.len() as u32 } else { deleted },
-            binary,
+            added: if stat_binary { new_data.len() as u32 } else { added },
+            deleted: if stat_binary { old_data.len() as u32 } else { deleted },
+            binary: stat_binary,
             a_exists: a.file.is_some(),
             b_exists: b.file.is_some(),
             a_mode: a.mode,
@@ -1191,8 +1597,57 @@ fn compare(
             b_oid: spec_oid(pair.two),
             status: pair.status,
             score: pair.score,
+            shown: false,
+            damage: if opts.fmt.dirstat && !opts.dirstat.by_file && !opts.dirstat.by_line {
+                match (a.file.is_some(), b.file.is_some()) {
+                    (true, true) => {
+                        let (copied, added) = super::diff_files::count_changes_sides(
+                            &old_data, !binary, &new_data, !binary,
+                        );
+                        (old_data.len() as u64).saturating_sub(copied) + added
+                    }
+                    (true, false) => old_data.len() as u64,
+                    (false, true) => new_data.len() as u64,
+                    (false, false) => 0,
+                }
+            } else {
+                0
+            },
         });
-        if opts.fmt.patch {
+        // `builtin_diff()` builds the header into a strbuf and hands it to
+        // `fn_out_consume()`, which emits it only when the first hunk line goes out.
+        // `must_show_header` forces it out early for a creation (diff.c:3613), a
+        // deletion (diff.c:3620), a mode change (diff.c:3627), and — through
+        // `fill_metainfo()` (diff.c:4491) — a rename or copy. A plain modification
+        // whose comparison found nothing, the usual result of `-w` over a
+        // whitespace-only edit, therefore prints no `diff --git` line at all.
+        let must_show = a.file.is_none()
+            || b.file.is_none()
+            || a.mode != b.mode
+            || matches!(pair.status, b'R' | b'C')
+            || !body.is_empty()
+            // The binary arm prints `Binary files … differ` and its header with it,
+            // but only once the two sides are known to differ (diff.c:3672).
+            || (binary && !same_content);
+        stats.last_mut().expect("just pushed").shown = must_show;
+        // `diff_flush_checkdiff()` (diff.c): an unmodified pair is skipped, and only
+        // the *new* side is examined — `--check` reports what the change introduces.
+        if opts.fmt.check && !same_content && !stat_binary {
+            check_failed |= emit_check(
+                &mut check_out,
+                b.display_name(),
+                &old_data,
+                &new_data,
+                ws_rule,
+                &opts.colors,
+            );
+        }
+        changed |= !from_contents || must_show;
+        if opts.fmt.patch && must_show {
+            paints.push(diff_color::FilePaint {
+                ws_rule,
+                blank_at_eof: diff_color::check_blank_at_eof(&old_data, &new_data),
+            });
             emit_header(&mut patch, a, b, &old_data, &new_data, &opts, same_content, binary, &pair);
             // `builtin_diff()` (diff.c:3596): with `-D`, a pair whose post-image label
             // is `/dev/null` stops right after its header — no `---`/`+++` pair, no
@@ -1241,18 +1696,145 @@ fn compare(
         }
     }
 
+    if opts.fmt.check {
+        out.extend_from_slice(&check_out);
+    }
     if !stats.is_empty() && non_patch_format(opts) {
-        render_non_patch(&mut out, &stats, opts);
+        render_non_patch(&mut out, &stats, opts, from_contents);
+    }
+    // `diff_flush()`: dirstat sits between the stat formats and the summary. The
+    // names it buckets by are the *post-image* ones, so a deletion is charged to
+    // `/dev/` exactly as stock 2.55.0 reports it.
+    if opts.fmt.dirstat && !stats.is_empty() {
+        let files: Vec<(BString, u64)> = stats
+            .iter()
+            .map(|r| {
+                let damage = if opts.dirstat.by_file {
+                    1
+                } else if opts.dirstat.by_line {
+                    let lines = u64::from(r.added) + u64::from(r.deleted);
+                    if r.binary { lines.div_ceil(64) } else { lines }
+                } else {
+                    // `show_dirstat()`'s content damage, and the single unit it
+                    // charges a pair that changed at all.
+                    let d = r.damage;
+                    if d == 0 { 1 } else { d }
+                };
+                (r.b_name.clone(), damage)
+            })
+            .collect();
+        super::diff_files::render_dirstat(&mut out, files, &opts.dirstat);
     }
     if !patch.is_empty() {
-        // `DIFF_SYMBOL_SEPARATOR`: one empty line, and only when a format already
-        // wrote something.
+        // `DIFF_SYMBOL_SEPARATOR`: one empty line — a NUL under `-z` — and only
+        // when a format already wrote something.
         if !out.is_empty() {
-            out.push(b'\n');
+            out.push(if opts.z { 0 } else { b'\n' });
         }
         out.extend_from_slice(&patch);
     }
-    Ok((out, changed))
+    Ok((out, changed, paints, check_failed))
+}
+
+/// `builtin_checkdiff()` (diff.c:4281) driving `checkdiff_consume()` (diff.c:3555)
+/// for one no-index pair.
+///
+/// The diff it walks is its own: `xecfg.ctxlen = 1` with `xpp.flags = 0`, so no
+/// `-w`/`-b`, no `--ignore-blank-lines`, no indent heuristic and no
+/// `--diff-algorithm` reach it. Returns `o->flags.check_failed` for the pair.
+///
+/// A no-index path has no `.gitattributes` behind it, so the whitespace rule is the
+/// one `core.whitespace` set for the whole run and the conflict-marker size is the
+/// built-in seven.
+fn emit_check(
+    out: &mut Vec<u8>,
+    name: &BString,
+    old_data: &[u8],
+    new_data: &[u8],
+    ws_rule: u32,
+    colors: &diff_color::DiffColors,
+) -> bool {
+    use gix::diff::blob::InternedInput;
+
+    let mut failed = false;
+    let set = colors.get(diff_color::DiffSlot::New);
+    let ws_color = colors.get(diff_color::DiffSlot::Whitespace);
+    let reset = colors.reset();
+
+    let before = super::diff::byte_lines(old_data);
+    let after = super::diff::byte_lines(new_data);
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| l.to_vec()));
+    input.update_after(after.iter().map(|l| l.to_vec()));
+    let mut diff = gix::diff::blob::Diff::compute(gix::diff::blob::Algorithm::Myers, &input);
+    diff.postprocess_no_heuristic(&input);
+
+    // xdiff hands `checkdiff_consume()` whole lines, and the record for a final line
+    // without a terminator arrives with the newline `xdl_emit_diff()` writes before
+    // the `\ No newline at end of file` marker — so `ws_check()` never sees the
+    // missing terminator, and `WS_INCOMPLETE_LINE` is reported by the marker's own
+    // branch instead.
+    let mut last_added_is_final = false;
+    for h in diff.hunks() {
+        let start = h.after.start as usize;
+        for (k, line) in after[start..start + h.after.len()].iter().enumerate() {
+            let lineno = start + k + 1;
+            let mut body: Vec<u8> = (*line).to_vec();
+            if body.last() != Some(&b'\n') {
+                body.push(b'\n');
+                last_added_is_final = true;
+            }
+            if super::diff_files::is_conflict_marker_sized(&body, 7) {
+                failed = true;
+                out.extend_from_slice(name.as_slice());
+                out.extend_from_slice(format!(":{lineno}: leftover conflict marker\n").as_bytes());
+            }
+            let bad = super::diff_files::ws_check(&body, ws_rule);
+            if bad == 0 {
+                continue;
+            }
+            failed = true;
+            out.extend_from_slice(name.as_slice());
+            out.extend_from_slice(
+                format!(":{lineno}: {}.\n", super::diff_files::whitespace_error_string(bad))
+                    .as_bytes(),
+            );
+            out.extend_from_slice(set.as_bytes());
+            out.push(b'+');
+            out.extend_from_slice(reset.as_bytes());
+            diff_color::ws_check_emit(out, &body, ws_rule, set, reset, ws_color);
+        }
+    }
+
+    if ws_rule & diff_color::WS_INCOMPLETE_LINE != 0 && last_added_is_final {
+        failed = true;
+        out.extend_from_slice(name.as_slice());
+        out.extend_from_slice(
+            format!(
+                ":{}: {}.\n",
+                after.len(),
+                super::diff_files::whitespace_error_string(diff_color::WS_INCOMPLETE_LINE)
+            )
+            .as_bytes(),
+        );
+    }
+
+    // `check_blank_at_eof()` runs over the whole file rather than the hunk stream.
+    if ws_rule & diff_color::WS_BLANK_AT_EOF != 0 {
+        let (_, post) = diff_color::check_blank_at_eof(old_data, new_data);
+        if post != 0 {
+            failed = true;
+            out.extend_from_slice(name.as_slice());
+            out.extend_from_slice(
+                format!(
+                    ":{post}: {}.\n",
+                    super::diff_files::whitespace_error_string(diff_color::WS_BLANK_AT_EOF)
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    failed
 }
 
 /// Whether any format other than the patch was asked for, so [`render_non_patch`] has
@@ -1260,6 +1842,11 @@ fn compare(
 fn non_patch_format(opts: &Opts) -> bool {
     let f = &opts.fmt;
     f.stat || f.numstat || f.shortstat || f.name_only || f.name_status || f.raw || f.summary
+}
+
+/// `options->line_termination`: a newline, or a NUL under `-z`.
+fn terminator(opts: &Opts) -> u8 {
+    if opts.z { 0 } else { b'\n' }
 }
 
 impl Opts {
@@ -1317,20 +1904,20 @@ fn emit_header(
     out.extend_from_slice(strip_one_leading_slash(b.header_name(a)));
     out.push(b'\n');
 
-    let hash = |data: &[u8], exists: bool| -> String {
-        if !exists {
-            return "0".repeat(opts.abbrev);
+    // `fill_metainfo()` (diff.c:4491) widens the `index` line to full object names
+    // under `--full-index`, and also under `--binary` — but only for a pair that
+    // really is binary, so text pairs in the same run keep the abbreviation.
+    // `diff_abbrev_oid()` truncates whatever id it is given to that same width, so
+    // the null id of an absent — or standard-input — side widens with it.
+    let hexsz = HASH_KIND.len_in_hex();
+    let width = if opts.full_index || (opts.binary && binary) { hexsz } else { opts.abbrev.min(hexsz) };
+    let hash = |data: &[u8], exists: bool, is_stdin: bool| -> String {
+        // `diff_fill_oid_info()` returns the null id for a filespec fed from
+        // standard input rather than hashing the stream.
+        if !exists || is_stdin {
+            return "0".repeat(width);
         }
-        let hex = blob_id(data).to_hex().to_string();
-        // `fill_metainfo()` (diff.c:4491) widens the `index` line to full object
-        // names under `--full-index`, and also under `--binary` — but only for a pair
-        // that really is binary, so text pairs in the same run keep the abbreviation.
-        let len = if opts.full_index || (opts.binary && binary) {
-            hex.len()
-        } else {
-            opts.abbrev.min(hex.len())
-        };
-        hex[..len].to_string()
+        blob_id(data).to_hex().to_string()[..width].to_string()
     };
 
     match (a.file.is_some(), b.file.is_some()) {
@@ -1373,9 +1960,9 @@ fn emit_header(
     }
 
     out.extend_from_slice(b"index ");
-    out.extend_from_slice(hash(old_data, a.file.is_some()).as_bytes());
+    out.extend_from_slice(hash(old_data, a.file.is_some(), a.name == STDIN_NAME).as_bytes());
     out.extend_from_slice(b"..");
-    out.extend_from_slice(hash(new_data, b.file.is_some()).as_bytes());
+    out.extend_from_slice(hash(new_data, b.file.is_some(), b.name == STDIN_NAME).as_bytes());
     // The mode is repeated on the index line only when both sides share it.
     if a.file.is_some() && b.file.is_some() && a.mode == b.mode {
         out.extend_from_slice(format!(" {:o}", a.mode).as_bytes());
@@ -1399,14 +1986,18 @@ fn emit_header(
 
 /// `--stat` / `--numstat` / `--shortstat` / `--name-only` / `--name-status` /
 /// `--raw` / `--summary`, in `diff_flush()`'s order.
-fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
+fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts, from_contents: bool) {
+    // `diff_flush()` (diff.c:7210): under `diff_from_contents` the raw and name
+    // formats skip a pair whose rendered content turned out to be empty.
+    let listed: Vec<&Row> = rows.iter().filter(|r| !from_contents || r.shown).collect();
     // `diff_flush_name()` prints the post-image name; `diff_flush_raw()` and
     // `--name-status` print the pre-image one, which for an addition is the only
     // name there is.
+    let term = terminator(opts);
     if opts.fmt.name_only {
-        for row in rows {
+        for row in &listed {
             out.extend_from_slice(row.b_name.as_bytes());
-            out.push(b'\n');
+            out.push(term);
         }
         return;
     }
@@ -1415,7 +2006,7 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
     // `DIFF_FORMAT_NAME_STATUS` is on. The raw/name block runs *before* the stat
     // family in `diff_flush()`, so `--raw --stat` prints both, raw first.
     if opts.fmt.name_status || opts.fmt.raw {
-        for row in rows {
+        for row in &listed {
             if opts.fmt.raw {
                 let side = |oid: Option<gix::ObjectId>| match oid {
                     Some(id) => {
@@ -1437,21 +2028,24 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
             }
             out.push(row.status);
             // `diff_flush_raw()`/`--name-status`: a rename or copy carries the
-            // similarity as three digits and then *both* names, TAB-separated.
+            // similarity as three digits and then *both* names. The separator is
+            // `o->line_termination ? '\t' : '\0'` (diff.c:6270-6296), so `-z`
+            // replaces every tab as well as the record terminator.
+            let sep = if opts.z { 0 } else { b'\t' };
             if row.renamed() {
                 out.extend_from_slice(
                     format!("{:03}", super::diffcore_rename::similarity_index(row.score)).as_bytes(),
                 );
-                out.push(b'\t');
+                out.push(sep);
                 out.extend_from_slice(row.a_name.as_bytes());
-                out.push(b'\t');
+                out.push(sep);
                 out.extend_from_slice(row.b_name.as_bytes());
             } else {
-                out.push(b'\t');
+                out.push(sep);
                 let name = if row.a_exists { &row.a_name } else { &row.b_name };
                 out.extend_from_slice(name.as_bytes());
             }
-            out.push(b'\n');
+            out.push(term);
         }
     }
     let stat_rows: Vec<(BString, BString, u32, u32, bool)> = rows
@@ -1459,10 +2053,16 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts) {
         .map(|r| (r.a_name.clone(), r.b_name.clone(), r.added, r.deleted, r.binary))
         .collect();
     if opts.fmt.numstat {
-        super::diff::render_rows_numstat(out, &stat_rows, false);
+        super::diff::render_rows_numstat(out, &stat_rows, opts.z);
     }
     if opts.fmt.stat {
-        super::diff::render_rows_stat(out, &stat_rows, &opts.colors);
+        super::diff::render_rows_stat_ex(
+            out,
+            &stat_rows,
+            &opts.colors,
+            &opts.stat_widths,
+            opts.fmt.compact_summary,
+        );
     }
     if opts.fmt.shortstat {
         let (adds, dels) = rows
@@ -1564,6 +2164,8 @@ mod tests {
             b_oid: (!exists_on_left).then_some(oid).flatten(),
             status: if exists_on_left { b'D' } else { b'A' },
             score: 0,
+            damage: 0,
+            shown: true,
         }
     }
 
@@ -1613,7 +2215,8 @@ mod tests {
 
     fn compared(s: &Scratch, fmt: Format, rename: &super::super::diffcore_rename::Options) -> String {
         let o = opts(fmt.resolved(), 7);
-        let (out, _) = compare(&s.at("A"), &s.at("B"), false, &o, rename).expect("readable operands");
+        let (out, ..) = compare(&s.at("A"), &s.at("B"), false, &o, rename, 0, None)
+            .expect("readable operands");
         String::from_utf8(out).expect("ascii fixtures")
     }
 
@@ -1644,12 +2247,20 @@ mod tests {
             binary: false,
             skip_or_rotate: None,
             compression_level: 1,
+            stat_widths: super::super::diffstat::StatWidths::default(),
+            z: false,
+            line_prefix: Vec::new(),
+            dirstat: super::super::diff_files::DirStat::default(),
+            ignore_blank_lines: false,
+            filter: super::super::diff_filter::Filter::default(),
+            paint: diff_color::PaintOptions::default(),
+            extra: diff_color::ExtraPaint::default(),
         }
     }
 
     fn rendered(rows: &[Row], o: &Opts) -> String {
         let mut out = Vec::new();
-        render_non_patch(&mut out, rows, o);
+        render_non_patch(&mut out, rows, o, false);
         String::from_utf8(out).expect("ascii fixtures")
     }
 
@@ -1706,6 +2317,8 @@ mod tests {
             b_oid: None,
             status: b'M',
             score: 0,
+            damage: 0,
+            shown: true,
         }];
         let o = opts(Format { summary: true, ..Format::default() }, 7);
         assert_eq!(rendered(&rows, &o), " mode change 100644 => 100755 y/m\n");
@@ -1729,6 +2342,8 @@ mod tests {
             b_oid: None,
             status: b'M',
             score: 0,
+            damage: 0,
+            shown: true,
         }];
         let o = opts(Format { summary: true, ..Format::default() }, 7);
         assert_eq!(rendered(&rows, &o), "");

@@ -37,8 +37,8 @@
 //!     `--whitespace` action, `--ours`/`--theirs`/`--union` without `--3way`,
 //!     `--reject` with `--3way`, and `--3way` outside a repository
 //!     (`fatal:`/`error:`, exit 128)
-//!   * patch kinds: modification, creation, deletion, rename, mode change, and
-//!     symlink blobs; git-style (`diff --git`) and traditional `---`/`+++` diffs
+//!   * patch kinds: modification, creation, deletion, rename, copy, mode change,
+//!     and symlink blobs; git-style (`diff --git`) and traditional `---`/`+++` diffs
 //!
 //! Faithful to git on the write side: every patch is checked before any file is
 //! touched (atomicity), `write_out_results()`'s two passes are kept — every removal
@@ -73,7 +73,8 @@
 //! `check_index` is set (`load_patch_target`). After the shared apply engine
 //! computes a file's new content, the new blob is written to the odb and the index
 //! entry for that path is added (creation), removed (deletion), or replaced with
-//! the new oid/mode (modification, rename — remove old path, add new path). The
+//! the new oid/mode (modification, rename — remove old path, add new path; a copy
+//! leaves the source alone). The
 //! whole index is written once, under the repo lock. `--index` additionally writes
 //! the worktree (the engine's usual write) and, matching git's `verify_index_match`
 //! gate, refuses (`does not match index`) when the worktree file's content differs
@@ -704,6 +705,19 @@ fn parse_opts(
                 _ => (given, false),
             };
 
+            // `get_value()` (parse-options.c:112): an `=<value>` glued to an entry
+            // declared without one is rejected before the entry's own handler runs.
+            // The name in the message is the one that was *typed*, so `--no-stat=40`
+            // reports `no-stat`.
+            if inline.is_some()
+                && LONG_OPTS
+                    .iter()
+                    .any(|o| o.name == name && matches!(o.arg, Arg::None))
+            {
+                eprintln!("error: option `{given}' takes no value");
+                return Err(ExitCode::from(129));
+            }
+
             match name {
                 // ---- honoured ----
                 "numstat" => o.numstat = !neg,
@@ -1143,6 +1157,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // out here so the summary can print where git prints it: *after* the write, and
     // not at all when the run failed (a `goto end` jumps clean over the block).
     let mut ws_errors = 0usize;
+    // `state->applied_after_fixing_ws`: how many lines `ws_fix_copy()` reported as
+    // *fixed*, which is what picks the summary's first wording.
+    let mut applied_after_fixing_ws = 0usize;
 
     // `check_whitespace()`: every added line is checked before anything is written,
     // so `--whitespace=error` refuses the patch with the worktree untouched. The rule
@@ -1168,7 +1185,11 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 for (_, hunk_idx, post_idx, rule) in targets {
                     if let Some(line) = p.hunks[hunk_idx].post.get_mut(post_idx) {
                         if super::diff_files::ws_check(line, rule) != 0 {
-                            *line = ws_fix_default(line);
+                            let (fixed_line, fixed) = ws_fix_default(line, rule);
+                            *line = fixed_line;
+                            if fixed {
+                                applied_after_fixing_ws += 1;
+                            }
                         }
                     }
                 }
@@ -1181,7 +1202,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         // the tail block, which nothing else reaches under this action because
         // `state->check || state->apply` is then false.
         if errors > 0 && matches!(o.ws, WsAction::Error) {
-            ws_summary(errors, &o.ws, o.apply, o.quiet());
+            ws_summary(errors, &o.ws, o.apply, applied_after_fixing_ws, o.quiet());
             return Ok(ExitCode::from(128));
         }
     }
@@ -1306,30 +1327,6 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             None
         };
 
-        // A path that must not already exist: a creation target, or a rename
-        // destination. git's `check_to_create` reports it against the index when
-        // `--index`/`--cached`, otherwise against the worktree.
-        if let Some(new) = &p.new_name {
-            if p.is_new || p.is_rename {
-                match create_block(&staged, idx_view, o.cached, new) {
-                    Some(Block::InIndex) => {
-                        err(o.quiet(), &format!("error: {new}: already exists in index"));
-                        failed = true;
-                        continue;
-                    }
-                    Some(Block::InWorktree) => {
-                        err(
-                            o.quiet(),
-                            &format!("error: {new}: already exists in working directory"),
-                        );
-                        failed = true;
-                        continue;
-                    }
-                    None => {}
-                }
-            }
-        }
-
         // `frag->rejected` per fragment; only `--reject` ever leaves a `false` here,
         // because without it the first failure fails the whole patch.
         let mut applied: Vec<bool> = Vec::new();
@@ -1367,6 +1364,33 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 }
             }
         };
+
+        // `check_patch()` (apply.c): `check_preimage()` runs *first*, and only then
+        // `check_to_create()` for a path that must not already exist — a creation
+        // target, a rename destination or a copy destination. Reporting the
+        // create-block first inverted the two diagnostics for a reversed copy,
+        // where stock names the missing pre-image. git's `check_to_create` reports
+        // against the index when `--index`/`--cached`, otherwise the worktree.
+        if let Some(new) = &p.new_name {
+            if p.is_new || p.is_rename || p.is_copy {
+                match create_block(&staged, idx_view, o.cached, new) {
+                    Some(Block::InIndex) => {
+                        err(o.quiet(), &format!("error: {new}: already exists in index"));
+                        failed = true;
+                        continue;
+                    }
+                    Some(Block::InWorktree) => {
+                        err(
+                            o.quiet(),
+                            &format!("error: {new}: already exists in working directory"),
+                        );
+                        failed = true;
+                        continue;
+                    }
+                    None => {}
+                }
+            }
+        }
 
         // apply.c:4142 — `check_unsafe_path()`, after the pre-image and
         // already-exists checks have had their say (so a missing out-of-tree file
@@ -1494,8 +1518,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 from_index.unwrap_or(0o100644)
             }
         };
+        // A rename removes its source; a copy does not.
         if let Some(old) = &p.old_name {
-            if old != &new {
+            if old != &new && !p.is_copy {
                 staged.insert(old.clone(), None);
             }
         }
@@ -1517,7 +1542,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
         ops.push(Op {
             name,
-            remove: p.old_name.clone(),
+            remove: if p.is_copy { None } else { p.old_name.clone() },
             prune_dirs: p.is_rename,
             create: Some((new, mode, data)),
             is_new: p.is_new,
@@ -1537,7 +1562,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         reports(&patches);
-        ws_summary(ws_errors, &o.ws, o.apply, o.quiet());
+        ws_summary(ws_errors, &o.ws, o.apply, applied_after_fixing_ws, o.quiet());
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1572,21 +1597,16 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     for op in ops {
         if let Some((path, mode, data)) = op.create {
             if !o.cached {
-                create_one_file(Path::new(&path), mode, &data)?;
+                // `create_file()`'s `error_errno()` (apply.c) unwinds to `git
+                // apply`'s exit 128, not to the crate's `zvcs: apply: …` exit 1.
+                if let Err(e) = create_one_file(Path::new(&path), mode, &data) {
+                    err(o.quiet(), &format!("error: {e}"));
+                    return Ok(ExitCode::from(128));
+                }
             }
             // `create_file()` (apply.c:4685): `check_index` stages every result,
             // `ita_only` stages only the paths the patch creates.
             if update_index && (check_index || op.is_new) {
-                // `add_index_entry_with_check()` (read-cache.c:1287) checks the name
-                // once more on the way in, and `add_index_file()` (apply.c:4488)
-                // adds its own line under it. `--unsafe-paths` waived the earlier
-                // gate but not this one, so `-N` on a patch that writes outside the
-                // tree ends here — with the file already written, as in git.
-                if !verify_path(&path, mode) {
-                    err(o.quiet(), &format!("error: invalid path '{path}'"));
-                    err(o.quiet(), &format!("error: unable to add cache entry for {path}"));
-                    return Ok(ExitCode::from(128));
-                }
                 let repo = idx_repo.as_ref().expect("repo present when update_index");
                 let (id, stat, flags) = if o.ita_only {
                     // `set_object_name_for_intent_to_add_entry()` (read-cache.c:704):
@@ -1612,6 +1632,41 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                     };
                     (id, stat, Flags::empty())
                 };
+                // `add_index_file()` (apply.c:4488) writes the blob *first* and
+                // only then calls `add_index_entry()`, so a refusal below still
+                // leaves the object in the store — which is what stock does.
+                //
+                // `add_index_entry_with_check()` (read-cache.c:1287) checks the
+                // name on the way in, and `add_index_file()` adds its own line
+                // under it. `--unsafe-paths` waived the earlier gate but not this
+                // one, so `-N` on a patch that writes outside the tree ends here —
+                // with the file already written, as in git.
+                if !verify_path(&path, mode) {
+                    err(o.quiet(), &format!("error: invalid path '{path}'"));
+                    err(o.quiet(), &format!("error: unable to add cache entry for {path}"));
+                    return Ok(ExitCode::from(128));
+                }
+                // `has_dir_name()` (read-cache.c): `add_index_entry()` is called
+                // without `ADD_CACHE_OK_TO_REPLACE`, so a file entry whose name is
+                // an existing entry's *directory* prefix is refused rather than
+                // taking its place.
+                let dir_prefix = format!("{path}/");
+                let clashes = idx_index.as_ref().is_some_and(|index| {
+                    index
+                        .entries()
+                        .iter()
+                        .any(|e| e.path(index).starts_with(dir_prefix.as_bytes()))
+                }) || idx_add.iter().any(|(p, ..): &(gix::bstr::BString, _, _, _, _)| {
+                    p.starts_with(dir_prefix.as_bytes())
+                });
+                if clashes {
+                    err(
+                        o.quiet(),
+                        &format!("error: '{path}' appears as both a file and as a directory"),
+                    );
+                    err(o.quiet(), &format!("error: unable to add cache entry for {path}"));
+                    return Ok(ExitCode::from(128));
+                }
                 idx_add.push((
                     path.clone().into_bytes().into(),
                     id,
@@ -1770,7 +1825,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
     reports(&patches);
-    ws_summary(ws_errors, &o.ws, o.apply, o.quiet());
+    ws_summary(ws_errors, &o.ws, o.apply, applied_after_fixing_ws, o.quiet());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1966,17 +2021,25 @@ fn create_block(
         Some(None) => return None, // deleted earlier this run: the path is free
         None => {}
     }
+    // `check_to_create()` (apply.c): `if (S_ISDIR(nst.st_mode) || ok_if_exists) return 0;`
+    // — a *directory* standing where the patch wants a file is not a create-block.
+    // git lets the check pass and fails later, in `create_file()`, with
+    // `unable to write file '<path>' mode <mode>: Is a directory`.
+    let blocked_on_disk = || match std::fs::symlink_metadata(new) {
+        Ok(meta) => !meta.is_dir(),
+        Err(_) => false,
+    };
     match idx {
         Some((_, index)) => {
             if index.entry_by_path(new.as_bytes().as_bstr()).is_some() {
                 return Some(Block::InIndex);
             }
-            if !cached && std::fs::symlink_metadata(new).is_ok() {
+            if !cached && blocked_on_disk() {
                 return Some(Block::InWorktree);
             }
             None
         }
-        None if std::fs::symlink_metadata(new).is_ok() => Some(Block::InWorktree),
+        None if blocked_on_disk() => Some(Block::InWorktree),
         None => None,
     }
 }
@@ -2131,6 +2194,10 @@ struct Patch {
     is_new: bool,
     is_delete: bool,
     is_rename: bool,
+    /// `patch->is_copy`: a `copy from`/`copy to` header pair. The post-image is
+    /// created exactly as a rename's is, and the *source is left in place* — which
+    /// is the only difference between the two on the write side.
+    is_copy: bool,
     binary: bool,
     /// The `GIT binary patch` payloads, forward first and the reverse second when the
     /// patch carries one (`--binary` writes both). `None` for a `Binary files … differ`
@@ -2809,7 +2876,23 @@ fn parse_patches(
             i += 1;
         }
     }
+    // "Empty patch cannot be applied if it is a text patch without metadata
+    // change" (apply.c): a header with no fragments, no binary payload and nothing
+    // `metadata_changes()` recognises leaves nothing to do, and git's list never
+    // gets it — which is what turns a lone `diff --git a/x b/x` into
+    // `No valid patches in input`.
+    out.retain(|p| !p.hunks.is_empty() || p.binary || metadata_changes(p));
     Ok(out)
+}
+
+/// `metadata_changes()` (apply.c): whether a fragment-less patch still says
+/// something — a rename, a copy, a creation, a deletion or a mode change.
+fn metadata_changes(p: &Patch) -> bool {
+    p.is_rename
+        || p.is_copy
+        || p.is_new
+        || p.is_delete
+        || matches!((p.old_mode, p.new_mode), (Some(a), Some(b)) if a != b)
 }
 
 /// Parse one file's patch beginning at `start`, returning it and the index of
@@ -2830,6 +2913,7 @@ fn parse_one(
         is_new: false,
         is_delete: false,
         is_rename: false,
+        is_copy: false,
         binary: false,
         binary_forward: None,
         binary_reverse: None,
@@ -2850,11 +2934,16 @@ fn parse_one(
     // stopped at, first line after the binary section)`.
     let mut binary_stop: Option<(usize, usize)> = None;
 
+    // `patch->def_name` (apply.c): the name off the `diff --git` line is only a
+    // *fallback*. `parse_git_diff_header()` installs it after the extended-header
+    // table has run, and only when neither `---` nor `+++` supplied a name — so a
+    // header carrying one of the two and not the other is a parse error rather than
+    // a patch to the `diff --git` name. Assigning both up front hid that.
+    let mut def_name: Option<String> = None;
     if git_style {
         let header = txt(lines[i]);
-        if let Some((a, b)) = git_header_names(&header["diff --git ".len()..], strip)? {
-            p.old_name = Some(a);
-            p.new_name = Some(b);
+        if let Some((a, _)) = git_header_names(&header["diff --git ".len()..], strip)? {
+            def_name = Some(a);
         }
         i += 1;
     }
@@ -2862,25 +2951,39 @@ fn parse_one(
     // Extended headers, then the `---`/`+++` pair, in whatever order they appear.
     while i < lines.len() {
         let l = txt(lines[i]);
+        // `parse_mode_line()` (apply.c): a mode `strtoul` cannot consume whole is
+        // `error("invalid mode at %s:%d: %s")` over the rest of the line — newline
+        // included, which is why the diagnostic is followed by a blank one — and
+        // unwinds to `git apply`'s exit 128.
+        let mode = |rest: &str| -> Result<u32> {
+            octal(rest).map_err(|_| {
+                let (file, line) = spans.location(i);
+                anyhow::Error::new(HeaderError(format!("invalid mode at {file}:{line}: {rest}\n")))
+            })
+        };
         if let Some(rest) = l.strip_prefix("new file mode ") {
             p.is_new = true;
-            p.new_mode = Some(octal(rest)?);
+            p.new_mode = Some(mode(rest)?);
         } else if let Some(rest) = l.strip_prefix("deleted file mode ") {
             p.is_delete = true;
-            p.old_mode = Some(octal(rest)?);
+            p.old_mode = Some(mode(rest)?);
         } else if let Some(rest) = l.strip_prefix("new mode ") {
-            p.new_mode = Some(octal(rest)?);
+            p.new_mode = Some(mode(rest)?);
         } else if let Some(rest) = l.strip_prefix("old mode ") {
             // The pre-image mode drives the summary's `mode change` line.
-            p.old_mode = Some(octal(rest)?);
+            p.old_mode = Some(mode(rest)?);
         } else if let Some(rest) = l.strip_prefix("rename from ") {
             p.is_rename = true;
             p.old_name = rename_path(rest, strip)?;
         } else if let Some(rest) = l.strip_prefix("rename to ") {
             p.is_rename = true;
             p.new_name = rename_path(rest, strip)?;
-        } else if l.starts_with("copy from ") || l.starts_with("copy to ") {
-            anyhow::bail!("copy patches are not implemented");
+        } else if let Some(rest) = l.strip_prefix("copy from ") {
+            p.is_copy = true;
+            p.old_name = rename_path(rest, strip)?;
+        } else if let Some(rest) = l.strip_prefix("copy to ") {
+            p.is_copy = true;
+            p.new_name = rename_path(rest, strip)?;
         } else if let Some(rest) = l.strip_prefix("similarity index ") {
             // Drives the `(N%)` in the summary's rename line.
             p.score = rest.trim().trim_end_matches('%').parse().unwrap_or(0);
@@ -2889,9 +2992,9 @@ fn parse_one(
         } else if let Some(rest) = l.strip_prefix("index ") {
             // `index <old>..<new> <mode>` carries the mode when it did not change;
             // git creates the result with it, so an executable file stays one.
-            if let Some((_, mode)) = rest.split_once(' ') {
+            if let Some((_, m)) = rest.split_once(' ') {
                 if p.new_mode.is_none() {
-                    p.new_mode = Some(octal(mode)?);
+                    p.new_mode = Some(mode(m)?);
                 }
             }
             // The ids themselves matter to a binary patch, which is only applied
@@ -2918,14 +3021,30 @@ fn parse_one(
             let stop = i;
             i += 1;
             // `parse_binary()`: the forward payload, then the reverse one when the
-            // patch was written with `--binary`. Anything else ends the section.
-            if let Some((forward, next)) = parse_binary_block(lines, i) {
-                p.binary_forward = Some(forward);
-                i = next;
-                if let Some((reverse, next)) = parse_binary_block(lines, i) {
-                    p.binary_reverse = Some(reverse);
+            // patch was written with `--binary`. A missing reverse half is not an
+            // error; a *corrupt* one is, and so is a corrupt forward half — both
+            // stop the parse with git's own `corrupt binary patch at <file>:<line>: `.
+            let corrupt = |idx: usize| -> anyhow::Error {
+                let (name, line) = spans.location(idx);
+                anyhow::Error::new(HeaderError(format!(
+                    "corrupt binary patch at {name}:{line}: "
+                )))
+            };
+            match parse_binary_block(lines, i) {
+                Err(at) => return Err(corrupt(at)),
+                Ok(Some((forward, next))) => {
+                    p.binary_forward = Some(forward);
                     i = next;
+                    match parse_binary_block(lines, i) {
+                        Err(at) => return Err(corrupt(at)),
+                        Ok(Some((reverse, next))) => {
+                            p.binary_reverse = Some(reverse);
+                            i = next;
+                        }
+                        Ok(None) => {}
+                    }
                 }
+                Ok(None) => {}
             }
             // Consume whatever is left of the section.
             while i < lines.len() {
@@ -2950,7 +3069,27 @@ fn parse_one(
     if !git_style {
         resolve_traditional(&mut p, trad_old.as_deref(), trad_new.as_deref(), strip)?;
     }
+    // "Some things may not have the old name in the rest of the headers anywhere
+    // (pure mode changes, or removing or adding empty files), so we get the default
+    // name from the header."
+    if p.old_name.is_none() && p.new_name.is_none() {
+        if let Some(def) = &def_name {
+            p.old_name = Some(def.clone());
+            p.new_name = Some(def.clone());
+        }
+    }
     require_names(&p, git_style, strip, spans, if git_style { hdr_stop } else { start })?;
+    // The second check `parse_git_diff_header()` makes once the fallback has had
+    // its chance: a header that named one side and not the other, without saying
+    // the other side is absent, is not a patch.
+    if git_style
+        && ((p.new_name.is_none() && !p.is_delete) || (p.old_name.is_none() && !p.is_new))
+    {
+        let (file, line) = spans.location(hdr_stop);
+        return Err(anyhow::Error::new(HeaderError(format!(
+            "git diff header lacks filename information at {file}:{line}"
+        ))));
+    }
 
     if let Some((_, next)) = binary_stop {
         return Ok((normalise(p)?, next));
@@ -3831,7 +3970,12 @@ fn render_stat(patches: &[Patch]) -> String {
     for p in patches {
         let raw = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
         let q = quote_path(raw);
-        max_len = max_len.max(q.len());
+        // `patch_stats()` (apply.c) widens `max_len` with *both* names, while
+        // `show_stats()` prints only the post-image one — so a rename or a copy
+        // sizes the column by whichever of its two names is longer.
+        for name in [p.old_name.as_deref(), p.new_name.as_deref()].into_iter().flatten() {
+            max_len = max_len.max(quote_path(name).len());
+        }
         max_change = max_change.max(p.added + p.deleted);
         adds += p.added;
         dels += p.deleted;
@@ -3916,7 +4060,7 @@ fn stat_summary_line(files: usize, ins: usize, del: usize) -> String {
 fn render_summary(patches: &[Patch]) -> String {
     let mut out = String::new();
     for p in patches {
-        if p.is_rename {
+        if p.is_rename || p.is_copy {
             out.push_str(&rename_line(p));
         } else if p.is_new {
             out.push_str(&format!(
@@ -3948,6 +4092,7 @@ fn render_summary(patches: &[Patch]) -> String {
 /// `foo/` components only, no suffix folding) and render `dir/{old => new}` when a
 /// prefix was found, else `old => new`.
 fn rename_line(p: &Patch) -> String {
+    let verb = if p.is_copy { "copy" } else { "rename" };
     let old = p.old_name.as_deref().unwrap_or("");
     let new = p.new_name.as_deref().unwrap_or("");
     let (ob, nb) = (old.as_bytes(), new.as_bytes());
@@ -3964,14 +4109,14 @@ fn rename_line(p: &Patch) -> String {
     }
     if pfx > 0 {
         format!(
-            " rename {}{{{} => {}}} ({}%)\n",
+            " {verb} {}{{{} => {}}} ({}%)\n",
             &old[..pfx],
             &old[pfx..],
             &new[pfx..],
             p.score
         )
     } else {
-        format!(" rename {old} => {new} ({}%)\n", p.score)
+        format!(" {verb} {old} => {new} ({}%)\n", p.score)
     }
 }
 
@@ -4165,17 +4310,45 @@ fn create_one_file(path: &Path, mode: u32, data: &[u8]) -> Result<()> {
     // `EEXIST` before it checks permissions, so the kernel cannot hand us that pair;
     // a real `EACCES` here means an unwritable parent, where `lstat()` also fails and
     // the C falls through to the error exactly as this does.
-    let was_dir = matches!(
+    // `errno` as the C carries it into `if (errno == EEXIST)`: the rewrite only
+    // happens when `lstat()` finds a non-directory, or a directory `rmdir()` could
+    // remove. A directory `rmdir()` refuses leaves *its* errno in place, which is
+    // what makes `git apply` over a non-empty directory report `Directory not
+    // empty` instead of looping over temporary names.
+    let mut reason = first
+        .downcast_ref::<std::io::Error>()
+        .map_or_else(|| first.to_string(), io_msg);
+    let mut eexist = kind == Some(std::io::ErrorKind::AlreadyExists);
+    let mut was_dir = false;
+    if matches!(
         kind,
         Some(std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied)
-    ) && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
-        && std::fs::remove_dir(path).is_ok();
+    ) {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => match std::fs::remove_dir(path) {
+                Ok(()) => {
+                    eexist = true;
+                    was_dir = true;
+                }
+                Err(e) => {
+                    eexist = false;
+                    reason = io_msg(&e);
+                }
+            },
+            Ok(_) => eexist = true,
+            Err(_) => {}
+        }
+    }
     if was_dir {
         if write_created(path, mode, data).is_ok() {
             return Ok(());
         }
-    } else if kind != Some(std::io::ErrorKind::AlreadyExists) {
-        return Err(first);
+    }
+    if !eexist {
+        bail!(
+            "unable to write file '{}' mode {mode:o}: {reason}",
+            path.to_string_lossy()
+        );
     }
     // `mkpathdup("%s~%u", path, nr)`, starting at the pid and counting up until a
     // name is free, then renamed over the target.
@@ -4198,7 +4371,7 @@ fn create_one_file(path: &Path, mode: u32, data: &[u8]) -> Result<()> {
         }
     }
     bail!(
-        "unable to write file '{}' mode {mode:o}",
+        "unable to write file '{}' mode {mode:o}: {reason}",
         path.to_string_lossy()
     );
 }
@@ -4337,7 +4510,13 @@ fn report_whitespace(
 ///
 /// `state->squelch_whitespace_errors` is 5, so the "squelched" line reports the
 /// offenders past the fifth that `check_whitespace()` did not print.
-fn ws_summary(errors: usize, action: &WsAction, apply: bool, quiet: bool) {
+fn ws_summary(
+    errors: usize,
+    action: &WsAction,
+    apply: bool,
+    applied_after_fixing: usize,
+    quiet: bool,
+) {
     const SQUELCH: usize = 5;
     if errors == 0 || matches!(action, WsAction::Silent | WsAction::Invalid) {
         return;
@@ -4361,15 +4540,21 @@ fn ws_summary(errors: usize, action: &WsAction, apply: bool, quiet: bool) {
                 if n == 1 { "line adds" } else { "lines add" }
             ),
         ),
-        // `state->applied_after_fixing_ws && state->apply` picks the first wording;
-        // anything else falls through to the plain count.
-        WsAction::Fix if apply => err(
-            quiet,
-            &format!(
-                "warning: {n} {} after fixing whitespace errors.",
-                if n == 1 { "line applied" } else { "lines applied" }
-            ),
-        ),
+        // `if (state->applied_after_fixing_ws && state->apply)` picks the first
+        // wording, and counts *that* rather than the error total; anything else
+        // falls through to the plain count. A `--whitespace=fix` run that only
+        // dropped a CR before the newline reports no fix at all, because
+        // `ws_fix_copy()` strips that byte without setting its `fixed` flag.
+        WsAction::Fix if apply && applied_after_fixing > 0 => {
+            let n = applied_after_fixing;
+            err(
+                quiet,
+                &format!(
+                    "warning: {n} {} after fixing whitespace errors.",
+                    if n == 1 { "line applied" } else { "lines applied" }
+                ),
+            )
+        }
         _ => err(
             quiet,
             &format!(
@@ -4469,47 +4654,84 @@ fn apply_git_delta(base: &[u8], delta: &[u8]) -> Option<Vec<u8>> {
     (out.len() == target_size).then_some(out)
 }
 
-/// Read one `literal <n>`/`delta <n>` block: the header line, then base85 lines until
-/// a blank one. Returns the payload and the index just past the block.
-fn parse_binary_block(lines: &[&[u8]], mut i: usize) -> Option<(BinaryPayload, usize)> {
-    let head = String::from_utf8_lossy(lines.get(i)?).trim_end().to_string();
+/// Read one `literal <n>`/`delta <n>` block: the header line, then base85 lines
+/// until a blank one.
+///
+/// `Ok(None)` is `parse_binary_hunk()` answering "there is no hunk here" — the
+/// line is neither `literal` nor `delta`, which is how the *reverse* half is
+/// found to be absent. `Err(<0-based line>)` is its `goto corrupt`, which is a
+/// different answer entirely: "Not having reverse hunk is not an error, but
+/// having a corrupt reverse hunk is" (`parse_binary()`, apply.c).
+///
+/// The block is terminated by a blank line and by nothing else. git's loop reads
+/// `llen = linelen(buffer, size)` and only `llen == 1` breaks it, so a base85
+/// run that reaches the end of the patch — or a line that is not base85 at all —
+/// falls through to `goto corrupt` rather than ending the block. Treating either
+/// as a terminator accepts a truncated payload that stock refuses: dropping the
+/// single blank line after a `literal 0` reverse block is a one-byte edit, and
+/// `git am` on the result is `error: corrupt binary patch …` at exit 128 while
+/// this reader used to commit the patch.
+fn parse_binary_block(
+    lines: &[&[u8]],
+    mut i: usize,
+) -> std::result::Result<Option<(BinaryPayload, usize)>, usize> {
+    let Some(head_line) = lines.get(i) else {
+        return Ok(None);
+    };
+    let head = String::from_utf8_lossy(head_line).trim_end().to_string();
     let (kind, size) = match head.split_once(' ') {
-        Some(("literal", n)) => ("literal", n.parse::<usize>().ok()?),
-        Some(("delta", n)) => ("delta", n.parse::<usize>().ok()?),
-        _ => return None,
+        Some(("literal", n)) => match n.parse::<usize>() {
+            Ok(n) => ("literal", n),
+            Err(_) => return Ok(None),
+        },
+        Some(("delta", n)) => match n.parse::<usize>() {
+            Ok(n) => ("delta", n),
+            Err(_) => return Ok(None),
+        },
+        _ => return Ok(None),
     };
     i += 1;
     let mut encoded: Vec<u8> = Vec::new();
-    while let Some(line) = lines.get(i) {
+    loop {
+        // Running out of input is `linelen()` returning 0, which is neither the
+        // blank line nor a well-formed base85 line: `goto corrupt`.
+        let Some(line) = lines.get(i) else {
+            return Err(i);
+        };
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         if body.is_empty() {
             i += 1;
             break;
         }
         // The first byte is the length this line encodes, in git's `A`..`Z`/`a`..`z`
-        // counting; a line outside that range ends the block.
+        // counting; a line outside that range is corrupt.
         let len = match body[0] {
             c @ b'A'..=b'Z' => (c - b'A') as usize + 1,
             c @ b'a'..=b'z' => (c - b'a') as usize + 27,
-            _ => break,
+            _ => return Err(i),
         };
-        encoded.extend_from_slice(&super::binary_patch::decode_base85(&body[1..], len)?);
+        match super::binary_patch::decode_base85(&body[1..], len) {
+            Some(decoded) => encoded.extend_from_slice(&decoded),
+            None => return Err(i),
+        }
         i += 1;
     }
     // The payload is deflated, exactly as `emit_binary_diff_body()` wrote it.
     let mut inflate = gix::zlib::Inflate::default();
     let mut out = vec![0u8; size];
-    let (_status, _consumed, written) = inflate.once(&encoded, out.as_mut_slice()).ok()?;
+    let Ok((_status, _consumed, written)) = inflate.once(&encoded, out.as_mut_slice()) else {
+        return Err(i);
+    };
     if written != size {
-        return None;
+        return Err(i);
     }
-    Some((
+    Ok(Some((
         match kind {
             "literal" => BinaryPayload::Literal(out),
             _ => BinaryPayload::Delta(out),
         },
         i,
-    ))
+    )))
 }
 
 /// `apply_binary()` (apply.c:3276): rebuild a binary file's post-image, refusing
@@ -4637,16 +4859,34 @@ fn blob_hex(data: &[u8]) -> String {
 /// reshape the indent in ways this has not been verified against, so a repository that
 /// configures them keeps the deferred `--whitespace=fix` refusal rather than getting a
 /// guess (see [`ws_fix_supported`]).
-fn ws_fix_default(line: &[u8]) -> Vec<u8> {
-    let (body, terminator): (&[u8], &[u8]) = match line.strip_suffix(b"\n") {
+fn ws_fix_default(line: &[u8], rule: u32) -> (Vec<u8>, bool) {
+    // `ws_fix_copy()`'s prologue, in its own order: the newline comes off first,
+    // then a `\r` in front of it — which is put back only under `cr-at-eol` and,
+    // crucially, does **not** count as a fix — and only then does the `isspace()`
+    // strip run and set `fixed`. That is why `git apply --whitespace=fix` over a
+    // patch whose added line ends CRLF removes the CR and still reports "N lines
+    // add whitespace errors" rather than "applied after fixing".
+    let mut fixed = false;
+    let (mut body, terminator): (&[u8], &[u8]) = match line.strip_suffix(b"\n") {
         Some(rest) => (rest, b"\n"),
         None => (line, b""),
     };
-    // `blank-at-eol`: everything after the last non-blank goes.
+    let mut cr_tail: &[u8] = b"";
+    if let Some(rest) = body.strip_suffix(b"\r") {
+        body = rest;
+        if rule & super::diff_color::WS_CR_AT_EOL != 0 {
+            cr_tail = b"\r";
+        }
+    }
+    // `blank-at-eol`: everything after the last non-blank goes. C's `isspace`, so
+    // the vertical tab and form feed count with space and tab.
     let end = body
         .iter()
-        .rposition(|b| !matches!(b, b' ' | b'\t'))
+        .rposition(|b| !b.is_ascii_whitespace())
         .map_or(0, |i| i + 1);
+    if end != body.len() {
+        fixed = true;
+    }
     let body = &body[..end];
 
     // `space-before-tab`: inside the indent, a run of spaces followed by a tab is the
@@ -4673,9 +4913,14 @@ fn ws_fix_default(line: &[u8]) -> Vec<u8> {
         }
         i = run_end;
     }
+    // A shortened indent is `need_fix_leading_space`, which does set `fixed`.
+    if out.len() != indent_end {
+        fixed = true;
+    }
     out.extend_from_slice(&body[indent_end..]);
+    out.extend_from_slice(cr_tail);
     out.extend_from_slice(terminator);
-    out
+    (out, fixed)
 }
 
 /// Whether [`ws_fix_default`] describes what `rule` asks for: git's default set, with
@@ -4700,6 +4945,7 @@ mod tests {
             is_new: false,
             is_delete: false,
             is_rename: false,
+            is_copy: false,
             binary: false,
             binary_forward: None,
             binary_reverse: None,

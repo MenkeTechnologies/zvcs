@@ -1265,8 +1265,17 @@ fn materialize_side(
     // A recorded blob: stage its bytes into a temp file.
     let oid = gix::ObjectId::from_hex(oid_hex.as_bytes())
         .map_err(|e| anyhow!("bad object id {oid_hex:?} in raw diff: {e}"))?;
-    let object = repo.find_object(oid)?;
-    write_temp(tmpdir, side, path, &object.data)
+    if let Some(object) = repo.try_find_object(oid)? {
+        return write_temp(tmpdir, side, path, &object.data);
+    }
+    // An id that names no object is one `hash_filespec()` (diffcore-rename.c)
+    // computed from the *worktree* file while looking for renames — an `add -N`
+    // post-image is the case that reaches here. `diff_populate_filespec()` reads
+    // that file rather than the object database, and `prepare_temp_file()` then
+    // borrows it whole, which is what `$LOCAL`/`$REMOTE` point at.
+    repo.workdir_path(gix::bstr::BStr::new(path))
+        .filter(|p| p.exists())
+        .ok_or_else(|| anyhow!("object {oid_hex} is not in the database and has no work-tree file"))
 }
 
 /// Stage `content` at `<tmpdir>/<side>/<path>`, creating leading directories, so

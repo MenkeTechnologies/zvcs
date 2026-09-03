@@ -705,6 +705,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // created and truncated during the option scan and every rendered byte goes there
     // instead of to stdout.
     let mut output_file: Option<std::fs::File> = None;
+    // `revs.diffopt.flags.ita_invisible_in_index`, which `cmd_diff()` sets before
+    // its option scan: an `add -N` entry is a *creation* to the index-vs-worktree
+    // walk rather than a modification of the empty blob it stands in for.
+    let mut ita_invisible = true;
     // `--dirstat`'s parameter block (`struct dirstat_opts`), shared with the
     // `diff-files`/`diff-index` port that renders it.
     let mut dirstat = super::diff_files::DirStat::default();
@@ -920,6 +924,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // for a slidable hunk. A command-line `--[no-]indent-heuristic` overrides it.
         if let Some(b) = snap.boolean("diff.indentHeuristic") {
             indent_heuristic = b;
+        }
+        // `diff.interHunkContext` (`git_diff_ui_config()`): `diff_setup()` seeds
+        // `options->interhunkcontext` from `diff_interhunk_context_default` before
+        // parse-options runs, so `--inter-hunk-context=<n>` simply overwrites it
+        // below. A negative value is the config reader's own refusal.
+        if let Some(n) = snap.integer("diff.interHunkContext") {
+            if n < 0 {
+                crate::git_fatal!("bad config variable 'diff.interhunkcontext'");
+            }
+            ignore.inter_hunk_ctx = n as usize;
         }
         // `diff.orderFile` (`git_diff_ui_config()`): `diff_setup()` seeds
         // `options->orderfile` from it before parse-options runs, so a `-O<file>`
@@ -1327,8 +1341,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `--ext-diff` both change stock's output and are not honored here.
             // `diff_pairs.rs` has the real implementations (`fill_textconv()` and
             // `run_external_diff()`); wiring this command through them is the fix.
-            "--no-ext-diff" | "--ext-diff" | "--textconv"
-            | "--no-textconv" | "--ita-invisible-in-index" | "--ita-visible-in-index" => {}
+            "--no-ext-diff" | "--ext-diff" | "--textconv" | "--no-textconv" => {}
+            // `cmd_diff()` (builtin/diff.c:635) raises
+            // `flags.ita_invisible_in_index` before parsing, so `git diff`'s default
+            // is "invisible" and only `--ita-visible-in-index` lowers it again.
+            "--ita-invisible-in-index" => ita_invisible = true,
+            "--ita-visible-in-index" => ita_invisible = false,
             // `XDF_IGNORE_BLANK_LINES` (`OPT_BIT` on `xdl_opts`).
             "--ignore-blank-lines" => ignore.blank_lines = true,
             // `DIFF_OPT_TEXT` (`OPT_BIT` on `flags.text`): diff content git would
@@ -2196,7 +2214,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // above returns `usage_error()` (129) for `revs.len() >= 2` before any of this
         // runs, so the tree-vs-index collection below always has exactly one endpoint.
         old_tree_id = Some(tree_id_for(&repo, revs.first())?);
-        collect_tree_index(&repo, revs.first(), &mut deltas)?;
+        collect_tree_index(&repo, revs.first(), &mut deltas, ita_invisible)?;
         cache = repo.diff_resource_cache_for_tree_diff()?;
     } else if revs.len() == 2 {
         let old_tree = rev_object(&repo, revs[0].as_str())?.peel_to_tree()?;
@@ -2217,7 +2235,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             old_tree_id = Some(tree_id_for(&repo, revs.first())?);
             collect_tree_worktree(&repo, &revs[0], &paths, &mut deltas)?;
         } else {
-            collect_index_worktree(&repo, &workdir, &paths, &mut deltas)?;
+            collect_index_worktree(&repo, &workdir, &paths, &mut deltas, ita_invisible)?;
         }
         // The side the platform resolves by *reading the path* rather than by id.
         // `-R` swaps the two filespecs, so the worktree side becomes the pre-image
@@ -2350,8 +2368,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `-O<file>` / `diff.orderFile` (`diffcore_order`): stably reorder the queue so
     // pairs whose path matches an earlier pattern in the order file come first. git
     // runs it last in `diffcore_std()`, after rename detection and `--diff-filter`.
-    if let Some(of) = &order_file {
-        let order = diff_files::read_order_file(of);
+    // `diffcore_order()` opens with `if (!q->nr) return;`, so an order file that
+    // cannot be read is only fatal when there is a queue to reorder.
+    if let (Some(of), false) = (&order_file, deltas.is_empty()) {
+        let order = diff_files::read_order_file(of)?;
         deltas.sort_by_cached_key(|d| diff_files::match_order(&order, d.path.as_slice()));
     }
 
@@ -3282,9 +3302,11 @@ fn collect_tree_index(
     repo: &gix::Repository,
     spec: Option<&String>,
     deltas: &mut Vec<Delta>,
+    ita_invisible: bool,
 ) -> Result<()> {
     let tree_id = tree_id_for(repo, spec)?;
     let index = repo.index_or_load_from_head()?;
+    let start = deltas.len();
     repo.tree_index_status(
         &tree_id,
         &index,
@@ -3297,6 +3319,26 @@ fn collect_tree_index(
     )?;
 
     let tree = repo.find_object(tree_id)?.peel_to_tree()?;
+    // `do_oneway_diff()` (diff-lib.c) nulls an `add -N` entry out only under
+    // `ita_invisible_in_index`; with `--ita-visible-in-index` the entry is an
+    // ordinary index record and the pair is the empty blob it names. gitoxide's
+    // index diff drops every intent-to-add entry unconditionally
+    // (`gix-diff/src/index/function.rs:283`), so the visible half is rebuilt here.
+    if !ita_invisible {
+        for e in index.entries() {
+            if !e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD) {
+                continue;
+            }
+            let Some(kind) = index_mode_kind(e.mode) else { continue };
+            let path = e.path(&index).to_owned();
+            let old = tree_entry(&tree, &path)?;
+            if old == Some((e.id, kind)) {
+                continue;
+            }
+            deltas.push(Delta::plain(path, old, NewSide::Blob(e.id, kind)));
+        }
+        deltas[start..].sort_by(|a, b| a.path.cmp(&b.path));
+    }
     for path in unmerged_paths(&index) {
         let old = tree_entry(&tree, &path)?;
         deltas.push(Delta {
@@ -3422,6 +3464,7 @@ fn collect_index_worktree(
     workdir: &std::path::Path,
     paths: &[String],
     deltas: &mut Vec<Delta>,
+    ita_invisible: bool,
 ) -> Result<()> {
     let index = repo.index_or_empty()?;
     let conflicts = conflict_stages(&index);
@@ -3459,7 +3502,19 @@ fn collect_index_worktree(
                 .entry_by_path(path.as_bstr())
                 .ok_or_else(|| anyhow::anyhow!("no index entry for {path:?}"))?;
             let old_kind = index_mode_kind(entry.mode).unwrap_or(EntryKind::Blob);
-            let mut delta = Delta::plain(path, Some((entry.id, old_kind)), new);
+            // `run_diff_files()` (diff-lib.c): under `ita_invisible_in_index` an
+            // `add -N` entry is reported through `diff_addremove('+', …)` — an
+            // addition with no pre-image at all — rather than as a modification of
+            // the empty blob the entry names. `--ita-visible-in-index` is the other
+            // half: the entry stands, and the pair is the ordinary modification.
+            // Only the entry gix reported *as* intent-to-add: a removed one took
+            // `check_removed()`'s branch above the flag test in `run_diff_files()`
+            // and is a plain deletion against the empty blob the entry names.
+            let ita = ita_invisible
+                && matches!(new, NewSide::Worktree(_))
+                && entry.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD);
+            let old = (!ita).then_some((entry.id, old_kind));
+            let mut delta = Delta::plain(path, old, new);
             delta.dirty_submodule = dirty;
             delta.new_commit = head;
             // `run_diff_files()` leaves a moved gitlink's post-image invalid, so
@@ -3642,11 +3697,17 @@ fn worktree_new_side(
         // A conflicted path still has worktree content; only `git diff` with no
         // revision treats it specially, and that caller intercepts it first.
         EntryStatus::Conflict { .. } => Some((rela_path, NewSide::Worktree(old_kind), 0, None)),
-        // Submodule content modification, intent-to-add, and stat-only refreshes
-        // produce no textual diff.
-        EntryStatus::Change(Change::SubmoduleModification(_))
-        | EntryStatus::IntentToAdd
-        | EntryStatus::NeedsUpdate(_) => None,
+        // gix reports an `add -N` entry as its own status rather than as a
+        // modification. The file is known to exist — the removal and directory
+        // tests both run ahead of the flag check
+        // (`gix-status/src/index_as_worktree/function.rs:415-442`) — so its
+        // post-image is the worktree's own content, at `ce_mode_from_stat()`'s mode.
+        EntryStatus::IntentToAdd => workdir
+            .and_then(|root| worktree_kind(root, &rela_path))
+            .map(|k| (rela_path, NewSide::Worktree(k), 0, None)),
+        // Submodule content modification and stat-only refreshes produce no
+        // textual diff.
+        EntryStatus::Change(Change::SubmoduleModification(_)) | EntryStatus::NeedsUpdate(_) => None,
     })
 }
 
@@ -5698,6 +5759,7 @@ pub(crate) fn no_index_body(
     ws: Whitespace,
     binary: bool,
     algorithm: gix::diff::blob::Algorithm,
+    ignore_blank_lines: bool,
 ) -> (u32, u32, Vec<u8>) {
     if binary {
         return (0, 0, Vec::new());
@@ -5710,12 +5772,20 @@ pub(crate) fn no_index_body(
     let diff = super::diff_pairs::compute_compacted(algorithm, &input, &before, &after, true);
     let changes: Vec<super::diff_pairs::Change> = diff
         .hunks()
-        .map(|h| super::diff_pairs::Change {
-            i1: h.before.start as usize,
-            chg1: h.before.len(),
-            i2: h.after.start as usize,
-            chg2: h.after.len(),
-            ignore: false,
+        .map(|h| {
+            // `xdl_mark_ignorable_lines()` (`--ignore-blank-lines`): a change group
+            // whose every removed and added record is blank is marked, which keeps
+            // `xdl_get_hunk()` from opening a hunk for it.
+            let ignore = ignore_blank_lines
+                && h.before.clone().all(|i| is_blank_record(before[i as usize], ws))
+                && h.after.clone().all(|i| is_blank_record(after[i as usize], ws));
+            super::diff_pairs::Change {
+                i1: h.before.start as usize,
+                chg1: h.before.len(),
+                i2: h.after.start as usize,
+                chg2: h.after.len(),
+                ignore,
+            }
         })
         .collect();
     super::diff_pairs::emit_unified(&before, &after, &changes, geom)
@@ -5729,13 +5799,28 @@ pub(crate) fn render_rows_stat(
     rows: &[(BString, BString, u32, u32, bool)],
     colors: &diff_color::DiffColors,
 ) {
+    render_rows_stat_ex(out, rows, colors, &StatWidths::default(), false);
+}
+
+/// [`render_rows_stat`] with the geometry `--stat=<w>` / `--stat-width` /
+/// `--stat-name-width` / `--stat-graph-width` / `--stat-count` selected, and with
+/// `--compact-summary`'s annotation switch.
+///
+/// `diff --no-index` is still `builtin/diff.c`, so it too has run
+/// `init_diffstat_widths()` and scales to the terminal; the four geometry flags
+/// are on the `add_diff_options()` table it shares with `git diff`.
+pub(crate) fn render_rows_stat_ex(
+    out: &mut Vec<u8>,
+    rows: &[(BString, BString, u32, u32, bool)],
+    colors: &diff_color::DiffColors,
+    widths: &StatWidths,
+    compact: bool,
+) {
     let (deltas, analyses) = synthetic_rows(rows);
-    // `diff --no-index` is still `builtin/diff.c`, so it too has run
-    // `init_diffstat_widths()` and scales to the terminal.
     diffstat::show_stats(
         out,
-        &stat_rows(&diffstat_pairs(&deltas, &analyses), false),
-        &StatWidths::default(),
+        &stat_rows(&diffstat_pairs(&deltas, &analyses), compact),
+        widths,
         colors,
     );
 }
@@ -6314,12 +6399,12 @@ fn stat_rows(pairs: &[(&Delta, &Analysis)], compact: bool) -> Vec<diffstat::Stat
 /// Each is an `OPT_CALLBACK_F` with a required argument (diff.c:6100-6111), so
 /// parse-options accepts both the glued `--opt=<n>` and the separated `--opt <n>`
 /// spelling; only the glued one used to be recognised here.
-fn is_stat_width_flag(flag: &str) -> bool {
+pub(crate) fn is_stat_width_flag(flag: &str) -> bool {
     matches!(flag, "--stat-width" | "--stat-name-width" | "--stat-graph-width" | "--stat-count")
 }
 
 /// The `StatWidths` slot a `--stat-*` flag writes.
-fn stat_width_slot_of<'a>(sw: &'a mut StatWidths, flag: &str) -> Option<&'a mut i64> {
+pub(crate) fn stat_width_slot_of<'a>(sw: &'a mut StatWidths, flag: &str) -> Option<&'a mut i64> {
     match flag {
         "--stat-width" => Some(&mut sw.width),
         "--stat-name-width" => Some(&mut sw.name_width),

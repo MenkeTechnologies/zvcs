@@ -318,6 +318,11 @@ impl Ws {
 struct Opts {
     cached: bool,                  // --cached: compare against the index, ignore the worktree
     match_missing: bool,           // -m: files missing from the worktree count as up to date
+    /// `--ita-invisible-in-index`: `do_oneway_diff()` (diff-lib.c) nulls out an
+    /// `add -N` index entry before comparing, so the path is either the tree's own
+    /// deletion or nothing at all. Off by default — the plumbing commands do not
+    /// raise the flag the way `cmd_diff()` does.
+    ita_invisible: bool,
     format: Format,
     nul: bool,                     // -z: NUL field/record terminators, no path quoting
     abbrev: Option<Option<usize>>, // --abbrev[=N]: None=full, Some(None)=auto, Some(Some(n))=N
@@ -559,7 +564,8 @@ common diff options:
 /// so `--ext-diff` and `--textconv` really had something to switch on.
 ///
 /// Deliberately absent, because the same sweep showed each one *does* change output:
-/// `--ita-invisible-in-index` (drops the `add -N` record under `--cached`). The
+/// `--ita-invisible-in-index` (drops the `add -N` record under `--cached`), which
+/// now has its own arm in the parse loop and its own field on [`Opts`]. The
 /// rename family — `-M`, `-C`, `-B`, `-l<n>`, `--rename-empty`/`--no-rename-empty` —
 /// left this list when `diffcore_rename` was wired in; each now has its own arm.
 /// `--diff-merges=<anything but off>` likewise has its own arm, because every mode but
@@ -603,8 +609,6 @@ fn render_only_option(a: &str) -> bool {
         "--function-context",
         "--ignore-submodules",
         "--irreversible-delete",
-        "--ita-invisible-in-index",
-        "--ita-visible-in-index",
         "--no-diff-merges",
         "--no-ext-diff",
         "--no-function-context",
@@ -737,6 +741,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut opts = Opts {
         cached: false,
         match_missing: false,
+        ita_invisible: false,
         format: Format::Raw,
         nul: false,
         abbrev: None,
@@ -967,6 +972,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
             "--merge-base" => merge_base = true,
             "-m" => opts.match_missing = true,
+            // `revs->diffopt.flags.ita_invisible_in_index`. Not render-only: it
+            // decides whether the `add -N` record is in the queue at all.
+            "--ita-invisible-in-index" => opts.ita_invisible = true,
+            "--ita-visible-in-index" => opts.ita_invisible = false,
             "--raw" => {
                 opts.format = Format::Raw;
                 raw_explicit = true;
@@ -2447,6 +2456,28 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
             });
             continue;
         };
+
+        // "i-t-a entries do not actually exist in the index (if we're looking at
+        // its content)" (`do_oneway_diff()`, diff-lib.c): the nulling is gated on
+        // `o->index_only`, so it applies under `--cached` and nowhere else — a
+        // worktree comparison still reports the file that is really there. With the
+        // entry nulled out, a path the tree also carries is a deletion and one it
+        // does not is not a change at all.
+        if opts.cached && opts.ita_invisible && info.intent_to_add {
+            if let Some((mode, id)) = src {
+                deltas.push(Delta {
+                    src_mode: mode,
+                    src_id: id,
+                    dst_mode: 0,
+                    dst_id: null,
+                    unmerged: false,
+                    path: path.clone(),
+                    rename: None,
+                    score: 0,
+                });
+            }
+            continue;
+        }
 
         if info.unmerged && opts.cached {
             // git's `diff_unmerge`: one record with the tree side and an empty

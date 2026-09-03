@@ -340,12 +340,25 @@ pub(crate) fn local_dest_that_is_not_a_repository(dest: &str) -> Option<&str> {
 }
 
 /// `match_push_refs()` reduced to what `send-pack` can ask of it: `--all` and
-/// `--mirror` take every local ref under `refs/`, and otherwise each `<ref>`
-/// argument is one `[+]<src>[:<dst>]` refspec.
+/// `--mirror` take local refs wholesale, and otherwise each `<ref>` argument is
+/// one `[+]<src>[:<dst>]` refspec.
 ///
-/// `get_local_heads()` (remote.c) is `for_each_ref`, so both flag forms cover
-/// tags and remote-tracking refs, not just branches — `send-pack --all` is a
-/// wider set than `git push --all`, which is refspec-driven.
+/// `get_local_heads()` (remote.c) is `for_each_ref`, so the candidate set is
+/// every ref — but `get_ref_match()` narrows it back down for the *matching*
+/// refspec that `--all` stands for:
+///
+/// ```c
+/// if (pat->matching) {
+///         if (!send_mirror && !starts_with(ref->name, "refs/heads/"))
+///                 return NULL;
+///         name = xstrdup(ref->name);
+/// }
+/// ```
+///
+/// So `--all` is `refs/heads/*` and only `--mirror` reaches tags and
+/// remote-tracking refs. Neither implies force: `--mirror` is `MATCH_REFS_MIRROR`,
+/// a *matching* flag, and the update's `force` still comes from the refspec's
+/// own `+` or from `args.force_update` (`--force`).
 fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
     let mut requests = Vec::new();
 
@@ -356,14 +369,15 @@ fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
             if !name.starts_with("refs/") {
                 continue;
             }
+            if !st.send_mirror && !name.starts_with("refs/heads/") {
+                continue;
+            }
             if let Some(id) = r.try_id() {
                 requests.push(Request {
                     src: Some(name.clone()),
                     name,
                     new: id.detach(),
-                    // `MATCH_REFS_MIRROR` forces every update; `--all` still
-                    // honours `--force` alone.
-                    force: st.force || st.send_mirror,
+                    force: st.force,
                     expected: None,
                     only_if_absent: false,
                     check_reachable: None,
@@ -569,17 +583,46 @@ fn prettify(name: &str) -> &str {
     name
 }
 
-/// `print_helper_status()` (send-pack.c): one machine-readable line per ref on
-/// **stdout**, terminated by a blank line, for a remote helper to parse.
+/// `print_helper_status()` (send-pack.c:28-126): one machine-readable line per
+/// ref on **stdout**, for a remote helper to parse.
+///
+/// It walks `remote_refs` — the remote's advertisement with each update's verdict
+/// filled in by `match_push_refs()` — so every advertised ref appears, and the
+/// ones no refspec matched are still reported, as `REF_STATUS_NONE`:
+///
+/// ```c
+/// case REF_STATUS_NONE:  res = "error"; msg = "no match"; break;
+/// case REF_STATUS_OK:    res = "ok";    break;
+/// case REF_STATUS_UPTODATE: res = "ok"; msg = "up to date"; break;
+/// case REF_STATUS_REJECT_NONFASTFORWARD: res = "error"; msg = "non-fast forward"; break;
+/// ```
+///
+/// Note `non-fast forward`: the helper vocabulary is its own, spelled without the
+/// second hyphen that the human-readable `To <url>` block uses. Newly created refs
+/// come last, in the order `match_push_refs()` appended them. There is no trailing
+/// blank line — each ref writes its own line and the loop ends.
 fn print_helper_status(outcome: &push_proto::Outcome) {
-    for s in &outcome.statuses {
+    let line = |s: &push_proto::RefStatus| {
         let name = s.report_name.as_deref().unwrap_or(&s.name);
         match &s.result {
+            Ok(()) if s.up_to_date => println!("ok {name} up to date"),
             Ok(()) => println!("ok {name}"),
+            // `REF_STATUS_REJECT_NONFASTFORWARD`'s helper spelling.
+            Err(reason) if reason == "non-fast-forward" => println!("error {name} non-fast forward"),
             Err(reason) => println!("error {name} {reason}"),
         }
+    };
+    for name in &outcome.advertised {
+        match outcome.statuses.iter().find(|s| &s.name == name) {
+            Some(s) => line(s),
+            None => println!("error {name} no match"),
+        }
     }
-    println!();
+    for s in &outcome.statuses {
+        if !outcome.advertised.contains(&s.name) {
+            line(s);
+        }
+    }
 }
 
 /// Walk `args` exactly the way git's parse-options walks them, emitting git's

@@ -331,6 +331,14 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
             .collect()
     };
 
+    // `enter_repo()` reads the candidate it settles on with the dying spelling of
+    // `read_gitfile()`, so an operand naming a plain file that is not a gitfile
+    // ends there rather than at the "does not appear to be a git repository" line
+    // below.
+    if let Some(code) = crate::setup::enter_repo_gitfile_gate(&candidates) {
+        return Ok(code);
+    }
+
     // `open_path_as_is` keeps gix from silently appending `/.git` itself, which
     // would make `--strict` accept a worktree root that git rejects.
     let options = gix::open::Options::default().open_path_as_is(true);
@@ -515,6 +523,11 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
             filter_spec = Some(spec.to_string());
             continue;
         }
+        // `process_deepen_not()` runs before the line reaches the rest of the
+        // shallow parser, and dies bare — see [`deepen_not_refused`].
+        if let Some(message) = deepen_not_refused(repo, text) {
+            crate::git_fatal!("{message}");
+        }
         // `shallow <oid>` and the four `deepen*` tokens (upload-pack.c:1046-1104).
         match shallow_req.absorb(text) {
             Ok(true) => continue,
@@ -536,9 +549,12 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
         let mut out = std::io::stdout().lock();
         // git reports the refusal twice: an `ERR` pkt-line so the client sees a
         // protocol-level reason, and the same text on stderr for the server log.
+        // The stderr half is `die()`, not `error()` — `check_non_tip()` writes the
+        // packet and then dies with the same sentence (upload-pack.c), so the line
+        // carries git's `fatal: ` prefix.
         write_pkt(&mut out, format!("ERR upload-pack: not our ref {refused}").as_bytes())?;
         out.flush()?;
-        eprintln!("error: git upload-pack: not our ref {refused}");
+        eprintln!("fatal: git upload-pack: not our ref {refused}");
         return Ok(ExitCode::from(128));
     }
 
@@ -550,6 +566,9 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     // walk below stops at them through `client_side_commits`.
     let deepening = shallow_req.deepen.requested();
     let boundary = deepening.then(|| crate::shallow_serve::compute(repo, &wants, &shallow_req));
+    if let Some(message) = empty_shallow_window(&shallow_req, boundary.as_ref()) {
+        crate::git_fatal!("{message}");
+    }
     if let Some(boundary) = &boundary {
         let mut out = std::io::stdout().lock();
         for id in &boundary.shallow {
@@ -2051,6 +2070,11 @@ fn process_fetch_args(
             _ => {}
         }
 
+        // `process_deepen_not()` again, with the same bare `die()` — v2 routes the
+        // line through the identical helper (upload-pack.c:1662).
+        if let Some(message) = deepen_not_refused(repo, &arg) {
+            die!("{message}");
+        }
         // `shallow <oid>` and the `deepen*` tokens, gated on the `shallow` fetch
         // capability this server advertises.
         match args.shallow.absorb(&arg) {
@@ -2152,6 +2176,9 @@ fn send_pack_section(
     // otherwise, so an ordinary fetch sees no shallow-info at all.
     let deepening = args.shallow.deepen.requested();
     let boundary = deepening.then(|| crate::shallow_serve::compute(repo, &args.wants, &args.shallow));
+    if let Some(message) = empty_shallow_window(&args.shallow, boundary.as_ref()) {
+        die!("{message}");
+    }
     let own: Vec<ObjectId> = repo
         .shallow_commits()
         .ok()
@@ -2465,4 +2492,94 @@ mod tests {
         assert_eq!(all.fetch_values(), "shallow wait-for-done filter ref-in-want sideband-all");
         assert!(!all.fetch_values().contains("packfile-uris"), "{}", all.fetch_values());
     }
+}
+
+/// `expand_ref()` (refs.c): how many `ref_rev_parse_rules` spellings of `name`
+/// resolve for reading.
+///
+/// ```c
+/// for (p = ref_rev_parse_rules; *p; p++) {
+///         strbuf_addf(&fullref, *p, len, str);
+///         r = refs_resolve_ref_unsafe(refs, fullref.buf, RESOLVE_REF_READING, …);
+///         if (r) {
+///                 if (!refs_found++)
+///                         *ref = xstrdup(r);
+///                 if (!warn_ambiguous_refs)
+///                         break;
+///         }
+/// }
+/// ```
+///
+/// The early `break` is why the count can never exceed one with
+/// `core.warnAmbiguousRefs` off, and therefore why the ambiguity `die()` below is
+/// unreachable in that configuration.
+fn expand_ref_count(repo: &gix::Repository, name: &str) -> usize {
+    let mut found = 0usize;
+    for rule in [
+        "",
+        "refs/",
+        "refs/tags/",
+        "refs/heads/",
+        "refs/remotes/",
+        "refs/remotes/\u{0}/HEAD",
+    ] {
+        let candidate = match rule.split_once('\u{0}') {
+            Some((head, tail)) => format!("{head}{name}{tail}"),
+            None => format!("{rule}{name}"),
+        };
+        if crate::refname::resolve_ref_reading(repo, &candidate).is_some() {
+            found += 1;
+            if !crate::refname::warn_ambiguous_refs(repo) {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// `process_deepen_not()` (upload-pack.c:1028-1046): the half of a `deepen-not`
+/// line that needs the repository, which the transport-agnostic
+/// [`crate::shallow_serve::Request::absorb`] cannot do.
+///
+/// ```c
+/// cnt = expand_ref(the_repository, arg, strlen(arg), &oid, &ref);
+/// if (cnt > 1)
+///         die("git upload-pack: ambiguous deepen-not: %s", line);
+/// if (cnt < 1)
+///         die("git upload-pack: deepen-not is not a ref: %s", line);
+/// ```
+///
+/// Both are bare `die()`s: unlike the `filter` refusals nearby, no `ERR` pkt-line
+/// precedes them, so the client sees this process's stderr and then end-of-file.
+/// Returns the message to die with, or `None` when the line is not a `deepen-not`
+/// or names exactly one ref.
+fn deepen_not_refused(repo: &gix::Repository, line: &str) -> Option<String> {
+    let arg = line.strip_prefix("deepen-not ")?.trim_end();
+    match expand_ref_count(repo, arg) {
+        1 => None,
+        0 => Some(format!("git upload-pack: deepen-not is not a ref: {line}")),
+        _ => Some(format!("git upload-pack: ambiguous deepen-not: {line}")),
+    }
+}
+
+/// `deepen_by_rev_list()`'s refusal (shallow.c:241-242):
+///
+/// ```c
+/// traverse_commit_list(&revs, show_commit, NULL, &not_shallow_list);
+/// if (!not_shallow_list)
+///         die("no commits selected for shallow requests");
+/// ```
+///
+/// It guards the `deepen-since`/`deepen-not` arm alone — the `--depth` arm goes
+/// through `deepen()`, which has no such check — so a `deepen-since` in the future
+/// or a `deepen-not` that excludes everything ends the request rather than
+/// producing an empty window.
+fn empty_shallow_window(
+    request: &crate::shallow_serve::Request,
+    boundary: Option<&crate::shallow_serve::Boundary>,
+) -> Option<String> {
+    let deepen_rev_list = request.deepen.since.is_some() || !request.deepen.not.is_empty();
+    let boundary = boundary?;
+    (deepen_rev_list && boundary.commits.is_empty())
+        .then(|| "no commits selected for shallow requests".to_owned())
 }

@@ -194,6 +194,11 @@ pub struct RefStatus {
 pub struct Outcome {
     pub url: String,
     pub statuses: Vec<RefStatus>,
+    /// Every ref the remote advertised, in the order it sent them — git's
+    /// `remote_refs` list before `match_push_refs()` fills in the updates.
+    /// `send-pack --helper-status` reports one line per entry, so the ones no
+    /// refspec matched have to survive to the report as `no match`.
+    pub advertised: Vec<String>,
     /// `unpack ok`, or the server's failure reason.
     pub unpack: Result<(), String>,
 }
@@ -380,6 +385,15 @@ pub fn send_pack(
             if crate::transport_err::ssh_fatal(url.as_str(), &err).is_some() {
                 crate::hosted::exit(128);
             }
+            // Over the local transport `git_connect()` spawns the receive-pack
+            // program itself and reads the advertisement from its stdout; when
+            // that read comes up empty the caller dies with
+            // `die_initial_contact(0)`, which names neither the program nor the
+            // path. `--receive-pack=false` is exactly that shape.
+            if crate::transport_err::is_local(url.as_str()) {
+                crate::transport_err::initial_contact_fatal();
+                crate::hosted::exit(128);
+            }
             return Err(err);
         }
     };
@@ -387,11 +401,16 @@ pub fn send_pack(
     // Map every advertised ref to its tip so we can fill in each update's old
     // value (git's `remote_refs`, matched against `refs->name`).
     let mut advertised: HashMap<String, ObjectId> = HashMap::new();
+    // The same names again in wire order, which is the order `print_helper_status()`
+    // walks `remote_refs` in.
+    let mut advertised_order: Vec<String> = Vec::new();
     if let Some(refs) = &handshake.refs {
         for r in refs {
             let (name, target, _peeled) = r.unpack();
             if let (Ok(name), Some(oid)) = (std::str::from_utf8(name), target) {
-                advertised.insert(name.to_owned(), oid.to_owned());
+                if advertised.insert(name.to_owned(), oid.to_owned()).is_none() {
+                    advertised_order.push(name.to_owned());
+                }
             }
         }
     }
@@ -482,7 +501,22 @@ pub fn send_pack(
         .filter(|v| !v.is_empty());
     let sign_cert = match opts.signed {
         Signed::Never => false,
-        Signed::IfAsked => nonce.is_some(),
+        Signed::IfAsked => {
+            // `send_pack()` (send-pack.c): the two non-`never` modes differ only
+            // in how loudly they give up on a server that advertised no nonce.
+            //
+            // ```c
+            // else if (args->push_cert == SEND_PACK_PUSH_CERT_IF_ASKED)
+            //         warning(_("not sending a push certificate since the"
+            //                   " receiving end does not support --signed push"));
+            // ```
+            if nonce.is_none() {
+                eprintln!(
+                    "warning: not sending a push certificate since the receiving end does not support --signed push"
+                );
+            }
+            nonce.is_some()
+        }
         Signed::Always => {
             if nonce.is_none() {
                 crate::git_fatal!("the receiving end does not support --signed push");
@@ -665,6 +699,7 @@ pub fn send_pack(
         return Ok(Outcome {
             url,
             statuses,
+            advertised: advertised_order,
             unpack: Ok(()),
         });
     }
@@ -723,6 +758,7 @@ pub fn send_pack(
         return Ok(Outcome {
             url,
             statuses,
+            advertised: advertised_order,
             unpack: Ok(()),
         });
     }
@@ -945,6 +981,7 @@ pub fn send_pack(
     Ok(Outcome {
         url,
         statuses,
+        advertised: advertised_order,
         unpack,
     })
 }

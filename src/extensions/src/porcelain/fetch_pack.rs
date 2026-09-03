@@ -14,7 +14,9 @@
 //!     given on the command line (the plain form; see below for `--stateless-rpc`).
 //!   * `-q`/`--quiet`, `-v`, `--no-progress` — accepted; this port never paints
 //!     progress, so they only ever affected stderr.
-//!   * `--thin`/`--no-thin` — accepted, see the note on thin packs below.
+//!   * `--thin` — accepted, see the note on thin packs below. There is no
+//!     `--no-thin`: git's option loop knows only `--thin`, so the negated spelling
+//!     is a usage error there and here.
 //!   * `--depth=<n>`, `--shallow-since=<date>`, `--shallow-exclude=<ref>`
 //!     (repeatable) and `--deepen-relative` — the shallow-clone family. Each is
 //!     mapped onto the vendored `Shallow` request, which puts the same
@@ -66,14 +68,6 @@
 //!   * `--upload-pack=<exec>` / `--exec=<exec>` naming anything but the default
 //!     `git-upload-pack` — the vendored transport `connect`
 //!     takes no per-invocation override for the remote program.
-//!   * `--diag-url` **on an ssh URL**. The local, `file://` and `git://` forms
-//!     are covered: [`parse_connect_url`] is a direct port of `connect.c`'s own
-//!     URL splitter, written out rather than delegated to `gix-url`, which
-//!     decomposes URLs differently (scp-like `host:path`, port defaulting, path
-//!     normalisation) and would not print git's fields. git reaches the ssh
-//!     breakdown (`userandhost`/`port` instead of `hostandport`) only after
-//!     `transport_check_allowed("ssh")` and the `strange pathname` guard, and
-//!     neither has a home in this tree, so that one form bails.
 //!   * `--check-self-contained-and-connected`, `--stateless-rpc`, `--lock-pack`.
 //!   * a `<ref>` given as a raw object hash (`uploadpack.allowTipSHA1InWant`
 //!     and friends): the vendored refspec layer maps names, not bare ids.
@@ -102,8 +96,8 @@ use gix::remote::fetch::{Shallow, Status, Tags};
 const USAGE: &str = "usage: git fetch-pack [--all] [--stdin] [--quiet | -q] [--keep | -k] [--thin] [--include-tag] [--upload-pack=<git-upload-pack>] [--depth=<n>] [--no-progress] [--diag-url] [-v] [<host>:]<directory> [<refs>...]\n";
 
 /// The flags this port implements, quoted in every rejection message.
-const PORTED: &str = "ported: --all, --stdin, -q/--quiet, -v, --no-progress, --thin/--no-thin, \
-                      --depth, --shallow-since, --shallow-exclude, --deepen-relative";
+const PORTED: &str = "ported: --all, --stdin, -q/--quiet, -v, --no-progress, --thin, \
+                      --depth, --shallow-since, --shallow-exclude, --deepen-relative, --diag-url";
 
 /// git's built-in `unpack_limit`, overridable via `fetch.unpackLimit` and then
 /// `transfer.unpackLimit`.
@@ -169,8 +163,10 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             // leaves empty on the success path.
             "-q" | "--quiet" | "-v" | "--no-progress" => {}
             // gitoxide always requests a thin pack; the end state is identical
-            // either way (see the module docs).
-            "--thin" | "--no-thin" => {}
+            // either way (see the module docs). git's loop knows `--thin` and
+            // nothing else — there is no `--no-thin` entry (builtin/fetch-pack.c:100),
+            // so that spelling falls through to `usage(fetch_pack_usage)`.
+            "--thin" => {}
             "-k" | "--keep" => keep = true,
             // `--lock-pack` additionally makes `index-pack` hold a `.keep` lock
             // whose path `cmd_fetch_pack()` prints as `lock <path>` and expects
@@ -369,6 +365,22 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
             crate::git_fatal!("{}", refusal.0);
         }
+        // `get_packet_data()` (pkt-line.c): a pkt-line read that meets end-of-file
+        // where a line was expected is
+        // `die(_("the remote end hung up unexpectedly"))`, not a complaint about
+        // the reply's shape. That is what a server which `die()`d mid-negotiation
+        // leaves behind — it has already said why on the stderr both processes
+        // share — so the port must not replace git's second line with a decoding
+        // error of its own.
+        let hung_up = e.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+        });
+        if hung_up {
+            eprintln!("fatal: the remote end hung up unexpectedly");
+            return Ok(ExitCode::from(128));
+        }
         eprintln!("fatal: {e}");
         return Ok(ExitCode::from(128));
     }
@@ -438,10 +450,34 @@ impl UrlScheme {
 /// on, so a percent-encoded URL prints twice in two forms — that is git's
 /// output and it is reproduced here.
 ///
-/// An SSH URL takes git's other arm, which prints `userandhost`/`port` instead
-/// and reaches it only after `transport_check_allowed("ssh")` and the
-/// `strange pathname` guard. Neither has a home in this tree, so that arm bails
-/// rather than printing a breakdown git might have refused to produce.
+/// An SSH URL takes git's other arm (connect.c:1459-1500), which is reached
+/// through the shared `else` branch and therefore runs two guards first:
+///
+/// ```c
+/// } else {
+///         if (looks_like_command_line_option(path))
+///                 die(_("strange pathname '%s' blocked"), path);
+///         …
+///         if (protocol == PROTO_SSH) {
+///                 char *ssh_host = hostandport;
+///                 const char *port = NULL;
+///                 transport_check_allowed("ssh");
+///                 get_host_and_port(&ssh_host, &port);
+///                 if (!port)
+///                         port = get_port(ssh_host);
+///                 if (flags & CONNECT_DIAG_URL) {
+///                         printf("Diag: url=%s\n", url ? url : "NULL");
+///                         printf("Diag: protocol=%s\n", prot_name(protocol));
+///                         printf("Diag: userandhost=%s\n", ssh_host ? ssh_host : "NULL");
+///                         printf("Diag: port=%s\n", port ? port : "NONE");
+///                         printf("Diag: path=%s\n", path ? path : "NULL");
+///                         return NULL;
+///                 }
+/// ```
+///
+/// so it prints `userandhost`/`port` in place of `hostandport`, and a path that
+/// looks like a command-line option or a `protocol.ssh.allow` that forbids the
+/// transport ends the command before any breakdown is printed.
 fn diag_connect_url(url: &str) -> Result<ExitCode> {
     let (scheme, hostandport, path) = match parse_connect_url(url) {
         Ok(parts) => parts,
@@ -450,19 +486,92 @@ fn diag_connect_url(url: &str) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
-    if scheme == UrlScheme::Ssh {
-        bail!(
-            "--diag-url on an ssh URL is not ported: git reaches that breakdown \
-             (userandhost/port) only after `transport_check_allowed(\"ssh\")` and the \
-             `strange pathname` guard, neither of which exists here ({PORTED}, --diag-url \
-             for local, file:// and git:// URLs)"
+    if scheme != UrlScheme::Ssh {
+        print!(
+            "Diag: url={url}\nDiag: protocol={}\nDiag: hostandport={hostandport}\nDiag: path={path}\n",
+            scheme.name()
         );
+        return Ok(ExitCode::SUCCESS);
     }
+
+    // `looks_like_command_line_option(path)`: a leading `-` would reach the
+    // remote shell as a flag rather than as a repository.
+    if path.starts_with('-') {
+        eprintln!("fatal: strange pathname '{path}' blocked");
+        return Ok(ExitCode::from(128));
+    }
+    if let Some(code) = crate::setup::transport_check_allowed("ssh") {
+        return Ok(code);
+    }
+    let (userandhost, port) = split_host_and_port(hostandport);
     print!(
-        "Diag: url={url}\nDiag: protocol={}\nDiag: hostandport={hostandport}\nDiag: path={path}\n",
-        scheme.name()
+        "Diag: url={url}\nDiag: protocol={}\nDiag: userandhost={userandhost}\nDiag: port={}\nDiag: path={path}\n",
+        scheme.name(),
+        port.as_deref().unwrap_or("NONE"),
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// `strtol(s, &end, 10)` under the caller's `end != start && *end == '\0'` test:
+/// the whole string has to be one optionally-signed decimal number, after the
+/// leading whitespace `strtol` skips of its own accord.
+fn strtol_whole(s: &str) -> Option<i64> {
+    let t = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: i64 = digits.parse().ok()?;
+    Some(if negative { -value } else { value })
+}
+
+/// `get_host_and_port()` (connect.c:772-786) followed by the `if (!port) port =
+/// get_port(ssh_host)` that always runs after it (connect.c:1061-1075,1485-1487).
+///
+/// Both look for a `:` and take what follows as the port only when it is a whole
+/// decimal number below 65536; `get_host_and_port` additionally drops a *trailing*
+/// colon that names no port, and searches from past an `[…]` IPv6 literal whose
+/// brackets it strips in place.
+fn split_host_and_port(mut host: String) -> (String, Option<String>) {
+    // `host_end(&host, 1)`.
+    let start = host.find("@[").map_or(0, |i| i + 1);
+    let mut end = 0usize;
+    if host[start..].starts_with('[') {
+        if let Some(rel) = host[start + 1..].find(']') {
+            let close = start + 1 + rel;
+            host.remove(close);
+            host.remove(start);
+            // One past the literal, now that both brackets are gone.
+            end = close - 1;
+        }
+    }
+    // `get_host_and_port`'s own colon search, from past the literal.
+    if let Some(rel) = host[end..].find(':') {
+        let colon = end + rel;
+        let rest = host[colon + 1..].to_owned();
+        if !rest.is_empty() && strtol_whole(&rest).is_some_and(|p| (0..65536).contains(&p)) {
+            host.truncate(colon);
+            return (host, Some(rest));
+        }
+        if rest.is_empty() {
+            // `else if (!colon[1]) *colon = 0;` — a bare trailing colon names no
+            // port, but is still not part of the host.
+            host.truncate(colon);
+        }
+    }
+    // `get_port()`, which runs whenever the above found no port and starts over
+    // from the front of whatever it left behind.
+    if let Some(colon) = host.find(':') {
+        let rest = host[colon + 1..].to_owned();
+        if !rest.is_empty() && strtol_whole(&rest).is_some_and(|p| (0..65536).contains(&p)) {
+            host.truncate(colon);
+            return (host, Some(rest));
+        }
+    }
+    (host, None)
 }
 
 /// Port of `parse_connect_url()` (connect.c:1054), returning

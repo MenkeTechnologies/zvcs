@@ -74,7 +74,7 @@
 //! `check_refname_format()` validation behind git's
 //! `die("bad git namespace path \"%s\"")`.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 /// The raw `GIT_NAMESPACE` value, or `None` when it is unset or empty.
 ///
@@ -117,7 +117,7 @@ pub fn from_env() -> Option<String> {
 pub fn apply(repo: &mut gix::Repository) -> Result<()> {
     let Some(raw) = from_env() else { return Ok(()) };
     if repo.set_namespace(raw.as_str()).is_err() {
-        bail!("bad git namespace path \"{raw}\"");
+        crate::git_fatal!("bad git namespace path \"{raw}\"");
     }
     Ok(())
 }

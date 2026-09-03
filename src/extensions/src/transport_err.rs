@@ -204,3 +204,29 @@ fn remote_error_message(err: &(dyn std::error::Error + 'static)) -> Option<Strin
 fn is_ssh(url: &str) -> bool {
     gix::url::parse(url.into()).is_ok_and(|u| u.scheme == gix::url::Scheme::Ssh)
 }
+
+/// `die_initial_contact(0)` (connect.c):
+///
+/// ```c
+/// die(_("Could not read from remote repository.\n\n"
+///       "Please make sure you have the correct access rights\n"
+///       "and the repository exists."));
+/// ```
+///
+/// The local transport reaches this whenever the program on the other end — the
+/// one `--receive-pack`/`--upload-pack` named — produced no advertisement, and it
+/// names neither the program nor the path: git has nothing to report but that the
+/// conversation never started. Exit 128.
+pub fn initial_contact_fatal() -> ExitCode {
+    eprintln!("fatal: Could not read from remote repository.");
+    eprintln!();
+    eprintln!("Please make sure you have the correct access rights");
+    eprintln!("and the repository exists.");
+    ExitCode::from(128)
+}
+
+/// Whether `url` names a path on this machine, which is the transport
+/// `git_connect()` serves by spawning the service program directly.
+pub fn is_local(url: &str) -> bool {
+    gix::url::parse(url.into()).is_ok_and(|u| u.scheme == gix::url::Scheme::File)
+}

@@ -255,6 +255,25 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
         Parsed::Exit(code) => return Ok(code),
     };
 
+    // `enter_repo()` reads the candidate its suffix scan settles on with the
+    // dying spelling of `read_gitfile()` (path.c:811), so an operand naming a
+    // plain file that is not a gitfile ends at `invalid gitfile format:` rather
+    // than at the "does not appear to be a git repository" line below.
+    {
+        let base = std::path::Path::new(&opts.dir).as_os_str().to_owned();
+        let candidates: Vec<std::path::PathBuf> = ["/.git", "", ".git/.git", ".git"]
+            .iter()
+            .map(|suffix| {
+                let mut p = base.clone();
+                p.push(suffix);
+                std::path::PathBuf::from(p)
+            })
+            .collect();
+        if let Some(code) = crate::setup::enter_repo_gitfile_gate(&candidates) {
+            return Ok(code);
+        }
+    }
+
     let Some(mut repo) = open_repo(&opts.dir) else {
         eprintln!(
             "fatal: '{}' does not appear to be a git repository",

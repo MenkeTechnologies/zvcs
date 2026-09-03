@@ -607,6 +607,11 @@ fn resolve_outcome<'repo>(
             peeled.push(id);
         }
         let (base, ours, theirs) = (peeled[0], peeled[1], peeled[2]);
+        // `opt.ancestor = merge_base` (merge-tree.c:463): the spec is used verbatim,
+        // so `||||||| <spec>` under `merge.conflictStyle=diff3`/`zdiff3` names what
+        // the user asked for rather than the tree it peeled to. Leaving it unset
+        // printed a bare `|||||||`.
+        labels.ancestor = Some(BStr::new(base_spec.as_bytes()));
         // `init_merge_options()` runs after the operands are peeled and can die
         // on a bad `merge.renameLimit` — see
         // [`super::merge::merge_recursive_config_check`].

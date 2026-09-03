@@ -323,21 +323,27 @@ fn render_one<'r, 's>(
         // sides are not regular files (merge-ort.c:4238-4269). `Unknown` is
         // `gix-merge`'s catch-all and lands here too whenever it carries the
         // same shape, which is how a symlink/submodule clash is reported.
-        Err(ResolutionFailure::OursAddedTheirsAddedTypeMismatch { .. })
-        | Err(ResolutionFailure::Unknown)
-            if is_type_clash(ours, theirs) =>
-        {
+        Err(
+            failure @ (ResolutionFailure::OursAddedTheirsAddedTypeMismatch { .. } | ResolutionFailure::Unknown),
+        ) if is_type_clash(ours, theirs) => {
             let path = ours.location().to_owned();
-            // `rename_a`/`rename_b` are set from `S_ISREG` alone: a regular file
-            // keeps its name and everything else moves, so "one" is renamed
-            // exactly when either side is a regular file.
+            // `rename_a`/`rename_b` are set from `S_ISREG` alone: the regular
+            // file is the side that moves, so exactly "one" of them is renamed
+            // whenever either side is a regular file, and "both" otherwise.
             let which = if change_mode(ours).is_blob() || change_mode(theirs).is_blob() {
                 "one"
             } else {
                 "both"
             };
+            // git names the shared path first and the path the moved side was
+            // given second (`path, rename_a ? a_path : b_path`,
+            // merge-ort.c:4163-4166) — a second field `merge-tree -z` prints.
+            let mut paths = vec![path.clone()];
+            if let ResolutionFailure::OursAddedTheirsAddedTypeMismatch { their_unique_location } = failure {
+                paths.push(their_unique_location.clone());
+            }
             out.push(Message {
-                paths: vec![path.clone()],
+                paths,
                 ctype: "CONFLICT (distinct modes)",
                 text: format!(
                     "CONFLICT (distinct types): {path} had different types on each side; renamed {which} of them so each can be recorded somewhere.\n"
@@ -375,9 +381,81 @@ fn render_one<'r, 's>(
             out.push(modify_delete(&path, delete_branch, modify_branch));
         }
 
+        // One side renamed a directory and the other put a change inside the old
+        // name, so merge-ort moved the change along (`apply_directory_rename_and_ort`,
+        // merge-ort.c:2797-2839). Under `merge.directoryRenames=conflict` — git's
+        // default — the move is only *suggested* and the path stays unmerged; under
+        // `true` the same sentence is printed as a `Path updated:` hint and the merge
+        // stays clean. Both come from the same `path_msg()` pair, keyed on the new
+        // path with the old one following it.
+        Err(ResolutionFailure::DirectoryRenameSuggested { final_location }) => {
+            out.push(directory_rename_message(
+                repo, operands, ours, theirs, final_location, true,
+            )?);
+        }
+        Ok(Resolution::SourceLocationAffectedByRename { final_location }) => {
+            out.push(directory_rename_message(
+                repo, operands, ours, theirs, final_location, false,
+            )?);
+        }
+
         _ => return Ok(None),
     }
     Ok(Some(out))
+}
+
+/// merge-ort's directory-rename notice (merge-ort.c:2797-2839), in both the
+/// `CONFLICT (file location)` and the `Path updated:` spelling.
+///
+/// The two changes arrive without a fixed order, so the directory rename is
+/// picked out by being the tree-mode [`Change::Rewrite`] — the only shape
+/// `rewrite_location_with_renamed_directory()` follows — and the other change is
+/// the one that was carried along.
+fn directory_rename_message<'r, 's>(
+    repo: &'r gix::Repository,
+    operands: &mut Operands<'r, 's>,
+    ours: &Change,
+    theirs: &Change,
+    final_location: &BString,
+    suggested: bool,
+) -> Result<Message> {
+    let moved = if change_mode(ours).is_tree() { theirs } else { ours };
+    let new_path = final_location.clone();
+    let old_path = moved.location().to_owned();
+    // `branch_with_new_path` is the side that carries the change, and it is the
+    // only side whose tree still holds a file at the change's own path.
+    let (branch_with_new_path, branch_with_dir_rename) = operands.split_at(repo, old_path.as_bstr())?;
+    // `pair->status == 'A'`: an addition names only where it landed, while a
+    // rename names where it came from as well.
+    let text = match (moved, suggested) {
+        (Change::Addition { .. }, true) => format!(
+            "CONFLICT (file location): {old_path} added in {branch_with_new_path} inside a directory that was renamed in {branch_with_dir_rename}, suggesting it should perhaps be moved to {new_path}.\n"
+        ),
+        (Change::Addition { .. }, false) => format!(
+            "Path updated: {old_path} added in {branch_with_new_path} inside a directory that was renamed in {branch_with_dir_rename}; moving it to {new_path}.\n"
+        ),
+        (_, true) => {
+            let source = moved.source_location();
+            format!(
+                "CONFLICT (file location): {source} renamed to {old_path} in {branch_with_new_path}, inside a directory that was renamed in {branch_with_dir_rename}, suggesting it should perhaps be moved to {new_path}.\n"
+            )
+        }
+        (_, false) => {
+            let source = moved.source_location();
+            format!(
+                "Path updated: {source} renamed to {old_path} in {branch_with_new_path}, inside a directory that was renamed in {branch_with_dir_rename}; moving it to {new_path}.\n"
+            )
+        }
+    };
+    Ok(Message {
+        paths: vec![new_path, old_path],
+        ctype: if suggested {
+            "CONFLICT (directory rename suggested)"
+        } else {
+            "Path updated due to directory rename"
+        },
+        text,
+    })
 }
 
 /// merge-ort's modify/delete notice (merge-ort.c:4406-4410), shared by the

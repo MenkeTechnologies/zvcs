@@ -1615,7 +1615,14 @@ fn abort() -> Result<ExitCode> {
     // git's `reset_refs()` records the pre-reset HEAD in ORIG_HEAD, and the reset it
     // performs (`--merge` to HEAD) logs on `HEAD` even though the branch does not move.
     set_orig_head(&repo, head_id)?;
-    super::checkout::record_head_move(&repo, Some(head_id), Some(head_id), "reset: moving to HEAD");
+    // `append_head_log`, not `record_head_move`: nothing here edits `HEAD`
+    // through `gix-ref` — `set_orig_head` writes `ORIG_HEAD` and the worktree
+    // update touches no ref — so there is no half-written line to replace, and
+    // `record_head_move`'s replace-the-identical-tail rule would instead eat the
+    // line an *earlier* `merge --abort` left behind. `log_ref_write_fd()` appends
+    // unconditionally, so aborting twice leaves two `reset: moving to HEAD`
+    // entries.
+    super::checkout::append_head_log(&repo, Some(head_id), Some(head_id), "reset: moving to HEAD");
     remove_merge_state(repo.git_dir(), true);
 
     Ok(ExitCode::SUCCESS)

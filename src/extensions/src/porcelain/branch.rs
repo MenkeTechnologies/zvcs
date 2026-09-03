@@ -755,9 +755,41 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    // git's option table marks --show-current and the list options as mutually
-    // exclusive, so `--list --show-current` is a usage error before any work.
-    if o.show_current && (o.explicit_list || o.delete || o.rename || o.copy) {
+    // ```c
+    // if (filter.with_commit || filter.no_commit ||
+    //     filter.reachable_from || filter.unreachable_from || filter.points_at.nr)
+    //         list = 1;
+    //
+    // if (!!delete + !!rename + !!copy + !!new_upstream + !!show_current +
+    //     !!list + !!edit_description + !!unset_upstream > 1)
+    //         usage_with_options(builtin_branch_usage, options);
+    // ```
+    //
+    // (`cmd_branch()`, builtin/branch.c.) Exactly one action per invocation, and
+    // a reachability filter counts as `--list` before the tally is taken — which
+    // is why `git branch -d --contains HEAD` is the usage block at 129 rather
+    // than a delete that quietly ignores the filter. `--show-current` is in the
+    // same tally, so the narrower check it used to have is subsumed here.
+    let listing = o.explicit_list
+        || !o.contains.is_empty()
+        || !o.no_contains.is_empty()
+        || !o.merged.is_empty()
+        || !o.no_merged.is_empty()
+        || !o.points_at.is_empty();
+    let actions = [
+        o.delete,
+        o.rename,
+        o.copy,
+        o.set_upstream_to.is_some(),
+        o.show_current,
+        listing,
+        o.edit_description,
+        o.unset_upstream,
+    ]
+    .into_iter()
+    .filter(|&on| on)
+    .count();
+    if actions > 1 {
         return usage_exit();
     }
 
@@ -2250,8 +2282,32 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         Some(r) => r,
         None => return fatal(format!("no branch named '{old}'")),
     };
-    if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() && !o.force {
-        return fatal(format!("a branch named '{new}' already exists"));
+    // ```c
+    // if (!force)
+    //         die(_("a branch named '%s' already exists"), ref->buf + strlen("refs/heads/"));
+    // worktrees = get_worktrees();
+    // wt = find_shared_symref(worktrees, "HEAD", ref->buf);
+    // if (wt && !wt->is_bare)
+    //         die(_("cannot force update the branch '%s' used by worktree at '%s'"),
+    //             ref->buf + strlen("refs/heads/"), wt->path);
+    // ```
+    //
+    // (`validate_new_branchname()`, branch.c.) `--force` overrides the destination
+    // already existing, never a worktree standing on it — moving the ref would
+    // leave that checkout's index and worktree describing a commit its own `HEAD`
+    // no longer names. Renaming a branch onto its own name skips the whole check,
+    // which is why it is guarded by `old_full != new_full` exactly as git guards
+    // it with `strcmp(oldname, newname)`.
+    if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() {
+        if !o.force {
+            return fatal(format!("a branch named '{new}' already exists"));
+        }
+        if let Some(path) = super::worktree::branch_checked_out(repo, &new_full)? {
+            return fatal(format!(
+                "cannot force update the branch '{new}' used by worktree at '{}'",
+                super::worktree::path_to_string(&path)
+            ));
+        }
     }
     let target = old_ref.peel_to_id()?.detach();
 
@@ -2327,6 +2383,22 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         })?;
         // git renames the branch's config section along with the ref.
         move_branch_config(repo, &old, &new, true)?;
+        // ```c
+        // for (i = 0; worktrees[i]; i++) {
+        //         if (!worktrees[i]->is_detached &&
+        //             !strcmp(oldref, worktrees[i]->head_ref)) {
+        //                 refs = get_worktree_ref_store(worktrees[i]);
+        //                 if (refs_update_symref(refs, "HEAD", newref, logmsg))
+        //                         die(...);
+        //         }
+        // }
+        // ```
+        //
+        // (`replace_each_worktree_head_symref()`, worktree.c, called by
+        // `copy_or_rename_branch()`.) A *linked* worktree standing on the renamed
+        // branch follows it; without this its `HEAD` was left naming a ref that no
+        // longer exists, so the checkout read as unborn.
+        repoint_linked_worktree_heads(repo, &old_full, &new_name, target, &message);
     }
 
     if head_follows {
@@ -2364,6 +2436,63 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Port of `replace_each_worktree_head_symref()` (`worktree.c`): repoint every
+/// *linked* worktree whose `HEAD` is symbolic to `old_full` at `new_name`,
+/// writing the rename's own message into that worktree's `logs/HEAD`. The
+/// current worktree's `HEAD` is the caller's business — it has the head-log
+/// pairing to get right — and a detached `HEAD` names no branch, so it is left
+/// alone.
+///
+/// Failures are silent: git dies here, but the rename itself has already
+/// committed, and this port has no way to roll it back.
+fn repoint_linked_worktree_heads(
+    repo: &gix::Repository,
+    old_full: &str,
+    new_name: &FullName,
+    target: ObjectId,
+    message: &str,
+) {
+    for proxy in repo.worktrees().unwrap_or_default() {
+        // `wt->is_current`: the worktree this process is standing in.
+        if proxy.git_dir() == repo.git_dir() {
+            continue;
+        }
+        let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree() else {
+            continue;
+        };
+        // `!worktrees[i]->is_detached && !strcmp(oldref, worktrees[i]->head_ref)`.
+        let follows = linked
+            .head_name()
+            .ok()
+            .flatten()
+            .is_some_and(|name| name.as_bstr() == old_full.as_bytes());
+        if !follows {
+            continue;
+        }
+        let Ok(head) = FullName::try_from("HEAD") else {
+            continue;
+        };
+        let _ = linked.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: message.into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Symbolic(new_name.clone()),
+            },
+            name: head,
+            deref: false,
+        });
+        // `refs_update_symref()` logs the update in the worktree's own
+        // `logs/HEAD`, and by the time it runs the old branch is already gone —
+        // so the entry reads `<null> <tip>`. gitoxide writes no reflog for a
+        // symbolic update, so the line is appended here.
+        super::checkout::append_head_log(&linked, None, Some(target), message);
+    }
+}
+
 /// `-c`/`-C`: copy a branch, duplicating its reflog and `branch.<name>.*` config
 /// into the new name and leaving the source (and HEAD) untouched.
 ///
@@ -2397,8 +2526,32 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         Some(r) => r,
         None => return fatal(format!("no branch named '{old}'")),
     };
-    if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() && !o.force {
-        return fatal(format!("a branch named '{new}' already exists"));
+    // ```c
+    // if (!force)
+    //         die(_("a branch named '%s' already exists"), ref->buf + strlen("refs/heads/"));
+    // worktrees = get_worktrees();
+    // wt = find_shared_symref(worktrees, "HEAD", ref->buf);
+    // if (wt && !wt->is_bare)
+    //         die(_("cannot force update the branch '%s' used by worktree at '%s'"),
+    //             ref->buf + strlen("refs/heads/"), wt->path);
+    // ```
+    //
+    // (`validate_new_branchname()`, branch.c.) `--force` overrides the destination
+    // already existing, never a worktree standing on it — moving the ref would
+    // leave that checkout's index and worktree describing a commit its own `HEAD`
+    // no longer names. Renaming a branch onto its own name skips the whole check,
+    // which is why it is guarded by `old_full != new_full` exactly as git guards
+    // it with `strcmp(oldname, newname)`.
+    if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() {
+        if !o.force {
+            return fatal(format!("a branch named '{new}' already exists"));
+        }
+        if let Some(path) = super::worktree::branch_checked_out(repo, &new_full)? {
+            return fatal(format!(
+                "cannot force update the branch '{new}' used by worktree at '{}'",
+                super::worktree::path_to_string(&path)
+            ));
+        }
     }
     let target = old_ref.peel_to_id()?.detach();
 
@@ -2444,6 +2597,25 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // does and records the entry regardless.
     if old_full == new_full {
         log_unchanged_rename(repo, &new_name, target, &message, o.create_reflog)?;
+    } else {
+        // ```c
+        // oidcpy(&lock->old_oid, &orig_oid);
+        // if (write_ref_to_lockfile(refs, lock, &orig_oid, 0, &err) ||
+        //     commit_ref_update(refs, lock, &orig_oid, logmsg, &err)) { ... }
+        // ```
+        //
+        // (`files_copy_or_rename_ref()`, refs/files-backend.c.) The lock's "old"
+        // value is overwritten with the *source's* object id before the reflog
+        // entry is composed, so a copy always reads `<source> <source>` — never
+        // the null id a brand-new destination would carry, and never the value
+        // `-C` overwrote at the destination.
+        rewrite_last_reflog_old_id(
+            &repo
+                .git_dir()
+                .join("logs")
+                .join(new_name.as_bstr().to_str_lossy().as_ref()),
+            target,
+        );
     }
 
     // git duplicates the branch's config section into the new name.
@@ -2452,6 +2624,29 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Drop the whole `branch.<name>` subsection from the local config, which is
+/// `repo_config_rename_section(the_repository, "branch.<name>", NULL)` — git's
+/// spelling of "remove this section". A branch that never had a section of its
+/// own leaves nothing to remove, and that is not an error.
+fn remove_branch_config(repo: &gix::Repository, name: &str) -> Result<()> {
+    let path = repo.common_dir().join("config");
+    let Ok(mut file) = ConfigFile::from_path_no_includes(path.clone(), Source::Local) else {
+        return Ok(());
+    };
+    let sub = gix::bstr::BString::from(name.as_bytes());
+    let mut removed = false;
+    while file
+        .remove_section("branch", Some(BStr::new(sub.as_slice())))
+        .is_some()
+    {
+        removed = true;
+    }
+    if removed {
+        write_config(&path, &file)?;
+    }
+    Ok(())
 }
 
 /// Copy every `branch.<old>.*` value into `branch.<new>.*` in the local config.
@@ -2674,6 +2869,20 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             name: name_full,
             deref: false,
         })?;
+
+        // ```c
+        // strbuf_addf(&buf, "branch.%s", bname.buf);
+        // if (repo_config_rename_section(the_repository, buf.buf, NULL) < 0)
+        //         warning(_("Update of config-file failed"));
+        // ```
+        //
+        // (`delete_branches()`, builtin/branch.c.) A deleted branch takes its
+        // `branch.<name>.*` configuration with it — the upstream a `--track`
+        // create wrote, any `branch.<name>.rebase`, everything in the subsection —
+        // so the name is free of stale tracking data if it is ever recreated. The
+        // section name is the branch's *short* name, and this happens for remote
+        // -tracking branches too, where there is simply nothing to remove.
+        remove_branch_config(repo, &name)?;
 
         if !o.quiet {
             // `printf(remote_branch ? _("Deleted remote-tracking branch %s (was %s).\n") : …)`.

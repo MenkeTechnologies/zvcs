@@ -55,6 +55,13 @@ use crate::lock::RepoLock;
 ///   * `--` to terminate option parsing
 /// ```
 ///
+/// The environment `cmd_init_db()` reads for itself is honored too: `GIT_DIR`
+/// names the directory to create (and `guess_repository_type()` then decides
+/// whether it is a bare layout), `GIT_WORK_TREE` without it — or with `--bare` —
+/// is the refusal git catches early, and `GIT_OBJECT_DIRECTORY` moves the object
+/// store out of the git dir entirely, with no `<git-dir>/objects` written
+/// alongside it.
+///
 /// A `<directory>` that does not exist is created, leading directories and all
 /// (git `chdir()`s into it and falls back to
 /// `safe_create_leading_directories_const()` + `mkdir()`), for bare and
@@ -82,14 +89,20 @@ use crate::lock::RepoLock;
 /// the `core.sharedrepository`/`receive.denyNonFastforwards` config values, the
 /// template merge semantics, and the `gitdir:` link file all match stock git.
 ///
+/// Reinitialization is `init_db()`'s second half, not a no-op that prints a
+/// line: the templates are re-copied (never overwriting what is already there),
+/// `core.bare` is rewritten when the flags disagree with the file, `--shared`
+/// records its config and re-widens the permissions, `--separate-git-dir` moves
+/// the existing git dir and leaves a `gitdir:` link behind, `--object-format`
+/// disagreeing with the repository's own hash is fatal, and `--initial-branch`
+/// is warned about and ignored. Which git dir is reinitialized follows git's own
+/// resolution — `GIT_DIR`, else `.git`, with a `gitdir:` link file followed — so
+/// `git init` inside a linked worktree reinitializes that worktree's git dir and
+/// `git init` standing inside a `.git` directory creates a repository under it
+/// rather than reinitializing the one it is standing in.
+///
 /// # Deviations (surfaced honestly, never faked)
 /// ```text
-///   * Reinitialization prints the git message and succeeds but applies no new
-///     options: `--template`, `--shared`, and `--separate-git-dir` migration are
-///     only honored on a *fresh* init. gix exposes no reinit path, so an
-///     already-initialized repo is not re-templated, re-shared, or migrated to a
-///     separate git dir. The overwhelmingly common `git init` into a fresh dir
-///     is unaffected.
 ///   * `--ref-format=reftable` is rejected with an honest "not supported" error
 ///     (not "silently accepted", and never faked into a mismatched-format repo):
 ///     there is no vendored reftable backend. `--ref-format=files` is a no-op
@@ -329,6 +342,57 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     }
     let directory = positionals.into_iter().next();
 
+    // `real_pathdup(real_git_dir, 1)` / `real_pathdup(template_dir, 1)`
+    // (`builtin/init-db.c`, immediately after `parse_options`): a *relative*
+    // `--separate-git-dir` / `--template` is resolved against the directory git
+    // was invoked from — before the `<directory>` operand moves it — and a path
+    // whose leading components do not exist is fatal on the spot. An absolute
+    // value is left untouched, exactly as `is_absolute_path()` decides.
+    let separate_git_dir = match separate_git_dir {
+        Some(p) if !Path::new(&p).is_absolute() => Some(real_pathdup(&p)?),
+        other => other,
+    };
+    let template = match template {
+        Some(p) if !p.is_empty() && !Path::new(&p).is_absolute() => Some(real_pathdup(&p)?),
+        other => other,
+    };
+
+    let target = PathBuf::from(directory.as_deref().unwrap_or("."));
+
+    // git `chdir()`s into the `<directory>` operand and, when that fails, creates
+    // it — leading directories via `safe_create_leading_directories_const()` then
+    // the leaf via `mkdir()` — before retrying (`builtin/init-db.c`). So
+    // `git init nested/dir` works with no `nested/` present. This port never
+    // chdirs (it passes the path down instead), so the creation has to be done
+    // here: `gix::init` happens to create leading directories itself, but
+    // `gix::init_bare` does not, which is why `git init --bare nested/dir` failed
+    // where the non-bare form succeeded.
+    //
+    // It runs here, *ahead* of the format validation below, because that is
+    // git's order: `cmd_init_db` enters (and creates) the operand directory and
+    // only then looks at `--object-format` / `--ref-format`. So
+    // `git init --object-format=bogus sub` leaves `sub/` behind on its way out.
+    if let Some(dir) = directory.as_deref() {
+        if !target.is_dir() {
+            if let Err(e) = std::fs::create_dir_all(&target) {
+                // git's `die_errno(_("cannot mkdir %s"), argv[0])`, whose reason
+                // is `strerror(errno)` with none of Rust's ` (os error N)` tail.
+                return Ok(fatal(&format!(
+                    "cannot mkdir {dir}: {}",
+                    crate::external::strerror(&e)
+                )));
+            }
+        }
+    }
+
+    // The directory git stands in once the operand has been entered. Every
+    // relative path read out of the environment below resolves against it,
+    // which is what `chdir(argv[0])` buys stock git.
+    let cwd = match std::fs::canonicalize(&target) {
+        Ok(p) => p,
+        Err(_) => std::env::current_dir()?.join(&target),
+    };
+
     // Resolve the repository formats with git's precedence (`builtin/init-db.c`
     // + `setup.c`): the command-line option wins, then the `GIT_DEFAULT_HASH` /
     // `GIT_DEFAULT_REF_FORMAT` environment variable, then the
@@ -340,11 +404,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // `init.defaultObjectFormat=bogus` prints `warning: unknown hash algorithm
     // 'bogus'` and still creates a sha1 repository).
     //
-    // Levels 1-2 are validated here, before any repository is touched, exactly
-    // where git validates them; the config level is read after the repository
-    // exists, because that is the only place a config snapshot is available.
-    let object_format = object_format.or_else(|| std::env::var("GIT_DEFAULT_HASH").ok());
-    let ref_format = ref_format.or_else(|| std::env::var("GIT_DEFAULT_REF_FORMAT").ok());
+    // The command-line level is judged here, where `cmd_init_db` judges it; the
+    // environment level is `init_db`'s `validate_hash_algorithm()` /
+    // `validate_ref_storage_format()`, which run later — after the git directory
+    // has been resolved — and are therefore checked further down.
     if let Some(fmt) = object_format.as_deref() {
         if check_object_format(fmt)? == FormatCheck::Unrecognized {
             return Ok(fatal(&format!("unknown hash algorithm '{fmt}'")));
@@ -360,52 +423,89 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // being passed (git's init_shared_repository == 0 is falsy).
     let shared = shared.filter(|&s| s != 0);
 
-    let target = PathBuf::from(directory.as_deref().unwrap_or("."));
+    // `--bare` makes the directory git is standing in the git directory itself:
+    // `setenv(GIT_DIR_ENVIRONMENT, cwd, argc > 0)`. The overwrite flag is
+    // `argc > 0`, so an inherited `GIT_DIR` survives `git init --bare` with no
+    // operand and loses to the operand directory when one is given.
+    let mut git_dir_env = std::env::var("GIT_DIR").ok();
+    if bare && (directory.is_some() || git_dir_env.is_none()) {
+        git_dir_env = Some(cwd.to_string_lossy().into_owned());
+    }
 
-    // git `chdir()`s into the `<directory>` operand and, when that fails, creates
-    // it — leading directories via `safe_create_leading_directories_const()` then
-    // the leaf via `mkdir()` — before retrying (`builtin/init-db.c`). So
-    // `git init nested/dir` works with no `nested/` present. This port never
-    // chdirs (it passes the path down instead), so the creation has to be done
-    // here: `gix::init` happens to create leading directories itself, but
-    // `gix::init_bare` does not, which is why `git init --bare nested/dir` failed
-    // where the non-bare form succeeded.
-    if let Some(dir) = directory.as_deref() {
-        if !target.is_dir() {
-            if let Err(e) = std::fs::create_dir_all(&target) {
-                // git's `die_errno(_("cannot mkdir %s"), argv[0])`.
-                return Ok(fatal(&format!("cannot mkdir {dir}: {e}")));
+    // "GIT_WORK_TREE makes sense only in conjunction with GIT_DIR without
+    // --bare.  Catch the error early." — `cmd_init_db`'s own comment, and its
+    // own message.
+    let work_tree_env = std::env::var("GIT_WORK_TREE").ok();
+    if (git_dir_env.is_none() || bare) && work_tree_env.is_some() {
+        crate::git_fatal!(
+            "GIT_WORK_TREE (or --work-tree=<directory>) not allowed without \
+             specifying GIT_DIR (or --git-dir=<directory>)"
+        );
+    }
+
+    // `if (!git_dir) git_dir = DEFAULT_GIT_DIR_ENVIRONMENT;`
+    let git_dir_spec = git_dir_env.unwrap_or_else(|| ".git".to_string());
+    // `guess_repository_type()`: with no `--bare`, a git dir that is not `.`,
+    // not the cwd, not `.git` and not `*/.git` is taken to be a bare repository
+    // ("Otherwise it is often bare. At this point we are just guessing.").
+    let bare_layout = bare || guess_repository_type(&git_dir_spec, &cwd);
+
+    // `init_db`'s `original_git_dir`: `real_pathdup(git_dir, 1)`, the git
+    // directory named on its own terms, before any `gitdir:` link is followed.
+    let git_dir_arg = PathBuf::from(&git_dir_spec);
+    let original_git_dir = real_path(if git_dir_arg.is_absolute() {
+        git_dir_arg
+    } else {
+        cwd.join(git_dir_arg)
+    })?;
+
+    // `separate_git_dir()` (`setup.c`): when the named git dir already exists,
+    // move it to the requested location and leave a `gitdir:` link file behind.
+    // On a fresh init there is nothing to move, and the relocation happens after
+    // the skeleton has been laid down (below), which is where this port already
+    // did it.
+    let migrated = separate_git_dir.is_some() && std::fs::symlink_metadata(&original_git_dir).is_ok();
+    let mut git_dir: PathBuf = match separate_git_dir.as_deref() {
+        Some(real) if migrated => {
+            let real_abs = PathBuf::from(real);
+            migrate_git_dir(&real_abs, &original_git_dir)?;
+            real_abs
+        }
+        Some(_) => original_git_dir.clone(),
+        // `repo_set_gitdir()` reads a `gitdir:` link file and takes its target as
+        // the git directory, which is how `git init` inside a linked worktree
+        // reinitializes `<common>/worktrees/<name>` rather than the link file.
+        None => read_gitfile(&original_git_dir).unwrap_or_else(|| original_git_dir.clone()),
+    };
+
+    // `is_reinit()` (`setup.c`) is exactly this: a readable (or symlinked)
+    // `HEAD` inside the git directory, nothing else.
+    let reinit = std::fs::symlink_metadata(git_dir.join("HEAD")).is_ok();
+
+    // `validate_hash_algorithm()` (`setup.c`), in its order: the command-line
+    // hash may not disagree with the hash an existing repository already uses,
+    // and only then is `GIT_DEFAULT_HASH` looked at.
+    if reinit {
+        if let Some(fmt) = object_format.as_deref() {
+            if fmt != repository_object_format(&git_dir) {
+                crate::git_fatal!("attempt to reinitialize repository with different hash");
             }
         }
     }
-
-    // Detect an already-initialized repository at the target so we can emit the
-    // `Reinitialized existing ...` line instead of failing. For a worktree repo
-    // the git dir is `<target>/.git`; for a bare repo it is `<target>` itself,
-    // recognized by its `HEAD` file at the root.
-    // With `--bare` the git directory IS the target, so a worktree repository sitting
-    // there is beside the point: git initialises a new bare repository on top of it
-    // (`git init --bare` inside a checkout is `Initialized empty`, not `Reinitialized`).
-    let existing_git_dir: Option<PathBuf> = {
-        let dot_git = target.join(".git");
-        if !bare && dot_git.exists() {
-            Some(dot_git)
-        } else if target.join("HEAD").is_file() && target.join("objects").is_dir() {
-            Some(target.clone())
-        } else {
-            None
+    let env_object_format = std::env::var("GIT_DEFAULT_HASH").ok();
+    if let Some(fmt) = env_object_format.as_deref() {
+        if check_object_format(fmt)? == FormatCheck::Unrecognized {
+            return Ok(fatal(&format!("unknown hash algorithm '{fmt}'")));
         }
-    };
-
-    if let Some(git_dir) = existing_git_dir {
-        if !quiet {
-            println!(
-                "Reinitialized existing Git repository in {}",
-                display_git_dir(&git_dir)
-            );
-        }
-        return Ok(ExitCode::SUCCESS);
     }
+    let env_ref_format = std::env::var("GIT_DEFAULT_REF_FORMAT").ok();
+    if let Some(fmt) = env_ref_format.as_deref() {
+        if check_ref_format(fmt)? == FormatCheck::Unrecognized {
+            return Ok(fatal(&format!("unknown ref storage format '{fmt}'")));
+        }
+    }
+    let object_format = object_format.or(env_object_format);
+    let ref_format = ref_format.or(env_ref_format);
 
     // Create the repository. gix lays down the full template + config and returns
     // an opened handle with an unborn HEAD on the default branch. gix refuses
@@ -435,125 +535,146 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         ),
         ..Default::default()
     };
-    let repo = if bare {
-        match gix::ThreadSafeRepository::init(&target, gix::create::Kind::Bare, create_opts) {
-            Ok(r) => r.to_thread_local(),
-            Err(gix::init::Error::Init(gix::create::Error::DirectoryNotEmpty { .. })) => {
-                init_bare_into_nonempty(&target, create_opts)?
-            }
-            Err(e) => return Err(anyhow::anyhow!("{e}")),
-        }
-    } else {
-        gix::ThreadSafeRepository::init(&target, gix::create::Kind::WithWorktree, create_opts)
-            .map(|r| r.to_thread_local())
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-    };
-
-    // The config level of the format precedence chain: consulted only when
-    // neither the option nor the environment variable named a format. An
-    // unrecognized value is a warning and falls back to the compiled-in default,
-    // matching stock git; a *recognized but unimplemented* value (`sha256` /
-    // `reftable`) is rejected with the same honest error the option produces,
-    // rather than silently laying down a repository in the other format.
-    if object_format.is_none() {
-        if let Some(fmt) = config_string(&repo, "init.defaultObjectFormat") {
-            if check_object_format(&fmt)? == FormatCheck::Unrecognized {
-                eprintln!("warning: unknown hash algorithm '{fmt}'");
-            }
-        }
-    }
-    if ref_format.is_none() {
-        if let Some(fmt) = config_string(&repo, "init.defaultRefFormat") {
-            if check_ref_format(&fmt)? == FormatCheck::Unrecognized {
-                eprintln!("warning: unknown ref storage format '{fmt}'");
-            }
-        }
-    }
-
-    // Resolve the initial branch name, matching git's precedence exactly:
-    //   1. `-b <name>` / `--initial-branch=<name>` on the command line, else
-    //   2. the `init.defaultBranch` config value (any scope), else
-    //   3. the compiled-in default `master`.
-    // gix::init already points the unborn HEAD at `init.defaultBranch` (or its
-    // own `main` fallback when that is unset), so recomputing here is what lets
-    // the no-config case land on git's `master` rather than gix's `main`. When
-    // the name gix already chose matches, the HEAD repoint below is a no-op.
-    let branch_name = match initial_branch {
-        Some(name) => name,
-        None => repo
-            .config_snapshot()
-            .string("init.defaultBranch")
-            .map(|v| v.to_string())
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "master".to_string()),
-    };
-
-    // Repoint the unborn HEAD symref to the resolved branch. This is a ref
-    // mutation, so serialize it through the repo coordinator like every other
-    // write command. gix writes no reflog for a symbolic update to an unborn
-    // branch, matching stock git init (which creates no `logs/HEAD`). For a
-    // separate git dir this happens before the git dir is moved, so the lock and
-    // ref edit still target the freshly-created `<target>/.git`.
-    //
-    // git checks the composed ref here, not at parse time:
-    // `create_reference_database()` (`setup.c`) builds `refs/heads/<name>` and
-    // `die(_("invalid initial branch name: '%s'"), initial_branch)` when
-    // `check_refname_format(ref, 0)` rejects it — so the diagnostic is git's
-    // `die()` (exit 128), and it lands only after the repository skeleton
-    // already exists, exactly like here.
-    let src_git_dir = repo.git_dir().to_path_buf();
-    let branch: FullName = match format!("refs/heads/{branch_name}").try_into() {
-        Ok(b) => b,
-        Err(_) => {
-            // git dies *before* `HEAD` is written: `create_default_files()` lays
-            // down `config`, `description`, `hooks/`, `info/` and the refs
-            // directories, and only then does `create_reference_database()`
-            // validate the name and, if it passes, symref `HEAD` at it. gix's
-            // `init`/`init_bare` bundle the skeleton and `HEAD` into one call, so
-            // the file exists here by the time the name can be checked; removing
-            // it leaves the same on-disk wreckage stock git leaves behind (which
-            // the parity probe compares, since a bare init drops these files in
-            // the caller's directory for it to see).
-            // Same reasoning for the object store: stock git creates
-            // `objects/{info,pack}` only after the reference database is set up,
-            // so a failed init leaves none. `remove_dir` refuses a non-empty
-            // directory, so a pre-existing object store is never touched.
-            let _ = std::fs::remove_file(src_git_dir.join("HEAD"));
-            for dir in ["objects/pack", "objects/info", "objects"] {
-                let _ = std::fs::remove_dir(src_git_dir.join(dir));
-            }
-            return Ok(fatal(&format!(
-                "invalid initial branch name: '{branch_name}'"
-            )));
-        }
-    };
-    {
-        let _lock = RepoLock::acquire(&src_git_dir);
-        repo.edit_reference(RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: false,
-                    message: "init: set initial branch".into(),
-                },
-                expected: PreviousValue::Any,
-                new: Target::Symbolic(branch),
+    // Where the skeleton goes is decided by the git directory, not by the
+    // operand: gix's bare kind lays it down *in* the directory it is given, its
+    // worktree kind lays it down in that directory's `.git`. A `bare_layout` git
+    // dir is therefore built directly, and a `<worktree>/.git` one is built from
+    // its parent.
+    let repo = if reinit {
+        None
+    } else if bare_layout {
+        Some(
+            match gix::ThreadSafeRepository::init(&git_dir, gix::create::Kind::Bare, create_opts) {
+                Ok(r) => r.to_thread_local(),
+                Err(gix::init::Error::Init(gix::create::Error::DirectoryNotEmpty { .. })) => {
+                    init_bare_into_nonempty(&git_dir, create_opts)?
+                }
+                Err(e) => return Err(anyhow::anyhow!("{e}")),
             },
-            name: "HEAD"
-                .try_into()
-                .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
-            deref: false,
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-
-    // `--separate-git-dir`: relocate the git dir to the requested path and drop a
-    // `gitdir: <abs>` link file in its place, exactly like git's
-    // `separate_git_dir()` (`setup.c`). The message then names the real git dir.
-    let git_dir: PathBuf = match &separate_git_dir {
-        Some(real) => relocate_git_dir(&src_git_dir, &target, real)?,
-        None => src_git_dir.clone(),
+        )
+    } else {
+        let worktree = git_dir.parent().unwrap_or(&cwd).to_path_buf();
+        Some(
+            gix::ThreadSafeRepository::init(
+                &worktree,
+                gix::create::Kind::WithWorktree,
+                create_opts,
+            )
+            .map(|r| r.to_thread_local())
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
     };
+
+    if let Some(repo) = repo.as_ref() {
+        // The config level of the format precedence chain: consulted only when
+        // neither the option nor the environment variable named a format. An
+        // unrecognized value is a warning and falls back to the compiled-in default,
+        // matching stock git; a *recognized but unimplemented* value (`sha256` /
+        // `reftable`) is rejected with the same honest error the option produces,
+        // rather than silently laying down a repository in the other format.
+        if object_format.is_none() {
+            if let Some(fmt) = config_string(repo, "init.defaultObjectFormat") {
+                if check_object_format(&fmt)? == FormatCheck::Unrecognized {
+                    eprintln!("warning: unknown hash algorithm '{fmt}'");
+                }
+            }
+        }
+        if ref_format.is_none() {
+            if let Some(fmt) = config_string(repo, "init.defaultRefFormat") {
+                if check_ref_format(&fmt)? == FormatCheck::Unrecognized {
+                    eprintln!("warning: unknown ref storage format '{fmt}'");
+                }
+            }
+        }
+
+        // Resolve the initial branch name, matching git's precedence exactly:
+        //   1. `-b <name>` / `--initial-branch=<name>` on the command line, else
+        //   2. the `init.defaultBranch` config value (any scope), else
+        //   3. the compiled-in default `master`.
+        // gix::init already points the unborn HEAD at `init.defaultBranch` (or its
+        // own `main` fallback when that is unset), so recomputing here is what lets
+        // the no-config case land on git's `master` rather than gix's `main`. When
+        // the name gix already chose matches, the HEAD repoint below is a no-op.
+        let branch_name = match initial_branch.clone() {
+            Some(name) => name,
+            None => repo
+                .config_snapshot()
+                .string("init.defaultBranch")
+                .map(|v| v.to_string())
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "master".to_string()),
+        };
+
+        // Repoint the unborn HEAD symref to the resolved branch. This is a ref
+        // mutation, so serialize it through the repo coordinator like every other
+        // write command. gix writes no reflog for a symbolic update to an unborn
+        // branch, matching stock git init (which creates no `logs/HEAD`). For a
+        // separate git dir this happens before the git dir is moved, so the lock and
+        // ref edit still target the freshly-created `<target>/.git`.
+        //
+        // git checks the composed ref here, not at parse time:
+        // `create_reference_database()` (`setup.c`) builds `refs/heads/<name>` and
+        // `die(_("invalid initial branch name: '%s'"), initial_branch)` when
+        // `check_refname_format(ref, 0)` rejects it — so the diagnostic is git's
+        // `die()` (exit 128), and it lands only after the repository skeleton
+        // already exists, exactly like here.
+        let src_git_dir = repo.git_dir().to_path_buf();
+        let branch: FullName = match format!("refs/heads/{branch_name}").try_into() {
+            Ok(b) => b,
+            Err(_) => {
+                // git dies *before* `HEAD` is written: `create_default_files()` lays
+                // down `config`, `description`, `hooks/`, `info/` and the refs
+                // directories, and only then does `create_reference_database()`
+                // validate the name and, if it passes, symref `HEAD` at it. gix's
+                // `init`/`init_bare` bundle the skeleton and `HEAD` into one call, so
+                // the file exists here by the time the name can be checked; removing
+                // it leaves the same on-disk wreckage stock git leaves behind (which
+                // the parity probe compares, since a bare init drops these files in
+                // the caller's directory for it to see).
+                // Same reasoning for the object store: stock git creates
+                // `objects/{info,pack}` only after the reference database is set up,
+                // so a failed init leaves none. `remove_dir` refuses a non-empty
+                // directory, so a pre-existing object store is never touched.
+                let _ = std::fs::remove_file(src_git_dir.join("HEAD"));
+                for dir in ["objects/pack", "objects/info", "objects"] {
+                    let _ = std::fs::remove_dir(src_git_dir.join(dir));
+                }
+                return Ok(fatal(&format!(
+                    "invalid initial branch name: '{branch_name}'"
+                )));
+            }
+        };
+        {
+            let _lock = RepoLock::acquire(&src_git_dir);
+            repo.edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: "init: set initial branch".into(),
+                    },
+                    expected: PreviousValue::Any,
+                    new: Target::Symbolic(branch),
+                },
+                name: "HEAD"
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+                deref: false,
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+
+        // `--separate-git-dir` on a *fresh* init: relocate the git dir just built
+        // to the requested path and drop a `gitdir: <abs>` link file in its
+        // place, exactly like git's `separate_git_dir()` (`setup.c`). The message
+        // then names the real git dir.
+        if let Some(real) = separate_git_dir.as_deref() {
+            git_dir = relocate_git_dir(&src_git_dir, &target, real)?;
+        }
+    } else if let Some(name) = initial_branch.as_deref() {
+        // `if (reinit && initial_branch) warning(_("re-init: ignored --initial-branch=%s"))`.
+        eprintln!("warning: re-init: ignored --initial-branch={name}");
+    }
 
     // Resolve the template directory with git's `copy_templates()` precedence
     // (`builtin/init-db.c`): the `--template` command-line value wins, else the
@@ -565,34 +686,73 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // config is a DEFAULT the flag/env override — never the other way around.
     let template = template
         .or_else(|| std::env::var("GIT_TEMPLATE_DIR").ok())
-        .or_else(|| {
-            repo.config_snapshot()
-                .trusted_path("init.templateDir")
-                .ok()
-                .flatten()
-                .map(|p| p.to_string_lossy().into_owned())
-        });
+        .or_else(|| configured_template_dir(repo.as_ref(), &git_dir));
 
-    // Seed the git dir from the resolved template, replacing gix's built-in
-    // default template so ONLY the requested template's files remain (matching
-    // git, which uses the given template dir instead of the default, not in
-    // addition to it). Structural files stay in place.
+    // Seed the git dir from the resolved template. On a fresh init this replaces
+    // gix's built-in default template so ONLY the requested template's files
+    // remain (matching git, which uses the given template dir instead of the
+    // default, not in addition to it); on a reinit git only fills in what is
+    // missing, so nothing already there is disturbed. Structural files stay in
+    // place either way.
     if let Some(tpl) = template.as_deref().filter(|t| !t.is_empty()) {
-        apply_template(tpl, &git_dir)?;
+        if reinit {
+            copy_templates(tpl, &git_dir)?;
+        } else {
+            apply_template(tpl, &git_dir)?;
+        }
     }
 
     // `init.defaultSubmodulePathConfig=true` asks every new repository to opt into
     // the submodule-path extension, which git records as
     // `extensions.submodulePathConfig=true` plus the `core.repositoryformatversion=1`
     // bump every extension requires.
-    if config_bool(&repo, "init.defaultSubmodulePathConfig") == Some(true) {
-        enable_submodule_path_config(&git_dir)?;
+    if let Some(repo) = repo.as_ref() {
+        if config_bool(repo, "init.defaultSubmodulePathConfig") == Some(true) {
+            enable_submodule_path_config(&git_dir)?;
+        }
     }
+
+    // `create_default_files()` rewrites `core.bare` (and, when the repository has
+    // a work tree, seeds `core.logallrefupdates`) on every run, reinit included —
+    // which is only observable when the flags disagree with what is on disk, as
+    // `git init --bare` inside an existing non-bare git dir does. gix has already
+    // written both for a fresh repository, so this only has work to do on reinit,
+    // and it writes nothing whose value is already correct.
+    let has_work_tree = !bare_layout || work_tree_env.is_some();
+    if reinit {
+        set_config_value(&git_dir, "core", "bare", if has_work_tree { "false" } else { "true" })?;
+        if has_work_tree {
+            set_config_default(&git_dir, "core", "logallrefupdates", "true")?;
+        }
+    } else if bare_layout && work_tree_env.is_some() {
+        // `is_bare_repository()` is `is_bare_repository_cfg && !get_git_work_tree()`,
+        // so a guessed-bare git dir with `GIT_WORK_TREE` set is *not* bare: git
+        // writes `core.bare = false` and points `core.worktree` back at the tree.
+        let work_tree = work_tree_env.as_deref().unwrap_or(".");
+        let work_tree_abs = real_path(cwd.join(work_tree))?;
+        set_config_value(&git_dir, "core", "bare", "false")?;
+        set_config_default(&git_dir, "core", "logallrefupdates", "true")?;
+        set_config_value(
+            &git_dir,
+            "core",
+            "worktree",
+            &work_tree_abs.to_string_lossy(),
+        )?;
+    }
+
+    // `create_object_directory()`: `GIT_OBJECT_DIRECTORY` moves the object store
+    // out of the git dir entirely, and git creates only the store the variable
+    // names — never `<git-dir>/objects` as well.
+    create_object_directory(&git_dir, &cwd)?;
 
     // `--shared[=...]`: record the sharing config and widen permissions across the
     // whole git dir, porting git's `create_default_files` config write and
     // `adjust_shared_perm` (which git applies per-file during creation; a single
-    // recursive walk here produces the identical on-disk result).
+    // recursive walk here produces the identical on-disk result). Absent the
+    // flag, `get_shared_repository()` still answers with whatever
+    // `core.sharedRepository` the repository's own config carries, which is what
+    // decides the wording of the message below.
+    let shared = shared.or_else(|| configured_shared(&git_dir));
     if let Some(shared) = shared {
         write_shared_config(&git_dir, shared)?;
         #[cfg(unix)]
@@ -601,8 +761,13 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
 
     if !quiet {
         let shared_word = if shared.is_some() { "shared " } else { "" };
+        let verb = if reinit {
+            "Reinitialized existing"
+        } else {
+            "Initialized empty"
+        };
         println!(
-            "Initialized empty {shared_word}Git repository in {}",
+            "{verb} {shared_word}Git repository in {}",
             display_git_dir(&git_dir)
         );
     }
@@ -768,6 +933,26 @@ pub(super) fn relocate_git_dir(src: &Path, target: &Path, real: &str) -> Result<
 /// `refs/`) remain. Shared with `git clone --template=<dir>`, which git routes
 /// through the very same `copy_templates()` call during its own init step.
 pub(super) fn apply_template(template: &str, git_dir: &Path) -> Result<()> {
+    // The strip happens before the template dir is even opened, because stock
+    // git has no default template to fall back on: `copy_templates()` warns and
+    // returns, leaving a repository with no `description`, no `info/exclude` and
+    // no `hooks/` at all. Stripping only on success would leave gix's default in
+    // place and answer `--template=no-such-dir` with a payload stock never wrote.
+    strip_default_template(git_dir)?;
+    copy_templates(template, git_dir)
+}
+
+/// The half of [`apply_template`] git's `copy_templates()` actually is: seed
+/// `git_dir` from `template` without touching what is already there. This is the
+/// whole of what a reinitialization does — the repository's existing hooks,
+/// `description` and `info/exclude` stay exactly as they are, and only paths the
+/// template names and the repository lacks are filled in.
+pub(super) fn copy_templates(template: &str, git_dir: &Path) -> Result<()> {
+    // `if (!template_dir[0]) goto free_return;` — an explicitly empty
+    // `--template=` names no template and is not a warning.
+    if template.is_empty() {
+        return Ok(());
+    }
     let src = {
         let p = PathBuf::from(template);
         if p.is_absolute() {
@@ -781,7 +966,6 @@ pub(super) fn apply_template(template: &str, git_dir: &Path) -> Result<()> {
         eprintln!("warning: templates not found in {template}");
         return Ok(());
     }
-    strip_default_template(git_dir)?;
     copy_template_dir(&src, git_dir)?;
     Ok(())
 }
@@ -872,8 +1056,16 @@ fn parse_shared_value(value: &str) -> Result<i32> {
             }
             Ok(-(mode & 0o666))
         }
-        // Not an octal number: fall back to boolean, like git_config_bool.
-        None => Ok(if parse_bool(value) { 0o660 } else { 0 }),
+        // Not an octal number: fall back to boolean, like git_config_bool —
+        // which is `git_parse_maybe_bool` plus a `die()` on anything it cannot
+        // read, not a silent "false". The variable name in the message is
+        // literally `arg`, because `git_config_perm("arg", arg)` is how
+        // `cmd_init_db`'s `--shared` callback spells it.
+        None => match parse_maybe_bool(value) {
+            Some(true) => Ok(0o660),
+            Some(false) => Ok(0),
+            None => crate::git_fatal!("bad boolean config value '{value}' for 'arg'"),
+        },
     }
 }
 
@@ -891,9 +1083,17 @@ fn parse_octal_full(s: &str) -> Option<i32> {
     }
 }
 
-/// git's boolean truthy spellings for the `--shared` fallback.
-fn parse_bool(s: &str) -> bool {
-    matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "on")
+/// Port of `git_parse_maybe_bool()` (`config.c`): the three truthy and three
+/// falsy spellings, the empty string as false, and — failing those — a plain
+/// integer read as C's `!!value`. `None` is git's `-1`, the answer that makes
+/// `git_config_bool()` die.
+fn parse_maybe_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "" => Some(false),
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" => Some(false),
+        _ => s.parse::<i64>().ok().map(|v| v != 0),
+    }
 }
 
 /// Write `core.sharedrepository` and `receive.denyNonFastforwards` into the git
@@ -911,7 +1111,7 @@ fn write_shared_config(git_dir: &Path, shared: i32) -> Result<()> {
         crate::git_fatal!("invalid value for shared repository");
     };
 
-    let path = git_dir.join("config");
+    let path = config_path(git_dir);
     let mut file =
         gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -998,4 +1198,276 @@ fn adjust_shared_perm_recursive(path: &Path, shared: i32) -> Result<()> {
 fn display_git_dir(git_dir: &Path) -> String {
     let abs = std::fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
     format!("{}/", abs.display())
+}
+
+/// Port of `real_pathdup(path, 1)` (`abspath.c`) as `cmd_init_db` uses it for
+/// `--separate-git-dir` and `--template`: resolve `path` against the current
+/// directory and die on a path git cannot resolve. The empty string is refused
+/// outright, matching `strbuf_realpath`'s first test.
+fn real_pathdup(path: &str) -> Result<String> {
+    if path.is_empty() {
+        crate::git_fatal!("The empty string is not a valid path");
+    }
+    let base = std::env::current_dir()?;
+    let full = match Path::new(path).is_absolute() {
+        true => PathBuf::from(path),
+        false => base.join(path),
+    };
+    Ok(real_path(full)?.to_string_lossy().into_owned())
+}
+
+/// Port of `strbuf_realpath(&out, path, die_on_error=1)` (`abspath.c`): walk the
+/// already-absolute `path` one component at a time, resolving symlinks as they
+/// are met. A component that does not exist is tolerated only as the *last* one
+/// ("error out unless this was the last component"); anything earlier is
+/// `die_errno(_("Invalid path '%s'"), resolved)` with only the part resolved so
+/// far named, which is the diagnostic `git init --separate-git-dir=sub/gd sub`
+/// produces before `sub` exists.
+fn real_path(path: PathBuf) -> Result<PathBuf> {
+    let components: Vec<_> = path.components().collect();
+    let last = components.len().saturating_sub(1);
+    let mut resolved = PathBuf::new();
+    for (i, component) in components.iter().enumerate() {
+        match component {
+            std::path::Component::Prefix(p) => {
+                resolved.push(p.as_os_str());
+                continue;
+            }
+            std::path::Component::RootDir => {
+                resolved.push(std::path::MAIN_SEPARATOR_STR);
+                continue;
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                resolved.pop();
+                continue;
+            }
+            std::path::Component::Normal(name) => resolved.push(name),
+        }
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if let Ok(target) = std::fs::canonicalize(&resolved) {
+                    resolved = target;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound || i != last {
+                    crate::git_fatal!(
+                        "Invalid path '{}': {}",
+                        resolved.display(),
+                        crate::external::strerror(&e)
+                    );
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Port of `guess_repository_type()` (`builtin/init-db.c`): with no `--bare` on
+/// the command line, the git directory's own spelling decides whether the
+/// repository is bare. `.`, the current directory itself, `.git` and `*/.git`
+/// are worktree repositories; everything else "is often bare … at this point we
+/// are just guessing".
+fn guess_repository_type(git_dir: &str, cwd: &Path) -> bool {
+    if git_dir == "." {
+        return true;
+    }
+    if Path::new(git_dir) == cwd {
+        return true;
+    }
+    if git_dir == ".git" {
+        return false;
+    }
+    !git_dir.ends_with("/.git")
+}
+
+/// Port of `read_gitfile()` (`setup.c`) as `repo_set_gitdir()` calls it: a
+/// regular file whose only line is `gitdir: <path>` names the real git
+/// directory, relative paths being taken from the link file's own directory.
+/// Anything else — a directory, a missing path, a file with another shape — is
+/// not a gitfile.
+fn read_gitfile(path: &Path) -> Option<PathBuf> {
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let target = text.trim_end_matches(['\n', '\r']).strip_prefix("gitdir: ")?;
+    let target = PathBuf::from(target);
+    match target.is_absolute() {
+        true => Some(target),
+        false => Some(path.parent()?.join(target)),
+    }
+}
+
+/// Port of `separate_git_dir()` (`setup.c`) for the reinitialization case: an
+/// existing git directory named by `link` (either the directory itself or a
+/// `gitdir:` file pointing at it) is moved to `real`, and a fresh `gitdir:` link
+/// file is written in its place. A `link` that does not exist yet leaves nothing
+/// to move — the caller lays the repository down at `real` and this only writes
+/// the link.
+fn migrate_git_dir(real: &Path, link: &Path) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(link) {
+        let src = if meta.is_file() {
+            match read_gitfile(link) {
+                Some(p) => p,
+                None => crate::git_fatal!("unable to handle file type {}", link.display()),
+            }
+        } else if meta.is_dir() {
+            link.to_path_buf()
+        } else {
+            crate::git_fatal!("unable to handle file type {}", link.display());
+        };
+        if let Some(parent) = real.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Err(e) = std::fs::rename(&src, real) {
+            crate::git_fatal!(
+                "unable to move {} to {}: {}",
+                src.display(),
+                real.display(),
+                crate::external::strerror(&e)
+            );
+        }
+    }
+    std::fs::write(link, format!("gitdir: {}\n", real.display()))?;
+    Ok(())
+}
+
+/// The object format an existing repository records, as
+/// `check_repository_format()` reads it: `extensions.objectFormat` when the
+/// config carries one, else git's compiled-in `sha1`.
+fn repository_object_format(git_dir: &Path) -> String {
+    local_config(git_dir)
+        .and_then(|f| {
+            f.string_by("extensions", None, "objectFormat")
+                .map(|v| v.to_string())
+        })
+        .unwrap_or_else(|| "sha1".to_string())
+}
+
+/// `core.sharedRepository` as `git_default_core_config` parses it into
+/// `get_shared_repository()`. `0`/`umask` reads as "not shared", which is the
+/// same falsy answer as an absent key, so it is reported as `None`.
+fn configured_shared(git_dir: &Path) -> Option<i32> {
+    let value = local_config(git_dir)?
+        .string_by("core", None, "sharedRepository")
+        .map(|v| v.to_string())?;
+    parse_shared_value(&value).ok().filter(|&s| s != 0)
+}
+
+/// The repository's own `config` file, parsed without following `include`s —
+/// the same file every write below edits in place.
+fn local_config(git_dir: &Path) -> Option<gix::config::File> {
+    gix::config::File::from_path_no_includes(config_path(git_dir), gix::config::Source::Local).ok()
+}
+
+/// Port of `get_common_dir()` (`setup.c`): a linked worktree's git directory
+/// carries a `commondir` file naming the repository every worktree shares, and
+/// the configuration, the object store and the ref database all live there
+/// rather than in the per-worktree directory. Without that file the git
+/// directory is its own common directory.
+fn common_dir(git_dir: &Path) -> PathBuf {
+    let Ok(text) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let target = PathBuf::from(text.trim_end_matches(['\n', '\r']));
+    match target.is_absolute() {
+        true => target,
+        false => git_dir.join(target),
+    }
+}
+
+/// The config file `git_config_set()` writes: the shared one when `git_dir` is a
+/// linked worktree, its own otherwise.
+fn config_path(git_dir: &Path) -> PathBuf {
+    common_dir(git_dir).join("config")
+}
+
+/// `git_config_set(<section>.<key>, <value>)` against the repository's own
+/// config, skipped when the file already spells that value — so a reinit that
+/// changes nothing rewrites nothing.
+fn set_config_value(git_dir: &Path, section: &str, key: &str, value: &str) -> Result<()> {
+    let path = config_path(git_dir);
+    let mut file =
+        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if file
+        .string_by(section, None, key)
+        .is_some_and(|v| v.to_string() == value)
+    {
+        return Ok(());
+    }
+    file.set_raw_value_by(section, None, key, value)?;
+    std::fs::write(&path, file.to_bstring())?;
+    Ok(())
+}
+
+/// `if (log_all_ref_updates == LOG_REFS_UNSET) git_config_set(...)`: seed a key
+/// only when the configuration does not define it at all, leaving an explicit
+/// value — including an explicit `false` — alone.
+fn set_config_default(git_dir: &Path, section: &str, key: &str, value: &str) -> Result<()> {
+    let path = config_path(git_dir);
+    let mut file =
+        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if file.string_by(section, None, key).is_some() {
+        return Ok(());
+    }
+    file.set_raw_value_by(section, None, key, value)?;
+    std::fs::write(&path, file.to_bstring())?;
+    Ok(())
+}
+
+/// Port of `create_object_directory()` (`setup.c`): the object store is
+/// `<git-dir>/objects` unless `GIT_OBJECT_DIRECTORY` names another, in which
+/// case git creates *only* that one — `info/` and `pack/` inside it and no
+/// `<git-dir>/objects` at all. gix always lays the default store down, so the
+/// unwanted one is removed here (only when empty, so an existing store is never
+/// destroyed).
+fn create_object_directory(git_dir: &Path, cwd: &Path) -> Result<()> {
+    let default = common_dir(git_dir).join("objects");
+    let objects = match std::env::var_os("GIT_OBJECT_DIRECTORY") {
+        Some(v) if !v.is_empty() => {
+            let p = PathBuf::from(v);
+            match p.is_absolute() {
+                true => p,
+                false => cwd.join(p),
+            }
+        }
+        _ => default.clone(),
+    };
+    if objects != default {
+        let _ = std::fs::remove_dir(default.join("info"));
+        let _ = std::fs::remove_dir(default.join("pack"));
+        let _ = std::fs::remove_dir(&default);
+    }
+    std::fs::create_dir_all(objects.join("info"))?;
+    std::fs::create_dir_all(objects.join("pack"))?;
+    Ok(())
+}
+
+/// `init.templateDir` read as a pathname out of whichever configuration is at
+/// hand: the repository just created, or — on a reinitialization, where there is
+/// no freshly-opened handle — the existing repository on disk.
+fn configured_template_dir(repo: Option<&gix::Repository>, git_dir: &Path) -> Option<String> {
+    fn read(repo: &gix::Repository) -> Option<String> {
+        repo.config_snapshot()
+            .trusted_path("init.templateDir")
+            .ok()
+            .flatten()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+    match repo {
+        Some(repo) => read(repo),
+        None => {
+            let repo = gix::open_opts(
+                git_dir,
+                gix::open::Options::isolated().open_path_as_is(true),
+            )
+            .ok()?;
+            read(&repo)
+        }
+    }
 }

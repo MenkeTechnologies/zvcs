@@ -369,6 +369,16 @@ enum TypeError {
     /// physical config line for a file, or `unable to parse command-line config`
     /// for a `-c` / `GIT_CONFIG_*` value.
     Callback(String),
+    /// ```c
+    /// *dest = interpolate_path(value, 0);
+    /// if (!*dest)
+    ///         die(_("failed to expand user dir in: '%s'"), value);
+    /// ```
+    ///
+    /// (`git_config_pathname()`, config.c.) `interpolate_path()` answers NULL for
+    /// a `~user` no passwd entry names and for a bare `~` with no `$HOME`; both
+    /// are one bare `die()` naming the *unexpanded* value.
+    ExpandUser,
 }
 
 impl ValueType {
@@ -437,7 +447,7 @@ impl ValueType {
                 Some(b) => b.to_string().into_bytes(),
                 None => value.to_vec(),
             }),
-            ValueType::Path => Ok(expand_config_path(&text).into_bytes()),
+            ValueType::Path => expand_config_path(&text).map(String::into_bytes),
             // `git_config_expiry_date()` (config.c) — `parse_expiry_date()` with an
             // `error()` in front of the failure, and the epoch seconds printed raw.
             ValueType::ExpiryDate => match crate::date::parse_expiry_date(&text) {
@@ -486,16 +496,61 @@ fn canonical_int(text: &str, width: Width) -> std::result::Result<Vec<u8>, TypeE
     }
 }
 
-/// `--type=path`: expand a leading `~` / `~user` the way git's
-/// `expand_user_path` does. `~user` needs a passwd lookup that is not vendored,
-/// so it is left verbatim rather than guessed at.
-fn expand_config_path(text: &str) -> String {
-    match text.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-            Some(home) => format!("{}/{}", home.to_string_lossy().trim_end_matches('/'), rest),
-            None => text.to_string(),
-        },
-        None => text.to_string(),
+/// `--type=path`: `interpolate_path(value, 0)` (`path.c`). A leading `~/`
+/// expands to `$HOME`, a leading `~user` to that user's passwd home directory,
+/// and everything else is returned as it stands. A `~user` no passwd entry
+/// names — and a bare `~` with no `$HOME` — is git's NULL return, which
+/// `git_config_pathname()` turns into a `die()`; answering with the unexpanded
+/// text instead made `git config --type=path --get pa.k` print
+/// `~nosuchuser000/x` and exit 0 where stock is fatal at 128.
+fn expand_config_path(text: &str) -> std::result::Result<String, TypeError> {
+    if let Some(rest) = text.strip_prefix("~/") {
+        return match std::env::var_os("HOME") {
+            Some(home) => Ok(format!(
+                "{}/{}",
+                home.to_string_lossy().trim_end_matches('/'),
+                rest
+            )),
+            None => Err(TypeError::ExpandUser),
+        };
+    }
+    let Some(rest) = text.strip_prefix('~') else {
+        return Ok(text.to_string());
+    };
+    // `const char *first_slash = strchrnul(path, '/');` — the username runs to
+    // the first slash, and everything from that slash on is copied verbatim.
+    let (user, tail) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, ""),
+    };
+    if user.is_empty() {
+        return match std::env::var_os("HOME") {
+            Some(home) => Ok(format!("{}{tail}", home.to_string_lossy())),
+            None => Err(TypeError::ExpandUser),
+        };
+    }
+    match passwd_home(user) {
+        Some(home) => Ok(format!("{home}{tail}")),
+        None => Err(TypeError::ExpandUser),
+    }
+}
+
+/// `getpw_str()` (`path.c`): a user's home directory out of the passwd database,
+/// or `None` when there is no such user.
+fn passwd_home(user: &str) -> Option<String> {
+    let name = std::ffi::CString::new(user).ok()?;
+    // SAFETY: `getpwnam` returns a pointer into libc's static passwd storage,
+    // which is copied out here before any other libc call can overwrite it.
+    unsafe {
+        let pw = libc::getpwnam(name.as_ptr());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        Some(
+            std::ffi::CStr::from_ptr((*pw).pw_dir)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 
@@ -1253,6 +1308,29 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 | Mode::GetKeyRegexpAll
                 | Mode::GetUrlMatch
         );
+    // `--fixed-value` only says *how* a `<value-pattern>` is compared, so the
+    // legacy form refuses it when the command line carries none — one `error:`
+    // line and exit 129, for every action alike, verified against stock 2.55.0
+    // for `--list`, `--get`, `--get-regexp`, `--get-color`, `--replace-all`,
+    // `--unset-all` and `--remove-section`. The `get`/`set`/`unset` subcommands
+    // make the same refusal in their own words (`fatal:` at 128) during the
+    // rewrite above, so they are excluded here.
+    if d.fixed_value && !from_subcommand {
+        let has_pattern = match mode {
+            Mode::Get
+            | Mode::GetAll
+            | Mode::GetRegexp
+            | Mode::GetKeyRegexp
+            | Mode::GetKeyRegexpAll
+            | Mode::Unset
+            | Mode::UnsetAll => positional.len() >= 2,
+            Mode::ReplaceAll | Mode::Auto => positional.len() >= 3,
+            _ => false,
+        };
+        if !has_pattern {
+            return usage_error("--fixed-value only applies with 'value-pattern'");
+        }
+    }
     d.name_only = name_only;
     if name_only && !get_subcommand && !matches!(mode, Mode::List | Mode::GetRegexp) {
         return usage_error("--name-only is only applicable to --list or --get-regexp");
@@ -1301,7 +1379,35 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // and system config with no repo present), while writes target the local
     // scope and still require a repo. Discovery failure is therefore not fatal
     // here — only an attempted write without a repo is.
-    let repo = crate::setup::discover().ok();
+    // ```c
+    // if (verify_repository_format(candidate, &err) < 0) {
+    //         if (nongit_ok) {
+    //                 warning("%s", err.buf);
+    //                 *nongit_ok = -1;
+    //                 return -1;
+    //         }
+    //         die("%s", err.buf);
+    // }
+    // ```
+    //
+    // (`check_repository_format_gently()`, setup.c.) `git config` is
+    // `RUN_SETUP_GENTLY`, so a repository whose format this build cannot honour
+    // is a *warning* and the command carries on outside the repository — which
+    // is already what discovery failing leaves behind here. Only the warning was
+    // missing, so `git config --get extensions.objectFormat` in a repository
+    // that declares `sha256` at format version 0 exited 1 in silence where stock
+    // says which extension it objected to.
+    let repo = match crate::setup::discover() {
+        Ok(repo) => Some(repo),
+        Err(err) => {
+            if let gix::discover::Error::Open(gix::open::Error::Config(config)) = &err {
+                if let Some(message) = crate::config::repository_format_message(config) {
+                    eprintln!("warning: {message}");
+                }
+            }
+            None
+        }
+    };
     d.prefix = repo.as_ref().and_then(crate::setup::prefix).map(|p| format!("{}/", p.display()));
     d.blob = match &scope {
         Scope::Blob(spec) => Some(spec.clone()),
@@ -1377,6 +1483,45 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         | Mode::RemoveSection
         | Mode::Edit => false,
     };
+
+    // ```c
+    // if (inc->depth > MAX_INCLUDE_DEPTH)
+    //         die(_(include_depth_advice), MAX_INCLUDE_DEPTH, path,
+    //             !cf ? "<unknown>" : cf->name ? cf->name : "the command line");
+    // ```
+    //
+    // (`handle_path_include()`, config.c.) A configuration that includes itself
+    // is fatal at 128, naming the include and the file that asked for it. gix
+    // answers a circular chain two other ways — silently capping it for the
+    // repository cascade, and with its own wording for an explicit
+    // `--file … --includes` — so the chain is walked here for the diagnostic.
+    if includes && reads_config {
+        let cyclic = match &scope {
+            Scope::File(path) => include_depth_overflow(path),
+            // A circular include also stops the repository from *opening* — gix
+            // gives up on the configuration and discovery fails with it — so the
+            // git directory is located directly rather than through `repo`,
+            // which is `None` in exactly the case this diagnostic is for.
+            Scope::Default | Scope::Local => {
+                let git_dir = match repo.as_ref() {
+                    Some(repo) => Some(repo.common_dir().to_path_buf()),
+                    None => gix::discover::upwards(std::path::Path::new("."))
+                        .ok()
+                        .map(|(path, _trust)| path.into_repository_and_work_tree_directories().0),
+                };
+                git_dir.and_then(|dir| include_depth_overflow(&dir.join("config")))
+            }
+            _ => None,
+        };
+        if let Some((path, from)) = cyclic {
+            eprintln!(
+                "fatal: exceeded maximum include depth ({MAX_INCLUDE_DEPTH}) while including\n\
+                 \t{path}\nfrom\n\t{from}\nThis might be due to circular includes."
+            );
+            return Ok(ExitCode::from(128));
+        }
+    }
+
     let file: &gix::config::File = match &scope {
         Scope::Default => match snapshot.as_ref() {
             Some(s) => s.plumbing(),
@@ -1407,7 +1552,15 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             })?;
             scope_file = worktree_config_file(repo)?;
             source_file = Some(&scope_file);
-            scoped = load_or_empty(&scope_file, Source::Local)?;
+            // Read like every other named scope, so a `config.worktree` that is
+            // not there is carried as the `io::Error` `--list` turns into
+            // `fatal: unable to read config file '<path>': <errno>`. It is
+            // reachable: `extensions.worktreeConfig` is a repository-wide switch
+            // while the file it names is per-worktree, so a linked worktree that
+            // has never been written to has none — where reading it as empty
+            // answered 0 and printed nothing, stock dies at 128.
+            scoped =
+                read_single_scope_file(&scope_file, Source::Local, reads_config, &mut unreadable)?;
             &scoped
         }
         // `location_options_init()` (builtin/config.c:959-972): a scope flag does
@@ -1477,9 +1630,17 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                         // follow-mode options have to be passed explicitly, with
                         // the gitdir context the conditional forms need.
                         let git_dir = repo.as_ref().map(|r| r.git_dir().to_owned());
+                        // `include_condition_is_true()` (config.c) is handed
+                        // both halves of the context: `gitdir:` matches against
+                        // the git directory, `onbranch:` against the checked-out
+                        // branch. Leaving the branch out made every `onbranch:`
+                        // condition false, so an include chain that passed
+                        // through one stopped there and the values behind it
+                        // never reached the snapshot.
+                        let branch_name = repo.as_ref().and_then(|r| r.head_name().ok().flatten());
                         let conditional = gix::config::file::includes::conditional::Context {
                             git_dir: git_dir.as_deref(),
-                            branch_name: None,
+                            branch_name: branch_name.as_ref().map(|n| n.as_ref()),
                         };
                         let opts = gix::config::file::init::Options {
                             includes: gix::config::file::includes::Options::follow(
@@ -1671,15 +1832,40 @@ fn name_and_value<'a>(positional: &[&'a str]) -> Result<(&'a str, &'a str)> {
 /// no usage block — and both exit 2 (`CONFIG_NO_SECTION_OR_NAME`, config.h:28), where this
 /// port reported its own `zvcs:` line at exit 1.
 fn parse_key(name: &str) -> Result<KeyRef<'_>> {
-    if let Some(key) = KeyRef::parse_unvalidated(name.into()) {
-        return Ok(key);
+    parse_key_as(name, 1)
+}
+
+/// [`parse_key`] for the write actions, where a key with no section or no
+/// variable name is `-CONFIG_NO_SECTION_OR_NAME` and surfaces as exit 2, rather
+/// than the read path's flat `CONFIG_INVALID_KEY` (1) for every shape of bad
+/// key. A key that parses into a section and a name but carries a byte
+/// `git_config_parse_key()` refuses — a space, say — is `CONFIG_INVALID_KEY` on
+/// both paths, so only the first class differs.
+fn parse_key_write(name: &str) -> Result<KeyRef<'_>> {
+    parse_key_as(name, 2)
+}
+
+/// The shared body: validate with the full `git_config_parse_key()` port (which
+/// `KeyRef::parse_unvalidated` does not do — it accepts `a.` and `ec.a b` alike)
+/// and report git's `error:` line at the caller's exit code.
+fn parse_key_as(name: &str, no_section_or_name: u8) -> Result<KeyRef<'_>> {
+    if let Err(message) = crate::config::parse_config_key(name) {
+        let code = match message.starts_with("invalid key") {
+            true => 1,
+            false => no_section_or_name,
+        };
+        eprintln!("error: {message}");
+        return Err(anyhow::Error::new(crate::fatal::Silent(code)));
     }
-    let message = match name.rfind('.') {
-        Some(dot) if dot + 1 == name.len() => "key does not contain variable name",
-        _ => "key does not contain a section",
-    };
-    eprintln!("error: {message}: {name}");
-    Err(anyhow::Error::new(crate::fatal::Silent(2)))
+    match KeyRef::parse_unvalidated(name.into()) {
+        Some(key) => Ok(key),
+        // Unreachable in practice: every shape `parse_config_key` accepts has a
+        // section and a variable name. Reported as git reports the same class.
+        None => {
+            eprintln!("error: key does not contain a section: {name}");
+            Err(anyhow::Error::new(crate::fatal::Silent(no_section_or_name)))
+        }
+    }
 }
 
 /// A compiled `<value-pattern>`: the optional second operand of a read, an
@@ -2048,6 +2234,7 @@ fn report_type_error(
             }
         }
         TypeError::BadBool => eprintln!("fatal: bad boolean config value '{shown}' for '{key}'"),
+        TypeError::ExpandUser => eprintln!("fatal: failed to expand user dir in: '{shown}'"),
         // The callback's own `error()`, then the line the config machinery adds
         // when a callback aborts the parse (config.c's `git_parse_source` /
         // `git_config_from_parameters`).
@@ -2108,7 +2295,7 @@ fn normalize_value(ty: Option<ValueType>, key: &str, value: &str) -> Option<Stri
             match err {
                 // A value handed to `git config` on the command line has no file
                 // behind it, so `die_bad_number()` takes its short form.
-                TypeError::BadNumber { .. } | TypeError::BadBool => {
+                TypeError::BadNumber { .. } | TypeError::BadBool | TypeError::ExpandUser => {
                     report_type_error(err, key, value.as_bytes(), None);
                 }
                 TypeError::Callback(message) => {
@@ -3085,11 +3272,24 @@ fn get_colorbool(file: &gix::config::File, positional: &[&str]) -> Result<ExitCo
         .or(color_ui)
         // `GIT_COLOR_AUTO` is the default when nothing in the config decided.
         .unwrap_or(ColorBool::Auto);
-    // `want_color()`: `ALWAYS` and `NEVER` answer outright, `AUTO` asks the terminal.
+    // `want_color()`: `ALWAYS` and `NEVER` answer outright, `AUTO` goes through
+    // `check_auto_color()` (`color.c`), which is not the terminal alone —
+    // a tty still answers `false` unless `TERM` names a terminal that can do
+    // more than `dumb`:
+    // ```c
+    // if (color_stdout_is_tty || (pager_in_use() && pager_use_color)) {
+    //         char *term = getenv("TERM");
+    //         if (term && strcmp(term, "dumb"))
+    //                 return 1;
+    // }
+    // return 0;
+    // ```
     let on = match found {
         ColorBool::Always => true,
         ColorBool::Never => false,
-        ColorBool::Auto => tty,
+        ColorBool::Auto => {
+            tty && std::env::var("TERM").is_ok_and(|term| term != "dumb")
+        }
     };
     if stated.is_some() {
         println!("{on}");
@@ -3152,6 +3352,21 @@ fn rename_section(target: &WriteTarget, positional: &[&str]) -> Result<ExitCode>
         [old, new] => (*old, *new),
         _ => return usage_error("wrong number of arguments, should be 2"),
     };
+    // ```c
+    // if (new_name && !section_name_is_valid(new_name)) {
+    //         ret = error(_("invalid section name: %s"), new_name);
+    //         goto out_no_rollback;
+    // }
+    // ```
+    //
+    // (`git_config_copy_or_rename_section_in_file()`, config.c.) It is the first
+    // thing the rename does — before the lock, before the file is read — and it
+    // is an `error()` returning -1, which surfaces as exit 255. Only the *new*
+    // name is checked; `--remove-section` passes a NULL new name and skips it.
+    if !section_name_is_valid(new) {
+        eprintln!("error: invalid section name: {new}");
+        return Ok(ExitCode::from(255));
+    }
     let (old_name, old_sub) = split_section(old);
     let (new_name, new_sub) = split_section(new);
 
@@ -3224,7 +3439,7 @@ fn replace_all(
     value_pattern: Option<&str>,
     fixed_value: bool,
 ) -> Result<ExitCode> {
-    let key = parse_key(name)?;
+    let key = parse_key_write(name)?;
     let section_lc = key.section_name.to_lowercase();
     let value_lc = key.value_name.to_lowercase();
     let filter = match value_pattern.map(|p| ValueFilter::parse(p, fixed_value)) {
@@ -3263,6 +3478,18 @@ fn replace_all(
 /// Split a `--rename-section`/`--remove-section` operand into its section and
 /// optional subsection halves: `remote.origin` is the subsection `origin` of
 /// `remote`, while `core` has none.
+/// Port of config.c's `section_name_is_valid()`: an empty name is bogus, and up
+/// to the first dot every byte must be ASCII alphanumeric or `-`. Past that dot
+/// lies the subsection, where "anything goes, so we can stop checking".
+fn section_name_is_valid(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    name.bytes()
+        .take_while(|&c| c != b'.')
+        .all(|c| c == b'-' || c.is_ascii_alphanumeric())
+}
+
 fn split_section(spec: &str) -> (String, Option<String>) {
     match spec.split_once('.') {
         Some((name, sub)) => (name.to_lowercase(), Some(sub.to_string())),
@@ -3349,7 +3576,12 @@ fn blob_config(repo: &gix::Repository, spec: &str) -> std::result::Result<Config
 /// single linked worktree already makes two.
 fn worktree_config_file(repo: &gix::Repository) -> Result<std::path::PathBuf> {
     if repo.config_snapshot().boolean("extensions.worktreeConfig").unwrap_or(false) {
-        return Ok(repo.git_dir().join("config.worktree"));
+        // `repo_git_path()` answers absolutely; `repo.git_dir()` is relative
+        // whenever the repository was discovered from the current directory, and
+        // the path is quoted back in `fatal: unable to read config file '%s'`,
+        // where stock prints `<repo>/.git/worktrees/wt/config.worktree` and this
+        // printed `./../.git/worktrees/wt/config.worktree`.
+        return Ok(absolute_git_path(repo.git_dir()).join("config.worktree"));
     }
     if !repo.worktrees().map(|w| w.is_empty()).unwrap_or(true) {
         let message = concat!(
@@ -3360,6 +3592,50 @@ fn worktree_config_file(repo: &gix::Repository) -> Result<std::path::PathBuf> {
         return Err(crate::fatal::Fatal(message.to_owned()).into());
     }
     Ok(repo.common_dir().join("config"))
+}
+
+/// `MAX_INCLUDE_DEPTH` (config.c): how many nested `include.path` hops git will
+/// follow before it decides the chain is circular.
+const MAX_INCLUDE_DEPTH: usize = 10;
+
+/// Walk `start`'s unconditional `include.path` chain looking for the hop that
+/// would exceed [`MAX_INCLUDE_DEPTH`], and return the pair git's diagnostic names:
+/// the include it refused to follow and the file that asked for it. `None` is
+/// every chain that terminates within the limit.
+///
+/// Only `include.path` is followed. A conditional `includeIf` hop is decided by
+/// `include_condition_is_true()` against a context this walk does not have, and
+/// a chain that is only circular through a condition would be mis-reported;
+/// leaving it out means such a chain keeps whatever answer the resolver gives it
+/// rather than getting a fabricated one.
+fn include_depth_overflow(start: &std::path::Path) -> Option<(String, String)> {
+    let mut current = start.to_path_buf();
+    for depth in 0..=MAX_INCLUDE_DEPTH {
+        let file =
+            gix::config::File::from_path_no_includes(current.clone(), Source::Local).ok()?;
+        let raw = file.string_by("include", None, "path")?.to_string();
+        // `handle_path_include()` resolves a relative include against the
+        // directory of the file that named it, not against the current directory.
+        let next = match std::path::Path::new(&raw).is_absolute() {
+            true => std::path::PathBuf::from(&raw),
+            false => match current.parent().filter(|d| !d.as_os_str().is_empty()) {
+                Some(dir) => dir.join(&raw),
+                None => std::path::PathBuf::from(&raw),
+            },
+        };
+        if depth == MAX_INCLUDE_DEPTH {
+            return Some((display_origin_path(&next), display_origin_path(&current)));
+        }
+        current = next;
+    }
+    None
+}
+
+/// A git directory as an absolute, symlink-resolved path — what
+/// `repo_git_path()` hands back and what git's diagnostics quote. Falls back to
+/// the path as given when it cannot be resolved.
+fn absolute_git_path(git_dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf())
 }
 
 /// An empty config file carrying `path`/`source` metadata, so entries written
@@ -3641,7 +3917,7 @@ fn unset_scoped(
     all: bool,
     fixed_value: bool,
 ) -> Result<ExitCode> {
-    let key = parse_key(name)?;
+    let key = parse_key_write(name)?;
     let filter = match value_pattern.map(|p| ValueFilter::parse(p, fixed_value)) {
         Some(Err(code)) => return Ok(code),
         Some(Ok(f)) => Some(f),
@@ -3724,7 +4000,7 @@ fn write_scoped(
     op: WriteOp,
     comment: Option<&str>,
 ) -> Result<ExitCode> {
-    let key = parse_key(name)?;
+    let key = parse_key_write(name)?;
     let section_lc = key.section_name.to_lowercase();
     let value_lc = key.value_name.to_lowercase();
 
@@ -3737,6 +4013,36 @@ fn write_scoped(
     };
 
     let comment = comment.map(prepare_comment).transpose()?;
+    // `git_config_set_in_file_gently()` is `git_config_set_multivar_in_file_gently(key,
+    // value, NULL, 0)`, and a NULL value-pattern makes `matches()` answer yes for
+    // every existing value of the key. So a key that already carries more than one
+    // value is not collapsed into one:
+    //
+    // ```c
+    // if (store.seen_nr > 1 && !store.multi_replace) {
+    //         error(_("cannot overwrite multiple values with a single value\n"
+    //                 "       Use a regexp, --add or --replace-all to change %s."), key);
+    //         ret = CONFIG_NOTHING_SET;
+    //         goto out_free;
+    // }
+    // ```
+    //
+    // preceded by `store_aux()`'s `warning(_("%s has multiple values"), key)` on
+    // the second match. Nothing is written and the exit code is 5.
+    if matches!(op, WriteOp::Set) {
+        let existing = file
+            .section(&section_lc, key.subsection_name)
+            .map(|section| section.values(&value_lc).len())
+            .unwrap_or(0);
+        if existing > 1 {
+            eprintln!("warning: {name} has multiple values");
+            eprintln!(
+                "error: cannot overwrite multiple values with a single value\n       \
+                 Use a regexp, --add or --replace-all to change {name}."
+            );
+            return Ok(ExitCode::from(5));
+        }
+    }
     match op {
         // A comment can only be attached to a line as it is written, so a `set` that would
         // have rewritten an existing value in place pushes a new one instead — which is
@@ -3817,7 +4123,7 @@ fn set_with_value_pattern(
     value: &str,
     value_pattern: &str,
 ) -> Result<ExitCode> {
-    let key = parse_key(name)?;
+    let key = parse_key_write(name)?;
     let section_lc = key.section_name.to_lowercase();
     let value_lc = key.value_name.to_lowercase();
 

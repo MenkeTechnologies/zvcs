@@ -34,9 +34,8 @@ use std::process::ExitCode;
 ///     `GIT_DEFAULT_REF_FORMAT` / `GIT_TEMPLATE_DIR` environment override) and
 ///     `init.defaultSubmodulePathConfig`.
 ///   * The divergences documented on [`super::init::init`] apply here unchanged:
-///     reinitialization does not re-copy missing template hooks or
-///     `info/exclude`, and a configured `reftable` format is rejected rather
-///     than silently laid down as `files`.
+///     a configured `reftable` format is rejected rather than silently laid down
+///     as `files`.
 ///
 /// One inherited divergence, on stderr and belonging to `init` rather than to this
 /// synonym: stock git prints the `advice.defaultBranchName` hint block when

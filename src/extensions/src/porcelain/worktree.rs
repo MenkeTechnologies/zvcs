@@ -1472,10 +1472,17 @@ fn repair_worktree_at_path(
     }
 
     let dotgit = path.join(".git");
+    // `strbuf_realpath(&realdotgit, realdotgit.buf, 0)` tolerates a missing
+    // *last* component and nothing before it, so a `<path>` that is not there at
+    // all — a typo, or a worktree whose directory has been deleted — fails the
+    // resolution and is reported as "not a valid path" rather than reaching the
+    // gitfile read and being reported as a repository that could not be located.
+    // `gix::path::realpath` resolves the missing parent happily, so the parent is
+    // tested here.
     let realdotgit = match gix::path::realpath(&dotgit) {
-        Ok(r) => r,
+        Ok(r) if std::fs::metadata(path).is_ok() => r,
         // strbuf_realpath(die_on_error=0): reported, not fatal.
-        Err(_) => {
+        _ => {
             report(rc, true, path, "not a valid path");
             return Ok(());
         }
@@ -2883,6 +2890,24 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
             });
         }
     }
+    // ```c
+    // if (validate_worktree(wt, &errmsg, 0))
+    //         die(_("validation failed, cannot move working tree: %s"), errmsg.buf);
+    // ```
+    //
+    // (`move_worktree()`, builtin/worktree.c.) `validate_worktree()` checks that
+    // the checkout is still where the administrative directory says it is, and
+    // its own message names the `.git` link that is missing. Without it a
+    // worktree whose directory has been deleted reported the failed `rename(2)`
+    // instead — a different message, and one that leaks the destination.
+    let dotgit = wt.path.join(".git");
+    if std::fs::symlink_metadata(&dotgit).is_err() {
+        return die(&format!(
+            "validation failed, cannot move working tree: '{}' does not exist",
+            path_to_string(&dotgit)
+        ));
+    }
+
     if let Err(e) = std::fs::rename(&wt.path, &dest) {
         return die(&format!(
             "failed to move '{}' to '{}': {}",

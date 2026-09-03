@@ -1079,10 +1079,12 @@ fn sign_buffer_gpg(payload: &[u8], program: &str, key: &str) -> Result<Vec<u8>, 
         .spawn()
     {
         Ok(child) => child,
-        // `start_command()` reports a failed exec from the forked child and the
-        // parent then sees an empty status stream, which is `(no gpg output)`.
+        // `start_command()` fails in the parent when the program cannot be found
+        // and reports `error_errno("cannot run %s", cmd->args.v[0])`
+        // (run-command.c); the status stream is then empty, which is what makes
+        // the caller's diagnostic `(no gpg output)`.
         Err(e) => {
-            eprintln!("fatal: cannot exec '{program}': {}", crate::external::strerror(&e));
+            eprintln!("error: cannot run {program}: {}", crate::external::strerror(&e));
             return Err(fail(b""));
         }
     };

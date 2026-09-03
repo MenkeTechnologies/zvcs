@@ -628,7 +628,13 @@ fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, tip: ObjectId) -> Res
 ///   * `--message=<msg>` / `-m<msg>` (attached value)
 ///   * `-F <file>` / `--file=<file>` (message from a file; `-` is stdin)
 ///   * `-C <commit>` / `-c <commit>` (reuse a commit's message + author; `-c`
-///     opens the editor), `--reset-author`, `--author=<ident>`, `--date=<date>`
+///     opens the editor), `--reset-author`, `--author=<ident>`, `--date=<date>`.
+///     An `--author` value with no `>` in it is a *search*, not an ident:
+///     `find_author_by_nickname()` walks every commit reachable from any ref,
+///     matching the pattern case-insensitively against mailmapped author lines,
+///     and takes the first match's `%aN <%aE>`; a pattern that matches nothing is
+///     `fatal: --author '<p>' is not 'Name <email>' and matches no existing
+///     author`
 ///   * `--amend` (replace `HEAD`; `--no-edit` keeps its message)
 ///   * `--allow-empty`, `--allow-empty-message`, `-q`/`--quiet`
 ///   * `-a`/`--all` (auto-stage tracked modifications and deletions)
@@ -681,8 +687,13 @@ fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, tip: ObjectId) -> Res
 /// and off, `--status`/`--no-status` (`commit.status`) gate the commented status
 /// block, and `-v`/`--verbose` (`commit.verbose`) appends the staged diff below a
 /// scissors line. `-n`/`--no-verify` and `--verify` toggle the `pre-commit` and
-/// `commit-msg` hooks; `--no-post-rewrite` suppresses the `post-rewrite` hook an
-/// `--amend` otherwise fires. `-S`/`--gpg-sign[=<keyid>]` (`commit.gpgSign`,
+/// `commit-msg` hooks — and only those two: `prepare-commit-msg` runs on every
+/// path that produces a message, right after the template reaches
+/// `COMMIT_EDITMSG` and before any editor opens, carrying the two arguments that
+/// name where the message came from. `--no-post-rewrite` suppresses the whole of
+/// `commit_post_rewrite()` an `--amend` otherwise fires: both the notes
+/// `notes.rewriteRef`/`GIT_NOTES_REWRITE_REF` carries onto the replacement commit
+/// and the `post-rewrite` hook. `-S`/`--gpg-sign[=<keyid>]` (`commit.gpgSign`,
 /// `user.signingKey`) writes a `gpgsig` header through [`crate::gitsig::Signer`],
 /// so the whole `gpg.format` table applies: `openpgp` via `gpg.program` or
 /// `gpg.openpgp.program`, `x509` via `gpg.x509.program` (default `gpgsm`), and
@@ -703,8 +714,10 @@ fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, tip: ObjectId) -> Res
 /// outside patch mode those two are refused, as git refuses them. The selection
 /// is rolled back when the commit does not go through — see [`InteractiveStage`].
 ///
-/// `--fixup=reword:` is still not backed and fails with a precise message rather
-/// than silently doing the wrong thing.
+/// `--fixup=reword:<commit>` shapes its message exactly like `--fixup=amend:` —
+/// git gives both the same `fixup_prefix` — and adds the `allow_empty` and
+/// pathless `--only` that make it record HEAD's tree, leaving whatever is staged
+/// staged.
 ///
 /// A commit that *concludes an operation* — [`determine_whence`] — is not an
 /// ordinary commit. Concluding a merge takes `HEAD` plus every id in `MERGE_HEAD`
@@ -1112,7 +1125,24 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // ```
     //
     // (builtin/commit.c:1322-1323.) It comes first because `--author` has already been
-    // through `find_author_by_nickname()` by this point.
+    // through `find_author_by_nickname()` by this point:
+    //
+    // ```c
+    // if (force_author && !strchr(force_author, '>'))
+    //         force_author = find_author_by_nickname(force_author);
+    // ```
+    //
+    // which is the very first statement of `parse_and_validate_options()`, ahead
+    // of every other refusal in this block. The repository is opened here rather
+    // than at the usual place below because the lookup is a revision walk — and
+    // only when a nickname is actually present, so a value that already names an
+    // ident still reaches the option checks without needing a repository.
+    if let Some(a) = &author_arg {
+        if !a.contains('>') {
+            let repo = crate::setup::discover()?;
+            author_arg = Some(find_author_by_nickname(&repo, a)?);
+        }
+    }
     if author_arg.is_some() && reset_author {
         crate::git_fatal!("options '--reset-author' and '--author' cannot be used together");
     }
@@ -1221,6 +1251,23 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     //
     // Rejecting the amend form broke `commit --amend -F <file> --only`, which is
     // how the JetBrains client rewords a commit message.
+    // ```c
+    // } else if (skip_prefix(fixup_message, "reword:", &fixup_commit)) {
+    //         fixup_prefix = "amend";
+    //         allow_empty = 1;
+    //         only = 1;
+    // }
+    // ```
+    //
+    // (builtin/commit.c's `--fixup` parsing.) `reword:` is `amend:` with two
+    // extra flags, and git sets them while parsing options — so they are in force
+    // for every check below, including the "No paths with --include/--only" one
+    // this sits in front of. The message itself is shaped further down, where the
+    // `amend` prefix it shares is handled.
+    let fixup_reword = fixup_arg.as_deref().is_some_and(|raw| raw.starts_with("reword:"));
+    if fixup_reword {
+        allow_empty = true;
+    }
     if pathspecs.is_empty() && (include_flag || (only_flag && !amend && !allow_empty)) {
         crate::git_fatal!("No paths with --include/--only does not make sense.");
     }
@@ -1258,7 +1305,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // likewise a whole-index commit: git's `prepare_index()` leaves its branch
     // with `commit_style = COMMIT_NORMAL`, so paths there only narrow the diff
     // the selector offers.
-    let only_mode = !pathspecs.is_empty() && !include_flag && !interactive;
+    // `--fixup=reword:` sets git's `only` with no pathspec at all, which commits
+    // HEAD's tree and leaves whatever is staged staged.
+    let only_mode = (!pathspecs.is_empty() || fixup_reword) && !include_flag && !interactive;
 
     // `-z` promotes an unset (or explicitly long) format to porcelain, and any
     // format at all implies a dry run — git's `finalize_deferred_config()` plus
@@ -1428,14 +1477,34 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `-F <file>` (repeatable) supplies the message from a file, joined with any
     // `-m` blocks in the order given; `-` reads stdin. Read here so it feeds the
     // same `from_flags`/no-editor path as `-m`.
+    //
+    // The *failure* is held back rather than raised here: git reads the file
+    // inside `prepare_to_commit()`, which runs after `prepare_index()` has
+    // already refreshed the index and written the tree — so an unreadable `-F`
+    // leaves those behind, and dying at this point would not. [`deferred_fatal`]
+    // is released once the tree is built.
+    let mut deferred_fatal: Option<String> = None;
     for f in &file_args {
         let content = if f == "-" {
             let mut s = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
             s
         } else {
-            std::fs::read_to_string(f)
-                .map_err(|e| anyhow::anyhow!("could not read message file `{f}`: {e}"))?
+            // `if (strbuf_read_file(&sb, logfile, 0) < 0) die_errno(_("could not
+            // read log file '%s'"), logfile);` (builtin/commit.c) — `die_errno`,
+            // so the bare strerror text follows and the status is 128.
+            match std::fs::read(f) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(e) => {
+                    deferred_fatal.get_or_insert_with(|| {
+                        format!(
+                            "could not read log file '{f}': {}",
+                            crate::external::strerror(&e)
+                        )
+                    });
+                    String::new()
+                }
+            }
         };
         messages.push(content);
     }
@@ -1452,8 +1521,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // built and written the tree, which is why `git commit -m ''` leaves a tree
         // object behind that this port's early refusal never created.
         //
-        // Match git's on-disk message, which is newline-terminated.
-        if !message.ends_with('\n') {
+        // Match git's on-disk message, which is newline-terminated — but only for
+        // `-m`, whose `opt_parse_m()` appends the newline itself. A `-F` message
+        // is `strbuf_read_file()`'s bytes verbatim, and git adds nothing to them;
+        // under `--cleanup=verbatim` that missing byte is the whole difference
+        // between two commit ids. (`-m` and `-F` cannot both be given.)
+        if file_args.is_empty() && !message.ends_with('\n') {
             message.push('\n');
         }
     }
@@ -1474,6 +1547,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 .rev_parse_single(spec.as_str())
                 .ok()
                 .and_then(|id| repo.find_object(id).ok());
+            // `lookup_commit_reference_by_name()` goes through
+            // `lookup_commit_reference_gently(…, quiet=1)`, which *peels* — so
+            // `-C <annotated tag>` reuses the tagged commit's message and author
+            // rather than dying, and only what the chain ends at has to be a
+            // commit.
+            let resolved = resolved.map(|o| match o.kind {
+                gix::object::Kind::Tag => o.clone().peel_tags_to_end().unwrap_or(o),
+                _ => o,
+            });
             match resolved {
                 Some(object) if object.kind == gix::object::Kind::Commit => {
                     Some(object.into_commit())
@@ -1514,9 +1596,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("options '--squash' and '--fixup' cannot be used together");
     }
     if let Some(spec) = &squash_arg {
-        if reuse_arg.is_some() {
-            anyhow::bail!("--squash together with -c/-C is not supported");
-        }
+        // `-c`/`-C` is *not* refused alongside `--squash`: measured against git
+        // 2.55.0, `commit -C HEAD --squash HEAD` records the message
+        // `squash! <subject>` and takes only its authorship from the reused
+        // commit — the `squash!` subject is inserted before every other message
+        // option contributes, and `squash_fixup_seed` outranks `reuse_commit`
+        // when the editor buffer is built.
         let c = repo.find_commit(
             repo.rev_parse_single(spec.as_str())
                 .map_err(|e| anyhow::anyhow!("could not lookup commit {spec}: {e}"))?
@@ -1524,8 +1609,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         )?;
         let subject = folded_subject(c.message_raw()?.to_str_lossy().as_ref());
         if from_flags {
-            // A `-m`/`-F` body follows the `squash!` subject line.
-            message = format!("squash! {subject}\n\n{message}");
+            // A `-m`/`-F` body follows the `squash!` subject line. A `-C`/`-c`
+            // message contributes only its *body* — git's `use_message` arm is
+            // `buffer = strstr(use_message_buffer, "\n\n"); if (buffer)
+            // strbuf_addstr(&sb, skip_blank_lines(buffer + 2));` — so reusing a
+            // commit whose message is a bare subject adds nothing at all.
+            let body = match reuse_commit.is_some() {
+                true => message_body(&message),
+                false => std::mem::take(&mut message),
+            };
+            message = format!("squash! {subject}\n\n{body}");
         } else {
             squash_fixup_seed = Some(format!("squash! {subject}\n\n"));
         }
@@ -1544,10 +1637,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 let sub = &raw[..alpha];
                 let commit = &raw[alpha + 1..];
                 match sub {
-                    "amend" => (commit, "amend"),
-                    "reword" => anyhow::bail!(
-                        "--fixup=reword: requires a paths-limited (--only) commit, which is not ported"
-                    ),
+                    // `reword:` shapes its message exactly like `amend:` — git
+                    // assigns it the same `fixup_prefix` — and differs only in
+                    // the `allow_empty`/`only` pair set during option parsing.
+                    "amend" | "reword" => (commit, "amend"),
                     _ => crate::git_fatal!("unknown option: --fixup={sub}:{commit}"),
                 }
             } else {
@@ -1587,14 +1680,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `--date=<date>` overrides the author date. `parse_force_date()` (builtin/commit.c:614)
     // tries `parse_date()` first and only falls back to `approxidate_careful()`, failing when
     // that reports an error — so `--date=0` is the current time, not the epoch.
+    //
+    // `determine_author_info()` runs it from inside `prepare_to_commit()`, after
+    // the index has been refreshed and the tree written, so an unparsable date is
+    // deferred with the same mechanism an unreadable `-F` file is.
     let date_override: Option<gix::date::Time> = match &date_arg {
-        Some(d) => Some(match crate::date::parse_date_basic(d) {
-            Some(time) => time,
+        Some(d) => match crate::date::parse_date_basic(d) {
+            Some(time) => Some(time),
             None => match crate::date::approxidate_careful(d) {
-                (seconds, false) => gix::date::Time::new(seconds, 0),
-                (_, true) => crate::git_fatal!("invalid date format: {d}"),
+                (seconds, false) => Some(gix::date::Time::new(seconds, 0)),
+                (_, true) => {
+                    deferred_fatal.get_or_insert_with(|| format!("invalid date format: {d}"));
+                    None
+                }
             },
-        }),
+        },
         None => None,
     };
 
@@ -1768,6 +1868,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
         }
     };
+
+    // The point `prepare_to_commit()` starts at: the index is refreshed and the
+    // tree is written, and everything it dies over dies from here on. An
+    // unreadable `-F` file or an unparsable `--date` is one of those, and the
+    // objects and index above stay behind exactly as stock leaves them.
+    if let Some(msg) = deferred_fatal {
+        crate::git_fatal!("{msg}");
+    }
 
     // --- parents ---------------------------------------------------------
     // `--amend` replaces HEAD: the new commit takes HEAD's *parents*, and the
@@ -2106,6 +2214,79 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // ```c
+    // if (run_commit_hook(use_editor, index_file, NULL, "prepare-commit-msg",
+    //                     git_path_commit_editmsg(), hook_arg1, hook_arg2, NULL))
+    //         return 0;
+    // ```
+    //
+    // (builtin/commit.c.) `prepare-commit-msg` is *not* one of the two hooks
+    // `--no-verify` bypasses — that is `pre-commit` and `commit-msg` — so it runs
+    // here on every path that reaches a message, right after the template is on
+    // disk and before any editor opens. Its edits to `COMMIT_EDITMSG` are picked
+    // up by the read below, and a non-zero exit abandons the commit (1).
+    //
+    // The two trailing arguments say where the message came from, in git's own
+    // branch order; `run_commit_hook()` stops at the first `NULL`, so a source it
+    // has no name for passes the file alone. It also tells the hook that no
+    // editor will run, with `GIT_EDITOR=:`.
+    {
+        // `if (amend && !use_message && !fixup_message) use_message = "HEAD";`
+        // (parse_and_validate_options), which is what makes a bare `--amend`
+        // report itself as `commit HEAD` rather than as no source at all.
+        let use_message: Option<String> = reuse_arg.clone().or(match amend && fixup_arg.is_none() {
+            true => Some("HEAD".to_string()),
+            false => None,
+        });
+        let (mut arg1, mut arg2): (Option<&str>, Option<String>) = if !messages.is_empty()
+            && fixup_arg.is_none()
+        {
+            (Some("message"), None)
+        } else if !file_args.is_empty() {
+            (Some("message"), None)
+        } else if let Some(m) = &use_message {
+            (Some("commit"), Some(m.clone()))
+        } else if fixup_arg.is_some() {
+            (Some("message"), None)
+        } else if merge_msg.is_some() {
+            (Some("merge"), None)
+        } else if squash_msg.is_some() {
+            (Some("squash"), None)
+        } else if template_file.is_some() {
+            (Some("template"), None)
+        } else if whence == Whence::Merge {
+            (Some("merge"), None)
+        } else if whence.is_cherry_pick() {
+            (Some("commit"), Some("CHERRY_PICK_HEAD".to_string()))
+        } else {
+            (None, None)
+        };
+        // `--squash` hijacks the message options, so git resets the args to say
+        // so rather than to name whichever branch above happened to fire.
+        if squash_arg.is_some() {
+            arg1 = Some("message");
+            arg2 = Some(String::new());
+        }
+
+        let mut hook_args: Vec<String> = vec![msg_path.to_string_lossy().into_owned()];
+        if let Some(a) = arg1 {
+            hook_args.push(a.to_string());
+            if let Some(b) = arg2 {
+                hook_args.push(b);
+            }
+        }
+        let borrowed: Vec<&str> = hook_args.iter().map(String::as_str).collect();
+        let mut env: Vec<(&str, &std::path::Path)> =
+            vec![("GIT_INDEX_FILE", index_file.as_path())];
+        let colon = std::path::Path::new(":");
+        if !use_editor {
+            env.push(("GIT_EDITOR", colon));
+        }
+        if !crate::hooks::run_with_env(&repo, "prepare-commit-msg", &borrowed, None, &env)?.ok {
+            return Ok(ExitCode::from(1));
+        }
+    }
+
+    // ```c
     // if (launch_editor(git_path_commit_editmsg(), NULL, env.v)) {
     //         fprintf(stderr,
     //         _("Please supply the message using either -m or -F option.\n"));
@@ -2133,7 +2314,24 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    if message.trim().is_empty() && !allow_empty_message {
+    // ```c
+    // static int message_is_empty(const struct strbuf *sb,
+    //                             enum commit_msg_cleanup_mode cleanup_mode)
+    // {
+    //         if (cleanup_mode == COMMIT_MSG_CLEANUP_NONE && sb->len)
+    //                 return 0;
+    //         return rest_is_empty(sb, 0);
+    // }
+    // ```
+    //
+    // Under `--cleanup=verbatim` any non-empty buffer counts as a message, so a
+    // file of nothing but newlines commits with an empty subject rather than
+    // aborting.
+    let empty_message = match cleanup {
+        Cleanup::Verbatim => message.is_empty(),
+        _ => message.trim().is_empty(),
+    };
+    if empty_message && !allow_empty_message {
         // Not a `die()`: `commit.c:1906-1909` writes this with `fprintf(stderr,
         // …)` and calls `exit(1)`, so it carries no `fatal:` prefix and exits 1,
         // exactly like the untouched-template abort a few lines above. Reachable
@@ -2142,7 +2340,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         eprintln!("Aborting commit due to empty commit message.");
         return Ok(ExitCode::from(1));
     }
-    if !message.is_empty() && !message.ends_with('\n') {
+    // `verbatim` is `COMMIT_MSG_CLEANUP_NONE`: nothing is added to the buffer, so
+    // a message with no trailing newline records without one. Every other mode
+    // has been through `strbuf_stripspace()`, which terminates the line itself.
+    if cleanup != Cleanup::Verbatim && !message.is_empty() && !message.ends_with('\n') {
         message.push('\n');
     }
 
@@ -2156,6 +2357,19 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         }
         message = std::fs::read_to_string(&msg_path)?;
     }
+    // ```c
+    // if (memchr(msg, '\0', msg_len))
+    //         return error(_("a NUL byte in commit log message not allowed."));
+    // ```
+    //
+    // (`commit_tree_extended()`, commit.c.) `cmd_commit` turns that refusal into
+    // `die(_("failed to write commit object"))`, so both lines are git's and the
+    // status is 128. A `-F` file or `-F -` is the only way a NUL gets this far.
+    if message.contains('\0') {
+        eprintln!("error: a NUL byte in commit log message not allowed.");
+        crate::git_fatal!("failed to write commit object");
+    }
+
     // `print_commit_summary()` renders `%s`, which is `format_subject(sb, msg,
     // " ")` — the *whole* first paragraph folded onto one line, not just its
     // first line. A subject written across two lines prints as one.
@@ -2370,11 +2584,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `--no-verify`, and its exit status is ignored.
     let _ = crate::hooks::run(&repo, "post-commit", &[], None);
 
-    // `--amend` rewrites a commit, so git notifies `post-rewrite` with the
-    // `amend` mode and one `<old-sha1> SP <new-sha1>` line on stdin;
-    // `--no-post-rewrite` suppresses it. Its exit status is ignored.
+    // `commit_post_rewrite()` (builtin/commit.c), which `--no-post-rewrite`
+    // suppresses whole: first the notes an `amend` carries onto the replacement
+    // commit — `init_copy_notes_for_rewrite("amend")`, which is a no-op unless
+    // `notes.rewriteRef`/`GIT_NOTES_REWRITE_REF` names a ref — and then the
+    // `post-rewrite` hook with the `amend` mode and one `<old> SP <new>` line on
+    // stdin. Both are notifications: the hook's exit status is ignored.
     if amend && post_rewrite {
         if let Some(prev) = head_tip {
+            if let Some(cfg) = super::notes::RewriteCfg::init(&repo, "amend")? {
+                cfg.copy(
+                    &repo,
+                    &[(prev, commit_id.detach())],
+                    "Notes added by 'git commit --amend'",
+                )?;
+            }
             let payload = format!("{} {}\n", prev, commit_id.detach());
             let _ = crate::hooks::run(&repo, "post-rewrite", &["amend"], Some(payload.as_bytes()));
         }
@@ -3597,6 +3821,13 @@ fn only_mode_stage(
 ) -> Result<(gix::index::File, StagedSet)> {
     let head_tree_id = head_tree(repo)?;
     let mut temp = repo.index_from_tree(&head_tree_id)?;
+    // `if (!pattern->nr) return 0;` — `list_paths()` leaves the false index as
+    // HEAD's tree when there is no pathspec at all, which is the whole of what
+    // `--fixup=reword:` (git's `only` with no paths) commits. An empty pathspec
+    // list must not read as "every path".
+    if pathspecs.is_empty() {
+        return Ok((temp, StagedSet { staged: Vec::new(), deletions: Vec::new() }));
+    }
     let tracked = tracked_map(&temp);
     let mut known: HashSet<BString> = tracked.keys().cloned().collect();
     let real = crate::index_open::or_empty(repo)?;
@@ -4018,17 +4249,121 @@ fn collect_tracked_changes(
 /// git's editor path for `git commit` without `-m`: build a template from
 /// `commit.template` and a commented status header, open it in the configured
 /// editor, and return the cleaned-up message per `commit.cleanup`.
-/// Parse a `--author` value of the form `Name <email>` into (name, email),
-/// splitting on the last `<`…`>` as git's `split_ident_line` does. git also
-/// accepts a bare string that searches existing commits' authors; that lookup
-/// form is not ported.
+/// `determine_author_info()`'s `--author` half: `split_ident_line()` on the
+/// value, then `fmt_ident(..., IDENT_STRICT)`.
+///
+/// The split is on the **first** `<` (mail starts after it) and the first `>`
+/// after that; the name ends at the last non-space before the `<`, so leading
+/// space survives the split and is removed later by `strbuf_addstr_without_crud`
+/// — which is what makes `--author='  Padded   <  pad@x.invalid  >'` record
+/// `Padded <pad@x.invalid>`. `IDENT_STRICT` refuses a value whose name is empty
+/// before that cleanup runs.
+///
+/// A value with no `<`…`>` at all never reaches here: `cmd_commit` sends it to
+/// [`find_author_by_nickname`] first.
 fn parse_author_ident(s: &str) -> Result<(String, String)> {
-    match (s.rfind('<'), s.rfind('>')) {
-        (Some(o), Some(c)) if c > o => Ok((s[..o].trim().to_string(), s[o + 1..c].to_string())),
-        _ => anyhow::bail!(
-            "--author '{s}': only the `Name <email>` form is supported (author search is not ported)"
-        ),
+    let bytes = s.as_bytes();
+    let Some(open) = s.find('<') else {
+        crate::git_fatal!("malformed --author parameter");
+    };
+    let Some(close) = s[open + 1..].find('>').map(|i| open + 1 + i) else {
+        crate::git_fatal!("malformed --author parameter");
+    };
+    // `name_end`: the last non-space at or before `open - 1`, else the name is
+    // empty. Everything before it — leading blanks included — is the raw name.
+    let mut name_end = 0;
+    for i in (0..open).rev() {
+        if !bytes[i].is_ascii_whitespace() {
+            name_end = i + 1;
+            break;
+        }
     }
+    let raw_name = &s[..name_end];
+    let raw_email = &s[open + 1..close];
+    if raw_name.is_empty() {
+        crate::git_fatal!("empty ident name (for <{raw_email}>) not allowed");
+    }
+    Ok((super::var::without_crud(raw_name), super::var::without_crud(raw_email)))
+}
+
+/// Port of `builtin/commit.c:find_author_by_nickname()`.
+///
+/// ```c
+/// av[++ac] = "--all";
+/// av[++ac] = "-i";
+/// av[++ac] = buf.buf;            /* "--author=<nickname>" */
+/// ...
+/// revs.mailmap = &mailmap;
+/// read_mailmap(revs.mailmap);
+/// ...
+/// commit = get_revision(&revs);
+/// if (commit) { format_commit_message(commit, "%aN <%aE>", &buf, &ctx); return ...; }
+/// die(_("--author '%s' is not 'Name <email>' and matches no existing author"), name);
+/// ```
+///
+/// So the pattern is matched case-insensitively against the **mailmapped**
+/// author line of every commit reachable from any ref, and the first commit the
+/// walk yields supplies the identity — mailmapped as well, which is why an
+/// address the mailmap rewrites away matches nothing.
+fn find_author_by_nickname(repo: &gix::Repository, nickname: &str) -> Result<String> {
+    let mailmap = std::sync::Arc::new(super::log::Mailmap::load(repo));
+    let filter = crate::revfilter::CommitFilter {
+        ident_map: Some({
+            let m = mailmap.clone();
+            std::sync::Arc::new(move |name: &[u8], email: &[u8]| m.mapped(name, email))
+                as crate::revfilter::IdentMapper
+        }),
+        author_res: crate::revfilter::compile_patterns(
+            std::slice::from_ref(&nickname.to_string()),
+            crate::revfilter::Dialect::Basic,
+            true,
+            crate::revfilter::Origin::Header,
+        )?,
+        committer_res: Vec::new(),
+        grep_res: Vec::new(),
+        all_match: false,
+        invert_grep: false,
+    };
+
+    // `--all`: every ref, plus `HEAD`, peeled to the commits they name.
+    let mut tips: Vec<ObjectId> = Vec::new();
+    let mut push = |id: ObjectId, tips: &mut Vec<ObjectId>| {
+        if !tips.contains(&id) {
+            tips.push(id);
+        }
+    };
+    for r in repo.references()?.all()?.filter_map(std::result::Result::ok) {
+        if let Ok(id) = r.into_fully_peeled_id() {
+            if repo.find_commit(id.detach()).is_ok() {
+                push(id.detach(), &mut tips);
+            }
+        }
+    }
+    if let Ok(Some(id)) = repo.head()?.try_peel_to_id() {
+        push(id.detach(), &mut tips);
+    }
+
+    if !tips.is_empty() {
+        let walk = repo
+            .rev_walk(tips)
+            .sorting(gix::revision::walk::Sorting::ByCommitTime(
+                gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+            ))
+            .all()?;
+        for info in walk.flatten() {
+            let commit = repo.find_commit(info.id)?;
+            if filter.matches(&commit)? {
+                let author = commit.author()?;
+                let (name, email) = mailmap.mapped(author.name, author.email);
+                return Ok(format!(
+                    "{} <{}>",
+                    String::from_utf8_lossy(&name),
+                    String::from_utf8_lossy(&email)
+                ));
+            }
+        }
+    }
+    crate::git_fatal!("--author '{nickname}' is not 'Name <email>' and matches no existing author");
 }
 
 /// The comment prefix: `core.commentChar` / `core.commentString`, which are one

@@ -46,7 +46,17 @@ use gix::refs::Target;
 /// `ours`/`theirs`/`union`/`cat_sort_uniq`/`manual`.
 /// `GIT_NOTES_REF` and `core.notesRef` are honoured with git's precedence, and
 /// `merge` without `-s` takes its strategy from `notes.<name>.mergeStrategy`
-/// then `notes.mergeStrategy`.
+/// then `notes.mergeStrategy`. `merge`'s operand goes through
+/// `expand_loose_notes_ref()`, so a name that already resolves to an object is
+/// taken as written and only one that resolves to nothing gets the
+/// `refs/notes/` prefix.
+///
+/// `copy --for-rewrite=<cmd>` and every other rewriting command share
+/// [`RewriteCfg`], the port of `notes-utils.c`'s `notes_rewrite_cfg`:
+/// `notes.rewrite.<cmd>`, `notes.rewriteRef`/`GIT_NOTES_REWRITE_REF` (globs
+/// expanded against the ref store) and `notes.rewriteMode`/
+/// `GIT_NOTES_REWRITE_MODE`, with the environment half suppressing the config
+/// half rather than merely outranking it.
 ///
 /// The editor round-trip is ported: `prepare_note_data()` writes
 /// `$GIT_DIR/NOTES_EDITMSG` with the message so far (or, for `edit`, the note
@@ -1750,34 +1760,16 @@ fn copy_stdin(
     force: bool,
     for_rewrite: Option<&str>,
 ) -> Result<ExitCode> {
-    // Resolve the combine mode and whether we are active at all.
-    let (active, combine) = match for_rewrite {
-        None => (true, Combine::Overwrite),
-        Some(cmd) => {
-            let snap = repo.config_snapshot();
-            let enabled = snap.boolean(&format!("notes.rewrite.{cmd}")).unwrap_or(true);
-            let mut selected = std::env::var("GIT_NOTES_REWRITE_REF")
-                .ok()
-                .into_iter()
-                .flat_map(|v| v.split(':').map(str::to_string).collect::<Vec<_>>())
-                .any(|r| ref_selects(&r, notes_ref));
-            if let Some(cfg) = snap.string("notes.rewriteRef") {
-                if ref_selects(&cfg.to_str_lossy(), notes_ref) {
-                    selected = true;
-                }
-            }
-            let mode = std::env::var("GIT_NOTES_REWRITE_MODE")
-                .ok()
-                .or_else(|| snap.string("notes.rewriteMode").map(|s| s.to_string()))
-                .unwrap_or_else(|| "concatenate".to_string());
-            let combine = match mode.as_str() {
-                "overwrite" => Combine::Overwrite,
-                "cat_sort_uniq" => Combine::CatSortUniq,
-                "ignore" => Combine::Ignore,
-                _ => Combine::Concatenate,
-            };
-            (enabled && selected, combine)
-        }
+    // `--for-rewrite` ignores `--ref` entirely: git loads the notes trees the
+    // rewrite configuration names and copies into all of them.
+    let rewrite = match for_rewrite {
+        None => None,
+        Some(cmd) => match RewriteCfg::init(repo, cmd)? {
+            Some(cfg) => Some(cfg),
+            // Rewriting is off, or nothing is configured: `notes_copy_from_stdin()`
+            // returns before it ever reads a line.
+            None => return Ok(ExitCode::SUCCESS),
+        },
     };
 
     let mut input = Vec::new();
@@ -1806,63 +1798,47 @@ fn copy_stdin(
         }
     }
 
-    if !active {
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    const MSG: &str = "Notes added by 'git notes copy'";
+
+    let mut resolved: Vec<(ObjectId, ObjectId)> = Vec::with_capacity(pairs.len());
+    for (from_spec, to_spec) in &pairs {
+        let (Ok(from), Ok(to)) = (resolve(repo, from_spec), resolve(repo, to_spec)) else {
+            // Lower-case `failed` here and capitalised in `notes remove`: the
+            // two call sites really do word it differently in git.
+            eprintln!("fatal: failed to resolve '{from_spec}' as a valid ref.");
+            return Ok(ExitCode::from(128));
+        };
+        resolved.push((from, to));
+    }
+
+    if let Some(cfg) = rewrite {
+        cfg.copy(repo, &resolved, MSG)?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let (mut notes, parent) = load(repo, notes_ref)?;
     let mut changed = false;
     let mut err = false;
 
-    for (from_spec, to_spec) in pairs {
-        let (Ok(from), Ok(to)) = (resolve(repo, &from_spec), resolve(repo, &to_spec)) else {
-            eprintln!("fatal: Failed to resolve '{from_spec}' as a valid ref.");
-            return Ok(ExitCode::from(128));
-        };
+    for (from, to) in resolved {
         let Some(src) = notes.map.get(&from).copied() else {
             // No source note: nothing to copy, silently skip.
             continue;
         };
-        let existing = notes.map.get(&to).copied();
-        match combine {
-            Combine::Overwrite => {
-                if existing.is_some() && for_rewrite.is_none() && !force {
-                    eprintln!("error: failed to copy notes from '{from}' to '{to}'");
-                    err = true;
-                    continue;
-                }
-                notes.map.insert(to, src);
-                changed = true;
-            }
-            Combine::Ignore => {
-                if existing.is_none() {
-                    notes.map.insert(to, src);
-                    changed = true;
-                }
-            }
-            Combine::Concatenate | Combine::CatSortUniq => {
-                let new = repo.find_object(src)?.data.clone();
-                let body = match existing {
-                    None => new,
-                    Some(cur_id) => {
-                        let cur = repo.find_object(cur_id)?.data.clone();
-                        if combine == Combine::CatSortUniq {
-                            combine_cat_sort_uniq(&cur, &new)
-                        } else {
-                            combine_concatenate(&cur, &new)
-                        }
-                    }
-                };
-                let blob = repo.write_blob(&body)?.detach();
-                notes.map.insert(to, blob);
-                changed = true;
-            }
+        // Plain `--stdin` always combines by overwriting, and refuses to clobber
+        // an existing note without `-f`.
+        if notes.map.contains_key(&to) && !force {
+            eprintln!("error: failed to copy notes from '{from}' to '{to}'");
+            err = true;
+            continue;
         }
+        notes.map.insert(to, src);
+        changed = true;
     }
 
     if changed {
-        commit_notes(repo, notes_ref, &notes, parent, "Notes added by 'git notes copy'")?;
+        commit_notes(repo, notes_ref, &notes, parent, MSG)?;
     }
     if err {
         return Ok(ExitCode::from(1));
@@ -1870,14 +1846,172 @@ fn copy_stdin(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `notes.rewriteRef` entries are refs or globs; git matches with fnmatch, but a
-/// plain ref name is by far the common case, so support an exact match plus a
-/// trailing `*` glob.
-fn ref_selects(pattern: &str, notes_ref: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => notes_ref.starts_with(prefix),
-        None => pattern == notes_ref,
+/// Port of `notes-utils.c:parse_combine_notes_fn()` — the four mode names, case
+/// folded; anything else is a configuration error the caller reports.
+fn parse_combine(value: &str) -> Option<Combine> {
+    match value.to_ascii_lowercase().as_str() {
+        "overwrite" => Some(Combine::Overwrite),
+        "ignore" => Some(Combine::Ignore),
+        "concatenate" => Some(Combine::Concatenate),
+        "cat_sort_uniq" => Some(Combine::CatSortUniq),
+        _ => None,
     }
+}
+
+/// Port of `notes-utils.c:struct notes_rewrite_cfg` — which notes refs a
+/// history-rewriting command carries notes across, and how a copied note is
+/// combined onto one the target object already has.
+///
+/// `GIT_NOTES_REWRITE_REF` and `GIT_NOTES_REWRITE_MODE` do not merely take
+/// precedence over `notes.rewriteRef`/`notes.rewriteMode`: setting either makes
+/// `notes_rewrite_config()` skip the matching config key outright, which is what
+/// `refs_from_env`/`mode_from_env` record.
+pub(crate) struct RewriteCfg {
+    /// Notes refs to rewrite, globs already expanded, in git's list order.
+    pub(crate) refs: Vec<String>,
+    combine: Combine,
+}
+
+impl RewriteCfg {
+    /// Port of `init_copy_notes_for_rewrite(<cmd>)`. `None` — the common case —
+    /// when `notes.rewrite.<cmd>` is false or nothing selects a ref, and the
+    /// caller then copies nothing at all.
+    pub(crate) fn init(repo: &gix::Repository, cmd: &str) -> Result<Option<RewriteCfg>> {
+        let snap = repo.config_snapshot();
+        let mut combine = Combine::Concatenate;
+        // A value git cannot parse does not fall back to `concatenate`: it
+        // leaves the copy without a combine function of its own, so `add_note()`
+        // uses the notes tree's, which `load_notes_trees()` set to
+        // `combine_notes_ignore`. An unparsable mode therefore *keeps* whatever
+        // note the target already had — measured against git 2.55.0.
+        let mode_from_env = match std::env::var("GIT_NOTES_REWRITE_MODE") {
+            Ok(v) => {
+                match parse_combine(&v) {
+                    Some(c) => combine = c,
+                    None => {
+                        eprintln!("error: Bad GIT_NOTES_REWRITE_MODE value: '{v}'");
+                        combine = Combine::Ignore;
+                    }
+                }
+                true
+            }
+            Err(_) => false,
+        };
+
+        let mut refs: Vec<String> = Vec::new();
+        let refs_from_env = match std::env::var("GIT_NOTES_REWRITE_REF") {
+            Ok(v) => {
+                for entry in v.split(':').filter(|s| !s.is_empty()) {
+                    add_by_glob(repo, &mut refs, entry)?;
+                }
+                true
+            }
+            Err(_) => false,
+        };
+
+        let enabled = snap.boolean(&format!("notes.rewrite.{cmd}")).unwrap_or(true);
+        if !mode_from_env {
+            if let Some(v) = snap.string("notes.rewriteMode") {
+                let v = v.to_str_lossy().into_owned();
+                match parse_combine(&v) {
+                    Some(c) => combine = c,
+                    None => {
+                        eprintln!("error: Bad notes.rewriteMode value: '{v}'");
+                        combine = Combine::Ignore;
+                    }
+                }
+            }
+        }
+        if !refs_from_env {
+            for v in snap.strings("notes.rewriteRef").unwrap_or_default() {
+                let v = v.to_str_lossy().into_owned();
+                if v.starts_with("refs/notes/") {
+                    add_by_glob(repo, &mut refs, &v)?;
+                } else {
+                    eprintln!("warning: Refusing to rewrite notes in {v} (outside of refs/notes/)");
+                }
+            }
+        }
+
+        if !enabled || refs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RewriteCfg { refs, combine }))
+    }
+
+    /// Port of `copy_note_for_rewrite()` over every pair, followed by
+    /// `finish_copy_notes_for_rewrite()`: each ref that `add_note()` touched
+    /// gets a notes commit carrying `msg`, and an untouched one is left alone.
+    pub(crate) fn copy(
+        &self,
+        repo: &gix::Repository,
+        pairs: &[(ObjectId, ObjectId)],
+        msg: &str,
+    ) -> Result<()> {
+        for notes_ref in &self.refs {
+            let (mut notes, parent) = load(repo, notes_ref)?;
+            let mut dirty = false;
+            for (from, to) in pairs {
+                // `copy_note()` with `force`: whenever it reaches `add_note()`
+                // the tree is marked dirty, even when the combine function then
+                // leaves the value alone — so `ignore` still writes a commit.
+                let Some(src) = notes.map.get(from).copied() else {
+                    if notes.map.contains_key(to) {
+                        dirty = true;
+                        if self.combine == Combine::Overwrite {
+                            notes.map.remove(to);
+                        }
+                    }
+                    continue;
+                };
+                dirty = true;
+                combine_into(repo, &mut notes, *to, src, self.combine)?;
+            }
+            if dirty {
+                commit_notes(repo, notes_ref, &notes, parent, msg)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One `add_note(t, to, src, combine)`: the combine function decides what the
+/// target ends up holding when it already has a note.
+fn combine_into(
+    repo: &gix::Repository,
+    notes: &mut Notes,
+    to: ObjectId,
+    src: ObjectId,
+    combine: Combine,
+) -> Result<()> {
+    let existing = notes.map.get(&to).copied();
+    match combine {
+        Combine::Overwrite => {
+            notes.map.insert(to, src);
+        }
+        Combine::Ignore => {
+            if existing.is_none() {
+                notes.map.insert(to, src);
+            }
+        }
+        Combine::Concatenate | Combine::CatSortUniq => {
+            let new = repo.find_object(src)?.data.clone();
+            let body = match existing {
+                None => new,
+                Some(cur_id) => {
+                    let cur = repo.find_object(cur_id)?.data.clone();
+                    if combine == Combine::CatSortUniq {
+                        combine_cat_sort_uniq(&cur, &new)
+                    } else {
+                        combine_concatenate(&cur, &new)
+                    }
+                }
+            };
+            let blob = repo.write_blob(&body)?.detach();
+            notes.map.insert(to, blob);
+        }
+    }
+    Ok(())
 }
 
 /// `notes.c:combine_notes_concatenate()` — one trailing newline is trimmed from
@@ -2311,7 +2445,24 @@ fn do_merge(
     strat: Strategy,
     verbosity: i32,
 ) -> Result<ExitCode> {
-    let remote_ref = expand_notes_ref(remote_spec);
+    // ```c
+    // static void expand_loose_notes_ref(struct strbuf *sb)
+    // {
+    //         struct object_id object;
+    //         if (repo_get_oid(the_repository, sb->buf, &object))
+    //                 /* fallback to expand_notes_ref */
+    //                 expand_notes_ref(sb);
+    // }
+    // ```
+    //
+    // (builtin/notes.c.) `merge` is the one subcommand that expands its operand
+    // this way: a name that already resolves to an object is taken as written, so
+    // `git notes merge HEAD` merges the tree `HEAD` names rather than looking for
+    // `refs/notes/HEAD`. Only a name that resolves to nothing gets the prefix.
+    let remote_ref = match crate::objname::resolve(repo, remote_spec) {
+        Some(_) => remote_spec.to_string(),
+        None => expand_notes_ref(remote_spec),
+    };
     let reflog = format!("Merged notes from {remote_ref} into {local_ref}");
 
     let resolve_tip = |name: &str| -> Result<Option<ObjectId>> {
@@ -2441,8 +2592,12 @@ fn do_merge(
                         println!("Auto-merging notes for {obj}");
                     }
                     if verbosity >= -1 {
+                        // `notes-merge.c:merge_one_change_manual()` calls the
+                        // conflict `add/add` when the merge base carries no
+                        // note for the object and `content` when it does.
+                        let reason = if b.is_none() { "add/add" } else { "content" };
                         println!(
-                            "CONFLICT (content): Merge conflict in notes for object {obj}"
+                            "CONFLICT ({reason}): Merge conflict in notes for object {obj}"
                         );
                     }
                     let content = conflict_content(local_ref, &remote_ref, &blob(lo)?, &blob(re)?);
@@ -2464,11 +2619,14 @@ fn do_merge(
 
     if conflicts.is_empty() {
         // Clean merge: a real two-parent merge commit.
+        //
+        // `builtin/notes.c:merge()` hands `notes_merge()` the headline with no
+        // trailing newline, and `create_notes_commit()` writes the buffer
+        // verbatim — so the merge commit's message ends at `…into <ref>`. The
+        // `\n` that `commit_notes()` completes ordinary note commits with is
+        // *not* added here.
         let tree_id = write_tree(repo, &out_notes)?;
-        let commit = repo
-            .new_commit(format!("{reflog}\n"), tree_id, vec![l, r])?
-            .id()
-            .detach();
+        let commit = repo.new_commit(reflog.clone(), tree_id, vec![l, r])?.id().detach();
         move_notes_ref(repo, local_ref, Some(l), commit, &reflog)?;
         Ok(ExitCode::SUCCESS)
     } else {
@@ -2490,12 +2648,21 @@ fn do_merge(
         for (obj, content) in &conflicts {
             std::fs::write(wt.join(obj.to_string()), content)?;
         }
-        // git prints the worktree path relative to the cwd (`.git/…` from the
-        // repo root), not the absolute git-dir path.
-        let wt_display = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| wt.strip_prefix(&cwd).ok().map(|p| p.display().to_string()))
-            .unwrap_or_else(|| wt.display().to_string());
+        // git names the worktree with `git_path(NOTES_MERGE_WORKTREE)`, which is
+        // the git dir exactly as setup resolved it — `.git/…` from the top of a
+        // normal worktree. `git_dir()` here can carry a `./` prefix the path git
+        // never prints, so drop it; an absolute git dir still gets made relative
+        // to the cwd when it is under it.
+        let wt_display = {
+            let shown = wt.display().to_string();
+            match shown.strip_prefix("./") {
+                Some(rest) => rest.to_string(),
+                None => std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| wt.strip_prefix(&cwd).ok().map(|p| p.display().to_string()))
+                    .unwrap_or(shown),
+            }
+        };
         eprintln!(
             "Automatic notes merge failed. Fix conflicts in {wt_display} and commit the result with 'git notes merge --commit', or abort the merge with 'git notes merge --abort'."
         );
@@ -2543,7 +2710,9 @@ fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
     let partial_commit = repo.find_commit(partial)?;
     let parents: Vec<ObjectId> = partial_commit.parent_ids().map(|id| id.detach()).collect();
     let full_msg = partial_commit.message_raw()?.to_string();
-    // The final commit drops the trailing `\n\nConflicts:` section.
+    // `notes-merge.c:notes_merge_commit()` reuses the partial commit's message
+    // verbatim, `Conflicts:` section and all; only the *reflog* line is the
+    // headline on its own.
     let headline = full_msg.split("\n\nConflicts:").next().unwrap_or(&full_msg);
     let reflog = headline.trim_end_matches('\n').to_string();
 
@@ -2567,10 +2736,7 @@ fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
     }
 
     let tree_id = write_tree(repo, &notes)?;
-    let commit = repo
-        .new_commit(format!("{reflog}\n"), tree_id, parents)?
-        .id()
-        .detach();
+    let commit = repo.new_commit(full_msg.clone(), tree_id, parents)?.id().detach();
     let local_tip = repo
         .try_find_reference(local_ref.as_str())?
         .map(|r| r.into_fully_peeled_id())
@@ -2581,8 +2747,23 @@ fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
     // Clear the staged merge.
     let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_PARTIAL"));
     let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_REF"));
-    let _ = std::fs::remove_dir_all(&wt);
+    clear_merge_worktree(&wt);
     Ok(ExitCode::SUCCESS)
+}
+
+/// `remove_dir_recursively(&buf, REMOVE_DIR_KEEP_TOPLEVEL)` on
+/// `$GIT_DIR/NOTES_MERGE_WORKTREE`, which is how both `--commit` and `--abort`
+/// tear the staged merge down: the conflict files go, the directory stays —
+/// git keeps it because it may be the user's current working directory.
+fn clear_merge_worktree(wt: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(wt) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let _ = match entry.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+    }
 }
 
 /// `git notes merge --abort` — discard a staged manual merge.
@@ -2593,7 +2774,7 @@ fn merge_abort(repo: &gix::Repository) -> Result<ExitCode> {
         eprintln!("error: failed to remove 'git notes merge' worktree");
         return Ok(ExitCode::from(1));
     }
-    let _ = std::fs::remove_dir_all(&wt);
+    clear_merge_worktree(&wt);
     let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_PARTIAL"));
     let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_REF"));
     Ok(ExitCode::SUCCESS)

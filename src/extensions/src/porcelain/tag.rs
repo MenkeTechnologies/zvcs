@@ -98,9 +98,15 @@
 //! stdout by `want_color()`, and `%(color:<spec>)` is rendered by the shared
 //! evaluator's port of `color_parse_mem`.
 //!
-//! Genuinely not backed here, and refused rather than faked: an editor-supplied
-//! message (`-a`/`-s`/`tag.gpgSign` with neither `-m` nor `-F`, and `-e`), and
-//! the git gecos identity fallback.
+//! An editor-supplied message is ported: `-e`/`--edit` reopens a message that was
+//! given, and `-a`/`-s`/`tag.gpgSign` with neither `-m` nor `-F` writes
+//! `$GIT_DIR/TAG_EDITMSG` — the previous tag's body when `-f` replaces one, else
+//! git's commented prompt — runs the configured editor on it and cleans up what
+//! comes back, which is what makes an editor that saves nothing `fatal: no tag
+//! message?`.
+//!
+//! Genuinely not backed here, and refused rather than faked: the git gecos
+//! identity fallback.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::{Read, Write};
@@ -1070,7 +1076,27 @@ fn list_tags(
         };
         let mut names: Vec<(BString, BString)> = Vec::new();
         for r in repo.references()?.tags()? {
-            let r = r.map_err(|e| anyhow!("failed to read a tag reference: {e}"))?;
+            // `warning: ignoring broken ref %s` — `ref_resolves_to_object()`'s
+            // refusal is a warning git walks past, not an error that ends the
+            // listing. A ref whose id cannot even be read for the repository's
+            // hash algorithm (a sha1 file under `extensions.objectFormat=sha256`)
+            // is exactly that case, and the exit stays 0.
+            let r = match r {
+                Ok(r) => r,
+                Err(e) => {
+                    use gix::refs::file::iter::loose_then_packed::Error as IterError;
+                    match e.downcast_ref::<IterError>() {
+                        Some(IterError::ReferenceCreation { relative_path, .. }) => {
+                            eprintln!(
+                                "warning: ignoring broken ref {}",
+                                relative_path.to_string_lossy().replace('\\', "/")
+                            );
+                            continue;
+                        }
+                        _ => return Err(anyhow!("failed to read a tag reference: {e}")),
+                    }
+                }
+            };
             let short = BString::from(r.name().shorten().to_vec());
             if !patterns.is_empty()
                 && !patterns
@@ -1291,21 +1317,56 @@ fn create_tag(
         if repo.find_header(target).is_err() {
             return fatal("bad object type.");
         }
-        // `should_edit = opt->use_editor || !opt->message_given` (builtin/tag.c:325):
-        // `-e` opens the editor even on a message that was given.
-        if edit_flag {
-            bail!("`-e` opens the tag message in an editor, which is not supported")
-        }
+        let message_given = message_file.is_some() || !messages.is_empty();
         let raw = match message_file {
             Some(path) => read_message_file(path)?,
-            None if messages.is_empty() => {
-                bail!("a tag message needs `-m`/`-F`; the editor git would open is not supported")
-            }
+            None if messages.is_empty() => Vec::new(),
             None => match mode {
                 // git's `-m` under `verbatim` uses each chunk literally.
                 CleanupMode::Verbatim => join_verbatim(messages),
                 _ => join_messages(messages),
             },
+        };
+        // ```c
+        // if (!opt->message_given || opt->use_editor) {
+        //         ... write TAG_EDITMSG ...
+        //         if (launch_editor(path, buf, NULL)) { ...; exit(1); }
+        //         unlink_or_warn(path);
+        // }
+        // ```
+        //
+        // (builtin/tag.c:create_tag.) `-e`/`--edit` opens the editor on a message
+        // that *was* given; no `-m`/`-F` at all opens it on a template — the body
+        // of the tag being replaced when there is one, otherwise a wholly
+        // commented prompt that the cleanup below reduces to nothing.
+        let raw = if !message_given || edit_flag {
+            let path = repo.git_dir().join("TAG_EDITMSG");
+            let seed: Vec<u8> = if message_given {
+                raw
+            } else if let Some(prev) = previous_tag_body(repo, &format!("refs/tags/{name}"))? {
+                prev
+            } else {
+                let mut b = vec![b'\n'];
+                let c = super::commit::comment_prefix(&repo.config_snapshot());
+                b.extend_from_slice(
+                    format!(
+                        "{c} Write a message for tag:\n{c}   {name}\n\
+                         {c} Lines starting with '{c}' will be ignored.\n"
+                    )
+                    .as_bytes(),
+                );
+                b
+            };
+            std::fs::write(&path, &seed)?;
+            if super::commit::launch_editor(&repo.config_snapshot(), &path).is_err() {
+                eprintln!("Please supply the message using either -m or -F option.");
+                return Ok(ExitCode::from(1));
+            }
+            let edited = std::fs::read(&path)?;
+            let _ = std::fs::remove_file(&path);
+            edited
+        } else {
+            raw
         };
         // git amends the message with `--trailer`s first and only then runs
         // `--cleanup`, so a trailer's own trailing whitespace and the blank lines
@@ -1315,12 +1376,29 @@ fn create_tag(
             Some(amended) => amended,
             None => return Ok(ExitCode::from(128)),
         };
+        // ```c
+        // if (opt->cleanup_mode != CLEANUP_NONE)
+        //         strbuf_stripspace(buf,
+        //                 opt->cleanup_mode == CLEANUP_ALL ? comment_line_str : NULL);
+        // ```
+        //
+        // (builtin/tag.c:create_tag.) The comment string is passed on the default
+        // (`strip`) mode whether or not an editor ran, so `-m`/`-F` text loses its
+        // `#` lines too; `whitespace` runs the same pass without them.
         let message = match mode {
             CleanupMode::Verbatim => raw,
-            // `whitespace` and `strip` coincide for `-m`/`-F` input (no comment
-            // stripping happens without an editor), both mapping to stripspace.
-            CleanupMode::Whitespace | CleanupMode::Strip => stripspace(&raw),
+            CleanupMode::Whitespace => super::stripspace::strip_space(&raw, None),
+            CleanupMode::Strip => {
+                let comment = super::commit::comment_prefix(&repo.config_snapshot());
+                super::stripspace::strip_space(&raw, Some(comment.as_bytes()))
+            }
         };
+        // `if (!opt->message_given && !buf->len) die(_("no tag message?"));` — an
+        // editor that saved nothing over the template leaves an empty message,
+        // while an explicitly empty `-m ''` is accepted.
+        if !message_given && message.is_empty() {
+            return fatal("no tag message?");
+        }
 
         let tagger = repo
             .committer()
@@ -1361,28 +1439,33 @@ fn create_tag(
             // stock git cannot verify, so the block is appended by hand below.
             pgp_signature: None,
         };
-        match signer {
-            None => repo.write_object(&object)?.detach(),
-            Some(signer) => {
-                // `build_tag_object()` (builtin/tag.c:269-278): the buffer that is
-                // signed is the finished object minus the signature, and the
-                // signature is appended to it — a tag's signature is body text, not
-                // a header, which is what makes the payload here byte-identical to
-                // the one `parse_signature()` recovers on the way back in.
-                let mut buf = Vec::new();
-                gix::objs::WriteTo::write_to(&object, &mut buf)?;
-                match signer.sign(&buf) {
-                    Ok(sig) => buf.extend_from_slice(&sig),
-                    Err(e) => return Ok(sign_failed(repo, e)),
-                }
-                // `odb_write_object_ext()`'s failure is `error(_("unable to write
-                // tag file"))`, which `create_tag` then turns into the same
-                // exit-128 pair a signing failure gets.
-                repo.objects
-                    .write_buf(Kind::Tag, &buf)
-                    .map_err(|_| anyhow!("unable to write tag file"))?
+        // `build_tag_object()` (builtin/tag.c:269-278): the buffer that is signed
+        // is the finished object minus the signature, and the signature is
+        // appended to it — a tag's signature is body text, not a header, which is
+        // what makes the payload byte-identical to the one `parse_signature()`
+        // recovers on the way back in. Both the signed and the unsigned tag are
+        // therefore serialised here rather than handed to `write_object`.
+        let mut buf = Vec::new();
+        gix::objs::WriteTo::write_to(&object, &mut buf)?;
+        // git's header ends `"tagger %s\n\n"` unconditionally, so the blank line
+        // between the headers and the message is there even when the message is
+        // empty; gix writes that newline only along with a non-empty message. One
+        // byte, and therefore a different tag id, for every empty-message tag.
+        if object.message.is_empty() {
+            buf.push(b'\n');
+        }
+        if let Some(signer) = signer {
+            match signer.sign(&buf) {
+                Ok(sig) => buf.extend_from_slice(&sig),
+                Err(e) => return Ok(sign_failed(repo, e)),
             }
         }
+        // `odb_write_object_ext()`'s failure is `error(_("unable to write tag
+        // file"))`, which `create_tag` then turns into the same exit-128 pair a
+        // signing failure gets.
+        repo.objects
+            .write_buf(Kind::Tag, &buf)
+            .map_err(|_| anyhow!("unable to write tag file"))?
     } else {
         target
     };
@@ -1540,14 +1623,44 @@ enum CleanupMode {
 }
 
 /// Read a `-F <file>` message, or stdin for `-`.
+///
+/// `strbuf_read_file(&buf, file, 0) < 0` is a `die_errno(_("could not open or
+/// read '%s'"), file)` in `parse_msg_arg()`, so the wording, the bare strerror
+/// tail and the 128 all come from git rather than from this port's own voice.
 fn read_message_file(path: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     if path == "-" {
         std::io::stdin().lock().read_to_end(&mut buf)?;
     } else {
-        buf = std::fs::read(path).map_err(|e| anyhow!("could not read '{path}': {e}"))?;
+        buf = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => crate::git_fatal!(
+                "could not open or read '{path}': {}",
+                crate::external::strerror(&e)
+            ),
+        };
     }
     Ok(buf)
+}
+
+/// Port of `builtin/tag.c:write_tag_body()` — the seed an editor is given when
+/// `-f` replaces an annotated tag and no new message was supplied: the previous
+/// tag's message with its signature block, if any, left off.
+fn previous_tag_body(repo: &gix::Repository, ref_name: &str) -> Result<Option<Vec<u8>>> {
+    let Ok(full) = FullName::try_from(ref_name) else { return Ok(None) };
+    let Some(r) = repo.try_find_reference(full.as_ref())? else { return Ok(None) };
+    let Some(id) = r.target().try_id().map(gix::hash::oid::to_owned) else { return Ok(None) };
+    let Ok(obj) = repo.find_object(id) else { return Ok(None) };
+    if obj.kind != Kind::Tag {
+        return Ok(None);
+    }
+    let tag = gix::objs::TagRef::from_bytes(&obj.data, repo.object_hash())?;
+    let body = tag.message;
+    let end = match tag.pgp_signature {
+        Some(sig) => body.len().saturating_sub(sig.len()),
+        None => body.len(),
+    };
+    Ok(Some(body[..end].to_vec()))
 }
 
 /// Port of git's `opt_parse_m`: each `-m` chunk is newline-terminated, and a
@@ -1579,32 +1692,6 @@ fn join_verbatim(messages: &[Vec<u8>]) -> Vec<u8> {
     buf
 }
 
-/// Port of git's `strbuf_stripspace(buf, NULL)`: trailing whitespace removed from
-/// every line, runs of blank lines collapsed to one, leading/trailing blank lines
-/// dropped, and a non-empty result ended with a newline.
-fn stripspace(input: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(input.len());
-    let mut pending_blank = false;
-    for line in input.split(|&b| b == b'\n') {
-        let end = line
-            .iter()
-            .rposition(|b| !b.is_ascii_whitespace())
-            .map_or(0, |i| i + 1);
-        let trimmed = &line[..end];
-        if trimmed.is_empty() {
-            pending_blank = !out.is_empty();
-            continue;
-        }
-        if pending_blank {
-            out.push(b'\n');
-            pending_blank = false;
-        }
-        out.extend_from_slice(trimmed);
-        out.push(b'\n');
-    }
-    out
-}
-
 /// Delete each named tag, printing `Deleted tag '<name>' (was <short>)`.
 fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode> {
     if positionals.is_empty() {
@@ -1612,6 +1699,30 @@ fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode>
     }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    // `delete_tags()` collects the refs and hands them to `repo_delete_refs()`,
+    // which is one transaction: naming the same tag twice is
+    // `multiple updates for ref '<ref>' not allowed`, and *nothing* is deleted —
+    // not even the tags named only once. The check is on the refs that exist, so
+    // a repeated name that resolves to no tag still reports "not found" instead.
+    {
+        let mut seen: Vec<String> = Vec::new();
+        for name in positionals {
+            let ref_name = format!("refs/tags/{name}");
+            if FullName::try_from(ref_name.as_str()).is_err()
+                || repo.try_find_reference(ref_name.as_str())?.is_none()
+            {
+                continue;
+            }
+            if seen.contains(&ref_name) {
+                eprintln!(
+                    "error: could not delete references: multiple updates for ref '{ref_name}' not allowed"
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            seen.push(ref_name);
+        }
+    }
 
     let mut had_failure = false;
     for name in positionals {

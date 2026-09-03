@@ -32,6 +32,13 @@
 //! * `trailer.separators`, `trailer.where`, `trailer.ifexists`, `trailer.ifmissing`
 //!   and the per-alias `trailer.<key-alias>.{key,where,ifexists,ifmissing}`,
 //!   loaded in git's two passes so that per-alias items inherit the final defaults
+//! * `trailer.<key-alias>.cmd` and the deprecated `trailer.<key-alias>.command`:
+//!   the program runs through the shell (`cmd` is handed the value as an argument,
+//!   `command` substitutes it for the first `$ARG`) and its trimmed stdout becomes
+//!   the trailer's value. A `command` alias also contributes one automatic
+//!   empty-valued trailer of its own, ahead of the `--trailer` arguments, and a
+//!   program that fails leaves the value empty behind
+//!   `error: running trailer command '<cmd>' failed`
 //! * `core.commentChar` / `core.commentString` (`auto` and absent both resolve to
 //!   `#`), which decide which lines are comments for the trailer-block scan
 //! * git's warnings on stderr — `warning: unknown value '<v>' for key '<k>'` and
@@ -56,12 +63,6 @@
 //!
 //! ### Not covered — these `bail!` rather than produce diverging output
 //!
-//! * `trailer.<key-alias>.cmd` and `trailer.<key-alias>.command`. Both require
-//!   running a shell command per trailer and folding its stdout back into the
-//!   value; the vendored crates have no `run-command.c` equivalent with git's
-//!   `local_repo_env` scrubbing, and guessing at it would silently change values.
-//!   Detected and refused only when the configuration is actually consulted, so
-//!   `--only-input` and `--parse` keep working with such config present.
 //! * `--help`, which stock git turns into `git help interpret-trailers` (a pager
 //!   or man page), not something this process can reproduce.
 //!
@@ -321,6 +322,14 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
     };
 
     // Pass one: the dotless keys.
+    //
+    // A fresh [`crate::config::CliEcho`] per pass because git runs `git_config()`
+    // twice here, once per callback, and each run sees one occurrence per
+    // configured value. Without it a single `-c trailer.<x>.key=…` reads as two
+    // settings — a spurious `warning: more than one …` — and the surviving copy
+    // is the command-line one, whose parser has already eaten the trailing blank
+    // that decides whether the emitted trailer is `Acked-by: v` or `Acked-by:v`.
+    let mut echoes = crate::config::CliEcho::new();
     for section in config.sections() {
         let header = section.header();
         if header.subsection_name().is_some()
@@ -328,7 +337,12 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
         {
             continue;
         }
+        let source = section.meta().source;
         for (name, value) in ordered_values(&section) {
+            let shown = String::from_utf8_lossy(&value).into_owned();
+            if echoes.is_echo(source, &format!("trailer.{name}"), Some(&shown)) {
+                continue;
+            }
             let ok = match name.as_str() {
                 "where" => set_where(&mut cfg.defaults.where_, Some(value.as_slice())),
                 "ifexists" => set_if_exists(&mut cfg.defaults.if_exists, Some(value.as_slice())),
@@ -346,6 +360,7 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
     }
 
     // Pass two: the per-alias keys.
+    let mut echoes = crate::config::CliEcho::new();
     for section in config.sections() {
         let header = section.header();
         if !header.name().to_string().eq_ignore_ascii_case("trailer") {
@@ -354,6 +369,8 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
         let Some(alias) = header.subsection_name() else {
             continue;
         };
+        let source = section.meta().source;
+        let alias_shown = alias.to_string();
         let alias = alias.to_string().into_bytes();
 
         for (name, value) in ordered_values(&section) {
@@ -361,6 +378,10 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
                 name.as_str(),
                 "key" | "command" | "cmd" | "where" | "ifexists" | "ifmissing"
             ) {
+                continue;
+            }
+            let shown = String::from_utf8_lossy(&value).into_owned();
+            if echoes.is_echo(source, &format!("trailer.{alias_shown}.{name}"), Some(&shown)) {
                 continue;
             }
             let idx = get_conf_item(&mut cfg, &alias);
@@ -600,16 +621,6 @@ pub fn interpret_trailers(args: &[String]) -> Result<ExitCode> {
     };
 
     let cfg = load_config()?;
-
-    // The value-producing hooks need a subprocess; refuse rather than drop them.
-    if !run.opts.only_input
-        && cfg
-            .items
-            .iter()
-            .any(|i| i.command.is_some() || i.cmd.is_some())
-    {
-        anyhow::bail!("unsupported config trailer.<key-alias>.cmd/.command (needs shell execution)");
-    }
 
     if run.files.is_empty() {
         let mut input = Vec::new();
@@ -1064,6 +1075,33 @@ fn parse_command_line_args(new_trailers: &[NewTrailer], cfg: &TrailerConfig) -> 
     cl_separators.extend_from_slice(&cfg.separators);
 
     let mut args = Vec::new();
+    // ```c
+    // /* Add an arg item for each configured trailer with a command */
+    // list_for_each(pos, &conf_head) {
+    //         item = list_entry(pos, struct arg_item, list);
+    //         if (item->conf.command)
+    //                 add_arg_item(arg_head, xstrdup(token_from_item(item, NULL)),
+    //                              xstrdup(""), &item->conf, NULL);
+    // }
+    // ```
+    //
+    // (`process_command_line_args()`, trailer.c.) Only the deprecated `command`
+    // form gets this automatic empty-valued item — `cmd` produces a trailer only
+    // where a `--trailer` names it — and it goes ahead of the command-line ones.
+    for item in &cfg.items {
+        if item.command.is_none() {
+            continue;
+        }
+        args.push(ArgItem {
+            token: item.key.clone().unwrap_or_else(|| item.name.clone()),
+            value: Vec::new(),
+            where_: item.where_,
+            if_exists: item.if_exists,
+            if_missing: item.if_missing,
+            command: item.command.clone(),
+            cmd: item.cmd.clone(),
+        });
+    }
     for tr in new_trailers {
         let sep = find_separator(&tr.text, &cl_separators);
         if sep == 0 {
@@ -1094,6 +1132,8 @@ fn parse_command_line_args(new_trailers: &[NewTrailer], cfg: &TrailerConfig) -> 
             } else {
                 tr.if_missing
             },
+            command: base.command.clone(),
+            cmd: base.cmd.clone(),
         });
     }
     args
@@ -1106,22 +1146,37 @@ struct ArgItem {
     where_: Where,
     if_exists: IfExists,
     if_missing: IfMissing,
+    /// `conf.command` — the deprecated `$ARG`-substituting form.
+    command: Option<Vec<u8>>,
+    /// `conf.cmd` — the value is passed as an argument instead.
+    cmd: Option<Vec<u8>>,
 }
 
 /// `process_trailers_lists()`: fold every argument into the input list in order.
 fn process_lists(head: &mut Vec<Item>, args: Vec<ArgItem>) {
-    for arg in args {
-        if !find_same_and_apply_arg(head, &arg) {
-            apply_arg_if_missing(head, arg);
+    for mut arg in args {
+        match find_same(head, &arg) {
+            Some((in_idx, on_idx)) => {
+                if arg.if_exists != IfExists::DoNothing {
+                    apply_item_command(&mut arg, Some(&head[in_idx]));
+                }
+                apply_arg_if_exists(head, in_idx, on_idx, &arg);
+            }
+            None => {
+                if arg.if_missing != IfMissing::DoNothing {
+                    apply_item_command(&mut arg, None);
+                }
+                apply_arg_if_missing(head, arg);
+            }
         }
     }
 }
 
-/// `find_same_and_apply_arg()`: locate the first same-token entry, walking from
-/// whichever end the placement implies, and apply the if-exists action there.
-fn find_same_and_apply_arg(head: &mut Vec<Item>, arg: &ArgItem) -> bool {
+/// `find_same_and_apply_arg()`'s search half: the first same-token entry, walking
+/// from whichever end the placement implies, as `(in_idx, on_idx)`.
+fn find_same(head: &[Item], arg: &ArgItem) -> Option<(usize, usize)> {
     if head.is_empty() {
-        return false;
+        return None;
     }
     let middle = arg.where_ == Where::After || arg.where_ == Where::Before;
     let backwards = after_or_end(arg.where_);
@@ -1133,15 +1188,83 @@ fn find_same_and_apply_arg(head: &mut Vec<Item>, arg: &ArgItem) -> bool {
         (0..head.len()).collect()
     };
 
-    for idx in order {
-        if !same_token(&head[idx], arg) {
-            continue;
-        }
-        let on_idx = if middle { idx } else { start_idx };
-        apply_arg_if_exists(head, idx, on_idx, arg);
-        return true;
+    order
+        .into_iter()
+        .find(|&idx| same_token(&head[idx], arg))
+        .map(|idx| (idx, if middle { idx } else { start_idx }))
+}
+
+/// Port of `apply_item_command()` (trailer.c).
+///
+/// ```c
+/// if (arg_tok->conf.command || arg_tok->conf.cmd) {
+///         const char *arg;
+///         if (arg_tok->value && arg_tok->value[0])
+///                 arg = arg_tok->value;
+///         else if (in_tok && in_tok->value)
+///                 arg = xstrdup(in_tok->value);
+///         else
+///                 arg = xstrdup("");
+///         arg_tok->value = apply_command(&arg_tok->conf, arg);
+/// }
+/// ```
+///
+/// So the argument is the `--trailer` value when there is one, the matched
+/// input trailer's value when the argument is empty, and the empty string
+/// otherwise. It runs only on the branches that actually add a trailer, which is
+/// why the two `DoNothing` actions never spawn anything.
+fn apply_item_command(arg: &mut ArgItem, in_tok: Option<&Item>) {
+    if arg.command.is_none() && arg.cmd.is_none() {
+        return;
     }
-    false
+    let value = if !arg.value.is_empty() {
+        arg.value.clone()
+    } else {
+        in_tok.map(|t| t.value.clone()).unwrap_or_default()
+    };
+    arg.value = run_trailer_command(arg.command.as_deref(), arg.cmd.as_deref(), &value);
+}
+
+/// Port of `apply_command()` (trailer.c): run the configured program through the
+/// shell and take its trimmed output as the trailer's value.
+///
+/// `cmd` is handed the value as an *argument* — `use_shell` with more than one
+/// argv entry becomes `sh -c '<cmd> "$@"' <cmd> <value>` — while the deprecated
+/// `command` substitutes the value for the first `$ARG` in the command text and
+/// runs that alone. A command that fails leaves the value empty and reports
+/// `error: running trailer command '<cmd>' failed`.
+fn run_trailer_command(command: Option<&[u8]>, cmd: Option<&[u8]>, arg: &[u8]) -> Vec<u8> {
+    use std::process::{Command, Stdio};
+
+    let arg = String::from_utf8_lossy(arg).into_owned();
+    let (shown, mut child) = match (cmd, command) {
+        (Some(cmd), _) => {
+            let text = String::from_utf8_lossy(cmd).into_owned();
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(format!("{text} \"$@\"")).arg(&text).arg(&arg);
+            (text, c)
+        }
+        (None, Some(command)) => {
+            let text = String::from_utf8_lossy(command).into_owned();
+            let text = text.replacen("$ARG", &arg, 1);
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&text);
+            (text, c)
+        }
+        (None, None) => return Vec::new(),
+    };
+
+    // `cp.no_stdin = 1`, and `capture_command()` captures *stdout only* — the
+    // command's own diagnostics stay on the terminal.
+    crate::cstdio::before_spawn();
+    let out = child.stdin(Stdio::null()).stderr(Stdio::inherit()).output();
+    match out {
+        Ok(out) if out.status.success() => trim(&out.stdout).to_vec(),
+        Ok(_) | Err(_) => {
+            eprintln!("error: running trailer command '{shown}' failed");
+            Vec::new()
+        }
+    }
 }
 
 /// `apply_arg_if_exists()`.

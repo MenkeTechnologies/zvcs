@@ -59,8 +59,10 @@
 //!   `GIT_CONFIG_NOSYSTEM`, which relocate or switch off the system config *scope*
 //!   without moving the installation — matching git, which keeps printing
 //!   `GIT_ATTR_SYSTEM` under `GIT_CONFIG_NOSYSTEM=1`.
-//! * `init.defaultBranch` is not run through git's `check_refname_format`, so an
-//!   invalid branch name is echoed rather than rejected.
+//! * `init.defaultBranch` is run through the same `refs/heads/<name>` validation
+//!   `git_default_branch_name()` applies, so a name `check_refname_format()`
+//!   rejects is `fatal: invalid branch name: init.defaultBranch = <value>` at
+//!   128 rather than being echoed.
 
 use anyhow::Result;
 use std::io::Write;
@@ -192,9 +194,20 @@ fn resolve(name: &str, cfg: &ConfigFile) -> Result<Option<Vec<BString>>> {
                 .or_else(|| editor(cfg)),
         ),
         "GIT_PAGER" => single(Some(pager(cfg))),
-        "GIT_DEFAULT_BRANCH" => single(Some(
-            cfg_str(cfg, "init.defaultBranch").unwrap_or_else(|| "master".into()),
-        )),
+        "GIT_DEFAULT_BRANCH" => {
+            // `git_default_branch_name()` (`refs.c`) composes `refs/heads/<name>`
+            // out of the configured value and dies when `check_refname_format()`
+            // rejects it — naming the config key in its display spelling and the
+            // value it read, so an empty `init.defaultBranch` reports an empty
+            // value rather than falling back to `master`.
+            let name = cfg_str(cfg, "init.defaultBranch").unwrap_or_else(|| "master".into());
+            let composed: std::result::Result<gix::refs::FullName, _> =
+                format!("refs/heads/{name}").try_into();
+            if composed.is_err() {
+                crate::git_fatal!("invalid branch name: init.defaultBranch = {name}");
+            }
+            single(Some(name))
+        }
         "GIT_SHELL_PATH" => Ok(Some(vec![os_bytes(gix::path::env::shell())])),
         "GIT_ATTR_SYSTEM" => Ok(attr_system().map(|v| vec![v])),
         "GIT_ATTR_GLOBAL" => Ok(attr_global(cfg)?.map(|v| vec![v])),
@@ -595,7 +608,7 @@ fn os_bytes(s: &std::ffi::OsStr) -> BString {
 /// git's `strbuf_addstr_without_crud`: strip leading and trailing whitespace and
 /// the punctuation git refuses to carry into an ident (`.,:;<>"` and backslash/
 /// apostrophe), then drop any remaining control characters.
-fn without_crud(s: &str) -> String {
+pub(super) fn without_crud(s: &str) -> String {
     const CRUD: &[char] = &['.', ',', ':', ';', '<', '>', '"', '\\', '\''];
     s.trim_matches(|c: char| c.is_whitespace() || CRUD.contains(&c))
         .chars()

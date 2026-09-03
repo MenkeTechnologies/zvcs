@@ -352,12 +352,22 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
     // 3. Paths read from stdin, one per line. git does not skip blank lines; it
     //    tries to open them and fails, so neither is skipped here.
     if opts.stdin_paths {
-        let mut buf = String::new();
-        if std::io::stdin().lock().read_to_string(&mut buf).is_err() {
+        let mut buf = Vec::new();
+        if std::io::stdin().lock().read_to_end(&mut buf).is_err() {
             return Err(Fatal::new("Unable to hash (null)"));
         }
-        for line in buf.lines() {
-            hash_file(line, repo.as_ref(), &mut filters, hash_kind, opts)?;
+        // `while (strbuf_getline(&buf, stdin) != EOF)`: records end at `\n` (a
+        // trailing CR stripped with it), and there is no `-z` — so a
+        // NUL-separated payload is *one* record. git then hands the record to
+        // `open()` as a C string, which ends the name at the first NUL, so
+        // `README.md\0src/lib.rs\0` hashes `README.md` alone and exits 0.
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        for line in text.lines() {
+            let name = match line.find('\0') {
+                Some(at) => &line[..at],
+                None => line,
+            };
+            hash_file(name, repo.as_ref(), &mut filters, hash_kind, opts)?;
         }
     }
 

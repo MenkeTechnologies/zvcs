@@ -814,7 +814,12 @@ fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
 
     let prefix = repo_prefix(&repo)?;
     let workdir = repo.workdir().map(ToOwned::to_owned);
-    let submodules = submodules(&repo)?;
+    // `prepare_submodule_summary()` asks `submodule_from_path()` for exactly one
+    // thing — the `--for-status` `ignore = all` filter — and
+    // `repo_read_gitmodules()` is lazy, so a summary with nothing to filter never
+    // opens `.gitmodules` at all. That laziness is visible: it is the difference
+    // between `submodule summary` exiting 0 and dying on a malformed one.
+    let mut submodules: Option<Vec<gix::Submodule<'_>>> = None;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
@@ -825,8 +830,14 @@ fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
             .as_ref()
             .map(|wd| wd.join(&*gix::path::from_bstr(change.path.as_bstr())));
         if change.status != 'D' && change.status != 'T' {
-            if for_status && change.status != 'A' && ignores_all(&repo, &submodules, &change.path) {
-                continue;
+            if for_status && change.status != 'A' {
+                let known = match submodules.as_ref() {
+                    Some(known) => known,
+                    None => submodules.insert(self::submodules(&repo)?),
+                };
+                if ignores_all(&repo, known, &change.path) {
+                    continue;
+                }
             }
             match &sm_dir {
                 Some(dir) if is_nonbare_repository_dir(dir) => {}
@@ -3956,6 +3967,16 @@ fn persist(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
 fn submodules(repo: &gix::Repository) -> Result<Vec<gix::Submodule<'_>>> {
     if !index_holds_a_gitlink(repo) {
         return Ok(Vec::new());
+    }
+    // `config_from_gitmodules()` (submodule-config.c) reads the worktree file
+    // through `config_with_options()` with no options, so the per-source
+    // `CONFIG_ERROR_DIE` applies and a `.gitmodules` git's parser refuses ends
+    // the command at 128. gitoxide's parser is the more permissive of the two,
+    // so the file is checked directly rather than through the load below.
+    if let Some(work_tree) = repo.workdir() {
+        if let Some(msg) = crate::config::gitmodules_bad_line(work_tree) {
+            return Err(crate::fatal::die(msg));
+        }
     }
     Ok(match repo.submodules()? {
         Some(iter) => iter.collect(),

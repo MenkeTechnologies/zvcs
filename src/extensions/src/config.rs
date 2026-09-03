@@ -1638,6 +1638,117 @@ pub fn first_bad_config_line(bytes: &[u8]) -> Option<usize> {
     }
 }
 
+/// git's `handle_extension()` (setup.c) refusing an `extensions.<key>` *value*,
+/// as `(the `error:` line, the `fatal:` line)`, or `None` when every one of them
+/// names a value git knows.
+///
+/// `check_repo_format()` is a config *callback*, so `return -1` from it stops
+/// `git_parse_source()` where it stands: the value diagnostic prints first and
+/// the reader's own `bad config line <n> in file <path>` follows, naming the line
+/// the offending key sits on. That is why this is not part of
+/// [`repository_format_refusal`] — the refusal happens while the file is being
+/// read, before `verify_repository_format()` looks at the version at all.
+///
+/// ```text
+/// error: invalid value for 'extensions.objectformat': 'bogus'
+/// fatal: bad config line 12 in file .git/config
+/// ```
+///
+/// Covers the extensions whose value git looks up in a table
+/// ([`validated_extension`]). The valueless form is left alone: git answers that
+/// one with `config_error_nonbool()`'s `missing value for '<key>'`, a different
+/// message, and gitoxide's parser renders it as an empty value rather than as an
+/// absent one — so an empty value is passed over here rather than reported as the
+/// wrong half of the pair.
+pub fn extension_value_refusal() -> Option<(String, String)> {
+    for candidate in config_file_sequence(ConfigScopes::Repository, GitDirNaming::AsDiscovered) {
+        let Ok(bytes) = std::fs::read(&candidate.path) else {
+            continue;
+        };
+        let Some((key, value, line)) = first_invalid_extension_value(&bytes) else {
+            continue;
+        };
+        return Some((
+            format!("invalid value for '{key}': '{value}'"),
+            format!("bad config line {line} in file {}", candidate.shown),
+        ));
+    }
+    None
+}
+
+/// The first `extensions.<key> = <value>` in `bytes` whose value git refuses, as
+/// `(git's spelling of the key, the value, the 1-based line)`.
+fn first_invalid_extension_value(bytes: &[u8]) -> Option<(&'static str, String, usize)> {
+    use gix::bstr::ByteSlice as _;
+    use gix::bstr::ByteSlice as _;
+    use gix::config::parse::EventRef;
+
+    let events = gix::config::parse::Events::from_bytes(bytes, None).ok()?;
+    let mut line = 1usize;
+    let mut in_extensions = false;
+    let mut pending: Option<(&'static str, &'static [&'static str])> = None;
+    for event in events.iter() {
+        match event {
+            EventRef::Newline(nl) => {
+                line += nl.iter().filter(|&&b| b == b'\n').count();
+            }
+            EventRef::SectionHeader {
+                name,
+                subsection_name,
+                ..
+            } => {
+                // `skip_prefix(var, "extensions.", &ext)` runs on the key
+                // `git_config_parse_key()` built, so `[extensions "x"]` yields
+                // `extensions.x.<name>` and matches no extension git knows.
+                in_extensions = subsection_name.is_none()
+                    && name.to_str_lossy().eq_ignore_ascii_case("extensions");
+                pending = None;
+            }
+            EventRef::SectionValueName(name) => {
+                pending = if in_extensions {
+                    validated_extension(name.to_str_lossy().as_ref())
+                } else {
+                    None
+                };
+            }
+            EventRef::Value(raw) => {
+                let Some((key, allowed)) = pending.take() else {
+                    continue;
+                };
+                let value = gix::config::value::normalize(raw);
+                if value.is_empty() {
+                    continue;
+                }
+                let text = value.to_str_lossy().into_owned();
+                if !allowed.iter().any(|name| *name == text) {
+                    return Some((key, text, line));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `extensions.<key>`s whose value `handle_extension()` (setup.c) resolves
+/// through a lookup table and refuses when the lookup misses, with git's own
+/// lower-case spelling of the key — the literal it passes to `error()`, not the
+/// spelling the file used — and the names its table holds.
+///
+/// `hash_algo_by_name()` (hash.c) and `ref_storage_format_by_name()` (refs.c)
+/// both compare with `strcmp`, so the value is case-*sensitive* even though the
+/// key is not.
+fn validated_extension(name: &str) -> Option<(&'static str, &'static [&'static str])> {
+    const HASHES: &[&str] = &["sha1", "sha256"];
+    const REF_STORAGES: &[&str] = &["files", "reftable"];
+    Some(match name.to_ascii_lowercase().as_str() {
+        "objectformat" => ("extensions.objectformat", HASHES),
+        "compatobjectformat" => ("extensions.compatobjectformat", HASHES),
+        "refstorage" => ("extensions.refstorage", REF_STORAGES),
+        _ => return None,
+    })
+}
+
 /// The line of the first valueless key that is not the last thing on its line,
 /// which git's `get_value()` refuses and gitoxide's parser accepts.
 ///
@@ -2428,14 +2539,30 @@ fn is_gitmodules_failure(cause: &(dyn std::error::Error + 'static)) -> bool {
 /// not a path, and re-parsing gives both from the one file git would have named.
 fn gitmodules_message() -> Option<String> {
     let dirs = repository_directories()?;
-    let path = crate::setup::realpath(&dirs.work_tree?).join(".gitmodules");
+    gitmodules_bad_line(&dirs.work_tree?)
+}
+
+/// `bad config line <n> in file <path>` for `work_tree`'s `.gitmodules`, or
+/// `None` when git's parser would accept the file — including when there is no
+/// such file.
+///
+/// Asked of the file rather than of a failed load, because the two parsers do
+/// not refuse the same input: gitoxide ends an implicit-boolean name wherever it
+/// stands, so `this is not a config line` parses there as four valueless names
+/// while `git_parse_source()` returns -1 at the first space and dies. The extra
+/// rule is [`unterminated_valueless_key`], the same one
+/// [`first_unparsable_config_file`] applies to `.git/config`.
+///
+/// The path is absolute because `repo_worktree_path(repo, GITMODULES_FILE)`
+/// builds it from the worktree root.
+pub fn gitmodules_bad_line(work_tree: &std::path::Path) -> Option<String> {
+    let path = crate::setup::realpath(work_tree).join(".gitmodules");
     let bytes = std::fs::read(&path).ok()?;
-    let err = gix::config::parse::Events::from_bytes(&bytes, None).err()?;
-    Some(format!(
-        "bad config line {} in file {}",
-        err.line_number(),
-        path.display()
-    ))
+    let line = match gix::config::parse::Events::from_bytes(&bytes, None) {
+        Err(err) => err.line_number(),
+        Ok(events) => unterminated_valueless_key(&events)?,
+    };
+    Some(format!("bad config line {line} in file {}", path.display()))
 }
 
 /// [`setup_fatal`] for one `gix::open::Error`.

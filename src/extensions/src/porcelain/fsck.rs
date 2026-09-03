@@ -35,16 +35,22 @@ const ERROR_REFS: u8 = 8;
 ///    reaches `snapshot_ref()`, which prints `error: <arg>: invalid sha1 pointer
 ///    <oid>`, sets `ERROR_REACHABLE` and leaves `default_refs` alone. Any
 ///    argument at all suppresses the default head set and turns reflogs off,
-///    exactly as `snapshot_refs()` does;
+///    exactly as `snapshot_refs()` does; without one, `snapshot_refs()` walks the
+///    reference store *here*, before any object is opened, which is why a
+///    reference to a missing object reports ahead of the scan's own lines;
 /// 3. unless `--connectivity-only`, every object in the odb is decoded, which is
 ///    where `--root` and `--tags` lines and the object-directory progress come
 ///    from;
-/// 4. the head set is marked reachable. If nothing at all became a head,
-///    `notice: No default references` goes to stderr and `--unreachable` is
-///    cleared, so the report falls back to dangling tips;
+/// 4. `process_refs()` acts on the snapshot and the reflogs join the head set. If
+///    nothing at all became a head, `notice: No default references` goes to
+///    stderr and `--unreachable` is cleared, so the report falls back to dangling
+///    tips;
 /// 5. index entries join the head set when no `<object>` was given, or when
 ///    `--cache` was passed;
-/// 6. the connectivity report is printed in `obj_hash` slot order.
+/// 6. the reachability walk runs; under `--connectivity-only`, which parsed
+///    nothing and so marked nothing `USED`, `mark_unreachable_referents()` then
+///    walks each unreachable object so `--dangling` means what it says;
+/// 7. the connectivity report is printed in `obj_hash` slot order.
 ///
 /// Ported flags:
 /// ```text
@@ -205,24 +211,29 @@ const ERROR_REFS: u8 = 8;
 /// the table's growth schedule.
 ///
 /// Collision resolution depends on the order in which `builtin/fsck.c` happens
-/// to create objects, and that order includes the raw `readdir()` sequence of
-/// `.git/objects/??`, which is a filesystem property and not reproducible. It
-/// does not always matter: under linear probing the *set* of occupied slots is
+/// to create objects, so the whole `lookup_<type>()` call sequence is replayed —
+/// `snapshot_refs()` before the scan, the scan, `process_refs()`, the reflogs,
+/// the index, and the reachability walk, in that order — which places every
+/// object exactly (see [`SlotOrder`] and [`replay_obj_hash`]). The replay needs
+/// the scan's own order, which comes from the raw `readdir()` sequence of
+/// `.git/objects/??` plus, when the odb holds one, the pack's offset order
+/// ([`loose_scan_order`]). Where that is unavailable — `--connectivity-only`,
+/// `--no-full` with a pack, more than one pack, a linked worktree — a weaker
+/// argument applies instead: under linear probing the *set* of occupied slots is
 /// independent of insertion order, so slots partition into clusters (maximal
 /// runs of occupied slots) whose boundaries are fixed, and an object never lands
 /// before its own home slot. Within a cluster whose home slots are all distinct,
 /// every object sits exactly on its home slot; between clusters, home-slot order
-/// always holds. So the report order is provable unless two reported objects
-/// share a cluster that contains a repeated home slot — and only then does this
-/// command `bail!` instead of guessing.
+/// always holds. So the report order is still provable unless two reported
+/// objects share a cluster that contains a repeated home slot — and only then
+/// does this command `bail!` instead of guessing.
 ///
-/// `root` and `tagged` lines come from the object-directory scan instead.
-/// `for_each_loose_file_in_source()` (`object-file.c`) walks the 256 subdirectories
-/// in numeric order and only the entries within one of them by raw `readdir()`, so
-/// these lines are ordered by the first byte of the id. That much is reproducible;
-/// two lines sharing a first byte, or any pack at all (`verify_pack()` re-runs
-/// `fsck_obj()` over packed objects afterwards, in pack-index order), makes the
-/// command `bail!` instead of guessing.
+/// `root` and `tagged` lines come from the object-directory scan instead, so
+/// they are ordered by the scan order above. Without it the same first-byte
+/// argument applies — `for_each_loose_file_in_source()` (`object-file.c`) walks
+/// the 256 subdirectories in numeric order and only the entries within one of
+/// them by raw `readdir()` — and two lines sharing a first byte, or a pack whose
+/// order could not be reconstructed, makes the command `bail!` rather than guess.
 pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // Tolerate the subcommand being present at index 0 regardless of how the
     // dispatcher slices argv.
@@ -363,6 +374,46 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         opt.include_reflogs = false;
     }
 
+    // The two shapes in which an object this repository does not have is not an
+    // error: a shallow boundary, whose parents were never sent, and a promisor
+    // pack's promise, which the remote still holds. Both are read here because
+    // `snapshot_refs()` below already needs the promisor set.
+    let shallow: HashSet<ObjectId> = repo
+        .shallow_commits()
+        .ok()
+        .flatten()
+        .map(|commits| commits.iter().copied().collect())
+        .unwrap_or_default();
+    let promisor = super::rev_list::promisor_objects(&repo);
+
+    // ---- 2b. `snapshot_refs()`: the reference half of the head set ----------
+    //
+    // ```c
+    // /*
+    //  * Take a snapshot of the refs before walking objects to avoid looking
+    //  * at a set of refs that may be changed by the user while we are walking
+    //  * objects. …
+    //  */
+    // snapshot_refs(repo, &snap, argc, argv);
+    // ```
+    //
+    // (`cmd_fsck`.) The snapshot is taken *before* the object scan and acted on
+    // after it, so every one of its `parse_object()` calls — and every
+    // `invalid sha1 pointer` line — comes first. An explicit `<object>` argument
+    // makes `snapshot_refs()` return before it touches the ref store, which is
+    // why this is the `else` of step 2.
+    let mut default_refs_snapshot = 0usize;
+    if !explicit_heads {
+        default_refs_snapshot = collect_default_heads(
+            &repo,
+            &mut state,
+            &mut heads,
+            &mut pre_parsed,
+            &promisor,
+            &mut errors,
+        )?;
+    }
+
     // ---- 3. every object in the odb ----------------------------------------
     //
     // `all` is the odb's contents, so membership must not depend on whether the
@@ -382,25 +433,26 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // is what decides where two colliding ids land in `obj_hash`. Take only
     // membership from the iterator and re-lay `all` in git's order whenever that
     // order is reconstructible — see [`loose_scan_order`].
-    let scan_ordered = match loose_scan_order(&repo) {
+    let scan_ordered = match loose_scan_order(&repo, opt.check_full) {
         Some(order) if order.len() == all.len() && order.iter().all(|id| in_odb.contains(id)) => {
             all = order;
             true
         }
         _ => false,
     };
+    // Where each object sits in that order, which is the order every line the
+    // scan itself emits comes out in.
+    let scan_index: Option<HashMap<ObjectId, usize>> = scan_ordered
+        .then(|| all.iter().enumerate().map(|(i, id)| (*id, i)).collect());
     // `lookup_<type>()` is called in one long sequence over the whole command,
     // and [`SlotOrder`] can only replay it when every caller is accounted for.
     // That holds when the scan itself is in git's order, when the scan runs at
-    // all (`--connectivity-only` replaces it with a listing walk this port does
-    // not order), when an explicit `<object>` argument made `snapshot_refs()`
-    // return before touching the ref store and turned reflogs off — the
-    // ref-and-reflog snapshot is the one phase this port takes at git's
-    // *handling* point rather than git's *snapshotting* point — and when no
-    // linked worktree can put its index ahead of the main one under `--cache`.
+    // all (`--connectivity-only` replaces it with a listing walk whose object
+    // creation this port does not model), and when there is no linked worktree —
+    // whose HEAD git snapshots with the main one but which this port handles in
+    // one later block together with that worktree's index and reflogs.
     let creation_modeled = scan_ordered
         && !opt.connectivity_only
-        && explicit_heads
         && repo.worktrees().map(|w| w.is_empty()).unwrap_or(true);
 
     // Children of every object, for `used` and `missing`. git checks every
@@ -432,22 +484,22 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         eprintln!("Checking object directory");
     }
     for &id in &all {
-        // `mark_object_for_connectivity()` creates the object straight from the
-        // odb's file listing, before anything is read.
+        // `--connectivity-only` replaces `fsck_source()` with
+        // `mark_object_for_connectivity()`, which creates the object straight
+        // from the odb's listing and sets `HAS_OBJ` without reading a byte. So
+        // nothing is parsed here, nothing is reported here, and — the part that
+        // shows on stdout — no object is marked `USED` here. `check_connectivity()`
+        // makes up for that with `mark_unreachable_referents()` below; the
+        // reachability walk is where a corrupt object is finally noticed, and
+        // only if it is a non-blob something reaches.
         if opt.connectivity_only {
             state.note(id);
+            continue;
         }
         // `fsck_loose()` reads the object out of the odb first of all. Every
         // failure of that read is reported and stepped over.
         let (kind, data) = match read_for_fsck(&repo, id) {
             Ok(read) => read,
-            // `--connectivity-only` replaces `fsck_source()` with
-            // `mark_object_for_connectivity()`, which sets `HAS_OBJ` from the
-            // odb's file listing without reading a byte. Nothing is reported and
-            // the object still counts as present; the reachability walk below is
-            // where a corrupt one is finally noticed, and only if it is a
-            // non-blob something reaches.
-            Err(_) if opt.connectivity_only => continue,
             Err(lines) => {
                 let slot = Slot::Scan(id.as_bytes()[0]);
                 for line in lines {
@@ -499,7 +551,20 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // nothing and `fsck_walk_tree()` decodes the entries and looks every one
         // of them up, on every run.
         let creates_children = kind == Kind::Tree || !pre_parsed.contains(&id);
-        for (child, _) in &decoded.children {
+        let grafted = kind == Kind::Commit && shallow.contains(&id);
+        for (child, child_kind) in &decoded.children {
+            // ```c
+            // if (graft && (graft->nr_parent < 0 || grafts_replace_parents))
+            //         continue;
+            // ```
+            //
+            // (`parse_commit_buffer()`, commit.c.) A shallow boundary carries a
+            // graft with no parents, so its `parent` lines are stepped over
+            // before `lookup_commit()` is reached: the parents are neither
+            // created nor marked used. Its tree is read as usual.
+            if grafted && *child_kind == Kind::Commit {
+                continue;
+            }
             // Absent children are `note`d all the same: `fsck_walk()` creates
             // them, so they occupy an `obj_hash` slot. They are not *reported*
             // here — `check_unreachable_object()` never prints `missing`, so an
@@ -508,11 +573,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 state.note(*child);
             }
             state.used.insert(*child);
-        }
-        // `--root` and `--tags` lines are emitted by `fsck_obj()`, which
-        // `--connectivity-only` skips entirely.
-        if opt.connectivity_only {
-            continue;
         }
 
         // `fsck_obj()` runs `fsck_walk()` before `fsck_object()`, and turns a
@@ -575,7 +635,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        if opt.show_root && decoded.is_root_commit {
+        // `fsck_commit()` reports a root as `!commit->parents`, which is what the
+        // graft above leaves a shallow boundary commit with — so `--root` names
+        // every boundary of a shallow clone as well as the history's own root.
+        if opt.show_root && (decoded.is_root_commit || grafted) {
             scan_lines.push((id, format!("root {id}")));
         }
         if opt.show_tags {
@@ -609,27 +672,33 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             &mut msg_lines,
         );
     }
-    // `for_each_loose_file_in_source()` walks the 256 subdirectories in numeric
-    // order and only the entries *within* one of them in raw `readdir()` order
-    // (`object-file.c`). So these lines are ordered by the first byte of the id,
-    // and only a pair sharing a first byte is unresolvable.
+    // These lines come out in the order the scan visited their objects, which is
+    // `scan_index` whenever this port could reconstruct it.
     //
-    // A pack breaks the argument outright: `verify_pack()` re-runs `fsck_obj()`
-    // over packed objects after every loose one, in pack-index order.
+    // Without it the weaker argument applies: `for_each_loose_file_in_source()`
+    // walks the 256 subdirectories in numeric order and only the entries *within*
+    // one of them in raw `readdir()` order (`object-file.c`), so the lines are
+    // ordered by the first byte of the id and only a pair sharing a first byte is
+    // unresolvable.
     if scan_lines.len() > 1 {
-        let mut by_subdir: HashSet<u8> = HashSet::new();
-        let collides = scan_lines
-            .iter()
-            .any(|(id, _)| !by_subdir.insert(id.as_bytes()[0]));
-        if collides || has_packs(&repo) {
-            anyhow::bail!(
-                "refusing to guess the output order: git emits these {} lines during its \
-                 object-directory scan, and two of them share the raw readdir() sequence of one \
-                 .git/objects/?? subdirectory",
-                scan_lines.len()
-            );
+        match &scan_index {
+            Some(index) => scan_lines.sort_by_key(|(id, _)| index.get(id).copied()),
+            None => {
+                let mut by_subdir: HashSet<u8> = HashSet::new();
+                let collides = scan_lines
+                    .iter()
+                    .any(|(id, _)| !by_subdir.insert(id.as_bytes()[0]));
+                if collides || has_packs(&repo) {
+                    anyhow::bail!(
+                        "refusing to guess the output order: git emits these {} lines during its \
+                         object-directory scan, and two of them share the raw readdir() sequence \
+                         of one .git/objects/?? subdirectory",
+                        scan_lines.len()
+                    );
+                }
+                scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
+            }
         }
-        scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
     }
 
     // The message layer's lines come from the same scan plus `fsck_finish()`,
@@ -640,19 +709,35 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         for &(slot, id, _) in &msg_lines {
             by_slot.entry(slot).or_default().insert(id);
         }
-        // Within one `.git/objects/??` subdirectory the walk is raw `readdir()`
-        // order; within one `fsck_finish()` sweep it is git's khash order.
-        // Either way, two distinct ids in the same slot are unorderable.
-        let collides = by_slot.values().any(|ids| ids.len() > 1);
-        if collides || has_packs(&repo) {
-            anyhow::bail!(
-                "refusing to guess the output order: git emits these {} object-content messages \
-                 during its object-directory scan, and two of them share the raw readdir() \
-                 sequence of one .git/objects/?? subdirectory",
-                msg_lines.len()
-            );
+        // Within one `fsck_finish()` sweep the order is git's khash order, which
+        // this port does not model, so two distinct ids in one sweep are
+        // unorderable either way. The scan half is `scan_index` when that was
+        // reconstructible, and the same first-byte argument as above when it was
+        // not.
+        let finish_collides = by_slot
+            .iter()
+            .any(|(slot, ids)| !matches!(slot, Slot::Scan(_)) && ids.len() > 1);
+        match &scan_index {
+            Some(index) if !finish_collides => {
+                msg_lines.sort_by_key(|&(slot, id, _)| match slot {
+                    Slot::Scan(_) => (0usize, index.get(&id).copied()),
+                    Slot::FinishGitmodules => (1, None),
+                    Slot::FinishGitattributes => (2, None),
+                });
+            }
+            _ => {
+                let collides = by_slot.values().any(|ids| ids.len() > 1);
+                if collides || has_packs(&repo) {
+                    anyhow::bail!(
+                        "refusing to guess the output order: git emits these {} object-content \
+                         messages during its object-directory scan, and two of them share the raw \
+                         readdir() sequence of one .git/objects/?? subdirectory",
+                        msg_lines.len()
+                    );
+                }
+                msg_lines.sort_by_key(|&(slot, _, _)| slot);
+            }
         }
-        msg_lines.sort_by_key(|&(slot, _, _)| slot);
     }
     for (_, _, line) in &msg_lines {
         eprintln!("{line}");
@@ -684,19 +769,14 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // which moves it back to its home slot — so the call has to be replayed even
     // though it changes nothing about the head set.
     //
-    // Only the explicit-`<object>` snapshot is replayed: the ref/reflog snapshot
-    // is taken below, at the point git *handles* it rather than the point git
-    // takes it, and `creation_modeled` is off for that case.
-    if explicit_heads {
-        for id in heads.clone() {
-            state.note(id);
-        }
+    // Every snapshotted head goes through it, whichever of the two ways it was
+    // snapshotted — an explicit `<object>` in step 2 or a reference in step 2b.
+    for id in heads.clone() {
+        state.note(id);
     }
 
-    // ---- 4. the head set ----------------------------------------------------
-    if !explicit_heads {
-        default_refs += collect_default_heads(&repo, &mut state, &mut heads, &mut errors)?;
-    }
+    // ---- 4. the rest of the head set ----------------------------------------
+    default_refs += default_refs_snapshot;
     if opt.include_reflogs {
         let logs_root = repo.common_dir().join("logs");
         errors |= collect_reflog_heads(&repo, &logs_root, &mut state, &mut heads, opt.verbose)?;
@@ -731,19 +811,17 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let mut queue: Vec<(ObjectId, Option<Kind>)> = Vec::new();
     for id in heads {
         if state.reachable.insert(id) {
+            // A head reaches `mark_object()` through `mark_object_reachable()`
+            // like any other object, so the promisor stop applies to it too: the
+            // ref tip of a partial clone is marked REACHABLE and never enters
+            // `pending`, which is why `fsck` on a `--filter=` clone reports the
+            // whole history behind the tip as unreachable.
+            if promisor.contains(&id) {
+                continue;
+            }
             queue.push((id, None));
         }
     }
-    // The two shapes in which an object this repository does not have is not an
-    // error: a shallow boundary, whose parents were never sent, and a promisor
-    // pack's promise, which the remote still holds.
-    let shallow: HashSet<ObjectId> = repo
-        .shallow_commits()
-        .ok()
-        .flatten()
-        .map(|commits| commits.iter().copied().collect())
-        .unwrap_or_default();
-    let promisor = super::rev_list::promisor_objects(&repo);
     while let Some((id, expected)) = queue.pop() {
         let kind = match repo.find_header(id) {
             Ok(h) => h.kind(),
@@ -828,6 +906,52 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             }
             if state.reachable.insert(child) {
                 queue.push((child, Some(child_kind)));
+            }
+        }
+    }
+
+    // ---- 6a. `mark_unreachable_referents()` ---------------------------------
+    //
+    // ```c
+    // if (connectivity_only && (show_dangling || write_lost_and_found)) {
+    //         odb_for_each_object(repo->objects, NULL,
+    //                             mark_unreachable_referents, repo, 0);
+    // }
+    // ```
+    //
+    // (`check_connectivity()`, builtin/fsck.c.) `--connectivity-only` never
+    // opened an object, so nothing carries `USED` and every unreachable object
+    // would look like the tip of its own set. This pass walks each unreachable
+    // object exactly once — `fsck_walk()` parses it first, which is what creates
+    // its referents in `obj_hash` — and marks what it names `USED`. Reachable
+    // objects are skipped: `traverse_reachable()` has already covered them.
+    if opt.connectivity_only && (opt.show_dangling || opt.write_lost_and_found) {
+        for &id in &all {
+            if state.reachable.contains(&id) {
+                continue;
+            }
+            // `fsck_walk_blob()` reads nothing and names nothing; an object the
+            // odb cannot type at all is read three times over and the third read
+            // is fatal — see [`unreadable_unreachable_object`].
+            let header = match repo.find_header(id) {
+                Ok(header) => header,
+                Err(_) => {
+                    if let Some(code) = unreadable_unreachable_object(&repo, id) {
+                        return Ok(code);
+                    }
+                    continue;
+                }
+            };
+            if header.kind() == Kind::Blob {
+                continue;
+            }
+            let Ok(Ok(decoded)) = decode(&repo, id) else { continue };
+            for (child, _) in &decoded.children {
+                // Unlike the scan, nothing here was parsed beforehand, so both
+                // `fsck_walk_tree()`'s `lookup_tree()`/`lookup_blob()` and
+                // `repo_parse_commit()`'s `lookup_commit()` create.
+                state.note(*child);
+                state.used.insert(*child);
             }
         }
     }
@@ -1464,18 +1588,63 @@ fn parse_tag_buffer(
     Ok((target, target_kind, String::from_utf8_lossy(&name[..nl]).into_owned()))
 }
 
-/// git's default head set minus reflogs and the index: every reference plus
-/// `HEAD`. Returns how many heads it contributed, which is git's `default_refs`.
+/// `snapshot_refs()`'s default head set: every reference plus `HEAD`, minus
+/// reflogs and the index. Returns how many heads it contributed, which is git's
+/// `default_refs`.
 ///
-/// Ids named by a reference but absent from the odb are still `note`d, because
-/// `parse_object()` creates those objects too and they occupy an `obj_hash` slot.
+/// This is the *snapshot*, and git takes it before it opens a single object —
+/// which is why this runs ahead of the object scan and why the `invalid sha1
+/// pointer` lines below precede the scan's. `snapshot_ref()` opens with
+/// `parse_object()`, so a reference to an id that is not in the odb reports
+/// against the reference and contributes no head at all, and a reference to a
+/// commit or a tag creates that object's links here rather than in the scan —
+/// which is what `pre_parsed` records for the scan to know.
 fn collect_default_heads(
     repo: &gix::Repository,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
+    pre_parsed: &mut HashSet<ObjectId>,
+    promisor: &HashSet<ObjectId>,
     errors: &mut u8,
 ) -> Result<usize> {
     let mut count = 0usize;
+    // One `snapshot_ref()` call: `parse_object()` first, which creates the object
+    // and then the links its parse stores — a commit's tree and parents, a tag's
+    // target. A tree's entries are not created here; `parse_tree_buffer()` only
+    // keeps the buffer. A NULL return is the *id's* problem rather than the
+    // reference's: git reports it, sets `ERROR_REACHABLE`, leaves `default_refs`
+    // alone and puts nothing in the snapshot — except for a promisor object,
+    // which still counts as a head because the remote can produce it.
+    let mut snapshot_ref = |state: &mut State,
+                            heads: &mut Vec<ObjectId>,
+                            pre_parsed: &mut HashSet<ObjectId>,
+                            errors: &mut u8,
+                            name: &str,
+                            id: ObjectId|
+     -> usize {
+        if !repo.has_object(id) {
+            if promisor.contains(&id) {
+                return 1;
+            }
+            eprintln!("error: {name}: invalid sha1 pointer {id}");
+            *errors |= ERROR_REACHABLE;
+            return 0;
+        }
+        state.note(id);
+        if matches!(
+            repo.find_header(id).map(|h| h.kind()),
+            Ok(Kind::Commit) | Ok(Kind::Tag)
+        ) {
+            if let Ok(Ok(parsed)) = decode(repo, id) {
+                for (child, _) in &parsed.children {
+                    state.note(*child);
+                }
+                pre_parsed.insert(id);
+            }
+        }
+        heads.push(id);
+        1
+    };
 
     // References, taking each ref's direct target rather than its fully peeled
     // one, so an annotated tag object counts as reachable in its own right.
@@ -1501,18 +1670,14 @@ fn collect_default_heads(
                 }
             },
         };
-        state.note(id);
-        heads.push(id);
-        count += 1;
+        count += snapshot_ref(state, heads, pre_parsed, errors, &name, id);
     }
 
-    // HEAD is a pseudo-ref and is not part of the `refs/` iteration above.
+    // HEAD is a pseudo-ref and is not part of the `refs/` iteration above:
+    // `snapshot_refs()` resolves it per worktree after the `for_each_ref` walk.
     if let Ok(head) = repo.head() {
         if let Some(id) = head.id() {
-            let id = id.detach();
-            state.note(id);
-            heads.push(id);
-            count += 1;
+            count += snapshot_ref(state, heads, pre_parsed, errors, "HEAD", id.detach());
         }
     }
 
@@ -1776,6 +1941,48 @@ fn loose_object_path(repo: &gix::Repository, id: ObjectId) -> Option<PathBuf> {
 fn loose_object_label(repo: &gix::Repository, id: ObjectId) -> Option<String> {
     let full = loose_object_path(repo, id)?;
     Some(loose_label_of(repo, &full))
+}
+
+/// `mark_unreachable_referents()` meeting an object the odb lists but cannot
+/// read: the diagnostics git prints, and `ExitCode::from(128)` when the last of
+/// its reads dies. `None` when the object turns out to be readable after all.
+///
+/// Three reads, because three callers ask in a row and none of them caches a
+/// failure:
+///
+/// 1. `mark_unreachable_referents()` itself, for the type
+///    (`odb_read_object_info`);
+/// 2. `fsck_walk()`, which parses an `OBJ_NONE` object before dispatching on its
+///    type — `parse_object()` asks for the type again;
+/// 3. `parse_object()`'s `odb_read_object()`, which for a loose object that
+///    exists and will not inflate ends in
+///    `die(_("loose object %s (stored in %s) is corrupt"))`.
+///
+/// Each read prints zlib's complaint and then `unable to unpack %s header`
+/// naming the **oid** — `read_loose_object()`'s scan-time walk is the one that
+/// names the file instead (see [`read_loose_object`]).
+fn unreadable_unreachable_object(repo: &gix::Repository, id: ObjectId) -> Option<ExitCode> {
+    let path = loose_object_path(repo, id)?;
+    let map = std::fs::read(&path).ok()?;
+    let mut diag: Vec<String> = Vec::new();
+    let mut z = gix::zlib::Decompress::new();
+    let mut hdr = [0u8; MAX_HEADER_LEN];
+    match unpack_loose_header(&mut z, &map, &mut hdr, &mut diag) {
+        LooseHeader::Ok => return None,
+        LooseHeader::Bad | LooseHeader::TooLong => {
+            diag.push(format!("error: unable to unpack {id} header"));
+        }
+    }
+    for _ in 0..3 {
+        for line in &diag {
+            eprintln!("{line}");
+        }
+    }
+    eprintln!(
+        "fatal: loose object {id} (stored in {}) is corrupt",
+        loose_label_of(repo, &path)
+    );
+    Some(ExitCode::from(128))
 }
 
 /// See [`loose_object_label`].
@@ -2502,13 +2709,74 @@ fn probe_insert(table: &mut [Option<ObjectId>], id: ObjectId) {
 /// in numeric order, and the entries within one of them in raw `readdir()`
 /// order, which `std::fs::read_dir` is the same system call for.
 ///
-/// `None` when the odb holds a pack: `check_full` re-runs `fsck_obj()` over
-/// packed objects through `verify_pack()` after the loose walk, in an order this
-/// port does not model.
-fn loose_scan_order(repo: &gix::Repository) -> Option<Vec<ObjectId>> {
+/// After every source's loose walk, `check_full` re-runs `fsck_obj()` over the
+/// packed objects through `verify_pack()`; [`pack_scan_order`] is that tail.
+///
+/// `None` when the tail is not reconstructible — `--no-full` (which skips the
+/// packs entirely, leaving the odb listing this port takes `all` from wider than
+/// what git created) or more than one pack, whose relative order is
+/// `rearrange_packed_git()`'s mtime sort.
+fn loose_scan_order(repo: &gix::Repository, check_full: bool) -> Option<Vec<ObjectId>> {
+    let mut out = loose_only_scan_order(repo);
     if has_packs(repo) {
-        return None;
+        if !check_full {
+            return None;
+        }
+        out.extend(pack_scan_order(repo)?);
     }
+    Some(out)
+}
+
+/// The order `verify_pack()` re-checks packed objects in.
+///
+/// `verify_packfile()` (pack-check.c) reads every index entry, sorts the array
+/// by **pack offset** — "since unpacking them is more efficient that way" — and
+/// only then calls `fsck_obj_buffer()` per entry. So the order is the pack's own
+/// layout, not its index's.
+///
+/// `None` unless there is exactly one pack across every odb source:
+/// `repo_for_each_pack()` walks `packed_git`, which `rearrange_packed_git()`
+/// orders by locality and then by mtime — a filesystem property this port does
+/// not read back.
+fn pack_scan_order(repo: &gix::Repository) -> Option<Vec<ObjectId>> {
+    let hash = repo.object_hash();
+    let mut found: Option<Vec<(u64, ObjectId)>> = None;
+    for objdir in odb_sources(repo) {
+        let dir = objdir.join("pack");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(base) = name.strip_suffix(".idx") else {
+                continue;
+            };
+            if !dir.join(format!("{base}.pack")).is_file() {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            let index = pack::index::File::at(dir.join(&name), hash).ok()?;
+            let mut byte_offsets: Vec<(u64, ObjectId)> = index
+                .iter()
+                .map(|entry| (entry.pack_offset, entry.oid))
+                .collect();
+            byte_offsets.sort();
+            found = Some(byte_offsets);
+        }
+    }
+    Some(
+        found
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect(),
+    )
+}
+
+/// The loose half of [`loose_scan_order`].
+fn loose_only_scan_order(repo: &gix::Repository) -> Vec<ObjectId> {
     let hexsz = repo.object_hash().len_in_hex();
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut out: Vec<ObjectId> = Vec::new();
@@ -2535,7 +2803,7 @@ fn loose_scan_order(repo: &gix::Repository) -> Option<Vec<ObjectId>> {
             }
         }
     }
-    Some(out)
+    out
 }
 
 /// The size `obj_hash` ends at after `n` objects have been created, replaying

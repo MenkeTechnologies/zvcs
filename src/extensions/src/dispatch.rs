@@ -1022,6 +1022,15 @@ fn repository_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
 /// The `err.buf` half of [`repository_format_gate`], split out so the two
 /// readings read as the two questions they are.
 fn format_refusal(sub: &str) -> Option<String> {
+    // `check_repo_format()` refusing an `extensions.<key>` value happens inside
+    // the config *reader*, so it precedes every reading below — and it prints its
+    // own `error:` line ahead of the reader's `fatal:`.
+    if !FORMAT_GENTLE_VERBS.contains(&sub) {
+        if let Some((diagnostic, fatal)) = crate::config::extension_value_refusal() {
+            eprintln!("error: {diagnostic}");
+            return Some(fatal);
+        }
+    }
     if REPO_FORMAT_GATE_VERBS.contains(&sub) {
         let discovered = crate::setup::discover().err();
         if let Some(gix::discover::Error::Open(gix::open::Error::Config(config))) = &discovered {

@@ -1293,6 +1293,30 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         )
     });
     let needs_peel = atoms().any(|a| a.deref);
+    // `populate_value()` (ref-filter.c) fills every atom that reads nothing
+    // first, and only asks the odb when one is still empty afterwards — so a
+    // reference whose object is gone still renders `%(refname)`,
+    // `%(objectname)`, `%(HEAD)` and the rest of that set, and only a format
+    // that wants something *out of* the object turns the absence into
+    // `missing object <oid> for <refname>`. This is the complement of that set,
+    // spelled as a negation so a newly added atom is assumed to read.
+    let reads_object = atoms().any(|a| {
+        a.deref
+            || !matches!(
+                a.field,
+                Field::RefName(_)
+                    | Field::SymRef(_)
+                    | Field::ObjectName(_)
+                    | Field::Head
+                    | Field::Flag
+                    | Field::Color(_)
+                    | Field::Upstream(_)
+                    | Field::Push(_)
+                    | Field::WorktreePath
+                    | Field::IsBase(_, _)
+                    | Field::AheadBehind(_)
+            )
+    });
     let needs_short = atoms().any(|a| matches!(a.field, Field::RefName(NameMod::Short)));
     let needs_symref_short = atoms().any(|a| matches!(a.field, Field::SymRef(NameMod::Short)));
 
@@ -1383,7 +1407,21 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        let obj = load(&repo, id, needs_data)?;
+        let obj = match load(&repo, id, needs_data) {
+            Ok(obj) => obj,
+            Err(_) if !reads_object => ObjInfo {
+                id,
+                // Never read: with no atom asking, nothing consults the type or
+                // the size. git leaves the same fields untouched.
+                kind: Kind::Commit,
+                size: 0,
+                data: None,
+            },
+            Err(_) => crate::git_fatal!(
+                "missing object {id} for {}",
+                String::from_utf8_lossy(&refname)
+            ),
+        };
         let peeled = match (needs_peel, obj.kind, chain.last()) {
             (true, Kind::Tag, Some(&last)) => Some(load(&repo, last, needs_data)?),
             _ => None,

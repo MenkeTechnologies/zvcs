@@ -97,6 +97,10 @@ struct Target {
     /// `ce_skip_worktree(ce)`: the entry sits outside the sparse-checkout
     /// definition, so `git rm` ignores it unless `--sparse` was given.
     sparse: bool,
+    /// `ce_intent_to_add(ce)`: an `add -N` placeholder, which `rm --cached` is
+    /// allowed to drop however far the index has drifted from HEAD and the file
+    /// (builtin/rm.c:307).
+    intent_to_add: bool,
 }
 
 /// Parsed option state.
@@ -332,6 +336,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 mode: e.mode,
                 stage: e.stage_raw(),
                 sparse: e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE),
+                intent_to_add: e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD),
             })
             .collect()
     };
@@ -432,6 +437,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             mode: t.mode,
             stage: t.stage,
             sparse: t.sparse,
+            intent_to_add: t.intent_to_add,
         });
     }
 
@@ -548,6 +554,16 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             };
 
             match (staged, local) {
+                // ```c
+                // if (local_changes && staged_changes) {
+                //         if (!index_only || !ce_intent_to_add(ce))
+                //                 string_list_append(&files_staged, name);
+                // }
+                // ```
+                // (builtin/rm.c:305-309.) `git rm --cached` on an intent-to-add
+                // entry loses nothing: the index holds a placeholder, never
+                // content, so there is no staged content to lose.
+                (true, true) if opts.cached && t.intent_to_add => {}
                 (true, true) => both.push(path_str),
                 (true, false) => staged_only.push(path_str),
                 (false, true) => local_only.push(path_str),

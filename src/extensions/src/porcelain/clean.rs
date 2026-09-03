@@ -388,6 +388,16 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     // `-X` keeps git's standard excludes (they are what it deletes); only `-x` drops
     // them and leaves the `-e` patterns as the sole protection.
     let cmdl_excludes_only = ignored_too && !ignored_only && !excludes.is_empty();
+    // `setup_standard_excludes()` reads `core.excludesFile` before the walk and
+    // dies on a path it cannot use, which is fatal for every mode `clean` has —
+    // see [`crate::config::excludes_file_fatal`]. `-x` is the one exception in
+    // git, since it skips the standard excludes entirely.
+    if !ignored_too {
+        if let Some(msg) = crate::config::excludes_file_fatal(&repo) {
+            eprintln!("fatal: {msg}");
+            return Ok(ExitCode::from(128));
+        }
+    }
     let mut options = repo
         .dirwalk_options()?
         .empty_patterns_match_prefix(true)
@@ -425,8 +435,28 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
             );
         }
 
-        let is_repo = entry.disk_kind == Some(gix::dir::entry::Kind::Repository);
-        let is_dir = is_repo || entry.disk_kind == Some(gix::dir::entry::Kind::Directory);
+        // `is_nonbare_repository_dir()` (setup.c:405) is the only repository test
+        // git's directory walk makes, and it looks at `<dir>/.git` alone:
+        //
+        // ```c
+        // strbuf_addstr(path, ".git");
+        // if (read_gitfile_gently(path->buf, &gitfile_error) || is_git_directory(path->buf))
+        //         ret = 1;
+        // ```
+        //
+        // gix additionally recognises a *bare* repository directory as
+        // `Kind::Repository` (`gix-dir/src/walk/classify.rs:318`), which git does
+        // not — a directory that merely looks like a git directory is ordinary
+        // untracked content to `git clean -dx`, removed without the second `-f`.
+        let is_repo_kind = entry.disk_kind == Some(gix::dir::entry::Kind::Repository);
+        let is_repo = is_repo_kind
+            && repo
+                .workdir_path(entry.rela_path.as_bstr())
+                .is_some_and(|p| p.join(".git").exists());
+        // Whether it counts as a repository or not, a directory is still removed
+        // as a directory — the two questions are separate, and conflating them
+        // sends a bare repository's path to `remove_file`.
+        let is_dir = is_repo_kind || entry.disk_kind == Some(gix::dir::entry::Kind::Directory);
         if is_dir && !remove_directories {
             continue;
         }

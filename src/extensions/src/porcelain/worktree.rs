@@ -1780,6 +1780,12 @@ fn abbrev(repo: &gix::Repository, oid: ObjectId) -> String {
 fn add(args: &[String]) -> Result<ExitCode> {
     let mut new_branch: Option<String> = None;
     let mut force_branch = false;
+    // git keeps `-b` and `-B` in two `OPT_STRING` slots (`new_branch` and
+    // `new_branch_force`) and only merges them after the conflict check below, so
+    // whether each *spelling* was seen is what that check reads — `-b x -b y` is
+    // last-one-wins while `-b x -B y` is fatal.
+    let mut saw_new_branch = false;
+    let mut saw_new_branch_force = false;
     let mut detach = false;
     let mut force = false;
     let mut checkout = true;
@@ -1812,6 +1818,11 @@ fn add(args: &[String]) -> Result<ExitCode> {
                 };
                 new_branch = Some(v.clone());
                 force_branch = a == "-B";
+                if force_branch {
+                    saw_new_branch_force = true;
+                } else {
+                    saw_new_branch = true;
+                }
                 i += 1;
             }
             "--detach" => detach = true,
@@ -1863,6 +1874,14 @@ fn add(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // `if (!!opts.detach + !!new_branch + !!new_branch_force > 1)` (worktree.c:836),
+    // the very first check `add()` makes — ahead of every `--orphan` combination,
+    // measured against git 2.50.1: `worktree add --orphan --detach -b x p` reports
+    // this one, not the `--orphan`/`--detach` pair below.
+    if u8::from(detach) + u8::from(saw_new_branch) + u8::from(saw_new_branch_force) > 1 {
+        eprintln!("fatal: options '-b', '-B', and '--detach' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
     // worktree.c:839-841, ahead of every other check and of the `Preparing
     // worktree` line: the combination is reported even when `--no-track` was the
     // spelling given, because the message names the option, not the mode.
@@ -2537,6 +2556,43 @@ fn state_branch(path: &Path) -> Option<String> {
         return None;
     }
     Some(text.strip_prefix("refs/heads/").unwrap_or(&text).to_owned())
+}
+
+/// `die_if_checked_out(branch, ignore_current_worktree = 1)` (branch.c:394): the
+/// *other* worktree whose `HEAD` is on `branch`, if any.
+///
+/// ```c
+/// wt = find_shared_symref(worktrees, "HEAD", branch);
+/// if (wt && (!ignore_current_worktree || !wt->is_current)) {
+///         skip_prefix(branch, "refs/heads/", &branch);
+///         die(_("'%s' is already used by worktree at '%s'"), branch, wt->path);
+/// }
+/// ```
+///
+/// This is the check `checkout`/`switch` make before moving `HEAD` onto a branch
+/// and before `-B`/`-C` resets one: a branch belongs to one worktree at a time,
+/// and moving it from another would pull the ref out from under a checked-out
+/// tree. `wt->is_current` is the worktree this command is running in, which is
+/// why `git checkout -B <current-branch>` is not a refusal.
+pub(super) fn used_by_other_worktree(repo: &gix::Repository, branch: &str) -> Option<PathBuf> {
+    let full = format!("refs/heads/{branch}");
+    let here = repo
+        .workdir()
+        .map(|p| gix::path::realpath(p).unwrap_or_else(|_| p.to_owned()));
+    for wt in collect(repo, u64::MAX).ok()? {
+        let HeadInfo::Branch { name, .. } = &wt.head else {
+            continue;
+        };
+        if name.as_bstr() != full.as_bytes() {
+            continue;
+        }
+        let candidate = gix::path::realpath(&wt.path).unwrap_or_else(|_| wt.path.clone());
+        if here.as_deref() == Some(candidate.as_path()) {
+            continue;
+        }
+        return Some(wt.path);
+    }
+    None
 }
 
 /// The worktree whose `HEAD` already points at `branch`, if any — git's

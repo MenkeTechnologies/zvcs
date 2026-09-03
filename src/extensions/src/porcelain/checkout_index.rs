@@ -300,7 +300,10 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
         _ => String::new(),
     };
 
-    let mut index = repo.open_index()?;
+    // `repo_read_index()` reads with `must_exist == 0` (read-cache.c:2216), so a
+    // `GIT_INDEX_FILE` naming a file that is not there is an *empty* index and
+    // not an error: `git checkout-index -a -f` against one is a silent exit 0.
+    let mut index = crate::index_open::or_empty(&repo)?;
     let stat_opts = repo.stat_options()?;
     let index_timestamp = index.timestamp();
     let ents: Vec<Ent> = index
@@ -329,7 +332,7 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
     )?;
     let mut ctx = Ctx {
         pipeline: gix::filter::Pipeline::new(&repo, cache.detach())?,
-        filter_index: repo.open_index()?,
+        filter_index: crate::index_open::or_empty(&repo)?,
         repo: &repo,
         workdir,
         cwd_prefix,
@@ -929,6 +932,16 @@ fn read_stdin_paths(nul_term: bool) -> Result<Option<Vec<BString>>> {
             out.push(BString::from(record));
             continue;
         }
+        // `strbuf_getline()` hands `prefix_path()` a `char *`, so every reader
+        // below sees the record only as far as its first NUL — a NUL-separated
+        // payload fed to this newline reader is one record that ends at the
+        // first path, and the rest is silently dropped. Measured on stock
+        // 2.55.0: `update-index --verbose --stdin` with
+        // `with space.txt\0src/lib.rs\0` prints one `add` line at exit 0, and
+        // `checkout-index --stdin -f` checks out one file. Keeping the NUL in
+        // the record instead looks up a path no index can hold and reports
+        // `is not in the cache`.
+        let record = &record[..record.iter().position(|&b| b == 0).unwrap_or(record.len())];
         let record = record.strip_suffix(b"\r").unwrap_or(record);
         if record.first() == Some(&b'"') {
             match unquote_c_style(record) {

@@ -228,6 +228,10 @@ struct Ctx {
     /// as it was, `Some(true)` splits it into `$GIT_DIR/sharedindex.<id>` plus a
     /// `link`-carrying index, `Some(false)` writes one whole index again.
     split_index: Option<bool>,
+    /// `--index-version <n>`: git's `the_repository->index->version = <n>`
+    /// (builtin/update-index.c:1206), which `do_write_index()` then writes
+    /// literally — the one command that names a version outright.
+    index_version: Option<gix::index::Version>,
 
     allow_add: bool,
     allow_remove: bool,
@@ -326,6 +330,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         .unwrap_or(true);
 
     let mut ctx = Ctx {
+        index_version: None,
         repo,
         index,
         workdir,
@@ -375,7 +380,8 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
                 // directories marked invalid, every untouched directory still
                 // carrying its tree id.
                 super::write_tree::prepare_offset_table(&ctx.repo, &mut ctx.index);
-                let write_options = crate::config::index_write_options(&ctx.repo);
+                let mut write_options = crate::config::index_write_options(&ctx.repo);
+                write_options.version = ctx.index_version;
                 if ctx.split_index == Some(true) {
                     // `write_shared_index()` then `write_split_index()`
                     // (read-cache.c:2358-2382). Everything the index holds moves into
@@ -771,9 +777,16 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
             eprintln!("fatal: index-version {preferred_index_format} not in range: 2..4");
             return Ok(Outcome::Die);
         } else {
-            // git records the version and flags the index for rewrite; the
-            // rewrite happens here too, but `gix_index` picks the header version
-            // itself (see the module documentation).
+            // ```c
+            // the_repository->index->version = preferred_index_format;
+            // the_repository->index->cache_changed |= SOMETHING_CHANGED;
+            // ```
+            //
+            // (builtin/update-index.c:1204-1209.) The version is recorded on the
+            // state itself, so it survives to `do_write_index()` and is written
+            // as asked — `--index-version 2` on a version-4 index really does
+            // demote it.
+            ctx.index_version = Some(crate::config::index_version(preferred_index_format.into()));
             ctx.dirty = true;
         }
     }
@@ -985,6 +998,13 @@ fn read_stdin_paths(ctx: &mut Ctx, nul_term_line: bool) -> Result<Step> {
         if line.is_empty() {
             continue;
         }
+        // The same C-string truncation `checkout-index`'s reader makes: a NUL
+        // inside a newline-terminated record ends the path there, because
+        // `prefix_path()` takes `buf.buf`.
+        let line = match nul_term_line {
+            true => line,
+            false => &line[..line.iter().position(|&b| b == 0).unwrap_or(line.len())],
+        };
         let line = if !nul_term_line && line.last() == Some(&b'\r') {
             &line[..line.len() - 1]
         } else {
@@ -1673,11 +1693,20 @@ fn chmod_path(ctx: &mut Ctx, flip: char, path: &BString) -> Step {
     } else {
         Mode::FILE
     };
-    if current != want {
-        ctx.index.entries_mut()[idx].mode = want;
-        ctx.dirty = true;
-        ctx.invalidate(path.as_bstr());
-    }
+    // ```c
+    // flags = ce->ce_flags;
+    // cache_tree_invalidate_path(the_repository->index, path);
+    // ce->ce_flags = flags | CE_UPDATE_IN_BASE;
+    // the_repository->index->cache_changed |= CE_ENTRY_CHANGED;
+    // ```
+    //
+    // (builtin/update-index.c:427-431.) Unconditional: git invalidates the
+    // cache-tree and rewrites the index even when the bit was already what was
+    // asked for, so `--chmod=-x` on a plain file leaves a *different* index than
+    // it found — one whose root cache-tree entry is invalid.
+    ctx.index.entries_mut()[idx].mode = want;
+    ctx.dirty = true;
+    ctx.invalidate(path.as_bstr());
     report(ctx, format_args!("chmod {flip}x '{path}'"));
     Ok(())
 }

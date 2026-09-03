@@ -6,6 +6,7 @@ use gix::bstr::BString;
 use gix::hash::ObjectId;
 
 use super::color::{Slot, StatusColors};
+use super::diffcore_rename;
 use super::{Arg, LongOpt};
 
 /// `cmd_status()`'s `struct option builtin_status_options[]`
@@ -299,8 +300,9 @@ fn status_report(
     // *after* the command line is parsed. `None` leaves each submodule's own
     // configured ignore level in force (gix's `AsConfigured` default).
     let mut ignore_submodules_arg: Option<String> = None;
-    // `None` keeps git's configured default (`status.renames`/`diff.renames`).
-    let mut renames: Option<Option<gix::diff::Rewrites>> = None;
+    // `None` keeps git's configured default (`status.renames`/`diff.renames`),
+    // i.e. `s->detect_rename == -1`; `Some` is what a command-line flag pinned.
+    let mut renames: Option<RenameOpts> = None;
     // `git status [--] <pathspec>...` limits the report to matching paths.
     let mut pathspecs: Vec<BString> = Vec::new();
     let mut operands_only = false;
@@ -357,21 +359,28 @@ fn status_report(
         };
         let s = resolved.as_ref();
         match s {
+            // `s->status_format` is one variable, so the last format option on
+            // the command line is the format — which means each of these has to
+            // clear porcelain-v2 as well, or `--porcelain=v2 --short` would keep
+            // rendering v2.
             "-s" | "--short" => {
                 short = true;
                 porcelain = false;
+                porcelain_v2 = false;
                 format_explicit = true;
                 long_format = false;
             }
             "--porcelain" | "--porcelain=v1" | "--porcelain=1" => {
                 short = true;
                 porcelain = true;
+                porcelain_v2 = false;
                 format_explicit = true;
                 long_format = false;
             }
             "--long" => {
                 short = false;
                 porcelain = false;
+                porcelain_v2 = false;
                 format_explicit = true;
                 long_format = true;
             }
@@ -424,9 +433,9 @@ fn status_report(
             // Everything after `--` is a pathspec; the pathspec arm below rejects
             // any that follow, and a trailing `--` on its own is a no-op.
             "--" => operands_only = true,
-            "--no-renames" => renames = Some(None),
+            "--no-renames" => renames = Some(RenameOpts::disabled()),
             "--renames" | "-M" | "--find-renames" => {
-                renames = Some(Some(gix::diff::Rewrites::default()));
+                renames = Some(RenameOpts::renames());
             }
             // `--column[=<opts>]` / `--no-column`: lay the long-format untracked and
             // ignored file listings out in columns (git's `OPT_COLUMN`).
@@ -471,7 +480,7 @@ fn status_report(
                     .strip_prefix("--find-renames=")
                     .unwrap_or_else(|| s.trim_start_matches("-M"));
                 match parse_similarity(raw) {
-                    Some(rewrites) => renames = Some(Some(rewrites)),
+                    Some(opts) => renames = Some(opts),
                     None => {
                         eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
                         eprint!("{USAGE}");
@@ -521,7 +530,7 @@ fn status_report(
                         }
                         'M' => {
                             match parse_similarity(rest) {
-                                Some(rewrites) => renames = Some(Some(rewrites)),
+                                Some(opts) => renames = Some(opts),
                                 None => {
                                     eprintln!("error: unknown option `{}'", &s[1..]);
                                     eprint!("{USAGE}");
@@ -654,7 +663,19 @@ fn status_report(
         // `-z` disables git's `use_deferred_config`, so `status.branch` (like
         // `status.short` above, already pinned via `format_explicit`) no longer
         // promotes the branch header.
-        if !branch_explicit && !null_term && snap.boolean("status.branch") == Some(true) {
+        // ```c
+        // if (use_deferred_config && s->status_format != STATUS_FORMAT_PORCELAIN &&
+        //     s->status_format != STATUS_FORMAT_PORCELAIN_V2)
+        //         s->show_branch = status_deferred_config.show_branch;
+        // ```
+        //
+        // (builtin/commit.c:1176-1179.) The machine formats never inherit
+        // `status.branch` — only `-b`/`--branch` puts a header on them — which is
+        // what keeps `git -c status.branch=true status --porcelain` parseable by
+        // everything that has ever consumed it.
+        if !branch_explicit && !null_term && !porcelain && !porcelain_v2
+            && snap.boolean("status.branch") == Some(true)
+        {
             branch_header = true;
         }
         // `status.renames` supplies the rename-detection default when the command
@@ -662,18 +683,27 @@ fn status_report(
         // in `status_config` — *before* it parses the command line — and dies on a
         // non-boolean value, so an invalid value is fatal even when a flag would
         // otherwise override it; only the resolved value is what a flag supersedes.
-        match configured_renames(&snap) {
-            Ok(setting) => {
-                if renames.is_none() {
-                    if let Some(cfg) = setting {
-                        renames = Some(cfg);
-                    }
-                }
-            }
+        let configured_detect = match configured_renames(&snap) {
+            Ok(setting) => setting,
             Err(bad) => {
                 eprintln!("fatal: bad boolean config value '{bad}' for 'status.renames'");
                 return Ok(ExitCode::from(128));
             }
+        };
+        if renames.is_none() {
+            // `s->detect_rename` is still `-1`: `diff_setup()` fills it from
+            // `diff.renames`, which is why `-c diff.renames=copies` reaches
+            // `status` at all.
+            let detect = configured_detect.unwrap_or_else(|| configured_diff_renames(&snap));
+            renames = Some(RenameOpts {
+                detect,
+                ..RenameOpts::disabled()
+            });
+        }
+        // The limit is not a flag on `status`, so config alone decides it — and it
+        // applies whichever way detection was turned on.
+        if let Some(opts) = renames.as_mut() {
+            opts.limit = configured_rename_limit(&snap);
         }
         // `status.showStash` is git's default for `--show-stash`; a command-line
         // flag (`Some`) always wins.
@@ -724,6 +754,10 @@ fn status_report(
         }
         .filter(|_| !matches!(ignore_submodules, Some(gix::submodule::config::Ignore::All)));
     }
+
+    // `rev.diffopt.detect_rename` for both halves of the report, settled: the
+    // command line, else `status.renames`, else `diff.renames`.
+    let renames = renames.unwrap_or_else(RenameOpts::renames);
 
     // git's `s->prefix`. Two renderers drop it regardless of the config:
     // `wt_porcelain_print` resets `relative_paths`/`prefix` before printing (v1
@@ -820,6 +854,30 @@ fn status_report(
     };
     let untracked = untracked_flag.unwrap_or(configured);
 
+    // `setup_standard_excludes()` runs before the walk and dies on an unusable
+    // `core.excludesFile`, whether or not the report would have listed anything
+    // ignored — see [`crate::config::excludes_file_fatal`].
+    if let Some(msg) = crate::config::excludes_file_fatal(&repo) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
+
+    // ```c
+    // if (s.show_ignored_mode == SHOW_MATCHING_IGNORED &&
+    //     s.show_untracked_files == SHOW_NO_UNTRACKED_FILES)
+    //         die(_("Unsupported combination of ignored and untracked-files arguments"));
+    // ```
+    //
+    // (builtin/commit.c:1527-1529.) `--ignored=matching` reports whatever the
+    // ignore patterns matched, which is a *superset* of the untracked walk it
+    // would have to run; asking for it with the walk turned off has no answer.
+    // The test is on the resolved untracked mode, so `status.showUntrackedFiles=no`
+    // reaches it just as `-uno` does.
+    if ignored_matching && untracked == Untracked::No {
+        eprintln!("fatal: Unsupported combination of ignored and untracked-files arguments");
+        return Ok(ExitCode::from(128));
+    }
+
     // The porcelain-v2 machine format is a separate renderer with its own,
     // richer per-path fields (HEAD/index/worktree modes + oids); it shares none
     // of the v1/long collection below, so the two cannot regress each other.
@@ -844,7 +902,13 @@ fn status_report(
 
     // Collect the four change classes from the unified status iterator.
     let mut staged: Vec<(StageKind, BString, Option<BString>)> = Vec::new();
-    let mut unstaged: Vec<(WorkKind, BString, SubmoduleState)> = Vec::new();
+    let mut unstaged: Vec<(WorkKind, BString, Option<BString>, SubmoduleState)> = Vec::new();
+    // The two `diff_filepair` queues `diffcore_rename()` runs over, in the order
+    // the iterator produced them — one per half of the report, as git has one per
+    // `run_diff_index()` / `run_diff_files()` call.
+    let mut staged_pairs: Vec<(RenameSide, RenameSide)> = Vec::new();
+    let mut work_pairs: Vec<(RenameSide, RenameSide)> = Vec::new();
+    let hash = repo.object_hash();
     let mut unmerged: Vec<(u8, BString)> = Vec::new();
     let mut untracked_paths: Vec<BString> = Vec::new();
     let mut ignored_paths: Vec<BString> = Vec::new();
@@ -877,12 +941,10 @@ fn status_report(
             opts.emit_ignored(Some(mode)).recurse_ignored_directories(descend)
         });
     }
-    if let Some(rewrites) = renames {
-        platform = platform.tree_index_track_renames(match rewrites {
-            Some(r) => gix::status::tree_index::TrackRenames::Given(r),
-            None => gix::status::tree_index::TrackRenames::Disabled,
-        });
-    }
+    // Rename detection is git's own `diffcore_rename()` pass, run over the
+    // collected pairs below — gix's tracker scores similarity differently and has
+    // no worktree-side equivalent at all, so it stays off on both halves.
+    platform = platform.tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
     // `--ignore-submodules=<when>` fixes the index↔worktree submodule check at the
     // requested ignore level (git's `handle_ignore_submodules_arg`); absent the
     // flag, gix keeps each submodule's own configured level.
@@ -921,16 +983,48 @@ fn status_report(
                     }
                 }
                 match change {
-                    ChangeRef::Addition { location, .. } => {
-                        staged.push((StageKind::New, location.into_owned(), None));
+                    ChangeRef::Addition {
+                        location,
+                        entry_mode,
+                        id,
+                        ..
+                    } => {
+                        let path = location.into_owned();
+                        staged_pairs.push((
+                            RenameSide::absent(path.clone(), hash),
+                            RenameSide {
+                                path: path.clone(),
+                                mode: entry_mode.bits(),
+                                id: id.into_owned(),
+                                id_valid: true,
+                            },
+                        ));
+                        staged.push((StageKind::New, path, None));
                     }
-                    ChangeRef::Deletion { location, .. } => {
-                        staged.push((StageKind::Deleted, location.into_owned(), None));
+                    ChangeRef::Deletion {
+                        location,
+                        entry_mode,
+                        id,
+                        ..
+                    } => {
+                        let path = location.into_owned();
+                        staged_pairs.push((
+                            RenameSide {
+                                path: path.clone(),
+                                mode: entry_mode.bits(),
+                                id: id.into_owned(),
+                                id_valid: true,
+                            },
+                            RenameSide::absent(path.clone(), hash),
+                        ));
+                        staged.push((StageKind::Deleted, path, None));
                     }
                     ChangeRef::Modification {
                         location,
                         previous_entry_mode,
+                        previous_id,
                         entry_mode,
+                        id,
                         ..
                     } => {
                         let kind = if type_class(previous_entry_mode) != type_class(entry_mode) {
@@ -938,20 +1032,27 @@ fn status_report(
                         } else {
                             StageKind::Modified
                         };
-                        staged.push((kind, location.into_owned(), None));
+                        let path = location.into_owned();
+                        staged_pairs.push((
+                            RenameSide {
+                                path: path.clone(),
+                                mode: previous_entry_mode.bits(),
+                                id: previous_id.into_owned(),
+                                id_valid: true,
+                            },
+                            RenameSide {
+                                path: path.clone(),
+                                mode: entry_mode.bits(),
+                                id: id.into_owned(),
+                                id_valid: true,
+                            },
+                        ));
+                        staged.push((kind, path, None));
                     }
-                    ChangeRef::Rewrite {
-                        source_location,
-                        location,
-                        copy,
-                        ..
-                    } => {
-                        let kind = if copy {
-                            StageKind::Copied
-                        } else {
-                            StageKind::Renamed
-                        };
-                        staged.push((kind, location.into_owned(), Some(source_location.into_owned())));
+                    // Rename tracking is off in the platform, so gix never emits
+                    // this: the pairing is `diffcore_rename()`'s below.
+                    ChangeRef::Rewrite { location, .. } => {
+                        staged.push((StageKind::Modified, location.into_owned(), None));
                     }
                 }
             }
@@ -959,7 +1060,12 @@ fn status_report(
                 use gix::status::index_worktree::Item;
                 use gix::status::plumbing::index_as_worktree::{Change, Conflict, EntryStatus};
                 match iw {
-                    Item::Modification { rela_path, status, .. } => match status {
+                    Item::Modification {
+                        rela_path,
+                        status,
+                        entry,
+                        ..
+                    } => match status {
                         // gitoxide already folds the up-to-three conflict stages
                         // of one path into a single summary, which maps 1:1 onto
                         // git's stagemask.
@@ -978,8 +1084,26 @@ fn status_report(
                         // `git add -N` records a placeholder so the path can be
                         // diffed, but nothing is staged: git lists it under
                         // "Changes not staged for commit" as a new file, ` A`.
+                        //
+                        // `rev.diffopt.ita_invisible_in_index = 1` (wt-status.c:665)
+                        // is what makes `diff-files` queue it as an *addition*, and
+                        // so the only worktree-side rename destination there is.
                         EntryStatus::IntentToAdd => {
-                            unstaged.push((WorkKind::Added, rela_path, SubmoduleState::default()))
+                            work_pairs.push((
+                                RenameSide::absent(rela_path.clone(), hash),
+                                RenameSide {
+                                    path: rela_path.clone(),
+                                    mode: worktree_mode(&repo, gix::bstr::BStr::new(&rela_path)),
+                                    id: ObjectId::null(hash),
+                                    id_valid: false,
+                                },
+                            ));
+                            unstaged.push((
+                                WorkKind::Added,
+                                rela_path,
+                                None,
+                                SubmoduleState::default(),
+                            ))
                         }
                         EntryStatus::NeedsUpdate(_) => {}
                         EntryStatus::Change(change) => {
@@ -1019,7 +1143,29 @@ fn status_report(
                             } else {
                                 kind
                             };
-                            unstaged.push((kind, rela_path, sub));
+                            // The worktree half of the pair: `diff-files` leaves it
+                            // unhashed (`oid_valid == 0`), so a similarity check
+                            // reads the file itself. A deletion has no worktree side
+                            // at all, which is what makes it a rename *source*.
+                            let wt_mode = match kind {
+                                WorkKind::Deleted => 0,
+                                _ => worktree_mode(&repo, gix::bstr::BStr::new(&rela_path)),
+                            };
+                            work_pairs.push((
+                                RenameSide {
+                                    path: rela_path.clone(),
+                                    mode: entry.mode.bits(),
+                                    id: entry.id,
+                                    id_valid: true,
+                                },
+                                RenameSide {
+                                    path: rela_path.clone(),
+                                    mode: wt_mode,
+                                    id: ObjectId::null(hash),
+                                    id_valid: false,
+                                },
+                            ));
+                            unstaged.push((kind, rela_path, None, sub));
                         }
                     },
                     Item::DirectoryContents { entry, .. } => match entry.status {
@@ -1035,6 +1181,40 @@ fn status_report(
                     // default status platform, so this never fires; ignore defensively.
                     Item::Rewrite { .. } => {}
                 }
+            }
+        }
+    }
+
+    // `diffcore_std()`'s rename pass, run once per half of the report exactly as
+    // `run_diff_index()` and `run_diff_files()` each run it. A rename replaces the
+    // destination's own classification and consumes the source's deletion record
+    // (diffcore-rename.c:1614: a deletion with `rename_used` set never reaches the
+    // output queue); a copy source that was a *modification* keeps its record.
+    for rw in detect_rewrites(&repo, &staged_pairs, renames) {
+        let kind = if rw.kind == b'C' {
+            StageKind::Copied
+        } else {
+            StageKind::Renamed
+        };
+        staged.retain(|(k, p, _)| !(matches!(k, StageKind::Deleted) && *p == rw.src.path));
+        for e in staged.iter_mut() {
+            if e.1 == rw.dst.path {
+                e.0 = kind;
+                e.2 = Some(rw.src.path.clone());
+            }
+        }
+    }
+    for rw in detect_rewrites(&repo, &work_pairs, renames) {
+        let kind = if rw.kind == b'C' {
+            WorkKind::Copied
+        } else {
+            WorkKind::Renamed
+        };
+        unstaged.retain(|(k, p, _, _)| !(matches!(k, WorkKind::Deleted) && *p == rw.src.path));
+        for e in unstaged.iter_mut() {
+            if e.1 == rw.dst.path {
+                e.0 = kind;
+                e.2 = Some(rw.src.path.clone());
             }
         }
     }
@@ -1325,38 +1505,64 @@ fn reference_tree_oid(repo: &gix::Repository, spec: &str) -> Result<ReferenceTre
 /// boolean — truthy means rename detection, falsy disables it — and a valueless
 /// key (`[status]\n\trenames`) is git's NULL value, i.e. plain rename detection.
 ///
-/// The three layers of the return value mirror the caller's `renames` field:
-/// `Ok(None)` — the key is unset, leave gitoxide's own default (which, like
-/// git's `diff.renames` default, detects renames); `Ok(Some(None))` — disabled;
-/// `Ok(Some(Some(rewrites)))` — enabled with those rewrite options. `Err(value)`
-/// is a non-boolean value, which git reports as a fatal config error (exit 128).
+/// `Ok(None)` is the key being unset, which leaves `s->detect_rename` at `-1` so
+/// that `diff_setup()`'s `diff_detect_rename_default` — i.e. `diff.renames` — has
+/// the last word. `Err(value)` is a non-boolean value, which git reports as a
+/// fatal config error (exit 128).
 fn configured_renames(
     snap: &gix::config::Snapshot,
-) -> std::result::Result<Option<Option<gix::diff::Rewrites>>, String> {
+) -> std::result::Result<Option<u8>, String> {
     use gix::bstr::ByteSlice;
     let Some(value) = snap.string("status.renames") else {
         // No string value: either the key is absent, or it is present but
         // valueless — gitoxide reports the latter as boolean `true`, which git's
         // NULL-value branch treats as plain rename detection.
         return Ok(match snap.boolean("status.renames") {
-            Some(true) => Some(Some(gix::diff::Rewrites::default())),
+            Some(true) => Some(diffcore_rename::DETECT_RENAME),
             _ => None,
         });
     };
     let text = value.to_str_lossy();
     if text.eq_ignore_ascii_case("copies") || text.eq_ignore_ascii_case("copy") {
-        return Ok(Some(Some(gix::diff::Rewrites {
-            copies: Some(gix::diff::rewrites::Copies::default()),
-            ..Default::default()
-        })));
+        return Ok(Some(diffcore_rename::DETECT_COPY));
     }
     // git_config_rename falls through to git_config_bool, which is exactly the
     // `git_parse_maybe_bool` we already port for `--untracked-files`.
     match parse_maybe_bool(&text) {
-        Some(true) => Ok(Some(Some(gix::diff::Rewrites::default()))),
-        Some(false) => Ok(Some(None)),
+        Some(true) => Ok(Some(diffcore_rename::DETECT_RENAME)),
+        Some(false) => Ok(Some(0)),
         None => Err(text.into_owned()),
     }
+}
+
+/// `diff.renames`, git's `diff_detect_rename_default` (diff.c:398): the fallback
+/// `diff_setup()` puts in `rev.diffopt.detect_rename` when `status.renames` left
+/// `s->detect_rename` at `-1`. Absent, it is `DIFF_DETECT_RENAME` — rename
+/// detection is on by default in every porcelain.
+///
+/// `git_config_rename()` dies on a value outside git's boolean grammar, and it
+/// does so while reading the config, before the command line is parsed; the
+/// shared reader in [`diffcore_rename::config_rename`] carries that exit.
+fn configured_diff_renames(snap: &gix::config::Snapshot) -> u8 {
+    match snap.string("diff.renames") {
+        Some(value) => diffcore_rename::config_rename(Some(value.as_ref())),
+        // A valueless `[diff]\n\trenames` is git's NULL value: plain detection.
+        None => match snap.boolean("diff.renames") {
+            Some(true) => diffcore_rename::DETECT_RENAME,
+            Some(false) => 0,
+            None => diffcore_rename::DETECT_RENAME,
+        },
+    }
+}
+
+/// `status.renameLimit`, else `diff.renameLimit`, else git's
+/// `diff_rename_limit_default` of 1000 — the ceiling
+/// `too_many_rename_candidates()` (diffcore-rename.c:1237) enforces on the
+/// inexact matrix.
+fn configured_rename_limit(snap: &gix::config::Snapshot) -> i64 {
+    snap.integer("status.renameLimit")
+        .or_else(|| snap.integer("diff.renameLimit"))
+        .unwrap_or(diffcore_rename::DEFAULT_RENAME_LIMIT)
 }
 
 /// Resolve `status.showUntrackedFiles`, which stands in for an absent
@@ -1540,30 +1746,18 @@ fn parse_git_int(value: &str) -> Option<i64> {
     Some(val * factor)
 }
 
-/// Parse the `<n>` of `-M<n>` / `--find-renames=<n>` into a similarity fraction.
-/// git accepts a bare percentage (`-M50`) or a fraction (`-M0.5`).
-fn parse_similarity(raw: &str) -> Option<gix::diff::Rewrites> {
-    let (body, had_percent) = match raw.strip_suffix('%') {
-        Some(body) => (body, true),
-        None => (raw, false),
-    };
-    if body.is_empty() {
-        return Some(gix::diff::Rewrites::default());
-    }
-    let value: f32 = body.parse().ok()?;
-    // git reads a bare integer as a percentage (`-M50`) and a decimal as a
-    // fraction (`-M0.5`); an explicit `%` always means a percentage.
-    let percentage = if had_percent || !body.contains('.') {
-        value / 100.0
-    } else {
-        value
-    };
-    if !(0.0..=1.0).contains(&percentage) {
+/// Parse the `<n>` of `-M<n>` / `--find-renames=<n>` through git's own
+/// `parse_rename_score()` (diff.c:5679), the same reader `git diff -M<n>` uses:
+/// `50`, `50%` and `.5` all mean half, and a trailing remainder the parser could
+/// not consume is what makes git reject the option.
+fn parse_similarity(raw: &str) -> Option<RenameOpts> {
+    let (score, rest) = diffcore_rename::parse_rename_score(raw);
+    if !rest.is_empty() {
         return None;
     }
-    Some(gix::diff::Rewrites {
-        percentage: Some(percentage),
-        ..Default::default()
+    Some(RenameOpts {
+        score,
+        ..RenameOpts::renames()
     })
 }
 
@@ -1619,6 +1813,11 @@ enum WorkKind {
     /// that is not staged. git reports it in the worktree column (` A`), never
     /// as a staged addition.
     Added,
+    /// `diffcore_rename()` paired a worktree deletion with an intent-to-add
+    /// destination: the rename that has not been staged, ` R old -> new`.
+    Renamed,
+    /// The same pairing, with the source used more than once.
+    Copied,
     /// `short_submodule_status()`'s `m` (wt-status.c:453): a submodule whose recorded
     /// commit is unchanged but whose worktree has modified tracked content. Reachable
     /// only from `--short`, never from `--porcelain` or the long format.
@@ -1881,7 +2080,7 @@ fn porcelain_v2_output(
     untracked: Untracked,
     show_ignored: bool,
     ignored_matching: bool,
-    renames: Option<Option<gix::diff::Rewrites>>,
+    renames: RenameOpts,
     branch_header: bool,
     pathspecs: &[BString],
     show_stash: bool,
@@ -1960,6 +2159,12 @@ fn porcelain_v2_output(
         sub: SubmoduleState::default(),
     };
 
+    // The two `diff_filepair` queues `diffcore_rename()` runs over — one per half
+    // of the report, as git has one per `run_diff_index()` / `run_diff_files()`.
+    let mut staged_pairs: Vec<(RenameSide, RenameSide)> = Vec::new();
+    let mut work_pairs: Vec<(RenameSide, RenameSide)> = Vec::new();
+    let hash = repo.object_hash();
+
     let mut platform = repo
         .status(gix::progress::Discard)?
         .index_worktree_options_mut(preload_index_threads(repo))
@@ -1984,12 +2189,9 @@ fn porcelain_v2_output(
             opts.emit_ignored(Some(mode)).recurse_ignored_directories(descend)
         });
     }
-    if let Some(rewrites) = renames {
-        platform = platform.tree_index_track_renames(match rewrites {
-            Some(r) => gix::status::tree_index::TrackRenames::Given(r),
-            None => gix::status::tree_index::TrackRenames::Disabled,
-        });
-    }
+    // Rename detection runs as git's own `diffcore_rename()` pass below, over
+    // both halves of the report; gix's tracker stays off.
+    platform = platform.tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
     if let Some(ignore) = ignore_submodules {
         platform = platform.index_worktree_submodules(gix::status::Submodule::Given {
             ignore,
@@ -2021,10 +2223,21 @@ fn porcelain_v2_output(
                         id,
                         ..
                     } => {
-                        let r = recs.entry(location.into_owned()).or_insert_with(new_rec);
+                        let path = location.into_owned();
+                        let id = id.into_owned();
+                        staged_pairs.push((
+                            RenameSide::absent(path.clone(), hash),
+                            RenameSide {
+                                path: path.clone(),
+                                mode: entry_mode.bits(),
+                                id,
+                                id_valid: true,
+                            },
+                        ));
+                        let r = recs.entry(path).or_insert_with(new_rec);
                         r.x = b'A';
                         r.m_i = entry_mode.bits();
-                        r.h_i = id.into_owned();
+                        r.h_i = id;
                         r.staged = true;
                     }
                     ChangeRef::Deletion {
@@ -2033,10 +2246,21 @@ fn porcelain_v2_output(
                         id,
                         ..
                     } => {
-                        let r = recs.entry(location.into_owned()).or_insert_with(new_rec);
+                        let path = location.into_owned();
+                        let id = id.into_owned();
+                        staged_pairs.push((
+                            RenameSide {
+                                path: path.clone(),
+                                mode: entry_mode.bits(),
+                                id,
+                                id_valid: true,
+                            },
+                            RenameSide::absent(path.clone(), hash),
+                        ));
+                        let r = recs.entry(path).or_insert_with(new_rec);
                         r.x = b'D';
                         r.m_h = entry_mode.bits();
-                        r.h_h = id.into_owned();
+                        r.h_h = id;
                         r.staged = true;
                     }
                     ChangeRef::Modification {
@@ -2047,39 +2271,48 @@ fn porcelain_v2_output(
                         id,
                         ..
                     } => {
-                        let r = recs.entry(location.into_owned()).or_insert_with(new_rec);
+                        let path = location.into_owned();
+                        let previous_id = previous_id.into_owned();
+                        let id = id.into_owned();
+                        staged_pairs.push((
+                            RenameSide {
+                                path: path.clone(),
+                                mode: previous_entry_mode.bits(),
+                                id: previous_id,
+                                id_valid: true,
+                            },
+                            RenameSide {
+                                path: path.clone(),
+                                mode: entry_mode.bits(),
+                                id,
+                                id_valid: true,
+                            },
+                        ));
+                        let r = recs.entry(path).or_insert_with(new_rec);
                         r.x = if type_class(previous_entry_mode) != type_class(entry_mode) {
                             b'T'
                         } else {
                             b'M'
                         };
                         r.m_h = previous_entry_mode.bits();
-                        r.h_h = previous_id.into_owned();
+                        r.h_h = previous_id;
                         r.m_i = entry_mode.bits();
-                        r.h_i = id.into_owned();
+                        r.h_i = id;
                         r.staged = true;
                     }
+                    // Rename tracking is off in the platform, so gix never emits
+                    // this: the pairing is `diffcore_rename()`'s below.
                     ChangeRef::Rewrite {
-                        source_location,
-                        source_entry_mode,
-                        source_id,
                         location,
                         entry_mode,
                         id,
-                        copy,
                         ..
                     } => {
-                        let kind = if copy { b'C' } else { b'R' };
-                        let orig = source_location.into_owned();
                         let r = recs.entry(location.into_owned()).or_insert_with(new_rec);
-                        r.x = kind;
-                        r.m_h = source_entry_mode.bits();
-                        r.h_h = source_id.into_owned();
+                        r.x = b'M';
                         r.m_i = entry_mode.bits();
                         r.h_i = id.into_owned();
                         r.staged = true;
-                        // Rename detection here is exact-match (100% similarity).
-                        r.rename = Some((kind, 100, orig));
                     }
                 }
             }
@@ -2088,7 +2321,10 @@ fn porcelain_v2_output(
                 use gix::status::plumbing::index_as_worktree::{Change, Conflict, EntryStatus};
                 match iw {
                     Item::Modification {
-                        rela_path, status, ..
+                        rela_path,
+                        status,
+                        entry,
+                        ..
                     } => match status {
                         EntryStatus::Conflict { summary, .. } => {
                             let mask = match summary {
@@ -2102,7 +2338,19 @@ fn porcelain_v2_output(
                             };
                             unmerged.push((mask, rela_path));
                         }
+                        // `rev.diffopt.ita_invisible_in_index = 1` (wt-status.c:665):
+                        // `diff-files` queues an intent-to-add entry as an addition,
+                        // which makes it the only worktree-side rename destination.
                         EntryStatus::IntentToAdd => {
+                            work_pairs.push((
+                                RenameSide::absent(rela_path.clone(), hash),
+                                RenameSide {
+                                    path: rela_path.clone(),
+                                    mode: worktree_mode(repo, gix::bstr::BStr::new(&rela_path)),
+                                    id: ObjectId::null(hash),
+                                    id_valid: false,
+                                },
+                            ));
                             let r = recs.entry(rela_path).or_insert_with(new_rec);
                             r.y = b'A';
                             r.ita = true;
@@ -2140,6 +2388,28 @@ fn porcelain_v2_output(
                                     (b'M', SubmoduleState::from_gix(&sm))
                                 }
                             };
+                            // The worktree side of the pair is unhashed, as
+                            // `diff-files` leaves it; a deletion has no worktree
+                            // side at all, which is what makes it a rename source.
+                            let wt_mode = if y == b'D' {
+                                0
+                            } else {
+                                worktree_mode(repo, gix::bstr::BStr::new(&rela_path))
+                            };
+                            work_pairs.push((
+                                RenameSide {
+                                    path: rela_path.clone(),
+                                    mode: entry.mode.bits(),
+                                    id: entry.id,
+                                    id_valid: true,
+                                },
+                                RenameSide {
+                                    path: rela_path.clone(),
+                                    mode: wt_mode,
+                                    id: ObjectId::null(hash),
+                                    id_valid: false,
+                                },
+                            ));
                             let r = recs.entry(rela_path).or_insert_with(new_rec);
                             r.y = y;
                             r.sub = sub;
@@ -2152,6 +2422,53 @@ fn porcelain_v2_output(
                     },
                     Item::Rewrite { .. } => {}
                 }
+            }
+        }
+    }
+
+    // ------------------------------------------------------ diffcore_rename()
+    // `wt_status_collect_updated_cb()`'s `DIFF_STATUS_RENAMED` arm
+    // (wt-status.c:559): the destination record keeps the rename source's path,
+    // mode and id in its HEAD columns, plus `d->rename_score`. The source's own
+    // deletion record is consumed by the rename and never printed.
+    for rw in detect_rewrites(repo, &staged_pairs, renames) {
+        match recs.get_mut(&rw.src.path) {
+            Some(r) if r.x == b'D' && r.y == b'.' => {
+                recs.remove(&rw.src.path);
+            }
+            Some(r) if r.x == b'D' => {
+                r.x = b'.';
+                r.m_h = 0;
+                r.h_h = zero;
+                r.staged = false;
+            }
+            _ => {}
+        }
+        if let Some(r) = recs.get_mut(&rw.dst.path) {
+            r.x = rw.kind;
+            r.m_h = rw.src.mode;
+            r.h_h = rw.src.id;
+            r.rename = Some((rw.kind, rw.score, rw.src.path.clone()));
+        }
+    }
+    // `wt_status_collect_changed_cb()`'s `DIFF_STATUS_RENAMED` arm
+    // (wt-status.c:520): the *index* columns come from the rename source, and the
+    // HEAD columns then follow them through `wt_porcelain_v2_fix_up_changed()`
+    // because nothing is staged for this path.
+    for rw in detect_rewrites(repo, &work_pairs, renames) {
+        if recs.get(&rw.src.path).is_some_and(|r| r.y == b'D' && r.x == b'.') {
+            recs.remove(&rw.src.path);
+        }
+        if let Some(r) = recs.get_mut(&rw.dst.path) {
+            r.y = rw.kind;
+            r.rename = Some((rw.kind, rw.score, rw.src.path.clone()));
+            if !r.staged {
+                r.m_i = rw.src.mode;
+                r.h_i = rw.src.id;
+                r.m_h = r.m_i;
+                r.h_h = r.h_i;
+                r.staged = true;
+                r.ita = false;
             }
         }
     }
@@ -2572,9 +2889,23 @@ fn preload_index_threads(
         .config_snapshot()
         .boolean("core.preloadIndex")
         .unwrap_or(true);
+    // `Repository::status()` reads `status.showUntrackedFiles` itself
+    // (gix/src/status/mod.rs:119-129), and `Platform::untracked_files(None)`
+    // *takes* the dirwalk options out of the platform
+    // (gix/src/status/platform.rs:35) — after which the walk cannot be turned
+    // back on, because every later setter mutates options that are no longer
+    // there. git resolves the key and the flag together with the flag winning
+    // (`handle_untracked_files_arg()`, builtin/commit.c:1215), so
+    // `-c status.showUntrackedFiles=no status -uall` must still walk. Putting
+    // the defaults back here restores that: the caller's own
+    // `untracked_files(...)` runs after this and has the final say.
+    let dirwalk = repo.dirwalk_options().ok();
     move |opts| {
         if !preload {
             opts.thread_limit = Some(1);
+        }
+        if opts.dirwalk_options.is_none() {
+            opts.dirwalk_options = dirwalk;
         }
     }
 }
@@ -3418,7 +3749,7 @@ fn render_long(
     untracked_mode: Untracked,
     show_ignored: bool,
     staged: &[(StageKind, BString, Option<BString>)],
-    unstaged: &[(WorkKind, BString, SubmoduleState)],
+    unstaged: &[(WorkKind, BString, Option<BString>, SubmoduleState)],
     unmerged: &[(u8, BString)],
     untracked: &[BString],
     ignored: &[BString],
@@ -3757,7 +4088,7 @@ fn render_long(
     }
 
     if !unstaged.is_empty() {
-        let any_deleted = unstaged.iter().any(|(k, _, _)| matches!(k, WorkKind::Deleted));
+        let any_deleted = unstaged.iter().any(|(k, ..)| matches!(k, WorkKind::Deleted));
         let add_hint = if any_deleted { "git add/rm" } else { "git add" };
         out.push_str(&h("Changes not staged for commit:\n"));
         if hints {
@@ -3770,15 +4101,24 @@ fn render_long(
             // `wt_longstatus_print_dirty_header()` (wt-status.c:262), keyed on
             // `d->dirty_submodule` alone — a submodule that merely moved to a new
             // commit does not raise it.
-            if unstaged.iter().any(|(_, _, sub)| sub.dirty()) {
+            if unstaged.iter().any(|(_, _, _, sub)| sub.dirty()) {
                 out.push_str(&h(
                     "  (commit or discard the untracked or modified content in submodules)\n",
                 ));
             }
         }
-        for (kind, path, sub) in unstaged {
+        for (kind, path, orig, sub) in unstaged {
             let label = work_label(*kind);
-            let body = format!("{label:<12}{}", quote_path(path, prefix));
+            // A worktree rename renders like the staged one:
+            // `renamed:    <source> -> <destination>`.
+            let body = match orig {
+                Some(o) => format!(
+                    "{label:<12}{} -> {}",
+                    quote_path(o, prefix),
+                    quote_path(path, prefix)
+                ),
+                None => format!("{label:<12}{}", quote_path(path, prefix)),
+            };
             // `wt_longstatus_print_change_data()` (wt-status.c:440) writes the
             // parenthesised submodule note in the *header* color, not the change color.
             let extra = submodule_extra(*sub);
@@ -4152,7 +4492,7 @@ fn count_stash_entries(repo: &gix::Repository) -> usize {
 
 fn render_short(
     staged: Vec<(StageKind, BString, Option<BString>)>,
-    unstaged: Vec<(WorkKind, BString, SubmoduleState)>,
+    unstaged: Vec<(WorkKind, BString, Option<BString>, SubmoduleState)>,
     unmerged: Vec<(u8, BString)>,
     untracked: &[BString],
     ignored: &[BString],
@@ -4185,7 +4525,7 @@ fn render_short(
             e.orig = orig;
         }
     }
-    for (kind, path, _) in unstaged {
+    for (kind, path, orig, _) in unstaged {
         let e = map.entry(path).or_insert(Short {
             x: b' ',
             y: b' ',
@@ -4193,6 +4533,9 @@ fn render_short(
             unmerged: false,
         });
         e.y = work_char(kind);
+        if orig.is_some() {
+            e.orig = orig;
+        }
     }
     for (mask, path) in unmerged {
         let (x, y) = unmerged_chars(mask);
@@ -4243,7 +4586,7 @@ fn render_short(
 fn render_short_z(
     out: &mut Vec<u8>,
     staged: &[(StageKind, BString, Option<BString>)],
-    unstaged: &[(WorkKind, BString, SubmoduleState)],
+    unstaged: &[(WorkKind, BString, Option<BString>, SubmoduleState)],
     unmerged: &[(u8, BString)],
     untracked: &[BString],
     ignored: &[BString],
@@ -4269,13 +4612,16 @@ fn render_short_z(
             e.orig = orig.clone();
         }
     }
-    for (kind, path, _) in unstaged {
+    for (kind, path, orig, _) in unstaged {
         let e = map.entry(path.clone()).or_insert(Short {
             x: b' ',
             y: b' ',
             orig: None,
         });
         e.y = work_char(*kind);
+        if orig.is_some() {
+            e.orig = orig.clone();
+        }
     }
     for (mask, path) in unmerged {
         let (x, y) = unmerged_chars(*mask);
@@ -4435,6 +4781,8 @@ fn work_label(kind: WorkKind) -> &'static str {
         WorkKind::Deleted => "deleted:",
         WorkKind::TypeChange => "typechange:",
         WorkKind::Added => "new file:",
+        WorkKind::Renamed => "renamed:",
+        WorkKind::Copied => "copied:",
     }
 }
 
@@ -4472,9 +4820,222 @@ fn work_char(kind: WorkKind) -> u8 {
         WorkKind::Deleted => b'D',
         WorkKind::TypeChange => b'T',
         WorkKind::Added => b'A',
+        WorkKind::Renamed => b'R',
+        WorkKind::Copied => b'C',
         WorkKind::SubmoduleDirty => b'm',
         WorkKind::SubmoduleUntracked => b'?',
     }
+}
+
+// ---------------------------------------------------------------------------
+// rename detection — the `diffcore_rename()` pass wt-status runs twice
+// ---------------------------------------------------------------------------
+
+/// The three `diff_options` fields `wt_status_collect_changes_index()` and
+/// `wt_status_collect_changes_worktree()` (wt-status.c:596, :660) set before they
+/// call `run_diff_index()` / `run_diff_files()`, which is where git's rename
+/// detection for `status` lives:
+///
+/// ```c
+/// if (s->detect_rename >= 0) rev.diffopt.detect_rename = s->detect_rename;
+/// if (s->rename_limit >= 0)  rev.diffopt.rename_limit  = s->rename_limit;
+/// if (s->rename_score >= 0)  rev.diffopt.rename_score  = s->rename_score;
+/// ```
+///
+/// So both halves of the report — staged *and* unstaged — get the same detection,
+/// which is why `git status` can print ` R old -> new` for a rename that was never
+/// staged (its destination being an intent-to-add entry, the only worktree addition
+/// `diff-files` can see).
+#[derive(Clone, Copy)]
+struct RenameOpts {
+    /// `0`, [`diffcore_rename::DETECT_RENAME`] or [`diffcore_rename::DETECT_COPY`].
+    detect: u8,
+    /// `-M<n>` in `MAX_SCORE` units; `0` means git's 50% default.
+    score: u32,
+    /// `status.renameLimit` / `diff.renameLimit`, git's `rename_limit`.
+    limit: i64,
+}
+
+impl RenameOpts {
+    /// `--no-renames`, and the resolved value of a falsy `status.renames`.
+    fn disabled() -> Self {
+        RenameOpts {
+            detect: 0,
+            score: 0,
+            limit: diffcore_rename::DEFAULT_RENAME_LIMIT,
+        }
+    }
+
+    /// Plain rename detection at git's default similarity — `diff_setup()`'s state
+    /// once `diff.renames` has had its say, which is what an unconfigured `status`
+    /// runs with.
+    fn renames() -> Self {
+        RenameOpts {
+            detect: diffcore_rename::DETECT_RENAME,
+            ..RenameOpts::disabled()
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self.detect != 0
+    }
+}
+
+/// One side of a `struct diff_filepair`, in the shape [`detect_rewrites`] needs.
+#[derive(Clone)]
+struct RenameSide {
+    path: BString,
+    /// The git mode; `0` is `!DIFF_FILE_VALID`, i.e. this side does not exist.
+    mode: u32,
+    id: ObjectId,
+    /// git's `oid_valid`. False for a worktree side, which `diff-files` leaves
+    /// unhashed and `diff_populate_filespec()` answers by reading the file.
+    id_valid: bool,
+}
+
+impl RenameSide {
+    /// The absent half of an addition or a deletion: git gives it the *other*
+    /// side's path and a zero mode.
+    fn absent(path: BString, hash: gix::hash::Kind) -> Self {
+        RenameSide {
+            path,
+            mode: 0,
+            id: ObjectId::null(hash),
+            id_valid: false,
+        }
+    }
+}
+
+/// An `R`/`C` pair `diffcore_rename()` produced, with the score already in the
+/// percentage units `d->rename_score` records (`p->score * 100 / MAX_SCORE`).
+struct Rewrite {
+    kind: u8,
+    score: u32,
+    src: RenameSide,
+    dst: RenameSide,
+}
+
+/// `diff_populate_filespec()` for a status pair: an id-carrying side is an odb
+/// lookup, a worktree side is read off disk (a symlink yields its target, which is
+/// what git hashes for a `120000` entry).
+struct StatusContent<'a> {
+    repo: &'a gix::Repository,
+    workdir: Option<std::path::PathBuf>,
+}
+
+impl StatusContent<'_> {
+    fn read_worktree(&self, path: &BString) -> Option<Vec<u8>> {
+        let full = self
+            .workdir
+            .as_ref()?
+            .join(gix::path::from_bstr(gix::bstr::BStr::new(path)));
+        let md = std::fs::symlink_metadata(&full).ok()?;
+        if md.is_symlink() {
+            let target = std::fs::read_link(&full).ok()?;
+            Some(gix::path::into_bstr(target).into_owned().into())
+        } else {
+            std::fs::read(&full).ok()
+        }
+    }
+}
+
+impl diffcore_rename::Content for StatusContent<'_> {
+    fn size(&mut self, spec: &diffcore_rename::FileSpec) -> Option<u64> {
+        if spec.oid_valid {
+            // `check_size_only = 1`: the odb header answers without inflating.
+            let header = self.repo.find_header(spec.oid).ok()?;
+            return (header.kind() == gix::object::Kind::Blob).then(|| header.size());
+        }
+        self.read_worktree(&spec.path).map(|d| d.len() as u64)
+    }
+
+    fn data(&mut self, spec: &diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        if spec.oid_valid {
+            if let Ok(obj) = self.repo.find_object(spec.oid) {
+                return Some(obj.detach().data);
+            }
+        }
+        self.read_worktree(&spec.path)
+    }
+}
+
+/// Run `diffcore_rename()` over one of `wt_status`' two queues and return only the
+/// rename/copy outcomes — everything else keeps the classification its caller
+/// already gave it, exactly as git's `wt_status_collect_*_cb()` reads
+/// `p->status` pair by pair.
+///
+/// The queue must hold *every* pair of that half of the report, not just the
+/// additions and deletions: `diffcore_rename()` registers a modified pair as a
+/// rename *source* under `-C` (diffcore-rename.c:1478), and the destination limit
+/// `too_many_rename_candidates()` enforces counts them all.
+fn detect_rewrites(
+    repo: &gix::Repository,
+    pairs: &[(RenameSide, RenameSide)],
+    opts: RenameOpts,
+) -> Vec<Rewrite> {
+    if !opts.enabled() || pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut q = diffcore_rename::Queue::default();
+    for (one, two) in pairs {
+        let a = q.add_spec(diffcore_rename::FileSpec::new(
+            one.path.clone(),
+            one.mode,
+            one.id,
+            one.id_valid,
+        ));
+        let b = q.add_spec(diffcore_rename::FileSpec::new(
+            two.path.clone(),
+            two.mode,
+            two.id,
+            two.id_valid,
+        ));
+        q.add_pair(a, b);
+    }
+
+    let ropts = diffcore_rename::Options {
+        detect_rename: opts.detect,
+        rename_score: opts.score,
+        rename_limit: opts.limit,
+        hash_kind: repo.object_hash(),
+        ..diffcore_rename::Options::default()
+    };
+    let mut content = StatusContent {
+        repo,
+        workdir: repo.workdir().map(std::path::Path::to_path_buf),
+    };
+    // `wt_status` never reaches `diff_warn_rename_limit()`: it flushes through
+    // `DIFF_FORMAT_CALLBACK`, and the warning is `diff_flush()`'s (diff.c:6875),
+    // printed only for the patch/stat formats. A `diff.renameLimit` too small to
+    // finish the matrix therefore just yields fewer renames, silently.
+    let _ = diffcore_rename::run(&mut q, &ropts, &mut content);
+    diffcore_rename::resolve_rename_copy(&mut q);
+
+    let mut out = Vec::new();
+    for p in &q.pairs {
+        if !matches!(p.status, b'R' | b'C') {
+            continue;
+        }
+        let one = &q.specs[p.one];
+        let two = &q.specs[p.two];
+        out.push(Rewrite {
+            kind: p.status,
+            score: diffcore_rename::similarity_index(p.score),
+            src: RenameSide {
+                path: one.path.clone(),
+                mode: one.mode,
+                id: one.oid,
+                id_valid: one.oid_valid,
+            },
+            dst: RenameSide {
+                path: two.path.clone(),
+                mode: two.mode,
+                id: two.oid,
+                id_valid: two.oid_valid,
+            },
+        });
+    }
+    out
 }
 
 #[cfg(test)]

@@ -243,6 +243,9 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut force = false;
     // `opts->ignore_skipworktree` (builtin/checkout.c:1821).
     let mut ignore_skipworktree = false;
+    // `--ignore-other-worktrees`: `opts->ignore_other_worktrees`, which turns off
+    // the `die_if_checked_out()` guard below.
+    let mut ignore_other_worktrees = false;
     // `-t`/`--track` vs `--no-track`; `None` leaves the decision to
     // `branch.autoSetupMerge`, which is how `checkout -b x origin/x` gets its upstream.
     let mut track: Option<bool> = None;
@@ -437,12 +440,12 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--no-orphan" => orphan = None,
             "--no-pathspec-from-file" => pathspec_from_file = None,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
-            // Accepted no-ops: progress is discarded, ignored-file overwrite is the
-            // default, and the other-worktree / skip-worktree checks git guards
-            // against are not enforced here, so toggling them changes nothing.
+            // Accepted no-ops: progress is discarded and ignored-file overwrite is
+            // the default, so toggling either changes nothing.
             "--progress" | "--no-progress" => {}
             "--overwrite-ignore" | "--no-overwrite-ignore" => {}
-            "--ignore-other-worktrees" | "--no-ignore-other-worktrees" => {}
+            "--ignore-other-worktrees" => ignore_other_worktrees = true,
+            "--no-ignore-other-worktrees" => ignore_other_worktrees = false,
             "--ignore-skip-worktree-bits" => ignore_skipworktree = true,
             "--no-ignore-skip-worktree-bits" => ignore_skipworktree = false,
             "-p" | "--patch" => patch_mode = true,
@@ -857,7 +860,17 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             if !quiet {
                 eprintln!("Switched to a new branch '{name}'");
             }
-            return Ok(ExitCode::SUCCESS);
+            let head = head_commit_id(&repo);
+            return Ok(run_post_checkout(&repo, head, head, true));
+        }
+        // `-B` resets an existing branch, and `create_branch()` refuses to move
+        // one another worktree has checked out (branch.c:400, through
+        // `validate_new_branchname()`). `-b` cannot reach it: a name that already
+        // exists is refused by the `already exists` check first.
+        if reset {
+            if let Some(code) = refuse_branch_in_other_worktree(&repo, &name, ignore_other_worktrees) {
+                return Ok(code);
+            }
         }
         return create_and_switch(
             &repo,
@@ -874,17 +887,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // `-t`/`--no-track` without `-b`/`-B`/`--orphan` no longer reaches here: the
     // DWIM block above has already turned it into a branch creation, or refused.
 
-    if has_dashdash {
-        if post.is_empty() {
-            // `opts.empty_pathspec_ok = 1` for `checkout` and `0` for `restore`
-            // (builtin/checkout.c:2118, :2202): `git checkout --` is not an error, it is the
-            // no-argument `git checkout` — the local-changes listing, exit 0. Only `restore`
-            // dies with `you must specify path(s) to restore`. A `<tree-ish> --` with nothing
-            // after it is the same: the pathspec is empty, so `checkout_paths()` writes nothing
-            // and the run ends in the same listing (verified against stock for both spellings).
-            let code = checkout_head_in_place(&repo, quiet, force)?;
-            return Ok(code);
-        }
+    if has_dashdash && !post.is_empty() {
         return match pre.len() {
             0 => restore_from_index(&repo, &post, false, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree),
             // Reached only under `has_dashdash`, and stock stays silent for the
@@ -893,6 +896,18 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             _ => crate::git_fatal!("only one <tree-ish> may precede `--`"),
         };
     }
+    if has_dashdash && pre.len() > 1 {
+        // `if (dash_dash_pos >= 2) die(_("only one reference expected, %d given."), dash_dash_pos)`
+        // (builtin/checkout.c:1440).
+        crate::git_fatal!("only one reference expected, {} given.", pre.len());
+    }
+    // `--` with nothing after it leaves `opts->pathspec` empty, and
+    // `checkout_main()` (builtin/checkout.c:1719) sends an empty pathspec to
+    // `checkout_branch()` — so `git checkout <branch> --` really does switch
+    // branches, exactly as the spelling without the separator does. Only the
+    // operand-less `git checkout --` stays where it is, and it does so through
+    // the same no-operand path below. Measured against git 2.50.1:
+    // `git checkout b1 --` answers `Switched to branch 'b1'`.
 
     // No `--`, no -b/-B.
     if pre.is_empty() {
@@ -964,6 +979,22 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             .flatten()
             .is_some();
         if is_branch && !detach {
+            // ```c
+            // if (new_branch_info->path && !opts->force_detach &&
+            //     !opts->new_branch && !opts->ignore_other_worktrees) {
+            //         ...
+            //         if (head_ref && (!(flag & REF_ISSYMREF) || strcmp(head_ref, new_branch_info->path)))
+            //                 die_if_checked_out(new_branch_info->path, 1);
+            // }
+            // ```
+            //
+            // (builtin/checkout.c:1874-1883.) `--detach` and `-b`/`-B` reach
+            // their own paths, so what is left here is the plain branch switch —
+            // and the `strcmp` guard is why switching to the branch this worktree
+            // is already on is never a refusal.
+            if let Some(code) = refuse_branch_in_other_worktree(&repo, spec, ignore_other_worktrees) {
+                return Ok(code);
+            }
             let code =
                 switch_to_branch_opts(&repo, spec, quiet, force, None, merge_opt(merge, &conflict_style, spec))?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
@@ -989,7 +1020,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // that resolution's result being used, not a second visit to
         // `get_oid_basic()` — warning again made `git checkout --detach <ambiguous>`
         // print two `refname … is ambiguous` lines where git prints one.
-        if let Some(id) = resolved {
+        // The same `refs/heads/<name>` override, for the detaching half of the
+        // command: `setup_new_branch_info_and_source_tree()` runs before
+        // `checkout_branch()` sees `--detach`, so `git checkout --detach <name>`
+        // detaches at the branch too.
+        if let Some(id) = branch_ref_id(&repo, spec).or(resolved) {
             let commit = match classify_tree_ish(&repo, id)? {
                 TreeIsh::Commit(commit) => commit,
                 // A tree is a legitimate `source_tree`, so `parse_branchname_arg()`
@@ -1181,6 +1216,9 @@ pub(super) fn maybe_recurse_submodules(
 /// a no-op and all that remains is the local-changes listing.
 fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    // `switch_branches()` runs even when the branch does not change, so the
+    // post-checkout hook fires here too — with the same id on both sides.
+    let head = head_commit_id(repo);
     if force {
         let tree = repo
             .head_tree_id()
@@ -1190,7 +1228,7 @@ fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> R
     } else {
         show_local_changes("HEAD", quiet)?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(run_post_checkout(repo, head, head_commit_id(repo), true))
 }
 
 /// Switch `HEAD` to an existing local branch `spec`, updating the worktree when
@@ -1217,6 +1255,107 @@ pub(crate) fn switch_to_branch(
 
 /// [`switch_to_branch`] with `opts->merge` made explicit — the spelling
 /// `git checkout -m <branch>` reaches, and the only one that can stash.
+/// `post_checkout_hook()` (builtin/checkout.c:112):
+///
+/// ```c
+/// static int post_checkout_hook(struct commit *old_commit, struct commit *new_commit,
+///                               int changed)
+/// {
+///         return run_hooks_l(the_repository, "post-checkout",
+///                            oid_to_hex(old_commit ? &old_commit->object.oid : null_oid(the_hash_algo)),
+///                            oid_to_hex(new_commit ? &new_commit->object.oid : null_oid(the_hash_algo)),
+///                            changed ? "1" : "0", NULL);
+/// }
+/// ```
+///
+/// `changed` is `1` for every `switch_branches()` move — a branch switch, a
+/// detach, `-b`, `--orphan`, and the no-op `git checkout` with no operand — and
+/// `0` for `checkout_paths()`, where the two ids are the same unchanged `HEAD`.
+/// Measured against git 2.50.1 on all of those spellings; `git switch --orphan`
+/// is the one exception, since `switch_unborn_to_new_branch()` returns before
+/// the hook.
+///
+/// The hook cannot veto the checkout — nothing is undone — but its exit status
+/// is folded into the command's (`errs |= post_checkout_hook(...)`,
+/// builtin/checkout.c:472 and :1218), which is what this returns.
+pub(crate) fn run_post_checkout(
+    repo: &gix::Repository,
+    old: Option<ObjectId>,
+    new: Option<ObjectId>,
+    changed: bool,
+) -> ExitCode {
+    let null = ObjectId::null(repo.object_hash());
+    let old = old.unwrap_or(null).to_string();
+    let new = new.unwrap_or(null).to_string();
+    let ok = crate::hooks::run(
+        repo,
+        "post-checkout",
+        &[&old, &new, if changed { "1" } else { "0" }],
+        None,
+    )
+    .unwrap_or(true);
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// `die_if_checked_out()`'s refusal, rendered: `Some` when the switch must not
+/// happen because another worktree holds `branch`.
+///
+/// `--ignore-other-worktrees` is git's escape hatch and turns the check off
+/// wholesale; `--detach` never reaches it, because a detached `HEAD` takes no
+/// branch away from anybody.
+pub(crate) fn refuse_branch_in_other_worktree(
+    repo: &gix::Repository,
+    branch: &str,
+    ignore_other_worktrees: bool,
+) -> Option<ExitCode> {
+    if ignore_other_worktrees {
+        return None;
+    }
+    let other = super::worktree::used_by_other_worktree(repo, branch)?;
+    eprintln!(
+        "fatal: '{branch}' is already used by worktree at '{}'",
+        super::worktree::path_to_string(&other)
+    );
+    Some(ExitCode::from(128))
+}
+
+/// The commit `HEAD` names, or `None` on an unborn branch — git's
+/// `old_branch_info.commit` / `new_branch_info->commit`.
+pub(crate) fn head_commit_id(repo: &gix::Repository) -> Option<ObjectId> {
+    repo.head_id().ok().map(|id| id.detach())
+}
+
+/// The `refs/heads/<name>` override of `setup_new_branch_info_and_source_tree()`
+/// (builtin/checkout.c:800-813):
+///
+/// ```c
+/// new_branch_info->name = arg;
+/// setup_branch_path(new_branch_info);
+///
+/// if (!check_refname_format(new_branch_info->path, 0) &&
+///     !refs_read_ref(get_main_ref_store(the_repository), new_branch_info->path, &branch_rev))
+///         oidcpy(rev, &branch_rev);
+/// else
+///         new_branch_info->path = NULL; /* not an existing branch */
+/// ```
+///
+/// `rev` at that point already holds `get_oid_mb(arg)`'s answer, which follows
+/// `rev-parse`'s six rules and so prefers `refs/tags/<name>` over
+/// `refs/heads/<name>`. This assignment overrides it: `checkout`, `switch` and
+/// `restore --source` all take the *branch* for a name that is both. `None` when
+/// the repository has no such branch, which is also every spec that is not a
+/// plain name (`HEAD~1`, `v1^{tree}`, a raw id): `refs/heads/<that>` cannot exist.
+pub(crate) fn branch_ref_id(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    repo.try_find_reference(format!("refs/heads/{spec}").as_str())
+        .ok()
+        .flatten()
+        .map(|r| r.id().detach())
+}
+
 pub(crate) fn switch_to_branch_opts(
     repo: &gix::Repository,
     spec: &str,
@@ -1232,6 +1371,9 @@ pub(crate) fn switch_to_branch_opts(
             return Ok(code);
         }
     }
+    // `old_branch_info.commit`, read before the move so the post-checkout hook
+    // below can name where the checkout came from.
+    let old_head = head_commit_id(repo);
 
     // Already on it → the branch `HEAD` points at does not change, but git still
     // goes through `refs_update_symref("HEAD", ...)`, so the move is reflogged
@@ -1270,11 +1412,18 @@ pub(crate) fn switch_to_branch_opts(
                 // git 2.50.1 and 2.55.0 print, while a real switch kept it.
                 print_tracking_status(repo);
             }
-            return Ok(ExitCode::SUCCESS);
+            return Ok(run_post_checkout(repo, old_head, head_commit_id(repo), true));
         }
     }
 
-    let commit = repo.rev_parse_single(spec)?.object()?.peel_to_commit()?;
+    // `setup_branch_path()` names `refs/heads/<spec>` and
+    // `setup_new_branch_info_and_source_tree()` lets it *replace* whatever the
+    // revision parser answered, so a name that is both a branch and a tag checks
+    // out the branch even though `git rev-parse` answers with the tag.
+    let commit = match branch_ref_id(repo, spec) {
+        Some(id) => id.attach(repo).object()?.peel_to_commit()?,
+        None => repo.rev_parse_single(spec)?.object()?.peel_to_commit()?,
+    };
     let target_tree = commit.tree_id()?.detach();
 
     let head = repo.head()?;
@@ -1335,7 +1484,7 @@ pub(crate) fn switch_to_branch_opts(
         // the same block `status` prints under its header.
         print_tracking_status(repo);
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(run_post_checkout(repo, old_head, Some(commit.id), true))
 }
 
 
@@ -1409,7 +1558,7 @@ fn detached_checkout(
         let (abbrev, summary) = describe(repo, target_id)?;
         eprintln!("HEAD is now at {abbrev} {summary}");
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(run_post_checkout(repo, old_commit, Some(target_id), true))
 }
 
 /// The `advice.detachedHead` block git prints when a bare `git checkout <commit>`
@@ -1446,6 +1595,8 @@ fn create_and_switch(
     merge_worktree: bool,
     merge: Option<MergeOpt<'_>>,
 ) -> Result<ExitCode> {
+    // `old_branch_info.commit` for the post-checkout hook at the tail.
+    let old_head = head_commit_id(repo);
     let full = format!("refs/heads/{name}");
     if !super::branch::valid_branch_name(name) {
         // `validate_branchname()` pairs the die with the refSyntax advice:
@@ -1640,7 +1791,7 @@ fn create_and_switch(
         println!("The following paths have local changes:");
         show_local_changes(&start_id.to_string(), quiet)?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(run_post_checkout(repo, old_head, head_commit_id(repo), true))
 }
 
 /// `git checkout --orphan <name> [<start>]`: point `HEAD` at an unborn branch
@@ -1657,6 +1808,8 @@ fn orphan_checkout(
     // thrown away rather than carried — and its closing listing is skipped.
     force: bool,
 ) -> Result<ExitCode> {
+    // `old_branch_info.commit` for the post-checkout hook at the tail.
+    let old_head = head_commit_id(repo);
     // git resolves the start-point before anything else: a bad one aborts here.
     // Resolution is `get_oid_mb()`'s, so a full-length hex name is the id itself
     // and a missing object is `parse_branchname_arg()`'s `unable to read tree`
@@ -1722,7 +1875,9 @@ fn orphan_checkout(
     if !quiet {
         eprintln!("Switched to a new branch '{name}'");
     }
-    Ok(ExitCode::SUCCESS)
+    // The new branch is unborn, so `new_branch_info->commit` is still the commit
+    // the orphan was started from — git reports the same id on both sides.
+    Ok(run_post_checkout(repo, old_head, old_head, true))
 }
 
 /// `git checkout --ours|--theirs <path>…`: write one side of a conflict into the
@@ -1789,6 +1944,28 @@ fn restore_conflict_stage(
         }
     }
 
+    // `nr_checkouts` is `checkout_entry()`'s counter, and that function returns
+    // before it increments when the worktree file already matches the entry
+    // (entry.c:585, the `!changed` early-out). A *conflicted* path's chosen stage
+    // never matches — a stage entry carries no stat data — so only the stage-0
+    // fallbacks can go uncounted, which is why `checkout --ours <clean-path>`
+    // reports `Updated 0 paths` and not one.
+    let n = if bare && !quiet {
+        let ctx = super::read_tree::StatCtx::new(repo, &index)?;
+        let backing = index.path_backing();
+        let stage0: Vec<(BString, gix::index::Entry)> = index
+            .entries()
+            .iter()
+            .filter(|e| e.stage_raw() == 0)
+            .map(|e| (e.path_in(backing).to_owned(), e.clone()))
+            .filter(|(p, _)| keep.get(p) == Some(&0))
+            .collect();
+        let conflicted = keep.values().filter(|st| **st != 0).count();
+        conflicted + nr_checkouts(repo, &ctx, stage0.iter().map(|(p, e)| (p, e)))
+    } else {
+        0
+    };
+
     if !keep.is_empty() {
         // Build a stage-0 view holding exactly the chosen entries and check it out;
         // the real index is never rewritten, so conflicts survive.
@@ -1808,13 +1985,13 @@ fn restore_conflict_stage(
         return Ok(ExitCode::from(1));
     }
     if bare && !quiet {
-        let n = keep.len();
         eprintln!(
             "Updated {n} path{} from the index",
             if n == 1 { "" } else { "s" }
         );
     }
-    Ok(ExitCode::SUCCESS)
+    let head = head_commit_id(repo);
+    Ok(run_post_checkout(repo, head, head, false))
 }
 
 /// Upstream a `-t`/`--track` start-point resolves to.
@@ -2296,7 +2473,9 @@ fn restore_from_index(
             if count == 1 { "" } else { "s" }
         );
     }
-    Ok(ExitCode::SUCCESS)
+    // `checkout_paths()`'s tail: `errs |= post_checkout_hook(head, head, 0)`.
+    let head = head_commit_id(repo);
+    Ok(run_post_checkout(repo, head, head, false))
 }
 
 /// Restore `paths` from `tree_ish` into both the index and the worktree
@@ -2492,7 +2671,8 @@ fn restore_from_tree(
             tree_id.attach(repo).shorten_or_id()
         );
     }
-    Ok(ExitCode::SUCCESS)
+    let head = head_commit_id(repo);
+    Ok(run_post_checkout(repo, head, head, false))
 }
 
 // --- Worktree / ref helpers ------------------------------------------------
@@ -3178,14 +3358,23 @@ fn write_head_log(
             time: &now,
         },
     };
+    // A `NULL` reflog message — `update_ref(NULL, "HEAD", …)`, which is how
+    // `submodule_move_head()` detaches a submodule — writes no tab either, so the
+    // line ends at the timestamp. `log_ref_write_fd()` (refs/files-backend.c:1770)
+    // appends `"\t%s"` only for a message it was given.
+    let tail = if message.is_empty() {
+        String::new()
+    } else {
+        format!("\t{message}")
+    };
     let line = format!(
-        "{} {} {} <{}> {}\t{}\n",
+        "{} {} {} <{}> {}{}\n",
         from.unwrap_or(null),
         to.unwrap_or(null),
         sig.name,
         sig.email,
         sig.time,
-        message
+        tail
     );
 
     let mut body = std::fs::read_to_string(&path).unwrap_or_default();

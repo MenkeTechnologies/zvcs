@@ -90,9 +90,12 @@
 //!   (cache-tree.c:872-891) cannot be reached through `read-tree`.
 //! * The `-u` untracked-collision check rejects any existing file at a path the read
 //!   adds; git additionally permits it when the file is `.gitignore`d.
-//! * `--sparse-checkout` is accepted but never applies a sparse filter, and
-//!   `--recurse-submodules` never descends into submodules — both need substrate
-//!   this port does not have, so they behave as their `--no-` counterparts.
+//! * `--sparse-checkout` is accepted but never applies a sparse filter — that
+//!   needs substrate this port does not have, so it behaves as its `--no-`
+//!   counterpart. `--recurse-submodules` (and `submodule.recurse`) *does*
+//!   descend: every gitlink a `-u` read wrote is moved to the commit the
+//!   superproject now records, through the same submodule mover
+//!   `git restore --recurse-submodules` uses.
 //! * `--exclude-per-directory` reproduces git's "meaningless unless -u" and
 //!   "must be .gitignore" gates, but the ignore file it names is not consulted,
 //!   since `-u` here never overwrites an existing untracked file in the first place.
@@ -152,6 +155,8 @@ pub(super) struct Opts {
     aggressive: bool,          // --aggressive
     trivial: bool,             // --trivial
     index_output: Option<PathBuf>, // --index-output=<file>
+    /// `--[no-]recurse-submodules`; `None` falls back to `submodule.recurse`.
+    recurse_submodules: Option<bool>,
     trees: Vec<String>,
 }
 
@@ -165,6 +170,30 @@ impl Opts {
     /// Whether the merge safety checks apply. `--reset` explicitly opts out of them.
     fn checked(&self) -> bool {
         (self.merge || self.prefix.is_some()) && !self.reset && !self.index_only
+    }
+}
+
+/// The index-write options for a `read-tree`, which differ from every other
+/// command's in one respect: the version.
+///
+/// ```c
+/// if (opts.reset || opts.merge || opts.prefix) {
+///         if (repo_read_index_unmerged(the_repository) && (opts.prefix || opts.merge))
+///                 die(_("You need to resolve your current index first"));
+///         stage = opts.merge = 1;
+/// }
+/// ```
+///
+/// (builtin/read-tree.c:236-241.) Only those three modes read the index they are
+/// about to replace; the plain read and `--empty` leave `the_repository->index`
+/// untouched, so `unpack_trees()` copies a *zero* version into its result and
+/// `do_write_index()` has a version to choose — which is the one and only place
+/// `GIT_INDEX_VERSION` / `index.version` reach an ordinary command.
+fn write_options(repo: &gix::Repository, o: &Opts) -> gix::index::write::Options {
+    if o.merge_like() {
+        crate::config::index_write_options(repo)
+    } else {
+        crate::config::index_write_options_fresh(repo)
     }
 }
 
@@ -478,13 +507,18 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
             "sparse-checkout" | "no-sparse-checkout" => no_value!(),
             // `unpack-trees` tracing has no analogue here.
             "debug-unpack" | "no-debug-unpack" => no_value!(),
-            "no-recurse-submodules" => no_value!(),
+            "no-recurse-submodules" => {
+                no_value!();
+                o.recurse_submodules = Some(false);
+            }
             "recurse-submodules" => {
                 // The optional value is a boolean; anything else is fatal in git.
-                if let Some(v) = inline {
-                    if parse_maybe_bool(v).is_none() {
-                        reject!(fatal(format!("bad recurse-submodules argument: {v}")));
-                    }
+                match inline {
+                    Some(v) => match parse_maybe_bool(v) {
+                        Some(b) => o.recurse_submodules = Some(b),
+                        None => reject!(fatal(format!("bad recurse-submodules argument: {v}"))),
+                    },
+                    None => o.recurse_submodules = Some(true),
                 }
             }
             // `OPT__SUPER_PREFIX` (parse-options.h:573-575) is an
@@ -798,6 +832,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
             );
         }
         checkout_subset(&repo, &mut new_index, &wanted)?;
+        move_submodules(&repo, &new_index, &o)?;
         for path in &removed {
             if let Some(full) = repo.workdir_path(path.as_bstr()) {
                 let _ = std::fs::remove_file(&full);
@@ -835,7 +870,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
         }
         _ => super::write_tree::rebuild_cache_tree(&repo, &mut new_index),
     }
-    crate::index_racy::write(&repo, &mut new_index)?;
+    crate::index_racy::write_with(&repo, &mut new_index, write_options(&repo, &o))?;
     // `core.fsync=index` (or an aggregate that contains it) hardens the index git
     // has just rewritten; the default set does not, so this is normally a no-op.
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
@@ -1118,7 +1153,7 @@ fn multi_tree_read(
     // repository already has keep an id, everything else — including every node above
     // an unmerged path — comes out invalid.
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    crate::index_racy::write(repo, &mut new_index)?;
+    crate::index_racy::write_with(repo, &mut new_index, write_options(repo, o))?;
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
     Ok(ExitCode::SUCCESS)
 }
@@ -1735,6 +1770,41 @@ fn worktree_absent(
 
 /// Check out exactly the entries of `index` named by `wanted`, then carry the stat
 /// information gained back onto `index` so the written index is clean for them.
+/// `unpack_trees()`'s submodule half: with `--recurse-submodules` (or
+/// `submodule.recurse`), every gitlink the read wrote is moved to the commit the
+/// superproject now records, through `submodule_move_head()`
+/// (submodule.c:1990) — which detaches the submodule `HEAD` there and logs the
+/// move with an empty reflog message, whether or not the gitlink changed.
+///
+/// The mover itself is [`super::restore::restore_submodule_worktree`], the same
+/// one `git restore --recurse-submodules` uses; only the set of submodules to
+/// move differs.
+fn move_submodules(repo: &gix::Repository, index: &gix::index::File, o: &Opts) -> Result<()> {
+    let recurse = o.recurse_submodules.unwrap_or_else(|| {
+        repo.config_snapshot().boolean("submodule.recurse") == Some(true)
+    });
+    if !recurse {
+        return Ok(());
+    }
+    let Some(subs) = repo.submodules()? else {
+        return Ok(());
+    };
+    let should_interrupt = AtomicBool::new(false);
+    for sm in subs {
+        let path = sm.path()?;
+        let Ok(idx) = index.entry_index_by_path(path.as_ref()) else {
+            continue;
+        };
+        let target = index.entries()[idx].id;
+        if !sm.is_active().unwrap_or(false) {
+            continue;
+        }
+        let Some(sm_repo) = sm.open()? else { continue };
+        super::restore::restore_submodule_worktree(&sm_repo, target, &should_interrupt)?;
+    }
+    Ok(())
+}
+
 fn checkout_subset(
     repo: &gix::Repository,
     index: &mut gix::index::File,

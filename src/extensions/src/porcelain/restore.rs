@@ -222,7 +222,7 @@ fn three_way_merge(
 /// out over the existing worktree with overwrite; files tracked before but absent
 /// in the target tree are deleted, the submodule index is rewritten with fresh
 /// stats, and `HEAD` is repointed to the detached commit.
-fn restore_submodule_worktree(
+pub(super) fn restore_submodule_worktree(
     sm_repo: &gix::Repository,
     commit: ObjectId,
     should_interrupt: &AtomicBool,
@@ -303,13 +303,24 @@ fn restore_submodule_worktree(
     // overrides reach that child through the environment.
     crate::index_racy::write(sm_repo, &mut target_index)?;
 
+    // The id `HEAD` resolves to before the move, which is the *old* side of the
+    // reflog line git writes below.
+    let previous = sm_repo.head_id().ok().map(|id| id.detach());
     // Detach the submodule HEAD at the restored commit (git detaches here).
+    //
+    // `submodule_move_head()` (submodule.c:1990) ends in
+    // `update_ref(NULL, "HEAD", new_head, NULL, 0, UPDATE_REFS_DIE_ON_ERR)`:
+    // the reflog message is `NULL`, so the entry git appends carries an *empty*
+    // message, and it is appended even when the submodule was already at that
+    // commit — the old id it records is the one `HEAD` resolved to, not the
+    // symref it replaced. `force_create_reflog` is what makes gix write the
+    // line for a move it would otherwise consider uninteresting.
     sm_repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
-                force_create_reflog: false,
-                message: format!("restore: moving to {commit}").into(),
+                force_create_reflog: true,
+                message: Default::default(),
             },
             expected: PreviousValue::Any,
             new: Target::Object(commit),
@@ -317,6 +328,10 @@ fn restore_submodule_worktree(
         name: "HEAD".try_into().map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
         deref: false,
     })?;
+    // gix writes no reflog line for a symbolic `HEAD` replaced by an object, and
+    // git writes one for every `submodule_move_head()` — with an empty message
+    // and the *resolved* old id, even when the submodule was already there.
+    super::checkout::append_head_log(sm_repo, previous, Some(commit), "");
     Ok(())
 }
 
@@ -354,7 +369,10 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let mut pathspec_from_file: Option<String> = None;
     let mut pathspec_file_nul = false;
     let mut ignore_skip_worktree = false;
-    let mut recurse_submodules = false;
+    // `--[no-]recurse-submodules`; `None` falls back to `submodule.recurse`,
+    // which `git_default_submodule_config()` (submodule-config.c:317) makes the
+    // default for every worktree-updating command.
+    let mut recurse_submodules: Option<bool> = None;
 
     // Parse a `--conflict` style value; git errors with exit 129 on unknown.
     let parse_conflict = |v: &str| -> Option<ConflictStyle> {
@@ -502,8 +520,22 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             "--no-ignore-skip-worktree-bits" => ignore_skip_worktree = false,
             "-p" | "--patch" => patch_mode = true,
             "--no-patch" => patch_mode = false,
-            "--recurse-submodules" => recurse_submodules = true,
-            "--no-recurse-submodules" => recurse_submodules = false,
+            "--recurse-submodules" => recurse_submodules = Some(true),
+            "--no-recurse-submodules" => recurse_submodules = Some(false),
+            // `option_parse_recurse_submodules_worktree_updater()`
+            // (submodule.c:2093): the optional value is `git_parse_maybe_bool`
+            // and anything else is fatal during the parse, before the repository
+            // is even opened.
+            s if s.starts_with("--recurse-submodules=") => {
+                let v = &s["--recurse-submodules=".len()..];
+                match crate::optint::maybe_bool(v) {
+                    Some(b) => recurse_submodules = Some(b),
+                    None => {
+                        eprintln!("fatal: bad recurse-submodules argument: {v}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
             s if s.starts_with("--source=") => source = Some(s["--source=".len()..].to_string()),
             s if s.starts_with("--conflict=") => {
                 let v = &s["--conflict=".len()..];
@@ -707,6 +739,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
 
     // --- Repository + lock --------------------------------------------------
     let repo = crate::setup::discover()?;
+    // An explicit flag wins over `submodule.recurse`.
+    let recurse_submodules = recurse_submodules
+        .unwrap_or_else(|| repo.config_snapshot().boolean("submodule.recurse") == Some(true));
     let workdir = repo
         .workdir()
         .ok_or_else(|| crate::fatal::need_work_tree())?
@@ -776,6 +811,11 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             let Some(id) = crate::objname::resolve(&repo, rev.as_str()) else {
                 crate::git_fatal!("could not resolve '{rev}'");
             };
+            // `--source` goes through the same
+            // `setup_new_branch_info_and_source_tree()` every ref operand does
+            // (builtin/checkout.c:1698), so `refs/heads/<name>` overrides the
+            // revision parser's answer for a name that is both a branch and a tag.
+            let id = super::checkout::branch_ref_id(&repo, rev.as_str()).unwrap_or(id);
             Some(super::checkout::classify_tree_ish(&repo, id)?.source_tree()?)
         }
         None if staged => Some(repo.head_tree_id_or_empty()?.detach()),
@@ -1169,5 +1209,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         crate::index_racy::write(&repo, &mut cur)?;
     }
 
-    Ok(ExitCode::SUCCESS)
+    // `checkout_paths()`'s tail (builtin/checkout.c:472): `errs |=
+    // post_checkout_hook(head, head, 0)` — a path restore never moves `HEAD`, so
+    // the hook sees the same id twice and the file-checkout flag.
+    let head = super::checkout::head_commit_id(&repo);
+    Ok(super::checkout::run_post_checkout(&repo, head, head, false))
 }

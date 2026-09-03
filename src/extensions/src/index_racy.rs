@@ -111,8 +111,20 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
 /// One function because git has one place too (`do_write_index()`); a smudge that some writers
 /// perform and others skip is a race that reappears through whichever writer forgot.
 pub fn write(repo: &gix::Repository, index: &mut gix::index::File) -> Result<(), gix::index::file::write::Error> {
+    write_with(repo, index, crate::config::index_write_options(repo))
+}
+
+/// [`write`] for a caller that has resolved the write options itself — the one
+/// thing a caller can need to decide is the index *version*, which git chooses
+/// only for a state it built from scratch
+/// ([`crate::config::index_write_options_fresh`]).
+pub fn write_with(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    options: gix::index::write::Options,
+) -> Result<(), gix::index::file::write::Error> {
     smudge_racily_clean(repo, index);
-    index.write(crate::config::index_write_options(repo))
+    index.write(options)
 }
 
 /// The bytes of a path as the index spells it, for diagnostics.

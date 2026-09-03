@@ -65,11 +65,11 @@
 //! * `pack.useSparse`, `pack.readReverseIndex` and
 //!   `pack.useBitmapBoundaryTraversal` — see their fields below for what each
 //!   would have steered.
-//! * `feature.manyFiles`' other two effects. `index.version = 4` is not written
-//!   because `gix-index`'s writer emits v2/v3 only (its `detect_required_version`
-//!   picks between the two and the entry writer has no prefix-compressed path
-//!   form), and `core.untrackedCache = write` is not written because that index
-//!   writer never emits the `UNTR` extension.
+//! * `feature.manyFiles`' `core.untrackedCache = write`, because the index
+//!   writer never emits the `UNTR` extension. Its `index.version = 4` *is*
+//!   honored — [`crate::config::index_format_default`] reads the cascade and
+//!   `gix-index`'s writer emits version 4's prefix-compressed entries — for the
+//!   writes where git chooses a version at all.
 
 use crate::config::config_ulong;
 

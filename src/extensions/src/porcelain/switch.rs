@@ -181,6 +181,9 @@ struct Parsed<'a> {
     /// `None` = unset on the CLI (fall back to `checkout.guess`, default on);
     /// `Some(true)` for `--guess`, `Some(false)` for `--no-guess`.
     guess: Option<bool>,
+    /// `--ignore-other-worktrees` → `opts->ignore_other_worktrees`, which turns
+    /// off the `die_if_checked_out()` guard.
+    ignore_other_worktrees: bool,
     positionals: Vec<&'a str>,
 }
 
@@ -206,6 +209,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         track: None,
         track_inherit: false,
         guess: None,
+        ignore_other_worktrees: false,
         positionals: Vec::new(),
     };
     let mut only_positional = false;
@@ -335,10 +339,21 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                 | "no-progress"
                 | "overwrite-ignore"
                 | "no-overwrite-ignore"
-                | "ignore-other-worktrees"
-                | "no-ignore-other-worktrees"
-                | "recurse-submodules"
                 | "no-recurse-submodules" => {}
+                // `option_parse_recurse_submodules_worktree_updater()`
+                // (submodule.c:2093) reads the optional value with
+                // `git_parse_maybe_bool` and dies on anything else, before the
+                // command has looked at the repository.
+                "recurse-submodules" => {
+                    if let Some(v) = attached {
+                        if crate::optint::maybe_bool(v).is_none() {
+                            return fatal(format!("bad recurse-submodules argument: {v}"))
+                                .map(Parse::Failed);
+                        }
+                    }
+                }
+                "ignore-other-worktrees" => p.ignore_other_worktrees = true,
+                "no-ignore-other-worktrees" => p.ignore_other_worktrees = false,
                 // The message names the argument as typed, `=<value>` and all
                 // (parse-options.c:1215-1216), so it quotes `long` whole.
                 _ => {
@@ -554,6 +569,14 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         return switch_detach(&repo, &p.positionals, discard, p.quiet, merge_style);
     }
     if let Some(name) = p.force_create {
+        // `-C` resets the branch, and `create_branch()` refuses to move one that
+        // another worktree has checked out (branch.c:400, through
+        // `validate_new_branchname()`).
+        if let Some(code) =
+            super::checkout::refuse_branch_in_other_worktree(&repo, name, p.ignore_other_worktrees)
+        {
+            return Ok(code);
+        }
         return switch_create(&repo, name, true, &p.positionals, p.quiet, discard, p.track,
             p.track_inherit, merge_style);
     }
@@ -574,12 +597,13 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         return fatal("missing branch or commit argument");
     }
     switch_existing(&repo, &p.positionals, p.quiet, guess, discard,
-        merge_style)
+        merge_style, p.ignore_other_worktrees)
 }
 
 
 /// `git switch <branch>` — attach `HEAD` to an existing local branch, with DWIM
 /// (`--guess`) fallback to a remote-tracking branch.
+#[allow(clippy::too_many_arguments)]
 fn switch_existing(
     repo: &gix::Repository,
     positionals: &[&str],
@@ -587,10 +611,14 @@ fn switch_existing(
     guess: bool,
     force: bool,
     merge_style: Option<&str>,
+    ignore_other_worktrees: bool,
 ) -> Result<ExitCode> {
     if positionals.len() > 1 {
         return fatal("only one reference expected");
     }
+    // `old_branch_info.commit`, for the post-checkout hook every
+    // `switch_branches()` ends with (see [`super::checkout::run_post_checkout`]).
+    let old_head = super::checkout::head_commit_id(repo);
 
     // Resolve the `-`/`@{-N}` previous-branch shorthand to a concrete name.
     let raw = positionals[0];
@@ -655,7 +683,12 @@ fn switch_existing(
         if !quiet {
             eprintln!("Already on '{branch}'");
         }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(super::checkout::run_post_checkout(
+            repo,
+            old_head,
+            super::checkout::head_commit_id(repo),
+            true,
+        ));
     }
 
     let full_name = match FullName::try_from(full.as_str()) {
@@ -683,6 +716,15 @@ fn switch_existing(
             }
         }
         return branch_expected(repo, branch);
+    }
+
+    // `die_if_checked_out(new_branch_info->path, 1)`: a branch belongs to one
+    // worktree at a time. Reached only for a branch that exists locally — the
+    // DWIM arm above creates a new one, which nobody can have checked out.
+    if let Some(code) =
+        super::checkout::refuse_branch_in_other_worktree(repo, branch, ignore_other_worktrees)
+    {
+        return Ok(code);
     }
 
     let target = repo
@@ -733,7 +775,12 @@ fn switch_existing(
     if autostashed {
         show_autostash_listing(&target.to_string(), quiet)?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(super::checkout::run_post_checkout(
+        repo,
+        old_head,
+        super::checkout::head_commit_id(repo),
+        true,
+    ))
 }
 
 /// `git switch -c|-C <new> [<start>]` — create (or, for `-C`, create-or-reset) a
@@ -750,6 +797,8 @@ fn switch_create(
     track_inherit: bool,
     merge_style: Option<&str>,
 ) -> Result<ExitCode> {
+    // `old_branch_info.commit`, for the post-checkout hook at the tail.
+    let old_head = super::checkout::head_commit_id(repo);
     if positionals.len() > 1 {
         return fatal("only one reference expected");
     }
@@ -831,7 +880,12 @@ fn switch_create(
         if !quiet {
             eprintln!("Switched to a new branch '{branch}'");
         }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(super::checkout::run_post_checkout(
+            repo,
+            old_head,
+            super::checkout::head_commit_id(repo),
+            true,
+        ));
     };
 
     // ```c
@@ -943,7 +997,12 @@ fn switch_create(
     if autostashed {
         show_autostash_listing(&start_commit.to_string(), quiet)?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(super::checkout::run_post_checkout(
+        repo,
+        old_head,
+        super::checkout::head_commit_id(repo),
+        true,
+    ))
 }
 
 /// `git switch -d|--detach [<commit>]` — detach `HEAD` at a commit.
@@ -957,6 +1016,8 @@ fn switch_detach(
     if positionals.len() > 1 {
         return fatal("only one reference expected");
     }
+    // `old_branch_info.commit`, for the post-checkout hook at the tail.
+    let old_head = super::checkout::head_commit_id(repo);
 
     let target_id: ObjectId = match positionals.first().copied() {
         // Same `get_oid_mb()` ordering as the `-c` path above: a full-length hex
@@ -983,6 +1044,11 @@ fn switch_detach(
             if super::rev_parse::dwim_ref_matches(repo, s).is_empty() {
                 crate::objname::resolve(repo, s);
             }
+            // That second resolution is also where `refs/heads/<name>` overrides
+            // the revision parser outright — see
+            // [`super::checkout::branch_ref_id`] — so `switch --detach <name>`
+            // detaches at the *branch* for a name that is also a tag.
+            let id = super::checkout::branch_ref_id(repo, s).unwrap_or(id);
             match super::checkout::classify_tree_ish(repo, id)? {
                 TreeIsh::Commit(commit) => commit.id,
                 TreeIsh::Tree(_) => {
@@ -1062,7 +1128,12 @@ fn switch_detach(
     if autostashed {
         show_autostash_listing(&target_id.to_string(), quiet)?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(super::checkout::run_post_checkout(
+        repo,
+        old_head,
+        Some(target_id),
+        true,
+    ))
 }
 
 /// `git switch --orphan <new>` — point `HEAD` at an unborn branch and clear the

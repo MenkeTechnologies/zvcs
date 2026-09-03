@@ -156,6 +156,21 @@ fn cmd_list(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // ```c
+    // if (get_sparse_checkout_patterns(&pl) < 0) {
+    //         warning(_("this worktree is not sparse (sparse-checkout file may not exist)"));
+    //         return 0;
+    // }
+    // ```
+    //
+    // (builtin/sparse-checkout.c:75-79.) `core.sparseCheckout=true` with no
+    // pattern file is not fatal — the fatal above is for sparsity being off —
+    // it is a warning and an empty listing at exit 0.
+    if !pattern_path(&repo).exists() {
+        eprintln!("warning: this worktree is not sparse (sparse-checkout file may not exist)");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let lines = read_pattern_file(&repo)?;
     let mut out = String::new();
     if is_cone(&repo)? {
@@ -918,7 +933,28 @@ fn worktree_config_path(repo: &gix::Repository) -> PathBuf {
 }
 
 /// Read a boolean from the worktree config, falling back to the repo-local one.
+///
+/// git reads `core.sparseCheckout` and `core.sparseCheckoutCone` through the
+/// ordinary config machinery (`git_config_get_bool()`), so the highest-precedence
+/// sources — `-c <key>=<value>` on the command line and the `GIT_CONFIG_*`
+/// environment — answer before any file does. Reading the two files alone made
+/// `git -c core.sparseCheckoutCone=false sparse-checkout list` report the cone
+/// listing of a worktree whose config file still said `true`.
+///
+/// Below that the file order stands as it was: the worktree config outranks the
+/// repository's own, which is the order git's `config.worktree` scope has.
 fn config_bool(repo: &gix::Repository, section: &str, key: &str) -> Result<Option<bool>> {
+    {
+        let snapshot = repo.config_snapshot();
+        let overridden = snapshot
+            .plumbing()
+            .boolean_filter(format!("{section}.{key}").as_str(), |meta| {
+                matches!(meta.source, Source::Cli | Source::Env)
+            });
+        if let Ok(Some(v)) = overridden {
+            return Ok(Some(v));
+        }
+    }
     for path in [worktree_config_path(repo), repo.common_dir().join("config")] {
         if !path.exists() {
             continue;

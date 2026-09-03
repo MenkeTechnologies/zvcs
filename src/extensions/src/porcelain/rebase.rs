@@ -240,16 +240,22 @@
 //! exit stops the rebase with `error: The pre-rebase hook refused to rebase.`
 //! before anything has moved.
 //!
-//! A rebase runs three more of them. `post-commit` fires for every commit the
-//! sequencer writes, and `post-rewrite amend` for every one that amended an
-//! existing commit (`try_to_commit()`, sequencer.c:1697-1699) — this port builds
-//! those commit objects directly instead of re-entering `git commit`, so it runs
-//! them itself. At the end, `post-rewrite rebase` receives the whole
+//! A rebase runs four more of them. `post-checkout <orig-head> <onto> 1` fires
+//! once at the start, from the `reset_head()` that detaches at `<onto>`
+//! (`RESET_HEAD_RUN_POST_CHECKOUT_HOOK`, sequencer.c:4936 and
+//! builtin/rebase.c:1882). `prepare-commit-msg <path> message` then runs before
+//! every commit the sequencer writes, and the message committed is the
+//! `COMMIT_EDITMSG` it leaves behind, so a hook that rewrites the file changes
+//! the replayed commit. `post-commit` fires for every commit the sequencer
+//! writes, and `post-rewrite amend` for every one that amended an existing
+//! commit (`try_to_commit()`, sequencer.c:1697-1699) — this port builds those
+//! commit objects directly instead of re-entering `git commit`, so it runs them
+//! itself. At the end, `post-rewrite rebase` receives the whole
 //! `<old> <new>` map the run accumulated in `$state_dir/rewritten-list`
 //! (sequencer.c:5190-5207), which is what makes a fixup chain report every melded
 //! commit against the single one that replaced it, and what carries the map
-//! across a conflict stop and `--continue`. None of the three can fail a rebase:
-//! their exit status is dropped, as git drops it.
+//! across a conflict stop and `--continue`. Only `prepare-commit-msg` can fail a
+//! rebase; every other exit status here is dropped, as git drops it.
 //!
 //! Not ported: the `git notes copy --for-rewrite=rebase` that git runs just
 //! before the final hook. Nothing here rewrites notes, and with no
@@ -1484,7 +1490,14 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     if fork_point < 0 {
                         fork_point = 1;
                     }
-                    name.shorten().to_string()
+                    // `options.upstream_name = branch_get_upstream(branch, NULL)`
+                    // (builtin/rebase.c) hands back `branch->merge[0]->dst`, the
+                    // **full** tracking ref — not the `origin/main` spelling a
+                    // user would type. Everything downstream quotes
+                    // `upstream_name` verbatim, so the reflog of a defaulted
+                    // rebase reads `rebase (start): checkout
+                    // refs/remotes/origin/main`. Measured against stock 2.55.0.
+                    name.as_bstr().to_string()
                 }
                 Some(Err(e)) => crate::git_fatal!("{e}"),
                 None => {
@@ -1577,6 +1590,16 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             let is_branch = branch_ref.is_some();
             if !is_branch {
                 crate::objname::warn_ambiguous_refname(&repo, requested);
+            } else if let Some(other) = checked_out_elsewhere(&repo, requested) {
+                // `die_if_checked_out(buf.buf, 1)` — the `refs_read_ref()` arm's
+                // very next line (builtin/rebase.c). A branch lives in one
+                // worktree at a time, and rebasing it from another would move a
+                // ref out from under a checked-out tree. The current worktree is
+                // the ignored one, so `git rebase <up> <current-branch>` is fine.
+                crate::git_fatal!(
+                    "'{requested}' is already used by worktree at '{}'",
+                    other.display()
+                );
             }
             // `lookup_commit_object()` for the ref arm — the tip as recorded, with
             // no tag peeling and no revspec grammar; `peel_to_commit()` for the
@@ -1611,9 +1634,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 branch = None;
             } else if current.as_deref() != Some(requested.as_str()) {
                 // Everything below rebases `<branch>`, so its tip stands in for
-                // `HEAD` right away. The worktree switch itself waits until after
-                // `require_clean_work_tree()`, which git runs first — a dirty tree
-                // must produce git's refusal, not the checkout's.
+                // `HEAD` right away. Nothing is checked out here: git only ever
+                // acts on `options.switch_to` in `checkout_up_to_date()`, the
+                // fast-forward arm below. A rebase that actually replays goes
+                // straight from the current `HEAD` to `<onto>` in
+                // `checkout_onto()`, so its `HEAD` reflog opens with
+                // `rebase (start): checkout <onto>` and carries no line for
+                // `<branch>` at all. Measured against stock 2.55.0: `git rebase
+                // main side` from `main` writes three `logs/HEAD` lines — start,
+                // pick, finish — where an eager switch writes four.
                 head_oid = resolved.ok_or_else(|| anyhow!("no such branch/commit '{requested}'"))?;
                 branch = Some(FullName::try_from(format!("refs/heads/{requested}"))?);
                 eager_switch = Some(requested.clone());
@@ -1732,18 +1761,36 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
-    // `cmd_rebase()`: with the tree known clean, check out the `<branch>` that is
-    // about to be rebased. git does this silently — the rebase's own messages are
-    // the only ones printed.
-    if let Some(requested) = &eager_switch {
-        super::checkout::switch_to_branch(
-            &repo,
-            requested,
-            true,
-            false,
-            Some(&format!("{}: checkout {requested}", reflog_action())),
-        )?;
-    }
+    // ```c
+    // if (options.autostash)
+    //         create_autostash(the_repository,
+    //                          state_dir_path("autostash", &options));
+    // ```
+    // (builtin/rebase.c) — the snapshot is taken *before* the pre-rebase hook, the
+    // lazy branch switch and the up-to-date fast path, and every refusal from
+    // here on reaches `goto cleanup_autostash`, which puts the changes back.
+    // Measured against stock 2.55.0: `rebase --autostash <up>` with a refusing
+    // `pre-rebase` hook prints `Created autostash: 44de9dd` before
+    // `error: The pre-rebase hook refused to rebase.` and then `Applied
+    // autostash.`, and an already-up-to-date `rebase --autostash` prints the same
+    // three-line shape around `Current branch main is up to date.` — so a port
+    // that waits until HEAD is about to move creates no stash on either path.
+    let autostash_oid = if autostash_wanted {
+        let oid = crate::porcelain::stash::create_autostash(&repo)?;
+        if flags & NO_QUIET != 0 {
+            println!("Created autostash: {}", oid.to_hex_with_len(7));
+        }
+        Some(oid)
+    } else {
+        None
+    };
+    // `goto cleanup_autostash` — restore the snapshot before an early exit.
+    let cleanup_autostash = |repo: &gix::Repository| -> Result<()> {
+        if let Some(oid) = autostash_oid {
+            crate::porcelain::stash::apply_autostash(repo, oid, flags & NO_QUIET == 0)?;
+        }
+        Ok(())
+    };
 
     // --- can_fast_forward() ------------------------------------------------
     // git calls `can_fast_forward()` with `options.upstream`, which `--root`
@@ -1760,9 +1807,19 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             // `checkout_up_to_date()` (builtin/rebase.c:855): the lazy switch to the
             // branch that needs no rebasing. Its `reset_head()` carries `ropts.branch`,
             // so the line lands in the branch's reflog as well as `HEAD`'s — even when
-            // the branch is the one already checked out and nothing moves. A switch to
-            // a *different* branch already happened above and is not repeated.
-            if let Some(requested) = switch_to.as_ref().filter(|_| eager_switch.is_none()) {
+            // the branch is the one already checked out and nothing moves. This is
+            // git's *only* use of `options.switch_to`: a `<branch>` operand that is
+            // not the current branch is checked out here and nowhere else, which is
+            // why a rebase that replays leaves no `rebase: checkout <branch>` line.
+            if let Some(requested) = eager_switch.as_ref() {
+                super::checkout::switch_to_branch(
+                    &repo,
+                    requested,
+                    true,
+                    false,
+                    Some(&format!("{}: checkout {requested}", reflog_action())),
+                )?;
+            } else if let Some(requested) = switch_to.as_ref() {
                 let message = format!("{}: checkout {requested}", reflog_action());
                 if let Some(name) = &branch {
                     repo.edit_reference(RefEdit {
@@ -1822,8 +1879,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     println!("Current branch {branch_name} is up to date.");
                 }
             }
-            // git reaches `finish_rebase()` here too, so the automatic
-            // maintenance run fires on the nothing-to-do path as well.
+            // git reaches `finish_rebase()` here too, so the two pseudo-refs go
+            // and the autostash is put back — `apply_autostash()` before
+            // `run_auto_maintenance()`, its order in that function — and the
+            // automatic maintenance run fires on the nothing-to-do path as well.
+            finish_rebase_refs(&repo);
+            cleanup_autostash(&repo)?;
             super::maintenance::run_auto_maintenance(&repo, flags & NO_QUIET == 0)?;
             return Ok(ExitCode::SUCCESS);
         } else if flags & NO_QUIET != 0 {
@@ -1863,6 +1924,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     }
     if !ok_to_skip_pre_rebase && !crate::hooks::run(&repo, "pre-rebase", &hook_args, None)? {
         eprintln!("error: The pre-rebase hook refused to rebase.");
+        // `goto cleanup_autostash`: the refusal leaves the worktree as the user
+        // left it, dirty changes included.
+        cleanup_autostash(&repo)?;
         return Ok(ExitCode::from(1));
     }
 
@@ -2083,20 +2147,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // no-op when no daemon is running), matching the merge/zsync write path.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    // `--autostash`: now that the rebase is committed to moving HEAD (every early
-    // refusal is behind us), snapshot the dirty tree and reset it clean. The
-    // stash `W` commit is re-applied with a three-way merge onto the rebased tip
-    // at each completion point below (and, on a conflict-stop, by
-    // `--continue`/`--abort` via the persisted `autostash` state file).
-    let autostash_oid = if autostash_wanted {
-        let oid = crate::porcelain::stash::create_autostash(&repo)?;
-        if flags & NO_QUIET != 0 {
-            println!("Created autostash: {}", oid.to_hex_with_len(7));
-        }
-        Some(oid)
-    } else {
-        None
-    };
+    // `--autostash` was taken before the pre-rebase hook ran (see the
+    // `create_autostash()` call above). The stash `W` commit is re-applied with a
+    // three-way merge onto the rebased tip at each completion point below (and,
+    // on a conflict-stop, by `--continue`/`--abort` via the persisted `autostash`
+    // state file).
 
     // Capture the current (clean) index BEFORE any ref moves: it mirrors the old
     // tree and carries the filesystem stats reused for unchanged files. Taken
@@ -2190,6 +2245,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     if !exact_replay {
         update_clean_worktree(&repo, &old_index, onto_oid, &should_interrupt)?;
     }
+    run_post_checkout(&repo, head_oid, onto_oid);
 
     // ... replays each commit onto the growing tip, ...
     let mut tip = onto_oid;
@@ -2412,7 +2468,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         None => "detached HEAD".to_string(),
     };
 
-    if flags & VERBOSE != 0 {
+    // The closing diffstat belongs to the **sequencer**: `pick_commits()` prints
+    // it from `opts->verbose` once the replay is done, and `run_am()` has no
+    // equivalent — `git am` was already handed `--quiet`/`-v` and reports per
+    // patch instead. Measured against stock 2.55.0: `rebase --verbose <up>` ends
+    // with a second `<file> | n +-` block, `rebase --apply --verbose <up>` ends
+    // with `Applying: …` and nothing after it.
+    if flags & VERBOSE != 0 && !apply_backend {
         verbose_replay_diffstat(head_oid, tip)?;
     }
 
@@ -2423,8 +2485,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         rewritten::post_rewrite(&repo, &rewritten_pairs);
     }
 
-    // The single-shot rebase completed; re-apply the autostash onto the new tip
-    // (before the summary line, matching git's finish_rebase ordering).
+    // The single-shot rebase completed. `run_specific_rebase()` calls
+    // `finish_rebase()` for the **apply** backend only — the merge backend
+    // "cleans up after itself" and never reaches it — so the two pseudo-refs are
+    // dropped here on the `git am` path and left alone on the sequencer's.
+    if apply_backend {
+        finish_rebase_refs(&repo);
+    }
     if let Some(oid) = autostash_oid {
         crate::porcelain::stash::apply_autostash(&repo, oid, flags & NO_QUIET == 0)?;
     }
@@ -2619,6 +2686,52 @@ fn get_fork_point(
     Ok(Some(base))
 }
 
+/// `find_shared_symref(worktrees, "HEAD", branch)` as `die_if_checked_out()`
+/// calls it with `ignore_current_worktree = 1` (worktree.c): the path of the
+/// *other* worktree whose `HEAD` is on `refs/heads/<branch>`, or `None`.
+///
+/// Only linked worktrees are walked when this one is the main worktree, and the
+/// main worktree is added to the walk when it is not — the same set
+/// `get_worktrees()` returns minus the current entry.
+fn checked_out_elsewhere(repo: &gix::Repository, branch: &str) -> Option<std::path::PathBuf> {
+    let full = format!("refs/heads/{branch}");
+    let on_branch = |candidate: &gix::Repository| -> bool {
+        candidate
+            .head_name()
+            .ok()
+            .flatten()
+            .is_some_and(|name| name.as_bstr() == full.as_bytes())
+    };
+    for wt in repo.worktrees().unwrap_or_default() {
+        // `wt->is_current`.
+        if wt.git_dir() == repo.git_dir() {
+            continue;
+        }
+        // `wt->path` is the absolute path git recorded in the worktree's `gitdir`
+        // file; gitoxide derives it by appending `..` to that file's directory,
+        // so it needs the same collapsing every other printed path gets.
+        let base = wt.base().ok().map(|p| crate::hooks::absolutize(&p));
+        if let Ok(linked) = wt.into_repo() {
+            if on_branch(&linked) {
+                return base;
+            }
+        }
+    }
+    // The main worktree, reached only from a linked one: its git dir is the
+    // common dir and its worktree is that directory's parent.
+    if repo.git_dir() != repo.common_dir() {
+        let main_git_dir = repo.common_dir().to_owned();
+        if let Ok(main) = gix::open(&main_git_dir) {
+            if on_branch(&main) {
+                return main.workdir().map(ToOwned::to_owned).or_else(|| {
+                    main_git_dir.parent().map(ToOwned::to_owned)
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Resolve `spec` and peel it to a commit id, or `None` when either step fails —
 /// git reports both as one "invalid" message rather than surfacing the cause.
 fn peel_to_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
@@ -2644,6 +2757,52 @@ fn peel_to_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 ///
 /// Both are notification hooks: their exit status is dropped, exactly as
 /// `run_commit_hook()`'s and `run_rewrite_hook()`'s are at this call site.
+/// `reset_head()`'s `RESET_HEAD_RUN_POST_CHECKOUT_HOOK` (reset.c):
+///
+/// ```c
+/// if (ropts->flags & RESET_HEAD_RUN_POST_CHECKOUT_HOOK)
+///         run_hooks_l(r, "post-checkout",
+///                     oid_to_hex(orig_head ? orig_head : null_oid()),
+///                     oid_to_hex(&oid), "1", NULL);
+/// ```
+///
+/// Every rebase start carries that flag — `checkout_onto()` (sequencer.c:4936)
+/// for the merge backend and `cmd_rebase()`'s own detach (builtin/rebase.c:1882)
+/// for the apply one — so the hook fires once, with the branch tip being rebased
+/// as `$1`, `<onto>` as `$2` and the "branch checkout" flag `1` as `$3`.
+/// Measured against stock 2.55.0: `git rebase main` from a branch runs
+/// `post-checkout <orig-head> <onto> 1` and nothing else.
+///
+/// Its exit status is dropped, as `run_hooks_l()`'s is at that call site.
+/// `finish_rebase()`'s first two lines (builtin/rebase.c):
+///
+/// ```c
+/// delete_ref(NULL, "REBASE_HEAD", NULL, REF_NO_DEREF);
+/// refs_delete_ref(get_main_ref_store(the_repository), NULL, "AUTO_MERGE",
+///                 NULL, REF_NO_DEREF);
+/// ```
+///
+/// Every way a rebase ends goes through that function — the replay finishing,
+/// the `Current branch <b> is up to date.` fast path, `--continue` running the
+/// sheet out — so neither pseudo-ref outlives the rebase that wrote it.
+/// Measured against stock 2.55.0: `rebase --apply` over a three-way fallback
+/// leaves no `AUTO_MERGE`, while a port that only writes it leaves the last
+/// merge's tree named for the next command to find.
+fn finish_rebase_refs(repo: &gix::Repository) {
+    for name in ["REBASE_HEAD", "AUTO_MERGE"] {
+        let _ = std::fs::remove_file(repo.git_dir().join(name));
+    }
+}
+
+fn run_post_checkout(repo: &gix::Repository, from: ObjectId, to: ObjectId) {
+    let _ = crate::hooks::run(
+        repo,
+        "post-checkout",
+        &[&from.to_string(), &to.to_string(), "1"],
+        None,
+    );
+}
+
 fn run_commit_hooks(repo: &gix::Repository, amended: Option<ObjectId>, new: ObjectId) {
     let _ = crate::hooks::run(repo, "post-commit", &[], None);
     if let Some(old) = amended {
@@ -4201,6 +4360,7 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
     )?;
     let should_interrupt = AtomicBool::new(false);
     update_clean_worktree(repo, start.old_index, base, &should_interrupt)?;
+    run_post_checkout(repo, start.state.orig_head, base);
 
     let mut seq = Sequencer::new(repo, start.state)?;
     seq.autostash = start.autostash;
@@ -4323,7 +4483,9 @@ fn checkout_onto(repo: &gix::Repository, start: &SequencerStart<'_>) -> Result<(
         &format!("{} (start): checkout {}", reflog_action(), start.onto_spec),
     )?;
     let should_interrupt = AtomicBool::new(false);
-    update_clean_worktree(repo, start.old_index, start.state.onto, &should_interrupt)
+    update_clean_worktree(repo, start.old_index, start.state.onto, &should_interrupt)?;
+    run_post_checkout(repo, start.state.orig_head, start.state.onto);
+    Ok(())
 }
 
 /// git writes `ORIG_HEAD` only once it commits to actually rebasing. It is a
@@ -4402,6 +4564,33 @@ fn short_revisions(repo: &gix::Repository, upstream: Option<ObjectId>, head: Obj
 /// stopped has already been moved to `done` by `save_todo()`, so dropping it is
 /// exactly "do not commit what is staged".
 fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
+    // ```c
+    // refresh_index(the_repository->index, REFRESH_QUIET, NULL, NULL, NULL);
+    // …
+    // if (has_unstaged_changes(the_repository, 1)) {
+    //         puts(_("You must edit all merge conflicts and then\n"
+    //                "mark them as resolved using git add"));
+    //         ret = 1;
+    //         goto cleanup;
+    // }
+    // ```
+    // (builtin/rebase.c's `ACTION_CONTINUE`) — `cmd_rebase` refuses an unresolved
+    // worktree itself, before the sequencer is entered at all, so the wording is
+    // the capitalised two-liner on **stdout** and not `sequencer.c`'s lowercase
+    // `error:` pair. `refresh_index()` prints its own `<path>: needs merge` line
+    // for every unmerged path first, also on stdout. `ACTION_SKIP` runs no such
+    // check: it throws the half-applied work away regardless.
+    if !skip {
+        let (unstaged, _staged, conflicts) = dirty_state(repo)?;
+        for path in &conflicts {
+            println!("{path}: needs merge");
+        }
+        if unstaged {
+            println!("You must edit all merge conflicts and then");
+            println!("mark them as resolved using git add");
+            return Ok(ExitCode::from(1));
+        }
+    }
     let st = read_basic_state(repo)?;
     let dir = rebase_merge_dir(repo);
     let (list, parsed_ok) = todo::List::parse(
@@ -5160,6 +5349,24 @@ impl<'r> Sequencer<'r> {
         } else {
             std::iter::once(head).collect()
         };
+        // `try_to_commit()`'s `prepare-commit-msg` (sequencer.c:1751-1758). Every
+        // `pick` a merge-backend rebase replays is committed in process, so
+        // without this the hook that `git commit` would have run never fires and
+        // a hook that rewrites `$1` cannot change the replayed message. Measured
+        // against stock 2.55.0, which runs it once per pick with
+        // `.git/COMMIT_EDITMSG message`.
+        let final_message: BString =
+            match crate::sequencer::prepare_commit_msg(repo, &final_message, false)? {
+                crate::sequencer::Prepared::NoHook => final_message,
+                crate::sequencer::Prepared::Message(m) => m.into(),
+                // `try_to_commit()` returning -1 stops the rebase. git also
+                // *reschedules* the instruction and prints the
+                // `Could not execute the todo command` hint block around it;
+                // that reschedule path is not ported, so the stop here is the
+                // plain one — the state directory is left in place and
+                // `--continue` retries from the same instruction.
+                crate::sequencer::Prepared::Failed => return Ok(Step::Stop(1)),
+            };
         // The sign-off and the `--trailer` arguments went on above, before the
         // merge, so that a conflict stop records them too. The reflog entry below
         // still names the original subject, which neither touches.
@@ -5270,18 +5477,46 @@ impl<'r> Sequencer<'r> {
     /// raw revision, which is what `make_script_with_merges()` writes for a base
     /// outside the replayed range).
     fn do_reset(&mut self, item: &todo::Item) -> Result<Step> {
-        // git takes the label as the first whitespace-delimited word of the
-        // argument, so the `# <oneline>` the sheet carries is ignored.
         let arg = item.arg.to_str_lossy().into_owned();
-        let name = arg.split_whitespace().next().unwrap_or_default().to_string();
-        if name == "[new" || arg.starts_with("[new root]") {
-            self.term_clear_line();
-            bail!(
-                "`reset [new root]` is not ported (it needs the `--root` stand-in commit \
-                 `do_reset()` mints); the rebase is still resumable with `git rebase --abort`"
-            );
-        }
-        let oid = self.lookup_label(&name)?;
+        // ```c
+        // if (len == 10 && !strncmp("[new root]", name, len)) {
+        //         if (!opts->have_squash_onto) {
+        //                 if (commit_tree("", 0, the_hash_algo->empty_tree, NULL,
+        //                                 &opts->squash_onto, NULL, NULL))
+        //                         return error(_("writing fake root commit"));
+        //                 opts->have_squash_onto = 1;
+        //                 hex = oid_to_hex(&opts->squash_onto);
+        //                 if (write_message(hex, strlen(hex),
+        //                                   rebase_path_squash_onto(), 0))
+        //                         return error(_("writing squash-onto"));
+        //         }
+        //         oidcpy(&oid, &opts->squash_onto);
+        // }
+        // ```
+        // (`do_reset()`, sequencer.c). The label is the whole two-word `[new
+        // root]`, and it names the empty-tree stand-in commit `--root` replays
+        // onto: already minted when `--root` came without `--onto`, and minted
+        // here (once) when `--onto` supplied a base of its own and the sheet still
+        // has a lane starting from nothing.
+        let (name, oid) = if arg.starts_with("[new root]") {
+            let oid = match self.st.squash_onto {
+                Some(oid) => oid,
+                None => {
+                    let oid = write_synth_root(self.repo)?;
+                    self.st.squash_onto = Some(oid);
+                    // `write_message(hex, strlen(hex), …, 0)`: no trailing newline.
+                    std::fs::write(self.dir().join("squash-onto"), oid.to_string())?;
+                    oid
+                }
+            };
+            ("[new root]".to_string(), oid)
+        } else {
+            // git takes the label as the first whitespace-delimited word of the
+            // argument, so the `# <oneline>` the sheet carries is ignored.
+            let name = arg.split_whitespace().next().unwrap_or_default().to_string();
+            let oid = self.lookup_label(&name)?;
+            (name, oid)
+        };
         let head = self.repo.head_id()?.detach();
         update_clean_worktree(self.repo, &self.index, oid, &self.should_interrupt)?;
         self.refresh_index()?;
@@ -5347,19 +5582,19 @@ impl<'r> Sequencer<'r> {
             self.term_clear_line();
             crate::git_fatal!("nothing to merge: '{arg}'");
         }
-        if heads.len() > 1 {
-            self.term_clear_line();
-            bail!(
-                "octopus `merge` is not ported (git runs `git merge -s octopus` for more than \
-                 one merge head); the rebase is still resumable with `git rebase --abort`"
-            );
-        }
-        let merge_head = self.lookup_label(heads[0])?;
+        let merge_heads: Vec<ObjectId> = heads
+            .iter()
+            .map(|h| self.lookup_label(h))
+            .collect::<Result<Vec<_>>>()?;
         let head = repo.head_id()?.detach();
 
         // `can_fast_forward`: HEAD is still the original merge's first parent and
-        // the merge heads are still its remaining parents, so the original merge
-        // commit already *is* the answer.
+        // the merge heads are still its remaining parents — in the same order and
+        // the same number of them, which is `if (j || p) can_fast_forward = 0`
+        // (sequencer.c:4270-4292) — so the original merge commit already *is* the
+        // answer. An octopus reaches this too, which is what makes
+        // `rebase --rebase-merges` over a four-parent merge reproduce it byte for
+        // byte instead of rebuilding it.
         let original_parents: Vec<ObjectId> = repo
             .find_commit(original)?
             .parent_ids()
@@ -5367,14 +5602,62 @@ impl<'r> Sequencer<'r> {
             .collect();
         let can_fast_forward = self.st.allow_ff
             && original_parents.first() == Some(&head)
-            && original_parents.len() == 2
-            && original_parents[1] == merge_head;
+            && original_parents.len() == merge_heads.len() + 1
+            && original_parents[1..] == merge_heads[..];
         if can_fast_forward {
             update_clean_worktree(repo, &self.index, original, &self.should_interrupt)?;
             self.refresh_index()?;
             set_head(repo, Target::Object(original), "rebase: fast-forward")?;
             return Ok(Step::Next);
         }
+
+        // ```c
+        // if (strategy || to_merge->next) {
+        //         /* Octopus merge */
+        //         …
+        //         strvec_pushl(&cmd.args, "merge", "-s", "octopus", "--no-edit",
+        //                      "--no-ff", "--no-log", "--no-stat", "-F",
+        //                      git_path_merge_msg(r), NULL);
+        //         …
+        //         for (j = to_merge; j; j = j->next)
+        //                 strvec_push(&cmd.args, oid_to_hex(&j->item->object.oid));
+        // ```
+        // (sequencer.c:4310-4348). More than one merge head is not merged in
+        // process at all: git hands the whole instruction to a
+        // `git merge -s octopus` child, which commits it, moves `HEAD` and writes
+        // its own `merge <oid> <oid> …: Merge made by the 'octopus' strategy.`
+        // reflog line — measured against stock 2.55.0 replaying a four-parent
+        // merge with `rebase --rebase-merges=rebase-cousins`.
+        if merge_heads.len() > 1 {
+            // `write_message(body, len, git_path_merge_msg(r), 0)`: the original
+            // merge's message from its subject onward, which is what `-F` reads.
+            let commit = repo.find_commit(original)?;
+            let raw = commit.message_raw()?.to_owned();
+            let msg_path = repo.git_dir().join("MERGE_MSG");
+            std::fs::write(&msg_path, super::format_patch::skip_blank_lines(&raw))?;
+            // `refs_delete_ref(…, "CHERRY_PICK_HEAD", …)` right before the child,
+            // so the `git commit` inside it does not conclude a pick instead.
+            let _ = std::fs::remove_file(repo.git_dir().join("CHERRY_PICK_HEAD"));
+            self.term_clear_line();
+            let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
+            cmd.current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
+                .args(["merge", "-s", "octopus", "--no-edit", "--no-ff", "--no-log", "--no-stat"])
+                .arg("-F")
+                .arg(&msg_path)
+                .arg("--no-gpg-sign");
+            for id in &merge_heads {
+                cmd.arg(id.to_string());
+            }
+            crate::cstdio::before_spawn();
+            let status = cmd.status()?;
+            if !status.success() {
+                return Ok(Step::Stop(status.code().unwrap_or(1).clamp(0, 255) as u8));
+            }
+            // "force re-reading of the cache": the child rewrote the index.
+            self.refresh_index()?;
+            return Ok(Step::Next);
+        }
+        let merge_head = merge_heads[0];
 
         // `merge_ort_recursive()` over the one merge base. Several bases would
         // need the virtual common ancestor git builds by merging them, which is
@@ -6109,6 +6392,12 @@ impl<'r> Sequencer<'r> {
         // directory being taken down here.
         let pending_ref_updates = read_update_refs_state(repo)?;
         let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+        // No `finish_rebase()` here: `run_specific_rebase()` skips it for this
+        // backend — `else if (opts->type == REBASE_MERGE) ; /* merge backend
+        // cleans up after itself */` — so the `AUTO_MERGE` the last pick's merge
+        // recorded outlives the rebase. Measured against stock 2.55.0: after
+        // `git rebase main` finishes on the sequencer, `AUTO_MERGE` still names
+        // that tree, while the same rebase under `--apply` leaves none.
         if let Some(oid) = self.autostash {
             crate::porcelain::stash::apply_autostash(repo, oid, self.st.quiet)?;
         }
@@ -6170,18 +6459,96 @@ fn make_patch(repo: &gix::Repository, dir: &std::path::Path, commit: &gix::Commi
     // `.git/logs` gains nothing when the stop happens.
     std::fs::write(repo.git_dir().join("REBASE_HEAD"), format!("{oid}\n"))?;
     let parent = commit.parent_ids().next().map(|p| p.detach());
-    let patch = super::diff::commit_patch(repo, commit, parent, 3)?;
-    std::fs::write(dir.join("patch"), patch)?;
+    std::fs::write(dir.join("patch"), stopped_patch(repo, commit, parent)?)?;
     let message = dir.join("message");
     if !message.exists() {
-        // `write_message(…, append_eol = 1)` appends a newline unconditionally
-        // (sequencer.c:498), so the raw message — which already ends in one —
-        // lands with a trailing blank line.
-        let mut body = commit.message_raw()?.to_vec();
-        body.push(b'\n');
+        // The file holds the commit message from its subject onward, ending in a
+        // single newline — measured against stock 2.55.0, whose `message` after a
+        // stop on `subj\n\nbody\n` is those bytes exactly, with no blank line
+        // appended. Leading blank lines are dropped the way
+        // `find_commit_subject()` drops them.
+        let raw = commit.message_raw()?;
+        let mut body = super::format_patch::skip_blank_lines(&raw).to_vec();
+        if !body.ends_with(b"\n") {
+            body.push(b'\n');
+        }
         std::fs::write(message, body)?;
     }
     Ok(())
+}
+
+/// The patch text `make_patch()` writes for the commit a stop landed on.
+///
+/// git builds it with a `rev_info` that sets only `diff = 1` and
+/// `DIFF_FORMAT_PATCH` (sequencer.c:3460-3470) and never sets
+/// `diffopt.flags.recursive`, which `builtin/log.c` does for every command that
+/// prints a patch. The tree walk therefore stops at the root: only entries
+/// directly under it are diffed, and a change below a directory produces no
+/// text at all. Measured against stock 2.55.0 — a rebase stopping on a conflict
+/// in `src/f.txt` writes a zero-byte `patch`, the same conflict in `f.txt`
+/// writes the whole diff, and a commit touching both writes only the `f.txt`
+/// half.
+///
+/// Reproduced here by limiting the patch to the root-level blob paths whose
+/// entry actually changed; a pair of trees is left out because a non-recursive
+/// diff renders nothing for one.
+fn stopped_patch(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    parent: Option<ObjectId>,
+) -> Result<Vec<u8>> {
+    // ```c
+    // if (!commit->parents) {
+    //         if (opt->show_root_diff) { … }
+    //         return !opt->loginfo;
+    // }
+    // ```
+    // (`log_tree_diff()`, log-tree.c) — `make_patch()`'s `rev_info` never sets
+    // `show_root_diff`, so a stop on a **root** commit writes a zero-byte patch
+    // rather than the whole tree as an addition. Measured against stock 2.55.0 on
+    // `rebase --onto <unrelated> --root`.
+    if parent.is_none() {
+        return Ok(Vec::new());
+    }
+    let root_entries = |tree: ObjectId| -> Result<HashMap<BString, (u16, ObjectId)>> {
+        Ok(repo
+            .find_tree(tree)?
+            .decode()?
+            .entries
+            .iter()
+            .map(|e| (e.filename.to_owned(), (e.mode.value(), e.oid.to_owned())))
+            .collect())
+    };
+    let after = root_entries(commit.tree_id()?.detach())?;
+    let before = match parent {
+        Some(p) => root_entries(repo.find_commit(p)?.tree_id()?.detach())?,
+        None => HashMap::new(),
+    };
+
+    let mut paths: Vec<String> = Vec::new();
+    for name in before.keys().chain(after.keys()).collect::<HashSet<_>>() {
+        let (old, new) = (before.get(name), after.get(name));
+        if old == new {
+            continue;
+        }
+        // `mode & S_IFMT == S_IFDIR`: a directory on either side is what the
+        // non-recursive walk cannot render, so it contributes nothing.
+        let is_tree = |e: Option<&(u16, ObjectId)>| e.is_some_and(|(m, _)| *m & 0o170000 == 0o040000);
+        if is_tree(old) || is_tree(new) {
+            continue;
+        }
+        // `:(literal,top)` so a name carrying glob characters limits to itself
+        // and is read from the root, the way git's `NULL` prefix reads it.
+        paths.push(format!(":(literal,top){}", name.to_str_lossy()));
+    }
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    paths.sort();
+
+    let opts = super::diff::PatchOpts { ctx: 3, ..Default::default() };
+    let mut out = super::diff::commit_patches(repo, &[(commit.id().detach(), parent)], &opts, &paths, false)?;
+    Ok(out.pop().unwrap_or_default())
 }
 
 /// `write_author_script()`: the replayed commit's author, in the sq-quoted
@@ -6432,7 +6799,23 @@ fn update_clean_worktree(
             let path = e.path_in(backing);
             if !new_paths.contains(&path.to_owned()) {
                 if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(full);
+                    let _ = std::fs::remove_file(&full);
+                    // `remove_path()` (entry.c:36-52): after the unlink, every
+                    // leading directory that has just become empty goes too —
+                    // `do { *slash = '\0'; } while (rmdir(dirs) == 0 …)`. Without
+                    // it a rebase that checks out a tree lacking a whole
+                    // directory leaves the empty directory behind, which `status`
+                    // ignores but the tree on disk does not match.
+                    let mut dir = full.parent().map(ToOwned::to_owned);
+                    while let Some(d) = dir {
+                        if d == workdir || !d.starts_with(&workdir) {
+                            break;
+                        }
+                        if std::fs::remove_dir(&d).is_err() {
+                            break;
+                        }
+                        dir = d.parent().map(ToOwned::to_owned);
+                    }
                 }
             }
         }

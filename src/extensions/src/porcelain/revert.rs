@@ -34,8 +34,9 @@
 //!   * `--strategy`/`-X`, which git's sequencer ignores outright for a revert:
 //!     `do_pick_commit` routes `TODO_REVERT` to the recursive merge regardless
 //!     of the selected strategy, so an unknown strategy name is not an error
-//!   * `--rerere-autoupdate`/`--no-rerere-autoupdate` and `--no-gpg-sign`,
-//!     accepted and without effect on a conflict-free revert
+//!   * `--rerere-autoupdate`/`--no-rerere-autoupdate` — handed to the
+//!     `repo_rerere()` a conflicted revert runs, and without effect on a
+//!     conflict-free one — and `--no-gpg-sign`
 //!   * the generated message (`Revert "…"` / `Reapply "…"`, the reference
 //!     format `<comment> *** SAY WHY … ***` plus `<short> (<subject>, <date>)`, the
 //!     `, reversing / changes made to` merge variant, the `Signed-off-by`
@@ -700,9 +701,25 @@ fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
         // `cmd == 'q'`: `sequencer_remove_state()` then `remove_branch_state()`.
         Cmd::Quit => {
             crate::sequencer::remove_state(&git_dir);
-            let _ = std::fs::remove_file(git_dir.join("REVERT_HEAD"));
-            let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-            let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
+            // `remove_branch_state()` (branch.c) in full: the two sequencer
+            // pseudo-refs `sequencer_post_commit_cleanup()` drops, then
+            // `MERGE_HEAD`, `MERGE_RR`, `MERGE_MSG`, `MERGE_MODE`, `SQUASH_MSG`
+            // and `AUTO_MERGE`. Measured against stock 2.55.0: `revert --quit` in
+            // a repository holding a conflicted merge leaves none of the seven,
+            // so forgetting `MERGE_HEAD` leaves the worktree claiming a merge is
+            // still in progress.
+            for name in [
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "MERGE_HEAD",
+                "MERGE_RR",
+                "MERGE_MSG",
+                "MERGE_MODE",
+                "SQUASH_MSG",
+                "AUTO_MERGE",
+            ] {
+                let _ = std::fs::remove_file(git_dir.join(name));
+            }
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Abort => sequencer_rollback(repo, &git_dir),
@@ -1305,6 +1322,13 @@ fn revert_one(
         // variant regardless of the action, since with no commit pending there
         // is no `--continue` to point at.
         crate::sequencer::print_advice(repo, crate::sequencer::Action::Revert, o.no_commit);
+        // `repo_rerere(r, opts->allow_rerere_auto)` (sequencer.c's
+        // `do_pick_commit()`), immediately after `print_advice()`: the conflict is
+        // recorded in `.git/rr-cache` and `MERGE_RR`, or a recorded resolution is
+        // replayed into the worktree. Measured against stock 2.55.0 — `-c
+        // rerere.enabled=true revert <conflicting>` leaves a `<id>/preimage`
+        // behind.
+        super::rerere::repo_rerere(repo, o.rerere)?;
         return Ok(Step::Failed(ExitCode::from(1)));
     }
 
@@ -1381,6 +1405,17 @@ fn revert_one(
     let author_ident = format!("{} <{}>", author.name, author.email);
     let committer_ident = format!("{} <{}>", committer.name, committer.email);
     let signer = super::commit::sequencer_signer(repo, o.gpg_sign.as_deref());
+    // `try_to_commit()`'s `prepare-commit-msg` (sequencer.c:1751-1758): the hook
+    // sees `.git/COMMIT_EDITMSG` and the message is read back from it, so a hook
+    // that rewrites the file changes the commit this revert writes.
+    let message = match crate::sequencer::prepare_commit_msg(repo, message.as_bytes(), false)? {
+        crate::sequencer::Prepared::NoHook => message,
+        crate::sequencer::Prepared::Message(m) => String::from_utf8_lossy(&m).into_owned(),
+        crate::sequencer::Prepared::Failed => {
+            eprintln!("fatal: revert failed");
+            return Ok(Step::Failed(ExitCode::from(128)));
+        }
+    };
     // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685):
     // the in-process commit signs with exactly the key the sequencer carries.
     let new_id = super::commit::write_commit_object(
@@ -1407,6 +1442,11 @@ fn revert_one(
             .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
         deref: true,
     })?;
+
+    // `run_commit_hook(0, r->index_file, NULL, "post-commit", NULL)`
+    // (sequencer.c:1697), the last thing `try_to_commit()` does. Its exit status
+    // is dropped: git ignores a failing `post-commit`.
+    let _ = crate::hooks::run(repo, "post-commit", &[], None);
 
     // A committed revert clears the in-progress markers, as git does.
     // `AUTO_MERGE` is *not* one of them: `sequencer_post_commit_cleanup()` only

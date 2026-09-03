@@ -1057,6 +1057,91 @@ pub fn remove_state(git_dir: &Path) {
     let _ = std::fs::remove_dir_all(dir(git_dir));
 }
 
+/// What [`prepare_commit_msg`] did.
+pub enum Prepared {
+    /// No `prepare-commit-msg` hook is installed — git writes no
+    /// `COMMIT_EDITMSG` at all on this path and the message stands.
+    NoHook,
+    /// The hook ran and exited 0; this is `COMMIT_EDITMSG` read back, which the
+    /// hook is free to have rewritten.
+    Message(Vec<u8>),
+    /// The hook exited non-zero. `error: 'prepare-commit-msg' hook failed` has
+    /// already been printed; the caller fails the commit the way its own command
+    /// fails one.
+    Failed,
+}
+
+/// `run_prepare_commit_msg_hook()` as `try_to_commit()` calls it
+/// (sequencer.c:1210-1229):
+///
+/// ```c
+/// name = git_path_commit_editmsg();
+/// if (write_message(msg->buf, msg->len, name, 0))
+///         return -1;
+/// if (commit) { arg1 = "commit"; arg2 = commit; } else { arg1 = "message"; }
+/// if (run_commit_hook(0, r->index_file, NULL, "prepare-commit-msg", name,
+///                     arg1, arg2, NULL))
+///         ret = error(_("'prepare-commit-msg' hook failed"));
+/// ```
+///
+/// Every commit the sequencer writes *in process* — a cherry-pick, a revert and
+/// every `pick` a merge-backend rebase replays — passes through it, and the
+/// message it commits is `COMMIT_EDITMSG` read back afterwards, not the one it
+/// started with. Measured against stock 2.55.0: a `prepare-commit-msg` hook that
+/// appends a line to `$1` changes the object id of the commit
+/// `git cherry-pick <c>`, `git revert <c>` and `git rebase <up>` produce, and the
+/// hook is handed `.git/COMMIT_EDITMSG message` (`$3` empty) for a fresh commit.
+///
+/// `amend` is git's `hook_commit`, set only for the `AMEND_MSG` commits a
+/// `fixup`/`squash`/`reword` writes, where the hook's arguments become
+/// `<path> commit HEAD` instead.
+pub fn prepare_commit_msg(
+    repo: &gix::Repository,
+    message: &[u8],
+    amend: bool,
+) -> Result<Prepared> {
+    if crate::hooks::find(repo, "prepare-commit-msg")?.is_none() {
+        return Ok(Prepared::NoHook);
+    }
+    let path = repo.git_dir().join("COMMIT_EDITMSG");
+    // `write_message(…, append_eol = 0)`: the message is written verbatim.
+    std::fs::write(&path, message)?;
+
+    // git has already `chdir`'d to the top of the worktree, so the path it hands
+    // the hook is the `.git/COMMIT_EDITMSG` its `git_path_commit_editmsg()`
+    // spells relative to the git dir it discovered. Hooks run with that same
+    // working directory here, so the relative form is passed whenever the git
+    // directory really is inside the worktree, and the absolute one otherwise
+    // (a linked worktree, a `--git-dir` elsewhere) where a relative path would
+    // name nothing.
+    let workdir = repo.workdir().map(crate::hooks::absolutize);
+    let spelled = match workdir
+        .as_ref()
+        .and_then(|w| crate::hooks::absolutize(repo.git_dir()).strip_prefix(w).ok().map(Path::to_path_buf))
+    {
+        Some(rel) => rel.join("COMMIT_EDITMSG").to_string_lossy().into_owned(),
+        None => crate::hooks::absolutize(&path).to_string_lossy().into_owned(),
+    };
+    let index = crate::hooks::absolutize(&repo.index_path());
+    let args: Vec<&str> = if amend {
+        vec![spelled.as_str(), "commit", "HEAD"]
+    } else {
+        vec![spelled.as_str(), "message"]
+    };
+    let outcome = crate::hooks::run_with_env(
+        repo,
+        "prepare-commit-msg",
+        &args,
+        None,
+        &[("GIT_INDEX_FILE", index.as_path())],
+    )?;
+    if !outcome.ok {
+        eprintln!("error: 'prepare-commit-msg' hook failed");
+        return Ok(Prepared::Failed);
+    }
+    Ok(Prepared::Message(std::fs::read(&path)?))
+}
+
 /// The option state `save_opts()` persists, in its declaration order.
 ///
 /// Every field is "was it given", not "what did it resolve to": `save_opts`

@@ -130,8 +130,10 @@
 //! cherry-pick-in-progress status block on stdout and its advice on stderr, and
 //! exits 1 — matching stock git, whose worktree is necessarily clean at that
 //! point, so the `nothing to commit, working tree clean` tail is unconditional.
-//! git's `MERGE_RR` is not written: it is rerere bookkeeping, and rerere does
-//! not participate here.
+//! The stop also runs `repo_rerere()` (`do_pick_commit()`'s call right after
+//! `print_advice()`), so `MERGE_RR` and the `.git/rr-cache` preimage are written
+//! when `rerere.enabled` is on, and a resolution already recorded there is
+//! replayed into the worktree.
 //!
 //! ## `AUTO_MERGE`
 //!
@@ -151,9 +153,9 @@
 //! `--allow-empty-message`, `--empty=stop|drop|keep`,
 //! `--keep-redundant-commits`, `-s`/`--signoff`, `--cleanup=<mode>`,
 //! `-e`/`--edit`, `--no-edit`, `--commit`, `-S`/`--gpg-sign[=<key-id>]` and
-//! `--no-gpg-sign`, the `--no-` forms of the above, `--quit`, and the no-ops `-r`
-//! and `--rerere-autoupdate` (rerere only participates in conflicts, which are
-//! refused anyway).
+//! `--no-gpg-sign`, the `--no-` forms of the above, `--quit`, the no-op `-r`, and
+//! `--[no-]rerere-autoupdate`, which is handed to the `repo_rerere()` a
+//! conflicted pick runs.
 //!
 //! `-S` carries the same three-state `opts->gpg_sign` git does: absent, empty
 //! (`-S` alone, or `commit.gpgSign` — which `sequencer_init_config()` reads before
@@ -1392,6 +1394,10 @@ fn pick_one(
                         }
                         crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit);
                     }
+                    // `repo_rerere(r, opts->allow_rerere_auto)` runs on the
+                    // `if (res)` path whatever produced the conflict — the
+                    // external `git merge-<strategy>` child included.
+                    super::rerere::repo_rerere(&repo, opts.rerere_auto)?;
                     return Ok(PickOutcome::Stopped(ExitCode::from(res)));
                 }
             }
@@ -1478,6 +1484,14 @@ fn pick_one(
         // conflicts *is* `res == 1`, so the hint always shows here. Which of the
         // two variants it is comes from `opts->no_commit`, not from the action.
         crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit);
+        // `repo_rerere(r, opts->allow_rerere_auto)` (sequencer.c's
+        // `do_pick_commit()`), immediately after `print_advice()`: a conflict a
+        // previous run resolved is replayed into the worktree, a new one has its
+        // preimage recorded under `.git/rr-cache`, and `MERGE_RR` names the paths
+        // either way. Measured against stock 2.55.0 — `-c rerere.enabled=true
+        // cherry-pick <conflicting>` leaves a `<id>/preimage` behind, which a
+        // pick that skips rerere does not.
+        super::rerere::repo_rerere(&repo, opts.rerere_auto)?;
         return Ok(PickOutcome::Stopped(ExitCode::from(1)));
     }
 
@@ -1567,6 +1581,23 @@ fn pick_one(
     let author_ident = format!("{} <{}>", author.name, author.email);
     let author_time = author.time()?;
 
+    // `try_to_commit()`'s `prepare-commit-msg` (sequencer.c:1751-1758): the hook
+    // is handed `.git/COMMIT_EDITMSG` and the message is read back from it, so a
+    // hook that rewrites the file changes the commit this pick writes.
+    let message: BString = match crate::sequencer::prepare_commit_msg(&repo, &message, false)? {
+        crate::sequencer::Prepared::NoHook => message,
+        crate::sequencer::Prepared::Message(m) => m.into(),
+        // `do_pick_commit()` turns `try_to_commit()`'s -1 into the same
+        // `fatal: cherry-pick failed` every other failed pick ends on.
+        crate::sequencer::Prepared::Failed => {
+            return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+        }
+    };
+    let subject = gix::objs::commit::MessageRef::from_bytes(message.as_bstr())
+        .summary()
+        .to_str_lossy()
+        .into_owned();
+
     // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685).
     let new_id = super::commit::write_commit_object(
         &repo,
@@ -1580,6 +1611,10 @@ fn pick_one(
 
     let reflog = gix::reference::log::message("cherry-pick", message.as_bstr(), 1);
     advance_head(&repo, head_id, new_id, reflog)?;
+    // `run_commit_hook(0, r->index_file, NULL, "post-commit", NULL)`
+    // (sequencer.c:1697), the last thing `try_to_commit()` does. Its exit status
+    // is dropped: git ignores a failing `post-commit`.
+    let _ = crate::hooks::run(&repo, "post-commit", &[], None);
     state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
     // The commit consumes `MERGE_MSG` — `do_commit()` passes it as the message
     // file and `remove_branch_state()` unlinks it — so a landed pick leaves
@@ -1716,9 +1751,25 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
         // index or the worktree, and succeeds even with nothing in progress.
         Verb::Quit => {
             crate::sequencer::remove_state(&git_dir);
-            let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
-            let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-            let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
+            // `remove_branch_state()` (branch.c) is the whole of it: the two
+            // sequencer pseudo-refs `sequencer_post_commit_cleanup()` drops, then
+            // `MERGE_HEAD`, `MERGE_RR`, `MERGE_MSG`, `MERGE_MODE`, `SQUASH_MSG`
+            // and `AUTO_MERGE`. Measured against stock 2.55.0: `cherry-pick
+            // --quit` in a repository holding a conflicted merge leaves none of
+            // those seven behind, so a `--quit` that forgets `MERGE_HEAD` leaves
+            // the worktree claiming a merge is still in progress.
+            for name in [
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "MERGE_HEAD",
+                "MERGE_RR",
+                "MERGE_MSG",
+                "MERGE_MODE",
+                "SQUASH_MSG",
+                "AUTO_MERGE",
+            ] {
+                let _ = std::fs::remove_file(git_dir.join(name));
+            }
             Ok(ExitCode::SUCCESS)
         }
         Verb::Continue => sequencer_continue(&repo),

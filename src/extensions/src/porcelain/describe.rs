@@ -90,6 +90,7 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     let mut max_candidates: usize = 10;
     // Raw `--abbrev` value, still signed: git clamps it late and treats 0 specially.
     let mut abbrev: Option<i64> = None;
+    let mut debug = false;
     // `.defval = (intptr_t) "-dirty"` / `"-broken"` on two `PARSE_OPT_OPTARG`
     // `OPTION_STRING`s (builtin/describe.c:667-684): the mark is appended *verbatim*,
     // leading dash included, so `--dirty=-modified` is `<name>-modified` and
@@ -141,7 +142,8 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             // A bare `--abbrev` restores the repo-sized default; `--no-abbrev` is 0.
             "--abbrev" => abbrev = None,
             "--no-abbrev" => abbrev = Some(0),
-            "--debug" | "--no-debug" => {}
+            "--debug" => debug = true,
+            "--no-debug" => debug = false,
             "--candidates" => match it.next() {
                 Some(v) => match opt_integer("candidates", v) {
                     Ok(n) => max_candidates = n.max(0) as usize,
@@ -275,6 +277,7 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
         max_candidates,
         abbrev,
         dirty_mark,
+        debug,
     };
 
     // Default target is HEAD; otherwise each positional commit-ish, in order.
@@ -290,6 +293,20 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     // instead, which is neither git's wording nor git's exit code.
     let targets: Vec<&str> = if revs.is_empty() { vec!["HEAD"] } else { revs.to_vec() };
     for rev in &targets {
+        // ```c
+        // static void describe(const char *arg, int last_one)
+        // {
+        //         …
+        //         if (debug)
+        //                 fprintf(stderr, _("describe %s\n"), arg);
+        // ```
+        //
+        // (`builtin/describe.c:565-569`.) The very first thing `describe()` does,
+        // ahead of resolving the operand — so it is printed even for a name that
+        // turns out not to be a valid object.
+        if opts.debug {
+            eprintln!("describe {rev}");
+        }
         // `repo_get_oid` takes a full-length hex name as the id without
         // consulting the odb, so an absent-but-well-formed id is *not* an
         // invalid object name here; it fails below, where neither
@@ -368,6 +385,8 @@ struct Options {
     max_candidates: usize,
     abbrev: Option<i64>,
     dirty_mark: Option<String>,
+    /// `--debug`: `describe.c` narrates the search on stderr.
+    debug: bool,
 }
 
 /// `--match`/`--exclude` glob filter, a port of the accept-test in
@@ -474,6 +493,24 @@ fn describe_commit_to_string(
     // parent-lookup reporting `describe_commit()` gets from `repo_parse_commit()`
     // cannot reach it either). [`build_names`] covers both selector cases, and
     // [`resolve`] owns the graph.
+    // ```c
+    // n = find_commit_name(&cmit->object.oid);
+    // if (n && (tags || all || n->prio == 2)) {
+    //         … display_name(n); … return;
+    // }
+    // …
+    // if (debug)
+    //         fprintf(stderr, _("No exact match on refs or tags, searching to describe\n"));
+    // ```
+    //
+    // (`builtin/describe.c:571-600`.) The line is the boundary between the two
+    // halves of `describe_commit()`: a name sitting on the commit itself is printed
+    // without any search, and everything below it is the candidate walk. The gate
+    // is exactly "is this commit in the name map", because the map only ever holds
+    // the priorities the selector admits.
+    if opts.debug && !build_names(repo, opts.select, filter)?.contains_key(&commit_oid) {
+        eprintln!("No exact match on refs or tags, searching to describe");
+    }
     let outcome = resolve(
         repo,
         &commit_oid,
@@ -725,10 +762,53 @@ fn format_outcome(
     // gix shortens ref names (`refs/heads/main` -> `main`); `--all` wants git's
     // form, which only strips `refs/`. Rewrite before formatting so the long form
     // (`heads/main-2-gabc1234`) picks the prefixed name up as well.
+    // ```c
+    // if (n->tag && !n->name_checked) {
+    //         if (strcmp(n->tag->tag, all ? n->path + 5 : n->path))
+    //                 warning(_("tag '%s' is externally known as '%s'"),
+    //                         all ? n->path + 5 : n->path, n->tag->tag);
+    //         n->name_checked = 1;
+    // }
+    //
+    // if (n->tag) {
+    //         if (all) strbuf_addstr(&dst, "tags/");
+    //         strbuf_addstr(&dst, n->tag->tag);
+    // } else {
+    //         strbuf_addstr(&dst, n->path);
+    // }
+    // ```
+    //
+    // (`display_name()`, builtin/describe.c:112-134.) An annotated tag is printed
+    // under the name recorded *inside* the tag object, not under the ref that
+    // reached it — so a lightweight `refs/tags/light-to-tag` pointing at an
+    // annotated tag object whose own name is `inner` describes as `inner`, with a
+    // warning naming both. gitoxide carries the ref name through instead, which
+    // printed `light-to-tag-2-g725c7d5` where stock prints `inner-2-g725c7d5`.
+    if let Some(name) = outcome.name.as_deref() {
+        if let Some(embedded) = annotated_tag_name(repo, name) {
+            if embedded != name {
+                eprintln!(
+                    "warning: tag '{}' is externally known as '{}'",
+                    name, embedded
+                );
+            }
+            let shown: BString = match opts.prefix_names {
+                true => {
+                    let mut b = BString::from(b"tags/".to_vec());
+                    b.extend_from_slice(&embedded);
+                    b
+                }
+                false => embedded,
+            };
+            outcome.name = Some(Cow::Owned(shown));
+        }
+    }
     if opts.prefix_names {
         let prefixed = outcome
             .name
             .as_deref()
+            // Already carries git's `tags/` prefix when it came off a tag object.
+            .filter(|name| !name.starts_with(b"tags/"))
             .and_then(|name| prefixed_name(repo, name));
         if let Some(full) = prefixed {
             outcome.name = Some(Cow::Owned(full));
@@ -758,10 +838,20 @@ fn format_outcome(
 
 /// git's abbreviation clamp: below `MINIMUM_ABBREV` it widens to 4, above the hash
 /// width it saturates, and an absent value means "let the repo size decide".
+///
+/// `--abbrev=<n>` is a **floor**, not a width: `describe_commit()` renders the tail
+/// with `repo_find_unique_abbrev(oid, abbrev)`, which starts at `n` and widens
+/// until the prefix names one object. On a repository where two objects share four
+/// hex characters, stock `git describe --always --abbrev=4` prints five for the
+/// colliding id and four for every other. Cutting at `n` printed the ambiguous
+/// four.
 fn hex_len(id: &gix::Id<'_>, abbrev: Option<i64>) -> Result<usize> {
     let full = id.kind().len_in_hex();
     Ok(match abbrev {
-        Some(n) => (n.max(4) as usize).min(full),
+        Some(n) => {
+            let floor = (n.max(4) as usize).min(full);
+            crate::abbrev::unique_abbrev(id.repo, &id.detach(), floor).len()
+        }
         None => id.shorten()?.hex_len(),
     })
 }
@@ -1167,30 +1257,70 @@ fn collect_tips(
         if taggerdate == i64::MAX {
             taggerdate = commit_info(cache, repo, commit)?.date;
         }
-        tips.push(Tip { commit, refname: tip_refname(full.as_bstr(), all), taggerdate, from_tag, deref });
+        tips.push(Tip {
+            commit,
+            refname: tip_refname(repo, full.as_bstr(), all),
+            taggerdate,
+            from_tag,
+            deref,
+        });
     }
     Ok(tips)
 }
 
-/// name-rev's `add_to_tip_table()` refname shortening. Under `!all` (tags-only,
-/// name-only) tags shorten to their bare name; under `--all` git strips `refs/heads/`
-/// else `refs/`.
-fn tip_refname(full: &BStr, all: bool) -> String {
-    let short: &BStr = if !all {
-        full.strip_prefix(b"refs/tags/").map(|r| r.as_bstr()).unwrap_or(full)
+/// ```c
+/// static void add_to_tip_table(const struct object_id *oid, const char *refname,
+///                              int shorten_unambiguous, …)
+/// {
+///         char *short_refname = NULL;
+///
+///         if (shorten_unambiguous)
+///                 short_refname = refs_shorten_unambiguous_ref(get_main_ref_store(the_repository),
+///                                                              refname, 0);
+///         else if (skip_prefix(refname, "refs/heads/", &refname))
+///                 ; /* refname already advanced */
+///         else
+///                 skip_prefix(refname, "refs/", &refname);
+/// ```
+///
+/// (`builtin/name-rev.c:311-330`.) `shorten_unambiguous` is
+/// `tags_only && name_only`, which `describe --contains` sets because it passes
+/// both — so the tags-only arm is **not** a plain `refs/tags/` strip. It is the
+/// reverse of `ref_rev_parse_rules`: the shortest suffix that still resolves back
+/// to this ref and no other. In a repository holding `refs/top`, `refs/heads/top`
+/// and `refs/tags/top`, the tag shortens to `tags/top`, because `top` alone would
+/// name `refs/top`. Stripping the prefix unconditionally printed `top~1` where
+/// stock prints `tags/top~1`.
+fn tip_refname(repo: &gix::Repository, full: &BStr, all: bool) -> String {
+    let short: Vec<u8> = if !all {
+        crate::refname::shorten_unambiguous(repo, full, false)
     } else if let Some(rest) = full.strip_prefix(b"refs/heads/") {
-        rest.as_bstr()
+        rest.to_vec()
     } else if let Some(rest) = full.strip_prefix(b"refs/") {
-        rest.as_bstr()
+        rest.to_vec()
     } else {
-        full
+        full.to_vec()
     };
-    short.to_str_lossy().into_owned()
+    short.as_bstr().to_str_lossy().into_owned()
 }
 
 /// Map a gix-shortened ref name back to git's `--all` spelling: the full name with
 /// only `refs/` stripped. On a name collision git's `replace_name()` order applies —
 /// annotated tag, then lightweight tag, then anything else.
+/// The name recorded inside the annotated tag object `short` names, or `None` when
+/// `refs/tags/<short>` is not a ref that reaches one.
+///
+/// This is `n->tag->tag` in [`display_name`'s](https://git-scm.com/) terms: the
+/// `tag ` header of the object, which a tag can be *created* with and then have
+/// the ref renamed out from under, and which `git describe` prefers over the ref
+/// name in every case where the two disagree.
+fn annotated_tag_name(repo: &gix::Repository, short: &BStr) -> Option<BString> {
+    let reference = repo.find_reference(format!("refs/tags/{short}").as_str()).ok()?;
+    let target = reference.target().try_id()?.to_owned();
+    let tag = repo.find_object(target).ok()?.try_into_tag().ok()?;
+    Some(BString::from(tag.decode().ok()?.name.to_vec()))
+}
+
 fn prefixed_name(repo: &gix::Repository, short: &BStr) -> Option<BString> {
     let platform = repo.references().ok()?;
     let mut best: Option<(u8, BString)> = None;

@@ -533,6 +533,13 @@ fn ambiguity_base(spec: &str) -> &str {
     strip_navigation(object_part(spec))
 }
 
+/// [`ambiguity_base`] for the two commands that hold `get_oid_basic()`'s flags
+/// themselves and so reach the diagnostics directly rather than through
+/// [`resolve_with_flags`].
+pub fn ambiguity_base_of(spec: &str) -> &str {
+    ambiguity_base(spec)
+}
+
 /// The suffix reduction `get_oid_1()` and `peel_onion()` run between them, taken
 /// to a fixed point: the name `get_oid_basic()` is finally handed.
 ///
@@ -816,7 +823,14 @@ pub fn resolve_with_flags(
         // `HEAD@{<old date>}^{blob}` and answers with the oldest entry.
         reflog_diagnostics(repo, spec);
     }
-    resolve_quiet(repo, spec)
+    let resolved = resolve_quiet(repo, spec);
+    if resolved.is_none() {
+        // `get_short_oid()` is the last thing `get_oid_1()` tries
+        // (`object-name.c:1134`), so its ambiguity report belongs after every
+        // other diagnostic and only for a name nothing else answered.
+        short_oid_ambiguous(repo, ambiguity_base(spec), false);
+    }
+    resolved
 }
 
 /// Everything `get_oid_basic()`'s reflog branch says about one operand
@@ -958,6 +972,7 @@ pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     repo.rev_parse_single(canonical_spec(repo, spec).as_ref()).ok().map(|id| id.detach())
 }
 
+
 /// Whether the reduction `repo_get_oid()` performs lands `get_oid_basic()` on a
 /// reflog operand, so that [`reflog_spec_oid`] and not gitoxide's revspec grammar
 /// is what answers for `spec`.
@@ -1044,6 +1059,9 @@ pub fn canonical_spec<'a>(
             canonical_spec(repo, &rewritten).into_owned(),
         );
     }
+    if let Some(rewritten) = hex_of_other_hash_as_refname(repo, spec) {
+        return std::borrow::Cow::Owned(rewritten);
+    }
     match crate::objpath::canonical_paths(repo, spec) {
         Ok(std::borrow::Cow::Borrowed(s)) => canonical_at_marks(s),
         Ok(std::borrow::Cow::Owned(s)) => {
@@ -1051,6 +1069,44 @@ pub fn canonical_spec<'a>(
         }
         Err(_) => canonical_at_marks(spec),
     }
+}
+
+/// `get_oid_hex()` decodes with `the_hash_algo->hexsz` and nothing else
+/// (`hex.c:76-84`), so a 64-hex name in a SHA-1 repository — or a 40-hex one in a
+/// SHA-256 repository — never takes `get_oid_basic()`'s object-name branch. git
+/// carries on to `repo_dwim_ref()` and the name is a candidate *refname*, which is
+/// why stock 2.55.0 answers `fatal: Not a valid object name <64-hex>` rather than
+/// producing the id.
+///
+/// gitoxide's rev-spec parser decodes every hash length it knows, and `gix-odb`'s
+/// loose store then asserts the id's kind against the repository's
+/// (`src/ported/gix-odb/src/store_impls/loose/find.rs:34`) — so handing it such a
+/// name aborts the process instead of answering, which is what `cat-file -t`,
+/// `-s`, `-p` and `--batch` all did. Rewriting the operand to the full ref name it
+/// dwims to keeps the ref case working (the slashes stop gitoxide reading it as
+/// hex) and reports the miss as a miss everywhere else.
+///
+/// `None` leaves the operand to the ordinary rewrites; `Some` is the spelling
+/// gitoxide may safely be handed.
+fn hex_of_other_hash_as_refname(repo: &gix::Repository, spec: &str) -> Option<String> {
+    let base = ambiguity_base(spec);
+    if !matches!(base.len(), 40 | 64)
+        || base.len() == repo.object_hash().len_in_hex()
+        || !base.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let suffix = spec.strip_prefix(base)?;
+    // `refs_found`'s order: the first `ref_rev_parse_rules` entry that matches is
+    // the ref git resolves the name to.
+    let full = crate::porcelain::rev_parse::dwim_ref_matches(repo, base).into_iter().next();
+    Some(match full {
+        Some(name) => format!("{name}{suffix}"),
+        // No ref of that name, so `get_oid_basic()` has nothing left to try. A
+        // spelling that cannot decode and cannot exist makes the caller see the
+        // miss rather than an abort.
+        None => format!("refs/{base}{suffix}"),
+    })
 }
 
 /// Whether `spec` names an object `handle_commit()` (`revision.c`) declines to
@@ -3043,4 +3099,191 @@ fn reflog_entries(
         out.push((line.previous_oid, line.signature.time));
     }
     Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// `get_short_oid()`'s ambiguity report (object-name.c:534-566)
+// ---------------------------------------------------------------------------
+
+/// `get_short_oid()`'s report for a hex prefix that names more than one object.
+///
+/// ```c
+/// if (!quietly && (status == SHORT_NAME_AMBIGUOUS)) {
+///         struct oid_array collect = OID_ARRAY_INIT;
+///
+///         error(_("short object ID %s is ambiguous"), ds.hex_pfx);
+///
+///         /*
+///          * We may still have ambiguity if we simply saw a series of
+///          * candidates that did not satisfy our hint function. In
+///          * that case, we still want to show them, so disable the hint
+///          * function entirely.
+///          */
+///         if (!ds.ambiguous)
+///                 ds.fn = NULL;
+///
+///         advise(_("The candidates are:"));
+///         repo_for_each_abbrev(ds.repo, ds.hex_pfx, GET_OID_QUIETLY, collect_ambiguous, &collect);
+///         QSORT_S(collect.oid, collect.nr, sort_ambiguous, ds.repo);
+///         oid_array_for_each(&collect, show_ambiguous_object, &ds);
+/// }
+/// ```
+///
+/// It is the *last* thing `get_oid_1()` tries, so it speaks only for a name that
+/// nothing else resolved — and it speaks before the caller's own "not a valid
+/// object name"/"ambiguous argument", which is why it is a separate call rather
+/// than part of a resolution result.
+///
+/// `ds.fn` is `core.disambiguate`'s filter. Two candidates that both pass it are
+/// listed as they are; a filter that leaves *none* is switched off for the listing
+/// (the comment above), so `-c core.disambiguate=commit git rev-parse <two blobs>`
+/// names both blobs. A filter that leaves exactly one is not ambiguous at all and
+/// never reaches here.
+///
+/// Returns whether anything was printed.
+pub fn short_oid_ambiguous(repo: &gix::Repository, name: &str, quietly: bool) -> bool {
+    // `get_short_oid()` refuses the name outright outside `[MINIMUM_ABBREV, hexsz]`
+    // (`object-name.c:503-506`), so those never reach the report.
+    if name.len() < crate::abbrev::MINIMUM_ABBREV
+        || name.len() > repo.object_hash().len_in_hex()
+        || !name.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let Ok(prefix) = gix::hash::Prefix::from_hex(&name.to_ascii_lowercase()) else {
+        return false;
+    };
+    let mut candidates = std::collections::HashSet::new();
+    if repo.objects.lookup_prefix(prefix, Some(&mut candidates)).is_err() {
+        return false;
+    }
+    if candidates.len() < 2 {
+        return false;
+    }
+    let kind_of = |id: &ObjectId| repo.find_header(*id).ok().map(|h| h.kind());
+    let mut listed: Vec<ObjectId> = match disambiguate_filter(repo) {
+        Some(want) => {
+            let passed: Vec<ObjectId> =
+                candidates.iter().copied().filter(|id| kind_passes(repo, id, want)).collect();
+            match passed.len() {
+                // `finish_object_disambiguation()` answered, so the name resolved.
+                1 => return false,
+                // `ds.fn = NULL`: nothing satisfied the hint, list everything.
+                0 => candidates.into_iter().collect(),
+                _ => passed,
+            }
+        }
+        None => candidates.into_iter().collect(),
+    };
+    if quietly {
+        return true;
+    }
+    // `sort_ambiguous()` (`object-name.c:453-484`): tags, then commits, then trees
+    // and blobs; inside one type, `oidcmp()`.
+    listed.sort_by_key(|id| (type_sort_order(kind_of(id)), *id));
+
+    eprintln!("error: short object ID {name} is ambiguous");
+    eprintln!("hint: The candidates are:");
+    for id in &listed {
+        let kind = kind_of(id);
+        // `repo_find_unique_abbrev(oid, DEFAULT_ABBREV)`, which widens past a
+        // collision rather than cutting at the requested width.
+        let hex = crate::abbrev::unique_abbrev(repo, id, crate::abbrev::FALLBACK_DEFAULT_ABBREV);
+        let type_name = match kind {
+            Some(gix::object::Kind::Tag) => "tag",
+            Some(gix::object::Kind::Commit) => "commit",
+            Some(gix::object::Kind::Tree) => "tree",
+            Some(gix::object::Kind::Blob) => "blob",
+            None => "unknown type",
+        };
+        eprintln!("hint:   {hex} {type_name}{}", ambiguous_object_desc(repo, id, kind));
+    }
+    true
+}
+
+/// `show_ambiguous_object()`'s `desc` (`object-name.c:412-451`): a commit gets
+/// `" %ad - %s"` rendered with `DATE_SHORT`, a tag gets `" %s"` of its tag name,
+/// and everything else gets nothing.
+fn ambiguous_object_desc(
+    repo: &gix::Repository,
+    id: &ObjectId,
+    kind: Option<gix::object::Kind>,
+) -> String {
+    match kind {
+        Some(gix::object::Kind::Commit) => {
+            let Ok(commit) = repo.find_object(*id).ok().and_then(|o| o.try_into_commit().ok()).ok_or(()) else {
+                return String::new();
+            };
+            let Ok(decoded) = commit.decode() else { return String::new() };
+            let Ok(author) = decoded.author() else { return String::new() };
+            let time = author.time().unwrap_or_default();
+            // git's `tz` is the `[-+]HHMM` integer off the object header;
+            // `gix_actor` carries the offset in seconds.
+            let tz = (time.offset / 3600) * 100 + (time.offset % 3600) / 60;
+            let date = crate::showdate::show_date(
+                time.seconds,
+                tz,
+                &crate::showdate::DateMode::new(crate::showdate::DateType::Short),
+                0,
+            );
+            let subject = decoded.message().summary().to_string();
+            format!(" {date} - {subject}")
+        }
+        Some(gix::object::Kind::Tag) => {
+            let Ok(tag) = repo.find_object(*id).ok().and_then(|o| o.try_into_tag().ok()).ok_or(()) else {
+                return String::new();
+            };
+            match tag.decode() {
+                Ok(decoded) => format!(" {}", decoded.name),
+                Err(_) => String::new(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// `type_sort_order()` (`object-name.c:453-470`): tags first, then commits, then
+/// trees and blobs together, then anything unreadable.
+fn type_sort_order(kind: Option<gix::object::Kind>) -> u8 {
+    match kind {
+        Some(gix::object::Kind::Tag) => 0,
+        Some(gix::object::Kind::Commit) => 1,
+        Some(gix::object::Kind::Tree) => 2,
+        Some(gix::object::Kind::Blob) => 3,
+        None => 4,
+    }
+}
+
+/// `core.disambiguate`'s value as the object kind it accepts, or `None` for
+/// `none`/absent/unreadable — the settings that filter nothing.
+///
+/// `committish` and `treeish` peel, so they are not a kind test on their own;
+/// [`kind_passes`] is what applies them.
+fn disambiguate_filter(repo: &gix::Repository) -> Option<&'static str> {
+    let value = repo.config_snapshot().string("core.disambiguate")?;
+    let value = value.to_string();
+    match value.as_str() {
+        "commit" => Some("commit"),
+        "committish" => Some("committish"),
+        "tree" => Some("tree"),
+        "treeish" => Some("treeish"),
+        "blob" => Some("blob"),
+        _ => None,
+    }
+}
+
+/// The `disambiguate_*_only()` family (`object-name.c:340-400`): whether one
+/// candidate satisfies `core.disambiguate`.
+fn kind_passes(repo: &gix::Repository, id: &ObjectId, want: &str) -> bool {
+    let Ok(kind) = repo.find_header(*id).map(|h| h.kind()) else { return false };
+    use gix::object::Kind::*;
+    match want {
+        "commit" => kind == Commit,
+        // A tag peels towards a commit, so it is committish too.
+        "committish" => matches!(kind, Commit | Tag),
+        "tree" => kind == Tree,
+        "treeish" => matches!(kind, Tree | Commit | Tag),
+        "blob" => kind == Blob,
+        _ => true,
+    }
 }

@@ -811,6 +811,12 @@ fn run_command(argv: &[String]) -> ExitCode {
     if let Some(code) = setup::command_line_config_gate(&sub, &rest) {
         return code;
     }
+    // `setup_explicit_git_dir()` (setup.c:1176-1190): with `$GIT_DIR` set there is
+    // no walk, so a directory that is not a repository is reported by name rather
+    // than as a failed search.
+    if let Some(code) = setup::explicit_git_dir_gate(&sub) {
+        return code;
+    }
     // `safe.bareRepository` (setup.c:1676-1678), one line ahead of ownership.
     if let Some(code) = disallowed_bare_repository(&sub) {
         return code;

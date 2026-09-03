@@ -530,6 +530,16 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // `die()` inside `get_oid()`, ahead of any path interpretation — nothing
         // has been echoed yet at this point, which is what keeps stdout empty.
         if resolved.is_none() {
+            // `get_short_oid()`'s ambiguity report, which `get_oid_1()` reaches
+            // last (`object-name.c:1134`) and so speaks only for a name nothing
+            // else resolved — before rev-parse's own "ambiguous argument"/"Needed
+            // a single revision". `--quiet` is git's `GET_OID_QUIETLY`, which
+            // silences it (`builtin/rev-parse.c:1010`).
+            crate::objname::short_oid_ambiguous(
+                &repo,
+                crate::objname::ambiguity_base_of(crate::objname::uninteresting_mark(arg).0),
+                o.quiet,
+            );
             // `peel_onion()`'s `error()` is *not* raised here. It comes out of the
             // resolution itself — [`warn_peel_type`] above — because `get_oid_1()`
             // carries on after it and the operand may still answer, which is how
@@ -1278,7 +1288,7 @@ fn query(
             //   set outright, so those print the absolute private git dir even at the top.
             // * `.` from `setup_bare_git_dir()` when the cwd *is* the git directory.
             // * the absolute path in every other case.
-            emit(out, git_dir_display(repo).as_os_str().as_encoded_bytes())?;
+            emit(out, gitdir_string(repo, paths).as_os_str().as_encoded_bytes())?;
         }
         Query::AbsoluteGitDir => emit(out, absolute(repo.git_dir()).as_os_str().as_encoded_bytes())?,
         Query::GitCommonDir => {
@@ -1359,22 +1369,6 @@ fn absolute(path: &std::path::Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
-/// The git directory the way `--git-dir` prints it, which is the string `setup.c` left in
-/// `$GIT_DIR`: the environment value verbatim when it was given, `.git` when discovery found a
-/// plain `.git` directory at the top of the work tree we stand in, `.` when the cwd *is* the git
-/// directory, and the absolute path otherwise.
-fn git_dir_display(repo: &gix::Repository) -> std::path::PathBuf {
-    if let Some(dir) = std::env::var_os("GIT_DIR") {
-        return dir.into();
-    }
-    let git_dir = absolute(repo.git_dir());
-    match toplevel(repo) {
-        Some(top) if is_cwd(&top) && git_dir == top.join(".git") => ".git".into(),
-        _ if is_cwd(&git_dir) => ".".into(),
-        _ => git_dir,
-    }
-}
-
 // `is_inside_git_dir()` and `is_inside_work_tree()` are shared with the other commands that ask
 // setup the same questions — see [`crate::setup`].
 use crate::setup::{is_inside_git_dir, is_inside_work_tree, prefix};
@@ -1387,13 +1381,6 @@ const USAGE: &str = r#"usage: git rev-parse --parseopt [<options>] -- [<args>...
 
 Run "git rev-parse --parseopt -h" for more information on the first usage.
 "#;
-
-fn is_cwd(dir: &std::path::Path) -> bool {
-    std::env::current_dir()
-        .ok()
-        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
-        .is_some_and(|cwd| cwd == dir)
-}
 
 fn is_worktree_path(repo: &gix::Repository, arg: &str) -> bool {
     if arg.is_empty() {
@@ -2174,15 +2161,26 @@ fn print_resolved_git_dir(out: &mut impl Write, suspect: &str) -> Result<bool> {
         writeln!(out, "{suspect}")?;
         return Ok(true);
     }
-    match read_gitfile(path) {
-        Some(target) => {
+    // `resolve_gitdir()` is `resolve_gitdir_gently(path, NULL)`, and the `NULL`
+    // makes `read_gitfile_gently()` *die* on six of its eight outcomes rather than
+    // report "no gitfile" (`setup.c:920-940`). So a regular file that is not a
+    // gitfile ends at `invalid gitfile format:` here, and only the two outcomes
+    // that mean "there is nothing gitfile-shaped at this path" — it does not exist,
+    // or it is not a regular file — reach rev-parse's own `not a gitdir '%s'`.
+    match read_gitfile_gently(path) {
+        Ok(Some(target)) => {
             out.write_all(target.as_os_str().as_encoded_bytes())?;
             out.write_all(b"\n")?;
             Ok(true)
         }
-        None => {
+        Ok(None) => {
             out.flush()?;
             eprintln!("fatal: not a gitdir '{suspect}'");
+            Ok(false)
+        }
+        Err(err) => {
+            out.flush()?;
+            eprintln!("fatal: {}", gitfile_error_message(path, err));
             Ok(false)
         }
     }
@@ -2220,7 +2218,7 @@ fn print_resolved_git_dir(out: &mut impl Write, suspect: &str) -> Result<bool> {
 /// `refs` in the *common* directory — which is what makes a linked worktree's
 /// private administrative directory (`.git/worktrees/<id>`, which has neither) a
 /// git directory all the same.
-fn is_git_directory(dir: &std::path::Path) -> bool {
+pub(crate) fn is_git_directory(dir: &std::path::Path) -> bool {
     if !validate_headref(&dir.join("HEAD")) {
         return false;
     }
@@ -2297,19 +2295,81 @@ fn validate_headref(path: &std::path::Path) -> bool {
 /// resolved against the gitfile's own directory when it is relative, and the answer
 /// is the symlink-resolved absolute path rather than the stored text.
 fn read_gitfile(file: &std::path::Path) -> Option<std::path::PathBuf> {
-    if !file.symlink_metadata().ok()?.is_file() {
-        return None;
+    read_gitfile_gently(file).ok().flatten()
+}
+
+/// `read_gitfile_gently()`'s error codes, in the wording
+/// `read_gitfile_error_die()` (`setup.c:920-940`) gives each of them.
+///
+/// `READ_GITFILE_ERR_STAT_FAILED` and `READ_GITFILE_ERR_NOT_A_FILE` are absent
+/// deliberately: `read_gitfile_error_die()` breaks out of its switch for those two
+/// without dying, because "there is no gitfile here" is the ordinary answer for a
+/// directory or a path that does not exist. They are `Ok(None)`.
+pub(crate) fn gitfile_error_message(file: &std::path::Path, err: GitfileError) -> String {
+    let path = file.display();
+    match err {
+        GitfileError::OpenFailed(e) => format!("error opening '{path}': {e}"),
+        GitfileError::TooLarge => format!("too large to be a .git file: '{path}'"),
+        GitfileError::ReadFailed => format!("error reading {path}"),
+        GitfileError::InvalidFormat => format!("invalid gitfile format: {path}"),
+        GitfileError::NoPath => format!("no path in gitfile: {path}"),
+        GitfileError::NotARepo(dir) => format!("not a git repository: {}", dir.display()),
     }
-    let text = std::fs::read_to_string(file).ok()?;
-    let target = text.strip_prefix("gitdir: ")?.trim_end_matches(['\n', '\r']);
+}
+
+/// The `READ_GITFILE_ERR_*` codes that `read_gitfile_error_die()` turns into a
+/// `die()`.
+#[derive(Debug)]
+pub(crate) enum GitfileError {
+    OpenFailed(std::io::Error),
+    TooLarge,
+    ReadFailed,
+    InvalidFormat,
+    NoPath,
+    NotARepo(std::path::PathBuf),
+}
+
+/// `read_gitfile_gently()` (`setup.c:956-1035`) with its error code kept rather
+/// than collapsed into "no gitfile": the caller that passes `NULL` for
+/// `return_error_code` dies on six of the eight outcomes, and the two it does not
+/// die on are the ones that mean "this is not a gitfile at all".
+pub(crate) fn read_gitfile_gently(
+    file: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, GitfileError> {
+    // `if (stat(path, &st))` / `if (!S_ISREG(st.st_mode))`: both are non-fatal.
+    let Ok(meta) = std::fs::metadata(file) else { return Ok(None) };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    // `const int max_file_size = 1 << 20;`
+    if meta.len() > (1 << 20) {
+        return Err(GitfileError::TooLarge);
+    }
+    let data = std::fs::read(file).map_err(GitfileError::OpenFailed)?;
+    let Some(rest) = data.strip_prefix(b"gitdir: ") else {
+        return Err(GitfileError::InvalidFormat);
+    };
+    let target = rest
+        .iter()
+        .rposition(|b| !matches!(b, b'\n' | b'\r'))
+        .map_or(&[][..], |end| &rest[..=end]);
+    // `if (len < 9)`, i.e. nothing after the eight-byte prefix.
     if target.is_empty() {
-        return None;
+        return Err(GitfileError::NoPath);
     }
-    let mut path = std::path::PathBuf::from(target);
+    let mut path = std::path::PathBuf::from(std::ffi::OsString::from(
+        String::from_utf8_lossy(target).into_owned(),
+    ));
     if path.is_relative() {
-        path = file.parent()?.join(path);
+        match file.parent() {
+            Some(parent) => path = parent.join(path),
+            None => return Err(GitfileError::NotARepo(path)),
+        }
     }
-    is_git_directory(&path).then(|| std::fs::canonicalize(&path).unwrap_or(path))
+    if !is_git_directory(&path) {
+        return Err(GitfileError::NotARepo(path));
+    }
+    Ok(Some(std::fs::canonicalize(&path).unwrap_or(path)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2360,6 +2420,9 @@ struct PathCtx {
     /// git's `prefix`, slash-terminated, or `None` when the command was already run
     /// at `root`.
     prefix: Option<String>,
+    /// `repo->different_commondir`, which is what `print_path()`'s
+    /// `DEFAULT_RELATIVE_IF_SHARED` reads — see [`different_commondir`].
+    different_commondir: bool,
 }
 
 impl PathCtx {
@@ -2387,7 +2450,7 @@ impl PathCtx {
             .and_then(|cwd| cwd.strip_prefix(&root).ok().map(std::path::Path::to_path_buf))
             .filter(|rel| !rel.as_os_str().is_empty())
             .map(|rel| format!("{}/", rel.display()));
-        PathCtx { root, prefix }
+        PathCtx { root, prefix, different_commondir: different_commondir(repo) }
     }
 
     /// `strbuf_realpath_forgiving()`: resolve as much of `path` as exists and keep
@@ -2466,11 +2529,28 @@ fn print_path(
             Some(base.as_os_str().as_encoded_bytes()),
         )
     } else if shared_default {
-        // git compares the *stored* strings here: a relative `prefix` against a
-        // relative git-directory path is what turns `.git/HEAD` into `../.git/HEAD`
-        // one directory down, and an absolute git directory (a linked worktree)
-        // shares no root with it and is printed whole.
-        relative_path(&text, ctx.prefix.as_deref().map(str::as_bytes))
+        // `DEFAULT_RELATIVE_IF_SHARED` relativizes only when the common directory
+        // *is* the git directory — a linked worktree's, or one named by
+        // `$GIT_COMMON_DIR`, is printed as it stands. Measured against stock
+        // 2.55.0: from a subdirectory of a plain checkout `--git-common-dir` is
+        // `../.git` and `--git-path HEAD` is `../.git/HEAD`, while the same two in
+        // a linked worktree's subdirectory are the absolute paths.
+        //
+        // With no prefix there is nothing to measure against and the stored string
+        // is printed unchanged, which is what `--git-path HEAD` inside `.git/refs`
+        // shows: the absolute path, not the `HEAD` a climb from the git directory
+        // would produce.
+        match ctx.prefix.as_deref() {
+            Some(prefix) if !ctx.different_commondir => {
+                let abs = ctx.realpath(path);
+                let base = ctx.root.join(prefix);
+                relative_path(
+                    abs.as_os_str().as_encoded_bytes(),
+                    Some(base.as_os_str().as_encoded_bytes()),
+                )
+            }
+            _ => text,
+        }
     } else {
         ctx.realpath(path).as_os_str().as_encoded_bytes().to_vec()
     };
@@ -2600,22 +2680,145 @@ fn git_path(repo: &gix::Repository, ctx: &PathCtx, name: &str) -> std::path::Pat
     std::path::PathBuf::from(buf)
 }
 
-/// The string `setup_git_directory()` leaves in `repo->gitdir`: `$GIT_DIR` verbatim
-/// when it was given, `.` when git's own working directory *is* the git directory,
-/// `.git` for a plain checkout, and the absolute path in every other case (a linked
-/// worktree, a submodule, a `--git-dir` elsewhere).
-fn gitdir_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
-    if let Some(dir) = std::env::var_os("GIT_DIR") {
-        return dir.into();
+/// The string `setup_git_directory()` leaves in `repo->gitdir`.
+///
+/// git does not store a canonical path there; it stores whatever the setup arm it
+/// took was handed, and `--git-dir`/`--git-common-dir`/`--git-path` all print that
+/// string. The three arms (`setup.c:1170-1330`):
+///
+/// | arm | string |
+/// |---|---|
+/// | `setup_explicit_git_dir()` — `$GIT_DIR` set, which is where `git.c` also puts `--git-dir` | `$GIT_DIR` verbatim, or the gitfile's target; realpath'd only when the cwd is *inside* the work tree |
+/// | `setup_discovered_git_dir()` — a `.git` found by walking up | `.git` when the cwd is the directory it was found in, else the realpath |
+/// | `setup_bare_git_dir()` — the cwd, or an ancestor, *is* a git directory | `.` when the cwd is that directory, else its absolute path |
+///
+/// The distinction is observable everywhere: `git --git-dir=../.git rev-parse
+/// --git-common-dir` from a subdirectory answers `../.git`, and with
+/// `GIT_WORK_TREE` pointing elsewhere `git rev-parse --git-dir` answers `.git`
+/// rather than the absolute path, because the cwd is then *outside* the work tree
+/// and `set_git_dir()` is called with `make_realpath = 0`.
+fn gitdir_string(repo: &gix::Repository, _ctx: &PathCtx) -> std::path::PathBuf {
+    let cwd = setup_cwd();
+    match std::env::var_os("GIT_DIR") {
+        Some(env) => {
+            let env = std::path::PathBuf::from(env);
+            // `read_gitfile()` replaces a `gitdir: <path>` file with the
+            // symlink-resolved directory it names (`setup.c:1176-1180`).
+            let stored = read_gitfile(&env).unwrap_or(env);
+            explicit_gitdir_string(repo, stored, &cwd)
+        }
+        None => discovered_gitdir_string(repo, &cwd),
     }
+}
+
+/// git's `cwd` for setup: `strbuf_getcwd()`, symlink-resolved by the kernel.
+fn setup_cwd() -> std::path::PathBuf {
+    std::env::current_dir().map(|c| absolute(&c)).unwrap_or_default()
+}
+
+/// The tail of `setup_explicit_git_dir()` (`setup.c:1197-1220`):
+///
+/// ```c
+/// worktree = get_git_work_tree();
+/// if (!strcmp(cwd->buf, worktree)) { set_git_dir(gitdirenv, 0); return NULL; }
+/// offset = dir_inside_of(cwd->buf, worktree);
+/// if (offset >= 0) { set_git_dir(gitdirenv, 1); … }
+/// set_git_dir(gitdirenv, 0);
+/// ```
+///
+/// The `1` is `make_realpath`. So the stored string is absolutized in exactly one
+/// situation — the cwd is strictly below the work tree — and kept as written when
+/// the cwd *is* the work tree, is outside it, or there is no work tree at all.
+fn explicit_gitdir_string(
+    repo: &gix::Repository,
+    stored: std::path::PathBuf,
+    cwd: &std::path::Path,
+) -> std::path::PathBuf {
+    match explicit_work_tree(repo, &stored, cwd) {
+        Some(worktree) if cwd != worktree && cwd.starts_with(&worktree) => absolute(&stored),
+        _ => stored,
+    }
+}
+
+/// The work tree `setup_explicit_git_dir()` installs before it decides how to
+/// store the git directory (`setup.c:1160-1196`), in its own order:
+/// `$GIT_WORK_TREE`, then `core.bare`, then `core.worktree`, then
+/// `GIT_IMPLICIT_WORK_TREE`, then the cwd.
+///
+/// `core.worktree` is resolved the way git resolves it — `chdir(gitdir)`,
+/// `chdir(core.worktree)`, `getcwd()` — so a relative value is relative to the
+/// *git directory*, not to the cwd. That is what makes a submodule's
+/// `core.worktree = ../../../sub` name the checkout rather than a path beside it.
+fn explicit_work_tree(
+    repo: &gix::Repository,
+    gitdir: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if let Some(wt) = std::env::var_os("GIT_WORK_TREE") {
+        let p = std::path::PathBuf::from(wt);
+        let joined = if p.is_absolute() { p } else { cwd.join(p) };
+        // `set_git_work_tree()` normalises but does not require the directory to
+        // exist: `git rev-parse --show-toplevel` prints a work tree that is not
+        // there.
+        return Some(std::fs::canonicalize(&joined).unwrap_or(joined));
+    }
+    let config = repo.config_snapshot();
+    if config.boolean("core.bare") == Some(true) {
+        return None;
+    }
+    if let Some(value) = config.string("core.worktree") {
+        let value = std::path::PathBuf::from(std::ffi::OsString::from(value.to_string()));
+        let base = if gitdir.is_absolute() { gitdir.to_path_buf() } else { cwd.join(gitdir) };
+        let joined = if value.is_absolute() { value } else { base.join(value) };
+        return std::fs::canonicalize(&joined).ok();
+    }
+    // `GIT_IMPLICIT_WORK_TREE=0` is what `setup_bare_git_dir()` sets before it
+    // hands over, so a bare repository does not acquire the cwd as a work tree.
+    if std::env::var("GIT_IMPLICIT_WORK_TREE").as_deref() == Ok("0") {
+        return None;
+    }
+    Some(cwd.to_path_buf())
+}
+
+/// `setup_discovered_git_dir()` and `setup_bare_git_dir()` — the two arms the
+/// upward walk ends in, told apart by where the git directory sits relative to the
+/// cwd.
+///
+/// Both call `set_git_dir(gitdir, offset != cwd->len)`, i.e. they realpath the
+/// string exactly when the walk had to climb. The bare arm's un-climbed spelling
+/// is `.` rather than `.git`, which is why `git rev-parse --git-dir` inside a
+/// `.git` directory answers a single dot.
+///
+/// The work-tree arm comes first in the C: with `$GIT_WORK_TREE` or
+/// `core.worktree` set, discovery hands the string it found to
+/// `setup_explicit_git_dir()` and that function's rules apply instead.
+fn discovered_gitdir_string(
+    repo: &gix::Repository,
+    cwd: &std::path::Path,
+) -> std::path::PathBuf {
     let git_dir = absolute(repo.git_dir());
-    if git_dir == ctx.root {
-        return ".".into();
+    let dot_git = git_dir.file_name() == Some(std::ffi::OsStr::new(".git"));
+    let root = git_dir.parent().map(std::path::Path::to_path_buf);
+    // `is_git_directory(dir)` is tested *before* `<dir>/.git` in the walk
+    // (`setup.c:1621-1640`), so standing in the git directory itself takes the
+    // bare arm even in a repository that has a work tree.
+    let inside_git_dir = cwd.starts_with(&git_dir);
+    match root {
+        Some(root) if dot_git && !inside_git_dir && cwd.starts_with(&root) => {
+            let climbed = cwd != root;
+            let has_work_tree_override = std::env::var_os("GIT_WORK_TREE").is_some()
+                || repo.config_snapshot().string("core.worktree").is_some();
+            let stored: std::path::PathBuf =
+                if climbed { root.join(".git") } else { ".git".into() };
+            if has_work_tree_override {
+                return explicit_gitdir_string(repo, stored, cwd);
+            }
+            stored
+        }
+        // `setup_bare_git_dir()`.
+        _ if cwd == git_dir => ".".into(),
+        _ => git_dir,
     }
-    if git_dir == ctx.root.join(".git") {
-        return ".git".into();
-    }
-    git_dir
 }
 
 /// ```c
@@ -2684,29 +2887,58 @@ fn adjust_git_path(repo: &gix::Repository, ctx: &PathCtx, buf: &mut String, git_
     }
 }
 
-/// The string git holds in `repo->commondir`, mirroring [`gitdir_string`]: `.git`
-/// for the main checkout of a plain repository, otherwise the absolute path.
+/// The string git holds in `repo->commondir` (`repo_setup_env()`, `repository.c`).
+///
+/// ```c
+/// static int find_common_dir(struct strbuf *sb, const char *gitdir, int fromenv)
+/// {
+///         if (fromenv) {
+///                 const char *value = getenv(GIT_COMMON_DIR_ENVIRONMENT);
+///                 if (value) { strbuf_addstr(sb, value); return 1; }
+///         }
+///         return get_common_dir_noenv(sb, gitdir);
+/// }
+/// ```
+///
+/// and `get_common_dir_noenv()` (`setup.c:312-350`) reads a `commondir` file into
+/// the *real* path it names, or — when there is no such file — copies the git
+/// directory string across unchanged. So for an ordinary repository the common
+/// directory is not merely equal to the git directory, it is the same **string**:
+/// `git --git-dir=../.git rev-parse --git-common-dir` answers `../.git`, and
+/// `GIT_WORK_TREE=… git rev-parse --git-common-dir` answers `.git`.
+///
+/// The return value of `find_common_dir()` is `repo->different_commondir`, which
+/// is what `print_path()`'s `DEFAULT_RELATIVE_IF_SHARED` branches on — see
+/// [`different_commondir`].
 fn gitdir_common_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
-    let common = absolute(repo.common_dir());
-    // The discriminator is the CWD, not [`PathCtx::root`]. Standing in the git
-    // directory itself, git's stored common-dir string is `.` — but one directory
-    // deeper (`.git/refs`) setup has absolutized it and git prints the whole path,
-    // while `root` is the git directory in both places. Comparing against `root`
-    // answered `.` for every directory below `.git`, where stock answers the
-    // absolute path.
-    let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok());
-    if cwd.is_some_and(|c| c == common) {
-        return ".".into();
+    if let Some(value) = std::env::var_os("GIT_COMMON_DIR") {
+        return value.into();
     }
-    // `.git` relative to the top of the work tree, which is the string git keeps
-    // while the cwd is anywhere inside that work tree; `print_path`'s
-    // `DEFAULT_RELATIVE_IF_SHARED` turns it into `../.git` one directory down.
-    if ctx.prefix.is_some() || !is_inside_git_dir(repo) {
-        if common == ctx.root.join(".git") {
-            return ".git".into();
-        }
+    match commondir_file_target(&absolute(repo.git_dir())) {
+        Some(target) => target,
+        None => gitdir_string(repo, ctx),
     }
-    common
+}
+
+/// `repo->different_commondir`: whether the common directory was named by
+/// `$GIT_COMMON_DIR` or by a `commondir` file, rather than simply being the git
+/// directory itself.
+fn different_commondir(repo: &gix::Repository) -> bool {
+    std::env::var_os("GIT_COMMON_DIR").is_some()
+        || commondir_file_target(&absolute(repo.git_dir())).is_some()
+}
+
+/// The `commondir` file's target, resolved the way `get_common_dir_noenv()`
+/// resolves it: relative to the git directory, then `strbuf_add_real_path()`.
+fn commondir_file_target(gitdir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let target = text.trim_end_matches(['\n', '\r']);
+    if target.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(target);
+    let joined = if path.is_absolute() { path.to_path_buf() } else { gitdir.join(path) };
+    Some(std::fs::canonicalize(&joined).unwrap_or(joined))
 }
 
 /// `common_list[]` (`path.c:98-124`) through `check_common()`: whether a path below

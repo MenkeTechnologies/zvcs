@@ -1016,6 +1016,51 @@ pub fn object_directory_gate(sub: &str) -> Option<ExitCode> {
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
 }
 
+/// `setup_explicit_git_dir()`'s two refusals (setup.c:1176-1190):
+///
+/// ```c
+/// gitfile = read_gitfile(gitdirenv);
+/// if (gitfile) { gitfile = xstrdup(gitfile); gitdirenv = gitfile; }
+///
+/// if (!is_git_directory(gitdirenv)) {
+///         if (nongit_ok) { *nongit_ok = 1; free(gitfile); return NULL; }
+///         die(_("not a git repository: '%s'"), gitdirenv);
+/// }
+/// ```
+///
+/// `read_gitfile()` is the *dying* spelling — `read_gitfile_gently(path, NULL)` —
+/// so a `$GIT_DIR` that names a regular file which is not a gitfile ends at
+/// `invalid gitfile format:` rather than at the "not a git repository" line.
+///
+/// This is the branch discovery never reaches: `$GIT_DIR` (which is where `git.c`
+/// puts `--git-dir` too) short-circuits the upward walk entirely, so the message
+/// names the directory it was handed instead of the `.git` it was looking for. The
+/// port previously fell through to gitoxide's discovery, which walks up from the
+/// cwd and reports `not a git repository (or any of the parent directories): .git`
+/// — a different message, and one that describes a search git did not perform.
+///
+/// Returns the exit code to leave with, or `None` to continue.
+pub fn explicit_git_dir_gate(sub: &str) -> Option<ExitCode> {
+    if crate::NO_SETUP_VERBS.contains(&sub) {
+        return None;
+    }
+    let env = std::env::var_os("GIT_DIR")?;
+    let path = PathBuf::from(&env);
+    let target = match crate::porcelain::rev_parse::read_gitfile_gently(&path) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => path.clone(),
+        Err(err) => {
+            eprintln!("fatal: {}", crate::porcelain::rev_parse::gitfile_error_message(&path, err));
+            return Some(ExitCode::from(crate::fatal::EXIT_FATAL));
+        }
+    };
+    if crate::porcelain::rev_parse::is_git_directory(&target) {
+        return None;
+    }
+    eprintln!("fatal: {}", crate::fatal::no_repository_explicit(&path.display().to_string()));
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
 /// `access(path, X_OK)`: the caller may search the directory.
 fn access_x_ok(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -1564,4 +1609,55 @@ pub fn transport_name(url: &gix::Url) -> String {
 /// time it is about to connect.
 pub fn check_url_allowed(url: &gix::Url) -> Option<ExitCode> {
     transport_check_allowed(&transport_name(url))
+}
+
+/// `enter_repo()`'s suffix scan, up to the point it reads a gitfile
+/// (`path.c:797-817`).
+///
+/// ```c
+/// for (i = 0; suffix[i]; i++) {
+///         struct stat st;
+///         strbuf_addstr(&used_path, suffix[i]);
+///         if (!stat(used_path.buf, &st) &&
+///             (S_ISREG(st.st_mode) ||
+///             (S_ISDIR(st.st_mode) && is_git_directory(used_path.buf)))) {
+///                 strbuf_addstr(&validated_path, suffix[i]);
+///                 break;
+///         }
+///         strbuf_setlen(&used_path, baselen);
+/// }
+/// if (!suffix[i]) return NULL;
+/// gitfile = read_gitfile(used_path.buf);
+/// ```
+///
+/// The scan stops at the first candidate that is a *regular file* or a git
+/// directory — a regular file is accepted sight unseen, on the assumption that it
+/// is a gitfile — and only then reads it, with the *dying* spelling of
+/// `read_gitfile()`. So `git upload-pack README.md` ends at
+/// `fatal: invalid gitfile format: README.md`, naming the operand, rather than at
+/// the "does not appear to be a git repository" line the callers fall back to
+/// when the scan finds nothing at all.
+///
+/// `candidates` are the paths the caller would try in order, already
+/// tilde-expanded. Returns the exit code to leave with, or `None` when the caller
+/// should carry on opening the repository itself.
+pub fn enter_repo_gitfile_gate(candidates: &[PathBuf]) -> Option<ExitCode> {
+    use crate::porcelain::rev_parse::{gitfile_error_message, is_git_directory, read_gitfile_gently};
+    for candidate in candidates {
+        let Ok(meta) = std::fs::metadata(candidate) else { continue };
+        if !meta.is_file() && !(meta.is_dir() && is_git_directory(candidate)) {
+            continue;
+        }
+        // This is the candidate `enter_repo()` settled on; its `read_gitfile()`
+        // is fatal for the six outcomes that mean "this looked like a gitfile
+        // and was not one".
+        return match read_gitfile_gently(candidate) {
+            Ok(_) => None,
+            Err(err) => {
+                eprintln!("fatal: {}", gitfile_error_message(candidate, err));
+                Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+            }
+        };
+    }
+    None
 }

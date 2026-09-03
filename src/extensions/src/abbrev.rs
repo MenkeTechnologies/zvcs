@@ -103,6 +103,42 @@ pub fn parse_abbrev_arg(v: &str, hexsz: usize) -> usize {
     (wide as u32 as usize).clamp(MINIMUM_ABBREV, hexsz)
 }
 
+/// `repo_find_unique_abbrev_r()` (object-name.c:889-935): the hex prefix of `id`
+/// that is unique in this object database, starting at `len` and **widening**
+/// until nothing else shares it.
+///
+/// ```c
+/// oid_to_hex_r(hex, oid);
+/// if (len == hexsz || !len)
+///         return hexsz;
+/// …
+/// find_abbrev_len_packed(&mad);
+/// …
+/// hex[mad.cur_len] = 0;
+/// return mad.cur_len;
+/// ```
+///
+/// The widening is the part a plain truncation misses: on a repository where two
+/// objects share four hex characters, `git describe --abbrev=4` prints *five* for
+/// the colliding id and four for every other, because `--abbrev=<n>` is a floor
+/// and not a width. An id the database does not hold has nothing to disambiguate
+/// against, and git returns `len` unchanged there rather than widening to the full
+/// hash (`repo_find_cmp_by_hash()` misses and the function returns early) — which
+/// is what a gitlink's commit id does in the superproject.
+pub fn unique_abbrev(repo: &gix::Repository, id: &gix::hash::ObjectId, len: usize) -> String {
+    let hex = id.to_string();
+    let hexsz = id.kind().len_in_hex();
+    if len == 0 || len >= hexsz {
+        return hex;
+    }
+    let len = len.max(MINIMUM_ABBREV);
+    let widened = gix::odb::store::prefix::disambiguate::Candidate::new(*id, len)
+        .ok()
+        .and_then(|candidate| repo.objects.disambiguate_prefix(candidate).ok().flatten())
+        .map_or(len, |prefix| prefix.hex_len());
+    hex[..widened.min(hexsz)].to_owned()
+}
+
 /// Auto abbreviation length: `ceil(log2(objects) / 2)`, floored at 7 — the same
 /// heuristic `gix` uses for `core.abbrev = auto`.
 pub fn auto_abbrev(repo: &gix::Repository, hexsz: usize) -> usize {

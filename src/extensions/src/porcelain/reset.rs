@@ -975,6 +975,60 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `set_reflog_message()` (builtin/reset.c): the reflog text every `git reset`
+/// writes.
+///
+/// ```c
+/// const char *rla = getenv("GIT_REFLOG_ACTION");
+/// if (rla)      strbuf_addf(sb, "%s: %s", rla, action);
+/// else if (rev) strbuf_addf(sb, "reset: moving to %s", rev);
+/// else          strbuf_addf(sb, "reset: %s", action);
+/// ```
+///
+/// The variable is why one command's reset carries another command's name: a
+/// merge that rewinds through `git stash apply --index` leaves `merge <heads>:
+/// updating HEAD` rather than `reset: moving to HEAD`, because `cmd_merge` set
+/// the variable before the reset ran. Reading it here is what keeps a reset
+/// invoked *by* another verb from announcing itself as a bare reset.
+/// `GIT_REFLOG_ACTION` held for the length of one command, then put back.
+///
+/// git's own `setenv(…, 0)` is a plain non-overwriting set: the value dies with
+/// the process, and the child commands it spawns in between inherit it. This
+/// binary serves several commands from one process, so the same value has to be
+/// released when the command that set it returns — otherwise `zrepl`'s next line
+/// reflogs under the previous line's name. Restoring the prior value (rather than
+/// clearing) is what preserves the non-overwrite: `git pull` sets `pull`, the
+/// merge it calls leaves it alone, and it is still `pull` afterwards.
+pub(crate) struct ReflogAction(Option<std::ffi::OsString>);
+
+impl ReflogAction {
+    /// Set the action unless one is already in force, as `setenv(…, 0)` does.
+    pub(crate) fn set(action: String) -> Self {
+        let prior = std::env::var_os("GIT_REFLOG_ACTION");
+        if prior.is_none() {
+            std::env::set_var("GIT_REFLOG_ACTION", action);
+        }
+        Self(prior)
+    }
+}
+
+impl Drop for ReflogAction {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(prior) => std::env::set_var("GIT_REFLOG_ACTION", prior),
+            None => std::env::remove_var("GIT_REFLOG_ACTION"),
+        }
+    }
+}
+
+pub(crate) fn reflog_message(action: &str, rev: Option<&str>) -> String {
+    match (std::env::var("GIT_REFLOG_ACTION"), rev) {
+        (Ok(rla), _) if !rla.is_empty() => format!("{rla}: {action}"),
+        (_, Some(rev)) => format!("reset: moving to {rev}"),
+        (_, None) => format!("reset: {action}"),
+    }
+}
+
 /// Point `HEAD` (or the branch it references) at `target`, writing a reflog entry
 /// `reset: moving to <spec>` on both refs, exactly as `git reset` does.
 fn move_head(repo: &gix::Repository, target: ObjectId, spec: &str) -> Result<()> {
@@ -983,7 +1037,7 @@ fn move_head(repo: &gix::Repository, target: ObjectId, spec: &str) -> Result<()>
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: format!("reset: moving to {spec}").into(),
+                message: reflog_message("updating HEAD", Some(spec)).into(),
             },
             expected: PreviousValue::Any,
             new: Target::Object(target),

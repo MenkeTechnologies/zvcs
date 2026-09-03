@@ -9,7 +9,7 @@ use gix_object::{
 };
 
 use crate::tree::{
-    Conflict, ConflictIndexEntry, ConflictIndexEntryPathHint, ConflictMapping,
+    Conflict, ConflictIndexEntry, ConflictIndexEntryPathHint, ConflictMapping, DirectoryRenames,
     ConflictMapping::{Original, Swapped},
     ContentMerge, Error, Options, Outcome, Resolution, ResolutionFailure, ResolveWith,
     utils::{
@@ -201,15 +201,37 @@ where
                     }) {
                     None => {
                         if let Some((rewritten_location, ours_idx)) = rewritten_location {
-                            // `no_entry` to the index because that's not a conflict at all,
-                            // but somewhat advanced rename tracking.
-                            if should_fail_on_conflict(Conflict::with_resolution(
-                                Resolution::SourceLocationAffectedByRename {
-                                    final_location: rewritten_location.to_owned(),
-                                },
-                                (&our_changes[*ours_idx].inner, theirs, Original, outer_side),
-                                [None, None, None],
-                            )) {
+                            // git's `merge.directoryRenames` decides whether following the
+                            // rename is silent or has to be confirmed (merge-ort.c:2797-2839).
+                            // Under `conflict` — its default — the change is moved all the
+                            // same, but the path is left with one unmerged stage carrying the
+                            // side that made the change.
+                            let (moved_mode, moved_id) = theirs.entry_mode_and_id();
+                            let moved = index_entry_at_path(
+                                &moved_mode,
+                                &moved_id.to_owned(),
+                                ConflictIndexEntryPathHint::RenamedOrTheirs,
+                            );
+                            let conflict = if options.directory_renames == DirectoryRenames::Conflict {
+                                Conflict::without_resolution(
+                                    ResolutionFailure::DirectoryRenameSuggested {
+                                        final_location: rewritten_location.to_owned(),
+                                    },
+                                    (&our_changes[*ours_idx].inner, theirs, Original, outer_side),
+                                    [None, None, moved],
+                                )
+                            } else {
+                                // `no_entry` to the index because that's not a conflict at all,
+                                // but somewhat advanced rename tracking.
+                                Conflict::with_resolution(
+                                    Resolution::SourceLocationAffectedByRename {
+                                        final_location: rewritten_location.to_owned(),
+                                    },
+                                    (&our_changes[*ours_idx].inner, theirs, Original, outer_side),
+                                    [None, None, None],
+                                )
+                            };
+                            if should_fail_on_conflict(conflict) {
                                 break 'outer;
                             }
                             editor.remove(to_components(theirs.location()))?;
@@ -227,8 +249,15 @@ where
                         let (ours_idx, match_kind) = match candidate {
                             PossibleConflict::PassedRewrittenDirectory { change_idx } => {
                                 let ours = &our_changes[change_idx];
+                                // `merge.directoryRenames=false` turns directory-rename
+                                // detection off entirely (merge-ort.c:5097), so the change
+                                // stays at the path its own side gave it.
                                 let location_after_passed_rename =
-                                    rewrite_location_with_renamed_directory(theirs.location(), &ours.inner);
+                                    if options.directory_renames == DirectoryRenames::Disabled {
+                                        None
+                                    } else {
+                                        rewrite_location_with_renamed_directory(theirs.location(), &ours.inner)
+                                    };
                                 if let Some(new_location) = location_after_passed_rename {
                                     their_tree.remove_existing_leaf(theirs.location());
                                     push_deferred_with_rewrite(
@@ -549,6 +578,124 @@ where
                                         index_entry(their_mode, their_id),
                                     ],
                                 )) {
+                                    break 'outer;
+                                }
+                            }
+                            // Both sides changed the path the base had into a *different*
+                            // non-directory type — a regular file on one side, a symlink on the
+                            // other. `merge-ort.c:4127-4237` keeps neither at the shared name by
+                            // content merge; it moves one side to `<path>~<that side's branch>` and
+                            // leaves the other at `<path>`. `rename_a`/`rename_b` there pick the
+                            // side by `S_ISREG` alone, so the regular file is what moves, and the
+                            // base stage stays with whichever side still has the base's type
+                            // (`filemask` drops to 2 or 4 for the side whose `S_IFMT` changed).
+                            // Without this arm the pair fell through to `_unknown`, which stacks all
+                            // three stages on the one path and leaves the base blob in the tree.
+                            (
+                                Change::Modification {
+                                    location,
+                                    previous_id,
+                                    previous_entry_mode,
+                                    entry_mode: our_mode,
+                                    id: our_id,
+                                    ..
+                                },
+                                Change::Modification {
+                                    entry_mode: their_mode,
+                                    id: their_id,
+                                    ..
+                                },
+                            ) if our_mode.is_blob_or_symlink()
+                                && their_mode.is_blob_or_symlink()
+                                && merge_modes(*our_mode, *their_mode).is_none() =>
+                            {
+                                let our_side_moves = is_regular_file(our_mode);
+                                // `logical_side` names the side that *stays*, matching how the
+                                // add/add type clash below picks its tree and change list.
+                                let (logical_side, label_of_side_to_be_moved) = if our_side_moves {
+                                    (Swapped, labels.current.unwrap_or_default())
+                                } else {
+                                    (Original, labels.other.unwrap_or_default())
+                                };
+                                let (kept_mode, kept_id, moved_mode, moved_id) = if our_side_moves {
+                                    (*their_mode, *their_id, *our_mode, *our_id)
+                                } else {
+                                    (*our_mode, *our_id, *their_mode, *their_id)
+                                };
+                                let tree_with_rename = pick_our_tree(logical_side, their_tree, our_tree);
+                                let renamed_location = unique_path_in_tree(
+                                    location.as_bstr(),
+                                    &editor,
+                                    tree_with_rename,
+                                    label_of_side_to_be_moved,
+                                )?;
+
+                                // Stage 1 follows the side whose `S_IFMT` still matches the base's;
+                                // if the base was a third type it is dropped from both entries.
+                                let base_hint = if same_file_type(previous_entry_mode, &kept_mode) {
+                                    Some(ConflictIndexEntryPathHint::Current)
+                                } else if same_file_type(previous_entry_mode, &moved_mode) {
+                                    Some(ConflictIndexEntryPathHint::RenamedOrTheirs)
+                                } else {
+                                    None
+                                };
+                                // `Conflict::entries()` un-swaps slots 1 and 2 for a `Swapped` map,
+                                // so they are stored in logical order here: the side that keeps the
+                                // path first, the side that moves second.
+                                let mut conflict = Conflict::without_resolution(
+                                    ResolutionFailure::OursAddedTheirsAddedTypeMismatch {
+                                        their_unique_location: renamed_location.clone(),
+                                    },
+                                    (ours, theirs, logical_side, outer_side),
+                                    [
+                                        base_hint
+                                            .and_then(|hint| index_entry_at_path(previous_entry_mode, previous_id, hint)),
+                                        index_entry_at_path(
+                                            &kept_mode,
+                                            &kept_id,
+                                            ConflictIndexEntryPathHint::Current,
+                                        ),
+                                        index_entry_at_path(
+                                            &moved_mode,
+                                            &moved_id,
+                                            ConflictIndexEntryPathHint::RenamedOrTheirs,
+                                        ),
+                                    ],
+                                );
+                                match tree_conflicts {
+                                    None => {
+                                        editor.upsert(toc(location), kept_mode.kind(), kept_id)?;
+                                        tree_with_rename.remove_existing_leaf(location.as_bstr());
+                                        push_deferred(
+                                            (
+                                                Change::Addition {
+                                                    location: renamed_location,
+                                                    entry_mode: moved_mode,
+                                                    id: moved_id,
+                                                    relation: None,
+                                                },
+                                                None,
+                                            ),
+                                            pick_our_changes_mut(logical_side, their_changes, our_changes),
+                                        );
+                                    }
+                                    Some(resolve) => {
+                                        conflict.entries = Default::default();
+                                        match resolve {
+                                            ResolveWith::Ours => match outer_side {
+                                                Original => {
+                                                    editor.upsert(toc(location), our_mode.kind(), *our_id)?;
+                                                }
+                                                Swapped => {
+                                                    editor.upsert(toc(location), their_mode.kind(), *their_id)?;
+                                                }
+                                            },
+                                            ResolveWith::Ancestor => {}
+                                        }
+                                    }
+                                }
+
+                                if should_fail_on_conflict(conflict) {
                                     break 'outer;
                                 }
                             }
@@ -1303,6 +1450,20 @@ fn apply_our_resolution(
 
 fn involves_submodule(a: &EntryMode, b: &EntryMode) -> bool {
     a.is_commit() || b.is_commit()
+}
+
+/// `S_ISREG(mode)`: the executable bit does not change the file *type*, so both
+/// blob kinds answer `true` here while symlinks, submodules and trees do not.
+fn is_regular_file(mode: &EntryMode) -> bool {
+    matches!(mode.kind(), EntryKind::Blob | EntryKind::BlobExecutable)
+}
+
+/// `(S_IFMT & a) == (S_IFMT & b)`: same file type, ignoring the executable bit.
+fn same_file_type(a: &EntryMode, b: &EntryMode) -> bool {
+    if is_regular_file(a) && is_regular_file(b) {
+        return true;
+    }
+    a.kind() == b.kind()
 }
 
 /// Allows equal modes or prefers executables bits in case of blobs

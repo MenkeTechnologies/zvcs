@@ -357,7 +357,7 @@ impl delegate::Navigate for Delegate<'_> {
                 Ok(())
             }
             None => {
-                let stage_hint = [Stage::Unconflicted, Stage::Base, Stage::Ours]
+                let stage_hint = [Stage::Unconflicted, Stage::Base, Stage::Ours, Stage::Theirs]
                     .iter()
                     .filter(|our_stage| **our_stage != stage)
                     .find_map(|stage| index.entry_index_by_path_and_stage(path, *stage).map(|_| *stage));

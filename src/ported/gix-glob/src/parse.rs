@@ -18,12 +18,12 @@ pub fn pattern(mut pat: &[u8], may_alter: bool) -> Option<(&[u8], pattern::Mode,
         if pat.first() == Some(&b'!') {
             mode |= Mode::NEGATIVE;
             pat = &pat[1..];
-        } else if pat.first() == Some(&b'\\') {
-            let second = pat.get(1);
-            if second == Some(&b'!') || second == Some(&b'#') {
-                pat = &pat[1..];
-            }
         }
+        // A leading `\!` or `\#` keeps its backslash. git's `parse_path_pattern()`
+        // strips only the `!` that marks a negation and hands everything else to
+        // `wildmatch()`, which is what un-escapes the character — the pattern
+        // *text* still reads `\#hash.dat`, and that is the text
+        // `git check-ignore -v` echoes back.
     }
     if pat.iter().all(u8::is_ascii_whitespace) {
         return None;

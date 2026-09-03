@@ -50,7 +50,12 @@ impl Defaults {
         let mut search_mode = glob
             .and_then(|glob| glob.then_some(SearchMode::PathAwareGlob))
             .unwrap_or_default();
+        // git reads this with `git_env_bool(…, 0)`: the variable being *present*
+        // means nothing, its value decides. `GIT_NOGLOB_PATHSPECS=0` (or `false`,
+        // or empty) therefore leaves the search mode exactly where the other
+        // variables put it, rather than forcing it to literal.
         search_mode = env_bool("GIT_NOGLOB_PATHSPECS")?
+            .filter(|no_glob| *no_glob)
             .map(|no_glob| {
                 if glob.unwrap_or_default() && no_glob {
                     Err(from_environment::Error::MixedGlobAndNoGlob)

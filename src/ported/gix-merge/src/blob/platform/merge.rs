@@ -423,15 +423,25 @@ impl<'parent> PlatformRef<'parent> {
                     cmd: format!("{:?}", cmd.cmd),
                     source: err,
                 })?;
-                if !status.success() {
-                    return Err(Error::ExternalDriverFailure {
-                        cmd: format!("{:?}", cmd.cmd),
-                        status,
-                    });
-                }
+                // `ll_ext_merge()` (merge-ll.c:261-267) reads the driver's result
+                // back whatever it exited with, and only then grades the status:
+                // `0` is a clean merge, anything up to `128` is the driver saying
+                // it left conflicts behind, and above that the process died from a
+                // signal and its output cannot be trusted. Treating every non-zero
+                // status as a hard failure aborted merges git completes.
                 out.clear();
                 cmd.open_result_file()?.read_to_end(out)?;
-                Ok((inner::builtin_merge::Pick::Buffer, Resolution::Complete))
+                let resolution = match status.code() {
+                    Some(0) => Resolution::Complete,
+                    Some(code) if (1..=128).contains(&code) => Resolution::Conflict,
+                    _ => {
+                        return Err(Error::ExternalDriverFailure {
+                            cmd: format!("{:?}", cmd.cmd),
+                            status,
+                        });
+                    }
+                };
+                Ok((inner::builtin_merge::Pick::Buffer, resolution))
             }
             Err(builtin) => {
                 let mut input = imara_diff::InternedInput::new(&[][..], &[]);

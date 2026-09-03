@@ -301,6 +301,7 @@ impl Conflict {
                     renamed_unique_path_to_modified_blob: _,
                 }
                 | ResolutionFailure::OursAddedTheirsAddedTypeMismatch { .. }
+                | ResolutionFailure::DirectoryRenameSuggested { .. }
                 | ResolutionFailure::OursDeletedTheirsRenamed => None,
             }
         }
@@ -392,9 +393,33 @@ pub enum ResolutionFailure {
     OursDeletedTheirsRenamed,
     /// *ours* was modified and *theirs* was deleted. We keep the modified one and ignore the deletion.
     OursModifiedTheirsDeleted,
+    /// *ours* had a renamed directory and *theirs* made a change inside it, and
+    /// [`DirectoryRenames::Conflict`] asks for the move to be confirmed rather than
+    /// taken silently. The change *was* moved to `final_location`, exactly as with
+    /// [`Resolution::SourceLocationAffectedByRename`], but the result stays conflicted
+    /// (merge-ort.c:2815-2839, `MERGE_DIRECTORY_RENAMES_CONFLICT`).
+    DirectoryRenameSuggested {
+        /// The repository-relative path the change ended up in after following the
+        /// directory rename.
+        final_location: BString,
+    },
     /// *ours* and *theirs* are in an untested state so it can't be handled yet, and is considered a conflict
     /// without adding our *or* their side to the resulting tree.
     Unknown,
+}
+
+/// How to treat a change that lands inside a directory the other side renamed —
+/// git's `merge.directoryRenames` (`MERGE_DIRECTORY_RENAMES_*`, merge-ort.c:2797).
+#[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum DirectoryRenames {
+    /// `false`: do not follow the directory rename — the change keeps the path it was given.
+    Disabled,
+    /// `conflict`: follow the rename, but leave the result unresolved so the move can be
+    /// confirmed. This is git's default (merge-ort.c:5402).
+    #[default]
+    Conflict,
+    /// `true`: follow the rename and report it as an informational update only.
+    Applied,
 }
 
 /// Information about a blob content merge for use in a [`Resolution`].
@@ -440,6 +465,9 @@ pub struct Options {
     /// the entries what would fit the index if no forced resolution was performed.
     /// It's up to the caller to handle that information mindfully.
     pub tree_conflicts: Option<ResolveWith>,
+    /// What to do when a change lands inside a directory the other side renamed.
+    /// Defaults to git's own default, [`DirectoryRenames::Conflict`].
+    pub directory_renames: DirectoryRenames,
 }
 
 /// Decide how to resolve tree-related conflicts, but only those that have [no way of being correct](ResolutionFailure).
@@ -544,6 +572,11 @@ pub mod apply_index_entries {
                         ),
                         ResolutionFailure::OursAddedTheirsAddedTypeMismatch { their_unique_location } => {
                             (Some(their_unique_location.as_bstr()), conflict.ours.location())
+                        }
+                        // The change was moved along with the directory rename, so both the
+                        // "renamed" and the "current" path are where it landed.
+                        ResolutionFailure::DirectoryRenameSuggested { final_location } => {
+                            (Some(final_location.as_bstr()), final_location.as_bstr())
                         }
                     },
                 };

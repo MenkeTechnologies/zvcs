@@ -105,6 +105,18 @@ impl Repository {
         if !is_configured {
             rewrites = Some(Default::default());
         }
+        // `merge.directoryRenames` (merge-ort.c:5366-5380): a boolean picks `true`
+        // or `none`, the literal `conflict` picks the third state, and anything
+        // else is ignored outright so a value from a future git does not fail the
+        // merge — leaving git's default of `conflict` in place.
+        let directory_renames = match self.config.resolved.string(tree::Merge::DIRECTORY_RENAMES) {
+            None => gix_merge::tree::DirectoryRenames::default(),
+            Some(value) => match gix_config::Boolean::try_from(crate::bstr::BStr::new(&value)).map(|b| b.0) {
+                Ok(true) => gix_merge::tree::DirectoryRenames::Applied,
+                Ok(false) => gix_merge::tree::DirectoryRenames::Disabled,
+                Err(_) => gix_merge::tree::DirectoryRenames::default(),
+            },
+        };
         Ok(gix_merge::tree::Options {
             rewrites,
             blob_merge: self.blob_merge_options()?,
@@ -113,6 +125,7 @@ impl Repository {
             marker_size_multiplier: 0,
             symlink_conflicts: None,
             tree_conflicts: None,
+            directory_renames,
         }
         .into())
     }

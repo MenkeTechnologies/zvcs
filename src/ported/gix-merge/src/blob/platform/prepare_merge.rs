@@ -87,7 +87,12 @@ impl Platform {
         .filter(|_| options.is_virtual_ancestor)
         {
             driver = self.find_driver_by_name(Some(recursive_driver_name.as_bstr()));
-            options.resolve_binary_with = Some(crate::blob::builtin_driver::binary::ResolveWith::Ours);
+            // `ll_binary_merge()` (merge-ll.c:76-79): inside a virtual ancestor the
+            // tentative result is the *common ancestor*, not our side — picking ours
+            // hands the outer merge a base that agrees with one side and silently
+            // takes the other. `-Xours`/`-Xtheirs` cannot reach here either, since
+            // `merge_3way()` clears `ll_opts.variant` for a merge-base merge.
+            options.resolve_binary_with = Some(crate::blob::builtin_driver::binary::ResolveWith::Ancestor);
         }
 
         let out = PlatformRef {

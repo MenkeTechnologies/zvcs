@@ -403,6 +403,18 @@ where
                 format!("Couldn't find index '{path}' stage 2", path = path.as_bstr())
             });
         }
+        // `get_oid_with_context_1()` (object-name.c:1821-1830) accepts
+        // `if (name[1] && name[1] >= '0' && name[1] <= '3' && name[2] == ':')`, so
+        // the merge stages are 0..=3 and `:3:<path>` is "theirs". Without this arm
+        // the operand fell through to the implicit-stage-0 lookup below and was
+        // read as a path literally named `3:<path>`, which never exists — so
+        // `git rev-parse :3:conflict.txt` in a conflicted work tree answered with
+        // the operand echoed back instead of the id.
+        [b':', b'3', b':', path @ ..] => {
+            return consume_all(delegate.index_lookup(path.as_bstr(), 3), || {
+                format!("Couldn't find index '{path}' stage 3", path = path.as_bstr())
+            });
+        }
         [b':', path @ ..] => {
             return consume_all(delegate.index_lookup(path.as_bstr(), 0), || {
                 format!("Couldn't find index '{path}' stage 0 (implicit)", path = path.as_bstr())

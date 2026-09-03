@@ -22,6 +22,8 @@ impl Merge {
     pub const RENORMALIZE: keys::Boolean = keys::Boolean::new_boolean("renormalize", &Tree::MERGE);
     /// The `merge.default` key
     pub const DEFAULT: keys::String = keys::String::new_string("default", &Tree::MERGE);
+    /// The `merge.directoryRenames` key.
+    pub const DIRECTORY_RENAMES: keys::String = keys::String::new_string("directoryRenames", &Tree::MERGE);
     /// The `merge.<driver>.name` key.
     pub const DRIVER_NAME: keys::String = keys::String::new_string("name", &config::Tree::MERGE)
         .with_subsection_requirement(Some(SubSectionRequirement::Parameter("driver")));
@@ -49,6 +51,7 @@ impl Section for Merge {
             &Self::RENAMES,
             &Self::RENORMALIZE,
             &Self::DEFAULT,
+            &Self::DIRECTORY_RENAMES,
             &Self::DRIVER_NAME,
             &Self::DRIVER_COMMAND,
             &Self::DRIVER_RECURSIVE,

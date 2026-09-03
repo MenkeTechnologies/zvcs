@@ -543,6 +543,19 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 notes_opt.enable_default();
                 notes_opt.given = true;
             }
+            // The deprecated `--show-notes=<ref>` keeps the default tree beside the
+            // ref it names; `--notes=<ref>` replaces it. `--standard-notes` puts it
+            // back and `--no-standard-notes` takes it away without counting as a
+            // `--notes` of its own.
+            "--standard-notes" => {
+                notes_opt.standard();
+                notes_opt.given = true;
+            }
+            "--no-standard-notes" => notes_opt.no_standard(),
+            a if a.starts_with("--show-notes=") => {
+                notes_opt.enable_ref_show(&a["--show-notes=".len()..]);
+                notes_opt.given = true;
+            }
             "--no-notes" | "--no-show-notes" => {
                 notes_opt.disable();
                 notes_opt.given = true;
@@ -663,11 +676,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         }
                         None => return Ok(fatal(&format!("invalid --pretty format: {spec}\n"))),
                     }
-                } else if let Some(v) = s
-                    .strip_prefix("--notes=")
-                    .or_else(|| s.strip_prefix("--show-notes="))
-                {
+                } else if let Some(v) = s.strip_prefix("--notes=") {
                     notes_opt.enable_ref(v);
+                    notes_opt.given = true;
+                } else if let Some(v) = s.strip_prefix("--show-notes=") {
+                    notes_opt.enable_ref_show(v);
                     notes_opt.given = true;
                 } else if let Some(v) = s.strip_prefix("--decorate=") {
                     // git's `decorate_callback` dies on a value its
@@ -1337,6 +1350,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         )
     };
 
+    // `if (w.source) rev->show_source = 1` (builtin/log.c): `git show` runs the
+    // same `cmd_log_init()`, so a `%S` in the user format names the argument the
+    // commit was reached from without `--source` being typed.
+    let source_mode = source_mode || super::log::pretty_uses_source(&pretty);
+
     // The commit→refs map for `--decorate`, filtered exactly as `git log` filters
     // it; skipped entirely when no decorations will be shown so the ref scan costs
     // nothing on a plain `git show`.
@@ -1748,7 +1766,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         if order == super::log::Order::Default {
             nodes
         } else {
-            super::log::topo_sort(nodes, order == super::log::Order::Date)
+            super::log::topo_sort(nodes, order == super::log::Order::Date, first_parent)
         }
     } else {
         Vec::new()
@@ -1816,7 +1834,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // git's `rev_info.shown_one`, which drives the inter-record separator.
     let mut shown_one = false;
     if !notes_opt.given && (!pretty_given || matches!(pretty, Pretty::User(_))) {
-        notes_opt.enable_default();
+        notes_opt.show_only();
     }
     let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
     let (cfg_subject_prefix, cfg_encode_email_headers) = super::log::email_config(&repo);
@@ -1828,6 +1846,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let disp = DisplayOpts {
         show_signature,
         notes: &notes_trees,
+        notes_shown: notes_opt.show,
         abbrev_commit,
         date_mode,
         show_root,
@@ -1889,7 +1908,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 super::log::ancestor_closure(&repo, &walk_hidden)?
             };
             let nodes = super::log::walk(&repo, &[start], &[], first_parent, &hidden, None, None)?;
-            let nodes = super::log::topo_sort(nodes, false);
+            let nodes = super::log::topo_sort(nodes, false, first_parent);
             let mut tracker = line_log::Tracker::new(&repo, start, tracked, first_parent);
             for node in &nodes {
                 let (Some(range), _) = tracker.process(node.id, &node.parents)? else {
@@ -2302,6 +2321,8 @@ struct DisplayOpts<'a> {
     rename_warn: &'a std::cell::RefCell<RenameWarnState>,
     /// The notes trees whose `Notes[ (<ref>)]:` block follows the message.
     notes: &'a [super::notes::Tree],
+    /// Whether the notes display is on at all — see `RenderCtx::notes_shown`.
+    notes_shown: bool,
     /// `-z`: NUL instead of newline as the record terminator, and paths written
     /// raw rather than through `write_name_quoted()`. It reaches the header's own
     /// terminator too — `git show --name-status -z --format=%H` ends the id with a
@@ -2785,6 +2806,7 @@ fn show_commit_record(
             mailmap: disp.mailmap,
             identity_mailmap: disp.identity_mailmap,
             notes: disp.notes,
+            notes_shown: disp.notes_shown,
             expand_tabs: disp.expand_tabs,
             email: disp.email,
             source: source.map(str::as_bytes),

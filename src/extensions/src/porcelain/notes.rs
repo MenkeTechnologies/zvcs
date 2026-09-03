@@ -411,6 +411,46 @@ impl DisplayOpt {
         self.show = true;
     }
 
+    /// The `--show-notes=<ref>` spelling, which is *not* `--notes=<ref>`:
+    ///
+    /// ```c
+    /// if (starts_with(arg, "--show-notes=") &&
+    ///     revs->notes_opt.use_default_notes < 0)
+    ///         revs->notes_opt.use_default_notes = 1;
+    /// enable_ref_display_notes(&revs->notes_opt, &revs->show_notes, optarg);
+    /// ```
+    ///
+    /// (revision.c.) The deprecated spelling keeps the default tree alongside the
+    /// ref it names, so `--show-notes=other` prints both blocks.
+    pub(crate) fn enable_ref_show(&mut self, name: &str) {
+        if self.use_default < 0 {
+            self.use_default = 1;
+        }
+        self.enable_ref(name);
+    }
+
+    /// `if (!rev->show_notes_given && (!rev->pretty_given || w.notes))
+    /// rev->show_notes = 1;` (builtin/log.c): the format asked for notes, which
+    /// turns the *display* on and nothing else — `use_default_notes` keeps
+    /// whatever `--no-standard-notes` or a `--notes=<ref>` left it at.
+    pub(crate) fn show_only(&mut self) {
+        self.show = true;
+    }
+
+    /// `--standard-notes`: `revs->notes_opt.use_default_notes = 1`, which adds the
+    /// default tree back beside an explicit `--notes=<ref>` without turning the
+    /// display on by itself.
+    pub(crate) fn standard(&mut self) {
+        self.use_default = 1;
+    }
+
+    /// `--no-standard-notes`: `use_default_notes = 0`. Unlike every other notes
+    /// spelling it does not set `show_notes_given`, so a `%N` in the format still
+    /// turns the display on — with no default tree to show.
+    pub(crate) fn no_standard(&mut self) {
+        self.use_default = 0;
+    }
+
     /// `disable_display_notes()`: `--no-notes` forgets every ref asked for.
     pub(crate) fn disable(&mut self) {
         self.use_default = -1;
@@ -493,7 +533,18 @@ fn add_by_glob(repo: &gix::Repository, refs: &mut Vec<String>, name: &str) -> Re
         }
         return Ok(());
     }
-    if repo.try_find_reference(name)?.is_none() {
+    // `string_list_add_refs_by_glob()` → `string_list_add_one_ref()`: a name that
+    // does not resolve — including one that is not a valid refname at all, which
+    // is what the empty `--notes=` expands to — is warned about and kept, so the
+    // walk simply finds no notes under it.
+    let found = match repo.try_find_reference(name) {
+        Ok(found) => found.is_some(),
+        Err(gix::reference::find::Error::Find(
+            gix::refs::file::find::Error::RefnameValidation(_),
+        )) => false,
+        Err(e) => return Err(e.into()),
+    };
+    if !found {
         eprintln!("warning: notes ref {name} is invalid");
     }
     push(refs, name.to_owned());

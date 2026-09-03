@@ -957,9 +957,16 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: --ancestry-path given but there are no bottom commits");
             return Ok(ExitCode::from(128));
         }
-        if filters.exclude_first_parent_only && excluded_side_has_merge(repo, &hidden)? {
-            bail!("`--exclude-first-parent-only` across a merge in the excluded history is not ported");
-        }
+        // `--exclude-first-parent-only` narrows the *marking*, not the walk:
+        // `mark_parents_uninteresting()` stops at each excluded commit's first
+        // parent. gix's `with_hidden` has no such mode — it paints every parent —
+        // so the closure is taken here and the walker is left to walk the whole
+        // history, with the excluded commits dropped from its result.
+        let fp_excluded = if filters.exclude_first_parent_only && !hidden.is_empty() {
+            Some(super::log::ancestor_closure_opt(repo, &hidden, true)?)
+        } else {
+            None
+        };
         if filters.boundary && (filters.skip != 0 || filters.max_count.is_some()) {
             bail!("`--boundary` combined with `--skip`/`--max-count` is not ported");
         }
@@ -974,7 +981,14 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         // `cmd_shortlog()` drains `get_revision()` into its author table and prints
         // nothing until the walk ends, so a parent it cannot read leaves no output
         // at all — only the two lines and 128. See [`super::log::WalkAbort`].
-        let (items, abort) = walk(repo, &tips, &hidden, &filters)?;
+        let (items, abort) = match &fp_excluded {
+            Some(_) => walk(repo, &tips, &[], &filters)?,
+            None => walk(repo, &tips, &hidden, &filters)?,
+        };
+        let items = match &fp_excluded {
+            Some(excluded) => items.into_iter().filter(|it| !excluded.contains(&it.id)).collect(),
+            None => items,
+        };
         if let Some(abort) = abort {
             // A pathspec puts `try_to_simplify_commit()` (revision.c:1182) ahead of
             // `process_parents()`'s parent loop, and its tree diff hits the
@@ -1470,7 +1484,16 @@ fn walk(
             .collect();
         let dates: std::collections::HashMap<ObjectId, i64> =
             ids.iter().map(|id| (*id, author_date(repo, *id))).collect();
-        let sorted = super::rev_list::topo_sort(&ids, &parents_of, Some(&dates));
+        // `--first-parent` narrows the topological sort's edges too, so a commit
+        // reached only as a merge's second parent sorts as a tip of its own.
+        let edges: std::collections::HashMap<ObjectId, Vec<ObjectId>> = match filters.first_parent {
+            true => parents_of
+                .iter()
+                .map(|(id, ps)| (*id, ps.iter().take(1).copied().collect()))
+                .collect(),
+            false => parents_of.clone(),
+        };
+        let sorted = super::rev_list::topo_sort(&ids, &edges, Some(&dates));
         let mut by_id: std::collections::HashMap<ObjectId, WalkItem> =
             items.into_iter().map(|item| (item.id, item)).collect();
         items = sorted
@@ -1547,19 +1570,6 @@ fn boundary_commits(items: &[WalkItem]) -> Vec<ObjectId> {
     out
 }
 
-/// True when nothing reachable from `hidden` is a merge, which is exactly when
-/// `--exclude-first-parent-only` cannot change the result.
-fn excluded_side_has_merge(repo: &gix::Repository, hidden: &[ObjectId]) -> Result<bool> {
-    if hidden.is_empty() {
-        return Ok(false);
-    }
-    for info in repo.rev_walk(hidden.to_vec()).all()? {
-        if info?.parent_ids.len() > 1 {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
 
 /// git's `--min-parents`/`--max-parents` gate.
 fn parent_count_matches(parents: usize, filters: &Filters) -> bool {

@@ -1757,14 +1757,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // flags below override scalars and append to the address/header lists.
     let snap = repo.config_snapshot();
     let cfg_str = |k: &str| snap.string(k).and_then(|v| v.to_str().ok().map(str::to_owned));
-    let cfg_list = |k: &str| {
-        snap.plumbing()
-            .values::<gix::bstr::BString>(k)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.to_str().ok().map(str::to_owned))
-            .collect::<Vec<String>>()
-    };
+    // The multi-valued `format.*` keys are read through the shared walk rather
+    // than `snapshot.values()`: a `-c format.to=<addr>` reaches gix twice (see
+    // `crate::setup::double_delivered`), and `values()` would then write the
+    // address into the `To:` header twice over.
+    let cfg_list = |k: &str| crate::config::multi_values(repo, k);
 
     // `format.from` resolves to an identity right away, because a value that is
     // neither a boolean nor a parsable ident line is fatal (exit 128).
@@ -1997,6 +1994,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // `--subject-prefix`/`--rfc` is given, and later `die()`s if `-k` is also
     // set. Track only that it was given, not its value.
     let mut subject_prefix_given = false;
+    // `--rfc[=<rfc>]` does not *replace* the subject prefix, it prepends to
+    // whichever prefix the rest of the line (or `format.subjectPrefix`) settles
+    // on — `--subject-prefix=A --rfc` and `--rfc --subject-prefix=A` both print
+    // `[RFC A]`. So the string is kept aside here, last spelling winning, and
+    // composed once the loop is done. `--no-rfc` clears it, and an explicitly
+    // empty `--rfc=` is a no-op that does not even conflict with `-k`.
+    let mut rfc: Option<String> = None;
     // `--commit-list-format` implies a cover letter, but only when the caller
     // did not spell `--cover-letter`/`--no-cover-letter` out.
     let mut commit_list_format_given = false;
@@ -2203,10 +2207,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s if s.starts_with("--signature-file=") => {
                 o.sig_file_arg = Some(s["--signature-file=".len()..].to_owned());
             }
-            "--rfc" => {
-                o.subject_prefix = "RFC PATCH".to_owned();
-                subject_prefix_given = true;
-            }
+            "--rfc" => rfc = Some("RFC".to_owned()),
+            "--no-rfc" => rfc = None,
             "-s" | "--signoff" => o.signoff = true,
             "--no-signoff" => o.signoff = false,
             "--force-in-body-from" => o.force_in_body_from = true,
@@ -2350,10 +2352,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     Err(code) => return Ok(Parsed::Exit(code)),
                 }
             }
-            s if s.starts_with("--rfc=") => {
-                o.subject_prefix = format!("{} PATCH", &s["--rfc=".len()..]);
-                subject_prefix_given = true;
-            }
+            s if s.starts_with("--rfc=") => rfc = Some(s["--rfc=".len()..].to_owned()),
             // The revision-walk counts share git's strict signed-int parser
             // (`strtol_i`, base 10): trailing junk or a non-numeral is
             // `die("'%s': not an integer")` (exit 128) from inside
@@ -3112,6 +3111,16 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 ))))
             }
         }
+    }
+
+    // `--rfc` is applied only now: it prepends to the prefix the command line
+    // ended up with, so ordering against `--subject-prefix` does not matter, and
+    // the `v<n>` of `-v`/`--reroll-count` is appended after this (giving
+    // `[RFC PATCH v2]`). A non-empty rfc string is also what makes `-k` fatal;
+    // `--rfc=` and `--no-rfc` leave both the prefix and that check alone.
+    if let Some(r) = rfc.filter(|r| !r.is_empty()) {
+        o.subject_prefix = format!("{r} {}", o.subject_prefix);
+        subject_prefix_given = true;
     }
 
     // builtin/log.c `cmd_format_patch()` `die()`s (exit 128) when `-k` is combined

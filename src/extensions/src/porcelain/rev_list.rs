@@ -447,7 +447,30 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `revs->ancestry_path_bottoms` as `--ancestry-path=<commit>` fills it.
     let mut ancestry_bottoms: Vec<ObjectId> = Vec::new();
     let mut simplify_by_decoration = false;
+    // `-g` / `--walk-reflogs`: `init_reflog_walk()` replaces the ancestry traversal
+    // with a walk of each named ref's reflog, so the "revisions" are the entries
+    // rather than the commits they point at.
+    let mut walk_reflogs = false;
+    // The revision words as typed, which is what the reflog walk needs: `main@{2}`
+    // names both the log to read and the entry to start at.
+    let mut reflog_names: Vec<String> = Vec::new();
+    // `revs->show_pulls`: keep a merge that is TREESAME to a later parent but not
+    // to its first — the merge that brought a change in rather than making it.
+    let mut show_pulls = false;
+    // `revs->exclude_first_parent_only`: the UNINTERESTING marking stops at each
+    // excluded commit's first parent.
+    let mut exclude_first_parent_only = false;
+    // `revs->skip_count`: how many commits `get_revision()` throws away before it
+    // starts answering, applied after every filter and ahead of `--max-count`.
+    let mut skip_count: usize = 0;
     let mut bisect = false;
+    // `--bisect-all`: `bisect_find_all` plus `BISECT_SHOW_ALL` and
+    // `revs.show_decorations = 1` (builtin/rev-list.c) — every candidate is
+    // listed, each decorated with the distance the search weighed it at.
+    let mut bisect_all = false;
+    // `--bisect-vars`: `bisect_show_vars`, which replaces the listing with the
+    // six `bisect_*` shell assignments `git bisect` sources.
+    let mut bisect_vars = false;
     let mut quiet = false;
     let mut disk_usage = false;
     let mut disk_usage_human = false;
@@ -721,12 +744,28 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // and — since simplification may not change the shape of the history — a
             // root or a merge; everything else is walked past.
             "--simplify-by-decoration" => simplify_by_decoration = true,
+            "--show-pulls" => show_pulls = true,
+            "-g" | "--walk-reflogs" => walk_reflogs = true,
+            "--exclude-first-parent-only" => exclude_first_parent_only = true,
             "--bisect" => {
                 if let Err(e) = seed_bisect_refs(&repo, negate, &mut seeds, &mut pending) {
                     return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
                 bisect = true;
+            }
+            // `--bisect-all` and `--bisect-vars` are read by `cmd_rev_list()`'s own
+            // leftover loop, *after* `setup_revisions()` — so unlike `--bisect`,
+            // neither is a revision pseudo-option and neither seeds anything from
+            // `refs/bisect/*`. They only ask for the search over whatever range the
+            // rest of the command line named.
+            "--bisect-all" => {
+                bisect = true;
+                bisect_all = true;
+            }
+            "--bisect-vars" => {
+                bisect = true;
+                bisect_vars = true;
             }
             // `revs->dense` (revision.c:2462-2465). `--dense` restores the
             // `repo_init_revisions()` default, so it is only ever an undo of an
@@ -746,6 +785,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // also what cancels a `--no-walk` seen earlier (the shared check at the
             // end of this loop does that).
             "--reflog" => {
+                // `add_reflogs_to_pending()` fills its `all_refs_cb` by hand rather
+                // than through `init_all_refs_cb()`, so it never sets
+                // `rev_input_given`: in a repository with no reflogs at all it pends
+                // nothing, and `cmd_rev_list()`'s empty-pending check is then the
+                // usage block rather than an empty listing.
                 for id in super::shortlog::reflog_pending(&repo)? {
                     seeds.push(Seed {
                         id,
@@ -753,8 +797,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                         symmetric_left: false,
                         bottom: negate,
                     });
+                    rev_input_given = true;
                 }
-                rev_input_given = true;
             }
             // `revs->encode_email_headers` (revision.c:2526-2529).
             // `builtin/rev-list.c`'s `struct pretty_print_context ctx = {0}` never
@@ -1083,6 +1127,37 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     )))
                 }
             },
+            // `--skip=<n>` / `--skip <n>`: `revs->skip_count`. A negative count is
+            // git's "no skip" (its `>= 0` guard), and a non-numeral is
+            // `setup_revisions()`'s `die("'%s': not an integer")` rather than the
+            // usage block.
+            "--skip" => {
+                i += 1;
+                let Some(v) = argv.get(i) else {
+                    return Ok(usage_error());
+                };
+                match parse_git_int(v) {
+                    Some(n) => skip_count = n.max(0) as usize,
+                    None => return Ok(not_an_integer(v)),
+                }
+            }
+            s if s.starts_with("--skip=") => {
+                let v = &s["--skip=".len()..];
+                match parse_git_int(v) {
+                    Some(n) => skip_count = n.max(0) as usize,
+                    None => return Ok(not_an_integer(v)),
+                }
+            }
+            // `if (revs.show_notes) die(_("rev-list does not support display of
+            // notes"));` (builtin/rev-list.c) — every spelling that turns notes on
+            // is fatal, and the ones that turn them off are accepted and inert.
+            "--notes" | "--show-notes" | "--standard-notes" => {
+                return Ok(fatal("rev-list does not support display of notes"));
+            }
+            s if s.starts_with("--notes=") || s.starts_with("--show-notes=") => {
+                return Ok(fatal("rev-list does not support display of notes"));
+            }
+            "--no-notes" | "--no-standard-notes" => {}
             s if s.starts_with("--max-count=") => {
                 let v = &s["--max-count=".len()..];
                 match parse_git_int(v) {
@@ -1167,6 +1242,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 }
                 note_parsed(&repo, s, &seeds[seeds_before..], &mut parsed_commits)?;
                 rev_input_given = true;
+                reflog_names.push(s.to_string());
             }
         }
         // `add_pending_object_with_path()` clears `revs->no_walk` the moment an
@@ -1277,7 +1353,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         if first_parent {
             platform = platform.first_parent_only();
         }
-        if !hidden.is_empty() {
+        // `--exclude-first-parent-only` stops `mark_parents_uninteresting()` at
+        // each excluded commit's first parent, which `with_hidden` cannot express
+        // — it paints every parent. So the closure is computed here and the walk
+        // is left unhidden, with the marked commits dropped from its result below.
+        if !hidden.is_empty() && !exclude_first_parent_only {
             platform = platform.with_hidden(hidden.clone());
         }
         for info in platform.all()? {
@@ -1300,6 +1380,24 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             parents_of.insert(info.id, info.parent_ids.to_vec());
             commits.push(info.id);
         }
+    }
+
+    if exclude_first_parent_only && !hidden.is_empty() {
+        let excluded = super::log::ancestor_closure_opt(&repo, &hidden, true)?;
+        commits.retain(|id| !excluded.contains(id));
+    }
+
+    // The reflog walk replaces the list wholesale: each entry is one "commit" in
+    // the order `git log -g` reports them, and every filter below then applies to
+    // that list exactly as it would to an ancestry walk.
+    if walk_reflogs {
+        if reflog_names.is_empty() {
+            reflog_names.push("HEAD".to_owned());
+        }
+        let nodes = super::log::reflog_walk(&repo, &reflog_names)?;
+        commits = nodes.iter().map(|n| n.id).collect();
+        parents_of = nodes.iter().map(|n| (n.id, n.parents.clone())).collect();
+        abort = None;
     }
 
     // `--since` is git's `max_age`: a commit older than the bound is marked
@@ -1396,7 +1494,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             let same =
-                treesame_parent(&repo, *id, parents, first_parent, &mut specs, &parents_of)?;
+                treesame_parent(&repo, *id, parents, first_parent, &mut specs, &parents_of, show_pulls)?;
             match same {
                 None => {}
                 Some(parent) => {
@@ -1450,21 +1548,71 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             Order::Date | Order::Topo => None,
         };
-        commits = topo_sort(&commits, &parents_of, dates.as_ref());
+        // `--first-parent` narrows the sort's edges only when a commit-graph with
+        // generation numbers is present: `prepare_revision_walk()` then picks
+        // `init_topo_walk()`, which breaks after each commit's first parent, over
+        // `sort_in_topological_order()`, which has no `rev_info` and counts every
+        // parent (revision.c, commit.c).
+        let first_parent = first_parent && repo.commit_graph().is_ok();
+        let fp_parents: HashMap<ObjectId, Vec<ObjectId>> = match first_parent {
+            true => parents_of
+                .iter()
+                .map(|(id, ps)| (*id, ps.iter().take(1).copied().collect()))
+                .collect(),
+            false => HashMap::new(),
+        };
+        let edges = if first_parent { &fp_parents } else { &parents_of };
+        commits = topo_sort(&commits, edges, dates.as_ref());
     }
 
     // `--bisect` replaces the whole list with the one commit `find_bisection`
-    // picks, before any output-time filter runs.
+    // picks, before any output-time filter runs. Under `--bisect-all` the list
+    // survives whole, reordered by the search and carrying the distance each
+    // commit was weighed at, which is decorated onto its line below.
+    let mut bisect_dist: HashMap<ObjectId, i64> = HashMap::new();
+    // The six `bisect_*` assignments, rendered once the search is done and
+    // written in place of (or, under `--bisect-all`, after) the listing.
+    let mut bisect_vars_text: Option<String> = None;
     if bisect {
-        if !pathspecs.is_empty() {
-            // git weighs a TREESAME commit as reaching nothing, and this port has
-            // no TREESAME marking during the walk to weigh with.
-            return Ok(fatal("--bisect with a pathspec is not supported"));
+        let found = find_bisection(&commits, &parents_of, first_parent, bisect_all, &treesame);
+        commits = found.commits.iter().map(|(id, _)| *id).collect();
+        if bisect_all {
+            bisect_dist = found.commits.iter().copied().collect();
         }
-        commits = find_bisection(&commits, &parents_of, first_parent)
-            .into_iter()
-            .collect();
+        if bisect_vars {
+            // `show_bisect_vars()` bails out on an empty range before it prints
+            // anything — `git rev-list --bisect-vars main ^main` writes nothing and
+            // exits 1, which is the one exit-1 rev-list has that is not an error.
+            // `--bisect-all` does not exempt it: stock answers the same way for
+            // `--bisect-all --bisect-vars` over an empty range.
+            if commits.is_empty() {
+                return Ok(ExitCode::from(1));
+            }
+            let (reaches, all) = (found.reaches, found.all);
+            let cnt = std::cmp::max(all - reaches, reaches);
+            let rev = commits.first().map(ToString::to_string).unwrap_or_default();
+            bisect_vars_text = Some(format!(
+                "bisect_rev='{rev}'\nbisect_nr={}\nbisect_good={}\nbisect_bad={}\nbisect_all={all}\nbisect_steps={}\n",
+                cnt - 1,
+                all - reaches - 1,
+                reaches - 1,
+                estimate_bisect_steps(all),
+            ));
+        }
     }
+    // `revs.show_decorations = 1` under `--bisect-all`: the listing carries the
+    // ordinary short ref decorations, with the search's `dist=<n>` last.
+    //
+    // `cmd_rev_list()` loads them with a *NULL* filter, not `git log`'s
+    // `set_default_decoration_filter()` one — so a ref outside the decorated
+    // namespaces (`refs/top`) shows here even though `git log --decorate` hides
+    // it. Hence `use_default = false` rather than log's `true`.
+    let bisect_decorations = if bisect_all {
+        let filter = super::log::DecorationFilter::build(&repo, &[], &[], false);
+        Some(super::log::build_decorations(&repo, &filter)?)
+    } else {
+        None
+    };
 
     // `set_children` runs over the limited list, before any output-time filter,
     // and prepends each child, so a commit's children come out newest first.
@@ -1575,6 +1723,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         parents_of.extend(rewritten);
     }
 
+    // `revs->skip_count` is spent inside `get_revision()` before the `max_count`
+    // check, so `--skip=2 --max-count=1` answers the third commit rather than none.
+    if skip_count > 0 {
+        commits.drain(..skip_count.min(commits.len()));
+    }
     if let Some(max) = max_count {
         // `cmd_rev_list()` stops calling `get_revision()` once the cap is spent, so
         // a walk whose remaining commits were all going to be dropped by the cap
@@ -1819,6 +1972,27 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     out.extend_from_slice(id.to_string().as_bytes());
                 }
             }
+            // `--bisect-all`'s decoration list: the refs pointing at the commit,
+            // then the `dist=<n>` `best_bisection_sorted()` attached to it, in
+            // `format_decorations()`'s ` (a, b)` shape.
+            if let Some(decos) = &bisect_decorations {
+                let mut refs: Vec<u8> = Vec::new();
+                super::log::format_decorations(
+                    &mut refs,
+                    decos,
+                    id,
+                    false,
+                    &super::color::DecorateColors::disabled(),
+                    &super::log::DecorationOpts { prefix: "", suffix: "", ..Default::default() },
+                );
+                out.extend_from_slice(b" (");
+                if !refs.is_empty() {
+                    out.extend_from_slice(&refs);
+                    out.extend_from_slice(b", ");
+                }
+                let dist = bisect_dist.get(id).copied().unwrap_or(0);
+                out.extend_from_slice(format!("dist={dist})").as_bytes());
+            }
             if show_parents {
                 for parent in parents_of.get(id).into_iter().flatten() {
                     out.push(b' ');
@@ -1929,6 +2103,18 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         sink.write_all(&out)?;
         sink.flush()?;
         return Ok(die(abort));
+    }
+    // `show_bisect_vars()` prints the listing only under `BISECT_SHOW_ALL`, with a
+    // `------` rule between it and the variables, and then `goto cleanup` — so the
+    // `--count`, `--disk-usage` and omitted-object summaries never run.
+    if let Some(vars) = bisect_vars_text {
+        if bisect_all {
+            sink.write_all(&out)?;
+            writeln!(sink, "------")?;
+        }
+        sink.write_all(vars.as_bytes())?;
+        sink.flush()?;
+        return Ok(ExitCode::SUCCESS);
     }
     if count_only {
         if left_right && cherry_mark {
@@ -2123,7 +2309,7 @@ fn revision_mark(
 /// relative order is the order they appear in the config *files*; this reads each
 /// key separately and puts `transfer.hideRefs` first. The order is observable only
 /// through a `!`-negated pattern that overlaps a positive one from the other key.
-fn hidden_ref_patterns(repo: &gix::Repository, section: &str) -> Result<Vec<String>, String> {
+pub(super) fn hidden_ref_patterns(repo: &gix::Repository, section: &str) -> Result<Vec<String>, String> {
     if !matches!(section, "fetch" | "receive" | "uploadpack") {
         return Err(format!("unsupported section for hidden refs: {section}"));
     }
@@ -2145,7 +2331,7 @@ fn hidden_ref_patterns(repo: &gix::Repository, section: &str) -> Result<Vec<Stri
 /// `!` negates it, and a match is a prefix that ends at the end of the name or at
 /// a `/`. `^` selects the un-stripped name, which is the same string here because
 /// this port has no ref namespaces.
-fn ref_is_hidden(refname: &str, patterns: &[String]) -> bool {
+pub(super) fn ref_is_hidden(refname: &str, patterns: &[String]) -> bool {
     for pattern in patterns.iter().rev() {
         let (negated, pattern) = match pattern.strip_prefix('!') {
             Some(rest) => (true, rest),
@@ -2549,6 +2735,44 @@ fn operand_path(repo: &gix::Repository, spec: &str) -> Vec<u8> {
 /// excluded, with the terms coming from `BISECT_TERMS` when a session renamed
 /// them (`read_bisect_terms`, defaults `bad`/`good`). Both are prefix matches,
 /// which is how the per-commit `good-<oid>` refs are picked up.
+pub(super) fn bisect_ref_tips(
+    repo: &gix::Repository,
+) -> anyhow::Result<Vec<(ObjectId, bool)>> {
+    let terms = std::fs::read_to_string(repo.path().join("BISECT_TERMS")).unwrap_or_default();
+    let mut lines = terms.lines();
+    let term_bad = lines.next().filter(|l| !l.is_empty()).unwrap_or("bad");
+    let term_good = lines.next().filter(|l| !l.is_empty()).unwrap_or("good");
+
+    let mut out = Vec::new();
+    for reference in repo.references()?.all()? {
+        let Ok(reference) = reference else { continue };
+        let full = reference.name().as_bstr().to_string();
+        let Some(rest) = full.strip_prefix("refs/bisect/") else {
+            continue;
+        };
+        let excluded = if rest.starts_with(term_bad) {
+            false
+        } else if rest.starts_with(term_good) {
+            true
+        } else {
+            continue;
+        };
+        let target = match reference.try_id() {
+            Some(id) => id.detach(),
+            None => match reference.into_fully_peeled_id() {
+                Ok(id) => id.detach(),
+                Err(_) => continue,
+            },
+        };
+        if let Some(commit) = repo.find_object(target).ok().and_then(|o| o.peel_to_commit().ok()) {
+            out.push((commit.id, excluded));
+        }
+    }
+    Ok(out)
+}
+
+/// git's `--bisect` pseudo-option for `rev-list`, which also records the tag
+/// objects it peeled through so `--objects` can list them.
 fn seed_bisect_refs(
     repo: &gix::Repository,
     negate: bool,
@@ -2604,18 +2828,27 @@ fn seed_bisect_refs(
 /// walk first, because their parents' reaches overlap and cannot be summed;
 /// everything else inherits `parent + 1` in the cheap fill-in pass.
 ///
-/// git also skips TREESAME commits, which only exist under a pathspec-limited
-/// walk; `--bisect` with a pathspec is rejected rather than weighed wrongly.
+/// A TREESAME commit — one a pathspec limit walks past — changes nothing, so git
+/// never *picks* one and never counts one: it is left out of `all`, adds nothing
+/// to a `count_distance()` walk it is on, and inherits its parent's weight
+/// unchanged instead of parent + 1.
+///
+/// `find_all` is `FIND_BISECTION_ALL`: the halfway shortcut is disabled (every
+/// weight is computed) and the answer is the whole range sorted by
+/// `best_bisection_sorted()`'s key rather than the single best commit.
 fn find_bisection(
     commits: &[ObjectId],
     parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
     first_parent_only: bool,
-) -> Option<ObjectId> {
+    find_all: bool,
+    treesame: &HashSet<ObjectId>,
+) -> Bisection {
     // git reverses the list while counting, so the oldest commit comes first.
+    // Only the tree-changing commits are counted: `if (!(flags & TREESAME)) nr++`.
     let list: Vec<ObjectId> = commits.iter().rev().copied().collect();
-    let nr = list.len() as i64;
+    let nr = list.iter().filter(|id| !treesame.contains(*id)).count() as i64;
     if nr == 0 {
-        return None;
+        return Bisection::default();
     }
     let slot: HashMap<ObjectId, usize> = list.iter().enumerate().map(|(i, id)| (*id, i)).collect();
     // A parent outside the list is one the walk marked UNINTERESTING.
@@ -2640,8 +2873,10 @@ fn find_bisection(
     let mut counted = 0i64;
     for (n, id) in list.iter().enumerate() {
         match parents(id).iter().filter(|p| interesting(p)).count() {
+            // A root reaches only itself — unless it is TREESAME, which reaches
+            // nothing at all and keeps the zero weight it was allocated with.
             0 => {
-                weights[n] = 1;
+                weights[n] = i64::from(!treesame.contains(id));
                 counted += 1;
             }
             1 => weights[n] = -1,
@@ -2654,9 +2889,10 @@ fn find_bisection(
             continue;
         }
         let mut visited: HashSet<ObjectId> = HashSet::new();
-        weights[n] = count_distance(list[n], parents_of, &slot, &mut visited, first_parent_only);
-        if approx_halfway(weights[n]) {
-            return Some(list[n]);
+        weights[n] =
+            count_distance(list[n], parents_of, &slot, &mut visited, first_parent_only, treesame);
+        if !find_all && approx_halfway(weights[n]) {
+            return Bisection::single(list[n], weights[n], nr);
         }
         counted += 1;
     }
@@ -2673,11 +2909,18 @@ fn find_bisection(
                 (weights[i] >= 0).then_some(weights[i])
             });
             let Some(w) = known else { continue };
-            weights[n] = w + 1;
             counted += 1;
             progressed = true;
-            if approx_halfway(weights[n]) {
-                return Some(list[n]);
+            // A TREESAME commit reaches exactly what its parent does, and the
+            // halfway shortcut is not even tried on one (git checks it only in the
+            // `else` arm).
+            if treesame.contains(&list[n]) {
+                weights[n] = w;
+                continue;
+            }
+            weights[n] = w + 1;
+            if !find_all && approx_halfway(weights[n]) {
+                return Bisection::single(list[n], weights[n], nr);
             }
         }
         if !progressed {
@@ -2685,17 +2928,97 @@ fn find_bisection(
         }
     }
 
-    // `best_bisection`: the commit whose smaller side is largest.
+    // `best_bisection_sorted()`: every candidate, keyed on the same distance the
+    // single-answer path maximises, ordered by descending distance and — for the
+    // ties that are the normal case — ascending object id (`compare_commit_dist`).
+    // `reaches` stays the *weight* of the commit that comes out first, not its
+    // distance, since git reads it back off the head of the list it returns.
+    if find_all {
+        let mut sorted: Vec<(ObjectId, i64, i64)> = list
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !treesame.contains(*id))
+            .map(|(n, id)| (*id, weights[n].min(nr - weights[n]), weights[n]))
+            .collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let reaches = sorted.first().map_or(0, |(_, _, w)| *w);
+        return Bisection {
+            commits: sorted.into_iter().map(|(id, dist, _)| (id, dist)).collect(),
+            reaches,
+            all: nr,
+        };
+    }
+
+    // `best_bisection`: the commit whose smaller side is largest, TREESAME
+    // commits skipped since picking one would name a commit the pathspec says
+    // changed nothing.
     let mut best = list[0];
+    let mut best_weight = weights[0];
     let mut best_distance = -1i64;
     for (n, id) in list.iter().enumerate() {
+        if treesame.contains(id) {
+            continue;
+        }
         let distance = weights[n].min(nr - weights[n]);
         if distance > best_distance {
             best = *id;
+            best_weight = weights[n];
             best_distance = distance;
         }
     }
-    Some(best)
+    Bisection::single(best, best_weight, nr)
+}
+
+/// What `find_bisection()` hands back: the commits to show and the two
+/// out-parameters `show_bisect_vars()` reads — `reaches`, the weight of the first
+/// of them, and `all`, the size of the range that was searched.
+#[derive(Default)]
+struct Bisection {
+    /// Each commit with the distance `best_bisection_sorted()` weighed it at.
+    /// Without `--bisect-all` this is the one chosen commit, whose distance is
+    /// never printed.
+    commits: Vec<(ObjectId, i64)>,
+    reaches: i64,
+    all: i64,
+}
+
+impl Bisection {
+    /// The single-commit answer, which is every path but `FIND_BISECTION_ALL`.
+    fn single(id: ObjectId, weight: i64, all: i64) -> Self {
+        Self { commits: vec![(id, weight.min(all - weight))], reaches: weight, all }
+    }
+}
+
+/// Port of `estimate_bisect_steps()` (bisect.c): how many more rounds a range of
+/// `all` commits is expected to take.
+///
+/// ```c
+/// int estimate_bisect_steps(int all)
+/// {
+///         int n, x, e;
+///
+///         if (all < 3)
+///                 return 0;
+///
+///         n = log2u(all);
+///         e = 1 << n;
+///         x = all - e;
+///
+///         return (e < 3 * x) ? n : n - 1;
+/// }
+/// ```
+fn estimate_bisect_steps(all: i64) -> i64 {
+    if all < 3 {
+        return 0;
+    }
+    let n = i64::from(63 - (all as u64).leading_zeros());
+    let e = 1i64 << n;
+    let x = all - e;
+    if e < 3 * x {
+        n
+    } else {
+        n - 1
+    }
 }
 
 /// git's `count_distance`: how many listed commits `start` reaches, itself
@@ -2706,6 +3029,7 @@ fn count_distance(
     slot: &HashMap<ObjectId, usize>,
     visited: &mut HashSet<ObjectId>,
     first_parent_only: bool,
+    treesame: &HashSet<ObjectId>,
 ) -> i64 {
     let mut nr = 0;
     let mut cur = Some(start);
@@ -2713,7 +3037,11 @@ fn count_distance(
         if !slot.contains_key(&id) || !visited.insert(id) {
             break;
         }
-        nr += 1;
+        // `if (!(commit->object.flags & TREESAME)) nr++;` — a commit the pathspec
+        // walked past is still traversed, it just does not count.
+        if !treesame.contains(&id) {
+            nr += 1;
+        }
         let parents = parents_of.get(&id).map(Vec::as_slice).unwrap_or(&[]);
         cur = parents.first().copied();
         if first_parent_only {
@@ -2721,7 +3049,7 @@ fn count_distance(
         }
         // A merge's extra parents are separate strands, counted recursively.
         for extra in parents.iter().skip(1) {
-            nr += count_distance(*extra, parents_of, slot, visited, first_parent_only);
+            nr += count_distance(*extra, parents_of, slot, visited, first_parent_only, treesame);
         }
     }
     nr
@@ -3289,6 +3617,7 @@ fn treesame_parent(
     first_parent: bool,
     specs: &mut super::log::PathspecMatcher,
     walked: &HashMap<ObjectId, Vec<ObjectId>>,
+    show_pulls: bool,
 ) -> Result<Option<Option<ObjectId>>> {
     let Some(tree) = commit_tree(repo, commit) else {
         return Ok(Some(None));
@@ -3301,7 +3630,7 @@ fn treesame_parent(
     }
     let considered = if first_parent { &parents[..1] } else { parents };
     let mut same: Option<Option<ObjectId>> = None;
-    for parent in considered {
+    for (nth, parent) in considered.iter().enumerate() {
         let parent_tree = commit_tree(repo, *parent);
         if diff_touches_path(repo, parent_tree, tree, specs)? {
             continue;
@@ -3309,6 +3638,12 @@ fn treesame_parent(
         // A parent outside the walk is UNINTERESTING, and `relevant_commit`
         // refuses to simplify onto one, so keep looking for a relevant match.
         if walked.contains_key(parent) {
+            // `if (!revs->show_pulls || !nth_parent) commit->object.flags |=
+            // TREESAME;`: matching a *later* parent makes this merge a diversion,
+            // which `--show-pulls` keeps.
+            if show_pulls && nth > 0 {
+                return Ok(None);
+            }
             return Ok(Some(Some(*parent)));
         }
         same = Some(None);
@@ -3581,9 +3916,20 @@ pub(super) fn has_promisor_remote(repo: &gix::Repository) -> bool {
     snapshot.string("extensions.partialClone").is_some()
 }
 
+/// Every object this repository's packs hold — git's `has_object_pack()` asked in
+/// bulk, which is what `--unpacked` filters on.
+pub(super) fn packed_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
+    pack_objects(repo, false)
+}
+
 /// The objects held by every pack with a `.promisor` file beside it — git's
 /// `FOR_EACH_OBJECT_PROMISOR_ONLY` enumeration.
 pub(super) fn promisor_pack_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
+    pack_objects(repo, true)
+}
+
+/// The ids in this repository's packs, optionally only the promisor ones.
+fn pack_objects(repo: &gix::Repository, promisor_only: bool) -> HashSet<ObjectId> {
     let mut set = HashSet::new();
     let store = repo.objects.store_ref();
     for dir in std::iter::once(store.path().to_path_buf())
@@ -3593,7 +3939,7 @@ pub(super) fn promisor_pack_objects(repo: &gix::Repository) -> HashSet<ObjectId>
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("idx")
-                || !path.with_extension("promisor").exists()
+                || (promisor_only && !path.with_extension("promisor").exists())
             {
                 continue;
             }

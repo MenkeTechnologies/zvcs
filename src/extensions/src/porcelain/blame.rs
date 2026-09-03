@@ -450,7 +450,8 @@ use crate::date::approxidate;
 ///     cannot be switched off. The positive `--indent-heuristic` *is* accepted:
 ///     `diff.c:57` seeds `diff_indent_heuristic = 1`, so it asks for the state
 ///     the engine is already in.
-///   * `--date=human` and the `-local` date variants.
+///   * the `-local` date variants, which need the recorded stamp folded into the
+///     process's own zone.
 ///
 /// `--first-parent` and `--minimal` are implemented: the first truncates every
 /// commit's parent list to one entry inside `gix-blame`, which is what git's
@@ -4234,6 +4235,9 @@ enum DateMode {
     /// git `DATE_RELATIVE` (`relative`): `3 days ago`, computed against the current
     /// time. Independent of the recorded timezone offset.
     Relative,
+    /// git `DATE_HUMAN` (`human`): the shared `show_date()` renderer, which drops
+    /// the parts of the stamp that are obvious from the current wall clock.
+    Human,
 }
 
 impl DateMode {
@@ -4251,6 +4255,10 @@ impl DateMode {
             // git: `utf8_strwidth("4 years, 11 months ago") + 1`, then the shared
             // `blame_date_width -= 1` (strip the NUL) leaves the string width.
             DateMode::Relative => "4 years, 11 months ago".len(),
+            // `case DATE_HUMAN: /* If the year is shown, no time is shown */
+            // blame_date_width = sizeof("Thu Oct 19 16:00");` (builtin/blame.c),
+            // less the NUL the shared `-= 1` strips.
+            DateMode::Human => "Thu Oct 19 16:00".len(),
         }
     }
 
@@ -4279,6 +4287,14 @@ impl DateMode {
             DateMode::Raw => t.format_or_unix(format::RAW),
             DateMode::Unix => t.format_or_unix(format::UNIX),
             DateMode::Relative => show_date_relative(seconds),
+            // The `human` renderer needs the process's own clock and zone, which
+            // is exactly what the shared `show_date()` does for `git log`.
+            DateMode::Human => crate::showdate::show_date(
+                seconds,
+                offset,
+                &crate::showdate::DateMode::new(crate::showdate::DateType::Human),
+                crate::date::now_seconds(),
+            ),
         }
     }
 }
@@ -4401,9 +4417,7 @@ fn classify_date(input: &str) -> DateClass {
         DateType::Raw => DateClass::Supported(DateMode::Raw),
         DateType::Unix => DateClass::Supported(DateMode::Unix),
         DateType::Relative => DateClass::Supported(DateMode::Relative),
-        // `human` needs a time-relative renderer that also folds the current
-        // time into local-timezone broken-down form; not implemented.
-        DateType::Human => DateClass::Unsupported(format),
+        DateType::Human => DateClass::Supported(DateMode::Human),
         DateType::Strftime => unreachable!("strftime handled above"),
     }
 }
@@ -4677,13 +4691,35 @@ fn git_knows_long_option(a: &str) -> bool {
     if LONG_OPTS.iter().any(|o| o.name == stem) {
         return false;
     }
-    // Everything else is `handle_revision_opt()`'s, which matches its names
-    // exactly (no abbreviation) and spells its own negations.
+    // Everything else is `handle_revision_opt()`'s or `diff_opt_parse()`'s. The two
+    // differ on negation: the diff table is `parse_options()`-driven, so every
+    // entry that is not `PARSE_OPT_NONEG` answers to `--no-<name>`, while
+    // `handle_revision_opt()` is a `strcmp` chain that spells the negations it
+    // has — `--no-merges` is its own name there, and there is no
+    // `--no-first-parent` at all.
     GIT_BLAME_LONG_OPTIONS.contains(&name)
         || name
             .strip_prefix("no-")
-            .is_some_and(|n| GIT_BLAME_LONG_OPTIONS.contains(&n))
+            .is_some_and(|n| GIT_BLAME_NEGATABLE_OPTIONS.contains(&n))
 }
+
+/// The subset of [`GIT_BLAME_LONG_OPTIONS`] that `--no-<name>` is *also* a valid
+/// spelling of, verified against git v2.55.0 by running `git blame --no-<name>`
+/// for every entry of that list and keeping the ones it did not answer with
+/// `error: unknown option`. These are the `parse_options()` entries — blame's own
+/// table and `diff_opt_parse()`'s — minus the `PARSE_OPT_NONEG` ones; the
+/// revision walker's own options are absent because it never spells a negation it
+/// does not list under its own name.
+static GIT_BLAME_NEGATABLE_OPTIONS: &[&str] = &[
+    "abbrev", "abbrev-commit", "color", "color-by-age", "color-lines", "color-moved",
+    "color-moved-ws", "compact-summary", "contents", "encode-email-headers", "exit-code",
+    "expand-tabs", "ext-diff", "find-copies-harder", "follow", "full-index",
+    "function-context", "graph", "ignore-matching-lines", "ignore-rev", "ignore-revs-file",
+    "incremental", "indent-heuristic", "line-porcelain", "max-parents", "merges",
+    "min-parents", "minimal", "notes", "patch", "porcelain", "progress", "quiet", "relative",
+    "rename-empty", "root", "score-debug", "show-email", "show-name", "show-number",
+    "show-signature", "show-stats", "standard-notes", "text", "textconv"
+];
 
 /// git's "pseudo revision arguments" — the first block of `handle_revision_opt()`
 /// (`revision.c:2325-2340`), which does not act on them at all:
@@ -4881,8 +4917,10 @@ impl Options {
                 "--help-all" => return Ok(ParseOutcome::HelpAll),
                 // `--first-parent` is a rev-list option blame forwards to
                 // `setup_revisions()`, which sets `revs->first_parent_only`.
+                // There is no `--no-first-parent`: `handle_revision_opt()` has no
+                // negation for it, so parse-options reports it as an unknown
+                // option (with git's `(null)` name quirk) and exits 129.
                 "--first-parent" => first_parent = true,
-                "--no-first-parent" => first_parent = false,
                 // `cmd_blame` rewrites `--reverse` to `--children` before handing the argument to
                 // `handle_revision_opt()` and sets its own `reverse` flag
                 // (`builtin/blame.c:1027-1029`), which is what turns the whole algorithm around.
@@ -4912,6 +4950,11 @@ impl Options {
                 // and has no path through that code, so it stays refused below
                 // rather than being accepted as a no-op.
                 "--indent-heuristic" => {}
+                // The same shape: `--no-textconv` asks for the state this port is
+                // already in, since the blame here never runs a textconv filter.
+                // (`--textconv` itself stays refused: with a `diff.<driver>.textconv`
+                // configured it changes what is blamed.)
+                "--no-textconv" => {}
                 // `optname()` names a short option by its character, so this is
                 // ``switch `L'`` and not ``option `-L'``; the refusal is
                 // parse-options' own `error:` line at 129, never a `zvcs:` gap
@@ -5096,6 +5139,14 @@ impl Options {
                 // the gap message below instead claimed the option was unported
                 // when it is merely incomplete.
                 _ if a.starts_with('-') && a.len() > 1 => {
+                    // …but only when the value really is absent. `get_arg()` takes
+                    // it from the next argv slot, so `-S <file>` is complete and
+                    // `-S` at the end of the line is not; reporting the complete
+                    // one as incomplete named the wrong problem.
+                    if takes_next_slot(a) && i + 1 < args.len() {
+                        i += 1;
+                        bail!("unsupported option: {a}")
+                    }
                     if let Some(code) = trailing_option_missing_value(a)? {
                         return Ok(ParseOutcome::Reported(code));
                     }

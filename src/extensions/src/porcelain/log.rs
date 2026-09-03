@@ -887,6 +887,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--glob=<glob>`, kept in command-line order because that is the order
     // `handle_refs()` appends their tips in.
     let mut ref_selections: Vec<RefSelection> = Vec::new();
+    // `--alternate-refs`, recorded by argv position like `--reflog` is: the ids an
+    // alternate's ref walk reports, pended where the flag stood.
+    let mut alternate_selections: Vec<(usize, bool)> = Vec::new();
+    // `--bisect`, likewise: `refs/bisect/<term_bad>*` are pended as tips and
+    // `refs/bisect/<term_good>*` with `*flags ^ (UNINTERESTING | BOTTOM)`.
+    let mut bisect_selections: Vec<(usize, bool)> = Vec::new();
+    // `revs->ref_excludes.hidden_refs` / `.hidden_refs_configured`, installed by
+    // `--exclude-hidden=<section>` and read by every later ref walk.
+    let mut hidden_refs: Vec<String> = Vec::new();
+    let mut hidden_configured = false;
     // `--exclude=<glob>`, accumulated until the next ref-selecting option consumes
     // and clears it (`clear_ref_exclusions`, revision.c).
     let mut ref_excludes: Vec<String> = Vec::new();
@@ -929,6 +939,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--simplify-by-decoration`, plus somewhere to keep the decoration map when
     // the format itself did not ask for one.
     let mut simplify_by_decoration = false;
+    // `revs->show_pulls`: keep the merges that are "diversions" — not TREESAME to
+    // their first parent but TREESAME to a later one, i.e. the merge that brought
+    // the change in rather than making it.
+    let mut show_pulls = false;
+    // `revs->remove_empty_trees`: when a commit adds *all* the pathspec's paths
+    // relative to a parent that has none of them, that parent is treated as a root
+    // and the history behind it is never walked.
+    let mut remove_empty = false;
+    // `revs->unpacked`: `get_commit_action()` ignores a commit that any pack
+    // holds, so a fully packed repository logs nothing under it.
+    let mut unpacked = false;
     // `--full-history` (git's `revs->simplify_history = 0`): follow every parent
     // of a merge even when the merge is TREESAME to one of them, so a change that
     // arrived on a side branch keeps both the merge and that side in the history.
@@ -968,6 +989,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     /// `revs->left_right` / `cherry_mark` / `cherry_pick` / `left_only` / `right_only`: the
     /// symmetric-difference marking `cherry_pick_list()` feeds.
     let mut left_right = false;
+    // `revs->ancestry_path`: keep only the commits that descend from a BOTTOM
+    // commit — an explicitly excluded tip — plus `ancestry_path_bottoms` when the
+    // `=<commit>` spelling named them itself.
+    let mut ancestry_path = false;
+    let mut ancestry_bottoms: Vec<ObjectId> = Vec::new();
+    // `revs->exclude_first_parent_only`: `mark_parents_uninteresting()` stops at
+    // each excluded commit's first parent instead of painting every parent.
+    let mut exclude_first_parent_only = false;
     let mut cherry_mark = false;
     let mut cherry_pick = false;
     let mut left_only = false;
@@ -997,6 +1026,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--since`/`--after` and `--until`/`--before` commit-date range (committer
     // time), parsed with git's approxidate.
     let mut since: Option<i64> = None;
+    // `revs->max_age_as_filter`, the display-time twin of `--since`.
+    let mut since_as_filter: Option<i64> = None;
     let mut until: Option<i64> = None;
     // Pickaxe: `-S<string>` (net occurrence count changed) / `-G<regex>` (a
     // changed line matches). Both diff each commit against its first parent.
@@ -1219,12 +1250,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         } else if a == "--notes" || a == "--show-notes" {
             notes_opt.enable_default();
             notes_opt.given = true;
-        } else if let Some(v) = a
-            .strip_prefix("--notes=")
-            .or_else(|| a.strip_prefix("--show-notes="))
-        {
+        } else if let Some(v) = a.strip_prefix("--notes=") {
             notes_opt.enable_ref(v);
             notes_opt.given = true;
+        } else if let Some(v) = a.strip_prefix("--show-notes=") {
+            notes_opt.enable_ref_show(v);
+            notes_opt.given = true;
+        } else if a == "--standard-notes" {
+            notes_opt.standard();
+            notes_opt.given = true;
+        } else if a == "--no-standard-notes" {
+            notes_opt.no_standard();
         } else if a == "--no-notes" || a == "--no-show-notes" {
             notes_opt.disable();
             notes_opt.given = true;
@@ -1326,8 +1362,57 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             simplify_merges_opt = true;
             full_history = true;
             order = Order::Topo;
+        } else if a == "--show-pulls" {
+            show_pulls = true;
+        } else if a == "--remove-empty" {
+            remove_empty = true;
+        } else if a == "--unpacked" {
+            unpacked = true;
+        // `revs->count` and the object-listing switches are `rev-list`'s output
+        // modes. `setup_revisions()` accepts them for every command that walks —
+        // `builtin/log.c` simply never reads them, so a `git log --count` is the
+        // ordinary log. They are inert here for the same reason, not unported.
+        } else if a == "--count" || a == "--objects" || a == "--objects-edge"
+            || a == "--objects-edge-aggressive" || a == "--indexed-objects"
+            || a == "--object-names" || a == "--no-object-names"
+        {
+        // `--single-worktree` stops `--all` and `--reflog` from reaching the
+        // per-worktree refs of the *other* worktrees. This port's ref walk is the
+        // current worktree's to begin with, so the flag has nothing to take away;
+        // it is accepted rather than refused because refusing it would report a
+        // difference that is not there.
+        } else if a == "--single-worktree" {
+        } else if a == "--alternate-refs" {
+            // ```c
+            // } else if (!strcmp(arg, "--alternate-refs")) {
+            //         add_alternate_refs_to_pending(revs, *flags);
+            // ```
+            //
+            // (revision.c.) The tips an alternate object store's repository
+            // reports, pended under the flags `--not` is holding, exactly like
+            // `--reflog` (which is why it lands in the same positional list).
+            if negate_revs {
+                no_walk = None;
+            }
+            alternate_selections.push((revs.len(), negate_revs));
         } else if a == "--simplify-by-decoration" {
+            // ```c
+            // } else if (!strcmp(arg, "--simplify-by-decoration")) {
+            //         revs->simplify_merges = 1;
+            //         revs->topo_order = 1;
+            //         revs->rewrite_parents = 1;
+            //         revs->simplify_history = 0;
+            //         revs->simplify_by_decoration = 1;
+            //         revs->limited = 1;
+            //         revs->prune = 1;
+            // ```
+            //
+            // (revision.c.) It is `--simplify-merges` with one extra rule in the
+            // tree comparison, not a mode of its own.
             simplify_by_decoration = true;
+            simplify_merges_opt = true;
+            full_history = true;
+            order = Order::Topo;
         } else if a == "--boundary" {
             boundary = true;
         } else if a == "--no-boundary" {
@@ -1453,7 +1538,48 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `--exclude` patterns had accumulated (`clear_ref_exclusions`), and each
         // takes the `UNINTERESTING` flag `--not` is holding, so `--not --all`
         // hides every ref instead of walking from it.
+        } else if a == "--bisect" {
+            if negate_revs {
+                no_walk = None;
+            }
+            bisect_selections.push((revs.len(), negate_revs));
+        } else if let Some(section) = a.strip_prefix("--exclude-hidden=") {
+            // `if (exclusions->hidden_refs_configured) die(_("--exclude-hidden= passed
+            // more than once"));` — the flag is set by the config walk itself, so a
+            // second spelling is fatal whatever section it names.
+            if hidden_configured {
+                eprintln!("fatal: --exclude-hidden= passed more than once");
+                return Ok(ExitCode::from(128));
+            }
+            match super::rev_list::hidden_ref_patterns(&repo, section) {
+                Ok(patterns) => {
+                    hidden_configured = true;
+                    hidden_refs = patterns;
+                }
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if let Some((sel, pattern)) = ref_selector(a) {
+            // `--branches`/`--tags`/`--remotes` refuse to run once
+            // `--exclude-hidden=` has been seen, and they do it with `error()`
+            // rather than `die()`: `handle_revision_pseudo_opt()` returns the
+            // failure, the argument is left in argv, and `cmd_log_init_finish()`
+            // then reports it as unrecognized. Both lines, then exit 128.
+            let conflicting = match sel {
+                RefSelector::Branches => Some("--branches"),
+                RefSelector::Tags => Some("--tags"),
+                RefSelector::Remotes => Some("--remotes"),
+                RefSelector::All | RefSelector::Glob => None,
+            };
+            if let (true, Some(name)) = (hidden_configured, conflicting) {
+                eprintln!(
+                    "error: options '--exclude-hidden' and '{name}' cannot be used together"
+                );
+                eprintln!("fatal: unrecognized argument: {a}");
+                return Ok(ExitCode::from(128));
+            }
             // `--glob` is a `parse_long_opt()` option, so its value may stand as
             // the next argv element; the fixed spellings never take one.
             let detached = if sel == RefSelector::Glob && pattern.is_none() {
@@ -1807,6 +1933,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             } else {
                 until = age;
             }
+        // `revs->max_age_as_filter = approxidate(optarg)`: the same cutoff as
+        // `--since`, applied by `get_commit_action()` to each commit as it is about
+        // to be shown instead of by `limit_list()` to the walk — so an older commit
+        // hides itself without hiding its ancestors.
+        } else if let Some(v) = a.strip_prefix("--since-as-filter=") {
+            since_as_filter = Some(approxidate(v));
+        } else if a == "--since-as-filter" {
+            i += 1;
+            since_as_filter = Some(approxidate(&args.get(i).cloned().unwrap_or_default()));
         } else if let Some(v) = a.strip_prefix("--since=").or_else(|| a.strip_prefix("--after=")) {
             since = Some(approxidate(v));
         } else if a == "--since" || a == "--after" {
@@ -2192,6 +2327,54 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // Accepted and inert: each of these sets a `diff_options` field to the
                 // value this port already runs at, so there is nothing to plumb and
                 // nothing that could come out wrong. See the list's own documentation.
+            } else if a == "--ancestry-path" {
+                // ```c
+                // } else if (!strcmp(arg, "--ancestry-path")) {
+                //         revs->ancestry_path = 1;
+                //         revs->simplify_history = 0;
+                //         revs->limited = 1;
+                // ```
+                //
+                // (revision.c.) `simplify_history = 0` is exactly what
+                // `--full-history` sets, so an ancestry-path walk keeps the merges
+                // a plain path limit would have simplified away.
+                ancestry_path = true;
+                full_history = true;
+            } else if let Some(spec) = a.strip_prefix("--ancestry-path=") {
+                // ```c
+                // } else if (skip_prefix(arg, "--ancestry-path=", &optarg)) {
+                //         struct commit *c;
+                //         struct object_id oid;
+                //         const char *msg = _("could not get commit for --ancestry-path argument %s");
+                //
+                //         revs->ancestry_path = 1;
+                //         revs->simplify_history = 0;
+                //         revs->limited = 1;
+                //
+                //         if (repo_get_oid_committish(revs->repo, optarg, &oid))
+                //                 return error(msg, optarg);
+                // ```
+                //
+                // (revision.c.) `error()` rather than `die()`, so the exit is
+                // parse-options' 128 with the `error:` wording.
+                ancestry_path = true;
+                full_history = true;
+                match repo.rev_parse_single(spec).ok().and_then(|id| {
+                    repo.find_object(id).ok()?.peel_to_kind(gix::object::Kind::Commit).ok()
+                }) {
+                    Some(obj) => ancestry_bottoms.push(obj.id),
+                    None => {
+                        eprintln!(
+                            "error: could not get commit for --ancestry-path argument {spec}"
+                        );
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            } else if a == "--exclude-first-parent-only" {
+                // `revs->exclude_first_parent_only`: only the *exclusion* walk is
+                // narrowed to first parents; the positive side still follows every
+                // parent unless `--first-parent` says otherwise.
+                exclude_first_parent_only = true;
             } else if a == "--left-right" {
                 left_right = true;
             } else if a == "--cherry-mark" {
@@ -2586,6 +2769,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     } else {
         super::shortlog::reflog_pending(&repo)?
     };
+    // `odb_for_each_alternate_ref()` runs a command *in the lender* and reads ids
+    // off its stdout, so it is only paid for when `--alternate-refs` was given.
+    let alternate_tips: Vec<ObjectId> = if alternate_selections.is_empty() {
+        Vec::new()
+    } else {
+        crate::alternate_refs::tips(&repo)
+    };
+    // `--bisect`: the ids under `refs/bisect/`, each with the flag it is pended
+    // under — `<term_good>*` takes `*flags ^ (UNINTERESTING | BOTTOM)`, so it
+    // excludes rather than seeds.
+    let bisect_tips: Vec<(ObjectId, bool)> = if bisect_selections.is_empty() {
+        Vec::new()
+    } else {
+        super::rev_list::bisect_ref_tips(&repo)?
+    };
     // Append the tips of the ref-selecting pseudo-options that stood at argument
     // index `at`. Each yields its refs in refname order — the ref iterator's own
     // order, which is what breaks a commit-date tie between two of them.
@@ -2618,9 +2816,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // A ref-selecting pseudo-option never pends `SYMMETRIC_LEFT`.
                 tip_left.push(false);
                 tip_names.push(name.to_string());
-                if source_mode {
-                    tip_sources.push(name.to_string());
-                }
+                tip_sources.push(name.to_string());
             };
             for full in &ref_names {
                 let Some(name) = sel.selects(full) else {
@@ -2677,9 +2873,31 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 }
                 tips.push(*oid);
                 tip_names.push(String::new());
-                if source_mode {
-                    tip_sources.push(String::new());
+                tip_sources.push(String::new());
+            }
+        }
+        // `add_one_alternate_ref()` pends each id under the ref name the alternate
+        // reported, which is the name `--source` would print.
+        for negated in alternate_selections.iter().filter(|(i, _)| *i == at).map(|(_, n)| *n) {
+            for oid in &alternate_tips {
+                if negated {
+                    neg_ids.push(*oid);
+                    continue;
                 }
+                tips.push(*oid);
+                tip_names.push(String::new());
+                tip_sources.push(String::new());
+            }
+        }
+        for negated in bisect_selections.iter().filter(|(i, _)| *i == at).map(|(_, n)| *n) {
+            for (oid, uninteresting) in &bisect_tips {
+                if *uninteresting != negated {
+                    neg_ids.push(*oid);
+                    continue;
+                }
+                tips.push(*oid);
+                tip_names.push(String::new());
+                tip_sources.push(String::new());
             }
         }
     };
@@ -2774,9 +2992,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     tips.push(commit);
                     tip_left.push(*sym_left);
                     tip_names.push(name.clone());
-                    if source_mode {
-                        tip_sources.push(name.clone());
-                    }
+                    tip_sources.push(name.clone());
                 }
                 Err(_) if spec_is_path(&repo, spec) => {
                     in_paths = true;
@@ -2798,11 +3014,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // rather than quietly walking `HEAD`. So does a namespace option that selected
     // nothing: `--remotes` in a repository with no remotes is still an input.
     // A token that turned out to be a pathspec is not — `git log .` walks `HEAD`.
+    // `init_all_refs_cb()` sets `revs->rev_input_given = 1`, so a ref-walking
+    // pseudo-option that selected nothing still counts as input and still keeps
+    // `HEAD` out of the walk — `--bisect` in a repository with no bisect refs
+    // prints nothing. `--alternate-refs` and `--reflog` are the exceptions: both
+    // fill their callback data by hand rather than through `init_all_refs_cb()`,
+    // so with no alternates (or no reflogs) the walk falls back to `HEAD`.
     let positive_from_args = rev_input_given
         || !tips.is_empty()
         || !neg_ids.is_empty()
         || !ref_selections.is_empty()
-        || !reflog_selections.is_empty();
+        || !bisect_selections.is_empty();
     if !positive_from_args {
         let head = repo.head()?;
         if head.is_unborn() && !all {
@@ -2816,9 +3038,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         if let Some(id) = repo.head()?.try_peel_to_id()? {
             tips.push(id.detach());
             tip_names.push("HEAD".to_string());
-            if source_mode {
-                tip_sources.push("HEAD".to_string());
-            }
+            tip_sources.push("HEAD".to_string());
         }
     }
 
@@ -2878,6 +3098,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // range exclusion). Empty when no `A..B`/`^A` was given.
     let hidden = if neg_ids.is_empty() {
         HashSet::new()
+    } else if exclude_first_parent_only {
+        ancestor_closure_opt(&repo, &neg_ids, true)?
     } else if no_walk.is_some() {
         // Nothing paints UNINTERESTING under `--no-walk`; only what
         // `mark_parents_uninteresting()` already reached is excluded.
@@ -2896,6 +3118,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         && min_parents.is_none()
         && max_parents.is_none()
         && since.is_none()
+        && since_as_filter.is_none()
         && until.is_none()
         && author_pats.is_empty()
         && committer_pats.is_empty()
@@ -3009,7 +3232,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         if let Some(abort) = abort {
             return Ok(abort.die_setup());
         }
-        nodes = topo_sort_ordered(&repo, nodes, effective_order);
+        // `prepare_revision_walk()` picks `init_topo_walk()` — the only sort that
+        // knows `--first-parent` — only when a commit-graph with generation
+        // numbers is there; without one it is `sort_in_topological_order()`, which
+        // counts every parent. See [`topo_sort_keyed`].
+        let fp_sort = first_parent && repo.commit_graph().is_ok();
+        nodes = topo_sort_ordered(&repo, nodes, effective_order, fp_sort);
     }
     // `--reverse` makes `cmd_log_walk()` buffer every commit and print them only
     // after `get_revision()` runs dry (`revision.c`'s `revs->reverse` handling in
@@ -3087,6 +3315,54 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         nodes = kept;
     }
 
+    // git's UNINTERESTING set as the simplification below has to read it: the
+    // exclusion closure, plus whatever `--ancestry-path` takes off the path. A
+    // commit in here is *irrelevant* (`relevant_commit()`) unless it is also a
+    // BOTTOM — an explicitly excluded tip, which stays relevant.
+    let mut uninteresting: HashSet<ObjectId> = hidden.clone();
+    let bottoms_set: HashSet<ObjectId> = neg_ids.iter().copied().collect();
+
+    // `if (revs->unpacked && has_object_pack(revs->repo, &commit->object.oid))
+    // return commit_ignore;` (`get_commit_action()`): a display-time filter, so it
+    // runs over the walked list rather than pruning the walk.
+    if unpacked {
+        let packed = super::rev_list::packed_objects(&repo);
+        nodes.retain(|n| !packed.contains(&n.id));
+    }
+
+    // `--ancestry-path`: `limit_list()` keeps only the commits that descend from a
+    // BOTTOM commit, which is what an explicit `^<rev>` (and so the left side of a
+    // range, and the merge bases of a symmetric one) marks. It runs after the walk
+    // and before the TREESAME recheck, so the path limit below sees the reduced
+    // list.
+    if ancestry_path {
+        // `collect_bottom_commits()` reads the flag off the commits the walk
+        // started from, so a range that excluded nothing — two unrelated tips,
+        // whose symmetric difference has no merge base — has no bottoms at all.
+        let bottoms: Vec<ObjectId> = match ancestry_bottoms.is_empty() {
+            false => ancestry_bottoms.clone(),
+            true => neg_ids.clone(),
+        };
+        if bottoms.is_empty() {
+            eprintln!("fatal: --ancestry-path given but there are no bottom commits");
+            return Ok(ExitCode::from(128));
+        }
+        let ids: Vec<ObjectId> = nodes.iter().map(|n| n.id).collect();
+        let parents_of: HashMap<ObjectId, Vec<ObjectId>> =
+            nodes.iter().map(|n| (n.id, n.parents.clone())).collect();
+        let kept: HashSet<ObjectId> =
+            super::rev_list::limit_to_ancestry(&bottoms, &ids, &parents_of)
+                .into_iter()
+                .collect();
+        // `limit_to_ancestry()` marks what is off the path UNINTERESTING rather
+        // than deleting it, and that is load-bearing below: a parent that has just
+        // become uninteresting is *irrelevant*, and an irrelevant parent cannot
+        // keep a merge !TREESAME. Dropping the commits here and remembering them
+        // as uninteresting is the same thing said twice.
+        uninteresting.extend(ids.iter().copied().filter(|id| !kept.contains(id)));
+        nodes.retain(|n| kept.contains(&n.id));
+    }
+
     // Path-limited traversal, a port of `try_to_simplify_commit()` followed by
     // `rewrite_parents()` (revision.c).
     //
@@ -3147,6 +3423,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
         nodes = shown;
     } else if !pathspecs.is_empty() {
+        // `rev_compare_tree()` answers `REV_TREE_DIFFERENT` for a decorated commit
+        // before it looks at any tree, so under `--simplify-by-decoration` a tagged
+        // commit is "changed" against every parent. The map is needed here, ahead
+        // of the one the *output* uses, whenever a pathspec and that flag meet.
+        let deco_simplify = if simplify_by_decoration {
+            let filter = DecorationFilter::build(
+                &repo,
+                &decorate_refs,
+                &decorate_refs_exclude,
+                default_decoration_filter,
+            );
+            Some(build_decorations(&repo, &filter)?)
+        } else {
+            None
+        };
+        let decorated = |id: &ObjectId| deco_simplify.as_ref().is_some_and(|d| d.decorates(id));
         let mut matcher = PathspecMatcher::new(&repo, &pathspecs)?;
         // id → (parents the simplified history follows, whether it is shown).
         let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
@@ -3161,6 +3453,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // gated on dense. Absent means the commit kept the parents it was walked
         // with.
         let mut pruned: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        // ```c
+        // case REV_TREE_NEW:
+        //         if (revs->remove_empty_trees &&
+        //             rev_same_tree_as_empty(revs, p, nth_parent)) {
+        //                 /* We are adding all the specified paths from this
+        //                  * parent, so the history beyond this parent is not
+        //                  * interesting. … we pretend this parent is a "root"
+        //                  * commit. */
+        //                 commit_list_free(p->parents);
+        //                 p->parents = NULL;
+        //         }
+        // ```
+        //
+        // (revision.c.) The parent keeps its place in the history; what it loses is
+        // everything behind it, which the reachability pass below then drops.
+        let mut forced_roots: HashSet<ObjectId> = HashSet::new();
         for node in &nodes {
             let commit = repo.find_object(node.id)?.try_into_commit()?;
             // `--first-parent` limits the comparison the same way it limits the
@@ -3177,7 +3485,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // root is still marked TREESAME under `--sparse`; what `--sparse`
                 // removes is the `revs->prune && revs->dense` gate that would have
                 // dropped it (revision.c:4221).
-                let changed = changes_match(&repo, &commit, None, &mut matcher)?;
+                let changed =
+                    decorated(&node.id) || changes_match(&repo, &commit, None, &mut matcher)?;
                 if simplify_merges_opt {
                     merge_simp.insert(
                         node.id,
@@ -3219,13 +3528,52 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // so a commit is shown exactly when some parent differs over the
                 // pathspec. That is what keeps a merge whose side branch carried
                 // the change, and the side itself, in the history.
-                let mut any_change = false;
+                // ```c
+                // if (relevant_commit(p))
+                //         relevant_change = 1;
+                // else
+                //         irrelevant_change = 1;
+                // …
+                // if (relevant_parents ? !relevant_change : !irrelevant_change)
+                //         commit->object.flags |= TREESAME;
+                // ```
+                //
+                // `relevant_commit()` is `(flags & (UNINTERESTING | BOTTOM)) !=
+                // UNINTERESTING`, so an excluded tip still counts while everything
+                // *behind* it does not. With relevant parents in play only those
+                // decide TREESAME, which is how a merge whose only relevant parent
+                // it matches is simplified away even though the other side
+                // differs — what `--ancestry-path` produces once it has marked the
+                // off-path parents uninteresting.
+                let mut relevant_parents = 0usize;
+                let mut relevant_change = false;
+                let mut irrelevant_change = false;
                 let mut treesame_with: Vec<bool> = Vec::with_capacity(parents.len());
                 for p in parents {
-                    let changed = changes_match(&repo, &commit, Some(*p), &mut matcher)?;
+                    let relevant = !uninteresting.contains(p) || bottoms_set.contains(p);
+                    let changed = decorated(&node.id)
+                        || changes_match(&repo, &commit, Some(*p), &mut matcher)?;
+                    if remove_empty && changed && pathspec_view_is_empty(&repo, *p, &mut matcher)? {
+                        forced_roots.insert(*p);
+                    }
                     treesame_with.push(!changed);
-                    any_change |= changed;
+                    if relevant {
+                        relevant_parents += 1;
+                        relevant_change |= changed;
+                    } else {
+                        irrelevant_change |= changed;
+                    }
                 }
+                let any_change = match relevant_parents {
+                    0 => irrelevant_change,
+                    _ => relevant_change,
+                };
+                // `if (!nth_parent) commit->object.flags |= PULL_MERGE;` — set
+                // where the *first* parent's comparison came out different, and
+                // read back by `get_commit_action()`: `if (revs->show_pulls &&
+                // (commit->object.flags & PULL_MERGE)) return commit_show;`, which
+                // overrides the TREESAME drop.
+                let pull_merge = show_pulls && treesame_with.first() == Some(&false);
                 if simplify_merges_opt {
                     // The parent list `simplify_one()` rewrites is the *whole*
                     // one: `--first-parent` stops the comparison at parent 1 but
@@ -3240,14 +3588,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         },
                     );
                 }
-                simplified.insert(node.id, (parents.to_vec(), any_change || !dense));
+                simplified.insert(node.id, (parents.to_vec(), any_change || pull_merge || !dense));
                 continue;
             }
-            let mut treesame: Option<ObjectId> = None;
-            for p in parents {
-                if !changes_match(&repo, &commit, Some(*p), &mut matcher)? {
-                    treesame = Some(*p);
+            // `nth_parent` of the parent this commit turned out to be TREESAME to,
+            // which is what decides both the parent prune and — under
+            // `--show-pulls` — whether the merge is still shown.
+            let mut treesame: Option<(usize, ObjectId)> = None;
+            for (nth, p) in parents.iter().enumerate() {
+                if !decorated(&node.id) && !changes_match(&repo, &commit, Some(*p), &mut matcher)? {
+                    treesame = Some((nth, *p));
                     break;
+                }
+                if remove_empty && pathspec_view_is_empty(&repo, *p, &mut matcher)? {
+                    forced_roots.insert(*p);
                 }
             }
             match treesame {
@@ -3256,12 +3610,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // the `revs->prune && revs->dense` display gate below it does not,
                 // so under `--sparse` the merge itself is still printed while the
                 // side it did not take stays unwalked.
-                Some(p) => {
+                //
+                // `if (!revs->show_pulls || !nth_parent) commit->object.flags |=
+                // TREESAME;`: a merge that matched a *later* parent is a diversion,
+                // and `--show-pulls` keeps it by never marking it TREESAME.
+                Some((nth, p)) => {
                     pruned.insert(node.id, vec![p]);
-                    simplified.insert(node.id, (vec![p], !dense))
+                    simplified.insert(node.id, (vec![p], !dense || (show_pulls && nth > 0)))
                 }
                 None => simplified.insert(node.id, (parents.to_vec(), true)),
             };
+        }
+        for root in &forced_roots {
+            if let Some((parents, _)) = simplified.get_mut(root) {
+                parents.clear();
+            }
         }
         // Whatever the simplified parent lists no longer reach was never walked
         // by git in the first place, so it cannot appear in the output.
@@ -3516,7 +3879,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--graph` with `-S`/`-G`: the commits the pickaxe kept. `None` when no
     // pickaxe ran, which means every commit prints.
     let mut pickaxe_shown: Option<HashSet<ObjectId>> = None;
-    if !commit_filter.is_empty() || since.is_some() || until.is_some() || has_pickaxe {
+    if !commit_filter.is_empty()
+        || since.is_some()
+        || since_as_filter.is_some()
+        || until.is_some()
+        || has_pickaxe
+    {
         let mut kept = Vec::with_capacity(nodes.len());
         for node in nodes.into_iter() {
             let commit = repo.find_commit(node.id)?;
@@ -3529,7 +3897,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 Some(rl) => rl.time.seconds,
                 None => commit.time()?.seconds,
             };
-            if since.is_some_and(|s| seconds < s) || until.is_some_and(|u| seconds > u) {
+            if since.is_some_and(|s| seconds < s)
+                || since_as_filter.is_some_and(|s| seconds < s)
+                || until.is_some_and(|u| seconds > u)
+            {
                 continue;
             }
             if !commit_filter.matches(&commit)? {
@@ -3741,6 +4112,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         Some(v) => v,
         None => diff_color::ws_error_highlight_default(&repo).unwrap_or(diff_color::WSEH_NEW),
     };
+    // `if (w.source) rev->show_source = 1` (builtin/log.c, right after
+    // `setup_revisions()`): a `%S` in the user format asks for the source ref, so
+    // it turns the tracking on the way `--source` would have.
+    source_mode = source_mode || pretty_uses_source(&pretty);
     // `%d`/`%D` need a commit→refs map; build it only when the format asks for one
     // so plain formats pay nothing for the ref scan.
     let decorations = if pretty_uses_decoration(&pretty) || decorate != DecorateStyle::Off {
@@ -3768,7 +4143,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // the shape of the history — a root or a merge; everything else is walked
     // past. The parent lists are rewritten so `--graph`/`--parents` draw the
     // simplified history rather than the real one.
-    if simplify_by_decoration {
+    // `if (!revs->prune_data.nr) return REV_TREE_SAME;`: without a pathspec every
+    // undecorated commit compares equal, which is this whole-history shortcut. With
+    // one, the comparison above already answered per commit and this must not run
+    // a second, coarser pass over its result.
+    if simplify_by_decoration && pathspecs.is_empty() {
         let decos = match &decorations {
             Some(d) => d,
             None => {
@@ -3901,7 +4280,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // format, where they surface only through `%N`. `--pretty=oneline` and the
     // other built-ins therefore stay silent unless asked.
     if !notes_opt.given && (!pretty_given || matches!(pretty, Pretty::User(_))) {
-        notes_opt.enable_default();
+        notes_opt.show_only();
     }
     let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
 
@@ -4008,6 +4387,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         empty_user_format,
         pretty: &pretty,
         notes: &notes_trees,
+        notes_shown: notes_opt.show,
         expand_tabs,
         date_explicit,
         // `show_log()`'s `ctx.rev = opt; ctx.print_email_subject = 1;`
@@ -4778,6 +5158,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             separator,
             record_terminator,
             first_parent,
+            left_right,
             &interest,
         )?;
         let out = super::diff::apply_line_prefix(out, &line_prefix);
@@ -5370,6 +5751,8 @@ struct EntryParams<'a> {
     pretty: &'a Pretty,
     /// The notes trees to render after the message; empty when notes are off.
     notes: &'a [super::notes::Tree],
+    /// Whether the notes display is on at all — see [`RenderCtx::notes_shown`].
+    notes_shown: bool,
     /// `--expand-tabs[=<n>]` / `--no-expand-tabs`; see [`RenderCtx::expand_tabs`].
     expand_tabs: Option<usize>,
     /// `revs->date_mode_explicit`: see [`RenderCtx::date_explicit`].
@@ -5581,6 +5964,7 @@ fn entry_block_from(
         mailmap: p.mailmap,
         identity_mailmap: p.identity_mailmap,
         notes: p.notes,
+        notes_shown: p.notes_shown,
         repo,
         // `get_revision_mark()` (revision.c): boundary, then patch-equivalent, then the
         // symmetric side, then `--cherry-mark`'s plain `+`. `put_revision_mark()` follows the
@@ -5598,6 +5982,14 @@ fn entry_block_from(
             }
             _ if p.cherry_mark => "+ ",
             _ => "",
+        },
+        // `%m` asks the same function with a NULL `rev_info`, which skips the
+        // graph and cherry-mark arms and makes the symmetric side the fallback.
+        revision_mark: match () {
+            _ if node.boundary => "-",
+            _ if node.patch_same => "=",
+            _ if node.symmetric_left => "<",
+            _ => ">",
         },
         parents: &node.parents,
         graph_width: node.graph_width,
@@ -6103,7 +6495,7 @@ impl ReflogCursor {
 /// decides whether it is shown at all are the ordinary ones. Only the *selection*
 /// of commits comes from the reflog, which is why one commit can appear several
 /// times over.
-fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Vec<Node>> {
+pub(super) fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Vec<Node>> {
     let reader = NodeReader::new(repo);
     let mut logs: Vec<ReflogCursor> = Vec::new();
     for name in names {
@@ -6692,6 +7084,27 @@ pub(super) fn no_walk_uninteresting(
 /// it, and `bundle` decides which pending refs still get written from it. A caller
 /// that only walks does not need this — `gix-traverse` paints the same commits itself.
 pub(super) fn ancestor_closure(repo: &gix::Repository, roots: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+    ancestor_closure_opt(repo, roots, false)
+}
+
+/// [`ancestor_closure`] with `revs->exclude_first_parent_only` in hand.
+///
+/// ```c
+/// for (l = commit->parents; l; l = l->next) {
+///         mark_one_parent_uninteresting(revs, l->item, &pending);
+///         if (revs->exclude_first_parent_only)
+///                 break;
+/// }
+/// ```
+///
+/// (`revision.c`, `mark_parents_uninteresting()`.) `--exclude-first-parent-only`
+/// stops the marking at each commit's first parent, so `^<merge>` hides the merge
+/// and its first-parent chain while everything that was merged *in* stays visible.
+pub(super) fn ancestor_closure_opt(
+    repo: &gix::Repository,
+    roots: &[ObjectId],
+    first_parent_only: bool,
+) -> Result<HashSet<ObjectId>> {
     let mut set: HashSet<ObjectId> = HashSet::new();
     let mut stack: Vec<ObjectId> = Vec::new();
     for &r in roots {
@@ -6706,6 +7119,9 @@ pub(super) fn ancestor_closure(repo: &gix::Repository, roots: &[ObjectId]) -> Re
             let pid = p.detach();
             if set.insert(pid) {
                 stack.push(pid);
+            }
+            if first_parent_only {
+                break;
             }
         }
     }
@@ -6963,8 +7379,11 @@ pub(super) fn walk_reporting(
     for (idx, tip) in tips.iter().enumerate() {
         if seen.insert(*tip) {
             let mut node = reader.read(repo, *tip)?;
-            // `--source` names each tip; without it `tip_sources` is empty and the
-            // source stays blank (never rendered). Parents inherit below.
+            // Every tip carries the name it was pended under, the way
+            // `prepare_revision_walk()` fills `revs->sources` from the pending
+            // array's own names — whether or not `--source` was given, since
+            // `%S` in a user format turns the display on after the command line
+            // has already been parsed. Parents inherit below.
             if let Some(src) = tip_sources.get(idx) {
                 node.source = src.clone();
             }
@@ -7029,9 +7448,9 @@ pub(super) fn walk_reporting(
 /// git's `sort_in_topological_order`: an indegree count over the already-walked
 /// set, drained through a queue that is date-ordered for `--date-order` and a
 /// LIFO stack for `--topo-order`.
-pub(crate) fn topo_sort(nodes: Vec<Node>, by_date: bool) -> Vec<Node> {
+pub(crate) fn topo_sort(nodes: Vec<Node>, by_date: bool, first_parent: bool) -> Vec<Node> {
     let keys = by_date.then(|| nodes.iter().map(|n| (n.id, n.time)).collect());
-    topo_sort_keyed(nodes, keys.as_ref())
+    topo_sort_keyed(nodes, keys.as_ref(), first_parent)
 }
 
 /// [`topo_sort`] driven by an [`Order`] rather than a bool, which is what
@@ -7063,6 +7482,7 @@ pub(crate) fn topo_sort_ordered(
     repo: &gix::Repository,
     nodes: Vec<Node>,
     order: Order,
+    first_parent: bool,
 ) -> Vec<Node> {
     let keys: Option<std::collections::HashMap<ObjectId, i64>> = match order {
         Order::Default | Order::Topo => None,
@@ -7074,7 +7494,7 @@ pub(crate) fn topo_sort_ordered(
                 .collect(),
         ),
     };
-    topo_sort_keyed(nodes, keys.as_ref())
+    topo_sort_keyed(nodes, keys.as_ref(), first_parent)
 }
 
 /// `record_author_date()` (`commit.c:866-891`): the `author` header's timestamp, or
@@ -7090,13 +7510,29 @@ fn author_date_of(repo: &gix::Repository, id: ObjectId) -> Option<i64> {
 fn topo_sort_keyed(
     nodes: Vec<Node>,
     keys: Option<&std::collections::HashMap<ObjectId, i64>>,
+    first_parent: bool,
 ) -> Vec<Node> {
     let by_date = keys.is_some();
     let key_of = |id: &ObjectId| keys.and_then(|k| k.get(id)).copied().unwrap_or(0);
     let mut indegree: std::collections::HashMap<ObjectId, usize> =
         nodes.iter().map(|n| (n.id, 1usize)).collect();
+    // ```c
+    // if (revs->topo_order && !generation_numbers_enabled(the_repository))
+    //         sort_in_topological_order(&revs->commits, revs->sort_order);
+    // else if (revs->topo_order)
+    //         init_topo_walk(revs);
+    // ```
+    //
+    // (`prepare_revision_walk()`, revision.c.) The two sorts differ on
+    // `--first-parent`: `init_topo_walk()`/`expand_topo_walk()` walk each commit's
+    // parents with `if (revs->first_parent_only) break;`, while
+    // `sort_in_topological_order()` (commit.c) has no `rev_info` and counts every
+    // parent. So the narrowing applies only where a commit-graph with generation
+    // numbers picks the first sort — which is why `--first-parent --topo-order`
+    // orders one repository differently from the same history without a graph.
+    let follow = if first_parent { 1 } else { usize::MAX };
     for node in &nodes {
-        for parent in &node.parents {
+        for parent in node.parents.iter().take(follow) {
             if let Some(d) = indegree.get_mut(parent) {
                 *d += 1;
             }
@@ -7131,7 +7567,7 @@ fn topo_sort_keyed(
         };
         let i = queue.remove(at);
 
-        for parent in &nodes[i].parents {
+        for parent in nodes[i].parents.iter().take(follow) {
             if let Some(d) = indegree.get_mut(parent) {
                 if *d == 0 {
                     continue;
@@ -7560,12 +7996,11 @@ fn check_format(fmt: &str) -> Result<()> {
             // not a placeholder at all, and git prints it literally rather than
             // failing (see [`pretty_pad`]).
             Some('<' | '>' | 'w') => {}
-            // The two `format_commit_one()` cases this port does not answer:
-            // `%m` is `rev->left_right`'s marker and `%S` the `--source` ref, both
-            // of which are walk state a bare format string cannot see from here.
-            // They are git's placeholders, so expanding them literally would print
-            // something plausible and wrong; they stay refused.
-            Some(x @ ('m' | 'S')) => anyhow::bail!("unsupported format placeholder %{x}"),
+            // `%m` is `get_revision_mark()`'s marker and `%S` the `--source` ref;
+            // both read walk state off the render context. `%S` without a source
+            // map prints literally rather than failing, which is git's `return 0`
+            // for it — so neither is rejected here.
+            Some('m' | 'S') => {}
             // Anything else is not a placeholder git knows either.
             // `format_commit_item()` returns 0 for it and the driver prints the `%`
             // and rescans from the character after it — so `%zz` is `%zz` and a
@@ -7609,8 +8044,10 @@ pub(crate) fn format_commit(
         // `rebase -i` renders its instruction lines with no notes; `%N` in an
         // instruction format expands to nothing, as it does under git.
         notes: &[],
+        notes_shown: false,
         repo,
         mark: "",
+        revision_mark: ">",
         parents: &[],
         // No `--graph` behind either of these callers.
         graph_width: 0,
@@ -7663,6 +8100,217 @@ fn unabbreviated(fmt: &str) -> String {
 /// A `%(trailers...)` placeholder starting at `chars[i] == '('`: its option text
 /// and the index just past the closing paren. `None` for anything else that opens
 /// with `%(`, which is `%C(...)`'s territory or a malformed placeholder.
+/// A `%(<name>[:<body>])` placeholder starting at `chars[i] == '('`: the option
+/// text between the `:` and the `)`, and the index just past the `)`. `None` when
+/// this is a different placeholder — `skip_prefix(placeholder, "(<name>", &arg)`
+/// followed by the `*arg == ':'` / `*arg == ')'` test.
+fn parenthesised(chars: &[char], i: usize, name: &str) -> Option<(String, usize)> {
+    let close = chars[i..].iter().position(|&c| c == ')')? + i;
+    let inner: String = chars[i + 1..close].iter().collect();
+    let body = match inner.strip_prefix(name) {
+        Some("") => String::new(),
+        Some(rest) => rest.strip_prefix(':')?.to_string(),
+        None => return None,
+    };
+    Some((body, close + 1))
+}
+
+/// `%(decorate:…)`'s options, owned because each value is expanded before use.
+struct DecorationOptsOwned {
+    prefix: String,
+    suffix: String,
+    separator: String,
+    pointer: String,
+    tag: String,
+}
+
+impl DecorationOptsOwned {
+    /// `parse_decoration_options()`: try the five names in order, over and over,
+    /// until none matches; anything left over then fails the `*arg == ')'` test in
+    /// the caller, which is why an unknown option prints the placeholder as typed.
+    fn parse(body: &str) -> Option<Self> {
+        let d = DecorationOpts::default();
+        let mut out = DecorationOptsOwned {
+            prefix: d.prefix.to_owned(),
+            suffix: d.suffix.to_owned(),
+            separator: d.separator.to_owned(),
+            pointer: d.pointer.to_owned(),
+            tag: d.tag.to_owned(),
+        };
+        let mut rest = body;
+        while !rest.is_empty() {
+            let mut matched = false;
+            for (name, which) in [
+                ("prefix", 0usize),
+                ("suffix", 1),
+                ("separator", 2),
+                ("pointer", 3),
+                ("tag", 4),
+            ] {
+                let Some((value, next)) = placeholder_arg_value(rest, name) else {
+                    continue;
+                };
+                let expanded = expand_string_arg(&value);
+                match which {
+                    0 => out.prefix = expanded,
+                    1 => out.suffix = expanded,
+                    2 => out.separator = expanded,
+                    3 => out.pointer = expanded,
+                    _ => out.tag = expanded,
+                }
+                rest = next;
+                matched = true;
+                break;
+            }
+            if !matched {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
+    fn borrow(&self) -> DecorationOpts<'_> {
+        DecorationOpts {
+            prefix: &self.prefix,
+            suffix: &self.suffix,
+            separator: &self.separator,
+            pointer: &self.pointer,
+            tag: &self.tag,
+        }
+    }
+}
+
+/// `match_placeholder_arg_value()`: `<name>=<value>` up to the next `,` or the end
+/// of the option list, or a bare `<name>` (empty value). Returns the value and the
+/// remaining option text.
+fn placeholder_arg_value<'a>(body: &'a str, name: &str) -> Option<(String, &'a str)> {
+    let rest = body.strip_prefix(name)?;
+    let (value, rest) = match rest.strip_prefix('=') {
+        Some(v) => {
+            let end = v.find(',').unwrap_or(v.len());
+            (v[..end].to_string(), &v[end..])
+        }
+        None => (String::new(), rest),
+    };
+    match rest.strip_prefix(',') {
+        Some(next) => Some((value, next)),
+        None if rest.is_empty() => Some((value, rest)),
+        None => None,
+    }
+}
+
+/// `expand_string_arg()`: an option value is expanded through
+/// `strbuf_expand_literal()`, which knows `%n`, `%xNN` and `%%` — the escapes a
+/// comma or a closing parenthesis has to be written as, since both end the value.
+fn expand_string_arg(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match chars.get(i) {
+            Some('%') => {
+                out.push('%');
+                i += 1;
+            }
+            Some('n') => {
+                out.push('\n');
+                i += 1;
+            }
+            Some('x') => match hex_byte(chars.get(i + 1).copied(), chars.get(i + 2).copied()) {
+                Some(byte) => {
+                    out.push(byte as char);
+                    i += 3;
+                }
+                None => out.push('%'),
+            },
+            // Anything else is not a literal placeholder: the `%` stands for
+            // itself and the scan resumes after it.
+            _ => out.push('%'),
+        }
+    }
+    out
+}
+
+/// `parse_describe_args()`: the four options `%(describe:…)` understands, turned
+/// into the `git describe` command line git builds. `None` for an option it does
+/// not know or a value it refuses, which makes the placeholder print as typed.
+fn describe_args(body: &str) -> Option<Vec<String>> {
+    let mut args: Vec<String> = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        if let Some((value, next)) = placeholder_arg_value(rest, "tags") {
+            // `match_placeholder_bool_arg`: a bare `tags` is true, and a value
+            // must be one `git_parse_maybe_bool()` accepts.
+            let on = match value.as_str() {
+                "" => true,
+                v => crate::optint::maybe_bool(v)?,
+            };
+            args.push(if on { "--tags".to_owned() } else { "--no-tags".to_owned() });
+            rest = next;
+            continue;
+        }
+        if let Some((value, next)) = placeholder_arg_value(rest, "abbrev") {
+            if value.is_empty() || value.parse::<i64>().is_err() {
+                return None;
+            }
+            args.push(format!("--abbrev={value}"));
+            rest = next;
+            continue;
+        }
+        if let Some((value, next)) = placeholder_arg_value(rest, "exclude") {
+            if value.is_empty() {
+                return None;
+            }
+            args.push(format!("--exclude={value}"));
+            rest = next;
+            continue;
+        }
+        if let Some((value, next)) = placeholder_arg_value(rest, "match") {
+            if value.is_empty() {
+                return None;
+            }
+            args.push(format!("--match={value}"));
+            rest = next;
+            continue;
+        }
+        return None;
+    }
+    Some(args)
+}
+
+/// Run `git describe <args> <oid>` the way `%(describe)` does — as a child
+/// process, so the placeholder answers exactly what the command answers — and
+/// return its output with the trailing whitespace trimmed. A failure prints
+/// nothing, which is git's `pipe_command()` result being used unchecked.
+fn run_describe(args: &[String], oid: &str) -> Vec<u8> {
+    use std::os::unix::process::CommandExt as _;
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let mut cmd = std::process::Command::new(exe);
+    // This binary dispatches on its own name, so the child has to be told it is
+    // `git` rather than whatever path it was installed under.
+    cmd.arg0("git");
+    cmd.arg("describe");
+    cmd.args(args);
+    cmd.arg(oid);
+    cmd.stderr(std::process::Stdio::null());
+    let Ok(out) = cmd.output() else {
+        return Vec::new();
+    };
+    let mut text = out.stdout;
+    while text.last().is_some_and(|b| b.is_ascii_whitespace()) {
+        text.pop();
+    }
+    text
+}
+
 fn trailers_placeholder(chars: &[char], i: usize) -> Option<(String, usize)> {
     let close = chars[i..].iter().position(|&c| c == ')')? + i;
     let inner: String = chars[i + 1..close].iter().collect();
@@ -7799,6 +8447,35 @@ fn expand_one(
     // trailer block; an unparsable option list makes git print the placeholder
     // literally rather than fail.
     if p == '(' {
+        // `%(decorate[:<options>])`: the same list `%d` prints, punctuated by the
+        // five strings the options name.
+        if let Some((body, next)) = parenthesised(chars, *i - 1, "decorate") {
+            let Some(opts) = DecorationOptsOwned::parse(&body) else {
+                return Ok(false);
+            };
+            expand_decoration(
+                out,
+                commit,
+                ctx,
+                *auto,
+                &opts.borrow(),
+                ctx.decorate == DecorateStyle::Full,
+            );
+            *i = next;
+            return Ok(true);
+        }
+        // `%(describe[:<options>])`: git runs `git describe [<args>] <oid>` as a
+        // child process and appends its trimmed stdout, printing nothing when it
+        // fails. This does the same, so every `describe` option and every one of
+        // its answers reaches the format unchanged.
+        if let Some((body, next)) = parenthesised(chars, *i - 1, "describe") {
+            let Some(args) = describe_args(&body) else {
+                return Ok(false);
+            };
+            out.extend_from_slice(&run_describe(&args, &commit.id().detach().to_string()));
+            *i = next;
+            return Ok(true);
+        }
         let Some((spec, next)) = trailers_placeholder(chars, *i - 1) else {
             return Ok(false);
         };
@@ -7869,8 +8546,24 @@ fn expand_one(
         // and `%N` prints literally — it is not the same as a commit that simply
         // has no note, which yields an empty (but present) message.
         'N' => {
-            if ctx.notes.is_empty() {
+            // ```c
+            // case 'N':
+            //         if (c->pretty_ctx->notes_message) {
+            //                 strbuf_addstr(sb, c->pretty_ctx->notes_message);
+            //                 return 1;
+            //         }
+            //         return 0;
+            // ```
+            //
+            // (pretty.c.) `notes_message` is set — possibly to the empty string —
+            // whenever the display is on, so `%N` expands to nothing under
+            // `--no-standard-notes` and prints *itself* only when notes are off
+            // entirely.
+            if !ctx.notes_shown {
                 return Ok(false);
+            }
+            if ctx.notes.is_empty() {
+                return Ok(true);
             }
             out.extend_from_slice(&super::notes::format_display(
                 ctx.repo,
@@ -7914,8 +8607,36 @@ fn expand_one(
         }
         // `%d`/`%D` are always shown (short by default); `log.decorate=full`
         // / `--decorate=full` switches them to full ref names.
-        'd' => expand_decoration(out, commit, ctx, *auto, true, ctx.decorate == DecorateStyle::Full),
-        'D' => expand_decoration(out, commit, ctx, *auto, false, ctx.decorate == DecorateStyle::Full),
+        'd' => expand_decoration(
+            out,
+            commit,
+            ctx,
+            *auto,
+            &DecorationOpts::default(),
+            ctx.decorate == DecorateStyle::Full,
+        ),
+        'D' => expand_decoration(
+            out,
+            commit,
+            ctx,
+            *auto,
+            &DecorationOpts::bare(),
+            ctx.decorate == DecorateStyle::Full,
+        ),
+        // `case 'S': if (!(c->pretty_ctx->rev && c->pretty_ctx->rev->sources)) return 0;`
+        // (pretty.c) — the `--source` ref this commit was reached from. Without a
+        // source map (a `--walk-reflogs` walk, or `rev-list`, which never builds
+        // one) the placeholder is *not* git's, so the driver prints it as typed.
+        'S' => match ctx.source {
+            Some(src) => out.extend_from_slice(src),
+            None => return Ok(false),
+        },
+        // `case 'm': strbuf_addstr(sb, get_revision_mark(NULL, commit));` — note
+        // the NULL `rev_info`: with no revision walk to ask, the `!revs ||
+        // revs->left_right` arm is always taken, so a commit that is neither a
+        // boundary nor patch-equivalent prints `>` (or `<` for the symmetric
+        // left side) whether or not `--left-right` was given.
+        'm' => out.extend_from_slice(ctx.revision_mark.as_bytes()),
         'a' | 'c' => {
             let who = match p {
                 'a' => commit.author()?,
@@ -8387,13 +9108,74 @@ impl DecorationFilter {
 /// Does this format use a decoration placeholder, so the ref map is worth
 /// building? `%%d` (an escaped percent then a literal `d`) does not count.
 pub(crate) fn pretty_uses_decoration(pretty: &Pretty) -> bool {
+    userformat_wants(pretty, &['d', 'D']) || userformat_wants_paren(pretty, "decorate")
+}
+
+/// The `case '(':` arm of `userformat_want_item()`:
+///
+/// ```c
+/// case '(':
+///         if (starts_with(placeholder + 1, "decorate"))
+///                 w->decorate = 1;
+///         break;
+/// ```
+///
+/// so `%(decorate:…)` asks for the ref map exactly as `%d` does.
+fn userformat_wants_paren(pretty: &Pretty, name: &str) -> bool {
     let Pretty::User(fmt) = pretty else {
         return false;
     };
-    let mut it = fmt.chars();
-    while let Some(c) = it.next() {
-        if c == '%' && matches!(it.next(), Some('d' | 'D')) {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if matches!(chars.get(i), Some('+' | '-' | ' ')) {
+            i += 1;
+        }
+        if chars.get(i) == Some(&'(') && chars[i + 1..].starts_with(&name.chars().collect::<Vec<_>>()[..])
+        {
             return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Does this format use `%S`? git's `userformat_find_requirements()` answers the
+/// same question and `cmd_log_init_finish()` turns `rev->show_source` on for it,
+/// which is why `git log --format=%S` names the tip without `--source` on the
+/// command line.
+pub(crate) fn pretty_uses_source(pretty: &Pretty) -> bool {
+    userformat_wants(pretty, &['S'])
+}
+
+/// Port of `userformat_want_item()` (pretty.c): walk the user format's
+/// placeholders and answer whether any of `atoms` is among them. The magic
+/// prefixes `%+`/`%-`/`% ` are skipped exactly as that function skips them, and
+/// `%%` is a literal percent rather than a placeholder introducer.
+fn userformat_wants(pretty: &Pretty, atoms: &[char]) -> bool {
+    let Pretty::User(fmt) = pretty else {
+        return false;
+    };
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if matches!(chars.get(i), Some('+' | '-' | ' ')) {
+            i += 1;
+        }
+        match chars.get(i) {
+            Some(&c) if atoms.contains(&c) => return true,
+            // `%%` is consumed whole, so `%%d` is a literal `d`.
+            Some(_) | None => i += 1,
         }
     }
     false
@@ -8479,7 +9261,7 @@ fn expand_decoration(
     commit: &gix::Commit<'_>,
     ctx: &RenderCtx<'_>,
     auto: bool,
-    wrap: bool,
+    opts: &DecorationOpts<'_>,
     full_refs: bool,
 ) {
     let Some(decos) = ctx.decorations else {
@@ -8494,7 +9276,7 @@ fn expand_decoration(
         disabled = super::color::DecorateColors::disabled();
         &disabled
     };
-    format_decorations(out, decos, &commit.id().detach(), full_refs, colors, wrap);
+    format_decorations(out, decos, &commit.id().detach(), full_refs, colors, opts);
 }
 
 /// Port of `log-tree.c:format_decorations`: the ` (HEAD -> main, tag: v1)` list
@@ -8509,7 +9291,7 @@ pub(crate) fn format_decorations(
     id: &ObjectId,
     full_refs: bool,
     colors: &super::color::DecorateColors,
-    wrap: bool,
+    opts: &DecorationOpts<'_>,
 ) {
     let Some(refs) = decos.map.get(id) else {
         return;
@@ -8581,31 +9363,63 @@ pub(crate) fn format_decorations(
         let mut entry = String::new();
         // git colors the `tag: ` prefix and the tag name as two separate
         // bold-yellow spans.
-        if d.kind == DecoKind::Tag {
-            entry.push_str(&paint("tag: ", color_of(d.kind)));
+        if d.kind == DecoKind::Tag && !opts.tag.is_empty() {
+            entry.push_str(&paint(opts.tag, color_of(d.kind)));
         }
         entry.push_str(&paint(&show(d), color_of(d.kind)));
         if d.kind == DecoKind::Head {
             if let Some(f) = folded {
-                entry.push_str(&punct(" -> "));
+                entry.push_str(&punct(opts.pointer));
                 entry.push_str(&paint(&show(f), color_of(f.kind)));
             }
         }
         entries.push(entry);
     }
 
-    // `%d` wraps in ` (…)`; `%D` emits the bare, comma-separated list.
-    if wrap {
-        out.extend_from_slice(punct(" (").as_bytes());
-    }
+    // `format_decorations()` writes `prefix` before the first entry and
+    // `separator` before every later one (`prefix = separator;` at the end of each
+    // iteration), then `suffix` — and skips each of the three when it is empty, so
+    // `%D`'s empty prefix/suffix emit no color codes either.
     for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
-            out.extend_from_slice(punct(", ").as_bytes());
+        let lead = if i == 0 { opts.prefix } else { opts.separator };
+        if !lead.is_empty() {
+            out.extend_from_slice(punct(lead).as_bytes());
         }
         out.extend_from_slice(e.as_bytes());
     }
-    if wrap {
-        out.extend_from_slice(punct(")").as_bytes());
+    if !opts.suffix.is_empty() {
+        out.extend_from_slice(punct(opts.suffix).as_bytes());
+    }
+}
+
+/// `struct decoration_options` (log-tree.h): the five strings
+/// `format_decorations()` punctuates a decoration list with. The defaults are
+/// `%d`'s; `%D` clears the prefix and suffix, and `%(decorate:…)` may set any of
+/// them.
+pub(crate) struct DecorationOpts<'a> {
+    /// Written before the first entry. Default ` (`.
+    pub(crate) prefix: &'a str,
+    /// Written after the last entry. Default `)`.
+    pub(crate) suffix: &'a str,
+    /// Written before every entry but the first. Default `, `.
+    pub(crate) separator: &'a str,
+    /// Written between `HEAD` and the branch it points at. Default ` -> `.
+    pub(crate) pointer: &'a str,
+    /// Written before a tag's name. Default `tag: `.
+    pub(crate) tag: &'a str,
+}
+
+impl Default for DecorationOpts<'_> {
+    /// `%d`, and every caller that passes git's `NULL` options.
+    fn default() -> Self {
+        DecorationOpts { prefix: " (", suffix: ")", separator: ", ", pointer: " -> ", tag: "tag: " }
+    }
+}
+
+impl DecorationOpts<'_> {
+    /// `%D`: `{ .prefix = "", .suffix = "" }` over the same defaults.
+    fn bare() -> Self {
+        DecorationOpts { prefix: "", suffix: "", ..Default::default() }
     }
 }
 
@@ -9160,8 +9974,10 @@ pub(crate) fn rev_list_pretty_body(
         // `cmd_rev_list` never calls `init_display_notes`, so `rev-list --pretty`
         // prints no notes even where `log` would.
         notes: &[],
+        notes_shown: false,
         repo,
         mark: "",
+        revision_mark: ">",
         parents: &[],
         // No `--graph` behind either of these callers.
         graph_width: 0,
@@ -9300,6 +10116,8 @@ pub(crate) struct ShowEntry<'a> {
     pub(crate) identity_mailmap: Option<&'a Mailmap>,
     /// The notes trees whose `Notes[ (<ref>)]:` blocks follow the message.
     pub(crate) notes: &'a [super::notes::Tree],
+    /// Whether the notes display is on at all — see [`RenderCtx::notes_shown`].
+    pub(crate) notes_shown: bool,
     /// `--expand-tabs[=<n>]` / `--no-expand-tabs`.
     pub(crate) expand_tabs: Option<usize>,
     /// The two `pretty_print_context` fields the mail formats read.
@@ -9392,9 +10210,11 @@ impl<'r> EntryRenderer<'r> {
             mailmap: opts.mailmap,
             identity_mailmap: opts.identity_mailmap,
             notes: opts.notes,
+            notes_shown: opts.notes_shown,
             repo: self.repo,
             // No `--boundary` mark and no `--graph` columns.
             mark: "",
+            revision_mark: ">",
             parents: &parents,
             graph_width: 0,
             expand_tabs: opts.expand_tabs,
@@ -9472,10 +10292,20 @@ struct RenderCtx<'a> {
     /// The notes trees whose `Notes[ (<ref>)]:` blocks follow the message. Empty
     /// when notes are off; a user format reaches them only through `%N`.
     notes: &'a [super::notes::Tree],
+    /// `pretty_ctx->notes_message != NULL`: whether the notes display is on at
+    /// all, which is what `%N` distinguishes from "on, but no tree had a note".
+    notes_shown: bool,
     /// Rendering a note means reading its blob.
     repo: &'a gix::Repository,
     /// `get_revision_mark()`: `- ` for a `--boundary` commit, empty otherwise.
     mark: &'static str,
+    /// The same mark as `%m` asks for, which is a *different* answer: git calls
+    /// `get_revision_mark(NULL, commit)` there, and the NULL `rev_info` makes the
+    /// symmetric-side arm unconditional. So this is `-`/`^`/`=` for a boundary,
+    /// uninteresting or patch-equivalent commit and `<`/`>` for everything else,
+    /// with no trailing space and regardless of `--left-right`, `--graph` or
+    /// `--cherry-mark`.
+    revision_mark: &'static str,
     /// The commit's effective parents — its own, or the rewritten list a history
     /// simplification left behind. What `Merge:` and `--parents` print.
     parents: &'a [ObjectId],
@@ -9601,7 +10431,7 @@ fn render_entry(
                     commit,
                     ctx,
                     ctx.want_color,
-                    true,
+                    &DecorationOpts::default(),
                     ctx.decorate == DecorateStyle::Full,
                 );
             }
@@ -9691,7 +10521,7 @@ fn render_entry(
                     commit,
                     ctx,
                     ctx.want_color,
-                    true,
+                    &DecorationOpts::default(),
                     ctx.decorate == DecorateStyle::Full,
                 );
             }
@@ -9736,7 +10566,7 @@ fn render_entry(
                     commit,
                     ctx,
                     ctx.want_color,
-                    true,
+                    &DecorationOpts::default(),
                     ctx.decorate == DecorateStyle::Full,
                 );
             }
@@ -10556,6 +11386,19 @@ fn similarity_score(old: &[u8], new: &[u8]) -> f64 {
     let (copied, _added) = super::diff_files::count_changes_sides(old, true, new, true);
     (copied as f64 * super::diffcore_rename::MAX_SCORE) / max
 }
+
+/// git's `rev_same_tree_as_empty()` under a pathspec: whether `id`'s tree carries
+/// nothing the pathspec matches, which is what makes `--remove-empty` treat that
+/// commit as a root.
+fn pathspec_view_is_empty(
+    repo: &gix::Repository,
+    id: ObjectId,
+    matcher: &mut PathspecMatcher,
+) -> Result<bool> {
+    let commit = repo.find_object(id)?.try_into_commit()?;
+    Ok(!changes_match(repo, &commit, None, matcher)?)
+}
+
 
 /// Whether `commit` changed any path the pathspec selects, against `parent` (or against
 /// the empty tree for a root commit). This is the comparison `try_to_simplify_commit()`
@@ -11496,7 +12339,8 @@ fn measure_graph_widths(nodes: &mut [Node], first_parent: bool, interest: &Graph
     let mut graph = Graph::new(vec![String::new()], false);
     for node in nodes.iter_mut() {
         let drawn_parents = interest.drawn_parents(node, first_parent);
-        graph.update(node.id, &drawn_parents, node.boundary);
+        // The glyph does not change the row's width, so the cheapest one will do.
+        graph.update(node.id, &drawn_parents, node.boundary, b'*');
         node.graph_width = graph.width as i32;
     }
 }
@@ -11566,6 +12410,7 @@ impl GraphInterest {
 /// `log_tree_commit()`, so such a commit still moves the columns on while
 /// emitting no row at all; the next commit that does print then opens with the
 /// `...` skip row, since the graph never reached padding.
+#[allow(clippy::too_many_arguments)]
 fn render_graph(
     nodes: &[Node],
     blocks: &[Option<GraphBlock>],
@@ -11574,6 +12419,7 @@ fn render_graph(
     separator: Option<u8>,
     terminator: Option<u8>,
     first_parent: bool,
+    left_right: bool,
     interest: &GraphInterest,
 ) -> Result<Vec<u8>> {
     let mut graph = Graph::new(colors, want_color);
@@ -11585,7 +12431,26 @@ fn render_graph(
     let mut prev_message: Option<&[u8]> = None;
 
     for (i, node) in nodes.iter().enumerate() {
-        graph.update(node.id, &interest.drawn_parents(node, first_parent), node.boundary);
+        // `get_revision_mark(graph->revs, graph->commit)[0]`: the graph's own `*`
+        // loses to a patch-equivalence `=` and to `--left-right`'s `<`/`>`, but
+        // wins over `--cherry-mark`'s `+` — the `revs->graph` arm is tested first.
+        let commit_char = match () {
+            _ if node.patch_same => b'=',
+            _ if left_right => {
+                if node.symmetric_left {
+                    b'<'
+                } else {
+                    b'>'
+                }
+            }
+            _ => b'*',
+        };
+        graph.update(
+            node.id,
+            &interest.drawn_parents(node, first_parent),
+            node.boundary,
+            commit_char,
+        );
 
         let Some(record) = blocks[i].as_ref() else {
             continue;
@@ -11790,6 +12655,11 @@ struct Graph {
     commit: ObjectId,
     /// `--boundary`: the current commit is an excluded ancestor, drawn `o`.
     boundary: bool,
+    /// `graph_output_commit_char()`'s glyph for the current commit: `o` for a
+    /// boundary, else `get_revision_mark(revs, commit)[0]` — `=` for a
+    /// patch-equivalent commit, `<`/`>` under `--left-right`, and otherwise the
+    /// `*` that `revs->graph` itself answers.
+    commit_char: u8,
     /// The current commit's parents, in order — the post-merge row draws one edge
     /// per parent and takes each edge's color from that parent's column.
     parents: Vec<ObjectId>,
@@ -11828,6 +12698,7 @@ impl Graph {
         let default_column_color = colors.len().saturating_sub(2);
         Graph {
             boundary: false,
+            commit_char: b'*',
             columns: Vec::new(),
             new_columns: Vec::new(),
             mapping: vec![-1; 2 * GRAPH_COLUMN_CAPACITY],
@@ -11959,9 +12830,10 @@ impl Graph {
             .all(|(i, &t)| t < 0 || t == (i as i32) / 2)
     }
 
-    fn update(&mut self, id: ObjectId, parents: &[ObjectId], boundary: bool) {
+    fn update(&mut self, id: ObjectId, parents: &[ObjectId], boundary: bool, commit_char: u8) {
         self.commit = id;
         self.boundary = boundary;
+        self.commit_char = commit_char;
         self.parents = parents.to_vec();
         self.num_parents = parents.len();
         self.prev_commit_index = self.commit_index;
@@ -12220,8 +13092,9 @@ impl Graph {
             if col_commit == self.commit {
                 seen_this = true;
                 // `graph_output_commit_char()`: a boundary commit is drawn as a
-                // hollow `o` rather than the usual `*`.
-                line.addch(if self.boundary { b'o' } else { b'*' });
+                // hollow `o`, and every other commit as the character
+                // `get_revision_mark()` answers for it.
+                line.addch(if self.boundary { b'o' } else { self.commit_char });
                 if self.num_parents > 2 {
                     self.draw_octopus_merge(line);
                 }

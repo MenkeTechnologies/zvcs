@@ -2462,7 +2462,17 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             // conflicts six ways at once: a case has to be able to ask about
             // rename/rename without also answering modify/delete.
             write(dir, "mm/md.txt", "base md\n")?;
-            write(dir, "mm/rr.txt", "base rr\nsecond line\nthird line\n")?;
+            // Ten lines, not three: a similarity score needs enough content to
+            // land between thresholds. Rewriting four of them scores R055,
+            // which is a rename at the default 50 and not one at 60 — so
+            // `-X find-renames=` and `-X rename-threshold=` can finally flip an
+            // answer instead of being negative controls.
+            write(
+                dir,
+                "mm/rr.txt",
+                "rr line 1\nrr line 2\nrr line 3\nrr line 4\nrr line 5\n\
+                 rr line 6\nrr line 7\nrr line 8\nrr line 9\nrr line 10\n",
+            )?;
             write(dir, "mm/old/a.txt", "a\n")?;
             write(dir, "mm/old/b.txt", "b\n")?;
             write(dir, "mm/mode.sh", "#!/bin/sh\necho mode\n")?;
@@ -2529,6 +2539,39 @@ pub fn build(shape: Shape, dir: &Path, home: &Path) -> Result<()> {
             symlink(dir, "mm/slink", "rr.txt")?;
             git(dir, home, &["add", "-A"])?;
             git(dir, home, &["commit", "-qm", "merge-matrix: slink repointed"])?;
+
+            // rename/delete and rename/add: `conflict_classes.rs` reported both
+            // unreachable because the renamed set and the deleted set were
+            // disjoint, and nothing added at a rename's destination. These
+            // three branches all act on `mm/rr.txt`, which `mm-ren-a` and
+            // `mm-ren-b` already rename, so the pairs close both classes.
+            git(dir, home, &["checkout", "-q", "-b", "mm-ren-del", &base])?;
+            git(dir, home, &["rm", "-q", "mm/rr.txt"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: delete rr.txt"])?;
+
+            git(dir, home, &["checkout", "-q", "-b", "mm-ren-add", &base])?;
+            write(dir, "mm/rr-a.txt", "an unrelated file at the rename's destination\n")?;
+            git(dir, home, &["add", "-A"])?;
+            git(dir, home, &["commit", "-qm", "merge-matrix: add rr-a.txt"])?;
+
+            // An *inexact* rename. Every other rename here is a bare `git mv`,
+            // and an exact rename is paired before any similarity score is
+            // consulted — which is why `conflict_classes.rs` had to keep
+            // `-X find-renames=` and `-X rename-threshold=` as negative
+            // controls that could not flip an answer. Two of three lines are
+            // rewritten out of ten, which stock scores R055: detected at the
+            // default and at -M40, not detected at -M60 or -M80. Measured, not
+            // assumed — a 2-of-3 edit on the old three-line file scored no
+            // rename at any threshold and would have shipped a dead control.
+            git(dir, home, &["checkout", "-q", "-b", "mm-ren-edit", &base])?;
+            git(dir, home, &["mv", "mm/rr.txt", "mm/rr-e.txt"])?;
+            write(
+                dir,
+                "mm/rr-e.txt",
+                "rr line 1\nrr line 2\nrr line 3\nrr line 4\nrr line 5\n\
+                 rr line 6\nrewritten 1\nrewritten 2\nrewritten 3\nrewritten 4\n",
+            )?;
+            git(dir, home, &["commit", "-qam", "merge-matrix: rename rr.txt to rr-e.txt with edits"])?;
 
             git(dir, home, &["checkout", "-q", "main"])?;
         }

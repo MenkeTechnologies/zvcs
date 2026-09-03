@@ -3654,6 +3654,7 @@ pub fn grammars() -> Vec<Grammar> {
                 // a conflict class no other fixture can build.
                 "mm-mod", "mm-del", "mm-ren-a", "mm-ren-b", "mm-dir", "mm-add",
                 "mm-mode", "mm-fd", "mm-file", "mm-reg", "mm-link",
+                "mm-ren-del", "mm-ren-add", "mm-ren-edit",
             ],
             shapes: &[
                 Shape::Branched,

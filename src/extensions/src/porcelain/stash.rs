@@ -4263,11 +4263,21 @@ mod tests {
 
     #[test]
     fn store_options_require_exactly_one_commit() {
-        // git: `"git stash store" requires one <commit> argument` on 0 or >1.
-        let none = parse_store_options(&v(&[])).unwrap_err().to_string();
-        assert_eq!(none, "\"git stash store\" requires one <commit> argument");
-        let many = parse_store_options(&v(&["a", "b"])).unwrap_err().to_string();
-        assert_eq!(many, "\"git stash store\" requires one <commit> argument");
+        // git prints `"git stash store" requires one <commit> argument` on 0 or
+        // >1 — with `fprintf_ln` and a `return -1`, not `die()`. So the line
+        // carries no `fatal:` and the status is 1, not 128, which is why the
+        // refusal is a `Silent(1)` whose text has already gone to stderr rather
+        // than an error whose message the caller would print a second time.
+        // Measured against stock 2.55.0: `git stash store` in a fresh repository
+        // prints exactly that line and exits 1.
+        for argv in [vec![], vec!["a", "b"]] {
+            let err = parse_store_options(&v(&argv)).unwrap_err();
+            let silent = err
+                .downcast_ref::<crate::fatal::Silent>()
+                .expect("the refusal is silent: it printed the line itself");
+            assert_eq!(silent.0, 1, "git returns -1, which cmd_stash's !!fn turns into exit 1");
+            assert_eq!(err.to_string(), "", "a second copy of the line must not reach the caller");
+        }
     }
 
     /// `git stash drop`'s argv used to be filtered through `positionals()`,

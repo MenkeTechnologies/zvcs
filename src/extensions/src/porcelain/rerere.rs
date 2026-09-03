@@ -389,6 +389,18 @@ fn cmd_forget(repo: &gix::Repository, paths: &[&str]) -> Result<ExitCode> {
     if paths.is_empty() {
         eprintln!("warning: 'git rerere forget' without paths is deprecated");
     }
+    // ```c
+    // parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_CWD, prefix, argv + 1);
+    // return rerere_forget(the_repository, &pathspec);
+    // ```
+    //
+    // (`cmd_rerere()`, builtin/rerere.c.) `parse_pathspec()` dies on an element
+    // that escapes the work tree — `fatal: ../outside: '../outside' is outside
+    // repository at '<toplevel>'` — before `rerere_forget()` runs, so the check
+    // belongs here rather than inside the match loop.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(repo, paths) {
+        crate::git_fatal!("{msg}");
+    }
     if !is_rerere_enabled(repo)? {
         return Ok(ExitCode::SUCCESS);
     }
@@ -404,15 +416,45 @@ fn cmd_forget(repo: &gix::Repository, paths: &[&str]) -> Result<ExitCode> {
     }
 
     // `rerere_forget()` walks its own `find_conflict()` list and keeps only the
-    // paths the pathspec matches; `git rerere forget` takes literal paths here.
+    // paths the pathspec matches:
+    //
+    // ```c
+    // for (i = 0; i < conflict.nr; i++) {
+    //         struct string_list_item *it = &conflict.items[i];
+    //         if (!match_pathspec(r->index, pathspec, it->string,
+    //                             strlen(it->string), 0, NULL, 0))
+    //                 continue;
+    //         rerere_forget_one_path(r, it->string, &merge_rr);
+    // }
+    // ```
+    //
+    // (rerere.c.) `match_pathspec()`, not string equality: every spelling git's
+    // pathspec grammar accepts selects here — `.` and a bare directory, a `*`
+    // glob, `:(glob)`, the `:!`/`:(exclude)` negations, `:/` from the top, and a
+    // `../`-relative path from a subdirectory. Comparing the argument to the
+    // path byte-for-byte matched **none** of those, so `git rerere forget .`
+    // walked every conflicted path and forgot nothing while still exiting 0.
+    //
+    // The matcher is built once for the whole list: `repo.pathspec()` borrows the
+    // index, and it resolves the specs against `repo.prefix()` — which is
+    // `PATHSPEC_PREFER_CWD`, and is what makes `rerere forget ../rr.txt` from a
+    // subdirectory name the path the index knows.
     //
     // `rerere_forget_one_path()`'s return value is discarded (rerere.c:1152): a
     // path with no remembered resolution prints `error: no remembered resolution
     // for '<path>'` and the command still exits 0. Only `write_rr()` decides the
     // status (rerere.c:1155), so a per-path failure must not reach the caller —
     // the diagnostic has already been printed by `forget_one_path`.
+    let patterns: Vec<BString> = paths.iter().map(|s| BString::from(*s)).collect();
+    let mut spec = repo.pathspec(
+        true,
+        &patterns,
+        false,
+        &index,
+        gix::worktree::stack::state::attributes::Source::IdMapping,
+    )?;
     for path in find_conflict(&index) {
-        if !paths.is_empty() && !paths.iter().any(|p| p.as_bytes() == path.as_slice()) {
+        if !spec.is_included(path.as_bstr(), Some(false)) {
             continue;
         }
         let _ = forget_one_path(repo, &index, &path, &mut rr, &mut dirs);
@@ -1183,6 +1225,18 @@ fn variant_path(id_dir: &Path, variant: i32, file: &str) -> PathBuf {
 /// `is_rerere_enabled()`: an explicit `rerere.enabled=false` disables it; unset
 /// means "enabled only if `rr-cache` already exists"; true creates `rr-cache`.
 fn is_rerere_enabled(repo: &gix::Repository) -> Result<bool> {
+    // `git_config_bool()` dies on a value it cannot read, and `rerere_enabled` is
+    // read through `git_config_get_bool()` like any other boolean
+    // (`setup_rerere()`, rerere.c). A lenient read — which is what
+    // `Snapshot::boolean` gives, `None` for both "unset" and "unparsable" —
+    // silently treated `rerere.enabled = bogus` as *unset* and fell back to
+    // "enabled iff rr-cache/ exists", where git exits 128 without recording a
+    // thing.
+    if let Some(Some(raw)) = crate::config::last_value_implicit(repo, "rerere.enabled") {
+        if repo.config_snapshot().boolean("rerere.enabled").is_none() {
+            crate::git_fatal!("bad boolean config value '{raw}' for 'rerere.enabled'");
+        }
+    }
     let configured = repo.config_snapshot().boolean("rerere.enabled");
     if configured == Some(false) {
         return Ok(false);

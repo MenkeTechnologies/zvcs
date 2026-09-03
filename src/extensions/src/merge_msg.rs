@@ -357,6 +357,21 @@ fn render_one<'r, 's>(
             // The operand that still has a *blob* at the original name is the one
             // that modified it; the other turned it into a directory.
             let (modify_branch, delete_branch) = operands.split_at(repo, original.as_bstr())?;
+            // The move itself is announced first (merge-ort.c:4170-4174) — the
+            // same `CONFLICT (file/directory)` line the add/add type clash emits,
+            // reached here through the other door: a path that was a blob in the
+            // base, edited on one side and replaced by a directory on the other.
+            // `gix-merge` performs the rename and names the destination, so only
+            // the notice was missing; without it stock's two-line report came out
+            // as one line and read as a bare modify/delete on a path the user
+            // never named.
+            out.push(Message {
+                paths: vec![path.clone(), original.clone()],
+                ctype: "CONFLICT (file/directory)",
+                text: format!(
+                    "CONFLICT (file/directory): directory in the way of {original} from {modify_branch}; moving it to {path} instead.\n"
+                ),
+            });
             out.push(modify_delete(&path, delete_branch, modify_branch));
         }
 

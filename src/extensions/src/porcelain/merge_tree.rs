@@ -67,9 +67,13 @@
 //!   * message rendering for the two conflict classes [`crate::merge_msg`]
 //!     still cannot name: a gitlink content merge, whose git text comes from
 //!     `merge_submodule()` plus the `advice.submoduleMergeConflict` hint block,
-//!     and `gix-merge`'s `Unknown` catch-all where the two sides are not a
-//!     plain type clash — the directory/file half of a D/F conflict lands there
-//!     without carrying the synthetic `~<label>` path its message needs.
+//!     and the *directory rename* class, whose `CONFLICT (file location)` text
+//!     `gix-merge` gives no input to build. (The other half of a D/F conflict —
+//!     a blob one side edited and the other replaced with a directory — is
+//!     rendered: `gix-merge` reports it as its own resolution failure carrying
+//!     the `~<label>` path git moves the blob to, and
+//!     [`crate::merge_msg`] prints git's `CONFLICT (file/directory)` line for
+//!     it.)
 //!     `merge-tree` is the strict half of that renderer: its stdout is a
 //!     machine-readable record and nothing has been written when the messages
 //!     are produced, so an unrenderable class is refused rather than
@@ -487,6 +491,46 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     }
 
     let (spec1, spec2) = (revs[0].as_str(), revs[1].as_str());
+
+    // `--quiet` is not a print switch: it sets merge-ort's `mergeability_only`
+    // (`cmd_merge_tree()`, builtin/merge-tree.c), and that flag stops the engine
+    // *before* it writes anything.
+    //
+    // ```c
+    //         if (opt->mergeability_only) {
+    //                 ...
+    //                 goto cleanup;
+    //         }
+    // ```
+    //
+    // Measured on stock 2.55.0 over a one-hunk content conflict:
+    // `cat-file --batch-all-objects` counts 9 objects before and 9 after
+    // `merge-tree --write-tree --quiet`, and 11 after the same merge without
+    // `--quiet` — the merged blob and its tree. Running the full merge and
+    // discarding the *output* left both of those in the object database, which
+    // no probe of stdout can see and every probe of the store can.
+    //
+    // The engine still has to run — the exit code is its verdict — so it runs
+    // against an in-memory object store, the same arrangement
+    // [`super::merge::virtual_base_tree`] uses for git's unwritten virtual
+    // commits, and nothing is persisted when it is dropped.
+    if quiet {
+        let mut mem = repo.clone();
+        mem.objects.enable_object_memory();
+        let mut outcome = match resolve_outcome(
+            &mem,
+            merge_base.as_deref(),
+            spec1,
+            spec2,
+            allow_unrelated,
+            &strategy,
+        )? {
+            Ok(o) => o,
+            Err(code) => return Ok(code),
+        };
+        return Ok(exit_code(outcome.has_unresolved_conflicts(TreatAsUnresolved::git())));
+    }
+
     let mut outcome = match resolve_outcome(
         &repo,
         merge_base.as_deref(),
@@ -500,11 +544,6 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     };
 
     let conflicted = outcome.has_unresolved_conflicts(TreatAsUnresolved::git());
-
-    if quiet {
-        // git suppresses all output here and only reports through the status.
-        return Ok(exit_code(conflicted));
-    }
 
     let buf = render_outcome(
         &repo,
@@ -568,6 +607,12 @@ fn resolve_outcome<'repo>(
             peeled.push(id);
         }
         let (base, ours, theirs) = (peeled[0], peeled[1], peeled[2]);
+        // `init_merge_options()` runs after the operands are peeled and can die
+        // on a bad `merge.renameLimit` — see
+        // [`super::merge::merge_recursive_config_check`].
+        if let Some(code) = super::merge::merge_recursive_config_check(repo) {
+            return Ok(Err(code));
+        }
         let (base, theirs) = strategy.shift(repo, ours, base, theirs)?;
         repo.merge_trees(base, ours, theirs, labels, strategy.apply(repo.tree_merge_options()?)?)?
     } else {
@@ -579,6 +624,12 @@ fn resolve_outcome<'repo>(
             eprintln!("merge-tree: {spec2} - not something we can merge");
             return Ok(Err(ExitCode::FAILURE));
         };
+        // `init_merge_options()` runs once both operands have peeled, and its
+        // `merge_recursive_config()` can die — see
+        // [`super::merge::merge_recursive_config_check`].
+        if let Some(code) = super::merge::merge_recursive_config_check(repo) {
+            return Ok(Err(code));
+        }
         let bases = repo.merge_bases_many(ours, &[theirs])?;
         if !allow_unrelated && bases.is_empty() {
             eprintln!("fatal: refusing to merge unrelated histories");

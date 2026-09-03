@@ -195,25 +195,31 @@
 //!
 //! What is refused or deferred rather than faked:
 //!
-//! * `--no-overwrite-ignore`: needs gitignore-aware checkout.
+//! * `--no-overwrite-ignore`: parsed and accepted, but the gitignore-aware
+//!   checkout refusal it asks for is not modelled — the flag changes nothing.
 //!
 //! Known fidelity gaps, stated rather than hidden: `merge.directoryRenames` is
-//! never read — every merge behaves as `=true`, where git's default is
+//! never read — a two-head merge behaves as `=true`, where git's default is
 //! `=conflict`, so a file added into a directory the other side renamed is moved
 //! silently instead of conflicting (`gix-merge` has no directory-rename input to
-//! drive); `merge.renameLimit`/`diff.renameLimit` are only honoured when
-//! `merge.renames`/`diff.renames` is also set, because gitoxide's
-//! `diff_resource_cache` returns before reading the limit otherwise;
+//! drive; the octopus is unaffected, because `read-tree --aggressive` has no
+//! rename detection at all and neither does stock's);
+//! `merge.renameLimit`/`diff.renameLimit` are validated but not applied — a
+//! value git cannot read is refused, and a value it can read does not bound the
+//! *merge's* rename matrix, because gitoxide's `diff_resource_cache` returns
+//! before reading the limit unless `merge.renames`/`diff.renames` is also set
+//! (the diffstat's own rename pass, [`super::diffcore_rename`], does honour it);
+//! `merge.conflictStyle` is read but a value git rejects is accepted leniently
+//! here, because the second line of git's refusal names the config file and the
+//! line number within it, which gitoxide's config metadata does not carry;
 //! `diff.algorithm=patience` reaches the blob merge as histogram, since
 //! gitoxide's configuration cache reports patience as unimplemented and falls
-//! back leniently (`-Xpatience` is unaffected — it bypasses the cache); the
-//! diffstat is computed
-//! with rename detection off, while `git merge` enables it, so a merge that
-//! renames a file reports it as a delete plus a create instead of a `rename`
-//! summary line; `--verbose`'s extra stderr diagnostics are not
+//! back leniently (`-Xpatience` is unaffected — it bypasses the cache);
+//! `merge.verbosity >= 5` does not emit merge-ort's `  From inner merge:` echo of
+//! the recursive base merge; `--verbose`'s extra stderr diagnostics are not
 //! emitted; a `pre-merge-commit` hook that edits the index is not reflected
-//! in the committed tree (the pre-computed merge tree is committed); the
-//! `prepare-commit-msg` hook is not run before the editor; `default_edit_option`
+//! in the committed tree (the pre-computed merge tree is committed);
+//! `default_edit_option`
 //! tests that stdin and stdout are both terminals rather than that they are the
 //! same file; `--signoff` adds its trailer before the `--edit` comment block
 //! rather than through `ignored_log_message_bytes()`;
@@ -672,6 +678,11 @@ fn branch_merge_options() -> std::result::Result<Vec<String>, String> {
 }
 
 pub fn merge(args: &[String]) -> Result<ExitCode> {
+    // `orig_argc` in `cmd_merge`, minus the `merge` word `dispatch::run` already
+    // stripped: the `--abort`/`--quit`/`--continue` argument-count gate below is
+    // measured against the command line as typed, before
+    // `branch.<name>.mergeoptions` is spliced in front of it.
+    let orig_argc = args.len();
     // `Updating <a>..<b>`, `Fast-forward` and the diffstat are stdout
     // (builtin/merge.c); a refused checkout's `error: …`/`Aborting` is stderr.
     // stdio holds the stdout half off a terminal, which is why stock prints the
@@ -680,9 +691,6 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
     let mut op = Op::Merge;
     let mut opts = Opts::default();
     let mut refs: Vec<String> = Vec::new();
-    // A pending `-F`/`--file` read, resolved after parsing so the diagnostic
-    // order matches git (options first, file open second).
-    let mut file: Option<String> = None;
     // git's `merge_log_config`, applied only after the options are parsed: a
     // `--log=<n>` that leaves the count negative falls back to it.
     let mut merge_log_config: i64 = 0;
@@ -871,7 +879,26 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             //  * `--no-strategy`: git's `option_parse_strategy` returns early on
             //    `unset` without clearing the strategy list, so it is a no-op that
             //    leaves any earlier `-s` in force (default `ort` when none given).
-            "--overwrite-ignore" | "--no-strategy" => {}
+            //  * `--no-overwrite-ignore`: `overwrite_ignore = 0` feeds
+            //    `unpack_trees()`'s `dir` argument (builtin/merge.c), which makes
+            //    a checkout refuse to clobber an *ignored* file the way it
+            //    already refuses to clobber an untracked one. This build's
+            //    [`crate::merge_guard`] does not read `.gitignore` at all, so
+            //    the flag is parsed and changes nothing — but it has to be
+            //    parsed, because the alternative is `merge:
+            //    --no-overwrite-ignore - not something we can merge`, which is
+            //    a *worse* difference than the unmodelled refusal: git merges
+            //    and this refused to.
+            "--overwrite-ignore" | "--no-overwrite-ignore" | "--no-strategy" => {}
+            // `-X` is git's `OPT_STRVEC`, whose negation is
+            // `strvec_clear(opt->value)` (parse-options.c): `--no-strategy-option`
+            // drops every `-X` given so far rather than being a no-op, so
+            // `git merge -X ours --no-strategy-option` merges with none.
+            "--no-strategy-option" => opts.strategy_options.clear(),
+            // `OPT_BOOL(0, "abort"|"quit"|"continue", …)`: the negation stores 0,
+            // putting the command back on the ordinary merge path it would have
+            // taken had the flag never been given.
+            "--no-abort" | "--no-quit" | "--no-continue" => op = Op::Merge,
             // `--[no-]verify-signatures` / `merge.verifySignatures`: check every
             // head's signature before merging it. `None` leaves the config to
             // decide.
@@ -926,14 +953,22 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // spelling was typed, so stock answers `git merge -F` with
             // ``option `file' requires a value`` and not ``switch `F'``.
             "-F" | "--file" => {
-                file = Some(
+                let path =
                     crate::parseopt::get_arg(args, &mut i, crate::parseopt::OptName::Long("file"))?
-                        .to_string(),
-                )
+                        .to_string();
+                if let Some(code) = read_message_file(&mut opts.message, &path) {
+                    return Ok(code);
+                }
             }
-            _ if a.starts_with("--file=") => file = Some(a["--file=".len()..].to_string()),
+            _ if a.starts_with("--file=") => {
+                if let Some(code) = read_message_file(&mut opts.message, &a["--file=".len()..]) {
+                    return Ok(code);
+                }
+            }
             _ if a.len() > 2 && a.starts_with("-F") && !a.starts_with("--") => {
-                file = Some(a[2..].to_string())
+                if let Some(code) = read_message_file(&mut opts.message, &a[2..]) {
+                    return Ok(code);
+                }
             }
             // `OPT_CLEANUP` is an `OPT_STRING`, so a missing value is
             // `get_arg()`'s refusal and never reaches `get_cleanup_mode()`.
@@ -1044,7 +1079,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
                         }
                         // Named `option \`file'` even here — see the `-F` arm.
                         'F' => {
-                            file = Some(match rest.is_empty() {
+                            let path = match rest.is_empty() {
                                 true => crate::parseopt::get_arg(
                                     args,
                                     &mut i,
@@ -1052,7 +1087,10 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
                                 )?
                                 .to_string(),
                                 false => rest.to_string(),
-                            });
+                            };
+                            if let Some(code) = read_message_file(&mut opts.message, &path) {
+                                return Ok(code);
+                            }
                             break;
                         }
                         's' => {
@@ -1100,34 +1138,35 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
         opts.log_len = if merge_log_config > 0 { merge_log_config } else { 0 };
     }
 
-    // `-F <path>` — read now, after option parsing. `-` and an empty value are
-    // stdin, matching git's `read_from_file`/`fix_filename`.
-    if let Some(path) = file {
-        let data = if path == "-" || path.is_empty() {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
-            buf
-        } else {
-            match std::fs::read(&path) {
-                Ok(buf) => buf,
-                Err(e) => {
-                    eprintln!("fatal: could not open '{path}' for reading: {}", strerror(&e));
-                    return Ok(ExitCode::from(128));
-                }
-            }
-        };
-        opts.message = Some(String::from_utf8_lossy(&data).into_owned());
-    }
-
     match op {
-        // git: `--abort`/`--quit`/`--continue` expect no arguments.
-        Op::Abort | Op::Quit | Op::Continue if !refs.is_empty() => {
+        // ```c
+        // if (abort_current_merge) {
+        //         int nargc = 2;
+        //         const char *nargv[] = {"reset", "--merge", NULL};
+        //         ...
+        //         if (orig_argc != 2)
+        //                 usage_msg_opt(_("--abort expects no arguments"),
+        //                       builtin_merge_usage, builtin_merge_options);
+        // ```
+        //
+        // (builtin/merge.c, and the same three lines for `--quit` and
+        // `--continue`.) The test is on the **argument count**, not on what is
+        // left over after parsing: `git merge --abort -s ort` is two options and
+        // no operand, and stock refuses it just as it refuses `git merge --abort
+        // <branch>`. Testing the operand list instead let every extra *option*
+        // through, so `--abort -s ort` aborted the merge stock declined to touch.
+        //
+        // `usage_msg_opt()` is `fatal: <msg>`, a blank line, then the whole usage
+        // block — all on stderr, exit 129.
+        Op::Abort | Op::Quit | Op::Continue if orig_argc != 1 => {
             let which = match op {
                 Op::Abort => "--abort",
                 Op::Quit => "--quit",
                 _ => "--continue",
             };
             eprintln!("fatal: {which} expects no arguments");
+            eprintln!();
+            eprint!("{USAGE}");
             Ok(ExitCode::from(129))
         }
         Op::Abort => abort(),
@@ -1373,6 +1412,11 @@ fn merge_with_strategies(
     let stash = begin_autostash(repo, opts)?;
     // Same `fflush(NULL)` as above: git reaches `stash create` through
     // `run_command()` too.
+    //
+    // Unconditional, and measured that way: stock 2.55.0 leaves a dangling stash
+    // commit behind `git merge <one-strategy>` over a dirty tree — three objects
+    // that `cat-file --batch-all-objects` sees — so `save_state()` runs whatever
+    // `use_strategies_nr` is.
     crate::cstdio::before_spawn();
     let snapshot = super::stash::create_snapshot(repo)?;
 
@@ -1449,26 +1493,25 @@ fn merge_with_strategies(
         return Ok(ExitCode::from(2));
     };
 
-    let conflicts = if best == wt {
-        // "We already have its result in the working tree."
-        match result {
-            Some(Attempt::Conflicts(c)) => c,
-            _ => unreachable!("a scored attempt is always a conflicted one"),
-        }
-    } else {
+    // The conflicted state itself is what the tail below reads — the paths come
+    // from the index, as `append_conflicts_hint()` reads them — so all this has
+    // to establish is that the *best* strategy's result is the one on disk.
+    if best != wt {
         println!("Rewinding the tree to pristine...");
         restore_state(ctx.local_id, snapshot)?;
         println!("Using the {} strategy to prepare resolving by hand.", picks[best].name);
+        // The re-run is what puts that strategy's result back on disk; its
+        // report is not needed, because the tail below reads the conflicted
+        // paths out of the index the way `append_conflicts_hint()` does. It can
+        // only land where the scoring run did — anything else means the rewind
+        // did not restore the state the score was taken from.
         match try_merge_strategy(repo, &picks[best], ctx, opts)? {
-            Attempt::Conflicts(c) => c,
-            // The re-run is over the same trees the scoring run saw, so it can
-            // only land where that one did. Anything else means the rewind did
-            // not restore the state the score was taken from.
+            Attempt::Conflicts(_) => {}
             _ => unreachable!("the best strategy conflicted once and cannot now do otherwise"),
         }
-    };
+    }
 
-    stop_for_conflicts(repo, ctx.local_id, ctx.targets, ctx.message.clone(), &conflicts, opts, stash)
+    stop_for_conflicts(repo, ctx.local_id, ctx.targets, ctx.message.clone(), opts, stash)
 }
 
 /// `try_merge_strategy()` (builtin/merge.c:789-851): run one strategy over the
@@ -1492,6 +1535,14 @@ fn try_merge_strategy(
         if ctx.targets.len() > 1 {
             eprintln!("error: Not handling anything other than two heads merge.");
             return Ok(Attempt::Refused);
+        }
+        // `init_merge_options()` (merge-ort.c) is next, and it opens with
+        // `merge_recursive_config()`. Its reads can die, so they run here —
+        // after the two-heads refusal above and after `ORIG_HEAD` has already
+        // been moved, which is why stock leaves a *new* `ORIG_HEAD` behind a
+        // merge it then refuses to start.
+        if let Some(code) = merge_recursive_config_check(repo) {
+            return Ok(Attempt::Done { code, autostash_applied: false });
         }
         let seed = crate::merge_apply::StrategyOptions {
             subtree_shift: (pick.kind == Strategy::Subtree).then(BString::default),
@@ -1860,6 +1911,19 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // each *surviving* head (merge.c:1493-1496) — the same names the strategies
     // are handed, which is why a `FETCH_HEAD` merge reflogs `merge <oid>`.
     let reflog_spec: String = head_labels.join(" ");
+    // `setenv("GIT_REFLOG_ACTION", "merge <heads>", 0)` (builtin/merge.c:1586).
+    // The zero is "do not overwrite", so `git pull` — which sets the variable to
+    // `pull` before calling merge — keeps its own name, and so does a rebase's
+    // integration step. Setting it is not bookkeeping: `restore_state()` rewinds
+    // through `git stash apply --index`, whose own reset reads this variable for
+    // its reflog text, so without it that reset announces itself as a bare
+    // `reset: moving to HEAD` where stock says `merge <heads>: updating HEAD`.
+    //
+    // Scoped rather than simply set: git can leak it into the environment because
+    // its process ends with the command, but this binary serves many commands from
+    // one process (`zrepl` runs a whole session in it), and a `merge` that left the
+    // variable behind would rename the reflog of every command after it.
+    let _reflog_action = super::reset::ReflogAction::set(format!("merge {reflog_spec}"));
 
     // `collect_parents()`'s *second* pass over the operands, which is where a
     // generated merge message is built:
@@ -2118,6 +2182,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         if !opts.quiet {
             print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
         }
+        run_post_merge(&repo, true)?;
         end_autostash(&repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -2154,6 +2219,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         println!("Fast-forward");
         print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
     }
+    run_post_merge(&repo, false)?;
     end_autostash(&repo, stash, true)?;
     // `finish(); remove_merge_branch_state();` — builtin/merge.c:1688. The order
     // is the point: `finish()` is what re-applies the autostash
@@ -2359,7 +2425,6 @@ fn ort_attempt(
     let staged = crate::merge_guard::index_changes_from_head(repo, ctx.head_tree, &old_index)?;
     if !staged.is_empty() {
         crate::merge_guard::report_index_changes(&staged);
-        log_strategy_failure(repo, ctx.local_id, ctx.reflog_spec);
         return Ok(Attempt::Refused);
     }
 
@@ -2512,7 +2577,6 @@ pub(super) fn virtual_base_tree(repo: &gix::Repository, bases: &[ObjectId]) -> R
 fn ours_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>) -> Result<Attempt> {
     let old_index = repo.index_or_load_from_head()?.into_owned();
     if !crate::merge_guard::index_changes_from_head(repo, ctx.head_tree, &old_index)?.is_empty() {
-        log_strategy_failure(repo, ctx.local_id, ctx.reflog_spec);
         return Ok(Attempt::Refused);
     }
     let should_interrupt = AtomicBool::new(false);
@@ -2538,7 +2602,6 @@ fn stop_for_conflicts(
     // conflicted octopus and a conflicted two-head merge take the same path.
     targets: &[ObjectId],
     message: String,
-    conflicts: &[BString],
     opts: &Opts,
     stash: Option<ObjectId>,
 ) -> Result<ExitCode> {
@@ -2571,17 +2634,84 @@ fn stop_for_conflicts(
     } else {
         write_merge_heads(repo, targets, opts.ff)?;
         merge_msg = message.into_bytes();
+        // ```c
+        // static void write_merge_state(struct commit_list *remoteheads)
+        // {
+        //         write_merge_heads(remoteheads);
+        //         strbuf_addch(&merge_msg, '\n');
+        //         write_file_buf(git_path_merge_msg(the_repository), merge_msg.buf, merge_msg.len);
+        // ```
+        //
+        // (builtin/merge.c.) The newline belongs to the *file*, not to the
+        // message — which is why `git commit`'s copy of it does not have one.
+        merge_msg.push(b'\n');
     }
     // `suggest_conflicts()` opens `MERGE_MSG` with `xfopen(filename, "a")`
     // and appends `append_conflicts_hint()`'s block (builtin/merge.c:967-979),
     // so the hint's leading blank line is always there and a squash — which
     // wrote no message for it to follow — leaves the hint alone in the file.
-    merge_msg.extend_from_slice(b"\n# Conflicts:\n");
-    for path in conflicts {
-        merge_msg.extend_from_slice(b"#\t");
+    //
+    // ```c
+    // void append_conflicts_hint(struct index_state *istate,
+    //                            struct strbuf *msgbuf, enum commit_msg_cleanup_mode cleanup_mode)
+    // {
+    //         if (cleanup_mode == COMMIT_MSG_CLEANUP_SCISSORS) {
+    //                 strbuf_addch(msgbuf, '\n');
+    //                 wt_status_append_cut_line(msgbuf);
+    //                 strbuf_addstr(msgbuf, comment_line_str);
+    //         }
+    //         strbuf_addch(msgbuf, '\n');
+    //         strbuf_commented_addf(msgbuf, comment_line_str, "Conflicts:\n");
+    // ```
+    //
+    // (merge.c.) `--cleanup=scissors` is the one mode that changes these bytes:
+    // the whole hint moves *below* a scissors line, because everything after
+    // that line is what `git commit` will strip. The trailing bare comment
+    // character is what turns the `strbuf_addch(msgbuf, '\n')` below it into the
+    // `#` line stock leaves between the cut line and `# Conflicts:`, so the two
+    // modes differ by the scissors block and nothing else.
+    let comment = comment_char(repo);
+    if opts.cleanup == Cleanup::Scissors {
+        merge_msg.push(b'\n');
+        merge_msg.extend_from_slice(comment.as_bytes());
+        merge_msg
+            .extend_from_slice(b" ------------------------ >8 ------------------------\n");
+        merge_msg.extend_from_slice(comment.as_bytes());
+        merge_msg.extend_from_slice(b" Do not modify or remove the line above.\n");
+        merge_msg.extend_from_slice(comment.as_bytes());
+        merge_msg.extend_from_slice(b" Everything below it will be ignored.\n");
+        merge_msg.extend_from_slice(comment.as_bytes());
+    }
+    merge_msg.push(b'\n');
+    merge_msg.extend_from_slice(comment.as_bytes());
+    merge_msg.extend_from_slice(b" Conflicts:\n");
+    // `append_conflicts_hint()` walks the **index**, not the strategy's report:
+    //
+    // ```c
+    // for (i = 0; i < istate->cache_nr;) {
+    //         const struct cache_entry *ce = istate->cache[i];
+    //         if (ce_stage(ce)) {
+    //                 strbuf_commented_addf(msgbuf, comment_line_str, "\t%s\n", ce->name);
+    //                 while (i < istate->cache_nr && !strcmp(ce->name, istate->cache[i]->name))
+    //                         i++;
+    //         } else
+    //                 i++;
+    // }
+    // ```
+    //
+    // (merge.c.) The index is sorted by path, so the list is sorted by path —
+    // where merge-ort's conflict list is in the order the engine produced it.
+    // The two agree on one conflict and diverge on three: stock lists
+    // `fresh.txt other.txt rr.txt` where the engine reported
+    // `other.txt rr.txt fresh.txt`.
+    let index = repo.open_index()?;
+    for path in unmerged_paths(&index) {
+        merge_msg.extend_from_slice(comment.as_bytes());
+        merge_msg.push(b'\t');
         merge_msg.extend_from_slice(&path[..]);
         merge_msg.push(b'\n');
     }
+    drop(index);
     std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
     // `suggest_conflicts()` runs rerere between the `# Conflicts:` hint and
     // the notice: a known resolution is replayed into the worktree (and
@@ -2590,6 +2720,20 @@ fn stop_for_conflicts(
     super::rerere::repo_rerere(repo, opts.rerere_autoupdate)?;
     if !opts.quiet {
         println!("Automatic merge failed; fix conflicts and then commit the result.");
+    }
+    // ```c
+    // if (autostash)
+    //         printf(_("When finished, apply stashed changes with `git stash pop`\n"));
+    // ```
+    //
+    // (`suggest_conflicts()`, builtin/merge.c.) Keyed on the *option*, not on
+    // whether a stash was created: measured against stock 2.55.0, a
+    // `--autostash` merge that conflicts prints the line whether the worktree was
+    // dirty (`Created autostash: …` first) or clean (no stash at all). The
+    // `MERGE_AUTOSTASH` the merge leaves behind is what `git merge --continue`
+    // and `git merge --abort` restore, and this is the only line that says so.
+    if opts.autostash {
+        println!("When finished, apply stashed changes with `git stash pop`");
     }
     end_autostash(repo, stash, false)?;
     return Ok(ExitCode::from(1));
@@ -2699,6 +2843,7 @@ fn finalize_clean(
         // before it writes the file, whatever `-q` says.
         println!("Squash commit -- not updating HEAD");
         write_squash_msg(repo, targets, local_id)?;
+        run_post_merge(repo, true)?;
         end_autostash(repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -2707,7 +2852,10 @@ fn finalize_clean(
     if !do_commit {
         let git_dir = repo.git_dir();
         write_merge_heads(repo, targets, opts.ff)?;
-        std::fs::write(git_dir.join("MERGE_MSG"), &message)?;
+        // `write_merge_state()` again — `--no-commit` leaves the same merge state
+        // a conflict does, newline and all (measured: `.git/MERGE_MSG` after
+        // `git merge --no-commit --no-ff -m mm <side>` is `mm\n`).
+        std::fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
         eprintln!("Automatic merge went well; stopped before committing as requested");
         end_autostash(repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
@@ -2739,6 +2887,28 @@ fn finalize_clean(
     write_merge_heads(repo, targets, opts.ff)?;
     let msg_path = git_dir.join("MERGE_MSG");
     std::fs::write(&msg_path, &msg)?;
+
+    // ```c
+    // if (run_commit_hook(0 < option_edit, get_index_file(), NULL,
+    //                     "prepare-commit-msg",
+    //                     git_path_merge_msg(the_repository), "merge", NULL))
+    //         abort_commit(remoteheads, NULL);
+    // ```
+    //
+    // (`prepare_to_commit()`, builtin/merge.c.) Two arguments: the message file
+    // and the literal source `merge` — there is no third, so a hook that prints
+    // `"$3"` prints nothing.
+    //
+    // **Not gated on `--no-verify`.** `pre-merge-commit` and `commit-msg` are
+    // wrapped in `if (!no_verify …)` and this one is not, which is exactly what
+    // makes `git merge --no-verify` still record a message the hook rewrote.
+    // Omitting the hook meant a repository whose `prepare-commit-msg` appends a
+    // trailer committed a *different message*, and so a different commit id,
+    // than stock.
+    let msg_arg = msg_path.to_string_lossy().into_owned();
+    if !crate::hooks::run(repo, "prepare-commit-msg", &[&msg_arg, "merge"], None)? {
+        return Ok(ExitCode::from(1));
+    }
 
     if edit && !launch_editor(repo, &msg_path)? {
         eprintln!("Not committing merge; use 'git commit' to complete the merge.");
@@ -2799,6 +2969,7 @@ fn finalize_clean(
         }
     }
     let new_id = repo.write_object(&commit)?.detach();
+    settle_index_for_commit(repo, merged_tree, true)?;
     advance(
         repo,
         local_id,
@@ -2809,6 +2980,7 @@ fn finalize_clean(
         println!("{finish_msg}");
         print!("{}", diffstat(repo, head_tree, merged_tree, opts.stat)?);
     }
+    run_post_merge(repo, false)?;
     end_autostash(repo, stash, true)?;
     // git's `finish(); remove_merge_branch_state();` (builtin/merge.c:1007,
     // 1038), in that order — `finish()` re-applies the autostash, whose `git
@@ -2816,6 +2988,98 @@ fn finalize_clean(
     // state cleared. Clearing first left that file behind.
     remove_merge_state(git_dir, false);
     Ok(ExitCode::SUCCESS)
+}
+
+/// `finish()`'s last act (builtin/merge.c):
+///
+/// ```c
+/// /* Run a post-merge hook */
+/// run_hooks_l(the_repository, "post-merge", squash ? "1" : "0", NULL);
+/// ```
+///
+/// One argument, `1` under `--squash` and `0` otherwise. It runs for every
+/// outcome `finish()` reaches — the merge commit, the fast-forward, the in-index
+/// merge and the squash alike — and for none of the outcomes that return before
+/// it: `Already up to date.`, `--no-commit`, a conflict, and every refusal. Its
+/// exit status is ignored, as `run_hooks_l` ignores it.
+fn run_post_merge(repo: &gix::Repository, squash: bool) -> Result<()> {
+    let arg = if squash { "1" } else { "0" };
+    let _ = crate::hooks::run(repo, "post-merge", &[arg], None)?;
+    Ok(())
+}
+
+/// What `git commit` leaves the index looking like once the merge commit is
+/// written: a fully valid cache-tree for the committed tree, and no resolve-undo.
+///
+/// `finish()` (builtin/merge.c) commits through `git commit`, whose
+/// `update_main_cache_tree()` fills every invalid cache-tree node in and whose
+/// commit clears the resolve-undo the merge accumulated. Neither is visible in
+/// any output, and both are in the index bytes stock git reads back.
+///
+/// The strategies reach this in two different states, which is why it is done
+/// once here rather than in each of them:
+///
+/// * merge-ort hands over an index it built itself, already carrying the
+///   cache-tree of the tree it merged and no resolve-undo — this rewrites the
+///   same bytes.
+/// * `resolve`, `octopus` and `subtree` run through `read-tree -m --aggressive`
+///   and `merge-index -o git-merge-one-file`, exactly as their shell drivers do.
+///   That pair *drops* the cache-tree (every path it touches is invalidated) and
+///   *records* resolve-undo for each unmerged entry it replaces — measured on
+///   stock 2.55.0, whose index after `merge-index` carries `REUC` and no `TREE`,
+///   and after the concluding commit carries `TREE` and no `REUC`. Leaving that
+///   intermediate state on disk is a difference no probe of stdout can see: it
+///   costs the next `write-tree` its shortcut and leaves an undo record for a
+///   conflict that is already committed.
+fn settle_index_for_commit(
+    repo: &gix::Repository,
+    tree: ObjectId,
+    drop_resolve_undo: bool,
+) -> Result<()> {
+    let mut index = repo.open_index()?;
+    let cache_tree = cache_tree_node(repo, &[], tree)?;
+    index.set_tree(Some(cache_tree));
+    if drop_resolve_undo {
+        index.remove_resolve_undo();
+    }
+    crate::index_racy::write(repo, &mut index)?;
+    Ok(())
+}
+
+/// One cache-tree node for `id`, recursively — `cache_tree_update()`'s answer for
+/// a tree that is entirely valid.
+///
+/// `num_entries` is the count of **non-tree** entries below the node, counted
+/// recursively (`it->entry_count` in cache-tree.c, which is a count of index
+/// entries and so counts a gitlink as one). Children are sorted by name, which is
+/// the order `cache_tree_update()` produces by building them from the
+/// bytewise-sorted index rather than from tree order — the two differ whenever a
+/// directory name is a prefix of a sibling's.
+fn cache_tree_node(
+    repo: &gix::Repository,
+    name: &[u8],
+    id: ObjectId,
+) -> Result<gix::index::extension::Tree> {
+    let tree = repo.find_tree(id)?;
+    let mut children = Vec::new();
+    let mut num_entries = 0u32;
+    for entry in tree.iter() {
+        let entry = entry?;
+        if entry.mode().is_tree() {
+            let child = cache_tree_node(repo, entry.filename(), entry.oid().to_owned())?;
+            num_entries += child.num_entries.unwrap_or(0);
+            children.push(child);
+        } else {
+            num_entries += 1;
+        }
+    }
+    children.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(gix::index::extension::Tree {
+        name: name.iter().copied().collect(),
+        id,
+        num_entries: Some(num_entries),
+        children,
+    })
 }
 
 /// git's `write_merge_heads()`: every merged head in `MERGE_HEAD`, plus the
@@ -2871,7 +3135,6 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
         for path in &staged {
             println!("    {}", quote_path(path));
         }
-        log_strategy_failure(repo, ctx.local_id, &ctx.refs.join(" "));
         return Ok(Attempt::Refused);
     }
     // `MRC` (git's merge-result-commit list): the parents of the eventual commit.
@@ -2884,6 +3147,23 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
     for (spec, head_id) in &heads {
         let tip = if mrc.len() == 1 { mrc[0] } else { ctx.local_id };
         let all_bases = repo.merge_bases_many(tip, &[*head_id])?;
+        // ```sh
+        // 	common=$(git merge-base --all $MRC $SHA1) ||
+        // 		die "Unable to find common commit with $pretty_name"
+        // ```
+        //
+        // (`git-merge-octopus`.) `die` exits 1, and `try_merge_command()` hands
+        // `cmd_merge` a non-zero-but-not-2 status — which is the *conflicted*
+        // verdict, not the strategy-failed one. So an octopus over unrelated
+        // histories records `MERGE_HEAD`, writes a `# Conflicts:` hint with an
+        // empty list (nothing in the index is unmerged), prints `Automatic merge
+        // failed; fix conflicts and then commit the result.` and exits 1.
+        // Propagating the missing merge base as an error instead left the
+        // repository untouched and printed a `zvcs:` diagnostic.
+        if all_bases.is_empty() {
+            eprintln!("Unable to find common commit with {spec}");
+            return Ok(Attempt::Conflicts(Vec::new()));
+        }
         let common = repo.merge_base(tip, *head_id)?.detach();
         if common == *head_id {
             if !opts.quiet {
@@ -2919,64 +3199,84 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
             println!("Trying simple merge with {spec}");
         }
         let base_tree = repo.find_object(common)?.peel_to_tree()?.id;
-        // `git read-tree -u -m --aggressive $common $MRT $SHA1 || exit 2`, which
-        // the script runs before the `git write-tree` that follows it. Refusing
-        // here rather than over the merged tree is what keeps a failed octopus
-        // from leaving that tree in the object database.
+        // `git read-tree -u -m --aggressive $common $MRT $SHA1`, then
+        // `git write-tree`, then — only if that failed — `git merge-index -o
+        // git-merge-one-file -a`:
+        //
+        // ```sh
+        // 	echo "Trying simple merge with $pretty_name"
+        // 	git read-tree -u -m --aggressive  $common $MRT $SHA1 || exit 2
+        // 	next=$(git write-tree 2>/dev/null) || {
+        // 		echo "Simple merge did not work, trying automatic merge."
+        // 		git merge-index -o git-merge-one-file -a || OCTOPUS_FAILURE=1
+        // 		next=$(git write-tree 2>/dev/null)
+        // 	}
+        // ```
+        //
+        // (`git-merge-octopus`.) Both plumbing commands run in process, exactly
+        // as [`super::merge_resolve`] runs the same pair for `git-merge-resolve`
+        // — which is the only way the octopus can produce the bytes stock does.
+        // Resolving through merge-ort instead was a *different engine*: it
+        // renames, it detects directory renames, and it reports merge-ort's
+        // `Auto-merging`/`CONFLICT (…)` lines. `git-merge-one-file` does none of
+        // those. Measured against stock 2.55.0 over the `merge-matrix` shape,
+        // the two disagree on the answer as well as the wording:
+        //
+        // * `git merge mm-mod mm-del` — stock prints `Simple merge did not work,
+        //   trying automatic merge.` and then `git-merge-one-file`'s
+        //   `ERROR: mm/md.txt: Not handling case <a> -> <b> -> ` on stderr, with
+        //   `fatal: merge program failed` from `merge-index`; merge-ort resolved
+        //   it as a modify/delete instead.
+        // * `git merge mm-dir mm-add` — merge-ort moves `mm/old/c.txt` into the
+        //   renamed `mm/new/`, committing a tree stock never writes;
+        //   `read-tree --aggressive` has no rename detection at all.
         let clobber =
             crate::merge_guard::verify_three_way(repo, base_tree, mrt, head_tree, &cur_index)?;
         if !clobber.is_empty() {
             clobber.report_plumbing();
             return Ok(Attempt::Refused);
         }
-        // `merge_ort_internal()`'s ancestor name again — see the recursive path
-        // above. Stock's octopus never reaches a rendering that shows it: it
-        // resolves unmerged paths through `git merge-index -o git-merge-one-file`,
-        // whose `git merge-file "$src1" "$orig" "$src2"` passes no `-L`, so a
-        // `diff3` conflict there is labelled with the run's `.merge_file_XXXXXX`
-        // temporary names. This driver renders merge-ort conflicts (the
-        // divergence `merge_octopus.rs` documents), so it names the base the way
-        // merge-ort does.
-        let ancestor = if all_bases.len() > 1 {
-            "merged common ancestors".to_string()
-        } else {
-            common.attach(repo).shorten_or_id().to_string()
-        };
-        let labels = gix::merge::blob::builtin_driver::text::Labels {
-            ancestor: Some(BStr::new(ancestor.as_bytes())),
-            current: Some(BStr::new(b"HEAD")),
-            other: Some(BStr::new(spec.as_bytes())),
-        };
-        let merged = crate::merge_apply::three_way_merge_guarded(
-            repo,
-            base_tree,
-            mrt,
-            head_tree,
-            &cur_index,
-            labels,
-            &should_interrupt,
-            merge_verbosity(repo) != 0,
-            &crate::merge_apply::StrategyOptions::default(),
-            mrt,
-        )?;
-        let applied = match merged {
-            crate::merge_apply::Merged::Applied(applied) => applied,
-            crate::merge_apply::Merged::Refused(clobber) => {
-                clobber.report_plumbing();
-                return Ok(Attempt::Refused);
-            }
-        };
-        cur_index = applied.index;
-        crate::index_racy::write(repo, &mut cur_index)?;
-
-        if !applied.conflicts.is_empty() {
-            // Octopus aborts on the first conflicting head, leaving the
-            // conflicted worktree and index. Everything downstream — MERGE_HEAD
-            // over every head, the `# Conflicts:` hint, rerere, the notice — is
-            // `cmd_merge`'s shared tail, not the strategy's.
-            return Ok(Attempt::Conflicts(applied.conflicts));
+        let read_tree_argv: Vec<String> = ["-u", "-m", "--aggressive"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .chain([common.to_string(), mrt.to_string(), head_tree.to_string()])
+            .collect();
+        if exit_status(super::read_tree::read_tree(&read_tree_argv)?) != 0 {
+            return Ok(Attempt::Refused);
         }
-        mrt = applied.tree_id;
+        cur_index = repo.open_index()?;
+
+        // `next=$(git write-tree 2>/dev/null) || …`: `write-tree` fails on an
+        // unmerged index and says so on the stderr the script discards, so the
+        // test is exactly "did `read-tree --aggressive` leave a stage behind".
+        // Asking the index directly keeps those suppressed lines suppressed.
+        if cur_index.entries().iter().any(|e| e.stage_raw() != 0) {
+            println!("Simple merge did not work, trying automatic merge.");
+            let merge_index_argv: Vec<String> = ["-o", "git-merge-one-file", "-a"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            let _ = super::merge_index::merge_index(&merge_index_argv)?;
+            cur_index = repo.open_index()?;
+            if cur_index.entries().iter().any(|e| e.stage_raw() != 0) {
+                // `OCTOPUS_FAILURE=1`, and `next` stays empty because the second
+                // `write-tree` fails too. The octopus stops here, leaving the
+                // conflicted worktree and index; everything downstream —
+                // `MERGE_HEAD` over every head, the `# Conflicts:` hint, rerere,
+                // the notice — is `cmd_merge`'s shared tail, not the strategy's.
+                return Ok(Attempt::Conflicts(unmerged_paths(&cur_index)));
+            }
+        }
+        // `next=$(git write-tree)`, and `write-tree` is what fills the index's
+        // cache-tree in (`cache_tree_update()` → `write_locked_index()`). The
+        // script runs it after every head, so the index the octopus leaves for
+        // `--no-commit` and `--squash` — which never reach the concluding commit
+        // — already carries it. Deriving the tree without writing it back left
+        // `<root>=-1`, an invalidated cache-tree stock never leaves there.
+        mrt = index_tree(repo, &cur_index)?;
+        let cache_tree = cache_tree_node(repo, &[], mrt)?;
+        cur_index.set_tree(Some(cache_tree));
+        crate::index_racy::write(repo, &mut cur_index)?;
         mrc.push(*head_id);
     }
 
@@ -3329,13 +3629,13 @@ fn compose_message(
         None => fetch_head_title(refs),
     };
     let mut msg = match (&opts.message, fetch_head_title, refs.len()) {
-        (Some(m), _, _) => {
-            let mut m = m.clone();
-            if !m.ends_with('\n') {
-                m.push('\n');
-            }
-            m
-        }
+        // `-m`/`-F` fill `merge_msg` verbatim (`option_parse_message()` /
+        // `option_read_message()`), so `git merge -m x` records a `merge_msg` of
+        // exactly `x` — no trailing newline. The one this used to add showed up
+        // wherever the file is read back rather than cleaned: a
+        // `prepare-commit-msg` hook that appends to `$1` produced `x\n\n<trailer>`
+        // where stock produces `x\n<trailer>`, i.e. a different commit.
+        (Some(m), _, _) => m.clone(),
         (None, Some(title), _) => {
             let current = match (opts.into_name.as_deref(), branch) {
                 (Some(n), _) => n.to_string(),
@@ -3355,6 +3655,16 @@ fn compose_message(
     };
     if opts.log_len != 0 {
         append_shortlog(repo, refs, targets, local_id, opts, &mut msg)?;
+    }
+    // A *generated* `merge_msg` carries no trailing newline either:
+    // `fmt_merge_msg()` hands `cmd_merge` `Merge branch 'x'` and, under `--log`,
+    // the shortlog block that follows it, both unterminated. The newline the
+    // merge state files carry is added at the two places git adds it — the
+    // `strbuf_addch(&merge_msg, '\n')` in `write_merge_state()` — and nowhere
+    // else. Measured against stock 2.55.0 through a `prepare-commit-msg` hook
+    // that appends to the file, which is the only way to see the byte at all.
+    if opts.message.is_none() && msg.ends_with('\n') {
+        msg.pop();
     }
     Ok(msg)
 }
@@ -3852,6 +4162,84 @@ fn append_message(buf: &mut Option<String>, arg: &str) {
     }
 }
 
+/// `merge_recursive_config()`'s integer reads (merge-recursive.c), which
+/// `init_merge_options()` runs for every merge-ort merge — `git merge`'s
+/// `recursive`/`subtree`/`ort` strategies and `merge-tree`'s `real_merge` alike.
+///
+/// ```c
+/// static void merge_recursive_config(struct merge_options *opt, int ui)
+/// {
+///         char *value = NULL;
+///         int renormalize = 0;
+///         git_config_get_int("merge.verbosity", &opt->verbosity);
+///         git_config_get_int("diff.renamelimit", &opt->rename_limit);
+///         git_config_get_int("merge.renamelimit", &opt->rename_limit);
+/// ```
+///
+/// `git_config_get_int()` **dies** on a value it cannot read, so the observable
+/// half of these keys is not the limit they set — this build does not cap the
+/// rename matrix at all — but the refusal: `merge.renameLimit = nonsense` stops
+/// the merge with `fatal: bad numeric config value 'nonsense' for
+/// 'merge.renamelimit': invalid unit` at exit 128.
+///
+/// It runs where `init_merge_options()` runs and not at startup, which is
+/// observable: stock records `ORIG_HEAD` before the strategy dispatch, so the
+/// merge that dies here still leaves the new `ORIG_HEAD` behind. Reading the
+/// keys in `cmd_merge`'s config pass instead left the old one.
+///
+/// Returns the exit code to hand back, having already printed git's `fatal:`.
+pub(super) fn merge_recursive_config_check(repo: &gix::Repository) -> Option<ExitCode> {
+    for key in ["merge.verbosity", "diff.renameLimit", "merge.renameLimit"] {
+        if let Err(msg) = crate::config::config_int(repo, key) {
+            eprintln!("fatal: {msg}");
+            return Some(ExitCode::from(128));
+        }
+    }
+    None
+}
+
+/// Append one `-F`/`--file` payload to the same buffer `-m` accumulates into,
+/// or report `option_read_message()`'s refusal and yield its exit code.
+///
+/// ```c
+/// if (buf->len)
+///         strbuf_addch(buf, '\n');
+/// if (ctx->prefix && !is_absolute_path(arg))
+///         arg = prefix_filename(ctx->prefix, arg);
+/// if (strbuf_read_file(buf, arg, 0) < 0)
+///         return error(_("could not read file '%s'"), arg);
+/// ```
+///
+/// (`option_read_message()`, builtin/merge.c.) Three things separate this from
+/// the read this port used to defer to the end of parsing, and all three are
+/// observable against stock 2.55.0:
+///
+/// * **The separator is one newline, not two.** `-m x -F f` records
+///   `x\n<file>`, where two `-m`s record `a\n\nb`. Replacing the buffer, as the
+///   deferred read did, dropped the `-m` half entirely.
+/// * **There is no stdin spelling.** `strbuf_read_file()` is handed the argument
+///   verbatim, so `git merge -F -` is a file named `-` and answers
+///   ``error: could not read file '-'`` — not a read of standard input.
+/// * **It runs during parsing, and its failure is `parse_options()`'.**
+///   `error()` returns -1, which `parse_options()` turns into exit **129** with
+///   no `fatal:`; the deferred read reported `fatal: could not open …` at 128
+///   after every later option had already been accepted.
+fn read_message_file(buf: &mut Option<String>, path: &str) -> Option<ExitCode> {
+    let Ok(data) = std::fs::read(path) else {
+        eprintln!("error: could not read file '{path}'");
+        return Some(ExitCode::from(129));
+    };
+    let text = String::from_utf8_lossy(&data);
+    match buf {
+        Some(existing) => {
+            existing.push('\n');
+            existing.push_str(&text);
+        }
+        None => *buf = Some(text.into_owned()),
+    }
+    None
+}
+
 /// Map a `--cleanup=<mode>` value to its mode, or `None` for an invalid one.
 fn parse_cleanup(value: &str) -> Option<Cleanup> {
     Some(match value {
@@ -4021,12 +4409,25 @@ fn write_squash_msg(repo: &gix::Repository, targets: &[ObjectId], head: ObjectId
         .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
     for info in walk.all()? {
         let commit = info?.object()?;
-        // `rev.ignore_merges = 1`: merge commits are skipped.
-        if commit.parent_ids().count() > 1 {
-            continue;
-        }
         out.push('\n');
         out.push_str(&format!("commit {}\n", commit.id));
+        // `add_merge_info()` (pretty.c), reached from `pp_header()` for every
+        // format but oneline and the mail ones: a commit with more than one
+        // parent prints them, abbreviated, on a `Merge:` line before the author.
+        //
+        // `squash_message()`'s `rev.ignore_merges = 1` is **not** a filter on the
+        // walk — in `rev_info` that flag suppresses the *diff* of a merge, and
+        // `squash_message()` prints no diffs at all. Reading it as "skip merge
+        // commits" dropped every merge from `SQUASH_MSG`, which is exactly the
+        // history a criss-cross squash is made of.
+        let parents: Vec<_> = commit.parent_ids().collect();
+        if parents.len() > 1 {
+            out.push_str("Merge:");
+            for parent in &parents {
+                out.push_str(&format!(" {}", parent.shorten_or_id()));
+            }
+            out.push('\n');
+        }
         let author = commit.author()?;
         out.push_str(&format!(
             "Author: {} <{}>\n",
@@ -4074,16 +4475,14 @@ pub(crate) fn index_tree(repo: &gix::Repository, index: &gix::index::File) -> Re
 /// merge leaves `merge origin/main: Fast-forward`, and how `git rebase`'s
 /// integration steps keep their own action. Reading it here is the half of that
 /// mechanism the merge side owes; `pull` has always set it.
-/// The no-op HEAD update git records (`<reflog action>: updating HEAD`) when a strategy
-/// refuses because the *index* does not match HEAD. Measured against stock 2.55.0 for
-/// `ort`, `ours` and `octopus`: the staged-change refusal logs it, while the refusal
-/// over unstaged worktree changes ("Your local changes … would be overwritten") does
-/// not, so this is tied to the index guards alone.
-fn log_strategy_failure(repo: &gix::Repository, head: ObjectId, spec: &str) {
-    let msg = format!("{}: updating HEAD", reflog_action(spec));
-    super::checkout::record_head_move(repo, Some(head), Some(head), &msg);
-}
-
+///
+/// The `<reflog action>: updating HEAD` line a strategy refusal leaves behind is
+/// *not* written here, and no longer written by merge at all. Stock's single line
+/// comes from `restore_state()`'s rewind: `git stash apply --index` ends on `git
+/// reset --quiet --refresh`, and that reset reads `GIT_REFLOG_ACTION` for its
+/// message (`set_reflog_message()`, builtin/reset.c). Merge used to synthesize the
+/// line because the port's stash apply did not yet log its reset; once it did,
+/// both wrote and every refusal over a staged change carried one line too many.
 fn reflog_action(spec: &str) -> String {
     std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| format!("merge {spec}"))
 }
@@ -4102,17 +4501,16 @@ fn continue_merge(opts: &Opts) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     // Refuse while the index still carries conflicted (stage 1/2/3) entries.
+    //
+    // `--continue` is `cmd_commit()` (builtin/merge.c invokes it with a one-word
+    // argv), so the refusal is *commit's*, not a copy of its wording:
+    // `refresh_index()` runs under `REFRESH_IN_PORCELAIN` first and reports each
+    // conflicted path as `U<TAB><path>` on **stdout** before the diagnosis goes
+    // to stderr. Reproducing only the stderr half left stock's three stdout lines
+    // unanswered on a merge stopped over three paths.
     let index = repo.open_index()?;
     if index.entries().iter().any(|e| e.stage() != Stage::Unconflicted) {
-        eprintln!("error: Committing is not possible because you have unmerged files.");
-        // `error_resolve_conflict` (sequencer.c) prints the error unconditionally
-        // and the two-line direction only under `advice.resolveConflict`.
-        crate::advice::Advice::ResolveConflict.advise_plain(
-            "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
-             as appropriate to mark resolution and make a commit.",
-        );
-        eprintln!("fatal: Exiting because of an unresolved conflict.");
-        return Ok(ExitCode::from(128));
+        return Ok(super::commit::die_resolve_conflict(&index));
     }
 
     let head = repo.head()?;
@@ -4159,6 +4557,12 @@ fn continue_merge(opts: &Opts) -> Result<ExitCode> {
 
     let tree_id = index_tree(&repo, &index)?;
     let commit_id = repo.commit("HEAD", &msg, tree_id, parents)?;
+    // `update_main_cache_tree()` again — see [`settle_index_for_commit`]. The
+    // resolve-undo stays: measured against stock 2.55.0, the index after
+    // `git merge --continue` over a hand-resolved conflict carries both the
+    // filled-in `TREE` and the `REUC` the conflict recorded, where the index
+    // after a strategy's own commit carries `TREE` alone.
+    settle_index_for_commit(&repo, tree_id, false)?;
 
     remove_merge_state(&git_dir, true);
     let _ = crate::hooks::run(&repo, "post-merge", &["0"], None);
@@ -4556,7 +4960,23 @@ fn update_worktree(
                 continue;
             }
             if let Some(full) = repo.workdir_path(path) {
-                let _ = std::fs::remove_file(full);
+                let _ = std::fs::remove_file(&full);
+                // `unlink_entry()` ends with `schedule_dir_for_removal()`, and
+                // `remove_scheduled_dirs()` then deletes every directory the
+                // removals emptied, innermost first (unpack-trees.c). Without it
+                // a merge that moves `mm/old/*` into `mm/new/` leaves an empty
+                // `mm/old/` behind — untracked, invisible to `status`, and
+                // present in nothing stock leaves on disk.
+                let mut dir = full.parent().map(std::path::Path::to_path_buf);
+                while let Some(d) = dir {
+                    if d == workdir || !d.starts_with(&workdir) {
+                        break;
+                    }
+                    if std::fs::remove_dir(&d).is_err() {
+                        break;
+                    }
+                    dir = d.parent().map(std::path::Path::to_path_buf);
+                }
             }
         }
     }
@@ -4783,6 +5203,7 @@ fn collect(
         Option<(ObjectId, bool)>,
         Option<(ObjectId, bool)>,
         Option<&'static str>,
+        (u32, u32),
     );
     let mut raw: Vec<RawRow> = Vec::new();
     let mut summary: Vec<(BString, String)> = Vec::new();
@@ -4801,6 +5222,19 @@ fn collect(
         }
         let path: BString = change.location().to_owned();
         let display = quote_path(&path[..]);
+        // Each side's `(oid, mode)` as `diff_tree_oid()` queues it, for the
+        // rename pass below. `0` for an absent side is git's `alloc_filespec()`
+        // without a `fill_filespec()`.
+        let modes: (u32, u32) = match &change {
+            TreeChange::Addition { entry_mode, .. } => (0, u32::from(entry_mode.value())),
+            TreeChange::Deletion { entry_mode, .. } => (u32::from(entry_mode.value()), 0),
+            TreeChange::Modification { previous_entry_mode, entry_mode, .. } => {
+                (u32::from(previous_entry_mode.value()), u32::from(entry_mode.value()))
+            }
+            TreeChange::Rewrite { source_entry_mode, entry_mode, .. } => {
+                (u32::from(source_entry_mode.value()), u32::from(entry_mode.value()))
+            }
+        };
         let (old_id, new_id, compact) = match change {
             TreeChange::Addition { entry_mode, id, .. } => {
                 summary.push((
@@ -4867,7 +5301,7 @@ fn collect(
             .and_then(|mut p| p.line_counts().ok())
             .flatten()
             .map(|c| (u64::from(c.insertions), u64::from(c.removals)));
-        raw.push((path, display, counts, old_id, new_id, compact));
+        raw.push((path, display, counts, old_id, new_id, compact, modes));
 
         resource_cache.clear_resource_cache_keep_allocation();
         Ok::<_, std::convert::Infallible>(Action::Continue(()))
@@ -4886,8 +5320,101 @@ fn collect(
         }
     };
 
+    // `diffcore_std()`'s rename pass, which `finish()` asks for:
+    //
+    // ```c
+    // repo_diff_setup(the_repository, &opts);
+    // init_diffstat_widths(&opts);
+    // opts.output_format |= DIFF_FORMAT_DIFFSTAT | DIFF_FORMAT_SUMMARY;
+    // opts.detect_rename = DIFF_DETECT_RENAME;
+    // diff_setup_done(&opts);
+    // diff_tree_oid(head, new_head, "", &opts);
+    // diffcore_std(&opts);
+    // diff_flush(&opts);
+    // ```
+    //
+    // (builtin/merge.c.) `DIFF_DETECT_RENAME` is the whole difference between
+    // this diffstat and `git diff-tree -r --stat`, and it is why a merge that
+    // renames a file reports one ` mm/{rr.txt => rr-a.txt} | 0` row and a
+    // ` rename … (100%)` summary line rather than a create and a delete. The
+    // pass is [`super::diffcore_rename`], the port of `diffcore-rename.c` — the
+    // same engine `git diff -M` runs, at the same default threshold — rather
+    // than `gix-diff`'s rewrite tracking, because the summary line prints the
+    // *score* and only git's `estimate_similarity()` produces git's number.
+    let renamed: HashMap<BString, (BString, u32)> = {
+        use super::diffcore_rename as dcr;
+        let mut q = dcr::Queue::default();
+        for (path, _, _, old_id, new_id, _, (old_mode, new_mode)) in &raw {
+            let one = match old_id {
+                Some((id, _)) => dcr::FileSpec::new(path.clone(), *old_mode, *id, true),
+                None => dcr::FileSpec::absent(path.clone()),
+            };
+            let two = match new_id {
+                Some((id, _)) => dcr::FileSpec::new(path.clone(), *new_mode, *id, true),
+                None => dcr::FileSpec::absent(path.clone()),
+            };
+            let (one, two) = (q.add_spec(one), q.add_spec(two));
+            q.add_pair(one, two);
+        }
+        let opts = dcr::Options {
+            detect_rename: dcr::DETECT_RENAME,
+            rename_limit: dcr::DEFAULT_RENAME_LIMIT,
+            hash_kind: repo.object_hash(),
+            ..Default::default()
+        };
+        // The warnings `diff_warn_rename_limit()` would print go to stderr from
+        // `diff_flush()`, which this diffstat does not reach; the limit is the
+        // default one and the shapes here are far below it.
+        let _ = dcr::run(&mut q, &opts, &mut dcr::OdbContent { repo });
+        dcr::resolve_rename_copy(&mut q);
+        let mut map = HashMap::new();
+        for pair in &q.pairs {
+            if pair.status != b'R' {
+                continue;
+            }
+            let src = q.specs[pair.one].path.clone();
+            let dst = q.specs[pair.two].path.clone();
+            map.insert(dst, (src, dcr::similarity_index(pair.score)));
+        }
+        map
+    };
+    // A rename consumes both of the rows the walk produced for it: the source's
+    // deletion disappears entirely and the destination's addition becomes the
+    // rename. The summary lines go the same way — `show_rename_copy()` replaces
+    // both the `delete mode` and the `create mode` with one ` rename … (<n>%)`.
+    if !renamed.is_empty() {
+        let sources: HashSet<BString> = renamed.values().map(|(src, _)| src.clone()).collect();
+        summary.retain(|(path, _)| !sources.contains(path) && !renamed.contains_key(path));
+        for (dst, (src, score)) in &renamed {
+            let display = String::from_utf8_lossy(&super::diff_pairs::pprint_rename(src, dst))
+                .into_owned();
+            summary.push((dst.clone(), format!("rename {display} ({score}%)")));
+        }
+    }
+
+    // The pre-image of every path the walk saw, so a rename destination can be
+    // measured against its source the way `diff_filespec` pairs them.
+    let old_sides: HashMap<BString, Option<(ObjectId, bool)>> =
+        raw.iter().map(|(p, _, _, o, _, _, _)| (p.clone(), *o)).collect();
+
     let mut rows: Vec<(BString, StatRow)> = Vec::with_capacity(raw.len());
-    for (path, name, counts, old_id, new_id, compact) in raw {
+    for (path, mut name, counts, old_id, new_id, compact, _) in raw {
+        // The source half of a detected rename is not a row of its own.
+        if renamed.values().any(|(src, _)| *src == path) {
+            continue;
+        }
+        // The destination half is, but under the factored `pfx{old => new}sfx`
+        // name and with the counts of the *rename's* diff — the walk measured it
+        // against nothing, because it saw an addition.
+        let mut counts = counts;
+        if let Some((src, _)) = renamed.get(&path) {
+            name = String::from_utf8_lossy(&super::diff_pairs::pprint_rename(src, &path))
+                .into_owned();
+            let before = old_sides.get(src).copied().flatten();
+            let (added, deleted) =
+                filespec::count_changed_lines(&content(before)?, &content(new_id)?)?;
+            counts = Some((added as u64, deleted as u64));
+        }
         // The tree diff has no blob to hand its resource cache for a gitlink, so it
         // yields no line counts; git diffs the substituted `Subproject commit`
         // lines, which is what makes a bumped submodule the ` 1 insertion(+), 1

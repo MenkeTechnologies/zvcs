@@ -3576,12 +3576,19 @@ fn blob_config(repo: &gix::Repository, spec: &str) -> std::result::Result<Config
 /// single linked worktree already makes two.
 fn worktree_config_file(repo: &gix::Repository) -> Result<std::path::PathBuf> {
     if repo.config_snapshot().boolean("extensions.worktreeConfig").unwrap_or(false) {
-        // `repo_git_path()` answers absolutely; `repo.git_dir()` is relative
-        // whenever the repository was discovered from the current directory, and
-        // the path is quoted back in `fatal: unable to read config file '%s'`,
-        // where stock prints `<repo>/.git/worktrees/wt/config.worktree` and this
-        // printed `./../.git/worktrees/wt/config.worktree`.
-        return Ok(absolute_git_path(repo.git_dir()).join("config.worktree"));
+        // In the main working tree stock quotes the path git discovered, which is
+        // relative to the current directory: `--show-origin` prints
+        // `file:.git/config.worktree` and a parse error names
+        // `.git/config.worktree`, so the discovered `repo.git_dir()` is used as it
+        // stands. A linked worktree is the case that needs resolving: `git_dir()`
+        // is then reached through the main tree and comes out as
+        // `./../.git/worktrees/wt`, where stock prints
+        // `<repo>/.git/worktrees/wt/config.worktree`.
+        let git_dir = repo.git_dir();
+        let linked = git_dir.components().any(|c| c.as_os_str() == "worktrees");
+        let base =
+            if linked { absolute_git_path(git_dir) } else { git_dir.to_path_buf() };
+        return Ok(base.join("config.worktree"));
     }
     if !repo.worktrees().map(|w| w.is_empty()).unwrap_or(true) {
         let message = concat!(

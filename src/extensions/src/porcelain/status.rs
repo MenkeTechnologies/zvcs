@@ -1544,7 +1544,12 @@ fn configured_renames(
 /// does so while reading the config, before the command line is parsed; the
 /// shared reader in [`diffcore_rename::config_rename`] carries that exit.
 fn configured_diff_renames(snap: &gix::config::Snapshot) -> u8 {
-    match snap.string("diff.renames") {
+    // The FIRST value, not the last: `git_status_config` reads this key under
+    // `if (s->detect_rename == -1)`, so the earliest one wins and the ones after
+    // it are never parsed. `snap.string()` answers with the last, which turns
+    // `-c diff.renames=false -c diff.renames=bogus status` — clean in git,
+    // because `false` settled the field — into a fatal on the value git skipped.
+    match snap.strings("diff.renames").and_then(|v| v.into_iter().next()) {
         Some(value) => diffcore_rename::config_rename(Some(value.as_ref())),
         // A valueless `[diff]\n\trenames` is git's NULL value: plain detection.
         None => match snap.boolean("diff.renames") {

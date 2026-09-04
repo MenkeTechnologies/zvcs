@@ -285,12 +285,13 @@ fn blame_date_invalid_is_fatal() {
 fn blame_date_unsupported_modes_rejected() {
     let (repo, home) = dated_fixture("unsup", "1700000000 +0000");
 
-    // These are valid git modes that need machinery blame.rs lacks (human
-    // rendering, local-timezone conversion, strftime). They must be rejected
-    // rather than emitting wrong bytes, and must NOT be mislabeled as an
-    // unknown-format fatal (which would be exit 128). `relative` IS supported
-    // and is covered separately by `blame_date_relative_matches_git`.
-    for m in ["human", "iso-local", "default-local", "format:%Y"] {
+    // These are valid git modes that need machinery blame.rs lacks
+    // (local-timezone conversion, strftime). They must be rejected rather than
+    // emitting wrong bytes, and must NOT be mislabeled as an unknown-format
+    // fatal (which would be exit 128). `relative` and `human` ARE supported and
+    // are covered by `blame_date_relative_matches_git` and
+    // `blame_date_human_matches_git`.
+    for m in ["iso-local", "default-local", "format:%Y"] {
         let flag = format!("--date={m}");
         let z = zvcs_blame(&repo, &home, &[&flag]);
         assert!(!z.status.success(), "--date={m} must be rejected");
@@ -419,6 +420,30 @@ fn blame_contents_matches_git() {
     );
     assert!(out.contains("extra"), "added line content present:\n{out}");
     assert!(out.contains("hello"), "committed line still shown:\n{out}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn blame_date_human_matches_git() {
+    // `human` hides the fields the reader can infer from the current clock, so
+    // what it prints depends on how far the commit is from now — which is why
+    // it is checked against git rather than against a literal. Both read the
+    // same clock on the same fixed commit date, so the rendering is identical.
+    let (repo, home) = dated_fixture("human", "1700000000 +0000");
+
+    let z = zvcs_blame(&repo, &home, &["--date=human"]);
+    let g = real_blame(&repo, &home, &["--date=human"]);
+    assert!(
+        z.status.success(),
+        "zvcs --date=human failed: {}",
+        String::from_utf8_lossy(&z.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&g.stdout),
+        stdout(&z),
+        "--date=human must match git"
+    );
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }

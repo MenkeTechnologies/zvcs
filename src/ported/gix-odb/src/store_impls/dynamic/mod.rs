@@ -82,6 +82,27 @@ thread_local! {
     static PROMISOR_FETCH_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// git's `fetch_if_missing` global (environment.c), which every command that must
+/// *observe* an absence rather than repair it turns off before it reads anything:
+/// `rev-list --missing=(allow-any|print|print-info|allow-promisor)`, anything with
+/// `--exclude-promisor-objects`, `fsck` and `index-pack`. It is a process-wide
+/// variable in git and a process-wide variable here, so a lookup on any thread
+/// sees the same answer.
+static FETCH_IF_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turn the promisor hook off (or back on) for this process.
+///
+/// A command that reports on what the repository holds must not change what it
+/// holds while looking; git spells that `fetch_if_missing = 0` and so does this.
+pub fn set_fetch_if_missing(enabled: bool) {
+    FETCH_IF_MISSING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a missing object may still be fetched from a promisor remote.
+pub fn fetch_if_missing() -> bool {
+    FETCH_IF_MISSING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Store {
     /// Install `fetch` as the hook consulted when an object is not present locally, unless one is installed
     /// already, in which case this does nothing.
@@ -106,7 +127,7 @@ impl Store {
         let Some(fetch) = self.promisor.get() else {
             return false;
         };
-        if ids.is_empty() || PROMISOR_FETCH_IN_PROGRESS.get() {
+        if ids.is_empty() || PROMISOR_FETCH_IN_PROGRESS.get() || !fetch_if_missing() {
             return false;
         }
         PROMISOR_FETCH_IN_PROGRESS.set(true);

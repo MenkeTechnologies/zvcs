@@ -185,10 +185,16 @@ mod impls {
 
     impl<S> gix_object::Exists for Cache<S>
     where
-        S: gix_pack::Find,
+        S: gix_pack::Find + gix_object::Exists,
     {
         fn exists(&self, id: &oid) -> bool {
-            self.inner.contains(id)
+            // Through the inner store's own `Exists`, not straight to
+            // `gix_pack::Find::contains()`: only the former consults a promisor
+            // remote, and `repo_has_object_file()` is one of the callers git
+            // lets do that (`ODB_HAS_OBJECT_FETCH_PROMISOR`). `contains()` stays
+            // the pure lookup the promisor hook itself uses, which is what keeps
+            // the two from calling each other.
+            gix_object::Exists::exists(&self.inner, id)
         }
     }
 

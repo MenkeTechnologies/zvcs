@@ -173,8 +173,37 @@ pub fn fetch(repo: &crate::Repository, promisor: &Remote, ids: &[gix_hash::Objec
     if ids.is_empty() {
         return Ok(false);
     }
+    // `fetch_objects()`'s first statement, before the subprocess is even built:
+    //
+    // ```c
+    // if (git_env_bool(NO_LAZY_FETCH_ENVIRONMENT, 0)) {
+    //         static int warning_shown;
+    //         if (!warning_shown) {
+    //                 warning_shown = 1;
+    //                 warning(_("lazy fetching disabled; some objects may not be available"));
+    //         }
+    //         return -1;
+    // }
+    // ```
+    //
+    // `git --no-lazy-fetch` sets that variable, and it is what lets a caller ask
+    // what a repository holds without a network round trip. The warning is once
+    // per process, however many objects go missing.
+    if no_lazy_fetch() {
+        static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("warning: lazy fetching disabled; some objects may not be available");
+        }
+        return Ok(false);
+    }
     let remote = repo.find_remote(promisor.name.as_str())?;
-    let mut con = remote.connect(crate::remote::Direction::Fetch)?;
+    let mut con = remote.connect_with_options(
+        crate::remote::Direction::Fetch,
+        crate::remote::connect::Options {
+            upload_pack: local_upload_pack(repo, promisor.name.as_str(), &remote),
+            ..Default::default()
+        },
+    )?;
 
     let mut credentials_storage;
     let url = con.transport.inner.to_url();
@@ -774,5 +803,81 @@ mod capability_tests {
     fn malformed_escape_is_kept_verbatim() {
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
+    }
+}
+
+/// The `git-upload-pack` a *local* promisor fetch should run: this very
+/// executable.
+///
+/// git's `main()` calls `setup_path()` (exec-cmd.c), which prepends git's own
+/// exec-path to `PATH` before anything is spawned, so `git_connect()`'s bare
+/// `git-upload-pack` always resolves to the same installation as the parent
+/// process. This tree has no directory of `git-*` programs to prepend — one
+/// binary serves every helper — so naming that binary outright is the
+/// equivalent, and without it a lazy fetch hands pack generation to whichever
+/// `git-upload-pack` happens to be first on `PATH`: a different git, or a
+/// different *build* of this one, whose answer is not the answer this process
+/// would have given.
+///
+/// `remote.<name>.uploadpack` wins when it is set, and a non-`file` URL is left
+/// alone: there the value names a program on the far machine, where a path out
+/// of this filesystem means nothing.
+#[cfg(feature = "blocking-network-client")]
+fn local_upload_pack(
+    repo: &crate::Repository,
+    name: &str,
+    remote: &crate::Remote<'_>,
+) -> Option<crate::bstr::BString> {
+    use crate::bstr::{BStr, BString};
+
+    // `get_upload_pack()`: `remote.<name>.uploadpack` names the program, and a
+    // caller that named one gets it.
+    if let Some(configured) = repo
+        .config_snapshot()
+        .string_by("remote", Some(BStr::new(name)), "uploadpack")
+    {
+        return Some(configured);
+    }
+    let url = remote.url(crate::remote::Direction::Fetch)?;
+    if url.scheme != crate::url::Scheme::File {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = gix_path::into_bstr(exe).into_owned();
+    // The local transport hands the override to a shell, so the path has to
+    // survive word splitting. Single-quote it, closing and reopening around any
+    // embedded quote — the only byte that can end the literal.
+    let mut out = BString::from("'");
+    for &byte in exe.iter() {
+        if byte == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(byte);
+        }
+    }
+    out.extend_from_slice(b"' upload-pack");
+    Some(out)
+}
+
+/// `git_env_bool(NO_LAZY_FETCH_ENVIRONMENT, 0)`: whether `GIT_NO_LAZY_FETCH` — the
+/// variable `git --no-lazy-fetch` exports — forbids going back to the promisor
+/// remote.
+///
+/// git parses it with `git_config_bool()`'s grammar, where an unset variable and
+/// an unparsable value both fall back to the `0` default.
+#[cfg(feature = "blocking-network-client")]
+fn no_lazy_fetch() -> bool {
+    let Some(value) = std::env::var_os("GIT_NO_LAZY_FETCH") else {
+        return false;
+    };
+    let Some(value) = value.to_str() else { return false };
+    match value.trim().to_ascii_lowercase().as_str() {
+        // `git_parse_maybe_bool_text()`: an empty value is false, a missing one
+        // takes the caller's default. An unparsable value makes git die; this
+        // reports it as unset rather than reproducing that death.
+        "" => false,
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        other => other.parse::<i64>().map(|n| n != 0).unwrap_or(false),
     }
 }

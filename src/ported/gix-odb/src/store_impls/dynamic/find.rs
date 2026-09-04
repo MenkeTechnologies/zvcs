@@ -549,6 +549,14 @@ where
     Self: gix_pack::Find,
 {
     fn exists(&self, id: &gix_hash::oid) -> bool {
+        // `odb_has_object(..., ODB_HAS_OBJECT_FETCH_PROMISOR)`, which is what
+        // `repo_has_object_file()` passes: asking whether an object is here is
+        // enough to go and get it from the promisor remote, and `cat-file -e`
+        // on a partial clone's skipped blob answers 0 for exactly that reason.
+        // The commands that must observe an absence instead of repairing it turn
+        // the hook off through `set_fetch_if_missing()`, the same lever git
+        // uses.
+        self.fetch_from_promisor(id);
         gix_pack::Find::contains(self, id)
     }
 }

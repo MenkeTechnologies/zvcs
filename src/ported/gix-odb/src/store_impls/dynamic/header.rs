@@ -184,6 +184,14 @@ where
     S: Deref<Target = super::Store> + Clone,
 {
     fn try_header(&self, id: &oid) -> Result<Option<Header>, gix_object::find::Error> {
+        // The same lazy fetch the object read does. git has one entry point for
+        // both — `oid_object_info_extended()`, which `repo_has_object_file()`
+        // and every `cat-file -t`/`-s` reach — and it consults the promisor
+        // remote whether the caller wanted the header or the whole object.
+        // Without this a partial clone answers `cat-file -t <missing blob>` with
+        // `could not get object info` while `cat-file -p` on the same id
+        // succeeds by fetching it.
+        self.fetch_from_promisor(id);
         let mut snapshot = self.snapshot.borrow_mut();
         let mut inflate = self.inflate.borrow_mut();
         self.try_header_inner(id, &mut inflate, &mut snapshot, None)

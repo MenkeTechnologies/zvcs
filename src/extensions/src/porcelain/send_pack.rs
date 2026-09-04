@@ -270,6 +270,9 @@ fn push(st: &State) -> Result<ExitCode> {
         local_refs: requests.iter().map(|r| r.name.clone()).collect(),
         signed: st.signed,
         receive_pack: st.receive_pack.clone(),
+        // `send-pack` has no matching refspec: `--all`/`--mirror` are its
+        // wholesale modes and every other invocation names its refs.
+        matching: None,
     };
 
     // `git_connect()` for a local destination runs `git-receive-pack '<dest>'`,

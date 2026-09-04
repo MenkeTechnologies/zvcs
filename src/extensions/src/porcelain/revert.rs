@@ -1197,46 +1197,35 @@ fn revert_one(
     // changed identically resolves trivially and is reported by neither, which is
     // why reverting an already-reverted change stays silent — and a refused
     // checkout reports none of them at all.
+    // Rendering is [`crate::merge_msg`], the single port of `path_msg()` /
+    // `merge_display_update_messages()` shared with `git merge`, `rebase`,
+    // `cherry-pick`, `merge-tree`, `merge-recursive` and `merge-subtree`. The
+    // renderer this replaced knew only `content`, `add/add` and `modify/delete`,
+    // so every *tree*-level class — rename/rename, file/directory, distinct
+    // types, a directory rename — came out as the generic content notice. It
+    // runs in `Approximate` mode because the worktree has already been moved by
+    // the time these are printed.
+    //
+    // *Ours* is `HEAD` and *theirs* is the reverted commit named the way the
+    // sequencer names it, with operand 1's tree telling the renderer which side
+    // a path belongs to.
     let unresolved = gix::merge::tree::TreatAsUnresolved::git();
     let mut conflicted: Vec<BString> = Vec::new();
     for conflict in &merge.conflicts {
-        let path = conflict.changes_in_resolution().0.location().to_owned();
-        if conflict.content_merge().is_some() {
-            println!("Auto-merging {path}");
+        if conflict.is_unresolved(unresolved) {
+            conflicted.push(crate::merge_msg::conflict_location(conflict));
         }
-        if !conflict.is_unresolved(unresolved) {
-            continue;
-        }
-        // merge-ort reports a path one side modified and the other deleted with
-        // its own message naming both operands, not the generic content notice.
-        // Reverting a root commit hits this for every file the commit added:
-        // "theirs" is the empty tree, so each one is deleted there and modified
-        // in HEAD. The modified side is the one whose tree still carries `path`.
-        if matches!(
-            conflict.resolution,
-            Err(gix::merge::tree::ResolutionFailure::OursModifiedTheirsDeleted)
-        ) {
-            let (modify, delete) = if ours.contains_key(&path) {
-                ("HEAD", other_label.as_str())
-            } else {
-                (other_label.as_str(), "HEAD")
-            };
-            println!(
-                "CONFLICT (modify/delete): {path} deleted in {delete} and modified in {modify}.  \
-                 Version {modify} of {path} left in tree."
-            );
-            conflicted.push(path);
-            continue;
-        }
-        // merge-ort's `filemask == 6`: no ancestor stage means both sides added
-        // the path, reported as `add/add` rather than `content`.
-        let kind = if conflict.entries()[0].is_none() {
-            "add/add"
-        } else {
-            "content"
-        };
-        println!("CONFLICT ({kind}): Merge conflict in {path}");
-        conflicted.push(path);
+    }
+    for msg in crate::merge_msg::render(
+        repo,
+        &merge.conflicts,
+        "HEAD",
+        &other_label,
+        crate::merge_msg::Operand1::Tree(ours_tree),
+        unresolved,
+        crate::merge_msg::Strictness::Approximate,
+    )? {
+        print!("{}", msg.text);
     }
 
     // --- message ----------------------------------------------------------
@@ -1284,15 +1273,7 @@ fn revert_one(
         // afterwards, because `cache_tree_update()` returns at `verify_cache()` on an
         // unmerged index before touching the extension (cache-tree.c:218-234, :523-526) —
         // which is why stock's index here still carries `TREE` with the touched nodes at -1.
-        let conflicted_paths: Vec<gix::bstr::BString> = {
-            let backing = new_index.path_backing();
-            new_index
-                .entries()
-                .iter()
-                .filter(|e| e.stage_raw() != 0)
-                .map(|e| e.path_in(backing).to_owned())
-                .collect()
-        };
+        let conflicted_paths = crate::merge_apply::unmerged_paths(&new_index);
         for path in &conflicted_paths {
             new_index.invalidate_path_in_tree(path.as_ref());
         }
@@ -1301,15 +1282,26 @@ fn revert_one(
         let git_dir = repo.git_dir();
         std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
 
-        // git's `append_conflicts_hint`: a blank line, `# Conflicts:`, then one
-        // commented path per unresolved conflict, appended to the commit message.
+        // `append_conflicts_hint()` (sequencer.c:721-744): a blank line, the
+        // header, then one commented line per path the **index** still holds at
+        // a non-zero stage — not per printed conflict. The two lists differ
+        // wherever a class spans more than the path it is named after (a
+        // rename/rename leaves the shared source and both destinations
+        // unmerged), and the prefix is `comment_line_str`, not a literal `#`:
+        // the cleanup that strips this block strips `core.commentChar`, so a
+        // hardcoded `#` survives into the committed message under any other
+        // setting.
+        let comment = super::rebase_todo::comment_prefix(repo);
         let mut merge_msg = message.clone();
         if !merge_msg.ends_with('\n') {
             merge_msg.push('\n');
         }
-        merge_msg.push_str("\n# Conflicts:\n");
-        for path in &conflicted {
-            merge_msg.push_str("#\t");
+        merge_msg.push('\n');
+        merge_msg.push_str(&comment);
+        merge_msg.push_str(" Conflicts:\n");
+        for path in &conflicted_paths {
+            merge_msg.push_str(&comment);
+            merge_msg.push('\t');
             merge_msg.push_str(&path.to_str_lossy());
             merge_msg.push('\n');
         }

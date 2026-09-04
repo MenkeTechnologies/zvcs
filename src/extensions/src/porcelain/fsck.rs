@@ -235,6 +235,10 @@ const ERROR_REFS: u8 = 8;
 /// them by raw `readdir()` — and two lines sharing a first byte, or a pack whose
 /// order could not be reconstructed, makes the command `bail!` rather than guess.
 pub fn fsck(args: &[String]) -> Result<ExitCode> {
+    // `cmd_fsck()` (builtin/fsck.c): `fetch_if_missing = 0;` before anything is read.
+    // An integrity report must describe the repository as it is, so a missing
+    // object stays missing rather than being fetched out from under the check.
+    gix::odb::store::set_fetch_if_missing(false);
     // Tolerate the subcommand being present at index 0 regardless of how the
     // dispatcher slices argv.
     let args: &[String] = match args.first() {

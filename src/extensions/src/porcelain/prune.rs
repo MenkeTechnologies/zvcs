@@ -308,14 +308,18 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
         roots.push(oid);
     }
 
-    collect_roots(&repo, &mut roots)?;
-
     let objdir = repo.objects.store_ref().path().to_path_buf();
-    collect_recent_roots(&objdir, repo.object_hash(), expire, &mut roots);
-    if let Err(code) = collect_hook_roots(&repo, expire, &mut roots) {
-        return Ok(code);
-    }
-    let reachable = close_over(&repo, roots);
+
+    // `perform_reachability_traversal()` runs **on demand**, from
+    // `is_object_reachable()` and from the shallow branch, and from nowhere
+    // else — the `static int initialized` inside it is what makes the whole
+    // sweep share one walk. Nothing before it reads the index, so an objdir
+    // whose every name `prune_cruft()` rejects never starts a traversal at all,
+    // and `cmd_prune()` still returns 0. Building the set up front instead —
+    // which is what this did — turned that sweep into a failure to open the
+    // index in any repository whose index cannot be read, where git says
+    // `bad sha1 file:` for each loose object and exits 0.
+    let mut traversal: Option<HashSet<ObjectId>> = None;
 
     let display_root = display_objdir(&repo, &objdir);
     let name_len = repo.object_hash().len_in_hex() - 2;
@@ -343,7 +347,7 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
             let Ok(oid) = ObjectId::from_hex(format!("{prefix}{name}").as_bytes()) else {
                 continue;
             };
-            if reachable.contains(&oid) {
+            if reachability(&mut traversal, &repo, &roots, &objdir, expire)?.contains(&oid) {
                 continue;
             }
             let Some(mtime) = mtime_of(&path) else {
@@ -443,9 +447,58 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
     //
     // (`cmd_prune()`, builtin/prune.c.) The last step, after the object sweep,
     // because it is decided by the very reachability marks that sweep used.
-    prune_shallow(&repo, &reachable, dry_run)?;
+    if repo.common_dir().join("shallow").exists() {
+        let reachable = reachability(&mut traversal, &repo, &roots, &objdir, expire)?;
+        prune_shallow(&repo, reachable, dry_run)?;
+    }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `perform_reachability_traversal()`: the one reachability walk this run gets,
+/// built the first time something asks for it and reused afterwards.
+///
+/// ```c
+/// static void perform_reachability_traversal(struct rev_info *revs)
+/// {
+///         static int initialized;
+///         [...]
+///         if (initialized)
+///                 return;
+///         [...]
+///         mark_reachable_objects(revs, 1, expire, progress);
+///         [...]
+///         initialized = 1;
+/// }
+/// ```
+///
+/// `heads` are the command line's `<head>` arguments, already resolved; the rest
+/// of the roots — index entries, refs, reflogs, recent pack objects and the
+/// `gc.recentObjectsHook` output — are collected here rather than at startup,
+/// because git collects them here too.
+///
+/// A hook that fails has already written its own `fatal:` lines, so the failure
+/// travels as [`crate::fatal::Silent`] and only carries the 128 out.
+fn reachability<'a>(
+    cache: &'a mut Option<HashSet<ObjectId>>,
+    repo: &gix::Repository,
+    heads: &[ObjectId],
+    objdir: &Path,
+    expire: i64,
+) -> Result<&'a HashSet<ObjectId>> {
+    if cache.is_none() {
+        let mut roots: Vec<ObjectId> = heads.to_vec();
+        collect_roots(repo, &mut roots)?;
+        collect_recent_roots(objdir, repo.object_hash(), expire, &mut roots);
+        // The only failure `collect_hook_roots` reports is git's
+        // `unable to enumerate additional recent objects` at 128, which it has
+        // already printed.
+        if collect_hook_roots(repo, expire, &mut roots).is_err() {
+            return Err(anyhow::Error::new(crate::fatal::Silent(128)));
+        }
+        *cache = Some(close_over(repo, roots));
+    }
+    Ok(cache.as_ref().expect("just filled"))
 }
 
 /// git's `prune_shallow()` (shallow.c): rewrite `.git/shallow` down to the
@@ -801,7 +854,26 @@ fn display_objdir(repo: &gix::Repository, objdir: &Path) -> PathBuf {
 pub(super) fn bad_object_ref(repo: &gix::Repository) -> Option<String> {
     let platform = repo.references().ok()?;
     for reference in platform.all().ok()? {
-        let Ok(mut reference) = reference else { continue };
+        let mut reference = match reference {
+            Ok(reference) => reference,
+            Err(e) => {
+                // A ref file whose body will not parse is still handed to the
+                // walk, with a null id standing in for the one that could not be
+                // read. `pack-objects --all` reaches it through
+                // `handle_one_ref()` and `get_reference()`, neither of which
+                // tests `REF_ISBROKEN` the way `apply_ref_filter()` does, so the
+                // null id goes to the odb, is not found, and
+                // `die("bad object %s", name)` follows — which is why `repack`
+                // and `gc` die on a repository where `for-each-ref` only warns.
+                use gix::refs::file::iter::loose_then_packed::Error as IterError;
+                match e.downcast_ref::<IterError>() {
+                    Some(IterError::ReferenceCreation { relative_path, .. }) => {
+                        return Some(relative_path.to_string_lossy().replace('\\', "/"));
+                    }
+                    _ => continue,
+                }
+            }
+        };
         let Ok(id) = reference.follow_to_object() else {
             continue;
         };

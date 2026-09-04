@@ -64,6 +64,7 @@ pub mod showdate;
 pub mod sigpipe;
 pub mod superset;
 pub mod threads;
+pub mod userdiff;
 pub mod transport_err;
 pub mod trace2;
 pub mod unicode_width;
@@ -885,6 +886,19 @@ fn run_command(argv: &[String]) -> ExitCode {
             let msg = config::setup_fatal(&e).expect("checked");
             trace2::error(&msg);
             eprintln!("fatal: {msg}");
+            ExitCode::from(fatal::EXIT_FATAL)
+        }
+        // Data git cannot read is a `die()` in git, not a `return 1`: every arm
+        // of `do_read_index()` that fails calls `die()`, and a loose ref whose
+        // body will not parse ends the verbs that do not tolerate broken refs at
+        // 128 as well. The port has no reproducible sentence for either — git's
+        // index message is four bytes of stat data and this port's is a rolling
+        // hash — so the diagnostic stays in the port's own voice and only the
+        // status is git's. See [`fatal::unreadable_repository_data`].
+        Err(e) if fatal::unreadable_repository_data(&e) => {
+            let msg = format!("{sub}: {e:#}");
+            trace2::error(&msg);
+            eprintln!("zvcs: {msg}");
             ExitCode::from(fatal::EXIT_FATAL)
         }
         Err(e) => {

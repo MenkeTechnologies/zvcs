@@ -1320,13 +1320,17 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     let needs_short = atoms().any(|a| matches!(a.field, Field::RefName(NameMod::Short)));
     let needs_symref_short = atoms().any(|a| matches!(a.field, Field::SymRef(NameMod::Short)));
 
-    let head_name = repo.head_name()?.map(|n| n.as_bstr().to_vec());
+    // `resolve_refdup("HEAD", RESOLVE_REF_READING, ...)` in
+    // `cmd_for_each_ref()`: a `HEAD` that does not resolve yields NULL and the
+    // listing runs without the `%(HEAD)` marker, so a *broken* referent is the
+    // same as an unborn one here and is not an error.
+    let head_name = broken_ref_is_absent(repo.head_name())?.flatten().map(|n| n.as_bstr().to_vec());
 
     // Materialise every ref name first: the iterator holds the packed-refs
     // buffer, which would block the per-ref object lookups below.
     let mut names: Vec<Vec<u8>> = Vec::new();
     for r in repo.references()?.all()? {
-        let r = r.map_err(|e| anyhow!("{e}"))?;
+        let Some(r) = skip_broken_ref(r)? else { continue };
         names.push(r.name().as_bstr().to_vec());
     }
     // `--include-root-refs` also lists HEAD and the pseudorefs in the git dir
@@ -3150,7 +3154,7 @@ fn render_upstream(
                 NameMod::Short => {
                     let mut all: HashSet<Vec<u8>> = HashSet::new();
                     for r in repo.references()?.all()? {
-                        let r = r.map_err(|e| anyhow!("{e}"))?;
+                        let Some(r) = skip_broken_ref(r)? else { continue };
                         all.insert(r.name().as_bstr().to_vec());
                     }
                     short_name(repo, &name, &all)
@@ -4498,5 +4502,66 @@ mod tests {
                 field: Field::Tree(NameLen::Full)
             })
         ));
+    }
+}
+
+/// One entry of a ref iteration, with a ref git would call *broken* dropped.
+///
+/// The ref iteration does not stop on a ref it cannot read: the entry arrives
+/// carrying `REF_ISBROKEN` and a null object id, and `apply_ref_filter()`
+/// (ref-filter.c) drops it there —
+///
+/// ```c
+/// if (ref->flags & REF_ISBROKEN) {
+///         warning(_("ignoring broken ref %s"), ref->name);
+///         return NULL;
+/// }
+/// ```
+///
+/// — so the listing continues and exits 0. A loose ref whose body is not an
+/// object id of the repository's hash width, a 40-hex file under
+/// `extensions.objectFormat = sha256` or a hand-corrupted one, is exactly that
+/// entry.
+///
+/// Only `ReferenceCreation` is dropped. A traversal or read failure is a real
+/// I/O error that git does not walk past either.
+fn skip_broken_ref<'r>(
+    entry: Result<gix::Reference<'r>, Box<dyn std::error::Error + Send + Sync + 'static>>,
+) -> Result<Option<gix::Reference<'r>>> {
+    use gix::refs::file::iter::loose_then_packed::Error as IterError;
+    match entry {
+        Ok(r) => Ok(Some(r)),
+        Err(e) => match e.downcast_ref::<IterError>() {
+            Some(IterError::ReferenceCreation { relative_path, .. }) => {
+                eprintln!(
+                    "warning: ignoring broken ref {}",
+                    relative_path.to_string_lossy().replace('\\', "/")
+                );
+                Ok(None)
+            }
+            _ => Err(anyhow!("{e}")),
+        },
+    }
+}
+
+/// A single-reference lookup whose target will not parse, reported as absent.
+///
+/// `resolve_ref_unsafe()` returns NULL for a ref it cannot read, and the callers
+/// that do not `die()` on NULL treat it exactly as they treat a ref that is not
+/// there. `Repository::head_name()` follows `HEAD`'s symbolic target and fails
+/// on that read instead, so the two endings have to be flattened back together
+/// here.
+fn broken_ref_is_absent<T>(
+    found: Result<T, gix::reference::find::existing::Error>,
+) -> Result<Option<T>> {
+    use gix::refs::file::loose::reference::decode::Error as DecodeError;
+    match found {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            let broken = std::error::Error::source(&e)
+                .and_then(|s| s.downcast_ref::<DecodeError>())
+                .is_some_and(|d| matches!(d, DecodeError::Parse { .. }));
+            if broken { Ok(None) } else { Err(e.into()) }
+        }
     }
 }

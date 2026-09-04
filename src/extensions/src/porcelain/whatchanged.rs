@@ -1025,7 +1025,10 @@ fn pathspec_is_exclude(s: &str) -> bool {
 }
 
 /// The first magic keyword in `s` that `--follow` rejects, if any.
-fn unsupported_follow_magic(s: &str) -> Option<String> {
+///
+/// Shared with `log`, which reaches the same `cmd_log_init_finish()` check
+/// through its own argument parser.
+pub(super) fn unsupported_follow_magic(s: &str) -> Option<String> {
     let kw = magic_keywords(s)?;
     kw.into_iter()
         .find(|k| !FOLLOW_OK_MAGIC.contains(&k.as_str()))

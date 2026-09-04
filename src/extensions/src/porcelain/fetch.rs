@@ -590,10 +590,21 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "--auto-maintenance" | "--auto-gc" => opts.auto_maintenance = true,
             "--no-auto-maintenance" | "--no-auto-gc" => opts.auto_maintenance = false,
 
-            // Options requiring substrate the high-level fetch does not expose.
+            // `--filter=<spec>`: ask the remote to withhold the objects `<spec>`
+            // selects. `parse_list_objects_filter()`
+            // (list-objects-filter-options.c) runs from the option table, so an
+            // invalid spec never reaches the network and ends on
+            // `die(_("invalid filter-spec '%s'"), arg)` — git's words at 128.
             "--filter" => {
-                let _ = take_value!("--filter");
-                anyhow::bail!("--filter (partial clone) is not supported");
+                let raw = take_value!("--filter");
+                opts.filter = Some(raw.parse().map_err(|e| crate::fatal::die(format!("{e}")))?);
+            }
+            // `list_objects_filter_set_no_filter()`: clears whatever `--filter`
+            // or `remote.<name>.partialclonefilter` asked for, leaving an
+            // ordinary complete fetch.
+            "--no-filter" => {
+                opts.filter = None;
+                opts.no_filter = true;
             }
             "--set-upstream" => opts.set_upstream = true,
             "--no-set-upstream" => opts.set_upstream = false,
@@ -676,6 +687,16 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         if !repo.is_shallow() {
             crate::git_fatal!("--unshallow on a complete repository does not make sense");
         }
+    }
+    // `--deepen=<n>` counts "from the current shallow boundary instead of from the
+    // tip of each remote branch history" (git-fetch(1)), so a repository with no
+    // boundary has nothing to deepen. Measured against stock 2.55.0: `git fetch
+    // --deepen=1` on a complete repository fetches normally and leaves **no**
+    // `.git/shallow` behind. Passing the request through instead asks the server
+    // for a boundary relative to the tips, which makes a complete repository
+    // shallow — the opposite of what the option is for.
+    if deepen_relative.is_some() && !repo.is_shallow() {
+        opts.shallow = None;
     }
 
     // Resolve the accumulated shallow-boundary selectors. `--shallow-exclude`
@@ -1157,7 +1178,11 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 /// among the refs at all, and the opportunistic second-stage refspecs are the ones git passes
 /// `missing_ok = 1`. An empty source is git's shorthand for `HEAD`.
 fn missing_remote_ref(map: &gix::remote::fetch::RefMap) -> Option<String> {
-    map.refspecs.iter().enumerate().find_map(|(index, spec)| {
+    // The advertisement is walked once per refspec below; materialising the names
+    // once keeps a remote with many refs from being re-rendered for each one.
+    let advertised: Vec<String> =
+        map.remote_refs.iter().map(|r| r.unpack().0.to_string()).collect();
+    map.refspecs.iter().find_map(|spec| {
         let src = match spec.to_ref().instruction() {
             gix::refspec::Instruction::Fetch(
                 gix::refspec::instruction::Fetch::Only { src }
@@ -1168,16 +1193,28 @@ fn missing_remote_ref(map: &gix::remote::fetch::RefMap) -> Option<String> {
         if src.find_byteset(b"*?[]\\").is_some() || gix::ObjectId::from_hex(src).is_ok() {
             return None;
         }
-        let matched = map.mappings.iter().any(|mapping| {
-            matches!(mapping.spec_index, gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(i) if i == index)
-        });
-        (!matched).then(|| {
-            if src.is_empty() {
-                "HEAD".to_string()
-            } else {
-                src.to_string()
-            }
-        })
+        let name = match src.is_empty() {
+            true => "HEAD".to_string(),
+            false => src.to_string(),
+        };
+        // ```c
+        // ref_map = get_remote_ref(remote_refs, name);
+        // if (!missing_ok && !ref_map)
+        //         die(_("couldn't find remote ref %s"), name);
+        // ```
+        //
+        // (`get_fetch_map()`, remote.c.) The question is asked of the
+        // *advertisement*, once per refspec, and `ref_remove_duplicates()` only
+        // runs afterwards. Asking whether the refspec produced a surviving
+        // mapping instead answers a different question: two refspecs naming one
+        // remote ref and one destination — `main:refs/heads/x` beside
+        // `refs/heads/main:refs/heads/x`, or the same `remote.<name>.fetch`
+        // entry reaching the snapshot twice — deduplicate down to one mapping,
+        // and the refspec whose mapping lost the tie is not a refspec that
+        // matched nothing.
+        let found =
+            advertised.iter().any(|full| crate::refname::refname_match(&name, full) != 0);
+        (!found).then_some(name)
     })
 }
 
@@ -1312,6 +1349,14 @@ struct FetchOpts {
     atomic: bool,
     /// `--refetch`: ask for everything, sending no `have` at all.
     refetch: bool,
+    /// `--filter=<spec>`: the object filter this fetch asks the remote to apply,
+    /// parsed up front so an invalid spec is refused before a connection is
+    /// made, the way `cmd_fetch`'s option table does it.
+    filter: Option<gix::protocol::fetch::filter::Filter>,
+    /// Whether `--no-filter` was given. `fetch_one_setup_partial()` checks it
+    /// before anything else, so it overrides the filter a partial clone would
+    /// otherwise inherit from `remote.<name>.partialclonefilter`.
+    no_filter: bool,
     /// `--auto-maintenance`/`--auto-gc`, on by default: run `maintenance run --auto` on the way out.
     auto_maintenance: bool,
     /// `-4`/`--ipv4` and `-6`/`--ipv6`, git's `transport_family`. `None` is `TRANSPORT_FAMILY_ALL`.
@@ -1352,6 +1397,8 @@ impl Default for FetchOpts {
             negotiate_only: false,
             atomic: false,
             refetch: false,
+            filter: None,
+            no_filter: false,
             set_upstream: false,
             submodule_prefix: String::new(),
             // "This is enabled by default."
@@ -2003,6 +2050,28 @@ fn fetch_one(
 ) -> Result<Verdict> {
     // A local path that is not a repository never reaches the transport in git:
     // `enter_repo()` fails on the other side and `die_initial_contact()` follows.
+    // ```c
+    // static int add_fetch_refspec(struct remote *remote, const char *ref)
+    // {
+    //         refspec_append(&remote->fetch, ref);
+    //         return 0;
+    // }
+    // ```
+    //
+    // `refspec_append()` ends in `refspec_item_init_or_die()`, so a
+    // `remote.<name>.fetch` that is not a valid refspec kills the command inside
+    // `remote_get()` — before the transport, before `FETCH_HEAD` is touched, and
+    // with the same `fatal: invalid refspec '<spec>'` a bad command-line refspec
+    // earns. gitoxide instead fails to build the remote at all, which sent the
+    // *name* down the URL path and truncated `FETCH_HEAD` on the way.
+    if let Some(name) = name_or_url.map(ToString::to_string) {
+        for spec in crate::config::multi_values(repo, &format!("remote.{name}.fetch")) {
+            if !refspec_globs_agree(&spec) || !refspec_is_valid(&spec) {
+                eprintln!("fatal: invalid refspec '{spec}'");
+                return Ok(Verdict::Fatal);
+            }
+        }
+    }
     if let Some(spec) = name_or_url {
         let spec = spec.to_string();
         if repo.try_find_remote(spec.as_str()).is_none() {
@@ -2486,6 +2555,7 @@ fn fetch_one(
         })
         .with_negotiation_restrictions(restrictions)
         .with_refetch(opts.refetch)
+        .with_filter(partial_fetch_filter(repo, remote_name.as_deref(), opts))
         .with_atomic(opts.atomic)
         .with_reflog_message(RefLogMessage::Prefixed {
             action: opts.reflog_action.clone().into(),
@@ -2501,6 +2571,21 @@ fn fetch_one(
             eprintln!("error: {url} did not send all necessary objects");
             return Ok(Verdict::Rejected);
         }
+        // gitoxide's "no explicit refspec produced a mapping" guard, which git
+        // does not have. git asks the question once per refspec, against the
+        // *advertisement*, inside `get_fetch_map()` — that is
+        // [`missing_remote_ref`], which has already run and found every exact
+        // source among the refs the remote offered. What remains after it is a
+        // mapping set emptied by something later: `omit_name_by_refspec()`
+        // subtracting a `^<ref>` from the very ref a positive spec matched, which
+        // git leaves as an ordinary fetch of nothing at exit 0:
+        //
+        // ```text
+        // $ git fetch origin ^refs/heads/div refs/heads/div:refs/heads/copy
+        // $ echo $?
+        // 0
+        // ```
+        Err(gix::remote::fetch::Error::NoMapping { .. }) => return Ok(Verdict::Ok),
         Err(e) => {
             // `ERR <message>` mid-response: the server's own refusal (an
             // unreachable want, a hidden ref), which git reports verbatim.
@@ -2636,6 +2721,16 @@ fn fetch_one(
             .or_else(|| mapping.remote.as_id().map(|id| id.to_hex_with_len(abbrev).to_string()))
             .unwrap_or_default();
 
+        // A destination `check_refname_format()` refuses never becomes a summary
+        // row: git names it and moves on, so this has to happen before the name is
+        // parsed as a [`FullName`] — parsing is what it fails.
+        if update.mode == Mode::RejectedFunnyRefName {
+            if let Some(name) = mapping.local.as_ref() {
+                eprintln!("error: * Ignoring funny ref '{name}' locally");
+            }
+            continue;
+        }
+
         // A mapping with no local destination lands in FETCH_HEAD only, which git
         // reports as a `* <kind> <from> -> FETCH_HEAD` row.
         let local_full = match mapping.local.as_ref() {
@@ -2695,7 +2790,18 @@ fn fetch_one(
         // neither the summary (not even under `-v`) nor FETCH_HEAD. gitoxide's
         // implicit tag refspec maps it regardless, so it is dropped here. An
         // explicit `--tags` fetches the whole namespace and does list them.
-        if is_tag && !matches!(opts.tags, Some(Tags::All)) && update.mode == Mode::NoChangeNeeded {
+        //
+        // So does a refspec written on the command line: `find_non_local_tags()`
+        // is the *automatic* half of tag following and has no say over what was
+        // asked for by name. `git fetch . tag v0.2.0` on a tag this repository
+        // already has still writes its `FETCH_HEAD` row — which is the row
+        // `git pull . tag v0.2.0` then merges, and without it the pull ends on
+        // `couldn't find remote ref FETCH_HEAD`.
+        if is_tag
+            && !from_command_line
+            && !matches!(opts.tags, Some(Tags::All))
+            && update.mode == Mode::NoChangeNeeded
+        {
             continue;
         }
 
@@ -2769,6 +2875,19 @@ fn fetch_one(
                 ('=', "[up to date]".to_string(), "")
             }
             Mode::ImplicitTagNotSentByRemote => continue,
+            // ```c
+            // if (check_refname_format(rm->peer_ref->name, 0)) {
+            //         error(_("* Ignoring funny ref '%s' locally"), rm->peer_ref->name);
+            //         continue;
+            // }
+            // ```
+            //
+            // (`store_updated_refs()`, builtin/fetch.c.) An `error()` and a
+            // `continue`: no summary row, no `From <url>` header on its account,
+            // and — because nothing sets the return code — exit 0. The `* ` is
+            // part of git's format string, not a summary flag. Reported before
+            // the destination is parsed as a ref name, since it is not one.
+            Mode::RejectedFunnyRefName => continue,
             Mode::RejectedNonFastForward => {
                 rejected = true;
                 ('!', "[rejected]".to_string(), "  (non-fast-forward)")
@@ -3767,4 +3886,49 @@ fn explode_small_pack(
         let _ = std::fs::remove_file(path);
     }
     Ok(())
+}
+
+/// `fetch_one_setup_partial()` (builtin/fetch.c): the filter this fetch actually
+/// sends, which is not always the one the command line named.
+///
+/// ```c
+/// if (filter_options->no_filter)
+///         return;
+/// if (!repo_has_promisor_remote(the_repository) && !filter_options->choice)
+///         return;
+/// if (filter_options->choice) {
+///         partial_clone_register(remote->name, filter_options);
+///         return;
+/// }
+/// if (!filter_options->choice)
+///         partial_clone_get_default_filter_spec(filter_options, remote->name);
+/// ```
+///
+/// The inheriting arm is the one that matters to an ordinary `git fetch` in a
+/// partial clone: with no `--filter` on the command line it still fetches
+/// *filtered*, using `remote.<name>.partialclonefilter`, so the fetch does not
+/// quietly undo the clone by dragging back every blob the filter skipped. A
+/// `--refetch` in such a repository is exactly that case — git re-sends the
+/// wants without negotiation but keeps the filter, and this port was sending an
+/// unfiltered request and writing every skipped blob into the object store.
+///
+/// `partial_clone_register()` — the config write that turns an ordinary
+/// repository into a partial clone the first time `--filter` is given — is not
+/// performed here; this function only decides what goes on the wire.
+fn partial_fetch_filter(
+    repo: &gix::Repository,
+    remote_name: Option<&str>,
+    opts: &FetchOpts,
+) -> Option<gix::protocol::fetch::filter::Filter> {
+    if opts.no_filter {
+        return None;
+    }
+    if let Some(filter) = opts.filter.clone() {
+        return Some(filter);
+    }
+    let name = remote_name?;
+    // `repo_has_promisor_remote()`: only a remote the repository already treats
+    // as a promisor hands a default down.
+    let promisor = gix::promisor::remotes(repo).into_iter().find(|r| r.name == name)?;
+    promisor.filter.as_deref().and_then(|spec| spec.parse().ok())
 }

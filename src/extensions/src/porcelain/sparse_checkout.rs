@@ -193,6 +193,14 @@ fn cmd_list(args: &[String]) -> Result<ExitCode> {
 /// it, and accepts the smaller option set git gives `add`).
 fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
+    // `sparse_checkout_set()` (builtin/sparse-checkout.c) opens with
+    // `setup_work_tree()`, so a repository without one is refused **before** any
+    // file is written. Leaving the check to `apply()` writes
+    // `info/sparse-checkout` and `config.worktree` into a bare repository first
+    // and only then dies — the message is the same, the repository is not.
+    if !add && repo.work_dir().is_none() {
+        return Err(crate::fatal::need_work_tree());
+    }
     // `add` demands an existing sparse-checkout before it looks at options.
     if add && !is_sparse(&repo)? {
         eprintln!("fatal: no sparse-checkout to add to");

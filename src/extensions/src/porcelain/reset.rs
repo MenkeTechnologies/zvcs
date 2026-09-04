@@ -1236,6 +1236,10 @@ fn reset_index_to_tree(
     intent_to_add: bool,
 ) -> Result<gix::index::File> {
     let mut new_index = repo.index_from_tree(&tree)?;
+    // `o->internal.result.split_index = o->src_index->split_index` (unpack-trees.c:1950):
+    // an index rebuilt from a tree keeps the shared half the one it replaces stood on, so
+    // the write below writes a split index again rather than dissolving the repository's.
+    new_index.inherit_split_index(old);
 
     // ```c
     // repo_read_index_unmerged(the_repository);
@@ -1346,6 +1350,55 @@ fn carry_skip_worktree(old: &gix::index::File, new_index: &mut gix::index::File)
     }
 }
 
+/// `oneway_merge()`'s `if (old && same(old, a))` arm (unpack-trees.c): a path whose mode
+/// and object id the reset does not change keeps the entry it already had — stat cache and
+/// all — rather than being rebuilt from the tree with a zeroed one.
+///
+/// ```c
+/// if (old && same(old, a)) {
+///         int update = 0;
+///         if (o->reset && o->update && !ce_uptodate(old) && !ce_skip_worktree(old) && [...]) {
+///                 struct stat st;
+///                 if (lstat(old->name, &st) ||
+///                     ie_match_stat(o->src_index, old, &st, [...]))
+///                         update |= CE_UPDATE;
+///         }
+///         [...]
+///         add_entry(o, old, update, CE_STAGEMASK);
+///         return 0;
+/// }
+/// ```
+///
+/// The stat is the whole point: it is what tells the checkout below that the file on disk
+/// already *is* the entry, so `CE_UPDATE` stays clear and nothing is written. Rebuilding
+/// the entry from the tree instead leaves a zeroed stat, which matches no file, so every
+/// tracked path gets re-materialised — normally invisible, and very visible when
+/// `refs/replace/` maps the entry's blob elsewhere.
+fn carry_stat_of_unchanged(old: &gix::index::File, new_index: &mut gix::index::File) {
+    use gix::index::entry::Stage;
+
+    let carried: HashMap<BString, (ObjectId, gix::index::entry::Mode, gix::index::entry::Stat)> = {
+        let backing = old.path_backing();
+        old.entries()
+            .iter()
+            .filter(|e| e.stage() == Stage::Unconflicted)
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
+            .collect()
+    };
+    if carried.is_empty() {
+        return;
+    }
+    let backing = new_index.path_backing().to_owned();
+    for e in new_index.entries_mut() {
+        // `same(old, a)`: "the same mode and the same object id", nothing else.
+        if let Some((id, mode, stat)) = carried.get(&e.path_in(&backing).to_owned()) {
+            if *id == e.id && *mode == e.mode {
+                e.stat = *stat;
+            }
+        }
+    }
+}
+
 /// `--hard`: overwrite the worktree and index from `tree`, discarding local changes
 /// to tracked files and deleting files the reset removes. Untracked files are left
 /// untouched, matching `git reset --hard`.
@@ -1360,14 +1413,21 @@ fn reset_worktree_hard(
         .ok_or_else(|| anyhow!("hard reset not allowed in a bare repository"))?
         .to_owned();
 
-    // The full target index; checking it all out overwrites every tracked file with
-    // the tree version (thus discarding worktree modifications) and back-fills fresh
-    // stats onto the entries, yielding a clean index after the write.
+    // The full target index; checking it out overwrites every tracked file whose content
+    // the reset changes (thus discarding worktree modifications) and back-fills fresh
+    // stats onto the entries, yielding a clean index after the write. A path the reset
+    // leaves alone and whose file already matches is skipped, exactly as
+    // `checkout_entry_ca()` skips it — see [`crate::worktree::checkout_subset`].
     let mut new_index = repo.index_from_tree(&tree)?;
+    // `o->internal.result.split_index = o->src_index->split_index` (unpack-trees.c:1950):
+    // an index rebuilt from a tree keeps the shared half the one it replaces stood on, so
+    // the write below writes a split index again rather than dissolving the repository's.
+    new_index.inherit_split_index(old);
     // Carried before the checkout, not after: the worktree writer skips a
     // `SKIP_WORKTREE` entry, which is what keeps a `--hard` from materialising the
     // paths the sparse checkout deliberately left out.
     carry_skip_worktree(old, &mut new_index);
+    carry_stat_of_unchanged(old, &mut new_index);
 
     let mut opts =
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;

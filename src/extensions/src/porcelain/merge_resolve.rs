@@ -195,9 +195,18 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
     // unmerged index and says so on the stderr the script discards, so the test
     // is exactly "did `read-tree --aggressive` leave a stage behind"; asking the
     // index directly keeps those suppressed lines suppressed.
-    let index = repo.index_or_empty()?;
-    let state: &gix::index::State = &index;
-    if state.entries().iter().all(|e| e.stage_raw() == 0) {
+    let mut index = repo.open_index()?;
+    if index.entries().iter().all(|e| e.stage_raw() == 0) {
+        // The test is only half of what `write-tree` is here for. The other half
+        // is its side effect: `write_index_as_tree()` (cache-tree.c:797-831)
+        // fills the cache-tree in and writes the index back, so the index this
+        // strategy leaves for its caller already names its root tree. Skipping
+        // the call left `git rebase -s resolve` with a fully *invalid* extension
+        // where stock has a fully valid one — `<root>=-1/2 …` against stock's
+        // `<root>=10/2:c3f03c98…` — because nothing downstream rebuilds it: the
+        // sequencer's own `write_index_as_tree()` finds the cache-tree already
+        // there and, for the strategy path, there is no merge-ort repair.
+        let _ = super::write_tree::refresh_cache_tree(&repo, &mut index, false)?;
         return Ok(ExitCode::SUCCESS);
     }
 

@@ -16,7 +16,8 @@
 //!   * `git bundle verify [-q | --quiet] <file>` — prerequisite check plus the
 //!     `The bundle contains …` / `The bundle requires …` /
 //!     `The bundle records a complete history.` /
-//!     `The bundle uses this hash algorithm: …` report on stdout and the
+//!     `The bundle uses this hash algorithm: …` / `The bundle uses this filter: …`
+//!     report on stdout and the
 //!     `<file> is okay` line on stderr, including all three failure paths
 //!     (`could not open`, `does not look like a v2 or v3 bundle file`,
 //!     `Repository lacks these prerequisite commits:`) and the
@@ -56,7 +57,9 @@
 //!     `<rev>^!`, `<rev>^-<n>`, `--not`, `--stdin` and the whole ref-selecting
 //!     family (`--all`, `--branches`, `--tags`, `--remotes`, each optionally
 //!     `=<glob>`, plus `--glob=<glob>` and the `--exclude=<glob>` patterns the
-//!     next of them consumes) all reach it. So does the half of that grammar
+//!     next of them consumes) all reach it, as does `--filter=<spec>`, which
+//!     raises the bundle version to 3, writes the `@filter` capability and
+//!     narrows the pack. So does the half of that grammar
 //!     that is *not* revisions: a `--` and everything behind it, and a bare `..`
 //!     — the pathspec for the parent directory rather than a range
 //!     (revision.c:2164) — become `prune_data`, which `setup_revisions()` then
@@ -110,14 +113,11 @@
 //!     then aborts (a shell sees 134). This returns the 255 an `error()` return
 //!     normally becomes rather than reproducing a `SIGABRT`.
 //!
-//! Two further deliberate gaps, so this doc claims no more than the code does:
-//! a v3 bundle's `@filter` capability is read and kept but never reported (git's
-//! `The bundle uses this filter: …` line is not reproduced from a verified
-//! source, and the spec is not re-parsed), and a header that parses as neither a
-//! capability nor a ref line is surfaced as a plain error rather than git's
-//! `unrecognized header:` text. A capability that is neither `@object-format`
-//! nor `@filter` is `error: unknown capability '<cap>'` at exit 1, which is what
-//! `parse_capability()` (bundle.c) reports.
+//! One deliberate gap, so this doc claims no more than the code does: a header
+//! that parses as neither a capability nor a ref line is surfaced as a plain
+//! error rather than git's `unrecognized header:` text. A capability that is
+//! neither `@object-format` nor `@filter` is `error: unknown capability '<cap>'`
+//! at exit 1, which is what `parse_capability()` (bundle.c) reports.
 //!
 //! `args` excludes the `bundle` verb itself: `dispatch::run` is handed
 //! `&argv[2..]` (see `lib.rs`), so `args[0]` is the subcommand.
@@ -228,8 +228,9 @@ pub(crate) struct Header {
     /// `(object id, ref name)` pairs. Ref names are kept as raw bytes because
     /// they are echoed verbatim and are not required to be UTF-8.
     pub(crate) refs: Vec<(ObjectId, Vec<u8>)>,
-    /// The `@filter` capability's value, when the bundle carries one. Recorded
-    /// because the header has to round-trip; none of the reading verbs use it.
+    /// The `@filter` capability's value, when the bundle carries one. `verify`
+    /// reports it as `The bundle uses this filter: <spec>`, and `create` writes it
+    /// back from the `--filter` the revision walk carried.
     filter: Option<String>,
 }
 
@@ -394,10 +395,10 @@ fn read_header_from(input: &mut BundleSource) -> Result<Header, HeaderError> {
             // }
             // ```
             //
-            // (`parse_capability()`, bundle.c.) `verify`, `list-heads` and
-            // `unbundle` read the header and never consult the filter, so the spec
-            // is recorded and not re-parsed; a spec git would have rejected here
-            // cannot come out of this port's own `bundle create`.
+            // (`parse_capability()`, bundle.c.) The spec is recorded verbatim
+            // rather than re-parsed: `verify` echoes it and nothing else reads it,
+            // and a spec git would have rejected here cannot come out of this
+            // port's own `bundle create`.
             None if cap.starts_with("filter=") => {
                 header.filter = Some(cap["filter=".len()..].to_string());
             }
@@ -580,6 +581,21 @@ fn verify(args: &[String]) -> Result<ExitCode> {
         out.extend_from_slice(
             format!("The bundle uses this hash algorithm: {}\n", header.hash).as_bytes(),
         );
+        // ```c
+        // if (header->filter.choice)
+        //         printf_ln(_("The bundle uses this filter: %s"),
+        //                   list_objects_filter_spec(&header->filter));
+        // ```
+        //
+        // (`verify_bundle()`, bundle.c.) The last line of the verbose block, and
+        // the only one a v2 bundle never has: `@filter=<spec>` exists in v3 alone.
+        // `list_objects_filter_spec()` re-renders the parsed filter, which for
+        // every spelling the corpus carries is the text as written.
+        if let Some(filter) = &header.filter {
+            out.extend_from_slice(
+                format!("The bundle uses this filter: {filter}\n").as_bytes(),
+            );
+        }
         io::stdout().write_all(&out)?;
     }
 
@@ -728,6 +744,43 @@ fn create(args: &[String]) -> Result<ExitCode> {
         return Ok(need_file(CREATE_USAGE));
     };
 
+    // ```c
+    // static int cmd_bundle_create(...)
+    // {
+    //         [...]
+    //         argc = parse_options(argc, argv, prefix, options, builtin_bundle_create_usage,
+    //                              PARSE_OPT_STOP_AT_NON_OPTION | PARSE_OPT_KEEP_ARGV0);
+    // ```
+    //
+    // `--filter` is not one of `bundle create`'s own options — before `<file>` it
+    // is `error: unknown option 'filter=…'` at 129 — it is a **rev-list** option,
+    // reaching `revs.filter` through `setup_revisions()`. That is why it may only
+    // appear after the file operand, and why the last spelling wins with
+    // `--no-filter` clearing it, as it does for `git rev-list`.
+    let mut filter: Option<String> = None;
+    {
+        let mut kept: Vec<&str> = Vec::with_capacity(rev_args.len());
+        let mut i = 0;
+        while i < rev_args.len() {
+            let a = rev_args[i];
+            match a {
+                "--no-filter" => filter = None,
+                "--filter" => {
+                    if let Some(v) = rev_args.get(i + 1) {
+                        filter = Some((*v).to_string());
+                        i += 1;
+                    }
+                }
+                _ if a.starts_with("--filter=") => {
+                    filter = Some(a["--filter=".len()..].to_string());
+                }
+                _ => kept.push(a),
+            }
+            i += 1;
+        }
+        rev_args = kept;
+    }
+
     let repo = crate::setup::discover()?;
     let (pending, pathspecs) = match resolve_revisions(&repo, &rev_args)? {
         Ok(p) => p,
@@ -750,14 +803,21 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // 3, and an explicit `--version=2` is refused rather than written as a
     // bundle whose reader would take 64-hex ids for 40-hex ones.
     let sha1_repo = repo.object_hash() == gix::hash::Kind::Sha1;
+    // A filter raises the minimum the same way a non-sha1 algorithm does: only a
+    // v3 header has an `@filter` capability to carry it. The refusal that follows
+    // is one message for both reasons and names the *algorithm* whichever raised
+    // the floor — measured against stock 2.55.0, `git bundle create --version=2
+    // <file> --all --filter=blob:none` in a sha1 repository answers
+    // `fatal: cannot write bundle version 2 with algorithm sha1`.
+    let min_version = if sha1_repo && filter.is_none() { 2 } else { 3 };
     // `-1` is the sentinel `cmd_bundle_create` starts from, so an explicit
     // `--version=-1` takes the same default as no `--version` at all.
-    let version = version.filter(|v| *v != -1).unwrap_or(if sha1_repo { 2 } else { 3 });
+    let version = version.filter(|v| *v != -1).unwrap_or(min_version);
     if !(2..=3).contains(&version) {
         eprintln!("fatal: unsupported bundle version {version}");
         return Ok(ExitCode::from(128));
     }
-    if version < 3 && !sha1_repo {
+    if version < min_version {
         eprintln!(
             "fatal: cannot write bundle version {version} with algorithm {}",
             repo.object_hash()
@@ -771,6 +831,12 @@ fn create(args: &[String]) -> Result<ExitCode> {
     } else {
         out.extend_from_slice(b"# v3 git bundle\n");
         out.extend_from_slice(format!("@object-format={}\n", repo.object_hash()).as_bytes());
+        // `@filter=<spec>` follows `@object-format`, in the order
+        // `write_bundle_header()` writes them, and is what `bundle verify` reads
+        // back as `The bundle uses this filter: …`.
+        if let Some(spec) = &filter {
+            out.extend_from_slice(format!("@filter={spec}\n").as_bytes());
+        }
     }
 
     // `revs.boundary = 1` then `traverse_commit_list(..., write_bundle_prerequisites, ...)`
@@ -864,7 +930,12 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // means.
     let mut haves = prereqs.clone();
     haves.extend_from_slice(&hidden);
-    let objects = crate::porcelain::push_proto::objects_to_send(&repo, &want_objects, &haves);
+    let mut objects = crate::porcelain::push_proto::objects_to_send(&repo, &want_objects, &haves);
+    // `pack-objects --filter=<spec>` is what `write_pack_data()` spawns when the
+    // revision walk carried one, so the same exemption applies here as there: the
+    // tips the user named are never filtered out, only the objects the walk
+    // reached through them.
+    super::pack_objects::apply_filter(&repo, filter.as_deref(), &want_objects, &mut objects);
     // `write_pack_data()` spawns `pack-objects --stdout --thin --delta-base-offset`
     // (bundle.c:333-336) — the flag is unconditional there, so a bundle's deltas
     // are always `OBJ_OFS_DELTA`. Passing `false` here wrote `OBJ_REF_DELTA`
@@ -1036,7 +1107,28 @@ fn resolve_revisions(
             // `handle_refs(for_each_ref)` then `handle_refs(head_ref)`
             // (revision.c) — which is why `HEAD` lands after the ref list.
             for r in repo.references()?.all()? {
-                let Ok(r) = r else { continue };
+                let r = match r {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // `handle_one_ref()` hands every entry to
+                        // `get_reference()`, which dies on one whose object the
+                        // repository does not have. A ref file that will not
+                        // parse arrives with a null id, so it dies there too —
+                        // and it dies *before* `create_bundle()` writes the
+                        // signature, which is why stock leaves stdout empty
+                        // rather than a header with no pack behind it.
+                        use gix::refs::file::iter::loose_then_packed::Error as IterError;
+                        match e.downcast_ref::<IterError>() {
+                            Some(IterError::ReferenceCreation { relative_path, .. }) => {
+                                crate::git_fatal!(
+                                    "bad object {}",
+                                    relative_path.to_string_lossy().replace('\\', "/")
+                                );
+                            }
+                            _ => continue,
+                        }
+                    }
+                };
                 let full = r.name().as_bstr().to_string();
                 if sel.selects(&full).is_none() {
                     continue;

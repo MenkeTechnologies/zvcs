@@ -827,7 +827,10 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         }
         None => match &opts.output {
             Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
-            None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+            // No `BufWriter`, and no `std::io::stdout()`: `Tar::raw` already hands
+            // this whole 10 KiB blocks, and both of those would chop them up
+            // again. See [`RawStdout`].
+            None => Box::new(RawStdout::new()),
         },
     };
     let sink = if gzipped {
@@ -913,6 +916,46 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// File descriptor 1, without Rust's line buffering.
+///
+/// `std::io::Stdout` is a `LineWriter` whatever fd 1 is, so `write_all` of a
+/// binary block is cut at its last `\n` — `LineWriterShim::write` does
+/// `memrchr(b'\n', buf)`, writes everything up to and including it, and buffers
+/// the tail. The bytes are the same either way, which is why this is invisible
+/// in `git archive > file`; it is not invisible through `upload-archive`, which
+/// frames one sideband packet per `read()` of the archiver's stdout. The `linear`
+/// fixture's tar has its last newline 3098 bytes in, so its single 10240-byte
+/// block reached the wire as one `0x2805` packet or as a `0x0c1f`/`0x1beb` pair,
+/// depending on whether the reader woke up between the writer's two `write(2)`s
+/// — the port disagreeing with itself across two runs.
+///
+/// git has no stdio in this path at all: `write_blocked()` ends in
+/// `write_or_die(1, block, BLOCKSIZE)`, one raw write per block. This is that.
+struct RawStdout(std::mem::ManuallyDrop<std::fs::File>);
+
+impl RawStdout {
+    fn new() -> Self {
+        use std::os::fd::FromRawFd as _;
+        // Anything Rust had buffered for fd 1 must reach it before this starts
+        // writing behind stdio's back. Nothing on the archive path prints, so
+        // this is normally a no-op.
+        let _ = std::io::stdout().flush();
+        // SAFETY: fd 1 is open for the lifetime of the process, and
+        // `ManuallyDrop` keeps the `File` from closing it — the descriptor is
+        // borrowed here, never owned.
+        Self(std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) }))
+    }
+}
+
+impl Write for RawStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 /// Where the tar bytes go: straight out, or through git's in-process gzip.

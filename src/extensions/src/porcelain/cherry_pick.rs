@@ -1307,50 +1307,41 @@ fn pick_one(
             // Identical changes on both sides resolve trivially and are
             // reported by neither, which is why picking a commit that is
             // already applied stays silent.
+            //
+            // Rendering is [`crate::merge_msg`], the single port of
+            // `path_msg()`/`merge_display_update_messages()` shared with
+            // `git merge`, `rebase`, `merge-tree`, `merge-recursive` and
+            // `merge-subtree`. The sequencer used to carry its own renderer that
+            // knew only `content`, `add/add` and `modify/delete`, so every
+            // *tree*-level class a pick can raise came out as the generic
+            // content notice: a `rename/rename` read as
+            // `CONFLICT (content): Merge conflict in mm/rr-a.txt`, a
+            // file/directory clash lost both of its lines, a `distinct types`
+            // clash lost its own, and a directory rename was reported as an
+            // `add/add` on the *directory*. merge-ort renders all of them from
+            // one place and so does this now — in `Approximate` mode, because
+            // the worktree has already been moved by the time the lines are
+            // printed and dying here would abandon a half-applied pick.
+            //
+            // *Ours* is `HEAD` and *theirs* is the picked commit, named the way
+            // the sequencer names it everywhere else, `<short> (<subject>)`;
+            // operand 1's tree is `HEAD`'s, which is what tells the renderer
+            // which side a path belongs to.
             for conflict in &merge.conflicts {
-                let path = conflict.changes_in_resolution().0.location().to_owned();
-                if conflict.content_merge().is_some() {
-                    println!("Auto-merging {path}");
+                if conflict.is_unresolved(unresolved) {
+                    conflicted.push(crate::merge_msg::conflict_location(conflict));
                 }
-                if !conflict.is_unresolved(unresolved) {
-                    continue;
-                }
-                // A path one side modified and the other deleted is merge-ort's
-                // own message naming both operands, not the generic content
-                // notice — and the picked commit is named the way the sequencer
-                // names it everywhere else, `<short> (<subject>)`.
-                //
-                // gix reports `modification|deletion` and `deletion|modification`
-                // as one failure, so the direction comes from the entries rather
-                // than from the variant: `entries()` has already compensated for
-                // any swap, and the side that deleted the path is the one with no
-                // entry.
-                if matches!(
-                    conflict.resolution,
-                    Err(gix::merge::tree::ResolutionFailure::OursModifiedTheirsDeleted)
-                ) {
-                    let entries = conflict.entries();
-                    let (modify, delete) = match entries[1].is_none() {
-                        true => (other_label.as_str(), "HEAD"),
-                        false => ("HEAD", other_label.as_str()),
-                    };
-                    println!(
-                        "CONFLICT (modify/delete): {path} deleted in {delete} and modified in \
-                         {modify}.  Version {modify} of {path} left in tree."
-                    );
-                    conflicted.push(path);
-                    continue;
-                }
-                // merge-ort's `filemask == 6`: no ancestor stage means both
-                // sides added the path, which it reports as `add/add` rather
-                // than `content`.
-                let kind = if conflict.entries()[0].is_none() {
-                    "add/add"
-                } else {
-                    "content"
-                };
-                println!("CONFLICT ({kind}): Merge conflict in {path}");
-                conflicted.push(path);
+            }
+            for msg in crate::merge_msg::render(
+                repo,
+                &merge.conflicts,
+                "HEAD",
+                &other_label,
+                crate::merge_msg::Operand1::Tree(head_tree),
+                unresolved,
+                crate::merge_msg::Strictness::Approximate,
+            )? {
+                print!("{}", msg.text);
             }
             // `res |= write_message(ctx->message…, git_path_merge_msg(r), 0);`
             // — sequencer.c:2450, immediately after `do_recursive_merge()` and
@@ -1415,30 +1406,40 @@ fn pick_one(
     if let Some(merge) = merge.as_mut().filter(|_| !conflicted.is_empty()) {
         let mut new_index =
             update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+        // The two steps below are `merge_switch_to_result()`'s, in its order
+        // (merge-ort.c), and the order is the whole of what the extension ends up
+        // looking like:
+        //
+        // 1. `checkout(opt, head, result->tree)` — an `unpack_trees()` onto the
+        //    as-merged-as-possible tree, ending in `cache_tree_update(...,
+        //    WRITE_TREE_SILENT | WRITE_TREE_REPAIR)` (unpack-trees.c:2088-2092).
+        //    Every path is stage 0 at that moment, so `verify_cache()` passes and
+        //    the extension is rebuilt in full — including nodes for directories
+        //    the pre-pick index did not have, which is how a pick that turns
+        //    `mm/fd` into a directory leaves stock a valid `mm/fd` node.
+        // 2. `record_conflicted_index_entries()` — the conflicted paths' stage-0
+        //    entries are swapped for their stage 1/2/3 ones, and
+        //    `remove_marked_cache_entries(index, 1)` (merge-ort.c:4509)
+        //    invalidates each on its way out. That is what leaves the root at
+        //    `-1` while the directories the conflict did not reach keep their
+        //    ids, and it is why a stale-valid root cannot survive here — stock's
+        //    `git write-tree` must die with `error building trees` on this index,
+        //    not hand back a cached root for a merge nobody resolved.
+        //
+        // Repairing after the conflicts instead made step 1 a no-op:
+        // `verify_cache()` refuses an unmerged entry (cache-tree.c:218-234) and
+        // `cache_tree_update()` returns before touching `istate->cache_tree`, so
+        // only what the pre-pick index carried survived.
+        super::write_tree::carry_and_repair_cache_tree(&repo, &state.index, &mut new_index);
         merge.index_changed_after_applying_conflicts(
             &mut new_index,
             unresolved,
             gix::merge::tree::apply_index_entries::RemovalMode::Prune,
         );
-        // The cache-tree has to be redone *after* the conflict entries land, and the
-        // repair `update_clean_worktree()` already ran is not it: that one measured an
-        // index without them, so its root node claims a tree for entries that are now
-        // unmerged. `write_index_as_tree()` takes `cache_tree_fully_valid()` as licence to
-        // skip the rebuild entirely and hand back the cached root (cache-tree.c:797-816),
-        // so a stale-valid root here made stock's `git write-tree` *succeed* on a
-        // conflicted index — emitting a tree for a merge nobody resolved — where it must
-        // die with `error building trees`.
-        //
-        // git's own shape comes out of `unpack_trees()`: every entry the merge touched is
-        // invalidated on the way through (`invalidate_ce_path()`, unpack-trees.c:190-197),
-        // and the parting `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
-        // then fails at `verify_cache()` on the unmerged entry (cache-tree.c:218-234)
-        // *before* touching anything — so the carried, partly-invalidated structure is
-        // what survives: the root marked `-1` and a directory the pick never reached still
-        // naming its tree. This is the same call every other merge-shaped verb makes in
-        // `merge_apply::three_way_merge()`; the conflicted pick was the one path that
-        // wrote its index without it.
-        super::write_tree::carry_and_repair_cache_tree(&repo, &state.index, &mut new_index);
+        for path in crate::merge_apply::unmerged_paths(&new_index) {
+            new_index.invalidate_path_in_tree(path.as_ref());
+        }
+        super::write_tree::prepare_offset_table(&repo, &mut new_index);
         crate::index_racy::write(repo, &mut new_index)?;
 
         let git_dir = repo.git_dir();
@@ -1466,14 +1467,26 @@ fn pick_one(
             std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
         }
 
-        // git's `append_conflicts_hint`: a blank line, then one commented
-        // line per conflicted path, appended to the message it would have
-        // committed.
+        // git's `append_conflicts_hint()` (sequencer.c:721-744): a blank line,
+        // then one commented line per path the **index** still holds at a
+        // non-zero stage — not per printed conflict. The two lists differ
+        // wherever a conflict class spans more than the path it is named after:
+        // a rename/rename leaves the shared source and both destinations
+        // unmerged behind one `CONFLICT (rename/rename)` line, and a directory
+        // rename leaves the carried file at its new name.
+        //
+        // The prefix is `comment_line_str`, not a literal `#`. Hardcoding it
+        // corrupted the committed message rather than its looks: the cleanup
+        // that strips this block strips `core.commentChar`, so under any other
+        // setting the whole block survived into the commit object.
+        let comment = super::rebase_todo::comment_prefix(&repo);
         let mut merge_msg = message.clone();
         merge_msg.push(b'\n');
-        merge_msg.extend_from_slice(b"# Conflicts:\n");
-        for path in &conflicted {
-            merge_msg.extend_from_slice(b"#\t");
+        merge_msg.extend_from_slice(comment.as_bytes());
+        merge_msg.extend_from_slice(b" Conflicts:\n");
+        for path in crate::merge_apply::unmerged_paths(&new_index) {
+            merge_msg.extend_from_slice(comment.as_bytes());
+            merge_msg.push(b'\t');
             merge_msg.extend_from_slice(&path[..]);
             merge_msg.push(b'\n');
         }
@@ -1663,7 +1676,7 @@ fn pick_one(
 /// `MERGE_MSG` is written first because the `else` arm of `do_pick_commit` does
 /// exactly that, before the child runs: a strategy that stops mid-way leaves the
 /// message behind for the eventual `--continue`.
-fn run_merge_strategy(
+pub(super) fn run_merge_strategy(
     repo: &gix::Repository,
     strategy: &str,
     xopts: &[&str],

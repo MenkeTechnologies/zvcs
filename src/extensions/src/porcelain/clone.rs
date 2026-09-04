@@ -691,19 +691,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `--also-filter-submodules` is meaningless without something to pass down and something to pass
-    // it to. Verified against stock git 2.55.0, which reports the missing option and exits 128 — and
-    // which raises this only for the explicit flag, never for a `clone.filterSubmodules=true` that
-    // happens to be configured.
-    if also_filter_submodules == Some(true) {
-        if filter.is_none() {
-            crate::git_fatal!("the option '--also-filter-submodules' requires '--filter'");
-        }
-        if !recurse_submodules {
-            crate::git_fatal!("the option '--also-filter-submodules' requires '--recurse-submodules'");
-        }
-    }
-
     // `builtin/clone.c`: bundles carry whole history, so they cannot be combined
     // with a shallow request.
     if bundle_uri.is_some() && (depth.is_some() || shallow_since.is_some() || !shallow_exclude.is_empty())
@@ -717,12 +704,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `fatal: options '--bare' and '--separate-git-dir' cannot be used together`).
     if bare && separate_git_dir.is_some() {
         crate::git_fatal!("options '--bare' and '--separate-git-dir' cannot be used together");
-    }
-    // A sparse checkout needs a worktree; stock git fails the clone here with
-    // `fatal: this operation must be run in a work tree` /
-    // `error: failed to initialize sparse-checkout`.
-    if sparse && bare {
-        crate::git_fatal!("failed to initialize sparse-checkout: this operation must be run in a work tree");
     }
 
     if positionals.len() > 2 {
@@ -769,6 +750,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     //
     // A source that is shallow itself takes `is_local` away again further down.
     let mut is_local = !no_local && !url_str.contains("://") && Path::new(url_str).is_dir();
+    let mut reject_shallow_source = false;
     if is_local && gix::open(url_str).map(|r| r.is_shallow()).unwrap_or(false) {
         // ```c
         // if (!access(mkpath("%s/shallow", path), F_OK)) {
@@ -783,16 +765,27 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         // (builtin/clone.c:1334-1340.) Copying a shallow object store would carry its
         // `shallow` boundary without the file that records it, so git falls back to the
         // transport, which negotiates the boundary properly.
+        // The key is read from the configuration `git_config()` had merged by
+        // then, which is the *ambient* one — `git -c clone.rejectShallow=true
+        // clone …` sets it, and so does `~/.gitconfig`. `clone`'s own
+        // `-c <key>=<value>` is written into the repository being created and is
+        // consulted here too, since git replays those through
+        // `git_config_parse_parameter()` before the transport runs.
         let reject = reject_shallow.unwrap_or_else(|| {
+            let truthy = |v: &str| v != "false" && v != "0" && !v.is_empty();
             config_pairs
                 .iter()
                 .rev()
                 .find(|(k, _)| k.eq_ignore_ascii_case("clone.rejectShallow"))
-                .map(|(_, v)| v != "false" && v != "0" && !v.is_empty())
+                .map(|(_, v)| truthy(v))
+                .or_else(|| crate::setup::cli_override("clone.rejectShallow").map(truthy))
                 .unwrap_or(false)
         });
+        // The refusal itself waits for the banner: git reaches this block from
+        // `cmd_clone` *after* `init_db()` has printed `Cloning into '<dir>'...`,
+        // so the fatal is the second line and not the first.
         if reject {
-            crate::git_fatal!("source repository is shallow, reject to clone.");
+            reject_shallow_source = true;
         }
         if local_explicit {
             eprintln!("warning: source repository is shallow, ignoring --local");
@@ -838,6 +831,30 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "destination path '{dir}' already exists and is not an empty directory."
         )));
     }
+    // The same test against the *repository* path, one message and one line of
+    // `cmd_clone` later. Measured against stock 2.55.0:
+    //
+    // ```text
+    // $ git clone --separate-git-dir=src . sgd
+    // fatal: repository path 'src' already exists and is not an empty directory.
+    // ```
+    //
+    // No banner precedes it and no `sgd` is left behind, so it belongs beside the
+    // destination test above rather than with the relocation that consumes the
+    // value. The path is named exactly as it was written, not resolved.
+    if let Some(real) = separate_git_dir.as_deref() {
+        let real_path = Path::new(real);
+        if real_path.exists()
+            && real_path
+                .read_dir()
+                .map(|mut e| e.next().is_some())
+                .unwrap_or(true)
+        {
+            return Ok(fatal(&format!(
+                "repository path '{real}' already exists and is not an empty directory."
+            )));
+        }
+    }
     // `junk_work_tree` in `cmd_clone()`: git remembers the directory it made so `remove_junk()`
     // can take it down again on any death below, and leaves a directory it found alone.
     let created_destination = !dst.exists();
@@ -874,6 +891,55 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             eprintln!("Cloning into bare repository '{dir}'...");
         } else {
             eprintln!("Cloning into '{dir}'...");
+        }
+    }
+
+    // ```c
+    // if (!access(mkpath("%s/shallow", path), F_OK)) {
+    //         if (reject_shallow)
+    //                 die(_("source repository is shallow, reject to clone."));
+    // ```
+    //
+    // (builtin/clone.c:1334-1336.) The test itself ran while the transport was
+    // being chosen; the refusal lands here, below the banner, because that is
+    // where `cmd_clone` reaches it.
+    if reject_shallow_source {
+        crate::git_fatal!("source repository is shallow, reject to clone.");
+    }
+
+    // `--also-filter-submodules` is meaningless without something to pass down and something to pass
+    // it to. Verified against stock git 2.55.0, which reports the missing option and exits 128 — and
+    // which raises this only for the explicit flag, never for a `clone.filterSubmodules=true` that
+    // happens to be configured.
+    //
+    // Both refusals come *after* `Cloning into '<dir>'...`: git reaches them from
+    // `cmd_clone` below `init_db()`, and the destination it made is taken back by
+    // the junk handler on the way out.
+    if also_filter_submodules == Some(true) {
+        if filter.is_none() {
+            crate::git_fatal!("the option '--also-filter-submodules' requires '--filter'");
+        }
+        if !recurse_submodules {
+            crate::git_fatal!("the option '--also-filter-submodules' requires '--recurse-submodules'");
+        }
+    }
+
+    // `strbuf_realpath()` resolves the requested git directory inside the init
+    // step, and a component of it that is not there is fatal. Measured against
+    // stock 2.55.0, with the banner already printed and the destination created
+    // and then taken away again by the junk handler:
+    //
+    // ```text
+    // $ git clone --separate-git-dir=a/b/gitdir . sgd
+    // Cloning into 'sgd'...
+    // fatal: Invalid path '<cwd>/a': No such file or directory
+    // ```
+    //
+    // The path named is absolute and is the *first* component that could not be
+    // entered, not the argument and not its parent.
+    if let Some(real) = separate_git_dir.as_deref() {
+        if let Some(missing) = first_unreachable_component(Path::new(real)) {
+            crate::git_fatal!("Invalid path '{}': No such file or directory", missing.display());
         }
     }
 
@@ -1001,7 +1067,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `--template=<dir>`: git runs its init step with the template, so the sample
     // hooks, `description` and `info/exclude` come from there instead of the
     // built-in default. Same code path `git init --template` uses.
-    if let Some(tpl) = template.as_deref().filter(|t| !t.is_empty()) {
+    // An *empty* `--template=` is still a `--template`: `init_db()` is called with
+    // it, `copy_templates()` returns on `if (!template_dir[0])` without warning,
+    // and the repository is left with whatever `init_db` itself created — no
+    // `hooks/`, no `info/`, no `description`. Filtering the empty string out here
+    // skipped the strip too and produced a fully-templated repository instead.
+    if let Some(tpl) = template.as_deref() {
         super::init::apply_template(tpl, &git_dir)?;
     }
 
@@ -1020,9 +1091,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             }
         }
         for (path, if_able) in &references {
-            match objects_dir_of(Path::new(path)) {
+            match compute_alternate_path(path) {
                 Ok(objects) => alternates.push(objects),
-                Err(e) if *if_able => {
+                // `--reference-if-able` downgrades only what
+                // `compute_alternate_path()` wrote into its `err` buffer. The
+                // gitfile refusal is a `die()` from inside `read_gitfile()`, which
+                // has no error slot to write into and no caller to consult, so it
+                // ends both spellings alike — see [`gitfile_target`].
+                Err(e) if *if_able && e.downcast_ref::<crate::fatal::Fatal>().is_none() => {
                     eprintln!("info: Could not add alternate for '{path}': {e}");
                 }
                 Err(e) => crate::git_fatal!("{e}"),
@@ -1052,7 +1128,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             .map_err(|_| anyhow::anyhow!("--branch expects a valid branch name, got {name:?}"))?;
     }
     prepare = prepare.with_shallow(shallow);
-    prepare = prepare.with_filter(filter.clone());
+    // "ignored in local clones" is literal: git never puts the filter on the wire
+    // for a local source, because there is no wire — `clone_local()` copies the
+    // object store whole. Sending it anyway reaches a server that does not
+    // advertise `filter` and earns a second warning,
+    // `warning: filtering not recognized by server, ignoring`, that stock never
+    // prints. The warning above already told the user the filter was dropped.
+    if !is_local {
+        prepare = prepare.with_filter(filter.clone());
+    }
 
     let mut overrides: Vec<String> = config_pairs
         .iter()
@@ -1598,6 +1682,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // has logs for `HEAD`, the checked-out branch and `refs/remotes/<remote>/HEAD`, and
     // nothing else. gitoxide logs every ref it writes, so the extra files are removed.
     remove_initial_remote_reflogs(&git_dir, origin.as_deref().unwrap_or("origin"));
+    let checked_out_branch = (!bare)
+        .then(|| std::fs::read_to_string(git_dir.join("HEAD")).ok())
+        .flatten()
+        .and_then(|head| {
+            head.trim_end()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_string)
+        });
+    remove_initial_branch_reflogs(&git_dir, checked_out_branch.as_deref());
 
     // The tags of a `--single-branch` clone are written by `write_followtags()`,
     // which runs *after* `write_remote_refs()` and outside its transaction, so
@@ -1705,14 +1798,80 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         eprintln!("done.");
     }
 
+    // ```c
+    // if (our && skip_prefix(our->name, "refs/heads/", &head)) {
+    //         /* Local default branch link */
+    //         refs_update_symref(get_main_ref_store(the_repository), "HEAD", our->name, NULL);
+    //         [...]
+    // } else if (our) {
+    //         struct commit *c = lookup_commit_reference(the_repository, &our->old_oid);
+    //         /* --branch specifies a non-branch (i.e. tags), detach HEAD */
+    //         refs_update_ref(get_main_ref_store(the_repository), msg, "HEAD", &c->object.oid,
+    //                         NULL, REF_NO_DEREF, UPDATE_REFS_DIE_ON_ERR);
+    // }
+    // ```
+    //
+    // (`update_head()`, builtin/clone.c:594-620.) `-b` naming a *tag* does not
+    // point `HEAD` at the tag: it detaches at the commit the tag resolves to, so
+    // the clone comes out on a detached `HEAD` with no branch at all. gitoxide
+    // writes the symref for any checked-out ref, which leaves `HEAD` naming
+    // `refs/tags/…` — a state `fsck` rejects (`badHeadTarget: HEAD points to
+    // non-branch`).
+    //
+    // The id written is `lookup_commit_reference()`'s, the *peeled* one, so an
+    // annotated tag detaches at its commit and not at the tag object; the
+    // `clone: from …` reflog entry records that same id. Measured against stock
+    // 2.55.0, a ref whose own target is not a commit is announced first —
+    // `warning: refs/tags/v0.2.0 <tag-object> is not a commit!`, naming the ref
+    // and the unpeeled id — and the clone then carries on and detaches anyway.
+    if branch.is_some() {
+        detach_head_from_non_branch(&git_dir, bare || no_checkout, quiet)?;
+    }
+
     // `--sparse`: git initializes a cone-mode sparse-checkout containing only the
     // top-level files. This port's own `sparse-checkout set --cone` writes the
     // identical `info/sparse-checkout` pattern pair and `config.worktree` keys and
     // prunes the worktree, so it is re-executed here rather than duplicated.
+    //
+    // ```c
+    // static int git_sparse_checkout_init(const char *repo)
+    // {
+    //         struct child_process cmd = CHILD_PROCESS_INIT;
+    //         int result = 0;
+    //         strvec_pushl(&cmd.args, "-C", repo, "sparse-checkout", "set", NULL);
+    //         cmd.git_cmd = 1;
+    //         if (run_command(&cmd)) {
+    //                 error(_("failed to initialize sparse-checkout"));
+    //                 result = 1;
+    //         }
+    //         return result;
+    // }
+    // ```
+    //
+    // (builtin/clone.c:783-798.) `--bare --sparse` is not refused during option
+    // parsing: the clone runs to completion — banner, transfer and `done.` — and
+    // only then does the child die `fatal: this operation must be run in a work
+    // tree`, leaving `error: failed to initialize sparse-checkout` and exit **1**
+    // behind it. Both lines are on stderr and the repository stays on disk.
+    //
+    // ```c
+    // if (option_sparse_checkout && git_sparse_checkout_init(dir))
+    //         return 1;
+    // ```
+    //
+    // (builtin/clone.c:1490-1491.) The bare `return 1` skips the `cleanup:` label
+    // that would have set `junk_mode = JUNK_LEAVE_ALL`, so the `atexit` handler
+    // still holds the destination and takes it away — a `git clone --bare
+    // --sparse` leaves nothing on disk. This port's junk guard was released when
+    // the fetch finished, so the removal is re-stated here.
     if sparse {
         let code = run_self(&dir, &["sparse-checkout", "set", "--cone"], true)?;
         if code != 0 {
-            return Ok(ExitCode::from(code));
+            eprintln!("error: failed to initialize sparse-checkout");
+            if created_destination {
+                let _ = std::fs::remove_dir_all(dst);
+            }
+            return Ok(ExitCode::from(1));
         }
     }
 
@@ -2195,8 +2354,35 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
         }
     }
 
-    // git writes every `-c` value, so a key given twice ends up with two values.
+    // git writes every `-c` value, so a key given twice ends up with two values —
+    // except the two keys that name the repository's own formats.
+    //
+    // `cmd_clone()` runs `initialize_repository_version()` twice. The first call
+    // precedes `write_config()` and only stubs the refdb out; the second runs
+    // once the remote's object format is known, with `reinit` set:
+    //
+    // ```c
+    // if (hash_algo != GIT_HASH_SHA1 && hash_algo != GIT_HASH_UNKNOWN)
+    //         repo_config_set(repo, "extensions.objectformat", ...);
+    // else if (reinit)
+    //         repo_config_set_gently(repo, "extensions.objectformat", NULL);
+    // ```
+    //
+    // and the same pair for `extensions.refstorage`. `NULL` is an *unset*, so a
+    // clone that lands on the defaults — sha1 objects and `files` refs, which is
+    // every clone this port performs — deletes both keys on its way out, taking
+    // any `-c` that wrote them with it. A caller must not be able to assert a
+    // format the clone did not use: the repository left behind would declare one
+    // width over objects of another, and neither implementation could read it.
+    // `extensions.worktreeConfig` and an unknown `extensions.*` are untouched by
+    // that unset and are still written, which is what makes this a two-key rule
+    // rather than a rule about the section.
     for (key, value) in fixups.config_pairs {
+        if key.eq_ignore_ascii_case("extensions.objectformat")
+            || key.eq_ignore_ascii_case("extensions.refstorage")
+        {
+            continue;
+        }
         let (section, subsection, name) = split_config_key(key)?;
         let mut sec = file
             .section_mut_or_create_new(&section, subsection.as_deref().map(Into::into))
@@ -2479,6 +2665,103 @@ fn objects_dir_of(path: &Path) -> Result<PathBuf> {
     Ok(std::fs::canonicalize(&objects).unwrap_or(objects))
 }
 
+/// `compute_alternate_path()` (object-file.c), the whole of what
+/// `--reference`/`--reference-if-able` runs before recording an alternate.
+///
+/// ```c
+/// ref_git = real_pathdup(path, 1);
+/// repo = read_gitfile(ref_git);
+/// if (!repo)
+///         repo = read_gitfile(mkpath("%s/.git", ref_git));
+/// [...]
+/// if (!is_directory(mkpath("%s/objects", ref_git))) {
+///         strbuf_addf(err, _("reference repository '%s' is not a local repository."), path);
+///         goto out;
+/// }
+/// if (!access(mkpath("%s/shallow", ref_git), F_OK)) {
+///         strbuf_addf(err, _("reference repository '%s' is shallow"), path);
+///         goto out;
+/// }
+/// if (!access(mkpath("%s/info/grafts", ref_git), F_OK)) {
+///         strbuf_addf(err, _("reference repository '%s' is grafted"), path);
+///         goto out;
+/// }
+/// ```
+///
+/// The three refusals are `strbuf_addf` into the caller's `err`, so
+/// `--reference-if-able` downgrades all three to its `info:` line and clones
+/// anyway. [`gitfile_target`]'s is not: `read_gitfile()` passes no error slot, so
+/// a file that is not a gitfile is a `die()` from inside this function and the
+/// `if-able` spelling dies with it.
+///
+/// Each message names `path` **as it was written**, never the resolved form.
+fn compute_alternate_path(given: &str) -> Result<PathBuf> {
+    let path = Path::new(given);
+    // `real_pathdup(path, 1)`: absolute and symlink-resolved where it can be.
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| {
+        std::env::current_dir().map(|cwd| cwd.join(path)).unwrap_or_else(|_| path.to_path_buf())
+    });
+    let from_gitfile = match gitfile_target(&real)? {
+        Some(dir) => Some(dir),
+        None => gitfile_target(&real.join(".git"))?,
+    };
+    // ```c
+    // if (!repo && is_directory(mkpath("%s/.git/objects", ref_git))) {
+    //         char *ref_git_git = mkpathdup("%s/.git", ref_git);
+    //         free(ref_git);
+    //         ref_git = ref_git_git;
+    // } else if (!is_directory(mkpath("%s/objects", ref_git))) {
+    //         [...]
+    //         strbuf_addf(err, _("reference repository '%s' is not a local repository."), path);
+    //         goto out;
+    // }
+    // ```
+    //
+    // The `.git/objects` branch is what lets an ordinary worktree be a reference:
+    // the path handed in is the working directory, and the object store is one
+    // level down. Only a path that is neither a gitfile, nor a worktree, nor a
+    // bare repository is refused.
+    let ref_git = match from_gitfile {
+        Some(dir) => dir,
+        None if real.join(".git").join("objects").is_dir() => real.join(".git"),
+        None if real.join("objects").is_dir() => real,
+        None => anyhow::bail!("reference repository '{given}' is not a local repository."),
+    };
+    if ref_git.join("shallow").exists() {
+        anyhow::bail!("reference repository '{given}' is shallow");
+    }
+    if ref_git.join("info").join("grafts").exists() {
+        anyhow::bail!("reference repository '{given}' is grafted");
+    }
+    let objects = ref_git.join("objects");
+    Ok(std::fs::canonicalize(&objects).unwrap_or(objects))
+}
+
+/// `read_gitfile()` — `read_gitfile_gently(path, NULL)`, whose null error slot is
+/// what turns one of its four failures into a `die()`.
+///
+/// A path that is missing or is not a regular file is `READ_GITFILE_ERR_STAT_FAILED`
+/// / `_NOT_A_FILE`, both of which that switch lets through as "no gitfile here".
+/// A regular file whose first eight bytes are not `gitdir: ` is
+/// `READ_GITFILE_ERR_INVALID_FORMAT`, and `die(_("invalid gitfile format: %s"), path)`
+/// names the resolved path.
+fn gitfile_target(path: &Path) -> Result<Option<PathBuf>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let Some(target) = body.trim_end().strip_prefix("gitdir: ") else {
+        crate::git_fatal!("invalid gitfile format: {}", path.display());
+    };
+    let target = Path::new(target);
+    Ok(Some(match target.is_absolute() {
+        true => target.to_path_buf(),
+        false => path.parent().unwrap_or(Path::new(".")).join(target),
+    }))
+}
+
 /// Write `objects/info/alternates` with one absolute object-directory path per
 /// line, the format git's `add_to_alternates_file` produces.
 fn write_alternates(git_dir: &Path, alternates: &[PathBuf]) -> Result<()> {
@@ -2631,6 +2914,86 @@ fn unborn_head_target(ref_map: &gix::remote::fetch::RefMap) -> Option<String> {
     })
 }
 
+/// The first directory on the way to `path` that does not exist, absolute — what
+/// `strbuf_realpath()` stops at.
+///
+/// The final component is exempt: it is the directory about to be created. Only
+/// the path *to* it has to be there already.
+fn first_unreachable_component(path: &Path) -> Option<PathBuf> {
+    let absolute = match path.is_absolute() {
+        true => path.to_path_buf(),
+        false => std::env::current_dir().ok()?.join(path),
+    };
+    let parent = absolute.parent()?;
+    let mut walked = PathBuf::new();
+    for component in parent.components() {
+        walked.push(component);
+        if !walked.as_os_str().is_empty() && !walked.exists() {
+            return Some(walked);
+        }
+    }
+    None
+}
+
+/// `update_head()`'s `else if (our)` arm: `HEAD` naming something that is not a
+/// branch becomes a detached `HEAD` at the commit that ref resolves to.
+///
+/// Nothing happens unless `HEAD` is a symbolic ref outside `refs/heads/`, which
+/// is the state `--branch <tag>` leaves behind — every other clone already has
+/// the branch link git wants.
+///
+/// Three things move together, and a port that does only the first leaves a
+/// repository `fsck` rejects:
+///
+/// * `HEAD` itself, rewritten from `ref: refs/tags/<name>` to the object id.
+/// * The `clone: from <url>` reflog entry, whose new-value field gitoxide filled
+///   with the ref's own target — the *tag object* for an annotated tag, where git
+///   records the peeled commit.
+/// * The `advice.detachedHead` block, which the checkout prints on the way out
+///   and which a bare or `--no-checkout` clone has no worktree to print for.
+fn detach_head_from_non_branch(git_dir: &Path, bare_or_no_checkout: bool, quiet: bool) -> Result<()> {
+    let head_path = git_dir.join("HEAD");
+    let Ok(text) = std::fs::read_to_string(&head_path) else { return Ok(()) };
+    let Some(target) = text.trim_end().strip_prefix("ref: ") else { return Ok(()) };
+    if target.starts_with("refs/heads/") {
+        return Ok(());
+    }
+    let target = target.to_string();
+    let Ok(repo) = gix::open(git_dir) else { return Ok(()) };
+    let Ok(mut reference) = repo.find_reference(target.as_str()) else { return Ok(()) };
+    let unpeeled = reference.target().try_id().map(ToOwned::to_owned);
+    // `lookup_commit_reference()` peels through tag objects; a ref whose own
+    // target is already a commit peels to itself and earns no warning.
+    let Ok(peeled) = reference.peel_to_id() else { return Ok(()) };
+    let peeled = peeled.detach();
+    if let Some(unpeeled) = unpeeled.filter(|id| *id != peeled) {
+        eprintln!("warning: {target} {unpeeled} is not a commit!");
+    }
+    std::fs::write(&head_path, format!("{peeled}\n"))?;
+
+    // The reflog is a single `clone: from <url>` line at this point; only its
+    // new-value field can be wrong, and only when the tag was annotated.
+    let log = git_dir.join("logs").join("HEAD");
+    if let Ok(body) = std::fs::read_to_string(&log) {
+        let fixed: String = body
+            .lines()
+            .map(|line| match line.split_once(' ') {
+                Some((old, rest)) => match rest.split_once(' ') {
+                    Some((_new, tail)) => format!("{old} {peeled} {tail}\n"),
+                    None => format!("{line}\n"),
+                },
+                None => format!("{line}\n"),
+            })
+            .collect();
+        std::fs::write(&log, fixed)?;
+    }
+
+    if !bare_or_no_checkout && !quiet && repo.config_snapshot().boolean("advice.detachedHead") != Some(false) {
+        super::checkout::print_detached_head_advice(&peeled.to_string());
+    }
+    Ok(())
+}
+
 /// Remove whatever the local fetch wrote into `objects/pack`.
 ///
 /// git reaches `clone_local()` instead of the transport for a local source, so neither
@@ -2687,6 +3050,41 @@ fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result
 /// Drop the per-branch reflogs under `logs/refs/remotes/<remote>/`, which
 /// `initial_ref_transaction_commit()` never creates. `HEAD` is kept: git writes that one
 /// through the ordinary ref machinery when it records where the remote points.
+/// The same cleanup for `refs/heads/`.
+///
+/// `write_remote_refs()` stores the branches through
+/// `initial_ref_transaction_commit()` too, so none of them gets a reflog however
+/// `core.logAllRefUpdates` is set. The one branch log a clone does leave behind
+/// belongs to the branch `HEAD` names in a worktree-bearing clone — and
+/// `--no-checkout` keeps it, since it is written on the way to pointing `HEAD` at
+/// the branch and not by the checkout. A bare clone therefore ends with
+/// `logs/HEAD` and nothing else, and so does a `-b <tag>` clone, whose `HEAD` is
+/// detached and names no branch at all.
+///
+/// Measured against stock 2.55.0: `git -c core.logAllRefUpdates=true clone --bare`
+/// writes `logs/HEAD` alone, where gitoxide logs every ref it wrote.
+fn remove_initial_branch_reflogs(git_dir: &Path, keep: Option<&str>) {
+    let root = git_dir.join("logs").join("refs").join("heads");
+    let keep_path = keep.map(|branch| root.join(branch));
+    fn walk(dir: &Path, keep: Option<&Path>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                walk(&path, keep);
+                let _ = std::fs::remove_dir(&path);
+                continue;
+            }
+            if keep.is_some_and(|k| k == path) {
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    walk(&root, keep_path.as_deref());
+    let _ = std::fs::remove_dir(&root);
+}
+
 fn remove_initial_remote_reflogs(git_dir: &Path, remote: &str) {
     let dir = git_dir.join("logs").join("refs").join("remotes").join(remote);
     let Ok(entries) = std::fs::read_dir(&dir) else {

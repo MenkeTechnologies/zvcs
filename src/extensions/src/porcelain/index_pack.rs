@@ -203,6 +203,10 @@ impl Opts {
 }
 
 pub fn index_pack(args: &[String]) -> Result<ExitCode> {
+    // `cmd_index_pack()` (builtin/index-pack.c): `fetch_if_missing = 0;`. A pack is
+    // resolved against what is on disk; a delta base that is genuinely absent is
+    // the caller's problem to report, not a reason to go to the network.
+    gix::odb::store::set_fetch_if_missing(false);
     // `show_usage_if_asked(argc, argv, index_pack_usage)` (builtin/index-pack.c:1909):
     // a LONE `-h` on stdout at 129, before any of the scan below.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {

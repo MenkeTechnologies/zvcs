@@ -1414,86 +1414,76 @@ fn walk(
 ) -> Result<(Vec<WalkItem>, Option<super::log::WalkAbort>)> {
     let mut items = Vec::new();
     let mut abort: Option<super::log::WalkAbort> = None;
-    match filters.order {
-        Order::Default | Order::AuthorDate => {
-            let mut platform = repo
-                .rev_walk(tips.to_vec())
-                .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
-            if filters.first_parent {
-                platform = platform.first_parent_only();
-            }
-            if !hidden.is_empty() {
-                platform = platform.with_hidden(hidden.to_vec());
-            }
-            for info in platform.all()? {
-                let info = match info {
-                    Ok(info) => info,
-                    // See the same interception in `rev_list`: the iterator notices
-                    // the unreadable parent one commit later than `process_parents()`
-                    // does, so the abort is put back where git has it.
-                    Err(err) => match locate_abort(repo, &items) {
-                        Some((at, found)) => {
-                            items.truncate(at);
-                            abort = Some(found);
-                            break;
-                        }
-                        None => return Err(err.into()),
-                    },
-                };
-                items.push(WalkItem {
-                    id: info.id,
-                    parents: info.parent_ids.iter().map(|id| id.to_owned()).collect(),
-                });
-            }
+    // Every order walks the same list: `prepare_revision_walk()` runs
+    // `limit_list()` — the commit-date traversal below — and only then
+    // `sort_in_topological_order(&revs->commits, revs->sort_order)`, so
+    // `--topo-order`, `--date-order` and `--author-date-order` all resort that one
+    // list rather than traversing differently.
+    {
+        let mut platform = repo
+            .rev_walk(tips.to_vec())
+            .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+        if filters.first_parent {
+            platform = platform.first_parent_only();
         }
-        Order::Date | Order::Topo => {
-            use gix::traverse::commit::{topo, Parents};
-            let sorting = if filters.order == Order::Topo {
-                topo::Sorting::TopoOrder
-            } else {
-                topo::Sorting::DateOrder
+        if !hidden.is_empty() {
+            platform = platform.with_hidden(hidden.to_vec());
+        }
+        for info in platform.all()? {
+            let info = match info {
+                Ok(info) => info,
+                // See the same interception in `rev_list`: the iterator notices
+                // the unreadable parent one commit later than `process_parents()`
+                // does, so the abort is put back where git has it.
+                Err(err) => match locate_abort(repo, &items) {
+                    Some((at, found)) => {
+                        items.truncate(at);
+                        abort = Some(found);
+                        break;
+                    }
+                    None => return Err(err.into()),
+                },
             };
-            let iter =
-                topo::Builder::from_iters(&repo.objects, tips.to_vec(), Some(hidden.to_vec()))
-                    .sorting(sorting)
-                    .parents(if filters.first_parent {
-                        Parents::First
-                    } else {
-                        Parents::All
-                    })
-                    .build()?;
-            for info in iter {
-                let info = info?;
-                items.push(WalkItem {
-                    id: info.id,
-                    parents: info.parent_ids.iter().map(|id| id.to_owned()).collect(),
-                });
-            }
+            items.push(WalkItem {
+                id: info.id,
+                parents: info.parent_ids.iter().map(|id| id.to_owned()).collect(),
+            });
         }
     }
-    // `sort_in_topological_order()` runs over the whole limited list inside
-    // `prepare_revision_walk()`, so `--author-date-order` reshuffles the
-    // commit-date walk above rather than replacing it: parents stay behind
-    // their children and the ready set is ranked by author date, which is
-    // `record_author_date()` feeding `compare_commits_by_author_date()`.
-    if filters.order == Order::AuthorDate {
+    // `sort_in_topological_order()`'s `sort_order`: `--topo-order` ranks the ready
+    // set by nothing but the graph, `--date-order` by committer date and
+    // `--author-date-order` by author date, which is `record_author_date()` feeding
+    // `compare_commits_by_author_date()`. In every case parents stay behind their
+    // children; only the tie-break differs.
+    if filters.order != Order::Default {
         let ids: Vec<ObjectId> = items.iter().map(|item| item.id).collect();
         let parents_of: std::collections::HashMap<ObjectId, Vec<ObjectId>> = items
             .iter()
             .map(|item| (item.id, item.parents.clone()))
             .collect();
-        let dates: std::collections::HashMap<ObjectId, i64> =
-            ids.iter().map(|id| (*id, author_date(repo, *id))).collect();
-        // `--first-parent` narrows the topological sort's edges too, so a commit
-        // reached only as a merge's second parent sorts as a tip of its own.
-        let edges: std::collections::HashMap<ObjectId, Vec<ObjectId>> = match filters.first_parent {
+        let dates: Option<std::collections::HashMap<ObjectId, i64>> = match filters.order {
+            Order::Date => Some(
+                ids.iter().map(|id| (*id, super::rev_list::commit_date(repo, *id))).collect(),
+            ),
+            Order::AuthorDate => {
+                Some(ids.iter().map(|id| (*id, author_date(repo, *id))).collect())
+            }
+            Order::Default | Order::Topo => None,
+        };
+        // `--first-parent` narrows the sort's edges only when a commit-graph with
+        // generation numbers is present: `prepare_revision_walk()` then picks
+        // `init_topo_walk()`, which breaks after each commit's first parent, over
+        // `sort_in_topological_order()`, which has no `rev_info` and counts every
+        // parent (revision.c, commit.c).
+        let first_parent = filters.first_parent && repo.commit_graph().is_ok();
+        let edges: std::collections::HashMap<ObjectId, Vec<ObjectId>> = match first_parent {
             true => parents_of
                 .iter()
                 .map(|(id, ps)| (*id, ps.iter().take(1).copied().collect()))
                 .collect(),
             false => parents_of.clone(),
         };
-        let sorted = super::rev_list::topo_sort(&ids, &edges, Some(&dates));
+        let sorted = super::rev_list::topo_sort(&ids, &edges, dates.as_ref());
         let mut by_id: std::collections::HashMap<ObjectId, WalkItem> =
             items.into_iter().map(|item| (item.id, item)).collect();
         items = sorted

@@ -461,6 +461,35 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // ```c
+    // if (remote->mirror)
+    //         flags |= (TRANSPORT_PUSH_MIRROR|TRANSPORT_PUSH_FORCE);
+    // ```
+    //
+    // (`do_push()`, builtin/push.c:425-426.) `remote.<name>.mirror` is `--mirror`
+    // written into the configuration, and it arms the force bit alongside it — a
+    // mirror that could not rewind would not be a mirror. Reading it here, after
+    // the remote name is known and before the refspec defaults are chosen, is
+    // where git reads it: the mirror flag is what keeps `setup_default_push_refspecs()`
+    // from running at all.
+    //
+    // `specs.is_empty()` is this port's limit, not git's. The `--mirror can't be
+    // combined with refspecs` refusal is `cmd_push`'s and tests the *option*, which
+    // is parsed before `do_push()` reads the configuration — so git accepts
+    // `remote.<name>.mirror` beside a refspec and mirrors the deletions alongside
+    // it. This port raises that refusal from the request builder, where the two
+    // spellings are no longer distinguishable, so the configured flag is applied
+    // only where it cannot reach it.
+    if specs.is_empty()
+        && repo
+            .config_snapshot()
+            .boolean(&format!("remote.{remote_name}.mirror"))
+            == Some(true)
+    {
+        f.mirror = true;
+        f.force = true;
+    }
+
     // git validates the push-option list once, after the command line and
     // `push.pushOption` have been reconciled, so a configured value is checked too.
     if f.push_options.iter().any(|o| o.contains('\n')) {
@@ -530,6 +559,31 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         specs
     };
 
+    // ```c
+    // if (!strcmp(refspec, ":")) {
+    //         item->matching = 1;
+    //         return 1;
+    // }
+    // ```
+    //
+    // (`parse_refspec()`, refspec.c:73-76, reached after the leading `+` has been
+    // stripped.) `:` is not a source and a destination that are both empty — it is
+    // the *matching* refspec, and `match_push_refs()` expands it against the
+    // advertisement: every local branch the remote already carries, and nothing
+    // created. It is taken out of the list here because there is nothing for the
+    // request builder to resolve; `send_pack` receives it as a flag.
+    let specs: Vec<String> = {
+        let mut kept = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match spec.as_str() {
+                ":" => f.matching = Some(false),
+                "+:" => f.matching = Some(true),
+                _ => kept.push(spec),
+            }
+        }
+        kept
+    };
+
     // Build the concrete updates, plus the (local-branch, remote-ref) pairs that
     // `--set-upstream` records after a successful push.
     //
@@ -542,19 +596,28 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // its own `failed to push some refs` line at exit 1.
     let (mut requests, upstreams) = match build_requests(&repo, &f, &specs) {
         Ok(pair) => pair,
-        Err(e) => match e.downcast_ref::<SrcRefspecMissing>() {
-            Some(missing) => {
-                let url = remote
-                    .url(Direction::Push)
-                    .or_else(|| remote.url(Direction::Fetch))
-                    .map(|u| u.to_bstring().to_string())
-                    .unwrap_or_else(|| remote_name.to_string());
-                eprintln!("error: src refspec {} does not match any", missing.0);
-                eprintln!("error: failed to push some refs to '{url}'");
-                return Ok(ExitCode::from(1));
+        Err(e) => {
+            // Both refusals `match_explicit()` can raise are `error()`s that leave
+            // the push to fail with the same trailer; only the first line differs.
+            let first_line = e
+                .downcast_ref::<SrcRefspecMissing>()
+                .map(ToString::to_string)
+                .or_else(|| e.downcast_ref::<SrcRefspecAmbiguous>().map(ToString::to_string))
+                .or_else(|| e.downcast_ref::<DstRefspecCollision>().map(ToString::to_string));
+            match first_line {
+                Some(line) => {
+                    let url = remote
+                        .url(Direction::Push)
+                        .or_else(|| remote.url(Direction::Fetch))
+                        .map(|u| u.to_bstring().to_string())
+                        .unwrap_or_else(|| remote_name.to_string());
+                    eprintln!("error: {line}");
+                    eprintln!("error: failed to push some refs to '{url}'");
+                    return Ok(ExitCode::from(1));
+                }
+                None => return Err(e),
             }
-            None => return Err(e),
-        },
+        }
     };
 
     // Resolve `--force-with-lease` into each request's expected old value.
@@ -607,9 +670,23 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         let mut payload = String::new();
         for req in &requests {
             let remote_sha = tracking_oid(&repo, &remote, &req.name).unwrap_or(null);
+            // ```c
+            // strbuf_addf(&buf, "%s %s %s %s\n",
+            //             r->peer_ref->name, oid_to_hex(&r->new_oid),
+            //             r->name, oid_to_hex(&r->old_oid));
+            // ```
+            //
+            // (`run_pre_push_hook()`, transport.c:1409-1412.) The first field is
+            // `peer_ref->name` — the *local* ref — and the third is `ref->name`,
+            // the remote one. They differ whenever the refspec renames, and
+            // `git push origin main:refs/heads/other` is exactly that case: the
+            // hook must read `refs/heads/main … refs/heads/other …`, not the
+            // destination twice. A deletion has no peer ref and git writes
+            // `(delete)` in its place.
+            let local = req.src.as_deref().unwrap_or("(delete)");
             payload.push_str(&format!(
-                "{0} {1} {0} {2}\n",
-                req.name, req.new, remote_sha
+                "{local} {} {} {remote_sha}\n",
+                req.new, req.name
             ));
         }
         if !crate::hooks::run(&repo, "pre-push", &[&remote_name, &url], Some(payload.as_bytes()))? {
@@ -721,6 +798,23 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         delete_scope,
         local_refs,
         receive_pack,
+        // ```c
+        // if (pat->matching) {
+        //         if (!send_mirror && !starts_with(ref->name, "refs/heads/"))
+        //                 return NULL;
+        //         name = xstrdup(ref->name);
+        // }
+        // ```
+        //
+        // (`get_ref_match()`, remote.c.) The candidate set for a matching refspec
+        // is `refs/heads/` alone — tags and remote-tracking refs are `--mirror`'s
+        // business — and each branch keeps its own name on the far side. Which of
+        // them are actually pushed is decided against the advertisement one layer
+        // down.
+        matching: f.matching.map(|force| push_proto::Matching {
+            force,
+            branches: local_branch_tips(&repo),
+        }),
     };
     let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run, &send_opts)?;
 
@@ -777,6 +871,14 @@ struct Flags {
     /// `--receive-pack`/`--exec`, else `remote.<name>.receivepack`.
     receive_pack: Option<String>,
     recurse: Recurse,
+    /// The *matching* refspec — a bare `:` on the command line, `remote.<name>.push = :`,
+    /// or `push.default = matching`, which git carries as `TRANSPORT_PUSH_MATCHING`
+    /// rather than as a refspec. `Some(force)` records whether it was written `+:`.
+    ///
+    /// It cannot be expanded before the handshake: "matching" means every local
+    /// branch **the remote already has**, so the set is decided by the
+    /// advertisement. `push_proto::send_pack` does the expansion.
+    matching: Option<bool>,
 }
 
 /// `--recurse-submodules=<mode>` state. Ported from git's `RECURSE_SUBMODULES_*`
@@ -858,11 +960,28 @@ fn parse_lease(value: Option<String>) -> Result<Lease> {
     };
     let (ref_name, expect) = match v.split_once(':') {
         Some((r, e)) if !e.is_empty() => {
-            let repo = crate::setup::discover()?;
-            let id = repo
-                .rev_parse_single(e)
-                .map_err(|_| anyhow!("cannot parse expected object name '{e}'"))?
-                .detach();
+            // ```c
+            // if (!repo_get_oid(the_repository, colon + 1, &entry->expect))
+            //         entry->use_tracking = 0;
+            // else if (!repo_get_oid_hex(the_repository, colon + 1, &entry->expect))
+            //         ; /* the object may not exist locally */
+            // ```
+            //
+            // (`parse_push_cas_option()`, remote.c.) The hex fallback is the whole
+            // point of the second arm: the value leased is *the remote's* tip, and
+            // a checkout that has never seen it cannot resolve it. git records the
+            // raw id and lets the server's compare-and-swap answer, which it does
+            // with `! [rejected] <ref> -> <ref> (stale info)`. Resolving only
+            // through `rev_parse` turned that rejection into a failure to run.
+            let id = match gix::ObjectId::from_hex(e.as_bytes()) {
+                Ok(id) => id,
+                Err(_) => {
+                    let repo = crate::setup::discover()?;
+                    repo.rev_parse_single(e)
+                        .map_err(|_| anyhow!("cannot parse expected object name '{e}'"))?
+                        .detach()
+                }
+            };
             (r.to_string(), Some(id))
         }
         Some((r, _)) => (r.to_string(), None),
@@ -1035,6 +1154,24 @@ fn build_requests(
 
     if f.delete {
         for spec in specs {
+            // ```c
+            // } else if (deleterefs) {
+            //         char *delref;
+            //         if (strchr(ref, ':') || !*ref)
+            //                 die(_("--delete only accepts plain target ref names"));
+            //         delref = xstrfmt(":%s", ref);
+            //         refspec_append(&rs, delref);
+            // ```
+            //
+            // (`set_refspecs()`, builtin/push.c:80-88.) `--delete <ref>` is the
+            // refspec `:<ref>` written the other way round, and it goes through the
+            // same `refspec_append()` → `refspec_item_init_or_die()` as any other.
+            // A `*` in `<ref>` therefore lands on the destination side of a spec
+            // whose source is empty, which is not a pattern on both sides — so the
+            // refusal names the colon-prefixed spelling the user never typed.
+            if spec.contains('*') {
+                crate::git_fatal!("invalid refspec ':{spec}'");
+            }
             requests.push(Request {
                 name: full_ref_name(spec),
                 src: None,
@@ -1055,11 +1192,30 @@ fn build_requests(
     }
 
     if specs.is_empty() {
-        let (req, up) = current_branch_request(repo, f.force)?;
-        requests.push(req);
-        upstreams.push(up);
+        // A matching refspec *is* the request set, and it is built from the
+        // advertisement in `send_pack`. Falling back to the current branch here
+        // would push one branch where git pushes every matching one.
+        if f.matching.is_none() {
+            let (req, up) = current_branch_request(repo, f.force)?;
+            requests.push(req);
+            upstreams.push(up);
+        }
     } else {
+        // `get_local_heads()` once, not once per refspec: `count_refspec_match()`
+        // is asked the same question of the same ref list for every explicit
+        // source, and a repository with many refs would otherwise walk them all
+        // again for each one.
+        let local_refs = crate::refname::all_ref_names(repo);
         for spec in specs {
+            // `parse_refspec()` accepts `^<src>` for a push — it sets
+            // `item->negative` and returns — but nothing on the push side reads
+            // that flag: `match_push_refs()` has no exclusion pass, so the spec is
+            // parsed, kept, and has no effect. Measured against stock 2.55.0,
+            // `git push origin ^refs/heads/div +refs/heads/*:refs/heads/n/*`
+            // pushes `div` and `main` alike and exits 0.
+            if spec.starts_with('^') {
+                continue;
+            }
             // A PATTERN refspec (`refs/heads/*:refs/heads/*`) expands to one
             // update per matching local ref, with the matched tail substituted
             // into the destination — git's `match_push_refs` glob handling. This
@@ -1069,7 +1225,23 @@ fn build_requests(
                 requests.extend(expand_pattern_refspec(repo, spec, f.force)?);
                 continue;
             }
-            let (req, up) = parse_refspec(repo, spec, f.force)?;
+            let (req, up) = parse_refspec(repo, spec, f.force, &local_refs)?;
+            // ```c
+            // if (matched_dst->peer_ref)
+            //         return error(_("dst ref %s receives from more than one src"),
+            //                      matched_dst->name);
+            // ```
+            //
+            // (`match_explicit()`, remote.c:1177-1179.) The destination remembers
+            // which source claimed it, and a second explicit refspec landing on it
+            // is refused — an `error()` that fails the whole push before anything
+            // is sent, not a last-one-wins overwrite. `fetch` refuses the same
+            // collision as a `die()` with a different sentence.
+            if let Some(claimed) = requests.iter().find(|r| r.name == req.name) {
+                if claimed.src != req.src {
+                    return Err(anyhow::Error::new(DstRefspecCollision(req.name.clone())));
+                }
+            }
             requests.push(req);
             if let Some(up) = up {
                 upstreams.push(up);
@@ -1151,6 +1323,7 @@ fn parse_refspec(
     repo: &gix::Repository,
     spec: &str,
     force: bool,
+    local_refs: &[String],
 ) -> Result<(Request, Option<Upstream>)> {
     let (spec, force) = match spec.strip_prefix('+') {
         Some(rest) => (rest, true),
@@ -1172,6 +1345,14 @@ fn parse_refspec(
     // `--set-upstream` follows the symref from `HEAD` rather than failing to
     // resolve `@` as a ref name.
     let src = if src == "@" { "HEAD" } else { src };
+
+    // `count_refspec_match()` runs before anything is resolved, and more than one
+    // match is refused rather than disambiguated — see [`SrcRefspecAmbiguous`].
+    // A source that matches exactly one ref, or none at all, falls through to the
+    // resolution below (the `case 0` object-name fallback included).
+    if !src.is_empty() && crate::refname::count_refspec_match(src, local_refs).0 > 1 {
+        return Err(anyhow::Error::new(SrcRefspecAmbiguous(src.to_string())));
+    }
 
     let new = if src.is_empty() {
         null(repo) // `:dst` deletes the remote ref.
@@ -1308,23 +1489,91 @@ impl std::fmt::Display for SrcRefspecMissing {
 
 impl std::error::Error for SrcRefspecMissing {}
 
+/// A refspec source that names more than one local ref — `match_explicit()`'s
+/// `default:` arm, which is an `error()` and a failed push just like
+/// [`SrcRefspecMissing`], with its own message:
+///
+/// ```c
+/// switch (count_refspec_match(rs->src, src, &matched_src)) {
+/// case 1:
+///         break;
+/// case 0:
+///         /* The source could be in the get_sha1() format
+///          * not a reference name.  :dst is IOW to delete dst.
+///          */
+///         if (try_explicit_object_name(rs->src, &matched_src) < 0)
+///                 return error(_("src refspec %s does not match any"), rs->src);
+///         [...]
+/// default:
+///         return error(_("src refspec %s matches more than one"), rs->src);
+/// }
+/// ```
+///
+/// (`match_explicit()`, remote.c:1121-1136.) Note where the object-name fallback
+/// sits: only under `case 0`. A name that matches two refs is refused outright and
+/// never re-read as a rev, which is why `git push . top:refs/heads/x` fails on a
+/// repository holding `refs/top`, `refs/heads/top` and `refs/tags/top` even though
+/// `rev-parse top` answers happily.
+#[derive(Debug)]
+struct SrcRefspecAmbiguous(String);
+
+impl std::fmt::Display for SrcRefspecAmbiguous {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "src refspec {} matches more than one", self.0)
+    }
+}
+
+impl std::error::Error for SrcRefspecAmbiguous {}
+
+/// Two explicit refspecs naming one destination — `match_explicit()`'s
+/// `dst ref %s receives from more than one src`, the third of its `error()`s and
+/// the third failure the push reports with the same trailer.
+#[derive(Debug)]
+struct DstRefspecCollision(String);
+
+impl std::fmt::Display for DstRefspecCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dst ref {} receives from more than one src", self.0)
+    }
+}
+
+impl std::error::Error for DstRefspecCollision {}
+
+/// Every `refs/heads/` ref and the object it points at — `get_ref_match()`'s
+/// candidate set for a matching refspec.
+///
+/// A symbolic branch is skipped: `try_id()` is `None` for it, and there is no
+/// branch to push under that name anyway.
+fn local_branch_tips(repo: &gix::Repository) -> Vec<(String, ObjectId)> {
+    let Ok(platform) = repo.references() else { return Vec::new() };
+    let Ok(iter) = platform.local_branches() else { return Vec::new() };
+    iter.filter_map(Result::ok)
+        .filter_map(|reference| {
+            let name = reference.name().as_bstr().to_str().ok()?.to_string();
+            Some((name, reference.try_id()?.detach()))
+        })
+        .collect()
+}
+
 /// `remote.<name>.push`, the refspecs a bare `git push <name>` uses in place of the
 /// `push.default` machinery (builtin/push.c:432-433).
 fn configured_push_refspecs(repo: &gix::Repository, name: &str) -> Vec<String> {
-    repo.config_snapshot()
-        .plumbing()
-        .strings_by("remote", Some(name.into()), "push")
-        .map(|values| values.iter().map(|v| v.to_str_lossy().into_owned()).collect())
-        .unwrap_or_default()
+    // `crate::config::multi_values` and not `strings_by`: a valued `-c` override
+    // reaches the snapshot on two sources (see `crate::setup::double_delivered`),
+    // so the plain reader returns `-c remote.origin.push=<spec>` twice. One
+    // refspec pushed twice is two commands for one ref on the wire, and the
+    // server reports the second under no name at all — `! [remote rejected]
+    // <ref> (remote end did not report status)` on a push git reports as clean.
+    crate::config::multi_values(repo, &format!("remote.{name}.push"))
 }
 
 /// `setup_default_push_refspecs()` (builtin/push.c:229-287): what a bare `git push` pushes
 /// when the remote configures no `push` refspec of its own.
 ///
 /// Returns the single `<src>:<dst>` refspec git appends, or the exit code of one of the
-/// `die()`s along the way. `matching` is the one mode this port cannot express as a
-/// refspec — git's `:` needs the remote's advertisement to pair branches up — and is left
-/// to the `current`-shaped fallback below.
+/// `die()`s along the way. `matching` comes back as the refspec `:`, which the caller
+/// turns into the flag git sets for it — the advertisement it needs to pair branches up
+/// is only there once the handshake has run.
 fn default_push_refspec(
     repo: &gix::Repository,
     remote: &gix::Remote<'_>,
@@ -1343,8 +1592,17 @@ fn default_push_refspec(
         );
         return Ok(Err(ExitCode::from(128)));
     }
+    // ```c
+    // case PUSH_DEFAULT_MATCHING:
+    //         *flags |= TRANSPORT_PUSH_MATCHING;
+    //         return;
+    // ```
+    //
+    // (`setup_default_push_refspecs()`, builtin/push.c.) git sets the flag rather
+    // than appending a refspec; returning the spelling that carries the same
+    // meaning — `:` — lets the one place that recognises it handle both spellings.
     if push_default == "matching" {
-        return Ok(Ok(Vec::new()));
+        return Ok(Ok(vec![":".to_string()]));
     }
 
     let Some(branch) = repo.head()?.referent_name().map(|n| n.shorten().to_string()) else {
@@ -2096,6 +2354,7 @@ fn expand_pattern_refspec(
     spec: &str,
     force: bool,
 ) -> Result<Vec<Request>> {
+    let original = spec;
     let (spec, force) = match spec.strip_prefix('+') {
         Some(rest) => (rest, true),
         None => (spec, force),
@@ -2104,8 +2363,21 @@ fn expand_pattern_refspec(
         Some((s, d)) => (s, d),
         None => (spec, spec),
     };
+    // `refspec_item_init_or_die()` names the refspec **as it was written** and says
+    // nothing else — the `+` included, and no explanation of which rule was broken:
+    //
+    // ```c
+    // void refspec_item_init_or_die(struct refspec_item *item, const char *refspec,
+    //                               int fetch)
+    // {
+    //         if (!refspec_item_init(item, refspec, fetch))
+    //                 die(_("invalid refspec '%s'"), refspec);
+    // }
+    // ```
+    //
+    // (refspec.c:198-203.)
     if src.matches('*').count() != 1 || dst.matches('*').count() != 1 {
-        crate::git_fatal!("invalid refspec '{spec}': a pattern needs exactly one '*' on each side");
+        crate::git_fatal!("invalid refspec '{original}'");
     }
     let (src_prefix, src_suffix) = src.split_once('*').expect("checked above");
     let (dst_prefix, dst_suffix) = dst.split_once('*').expect("checked above");
@@ -2126,9 +2398,14 @@ fn expand_pattern_refspec(
     for (name, id) in names {
         let Some(rest) = name.strip_prefix(src_prefix.as_str()) else { continue };
         let Some(matched) = rest.strip_suffix(src_suffix) else { continue };
-        if matched.is_empty() {
-            continue;
-        }
+        // A zero-width capture is a match like any other. `match_name_with_pattern()`
+        // measures the two ends and copies whatever lies between them, with no
+        // lower bound on its length, so `refs/heads/main*` matches
+        // `refs/heads/main` and splices nothing into the destination. The name
+        // that comes out — `refs/heads/zero/` for `refs/heads/zero/*` — is one
+        // git will not write, but the refusal belongs to the ref-update layer:
+        // dropping the match here reports `Everything up-to-date` where git
+        // reports `! [remote rejected] main -> zero/ (funny refname)`.
         out.push(Request {
             name: format!("{dst_prefix}{matched}{dst_suffix}"),
             src: Some(name.clone()),

@@ -1331,7 +1331,14 @@ fn emit_commit_header(
         out.push(if oneline { b' ' } else { term });
     }
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
-    let body = super::log::rev_list_pretty_body(repo, &commit, pretty)?;
+    // `diff-tree` has no `--date` option, so its pretty printer always renders the
+    // default date mode.
+    let body = super::log::rev_list_pretty_body(
+        repo,
+        &commit,
+        pretty,
+        &super::log::DateMode::Default,
+    )?;
     let empty_format = user_format && body.is_empty();
     if !body.is_empty() {
         out.extend_from_slice(&body);

@@ -179,12 +179,23 @@
 //!   The regex engine is the `regex` crate rather than the platform `regcomp`, so
 //!   which *patterns compile* can differ even though the message
 //!   (`error: invalid regex given to -I: '<pat>'`, 129) does not.
-//! * `--textconv` / `--no-textconv` and `--ext-diff` / `--no-ext-diff` are accepted and
-//!   inert. `GIT_EXTERNAL_DIFF`, `diff.external` and a `diff.<driver>.command` or
-//!   `diff.<driver>.textconv` reached through gitattributes are all ignored: the blob
-//!   platform is built with `skip_internal_diff_if_external_is_configured` off, so it
-//!   never even reports an external command. `diff-files`, `diff-index` and
-//!   `diff-pairs` do honour them — see [`super::diff_pairs`] for the port.
+//! * Userdiff drivers are honoured: the driver a path's `diff` gitattribute names is
+//!   resolved by [`resolve_drivers`] out of git's built-in table
+//!   ([`crate::userdiff`]) overlaid with `diff.<name>.*`, and three of its fields
+//!   reach the output.
+//!   - `funcname`/`xfuncname` (and every built-in driver's own pattern) supply the
+//!     `@@ … @@ <section>` heading, in place of xdiff's `def_ff` heuristic. The same
+//!     pattern also drives `-L :<funcname>` for `blame` and `log`.
+//!   - `textconv` converts each side before xdiff ([`apply_textconv`]); the counts
+//!     `--stat`/`--numstat` print still come from the unconverted images, because
+//!     `builtin_diffstat()` never calls `fill_textconv()`. `--no-textconv` turns it
+//!     off, and `diff.<driver>.cachetextconv`'s notes cache is not written — the
+//!     patch is the same, the converter just runs every time.
+//!   - `command`, plus `GIT_EXTERNAL_DIFF` and `diff.external`, replace the whole
+//!     section with the program's stdout, through the `run_external_diff()` port in
+//!     [`super::diff_pairs`] that `diff-files`, `diff-index` and `diff-pairs` share.
+//!     `git diff` allows it by default and `--no-ext-diff` refuses it; `log`/`show`
+//!     leave `flags.allow_external` down until `--ext-diff` raises it.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
 //!   filtering is supported.
 //! * `--anchored=<text>` is implemented: the anchor prefixes reach
@@ -358,9 +369,6 @@ pub(crate) enum SubmoduleFormat {
 /// or default-valued spelling whose callback, read in git 2.55.0, writes the state
 /// this port is permanently in:
 ///
-/// * `--no-textconv` — clears `flags.allow_textconv`. No textconv driver is ever
-///   run here, so the converted side never existed to suppress.
-/// * `--no-ext-diff` — clears `flags.allow_external`, likewise.
 /// * `--ita-visible-in-index` / `--ita-invisible-in-index` — `flags.ita_invisible_in_index`
 ///   is read only by the index-vs-worktree and index-vs-tree walks (diff-lib.c);
 ///   `log`/`show`/`whatchanged` diff two trees and never see an intent-to-add entry.
@@ -372,19 +380,13 @@ pub(crate) enum SubmoduleFormat {
 /// rename, a symlink, an exec-bit flip and a tab in a pathname.
 ///
 /// The negations that *used* to live here — `--no-compact-summary`,
-/// `--no-color-moved`, `--color-moved=no`, `--no-color-moved-ws`, `--word-diff=none`
-/// and `--no-relative` — have moved out because their positive spellings are now
-/// ported: each is handled by the option parser that owns the flag it clears, so
-/// `--compact-summary --no-compact-summary` really does undo the first flag instead
-/// of being swallowed twice.
+/// `--no-color-moved`, `--color-moved=no`, `--no-color-moved-ws`, `--word-diff=none`,
+/// `--no-relative`, `--no-textconv` and `--no-ext-diff` — have moved out because
+/// their positive spellings are now ported: each is handled by the option parser that
+/// owns the flag it clears, so `--compact-summary --no-compact-summary` really does
+/// undo the first flag instead of being swallowed twice.
 pub(crate) fn history_noop_diff_option(a: &str) -> bool {
-    matches!(
-        a,
-        "--no-textconv"
-            | "--no-ext-diff"
-            | "--ita-visible-in-index"
-            | "--ita-invisible-in-index"
-    )
+    matches!(a, "--ita-visible-in-index" | "--ita-invisible-in-index")
 }
 
 /// `parse_submodule_params()` (diff.c:194): the three format names, or `None` for
@@ -470,6 +472,38 @@ struct Delta {
     /// currently has checked out, which `run_diff_files()` writes into `p->two->oid`
     /// while leaving the filespec invalid. `None` for every other pair.
     new_commit: Option<ObjectId>,
+    /// The userdiff drivers this pair's two filespec paths select, resolved once by
+    /// [`resolve_drivers`] after the queue is built.
+    drivers: PairDrivers,
+    /// `fill_textconv()`'s two images, present only when one of the pair's drivers
+    /// configures `diff.<name>.textconv`. Filled by [`apply_textconv`] ahead of the
+    /// analysis; a side whose own driver has no converter carries its raw content
+    /// here, which is what `fill_textconv(NULL, df)` hands back.
+    textconv: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+/// `userdiff_find_by_path()` for a pair's two filespecs. git looks the two sides up
+/// separately and uses them for different things: `run_diff_cmd()` takes the external
+/// command from `attr_path`, which is `p->one->path` (diff.c:5036); `builtin_diff()`
+/// asks `one` for the funcname pattern and falls back to `two` (diff.c:4036-4038); and
+/// `get_textconv()` converts each side through its *own* path's driver
+/// (diff.c:3891-3892). The two differ only for a rename or a copy.
+#[derive(Clone, Default)]
+struct PairDrivers {
+    /// `p->one->path`, git's `attr_path`.
+    one: Option<std::sync::Arc<crate::userdiff::Driver>>,
+    /// `p->two->path`.
+    two: Option<std::sync::Arc<crate::userdiff::Driver>>,
+}
+
+impl PairDrivers {
+    /// `pe = diff_funcname_pattern(o, one); if (!pe) pe = diff_funcname_pattern(o, two);`
+    fn funcname(&self) -> Option<&crate::userdiff::FuncName> {
+        self.one
+            .as_ref()
+            .and_then(|d| d.funcname.as_ref())
+            .or_else(|| self.two.as_ref().and_then(|d| d.funcname.as_ref()))
+    }
 }
 
 impl Delta {
@@ -518,6 +552,8 @@ impl Delta {
             old_dirty_submodule: 0,
             dirty_submodule: 0,
             new_commit: None,
+            drivers: PairDrivers::default(),
+            textconv: None,
         }
     }
 
@@ -550,6 +586,237 @@ impl Delta {
         old_ok && new_ok && (self.old.is_some() || self.new_valid())
     }
 }
+
+/// `external_diff()` (diff.c:5026): the program every pair goes to unless its own
+/// driver names one. `GIT_EXTERNAL_DIFF` first — kept even when it is the empty
+/// string, which `xstrdup_or_null()` does not turn into NULL — and `diff.external`
+/// with `diff.trustExitCode` second.
+///
+/// `git_diff_ui_config()` owns the two configuration keys, so only the porcelains
+/// (`diff`, `log`, `show`) read them; the plumbing verbs see the environment alone.
+fn external_diff_program(
+    repo: &gix::Repository,
+) -> Result<Option<super::diff_pairs::ExternalDiff>> {
+    if let Some(env) = super::diff_pairs::external_diff_env().map_err(crate::fatal::die)? {
+        return Ok(Some(env));
+    }
+    let snapshot = repo.config_snapshot();
+    let Some(cmd) = snapshot.string("diff.external") else {
+        return Ok(None);
+    };
+    Ok(Some(super::diff_pairs::ExternalDiff {
+        cmd: cmd.to_string(),
+        trust_exit_code: snapshot.boolean("diff.trustExitCode").unwrap_or(false),
+    }))
+}
+
+/// `run_diff_cmd()`'s driver override (diff.c:4952-4956): a pair whose `attr_path`
+/// selects a driver configuring `diff.<name>.command` goes to that program in
+/// preference to [`external_diff_program`]'s.
+fn external_for_pair(
+    delta: &Delta,
+    env: Option<&super::diff_pairs::ExternalDiff>,
+) -> Option<super::diff_pairs::ExternalDiff> {
+    if let Some(drv) = &delta.drivers.one {
+        if let Some(cmd) = &drv.settings.external {
+            return Some(super::diff_pairs::ExternalDiff {
+                cmd: cmd.clone(),
+                trust_exit_code: drv.settings.trust_exit_code,
+            });
+        }
+    }
+    env.cloned()
+}
+
+/// This pair as the shared [`super::diff_pairs::run_external_diff`] engine sees it.
+///
+/// `old_id`/`new_id` are `diff_fill_oid_info()`'s (diff.c:4990), which the caller
+/// already has: for a tree pair they are the queue's own ids, and for a worktree side
+/// the hash the analysis computed. git fills that hash without raising `oid_valid`,
+/// which is why the id can be real while `prepare_temp_file()` still hands the driver
+/// the worktree path and names it by the null id.
+fn ext_pair(
+    delta: &Delta,
+    old_id: ObjectId,
+    new_id: ObjectId,
+    null: ObjectId,
+) -> super::diff_pairs::ExtPair {
+    let kind = status_char(delta);
+    super::diff_pairs::ExtPair {
+        old_path: delta.old_path().clone(),
+        new_path: delta.path.clone(),
+        old_id: if delta.old.is_some() { old_id } else { null },
+        new_id: if delta.new_valid() { new_id } else { null },
+        old_mode: delta.old.map_or(0, |(_, k)| kind_mode(k)),
+        new_mode: delta.new_kind().map_or(0, kind_mode),
+        old_oid_valid: !delta.old_worktree,
+        new_oid_valid: !matches!(delta.new, NewSide::Worktree(_)),
+        kind,
+        // `fill_metainfo()` prints `similarity index %d%%` through
+        // `similarity_index(p->score)`, so the engine is handed the percentage.
+        score: match kind {
+            b'C' | b'R' | b'M' => diffcore_rename::similarity_index(delta.score),
+            _ => 0,
+        },
+    }
+}
+
+/// The state one command's external-diff invocations share: the gitattributes stack
+/// `run_diff_cmd()` resolves `attr_path` through, `external_diff()`'s program, and
+/// `o->diff_path_counter`.
+///
+/// `index_read` is false because this port never populates `r->index` before
+/// diffing, which is what `reuse_worktree_file()` requires: measured against git
+/// 2.55.0, `GIT_EXTERNAL_DIFF=echo git diff HEAD~1 HEAD` hands the driver two
+/// temporary files even when the worktree already holds the post-image byte for
+/// byte. A side that has no object at all still reaches the driver as its worktree
+/// path, through `prepare_temp_file()`'s `!oid_valid` branch.
+fn ext_context<'a, 'repo>(
+    drivers: super::diff_pairs::Drivers<'a, 'repo>,
+    env: Option<super::diff_pairs::ExternalDiff>,
+) -> super::diff_pairs::ExtCtx<'a, 'repo> {
+    super::diff_pairs::ExtCtx {
+        drivers,
+        env,
+        counter: std::cell::Cell::new(0),
+        index_read: std::cell::Cell::new(false),
+        index: std::cell::OnceCell::new(),
+    }
+}
+
+/// `fill_textconv()` (diff.c:7793) for every queued pair, ahead of the analysis.
+///
+/// git converts a side inside `builtin_diff()` as the pair is rendered
+/// (diff.c:4027-4028). This runs the converters in one pass instead, because
+/// [`analyze_all`] fans the pairs across worker threads and a textconv program is an
+/// external process that has to be started once per side, in queue order, the way git
+/// starts it.
+///
+/// A pair whose drivers configure no converter is left alone, so the ordinary diff
+/// pays nothing for this pass beyond the walk.
+///
+/// One consequence of converting up front: `die(_("unable to read files to diff"))`
+/// arrives before anything has been printed, where git — which converts as it
+/// renders — has already flushed whatever preceded the failing pair. Measured
+/// against git 2.55.0, `git -c diff.<drv>.textconv=false diff -p --stat` prints the
+/// stat block and then the fatal, while this prints the fatal alone. Both exit 128,
+/// and a run whose *first* rendered pair is the failing one agrees byte for byte.
+///
+/// Not reproduced: `diff.<driver>.cachetextconv`. git memoises the converted bytes in
+/// a `refs/notes/textconv/<driver>` notes cache keyed by blob id (`notes_cache_get()`
+/// / `notes_cache_put()`); this port re-runs the converter every time, which produces
+/// the same patch and leaves the notes ref unwritten.
+fn apply_textconv(
+    repo: &gix::Repository,
+    drivers: &mut DriverCache<'_>,
+    deltas: &mut [Delta],
+    workdir: Option<&std::path::Path>,
+) -> Result<()> {
+    for d in deltas.iter_mut() {
+        // `builtin_diff()` returns from its submodule branches (diff.c:3870-3887)
+        // before `get_textconv()` is ever called, and an unmerged pair never reaches
+        // `builtin_diff()` at all.
+        if d.unmerged || d.is_submodule_pair() {
+            continue;
+        }
+        let one = d.drivers.one.as_ref().and_then(|x| x.settings.textconv.clone());
+        let two = d.drivers.two.as_ref().and_then(|x| x.settings.textconv.clone());
+        if one.is_none() && two.is_none() {
+            continue;
+        }
+        let old_path = d.old_path().clone();
+        // `get_textconv()` (diff.c:7745) answers NULL for an invalid filespec, so an
+        // addition's pre-image and a deletion's post-image are never converted —
+        // `fill_textconv()` then returns the empty string for them.
+        let old_img = match (&one, d.old) {
+            (Some(pgm), Some((id, _))) => {
+                let raw = match d.old_worktree {
+                    true => read_worktree_bytes(workdir, &old_path).unwrap_or_default(),
+                    false => read_blob(&repo.objects, id)?,
+                };
+                run_textconv(drivers, pgm, old_path.as_bstr(), &raw)?
+            }
+            (_, Some((id, _))) => match d.old_worktree {
+                true => read_worktree_bytes(workdir, &old_path).unwrap_or_default(),
+                false => read_blob(&repo.objects, id)?,
+            },
+            (_, None) => Vec::new(),
+        };
+        let new_raw = match &d.new {
+            NewSide::Absent => None,
+            NewSide::Blob(id, _) => Some(read_blob(&repo.objects, *id)?),
+            NewSide::Worktree(_) => Some(read_worktree_bytes(workdir, &d.path).unwrap_or_default()),
+        };
+        let new_img = match (&two, new_raw) {
+            (Some(pgm), Some(raw)) => run_textconv(drivers, pgm, d.path.as_bstr(), &raw)?,
+            (_, Some(raw)) => raw,
+            (_, None) => Vec::new(),
+        };
+        d.textconv = Some((old_img, new_img));
+    }
+    Ok(())
+}
+
+/// `run_textconv()` (diff.c:7758): materialise the blob the way `prepare_temp_file()`
+/// does — its worktree form, under its own basename in a private directory — run the
+/// program over it through the shell, and take its stdout.
+///
+/// `if (!*outbuf) die(_("unable to read files to diff"))`: a program that could not be
+/// started, or that exited non-zero, is fatal.
+///
+/// One departure: `prepare_temp_file()` hands the program the *worktree file itself*
+/// for a side that has no object of its own (`!one->oid_valid`), where this always
+/// writes a temporary copy. The bytes agree for every path whose worktree form is its
+/// stored form; a path with a smudge filter would have that filter applied twice, and
+/// a converter that reads its argument's directory sees the temporary one. No such
+/// converter is reachable from the cases this is measured on, and the fix is a second
+/// entry point on [`super::cat_file::Textconv`] rather than a change here.
+fn run_textconv(
+    drivers: &mut DriverCache<'_>,
+    program: &str,
+    path: &gix::bstr::BStr,
+    raw: &[u8],
+) -> Result<Vec<u8>> {
+    match drivers.run_program(program, path, raw)? {
+        Some(text) => Ok(text),
+        None => Err(crate::fatal::die("unable to read files to diff")),
+    }
+}
+
+/// `userdiff_find_by_path()` over the whole queue, plus `xdiff_set_find_func()` once
+/// per distinct driver.
+///
+/// git resolves this inside `run_diff_cmd()` and `builtin_diff()`, per pair, as each
+/// one is rendered. Doing it in a single pass here keeps the gitattributes stack and
+/// the compiled regexes out of the worker threads [`analyze_all`] fans the pairs
+/// across, and compiles each driver's pattern once instead of once per file.
+///
+/// A pattern that will not compile is `die(_("Invalid regexp to look for hunk header:
+/// %s"))`. git raises it when the first pair carrying that driver reaches xdiff, so a
+/// pair rendered *before* that one has already printed; this port renders nothing
+/// until every pair has been analyzed, so its refusal always arrives with no output.
+/// The two agree whenever the offending pair is the first one — measured against git
+/// 2.55.0, `git -c diff.markdown.xfuncname='^[' diff HEAD~3 HEAD` over a three-file
+/// change prints the fatal and nothing else.
+fn resolve_drivers(drivers: &mut DriverCache<'_>, deltas: &mut [Delta]) -> Result<()> {
+    for d in deltas.iter_mut() {
+        let one_path = d.old_path().clone();
+        let one = drivers.for_path(one_path.as_bstr()).map_err(crate::fatal::die)?;
+        d.drivers.two = if d.path == one_path {
+            one.clone()
+        } else {
+            drivers.for_path(d.path.as_bstr()).map_err(crate::fatal::die)?
+        };
+        d.drivers.one = one;
+    }
+    Ok(())
+}
+
+/// The [`crate::userdiff::Lookup`] a command holds for its whole run: one
+/// gitattributes stack, one compiled driver per name, and the worktree filter the
+/// textconv programs are fed through. Shared by [`resolve_drivers`],
+/// [`apply_textconv`] and every commit one `log -p` worker renders.
+pub(crate) type DriverCache<'repo> = crate::userdiff::Lookup<'repo>;
 
 /// The `S_IFMT` class of a tree entry mode — what `run_diff()` compares when it
 /// decides a pair is a type change (diff.c:5054). `100644` and `100755` are both
@@ -590,6 +857,10 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         old_dirty_submodule: 0,
         dirty_submodule: 0,
         new_commit: None,
+        drivers: d.drivers.clone(),
+        // The deletion half's post-image is git's invalid filespec, which
+        // `fill_textconv()` renders as nothing at all.
+        textconv: d.textconv.as_ref().map(|(o, _)| (o.clone(), Vec::new())),
     };
     let creation = Delta {
         path: d.path.clone(),
@@ -610,6 +881,8 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         old_dirty_submodule: 0,
         dirty_submodule: d.dirty_submodule,
         new_commit: d.new_commit,
+        drivers: d.drivers.clone(),
+        textconv: d.textconv.as_ref().map(|(_, n)| (Vec::new(), n.clone())),
     };
     Some((deletion, creation))
 }
@@ -691,6 +964,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--compact-summary`: annotate `--stat` names with create/delete/mode info.
     let mut compact_summary = false;
     let mut func_context = false;
+    // `cmd_diff()` (builtin/diff.c:635) sets `flags.allow_textconv` before the option
+    // parse, so `git diff` converts by default and only `--no-textconv` stops it.
+    let mut allow_textconv = true;
+    // `flags.allow_external`, raised beside it: `git diff` runs an external driver by
+    // default where `log`/`show` need `--ext-diff` to ask for one.
+    let mut allow_external = true;
     // The `xdiff` knobs fed to [`super::diff_pairs::emit_unified`]: `xpp.flags`'
     // `XDF_IGNORE_BLANK_LINES`, `xpp.ignore_regex` (`-I<re>`),
     // `xecfg.interhunkctxlen` and `DIFF_OPT_TEXT`.
@@ -1337,11 +1616,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // default here, so it cannot change any output this command produces.
             "--no-notes" => {}
             "--ignore-cr-at-eol" => ws = Whitespace::IgnoreCrAtEol,
-            // KNOWN DIVERGENCE, do not describe these as no-ops: `--textconv` and
-            // `--ext-diff` both change stock's output and are not honored here.
-            // `diff_pairs.rs` has the real implementations (`fill_textconv()` and
-            // `run_external_diff()`); wiring this command through them is the fix.
-            "--no-ext-diff" | "--ext-diff" | "--textconv" | "--no-textconv" => {}
+            // `cmd_diff()` (builtin/diff.c) raises `flags.allow_textconv` before
+            // parsing, so `--textconv` only restores git's default for this command.
+            "--textconv" => allow_textconv = true,
+            "--no-textconv" => allow_textconv = false,
+            // `cmd_diff()` raises `flags.allow_external` before parsing, so
+            // `--ext-diff` only restores git's default for this command.
+            "--ext-diff" => allow_external = true,
+            "--no-ext-diff" => allow_external = false,
             // `cmd_diff()` (builtin/diff.c:635) raises
             // `flags.ita_invisible_in_index` before parsing, so `git diff`'s default
             // is "invisible" and only `--ita-visible-in-index` lowers it again.
@@ -2397,6 +2679,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `userdiff_find_by_path()` for every queued pair, on the repository-relative
+    // names — `run_diff()` reads `attr_path` off `p->one->path` before
+    // `strip_prefix()` shortens anything (diff.c:5036-5038), and `--relative`'s
+    // shortening here happens later still.
+    let mut drivers = DriverCache::new(&repo)?;
+    resolve_drivers(&mut drivers, &mut deltas)?;
+
     // ---- analyze every delta once -----------------------------------------
     // `--quiet`/`-s` produce no output, so the patch bodies are never needed.
     let workdir = repo.workdir().map(|p| p.to_owned());
@@ -2407,7 +2696,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // against 2.55.0, `git diff -w --raw` and `git diff -I<re> --raw` print a real
     // post-image object name for a worktree side while `git diff
     // --ignore-blank-lines --raw` prints all-zero.
-    let from_contents = ws != Whitespace::Keep || !ignore.lines.is_empty();
+    // `diff_setup_done()` (diff.c:5360): "External diffs could declare non-identical
+    // contents equal", so `--exit-code`/`--quiet` beside an allowed external driver
+    // also has to look at what the rendering pass found.
+    let from_contents = ws != Whitespace::Keep
+        || !ignore.lines.is_empty()
+        || (allow_external && want_exit_code);
     // `diff_flush()` (diff.c:6828): `--quiet`/`-s` produce no output, but with
     // `diff_from_contents` and `--exit-code` git still runs the patch machinery with
     // its output redirected to `/dev/null` purely to learn the exit status.
@@ -2433,6 +2727,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         || exit_needs_patch
         || names_need_patch
         || fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH) != 0;
+    // `fill_textconv()` is reached from `builtin_diff()` and `emit_rewrite_diff()`
+    // and from nowhere else: `builtin_diffstat()`, `run_checkdiff()`,
+    // `show_dirstat()` and every name/raw format read the filespec straight. So a
+    // `--stat`-only or `--raw`-only run never starts a converter, and a converter
+    // that would have died never gets the chance — measured against git 2.55.0,
+    // `git -c diff.markdown.textconv=false diff --raw HEAD~2 HEAD~1` prints the raw
+    // record and exits 0 while the same command with `-p` is fatal.
+    if allow_textconv && (fmt & F_PATCH != 0 || exit_needs_patch) {
+        apply_textconv(&repo, &mut drivers, &mut deltas, repo.workdir())?;
+    }
+
     let mut analyses: Vec<Analysis> = Vec::new();
     if (!quiet || exit_needs_patch) && want_analysis {
         analyses = analyze_all(
@@ -2457,13 +2762,25 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         )?;
     }
 
+    // `external_diff()` (diff.c:5026), read once for the whole command as git's
+    // function-scoped static is.
+    let ext_program = match allow_external {
+        true => external_diff_program(&repo)?,
+        false => None,
+    };
+
     // `run_diff()` splits a type change into a deletion patch and a creation patch
     // (diff.c:5052) — but only for the patch formats, so the split lives beside
     // `deltas` rather than in it. The entry is `None` for every pair git renders
     // whole, which is all of them in the overwhelmingly common case; the two halves
     // are analyzed here so the patch loop has hunks for each.
     let mut splits: Vec<Option<(Delta, Analysis, Delta, Analysis)>> = Vec::new();
-    if want_patch && deltas.iter().any(Delta::type_changed) {
+    // `if (!pgm && ... (S_IFMT & one->mode) != (S_IFMT & two->mode))`: with an
+    // environment or configured external program in play the pair goes to the driver
+    // whole. A `diff.<driver>.command` reached through the path's attribute does not
+    // suppress the split — `run_diff()` tests `pgm` before either half re-resolves
+    // the attribute.
+    if want_patch && ext_program.is_none() && deltas.iter().any(Delta::type_changed) {
         // The deletion half's post-image is git's invalid filespec — no content at
         // all. A worktree diff's blob platform resolves a null object id by *reading
         // the path*, which for a type change is the file that replaced the old one,
@@ -2650,6 +2967,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `diff_flush()` bails out before printing anything at all when the change
     // queue is empty, so even `--shortstat` stays silent on a clean tree.
     let mut out: Vec<u8> = Vec::new();
+    // Where each external driver's stdout landed in `out`, so `--line-prefix` can skip
+    // it: git's child writes past `emit_line()` entirely.
+    let mut ext_spans: Vec<(usize, usize)> = Vec::new();
     let mut separator = false;
     // `o->found_changes`: what the whitespace-ignoring options make the exit status
     // depend on. Only a format that actually emitted something sets it — see the
@@ -2778,6 +3098,30 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `--color-moved` is the only thing a split buffer would cost, and this
             // command rejects it outright.
             let sub_abbrev = crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex());
+            // `run_diff_cmd()` reaches an external program only when one is
+            // configured somewhere: the environment, `diff.external`, or a driver a
+            // queued path's `diff` attribute names. With none of those the whole
+            // apparatus — a second gitattributes stack included — is never built.
+            let want_ext = allow_external
+                && (ext_program.is_some()
+                    || deltas.iter().any(|d| {
+                        d.drivers.one.as_ref().is_some_and(|x| x.settings.external.is_some())
+                    }));
+            let ext_drivers = match want_ext {
+                true => Some(std::cell::RefCell::new(super::cat_file::Textconv::new(&repo)?)),
+                false => None,
+            };
+            let ext = ext_drivers
+                .as_ref()
+                .map(|d| ext_context(d, ext_program.clone()));
+            // `GIT_DIFF_PATH_TOTAL`: `q->nr`, the queue as `diff_flush()` received it.
+            let ext_total = deltas.len();
+            let ext_naming = super::diff_pairs::IndexNaming {
+                base_abbrev: r.abbrev,
+                full_index: r.full_index,
+                abbrev_explicit: abbrev_explicit.then_some(abbrev),
+            };
+            let null_id = repo.object_hash().null();
             for (i, (queued, queued_an)) in deltas.iter().zip(&analyses).enumerate() {
                 if !queued.unmerged && unmerged.contains(&queued.path) {
                     continue;
@@ -2788,6 +3132,59 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // though the whole pair is not.
                 for (delta, an) in patch_steps(queued, queued_an, splits.get(i).and_then(|s| s.as_ref()))
                 {
+                    // `run_diff_cmd()` (diff.c:4969) hands the pair to the program and
+                    // returns: the driver's stdout *is* this pair's section, written
+                    // straight to git's own output descriptor, so it is never coloured
+                    // and never carries `--line-prefix`. That is upstream of
+                    // `builtin_diff()`, so it also pre-empts the submodule branches
+                    // below.
+                    let pgm = match (&ext, delta.unmerged) {
+                        (Some(ctx), false) => external_for_pair(delta, ctx.env.as_ref()),
+                        _ => None,
+                    };
+                    if let (Some(ctx), Some(pgm)) = (ext.as_ref(), pgm) {
+                        out.extend_from_slice(&diff_color::colorize_patch_ex(
+                            &plain,
+                            &colors,
+                            &paint_opts,
+                            &files,
+                            diff_color::FilePaint::new(ws_rule),
+                            &extra,
+                        ));
+                        plain.clear();
+                        files.clear();
+                        let run = super::diff_pairs::run_external_diff(
+                            &pgm,
+                            &repo,
+                            ctx,
+                            &ext_pair(delta, an.old_id, an.new_id, null_id),
+                            &ext_naming,
+                            ext_total,
+                            true,
+                        )
+                        .map_err(crate::fatal::die)?;
+                        found_changes |= run.found_changes;
+                        let at = out.len();
+                        out.extend_from_slice(&run.stdout);
+                        ext_spans.push((at, out.len()));
+                        // `die(_("external diff died, stopping at %s"))` fires only
+                        // after the child's own output has gone out, which it already
+                        // has above.
+                        if let Some(msg) = run.died {
+                            // git's child wrote straight to the output descriptor, so
+                            // everything printed before the failure is already out.
+                            let done = apply_line_prefix_except(
+                                std::mem::take(&mut out),
+                                &line_prefix,
+                                &ext_spans,
+                            );
+                            let mut stdout = std::io::stdout().lock();
+                            stdout.write_all(&done)?;
+                            stdout.flush()?;
+                            return Err(crate::fatal::die(msg));
+                        }
+                        continue;
+                    }
                     if submodule_format != SubmoduleFormat::Short
                         && !delta.unmerged
                         && delta.is_submodule_pair()
@@ -2866,7 +3263,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // line, so a whole-buffer pass over the newline-terminated output reproduces it
     // for the ordinary half. The combined half prefixes itself instead, because
     // `show_combined_header()` leaves the prefix off two of the lines it prints.
-    let mut out = apply_line_prefix(out, &line_prefix);
+    let mut out = apply_line_prefix_except(out, &line_prefix, &ext_spans);
 
     // The combined half of `diff_tree_combined()` (combine-diff.c:1611-1631): the
     // raw/name formats and the patch are served from the path set the result shares
@@ -3240,6 +3637,8 @@ fn run_diffcore_rename(
             old_dirty_submodule: q.specs[p.one].dirty_submodule,
             dirty_submodule: sub_state.map(|(d, _, _)| d).unwrap_or(0),
             new_commit: sub_state.and_then(|(_, c, _)| c),
+            drivers: PairDrivers::default(),
+            textconv: None,
         });
     }
     deltas.extend(held);
@@ -3356,6 +3755,8 @@ fn collect_tree_index(
             old_dirty_submodule: 0,
             dirty_submodule: 0,
             new_commit: None,
+            drivers: PairDrivers::default(),
+            textconv: None,
         });
     }
     Ok(())
@@ -3548,6 +3949,8 @@ fn collect_index_worktree(
             old_dirty_submodule: 0,
             dirty_submodule: 0,
             new_commit: None,
+            drivers: PairDrivers::default(),
+            textconv: None,
         });
         if let (Some(s), Some(k)) = (stages, wt_kind) {
             deltas.push(Delta::plain(path, Some((s.ours.0, s.ours.1)), NewSide::Worktree(k)));
@@ -4297,7 +4700,8 @@ pub(crate) fn commit_patch(
 ) -> Result<Vec<u8>> {
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
     let r = patch_render(repo, &PatchOpts { ctx, ..Default::default() });
-    commit_patch_with(repo, &mut cache, &r, commit.id, parent, &PatchOpts { ctx, ..Default::default() }, None, false)
+    let mut drivers = DriverCache::new(repo)?;
+    commit_patch_with(repo, &mut cache, &mut drivers, &r, commit.id, parent, &PatchOpts { ctx, ..Default::default() }, None, false)
 }
 
 /// The render settings `log -p`/`show` use for a patch body. Resolved once per
@@ -4345,6 +4749,14 @@ pub(crate) struct PatchOpts {
     pub text: bool,
     /// `-W`/`--function-context`.
     pub func_context: bool,
+    /// `flags.allow_textconv`: `cmd_log_init_defaults()` (builtin/log.c) raises it for
+    /// every history command, and `--no-textconv` lowers it again. With it clear no
+    /// `diff.<driver>.textconv` program is run.
+    pub allow_textconv: bool,
+    /// `flags.allow_external`: unlike `allow_textconv` the history commands leave this
+    /// down, so `GIT_EXTERNAL_DIFF`, `diff.external` and a driver's
+    /// `diff.<name>.command` are inert until `--ext-diff` raises it.
+    pub allow_external: bool,
     /// `--no-prefix`/`--src-prefix=`/`--dst-prefix=`.
     pub src_prefix: Vec<u8>,
     pub dst_prefix: Vec<u8>,
@@ -4425,6 +4837,8 @@ impl Default for PatchOpts {
             full_index: false,
             text: false,
             func_context: false,
+            allow_textconv: true,
+            allow_external: false,
             src_prefix: b"a/".to_vec(),
             dst_prefix: b"b/".to_vec(),
             renames: None,
@@ -4487,10 +4901,11 @@ pub(crate) fn commit_patches(
         let mut cache = repo.diff_resource_cache_for_tree_diff()?;
         let r = patch_render(repo, opts);
         let mut specs = matcher(repo)?;
+        let mut drivers = DriverCache::new(repo)?;
         return jobs
             .iter()
             .map(|(id, parent)| {
-                commit_patch_with(repo, &mut cache, &r, *id, *parent, opts, specs.as_mut(), follow)
+                commit_patch_with(repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), follow)
             })
             .collect();
     }
@@ -4509,13 +4924,14 @@ pub(crate) fn commit_patches(
                 let mut cache = repo.diff_resource_cache_for_tree_diff()?;
                 let r = patch_render(&repo, opts);
                 let mut specs = matcher(&repo)?;
+                let mut drivers = DriverCache::new(&repo)?;
                 let mut mine = Vec::new();
                 loop {
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some((id, parent)) = jobs.get(i) else { break };
                     mine.push((
                         i,
-                        commit_patch_with(&repo, &mut cache, &r, *id, *parent, opts, specs.as_mut(), follow)?,
+                        commit_patch_with(&repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), follow)?,
                     ));
                 }
                 Ok(mine)
@@ -4553,6 +4969,7 @@ pub(crate) fn commit_patches(
 fn commit_deltas(
     repo: &gix::Repository,
     cache: &mut gix::diff::blob::Platform,
+    drivers: &mut DriverCache<'_>,
     commit_id: ObjectId,
     parent: Option<ObjectId>,
     opts: &PatchOpts,
@@ -4661,6 +5078,11 @@ fn commit_deltas(
         deltas.retain(|d| diff_filter_selected(filter, status_char(d)));
     }
 
+    // `userdiff_find_by_path()` runs on `attr_path`, which `run_diff()` captures
+    // *before* `strip_prefix()` (diff.c:5036-5038) — so the lookup has to happen
+    // while the pairs still carry their repository-relative names.
+    resolve_drivers(drivers, &mut deltas)?;
+
     // `--relative[=<path>]` is two separate things in git. The *narrowing* is done
     // by `diff_queue()`'s prefix test (diff.c:7630, 7748) and so applies to every
     // format; the *shortening* is `strip_prefix()` (diff.c:5009), called only from
@@ -4703,7 +5125,8 @@ pub(crate) fn commit_dirstat(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
-    let deltas = commit_deltas(repo, &mut cache, commit_id, parent, opts, specs, false, false)?;
+    let mut drivers = DriverCache::new(repo)?;
+    let deltas = commit_deltas(repo, &mut cache, &mut drivers, commit_id, parent, opts, specs, false, false)?;
     let hash_kind = repo.object_hash();
     let want_damage = !ds.by_file && !ds.by_line;
     let mut files: Vec<(BString, u64)> = Vec::with_capacity(deltas.len());
@@ -4760,6 +5183,7 @@ pub(crate) fn commit_dirstat(
 fn commit_patch_with(
     repo: &gix::Repository,
     cache: &mut gix::diff::blob::Platform,
+    drivers: &mut DriverCache<'_>,
     r: &Render,
     commit_id: ObjectId,
     parent: Option<ObjectId>,
@@ -4772,8 +5196,37 @@ fn commit_patch_with(
     // leave the rename rendered as an addition.
     follow: bool,
 ) -> Result<Vec<u8>> {
-    let deltas = commit_deltas(repo, cache, commit_id, parent, opts, specs, follow, true)?;
+    let mut deltas = commit_deltas(repo, cache, drivers, commit_id, parent, opts, specs, follow, true)?;
+    // `fill_textconv()` lives in `builtin_diff()`, so only the patch renderer starts
+    // a converter — `commit_dirstat()` shares `commit_deltas` and must not. A
+    // tree-to-tree diff has no worktree side, so no filespec is ever read by path.
+    if opts.allow_textconv {
+        apply_textconv(repo, drivers, &mut deltas, None)?;
+    }
+    let deltas = deltas;
     let hash_kind = repo.object_hash();
+    // `external_diff()` plus the per-path `diff.<name>.command` override, both inert
+    // until `--ext-diff` raises `flags.allow_external`.
+    let ext_program = match opts.allow_external {
+        true => external_diff_program(repo)?,
+        false => None,
+    };
+    let want_ext = opts.allow_external
+        && (ext_program.is_some()
+            || deltas
+                .iter()
+                .any(|d| d.drivers.one.as_ref().is_some_and(|x| x.settings.external.is_some())));
+    let ext_drivers = match want_ext {
+        true => Some(std::cell::RefCell::new(super::cat_file::Textconv::new(repo)?)),
+        false => None,
+    };
+    let ext = ext_drivers.as_ref().map(|d| ext_context(d, ext_program.clone()));
+    let ext_naming = super::diff_pairs::IndexNaming {
+        base_abbrev: r.abbrev,
+        full_index: r.full_index,
+        abbrev_explicit: None,
+    };
+    let null_id = hash_kind.null();
     let mut out: Vec<u8> = Vec::new();
     // The patch is assembled uncolored and re-emitted through the same
     // `fn_out_consume()` chain `git diff` uses, so `--word-diff`, `--color-moved`
@@ -4795,6 +5248,51 @@ fn commit_patch_with(
             None => vec![queued],
         };
         for delta in steps {
+            // `run_diff_cmd()` (diff.c:4969) runs the driver and returns, upstream of
+            // every `builtin_diff()` branch below. Its stdout is spliced in verbatim:
+            // git hands the child its own output descriptor, so those bytes are never
+            // re-coloured.
+            let pgm = match (&ext, delta.unmerged) {
+                (Some(ctx), false) => external_for_pair(delta, ctx.env.as_ref()),
+                _ => None,
+            };
+            if let (Some(ctx), Some(pgm)) = (ext.as_ref(), pgm) {
+                out.extend_from_slice(&diff_color::colorize_patch_ex(
+                    &plain,
+                    &opts.colors,
+                    &paint_opts,
+                    &files,
+                    diff_color::FilePaint::new(ws_rule),
+                    &opts.extra,
+                ));
+                plain.clear();
+                files.clear();
+                // A tree diff reads no side from a worktree, so the queue's own ids
+                // are already `diff_fill_oid_info()`'s answer.
+                let old_id = delta.old.map_or(null_id, |(id, _)| id);
+                let new_id = match delta.new {
+                    NewSide::Blob(id, _) => id,
+                    _ => null_id,
+                };
+                let run = super::diff_pairs::run_external_diff(
+                    &pgm,
+                    repo,
+                    ctx,
+                    &ext_pair(delta, old_id, new_id, null_id),
+                    &ext_naming,
+                    deltas.len(),
+                    true,
+                )
+                .map_err(crate::fatal::die)?;
+                out.extend_from_slice(&run.stdout);
+                if let Some(msg) = run.died {
+                    // Everything the child printed before failing has already gone
+                    // out in git; this buffer is the caller's, so it travels with the
+                    // error rather than being dropped.
+                    return Err(crate::fatal::die(msg));
+                }
+                continue;
+            }
             // `builtin_diff()`'s submodule branches (diff.c:3870) sit downstream of
             // `run_diff()`'s type-change split, so each half is tested on its own —
             // the same placement `git diff` uses at line 2424 above. Under the default
@@ -5218,6 +5716,9 @@ fn analyze(
     ignore: &IgnoreOpts,
 ) -> Result<Analysis> {
     let null = hash_kind.null();
+    // `builtin_diff()` installs `xecfg.find_func` from the pair's driver before it
+    // runs xdiff, so every hunk of this pair reads its heading off the same pattern.
+    let funcname = delta.drivers.funcname();
     if delta.unmerged {
         return Ok(Analysis {
             old_id: null,
@@ -5315,6 +5816,10 @@ fn analyze(
         }
     };
 
+    // The platform's configured `diff.algorithm`, read before `prepare_diff()` takes
+    // its borrow. Only the textconv path below needs it: everywhere else the
+    // algorithm arrives with the operation.
+    let platform_algorithm = cache.options.algorithm.unwrap_or_default();
     let prep = cache.prepare_diff()?;
 
     // `diff_populate_filespec()` hashes a filespec that has no id of its own, which
@@ -5354,7 +5859,15 @@ fn analyze(
         }
     };
 
-    match prep.operation {
+    // `builtin_diff()` (diff.c:3965) drops the binary test for a side that went
+    // through a converter, so a pair with textconv always takes the textual path.
+    let operation = match delta.textconv {
+        Some(_) => Operation::InternalDiff {
+            algorithm: platform_algorithm,
+        },
+        None => prep.operation,
+    };
+    match operation {
         Operation::SourceOrDestinationIsBinary => {
             // The blob pipeline withholds the data for a binary pair, so both images
             // are read back here — and only if `--dirstat`, `--binary` or `-a` is
@@ -5405,6 +5918,7 @@ fn analyze(
                         algo_override.unwrap_or(gix::diff::blob::Algorithm::Myers),
                         func_context,
                         ignore,
+                        funcname,
                     )?
                     .1,
                     _ => None,
@@ -5432,8 +5946,17 @@ fn analyze(
         Operation::InternalDiff { algorithm } => {
             // `--minimal`/`--histogram`/`--diff-algorithm=` override the default.
             let algorithm = algo_override.unwrap_or(algorithm);
-            let old_data = prep.old.data.as_slice().unwrap_or_default();
-            let new_data = prep.new.data.as_slice().unwrap_or_default();
+            let raw_old = prep.old.data.as_slice().unwrap_or_default();
+            let raw_new = prep.new.data.as_slice().unwrap_or_default();
+            // `builtin_diff()` (diff.c:4027-4028) hands xdiff the *converted* images,
+            // while `builtin_diffstat()` (diff.c:4189) never calls `fill_textconv()`
+            // at all and `show_dirstat()` weighs `diff_populate_filespec()`'s raw
+            // bytes — so a `-p --stat` run over a textconv'd path prints a patch of
+            // the converted text beside a stat of the original.
+            let (old_data, new_data) = match &delta.textconv {
+                Some((o, n)) => (o.as_slice(), n.as_slice()),
+                None => (raw_old, raw_new),
+            };
             // `check_blank_at_eof()` runs on the whole images, before xdiff, so the
             // emit layer can tell an added blank line at EOF from an ordinary one.
             let blank_at_eof = diff_color::check_blank_at_eof(old_data, new_data);
@@ -5443,8 +5966,8 @@ fn analyze(
             // one hunk deleting every old line and adding every new one — and
             // `diffstat` counts the same way (`count_lines()` on each side).
             if delta.complete_rewrite() {
-                let deleted = count_lines(old_data);
-                let added = count_lines(new_data);
+                let deleted = count_lines(raw_old);
+                let added = count_lines(raw_new);
                 let hunks = want_patch.then(|| emit_rewrite_diff(old_data, new_data));
                 return Ok(Analysis {
                     old_id,
@@ -5455,7 +5978,7 @@ fn analyze(
                     hunks,
                     blank_at_eof,
                     damage: if want_dirstat {
-                        byte_damage(old_data, new_data, delta.old.is_some(), delta.new_valid(), false)
+                        byte_damage(raw_old, raw_new, delta.old.is_some(), delta.new_valid(), false)
                     } else {
                         0
                     },
@@ -5502,8 +6025,29 @@ fn analyze(
                     algorithm,
                     func_context,
                     ignore,
+                    funcname,
                 )
                 .map(|(counts, hunks)| (counts, hunks.filter(|_| want_patch)))?,
+            };
+            // `builtin_diffstat()` diffs the unconverted filespecs, so the numbers
+            // `--stat`/`--numstat` print are the raw ones even when the patch beside
+            // them is of the converted text.
+            let (added, deleted) = match &delta.textconv {
+                Some(_) => {
+                    text_hunks(
+                        raw_old,
+                        raw_new,
+                        ctx,
+                        ws,
+                        indent_heuristic,
+                        algorithm,
+                        func_context,
+                        ignore,
+                        funcname,
+                    )?
+                    .0
+                }
+                None => (added, deleted),
             };
             Ok(Analysis {
                 old_id,
@@ -5514,7 +6058,7 @@ fn analyze(
                 hunks,
                 blank_at_eof,
                 damage: if want_dirstat {
-                    byte_damage(old_data, new_data, delta.old.is_some(), delta.new_valid(), false)
+                    byte_damage(raw_old, raw_new, delta.old.is_some(), delta.new_valid(), false)
                 } else {
                     0
                 },
@@ -5548,6 +6092,8 @@ fn text_hunks(
     algorithm: gix::diff::blob::Algorithm,
     func_context: bool,
     ignore: &IgnoreOpts,
+    // `xecfg->find_func`: the path's userdiff driver funcname pattern, if any.
+    funcname: Option<&crate::userdiff::FuncName>,
 ) -> Result<((u32, u32), Option<Vec<u8>>)> {
     let before: Vec<&[u8]> = byte_lines(old_data);
     let after: Vec<&[u8]> = byte_lines(new_data);
@@ -5570,6 +6116,7 @@ fn text_hunks(
             buf: Vec::new(),
             before: &before,
             after: &after,
+            funcname,
             // No hunk has been emitted yet, so nothing bounds the first search.
             func_prev: -1,
             func_text: Vec::new(),
@@ -5611,6 +6158,7 @@ fn text_hunks(
             ctx: ctx as usize,
             inter_hunk_ctx: ignore.inter_hunk_ctx,
             func_context,
+            funcname,
         },
     );
     Ok(((added, deleted), (!buf.is_empty()).then_some(buf)))
@@ -5755,7 +6303,7 @@ pub(crate) fn looks_binary(buf: &[u8]) -> bool {
 pub(crate) fn no_index_body(
     old_data: &[u8],
     new_data: &[u8],
-    geom: &super::diff_pairs::EmitGeometry,
+    geom: &super::diff_pairs::EmitGeometry<'_>,
     ws: Whitespace,
     binary: bool,
     algorithm: gix::diff::blob::Algorithm,
@@ -6041,6 +6589,10 @@ fn analyze_images(
             buf: Vec::new(),
             before: &before,
             after: &after,
+            // Both images here are the synthetic `Subproject commit <oid>` line
+            // `diff_populate_filespec()` writes for a gitlink, which no funcname
+            // pattern is meant to read.
+            funcname: None,
             // No hunk has been emitted yet, so nothing bounds the first search.
             func_prev: -1,
             func_text: Vec::new(),
@@ -6948,16 +7500,38 @@ fn apply_suppress_blank_empty(out: Vec<u8>, on: bool) -> Vec<u8> {
 /// nothing at all on a clean tree), and a trailing newline is not followed by a
 /// dangling prefixed empty line.
 pub(crate) fn apply_line_prefix(out: Vec<u8>, prefix: &[u8]) -> Vec<u8> {
+    apply_line_prefix_except(out, prefix, &[])
+}
+
+/// [`apply_line_prefix`], leaving the half-open byte ranges in `verbatim` untouched.
+///
+/// An external diff driver writes to git's own output descriptor, so `emit_line()`
+/// never sees its bytes and `diff_line_prefix()` never reaches them. This port
+/// captures that output through a pipe and splices it into the same buffer as
+/// everything else, so the spans it occupies have to be marked and skipped here.
+/// `verbatim` is in ascending order and does not overlap.
+pub(crate) fn apply_line_prefix_except(
+    out: Vec<u8>,
+    prefix: &[u8],
+    verbatim: &[(usize, usize)],
+) -> Vec<u8> {
     if prefix.is_empty() || out.is_empty() {
         return out;
     }
     let mut res = Vec::with_capacity(out.len() + prefix.len() * 2);
-    res.extend_from_slice(prefix);
+    let mut at_line_start = true;
+    let mut spans = verbatim.iter().peekable();
     for (i, &b) in out.iter().enumerate() {
-        res.push(b);
-        if b == b'\n' && i + 1 < out.len() {
+        while spans.peek().is_some_and(|(_, end)| *end <= i) {
+            spans.next();
+        }
+        let inside = spans.peek().is_some_and(|(start, end)| i >= *start && i < *end);
+        if at_line_start && !inside {
             res.extend_from_slice(prefix);
         }
+        res.push(b);
+        // A span always ends on a record boundary, so the byte after it starts a line.
+        at_line_start = b == b'\n';
     }
     res
 }
@@ -8105,6 +8679,9 @@ struct PatchSink<'a> {
     buf: Vec<u8>,
     before: &'a [&'a [u8]],
     after: &'a [&'a [u8]],
+    /// `xecfg->find_func`: the path's userdiff driver funcname pattern, when it has
+    /// one. `None` leaves git's built-in [`super::diff_pairs::def_ff`] in charge.
+    funcname: Option<&'a crate::userdiff::FuncName>,
     /// git's `funclineprev`: the line the previous hunk's search started from, and
     /// the limit for the next one, so a heading is never scanned for twice.
     func_prev: i64,
@@ -8148,10 +8725,28 @@ pub(crate) const HUNK_HDR_MAX: usize = 128;
 /// the endpoints — backward for the normal case where the previous hunk sits
 /// above this one — and `limit` itself is never examined.
 pub(crate) fn func_line<'a>(before: &[&'a [u8]], start: i64, limit: i64) -> Option<&'a [u8]> {
+    func_line_with(None, before, start, limit)
+}
+
+/// [`func_line`] with `xecfg->find_func` supplied: a path whose `diff` gitattribute
+/// selects a driver carrying a `funcname`/`xfuncname` pattern reads its headings off
+/// that pattern instead of [`def_ff`], and a line the pattern rejects is simply not a
+/// heading — there is no fall-back to the built-in heuristic.
+pub(crate) fn func_line_with<'a>(
+    ff: Option<&crate::userdiff::FuncName>,
+    before: &[&'a [u8]],
+    start: i64,
+    limit: i64,
+) -> Option<&'a [u8]> {
     let step: i64 = if start > limit { -1 } else { 1 };
     let mut l = start;
     while l != limit && l >= 0 && (l as usize) < before.len() {
-        if let Some(text) = def_ff(before[l as usize], FUNC_LINE_MAX) {
+        let rec = before[l as usize];
+        let hit = match ff {
+            Some(f) => f.find(rec, FUNC_LINE_MAX),
+            None => def_ff(rec, FUNC_LINE_MAX),
+        };
+        if let Some(text) = hit {
             return Some(text);
         }
         l += step;
@@ -8161,7 +8756,7 @@ pub(crate) fn func_line<'a>(before: &[&'a [u8]], start: i64, limit: i64) -> Opti
 
 impl PatchSink<'_> {
     fn func_line(&self, start: i64, limit: i64) -> Option<&[u8]> {
-        func_line(self.before, start, limit)
+        func_line_with(self.funcname, self.before, start, limit)
     }
 }
 
@@ -8338,9 +8933,11 @@ pub(crate) fn commit_check(
         false => Some(super::log::PathspecMatcher::new(repo, paths)?),
     };
     let r = patch_render(repo, opts);
+    let mut drivers = DriverCache::new(repo)?;
     let deltas = commit_deltas(
         repo,
         &mut cache,
+        &mut drivers,
         commit_id,
         parent,
         opts,

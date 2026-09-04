@@ -123,8 +123,82 @@ pub fn write_with(
     index: &mut gix::index::File,
     options: gix::index::write::Options,
 ) -> Result<(), gix::index::file::write::Error> {
+    write_split(repo, index, options, gix::index::file::split::Request::Keep)
+}
+
+/// [`write_with`] for a caller that also knows what git's `cache_changed` would say about
+/// the *shape* of the index — see [`gix::index::file::split::Request`].
+///
+/// This is git's `write_locked_index()` (read-cache.c:3309) rather than
+/// `do_write_locked_index()`: an index that was read as a split index is written back as
+/// one, with only the entries the shared half does not already hold, unless `request`
+/// says otherwise. Every writer in this port goes through here for the same reason they
+/// all go through the smudge — git has one such function, and a writer that skipped it
+/// would dissolve a repository's split index the first time it touched it.
+pub fn write_split(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    options: gix::index::write::Options,
+    request: gix::index::file::split::Request,
+) -> Result<(), gix::index::file::write::Error> {
     smudge_racily_clean(repo, index);
-    index.write(options)
+    // `alternate_index_output` (read-cache.c:3332): `read-tree --index-output=<file>` and
+    // friends write somewhere that is not the repository's index, and git writes a whole
+    // index there whatever shape the real one has.
+    if index.path() != repo.index_path() {
+        return index.write(options);
+    }
+    write_locked(repo, index, options, request)
+}
+
+/// git's `write_locked_index()` proper, without the smudge its `do_write_index()` does —
+/// for the one caller, `update-index`, that already resolved every entry it touched.
+pub fn write_locked(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    options: gix::index::write::Options,
+    request: gix::index::file::split::Request,
+) -> Result<(), gix::index::file::write::Error> {
+    let request = tweak_split_index(repo, request);
+    let git_dir = repo.git_dir().to_owned();
+    let max_percent = crate::config::split_index_max_percent_change(repo);
+    match index.write_locked(&git_dir, request, max_percent, options) {
+        Ok(_) => Ok(()),
+        Err(gix::index::file::split::Error::Write(err)) => Err(err),
+        Err(err) => Err(gix::index::file::write::Error::Io(std::io::Error::other(err).into())),
+    }
+}
+
+/// `tweak_split_index()` (read-cache.c:1932-1946), which git runs on every index it reads:
+/// `core.splitIndex=false` calls `remove_split_index()` and so sets `SOMETHING_CHANGED`,
+/// and `core.splitIndex=true` calls `add_split_index()`, which sets `SPLIT_INDEX_ORDERED`
+/// only when the index is not split already.
+///
+/// A request the caller made itself outranks both — it describes a change that has already
+/// happened, and git's own order puts `cache_changed & ~EXTMASK` first.
+///
+/// ### Only the `false` half is here
+///
+/// git runs this from `post_read_index_from()`, so it applies to an index that was *read*
+/// and to no other. Applied at the write instead, the `true` half would split indexes git
+/// leaves whole: a plain `read-tree <tree>` never reads the old index at all
+/// (builtin/read-tree.c:201 reads it only `if (opts.reset || opts.merge || opts.prefix)`),
+/// so `add_split_index()` never runs for it and stock writes one whole file even under
+/// `core.splitIndex=true`. Moving the whole tweak to where it belongs needs the read side
+/// to carry `SPLIT_INDEX_ORDERED` from `add_split_index()` through to the write, which
+/// this port has no room for on `State` yet; the `false` half needs no such carrier,
+/// because dropping the shared half is a decision the write can make on its own.
+fn tweak_split_index(
+    repo: &gix::Repository,
+    request: gix::index::file::split::Request,
+) -> gix::index::file::split::Request {
+    if request != gix::index::file::split::Request::Keep {
+        return request;
+    }
+    match crate::config::split_index(repo) {
+        Some(false) => gix::index::file::split::Request::Whole,
+        _ => request,
+    }
 }
 
 /// The bytes of a path as the index spells it, for diagnostics.

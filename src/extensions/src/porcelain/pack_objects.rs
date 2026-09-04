@@ -3610,7 +3610,11 @@ fn collect_counts(
     };
 
     dedup(&mut ids);
-    apply_filter(repo, st.filter.as_deref(), &mut ids);
+    // `pack-objects` builds its pending list from `--all`/`--reflog`/`--revs`,
+    // whose entries are commits, and a commit is not something any spec
+    // implemented here removes — so there is nothing to exempt on this path and
+    // the set is passed empty rather than threaded out of the walk.
+    apply_filter(repo, st.filter.as_deref(), &[], &mut ids);
 
     Ok(ids
         .into_iter()
@@ -4034,30 +4038,64 @@ fn loose_objects(repo: &gix::Repository) -> Vec<ObjectId> {
     out
 }
 
-/// Drop `--filter`ed objects from the set.
+/// Drop `--filter`ed objects from the set, except the ones the caller asked for
+/// by name.
 ///
 /// git evaluates a filter during the reachability walk, so a filtered-out tree
 /// also hides everything below it. Applying it afterwards agrees for every spec
 /// implemented here — `tree:0` removes all trees *and* all blobs, which is the
 /// same closure — and specs that need the walk (`sparse:oid=`, `combine:`) are
 /// left as no-ops rather than approximated.
-pub(super) fn apply_filter(repo: &gix::Repository, spec: Option<&str>, ids: &mut Vec<ObjectId>) {
+///
+/// `user_given` is the exemption git builds into the filter itself:
+///
+/// ```c
+/// enum list_objects_filter_result list_objects_filter__filter_object(...)
+/// {
+///         if (filter && (obj->flags & NOT_USER_GIVEN))
+///                 return filter->filter_object_fn(...);
+///         /*
+///          * No filter is active or user gave object explicitly. In this case,
+///          * always show the object (except when LOFS_END_TREE).
+///          */
+/// ```
+///
+/// (list-objects-filter.c.) `NOT_USER_GIVEN` is set only where `list-objects.c`
+/// *discovers* an object — a tree entry, a blob entry, a commit's root tree — so
+/// an object the caller named is never offered to the filter at all. On the
+/// server that set is the `want` list, and getting it wrong is what made a
+/// partial clone's lazy fetch answer with an empty pack: the fetch asks for a
+/// blob by id and repeats the clone's own `filter blob:none`, so filtering the
+/// wants deletes the one object the request was for.
+pub(super) fn apply_filter(
+    repo: &gix::Repository,
+    spec: Option<&str>,
+    user_given: &[ObjectId],
+    ids: &mut Vec<ObjectId>,
+) {
     use gix::object::Kind;
     let Some(spec) = spec else { return };
 
     let kind_of = |id: &ObjectId| repo.find_object(*id).ok().map(|o| o.kind);
     let size_of = |id: &ObjectId| repo.find_object(*id).ok().map(|o| o.data.len() as u64);
+    // The exemption is applied in place rather than by lifting the objects out
+    // and putting them back, so the surviving set keeps the order the walk
+    // produced it in — which is the order it reaches the pack.
+    let exempt: HashSet<ObjectId> = user_given.iter().copied().collect();
+    let spared = |id: &ObjectId| exempt.contains(id);
 
     if spec == "blob:none" {
-        ids.retain(|id| kind_of(id) != Some(Kind::Blob));
+        ids.retain(|id| spared(id) || kind_of(id) != Some(Kind::Blob));
     } else if let Some(limit) = spec.strip_prefix("blob:limit=") {
         let Some(limit) = magnitude(limit) else { return };
-        ids.retain(|id| kind_of(id) != Some(Kind::Blob) || size_of(id).is_some_and(|n| n <= limit));
+        ids.retain(|id| {
+            spared(id) || kind_of(id) != Some(Kind::Blob) || size_of(id).is_some_and(|n| n <= limit)
+        });
     } else if let Some(depth) = spec.strip_prefix("tree:") {
         // Only depth 0 is expressible without the walk's depth bookkeeping, and
         // it is the only depth in common use.
         if depth == "0" {
-            ids.retain(|id| matches!(kind_of(id), Some(Kind::Commit | Kind::Tag)));
+            ids.retain(|id| spared(id) || matches!(kind_of(id), Some(Kind::Commit | Kind::Tag)));
         }
     } else if let Some(want) = spec.strip_prefix("object:type=") {
         let want = match want {
@@ -4068,7 +4106,7 @@ pub(super) fn apply_filter(repo: &gix::Repository, spec: Option<&str>, ids: &mut
             _ => None,
         };
         if let Some(want) = want {
-            ids.retain(|id| kind_of(id) == Some(want));
+            ids.retain(|id| spared(id) || kind_of(id) == Some(want));
         }
     }
 }

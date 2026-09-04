@@ -3345,6 +3345,10 @@ fn analyze_index_delta(
             ctx: opts.ctx as usize,
             inter_hunk_ctx: opts.inter_hunk_ctx,
             func_context: false,
+            // `diff-index`/`diff-files` honour a driver's `textconv` and its
+            // `command` under `--ext-diff`, but the funcname pattern is not
+            // threaded this far yet, so hunk headings use git's built-in `def_ff`.
+            funcname: None,
         },
     );
     // `--check` walks the hunk stream too, so it is rendered for that format as well.

@@ -375,17 +375,113 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     }
 
     if has_promisor_remote(&repo) {
-        crate::git_fatal!(
-            "backfill cannot download from a promisor remote: the vendored gitoxide has no \
-             partial-clone support — no crate mentions promisor remotes or extensions.partialClone, \
-             gix-protocol's fetch arguments expose no filter line, and there is no way to request \
-             explicit blob ids"
-        );
+        download_missing_blobs(&repo);
     }
 
     // No promisor remote: there is nothing to request and nothing to write.
     // Stock git prints nothing, touches nothing and exits 0.
     Ok(ExitCode::SUCCESS)
+}
+
+/// `do_backfill()`: hand the promisor remote every blob the history reaches that
+/// this repository does not have.
+///
+/// ```c
+/// info.blobs = 1;
+/// info.tags = info.commits = info.trees = 0;
+/// info.revs = &ctx->revs;
+/// info.path_fn = fill_missing_blobs;
+/// ret = walk_objects_by_path(&info);
+/// if (!ret)
+///         download_batch(ctx);
+/// ```
+///
+/// with `fill_missing_blobs()` keeping the ids `odb_has_object()` says are
+/// absent, and `download_batch()` handing them to `promisor_remote_get_direct()`.
+/// The walk starts at `HEAD` when no revision range was given
+/// (`add_head_to_pending()`), which is every case this port accepts today.
+///
+/// `--min-batch-size` decides how many round trips those ids are split across
+/// and nothing else, so one request is made here: the objects that end up on
+/// disk are the same set either way, which is the whole of what the command
+/// leaves behind. A blob the remote will not hand over is not an error —
+/// `download_batch()` ignores the outcome and `cmd_backfill()` still returns 0.
+fn download_missing_blobs(repo: &gix::Repository) {
+    use gix::object::Kind;
+
+    let Ok(head) = repo.head_id() else { return };
+
+    // `fill_missing_blobs()` asks `odb_has_object(ctx->repo->objects, &oid, 0)` —
+    // flags `0`, so *without* `ODB_HAS_OBJECT_FETCH_PROMISOR`. The point of the
+    // command is to batch the download; a presence check that fetched would turn
+    // it into one round trip per blob, which is what the batch exists to avoid.
+    let restore = gix::odb::store::fetch_if_missing();
+    gix::odb::store::set_fetch_if_missing(false);
+
+    // Walk commits and trees only, never blobs: reading a blob is what the walk
+    // is trying to *avoid* doing one at a time. Tree entries name the blobs, and
+    // a tree in a `blob:none` clone is present by construction.
+    let mut seen: std::collections::HashSet<gix::ObjectId> = std::collections::HashSet::new();
+    let mut stack: Vec<gix::ObjectId> = vec![head.detach()];
+    let mut missing: Vec<gix::ObjectId> = Vec::new();
+    seen.insert(head.detach());
+    while let Some(id) = stack.pop() {
+        let Ok(object) = repo.find_object(id) else { continue };
+        let mut next: Vec<gix::ObjectId> = Vec::new();
+        match object.kind {
+            Kind::Commit => {
+                if let Some((tree, parents)) = object
+                    .into_commit()
+                    .decode()
+                    .ok()
+                    .map(|c| (c.tree(), c.parents().collect::<Vec<_>>()))
+                {
+                    next.push(tree);
+                    next.extend(parents);
+                }
+            }
+            Kind::Tag => {
+                if let Ok(tag) = object.into_tag().decode() {
+                    next.push(tag.target());
+                }
+            }
+            Kind::Tree => {
+                if let Ok(tree) = object.into_tree().decode() {
+                    for entry in &tree.entries {
+                        let oid = entry.oid.to_owned();
+                        match entry.mode.kind() {
+                            // `process_tree()` never descends into a submodule,
+                            // and a gitlink names a commit this repository is not
+                            // expected to hold.
+                            gix::object::tree::EntryKind::Commit => {}
+                            gix::object::tree::EntryKind::Tree => next.push(oid),
+                            // Blob, executable or link: `fill_missing_blobs()`
+                            // keeps the ones the object database does not have.
+                            _ => {
+                                if seen.insert(oid) && !repo.has_object(oid) {
+                                    missing.push(oid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Kind::Blob => {}
+        }
+        for id in next {
+            if seen.insert(id) {
+                stack.push(id);
+            }
+        }
+    }
+
+    gix::odb::store::set_fetch_if_missing(restore);
+    // Straight to the store rather than through `gix::promisor::prefetch`: that
+    // helper re-checks each id with `Exists`, which *is* one of the callers that
+    // consults the promisor remote, so the batch would be spent one object at a
+    // time before it was ever sent. The ids collected above are already known to
+    // be absent.
+    repo.objects.store_ref().fetch_from_promisor(&missing);
 }
 
 /// git's `strtol_i`: is `s` a base-10 signed `int` the way `strtol(s, &end, 10)`

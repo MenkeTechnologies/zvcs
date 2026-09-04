@@ -64,7 +64,12 @@ pub fn parallel_checkout_configs(repo: &gix::Repository) -> Result<(i64, i64), S
 }
 
 /// Check out `index` into `dir`, skipping the call entirely when the index has
-/// no entries.
+/// no entries and skipping each entry the work tree already holds.
+///
+/// The per-entry skip is git's, not an optimization either: `checkout_entry_ca()`
+/// returns before it writes anything for a path whose file already matches its entry
+/// (see [`is_up_to_date`]), and the difference shows up as soon as `refs/replace/`
+/// maps an entry's blob to another object.
 ///
 /// The guard is not an optimization. Commands that check out a *reduced* index
 /// build it by cloning the target tree and calling `remove_entries` to drop
@@ -100,16 +105,132 @@ where
     if index.entries().is_empty() {
         return Ok(());
     }
-    gix::worktree::state::checkout(
-        index,
-        dir,
-        objects,
-        files,
-        bytes,
-        should_interrupt,
-        options,
-    )
-    .map(|_| ())
+    let dir = dir.into();
+
+    // ```c
+    // if (!check_path(path.buf, path.len, &st, state->base_dir_len)) {
+    //         [...]
+    //         unsigned changed = ie_match_stat(state->istate, ce, &st,
+    //                                          CE_MATCH_IGNORE_VALID | CE_MATCH_IGNORE_SKIP_WORKTREE);
+    //         [...]
+    //         if (!changed)
+    //                 return 0;
+    // ```
+    //
+    // (`checkout_entry_ca()`, entry.c.) The early return is ahead of the `state->force`
+    // test, so *no* checkout writes a file that already matches its entry — not
+    // `checkout -f`, not `reset --hard`, not `checkout-index -f`. This crate's checkout
+    // has no such gate and writes every entry it is handed, which is invisible in the
+    // ordinary case and not invisible at all when `refs/replace/` maps the entry's blob
+    // to another one: re-materialising then puts the *replacement* bytes in the work tree
+    // and leaves the file modified against the very index that named it. git materialises
+    // through the replacement too when it materialises at all — the difference is that it
+    // does not materialise a file it has no reason to touch.
+    let stale: Vec<usize> = {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !is_up_to_date(entry, backing, &dir, options.stat_options))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    if stale.len() == index.entries().len() {
+        return gix::worktree::state::checkout(index, dir, objects, files, bytes, should_interrupt, options)
+            .map(|_| ());
+    }
+
+    // Narrow the state to the entries that still need writing, check those out, then put
+    // the full list back with the stat data the checkout recorded for each one it wrote.
+    // The path storage is left alone throughout — `checkout()` takes it and returns it —
+    // so every entry's path range stays valid on both sides of the call.
+    let mut all = index.swap_entries(Vec::new());
+    if stale.is_empty() {
+        index.swap_entries(all);
+        return Ok(());
+    }
+    index.swap_entries(stale.iter().map(|&i| all[i].clone()).collect());
+    let res = gix::worktree::state::checkout(index, dir, objects, files, bytes, should_interrupt, options);
+    let written = index.swap_entries(Vec::new());
+    for (slot, entry) in stale.into_iter().zip(written) {
+        all[slot] = entry;
+    }
+    index.swap_entries(all);
+    res.map(|_| ())
+}
+
+/// `ie_match_stat()` (read-cache.c) as `checkout_entry_ca()` asks it: does the work tree
+/// already hold exactly what this entry names?
+///
+/// Three things have to agree, and the entry is written whenever any of them cannot be
+/// established:
+///
+///  * the file exists and its **type** is the entry's — a gitlink is never skipped,
+///    because a directory is not something a stat comparison can answer for;
+///  * the recorded `stat` matches the file's under the repository's `core.checkStat` /
+///    `core.trustCtime` settings, which is `ce_match_stat_basic()`;
+///  * the file's **content** hashes to the entry's object id, which is git's
+///    `ce_modified_check_fs()` — the branch it takes for a racily-clean entry, whose stat
+///    cannot be trusted on its own.
+///
+/// The content check is unconditional here rather than only for racy entries, which is the
+/// stricter of the two readings: it can only cause a file to be written that git would have
+/// left alone, never the reverse. It hashes the file raw, so a path whose blob went through
+/// a clean filter compares unequal and is rewritten — the same conservative direction.
+fn is_up_to_date(
+    entry: &gix::index::Entry,
+    backing: &gix::index::PathStorageRef,
+    dir: &std::path::Path,
+    stat_options: gix::index::entry::stat::Options,
+) -> bool {
+    use gix::index::entry::Mode;
+    if !matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK) {
+        return false;
+    }
+    let path = entry.path_in(backing);
+    let Ok(rela) = gix::path::try_from_bstr(path) else {
+        return false;
+    };
+    let full = dir.join(rela);
+    let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
+        return false;
+    };
+    // `ce_match_stat_basic()`'s type switch: a symlink entry needs a symlink on disk and a
+    // blob entry needs a regular file, whatever the stat fields say.
+    let type_matches = match entry.mode {
+        Mode::SYMLINK => md.is_symlink(),
+        _ => md.is_file(),
+    };
+    if !type_matches {
+        return false;
+    }
+    // `ce_match_stat_basic()`'s `S_IFREG` arm: the executable bit is part of the mode git
+    // compares, and no stat field carries it.
+    if entry.mode == Mode::FILE_EXECUTABLE && !md.is_executable() {
+        return false;
+    }
+    if entry.mode == Mode::FILE && md.is_executable() {
+        return false;
+    }
+    let Ok(disk) = gix::index::entry::Stat::from_fs(&md) else {
+        return false;
+    };
+    if !entry.stat.matches(&disk, stat_options) {
+        return false;
+    }
+    let content = if md.is_symlink() {
+        let Ok(target) = std::fs::read_link(&full) else {
+            return false;
+        };
+        gix::path::into_bstr(target).into_owned().into()
+    } else {
+        let Ok(bytes) = std::fs::read(&full) else {
+            return false;
+        };
+        bytes
+    };
+    gix::objs::compute_hash(entry.id.kind(), gix::objs::Kind::Blob, &content).is_ok_and(|id| id == entry.id)
 }
 
 /// Remove the now-empty ancestor directories of `full`, stopping at `workdir` or at the

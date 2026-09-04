@@ -502,7 +502,7 @@ mod blame;
 pub(crate) mod branch;
 mod bugreport;
 mod bundle;
-mod cat_file;
+pub(crate) mod cat_file;
 mod check_attr;
 mod check_ignore;
 mod check_mailmap;

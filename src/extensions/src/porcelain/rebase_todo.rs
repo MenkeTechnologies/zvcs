@@ -780,9 +780,32 @@ fn label_oid(
 /// range `get_revision_ranges()` builds — which git pre-labels `onto` before the
 /// walk. Unrelated histories have no merge base and so get no `onto` label.
 ///
-/// Not ported, matching [`make_script`]: `revs.cherry_mark`, so no commit is
-/// dropped for being already upstream. `--rebase-merges=rebase-cousins` is
-/// rejected by the caller, so the `rebase_cousins` arms are not reproduced.
+/// `rebase_cousins` is `TODO_LIST_REBASE_COUSINS` (`--rebase-merges=rebase-cousins`)
+/// and `root_with_onto` is `TODO_LIST_ROOT_WITH_ONTO` (`--root` *with* an explicit
+/// `--onto`). Both only reach the third phase, where they decide what a branch is
+/// `reset` to before its picks:
+///
+/// ```c
+/// if (!commit)
+///         strbuf_addf(out, "%s %s\n", cmd_reset,
+///                     rebase_cousins || root_with_onto ? "onto" : "[new root]");
+/// else {
+///         const char *to = NULL;
+///         entry = oidmap_get(&state.commit2label, &commit->object.oid);
+///         if (entry)
+///                 to = entry->string;
+///         else if (!rebase_cousins)
+///                 to = label_oid(&commit->object.oid, NULL, &state);
+///         if (!to || !strcmp(to, "onto"))
+///                 strbuf_addf(out, "%s onto\n", cmd_reset);
+/// ```
+///
+/// (sequencer.c:5592-5613.) So `rebase-cousins` moves a branch whose fork point is
+/// *not* being replayed onto `onto` — that is the whole of what the mode does —
+/// and `--root --onto <x>` puts the replayed root on `<x>` instead of minting a
+/// new root. Treating both as the default mode replayed the octopus fixture onto
+/// its old fork points and gave `--root --onto alien` a history with no `alien.txt`
+/// in it.
 pub(crate) fn make_script_with_merges(
     repo: &gix::Repository,
     commits: &[ObjectId],
@@ -790,6 +813,8 @@ pub(crate) fn make_script_with_merges(
     keep_empty: bool,
     abbreviate: bool,
     cherry: &CherryMark,
+    rebase_cousins: bool,
+    root_with_onto: bool,
 ) -> Result<Vec<u8>> {
     use std::collections::{HashMap, HashSet};
 
@@ -929,13 +954,22 @@ pub(crate) fn make_script_with_merges(
         }
 
         match walk {
-            // Ran off the end of history: the branch starts at a new root.
-            None => out.extend_from_slice(format!("{cmd_reset} [new root]\n").as_bytes()),
+            // Ran off the end of history: the branch starts at a new root — or,
+            // under either flag, at `onto`.
+            None => {
+                let to = if rebase_cousins || root_with_onto { "onto" } else { "[new root]" };
+                out.extend_from_slice(format!("{cmd_reset} {to}\n").as_bytes());
+            }
             Some(base) => {
+                // `else if (!rebase_cousins) to = label_oid(...)`: with cousins
+                // on, a base that carries no label is left unnamed, and the
+                // `!to` test below then resets to `onto`.
                 let to = match state.commit2label.get(&base) {
-                    Some(name) => name.clone(),
-                    None => label_oid(repo, base, None, &mut state),
+                    Some(name) => Some(name.clone()),
+                    None if rebase_cousins => None,
+                    None => Some(label_oid(repo, base, None, &mut state)),
                 };
+                let to = to.unwrap_or_else(|| "onto".to_string());
                 if to == "onto" {
                     out.extend_from_slice(format!("{cmd_reset} onto\n").as_bytes());
                 } else {

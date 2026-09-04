@@ -73,8 +73,38 @@ impl<'spec> MatchGroup<'spec> {
                 has_negation = true;
                 continue;
             }
+            let Some(matcher) = matcher else { continue };
+            // An abbreviated source is not a pattern: git resolves it with
+            // `get_remote_ref()` → `find_ref_by_name_abbrev()`, which scores every
+            // advertised ref with `refname_match()` and keeps the single
+            // best-ranked one. Emitting a mapping per candidate instead turns an
+            // ordinary lookup into a destination conflict — `top` names
+            // `refs/top`, not `refs/top` *and* `refs/heads/top` *and*
+            // `refs/tags/top`.
+            if let Some(Needle::PartialName(name)) = matcher.lhs {
+                let mut best: Option<(usize, usize, Item<'_>)> = None;
+                for (item_index, item) in items.clone().enumerate() {
+                    let rank = util::partial_name_rank(name, item.full_ref_name);
+                    // `>` and not `>=`: the C loop keeps the first ref of a tie,
+                    // which is the order the advertisement arrived in.
+                    if rank > best.map_or(0, |(rank, _, _)| rank) {
+                        best = Some((rank, item_index, item));
+                    }
+                }
+                if let Some((_, item_index, item)) = best {
+                    let (matched, rhs) = matcher.matches_lhs(item);
+                    if matched {
+                        push_unique(Mapping {
+                            item_index: Some(item_index),
+                            lhs: SourceRef::FullName(item.full_ref_name.into()),
+                            rhs,
+                            spec_index,
+                        });
+                    }
+                }
+                continue;
+            }
             for (item_index, item) in items.clone().enumerate() {
-                let Some(matcher) = matcher else { continue };
                 let (matched, rhs) = matcher.matches_lhs(item);
                 if matched {
                     push_unique(Mapping {

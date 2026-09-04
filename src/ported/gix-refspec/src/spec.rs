@@ -246,17 +246,25 @@ impl RefSpecRef<'_> {
     }
 }
 
+/// `ref_rev_parse_rules` (`refs.c:622-630`) split into the base each rule prefixes
+/// the abbreviated name with and whether it appends `/HEAD`, in the same order.
+///
+/// The order is the whole point: `refs.c`'s `refname_match()` returns the rule's
+/// rank counted from the end, so an earlier entry outranks a later one, and
+/// `find_ref_by_name_abbrev()` keeps the best-ranked candidate.
+pub(crate) const REV_PARSE_RULES: [(&str, bool); 6] = [
+    ("", false),
+    ("refs/", false),
+    ("refs/tags/", false),
+    ("refs/heads/", false),
+    ("refs/remotes/", false),
+    ("refs/remotes/", true),
+];
+
 pub(crate) fn expand_partial_name<T>(name: &BStr, mut cb: impl FnMut(&BStr) -> Option<T>) -> Option<T> {
     use bstr::ByteVec;
     let mut buf = BString::from(Vec::with_capacity(128));
-    for (base, append_head) in [
-        ("", false),
-        ("refs/", false),
-        ("refs/tags/", false),
-        ("refs/heads/", false),
-        ("refs/remotes/", false),
-        ("refs/remotes/", true),
-    ] {
+    for (base, append_head) in REV_PARSE_RULES {
         buf.clear();
         buf.push_str(base);
         buf.push_str(name);

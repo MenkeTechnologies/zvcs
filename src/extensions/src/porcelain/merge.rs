@@ -1301,19 +1301,12 @@ fn evaluate_result(repo: &gix::Repository) -> Result<i64> {
 
 /// The paths the index still holds at a non-zero stage, in index order and
 /// without repeats — what `append_conflicts_hint()` lists under `# Conflicts:`.
+///
+/// One implementation, in [`crate::merge_apply::unmerged_paths`]: `rebase` and
+/// `cherry-pick` write the same block and used to derive it from the *messages*
+/// instead, which is a different list.
 fn unmerged_paths(index: &gix::index::File) -> Vec<BString> {
-    let backing = index.path_backing().to_owned();
-    let mut paths: Vec<BString> = Vec::new();
-    for entry in index.entries() {
-        if entry.stage() == Stage::Unconflicted {
-            continue;
-        }
-        let path = entry.path_in(&backing).to_owned();
-        if paths.last() != Some(&path) {
-            paths.push(path);
-        }
-    }
-    paths
+    crate::merge_apply::unmerged_paths(index)
 }
 
 /// Everything `try_merge_strategy()` is given that does not change between
@@ -1863,7 +1856,20 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // Resolve every ref to merge and peel it to a commit (tags included).
     let mut targets: Vec<ObjectId> = Vec::with_capacity(refs.len());
     for (id, _) in &fetch_head {
-        targets.push(*id);
+        // `handle_fetch_head()` turns each id it reads out of the file into a
+        // *commit* — `lookup_commit_or_die()`, which peels — before it becomes a
+        // merge head. A tag fetched into `FETCH_HEAD` (`git pull . v0.2.0` on an
+        // annotated tag) otherwise arrives here as the tag object, and every
+        // merge-base question asked of it answers "unrelated histories".
+        // The label the head carries stays the id as `FETCH_HEAD` spells it; only
+        // the object merged is peeled.
+        let commit = repo
+            .find_object(*id)
+            .ok()
+            .and_then(|object| object.peel_to_kind(gix::objs::Kind::Commit).ok())
+            .map(|commit| commit.id)
+            .unwrap_or(*id);
+        targets.push(commit);
     }
     for spec in refs.iter().filter(|_| fetch_head.is_empty()) {
         // `collect_parents()`'s `get_merge_parent(argv[i])`, which opens with a
@@ -2039,7 +2045,14 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         return merge_with_strategies(&repo, &ctx, opts, &picks);
     }
 
-    let spec = refs[0].as_str();
+    // The label a strategy is handed, which is `merge_remote_util(commit)->name`
+    // and not the operand text. `handle_fetch_head()` gives every head it reads
+    // out of `FETCH_HEAD` a description whose name is `oid_to_hex(&oid)`
+    // (builtin/merge.c), so the operand `FETCH_HEAD` never reaches a conflict
+    // marker: stock writes `>>>>>>> d13d18a3…`, the id, where a command-line
+    // operand writes `>>>>>>> cc-right`. [`head_labels`] already holds exactly
+    // that distinction for the reflog, so it is the label here too.
+    let spec = head_labels.first().map_or_else(|| refs[0].as_str(), String::as_str);
     let target_id = targets[0];
 
     // merge-base analysis. An empty set of merge bases means unrelated histories,
@@ -2553,6 +2566,12 @@ fn ort_attempt(
 /// gitoxide writes its virtual commits too, so the recursion runs against an in-memory
 /// object store and only the objects git would have written are persisted afterwards.
 pub(super) fn virtual_base_tree(repo: &gix::Repository, bases: &[ObjectId]) -> Result<ObjectId> {
+    // The inner merge builds merge options too, and `merge.conflictStyle` is read
+    // when they are built — so an unusable value kills the recursion before the
+    // virtual base exists, not after. Validating only in the outer merge left the
+    // criss-cross case one blob richer than stock: the virtual base's own blob was
+    // written, and only then did the outer merge refuse.
+    crate::merge_apply::validate_conflict_style(repo).map_err(|r| r.into_error())?;
     let mut mem = repo.clone();
     mem.objects.enable_object_memory();
     let out = mem.virtual_merge_base(bases.iter().copied(), mem.tree_merge_options()?)?;

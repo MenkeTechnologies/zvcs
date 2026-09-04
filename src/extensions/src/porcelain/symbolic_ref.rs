@@ -423,7 +423,17 @@ fn resolve_ref(repo: &gix::Repository, name: &str, recurse: bool) -> Result<Reso
     let mut current = BString::from(name);
     let mut saw_symref = false;
     for _ in 0..SYMREF_MAXDEPTH {
-        let Some(reference) = find_exact(repo, current.as_bstr())? else {
+        // A ref file whose body will not parse is `REF_ISBROKEN`, and
+        // `refs_werrres_ref_unsafe()` returns NULL for it — the same NULL an
+        // unusable name produces, which is `NoSuchRef` and not "absent". This
+        // is what makes `symbolic-ref HEAD` die with `No such ref: HEAD` over a
+        // branch file the repository's hash width cannot read.
+        let found = match find_exact(repo, current.as_bstr()) {
+            Ok(found) => found,
+            Err(e) if is_unparsable_ref(&e) => return Ok(Resolution::NoSuchRef),
+            Err(e) => return Err(e),
+        };
+        let Some(reference) = found else {
             // A missing ref is not a failure here: git hands the name back with
             // a null id, which is how a dangling symref still prints its target.
             return Ok(terminal(saw_symref, current));
@@ -503,7 +513,17 @@ fn valid_refname(name: &str) -> bool {
 fn leaf_object_id(repo: &gix::Repository, name: &BStr) -> Result<Option<ObjectId>> {
     let mut current = name.to_owned();
     for _ in 0..=SYMREF_MAXDEPTH {
-        let found = find_exact(repo, current.as_bstr())?;
+        // A leaf whose file will not parse resolves to nothing, exactly as one
+        // that is not there does. `lock_ref_oid_basic()` reads the old value
+        // through `refs_resolve_ref_unsafe()`, which returns NULL for a broken
+        // ref without failing the transaction — so writing `HEAD` over a branch
+        // whose file cannot be read still succeeds, and simply records no
+        // reflog line (git leaves `.git/logs/HEAD` untouched there).
+        let found = match find_exact(repo, current.as_bstr()) {
+            Ok(found) => found,
+            Err(e) if is_unparsable_ref(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         match found {
             Some(reference) => match reference.target {
                 Target::Object(id) => return Ok(Some(id)),
@@ -669,4 +689,16 @@ fn usage_error(error: Option<&str>) -> Result<ExitCode> {
     }
     eprint!("{USAGE}");
     Ok(ExitCode::from(129))
+}
+
+/// Whether a ref lookup failed because the ref file's body would not parse —
+/// git's *broken ref*, which `refs_resolve_ref_unsafe()` reports as an absence
+/// rather than as a failure.
+fn is_unparsable_ref(err: &anyhow::Error) -> bool {
+    use gix::refs::file::loose::reference::decode::Error as DecodeError;
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<DecodeError>()
+            .is_some_and(|d| matches!(d, DecodeError::Parse { .. }))
+    })
 }

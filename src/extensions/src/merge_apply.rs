@@ -117,6 +117,45 @@ pub fn write_auto_merge(repo: &gix::Repository, tree_id: ObjectId) -> Result<()>
     Ok(())
 }
 
+/// The paths the index still holds at a non-zero stage, in index order and
+/// without repeats — what `append_conflicts_hint()` lists under `# Conflicts:`.
+///
+/// ```c
+/// for (i = 0; i < istate->cache_nr;) {
+///         const struct cache_entry *ce = istate->cache[i++];
+///         if (ce_stage(ce)) {
+///                 strbuf_commented_addf(msgbuf, comment_line_str, "\t%s\n", ce->name);
+///                 while (i < istate->cache_nr &&
+///                        !strcmp(ce->name, istate->cache[i]->name))
+///                         i++;
+///         }
+/// }
+/// ```
+///
+/// (sequencer.c:721-744.) The list is the **index's**, not the message
+/// renderer's, and the two are not the same list: a rename/rename leaves three
+/// unmerged paths (the shared source and both destinations) behind one
+/// `CONFLICT (rename/rename)` line, and a directory rename leaves the carried
+/// file at its *new* name behind a `CONFLICT (file location)` line that names
+/// both. Deriving the hint from the printed conflicts — as `rebase` and
+/// `cherry-pick` did — therefore wrote a `# Conflicts:` block stock never
+/// writes, into `MERGE_MSG`, `rebase-merge/message` and from there into the
+/// commit a `--continue` makes.
+pub fn unmerged_paths(index: &gix::index::File) -> Vec<BString> {
+    let backing = index.path_backing().to_owned();
+    let mut paths: Vec<BString> = Vec::new();
+    for entry in index.entries() {
+        if entry.stage() == gix::index::entry::Stage::Unconflicted {
+            continue;
+        }
+        let path = entry.path_in(&backing).to_owned();
+        if paths.last() != Some(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 /// Three-way merge `ours_tree` and `theirs_tree` against `base_tree`.
 ///
 /// Prints git's `Auto-merging` / `CONFLICT (…)` lines, checks the merged tree out
@@ -304,6 +343,61 @@ pub fn conflict_style(name: &str) -> Option<ConflictStyle> {
     })
 }
 
+/// `git_xmerge_config()`'s `merge.conflictstyle` arm (xdiff-interface.c):
+///
+/// ```c
+/// if (!strcmp(var, "merge.conflictstyle")) {
+///         if (!value)
+///                 return error(_("'%s' is not a boolean"), var);
+///         if (!strcmp(value, "diff3")) …
+///         else if (!strcmp(value, "zdiff3")) …
+///         else if (!strcmp(value, "merge")) …
+///         else
+///                 return error(_("unknown style '%s' given for '%s'"), value, var);
+/// ```
+///
+/// It is a *config callback*, so it runs while the configuration is being read —
+/// before the options are parsed, before a strategy is chosen and before a byte
+/// of output. A negative return from a callback is turned into a second line by
+/// `configset_iter()`, which is why the refusal is two lines and names where the
+/// value came from:
+///
+/// ```text
+/// error: unknown style 'nonsense' given for 'merge.conflictstyle'
+/// fatal: unable to parse 'merge.conflictstyle' from command-line config
+/// ```
+///
+/// (measured against git 2.55.0, exit 128, empty stdout). A value gitoxide
+/// silently fell back on instead let `-c merge.conflictStyle=nonsense git merge`
+/// perform the whole merge and exit 1.
+///
+/// Being a callback, it also validates **every** occurrence in configuration
+/// order rather than the last-value-wins one, which is why this walks
+/// [`crate::config::walk_config`] rather than reading the snapshot.
+pub fn validate_conflict_style(repo: &gix::Repository) -> Result<(), crate::default_config::Rejection> {
+    use crate::default_config::Rejection;
+
+    for v in crate::config::walk_config(repo) {
+        if v.key != "merge.conflictstyle" {
+            continue;
+        }
+        let error = match &v.value {
+            // `config_error_nonbool()`'s wording for a valueless `[merge]
+            // conflictstyle` line.
+            None => format!("'{}' is not a boolean", v.key),
+            Some(raw) if conflict_style(raw).is_none() => {
+                format!("unknown style '{raw}' given for '{}'", v.key)
+            }
+            Some(_) => continue,
+        };
+        return Err(Rejection::Reported {
+            errors: vec![error],
+            fatal: v.origin.die_linenr(&v.key),
+        });
+    }
+    Ok(())
+}
+
 /// The shared body: merge the trees, report, then (unless the guard refuses)
 /// move the worktree and index onto the result.
 #[allow(clippy::too_many_arguments)]
@@ -408,13 +502,6 @@ fn merge_and_apply(
     }
 
     let mut index = update_worktree_to_tree(repo, old_index, tree_id, should_interrupt)?;
-    if !conflicts.is_empty() {
-        merge.index_changed_after_applying_conflicts(
-            &mut index,
-            unresolved,
-            gix::merge::tree::apply_index_entries::RemovalMode::Prune,
-        );
-    }
     // Every merge-shaped verb — `merge` and its strategies, `pull`, `am`, `rebase`,
     // `cherry-pick`, `revert`, `stash apply`, `checkout`'s autostash — reaches its
     // finished index through this one function and then writes it, so this is where
@@ -422,16 +509,42 @@ fn merge_and_apply(
     // WRITE_TREE_REPAIR)` belongs (unpack-trees.c:2088-2092). Doing it here rather
     // than at each writer is what keeps the twelve of them from drifting apart.
     //
-    // It runs *after* the conflict entries are applied, because what the extension
-    // ends up looking like depends on them: `verify_cache()` refuses an unmerged
-    // entry (cache-tree.c:218-234) and `cache_tree_update()` returns before it has
-    // touched `istate->cache_tree`, so a conflicted result keeps the cache-tree
-    // `unpack_trees()` carried over from the pre-merge index — with the paths the
-    // merge touched invalidated and the rest still naming their trees. Carrying
-    // and invalidating rather than dropping is what reproduces that: stock's index
-    // after a conflicting merge still has `TREE`, and an index with none is 34-42
-    // bytes shorter than the one git wrote.
+    // It runs on the **clean** result, before the conflict entries are applied,
+    // because that is where git's runs. `merge_switch_to_result()` does the two in
+    // this order (merge-ort.c):
+    //
+    // 1. `checkout(opt, head, result->tree)` — an `unpack_trees()` onto the
+    //    as-merged-as-possible tree, whose tail is the `cache_tree_update()` above.
+    //    Every path is stage 0 at that moment, so `verify_cache()` passes and the
+    //    extension is rebuilt in full, *including nodes for directories the
+    //    pre-merge index did not have*.
+    // 2. `record_conflicted_index_entries()` — which swaps each conflicted path's
+    //    stage-0 entry for its stage 1/2/3 ones and ends with
+    //    `remove_marked_cache_entries(index, 1)` (merge-ort.c:4509), the `1` being
+    //    `invalidate_cache_tree`: each removed path is invalidated on its way out.
+    //
+    // Running the repair *after* the conflicts instead made it a no-op —
+    // `verify_cache()` refuses an unmerged entry (cache-tree.c:218-234) and
+    // `cache_tree_update()` returns before touching `istate->cache_tree` — so all
+    // that survived was whatever the pre-merge index carried. A conflicting
+    // `git rebase --onto alien main~1` between unrelated roots showed the gap: the
+    // merged tree adds `src/`, which the `alien` index has no node for, so stock's
+    // `TREE:15(<root>=-1/1 src=-1/0)` came out as `TREE:6(<root>=-1/0)`.
     crate::porcelain::write_tree::carry_and_repair_cache_tree(repo, old_index, &mut index);
+    if !conflicts.is_empty() {
+        merge.index_changed_after_applying_conflicts(
+            &mut index,
+            unresolved,
+            gix::merge::tree::apply_index_entries::RemovalMode::Prune,
+        );
+        // `remove_marked_cache_entries(index, 1)`: the stage-0 entry each
+        // conflicted path had is gone, and its node — and every node above it —
+        // goes invalid with it.
+        for path in unmerged_paths(&index) {
+            index.invalidate_path_in_tree(path.as_ref());
+        }
+        crate::porcelain::write_tree::prepare_offset_table(repo, &mut index);
+    }
 
     Ok(Merged::Applied(Applied {
         tree_id,
@@ -816,6 +929,15 @@ pub(crate) fn tree_merge_options(
     ui: bool,
 ) -> Result<gix::merge::tree::Options> {
     use gix::merge::plumbing::blob::builtin_driver::{binary, text};
+
+    // `merge.conflictStyle` is read *here*, where the merge engine's options are
+    // built, not while the configuration is parsed — which is what decides when
+    // an unusable value is fatal. Measured against git 2.55.0 with
+    // `-c merge.conflictStyle=nonsense`: `git merge <ref>` writes `ORIG_HEAD`
+    // and *then* dies at 128, while `Already up to date.`, a fast-forward,
+    // `git status` and `git diff` all succeed — none of them reaches a real
+    // three-way merge. `git merge-tree` and `git cherry-pick` die like `merge`.
+    validate_conflict_style(repo).map_err(|r| r.into_error())?;
 
     let mut opts: gix::merge::plumbing::tree::Options = repo.tree_merge_options()?.into();
 

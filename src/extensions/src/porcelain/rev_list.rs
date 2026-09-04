@@ -361,6 +361,10 @@ struct ObjectWalk<'a> {
 ///   * `--sparse` / `--dense`         — whether a path-limited walk drops the
 ///                                       commits it found TREESAME (the in-place
 ///                                       parent prune happens either way)
+///   * `--full-history`               — compare every parent instead of pruning a
+///                                       merge onto the first parent it matches
+///   * `--simplify-merges`            — `--full-history` plus the merge-collapsing
+///                                       pass, which also forces topological order
 ///   * `--grep=` / `--author=` / `--committer=` with `-i`/`-E`/`-F`/`-P`,
 ///     `--all-match` and `--invert-grep` — header and message predicates
 ///   * `-- <path>...`                 — path-limited: keep only commits whose diff
@@ -382,11 +386,22 @@ struct ObjectWalk<'a> {
 ///                                       name (git needs *both*: `--abbrev=<n>` on
 ///                                       its own leaves the id whole)
 ///   * `--header` / `--pretty[=<fmt>]` / `--format=<fmt>` — render each commit
+///   * `--date=<mode>` / `--date <mode>` — the mode `%ad`/`%cd` and the header
+///                                       lines render in (no `log.date` here:
+///                                       that config belongs to `log`)
 ///   * `--[no-]commit-header`         — keep or drop the object-name line
 ///   * `--objects` / `--in-commit-order` / `--filter=<spec>` — also list the
 ///                                       trees and blobs reachable from the commits
 ///   * `--missing=(error|allow-any)`  — tolerate objects the repository lacks
 ///   * `--disk-usage[=human]`         — print the total on-disk size instead
+///   * `--graph`                      — the ASCII ancestry graph in front of each
+///                                       record, over the same renderer `log` uses;
+///                                       it forces topological order and parent
+///                                       rewriting, and takes over the `<`/`>`/`=`/`o`
+///                                       marks. Not rendered — and so still refused —
+///                                       beside `--objects`, `--count`, `--quiet` or
+///                                       `--disk-usage`, which put lines between the
+///                                       records or leave the records out
 /// ```
 ///
 /// `--[no-]encode-email-headers` is accepted and does nothing:
@@ -394,9 +409,8 @@ struct ObjectWalk<'a> {
 /// copies `revs->encode_email_headers` into it, so — unlike `log` — the mail
 /// formats here never see the switch (see [`super::log::EmailStyle::REV_LIST`]).
 ///
-/// Genuinely unsupported forms stay rejected rather than silently accepted:
-/// magic pathspecs (`:(glob)`, `:!exclude`, …), `-z`, `--full-history`, the diff
-/// options `setup_revisions()` accepts and this command ignores (`-s` /
+/// Genuinely unsupported forms stay rejected rather than silently accepted: `-z`,
+/// the diff options `setup_revisions()` accepts and this command ignores (`-s` /
 /// `--no-patch`, …), the `--missing` actions that need promisor plumbing,
 /// `--bisect` under a pathspec (git weighs a TREESAME commit as reaching nothing
 /// and there is no TREESAME marking during the walk here to weigh with), and a
@@ -486,6 +500,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // the abbreviation off however `--abbrev-commit` stands.
     let mut abbrev_len: Option<usize> = None;
     let mut pretty: Option<Pretty> = None;
+    // `revs->date_mode`: the mode `%ad`/`%cd` and the header lines render in.
+    // `rev-list` has no `log.date` equivalent — `git_log_config()` is `log`'s — so
+    // the default stands until `--date=<mode>` moves it.
+    let mut date_mode = super::log::DateMode::Default;
     let mut order = Order::Date;
     let mut filter: Option<Filter> = None;
     let mut missing = Missing::Error;
@@ -504,6 +522,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `revs->dense` (revision.c:2462-2465), which `repo_init_revisions()` starts
     // at 1. `--sparse` clears it and `--dense` puts it back.
     let mut dense = true;
+    // `revs->simplify_history`, inverted. `--full-history` clears the flag so
+    // `try_to_simplify_commit()` compares *every* parent and keeps the per-parent
+    // verdicts instead of pruning the list to the first TREESAME parent.
+    let mut full_history = false;
+    // `revs->simplify_merges`, which also clears `simplify_history` and sets
+    // `topo_order` and `rewrite_parents` (revision.c).
+    let mut simplify_merges_opt = false;
+    // `revs->graph`: `--graph` is a `revision.c` option, so `rev-list` draws the
+    // same ASCII graph in front of its object names that `log` does.
+    let mut graph = false;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
     // argument vector before anything is resolved.
@@ -702,7 +730,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // so the traversal never crosses from the objects this repository
             // realized into the ones the remote still owns. In a fresh partial
             // clone that is *everything*, and the listing is empty.
-            "--exclude-promisor-objects" => exclude_promisor = true,
+            // ```c
+            // } else if (!strcmp(arg, "--exclude-promisor-objects")) {
+            //         fetch_if_missing = 0;
+            //         revs.exclude_promisor_objects = 1;
+            // ```
+            "--exclude-promisor-objects" => {
+                gix::odb::store::set_fetch_if_missing(false);
+                exclude_promisor = true;
+            }
             // `--filter-print-omitted`: the objects the filter left out, as
             // `~<oid>` lines after the listing (builtin/rev-list.c:817-818,
             // 989-996).
@@ -771,8 +807,78 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // `repo_init_revisions()` default, so it is only ever an undo of an
             // earlier `--sparse`. Neither says anything without a pathspec: the
             // flag is read where `try_to_simplify_commit()` runs.
+            // `OPT_CALLBACK_F(0, "date", …, parse_opt_date_mode)` in
+            // `handle_revision_opt()`: the mode is a `parse_options` argument, so
+            // both `--date=<mode>` and `--date <mode>` reach it, and an unknown one
+            // is `die("unknown date format %s")` — 128, not the 129 a usage error
+            // would give.
+            "--date" => {
+                let v = args.get(i + 1).cloned().unwrap_or_default();
+                i += 1;
+                match super::log::parse_date_mode(&v) {
+                    Some(m) => date_mode = m,
+                    None => return Ok(fatal(&format!("unknown date format {v}"))),
+                }
+            }
+            s if s.starts_with("--date=") => {
+                let v = &s["--date=".len()..];
+                match super::log::parse_date_mode(v) {
+                    Some(m) => date_mode = m,
+                    None => return Ok(fatal(&format!("unknown date format {v}"))),
+                }
+            }
             "--sparse" => dense = false,
             "--dense" => dense = true,
+            // ```c
+            // } else if (!strcmp(arg, "--full-history")) {
+            //         revs->simplify_history = 0;
+            // }
+            // ```
+            //
+            // (revision.c.) Nothing else: the walk is unchanged, and what changes
+            // is that `try_to_simplify_commit()` stops pruning a merge's parent
+            // list onto the first parent it is TREESAME to.
+            "--full-history" => full_history = true,
+            // ```c
+            // } else if (!strcmp(arg, "--simplify-merges")) {
+            //         revs->simplify_merges = 1;
+            //         revs->topo_order = 1;
+            //         revs->rewrite_parents = 1;
+            //         revs->simplify_history = 0;
+            //         revs->limited = 1;
+            // }
+            // ```
+            //
+            // (revision.c.) `topo_order` alone, so a `--date-order` already given
+            // keeps its `sort_order` and stays date-topo; only the default date
+            // order is upgraded.
+            "--simplify-merges" => {
+                simplify_merges_opt = true;
+                full_history = true;
+                if order == Order::Date {
+                    order = Order::Topo;
+                }
+            }
+            // ```c
+            // } else if (!strcmp(arg, "--graph")) {
+            //         graph_clear(revs->graph);
+            //         revs->graph = graph_init(revs);
+            // }
+            // ```
+            //
+            // (revision.c.) Setting up the graph also turns on `revs->topo_order`
+            // and `revs->rewrite_parents`. Both are observable in stock: on a
+            // history where the two orders differ, `rev-list --graph --all` answers
+            // in the `--topo-order` sequence and not the date one; and `rev-list
+            // --graph --children` dies with `options '--parents' and '--children'
+            // cannot be used together`, which is the `rewrite_parents && children`
+            // check.
+            "--graph" => {
+                graph = true;
+                if order == Order::Date {
+                    order = Order::Topo;
+                }
+            }
             // ```c
             // } else if (!strcmp(arg, "--reflog")) {
             //         add_reflogs_to_pending(revs, *flags);
@@ -1102,13 +1208,28 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 }
                 no_walk = true;
             }
+            // `parse_missing_action_value()` (builtin/rev-list.c) clears
+            // `fetch_if_missing` for every action but `error`: an action that
+            // *reports* an absence must not repair it on the way past, or the
+            // walk changes what it is measuring. `MA_ERROR` deliberately keeps
+            // the lazy fetch on, which is why `--missing=error` succeeds in a
+            // partial clone rather than dying on the objects the clone skipped.
             s if s.starts_with("--missing=") => match &s["--missing=".len()..] {
-                "allow-any" => missing = Missing::AllowAny,
-                "print" => missing = Missing::Print,
+                "allow-any" => {
+                    gix::odb::store::set_fetch_if_missing(false);
+                    missing = Missing::AllowAny;
+                }
+                "print" => {
+                    gix::odb::store::set_fetch_if_missing(false);
+                    missing = Missing::Print;
+                }
                 // `print-info` reports each missing object's path and type through
                 // `quote_path`, and `allow-promisor` consults the promisor remote;
                 // neither has plumbing here.
-                "allow-promisor" => missing = Missing::AllowPromisor,
+                "allow-promisor" => {
+                    gix::odb::store::set_fetch_if_missing(false);
+                    missing = Missing::AllowPromisor;
+                }
                 // `print-info` reports each missing object's path and type through
                 // `quote_path`, in the order git's `oidmap` iterates — a hash
                 // order this port does not reproduce.
@@ -1258,10 +1379,31 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    if show_parents && show_children {
+    // `want_ancestry()` is `revs->rewrite_parents || revs->children.name`, and the
+    // die reads the first as `--parents` however it was turned on — which `--graph`
+    // does.
+    if (show_parents || graph) && show_children {
         return Ok(fatal(
             "options '--parents' and '--children' cannot be used together",
         ));
+    }
+    if graph && reverse {
+        return Ok(fatal(
+            "options '--graph' and '--reverse' cannot be used together",
+        ));
+    }
+    if graph && no_walk {
+        return Ok(fatal(
+            "options '--no-walk' and '--graph' cannot be used together",
+        ));
+    }
+    // The graph draws one block per commit record. `--objects` interleaves object
+    // names between those blocks unprefixed, and `--count`/`--quiet`/`--disk-usage`
+    // draw the rows with no record at all; neither shape is rendered here, so those
+    // combinations keep the refusal they already had rather than printing something
+    // that is not what stock prints.
+    if graph && (objects || count_only || quiet || disk_usage) {
+        return Ok(usage_error());
     }
 
     // `parse_pathspec()` runs inside `setup_revisions()`, so a rejected element
@@ -1480,47 +1622,161 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // a TREESAME merge onto one parent changes both the topological sort and the
     // `--children` map that follow.
     let mut treesame: HashSet<ObjectId> = HashSet::new();
+    // `rewrite_parents()`'s answer for every shown commit, when `--simplify-merges`
+    // produced it. The pass belongs to the *display*, so it is applied where git
+    // applies it — in `simplify_commit()`, after `get_commit_action()` has read the
+    // parent list `simplify_one()` left behind.
+    let mut simplified_display: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     if !pathspecs.is_empty() {
         let mut specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
-        let mut simplified: Vec<(ObjectId, Vec<ObjectId>)> = Vec::new();
-        for id in &commits {
-            let parents = parents_of.get(id).map(Vec::as_slice).unwrap_or(&[]);
-            // `if (!revs->dense && !commit->parents->next) return;`
-            // (revision.c:996): under `--sparse` a non-merge is never compared at
-            // all, so it is never TREESAME, is always shown, and keeps its parent.
-            // A root has no `parents->next` either but is compared earlier, at
-            // revision.c:979-997.
-            if !dense && parents.len() == 1 {
-                continue;
+        if full_history {
+            // `--full-history` clears `revs->simplify_history`, so
+            // `try_to_simplify_commit()` compares every parent, records a
+            // per-parent TREESAME decoration and leaves `commit->parents` alone.
+            // No side of a merge is walked past, which is why nothing is dropped
+            // for unreachability here. The shared port of the three revision.c
+            // passes is [`super::simplify`]; `log`, `shortlog` and `whatchanged`
+            // read the same one, which is the point of it being shared.
+            //
+            // Relevance is `relevant_commit()` — `!(flags & UNINTERESTING)` — and
+            // an excluded commit never reaches this list, so the walked set is
+            // exactly the relevant one.
+            let walked: HashSet<ObjectId> = commits.iter().copied().collect();
+            let mode = super::simplify::Mode {
+                dense,
+                simplify_history: false,
+                first_parent,
+            };
+            let mut diff = PathDiff { repo: &repo, specs: &mut specs };
+            let mut info: HashMap<ObjectId, super::simplify::Classified> =
+                HashMap::with_capacity(commits.len());
+            for id in &commits {
+                let parents = parents_of.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                info.insert(
+                    *id,
+                    super::simplify::classify(*id, parents, &walked, mode, &mut diff)?,
+                );
             }
-            let same =
-                treesame_parent(&repo, *id, parents, first_parent, &mut specs, &parents_of, show_pulls)?;
-            match same {
-                None => {}
-                Some(parent) => {
-                    // The `revs->prune && revs->dense` display gate
-                    // (revision.c:4221) is what drops a TREESAME commit. Under
-                    // `--sparse` it does not fire, so the commit stays even though
-                    // git has marked it — what `--sparse` leaves in place is only
-                    // the in-place parent prune below.
-                    if dense {
+            if simplify_merges_opt {
+                // `simplify_merges()` prunes `revs->commits` to the commits that
+                // simplify to themselves, and it runs inside `limit_list()` — so
+                // the survivors are what `set_children()` and every later stage
+                // see. `get_commit_action()` then applies its own TREESAME filter
+                // on top, with `want_ancestry()` true because `--simplify-merges`
+                // sets `revs->rewrite_parents`.
+                let sm =
+                    super::simplify::merge_simplify(&repo, &commits, &info, first_parent)?;
+                let ancestry = super::simplify::Ancestry {
+                    walked: &walked,
+                    treesame: &sm.treesame,
+                    parents: &sm.parents,
+                    first_parent,
+                };
+                let kept: HashSet<ObjectId> = commits
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        sm.kept(id)
+                            && super::simplify::shows(
+                                sm.treesame.get(id).copied().unwrap_or(false),
+                                sm.parents.get(id).map(Vec::as_slice).unwrap_or(&[]),
+                                &walked,
+                                true,
+                                dense,
+                                true,
+                            )
+                    })
+                    .collect();
+                for id in &kept {
+                    let parents = sm.parents.get(id).cloned().unwrap_or_default();
+                    // `simplify_commit()` reaches `rewrite_parents()` only under
+                    // `revs->prune && revs->dense`; `--sparse` prints the list
+                    // `simplify_one()` produced.
+                    let display =
+                        if dense { ancestry.rewrite(&parents) } else { parents.clone() };
+                    simplified_display.insert(*id, display);
+                }
+                // `simplify_one()` rewrote `commit->parents` in place, so the
+                // parent-count filters and the `--children` map below read the
+                // simplified list rather than the recorded one.
+                let rewritten: Vec<(ObjectId, Vec<ObjectId>)> = sm.parents.into_iter().collect();
+                parents_of.extend(rewritten);
+                commits.retain(|id| kept.contains(id));
+            } else {
+                // `want_ancestry()` is `revs->rewrite_parents || revs->children.name`:
+                // `--parents` sets the first, `--children` the second. With it,
+                // `get_commit_action()` keeps a TREESAME merge between two or more
+                // relevant commits, because that merge ties the topology together.
+                let want_ancestry = show_parents || show_children;
+                for id in &commits {
+                    let Some(classified) = info.get(id) else { continue };
+                    // `if (revs->show_pulls && (commit->object.flags & PULL_MERGE))
+                    // return commit_show;`. PULL_MERGE is set where the *first*
+                    // parent's comparison came out different — the merge that
+                    // brought a change in rather than diverted around it.
+                    if show_pulls && classified.treesame_with.first() == Some(&false) {
+                        continue;
+                    }
+                    if !super::simplify::shows(
+                        classified.treesame,
+                        &classified.parents,
+                        &walked,
+                        true,
+                        dense,
+                        want_ancestry,
+                    ) {
                         treesame.insert(*id);
                     }
-                    if let Some(parent) = parent {
-                        if parents.len() > 1 {
-                            simplified.push((*id, vec![parent]));
+                }
+            }
+        } else {
+            let mut simplified: Vec<(ObjectId, Vec<ObjectId>)> = Vec::new();
+            for id in &commits {
+                let parents = parents_of.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                // `if (!revs->dense && !commit->parents->next) return;`
+                // (revision.c:996): under `--sparse` a non-merge is never compared at
+                // all, so it is never TREESAME, is always shown, and keeps its parent.
+                // A root has no `parents->next` either but is compared earlier, at
+                // revision.c:979-997.
+                if !dense && parents.len() == 1 {
+                    continue;
+                }
+                let same = treesame_parent(
+                    &repo,
+                    *id,
+                    parents,
+                    first_parent,
+                    &mut specs,
+                    &parents_of,
+                    show_pulls,
+                )?;
+                match same {
+                    None => {}
+                    Some(parent) => {
+                        // The `revs->prune && revs->dense` display gate
+                        // (revision.c:4221) is what drops a TREESAME commit. Under
+                        // `--sparse` it does not fire, so the commit stays even though
+                        // git has marked it — what `--sparse` leaves in place is only
+                        // the in-place parent prune below.
+                        if dense {
+                            treesame.insert(*id);
+                        }
+                        if let Some(parent) = parent {
+                            if parents.len() > 1 {
+                                simplified.push((*id, vec![parent]));
+                            }
                         }
                     }
                 }
             }
+            parents_of.extend(simplified);
+            // `process_parents` simplifies a commit *before* queueing its parents, so
+            // the side of a collapsed merge is never walked at all. Re-deriving what
+            // the simplified links still reach drops those commits here too, which is
+            // what keeps them out of the `--children` map.
+            let reachable = reachable_from(&tips, &parents_of);
+            commits.retain(|id| reachable.contains(id));
         }
-        parents_of.extend(simplified);
-        // `process_parents` simplifies a commit *before* queueing its parents, so
-        // the side of a collapsed merge is never walked at all. Re-deriving what
-        // the simplified links still reach drops those commits here too, which is
-        // what keeps them out of the `--children` map.
-        let reachable = reachable_from(&tips, &parents_of);
-        commits.retain(|id| reachable.contains(id));
     }
 
     // 2. Reorder, 3. filter by parent count, 4. limit, 5. reverse — in that
@@ -1710,16 +1966,23 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // so `--sparse --parents` prints the ancestry the commits really have — as
     // the in-place prune left it, not as `rewrite_parents()` would.
     if !pathspecs.is_empty() && show_parents && dense {
-        let survivors: HashSet<ObjectId> = commits.iter().copied().collect();
-        let rewritten: Vec<(ObjectId, Vec<ObjectId>)> = commits
-            .iter()
-            .map(|id| {
-                (
-                    *id,
-                    rewrite_parents(id, &survivors, &parents_of, first_parent),
-                )
-            })
-            .collect();
+        // `--simplify-merges` already ran the same `rewrite_parents()` over the
+        // list `simplify_one()` produced; rerunning it over the survivors would
+        // rewrite a rewrite.
+        let rewritten: Vec<(ObjectId, Vec<ObjectId>)> = if simplify_merges_opt {
+            simplified_display.into_iter().collect()
+        } else {
+            let survivors: HashSet<ObjectId> = commits.iter().copied().collect();
+            commits
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        rewrite_parents(id, &survivors, &parents_of, first_parent),
+                    )
+                })
+                .collect()
+        };
         parents_of.extend(rewritten);
     }
 
@@ -1918,7 +2181,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         commits.reverse();
     }
 
+    // `--graph`: one block per record, drawn behind the graph rows once the whole
+    // list is known. `show_log()` renders the record and hands it to
+    // `graph_show_commit_msg()`, which is what [`super::log::render_graph`] does
+    // with these.
+    let mut graph_blocks: Vec<Option<super::log::GraphBlock>> = Vec::new();
+
     for (id, is_boundary) in &emitted {
+        let record_start = out.len();
         if disk_usage {
             match object_disk_size(&repo, *id) {
                 Some(n) => disk_total += n,
@@ -1956,13 +2226,19 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 out.push(b' ');
             }
             if include_header {
-                out.extend_from_slice(revision_mark(
-                    *is_boundary,
-                    left.contains(id),
-                    patch_same.contains(id),
-                    left_right,
-                    cherry_mark,
-                ));
+                // `get_revision_mark()` is the graph's own glyph under `--graph`:
+                // `graph_show_commit()` draws `<`, `>`, `=` and `o` in the column
+                // where it would otherwise draw `*`, so the mark is not also
+                // printed in front of the object name.
+                if !graph {
+                    out.extend_from_slice(revision_mark(
+                        *is_boundary,
+                        left.contains(id),
+                        patch_same.contains(id),
+                        left_right,
+                        cherry_mark,
+                    ));
+                }
                 // `if (revs->abbrev_commit && revs->abbrev)` — both are needed,
                 // which is why `--abbrev=8` alone prints the whole id and
                 // `--abbrev-commit --no-abbrev` does too.
@@ -2014,12 +2290,18 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             if let Some(p) = &pretty {
                 let object = repo.find_object(*id)?;
-                let body = rev_list_pretty_body(&repo, &object.into_commit(), p)?;
+                let body = rev_list_pretty_body(&repo, &object.into_commit(), p, &date_mode)?;
                 if !body.is_empty() {
                     out.extend_from_slice(&body);
                     out.push(hdr_term);
                 }
             }
+        }
+        if graph {
+            // A commit that printed nothing is `None`: git still runs it through
+            // `graph_update()`, so its lane moves on with no row of its own.
+            let text = out.split_off(record_start);
+            graph_blocks.push((!text.is_empty()).then(|| super::log::GraphBlock::message_only(text)));
         }
         if objects && in_commit_order && !is_boundary {
             if let Err(code) = collect_commit_objects(
@@ -2046,6 +2328,57 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
+    }
+
+    if graph {
+        // The nodes the graph state machine walks, in emission order.
+        // `rev-list` has no `--color` option, so `revs->diffopt.use_color` is never
+        // turned on and the graph is drawn plain.
+        let shown: HashSet<ObjectId> =
+            emitted.iter().filter(|(_, b)| !*b).map(|(id, _)| *id).collect();
+        // `--boundary`: every parent of a commit the walk *returned* carries
+        // CHILD_SHOWN, which `graph_is_interesting()` accepts on its own; the
+        // boundary commits themselves are handed out below the marking loop and
+        // mark none of theirs.
+        let child_shown: HashSet<ObjectId> = match boundary {
+            true => emitted
+                .iter()
+                .filter(|(_, b)| !*b)
+                .flat_map(|(id, _)| parents_of.get(id).into_iter().flatten().copied())
+                .collect(),
+            false => HashSet::new(),
+        };
+        let nodes: Vec<super::log::Node> = emitted
+            .iter()
+            .map(|(id, is_boundary)| super::log::Node {
+                id: *id,
+                parents: parents_of.get(id).cloned().unwrap_or_default(),
+                time: 0,
+                source: String::new(),
+                seq: 0,
+                boundary: *is_boundary,
+                symmetric_left: left.contains(id),
+                patch_same: patch_same.contains(id),
+                follow_path: None,
+                graph_width: 0,
+                reflog: None,
+            })
+            .collect();
+        let interest = super::log::GraphInterest { child_shown, shown };
+        // Every record here already ends in its own terminator, which
+        // `show_log()` prints after the commit's remaining graph rows.
+        let drawn = super::log::render_graph(
+            &nodes,
+            &graph_blocks,
+            super::log::graph_colors(&repo),
+            false,
+            None,
+            Some(hdr_term),
+            first_parent,
+            left_right,
+            &interest,
+        )?;
+        out.extend_from_slice(&drawn);
     }
 
     // `traverse_commit_list()` (list-objects.c) drains `get_revision()` first and
@@ -3593,6 +3926,23 @@ fn commit_tree(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
         return None;
     }
     Some(object.into_commit().tree_id().ok()?.detach())
+}
+
+/// `rev_compare_tree()` for the shared simplification passes, over rev-list's own
+/// tree comparison so there is one pathspec engine in play and not two.
+struct PathDiff<'a> {
+    repo: &'a gix::Repository,
+    specs: &'a mut super::log::PathspecMatcher,
+}
+
+impl super::simplify::TreeDiff for PathDiff<'_> {
+    fn differs(&mut self, commit: ObjectId, parent: Option<ObjectId>) -> Result<bool> {
+        let Some(tree) = commit_tree(self.repo, commit) else {
+            return Ok(false);
+        };
+        let parent_tree = parent.and_then(|id| commit_tree(self.repo, id));
+        diff_touches_path(self.repo, parent_tree, tree, self.specs)
+    }
 }
 
 /// git's TREESAME test for one commit under a path limit.

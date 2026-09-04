@@ -25,6 +25,14 @@
 //!   the same way. merge-ort's `Auto-merging`/`CONFLICT` block is shown only
 //!   when the merge came out unclean, which is git's
 //!   `show_output = !is_rebase_i(opts) || !result.clean` (sequencer.c:783).
+//! * `-s <strategy>`. `do_pick_commit()` sends no `-s`, `recursive` and `ort` to
+//!   the in-process merge and **every other name to a `git merge-<name>` child**
+//!   (sequencer.c:2300-2325), and so does this — through the same runner
+//!   [`super::cherry_pick`] uses, because git shares that function between the
+//!   two verbs. The child is a different engine with different answers:
+//!   `git-merge-resolve` does no rename detection, so
+//!   `git rebase -s resolve` over a rename/rename lands both files and finishes
+//!   at 0 where merge-ort raises `CONFLICT (rename/rename)` and stops.
 //! * The whole option grammar, including the backend inference (`imply_merge()`,
 //!   `parse_opt_am()`/`parse_opt_merge()`/`parse_opt_interactive()`), and every
 //!   `die()` it can raise — `apply options and merge options cannot be used
@@ -140,15 +148,6 @@
 //!
 //! ### What is NOT ported, and why
 //!
-//! * `-s <strategy>` other than `ort`/`recursive`: the name is honoured as far
-//!   as `$state_dir/strategy` and the `-Xsubtree` seeding go, but the merge is
-//!   always merge-ort. `git rebase -s resolve` therefore reports merge-ort's
-//!   `CONFLICT (content)` and stops resumably where git's `git-merge-resolve`
-//!   shell strategy prints `Trying simple merge.` / `fatal: merge program
-//!   failed` and dies.
-//! * `--rebase-merges=rebase-cousins`, which changes which base
-//!   `make_script_with_merges()` resets a branch to; only the default mode is
-//!   ported.
 //! * **The apply backend's mailbox.** [`run_am`] is ported in full — it pipes
 //!   `git format-patch -k --stdout --full-index --cherry-pick --right-only
 //!   --default-prefix --no-renames --no-cover-letter --pretty=mboxrd
@@ -257,9 +256,9 @@
 //! across a conflict stop and `--continue`. Only `prepare-commit-msg` can fail a
 //! rebase; every other exit status here is dropped, as git drops it.
 //!
-//! Not ported: the `git notes copy --for-rewrite=rebase` that git runs just
-//! before the final hook. Nothing here rewrites notes, and with no
-//! `notes.rewriteRef` configured stock copies nothing either.
+//! `git notes copy --for-rewrite=rebase` runs just before that final hook, on
+//! the same `<old> <new>` list, so a rebase carries every replayed commit's
+//! notes forward under `notes.rewriteRef`/`notes.rewrite.rebase`.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -600,6 +599,22 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let mut autostash = false;
     let mut exec: Vec<String> = Vec::new();
     let mut rebase_merges: i32 = -1;
+    // `options.rebase_cousins`, set from the *mode* half of `--rebase-merges`:
+    //
+    // ```c
+    // if (rebase_merges) {
+    //         if (!*rebase_merges)
+    //                 ; /* default mode; do nothing */
+    //         else if (!strcmp("rebase-cousins", rebase_merges))
+    //                 options.rebase_cousins = 1;
+    //         else if (strcmp("no-rebase-cousins", rebase_merges))
+    //                 die(_("Unknown mode: %s"), rebase_merges);
+    // ```
+    //
+    // (builtin/rebase.c:1439.) `--rebase-merges` is an optional-argument string,
+    // so the last spelling on the command line decides, and `--no-rebase-merges`
+    // clears it along with the mode.
+    let mut rebase_cousins = false;
     let mut fork_point: i32 = -1;
     let mut strategy: Option<String> = None;
     let mut strategy_opts: Vec<String> = Vec::new();
@@ -963,14 +978,17 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 "rebase-merges" => {
                     if unset {
                         rebase_merges = 0;
+                        rebase_cousins = false;
                     } else {
                         rebase_merges = 1;
+                        rebase_cousins = false;
                         match inline.as_deref() {
                             None => {}
                             Some("") => eprintln!(
                                 "warning: --rebase-merges with an empty string argument is deprecated and will stop working in a future version of Git. Use --rebase-merges without an argument instead, which does the same thing."
                             ),
-                            Some("no-rebase-cousins" | "rebase-cousins") => {}
+                            Some("rebase-cousins") => rebase_cousins = true,
+                            Some("no-rebase-cousins") => {}
                             Some(other) => die!("Unknown rebase-merges mode: {other}"),
                         }
                     }
@@ -1085,9 +1103,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 }
                 'r' => {
                     rebase_merges = 1;
+                    rebase_cousins = false;
                     if !rest.is_empty() {
                         match rest.as_str() {
-                            "no-rebase-cousins" | "rebase-cousins" => {}
+                            "rebase-cousins" => rebase_cousins = true,
+                            "no-rebase-cousins" => {}
                             other => die!("Unknown rebase-merges mode: {other}"),
                         }
                     }
@@ -2213,6 +2233,8 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             interactive: flags & INTERACTIVE_EXPLICIT != 0,
             autostash: autostash_oid,
             rebase_merges: rebase_merges == 1,
+            rebase_cousins,
+            root_with_onto: root && onto_name.is_some(),
             old_index: &old_index,
             cherry: todo::CherryMark::new(patchsame, flags & NO_QUIET != 0),
             update_refs: update_refs == 1,
@@ -2942,12 +2964,43 @@ mod rewritten {
         if payload.is_empty() {
             return;
         }
-        // git shells out to `git notes copy --for-rewrite=rebase` just before
-        // this and explicitly ignores the result ("we don't care if this copying
-        // failed"). Nothing in this port rewrites notes, so the step is a no-op
-        // rather than a divergence: with no `notes.rewriteRef` configured stock
-        // copies nothing either.
+        // ```c
+        // child.in = open(rebase_path_rewritten_list(), O_RDONLY);
+        // child.git_cmd = 1;
+        // strvec_push(&child.args, "notes");
+        // strvec_push(&child.args, "copy");
+        // strvec_push(&child.args, "--for-rewrite=rebase");
+        // /* we don't care if this copying failed */
+        // run_command(&child);
+        // ```
+        //
+        // (sequencer.c:5190-5199, immediately before the hook and reading the
+        // very same file.) `notes copy --for-rewrite=<cmd>` consults
+        // `notes.rewrite.<cmd>`, `notes.rewriteRef` and `notes.rewriteMode`, so
+        // with none of them set it copies nothing and the step is invisible —
+        // which is why skipping it went unnoticed until a case set
+        // `notes.rewriteRef`: a `git rebase` then left every replayed commit
+        // without the note its original carried.
+        copy_notes_for_rewrite(payload);
         let _ = crate::hooks::run(repo, "post-rewrite", &["rebase"], Some(payload));
+    }
+
+    /// The `git notes copy --for-rewrite=rebase` child, with the `<old> <new>`
+    /// list on its stdin. Every failure is dropped, as git drops it.
+    fn copy_notes_for_rewrite(payload: &[u8]) {
+        use std::io::Write;
+
+        let Ok(exe) = crate::hosted::git_exe() else { return };
+        crate::cstdio::before_spawn();
+        let child = std::process::Command::new(exe)
+            .args(["notes", "copy", "--for-rewrite=rebase"])
+            .stdin(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut child) = child else { return };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(payload);
+        }
+        let _ = child.wait();
     }
 }
 
@@ -4220,6 +4273,15 @@ struct SequencerStart<'a> {
     /// `--rebase-merges`: the sheet rebuilds the branch topology instead of
     /// flattening it, so `make_script_with_merges()` generates it.
     rebase_merges: bool,
+    /// `--rebase-merges=rebase-cousins` (`TODO_LIST_REBASE_COUSINS`): a branch
+    /// whose base is not itself being replayed is reset to `onto` rather than to
+    /// that base, so a cousin is rebased along with the rest instead of keeping
+    /// its old fork point.
+    rebase_cousins: bool,
+    /// `options.root_with_onto` (`TODO_LIST_ROOT_WITH_ONTO`): `--root` *with* an
+    /// explicit `--onto`, which makes a branch that runs off the end of history
+    /// reset to `onto` instead of starting a `[new root]`.
+    root_with_onto: bool,
     autostash: Option<ObjectId>,
     old_index: &'a gix::index::File,
     /// `revs.cherry_mark = !reapply_cherry_picks` — the commits
@@ -4261,6 +4323,8 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
             start.keep_empty,
             abbreviate,
             &start.cherry,
+            start.rebase_cousins,
+            start.root_with_onto,
         )?
     } else {
         todo::make_script(repo, &start.range, start.keep_empty, abbreviate, &start.cherry)?
@@ -5183,17 +5247,82 @@ impl<'r> Sequencer<'r> {
         // `git rebase -Xours`/`-Xtheirs` — where the option resolves every hunk —
         // announce a merge stock replays silently. The decision needs the result,
         // so the lines come back with it and are printed here.
-        let applied = crate::merge_apply::three_way_merge_with_options(
-            repo,
-            base_tree,
-            head_tree,
-            ctree,
-            &self.index,
-            labels,
-            &self.should_interrupt,
-            false,
-            &self.xopts,
-        )?;
+        // `do_pick_commit()` splits on the strategy name and nothing else
+        // (sequencer.c:2300-2325): no `-s`, `recursive` and `ort` reach
+        // `do_recursive_merge()`, and **every other name is a `git merge-<name>`
+        // child** run by `try_merge_command()`. That child has its own engine, so
+        // its answer, its messages and its exit status are all different from
+        // merge-ort's — `git-merge-resolve` does no rename detection at all, which
+        // is why `git rebase -s resolve mm-ren-a mm-ren-b` is a stock *success*
+        // that lands both files while merge-ort raises `CONFLICT (rename/rename)`
+        // and stops the rebase.
+        //
+        // The same dispatch has always been in [`super::cherry_pick`]; the two
+        // verbs share `do_pick_commit()` in git and now share the child runner
+        // here, so `-s` means one thing across both.
+        let child_strategy = self
+            .st
+            .strategy
+            .as_deref()
+            .filter(|name| !matches!(*name, "recursive" | "ort"));
+        let applied = match child_strategy {
+            Some(strategy) => {
+                let xopts: Vec<&str> =
+                    self.st.strategy_opts.iter().map(String::as_str).collect();
+                // `try_merge_command(r, opts->strategy, …, common, head, remotes)`:
+                // the merge base is the picked commit's own parent, *ours* is
+                // `HEAD` and *theirs* is the commit being replayed.
+                // `run_merge_strategy()` writes `MERGE_MSG` first, as the `else`
+                // arm does, and no `append_conflicts_hint()` follows — that call
+                // lives inside `do_recursive_merge()` alone, so a stop here leaves
+                // the picked message with no `# Conflicts:` block.
+                let res = super::cherry_pick::run_merge_strategy(
+                    repo,
+                    strategy,
+                    &xopts,
+                    parent,
+                    head,
+                    oid,
+                    &final_message,
+                )?;
+                // "force re-reading of the cache" (`try_merge_command()`'s tail):
+                // the child rewrote the index on disk.
+                let index = repo.open_index()?;
+                if res != 0 {
+                    // `if (res) { error(…); print_advice(…); repo_rerere(…); }`
+                    // and then `pick_commits()`'s `error_with_patch()` — which is
+                    // what [`Self::stop_for_conflict`] already is.
+                    self.index = index;
+                    write_author_script(repo, &commit)?;
+                    return self.stop_for_conflict(
+                        item,
+                        oid,
+                        &short,
+                        &subject,
+                        &final_message,
+                        None,
+                        true,
+                    );
+                }
+                crate::merge_apply::Applied {
+                    tree_id: tree_from_index(repo, &index)?,
+                    conflicts: Vec::new(),
+                    index,
+                    messages: Vec::new(),
+                }
+            }
+            None => crate::merge_apply::three_way_merge_with_options(
+                repo,
+                base_tree,
+                head_tree,
+                ctree,
+                &self.index,
+                labels,
+                &self.should_interrupt,
+                false,
+                &self.xopts,
+            )?,
+        };
         if !applied.conflicts.is_empty() {
             for line in &applied.messages {
                 println!("{line}");
@@ -5216,13 +5345,21 @@ impl<'r> Sequencer<'r> {
             // Writing it only on the paths that reach the commit left a stop with
             // no record of the author it was replaying.
             write_author_script(repo, &commit)?;
+            // `append_conflicts_hint()` reads the **index**, not the conflict
+            // messages: a rename/rename leaves three unmerged paths behind one
+            // `CONFLICT (rename/rename)` line and a directory rename leaves the
+            // carried file at its new name, so the message list is a different
+            // list and put a `# Conflicts:` block into `MERGE_MSG` and
+            // `rebase-merge/message` that stock never writes.
+            let hint = crate::merge_apply::unmerged_paths(&self.index);
             return self.stop_for_conflict(
                 item,
                 oid,
                 &short,
                 &subject,
                 &final_message,
-                Some(&applied.conflicts),
+                Some(&hint),
+                true,
             );
         }
 
@@ -5241,10 +5378,20 @@ impl<'r> Sequencer<'r> {
         // instead. Observable: `git rebase --onto main HEAD~1` leaves none while
         // `git rebase -f HEAD~1`, whose `-f` clears `allow_ff`, leaves the last
         // pick's tree.
-        if !fast_forward {
+        //
+        // A `merge-<strategy>` child is excluded for the same reason: the file is
+        // `merge_switch_to_result()`'s, and that function belongs to merge-ort —
+        // a strategy run out of process never reaches it and leaves none.
+        if !fast_forward && child_strategy.is_none() {
             crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
         }
         if fast_forward {
+            // `do_pick_commit()` takes its fast-forward arm *before* any merge
+            // runs, so nothing has written `MERGE_MSG` by this point. This port
+            // merges first either way — and a `merge-<strategy>` child writes the
+            // file on its way in — so the record has to be taken back off disk
+            // here, as the commit path below does for the same reason.
+            let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
             write_author_script(repo, &commit)?;
             set_head(repo, Target::Object(oid), "rebase: fast-forward")?;
             if item.cmd == todo::Cmd::Reword {
@@ -5391,6 +5538,20 @@ impl<'r> Sequencer<'r> {
             )
             .to_string(),
         )?;
+        // ```c
+        // if (!res) {
+        //         refs_delete_ref(…, "CHERRY_PICK_HEAD", …);
+        //         unlink(git_path_merge_msg(r));
+        // ```
+        //
+        // (sequencer.c:1641-1645, `do_commit()`'s success arm.) A pick that
+        // commits takes the in-progress message back off disk. It only became
+        // visible once `-s <strategy>` started reaching this path:
+        // `try_merge_command()` writes `MERGE_MSG` *before* the strategy runs,
+        // so a successful `git rebase -s resolve` left the picked message behind
+        // where stock leaves none. The in-process merge never writes it on a
+        // clean pick, so the removal is a no-op there.
+        let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
         // A plain pick carries no `AMEND_MSG`, so only `post-commit` fires here;
         // a `reword` adds the `amend` half below, from the `git commit --amend`
         // it re-enters.
@@ -5714,7 +5875,7 @@ impl<'r> Sequencer<'r> {
             std::fs::write(repo.git_dir().join("MERGE_MSG"), &message)?;
             let short = todo::short_name(repo, original);
             let subject = first_line(message.as_bstr());
-            return self.stop_for_conflict(item, original, &short, &subject, &message, None);
+            return self.stop_for_conflict(item, original, &short, &subject, &message, None, false);
         }
 
         write_author_script(repo, &commit)?;
@@ -6081,10 +6242,16 @@ impl<'r> Sequencer<'r> {
         short: &str,
         subject: &BString,
         message: &BString,
-        // The conflicted paths a `pick` stopped on, or `None` from the `merge`
-        // command — `do_merge()` has its own `MERGE_MSG` and writes it before
-        // getting here.
+        // The conflicted paths a `pick` stopped on, or `None` when the caller
+        // already owns `MERGE_MSG`: the `merge` command (`do_merge()` writes its
+        // own) and a `merge-<strategy>` child, whose message
+        // `try_merge_command()` wrote before it ran and which no
+        // `append_conflicts_hint()` follows.
         conflicts: Option<&[BString]>,
+        // `error_with_patch()` calls `make_patch()` for every stop that has a
+        // commit (sequencer.c:3505-3507). The `merge` command's stop is the one
+        // that does not, so it is the caller that says.
+        patch: bool,
     ) -> Result<Step> {
         let dir = self.dir();
         // The `merge` command's stop never reaches `make_patch()` below, so the
@@ -6153,7 +6320,7 @@ impl<'r> Sequencer<'r> {
         // `error_with_patch()` opens with `make_patch()` whenever it has a commit
         // (sequencer.c:3505-3507); the `message` above is already on disk, so the
         // `if (!file_exists(…))` arm there leaves it alone.
-        if conflicts.is_some() {
+        if patch {
             make_patch(self.repo, &dir, &self.repo.find_commit(oid)?)?;
         }
         if let Some(oid) = self.autostash {

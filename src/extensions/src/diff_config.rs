@@ -60,11 +60,12 @@
 //! `userdiff_config()` (userdiff.c), which `git_diff_basic_config` calls between
 //! the rename limit and the colour slots, owns the `diff.<driver>.funcname`,
 //! `.xfuncname`, `.wordregex`, `.binary`, `.textconv`, `.cachetextconv`,
-//! `.command` and `.algorithm` keys of a *user-defined driver*. Its refusals are
-//! regex-compilation failures whose text comes from the platform's regex library,
-//! so reproducing them means reproducing that library's messages; and this port
-//! has no user-driver machinery for a valid value to steer. It is left out rather
-//! than approximated.
+//! `.command` and `.algorithm` keys. Its *values* are read where they are used —
+//! [`crate::userdiff::Settings`] resolves them against git's built-in driver table
+//! — but its *refusals* are not raised here. git compiles a funcname pattern
+//! lazily, at the first pair that needs one (`xdiff_set_find_func()`), rather than
+//! at config-parse time, so that is where this port raises it too; and `.wordregex`
+//! and `.algorithm` have no reader yet.
 
 use crate::config::{ConfigValue, walk_config};
 use crate::default_config::{DefaultConfig, ObjectCreationMode, Rejection, git_default_config};

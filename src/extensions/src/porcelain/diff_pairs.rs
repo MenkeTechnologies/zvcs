@@ -164,8 +164,10 @@
 //! * `--follow` is fatal (`--follow requires exactly one pathspec`), matching git — the
 //!   command takes no pathspec, so the option can never be satisfied.
 //! * `gitattributes` diff drivers: a driver's `textconv` is honoured under `--textconv`
-//!   and its `command` under `--ext-diff`, but its custom `funcname` pattern is not, so
-//!   hunk headers use git's built-in `def_ff` heuristic only.
+//!   and its `command` under `--ext-diff`. Its funcname pattern is not threaded into
+//!   `text_analysis` here, so hunk headers use git's built-in `def_ff` heuristic only —
+//!   [`crate::userdiff`] has the compiled pattern, and `git diff`, `log` and `show`
+//!   read it, but the three plumbing verbs routed through this file do not yet.
 //! * `--stat`/`--summary` file names are not C-quoted, so a path containing a byte that
 //!   git would escape is emitted verbatim.
 
@@ -874,6 +876,22 @@ struct Pair {
 impl Pair {
     fn kind(&self) -> u8 {
         self.status[0]
+    }
+
+    /// This pair as the shared external-diff engine sees it.
+    fn ext(&self) -> ExtPair {
+        ExtPair {
+            old_path: self.old_path.clone(),
+            new_path: self.new_path.clone(),
+            old_id: self.old_id,
+            new_id: self.new_id,
+            old_mode: self.old_mode,
+            new_mode: self.new_mode,
+            old_oid_valid: true,
+            new_oid_valid: true,
+            kind: self.kind(),
+            score: self.score(),
+        }
     }
 
     /// The similarity/dissimilarity score encoded in the status token, if any.
@@ -1734,7 +1752,7 @@ pub(crate) fn render_raw_stream(
     // move detection needs the symbol stream the driver's output never enters.
     let ext_env = match external_diff_env() {
         Ok(e) => e,
-        Err(code) => return Ok(code),
+        Err(msg) => return Ok(fatal(&msg)),
     };
     let ext = match (opts.allow_external, drivers.as_ref()) {
         (true, Some(d)) => {
@@ -2983,37 +3001,84 @@ fn hex_or_full(id: &ObjectId, abbrev: Option<usize>) -> String {
 /// git's `struct external_diff`: the command line to run, plus whether its exit
 /// status carries the "were there changes" answer.
 #[derive(Clone)]
-struct ExternalDiff {
-    cmd: String,
-    trust_exit_code: bool,
+pub(crate) struct ExternalDiff {
+    pub(crate) cmd: String,
+    pub(crate) trust_exit_code: bool,
+}
+
+/// One filepair as [`run_external_diff`] sees it.
+///
+/// The engine is shared with [`super::diff`], whose queue is a different type
+/// (`Delta`) built from a different source, so the seven-positional argument group
+/// and the `fill_metainfo()` header are computed from this neutral view rather than
+/// from either command's own pair.
+pub(crate) struct ExtPair {
+    pub(crate) old_path: BString,
+    /// Equal to `old_path` unless the pair carries a second name (rename/copy).
+    pub(crate) new_path: BString,
+    pub(crate) old_id: ObjectId,
+    pub(crate) new_id: ObjectId,
+    /// Zero for a side git's `DIFF_FILE_VALID()` calls invalid — an addition's
+    /// pre-image or a deletion's post-image.
+    pub(crate) old_mode: u32,
+    pub(crate) new_mode: u32,
+    /// `p->one->oid_valid` / `p->two->oid_valid`. Clear for a side that is a worktree
+    /// file: `diff_fill_oid_info()` (diff.c:4990) hashes such a side into `oid` but
+    /// leaves the flag down, and `prepare_temp_file()` then hands the driver the
+    /// worktree path itself. `diff-pairs` reads its queue from stdin and has no
+    /// worktree side at all, so both are always set there.
+    pub(crate) old_oid_valid: bool,
+    pub(crate) new_oid_valid: bool,
+    /// The status letter: `M`, `A`, `D`, `R`, `C` or `T`.
+    pub(crate) kind: u8,
+    /// `p->score`, in [`super::diffcore_rename::MAX_SCORE`] units.
+    pub(crate) score: u32,
+}
+
+impl ExtPair {
+    fn old_valid(&self) -> bool {
+        self.old_mode != 0
+    }
+
+    fn new_valid(&self) -> bool {
+        self.new_mode != 0
+    }
+}
+
+/// How the `index <old>..<new>` line of `fill_metainfo()`'s header names its two
+/// object ids: `--abbrev=<n>`, `--full-index` and the `core.abbrev` default.
+pub(crate) struct IndexNaming {
+    pub(crate) base_abbrev: usize,
+    pub(crate) full_index: bool,
+    pub(crate) abbrev_explicit: Option<usize>,
 }
 
 /// The gitattributes stack + filter pipeline `userdiff_find_by_path()` and
 /// `prep_temp_blob()` share. One instance serves both `--textconv` and `--ext-diff`.
-type Drivers<'a, 'repo> = &'a std::cell::RefCell<super::cat_file::Textconv<'repo>>;
+pub(crate) type Drivers<'a, 'repo> = &'a std::cell::RefCell<super::cat_file::Textconv<'repo>>;
 
 /// The `--ext-diff` state the whole stream shares. Present only when the flag was
 /// given; `env` may still be `None`, in which case only a path whose `diff`
 /// attribute names a driver with a `command` reaches an external program.
-struct ExtCtx<'a, 'repo> {
-    drivers: Drivers<'a, 'repo>,
+pub(crate) struct ExtCtx<'a, 'repo> {
+    pub(crate) drivers: Drivers<'a, 'repo>,
     /// `external_diff()`. Its *presence* — not just its use on some path — is what
     /// suppresses `run_diff()`'s file/symlink split and `--color-moved`.
-    env: Option<ExternalDiff>,
+    pub(crate) env: Option<ExternalDiff>,
     /// `o->diff_path_counter`: set to zero by `diff_setup_done()` and never reset,
     /// so it counts external invocations across every batch.
-    counter: std::cell::Cell<u32>,
+    pub(crate) counter: std::cell::Cell<u32>,
     /// Whether `r->index` has been populated, which decides whether
     /// `reuse_worktree_file()` can borrow a worktree file at all. See
     /// [`queues_read_index`].
-    index_read: std::cell::Cell<bool>,
+    pub(crate) index_read: std::cell::Cell<bool>,
     /// The worktree index, opened the first time it is needed.
-    index: std::cell::OnceCell<Option<WorktreeIndex>>,
+    pub(crate) index: std::cell::OnceCell<Option<WorktreeIndex>>,
 }
 
 /// The worktree index plus the `core.trustCtime` / `core.checkStat` knobs
 /// `ie_match_stat()` obeys.
-struct WorktreeIndex {
+pub(crate) struct WorktreeIndex {
     state: gix::worktree::IndexPersistedOrInMemory,
     stat: gix::index::entry::stat::Options,
     workdir: std::path::PathBuf,
@@ -3166,7 +3231,7 @@ impl PatchSink<'_> {
 /// `git_diff_basic_config()` instead, so `diff-pairs` never reads it. Verified
 /// against stock git 2.55.0: `git -c diff.external=<prog> diff-pairs -z --ext-diff`
 /// still prints the internal patch. Only the environment reaches here.
-fn external_diff_env() -> std::result::Result<Option<ExternalDiff>, Status> {
+pub(crate) fn external_diff_env() -> std::result::Result<Option<ExternalDiff>, String> {
     let Some(cmd) = std::env::var_os("GIT_EXTERNAL_DIFF") else {
         return Ok(None);
     };
@@ -3181,7 +3246,7 @@ fn external_diff_env() -> std::result::Result<Option<ExternalDiff>, Status> {
 /// `git_env_bool()` + `git_parse_maybe_bool()`: an unset variable takes the default,
 /// `true`/`yes`/`on`/a non-zero integer are true, `false`/`no`/`off`/`0`/empty are
 /// false, and anything else is fatal.
-fn git_env_bool(key: &str, def: bool) -> std::result::Result<bool, Status> {
+pub(crate) fn git_env_bool(key: &str, def: bool) -> std::result::Result<bool, String> {
     let Some(raw) = std::env::var_os(key) else {
         return Ok(def);
     };
@@ -3201,24 +3266,22 @@ fn git_env_bool(key: &str, def: bool) -> std::result::Result<bool, Status> {
     }
     match v.parse::<i64>() {
         Ok(n) => Ok(n != 0),
-        Err(_) => Err(fatal(&format!(
-            "bad boolean environment value '{v}' for '{key}'"
-        ))),
+        Err(_) => Err(format!("bad boolean environment value '{v}' for '{key}'")),
     }
 }
 
 /// `run_diff_cmd()`'s driver override: with `allow_external` on, a path whose `diff`
 /// gitattribute names a driver that configures `diff.<name>.command` uses that
 /// driver in preference to `GIT_EXTERNAL_DIFF`.
-fn external_for_path(
+pub(crate) fn external_for_path(
     repo: &gix::Repository,
     drivers: Drivers<'_, '_>,
     path: &gix::bstr::BStr,
     env: Option<&ExternalDiff>,
-) -> std::result::Result<Option<ExternalDiff>, Status> {
+) -> std::result::Result<Option<ExternalDiff>, String> {
     let name = match drivers.borrow_mut().driver_name(path) {
         Ok(n) => n,
-        Err(e) => return Err(fatal(&e.to_string())),
+        Err(e) => return Err(e.to_string()),
     };
     if let Some(name) = name {
         if let Some(cmd) = super::cat_file::diff_driver_config(repo, &name, "command") {
@@ -3254,10 +3317,12 @@ struct TempSide {
 /// `prepare_temp_file()` (diff.c:4698).
 ///
 /// A missing side becomes the `/dev/null` `.`/`.` triple. An existing one is
-/// normally inflated into a temporary file of its own, except when
+/// normally inflated into a temporary file of its own, except when the side has no
+/// object of its own (`!one->oid_valid`, i.e. a worktree file) or
 /// `reuse_worktree_file()` confirms the checked-out file already holds exactly that
 /// object — then the driver is handed the worktree path itself, with the pair's own
 /// mode rather than the index entry's. Gitlinks never take that branch.
+#[allow(clippy::too_many_arguments)]
 fn prepare_temp_file(
     repo: &gix::Repository,
     drivers: Drivers<'_, '_>,
@@ -3266,7 +3331,8 @@ fn prepare_temp_file(
     id: &ObjectId,
     mode: u32,
     valid: bool,
-) -> std::result::Result<TempSide, Status> {
+    oid_valid: bool,
+) -> std::result::Result<TempSide, String> {
     use std::os::unix::ffi::OsStrExt;
 
     if !valid {
@@ -3277,11 +3343,22 @@ fn prepare_temp_file(
             mode: ".".to_string(),
         });
     }
-    if !is_gitlink_mode(mode) && ctx.reuse_worktree_file(repo, path, id) {
+    if !is_gitlink_mode(mode) && (!oid_valid || ctx.reuse_worktree_file(repo, path, id)) {
         return Ok(TempSide {
             dir: None,
             name: std::ffi::OsStr::from_bytes(path).to_os_string(),
-            hex: id.to_hex().to_string(),
+            // "we can borrow from the file in the work tree": a side with no object
+            // of its own is named to the driver by the null id, not by the hash
+            // `diff_fill_oid_info()` computed for the raw listing. Measured against
+            // git 2.55.0, `GIT_EXTERNAL_DIFF=echo git diff` prints
+            // `keep.txt <temp> <oid> 100644 keep.txt 0000000000000000000000000000000000000000 100644`.
+            hex: match oid_valid {
+                true => id.to_hex().to_string(),
+                false => id.kind().null().to_hex().to_string(),
+            },
+            // "Even though we may sometimes borrow the contents from the work tree,
+            // we always want one->mode. mode is trustworthy even when
+            // !(one->oid_valid), as long as DIFF_FILE_VALID(one)."
             mode: format!("{mode:06o}"),
         });
     }
@@ -3290,11 +3367,11 @@ fn prepare_temp_file(
     let data = if is_gitlink_mode(mode) {
         format!("Subproject commit {}\n", id.to_hex()).into_bytes()
     } else {
-        read_blob(repo, *id, true)?
+        read_blob(repo, *id, true).map_err(|_| format!("unable to read {}", id.to_hex()))?
     };
     let dir = match super::cat_file::temp_blob_dir() {
         Ok(d) => d,
-        Err(e) => return Err(fatal(&e.to_string())),
+        Err(e) => return Err(e.to_string()),
     };
     let file = match drivers
         .borrow_mut()
@@ -3303,7 +3380,7 @@ fn prepare_temp_file(
         Ok(f) => f,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
-            return Err(fatal(&format!("unable to write temp-file: {e}")));
+            return Err(format!("unable to write temp-file: {e}"));
         }
     };
     Ok(TempSide {
@@ -3319,33 +3396,28 @@ fn prepare_temp_file(
 /// `deleted file mode`, `old mode`/`new mode`) are *not* part of it — `builtin_diff()`
 /// writes those itself — so an addition or a deletion carries nothing but the
 /// `index` line.
-fn external_xfrm_msg(
-    repo: &gix::Repository,
-    p: &Pair,
-    opts: &Opts,
-    base_abbrev: usize,
-) -> Vec<u8> {
+fn external_xfrm_msg(repo: &gix::Repository, p: &ExtPair, naming: &IndexNaming) -> Vec<u8> {
     let mut msg = Vec::new();
-    match p.kind() {
+    match p.kind {
         k @ (b'C' | b'R') => {
             let verb = if k == b'C' { "copy" } else { "rename" };
-            msg.extend_from_slice(format!("similarity index {}%\n", p.score()).as_bytes());
+            msg.extend_from_slice(format!("similarity index {}%\n", p.score).as_bytes());
             msg.extend_from_slice(format!("{verb} from ").as_bytes());
             msg.extend_from_slice(&p.old_path);
             msg.extend_from_slice(format!("\n{verb} to ").as_bytes());
             msg.extend_from_slice(&p.new_path);
             msg.push(b'\n');
         }
-        b'M' if p.score() != 0 => {
-            msg.extend_from_slice(format!("dissimilarity index {}%\n", p.score()).as_bytes());
+        b'M' if p.score != 0 => {
+            msg.extend_from_slice(format!("dissimilarity index {}%\n", p.score).as_bytes());
         }
         _ => {}
     }
     if p.old_id != p.new_id {
         msg.extend_from_slice(b"index ");
-        msg.extend_from_slice(oid_text(repo, &p.old_id, base_abbrev, opts.full_index, opts.abbrev_explicit).as_bytes());
+        msg.extend_from_slice(oid_text(repo, &p.old_id, naming.base_abbrev, naming.full_index, naming.abbrev_explicit).as_bytes());
         msg.extend_from_slice(b"..");
-        msg.extend_from_slice(oid_text(repo, &p.new_id, base_abbrev, opts.full_index, opts.abbrev_explicit).as_bytes());
+        msg.extend_from_slice(oid_text(repo, &p.new_id, naming.base_abbrev, naming.full_index, naming.abbrev_explicit).as_bytes());
         if p.old_valid() && p.new_valid() && p.old_mode == p.new_mode {
             msg.extend_from_slice(format!(" {:06o}", p.new_mode).as_bytes());
         }
@@ -3355,13 +3427,13 @@ fn external_xfrm_msg(
 }
 
 /// Whatever the driver wrote, and whether git counted the pair as changed.
-struct ExtRun {
-    stdout: Vec<u8>,
-    found_changes: bool,
+pub(crate) struct ExtRun {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) found_changes: bool,
     /// `die(_("external diff died, stopping at %s"))`. Raised by the caller only
     /// *after* `stdout` has been passed on: git's child writes straight to the
     /// output descriptor, so everything it printed before failing is already out.
-    died: Option<String>,
+    pub(crate) died: Option<String>,
 }
 
 /// `run_external_diff()` (diff.c:4777).
@@ -3372,18 +3444,17 @@ struct ExtRun {
 /// puts the same bytes in the same order — git's own `fflush(NULL)` before forking
 /// exists to guarantee exactly that ordering.
 #[allow(clippy::too_many_arguments)]
-fn run_external_diff(
+pub(crate) fn run_external_diff(
     pgm: &ExternalDiff,
     repo: &gix::Repository,
     ctx: &ExtCtx<'_, '_>,
-    p: &Pair,
-    opts: &Opts,
-    base_abbrev: usize,
+    p: &ExtPair,
+    naming: &IndexNaming,
     total: usize,
     // `o->file`: `false` is git's quiet probe (`diff_flush_patch_quietly()`), which
     // nulls the file pointer so nothing is written.
     want_output: bool,
-) -> std::result::Result<ExtRun, Status> {
+) -> std::result::Result<ExtRun, String> {
     use std::os::unix::ffi::OsStrExt;
 
     // "If we don't need to show the diff and the external diff program lacks the
@@ -3408,6 +3479,7 @@ fn run_external_diff(
         &p.old_id,
         p.old_mode,
         p.old_valid(),
+        p.old_oid_valid,
     )?;
     let two = match prepare_temp_file(
         repo,
@@ -3417,6 +3489,7 @@ fn run_external_diff(
         &p.new_id,
         p.new_mode,
         p.new_valid(),
+        p.new_oid_valid,
     ) {
         Ok(t) => t,
         Err(code) => {
@@ -3442,7 +3515,7 @@ fn run_external_diff(
     ];
     if let Some(other) = &other {
         argv.push(std::ffi::OsStr::from_bytes(other).to_os_string());
-        let xfrm = external_xfrm_msg(repo, p, opts, base_abbrev);
+        let xfrm = external_xfrm_msg(repo, p, naming);
         if !xfrm.is_empty() {
             argv.push(std::ffi::OsStr::from_bytes(&xfrm).to_os_string());
         }
@@ -4684,6 +4757,10 @@ fn text_analysis(
             ctx: opts.ctx as usize,
             inter_hunk_ctx: opts.inter_hunk_ctx,
             func_context: opts.func_context,
+            // `diff-pairs` resolves a path's driver for `--textconv` and
+            // `--ext-diff`, but its funcname pattern is not threaded into
+            // `text_analysis` yet, so hunk headings use git's built-in `def_ff`.
+            funcname: None,
         },
     );
     Ok((add, del, hunks))
@@ -4717,13 +4794,28 @@ fn is_empty_rec(line: &[u8]) -> bool {
     line.iter().all(|b| b.is_ascii_whitespace())
 }
 
+/// `xecfg->find_func`: the driver's compiled `funcname`/`xfuncname` pattern when the
+/// path has one, and git's built-in [`def_ff`] heuristic when it does not — which is
+/// exactly what `xdl_emit_diff()` does with a NULL `find_func`.
+fn find_func<'a>(ff: Option<&crate::userdiff::FuncName>, rec: &'a [u8]) -> Option<&'a [u8]> {
+    match ff {
+        Some(f) => f.find(rec, FUNCNAME_MAX),
+        None => def_ff(rec),
+    }
+}
+
 /// `get_func_line`: walk the pre-image from `start` toward `limit` (exclusive, in either
-/// direction) and return the first record `def_ff` accepts as a function line, or `-1`.
-fn get_func_line(before: &[&[u8]], start: isize, limit: isize) -> isize {
+/// direction) and return the first record the find-func accepts as a function line, or `-1`.
+fn get_func_line(
+    ff: Option<&crate::userdiff::FuncName>,
+    before: &[&[u8]],
+    start: isize,
+    limit: isize,
+) -> isize {
     let step: isize = if start > limit { -1 } else { 1 };
     let mut l = start;
     while l != limit && l >= 0 && (l as usize) < before.len() {
-        if def_ff(before[l as usize]).is_some() {
+        if find_func(ff, before[l as usize]).is_some() {
             return l;
         }
         l += step;
@@ -4787,13 +4879,16 @@ fn get_hunk(changes: &[Change], cursor: usize, ctxlen: usize, interhunk: usize) 
 /// The three knobs `xdl_emit_diff` reads out of `xdemitconf_t` to decide hunk
 /// geometry, split out so callers that keep their options elsewhere — `git diff`'s
 /// own patch path, for one — can drive the same emitter.
-pub(crate) struct EmitGeometry {
+pub(crate) struct EmitGeometry<'a> {
     /// `--unified=<n>`.
     pub(crate) ctx: usize,
     /// `--inter-hunk-context=<n>`.
     pub(crate) inter_hunk_ctx: usize,
     /// `-W` / `--function-context`, i.e. `XDL_EMIT_FUNCCONTEXT`.
     pub(crate) func_context: bool,
+    /// `xecfg->find_func`: the path's userdiff driver funcname pattern, when it has
+    /// one. `None` leaves git's built-in [`def_ff`] in charge.
+    pub(crate) funcname: Option<&'a crate::userdiff::FuncName>,
 }
 
 /// `xdl_emit_diff`: turn the change script into unified-diff text and count the emitted
@@ -4807,7 +4902,7 @@ pub(crate) fn emit_unified(
     before: &[&[u8]],
     after: &[&[u8]],
     changes: &[Change],
-    geom: &EmitGeometry,
+    geom: &EmitGeometry<'_>,
 ) -> (u32, u32, Vec<u8>) {
     let (nrec1, nrec2) = (before.len(), after.len());
     let ctxlen = geom.ctx;
@@ -4849,7 +4944,7 @@ pub(crate) fn emit_unified(
             if i1 >= nrec1 as isize {
                 // An appended chunk needs no extra context if it added a whole function.
                 let mut i2 = changes[first].i2;
-                while i2 < nrec2 && def_ff(after[i2]).is_none() {
+                while i2 < nrec2 && find_func(geom.funcname, after[i2]).is_none() {
                     i2 += 1;
                 }
                 if i2 < nrec2 {
@@ -4857,10 +4952,10 @@ pub(crate) fn emit_unified(
                 }
                 i1 = nrec1 as isize - 1;
             }
-            let mut fs1 = get_func_line(before, i1, -1);
+            let mut fs1 = get_func_line(geom.funcname, before, i1, -1);
             while fs1 > 0
                 && !is_empty_rec(before[(fs1 - 1) as usize])
-                && def_ff(before[(fs1 - 1) as usize]).is_none()
+                && find_func(geom.funcname, before[(fs1 - 1) as usize]).is_none()
             {
                 fs1 -= 1;
             }
@@ -4890,7 +4985,7 @@ pub(crate) fn emit_unified(
             let (mut e1, mut e2) = (end1 + lctx, end2 + lctx);
 
             if geom.func_context {
-                let mut fe1 = get_func_line(before, end1 as isize, nrec1 as isize);
+                let mut fe1 = get_func_line(geom.funcname, before, end1 as isize, nrec1 as isize);
                 while fe1 > 0 && is_empty_rec(before[(fe1 - 1) as usize]) {
                     fe1 -= 1;
                 }
@@ -4902,7 +4997,7 @@ pub(crate) fn emit_unified(
                 // Overlap with the next change? Then fold it into this hunk.
                 if last + 1 < changes.len() {
                     let l = changes[last + 1].i1.min(nrec1.saturating_sub(1));
-                    if l <= e1 + ctxlen || get_func_line(before, l as isize, e1 as isize) < 0 {
+                    if l <= e1 + ctxlen || get_func_line(geom.funcname, before, l as isize, e1 as isize) < 0 {
                         last += 1;
                         continue;
                     }
@@ -4920,10 +5015,12 @@ pub(crate) fn emit_unified(
         // `func_line` lives across hunks in `xdl_emit_diff`: a failed search leaves the
         // previously found name in place, because the search only spans back to the last
         // hunk's origin and finding nothing means the enclosing function is unchanged.
-        let fl = get_func_line(before, s1 as isize - 1, funclineprev);
+        let fl = get_func_line(geom.funcname, before, s1 as isize - 1, funclineprev);
         funclineprev = s1 as isize - 1;
         if fl >= 0 {
-            func_name = def_ff(before[fl as usize]).unwrap_or_default().to_vec();
+            func_name = find_func(geom.funcname, before[fl as usize])
+                .unwrap_or_default()
+                .to_vec();
         }
         if !func_name.is_empty() {
             buf.push(b' ');
@@ -5432,11 +5529,16 @@ fn render_patch(
     for step in &steps {
         if let Some(ctx) = ext {
             let pgm =
-                external_for_path(repo, ctx.drivers, step.old_path.as_bstr(), ctx.env.as_ref())?;
+                external_for_path(repo, ctx.drivers, step.old_path.as_bstr(), ctx.env.as_ref())
+                    .map_err(|m| fatal(&m))?;
             if let Some(pgm) = pgm {
-                let run = run_external_diff(
-                    &pgm, repo, ctx, step, opts, base_abbrev, total, true,
-                )?;
+                let naming = IndexNaming {
+                    base_abbrev,
+                    full_index: opts.full_index,
+                    abbrev_explicit: opts.abbrev_explicit,
+                };
+                let run = run_external_diff(&pgm, repo, ctx, &step.ext(), &naming, total, true)
+                    .map_err(|m| fatal(&m))?;
                 *found_changes |= run.found_changes;
                 sink.splice(&run.stdout);
                 if let Some(msg) = run.died {
@@ -5543,11 +5645,16 @@ fn pair_found_changes(
     for step in &steps {
         if let Some(ctx) = ext {
             let pgm =
-                external_for_path(repo, ctx.drivers, step.old_path.as_bstr(), ctx.env.as_ref())?;
+                external_for_path(repo, ctx.drivers, step.old_path.as_bstr(), ctx.env.as_ref())
+                    .map_err(|m| fatal(&m))?;
             if let Some(pgm) = pgm {
-                let run = run_external_diff(
-                    &pgm, repo, ctx, step, opts, base_abbrev, total, false,
-                )?;
+                let naming = IndexNaming {
+                    base_abbrev,
+                    full_index: opts.full_index,
+                    abbrev_explicit: opts.abbrev_explicit,
+                };
+                let run = run_external_diff(&pgm, repo, ctx, &step.ext(), &naming, total, false)
+                    .map_err(|m| fatal(&m))?;
                 found |= run.found_changes;
                 if let Some(msg) = run.died {
                     return Err(fatal(&msg));

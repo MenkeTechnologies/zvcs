@@ -1850,11 +1850,15 @@ fn terminator(opts: &Opts) -> u8 {
 }
 
 impl Opts {
-    fn ctx_geometry(&self) -> super::diff_pairs::EmitGeometry {
+    /// `--no-index` reads no gitattributes at all (`diff_no_index()` never opens a
+    /// repository), so no userdiff driver can apply and the built-in `def_ff` is the
+    /// only heading heuristic there is.
+    fn ctx_geometry(&self) -> super::diff_pairs::EmitGeometry<'static> {
         super::diff_pairs::EmitGeometry {
             ctx: self.ctx as usize,
             inter_hunk_ctx: self.inter_hunk_ctx,
             func_context: self.func_context,
+            funcname: None,
         }
     }
 }

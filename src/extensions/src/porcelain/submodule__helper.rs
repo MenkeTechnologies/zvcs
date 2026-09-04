@@ -880,7 +880,7 @@ fn push_check(args: &[String]) -> Result<ExitCode> {
 
     // `if (argc > 2)`: the refspecs start at the third operand.
     if args.len() > 2 {
-        let local_refs = local_heads(&repo)?;
+        let local_refs = crate::refname::all_ref_names(&repo);
         for spec in &args[2..] {
             let Some(item) = parse_push_refspec(spec) else {
                 crate::git_fatal!("invalid refspec '{spec}'");
@@ -888,7 +888,7 @@ fn push_check(args: &[String]) -> Result<ExitCode> {
             if item.pattern || item.matching {
                 continue;
             }
-            match count_refspec_match(&item.src, &local_refs) {
+            match crate::refname::count_refspec_match(&item.src, &local_refs).0 {
                 1 => {}
                 0 if item.src == "HEAD" => {
                     if detached_head || head != superproject_head {
@@ -924,88 +924,6 @@ fn remote_is_configured(repo: &gix::Repository, name: &str) -> bool {
     configured
 }
 
-/// `get_local_heads()`: every ref under `refs/`, minus the ones whose name is
-/// malformed (`one_local_ref` drops those with `check_refname_format`).
-///
-/// The name is git's, not a description: `refs_for_each_ref()` walks all of
-/// `refs/`, so remote-tracking refs and tags are in the list too — which is the
-/// reason `count_refspec_match()` has a notion of a "weak" match at all.
-fn local_heads(repo: &gix::Repository) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for reference in repo.references()?.all()? {
-        let Ok(reference) = reference else { continue };
-        let name = reference.name().as_bstr().to_str_lossy().into_owned();
-        let Some(rest) = name.strip_prefix("refs/") else {
-            continue;
-        };
-        if gix::validate::reference::name(rest.into()).is_err() {
-            continue;
-        }
-        out.push(name);
-    }
-    Ok(out)
-}
-
-/// remote.c's `count_refspec_match()`, minus the matched-ref output parameter
-/// that `push_check()` passes as `NULL`.
-///
-/// A match is "weak" when it is with a ref outside `refs/heads/` and
-/// `refs/tags/` that the pattern did not name in full (or at least from
-/// `refs/`); one strong match with any number of weak ones is still unique.
-fn count_refspec_match(pattern: &str, refs: &[String]) -> usize {
-    let patlen = pattern.len();
-    let (mut weak_match, mut strong_match) = (0usize, 0usize);
-    let mut matched = false;
-    for name in refs {
-        if refname_match(pattern, name) == 0 {
-            continue;
-        }
-        let namelen = name.len();
-        if namelen != patlen
-            && patlen + 5 != namelen
-            && !name.starts_with("refs/heads/")
-            && !name.starts_with("refs/tags/")
-        {
-            weak_match += 1;
-        } else {
-            matched = true;
-            strong_match += 1;
-        }
-    }
-    match matched {
-        true => strong_match,
-        false => weak_match,
-    }
-}
-
-/// refs.c's `refname_match()`: could `abbrev_name` have meant `full_name`?
-///
-/// ```c
-/// static const char *ref_rev_parse_rules[] = {
-///         "%.*s", "refs/%.*s", "refs/tags/%.*s", "refs/heads/%.*s",
-///         "refs/remotes/%.*s", "refs/remotes/%.*s/HEAD", NULL
-/// };
-/// ```
-///
-/// (refs.c:622-630.) The return value is the rule's rank counted from the end,
-/// so an earlier rule scores higher; `count_refspec_match()` only asks whether
-/// it is non-zero.
-fn refname_match(abbrev_name: &str, full_name: &str) -> usize {
-    const RULES: [&str; 6] = [
-        "{}",
-        "refs/{}",
-        "refs/tags/{}",
-        "refs/heads/{}",
-        "refs/remotes/{}",
-        "refs/remotes/{}/HEAD",
-    ];
-    for (i, rule) in RULES.iter().enumerate() {
-        if full_name == rule.replace("{}", abbrev_name) {
-            return RULES.len() - i;
-        }
-    }
-    0
-}
 
 /// The three fields of a `struct refspec_item` that `push_check()` reads.
 struct PushRefspec {

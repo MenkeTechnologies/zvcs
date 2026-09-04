@@ -897,7 +897,7 @@ impl<'repo> Textconv<'repo> {
     /// temporary directory under its own basename — the name the program is handed
     /// — and capture the program's stdout. `None` when the program could not be
     /// started or exited non-zero, which is git's NULL return.
-    fn run(&mut self, program: &str, path: &BStr, blob: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn run(&mut self, program: &str, path: &BStr, blob: &[u8]) -> Result<Option<Vec<u8>>> {
         let dir = temp_blob_dir()?;
         let file = self.prep_temp_blob(&dir, path, blob)?;
 

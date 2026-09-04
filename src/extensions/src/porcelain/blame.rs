@@ -491,6 +491,15 @@ use crate::date::approxidate;
 /// path is known, with multiple `-L`s threading git's anchor from one to the next.
 /// The regexes are `regex::bytes` built with `multi_line` and without
 /// `dot_matches_new_line`, which is `regcomp(…, REG_NEWLINE)`.
+///
+/// git narrows the scoreboard to that range before the walk starts, and the walk
+/// is narrowed here too — which is what makes the `-M`/`-C` thresholds agree:
+/// `blame_entry_score()` measures the lines of the entry, so a three-line `-L`
+/// scores 31 where the whole file scores hundreds, and only the narrowed number is
+/// close enough to the default 40 for `-C` to decline a copy. The exception is the
+/// working-tree overlay, whose `-L` was resolved in the final image's line numbers
+/// rather than the blob's: the walk is narrowed only when the two images are
+/// byte-identical, so the mapping between them is the identity.
 pub fn blame(args: &[String]) -> Result<ExitCode> {
     blame_with(args, "blame")
 }
@@ -883,7 +892,21 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             .map(|o| o.detach().data)
             .unwrap_or_default(),
     };
-    match resolve_line_specs(&opts.line_specs, &final_image, &rel_path) {
+    // `parse_range_funcname()` (line-range.c:118) resolves the path's diff driver
+    // and installs its funcname pattern before searching, so `-L :<re>` looks at the
+    // section headings that driver recognises rather than at xdiff's built-in
+    // heuristic. Resolved once for the one path blame is given.
+    let line_funcname = match line_range_funcname(&repo, &rel_path) {
+        Ok(f) => f,
+        Err(msg) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "fatal: {msg}")?;
+            err.flush()?;
+            return Ok(ExitCode::from(128));
+        }
+    };
+    let line_funcname = line_funcname.as_ref().and_then(|d| d.funcname.as_ref());
+    match resolve_line_specs(&opts.line_specs, &final_image, &rel_path, line_funcname) {
         Ok(ranges) => opts.ranges = ranges,
         Err(LineSpecError::Usage) => return print_usage(cmd, false),
         Err(LineSpecError::Fatal(msg)) => {
@@ -894,9 +917,23 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         }
     }
 
-    // Blame the full file; `-L` is applied to the result so that the working-tree
-    // overlay can be built in working-tree line coordinates, as git does.
-    let ranges = if opts.ranges.is_empty() || worktree_content.is_some() {
+    // `fake_working_tree_commit()` hands the whole blame straight down when the
+    // final image *is* the suspect's blob, and the overlay is then the identity
+    // map — which is the one case where the walk can be narrowed to `-L` in the
+    // blob's own line numbers. Mid-merge the extra scapegoats are blamed by
+    // separate walks whose line numbers are their own, so the narrowing does not
+    // carry and the full file is walked instead.
+    let overlay_is_verbatim = worktree_content.as_ref().is_some_and(|content| {
+        merge_parents.is_empty()
+            && blob_at(&repo, &suspect, &rel_path)
+                .and_then(|id| repo.find_object(id).ok())
+                .is_some_and(|blob| blob.detach().data == *content)
+    });
+    // git narrows the scoreboard to `-L` before the walk starts, so
+    // `blame_entry_score()` — and with it the `-M`/`-C` thresholds — measures only
+    // the lines the range names. Where the overlay changes the line numbering the
+    // walk has to cover the whole file instead, and `-L` is applied to the result.
+    let ranges = if opts.ranges.is_empty() || (worktree_content.is_some() && !overlay_is_verbatim) {
         gix::blame::BlameRanges::default()
     } else {
         gix::blame::BlameRanges::from_one_based_inclusive_ranges(opts.ranges.clone())
@@ -977,6 +1014,11 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // `--incremental` is not cached either: it needs the walk-order, uncoalesced entries,
     // which the run encoding does not preserve.
     //
+    // Nor are `--porcelain` and `--line-porcelain`: their `previous <commit> <path>` field
+    // is `blame_origin::previous`, which only the walk knows — it carries the name the
+    // file had in the parent, and a commit that renamed and edited in one step has no
+    // other record of it. A cache hit would silently drop the field.
+    //
     // Neither are `--show-stats` and `--score-debug`: both report on the walk itself — the work it
     // did, and the `blame_origin` refcounts it ended up with — and a cache hit is precisely the
     // case where no walk happened. `--reverse` is a different traversal over a range the key does
@@ -1002,6 +1044,8 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         && !opts.show_stats
         && !opts.score_debug
         && !opts.reverse
+        && !opts.porcelain
+        && !opts.line_porcelain
         && opts.bottom.is_empty())
         .then(|| (suspect.to_string(), rel_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
@@ -1138,7 +1182,15 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         }
         let info = collect_commit_info(&repo, &lines, &opts, &null_id, &rel_path)?;
         let head_id = if index_only { None } else { head_id };
-        return emit_incremental(&repo, &entries, &info, &rel_path, head_id, &null_id);
+        return emit_incremental(
+            &repo,
+            &entries,
+            &info,
+            &rel_path,
+            head_id,
+            &null_id,
+            &previous_origins,
+        );
     }
 
     // cmd_blame folds `blame.coloring` in only when neither color bit survived
@@ -1448,6 +1500,11 @@ fn overlay_worktree(
         .collect();
 
     for (parent_lines, parent_blob) in sources {
+        // Keyed by the parent's own line number rather than by position: a walk
+        // narrowed to `-L` produces only the lines of the range, so the nth entry
+        // is not in general the nth line of the blob.
+        let by_line: std::collections::HashMap<u32, &Line> =
+            parent_lines.iter().map(|l| (l.final_no, l)).collect();
         let mapped =
             worktree_line_map(repo, parent_blob, worktree, diff_algorithm, ignore_whitespace)?;
         for (i, line) in out.iter_mut().enumerate() {
@@ -1456,7 +1513,7 @@ fn overlay_worktree(
             if line.commit_id != null_id {
                 continue;
             }
-            let Some(src) = mapped.get(i).copied().flatten().and_then(|n| parent_lines.get(n as usize))
+            let Some(src) = mapped.get(i).copied().flatten().and_then(|n| by_line.get(&(n + 1)).copied())
             else {
                 continue;
             };
@@ -1994,16 +2051,15 @@ fn emit_porcelain(
             } else if opts.reverse {
                 // Walking forwards, `origin->previous` is the first *child* the origin handed
                 // entries to, which no amount of looking at the commit's parents will find.
-                previous_origins
-                    .get(&(first.commit_id, first.source_name.clone()))
-                    .map(|(commit_id, name)| {
-                        (
-                            commit_id.to_hex().to_string(),
-                            name.clone().unwrap_or_else(|| current_path.to_vec()),
-                        )
-                    })
+                previous_of(previous_origins, first, current_path)
             } else {
-                find_previous(repo, first.commit_id, path)?
+                // `origin->previous` as `pass_blame()` recorded it — the first parent
+                // origin the commit handed entries to. That origin carries the path
+                // the file had *in the parent*, which is the only place a commit that
+                // renamed and modified in one step states its pre-rename name. A cache
+                // hit ran no walk and so has no map; the parent tree answers there.
+                previous_of(previous_origins, first, current_path)
+                    .map_or_else(|| find_previous(repo, first.commit_id, path), |p| Ok(Some(p)))?
             };
             previous_cache.insert(key.clone(), previous);
         }
@@ -2206,6 +2262,7 @@ fn emit_incremental(
     rel_path: &str,
     head_id: Option<ObjectId>,
     null_id: &ObjectId,
+    previous_origins: &PreviousOrigins,
 ) -> Result<ExitCode> {
     let current_path = rel_path.as_bytes();
     let stdout = std::io::stdout();
@@ -2231,7 +2288,16 @@ fn emit_incremental(
             let previous = if &entry.commit_id == null_id {
                 head_id.map(|h| (h.to_hex().to_string(), current_path.to_vec()))
             } else {
-                find_previous(repo, entry.commit_id, path)?
+                // Same `blame_origin::previous` the coalesced porcelain reports.
+                previous_origins
+                    .get(&(entry.commit_id, entry.source_name.clone()))
+                    .map(|(commit_id, name)| {
+                        (
+                            commit_id.to_hex().to_string(),
+                            name.clone().unwrap_or_else(|| current_path.to_vec()),
+                        )
+                    })
+                    .map_or_else(|| find_previous(repo, entry.commit_id, path), |p| Ok(Some(p)))?
             };
             previous_cache.insert(key.clone(), previous);
         }
@@ -2335,14 +2401,32 @@ fn group_lines(lines: &[Line]) -> Vec<Group> {
     groups
 }
 
-/// The `previous <commit> <path>` field: the first parent of `commit` in which
-/// `path` still exists. git records the origin it found in the first parent it
-/// looked at; when the file is not in that parent (the commit added it, or the
-/// commit is a root) there is no `previous` line at all.
+/// `blame_origin::previous` for the origin a group of lines names, as the walk
+/// recorded it: `(<parent commit>, <the path the file had in that parent>)`.
 ///
-/// A commit that both renamed and modified the file in one step would need
-/// rename detection against the parent to name the pre-rename path; that case is
-/// not covered here and yields no `previous` line.
+/// This is what git prints, and the pre-rename path is only knowable here —
+/// `pass_blame()` had the parent origin in hand, complete with the name rename
+/// detection gave it. `None` means the walk recorded no `previous` for this
+/// origin, which includes every case where no walk ran at all (a cache hit).
+fn previous_of(
+    previous_origins: &PreviousOrigins,
+    line: &Line,
+    current_path: &[u8],
+) -> Option<(String, Vec<u8>)> {
+    previous_origins
+        .get(&(line.commit_id, line.source_name.clone()))
+        .map(|(commit_id, name)| {
+            (
+                commit_id.to_hex().to_string(),
+                name.clone().unwrap_or_else(|| current_path.to_vec()),
+            )
+        })
+}
+
+/// The `previous <commit> <path>` field derived from the object database alone:
+/// the first parent of `commit` in which `path` still exists. Used only where the
+/// walk's own record is unavailable — a cache hit — since it cannot name a path
+/// a rename changed.
 fn find_previous(
     repo: &gix::Repository,
     commit: ObjectId,
@@ -4952,6 +5036,9 @@ impl Options {
                 "--indent-heuristic" => {}
                 // The same shape: `--no-textconv` asks for the state this port is
                 // already in, since the blame here never runs a textconv filter.
+                // `-L :<funcname>` *does* read the path's driver — see
+                // [`line_range_funcname`] — but converting each revision's blob
+                // before blaming it is a separate change to the scoreboard.
                 // (`--textconv` itself stays refused: with a `diff.<driver>.textconv`
                 // configured it changes what is blamed.)
                 "--no-textconv" => {}
@@ -5298,13 +5385,15 @@ fn resolve_line_specs(
     specs: &[String],
     image: &[u8],
     path: &str,
+    // `xecfg->find_func`: the path's diff-driver funcname pattern, if it has one.
+    funcname: Option<&crate::userdiff::FuncName>,
 ) -> Result<Vec<RangeInclusive<u32>>, LineSpecError> {
     let lines = split_lines(image);
     let num_lines = lines.len() as u32;
     let mut out: Vec<RangeInclusive<u32>> = Vec::with_capacity(specs.len());
     let mut anchor: u32 = 1;
     for spec in specs {
-        let (bottom, top) = parse_range_arg(spec, image, &lines, num_lines, anchor)?;
+        let (bottom, top) = parse_range_arg(spec, image, &lines, num_lines, anchor, funcname)?;
         // `if ((!lno && (top || bottom)) || lno < bottom)` — an empty file with a
         // non-empty request, or a start past the last line.
         if (num_lines == 0 && (top != 0 || bottom != 0)) || num_lines < bottom {
@@ -5326,12 +5415,13 @@ fn parse_range_arg(
     lines: &[&[u8]],
     num_lines: u32,
     anchor: u32,
+    funcname: Option<&crate::userdiff::FuncName>,
 ) -> Result<(u32, u32), LineSpecError> {
     // `if (anchor < 1) anchor = 1; if (anchor > lines) anchor = lines + 1;`
     let anchor = anchor.clamp(1, num_lines + 1);
 
     if spec.starts_with(':') || spec.starts_with("^:") {
-        return parse_range_funcname(spec, image, lines, num_lines, anchor);
+        return parse_range_funcname(spec, image, lines, num_lines, anchor, funcname);
     }
 
     // `parse_loc(arg, …, -anchor, begin)` then, after a comma,
@@ -5467,6 +5557,7 @@ fn parse_range_funcname(
     lines: &[&[u8]],
     num_lines: u32,
     anchor: u32,
+    funcname: Option<&crate::userdiff::FuncName>,
 ) -> Result<(u32, u32), LineSpecError> {
     // `if (*arg == '^') { anchor = 1; arg++; }`
     let (anchor, spec) = match spec.strip_prefix('^') {
@@ -5515,7 +5606,7 @@ fn parse_range_funcname(
         while lno + 1 <= lines.len() && line_offset(lines, image, lno + 1) <= match_at {
             lno += 1;
         }
-        if lno < lines.len() && is_funcname_line(lines[lno]) {
+        if lno < lines.len() && match_funcname(funcname, lines[lno]) {
             break lno as u32;
         }
         // `start = eol` — resume after the line the match ended on.
@@ -5541,7 +5632,7 @@ fn parse_range_funcname(
     }
     // `*end = *begin+1; while (*end < lines && !match_funcname(…)) (*end)++;`
     let mut end_line = begin + 1;
-    while end_line < num_lines && !is_funcname_line(lines[end_line as usize]) {
+    while end_line < num_lines && !match_funcname(funcname, lines[end_line as usize]) {
         end_line += 1;
     }
     // `(*begin)++` compensates for the 0-based scan.
@@ -5604,6 +5695,34 @@ fn whole_number(s: &str) -> Option<u32> {
 /// pattern.
 fn is_funcname_line(line: &[u8]) -> bool {
     matches!(line.first(), Some(&c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$')
+}
+
+/// `line-range.c:match_funcname()`: the driver's pattern when the path has one —
+/// only *whether* it matched is read, which is why git hands `find_func` a
+/// one-byte buffer — and [`is_funcname_line`] when it does not.
+pub(crate) fn match_funcname(
+    funcname: Option<&crate::userdiff::FuncName>,
+    line: &[u8],
+) -> bool {
+    match funcname {
+        Some(f) => f.find(line, 1).is_some(),
+        None => is_funcname_line(line),
+    }
+}
+
+/// `userdiff_find_by_path()` + `xdiff_set_find_func()` for one path, as
+/// `parse_range_funcname()` performs them.
+///
+/// The driver is returned rather than its pattern because the pattern is owned by it;
+/// callers read [`crate::userdiff::Driver::funcname`]. `Err` carries git's
+/// `die("Invalid regexp to look for hunk header: %s")`.
+pub(crate) fn line_range_funcname(
+    repo: &gix::Repository,
+    path: &str,
+) -> Result<Option<std::sync::Arc<crate::userdiff::Driver>>, String> {
+    use gix::bstr::ByteSlice;
+    let mut lookup = crate::userdiff::Lookup::new(repo).map_err(|e| e.to_string())?;
+    lookup.for_path(path.as_bytes().as_bstr())
 }
 
 /// git's `Q_("file %s has only %lu line", "file %s has only %lu lines", lines)`.
@@ -5673,7 +5792,8 @@ mod tests {
 
     fn ranges(specs: &[&str]) -> Result<Vec<RangeInclusive<u32>>, LineSpecError> {
         let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
-        resolve_line_specs(&specs, FILE, "g.txt")
+        // No `diff` gitattribute in these fixtures, so xdiff's built-in heuristic applies.
+        resolve_line_specs(&specs, FILE, "g.txt", None)
     }
 
     fn fatal(specs: &[&str]) -> String {

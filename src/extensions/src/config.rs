@@ -587,6 +587,23 @@ pub fn index_write_options_fresh(repo: &gix::Repository) -> gix::index::write::O
     }
 }
 
+/// `git_config_get_split_index()`: `core.splitIndex` as `tweak_split_index()`
+/// (read-cache.c:1932-1946) reads it — `None` for unset or unparseable, which is the
+/// `case -1: /* unset: do nothing */` that leaves an index in whatever shape it was read.
+pub fn split_index(repo: &gix::Repository) -> Option<bool> {
+    repo.config_snapshot().boolean("core.splitIndex")
+}
+
+/// `git_config_get_max_percent_split_change()`: `splitIndex.maxPercentChange` as
+/// `too_many_not_shared_entries()` (read-cache.c:3283) reads it.
+///
+/// git rejects a value outside `0..=100` with a warning and falls back to the default,
+/// which is what `None` asks for here.
+pub fn split_index_max_percent_change(repo: &gix::Repository) -> Option<u32> {
+    let value = repo.config_snapshot().integer("splitIndex.maxPercentChange")?;
+    u32::try_from(value).ok().filter(|v| *v <= 100)
+}
+
 /// `INDEX_FORMAT_LB` / `INDEX_FORMAT_UB` / `INDEX_FORMAT_DEFAULT`
 /// (`read-cache.h:9-11`): the supported range, and the version git falls back to
 /// when a request lands outside it.

@@ -21,9 +21,6 @@
 //!
 //! Deviations, surfaced rather than faked:
 //!
-//!   * `gitattributes` `diff=<driver>` `funcname` patterns are not read, so
-//!     `:<funcname>:` uses xdiff's built-in `def_ff` heading test — which is what
-//!     git itself uses for a path with no driver attribute.
 //!   * A regular expression that fails to compile reports git's message text for
 //!     the balance/repetition errors this module checks for and a generic
 //!     `invalid regular expression` otherwise; the exact wording of the rest comes
@@ -679,13 +676,24 @@ fn parse_loc<'a>(
 }
 
 /// `match_funcname` with no `diff=<driver>` pattern: xdiff's built-in heading test.
-fn match_funcname(data: &[u8], bol: usize, eol: usize) -> bool {
-    bol != eol && def_ff(&data[bol..eol], 1).is_some()
+fn match_funcname(
+    ff: Option<&crate::userdiff::FuncName>,
+    data: &[u8],
+    bol: usize,
+    eol: usize,
+) -> bool {
+    match ff {
+        // `xecfg->find_func(bol, eol - bol, buf, 1, priv) >= 0` — only whether the
+        // pattern matched is read, which is why git hands it a one-byte buffer.
+        Some(f) => f.find(&data[bol..eol], 1).is_some(),
+        None => bol != eol && def_ff(&data[bol..eol], 1).is_some(),
+    }
 }
 
 /// `find_funcname_matching_regexp`: the first match of `re` at or after `start` that
 /// sits on a line reading as a function heading.
 fn find_funcname_matching_regexp(
+    ff: Option<&crate::userdiff::FuncName>,
     data: &[u8],
     start: usize,
     re: &regex::bytes::Regex,
@@ -712,7 +720,7 @@ fn find_funcname_matching_regexp(
         if data.get(eol) == Some(&b'\n') {
             eol += 1;
         }
-        if match_funcname(data, bol, eol) {
+        if match_funcname(ff, data, bol, eol) {
             return Some(bol);
         }
         if eol <= start {
@@ -731,6 +739,9 @@ fn parse_range_funcname<'a>(
     lines: i64,
     mut anchor: i64,
     out: Option<(&mut i64, &mut i64)>,
+    // `xecfg->find_func`: the diff driver the `-L` path's `diff` gitattribute names,
+    // if it carries a funcname pattern.
+    ff: Option<&crate::userdiff::FuncName>,
 ) -> R<Option<&'a str>> {
     let mut arg = arg;
     if arg.starts_with('^') {
@@ -761,7 +772,7 @@ fn parse_range_funcname<'a>(
         Ok(re) => re,
         Err(msg) => return die(format!("-L parameter '{pattern}': {msg}")),
     };
-    let Some(p) = find_funcname_matching_regexp(blob.data, start, &re) else {
+    let Some(p) = find_funcname_matching_regexp(ff, blob.data, start, &re) else {
         return die(format!(
             "-L parameter '{pattern}' starting at line {}: no match",
             anchor + 1
@@ -779,7 +790,7 @@ fn parse_range_funcname<'a>(
     while *end < lines {
         let bol = blob.at(*end);
         let eol = blob.at(*end + 1);
-        if match_funcname(blob.data, bol, eol) {
+        if match_funcname(ff, blob.data, bol, eol) {
             break;
         }
         *end += 1;
@@ -795,6 +806,7 @@ fn parse_range_arg(
     blob: &Blob<'_>,
     lines: i64,
     mut anchor: i64,
+    ff: Option<&crate::userdiff::FuncName>,
 ) -> R<Option<(i64, i64)>> {
     let (mut begin, mut end) = (0i64, 0i64);
     if anchor < 1 {
@@ -806,7 +818,7 @@ fn parse_range_arg(
 
     if arg.starts_with(':') || (arg.starts_with("^:")) {
         let rest =
-            parse_range_funcname(arg, Some(blob), lines, anchor, Some((&mut begin, &mut end)))?;
+            parse_range_funcname(arg, Some(blob), lines, anchor, Some((&mut begin, &mut end)), ff)?;
         return match rest {
             Some(r) if r.is_empty() => Ok(Some((begin, end))),
             _ => Ok(None),
@@ -832,7 +844,8 @@ fn parse_range_arg(
 /// leaving the `:<file>` tail. `Ok(None)` is git's NULL return.
 fn skip_range_arg(arg: &str) -> R<Option<&str>> {
     if arg.starts_with(':') || arg.starts_with("^:") {
-        return parse_range_funcname(arg, None, 0, 0, None);
+        // Skipping consults no funcname pattern: `skip_range_arg()` never resolves.
+        return parse_range_funcname(arg, None, 0, 0, None, None);
     }
     let rest = parse_loc(arg, None, 0, -1, None)?;
     let rest = match rest.strip_prefix(',') {
@@ -921,7 +934,16 @@ pub(crate) fn parse_lines(
             _ => 1,
         };
 
-        let Some((mut begin, mut end)) = parse_range_arg(range_part, &blob, lines, anchor)? else {
+        // `parse_range_funcname()` (line-range.c:152) resolves the path's diff
+        // driver and installs its funcname pattern, so `:<re>` searches that
+        // driver's section headings rather than xdiff's built-in heuristic.
+        let ff = match super::blame::line_range_funcname(repo, &String::from_utf8_lossy(&full_name)) {
+            Ok(f) => f,
+            Err(msg) => return die(msg),
+        };
+        let Some((mut begin, mut end)) =
+            parse_range_arg(range_part, &blob, lines, anchor, ff.as_ref().and_then(|d| d.funcname.as_ref()))?
+        else {
             return die(format!("malformed -L argument '{range_part}'"));
         };
         if (lines == 0 && (begin != 0 || end != 0)) || lines < begin {

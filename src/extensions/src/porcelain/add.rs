@@ -1219,7 +1219,15 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     } else {
         staged.len()
     };
-    if index_entries == 0 && deletions.is_empty() && chmod.is_none() {
+    // …unless the shape of the index itself has to change. `tweak_split_index()` calls
+    // `remove_split_index()` on every index read under `core.splitIndex=false`
+    // (read-cache.c:1932-1946), and that sets `SOMETHING_CHANGED` (split-index.c:491) —
+    // so `cache_changed` is already non-zero before `cmd_add` stages anything and its
+    // `write_locked_index(..., COMMIT_LOCK | SKIP_IF_UNCHANGED)` writes regardless. What
+    // it writes is one whole index with the `link` extension gone, which is the point:
+    // the setting un-splits the index whether or not the command staged a byte.
+    let unsplit_pending = index.had_link() && crate::config::split_index(&repo) == Some(false);
+    if index_entries == 0 && deletions.is_empty() && chmod.is_none() && !unsplit_pending {
         // The report still comes out: git prints `add '<path>'` from inside
         // `add_to_index()` as it goes, whether or not the cache ends up changing.
         if verbose {
@@ -1278,7 +1286,32 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         let chmod_errors = apply_chmod_pathspec(&mut index, chmod, include_sparse, sparsity.as_ref(), |p| {
             pathspec.is_included(p, Some(false))
         });
-        invalidate_tree_cache(&mut index, &remove);
+        // Every path that reached `add_to_index()` invalidates its tree-cache node, and
+        // that includes the tracked ones `-N` then declines to replace:
+        //
+        // ```c
+        // if (!(option & ADD_CACHE_KEEP_CACHE_TREE))
+        //         cache_tree_invalidate_path(istate, ce->name);
+        //
+        // /* existing match? Just replace it. */
+        // if (pos >= 0) {
+        //         if (!new_only)
+        //                 replace_index_entry(istate, pos, ce);
+        //         return 0;
+        // }
+        // ```
+        //
+        // (`add_index_entry_with_check()`, read-cache.c:1273-1283.) The invalidation is
+        // ahead of the `ADD_CACHE_NEW_ONLY` return, so `git add -N .` in a repository
+        // whose entries are still racily clean invalidates the directory of every one of
+        // them while changing not a single entry — which is exactly the tree-cache stock
+        // leaves behind.
+        let invalidate: HashSet<BString> = staged
+            .iter()
+            .map(|s| s.path.clone())
+            .chain(deletions.iter().cloned())
+            .collect();
+        invalidate_tree_cache(&mut index, &invalidate);
         // `do_write_index()` sets the hashfile's `skip_hash` from the repository's
         // settings block before it serialises a single entry
         // (read-cache.c:2830-2831), so `index.skipHash` — and the

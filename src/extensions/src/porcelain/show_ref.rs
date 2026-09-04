@@ -357,8 +357,25 @@ fn run_patterns(repo: &gix::Repository, opts: &Opts, patterns: &[String]) -> Res
     }
 
     for reference in repo.references()?.all()? {
-        // Broken refs are skipped, as git's ref iteration does.
-        let Ok(mut reference) = reference else { continue };
+        // A ref whose file will not parse is still *yielded*, with a null oid
+        // in place of the id that could not be read — the same entry
+        // `for-each-ref` drops with `warning: ignoring broken ref`. `show_one()`
+        // has no such filter: it asks the odb for that null id, does not find
+        // it, and dies. So the broken ref reaches the `bad ref` path below
+        // rather than being skipped, and the id git prints is the null one.
+        let mut reference = match broken_as_null(reference) {
+            Ok(r) => r,
+            Err(None) => continue,
+            Err(Some(name)) => {
+                if (opts.branches || opts.tags) && !prefix_selected(&name, opts) {
+                    continue;
+                }
+                if !patterns.is_empty() && !patterns.iter().any(|p| matches_pattern(&name, p)) {
+                    continue;
+                }
+                return bad_ref(&out, &name, ObjectId::null(repo.object_hash()));
+            }
+        };
         let name = reference.name().as_bstr().to_string();
 
         if (opts.branches || opts.tags) && !prefix_selected(&name, opts) {
@@ -625,4 +642,40 @@ fn bad_ref(pending: &str, name: &str, id: ObjectId) -> Result<ExitCode> {
     print!("{pending}");
     eprintln!("fatal: git show-ref: bad ref {name} ({id})");
     Ok(ExitCode::from(128))
+}
+
+/// One ref of an iteration, or the name of one git would hand back with a null
+/// object id because its file did not parse.
+///
+/// The ref iteration does not stop on a ref it cannot read: it zeroes the id,
+/// marks the entry `REF_ISBROKEN` and yields it anyway. Callers then differ —
+/// `apply_ref_filter()` (ref-filter.c) drops it with
+/// `warning: ignoring broken ref <name>` and `for-each-ref` exits 0, while
+/// `show-ref` has no such test and `show_one()` reaches the odb with the null
+/// id it was handed:
+///
+/// ```c
+/// if (!odb_has_object(the_repository->objects, ref->oid, ...))
+///         die("git show-ref: bad ref %s (%s)", ref->name, oid_to_hex(ref->oid));
+/// ```
+///
+/// Returning the *name* here is what lets the caller reproduce that.
+fn broken_as_null<'r>(
+    entry: std::result::Result<
+        gix::Reference<'r>,
+        Box<dyn std::error::Error + Send + Sync + 'static>,
+    >,
+) -> std::result::Result<gix::Reference<'r>, Option<String>> {
+    use gix::refs::file::iter::loose_then_packed::Error as IterError;
+    match entry {
+        Ok(r) => Ok(r),
+        Err(e) => match e.downcast_ref::<IterError>() {
+            Some(IterError::ReferenceCreation { relative_path, .. }) => {
+                Err(Some(relative_path.to_string_lossy().replace('\\', "/")))
+            }
+            // A traversal or read failure is not a broken ref, and the listing
+            // walked past those before this function existed.
+            _ => Err(None),
+        },
+    }
 }

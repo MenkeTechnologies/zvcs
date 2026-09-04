@@ -717,7 +717,13 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
         None => crate::porcelain::push_proto::objects_to_send(repo, &wants, &common),
     };
     // `--filter=<spec>` on the `pack-objects` git spawns (upload-pack.c:340-344).
-    crate::porcelain::pack_objects::apply_filter(repo, filter_spec.as_deref(), &mut objects);
+    // The `want`s go in as the exemption: they reach `pack-objects` as pending
+    // revisions, which never carry `NOT_USER_GIVEN`, and
+    // `list_objects_filter__filter_object()` only consults the filter for
+    // objects that do. A client asking for a blob by id while repeating its own
+    // `filter blob:none` — every lazy fetch of a partial clone — must get that
+    // blob back, not an empty pack.
+    crate::porcelain::pack_objects::apply_filter(repo, filter_spec.as_deref(), &wants, &mut objects);
     // `include-tag` off the client's capability list, the v0 spelling of the v2
     // argument. A shallow clone depends on it: its tags are never `want`ed, so a
     // tag whose target landed inside the window arrives only if the pack carries
@@ -2236,7 +2242,8 @@ fn send_pack_section(
         }
         None => crate::porcelain::push_proto::objects_to_send(repo, &args.wants, &args.haves),
     };
-    crate::porcelain::pack_objects::apply_filter(repo, args.filter.as_deref(), &mut objects);
+    // The `want`s are exempt from the filter; see the v0 half above.
+    crate::porcelain::pack_objects::apply_filter(repo, args.filter.as_deref(), &args.wants, &mut objects);
     if args.include_tag {
         add_included_tags(repo, &mut objects);
     }

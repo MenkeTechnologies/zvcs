@@ -92,7 +92,8 @@
 //!
 //! What is refused rather than faked, because the underlying substrate is
 //! absent: `--rebase=interactive` (interactive todo editing needs a TTY editor
-//! loop) and `--set-upstream`.
+//! loop). `--set-upstream` is forwarded to the fetch, which is where
+//! `run_fetch()` pushes it and where the ported fetch implements it.
 //!
 //! Option *errors* are `parse-options`': an unknown option prints
 //! `error: unknown option \`<name>'` and the whole usage block on stderr and
@@ -544,6 +545,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_progress: Option<bool> = None;
     let mut f_dry_run = false;
     let mut f_append = false;
+    let mut f_set_upstream = false;
     let mut f_keep: Option<bool> = None;
     let mut f_show_forced: Option<bool> = None;
     let mut f_recurse: Option<String> = None;
@@ -692,8 +694,25 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--no-keep" => f_keep = Some(false),
             "--show-forced-updates" => f_show_forced = Some(true),
             "--no-show-forced-updates" => f_show_forced = Some(false),
+            // ```c
+            // OPT_CALLBACK_F(0, "recurse-submodules", &recurse_submodules_cli, N_("on-demand"),
+            //                N_("control recursive fetching of submodules"),
+            //                PARSE_OPT_OPTARG, option_fetch_parse_recurse_submodules),
+            // ```
+            //
+            // (builtin/pull.c:127-130.) The value is parsed by `cmd_pull` itself,
+            // not by the fetch it spawns, so a bad one is *pull's* `die()` at 128
+            // — `bad recurse-submodules argument: <value>` — and never reaches the
+            // child whose failures pull reports as 1.
             "--recurse-submodules" => {
-                f_recurse = Some(inline.clone().unwrap_or_else(|| "yes".into()))
+                let value = inline.clone().unwrap_or_else(|| "yes".into());
+                if !matches!(
+                    value.as_str(),
+                    "yes" | "true" | "no" | "false" | "on-demand"
+                ) {
+                    crate::git_fatal!("bad recurse-submodules argument: {value}");
+                }
+                f_recurse = Some(value)
             }
             "--no-recurse-submodules" => f_recurse = Some("no".into()),
             // `OPT_PASSTHRU('j', "jobs", …, PARSE_OPT_OPTARG)`: an attached value
@@ -758,13 +777,17 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             // value and sends nothing, rather than being an unknown option.
             "--no-cleanup" => merge_passthru.retain(|o| !o.starts_with("--cleanup=")),
 
-            // Absent substrate. `--no-set-upstream` asks for the default (do
-            // nothing), so it is accepted where the positive form is refused,
-            // exactly as git treats it as an ordinary negation.
-            "--no-set-upstream" => {}
-            "--set-upstream" => {
-                bail!("--set-upstream is not supported (not exposed by the high-level fetch)")
-            }
+            // ```c
+            // if (set_upstream)
+            //         strvec_push(&args, "--set-upstream");
+            // ```
+            //
+            // (`run_fetch()`, builtin/pull.c.) `--set-upstream` belongs to the
+            // *fetch*, not to the integration step: the branch it records is the
+            // one `FETCH_HEAD` came from, which only the fetch knows. The ported
+            // fetch implements it, so pull forwards it exactly as git does.
+            "--no-set-upstream" => f_set_upstream = false,
+            "--set-upstream" => f_set_upstream = true,
 
             // `OPT_PASSTHRU('S', "gpg-sign", …, PARSE_OPT_OPTARG)` and
             // `OPT_PASSTHRU(0, "verify-signatures", …, PARSE_OPT_NOARG)`: pull
@@ -927,6 +950,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if f_append {
         fetch_args.push("--append".into());
     }
+    if f_set_upstream {
+        fetch_args.push("--set-upstream".into());
+    }
     match f_keep {
         Some(true) => fetch_args.push("--keep".into()),
         Some(false) => fetch_args.push("--no-keep".into()),
@@ -975,7 +1001,25 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // Network / bad-remote failures surface as `Err`; a ref-rejection returns a
     // non-success code with the summary already printed. The tracking-ref check
     // below then reports the missing upstream, as git's pull does.
-    let fetch_code = super::fetch(&fetch_args)?;
+    let fetch_code = match super::fetch(&fetch_args) {
+        Ok(code) => code,
+        // git spawns the fetch as a child, so a `die()` inside it prints there and
+        // `run_fetch()` sees nothing but a non-zero status — which `cmd_pull`
+        // flattens to 1 like every other fetch failure. This port calls the fetch
+        // in-process, so its `fatal:` has to be rendered here; letting the error
+        // travel on would end the *pull* at 128, which is the status git reserves
+        // for a `die()` of its own.
+        Err(e) => {
+            if let Some(fatal) = e.downcast_ref::<crate::fatal::Fatal>() {
+                eprintln!("fatal: {fatal}");
+                return Ok(ExitCode::FAILURE);
+            }
+            if e.downcast_ref::<crate::fatal::Silent>().is_some() {
+                return Ok(ExitCode::FAILURE);
+            }
+            return Err(e);
+        }
+    };
 
     // `cmd_pull()` is `if (run_fetch(...)) return 1;` - a fetch that failed ends the pull right
     // there, with 1 whatever the fetch itself exited with, and no integration step is attempted.
@@ -1064,8 +1108,27 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // `Already up to date.` while the rebase, which still runs, says
     // `Current branch <b> is up to date.`. Both are exercised against stock git
     // in tests/pull_up_to_date.rs, so nothing is short-circuited here.
+    // ```c
+    // theirs = lookup_commit_reference(the_repository, &merge_heads->oid[i]);
+    // ```
+    //
+    // (`already_up_to_date()`, builtin/pull.c:963, and `get_can_ff()` at :976
+    // does the same on its side.) Both questions are asked of *commits*, and
+    // `lookup_commit_reference()` peels a tag object to reach one — so
+    // `git pull . v0.2.0` on an annotated tag compares the commit it names, not
+    // the tag object. Comparing the tag object instead makes every ancestry test
+    // fail, which reads as a diverged branch and refuses a pull git calls
+    // `Already up to date.`.
+    let commit_of = |id: gix::ObjectId| -> gix::ObjectId {
+        repo.find_object(id)
+            .ok()
+            .and_then(|object| object.peel_to_kind(gix::objs::Kind::Commit).ok())
+            .map(|commit| commit.id)
+            .unwrap_or(id)
+    };
     let already_up_to_date = merge_heads.iter().all(|(id, _)| {
-        repo.merge_base(*id, head_id).map(|base| base.detach() == *id).unwrap_or(false)
+        let id = commit_of(*id);
+        repo.merge_base(id, head_id).map(|base| base.detach() == id).unwrap_or(false)
     });
 
     // `builtin/pull.c`'s `can_ff`: `get_can_ff()` asks whether the *first* fetched
@@ -1073,7 +1136,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // git forces `opt_ff = "--ff-only"` and runs the *merge* (`ran_ff`), never
     // starting the rebase.
     let can_ff = repo
-        .merge_base(merge_heads[0].0, head_id)
+        .merge_base(commit_of(merge_heads[0].0), head_id)
         .map(|base| base.detach() == head_id)
         .unwrap_or(false);
 

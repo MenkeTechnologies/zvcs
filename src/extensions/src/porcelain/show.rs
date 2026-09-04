@@ -728,6 +728,18 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     patch_opts.ws = super::diff::Whitespace::IgnoreAtEol;
                 } else if s == "--ignore-cr-at-eol" {
                     patch_opts.ws = super::diff::Whitespace::IgnoreCrAtEol;
+                } else if s == "--textconv" {
+                    // `cmd_log_init_defaults()` raises `flags.allow_textconv`, so this
+                    // only restores the default; `--no-textconv` is what matters.
+                    patch_opts.allow_textconv = true;
+                } else if s == "--no-textconv" {
+                    patch_opts.allow_textconv = false;
+                } else if s == "--ext-diff" {
+                    // `cmd_log_init_defaults()` leaves `flags.allow_external` down, so
+                    // `show` reaches an external driver only through this flag.
+                    patch_opts.allow_external = true;
+                } else if s == "--no-ext-diff" {
+                    patch_opts.allow_external = false;
                 } else if s == "--full-index" {
                     patch_opts.full_index = true;
                 } else if s == "-a" || s == "--text" {

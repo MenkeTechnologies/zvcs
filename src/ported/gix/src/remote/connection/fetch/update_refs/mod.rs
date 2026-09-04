@@ -116,6 +116,27 @@ pub(crate) fn update(
                 continue;
             }
         }
+        // ```c
+        // if (!rm->peer_ref)
+        //         continue;
+        // [...]
+        // if (check_refname_format(rm->peer_ref->name, 0)) {
+        //         error(_("* Ignoring funny ref '%s' locally"), rm->peer_ref->name);
+        //         continue;
+        // }
+        // ```
+        //
+        // (`store_updated_refs()`, builtin/fetch.c.) A destination the ref store
+        // would refuse is skipped, not fatal: the rest of the fetch is applied
+        // and the command still exits 0. Looking the name up first would turn it
+        // into a validation error instead, which is a different ending.
+        if local
+            .as_ref()
+            .is_some_and(|name| gix_validate::reference::name(name.as_slice().into()).is_err())
+        {
+            updates.push(Mode::RejectedFunnyRefName.into());
+            continue;
+        }
         let (mode, edit_index, type_change) = match local {
             Some(name) => {
                 let (mode, reflog_message, name, previous_value) = match repo.try_find_reference(name)? {

@@ -575,10 +575,13 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///
 /// `--follow` itself is ported: `try_to_follow_renames()`'s rewrite of the
 /// pathspec, one commit at a time along the first parent, so the log walks back
-/// through every name the file has had. Its exact-rename pass is git's; the
-/// inexact one uses the same `diffcore_count_changes()` estimator, which agrees on
-/// the score but may pick a different winner when several deletions in one commit
-/// score alike.
+/// through every name the file has had. It runs at the command's own `-M<n>`
+/// threshold, and its exact pass is git's, over every file the parent has — the
+/// `find_copies_harder` that `try_to_follow_renames()` sets, which is what lets a
+/// copy be followed to a source the commit left in place. The inexact pass uses
+/// the same `diffcore_count_changes()` estimator, so it agrees on the score of
+/// every pair it forms, but it forms pairs only against the paths the commit
+/// changed and may pick a different winner when several of them score alike.
 ///
 /// Output separation follows git's `format:` (separator) versus `tformat:`
 /// (terminator) distinction, which is why `--format=%s` and `--pretty=format:%s`
@@ -2265,6 +2268,19 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         } else if a == "-D" || a == "--irreversible-delete" {
             patch_opts.irreversible_delete = true;
+        } else if a == "--textconv" {
+            // `cmd_log_init_defaults()` raises `flags.allow_textconv`, so this only
+            // restores the default; `--no-textconv` is the spelling that matters.
+            patch_opts.allow_textconv = true;
+        } else if a == "--no-textconv" {
+            patch_opts.allow_textconv = false;
+        } else if a == "--ext-diff" {
+            // `cmd_log_init_defaults()` leaves `flags.allow_external` down, so a
+            // history command reaches `GIT_EXTERNAL_DIFF`, `diff.external` and a
+            // driver's `diff.<name>.command` only through this flag.
+            patch_opts.allow_external = true;
+        } else if a == "--no-ext-diff" {
+            patch_opts.allow_external = false;
         } else if a == "-W" || a == "--function-context" {
             patch_opts.func_context = true;
         } else if a == "--no-function-context" {
@@ -3385,6 +3401,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             eprintln!("fatal: --follow requires exactly one pathspec");
             return Ok(ExitCode::from(128));
         }
+        // `cmd_log_init_finish()` again: the followed path is rewritten as the
+        // walk goes back, so only the magic that survives a rename — `top` and
+        // `exclude` — is accepted. Anything else, `:(glob)` included, is fatal.
+        for spec in &pathspecs {
+            if let Some(magic) = super::whatchanged::unsupported_follow_magic(spec) {
+                eprintln!("fatal: pathspec magic not supported by --follow: '{magic}'");
+                return Ok(ExitCode::from(128));
+            }
+        }
         // `try_to_follow_renames()` (tree-diff.c): walk newest first along the
         // first parent, and when the followed path turns out to have arrived by a
         // rename, switch to the name it came from. A commit is shown exactly when
@@ -3415,7 +3440,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // The switch happens after the commit is judged: the rename *is* the
             // change that makes the commit interesting.
             if let Some(parent) = parent {
-                if let Some(src) = follow_source(&repo, &commit, parent, &current)? {
+                // `diff_opts.rename_score = opt->rename_score`: `--follow` runs its
+                // rename search at the threshold the command line set, so
+                // `--follow -M90%` declines a rename the default 50% would take.
+                let min_score = match patch_opts.rename_score {
+                    0 => super::diffcore_rename::DEFAULT_RENAME_SCORE,
+                    n => n,
+                };
+                if let Some(src) = follow_source(&repo, &commit, parent, &current, min_score)? {
                     current = src;
                     matcher = PathspecMatcher::new(&repo, &[current.to_string()])?;
                 }
@@ -9952,6 +9984,7 @@ pub(crate) fn rev_list_pretty_body(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     pretty: &Pretty,
+    date_mode: &DateMode,
 ) -> Result<Vec<u8>> {
     let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
     let colors = super::color::DecorateColors::disabled();
@@ -9961,7 +9994,10 @@ pub(crate) fn rev_list_pretty_body(
         // Neither caller is `git log`: `--show-signature` is a `rev_info` field and
         // these two render through `pretty_print_commit()` with a bare context.
         show_signature: false,
-        date_mode: DateMode::Default,
+        // `--date=<mode>` is `revs->date_mode`, which the pretty printer reads for
+        // `%ad`/`%cd` and the header lines. `diff-tree` has no `--date` of its own
+        // and passes the default.
+        date_mode: date_mode.clone(),
         extra: Vec::new(),
         want_color: false,
         colors: &colors,
@@ -11316,19 +11352,38 @@ fn decode_changes(text: &str) -> Option<Vec<FileChange>> {
 
 /// Whether the diff between `commit` and `parent` (the empty tree when `None`)
 /// touches any of the pathspecs — git's TREESAME test, negated.
-/// The name the followed path arrived from, when this commit renamed it —
-/// `try_to_follow_renames()` reduced to what `--follow` needs: the path must be new
-/// in this commit, and the source is the deletion whose content is most similar.
+/// The name the followed path arrived from, when this commit renamed or copied it
+/// — `try_to_follow_renames()` reduced to what `--follow` needs: the path must be
+/// new in this commit, and the source is the file it came from.
 ///
-/// git runs its full `diffcore_rename` here (exact matches first, then the 50%
-/// similarity pass). The exact pass is reproduced faithfully; the inexact one uses
-/// the same `diffcore_count_changes()` estimator, so it agrees on the score but
-/// picks its own winner when several deletions score alike.
+/// ```c
+/// diff_opts.flags.recursive = 1;
+/// diff_opts.flags.find_copies_harder = 1;
+/// diff_opts.detect_rename = DIFF_DETECT_RENAME;
+/// diff_opts.rename_score = opt->rename_score;
+/// diff_opts.single_follow = opt->pathspec.items[0].match;
+/// ```
+///
+/// (`try_to_follow_renames()`, tree-diff.c.) Two things follow from that block and
+/// both are reproduced here. `find_copies_harder` puts *every* file the parent has
+/// on the source side, not only the ones this commit changed — which is how a copy
+/// whose source the commit left in place is still followed. And `rename_score` is
+/// the command's own `-M<n>`, so `--follow -M90%` declines a rename that only
+/// scores 72.
+///
+/// The exact pass is reproduced over the whole parent tree, as
+/// `find_exact_renames()` runs it. The inexact pass is run over the paths this
+/// commit changed rather than over every file the parent has: it uses the same
+/// `diffcore_count_changes()` estimator, so it agrees on the score of every pair it
+/// scores, but a *modified* copy of an untouched file is a pair it never forms.
+/// `min_score` is `MAX_SCORE` units, already resolved from
+/// [`super::diffcore_rename::DEFAULT_RENAME_SCORE`] by the caller.
 fn follow_source(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parent: ObjectId,
     path: &gix::bstr::BString,
+    min_score: u32,
 ) -> Result<Option<gix::bstr::BString>> {
     let files = collect_changes(repo, commit, Some(parent), false, super::diff::Whitespace::Keep, None, None, None)?;
     // The followed path has to be an addition here; anything else is not a rename.
@@ -11348,28 +11403,62 @@ fn follow_source(
         return Ok(None);
     };
 
+    // `find_exact_renames()` runs before any similarity is measured and takes an
+    // identical blob outright, whatever `-M<n>` was given. Under
+    // `find_copies_harder` its source side is the parent's whole tree, so the
+    // source may be a file this commit never touched.
+    if let Some(src) = exact_follow_source(&old_tree, new_id, path)? {
+        return Ok(Some(src));
+    }
+
+    let minimum = f64::from(min_score);
     let mut best: Option<(f64, gix::bstr::BString)> = None;
     for f in &files {
-        if f.status != b'D' {
+        // The parent's side of a deletion is the file itself; the parent's side of
+        // a modification is the same path with the content it had before. Both are
+        // copy sources under `find_copies_harder`; an addition has no parent side.
+        if f.status != b'D' && f.status != b'M' {
             continue;
         }
         let old_name = gix::bstr::BString::from(f.path.clone());
-        let Some((old_id, old_bytes)) = blob(&old_tree, &old_name)? else {
+        if old_name == *path {
+            continue;
+        }
+        let Some((_, old_bytes)) = blob(&old_tree, &old_name)? else {
             continue;
         };
-        // `find_exact_renames()`: an identical blob is a rename outright.
-        if old_id == new_id {
-            return Ok(Some(old_name));
-        }
         let score = similarity_score(&old_bytes, &new_bytes);
-        // `DEFAULT_RENAME_SCORE`: half the content has to survive.
-        if score >= super::diffcore_rename::MAX_SCORE / 2.0
-            && best.as_ref().is_none_or(|(b, _)| score > *b)
-        {
+        if score >= minimum && best.as_ref().is_none_or(|(b, _)| score > *b) {
             best = Some((score, old_name));
         }
     }
     Ok(best.map(|(_, p)| p))
+}
+
+/// `find_exact_renames()` for one destination: the first path in `tree` whose blob
+/// is byte-identical to `new_id` and is not the destination itself.
+///
+/// git hashes the sources and looks the destination up, then breaks a tie with
+/// `record_if_better()`'s basename preference; with one destination in play the
+/// only observable difference is which of several identical files wins, and this
+/// takes the first in tree order.
+fn exact_follow_source(
+    tree: &gix::Tree<'_>,
+    new_id: ObjectId,
+    path: &gix::bstr::BString,
+) -> Result<Option<gix::bstr::BString>> {
+    let mut recorder = gix::traverse::tree::Recorder::default();
+    tree.traverse().breadthfirst(&mut recorder)?;
+    for entry in recorder.records {
+        if !entry.mode.is_blob() || entry.oid != new_id {
+            continue;
+        }
+        if entry.filepath == *path {
+            continue;
+        }
+        return Ok(Some(entry.filepath));
+    }
+    Ok(None)
 }
 
 /// `estimate_similarity()` (diffcore-rename.c): how much of `old` survives in
@@ -12287,7 +12376,7 @@ fn emit_shortstat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
 ///
 /// `git help config` calls the knob `log.graphColors`; git's `parse_graph_colors_config`
 /// splits it on commas, keeps the specs it can parse, and warns about the rest.
-fn graph_colors(repo: &gix::Repository) -> Vec<String> {
+pub(super) fn graph_colors(repo: &gix::Repository) -> Vec<String> {
     const RESET: &str = "\x1b[m";
     let Some(spec) = repo.config_snapshot().string("log.graphColors") else {
         // git's `column_colors_ansi`.
@@ -12356,7 +12445,7 @@ fn measure_graph_widths(nodes: &mut [Node], first_parent: bool, interest: &Graph
 /// commit, even though its `Merge:` header and `%P` still list the parent.
 ///
 /// The two halves of the function are held as two sets.
-struct GraphInterest {
+pub(super) struct GraphInterest {
     /// `revs->boundary` together with the CHILD_SHOWN flag: before returning a
     /// commit git marks each of its parents CHILD_SHOWN (revision.c:4583-4590), and
     /// under `--boundary` `graph_is_interesting()` accepts that flag on its own —
@@ -12367,7 +12456,7 @@ struct GraphInterest {
     /// contributes nothing — and neither does a boundary commit, which
     /// `create_boundary_commit_list()` (revision.c:4470) hands out from below the
     /// marking loop. That is what closes the column under the last `o` of a branch.
-    child_shown: HashSet<ObjectId>,
+    pub(super) child_shown: HashSet<ObjectId>,
     /// The commits that survived the filters `get_commit_action()` applies. git
     /// decides one commit at a time as the walk reaches it, and the walk that feeds
     /// `--graph` is never cut short (`--no-walk` is refused, and the early-exit
@@ -12375,7 +12464,7 @@ struct GraphInterest {
     /// same answer. `--skip`/`--max-count` are deliberately not among them — they
     /// stop the walk rather than judge a commit, which is why `log --graph -1` still
     /// draws a merge's `|\` with neither parent below it.
-    shown: HashSet<ObjectId>,
+    pub(super) shown: HashSet<ObjectId>,
 }
 
 impl GraphInterest {
@@ -12411,7 +12500,7 @@ impl GraphInterest {
 /// emitting no row at all; the next commit that does print then opens with the
 /// `...` skip row, since the graph never reached padding.
 #[allow(clippy::too_many_arguments)]
-fn render_graph(
+pub(super) fn render_graph(
     nodes: &[Node],
     blocks: &[Option<GraphBlock>],
     colors: Vec<String>,
@@ -12550,7 +12639,7 @@ fn render_graph(
 }
 
 /// One record's text, split where `show_log()` hands over to `log_tree_diff_flush()`.
-struct GraphBlock {
+pub(super) struct GraphBlock {
     /// Everything the record prints, message and diff together.
     text: Vec<u8>,
     /// How much of `text` is the commit message — what `graph_show_commit_msg()`
@@ -12561,7 +12650,7 @@ struct GraphBlock {
 
 impl GraphBlock {
     /// A record with no diff, so nothing follows the message.
-    fn message_only(text: Vec<u8>) -> Self {
+    pub(super) fn message_only(text: Vec<u8>) -> Self {
         GraphBlock { msg_len: text.len(), text }
     }
 }

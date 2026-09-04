@@ -1491,6 +1491,30 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
     for name in &names {
         // Without `-n`, contact the remote once; a failure is fatal, exactly as
         // git's `transport_get_remote_refs` dies.
+        // ```c
+        // states.remote = remote_get(*argv);
+        // if (!states.remote)
+        //         return error(_("No such remote: '%s'"), *argv);
+        // ```
+        //
+        // (`show()`, builtin/remote.c:1200-1203.) `remote_get()` does *not* fail
+        // on a name nothing configures: `remote_get_1()` makes an anonymous remote
+        // whose one URL is the name itself, so the `No such remote` arm is
+        // unreachable for `git remote show <anything>` and the argument is
+        // *connected to* instead. A name that is neither a configured remote nor
+        // a repository on disk therefore ends where every other unreachable
+        // transport does.
+        if !no_query && repo.find_remote(*name).is_err() {
+            if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(name) {
+                eprintln!("fatal: '{bad}' does not appear to be a git repository");
+                eprintln!(
+                    "fatal: Could not read from remote repository.\n\n\
+                     Please make sure you have the correct access rights\n\
+                     and the repository exists."
+                );
+                return Ok(ExitCode::from(128));
+            }
+        }
         let map = if no_query {
             None
         } else {
@@ -2394,19 +2418,33 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         if announce {
             println!("Fetching {name}");
         }
+        // ```c
+        // strvec_push(&cmd.args, "fetch");
+        // if (prune != -1)
+        //         strvec_push(&cmd.args, prune ? "--prune" : "--no-prune");
+        // ```
+        //
+        // (`update()`, builtin/remote.c:1601-1607.) `--prune` is handed to the
+        // fetch and is not a `prune` of its own: the stale refs are deleted by
+        // the fetch, which reports them as `- [deleted]` rows on stderr like any
+        // other ref it touched. Running `prune_one()` beside the fetch printed
+        // `git remote prune`'s stdout block — `Pruning <name>`, the URL and a
+        // `* [pruned]` line per ref — that `git remote update` never emits.
+        let mut fetch_args: Vec<String> = Vec::new();
+        if do_prune {
+            fetch_args.push("--prune".to_string());
+        }
+        fetch_args.push(name.clone());
         // Same as the `add -f` arm above: an ordinary fetch failure comes back
         // as `Ok(ExitCode::from(128))`, so `is_err()` alone let
         // `git remote update` walk on to the next remote and exit 0.
-        let failed = match super::fetch::fetch(std::slice::from_ref(name)) {
+        let failed = match super::fetch::fetch(&fetch_args) {
             Ok(code) => code != ExitCode::SUCCESS,
             Err(_) => true,
         };
         if failed {
             eprintln!("error: Could not fetch {name}");
             return Ok(ExitCode::from(1));
-        }
-        if do_prune && !prune_one(repo, name, false)? {
-            return Ok(ExitCode::from(128));
         }
     }
     Ok(ExitCode::SUCCESS)

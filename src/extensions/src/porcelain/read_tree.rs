@@ -718,6 +718,17 @@ fn finish(o: Opts) -> Result<ExitCode> {
             Err(code) => return Ok(code),
         }
     };
+    // `o->internal.result.split_index = o->src_index->split_index` (unpack-trees.c:1950):
+    // the index a tree read leaves behind keeps the shared half the old one stood on.
+    //
+    // Only when git read the old index at all, which is `if (opts.reset || opts.merge ||
+    // opts.prefix) repo_read_index_unmerged(...)` (builtin/read-tree.c:201). A plain
+    // `read-tree <tree>` and a `read-tree --empty` never read it, so `o->src_index` is the
+    // unborn index, `o->src_index->split_index` is `NULL`, and the result is written whole
+    // — the un-split git's own NEEDSWORK comment right above that line describes.
+    if o.merge_like() {
+        new_index.inherit_split_index(&old);
+    }
 
     // `-m`/`--reset` carry the stat cache of entries the tree leaves untouched, so a
     // later `git status` does not see the whole tree as freshly modified.
@@ -1113,6 +1124,8 @@ fn multi_tree_read(
     // ---- Assemble the result index. ----
     let mut new_index =
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path());
+    // `o->internal.result.split_index = o->src_index->split_index` (unpack-trees.c:1950).
+    new_index.inherit_split_index(old);
     let mut wanted: BTreeSet<BString> = BTreeSet::new();
     for (path, ce, stage, update) in &result {
         // "Take the stat information from stage0": an entry carried through

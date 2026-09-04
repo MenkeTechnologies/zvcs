@@ -74,6 +74,39 @@ impl Match {
     }
 }
 
+/// `refs.c`'s `refname_match()`: which `ref_rev_parse_rules` entry lets the
+/// abbreviated `name` mean `full_ref_name`, as a rank counted from the end of the
+/// list so that an earlier rule scores higher. `0` means no rule does.
+///
+/// ```c
+/// int refname_match(const char *abbrev_name, const char *full_name)
+/// {
+///         const char **p;
+///         const int abbrev_name_len = strlen(abbrev_name);
+///         const int num_rules = NUM_REV_PARSE_RULES;
+///
+///         for (p = ref_rev_parse_rules; *p; p++)
+///                 if (!strcmp(full_name, mkpath(*p, abbrev_name_len, abbrev_name)))
+///                         return &ref_rev_parse_rules[num_rules] - p;
+///
+///         return 0;
+/// }
+/// ```
+///
+/// (`refs.c:632-643`.) `find_ref_by_name_abbrev()` scores every advertised ref
+/// with it and keeps the best — which is how `top` reaches `refs/top` even though
+/// `refs/heads/top` and `refs/tags/top` exist beside it.
+pub(crate) fn partial_name_rank(name: &BStr, full_ref_name: &BStr) -> usize {
+    let rules = crate::spec::REV_PARSE_RULES.len();
+    let mut rule = 0;
+    crate::spec::expand_partial_name(name, |expanded| {
+        let matched = (expanded == full_ref_name).then_some(rules - rule);
+        rule += 1;
+        matched
+    })
+    .unwrap_or(0)
+}
+
 impl<'a> Needle<'a> {
     #[inline]
     fn matches(&self, item: Item<'_>) -> Match {
@@ -130,9 +163,26 @@ impl<'a> Needle<'a> {
     fn to_bstr_replace(self, range: Option<(Range<usize>, Item<'_>)>) -> Cow<'a, BStr> {
         match (self, range) {
             (Needle::FullName(name), None) => Cow::Borrowed(name),
+            // ```c
+            // if (starts_with(name, "refs/"))
+            //         return alloc_ref(name);
+            // if (starts_with(name, "heads/") ||
+            //     starts_with(name, "tags/") ||
+            //     starts_with(name, "remotes/"))
+            //         return alloc_ref_with_prefix("refs/", 5, name);
+            // return alloc_ref_with_prefix("refs/heads/", 11, name);
+            // ```
+            //
+            // (`get_local_ref()`, remote.c.) All three of git's namespaces are
+            // completed with `refs/` alone; only a name in none of them gets
+            // `refs/heads/`. Omitting `heads/` from that list turned
+            // `refs/heads/main:heads/partial` into `refs/heads/heads/partial`.
             (Needle::PartialName(name), None) => Cow::Owned({
                 let mut base: BString = "refs/".into();
-                if !(name.starts_with(b"tags/") || name.starts_with(b"remotes/")) {
+                if !(name.starts_with(b"heads/")
+                    || name.starts_with(b"tags/")
+                    || name.starts_with(b"remotes/"))
+                {
                     base.push_str("heads/");
                 }
                 base.push_str(name);

@@ -52,22 +52,38 @@
 //! `--split-index` really splits. The entries are written to
 //! `$GIT_DIR/sharedindex.<id>` and `$GIT_DIR/index` keeps the tree-cache plus a
 //! `link` extension naming it, which is exactly what stock git then reads
-//! (`write_shared_index()` / `write_split_index()`, read-cache.c:2338-2382).
-//! `--no-split-index` writes one whole index again: reading a split index has
-//! already dissolved its `link` into the entries, so the ordinary write *is* the
-//! un-split. Both spellings emit git's `core.splitIndex` disagreement warning.
+//! (`write_shared_index()` / `write_split_index()`, read-cache.c:3241-3276 and
+//! :3161-3169). `--no-split-index` writes one whole index again, and both spellings
+//! emit git's `core.splitIndex` disagreement warning.
+//!
+//! A split index *stays* split across every later write, which is where the option
+//! stops being the whole story. `write_locked_index()` (read-cache.c:3309) writes a
+//! whole index only for `cache_changed & ~EXTMASK`, and `EXTMASK` covers every
+//! entry-level change — so `--force-remove`, `--assume-unchanged`, `--skip-worktree`
+//! and `--cacheinfo` all leave the `link` where it was, while the two things this
+//! command does set outside `EXTMASK` dissolve it:
+//!
+//!  * `--refresh` / `--really-refresh` when `has_racy_timestamp()` holds
+//!    (builtin/update-index.c:740-750), and
+//!  * `--index-version <n>` naming a version the index does not already have
+//!    (:1204-1209).
+//!
+//! That is why `update-index --split-index` splits an index while
+//! `update-index --split-index --index-version 4` writes one whole file instead.
+//! See [`gix::index::file::split`] for the decision and the shape it produces.
 //!
 //! Both halves come out byte-for-byte what stock git writes from the same index,
-//! down to the name-stripped stand-in entry the split half keeps for every entry
-//! that moved into the shared one and the replace bitmap that points at them
-//! (split-index.c:223-309) — the shared index is therefore stored under the same
+//! down to the name-stripped stand-in entry the split half keeps for every base
+//! entry it replaces and the replace bitmap that points at them
+//! (split-index.c:360-373) — the shared index is therefore stored under the same
 //! name, since that name is its own checksum.
 //!
-//! `core.splitIndex`, `splitIndex.maxPercentChange` and
-//! `splitIndex.sharedIndexExpire` remain unimplemented: a split happens when this
-//! flag asks for one and at no other time, no *subsequent* write keeps the index
-//! split (the next command reads it, dissolves the `link`, and writes one whole
-//! index again), and no shared index is ever expired.
+//! `splitIndex.maxPercentChange` is honoured (`too_many_not_shared_entries()`,
+//! read-cache.c:3281): once too much of the index lives outside the shared half, the
+//! next write folds it all back into a new one. `splitIndex.sharedIndexExpire`
+//! remains unimplemented — `clean_shared_index_files()` (read-cache.c:3212) deletes
+//! only shared indexes older than it, which is two weeks by default, so nothing this
+//! port has just superseded would qualify.
 //!
 //! `--unresolve` restores the conflict stages recorded in the index's `REUC`
 //! extension exactly as git does — dropping the stage-0 entry, re-adding stages
@@ -219,6 +235,15 @@ struct Ctx {
     prefix: String,
     /// The index has entry changes that must be persisted.
     dirty: bool,
+    /// git's `SOMETHING_CHANGED`, the one `cache_changed` bit outside `EXTMASK`
+    /// (read-cache.c:79-81), and so the one that makes `write_locked_index()` write a
+    /// whole index and drop the `link` extension.
+    ///
+    /// `update-index` is the only builtin that sets it, and it does so in two places:
+    /// after a `--refresh` that found a racy timestamp (builtin/update-index.c:749) and
+    /// for an `--index-version <n>` that actually changes the version (:1192).
+    /// `--no-split-index` reaches it through `remove_split_index()` (split-index.c:491).
+    something_changed: bool,
     /// `--refresh` reported at least one path; the command exits 1.
     has_errors: bool,
     /// `--force-write-index`: persist the index even when nothing changed.
@@ -336,6 +361,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         workdir,
         prefix,
         dirty: false,
+        something_changed: false,
         has_errors: false,
         force_write: false,
         split_index: None,
@@ -382,18 +408,22 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
                 super::write_tree::prepare_offset_table(&ctx.repo, &mut ctx.index);
                 let mut write_options = crate::config::index_write_options(&ctx.repo);
                 write_options.version = ctx.index_version;
-                if ctx.split_index == Some(true) {
-                    // `write_shared_index()` then `write_split_index()`
-                    // (read-cache.c:2358-2382). Everything the index holds moves into
-                    // `$GIT_DIR/sharedindex.<id>`; what stays behind is the tree-cache
-                    // and the `link` extension naming it.
-                    let git_dir = ctx.repo.git_dir().to_owned();
-                    ctx.index.write_split(&git_dir, write_options)?;
+                // git's `cache_changed` as `write_locked_index()` reads it. The order is
+                // its own: the `cache_changed & ~EXTMASK` test comes first and wins over
+                // `SPLIT_INDEX_ORDERED`, which is why `--split-index --index-version 4`
+                // leaves a whole index behind while `--split-index` alone splits.
+                let request = if ctx.something_changed || ctx.split_index == Some(false) {
+                    gix::index::file::split::Request::Whole
+                } else if ctx.split_index == Some(true) {
+                    // `add_split_index()` (split-index.c:459-464): everything the index
+                    // holds moves into `$GIT_DIR/sharedindex.<id>`, and what stays behind
+                    // is the tree-cache, the entries the shared half does not already
+                    // hold, and the `link` extension naming it.
+                    gix::index::file::split::Request::NewShared
                 } else {
-                    // A split index that was read has already been dissolved into its
-                    // entries, so the ordinary write is also git's un-split.
-                    ctx.index.write(write_options)?;
-                }
+                    gix::index::file::split::Request::Keep
+                };
+                crate::index_racy::write_locked(&ctx.repo, &mut ctx.index, write_options, request)?;
                 // `core.fsync=index` (or an aggregate containing it) hardens the
                 // index git has just rewritten; the platform default does not.
                 fsync.harden_path(crate::config::FsyncComponent::Index, ctx.index.path());
@@ -708,8 +738,12 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                     // `if (the_repository->index->split_index) { ... }`
                     // (builtin/update-index.c:1188-1194): un-splitting an index that
                     // was never split changes nothing, and git does not rewrite it.
+                    // `remove_split_index()` is what sets `SOMETHING_CHANGED`
+                    // (split-index.c:491), so this is one of the three ways an index
+                    // comes out whole.
                     if ctx.index.had_link() {
                         ctx.dirty = true;
+                        ctx.something_changed = true;
                     }
                 }
                 // git's `fsmonitor` is a tri-state that only the tail acts on, so
@@ -786,7 +820,17 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
             // state itself, so it survives to `do_write_index()` and is written
             // as asked — `--index-version 2` on a version-4 index really does
             // demote it.
-            ctx.index_version = Some(crate::config::index_version(preferred_index_format.into()));
+            //
+            // git guards the `SOMETHING_CHANGED` with `if (the_repository->index->version
+            // != preferred_index_format)`, so naming the version the index already has
+            // changes nothing about its shape. Naming a different one is the third and
+            // last way an index comes out whole, which is why `update-index --split-index
+            // --index-version 4` writes no shared index while `--split-index` alone does.
+            let requested = crate::config::index_version(preferred_index_format.into());
+            if ctx.index.version() != requested {
+                ctx.something_changed = true;
+            }
+            ctx.index_version = Some(requested);
             ctx.dirty = true;
         }
     }
@@ -1614,8 +1658,25 @@ fn add_index_entry(
         return Ok(false);
     }
 
-    // File/directory conflict: either `path` shadows existing entries below it,
-    // or an ancestor of `path` is itself a tracked file.
+    // File/directory conflict: either `path` shadows existing entries below it
+    // (`has_file_name()`, read-cache.c:1108-1135) or an ancestor of `path` is
+    // itself a tracked file (`has_dir_name()`, read-cache.c:1164-1290).
+    //
+    // **Both halves are scoped to the entry's own stage.** `has_file_name()`
+    // skips every candidate with `if (ce_stage(p) != stage) continue;` and
+    // `has_dir_name()` searches with `index_name_stage_pos(istate, name, len,
+    // stage, …)`, so a stage-0 add is only ever blocked by other stage-0
+    // entries: an unmerged path is "not a part of the resulting tree", as the
+    // comment beside that search says, and a directory may sit at its name.
+    //
+    // Ignoring the stage refused exactly the resolution `git-merge-one-file`
+    // makes for a file/directory conflict: with `mm/fd` unmerged at stages 1 and
+    // 3, its `git update-index --add --cacheinfo … mm/fd/inside.txt` came back
+    // `error: 'mm/fd/inside.txt' appears as both a file and as a directory`, so
+    // the path stayed at stage 2, no `remove_index_entry_at()` ran, and the
+    // `REUC` record stock leaves behind an octopus merge was never written.
+    // Every entry this function adds is a stage-0 one (`want_flags` carries no
+    // stage bits), so that is the stage the two scans are restricted to.
     let conflicting: Vec<BString> = {
         let backing = ctx.index.path_backing();
         let mut dir_prefix = owned.to_vec();
@@ -1623,6 +1684,7 @@ fn add_index_entry(
         ctx.index
             .entries()
             .iter()
+            .filter(|e| e.stage() == Stage::Unconflicted)
             .map(|e| e.path_in(backing))
             .filter(|p| p.starts_with(&dir_prefix) || is_ancestor_entry(p, owned.as_bstr()))
             .map(|p| p.to_owned())
@@ -1633,8 +1695,9 @@ fn add_index_entry(
             eprintln!("error: '{path}' appears as both a file and as a directory");
             return Ok(false);
         }
-        ctx.index
-            .remove_entries(|_, p, _| conflicting.iter().any(|c| c.as_bstr() == p));
+        ctx.index.remove_entries(|_, p, e| {
+            e.stage() == Stage::Unconflicted && conflicting.iter().any(|c| c.as_bstr() == p)
+        });
         ctx.dirty = true;
         for c in &conflicting {
             ctx.invalidate(c.as_bstr());
@@ -1841,7 +1904,46 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
         }
         i += 1;
     }
+
+    // ```c
+    // if (has_racy_timestamp(the_repository->index)) {
+    //         /*
+    //          * Even if nothing else has changed, updating the file
+    //          * increases the chance that racy timestamps become
+    //          * non-racy, helping future run-time performance.
+    //          * [...]
+    //          */
+    //         the_repository->index->cache_changed |= SOMETHING_CHANGED;
+    // }
+    // ```
+    //
+    // (builtin/update-index.c:740-750.) `SOMETHING_CHANGED` is the one bit outside
+    // `EXTMASK`, so a `--refresh` that finds a racy entry does not just rewrite the
+    // index — it rewrites it *whole*, dissolving a split index into one file. That is
+    // the whole of why `update-index --refresh` un-splits and `update-index
+    // --assume-unchanged` does not.
+    if has_racy_timestamp(&ctx.index) {
+        ctx.something_changed = true;
+        ctx.dirty = true;
+    }
     Ok(Ok(()))
+}
+
+/// `has_racy_timestamp()` (read-cache.c:2732-2743): whether any entry's recorded mtime is
+/// not older than the index's own, which is the window in which a second write inside one
+/// second could hide a change.
+fn has_racy_timestamp(index: &gix::index::File) -> bool {
+    let seconds = index.timestamp().unix_seconds();
+    if seconds == 0 {
+        return false;
+    }
+    index
+        .entries()
+        .iter()
+        // `is_racy_timestamp()` exempts a gitlink, which is answered by the nested
+        // repository rather than by a stat.
+        .filter(|e| e.mode != Mode::COMMIT)
+        .any(|e| seconds <= i64::from(e.stat.mtime.secs))
 }
 
 /// git's `do_reupdate` (`-g` / `--again`): re-run `update_one` on every stage-0

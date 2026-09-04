@@ -773,7 +773,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             0 => restore_from_index(&repo, &refs, false, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree),
             // `--pathspec-from-file` rejects a `--` above, so this is the bare
             // form: stock reports `Updated N paths from <tree>` here.
-            1 => restore_from_tree(&repo, pre[0], &refs, overlay, true, quiet),
+            1 => restore_from_tree(&repo, pre[0], &refs, overlay, true, quiet, ignore_skipworktree),
             _ => crate::git_fatal!("only one <tree-ish> may precede pathspecs"),
         };
     }
@@ -892,7 +892,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             0 => restore_from_index(&repo, &post, false, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree),
             // Reached only under `has_dashdash`, and stock stays silent for the
             // `--` form even though it updates the same paths.
-            1 => restore_from_tree(&repo, pre[0], &post, overlay, false, quiet),
+            1 => restore_from_tree(&repo, pre[0], &post, overlay, false, quiet, ignore_skipworktree),
             _ => crate::git_fatal!("only one <tree-ish> may precede `--`"),
         };
     }
@@ -1076,7 +1076,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // Multiple positionals, no `--`: if the first resolves to a tree-ish it is the
     // source and the rest are paths; otherwise all are paths from the index.
     if crate::objname::resolve_quiet(&repo, pre[0]).is_some() {
-        return restore_from_tree(&repo, pre[0], &pre[1..], overlay, true, quiet);
+        return restore_from_tree(&repo, pre[0], &pre[1..], overlay, true, quiet, ignore_skipworktree);
     }
     restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree)
 }
@@ -1563,7 +1563,7 @@ fn detached_checkout(
 
 /// The `advice.detachedHead` block git prints when a bare `git checkout <commit>`
 /// moves off a branch, verbatim (git 2.55.0, `builtin/checkout.c`).
-fn print_detached_head_advice(spec: &str) {
+pub(super) fn print_detached_head_advice(spec: &str) {
     eprintln!("Note: switching to '{spec}'.\n");
     eprintln!(
         "You are in 'detached HEAD' state. You can look around, make experimental\n\
@@ -2506,6 +2506,9 @@ fn restore_from_tree(
     overlay: bool,
     bare: bool,
     quiet: bool,
+    // `opts->ignore_skipworktree`: let the pathspec reach the entries the sparse-checkout
+    // definition keeps out of the worktree, and write them out.
+    ignore_skipworktree: bool,
 ) -> Result<ExitCode> {
     // `parse_branchname_arg()` resolves this through `get_oid_mb()` and dies with
     // `invalid reference` when nothing resolves. Propagating the revision parser's
@@ -2523,7 +2526,21 @@ fn restore_from_tree(
     // the worktree is not something a pathspec can match, so naming one is git's
     // "did not match any file(s) known to git" rather than a checkout of a file the
     // definition says should not be there.
-    let sparse: HashSet<BString> = {
+    //
+    // ```c
+    // if (!opts->ignore_skipworktree && ce_skip_worktree(ce))
+    //         return;
+    // ```
+    //
+    // (`mark_ce_for_checkout_overlay()`, builtin/checkout.c:391-392.) The flag is what
+    // lets the pathspec through to those entries, and once they are through they are
+    // checked out like any other — the file lands in the work tree, and the next command
+    // to read the index drops the bit for it in `clear_skip_worktree_from_present_files()`
+    // (repository.c:458, sparse-index.c:673-686), because the path it says is absent is
+    // now there.
+    let sparse: HashSet<BString> = if ignore_skipworktree {
+        HashSet::new()
+    } else {
         let index = repo.open_index()?;
         let backing = index.path_backing();
         index
@@ -2620,6 +2637,31 @@ fn restore_from_tree(
                 e.id = *id;
                 e.mode = *mode;
                 e.stat = *stat;
+                // `clear_skip_worktree_from_present_files()` (sparse-index.c:643-671): a
+                // `SKIP_WORKTREE` entry whose file is on disk stops being one, and
+                // `--ignore-skip-worktree-bits` has just put this one there. git clears it on
+                // the next read of the index rather than here; recording it now is the same
+                // index either way, and it is the index every later reader sees.
+                if ignore_skipworktree {
+                    e.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
+                    // ```c
+                    // /* reduce extended entries if possible */
+                    // cache[i]->ce_flags &= ~CE_EXTENDED;
+                    // if (cache[i]->ce_flags & CE_EXTENDED_FLAGS) {
+                    //         extended++;
+                    //         cache[i]->ce_flags |= CE_EXTENDED;
+                    // }
+                    // ```
+                    //
+                    // (`do_write_index()`, read-cache.c:2884-2891.) `CE_EXTENDED` is derived
+                    // from `CE_EXTENDED_FLAGS` — `CE_INTENT_TO_ADD | CE_SKIP_WORKTREE` — and
+                    // git recomputes it on every write; the entry that just lost its last
+                    // extended flag stops needing the extended word, and an index with no such
+                    // entry is written at version 2 rather than 3.
+                    if !e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD) {
+                        e.flags.remove(gix::index::entry::Flags::EXTENDED);
+                    }
+                }
             }
             Err(_) => {
                 index.dangerously_push_entry(

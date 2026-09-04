@@ -181,3 +181,78 @@ pub fn discovery_fatal(err: &anyhow::Error) -> Option<String> {
         cause.downcast_ref::<gix::discover::upwards::Error>().and_then(upwards_message)
     })
 }
+
+// ---------------------------------------------------------------------------
+// read-cache.c and refs.c: data git cannot read is a `die()`, not a return 1
+// ---------------------------------------------------------------------------
+
+/// Whether the failure is "the on-disk repository data could not be read at the
+/// width the repository declares", which git ends at exit 128 rather than 1.
+///
+/// Two front doors reach the same ending in git:
+///
+/// * **The index.** Every path into `do_read_index()` that cannot produce a
+///   state calls `die()`: `"%s: index file open failed"`, `"index file smaller
+///   than expected"`, `"bad index file sha1 signature"`, `"index file corrupt"`,
+///   and — the one this port meets most often — `"unknown index entry format
+///   0x%08x"` from `create_from_disk()`. There is no arm that returns a
+///   non-fatal failure, so an unreadable index is 128 without exception.
+/// * **A loose ref whose contents will not parse.** `refs.c` reports it as a
+///   *broken ref* rather than as an error on the store, and what happens next is
+///   the verb's decision: `for-each-ref` warns (`warning: ignoring broken ref
+///   <name>`) and exits 0, while `log`, `show-ref`, `branch` and
+///   `symbolic-ref` die at 128 with their own sentences. The verbs that
+///   tolerate it handle it themselves before the error ever reaches here; what
+///   arrives here is the half git dies on.
+///
+/// Measured on git 2.55.0 against a repository declaring
+/// `extensions.objectFormat = sha256` over a SHA-1 store, and again against a
+/// SHA-1 repository with a hand-corrupted `.git/index` and `.git/refs/heads/main`
+/// — the exit codes are the same in both, so this is the general condition and
+/// not a property of the mislabelled-hash fixture.
+///
+/// **Only the exit code is borrowed, never the sentence.** git's index message
+/// carries four bytes of stat data read back as a format word
+/// (`0xb17b0000` on one run of this fixture, a different value on the next) and
+/// the port's carries a rolling hash, so neither side has a reproducible string
+/// and this port must not invent one in git's voice. The caller therefore keeps
+/// the port's own `zvcs: <verb>: …` diagnostic and changes only the status,
+/// which is the part a caller branches on.
+pub fn unreadable_repository_data(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        // The index. `gix::worktree::open_index::Error` is the wrapper every
+        // call site in this port returns, and it is the *outermost* type in the
+        // chain — every layer beneath it is `#[error(transparent)]`, and
+        // `transparent` forwards `source()` as well as `Display`, so
+        // `gix_index::file::init::Error` and `gix_index::decode::Error` are
+        // skipped entirely and downcasting to them finds nothing. The two
+        // narrower types are still tried for the call sites that open an index
+        // file directly rather than through the repository.
+        if let Some(err) = cause.downcast_ref::<gix::worktree::open_index::Error>() {
+            // Only the two arms that are about the *file*. The config arms are
+            // a bad `index.threads`/`index.skipHash` value, which is a
+            // configuration failure and belongs to `config::setup_fatal`.
+            return matches!(
+                err,
+                gix::worktree::open_index::Error::IndexFile(_)
+                    | gix::worktree::open_index::Error::IndexCorrupt(_)
+            );
+        }
+        if cause.downcast_ref::<gix::index::file::init::Error>().is_some()
+            || cause.downcast_ref::<gix::index::decode::Error>().is_some()
+        {
+            return true;
+        }
+        // A ref file whose body is neither an object id of this repository's
+        // width nor a valid `ref:` line. This is the *leaf* of the chain for the
+        // same transparency reason as above — `gix_ref::file::find::Error` and
+        // both of its `gix` wrappers forward straight past themselves — so it is
+        // the one link that is always reachable whichever front door the verb
+        // used. `RefnameValidation` is excluded: a symbolic ref pointing at an
+        // invalid name is a different condition and git does not die alike on it.
+        if let Some(err) = cause.downcast_ref::<gix::refs::file::loose::reference::decode::Error>() {
+            return matches!(err, gix::refs::file::loose::reference::decode::Error::Parse { .. });
+        }
+        false
+    })
+}

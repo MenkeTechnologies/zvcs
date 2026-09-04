@@ -142,6 +142,21 @@ pub struct SendOptions {
     /// the program to run in place of `git-receive-pack` on the other end. git
     /// hands it to `git_connect()` for a push (`connect_setup()`, transport.c:314).
     pub receive_pack: Option<String>,
+    /// The *matching* refspec, if one is in play. `None` for every push that named
+    /// its refs.
+    pub matching: Option<Matching>,
+}
+
+/// `TRANSPORT_PUSH_MATCHING`: push every local branch the remote already carries.
+///
+/// The branch list is the caller's — `get_ref_match()`'s `refs/heads/` candidate
+/// set — and the advertisement decides which of them travel, which is why the
+/// expansion happens after the handshake rather than in the request builder.
+pub struct Matching {
+    /// `+:` rather than `:` — a matching refspec may be forced like any other.
+    pub force: bool,
+    /// Every local branch, as `(full ref name, tip)`.
+    pub branches: Vec<(String, ObjectId)>,
 }
 
 /// `--signed=<mode>` — git's `SEND_PACK_PUSH_CERT_*`.
@@ -541,7 +556,35 @@ pub fn send_pack(
     }
     let mut wire: Vec<Wire> = Vec::new();
     let mut statuses: Vec<RefStatus> = Vec::new();
-    for req in requests {
+    // ```c
+    // if (!ref->peer_ref)
+    //         continue;
+    // ```
+    //
+    // (`match_push_refs()`, remote.c, walking the *advertised* refs for a matching
+    // refspec.) The expansion runs over what the remote has, not over what this
+    // repository has: a local branch the remote does not carry is simply not
+    // pushed, which is the whole difference between `git push origin :` and
+    // `git push origin --all`.
+    let matched: Vec<Request> = match &opts.matching {
+        None => Vec::new(),
+        Some(matching) => matching
+            .branches
+            .iter()
+            .filter(|(name, _)| advertised.contains_key(name))
+            .map(|(name, id)| Request {
+                name: name.clone(),
+                src: Some(name.clone()),
+                new: *id,
+                force: matching.force,
+                expected: None,
+                only_if_absent: false,
+                check_reachable: None,
+                explicit_delete: false,
+            })
+            .collect(),
+    };
+    for req in requests.iter().chain(matched.iter()) {
         // A followed tag (`--follow-tags`) the remote already carries is dropped
         // outright — not reported, not sent — exactly as git omits it from the
         // ref list it builds after reading the advertisement.
@@ -676,6 +719,67 @@ pub fn send_pack(
             new: req.new,
             forced,
         });
+    }
+
+    // ```c
+    // static void atomic_push_failure(struct send_pack_args *args,
+    //                                 struct ref *remote_refs,
+    //                                 struct ref *failing_ref)
+    // {
+    //         error(_("atomic push failed for ref %s. status: %d"),
+    //               failing_ref->name, failing_ref->status);
+    //         for (struct ref *ref = remote_refs; ref; ref = ref->next) {
+    //                 if (ref->status != REF_STATUS_NONE &&
+    //                     ref->status != REF_STATUS_OK &&
+    //                     ref->status != REF_STATUS_UPTODATE)
+    //                         continue;
+    //                 ref->status = REF_STATUS_ATOMIC_PUSH_FAILED;
+    //         }
+    // }
+    // ```
+    //
+    // (send-pack.c.) `--atomic` is decided *before* the wire request: one ref the
+    // local checks rejected takes every other ref down with it and nothing is
+    // sent at all. Sending the survivors instead publishes half of what the user
+    // asked to publish atomically, which is the one outcome the option exists to
+    // prevent.
+    //
+    // The number in the message is the `enum ref_status` ordinal of the ref that
+    // failed. `2` for a non-fast-forward is the value this corpus measures; the
+    // rest follow the enum's declaration order in remote.h.
+    if opts.atomic {
+        if let Some(failing) = statuses.iter().find(|s| s.result.is_err()) {
+            let status = match failing.result.as_ref().err().map(String::as_str) {
+                Some("non-fast-forward") => 2,
+                Some("already exists") => 3,
+                Some("remote does not support deleting refs") => 4,
+                Some("fetch first") => 5,
+                Some("needs force") => 6,
+                Some("stale info") | Some("remote ref updated since checkout") => 7,
+                _ => 2,
+            };
+            eprintln!("error: atomic push failed for ref {}. status: {status}", failing.name);
+            for w in wire.drain(..) {
+                statuses.push(RefStatus {
+                    name: w.name,
+                    src: w.src,
+                    report_name: None,
+                    old: w.old,
+                    new: w.new,
+                    result: Err("atomic push failed".to_owned()),
+                    forced: false,
+                    up_to_date: false,
+                    pre_transport: false,
+                    remote_rejected: false,
+                });
+            }
+            return Ok(Outcome {
+                url,
+                statuses,
+                advertised: advertised_order,
+                unpack: Ok(()),
+            });
+        }
     }
 
     // `--dry-run`: everything up to the wire request has run (handshake, the local

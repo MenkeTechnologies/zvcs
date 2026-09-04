@@ -26,8 +26,9 @@
 //! separators, over git's fallback funcname heuristic (a line that begins an
 //! identifier). A path whose `diff` attribute names a driver carrying a funcname
 //! regex — a built-in userdiff driver or a configured `funcname`/`xfuncname` —
-//! would drive git off its regex tables instead, which this port does not
-//! reproduce, so such a matching file is refused rather than approximated.
+//! would drive git off its regex tables instead. [`crate::userdiff`] compiles those
+//! patterns for the diff and `-L` paths, but `show_funcname_line()` here is not
+//! wired to them yet, so such a matching file is refused rather than approximated.
 //!
 //! Context lines are covered: `-A`/`-B`/`-C` (and `--after-context`/
 //! `--before-context`/`--context`/`-<num>`) render the surrounding lines with
@@ -2816,8 +2817,15 @@ fn is_blank_line(line: &[u8]) -> bool {
 /// The set of git's built-in userdiff drivers that carry a funcname pattern (from
 /// `userdiff.c`). A path whose `diff` attribute names one of these — or a
 /// user-configured driver with a `funcname`/`xfuncname` — would drive git's
-/// funcname detection off these regex tables, which this port does not reproduce;
-/// such a file is refused rather than approximated (see [`grep`]).
+/// funcname detection off those regex tables. [`crate::userdiff::Settings`] resolves
+/// and compiles them for the diff and `-L` paths; `show_funcname_line()` here is not
+/// wired to them, so such a file is refused rather than approximated (see [`grep`]).
+///
+/// This list is narrower than [`crate::userdiff`]'s table: `ini` and `r` also carry
+/// funcname patterns in git 2.55.0 and are absent here, so a path whose `diff`
+/// attribute names one of those two is answered with `def_ff`'s heading instead of
+/// being refused. Nothing in this file reads the table yet, which is why the two are
+/// still listed separately rather than derived from it.
 const BUILTIN_FUNCNAME_DRIVERS: &[&str] = &[
     "ada", "bash", "bibtex", "cpp", "csharp", "css", "dts", "elixir", "fortran",
     "fountain", "golang", "html", "java", "kotlin", "markdown", "matlab", "objc",
@@ -2908,7 +2916,7 @@ impl<'r> DiffAttrs<'r> {
     }
 
     /// Whether the path's diff driver carries a funcname pattern this port cannot
-    /// reproduce — a built-in funcname driver, or a user driver with a configured
+    /// wired to — a built-in funcname driver, or a user driver with a configured
     /// `funcname`/`xfuncname`.
     fn has_funcname_driver(&mut self, rela: &BStr) -> Result<bool> {
         let Some(drv) = self.driver_of(rela)? else {

@@ -3378,6 +3378,10 @@ fn internal_diff(
             ctx: opts.ctx as usize,
             inter_hunk_ctx: opts.inter_hunk_ctx,
             func_context: false,
+            // `diff-index`/`diff-files` honour a driver's `textconv` and its
+            // `command` under `--ext-diff`, but the funcname pattern is not
+            // threaded this far yet, so hunk headings use git's built-in `def_ff`.
+            funcname: None,
         },
     );
     let hunks = (want_patch && (added != 0 || deleted != 0)).then_some(buf);

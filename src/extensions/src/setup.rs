@@ -89,6 +89,25 @@ pub fn double_delivered() -> &'static [(String, String)] {
     DOUBLE_DELIVERED.get().map_or(&[], Vec::as_slice)
 }
 
+/// The last value a `git -c <key>=<value>` on *this* command line gave `key`, for
+/// the handful of readers that run before any repository exists.
+///
+/// `git_config()` merges the command-line source into every configuration read,
+/// including the ones `cmd_clone` performs before `init_db()`; a port that opens
+/// the destination repository to answer the same question cannot, because the
+/// destination is what the answer decides. Comparison is git's
+/// `git_config_parse_key`: the section and the variable name fold case, a
+/// subsection does not — and `clone.rejectShallow`, the only caller so far, has
+/// none.
+pub fn cli_override(key: &str) -> Option<&'static str> {
+    DOUBLE_DELIVERED
+        .get()?
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.as_str())
+}
+
 /// `gix::discover(".")`, with this process's `-c` overrides applied to the
 /// repository's configuration.
 ///

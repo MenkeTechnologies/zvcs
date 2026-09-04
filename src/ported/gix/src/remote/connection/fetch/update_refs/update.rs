@@ -83,6 +83,15 @@ pub enum Mode {
     /// Note that this mode may have an associated ref-edit that is a no-op, or current-state assertion, for logistical reasons only
     /// and having no edit would be preferred.
     RejectedToReplaceWithUnborn,
+    /// The local name the ref-spec mapped to is not one git will write.
+    ///
+    /// `check_refname_format()` refuses it, and `store_updated_refs()` skips the
+    /// mapping with `error(_("* Ignoring funny ref '%s' locally"), …)` rather than
+    /// failing the fetch — everything else it asked for is still applied and the
+    /// command still exits 0. A zero-width glob capture is how one is usually
+    /// reached: `refs/heads/main*:refs/remotes/zero/*` maps `refs/heads/main` onto
+    /// the trailing-slash name `refs/remotes/zero/`.
+    RejectedFunnyRefName,
     /// The update was rejected because the branch is checked out in the given worktree_dir.
     ///
     /// Note that the check applies to any known worktree, whether it's present on disk or not.
@@ -120,6 +129,7 @@ impl std::fmt::Display for Mode {
             Mode::RejectedTagUpdate => "rejected (would overwrite existing tag)",
             Mode::RejectedNonFastForward => "rejected (non-fast-forward)",
             Mode::RejectedToReplaceWithUnborn => "rejected (refusing to overwrite existing with unborn ref)",
+            Mode::RejectedFunnyRefName => "rejected (funny ref name)",
             Mode::RejectedCurrentlyCheckedOut { worktree_dirs } => {
                 return write!(
                     f,

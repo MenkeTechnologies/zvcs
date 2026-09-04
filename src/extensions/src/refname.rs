@@ -182,6 +182,109 @@ pub fn resolve_ref_reading(repo: &gix::Repository, path: &str) -> Option<String>
     None
 }
 
+/// `refs.c`'s `refname_match()` (`refs.c:632-643`): could `abbrev_name` have meant
+/// `full_name`?
+///
+/// ```c
+/// int refname_match(const char *abbrev_name, const char *full_name)
+/// {
+///         const char **p;
+///         const int abbrev_name_len = strlen(abbrev_name);
+///         const int num_rules = NUM_REV_PARSE_RULES;
+///
+///         for (p = ref_rev_parse_rules; *p; p++)
+///                 if (!strcmp(full_name, mkpath(*p, abbrev_name_len, abbrev_name)))
+///                         return &ref_rev_parse_rules[num_rules] - p;
+///
+///         return 0;
+/// }
+/// ```
+///
+/// The return value is the rule's rank counted from the end of
+/// [`REV_PARSE_RULES`], so an earlier rule scores higher and `0` means no rule
+/// matched. Callers that only ask "does it match at all" compare against zero;
+/// `find_ref_by_name_abbrev()` keeps the highest-ranked candidate.
+pub fn refname_match(abbrev_name: &str, full_name: &str) -> usize {
+    REV_PARSE_RULES
+        .iter()
+        .position(|(prefix, suffix)| {
+            full_name.len() == prefix.len() + abbrev_name.len() + suffix.len()
+                && full_name.as_bytes().starts_with(prefix)
+                && full_name.as_bytes().ends_with(suffix)
+                && full_name[prefix.len()..full_name.len() - suffix.len()] == *abbrev_name
+        })
+        .map_or(0, |i| REV_PARSE_RULES.len() - i)
+}
+
+/// `remote.c`'s `count_refspec_match()`: how many of `refs` the abbreviated
+/// `pattern` could name, and which one git would use.
+///
+/// ```c
+///         if (namelen != patlen &&
+///             patlen != namelen - 5 &&
+///             !starts_with(name, "refs/heads/") &&
+///             !starts_with(name, "refs/tags/")) {
+///                 matched_weak = refs;
+///                 weak_match++;
+///         }
+///         else {
+///                 matched = refs;
+///                 match++;
+///         }
+/// ```
+///
+/// A match is "weak" when it is with a ref outside `refs/heads/` and `refs/tags/`
+/// that the pattern named neither in full nor from `refs/`; git's comment gives
+/// the reason — otherwise `git push $URL master` would be ambiguous between
+/// `refs/remotes/origin/master` and `refs/heads/master`. One strong match with any
+/// number of weak ones beside it is still unique, and the weak set is consulted
+/// only when there is no strong match at all.
+pub fn count_refspec_match<'a>(pattern: &str, refs: &'a [String]) -> (usize, Option<&'a String>) {
+    let patlen = pattern.len();
+    let (mut weak_match, mut strong_match) = (0usize, 0usize);
+    let (mut matched_weak, mut matched) = (None, None);
+    for name in refs {
+        if refname_match(pattern, name) == 0 {
+            continue;
+        }
+        let namelen = name.len();
+        if namelen != patlen
+            && patlen + 5 != namelen
+            && !name.starts_with("refs/heads/")
+            && !name.starts_with("refs/tags/")
+        {
+            matched_weak = Some(name);
+            weak_match += 1;
+        } else {
+            matched = Some(name);
+            strong_match += 1;
+        }
+    }
+    match matched {
+        Some(_) => (strong_match, matched),
+        None => (weak_match, matched_weak),
+    }
+}
+
+/// The ref names `count_refspec_match()` is run over: `refs_for_each_ref()`, which
+/// walks all of `refs/` — remote-tracking refs and tags included, which is the
+/// reason a "weak" match exists at all.
+pub fn all_ref_names(repo: &gix::Repository) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(platform) = repo.references() else { return out };
+    let Ok(iter) = platform.all() else { return out };
+    for reference in iter {
+        let Ok(reference) = reference else { continue };
+        let name = reference.name().as_bstr().to_str_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("refs/") else { continue };
+        if gix::validate::reference::name(rest.into()).is_err() {
+            continue;
+        }
+        out.push(name);
+    }
+    out
+}
+
 /// `core.warnAmbiguousRefs`, the `strict` argument most callers pass.
 /// `repo_settings_get_warn_ambiguous_refs()` (`repo-settings.c:196-202`) defaults
 /// it to 1, so only an explicit false turns it off.

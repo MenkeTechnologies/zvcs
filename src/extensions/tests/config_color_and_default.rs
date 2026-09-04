@@ -24,16 +24,29 @@ use std::process::{Command, Output};
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn run(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
-        .args(args)
+    run_with_term(dir, args, Some("xterm"))
+}
+
+/// `run`, with `TERM` under the test's control.
+///
+/// `check_auto_color()` answers `false` for an `auto` slot when `TERM` is unset
+/// or `dumb`, however loudly the caller states that stdout is a tty, so a test
+/// that leaves `TERM` to the environment reads one answer on a developer's
+/// terminal and the other on a CI runner, which sets no `TERM` at all.
+fn run_with_term(dir: &Path, args: &[&str], term: Option<&str>) -> Output {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("LC_ALL", "C")
-        .env_remove("GIT_DIR")
-        .output()
-        .expect("run zvcs git")
+        .env_remove("GIT_DIR");
+    match term {
+        Some(t) => cmd.env("TERM", t),
+        None => cmd.env_remove("TERM"),
+    };
+    cmd.output().expect("run zvcs git")
 }
 
 fn out(o: &Output) -> String {
@@ -258,6 +271,12 @@ fn get_colorbool_prints_when_told_whether_stdout_is_a_tty() {
     let dir = workdir("cb-print2", "");
     assert_eq!(out(&run(&dir, &["config", "-f", "f", "--get-colorbool", "color.diff", "true"])), "true\n");
     assert_eq!(out(&run(&dir, &["config", "-f", "f", "--get-colorbool", "color.diff", "false"])), "false\n");
+
+    // A stated tty is not enough on its own: `check_auto_color()` wants a `TERM`
+    // that names a terminal, so `dumb` and an unset `TERM` both answer `false`.
+    let args = ["config", "-f", "f", "--get-colorbool", "color.diff", "true"];
+    assert_eq!(out(&run_with_term(&dir, &args, Some("dumb"))), "false\n");
+    assert_eq!(out(&run_with_term(&dir, &args, None)), "false\n");
 
     // `git_config_bool("command line", …)` dies on a word that is not a boolean.
     let o = run(&dir, &["config", "-f", "f", "--get-colorbool", "color.diff", "bogus"]);

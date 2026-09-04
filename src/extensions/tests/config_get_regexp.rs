@@ -22,7 +22,16 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// Run the zvcs binary in `dir` and return the raw output.
 fn zvcs(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN).args(args).current_dir(dir).output().expect("run zvcs git")
+    // `TERM` is stated rather than inherited: `check_auto_color()` answers false
+    // for an `auto` slot when `TERM` is unset or `dumb`, however loudly the caller
+    // states that stdout is a tty, so `--get-colorbool` reads one way on a
+    // developer's terminal and the other on a CI runner, which sets no `TERM`.
+    Command::new(BIN)
+        .args(args)
+        .current_dir(dir)
+        .env("TERM", "xterm")
+        .output()
+        .expect("run zvcs git")
 }
 
 fn stdout_of(out: &Output) -> String {

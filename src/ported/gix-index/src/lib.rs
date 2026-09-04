@@ -38,6 +38,10 @@ pub mod verify;
 ///
 pub mod write;
 
+/// What a *split* index remembers about its shared half.
+pub mod split_index;
+pub use split_index::SplitIndex;
+
 pub mod fs;
 
 /// All known versions of a git index file.
@@ -168,6 +172,15 @@ pub struct State {
     /// i.e. was a split index. `link` itself is dissolved into the entries at
     /// decode time, so this is the only thing left saying it was ever there.
     link_at_decode_time: bool,
+    /// git's `istate->split_index` after `merge_base_index()`: the shared half this
+    /// state stands on, kept so the state can be written back as a split index.
+    ///
+    /// `link` above is the *serialised* extension and is `None` on a state that was
+    /// read from a split index, because reading dissolves it; this is the live
+    /// relationship, and it is what [`File::write_locked()`](crate::File::write_locked())
+    /// tests exactly as `write_locked_index()` tests `istate->split_index`
+    /// (read-cache.c:3331).
+    split_index: Option<SplitIndex>,
     resolve_undo: Option<extension::resolve_undo::Paths>,
     untracked: Option<extension::UntrackedCache>,
     fs_monitor: Option<extension::FsMonitor>,

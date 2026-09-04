@@ -275,6 +275,7 @@ impl State {
                 offset_table_threads: None,
                 tree,
                 link_at_decode_time: link.is_some(),
+                split_index: None,
                 link,
                 resolve_undo,
                 untracked,

@@ -150,6 +150,11 @@ impl Link {
 
         if let Some(bitmaps) = self.bitmaps {
             let mut split_entry_index = 0;
+            // git's `si->base->cache_nr` before `merge_base_index()` appends the split
+            // half's own entries, which is the width both bitmaps address.
+            let base_len = shared_index.entries.len();
+            let mut replaced = vec![false; base_len];
+            let mut removed = vec![false; base_len];
 
             let mut err = None;
             if bitmaps.replace.for_each_set_bit(|replace_index| {
@@ -183,8 +188,14 @@ impl Link {
                 }
                 shared_entry.stat = split_entry.stat;
                 shared_entry.id = split_entry.id;
-                shared_entry.flags = split_entry.flags;
+                // `src->ce_flags |= CE_UPDATE_IN_BASE` before `copy_cache_entry(dst, src)`
+                // (split-index.c:151-153), and that `memcpy` spans `ce_flags`: a base entry
+                // the split half replaced carries the flag from the moment it is read, which
+                // is why it keeps a stand-in on the next write even when nothing touched it —
+                // and why `ls-files --debug` prints `flags: 8000000` for it.
+                shared_entry.flags = split_entry.flags | crate::entry::Flags::UPDATE_IN_BASE;
                 shared_entry.mode = split_entry.mode;
+                replaced[replace_index] = true;
 
                 split_entry_index += 1;
                 Some(())
@@ -217,6 +228,9 @@ impl Link {
                     }
                 };
                 shared_entry.flags.insert(crate::entry::Flags::REMOVE);
+                if delete_index < base_len {
+                    removed[delete_index] = true;
+                }
                 Some(())
             }).is_none() && err.is_none() {
                 err = decode::Error::Corrupt("delete bitmap is malformed").into();
@@ -224,6 +238,23 @@ impl Link {
             if let Some(err) = err {
                 return Err(err.into());
             }
+
+            // git's `si->base` survives the merge — `merge_base_index()` only takes
+            // `si->delete_bitmap`/`si->replace_bitmap` down, never the base itself
+            // (split-index.c:195-199) — and `prepare_to_write_split_index()` walks it again
+            // on the next write. This crate cannot leave the base entries shared with the
+            // merged ones, so it keeps its own copy of them here, in base order and with the
+            // replacements already applied, exactly as `si->base->cache[]` stands.
+            let mut si = crate::SplitIndex::from_written_shared_index(
+                self.shared_index_checksum,
+                &shared_index.entries[..base_len],
+                &shared_index.path_backing,
+            );
+            for (base, (replaced, removed)) in si.base.iter_mut().zip(replaced.iter().zip(removed.iter())) {
+                base.replaced = *replaced;
+                base.removed = *removed;
+            }
+            split_index.state.split_index = Some(si);
 
             shared_index
                 .entries

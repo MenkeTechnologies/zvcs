@@ -671,9 +671,50 @@ impl State {
     /// the extension into the entries it refers to, leaving `link` as `None` on a
     /// state that very much came from a split index. git keeps the same distinction
     /// in `istate->split_index`, which is what `--no-split-index` tests before it
-    /// bothers to rewrite anything (builtin/update-index.c:1188-1194).
+    /// bothers to rewrite anything (builtin/update-index.c:1188-1194) — and which
+    /// [`split_index()`](Self::split_index()) holds, this being the flag beside it.
     pub fn had_link(&self) -> bool {
         self.link_at_decode_time
+    }
+    /// Put `entries` in place of this state's own and hand the old list back, leaving the
+    /// path storage untouched so the ranges in *both* lists stay valid.
+    ///
+    /// git does this with a flag rather than a swap — `checkout_entry()` is called once per
+    /// entry and returns early for the ones it has nothing to write — but this crate's
+    /// checkout takes a whole state, so the caller narrows the state instead and puts the
+    /// full list back afterwards. `si->saved_cache` in `prepare_to_write_split_index()`
+    /// (split-index.c:386-392) is the same manoeuvre for the same reason.
+    pub fn swap_entries(&mut self, entries: Vec<Entry>) -> Vec<Entry> {
+        std::mem::replace(&mut self.entries, entries)
+    }
+    /// The shared half this state stands on, git's `istate->split_index`.
+    ///
+    /// `Some` exactly when the state was read from a split index (or was just split by
+    /// [`File::write_locked()`](crate::File::write_locked())), which is the condition
+    /// `write_locked_index()` tests before it writes a split index at all
+    /// (read-cache.c:3331).
+    pub fn split_index(&self) -> Option<&crate::SplitIndex> {
+        self.split_index.as_ref()
+    }
+    /// Install `si` as the shared half this state stands on, git's
+    /// `init_split_index()` followed by a base.
+    pub fn set_split_index(&mut self, si: Option<crate::SplitIndex>) {
+        self.split_index = si;
+    }
+    /// Take the shared half away, git's `remove_split_index()` (split-index.c:465-493):
+    /// the next write is a whole index and drops the `link` extension.
+    pub fn remove_split_index(&mut self) -> Option<crate::SplitIndex> {
+        self.link = None;
+        self.link_at_decode_time = false;
+        self.split_index.take()
+    }
+    /// Adopt `src`'s shared half, git's carry-over in `unpack_trees()`
+    /// (unpack-trees.c:1941-1957): an index rebuilt from a tree keeps the split index the
+    /// one it was built from had, so writing it writes the split half again rather than
+    /// dissolving the repository's shared index.
+    pub fn inherit_split_index(&mut self, src: &State) {
+        self.split_index = src.split_index.clone();
+        self.link_at_decode_time = src.link_at_decode_time;
     }
     /// Obtain the resolve-undo extension.
     pub fn resolve_undo(&self) -> Option<&extension::resolve_undo::Paths> {

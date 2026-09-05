@@ -91,10 +91,20 @@ pub(super) mod function {
             other: Some("Temporary merge branch 2".into()),
             ancestor: None,
         };
+        // `merge_ort_internal()`'s loop brackets each iteration with
+        // `opt->priv->call_depth++` / `opt->priv->call_depth--`
+        // (merge-ort.c:5350-5368), so *every* base merged in this loop runs one
+        // level below the caller — not one level below the previous iteration.
+        // The marker size the content merge asks for is `call_depth * 2` on top
+        // of the configured seven (merge-ort.c:4337), so incrementing per
+        // iteration made the third and later bases draw markers two characters
+        // longer than git's: `git merge-recursive cc-a cc-b main -- cc-left
+        // cc-right` wrote a 90-byte stage-1 blob whose markers were eleven
+        // characters wide where stock writes 84 bytes with nine.
+        options.marker_size_multiplier = options.marker_size_multiplier.saturating_add(1);
         let mut virtual_merge_bases = Vec::new();
         let mut tree_id = None;
         while let Some(next_commit_id) = others.pop() {
-            options.marker_size_multiplier += 1;
             let mut out = crate::commit(
                 merged_commit_id,
                 next_commit_id,

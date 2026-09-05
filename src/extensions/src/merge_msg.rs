@@ -108,6 +108,7 @@ pub fn render<'r, 's>(
     strictness: Strictness,
 ) -> Result<Vec<Message>> {
     let mut operands = Operands::new(label1, label2, operand1);
+    operands.default_driver_is_binary = default_driver_is_binary(repo);
     let mut out: Vec<Message> = Vec::new();
     for conflict in conflicts {
         match render_one(repo, conflict, unresolved, &mut operands)? {
@@ -177,7 +178,7 @@ fn render_one<'r, 's>(
                     && ours.location() == theirs.location()
                     && !matches!(ours, Change::Rewrite { .. })
                     && !matches!(theirs, Change::Rewrite { .. })
-                    && stages.any_is_binary(repo)?
+                    && (operands.default_driver_is_binary || stages.any_is_binary(repo)?)
                 {
                     out.push(Message {
                         paths: vec![path.clone()],
@@ -687,6 +688,24 @@ fn is_binary(repo: &gix::Repository, id: &ObjectId) -> Result<bool> {
     Ok(head.contains(&0))
 }
 
+/// `find_ll_merge_driver()` (merge-ll.c:363-393) for the one answer this module
+/// needs: whether the driver a path merges with is the built-in `binary`, which
+/// returns `LL_MERGE_BINARY_CONFLICT` and so earns `merge_3way()`'s
+/// `warning: Cannot merge binary files` line (merge-ort.c:2154-2159) even when the
+/// content is plain text.
+///
+/// Only `merge.default` is read. The per-path `merge` attribute — `ATTR_FALSE`
+/// (`-merge`) is the other way to reach the binary driver — needs the attribute
+/// index `initialize_attr_index()` builds out of the merge's *own*
+/// `.gitattributes` entries (merge-ort.c), which this module is not given; a
+/// `-merge` path whose content is text therefore still gets no warning here.
+/// Content that really is binary is caught by [`Stages::any_is_binary`] either way.
+fn default_driver_is_binary(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .string("merge.default")
+        .is_some_and(|v| v.as_slice() == b"binary")
+}
+
 /// The two command-line operands, and the tree of the first one — peeled at most
 /// once, and only when a message class actually needs to name a side.
 struct Operands<'r, 's> {
@@ -694,6 +713,9 @@ struct Operands<'r, 's> {
     label2: &'s str,
     operand1: Operand1<'s>,
     tree1: Option<gix::Tree<'r>>,
+    /// Whether `merge.default` names the built-in `binary` driver, which makes
+    /// every path without a `merge` attribute merge as if its content were binary.
+    default_driver_is_binary: bool,
 }
 
 impl<'r, 's> Operands<'r, 's> {
@@ -703,6 +725,7 @@ impl<'r, 's> Operands<'r, 's> {
             label2,
             operand1,
             tree1: None,
+            default_driver_is_binary: false,
         }
     }
 

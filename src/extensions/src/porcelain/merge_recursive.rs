@@ -5,7 +5,9 @@
 //! Unlike `merge-tree`, this command is a mutator. The merge itself is done by
 //! the vendored `gix-merge` tree merge (three-way content merges, rename
 //! detection, recursive merge-base consolidation via
-//! `Repository::virtual_merge_base`); the resulting tree is then materialised
+//! `Repository::virtual_merge_base`, or by
+//! [`crate::merge_apply::shifted_virtual_base_tree`] when a subtree shift has to
+//! ride along with it); the resulting tree is then materialised
 //! into the worktree and written to `.git/index` with stage 1/2/3 entries for
 //! every unresolved path.
 //!
@@ -47,10 +49,13 @@
 //!     The shift itself is [`crate::merge_apply::shift_tree_object`], which is
 //!     also what the porcelain's `-Xsubtree` runs.
 //!
-//! Not covered, and refused rather than approximated:
 //!   * `--subtree` over a criss-cross history, or over two or more explicit
-//!     bases: git shifts inside every level of the virtual-merge-base recursion,
-//!     and `Repository::virtual_merge_base` cannot carry the shift into its own
+//!     bases. git shifts inside *every* level of the virtual-merge-base
+//!     recursion, which `Repository::virtual_merge_base` cannot express, so that
+//!     recursion is spelled out in
+//!     [`crate::merge_apply::shifted_virtual_base_tree`] instead
+//!
+//! Not covered, and refused rather than approximated:
 //!   * the conflict classes [`crate::merge_msg`] still cannot name: a gitlink
 //!     content merge (git's `merge_submodule()` diagnostics and its
 //!     `advice.submoduleMergeConflict` hint block are not ported) and
@@ -230,6 +235,19 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     // spellings cannot drift apart.
     let subtree_shift = xopts.subtree_shift.clone();
 
+    // git's virtual commits are `alloc_commit_node()`s and are never written
+    // (`make_virtual_commit()`, merge-ort.c:5006-5015): a criss-cross merge
+    // leaves the merged base *tree* and the blobs it needed in the object store
+    // and no commit at all. `gix-merge` writes its virtual commits, so the merge
+    // runs against an in-memory object store and only the objects git would have
+    // written are persisted afterwards — the same trick
+    // [`super::merge::virtual_base_tree`] plays for the porcelain.
+    let merge_repo = {
+        let mut mem = repo.clone();
+        mem.objects.enable_object_memory();
+        mem
+    };
+
     // With no explicit bases git computes them itself (recursively merging
     // multiple bases); with bases given it uses exactly those. A shift forces
     // the explicit-tree path even with no bases, because the base tree has to be
@@ -240,9 +258,10 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
             current: Some(BStr::new(label1.as_bytes())),
             other: Some(BStr::new(label2.as_bytes())),
         };
-        let commit_options = gix::merge::commit::Options::from(tree_options)
-            .with_allow_missing_merge_base(true);
-        repo.merge_commits(head_id, remote_id, labels, commit_options)?
+        let commit_options =
+            gix::merge::commit::Options::from(tree_options).with_allow_missing_merge_base(true);
+        merge_repo
+            .merge_commits(head_id, remote_id, labels, commit_options)?
             .tree_merge
     } else {
         let (base_tree, ancestor_label) = if bases.is_empty() {
@@ -255,42 +274,78 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
                 1 => (repo.find_commit(computed[0].detach())?.tree_id()?.detach(), None),
                 // The virtual merge base is built by recursively merging the
                 // bases, and `merge_ort_internal()` applies the shift at every
-                // level of that recursion. `Repository::virtual_merge_base`
-                // cannot thread a shift through its own recursion, so this is a
-                // floor rather than a wrong answer — the same one
-                // `super::merge_subtree` documents.
-                n => crate::git_fatal!(
-                    "merge-recursive --subtree cannot be performed: the history has {n} merge \
-                     bases (criss-cross), whose virtual merge base git builds by recursively \
-                     merging them with the subtree shift applied at each level; \
-                     Repository::virtual_merge_base cannot thread the shift through its recursion"
-                ),
+                // level of that recursion — which is why it cannot be delegated
+                // to `Repository::virtual_merge_base`.
+                //
+                // `repo_get_merge_bases()` is followed by `commit_list_reverse()`
+                // (merge-ort.c:5316-5322), so the list `pop_commit()` walks is the
+                // reverse of the one the traversal produced.
+                _ => {
+                    let mut computed: Vec<ObjectId> =
+                        computed.iter().map(|id| id.detach()).collect();
+                    computed.reverse();
+                    (
+                        crate::merge_apply::shifted_virtual_base_tree(
+                            &merge_repo,
+                            &computed,
+                            subtree_shift.as_ref().expect("the shift path").as_ref(),
+                            &tree_options,
+                        )?,
+                        Some("merged common ancestors"),
+                    )
+                }
             }
         } else if bases.len() == 1 {
             (
                 repo.find_commit(bases[0])?.tree_id()?.detach(),
                 Some("constructed merge base"),
             )
-        } else if subtree_shift.is_some() {
-            crate::git_fatal!(
-                "merge-recursive --subtree cannot be performed: {} explicit merge bases require a \
-                 virtual merge base built by recursively merging them with the subtree shift \
-                 applied at each level; Repository::virtual_merge_base cannot thread the shift \
-                 through its recursion",
-                bases.len()
+        } else if let Some(prefix) = &subtree_shift {
+            // `merge_ort_generic()` builds `ca` with `commit_list_insert()`
+            // (merge-ort-wrappers.c:107-113), which *prepends* — so the last
+            // `<base>` written on the command line is the head of the list and the
+            // one `pop_commit()` takes first.
+            let mut ca: Vec<ObjectId> = bases.clone();
+            ca.reverse();
+            (
+                crate::merge_apply::shifted_virtual_base_tree(
+                    &merge_repo,
+                    &ca,
+                    prefix.as_ref(),
+                    &tree_options,
+                )?,
+                Some("merged common ancestors"),
             )
         } else {
             (
-                repo.virtual_merge_base(bases.clone(), tree_options.clone())?
-                    .tree_id
-                    .detach(),
+                // git's virtual commits are `alloc_commit_node()`s
+                // (`make_virtual_commit()`, merge-ort.c:5006-5015) and are never
+                // written; only the merged base *tree* and the blobs it needed
+                // reach the object store. `Repository::virtual_merge_base` writes
+                // its virtual commits too, so the recursion runs against an
+                // in-memory store and only the objects git would have written are
+                // persisted — the same path `git merge`'s criss-cross takes.
+                super::merge::virtual_base_tree_with(&repo, &bases, Some(tree_options.clone()))?,
                 Some("merged common ancestors"),
             )
         };
         let (base_tree, remote_tree) = match &subtree_shift {
+            // Through `merge_repo`, not `repo`: a virtual merge base built above
+            // lives only in the in-memory store until the merge is done, so the
+            // shift has to be able to read it back.
             Some(prefix) => (
-                crate::merge_apply::shift_tree_object(&repo, head_tree, base_tree, prefix.as_ref())?,
-                crate::merge_apply::shift_tree_object(&repo, head_tree, remote_tree, prefix.as_ref())?,
+                crate::merge_apply::shift_tree_object(
+                    &merge_repo,
+                    head_tree,
+                    base_tree,
+                    prefix.as_ref(),
+                )?,
+                crate::merge_apply::shift_tree_object(
+                    &merge_repo,
+                    head_tree,
+                    remote_tree,
+                    prefix.as_ref(),
+                )?,
             ),
             None => (base_tree, remote_tree),
         };
@@ -299,13 +354,13 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
             current: Some(BStr::new(label1.as_bytes())),
             other: Some(BStr::new(label2.as_bytes())),
         };
-        repo.merge_trees(base_tree, head_tree, remote_tree, labels, tree_options)?
+        merge_repo.merge_trees(base_tree, head_tree, remote_tree, labels, tree_options)?
     };
 
     // Render every message first: an unrenderable conflict class must fail
     // before a single byte of index or worktree is touched.
     let messages = crate::merge_msg::render(
-        &repo,
+        &merge_repo,
         &outcome.conflicts,
         &label1,
         &label2,
@@ -328,6 +383,25 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     let how = TreatAsUnresolved::git();
     let conflicted = outcome.has_unresolved_conflicts(how);
     let merged_tree = outcome.tree.write()?.detach();
+
+    // Everything the merge produced now reaches the real object store *except*
+    // the virtual commits, which git never writes. This is where git's own
+    // writes have landed by the time `merge_switch_to_result()` starts its
+    // checkout (merge-ort.c:4964), so a refusal below leaves the same objects
+    // behind that stock leaves.
+    {
+        let written = merge_repo
+            .objects
+            .reset_object_memory()
+            .expect("object memory was just enabled");
+        for (_id, (kind, data)) in written.iter() {
+            if *kind == gix::object::Kind::Commit {
+                continue;
+            }
+            gix::objs::Write::write_buf(&repo, *kind, data)
+                .map_err(|e| anyhow!("failed to write merge object: {e}"))?;
+        }
+    }
 
     // `merge_switch_to_result()`'s `checkout()`: an `unpack_trees()` from
     // `<head>`'s tree to the merged one, which refuses rather than overwrite
@@ -366,10 +440,31 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    // `merge_switch_to_result()` does the two in this order (merge-ort.c:4964-4975):
+    // `checkout()` — an `unpack_trees()` onto the as-merged-as-possible tree whose
+    // tail is `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // (unpack-trees.c:2088-2092) — and only then
+    // `record_conflicted_index_entries()`, which swaps each conflicted path's
+    // stage-0 entry for its stage 1/2/3 ones and ends in
+    // `remove_marked_cache_entries(index, 1)` (merge-ort.c:4509), the `1` being
+    // `invalidate_cache_tree`.
+    //
+    // Repairing *after* the conflicts instead made the repair a no-op —
+    // `verify_cache()` refuses an unmerged entry (cache-tree.c:218-234) and
+    // `cache_tree_update()` returns before touching `istate->cache_tree` — and
+    // `rebuild_cache_tree` had already dropped what the pre-merge index carried, so
+    // a conflicting merge-recursive wrote an index with no `TREE` extension at all
+    // where stock leaves the carried structure with the touched nodes at `-1`.
+    // This is the same ordering `crate::merge_apply` runs for every porcelain
+    // merge-shaped verb.
+    super::write_tree::carry_and_repair_cache_tree(&repo, &old_index, &mut index);
     outcome.index_changed_after_applying_conflicts(&mut index, how, RemovalMode::Prune);
-    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
-    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
-    super::write_tree::rebuild_cache_tree(&repo, &mut index);
+    // `remove_marked_cache_entries(index, 1)`: the stage-0 entry each conflicted
+    // path had is gone, and its node — and every node above it — goes with it.
+    for path in crate::merge_apply::unmerged_paths(&index) {
+        index.invalidate_path_in_tree(path.as_ref());
+    }
+    super::write_tree::prepare_offset_table(&repo, &mut index);
     crate::index_racy::write(&repo, &mut index)?;
 
     // `merge_ort_generic()` reaches `merge_switch_to_result()` like every other
@@ -466,9 +561,7 @@ fn apply_to_worktree(
     };
     for path in old_stats.keys() {
         if !kept.contains(path) {
-            if let Some(full) = repo.workdir_path(path.as_bstr()) {
-                let _ = std::fs::remove_file(full);
-            }
+            crate::merge_apply::remove_worktree_entry(repo, path.as_bstr());
         }
     }
 

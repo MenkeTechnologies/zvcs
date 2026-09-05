@@ -21,7 +21,11 @@
 //! * `--ref-action=update|print` and the `replay.refAction` configuration
 //!   variable. `print` emits `update <ref> <new> <old>` lines; `update` runs one
 //!   atomic reference transaction and prints nothing.
-//! * Revision ranges in the forms `<rev>`, `^<rev>` and `<a>..<b>`, walked
+//! * Revision ranges in the forms `<rev>`, `^<rev>`, `<a>..<b>` and `<a>...<b>`
+//!   (the symmetric difference's merge bases go in as the excluded side, ahead of
+//!   both endpoints, exactly as `handle_dotdot_1()` queues them), plus the ref-set
+//!   pseudo-options `--all`, `--branches`/`--heads`, `--tags` and `--remotes` and
+//!   the `--not` toggle, walked
 //!   `--topo-order` (reversed for pick mode, newest-first for revert mode) via
 //!   `gix_traverse::commit::topo`, which is a port of git's
 //!   `sort_in_topological_order`.
@@ -34,11 +38,11 @@
 //!
 //! ## Not covered
 //!
-//! * `<a>...<b>` symmetric difference, `--` pathspec limiting, and every
-//!   rev-list commit-limiting option (`-n`, `--grep`, `--since`, `--merges`, …).
-//!   git passes those through `setup_revisions`; here they are refused rather
-//!   than silently ignored, because ignoring them would change which commits get
-//!   replayed.
+//! * `--` pathspec limiting, the `=<pattern>` spellings of the ref-set
+//!   pseudo-options, and every rev-list commit-limiting option (`-n`, `--grep`,
+//!   `--since`, `--merges`, …). git passes those through `setup_revisions`; here
+//!   they are refused rather than silently ignored, because ignoring them would
+//!   change which commits get replayed.
 //! * Replaying merge commits — git refuses these too.
 //!
 //! ## Known divergences
@@ -222,6 +226,58 @@ struct RevArg {
     oid: ObjectId,
 }
 
+/// One operand `setup_revisions()` kept, in the order it was written, carrying the
+/// `UNINTERESTING | BOTTOM` state `--not` had toggled to when it was reached
+/// (revision.c's `handle_revision_pseudo_opt`: `if (!strcmp(arg, "--not")) *flags ^=
+/// UNINTERESTING | BOTTOM;`).
+enum RevInput {
+    /// A revision expression as written: a name, `^<name>`, `<a>..<b>` or `<a>...<b>`.
+    Expr { text: String, not: bool },
+    /// One of the ref-set pseudo-options, which `handle_refs()` expands into one
+    /// `rev_cmdline_entry` per reference, named by its full refname.
+    Refs { kind: RefsKind, not: bool },
+}
+
+/// Which references a ref-set pseudo-option stands for.
+#[derive(Clone, Copy, PartialEq)]
+enum RefsKind {
+    /// `--all`: `for_each_ref` and then `head_ref`, so `HEAD` comes last.
+    All,
+    /// `--branches`: `for_each_branch_ref`.
+    Branches,
+    /// `--tags`: `for_each_tag_ref`.
+    Tags,
+    /// `--remotes`: `for_each_remote_ref`.
+    Remotes,
+}
+
+/// The references one ref-set pseudo-option stands for, in `for_each_ref` order —
+/// which is refname order, with `--all`'s `HEAD` appended last because
+/// `handle_revision_pseudo_opt` runs `refs_head_ref` after `refs_for_each_ref`.
+///
+/// Only `refs/` is walked. `for_each_ref` never yields `HEAD` or any other
+/// pseudo-ref, which is exactly why `--all` has to ask for it separately.
+fn ref_set(repo: &gix::Repository, kind: RefsKind) -> Result<Vec<String>> {
+    let prefix = match kind {
+        RefsKind::All => "refs/",
+        RefsKind::Branches => "refs/heads/",
+        RefsKind::Tags => "refs/tags/",
+        RefsKind::Remotes => "refs/remotes/",
+    };
+    let mut names: Vec<String> = repo
+        .references()?
+        .prefixed(prefix)?
+        .filter_map(std::result::Result::ok)
+        .map(|r| r.name().as_bstr().to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    if kind == RefsKind::All {
+        names.push("HEAD".to_string());
+    }
+    Ok(names)
+}
+
 /// One queued `struct replay_ref_update`.
 struct Update {
     refname: String,
@@ -245,7 +301,10 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
     let mut revert_name: Option<String> = None;
     let mut ref_name: Option<String> = None;
     let mut ref_action: Option<String> = None;
-    let mut rev_exprs: Vec<String> = Vec::new();
+    let mut rev_exprs: Vec<RevInput> = Vec::new();
+    // `*flags ^= UNINTERESTING | BOTTOM` — `--not` toggles, so a second one
+    // switches the sense back.
+    let mut not = false;
     // The first argument `parse_options()` kept for `setup_revisions()` that this
     // port cannot hand on. Recorded rather than raised, because `parse_options()`
     // is not where git looks at it; see the arm that fills it in.
@@ -288,6 +347,32 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
                         .to_string()
                 });
             }
+            // revision.c's `handle_revision_pseudo_opt`. These four expand to
+            // references rather than being commit-limiting options, so they can be
+            // honoured exactly rather than refused: `handle_refs()` walks the ref
+            // store and hands `add_rev_cmdline()` each full refname, which is what
+            // `get_ref_information()` then dwims back into `positive_refs`.
+            //
+            // The `=<pattern>` spellings fall through to the refusal below: a
+            // pattern narrows the set and honouring the flag while ignoring it
+            // would replay the wrong commits.
+            "--not" if inline.is_none() => not = !not,
+            "--all" if inline.is_none() => rev_exprs.push(RevInput::Refs {
+                kind: RefsKind::All,
+                not,
+            }),
+            "--branches" | "--heads" if inline.is_none() => rev_exprs.push(RevInput::Refs {
+                kind: RefsKind::Branches,
+                not,
+            }),
+            "--tags" if inline.is_none() => rev_exprs.push(RevInput::Refs {
+                kind: RefsKind::Tags,
+                not,
+            }),
+            "--remotes" if inline.is_none() => rev_exprs.push(RevInput::Refs {
+                kind: RefsKind::Remotes,
+                not,
+            }),
             s if s.starts_with('-') && s.len() > 1 => {
                 unported.get_or_insert_with(|| {
                     format!(
@@ -297,7 +382,10 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
                     )
                 });
             }
-            s => rev_exprs.push(s.to_string()),
+            s => rev_exprs.push(RevInput::Expr {
+                text: s.to_string(),
+                not,
+            }),
         }
         i += 1;
     }
@@ -375,7 +463,29 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
 
     // --- setup_revisions --------------------------------------------------
     let mut revs: Vec<RevArg> = Vec::new();
-    for expr in &rev_exprs {
+    for input in &rev_exprs {
+        let (expr, not) = match input {
+            RevInput::Expr { text, not } => (text, *not),
+            // `handle_refs()` (revision.c): one `rev_cmdline_entry` per reference,
+            // named by its full refname, in ref-name order — and for `--all`,
+            // `head_ref` last, which is what puts `HEAD` at the end of the list.
+            RevInput::Refs { kind, not } => {
+                for name in ref_set(&repo, *kind)? {
+                    // `get_reference()` peels; an annotated tag contributes the
+                    // commit it names, and a ref that reaches no commit is skipped
+                    // the way `handle_one_ref()`'s `object_as_type()` drops it.
+                    if let Ok(oid) = peel_to_commit(&repo, &name) {
+                        revs.push(RevArg {
+                            name,
+                            negative: *not,
+                            oid,
+                        });
+                    }
+                }
+                continue;
+            }
+        };
+        let expr = expr.as_str();
         // Every rejection here is `setup_revisions()`'s, not this port's, so the
         // whole operand goes to the shared diagnosis rather than the endpoint
         // that failed: an absent full-length hex resolves (see
@@ -401,29 +511,46 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
                 eprint!("{}", super::log::bad_revision_message_in(&repo, expr));
                 return Ok(ExitCode::from(128));
             }
-            // A range whose endpoints are all good is the one shape that really
-            // is unported; anything `handle_dotdot()` did not accept falls
-            // through to the per-endpoint resolution below, which reports it the
-            // way `setup_revisions()` does.
-            crate::objname::Dotdot::Ok { .. }
-                if crate::objname::split_range(expr).is_some_and(|r| r.symmetric) =>
-            {
-                bail!(
-                    "unsupported revision range {expr:?} \
-                     (symmetric difference `...` is not ported)"
-                )
-            }
+            // Anything `handle_dotdot()` did not reject outright falls through to
+            // the per-endpoint resolution below, which reports it the way
+            // `setup_revisions()` does.
             _ => {}
         }
-        let resolved = if let Some((left, right)) = expr.split_once("..") {
+        // `handle_dotdot_1()` (revision.c) computes `flags_exclude = flags ^
+        // (UNINTERESTING | BOTTOM)`, so a range written after `--not` has its two
+        // ends swapped along with everything else.
+        let symmetric = crate::objname::split_range(expr).is_some_and(|r| r.symmetric);
+        let resolved = if symmetric {
+            let (left, right) = expr.split_once("...").expect("a symmetric range has `...`");
+            let left = if left.is_empty() { "HEAD" } else { left };
+            let right = if right.is_empty() { "HEAD" } else { right };
+            // "the merge bases go in as the excluded side, then a, then b" —
+            // `add_rev_cmdline_list(revs, exclude, REV_CMD_MERGE_BASE, flags_exclude)`
+            // runs before either endpoint, and names each base by its hex, which is
+            // why no merge base can dwim into `positive_refs`/`negative_refs`.
+            arg(left, not).and_then(|a| {
+                let b = arg(right, not)?;
+                let mut out = Vec::new();
+                for base in repo.merge_bases_many(a.oid, &[b.oid])? {
+                    out.push(RevArg {
+                        name: base.detach().to_string(),
+                        negative: !not,
+                        oid: base.detach(),
+                    });
+                }
+                out.push(a);
+                out.push(b);
+                Ok(out)
+            })
+        } else if let Some((left, right)) = expr.split_once("..") {
             // git substitutes `HEAD` for an omitted side of the range.
             let left = if left.is_empty() { "HEAD" } else { left };
             let right = if right.is_empty() { "HEAD" } else { right };
-            arg(left, true).and_then(|a| Ok(vec![a, arg(right, false)?]))
+            arg(left, !not).and_then(|a| Ok(vec![a, arg(right, not)?]))
         } else if let Some(bare) = expr.strip_prefix('^') {
-            arg(bare, true).map(|a| vec![a])
+            arg(bare, !not).map(|a| vec![a])
         } else {
-            arg(expr, false).map(|a| vec![a])
+            arg(expr, not).map(|a| vec![a])
         };
         match resolved {
             Ok(args) => revs.extend(args),
@@ -631,11 +758,20 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
         RefAction::Update => {
             let mut edits: Vec<RefEdit> = Vec::new();
             for u in &updates {
-                // git's transaction turns a no-op update into nothing at all —
-                // no ref write and, importantly, no reflog entry.
-                if u.old == u.new {
-                    continue;
-                }
+                // A no-op update is *not* nothing. `lock_ref_for_update()` skips the
+                // ref write when "the reference already has the desired value"
+                // (refs/files-backend.c:2804-2812) and therefore never sets
+                // `REF_NEEDS_COMMIT`, so the branch's own log stays untouched — but
+                // `split_head_update()` has already added a `REF_LOG_ONLY` entry for
+                // `HEAD`, and `files_transaction_finish()` writes that one on
+                // `REF_NEEDS_COMMIT || REF_LOG_ONLY`. So `git replay --onto main
+                // main~4..main`, where every commit is dropped as empty and the
+                // result is the branch it started from, still appends
+                // `<oid> <oid> … replay --onto <oid>` to `.git/logs/HEAD`.
+                // Dropping the edit here wrote nothing at all. `gix-ref` reproduces
+                // both halves of that (its `commit()` logs a `RefLog::Only` edit
+                // unconditionally and an unchanged value never), so the edit is
+                // handed over as written.
                 let name = FullName::try_from(u.refname.as_str())
                     .map_err(|e| anyhow!("invalid ref name {:?}: {e}", u.refname))?;
                 let expected = if u.old.is_null() {

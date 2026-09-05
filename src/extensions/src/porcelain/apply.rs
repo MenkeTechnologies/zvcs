@@ -1152,6 +1152,18 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         patches.retain(|p| use_patch(p, &prefix, &o.limits, o.has_include));
     }
 
+    // `apply_patch()` links each parsed patch onto the list it will walk, and under
+    // `-R` it *prepends* instead of appending: `if (!list || !state->apply_in_reverse)
+    // { *listp = patch; listp = &patch->next; } else { patch->next = list; list =
+    // patch; }` (apply.c:4908-4915). So a reversed run visits the patches in the
+    // opposite order to the one the input wrote them in — which is the order every
+    // per-patch diagnostic comes out in. `git apply -R --check` over a three-file
+    // patch reported `src/lib.rs`, `added.txt`, `README.md` where this printed
+    // `README.md`, `added.txt`, `src/lib.rs`.
+    if o.reverse {
+        patches.reverse();
+    }
+
     // `state->whitespace_error`, which `apply_all_patches()` summarises only once
     // every input file has been through `apply_patch()` (apply.c:5141-5171). Carried
     // out here so the summary can print where git prints it: *after* the write, and
@@ -1160,6 +1172,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // `state->applied_after_fixing_ws`: how many lines `ws_fix_copy()` reported as
     // *fixed*, which is what picks the summary's first wording.
     let mut applied_after_fixing_ws = 0usize;
+    // `patch->ws_rule` per patch, kept for `match_fragment()`'s `correct_ws_error`
+    // retry. `None` when the run is not fixing whitespace.
+    let mut fix_rules: Vec<Option<u32>> = vec![None; patches.len()];
 
     // `check_whitespace()`: every added line is checked before anything is written,
     // so `--whitespace=error` refuses the patch with the worktree untouched. The rule
@@ -1178,11 +1193,17 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                  core.whitespace"
             );
         }
-        let errors = report_whitespace(&patches, &spans, rule, &o.ws, o.quiet());
+        // `parse_fragment()` puts context lines under the check only when both hold
+        // (apply.c:1841-1842).
+        let context_ws = matches!(o.ws, WsAction::Fix) && !o.reverse;
+        let errors = report_whitespace(&patches, &spans, rule, &o.ws, o.quiet(), context_ws);
         if matches!(o.ws, WsAction::Fix) {
+            for (i, p) in patches.iter().enumerate() {
+                fix_rules[i] = Some(patch_ws_rule(p, rule));
+            }
             for p in &mut patches {
-                let targets = ws_targets(p, rule);
-                for (_, hunk_idx, post_idx, rule) in targets {
+                let targets = ws_targets(p, rule, false);
+                for (_, hunk_idx, _, post_idx, rule) in targets {
                     if let Some(line) = p.hunks[hunk_idx].post.get_mut(post_idx) {
                         if super::diff_files::ws_check(line, rule) != 0 {
                             let (fixed_line, fixed) = ws_fix_default(line, rule);
@@ -1304,7 +1325,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // with the stage 1/2/3 blobs `add_conflicted_stages_file()` records.
     let mut conflicted: Vec<(String, u32, [Option<ObjectId>; 3])> = Vec::new();
 
-    for p in &patches {
+    for (patch_idx, p) in patches.iter().enumerate() {
         // The name git reports progress and success against.
         let name = p.new_name.clone().or_else(|| p.old_name.clone()).unwrap_or_default();
         // The name git reports errors against: the pre-image path when there is
@@ -1458,6 +1479,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 o.no_add,
                 o.p_context,
                 o.ignore_ws,
+                fix_rules[patch_idx],
                 o.allow_overlap,
                 verbosity(&o),
                 o.reject,
@@ -1591,6 +1613,14 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `create_file()` (apply.c:4683-4686) branches: a `conflicted_threeway` path goes
+    // to `add_conflicted_stages_file()` and to nothing else, so its merged content
+    // reaches the worktree and **never becomes an object**. Staging it first and
+    // replacing the entry afterwards left the marked-up text behind as a loose blob
+    // stock never writes.
+    let conflicted_stage0: HashSet<String> =
+        conflicted.iter().map(|(path, _, _)| path.clone()).collect();
+
     // `write_out_one_reject()` returns non-zero for every patch that left a `*.rej`,
     // which is what makes the run exit 1.
     let mut any_reject = false;
@@ -1605,8 +1635,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 }
             }
             // `create_file()` (apply.c:4685): `check_index` stages every result,
-            // `ita_only` stages only the paths the patch creates.
-            if update_index && (check_index || op.is_new) {
+            // `ita_only` stages only the paths the patch creates — and a conflicted
+            // three-way result takes neither branch.
+            if update_index && (check_index || op.is_new) && !conflicted_stage0.contains(&path) {
                 let repo = idx_repo.as_ref().expect("repo present when update_index");
                 let (id, stat, flags) = if o.ita_only {
                     // `set_object_name_for_intent_to_add_entry()` (read-cache.c:704):
@@ -1728,7 +1759,10 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // anything rolls the whole index update back, including the paths that did
     // apply cleanly. Everything already written to the worktree stays.
     let roll_back_index = o.reject && (failed || any_reject);
-    if update_index && !roll_back_index && !(idx_add.is_empty() && idx_remove.is_empty()) {
+    if update_index
+        && !roll_back_index
+        && !(idx_add.is_empty() && idx_remove.is_empty() && conflicted.is_empty())
+    {
         let index = idx_index.as_mut().expect("index present when update_index");
         // If two patches in one input touched the same path, keep only the last
         // add for it — git's `add_index_entry` replaces in place, so the final
@@ -1739,10 +1773,19 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         idx_add.retain(|(p, _, _, _, _)| seen.insert(p.clone()));
         // Every touched path is dropped (any prior stage) before its fresh stage-0
         // entry is pushed; a pure deletion contributes only a removal.
+        // `add_conflicted_stages_file()` opens with
+        // `remove_file_from_index(state->repo->index, patch->new_name)`
+        // (apply.c:4655), so a conflicted path's stage-0 entry goes even though it
+        // contributes no `idx_add` row of its own.
         let drop_set: HashSet<BString> = idx_remove
             .iter()
             .cloned()
             .chain(idx_add.iter().map(|(p, _, _, _, _)| p.clone()))
+            .chain(
+                conflicted
+                    .iter()
+                    .map(|(p, _, _)| BString::from(p.clone().into_bytes())),
+            )
             .collect();
         index.remove_entries(|_, path, _| drop_set.contains(&path.to_owned()));
         // `add_conflicted_stages_file()` replaces a conflicted path's stage-0
@@ -1915,6 +1958,9 @@ fn try_threeway(
         o.no_add,
         o.p_context,
         o.ignore_ws,
+        // `try_threeway()` rebuilds the patch's own post-image against the blob the
+        // patch names, where no whitespace correction is in play.
+        None,
         o.allow_overlap,
         verbosity(o),
         // `try_threeway()` builds the patch's own post-image, which either applies
@@ -2323,6 +2369,10 @@ fn apply_hunks(
     p_context: Option<usize>,
     // `state->ws_ignore_action == ignore_ws_change`.
     ignore_ws: bool,
+    // `Some(patch->ws_rule)` when `state->ws_error_action == correct_ws_error`, which
+    // is what lets `match_fragment()` retry a failed placement after fixing the
+    // whitespace on both sides (apply.c:2705-2806).
+    ws_fix: Option<u32>,
     // `state->allow_overlap`: do not mark the lines a fragment wrote as `LINE_PATCHED`,
     // so a later fragment of the same patch may match against them.
     allow_overlap: bool,
@@ -2340,9 +2390,15 @@ fn apply_hunks(
     // is precisely "stop setting this".
     let mut patched: Vec<bool> = vec![false; image.len()];
     for (idx, h) in p.hunks.iter().enumerate() {
-        let Some(placed) =
-            place_with_context(image.as_slice(), &patched, h, unidiff_zero, p_context, ignore_ws)
-        else {
+        let Some(placed) = place_with_context(
+            image.as_slice(),
+            &patched,
+            h,
+            unidiff_zero,
+            p_context,
+            ignore_ws,
+            ws_fix,
+        ) else {
             // apply.c:3369-3374 — the diagnostics come first either way; only what
             // happens next differs.
             if v.verbose {
@@ -2409,6 +2465,9 @@ struct Placed {
     /// The context counts left on the placed form, for the reduction warning.
     leading: usize,
     trailing: usize,
+    /// Whether context actually had to be dropped. `hunk` is also `Some` when the
+    /// placement only needed whitespace correction, which git does not announce.
+    reduced: bool,
 }
 
 impl Placed {
@@ -2423,7 +2482,7 @@ impl Placed {
                 if offset.abs() == 1 { "line" } else { "lines" }
             );
         }
-        if self.hunk.is_some() && !v.quiet {
+        if self.reduced && !v.quiet {
             eprintln!(
                 "Context reduced to ({}/{}) to apply fragment at {}",
                 self.leading,
@@ -2494,6 +2553,7 @@ fn place_with_context(
     unidiff_zero: bool,
     p_context: Option<usize>,
     ignore_ws: bool,
+    ws_fix: Option<u32>,
 ) -> Option<Placed> {
     let mut cur = h.clone();
     // apply.c:3134 — `pos = frag->newpos ? (frag->newpos - 1) : 0`, which the
@@ -2512,7 +2572,7 @@ fn place_with_context(
     // satisfied at once and no reduction happens unless `-C<n>` asked for one.
     let floor = p_context.unwrap_or(usize::MAX);
     loop {
-        if let Some(at) = find_pos(
+        if let Some((at, fixed)) = find_pos(
             image,
             patched,
             &cur.pre,
@@ -2520,16 +2580,24 @@ fn place_with_context(
             match_beginning,
             match_end,
             ignore_ws,
+            ws_fix,
             cur.eof_fudge,
         ) {
             let (leading, trailing) = (cur.leading, cur.trailing);
             let reduced = leading != h.leading || trailing != h.trailing;
+            // A whitespace-corrected match replaces both images, so the placed form
+            // has to travel with the hunk even when no context was dropped.
+            let corrected = fixed.is_some();
+            if let Some(fixed) = fixed {
+                apply_ws_fixed_images(&mut cur, fixed);
+            }
             return Some(Placed {
                 at,
-                hunk: reduced.then_some(cur),
+                hunk: (reduced || corrected).then_some(cur),
                 expected,
                 leading,
                 trailing,
+                reduced,
             });
         }
         // "Am I at my context limits?"
@@ -2566,6 +2634,37 @@ fn place_with_context(
     }
 }
 
+/// `update_pre_post_images()` (apply.c:2433-2494) for the `correct_ws_error` retry:
+/// the pre-image becomes the whitespace-fixed text that matched, and every
+/// `LINE_COMMON` line of the post-image takes its counterpart from it, in order. Only
+/// the context lines move — an added line keeps whatever `apply_one_fragment()`
+/// already made of it.
+fn apply_ws_fixed_images(h: &mut Hunk, fixed: Vec<Vec<u8>>) {
+    h.pre = fixed;
+    let common: Vec<Vec<u8>> = h
+        .pre
+        .iter()
+        .zip(&h.pre_common)
+        .filter(|(_, &c)| c)
+        .map(|(line, _)| line.clone())
+        .collect();
+    let mut next = common.iter();
+    for (k, line) in h.post.iter_mut().enumerate() {
+        if h.post_common.get(k).copied().unwrap_or(false) {
+            if let Some(fixed) = next.next() {
+                *line = fixed.clone();
+            }
+        }
+    }
+    // `--no-add` builds the post-image out of the context lines alone, so they are
+    // the same lines and take the same fix.
+    for (k, line) in h.context.iter_mut().enumerate() {
+        if let Some(fixed) = common.get(k) {
+            *line = fixed.clone();
+        }
+    }
+}
+
 /// Locate `pre` in `image`, starting at `line` and walking outward one line at a
 /// time, alternating backwards then forwards exactly as git does (so a patch
 /// that could land in two places lands where git lands it).
@@ -2577,8 +2676,9 @@ fn find_pos(
     match_beginning: bool,
     match_end: bool,
     ignore_ws: bool,
+    ws_fix: Option<u32>,
     eof_fudge: bool,
-) -> Option<usize> {
+) -> Option<(usize, Option<Vec<Vec<u8>>>)> {
     let mut line = if match_beginning {
         0
     } else if match_end {
@@ -2597,8 +2697,18 @@ fn find_pos(
     let (mut backwards, mut forwards, mut current) = (line, line, line);
     let mut i: usize = 0;
     loop {
-        if matches_at(image, patched, pre, current, match_beginning, match_end, ignore_ws, eof_fudge) {
-            return Some(current);
+        if let Some(fixed) = matches_at(
+            image,
+            patched,
+            pre,
+            current,
+            match_beginning,
+            match_end,
+            ignore_ws,
+            ws_fix,
+            eof_fudge,
+        ) {
+            return Some((current, fixed));
         }
         // Pick the next candidate: odd steps go backwards, even steps forwards,
         // skipping (and burning a step on) a direction that has run out.
@@ -2641,44 +2751,65 @@ fn matches_at(
     match_beginning: bool,
     match_end: bool,
     ignore_ws: bool,
+    // `Some(ws_rule)` under `--whitespace=fix`, which lets a hunk that does not land
+    // byte for byte land after `ws_fix_copy()` has been run over both sides.
+    ws_fix: Option<u32>,
     eof_fudge: bool,
-) -> bool {
+) -> Option<Option<Vec<Vec<u8>>>> {
     if at + pre.len() > image.len() {
-        return false;
+        return None;
     }
     // "Quick hash check" (apply.c:2648-2655): a line an earlier fragment of this same
     // patch already wrote is off limits, so a hunk cannot match text the patch itself
     // produced. `--allow-overlap` is the flag that stops the marking in the first
     // place (apply.c:2969), which is why nothing here consults it.
     if patched[at..at + pre.len()].iter().any(|&p| p) {
-        return false;
+        return None;
     }
     if match_end && at + pre.len() != image.len() {
-        return false;
+        return None;
     }
     if match_beginning && at != 0 {
-        return false;
+        return None;
     }
     if eof_fudge && !pre.is_empty() {
         let last = pre.len() - 1;
-        if image[at..at + last] == pre[..last]
-            && image[at + last].starts_with(&pre[last])
-        {
-            return true;
+        if image[at..at + last] == pre[..last] && image[at + last].starts_with(&pre[last]) {
+            return Some(None);
         }
     } else if image[at..at + pre.len()] == *pre {
-        return true;
+        return Some(None);
     }
     // `match_fragment()` tries the byte-exact comparison first and only then, under
     // `--ignore-whitespace`, `line_by_line_fuzzy_match()`. Its trailing check that
     // whatever of the pre-image runs past EOF is blank cannot fire here: the
     // pre-image is only allowed to overrun the file under `--whitespace=fix`
     // (`correct_ws_error`), and the length test above has already ruled it out.
-    ignore_ws
-        && image[at..at + pre.len()]
+    if ignore_ws {
+        return image[at..at + pre.len()]
             .iter()
             .zip(pre)
             .all(|(a, b)| fuzzy_matchlines(a, b))
+            .then_some(None);
+    }
+    // "The hunk does not apply byte-by-byte, but the hash says it might with
+    // whitespace fuzz. We weren't asked to ignore whitespace, we were asked to
+    // correct whitespace errors, so let's try matching after whitespace correction."
+    // (apply.c:2711-2718.) Both sides go through `ws_fix_copy()` and must come out
+    // equal; what the hunk then applies is the **fixed pre-image**, which
+    // `update_pre_post_images()` (apply.c:2433-2494) installs over the pre-image and
+    // over the post-image's context lines.
+    let rule = ws_fix?;
+    let mut fixed: Vec<Vec<u8>> = Vec::with_capacity(pre.len());
+    for (want, have) in pre.iter().zip(&image[at..at + pre.len()]) {
+        let (want_fixed, _) = ws_fix_default(want, rule);
+        let (have_fixed, _) = ws_fix_default(have, rule);
+        if want_fixed != have_fixed {
+            return None;
+        }
+        fixed.push(want_fixed);
+    }
+    Some(Some(fixed))
 }
 
 /// C's `isspace()` in the C locale, which is what apply.c compares against — one
@@ -4415,9 +4546,10 @@ fn io_msg(e: &std::io::Error) -> String {
 // ---------------------------------------------------------------------------
 
 /// One line the whitespace check will look at: `(index into the concatenated input,
-/// index of the hunk, index into that hunk's `post`, the `patch->ws_rule` in force
-/// when `parse_fragment()` reached it)`.
-type WsTarget = (usize, usize, usize, u32);
+/// index of the hunk, the `' '`/`'+'` marker, index into that hunk's `post` (for
+/// `'+'`) or `pre` (for `' '`), the `patch->ws_rule` in force when
+/// `parse_fragment()` reached it)`.
+type WsTarget = (usize, usize, u8, usize, u32);
 
 /// `check_old_for_crlf()` (apply.c:1716): a context or removed line that ends `\r\n`
 /// means the *pre-image* is a CRLF file, so the `\r` the patch adds back on every
@@ -4437,19 +4569,47 @@ fn ends_with_crlf(line: &[u8]) -> bool {
 ///
 /// `patch->ws_rule` is per patch, not per fragment, so a CRLF line in one hunk
 /// relaxes the hunks after it too.
-fn ws_targets(p: &Patch, base: u32) -> Vec<WsTarget> {
+fn ws_targets(p: &Patch, base: u32, context_too: bool) -> Vec<WsTarget> {
     let mut rule = base;
     let mut out = Vec::new();
     for (hunk_idx, h) in p.hunks.iter().enumerate() {
         for &(input_idx, marker, idx) in &h.body {
             if marker == b'+' {
-                out.push((input_idx, hunk_idx, idx, rule));
-            } else if h.pre.get(idx).is_some_and(|l| ends_with_crlf(l)) {
+                out.push((input_idx, hunk_idx, b'+', idx, rule));
+                continue;
+            }
+            if h.pre.get(idx).is_some_and(|l| ends_with_crlf(l)) {
                 rule |= super::diff_color::WS_CR_AT_EOL;
+            }
+            // `parse_fragment()`'s `case ' '` runs `check_whitespace()` too, but only
+            // `if (!state->apply_in_reverse && state->ws_error_action ==
+            // correct_ws_error)` (apply.c:1841-1852) — so a *context* line's trailing
+            // whitespace is reported under `--whitespace=fix` and under nothing else.
+            // It is reported and never rewritten: `apply_one_fragment()` runs
+            // `ws_fix_copy()` on `'+'` lines alone (apply.c:3062-3067), which is why
+            // this carries the marker and the fixing loop filters on it.
+            if context_too && marker == b' ' {
+                out.push((input_idx, hunk_idx, b' ', idx, rule));
             }
         }
     }
     out
+}
+
+/// `patch->ws_rule` once `parse_fragment()` has walked the whole patch — the value
+/// `apply_one_fragment()` and `match_fragment()` see, since parsing finishes before
+/// anything is applied. `check_old_for_crlf()` only ever ORs bits in, so this is the
+/// accumulated form rather than the per-line one [`ws_targets`] reports against.
+fn patch_ws_rule(p: &Patch, base: u32) -> u32 {
+    let mut rule = base;
+    for h in &p.hunks {
+        for &(_, marker, idx) in &h.body {
+            if marker != b'+' && h.pre.get(idx).is_some_and(|l| ends_with_crlf(l)) {
+                rule |= super::diff_color::WS_CR_AT_EOL;
+            }
+        }
+    }
+    rule
 }
 
 /// Report the whitespace errors every added line carries, as `apply.c`'s
@@ -4469,6 +4629,9 @@ fn report_whitespace(
     rule: u32,
     action: &WsAction,
     quiet: bool,
+    // `!state->apply_in_reverse && state->ws_error_action == correct_ws_error`, the
+    // pair of conditions that puts context lines under the check as well.
+    context_too: bool,
 ) -> usize {
     // `squelch_whitespace_errors`: git prints the first five and summarises the rest.
     const SQUELCH: usize = 5;
@@ -4476,8 +4639,13 @@ fn report_whitespace(
     let mut printed = 0usize;
     let silent = matches!(action, WsAction::Silent);
     for p in patches {
-        for (input_idx, hunk_idx, post_idx, rule) in ws_targets(p, rule) {
-            let Some(line) = p.hunks[hunk_idx].post.get(post_idx) else {
+        for (input_idx, hunk_idx, marker, idx, rule) in ws_targets(p, rule, context_too) {
+            let hunk = &p.hunks[hunk_idx];
+            let Some(line) = (if marker == b'+' {
+                hunk.post.get(idx)
+            } else {
+                hunk.pre.get(idx)
+            }) else {
                 continue;
             };
             let result = super::diff_files::ws_check(line, rule);
@@ -5180,12 +5348,12 @@ mod tests {
             eof_fudge: false,
         };
         assert_eq!(
-            place_with_context(&image, &[false; 3], &h, false, None, false).map(|p| p.at),
+            place_with_context(&image, &[false; 3], &h, false, None, false, None).map(|p| p.at),
             None,
             "byte-exact matching still rejects it"
         );
         assert_eq!(
-            place_with_context(&image, &[false; 3], &h, false, None, true).map(|p| p.at),
+            place_with_context(&image, &[false; 3], &h, false, None, true, None).map(|p| p.at),
             Some(0)
         );
         assert_eq!(

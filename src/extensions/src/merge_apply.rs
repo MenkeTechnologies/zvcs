@@ -156,6 +156,47 @@ pub fn unmerged_paths(index: &gix::index::File) -> Vec<BString> {
     paths
 }
 
+/// Remove the worktree file `path` names, then `rmdir` every directory the
+/// removal may have emptied, deepest first.
+///
+/// `unlink_entry()` (entry.c:592-607) does not stop at the file: it ends in
+/// `schedule_dir_for_removal(ce->name, ce_namelen(ce))`, and `unpack_trees()`
+/// closes its checkout with `remove_scheduled_dirs()` (unpack-trees.c:470).
+/// `do_remove_scheduled_dirs()` (symlinks.c:284-298) walks the scheduled path
+/// from the deepest component upwards, `rmdir`-ing each one and stopping at the
+/// first that does not go — which is exactly "delete the parents the file was
+/// the last thing in". Removing only the file left an empty directory standing
+/// where stock leaves nothing: `git merge-recursive main -- main alien` between
+/// unrelated roots dropped `src/lib.rs` and kept `src/`.
+///
+/// The current working directory is never removed, the same refusal
+/// `schedule_dir_for_removal()` opens with (symlinks.c:303-305).
+pub fn remove_worktree_entry(repo: &gix::Repository, path: &BStr) {
+    let Some(full) = repo.workdir_path(path) else {
+        return;
+    };
+    if std::fs::remove_file(&full).is_err() {
+        return;
+    }
+    let Some(workdir) = repo.workdir() else {
+        return;
+    };
+    let cwd = std::env::current_dir().ok();
+    let mut dir = full.parent().map(std::path::Path::to_path_buf);
+    while let Some(candidate) = dir {
+        if candidate == workdir || !candidate.starts_with(workdir) {
+            break;
+        }
+        if cwd.as_deref() == Some(candidate.as_path()) {
+            break;
+        }
+        if std::fs::remove_dir(&candidate).is_err() {
+            break;
+        }
+        dir = candidate.parent().map(std::path::Path::to_path_buf);
+    }
+}
+
 /// Three-way merge `ours_tree` and `theirs_tree` against `base_tree`.
 ///
 /// Prints git's `Auto-merging` / `CONFLICT (…)` lines, checks the merged tree out
@@ -617,9 +658,7 @@ fn update_worktree_to_tree(
         for e in old.entries() {
             let path = e.path_in(backing);
             if !new_paths.contains(&path.to_owned()) {
-                if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(full);
-                }
+                remove_worktree_entry(repo, path);
             }
         }
     }
@@ -1385,6 +1424,198 @@ fn shift_tree_by(
         2 => Ok(sub2.expect("set").0),
         // Neither is plausible — do not shift.
         _ => Ok(hash2),
+    }
+}
+
+/// `merge_ort_internal()`'s base consolidation (merge-ort.c:5327-5375) with the
+/// subtree shift threaded through it.
+///
+/// git builds the virtual merge base by merging the bases pairwise, and the shift
+/// lives in `merge_ort_nonrecursive_internal()` (merge-ort.c:5243-5248) — which
+/// every level of that recursion reaches. `Repository::virtual_merge_base` has no
+/// notion of the shift and cannot carry one into its own recursion, which is why
+/// this walk is spelled out rather than delegated.
+///
+/// `repo` **must** have object memory enabled. git's virtual commits are
+/// `alloc_commit_node()`s that never reach the object store
+/// (`make_virtual_commit()`, merge-ort.c:5006-5015); they are written here only so
+/// `merge_bases_many()` can walk *through* their parents, and the caller is
+/// expected to persist everything except the commits.
+///
+/// `bases` is in git's `commit_list` order — `merge_ort_generic()` builds `ca` with
+/// `commit_list_insert()`, which prepends, so the last `<base>` on the command line
+/// is the head of the list and the one `pop_commit()` takes first.
+pub(crate) fn shifted_virtual_base_tree(
+    repo: &gix::Repository,
+    bases: &[ObjectId],
+    shift: &BStr,
+    options: &gix::merge::tree::Options,
+) -> Result<ObjectId> {
+    Ok(consolidate_bases(repo, bases, shift, options, 1)?.0)
+}
+
+/// The loop `merge_ort_internal()` runs over its merge bases, returning the tree it
+/// settled on and the (virtual) commit that names it.
+///
+/// `inner_depth` is `opt->priv->call_depth` *inside* the loop: the C brackets each
+/// iteration with `opt->priv->call_depth++` / `--` (merge-ort.c:5350-5368), so every
+/// base merges one level below the caller and not one below its predecessor.
+fn consolidate_bases(
+    repo: &gix::Repository,
+    bases: &[ObjectId],
+    shift: &BStr,
+    options: &gix::merge::tree::Options,
+    inner_depth: u8,
+) -> Result<(ObjectId, Option<ObjectId>)> {
+    let mut iter = bases.iter().copied();
+    let mut merged_commit = iter.next();
+    // "if there is no common ancestor, use an empty tree" (merge-ort.c:5330-5334).
+    let mut merged_tree = match merged_commit {
+        Some(c) => repo.find_commit(c)?.tree_id()?.detach(),
+        None => ObjectId::empty_tree(repo.object_hash()),
+    };
+    for next in iter {
+        let prev = match merged_commit {
+            Some(c) => c,
+            None => write_virtual_commit(repo, None, merged_tree)?,
+        };
+        merged_tree = merge_ort_internal(repo, None, prev, next, shift, options, inner_depth)?;
+        // `commit_list_insert(prev, …); commit_list_insert(next, …)` — the virtual
+        // commit's two parents, which is what lets the *next* iteration find a
+        // merge base for it.
+        merged_commit = Some(write_virtual_commit(repo, Some((prev, next)), merged_tree)?);
+    }
+    Ok((merged_tree, merged_commit))
+}
+
+/// `merge_ort_internal()` (merge-ort.c:5303-5395) reduced to the tree it produces.
+///
+/// `merge_bases` is `None` for the C's `NULL`, which means "compute them here";
+/// `depth` is the `call_depth` the final, non-recursive merge runs at.
+fn merge_ort_internal(
+    repo: &gix::Repository,
+    merge_bases: Option<Vec<ObjectId>>,
+    h1: ObjectId,
+    h2: ObjectId,
+    shift: &BStr,
+    options: &gix::merge::tree::Options,
+    depth: u8,
+) -> Result<ObjectId> {
+    let bases = match merge_bases {
+        Some(bases) => bases,
+        None => {
+            // `repo_get_merge_bases()` followed by `commit_list_reverse()`
+            // (merge-ort.c:5316-5322).
+            let mut found: Vec<ObjectId> = repo
+                .merge_bases_many(h1, &[h2])?
+                .into_iter()
+                .map(|id| id.detach())
+                .collect();
+            found.reverse();
+            found
+        }
+    };
+    let (base_tree, _) = consolidate_bases(repo, &bases, shift, options, depth + 1)?;
+
+    // `merge_ort_nonrecursive_internal()`: the shift aligns the *remote* and the
+    // *base* onto the head, at every level (merge-ort.c:5243-5248).
+    let side1 = repo.find_commit(h1)?.tree_id()?.detach();
+    let side2 = repo.find_commit(h2)?.tree_id()?.detach();
+    let side2 = shift_tree_object(repo, side1, side2, shift)?;
+    let base_tree = shift_tree_object(repo, side1, base_tree, shift)?;
+
+    // `saved_b1/saved_b2` are swapped for "Temporary merge branch 1"/"2" around
+    // the recursive call (merge-ort.c:5354-5356).
+    let labels = gix::merge::blob::builtin_driver::text::Labels {
+        ancestor: None,
+        current: Some(BStr::new(b"Temporary merge branch 1")),
+        other: Some(BStr::new(b"Temporary merge branch 2")),
+    };
+    let mut outcome = repo.merge_trees(
+        base_tree,
+        side1,
+        side2,
+        labels,
+        virtual_ancestor_options(options, depth),
+    )?;
+    Ok(outcome.tree.write()?.detach())
+}
+
+/// The options a merge-base merge runs under: `merge_3way()`'s
+/// `if (opt->priv->call_depth) { ll_opts.virtual_ancestor = 1; ll_opts.variant = 0; }`
+/// plus the marker widening `handle_content_merge()` asks for
+/// (`opt->priv->call_depth * 2` on top of the configured seven, merge-ort.c:4337).
+///
+/// A merge-base merge keeps its content conflicts — the blob recorded in the virtual
+/// ancestor is the one *with* the markers — so `-X ours`/`-X theirs` does not reach
+/// here, and an undecidable tree conflict resolves to the ancestor.
+fn virtual_ancestor_options(
+    options: &gix::merge::tree::Options,
+    depth: u8,
+) -> gix::merge::tree::Options {
+    use gix::merge::plumbing::blob::builtin_driver::{binary, text};
+
+    let mut opts: gix::merge::plumbing::tree::Options = options.clone().into();
+    if depth == 0 {
+        return opts.into();
+    }
+    opts.tree_conflicts = Some(gix::merge::plumbing::tree::ResolveWith::Ancestor);
+    opts.blob_merge.is_virtual_ancestor = true;
+    if !matches!(opts.blob_merge.text.conflict, text::Conflict::Keep { .. }) {
+        opts.blob_merge.text.conflict = text::Conflict::Keep {
+            style: Default::default(),
+            marker_size: text::Conflict::DEFAULT_MARKER_SIZE
+                .try_into()
+                .expect("non-zero default"),
+        };
+    }
+    opts.blob_merge.resolve_binary_with = Some(binary::ResolveWith::Ancestor);
+    opts.symlink_conflicts = Some(binary::ResolveWith::Ancestor);
+    opts.marker_size_multiplier = depth;
+    opts.into()
+}
+
+/// `make_virtual_commit()` (merge-ort.c:5006-5015) made addressable.
+///
+/// git allocates the commit and never writes it; `merge_bases_many()` here can only
+/// walk objects the database can hand back, so the commit goes into the caller's
+/// in-memory store. `parents` is `None` for the "no common ancestor" commit, which
+/// git builds over the empty tree with no parents at all.
+fn write_virtual_commit(
+    repo: &gix::Repository,
+    parents: Option<(ObjectId, ObjectId)>,
+    tree: ObjectId,
+) -> Result<ObjectId> {
+    let (parent_ids, template) = match parents {
+        // gix's own virtual commits copy the first parent's headers and replace the
+        // parents and the tree, which keeps every field valid without inventing one.
+        Some((a, b)) => (vec![a, b], Some(a)),
+        None => (Vec::new(), None),
+    };
+    let mut commit = match template {
+        Some(id) => repo.find_commit(id)?.decode()?.to_owned()?,
+        None => gix::objs::Commit {
+            tree,
+            parents: Default::default(),
+            author: virtual_signature(),
+            committer: virtual_signature(),
+            encoding: None,
+            message: "ancestor".into(),
+            extra_headers: Vec::new(),
+        },
+    };
+    commit.tree = tree;
+    commit.parents = parent_ids.into();
+    Ok(repo.write_object(&commit)?.detach())
+}
+
+/// The identity on the one virtual commit that has no commit to copy from. It never
+/// leaves the in-memory store, so only its shape matters.
+fn virtual_signature() -> gix::actor::Signature {
+    gix::actor::Signature {
+        name: "merge-recursive".into(),
+        email: "merge-recursive@example.invalid".into(),
+        time: gix::date::Time::new(0, 0),
     }
 }
 

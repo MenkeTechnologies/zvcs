@@ -2027,6 +2027,37 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // a base per head as it folds them in, so that list is not carried here.
     if targets.len() > 1 {
         set_orig_head(&repo, local_id)?;
+
+        // ```c
+        // else {
+        //         struct commit_list *list = remoteheads;
+        //         commit_list_insert(head_commit, &list);
+        //         common = get_octopus_merge_bases(list);
+        //         free(list);
+        // }
+        // …
+        // if (remoteheads && !common) {
+        //         /* No common ancestors found. */
+        //         if (!allow_unrelated_histories)
+        //                 die(_("refusing to merge unrelated histories"));
+        // ```
+        //
+        // (builtin/merge.c:1534-1548.) The refusal is not the single-head check
+        // repeated per head: git folds `HEAD` and *every* remote head into one
+        // octopus base computation and refuses when that whole set shares no
+        // ancestor. Without it the octopus strategy runs anyway and reports its
+        // own per-head `Unable to find common commit with <name>` — a different
+        // message, a different exit code, and a `MERGE_HEAD` left behind.
+        if !opts.allow_unrelated {
+            let mut heads = Vec::with_capacity(targets.len() + 1);
+            heads.push(local_id);
+            heads.extend(targets.iter().copied());
+            if octopus_merge_bases(&repo, &heads)?.is_empty() {
+                eprintln!("fatal: refusing to merge unrelated histories");
+                return Ok(ExitCode::from(128));
+            }
+        }
+
         let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
         let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
         let ctx = MergeCtx {
@@ -2566,6 +2597,20 @@ fn ort_attempt(
 /// gitoxide writes its virtual commits too, so the recursion runs against an in-memory
 /// object store and only the objects git would have written are persisted afterwards.
 pub(super) fn virtual_base_tree(repo: &gix::Repository, bases: &[ObjectId]) -> Result<ObjectId> {
+    virtual_base_tree_with(repo, bases, None)
+}
+
+/// [`virtual_base_tree`] with the caller's own tree-merge options.
+///
+/// `merge_ort_internal()` recurses with the *same* `opt` the outer merge carries
+/// (merge-ort.c:5363) — only `call_depth`, `branch1` and `branch2` change — so a
+/// caller that already built options from `-X` has to hand them down rather than
+/// let the recursion rebuild defaults. `None` keeps the repository's own.
+pub(super) fn virtual_base_tree_with(
+    repo: &gix::Repository,
+    bases: &[ObjectId],
+    options: Option<gix::merge::tree::Options>,
+) -> Result<ObjectId> {
     // The inner merge builds merge options too, and `merge.conflictStyle` is read
     // when they are built — so an unusable value kills the recursion before the
     // virtual base exists, not after. Validating only in the outer merge left the
@@ -2574,7 +2619,11 @@ pub(super) fn virtual_base_tree(repo: &gix::Repository, bases: &[ObjectId]) -> R
     crate::merge_apply::validate_conflict_style(repo).map_err(|r| r.into_error())?;
     let mut mem = repo.clone();
     mem.objects.enable_object_memory();
-    let out = mem.virtual_merge_base(bases.iter().copied(), mem.tree_merge_options()?)?;
+    let options = match options {
+        Some(options) => options,
+        None => mem.tree_merge_options()?.into(),
+    };
+    let out = mem.virtual_merge_base(bases.iter().copied(), options)?;
     let tree = out.tree_id.detach();
     let written = mem
         .objects
@@ -4650,6 +4699,51 @@ fn up_to_date_line(opts: &Opts) -> &'static str {
 }
 
 /// Point `ORIG_HEAD` at `id`, as git does before it moves `HEAD`.
+/// `get_octopus_merge_bases()` (commit-reach.c), the merge bases shared by a
+/// whole list of heads rather than by a pair.
+///
+/// ```c
+/// commit_list_insert(in->item, &ret);
+///
+/// for (i = in->next; i; i = i->next) {
+///         struct commit_list *new_commits = NULL, *end = NULL;
+///
+///         for (j = ret; j; j = j->next) {
+///                 struct commit_list *bases;
+///                 bases = repo_get_merge_bases(the_repository, i->item, j->item);
+///                 …
+///         }
+///         ret = new_commits;
+/// }
+/// ```
+///
+/// The seed is the first head, and each further head replaces the accumulator
+/// with the union of its pairwise bases against everything already in it. Once
+/// that union is empty every later round unions nothing into nothing, so the
+/// early exit below returns the same list the C loop would — emptiness is all
+/// `cmd_merge()` reads off the result.
+fn octopus_merge_bases(repo: &gix::Repository, heads: &[ObjectId]) -> Result<Vec<ObjectId>> {
+    let Some((first, rest)) = heads.split_first() else {
+        return Ok(Vec::new());
+    };
+    let mut ret = vec![*first];
+    for head in rest {
+        let mut next = Vec::new();
+        for base in &ret {
+            next.extend(
+                repo.merge_bases_many(*head, &[*base])?
+                    .into_iter()
+                    .map(|id| id.detach()),
+            );
+        }
+        ret = next;
+        if ret.is_empty() {
+            break;
+        }
+    }
+    Ok(ret)
+}
+
 fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> {
     let name: FullName = "ORIG_HEAD"
         .try_into()

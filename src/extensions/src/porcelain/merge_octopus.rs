@@ -395,23 +395,80 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
 /// and the loop goes on to print the *stale* `pretty_name`. Both `eval`s share
 /// that fate, since uppercasing cannot rescue an invalid name.
 fn pretty_name(sha1: &str, previous: &str) -> String {
-    // `GITHEAD_$SHA1` is a valid parameter name only while `$SHA1` keeps the
-    // expansion inside the shell's portable-name character set; the `GITHEAD_`
-    // prefix already satisfies the leading-non-digit rule.
-    if !sha1.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    let Some(name) = expand_githead(sha1, sha1) else {
         return previous.to_string();
-    }
-    let lookup = |key: String| std::env::var(key).ok().filter(|v| !v.is_empty());
-    if let Some(name) = lookup(format!("GITHEAD_{sha1}")) {
+    };
+    // `test "$SHA1" = "$pretty_name"`, which only holds when the first expansion
+    // fell through to its own default. The retry's default is the value that
+    // expansion just assigned, not `$SHA1` — the same string here.
+    if name != sha1 {
         return name;
     }
-    // `test "$SHA1" = "$pretty_name"` holds: the `:-` fallback just assigned
-    // `$SHA1`. The retry's own `:-` default is that same value.
     let upper: String = sha1
         .chars()
         .map(|c| if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c })
         .collect();
-    lookup(format!("GITHEAD_{upper}")).unwrap_or_else(|| sha1.to_string())
+    expand_githead(&upper, &name).unwrap_or(name)
+}
+
+/// The shell's `${...}` expansion of the one string `eval pretty_name=\${GITHEAD_$SHA1:-$SHA1}`
+/// builds, which is `GITHEAD_<sha1>:-<default>` **after** `$SHA1` has been
+/// interpolated. `None` is a bad substitution: the `eval` fails, assigns nothing,
+/// and `pretty_name` keeps whatever it already held.
+///
+/// The interpolation happens *inside* the braces, so `$SHA1` is not merely the
+/// parameter's name — it can carry the operator with it. A head spelled `cc-right`
+/// makes the braces read `${GITHEAD_cc-right:-cc-right}`, and `-` ends a parameter
+/// name: the shell reads that as `${GITHEAD_cc-<word>}` with the word
+/// `right:-cc-right`, so an unset `GITHEAD_cc` produces exactly that as the pretty
+/// name. Stock 2.55.0 prints `Trying simple merge with right:-cc-right`, and
+/// `oct-a` / `div-cold` come out as `a:-oct-a` / `cold:-div-cold`. Treating any
+/// non-name character as a bad substitution printed an empty name for all three.
+///
+/// `-`/`:-` and `+`/`:+` are the operators reproduced. `=`, `?`, `#` and `%` reach
+/// this only from a head whose spelling contains one, and each has a side effect of
+/// its own (assignment, an error that kills the `eval`, prefix/suffix removal); they
+/// keep the stale-value answer rather than a guess.
+fn expand_githead(sha1: &str, default: &str) -> Option<String> {
+    let text = format!("GITHEAD_{sha1}:-{default}");
+    // The parameter name: `[A-Za-z_][A-Za-z0-9_]*`. The `GITHEAD_` prefix already
+    // satisfies the leading-non-digit rule, so this only has to stop at the first
+    // byte `$SHA1` contributes that a name cannot hold.
+    let name_len = text
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    let (name, rest) = text.split_at(name_len);
+    let value = std::env::var(name).ok();
+    // `${NAME}` with nothing after the name cannot occur here (the `:-` is always
+    // appended), but it is the shell's other legal ending and costs nothing to keep.
+    if rest.is_empty() {
+        return Some(value.unwrap_or_default());
+    }
+    // `null_is_unset` is the colon: `${x:-y}` treats an empty value as unset,
+    // `${x-y}` does not.
+    let (op, word) = if let Some(w) = rest.strip_prefix(":-") {
+        (('-', true), w)
+    } else if let Some(w) = rest.strip_prefix(":+") {
+        (('+', true), w)
+    } else if let Some(w) = rest.strip_prefix('-') {
+        (('-', false), w)
+    } else if let Some(w) = rest.strip_prefix('+') {
+        (('+', false), w)
+    } else {
+        return None;
+    };
+    let (kind, null_is_unset) = op;
+    let set = match &value {
+        Some(v) => !(null_is_unset && v.is_empty()),
+        None => false,
+    };
+    Some(match (kind, set) {
+        ('-', true) => value.unwrap_or_default(),
+        ('-', false) => word.to_string(),
+        ('+', true) => word.to_string(),
+        _ => String::new(),
+    })
 }
 
 /// `git merge-base --all $SHA1 $MRC`: every best common ancestor of the head

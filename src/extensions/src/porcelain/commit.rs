@@ -1700,6 +1700,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 
     let hash = repo.object_hash();
 
+    // git's `COMMIT_NORMAL` staging is written into `index.lock` and only renamed
+    // over the real index by `commit_index_files()`; every earlier exit — a
+    // `pre-commit` hook that refuses, an empty message, an editor that fails —
+    // reaches `rollback_index_files()` and the lock is discarded, so the real index
+    // never saw the staging at all (builtin/commit.c:217-247). This port cannot
+    // hand a hook `.git/index.lock` (see the `index_file` comment below), so it
+    // writes the real index and parks a copy of the original to put back instead.
+    let mut staged_index = match all || include_flag {
+        true => Some(StagedIndex::hold(&repo)?),
+        false => None,
+    };
     // --- `-a`/`--all`: auto-stage tracked modifications and deletions -----
     // Runs under the same lock, and writes the index through before the tree is
     // built so the on-disk index and the commit agree even if we bail later.
@@ -1713,6 +1724,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if include_flag {
         let mut index = crate::index_open::or_empty(&repo)?;
         include_stage(&repo, &pathspecs, &index)?.apply_to(&mut index);
+        // Same `cache_tree_update(WRITE_TREE_SILENT)` as `-a`: `also && pathspec.nr`
+        // shares the branch (builtin/commit.c:455-461).
+        super::write_tree::write_cache_tree_only(&repo, &mut index);
         // `-i` writes the real index through `write_locked_index()`
         // (builtin/commit.c:454-465), so the repository's index-write settings apply:
         // `do_write_index()` takes `skip_hash` from the settings block for every
@@ -1734,6 +1748,32 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         .any(|e| e.stage() != gix::index::entry::Stage::Unconflicted)
     {
         return Ok(die_resolve_conflict(&index));
+    }
+
+    // The as-is branch of `prepare_index()` — `if (!only && !pathspec.nr)`:
+    //
+    // ```c
+    // repo_hold_locked_index(the_repository, &index_lock, LOCK_DIE_ON_ERROR);
+    // refresh_cache_or_die(refresh_flags);
+    // if (the_repository->index->cache_changed
+    //     || !cache_tree_fully_valid(the_repository->index->cache_tree))
+    //         cache_tree_update(the_repository->index, WRITE_TREE_SILENT);
+    // if (write_locked_index(the_repository->index, &index_lock,
+    //                        COMMIT_LOCK | SKIP_IF_UNCHANGED))
+    //         die(_("unable to write new index file"));
+    // commit_style = COMMIT_AS_IS;
+    // ```
+    //
+    // (builtin/commit.c:482-493.) `COMMIT_LOCK` is what makes this branch different
+    // from the other two: the refreshed index and its rebuilt cache-tree are
+    // committed *here*, before any hook runs, and `rollback_index_files()` for
+    // `COMMIT_AS_IS` is a no-op (`:220`). So `git add <path> && git commit` whose
+    // `pre-commit` hook then refuses still leaves the index with a valid cache-tree
+    // and the tree objects in the store — measured as `TREE:53(<root>=5/1:4d77229a…)`
+    // where this port used to leave `<root>=-1/1`, because it only rebuilt the
+    // cache-tree past the hook, on the way to the commit it never made.
+    if !all && !include_flag && !only_mode {
+        super::write_tree::update_cache_tree_if_stale(&repo, &mut index)?;
     }
 
     // --- `prepare_index()`'s return value: the index this commit is built from ---
@@ -1760,19 +1800,23 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     };
     // Absolute, because the hook is spawned with its cwd moved to the top of the
     // work tree while zvcs stays where it was invoked ([`crate::hooks::absolutize`]).
+    //
+    // `-a`/`-i` are `COMMIT_NORMAL`, whose `prepare_index()` returns
+    // `get_lock_file_path(&index_lock)` — `<git-dir>/index.lock`
+    // (builtin/commit.c:451) — so every hook on that path sees the *lock*, not
+    // `.git/index`. [`HookIndexLock`] is that file: this port cannot hold the
+    // lock across the whole command the way git does (its own index writes take
+    // the same `O_EXCL` path through gitoxide), so the lock exists exactly around
+    // each hook and the hook's staging is replayed into the real index on
+    // release, which is what git's `commit_lock_file(&index_lock)` does with it.
+    let normal_lock = (all || include_flag) && partial.is_none() && repo.index_path().exists();
     let index_file: std::path::PathBuf = match &partial {
         Some(p) => crate::hooks::absolutize(&p.path),
-        // `-a`/`-i` reach here too. git points their hook at the *lock* it is
-        // holding over the real index, and rolls that lock back if the commit is
-        // then abandoned, so a hook's staging under `-a` does not survive an
-        // aborted commit. zvcs cannot hand a hook `.git/index.lock`: this port
-        // serialises index writers through the daemon lane and treats an existing
-        // `.git/index.lock` as a *foreign* holder to wait out
-        // (`lock.rs:604-623`), so the `git add` inside the hook would sit waiting
-        // on the lock its own parent is holding. It gets the real index instead,
-        // which agrees with git on every path that reaches a commit and differs
-        // only in that an aborted `-a` commit leaves the hook's staging in place
-        // rather than discarding it.
+        None if normal_lock => {
+            crate::hooks::absolutize(&repo.index_path().with_file_name("index.lock"))
+        }
+        // `COMMIT_AS_IS` — a plain `git commit` or `--amend` — whose
+        // `prepare_index()` returns `get_index_file()` instead (builtin/commit.c:493).
         None => crate::hooks::absolutize(&repo.index_path()),
     };
 
@@ -1780,13 +1824,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
     // skips it, as it does `commit-msg`.
     if verify {
-        let hook = crate::hooks::run_with_env(
-            &repo,
-            "pre-commit",
-            &[],
-            None,
-            &[("GIT_INDEX_FILE", index_file.as_path())],
-        )?;
+        let hook = HookIndexLock::around(&repo, normal_lock, "pre-commit", &index_file, || {
+            crate::hooks::run_with_env(
+                &repo,
+                "pre-commit",
+                &[],
+                None,
+                &[("GIT_INDEX_FILE", index_file.as_path())],
+            )
+        })?;
         if !hook.ok {
             return Ok(ExitCode::from(1));
         }
@@ -1852,9 +1898,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     //
     // In pathspec-limited ("only") mode the tree comes from HEAD's tree with only
     // the listed paths swapped for their worktree content instead — see
-    // [`PartialIndex`], which also stages those paths into the real index.
-    let tree_id: ObjectId = if let Some(partial) = partial.take() {
-        partial.finish(&repo)?
+    // [`PartialIndex`], which also stages those paths into the real index — but
+    // only once the commit has actually been recorded, so it stays borrowed here.
+    let tree_id: ObjectId = if let Some(partial) = &partial {
+        partial.tree(&repo)?
     } else {
         match super::write_tree::refresh_cache_tree(&repo, &mut index, false)? {
             Ok(id) => id,
@@ -1954,7 +2001,24 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // The long format is the only one reachable: a `--short`/`--porcelain`/
         // `-z` request has already turned the command into a dry run
         // (builtin/commit.c:1422-1423) and returned far above.
-        return refuse_nothing_to_commit(untracked_arg.as_deref(), amend, whence);
+        //
+        // `index_file` here is `prepare_index()`'s return value, so under `--only`
+        // the report is taken over the *false* index — HEAD's tree with just the
+        // named paths swapped in — and not over the repository's. That is what
+        // makes `git commit -m x -- untouched.txt` in a repository with other
+        // staged work say "Changes not staged for commit" about that work: the
+        // false index holds HEAD's version of it, so it reads as a worktree-only
+        // difference. The real index is never even written on this path, since git
+        // reaches `rollback_index_files()` (builtin/commit.c:1845) instead of
+        // `commit_index_files()`.
+        let code = {
+            let _swap = match &partial {
+                Some(p) => Some(IndexSwap::install(&repo, &p.index)?),
+                None => None,
+            };
+            refuse_nothing_to_commit(untracked_arg.as_deref(), amend, whence)?
+        };
+        return Ok(code);
     }
 
     // --- message: `prepare_to_commit()` -----------------------------------
@@ -2281,7 +2345,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if !use_editor {
             env.push(("GIT_EDITOR", colon));
         }
-        if !crate::hooks::run_with_env(&repo, "prepare-commit-msg", &borrowed, None, &env)?.ok {
+        let outcome = HookIndexLock::around(
+            &repo,
+            normal_lock,
+            "prepare-commit-msg",
+            &index_file,
+            || crate::hooks::run_with_env(&repo, "prepare-commit-msg", &borrowed, None, &env),
+        )?;
+        if !outcome.ok {
             return Ok(ExitCode::from(1));
         }
     }
@@ -2349,10 +2420,26 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 
     // `commit-msg` gets the message file and may rewrite it (e.g. add a trailer);
     // a non-zero exit aborts. Re-read afterward to pick up any edits.
+    //
+    // It is a `run_commit_hook()` call like the two above it — `run_commit_hook(
+    // use_editor, index_file, NULL, "commit-msg", git_path(commit_editmsg), NULL)`
+    // (builtin/commit.c:1101-1102) — so it gets the same `GIT_INDEX_FILE` they do
+    // (`commit.c:1744`). Running it through the plain `run()` left the variable
+    // unset, and a `commit-msg` hook that shells out to git then read whatever
+    // index the ambient environment named rather than the one being committed.
     if verify {
         std::fs::write(&msg_path, &message)?;
         let arg = msg_path.to_string_lossy().into_owned();
-        if !crate::hooks::run(&repo, "commit-msg", &[&arg], None)? {
+        let outcome = HookIndexLock::around(&repo, normal_lock, "commit-msg", &index_file, || {
+            crate::hooks::run_with_env(
+                &repo,
+                "commit-msg",
+                &[&arg],
+                None,
+                &[("GIT_INDEX_FILE", index_file.as_path())],
+            )
+        })?;
+        if !outcome.ok {
             return Ok(ExitCode::from(1));
         }
         message = std::fs::read_to_string(&msg_path)?;
@@ -2536,6 +2623,19 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `commit_index_files()` moment: the prepared index becomes the real one and
     // an interactive selection is no longer rolled back.
     if let Some(stage) = &mut interactive_stage {
+        stage.keep();
+    }
+    // `err = commit_lock_file(&index_lock)` for `COMMIT_PARTIAL`
+    // (builtin/commit.c:242): the real index git staged the named paths into under
+    // the lock becomes the repository's. Everything that returned before this point
+    // went through `rollback_index_files()` and left it untouched.
+    if let Some(p) = &mut partial {
+        p.stage_into_real_index(&repo)?;
+    }
+    // The same line for `COMMIT_NORMAL` — `-a` and `-i`, whose staging this port
+    // has to write to the real index up front so the hooks can see it, and whose
+    // guard therefore stops rolling it back here.
+    if let Some(stage) = &mut staged_index {
         stage.keep();
     }
 
@@ -2887,9 +2987,20 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
         super::write_tree::write_cache_tree_only(repo, &mut index);
         Some(index)
     } else if !o.pathspecs.is_empty() {
-        let mut index = only_mode_stage(repo, &o.pathspecs)?.0;
-        super::write_tree::write_cache_tree_only(repo, &mut index);
-        Some(index)
+        // A partial commit prepares *two* indexes, and only one of them gets a
+        // cache-tree. Steps (2)/(3) stage the named paths into the real index and
+        // then `cache_tree_update(WRITE_TREE_SILENT)` it (builtin/commit.c:534-539),
+        // which is what mints the tree objects a dry run leaves behind; steps
+        // (5)/(7) build the false index and write it with no `cache_tree_update()`
+        // at all (`:546-551`). The false index's tree is only computed later, by
+        // the `cache_tree_update(the_repository->index, 0)` at `:1111` — past the
+        // point `dry_run_commit()` returns from — so a dry run writes the real
+        // index's tree and never the false one's.
+        let (temp, staged) = only_mode_stage(repo, &o.pathspecs)?;
+        let mut real = crate::index_open::or_empty(repo)?;
+        staged.apply_to(&mut real);
+        super::write_tree::write_cache_tree_only(repo, &mut real);
+        Some(temp)
     } else {
         // An as-is dry run is not read-only, and that is not an accident of this
         // port: `dry_run_commit()` calls `prepare_index(..., is_status=1)` and
@@ -3230,6 +3341,195 @@ impl Drop for InteractiveStage {
                 let _ = std::fs::rename(original, &self.index);
             }
             // There was no index before the selector ran, so git's rollback leaves
+            // the repository without one.
+            None if !self.keep => {
+                let _ = std::fs::remove_file(&self.index);
+            }
+            None => {}
+        }
+    }
+}
+
+/// git's `index_lock` around a `COMMIT_NORMAL` commit — `-a` and `-i`.
+///
+/// `prepare_index()` takes the lock, stages into the in-core index and writes the
+/// result to `index.lock` rather than to `.git/index` (builtin/commit.c:455-467).
+/// The real index is only replaced by the `commit_lock_file(&index_lock)` inside
+/// `commit_index_files()`, reached once the commit object exists and `HEAD` has
+/// moved; every other exit calls `rollback_index_files()`, which unlinks the lock
+/// and leaves `.git/index` byte for byte as it was (`:217-247`). So a `pre-commit`
+/// hook that exits non-zero over `git commit -am ...` does not leave the
+/// auto-staging behind — measured against git 2.55.0, `git status --porcelain`
+/// afterwards still reports ` M path`, not `M  path`.
+///
+/// This port cannot write the staging to `.git/index.lock`: it serialises index
+/// writers through the daemon lane and treats an existing `.git/index.lock` as a
+/// foreign holder to wait out (`lock.rs:604-623`), so a `git add` inside a hook
+/// pointed at that path would sit waiting on the lock its own parent holds. The
+/// staging therefore goes to the real index and the *original* is parked beside it
+/// for the duration; [`Self::keep`] at the `commit_index_files()` moment discards
+/// the parked copy, and [`Drop`] otherwise renames it back — with its inode, mode
+/// and mtime intact, since it is moved rather than copied.
+///
+/// A hook's own `git add` is covered by the same guard, which is git's answer too:
+/// the hook stages into `GIT_INDEX_FILE`, that file is the lock, and the lock is
+/// what gets rolled back.
+struct StagedIndex {
+    /// The repository index the staging was written to.
+    index: std::path::PathBuf,
+    /// Where the index as it was before staging is parked, or `None` when the
+    /// repository had no index file at all.
+    original: Option<std::path::PathBuf>,
+    /// Set once the commit has succeeded, which disarms the rollback.
+    keep: bool,
+}
+
+/// Where the pre-staging index is parked for the duration of a `-a`/`-i` commit.
+/// Beside the index, so putting it back is a rename on the same filesystem.
+const PRESTAGE_INDEX: &str = "index.zvcs-commit-orig";
+
+/// `<git-dir>/index.lock` as a `COMMIT_NORMAL` commit's hooks see it.
+///
+/// `prepare_index()` returns `get_lock_file_path(&index_lock)` for `-a` and `-i`
+/// (builtin/commit.c:451), and `run_commit_hook()` exports that path to every
+/// hook on the commit path as `GIT_INDEX_FILE` (`commit.c:1744`). So a hook under
+/// `git commit -am ...` is pointed at `.git/index.lock`, not at `.git/index` —
+/// measured against git 2.55.0 with a `pre-commit` hook that echoes
+/// `${GIT_INDEX_FILE##*/}`, which prints `index.lock` there and `index` for a
+/// plain `git commit`.
+///
+/// git can hold that lock for the whole command because every index write it
+/// makes goes through the lockfile it already owns. This port cannot: its index
+/// writes go through gitoxide, which takes `<index>.lock` itself with
+/// `Fail::Immediately`, so a lock held across the tree build would collide with
+/// the port's own `write_locked_index()` equivalent. The lock therefore exists
+/// exactly around each hook — created before the child is spawned, released as
+/// soon as it returns — which is the window in which anything can observe it.
+///
+/// Release replays what the hook staged into the real index, which is git's
+/// `commit_lock_file(&index_lock)` (builtin/commit.c:242) applied to that one
+/// file: a `pre-commit` auto-formatter that runs `git add` has its staging land
+/// in the commit, exactly as it did when the hook was handed `.git/index`
+/// directly.
+struct HookIndexLock {
+    /// `<git-dir>/index.lock`, handed to the hook as `GIT_INDEX_FILE`.
+    lock: std::path::PathBuf,
+    /// `<git-dir>/index`, where the hook's staging is replayed on release.
+    index: std::path::PathBuf,
+}
+
+impl HookIndexLock {
+    /// Run `hook` with `<git-dir>/index.lock` in place when `armed`, and with
+    /// nothing changed when it is not — `COMMIT_AS_IS` and `COMMIT_PARTIAL` name
+    /// a file that is already there.
+    ///
+    /// `index_file` is the path the caller exports, so the guard and the child
+    /// cannot disagree about which file is meant.
+    fn around<T>(
+        repo: &gix::Repository,
+        armed: bool,
+        event: &str,
+        index_file: &std::path::Path,
+        hook: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        // Nothing can observe the lock when there is no hook to spawn, and a
+        // repository without hooks is the common case: creating and removing the
+        // file anyway would be three writes per `commit -a` that no one reads.
+        if !armed || crate::hooks::find(repo, event)?.is_none() {
+            return hook();
+        }
+        let guard = Self::take(repo, index_file)?;
+        let out = hook();
+        // The replay runs even when the hook refused: git rolls the lock back at
+        // that point, and this port's rollback is [`StagedIndex`], which puts the
+        // whole index back regardless of what was replayed into it.
+        guard.release()?;
+        out
+    }
+
+    /// `repo_hold_locked_index(&index_lock, LOCK_DIE_ON_ERROR)` plus the
+    /// `write_locked_index()` that fills it (builtin/commit.c:443-449): the lock
+    /// carries the staged index, since that is what git wrote into it.
+    fn take(repo: &gix::Repository, lock: &std::path::Path) -> Result<Self> {
+        let index = repo.index_path();
+        // A lock left behind by a killed run must not be inherited, and a foreign
+        // holder must not be stolen — `create_new` is git's `O_EXCL`.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock)
+        {
+            Ok(_) => {}
+            Err(e) => anyhow::bail!(
+                "Unable to create '{}': {e}\n\n\
+                 Another git process seems to be running in this repository.",
+                lock.display()
+            ),
+        }
+        let guard = Self {
+            lock: lock.to_path_buf(),
+            index,
+        };
+        std::fs::copy(&guard.index, &guard.lock)?;
+        Ok(guard)
+    }
+
+    /// `commit_lock_file(&index_lock)` for whatever the hook staged, then the
+    /// lock is gone.
+    fn release(self) -> Result<()> {
+        if std::fs::read(&self.lock).ok() != std::fs::read(&self.index).ok() {
+            std::fs::copy(&self.lock, &self.index)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HookIndexLock {
+    /// `rollback_lock_file()` on every exit the release did not take — a `?` in
+    /// the replay, or a panic. Leaving the file behind would make the next
+    /// command in the repository think a foreign writer is holding the index.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock);
+    }
+}
+
+impl StagedIndex {
+    /// `repo_hold_locked_index(&index_lock)` — park the current index so it can be
+    /// put back. Moving it aside is not an option: the staging that follows reads
+    /// the index it is extending.
+    fn hold(repo: &gix::Repository) -> Result<Self> {
+        let index = repo.index_path();
+        let mut guard = Self {
+            index,
+            original: None,
+            keep: false,
+        };
+        if guard.index.exists() {
+            let original = guard.index.with_file_name(PRESTAGE_INDEX);
+            // A copy left behind by a killed run must not be inherited.
+            let _ = std::fs::remove_file(&original);
+            std::fs::copy(&guard.index, &original)?;
+            guard.original = Some(original);
+        }
+        Ok(guard)
+    }
+
+    /// git's `commit_index_files()`: the staging stands.
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for StagedIndex {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(original) if self.keep => {
+                let _ = std::fs::remove_file(original);
+            }
+            Some(original) => {
+                let _ = std::fs::rename(original, &self.index);
+            }
+            // There was no index before the staging ran, so git's rollback leaves
             // the repository without one.
             None if !self.keep => {
                 let _ = std::fs::remove_file(&self.index);
@@ -3675,9 +3975,10 @@ struct PartialIndex {
     path: std::path::PathBuf,
     /// The false index itself, re-read from [`Self::path`] after a hook ran.
     index: gix::index::File,
-    /// The same worktree content, kept so it can be replayed onto the *real*
-    /// index without hashing anything twice — git's steps (2)/(3).
-    staged: StagedSet,
+    /// The real index with the named paths staged into it — git's steps (2)/(3),
+    /// built here so its cache-tree objects are minted at preparation time and
+    /// written to `.git/index` only if the commit is actually recorded.
+    real: gix::index::File,
 }
 
 impl PartialIndex {
@@ -3685,6 +3986,16 @@ impl PartialIndex {
     /// git returns the false index's path to its caller.
     fn prepare(repo: &gix::Repository, pathspecs: &[String]) -> Result<Self> {
         let (mut index, staged) = only_mode_stage(repo, pathspecs)?;
+        // Steps (2)/(3), `:534-539`: the named paths go into the real index and
+        // `cache_tree_update(WRITE_TREE_SILENT)` runs over it. That call *writes*
+        // the tree objects it computes, and it happens here, before the hooks and
+        // before the empty-commit refusal — so a partial commit that is turned away
+        // still leaves those trees in the object store even though `.git/index` is
+        // rolled back untouched. Only the index write is deferred, to
+        // [`Self::stage_into_real_index`] at the `commit_index_files()` moment.
+        let mut real = crate::index_open::or_empty(repo)?;
+        staged.apply_to(&mut real);
+        super::write_tree::update_cache_tree_quietly(repo, &mut real);
         // `hold_lock_file_for_update(&false_lock, git_path("next-index-%"PRIuMAX,
         // getpid()), LOCK_DIE_ON_ERROR)` (builtin/commit.c:541-544). The pid keeps
         // two concurrent partial commits in one repository off each other's file.
@@ -3696,7 +4007,7 @@ impl PartialIndex {
         // cheap and what a hook's own `git add` extends rather than rebuilds.
         super::write_tree::update_cache_tree_quietly(repo, &mut index);
         crate::index_racy::write(repo, &mut index)?;
-        Ok(Self { path, index, staged })
+        Ok(Self { path, index, real })
     }
 
     /// `discard_index()` + `read_index_from(index_file)` (builtin/commit.c:1107-1109)
@@ -3716,10 +4027,11 @@ impl PartialIndex {
         Ok(())
     }
 
-    /// The tree the commit records, plus git's steps (2)/(3): the named paths are
-    /// staged into the *real* on-disk index, leaving every other entry alone, so
-    /// the next command sees a ready index.
-    fn finish(self, repo: &gix::Repository) -> Result<ObjectId> {
+    /// The tree the commit records: `cache_tree_update(the_repository->index, 0)`
+    /// over the false index (builtin/commit.c:1111), which runs *after* the
+    /// empty-commit refusal at `:1081` and so never fires for a commit that is
+    /// turned away.
+    fn tree(&self, repo: &gix::Repository) -> Result<ObjectId> {
         let hash = repo.object_hash();
         let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
         {
@@ -3737,26 +4049,34 @@ impl PartialIndex {
             }
         }
         let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
-
-        // Step (2)/(3) (builtin/commit.c:534-539) rewrites the real on-disk index,
-        // so it carries the repository's index-write options like every other write
-        // does (read-cache.c:2830-2831). The `cache_tree_update()` that git runs
-        // between the staging and the write (builtin/commit.c:537) is what leaves
-        // the real index with a *valid* cache-tree afterwards rather than the
-        // invalidated one `apply_to` produced — the partial commit's whole point is
-        // that the next command sees a ready index.
-        //
-        // Note that this replays the pre-hook staged set, not the false index: what
-        // a hook staged goes into the commit and stops there, which is git's
-        // behaviour and follows from the false index being the lock git rolls back
-        // (`rollback_lock_file(&false_lock)`, builtin/commit.c:244) while the real
-        // one is committed.
-        let mut real = crate::index_open::or_empty(repo)?;
-        self.staged.apply_to(&mut real);
-        super::write_tree::update_cache_tree_quietly(repo, &mut real);
-        crate::index_racy::write(repo, &mut real)?;
-
         Ok(tree_id)
+    }
+
+    /// Steps (2)/(3) (builtin/commit.c:534-539): the named paths are staged into
+    /// the *real* on-disk index, leaving every other entry alone, so the next
+    /// command sees a ready index. It carries the repository's index-write options
+    /// like every other write does (read-cache.c:2830-2831), and the
+    /// `cache_tree_update()` git runs between the staging and the write
+    /// (builtin/commit.c:537) is what leaves the real index with a *valid*
+    /// cache-tree rather than the invalidated one `apply_to` produced — the
+    /// partial commit's whole point is that the next command sees a ready index.
+    ///
+    /// git does this under `index_lock` at preparation time and only *renames* the
+    /// result into place from `commit_index_files()`, once the commit object exists
+    /// and `HEAD` has moved; every earlier exit reaches `rollback_index_files()`
+    /// instead and the real index is left exactly as it was (builtin/commit.c:217-247,
+    /// and the callers at `:1845`/`:1957`). This port has no lock file to rename, so
+    /// it defers the write to the same moment — an abandoned partial commit must not
+    /// stage anything, and until this moved it did.
+    ///
+    /// Note that this replays the pre-hook staged set, not the false index: what
+    /// a hook staged goes into the commit and stops there, which is git's
+    /// behaviour and follows from the false index being the lock git rolls back
+    /// (`rollback_lock_file(&false_lock)`, builtin/commit.c:244) while the real
+    /// one is committed.
+    fn stage_into_real_index(&mut self, repo: &gix::Repository) -> Result<()> {
+        crate::index_racy::write(repo, &mut self.real)?;
+        Ok(())
     }
 }
 
@@ -3820,7 +4140,9 @@ fn only_mode_stage(
     pathspecs: &[String],
 ) -> Result<(gix::index::File, StagedSet)> {
     let head_tree_id = head_tree(repo)?;
+    let real = crate::index_open::or_empty(repo)?;
     let mut temp = repo.index_from_tree(&head_tree_id)?;
+    carry_unchanged_entries(&mut temp, &real);
     // `if (!pattern->nr) return 0;` — `list_paths()` leaves the false index as
     // HEAD's tree when there is no pathspec at all, which is the whole of what
     // `--fixup=reword:` (git's `only` with no paths) commits. An empty pathspec
@@ -3830,7 +4152,6 @@ fn only_mode_stage(
     }
     let tracked = tracked_map(&temp);
     let mut known: HashSet<BString> = tracked.keys().cloned().collect();
-    let real = crate::index_open::or_empty(repo)?;
     let backing = real.path_backing();
     known.extend(real.entries().iter().map(|e| e.path_in(backing).to_owned()));
     // `list_paths()` reads `ce_skip_worktree(ce)` off the *real* index, not the
@@ -3839,6 +4160,56 @@ fn only_mode_stage(
     let staged = stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree)?;
     staged.apply_to(&mut temp);
     Ok((temp, staged))
+}
+
+/// The half of `oneway_merge()` (unpack-trees.c) that `create_base_index()` is
+/// built out of: an entry the tree and the index agree on keeps the *index's*
+/// entry, not the tree's.
+///
+/// ```c
+/// if (old && same(old, a)) {
+///         …
+///         add_entry(o, old, update, 0);
+///         return 0;
+/// }
+/// return merged_entry(a, old, o);
+/// ```
+///
+/// `create_base_index()` runs `unpack_trees()` with `index_only`, `merge` and
+/// `oneway_merge` over `the_repository->index` as both source and destination
+/// (builtin/commit.c:311-339), so the false index is not HEAD's tree read fresh:
+/// every path whose HEAD version already matches the index carries the index
+/// entry's *flags and stat data* across. `CE_SKIP_WORKTREE` is the one that shows:
+/// without this, a partial commit in a sparse checkout reported every
+/// sparse-excluded path as `deleted:` and the header as 100% present, because the
+/// tree-derived index has no sparse bits and the files are genuinely not there.
+///
+/// `same()` is `(a->ce_mode == b->ce_mode) && oideq(&a->oid, &b->oid)` with the
+/// intent-to-add bit masked out; a path the tree does not carry is simply absent
+/// from `tree`, and one only the index has has already been dropped by the tree
+/// read, which is `merged_entry()`/`deleted_entry()` respectively.
+fn carry_unchanged_entries(tree: &mut gix::index::File, real: &gix::index::File) {
+    if real.entries().is_empty() {
+        return;
+    }
+    let backing = real.path_backing();
+    let prior: HashMap<BString, &gix::index::Entry> = real
+        .entries()
+        .iter()
+        .filter(|e| e.stage() == Stage::Unconflicted)
+        .map(|e| (e.path_in(backing).to_owned(), e))
+        .collect();
+    let (entries, tree_backing) = tree.entries_mut_and_pathbacking();
+    for entry in entries {
+        let path = entry.path_in(tree_backing).to_owned();
+        let Some(old) = prior.get(&path) else {
+            continue;
+        };
+        if old.mode == entry.mode && old.id == entry.id {
+            entry.stat = old.stat;
+            entry.flags = old.flags;
+        }
+    }
 }
 
 /// A worktree file to write into an index: the blob that was hashed for it, its
@@ -4126,13 +4497,19 @@ fn stage_tracked_changes(repo: &gix::Repository) -> Result<()> {
     }
     let mut index = repo.open_index()?;
     let staged = collect_tracked_changes(repo, &index)?;
-    if staged.is_empty() {
-        return Ok(());
-    }
     staged.apply_to(&mut index);
+    // `cache_tree_update(the_repository->index, WRITE_TREE_SILENT)`
+    // (builtin/commit.c:461), which runs on this branch unconditionally and
+    // *writes* the tree objects it computes. It is why a `git commit -a` whose
+    // `pre-commit` hook then refuses still leaves the tree of the auto-staged
+    // index in the object store — the staging is rolled back, the objects are not.
+    // A cache-tree that is already valid mints nothing, which is `update_one()`'s
+    // `it->entry_count != -1` early return.
+    super::write_tree::write_cache_tree_only(repo, &mut index);
     // `add_files_to_cache()` + `write_locked_index()` (builtin/commit.c:454-465):
     // an ordinary index write, with the repository's options
-    // (read-cache.c:2830-2831).
+    // (read-cache.c:2830-2831). Unconditional there too — the branch has no
+    // "nothing changed" early exit, and `SKIP_IF_UNCHANGED` is not passed.
     crate::index_racy::write(repo, &mut index)?;
     Ok(())
 }

@@ -3126,10 +3126,11 @@ fn settle_index_for_commit(
 ///
 /// `num_entries` is the count of **non-tree** entries below the node, counted
 /// recursively (`it->entry_count` in cache-tree.c, which is a count of index
-/// entries and so counts a gitlink as one). Children are sorted by name, which is
-/// the order `cache_tree_update()` produces by building them from the
-/// bytewise-sorted index rather than from tree order — the two differ whenever a
-/// directory name is a prefix of a sibling's.
+/// entries and so counts a gitlink as one). Children go in `subtree_name_cmp`
+/// order — length first, then `memcmp` (cache-tree.c:49-57) — which is neither
+/// tree order nor plain lexicographic order: a repository holding `sub/` beside
+/// `other/` has stock git write `sub` first, and sorting by name alone wrote
+/// `other` first and left an index no `merge` of stock git's would produce.
 fn cache_tree_node(
     repo: &gix::Repository,
     name: &[u8],
@@ -3148,7 +3149,7 @@ fn cache_tree_node(
             num_entries += 1;
         }
     }
-    children.sort_by(|a, b| a.name.cmp(&b.name));
+    children.sort_by(|a, b| super::write_tree::subtree_name_cmp(&a.name, &b.name));
     Ok(gix::index::extension::Tree {
         name: name.iter().copied().collect(),
         id,

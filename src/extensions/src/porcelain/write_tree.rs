@@ -787,13 +787,20 @@ fn finish_children(
     it: &mut gix::index::extension::Tree,
     mut children: Vec<(gix::index::extension::Tree, usize)>,
 ) {
-    children.sort_by(|a, b| {
-        a.0.name
-            .len()
-            .cmp(&b.0.name.len())
-            .then_with(|| a.0.name.cmp(&b.0.name))
-    });
+    children.sort_by(|a, b| subtree_name_cmp(&a.0.name, &b.0.name));
     it.children = children.into_iter().map(|(node, _)| node).collect();
+}
+
+/// `subtree_name_cmp()` (cache-tree.c:49-57): shorter names first, then `memcmp` between names
+/// of equal length.
+///
+/// Every place that builds a node's `down[]` has to order it this way, whether it walked the
+/// index ([`finish_children`]) or read the committed tree back
+/// (`merge::cache_tree_node`) — `write_one()` dies with "fatal - unsorted cache subtree"
+/// on anything else (cache-tree.c:535-540), and a merge whose repository holds `sub/` beside
+/// `other/` wrote them in the plain lexicographic order git does not use.
+pub(crate) fn subtree_name_cmp(one: &[u8], two: &[u8]) -> std::cmp::Ordering {
+    one.len().cmp(&two.len()).then_with(|| one.cmp(two))
 }
 
 /// Append `mode` in octal the way `strbuf_addf(..., "%o", mode)` renders it — no leading zero,

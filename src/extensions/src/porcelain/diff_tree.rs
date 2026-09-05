@@ -2317,14 +2317,16 @@ fn combined_commit(
                 // two-tree raw format uses, which `--abbrev=<n>` narrows.
                 let zeros = "0".repeat(opts.abbrev);
                 for s in sides {
-                    let id = s
-                        .old
-                        .map_or_else(|| zeros.clone(), |o| o.id.to_hex_with_len(opts.abbrev).to_string());
+                    let id = s.old.map_or_else(
+                        || zeros.clone(),
+                        |o| crate::abbrev::unique_abbrev(repo, &o.id, opts.abbrev),
+                    );
                     out.extend_from_slice(format!(" {id}").as_bytes());
                 }
-                let rid = sides[0]
-                    .new
-                    .map_or_else(|| zeros.clone(), |n| n.id.to_hex_with_len(opts.abbrev).to_string());
+                let rid = sides[0].new.map_or_else(
+                    || zeros.clone(),
+                    |n| crate::abbrev::unique_abbrev(repo, &n.id, opts.abbrev),
+                );
                 out.extend_from_slice(format!(" {rid} ").as_bytes());
             }
             // The status column is one letter per parent, for `--raw` and
@@ -2755,19 +2757,22 @@ fn render_all(
     // A routed run hands the walk output straight to `diff-pairs`, which owns every
     // patch, diffstat, dirstat, whitespace and rename format.
     if let Some(args) = &opts.route {
-        let status =
-            super::diff_pairs::render_raw_stream(
-                args,
-                Some(raw_pair_stream(changes)),
-                Some(out),
-                super::diff_pairs::RouteCtx {
-                    abbrev: opts.abbrev_explicit,
-                    // An unrecursed walk queues `040000` entries, and git keeps them:
-                    // only the content formats force recursion, so `diff-tree <commit>
-                    // -M --name-status` really does list the changed top-level trees.
-                    allow_trees: true,
-                },
-            )?;
+        let status = super::diff_pairs::render_raw_stream(
+            args,
+            Some(raw_pair_stream(changes)),
+            Some(out),
+            super::diff_pairs::RouteCtx {
+                abbrev: opts.abbrev_explicit,
+                // An unrecursed walk queues `040000` entries, and git keeps them:
+                // only the content formats force recursion, so `diff-tree <commit>
+                // -M --name-status` really does list the changed top-level trees.
+                allow_trees: true,
+                // `builtin/diff-tree.c` reads the config before
+                // `repo_diff_setup()`, so `diff.dirstat` reaches it — unlike
+                // `diff-pairs`, whose own order shuts the config out.
+                dirstat_config: true,
+            },
+        )?;
         return Ok(status.code());
     }
     match opts.format {
@@ -2784,7 +2789,7 @@ fn render_all(
         }
         _ => {
             for c in changes {
-                render(out, c, opts);
+                render(repo, out, c, opts);
             }
         }
     }
@@ -2946,7 +2951,7 @@ fn status(c: &Change) -> u8 {
     }
 }
 
-fn render(out: &mut Vec<u8>, c: &Change, opts: &Opts) {
+fn render(repo: &gix::Repository, out: &mut Vec<u8>, c: &Change, opts: &Opts) {
     let sep = if opts.nul { b'\0' } else { b'\t' };
     let term = if opts.nul { b'\0' } else { b'\n' };
 
@@ -2972,11 +2977,19 @@ fn render(out: &mut Vec<u8>, c: &Change, opts: &Opts) {
             // Absent sides render as an all-zero mode and an all-zero object id.
             let zeros = "0".repeat(opts.abbrev);
             let (omode, ooid) = match c.old {
-                Some(s) => (s.mode.value(), s.id.to_hex_with_len(opts.abbrev).to_string()),
+                // `diff_aligned_abbrev()` → `diff_abbrev_oid()` → `repo_find_unique_
+                // abbrev()`: `--abbrev=<n>` is a floor, so a colliding prefix widens.
+                Some(s) => (
+                    s.mode.value(),
+                    crate::abbrev::unique_abbrev(repo, &s.id, opts.abbrev),
+                ),
                 None => (0, zeros.clone()),
             };
             let (nmode, noid) = match c.new {
-                Some(s) => (s.mode.value(), s.id.to_hex_with_len(opts.abbrev).to_string()),
+                Some(s) => (
+                    s.mode.value(),
+                    crate::abbrev::unique_abbrev(repo, &s.id, opts.abbrev),
+                ),
                 None => (0, zeros),
             };
             out.extend_from_slice(format!(":{omode:06o} {nmode:06o} {ooid} {noid} ").as_bytes());

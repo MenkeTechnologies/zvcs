@@ -59,7 +59,8 @@
 //!     `gc.autoDetach` — and only after the `--auto` threshold gate. The key
 //!     itself is validated at config-read time by `repo_config_get_expiry()`'s
 //!     "must resolve to the past" rule; see [`log_expiry`].
-//!   * **`pack-refs --all --prune`**, delegated to [`super::pack_refs::pack_refs`],
+//!   * **`pack-refs --all --prune`** (plus `--auto` when the gc run is itself an
+//!     automatic one), delegated to [`super::pack_refs::pack_refs`],
 //!     which is a real port. This is what moves `refs/heads/*` and `refs/tags/*`
 //!     into `packed-refs`.
 //!   * **`reflog expire --all`**, as [`expire_reflogs`] below: a faithful port
@@ -541,8 +542,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     }
 
     // `gc --auto` is a no-op below the thresholds; git returns before touching
-    // anything, so nothing below this point may run either.
-    if auto && !gc_needed(&repo) {
+    // anything, so nothing below this point may run either. `need_to_gc()`
+    // decides in two steps and the second one was missing here: the counters
+    // first, and then the `pre-auto-gc` hook, which gets the last word.
+    if auto && !(gc_needed(&repo) && pre_auto_gc_allows(&repo)) {
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -607,11 +610,29 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // git's order: pack-refs, then reflog expire, then repack, then prune, then
     // worktree prune, then rerere gc, then commit-graph write.
     if pack_refs_enabled(&repo) {
-        super::pack_refs::pack_refs(&[
+        // `maintenance_task_pack_refs()` (builtin/gc.c:168-175) runs
+        // `pack-refs --all --prune`, and an *automatic* run adds `--auto` on top
+        // — which is what makes an auto-gc leave `packed-refs` alone until the
+        // loose-ref count is worth the rewrite. Confirmed against git 2.55.0:
+        //
+        // ```text
+        // $ GIT_TRACE=1 git -c gc.auto=1 -c gc.autoPackLimit=1 gc --auto --quiet
+        // trace: run_command: git pack-refs --all --prune --auto
+        // $ GIT_TRACE=1 git gc --quiet
+        // trace: run_command: git pack-refs --all --prune
+        // ```
+        //
+        // The threshold itself is [`super::pack_refs`]'s port of
+        // `should_pack_refs()`; all that is decided here is whether to ask for it.
+        let mut argv = vec![
             "pack-refs".to_string(),
             "--all".to_string(),
             "--prune".to_string(),
-        ])?;
+        ];
+        if auto {
+            argv.push("--auto".to_string());
+        }
+        super::pack_refs::pack_refs(&argv)?;
     }
 
     // Re-discovered because `pack-refs` rewrote the ref store underneath the
@@ -951,7 +972,13 @@ fn repack_all(
 
     // The new pack has to be written before anything is removed: every object in
     // it is read back out of the very packs and loose files being replaced.
-    let mut written = Vec::new();
+    //
+    // Every pack the run produces is *built* first and installed together at the
+    // end, because that is what git's `packtmp` prefix plus
+    // `generated_pack_install()` amounts to: a `pack-objects` child that dies
+    // leaves nothing behind, and `gc` reports `fatal: failed to run repack` over
+    // an object store it has not touched. See [`Bundle`].
+    let mut bundles: Vec<(Bundle, bool)> = Vec::new();
     // `repack_promisor_objects()` runs *before* the main `pack-objects`, and
     // finishes with `write_promisor_file(promisor_name, NULL, 0)` — an empty
     // file named for the pack it marks — so what `-d` deletes below is replaced
@@ -959,13 +986,12 @@ fn repack_all(
     if !promisor_held.is_empty() {
         let mut ids: Vec<ObjectId> = promisor_held.iter().copied().collect();
         ids.sort_unstable();
-        if let Some(base) = write_bundle(repo, &pack_dir, &ids, None, delta)? {
-            std::fs::write(pack_dir.join(format!("{base}.promisor")), b"")?;
-            written.push(base);
+        if let Some(bundle) = build_bundle(repo, &ids, None, delta)? {
+            bundles.push((bundle, true));
         }
     }
-    if let Some(base) = write_bundle(repo, &pack_dir, &keep, None, delta)? {
-        written.push(base);
+    if let Some(bundle) = build_bundle(repo, &keep, None, delta)? {
+        bundles.push((bundle, false));
     }
     if unreachable == Unreachable::Cruft {
         // git reports the cruft pass separately. Its second line, `Traversing
@@ -989,9 +1015,21 @@ fn repack_all(
                 (*id, stamp)
             })
             .collect();
-        if let Some(base) = write_bundle(repo, &pack_dir, &rest, Some(&mtimes), cruft_delta_options(repo, delta))? {
-            written.push(base);
+        if let Some(bundle) =
+            build_bundle(repo, &rest, Some(&mtimes), cruft_delta_options(repo, delta))?
+        {
+            bundles.push((bundle, false));
         }
+    }
+
+    // `generated_pack_install()`: nothing lands until every pack has been built.
+    let mut written = Vec::new();
+    for (bundle, promisor) in &bundles {
+        let base = install_bundle(&pack_dir, bundle)?;
+        if *promisor {
+            std::fs::write(pack_dir.join(format!("{base}.promisor")), b"")?;
+        }
+        written.push(base);
     }
 
     // `--no-cruft` keeps the unreachable objects but packs them nowhere, so any
@@ -1207,6 +1245,25 @@ fn local_packs(
     out
 }
 
+/// One finished pack, held in memory until every pack the run produces has been
+/// built.
+///
+/// git's `pack-objects` children all write under one `packtmp` prefix and
+/// `generated_pack_install()` moves them into `objects/pack` only afterwards, so
+/// a later child that dies — a cruft pass that cannot read a damaged loose
+/// object, say — leaves the store exactly as it found it. Installing each pack
+/// as it was written instead left the main pack behind on `git gc` over a
+/// repository stock git refuses outright.
+struct Bundle {
+    /// `pack-<checksum>`, the name every artifact shares.
+    base: String,
+    pack: Vec<u8>,
+    idx: Vec<u8>,
+    rev: Vec<u8>,
+    /// The `.mtimes` sidecar a cruft pack carries, and nothing else does.
+    mtimes: Option<Vec<u8>>,
+}
+
 /// Write one pack and its sidecars for `ids`, returning the `pack-<hash>` base
 /// name, or `None` when there was nothing to write.
 ///
@@ -1221,19 +1278,16 @@ fn local_packs(
 /// An object the writer could not read is absent from the pack, and is dropped
 /// from the index and the `.mtimes` alongside it rather than left as a dangling
 /// entry.
-fn write_bundle(
+fn build_bundle(
     repo: &gix::Repository,
-    pack_dir: &Path,
     ids: &[ObjectId],
     mtimes: Option<&HashMap<ObjectId, u32>>,
     delta: super::pack_objects::WriteOptions,
-) -> Result<Option<String>> {
+) -> Result<Option<Bundle>> {
     if ids.is_empty() {
         return Ok(None);
     }
     let hash = repo.object_hash();
-    std::fs::create_dir_all(pack_dir)
-        .with_context(|| format!("create {}", pack_dir.display()))?;
 
     let packed = super::pack_objects::packed_for(repo, ids, delta)
         .with_context(|| format!("build a pack of {} objects", ids.len()))?;
@@ -1249,13 +1303,39 @@ fn write_bundle(
     let offsets: Vec<u64> = by_oid.iter().map(|entry| entry.offset).collect();
     let crcs: Vec<u32> = by_oid.iter().map(|entry| entry.crc32).collect();
 
-    // The pack is built under a temporary name because its final name is its own
-    // checksum, which is only known once the last byte is in. This is also how
-    // git writes it. The name carries the pid because concurrent runs against one
-    // object store are the norm here, and a shared name would have them writing
-    // over each other's bytes before either rename.
+    let pack_hash = packed.id;
+    let pack_id = pack_hash.as_slice();
+    Ok(Some(Bundle {
+        base: format!("pack-{pack_hash}"),
+        idx: index_bytes(hash, &written, &offsets, &crcs, pack_id)?,
+        rev: reverse_index_bytes(hash, &offsets, pack_id)?,
+        mtimes: match mtimes {
+            None => None,
+            Some(mtimes) => {
+                let stamps: Vec<u32> = written
+                    .iter()
+                    .map(|id| mtimes.get(id).copied().unwrap_or(0))
+                    .collect();
+                Some(mtimes_bytes(hash, &stamps, pack_id)?)
+            }
+        },
+        pack: packed.bytes,
+    }))
+}
+
+/// `generated_pack_install()` (builtin/repack.c): move one finished pack and its
+/// sidecars into `objects/pack`.
+///
+/// The pack is written under a temporary name because its final name is its own
+/// checksum, which is only known once the last byte is in — this is also how git
+/// writes it. The name carries the pid because concurrent runs against one
+/// object store are the norm here, and a shared name would have them writing
+/// over each other's bytes before either rename.
+fn install_bundle(pack_dir: &Path, bundle: &Bundle) -> Result<String> {
+    std::fs::create_dir_all(pack_dir).with_context(|| format!("create {}", pack_dir.display()))?;
+
     let tmp = pack_dir.join(format!("tmp_pack_zvcs_gc_{}", std::process::id()));
-    std::fs::write(&tmp, &packed.bytes).with_context(|| format!("create {}", tmp.display()))?;
+    std::fs::write(&tmp, &bundle.pack).with_context(|| format!("create {}", tmp.display()))?;
     {
         use std::os::unix::fs::PermissionsExt;
         // git installs pack artifacts read-only; a failure to set the mode is not
@@ -1263,19 +1343,16 @@ fn write_bundle(
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444));
     }
 
-    let pack_hash = packed.id;
-    let base = format!("pack-{pack_hash}");
+    let base = &bundle.base;
     std::fs::rename(&tmp, pack_dir.join(format!("{base}.pack")))
         .with_context(|| format!("install {base}.pack"))?;
 
-    let pack_id = pack_hash.as_slice();
-    write_sidecar(pack_dir, &base, "idx", &index_bytes(hash, &written, &offsets, &crcs, pack_id)?)?;
-    write_sidecar(pack_dir, &base, "rev", &reverse_index_bytes(hash, &offsets, pack_id)?)?;
-    if let Some(mtimes) = mtimes {
-        let stamps: Vec<u32> = written.iter().map(|id| mtimes.get(id).copied().unwrap_or(0)).collect();
-        write_sidecar(pack_dir, &base, "mtimes", &mtimes_bytes(hash, &stamps, pack_id)?)?;
+    write_sidecar(pack_dir, base, "idx", &bundle.idx)?;
+    write_sidecar(pack_dir, base, "rev", &bundle.rev)?;
+    if let Some(bytes) = bundle.mtimes.as_deref() {
+        write_sidecar(pack_dir, base, "mtimes", bytes)?;
     }
-    Ok(Some(base))
+    Ok(base.clone())
 }
 
 /// Install one `.idx`/`.rev`/`.mtimes` beside the pack it belongs to.
@@ -1410,9 +1487,26 @@ fn pack_refs_enabled(repo: &gix::Repository) -> bool {
     }
 }
 
-/// `need_to_gc()`: true when either the loose-object or the pack-count
-/// heuristic trips. Ported from `builtin/gc.c`; both halves compare with `>`,
-/// and a non-positive threshold disables that half.
+/// `need_to_gc()`'s closing two lines (builtin/gc.c:404-406):
+///
+/// ```c
+/// if (run_hooks("pre-auto-gc"))
+///         return 0;
+/// return 1;
+/// ```
+///
+/// Once the counters say a collection is warranted, the `pre-auto-gc` hook can
+/// still veto it by exiting non-zero, and the veto is silent — `cmd_gc()` just
+/// returns 0. Only an automatic run consults it; plain `gc` never calls
+/// `need_to_gc()` at all. A hook that cannot be run does not veto.
+pub(super) fn pre_auto_gc_allows(repo: &gix::Repository) -> bool {
+    crate::hooks::run(repo, "pre-auto-gc", &[], None).unwrap_or(true)
+}
+
+/// `need_to_gc()`'s counters: true when either the loose-object or the
+/// pack-count heuristic trips. Ported from `builtin/gc.c`; both halves compare
+/// with `>`, and a non-positive threshold disables that half. The `pre-auto-gc`
+/// veto that closes the same function is [`pre_auto_gc_allows`].
 pub(super) fn gc_needed(repo: &gix::Repository) -> bool {
     // `gc.auto` at zero or below disables automatic gc outright — git returns
     // before it ever counts packs, so a repository over `gc.autoPackLimit` is

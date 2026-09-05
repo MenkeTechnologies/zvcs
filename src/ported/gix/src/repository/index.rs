@@ -30,10 +30,26 @@ impl crate::Repository {
             .map(|value| crate::config::tree::Index::THREADS.try_into_index_threads(value))
             .transpose()
             .with_lenient_default(self.config.lenient_config)?;
-        let skip_hash = crate::config::tree::Index::SKIP_HASH
-            .enrich_error(self.config.resolved.boolean(Index::SKIP_HASH))
-            .with_lenient_default(self.config.lenient_config)?
-            .unwrap_or_default();
+        // git's `verify_hdr()` (read-cache.c:1827) leaves after the signature and
+        // version checks unless `verify_index_checksum` is set, and the only
+        // place that ever sets it is `builtin/fsck.c:959`. So no ordinary read
+        // of `.git/index` hashes the file — `git status`, `git ls-files` and
+        // `git submodule status` all parse whatever bytes are there and report
+        // on what they find.
+        //
+        // Reading `index.skipHash` here instead made every one of them refuse a
+        // file git reads: a repository that declares `extensions.objectFormat =
+        // sha256` over a SHA-1 index parses into nonsense on both sides, and
+        // stock carries on (exit 0, no output) where this died with `Shared
+        // index checksum mismatch`. `index.skipHash` is a *write* setting in git
+        // — `do_write_index()` decides whether to put a null trailer down — and
+        // has no say over reads.
+        //
+        // The shared half of a split index is still identified by its checksum:
+        // that comparison is `decode::Options::expected_checksum` against the
+        // `link` extension's recorded id, which is git's `read_link_extension()`
+        // check and is unaffected by this.
+        let skip_hash = true;
 
         // The git directory is what git resolves a split index's `sharedindex.<id>`
         // against (read-cache.c:1893); the index file's own directory is only the

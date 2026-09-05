@@ -1134,13 +1134,14 @@ pub(super) fn close_over_excluding(
     seen
 }
 
-/// Every object this repository's own store holds, loose or packed.
+/// Every *loose* object this repository's own store holds, in fan-out order.
 ///
-/// This is what `pack-objects --keep-unreachable` / `--pack-loose-unreachable` enumerate
-/// beyond the traversal: the objects that exist but nothing reaches. Alternates are not
-/// included — a repack rewrites this repository's store and must not absorb one it merely
-/// borrows from.
-pub(super) fn all_object_ids(repo: &gix::Repository, objdir: &Path) -> Vec<ObjectId> {
+/// `for_each_loose_file_in_objdir(get_object_directory(), ...)`, which is what
+/// `add_unreachable_loose_objects()` (builtin/pack-objects.c:3829-3834) walks:
+/// every loose file whose name is a valid object id, reachable or not, with no
+/// pack consulted. Alternates are not visited — the walk is rooted at this
+/// repository's own object directory alone.
+pub(super) fn loose_object_ids(repo: &gix::Repository, objdir: &Path) -> Vec<ObjectId> {
     let mut out = Vec::new();
     let name_len = repo.object_hash().len_in_hex() - 2;
     for fanout in 0u16..256 {
@@ -1158,6 +1159,17 @@ pub(super) fn all_object_ids(repo: &gix::Repository, objdir: &Path) -> Vec<Objec
             }
         }
     }
+    out
+}
+
+/// Every object this repository's own store holds, loose or packed.
+///
+/// This is what `pack-objects --keep-unreachable` / `--pack-loose-unreachable` enumerate
+/// beyond the traversal: the objects that exist but nothing reaches. Alternates are not
+/// included — a repack rewrites this repository's store and must not absorb one it merely
+/// borrows from.
+pub(super) fn all_object_ids(repo: &gix::Repository, objdir: &Path) -> Vec<ObjectId> {
+    let mut out = loose_object_ids(repo, objdir);
     let pack_dir = objdir.join("pack");
     if let Some(names) = read_dir_raw(&pack_dir) {
         for name in names {

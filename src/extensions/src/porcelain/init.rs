@@ -105,11 +105,17 @@ use crate::lock::RepoLock;
 /// ```text
 ///   * `--ref-format=reftable` is rejected with an honest "not supported" error
 ///     (not "silently accepted", and never faked into a mismatched-format repo):
-///     there is no vendored reftable backend. `--ref-format=files` is a no-op
-///     that matches the repository gix already writes, both object formats are
-///     laid down for real, and an otherwise unrecognized value reproduces git's
-///     exact error text (`unknown hash algorithm '<v>'` / `unknown ref storage
-///     format '<v>'`).
+///     there is no vendored reftable backend. The refusal comes *last*, though:
+///     every diagnostic git emits before it would build the store is emitted
+///     first, so an unrecognized format still says `unknown ref storage format
+///     '<v>'` and a reinitialization that would change the format still says
+///     `attempt to reinitialize repository with different reference storage
+///     format` — both `fatal:`, both exit 128, exactly as git does. Only a run
+///     that would really have to write a reftable store is refused.
+///     `--ref-format=files` is a no-op that matches the repository gix already
+///     writes, both object formats are laid down for real, and an otherwise
+///     unrecognized value reproduces git's exact error text (`unknown hash
+///     algorithm '<v>'` / `unknown ref storage format '<v>'`).
 /// ```
 
 /// `cmd_init_db()`'s `struct option init_db_options[]` (builtin/init-db.c), in
@@ -491,6 +497,26 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                 crate::git_fatal!("attempt to reinitialize repository with different hash");
             }
         }
+        // `validate_ref_storage_format()` is `validate_hash_algorithm()`'s twin
+        // and runs on the same terms: an existing repository (`repo_fmt->version
+        // >= 0`) may not be reinitialized under a ref storage format other than
+        // the one `extensions.refStorage` already records. It is the
+        // *command-line* format alone that is compared — the environment
+        // variable is the `else if` branch below it — which is why
+        // `GIT_DEFAULT_REF_FORMAT=reftable git init` over a `files` repository
+        // reinitializes quietly (git 2.55.0, exit 0) while
+        // `git init --ref-format=reftable` over the same repository dies.
+        //
+        // This runs *before* the port's own refusal below, so a repository that
+        // already exists gets git's diagnostic rather than a "not supported"
+        // that git never prints.
+        if let Some(fmt) = ref_format.as_deref() {
+            if fmt != repository_ref_format(&git_dir) {
+                crate::git_fatal!(
+                    "attempt to reinitialize repository with different reference storage format"
+                );
+            }
+        }
     }
     let env_object_format = std::env::var("GIT_DEFAULT_HASH").ok();
     if let Some(fmt) = env_object_format.as_deref() {
@@ -506,6 +532,17 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     }
     let object_format = object_format.or(env_object_format);
     let ref_format = ref_format.or(env_ref_format);
+
+    // Only now, with every diagnostic git produces ahead of the store already
+    // emitted, is a run that would have to *write* a reftable store refused. A
+    // reinitialization was answered above and never reaches here, so this is the
+    // one shape left: a repository that does not exist yet.
+    if matches!(
+        ref_format.as_deref().map(check_ref_format),
+        Some(Ok(FormatCheck::Unimplemented))
+    ) {
+        return Err(reftable_unsupported());
+    }
 
     // Create the repository. gix lays down the full template + config and returns
     // an opened handle with an unborn HEAD on the default branch. gix refuses
@@ -581,8 +618,15 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         }
         if ref_format.is_none() {
             if let Some(fmt) = config_string(repo, "init.defaultRefFormat") {
-                if check_ref_format(&fmt)? == FormatCheck::Unrecognized {
-                    eprintln!("warning: unknown ref storage format '{fmt}'");
+                match check_ref_format(&fmt)? {
+                    FormatCheck::Unrecognized => {
+                        eprintln!("warning: unknown ref storage format '{fmt}'");
+                    }
+                    // git would have laid down a reftable store here; silently
+                    // leaving a `files` one under that configuration would be a
+                    // repository that does not match what was asked for.
+                    FormatCheck::Unimplemented => return Err(reftable_unsupported()),
+                    FormatCheck::Implemented => {}
                 }
             }
         }
@@ -783,6 +827,12 @@ enum FormatCheck {
     /// A name git does not recognize at all. The caller decides whether that is
     /// fatal (command line / environment) or a warning (config).
     Unrecognized,
+    /// A name git recognizes and lays down but this port has no backend for
+    /// (`reftable`). git's own parser accepts it, so every diagnostic git emits
+    /// ahead of actually building the store — an unknown *other* format, a
+    /// reinitialization that would change the format — still has to come out
+    /// first; only a run that would really write the store is refused.
+    Unimplemented,
 }
 
 /// git's `hash_algo_by_name` recognizes exactly `sha1` and `sha256`, and this
@@ -816,12 +866,30 @@ fn object_hash_of(fmt: Option<&str>) -> Option<gix::hash::Kind> {
 fn check_ref_format(fmt: &str) -> Result<FormatCheck> {
     match fmt {
         "files" => Ok(FormatCheck::Implemented),
-        "reftable" => anyhow::bail!(
-            "the reftable ref storage format is not supported: no vendored \
-             reftable backend"
-        ),
+        "reftable" => Ok(FormatCheck::Unimplemented),
         _ => Ok(FormatCheck::Unrecognized),
     }
+}
+
+/// The error every caller that would actually have to *write* a reftable store
+/// reports, rather than laying down a `files` repository under a name that
+/// promises otherwise.
+fn reftable_unsupported() -> anyhow::Error {
+    anyhow::anyhow!(
+        "the reftable ref storage format is not supported: no vendored reftable backend"
+    )
+}
+
+/// `extensions.refStorage` as an existing repository records it, defaulting to
+/// git's compiled-in `files` — the value `validate_ref_storage_format()`
+/// compares a command-line `--ref-format` against.
+fn repository_ref_format(git_dir: &Path) -> String {
+    local_config(git_dir)
+        .and_then(|f| {
+            f.string_by("extensions", None, "refStorage")
+                .map(|v| v.to_string())
+        })
+        .unwrap_or_else(|| "files".to_string())
 }
 
 /// Read a non-empty string config value from `repo`'s resolved configuration

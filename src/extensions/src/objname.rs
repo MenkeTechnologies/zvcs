@@ -1090,8 +1090,15 @@ pub fn canonical_spec<'a>(
 /// gitoxide may safely be handed.
 fn hex_of_other_hash_as_refname(repo: &gix::Repository, spec: &str) -> Option<String> {
     let base = ambiguity_base(spec);
-    if !matches!(base.len(), 40 | 64)
-        || base.len() == repo.object_hash().len_in_hex()
+    // LONGER than the repository's own width, not merely different from it: a
+    // name shorter than `hexsz` is an ABBREVIATION, which git resolves against
+    // the object database (`get_short_oid()`), and gitoxide's prefix lookup
+    // reaches the same object. Rewriting those too made every 40-character
+    // prefix in a sha256 repository resolve to `refs/<40-hex>` and die
+    // `ambiguous argument` — `rev-parse <40-hex>` and, through it, every verb
+    // that takes an abbreviated revision there.
+    if base.len() <= repo.object_hash().len_in_hex()
+        || !matches!(base.len(), 40 | 64)
         || !base.bytes().all(|b| b.is_ascii_hexdigit())
     {
         return None;

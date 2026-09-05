@@ -577,7 +577,24 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
     let spec = positional[0];
 
     let Some(oid) = crate::objname::resolve(&repo, spec) else {
-        eprintln!("fatal: Not a valid object name {spec}");
+        // `cat_one_file()` resolves with `GET_OID_RECORD_PATH | GET_OID_ONLY_TO_DIE`
+        // (builtin/cat-file.c:101), and `only_to_die` makes
+        // `get_oid_with_context_1()` die *inside* the lookup with the specific
+        // diagnosis before the blanket message below can run:
+        // `diagnose_invalid_index_path()` for the `:<stage>:<path>` form
+        // (object-name.c:1985) and `diagnose_invalid_oid_path()` for `<rev>:<path>`
+        // (object-name.c:2022). Only a name neither branch can explain reaches
+        // `die("Not a valid object name %s")` (builtin/cat-file.c:112).
+        if let Some(msg) = crate::objpath::misspelt_object_name(&repo, spec) {
+            eprintln!("fatal: {msg}");
+        } else if let crate::objpath::Split::Tree { rev, .. } = crate::objpath::split(spec) {
+            // The `<rev>:<path>` arm whose *revision* half is what failed:
+            // `die(_("invalid object name '%.*s'."), len, name)` (object-name.c:2035),
+            // naming only the part before the colon.
+            eprintln!("fatal: invalid object name '{rev}'.");
+        } else {
+            eprintln!("fatal: Not a valid object name {spec}");
+        }
         return Ok(ExitCode::from(128));
     };
 
@@ -2016,9 +2033,30 @@ fn resolve_follow_symlinks(repo: &gix::Repository, name: &[u8]) -> FollowResult 
 /// the tree `tree_id`, following in-tree symlink blobs up to 40 hops. The `parents`
 /// stack lets a symlink target's `..` ascend toward the root, exactly as git's
 /// `dir_state` array does.
+///
+/// The C carries one running verdict for the whole walk: `retval` starts at
+/// `MISSING_OBJECT` (tree-walk.c:661) and the symlink branch raises it to
+/// `DANGLING_SYMLINK` *before* reading the link's contents — "At this point, we
+/// have followed at a least one symlink, so on error we need to report this"
+/// (tree-walk.c:786-788). Every later `goto done` — the unreadable tree
+/// (tree-walk.c:685), the empty tree (tree-walk.c:701) and the missing entry
+/// (tree-walk.c:753) — then reports `dangling` rather than `missing`. `followed`
+/// is that latch; without it `HEAD:link` for a symlink pointing at a path the
+/// tree does not carry answers `missing` where stock answers `dangling`.
 fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u8>) -> FollowResult {
     const MAX_LINKS: i32 = 40;
     let hash_kind = repo.object_hash();
+
+    // git's `retval`, which only ever moves from `MISSING_OBJECT` to
+    // `DANGLING_SYMLINK` and stays there for the rest of the walk.
+    let mut followed = false;
+    let miss = |followed: bool| {
+        if followed {
+            FollowResult::Dangling
+        } else {
+            FollowResult::Missing
+        }
+    };
 
     // Each parent holds (root oid, tree bytes); the last is the tree currently
     // being scanned. `t_loaded == false` forces a read at the loop top.
@@ -2032,11 +2070,11 @@ fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u
         if !t_loaded {
             let obj = match repo.find_object(current_tree_oid) {
                 Ok(o) => o,
-                Err(_) => return FollowResult::Missing,
+                Err(_) => return miss(followed),
             };
             let tree = match obj.peel_to_kind(Kind::Tree) {
                 Ok(t) => t,
-                Err(_) => return FollowResult::Missing,
+                Err(_) => return miss(followed),
             };
             let root = tree.id;
             let bytes = tree.data.clone();
@@ -2046,7 +2084,7 @@ fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u
                 return FollowResult::Found(root);
             }
             if empty {
-                return FollowResult::Missing;
+                return miss(followed);
             }
             t_loaded = true;
         }
@@ -2083,7 +2121,7 @@ fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u
 
         let Some((entry_oid, kind)) = find_entry(&parents.last().unwrap().1, component, hash_kind)
         else {
-            return FollowResult::Missing;
+            return miss(followed);
         };
         current_tree_oid = entry_oid;
 
@@ -2101,6 +2139,10 @@ fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u
                     return FollowResult::Loop;
                 }
                 follows_remaining -= 1;
+                // `retval = DANGLING_SYMLINK` (tree-walk.c:789), raised before the
+                // read so an unreadable link *and* everything that fails after it
+                // report the followed symlink rather than a plain miss.
+                followed = true;
                 let contents = match repo.find_object(current_tree_oid) {
                     Ok(o) => o.data.clone(),
                     Err(_) => return FollowResult::Dangling,

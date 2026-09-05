@@ -14,11 +14,11 @@
 //!   Collects the commit set the way git does — from every pack in the object
 //!   directory by default, from all refs under `--reachable`, from stdin under
 //!   `--stdin-commits` / `--stdin-packs` — closes it over all ancestors, then
-//!   serializes `OIDF`/`OIDL`/`CDAT`/`GDA2` (plus `GDO2`, `EDGE` and the
-//!   changed-path `BIDX`/`BDAT` pair when needed) into
-//!   `<object-dir>/info/commit-graph`. As in git, an empty commit
-//!   set writes no file and exits 0, and a successful non-split write removes
-//!   any existing split chain.
+//!   serializes `OIDF`/`OIDL`/`CDAT`/`GDA2` (plus `GDO2`, `EDGE`, the
+//!   changed-path `BIDX`/`BDAT` pair and, for a layer of a chain, `BASE`) into
+//!   `<object-dir>/info/commit-graph`, or under `info/commit-graphs/` for
+//!   `--split`. As in git, an empty commit set writes no file and exits 0, and a
+//!   successful non-split write removes any existing split chain.
 //!
 //! `core.commitGraph=false` turns the feature off outright: `write_commit_graph()`
 //! opens with that check, so a `write` under it warns `attempting to write a
@@ -55,23 +55,38 @@
 //! last-extra-edge marker both `0x80000000`; `GDA2` holding the corrected
 //! commit date *offset* per commit.
 //!
-//! `--split` writes the *first* layer of a chain: the graph goes to
+//! `--split` writes a *chain*: every layer lives at
 //! `info/commit-graphs/graph-<checksum>.graph` and `commit-graph-chain` names
-//! it. A one-layer chain has no base graph, so its bytes are exactly the
-//! single-file graph's — verified byte-for-byte against git 2.55.0 — and only
-//! the naming differs. `--split=no-merge` and `--split=replace` reach the same
-//! layer, there being nothing to merge or replace.
+//! them bottom-first, one checksum per line. Into an object directory that has
+//! no graph the chain is one layer, whose bytes are exactly the single-file
+//! graph's — verified byte-for-byte against git 2.55.0 — and only the naming
+//! differs.
 //!
-//! Deliberately not implemented — this bails rather than writing a file that
-//! only looks right:
-//!   * `--split` over a commit-graph that already exists. Folding one into the
-//!     new tip needs `split_graph_merge_strategy()`'s layer accounting, the
-//!     `BASE` chunk, parent positions renumbered across the whole chain, and
-//!     `expire_commit_graphs()` — none of which the vendored crate models.
+//! Over a graph that *does* exist, the write reproduces
+//! `split_graph_merge_strategy()` (commit-graph.c:2192-2273): the layers that
+//! survive underneath the new tip keep their bytes and their positions, the new
+//! tip holds only the commits none of them already carries, its header records
+//! how many layers it sits on and a `BASE` chunk names their checksums, and its
+//! parent references are positions in the *whole chain* — the surviving layers
+//! occupy `0..num_commits_in_base`, the tip's own commits follow. The three
+//! strategies differ only in how many layers survive: the default merges a layer
+//! into the tip while `layer.num_commits <= size_multiple * new_commits` (or
+//! while `max_commits` is exceeded), `--split=no-merge` merges none, and
+//! `--split=replace` merges all of them into a single layer.
 //!
-//! `--max-commits`, `--size-multiple` and `--expire-time` only steer the merge
-//! strategy above; git accepts and ignores them for a non-split write, and so
-//! does this, after validating their values so the exit codes still agree.
+//! A non-split write still supersedes a chain: it writes `info/commit-graph` and
+//! removes `info/commit-graphs/`, as git does.
+//!
+//! Deliberately not implemented:
+//!   * `--expire-time` / `expire_commit_graphs()`. A layer the merge strategy
+//!     dropped is unlinked outright here; git instead leaves it on disk until
+//!     the expiry window has passed, so a concurrent reader mid-write still
+//!     finds the file the chain it read names.
+//!
+//! `--max-commits` and `--size-multiple` steer the merge strategy above;
+//! `--expire-time` only steers the expiry that is not modelled. git accepts and
+//! ignores all three for a non-split write, and so does this, after validating
+//! their values so the exit codes still agree.
 //!
 //! Progress goes to stderr in git and is not emitted here. Verification
 //! *failure* text is gix's diagnostic, not git's wording; only the success path
@@ -306,20 +321,25 @@ fn long_value<'a>(arg: &'a str, name: &str) -> Option<&'a str> {
 /// git's `OPT_INTEGER` scanner: a decimal number with an optional `k`/`m`/`g`
 /// suffix. Only the validity of the value matters here — the values themselves
 /// steer split writes, which are not produced.
-fn parse_scaled_int(name: &str, raw: &str) -> std::result::Result<(), ExitCode> {
+fn parse_scaled_int(name: &str, raw: &str) -> std::result::Result<i64, ExitCode> {
     let (digits, scale) = match raw.chars().last() {
         Some(c) if matches!(c.to_ascii_lowercase(), 'k' | 'm' | 'g') => (&raw[..raw.len() - 1], true),
         _ => (raw, false),
     };
-    let ok = !digits.is_empty()
-        && digits.parse::<i64>().is_ok()
-        && (!scale || !digits.starts_with('-'));
-    if ok {
-        Ok(())
-    } else {
+    let parsed = digits.parse::<i64>().ok();
+    let ok = !digits.is_empty() && parsed.is_some() && (!scale || !digits.starts_with('-'));
+    if !ok {
         eprintln!("error: option `{name}' expects an integer value with an optional k/m/g suffix");
-        Err(ExitCode::from(129))
+        return Err(ExitCode::from(129));
     }
+    // `OPT_MAGNITUDE` scales by 1024 per suffix step.
+    let factor = match raw.chars().last().map(|c| c.to_ascii_lowercase()) {
+        Some('k') => 1024,
+        Some('m') => 1024 * 1024,
+        Some('g') => 1024 * 1024 * 1024,
+        _ => 1,
+    };
+    Ok(parsed.unwrap_or_default().saturating_mul(factor))
 }
 
 // --- verify ----------------------------------------------------------------
@@ -455,6 +475,11 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
     // `opts->max_new_filters`, where a negative value means "no bound".
     let mut max_new_filters: Option<i64> = None;
     let mut split = false;
+    // `opts->split_flags` / `opts->max_commits` / `opts->size_multiple`
+    // (builtin/commit-graph.c), the three inputs to `split_graph_merge_strategy()`.
+    let mut split_flags = SplitFlags::Unspecified;
+    let mut max_commits: i64 = 0;
+    let mut size_multiple: i64 = 0;
     let mut end_of_opts = false;
 
     let mut i = 0;
@@ -518,11 +543,15 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
                 let Some(v) = args.get(i) else {
                     return Ok(missing_value(name));
                 };
-                if let Err(code) = parse_scaled_int(name, v) {
-                    return Ok(code);
+                match parse_scaled_int(name, v) {
+                    Ok(n) if name == "max-commits" => max_commits = n,
+                    Ok(n) => size_multiple = n,
+                    Err(code) => return Ok(code),
                 }
             }
-            "--no-max-commits" | "--no-size-multiple" | "--no-expire-time" => {}
+            "--no-max-commits" => max_commits = 0,
+            "--no-size-multiple" => size_multiple = 0,
+            "--no-expire-time" => {}
             "--expire-time" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
@@ -538,10 +567,13 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             }
             s if s.starts_with("--split=") => {
                 split = true;
-                let strategy = &s["--split=".len()..];
-                if !matches!(strategy, "no-merge" | "replace") {
-                    return Ok(fatal(&format!("unrecognized --split argument, {strategy}")));
-                }
+                split_flags = match &s["--split=".len()..] {
+                    "no-merge" => SplitFlags::MergeProhibited,
+                    "replace" => SplitFlags::Replace,
+                    strategy => {
+                        return Ok(fatal(&format!("unrecognized --split argument, {strategy}")))
+                    }
+                };
             }
             s if long_value(s, "max-new-filters").is_some() => {
                 let v = long_value(s, "max-new-filters").unwrap_or_default();
@@ -558,14 +590,16 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             }
             s if long_value(s, "max-commits").is_some() => {
                 let v = long_value(s, "max-commits").unwrap_or_default();
-                if let Err(code) = parse_scaled_int("max-commits", v) {
-                    return Ok(code);
+                match parse_scaled_int("max-commits", v) {
+                    Ok(n) => max_commits = n,
+                    Err(code) => return Ok(code),
                 }
             }
             s if long_value(s, "size-multiple").is_some() => {
                 let v = long_value(s, "size-multiple").unwrap_or_default();
-                if let Err(code) = parse_scaled_int("size-multiple", v) {
-                    return Ok(code);
+                match parse_scaled_int("size-multiple", v) {
+                    Ok(n) => size_multiple = n,
+                    Err(code) => return Ok(code),
                 }
             }
             s if long_value(s, "expire-time").is_some() => {
@@ -656,31 +690,6 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
-
-    // What `--split` is *not*: the strategies that fold an existing graph into
-    // the new tip. `split_graph_merge_strategy()` decides how many layers of the
-    // old chain survive, `write_commit_graph_file()` writes their checksums into
-    // a `BASE` chunk and renumbers every parent position across the whole chain,
-    // and `expire_commit_graphs()` removes what is left over. None of that is
-    // modelled, so a repository that already has a graph to build on is refused
-    // rather than answered with a chain that only looks right. Writing the
-    // *first* layer of a chain needs none of it: with no base graph the layer's
-    // bytes are exactly the single-file graph's — verified byte-for-byte against
-    // git 2.55.0 — and only the naming and the chain file differ.
-    if split
-        && (objects.join("info").join("commit-graph").exists()
-            || objects
-                .join("info")
-                .join("commit-graphs")
-                .join("commit-graph-chain")
-                .exists())
-    {
-        bail!(
-            "unsupported flag \"--split\" over an existing commit-graph: the chain merge, \
-             BASE chunk and expiry strategies are not modelled by the read-only vendored \
-             gix-commitgraph"
-        );
-    }
 
     // `write_commit_graph()`'s first act is to refuse outright when the feature
     // is switched off, so `-c core.commitGraph=false commit-graph write` warns,
@@ -809,6 +818,77 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         return Ok(ExitCode::SUCCESS);
     }
 
+    // `split_graph_merge_strategy()` (commit-graph.c:2192) picks how many of the
+    // layers already on disk survive underneath the new tip; `copy_oids_to_commits()`
+    // then drops from the write every commit those survivors already hold.
+    let surviving = if split {
+        match survivors(
+            &objects,
+            repo.object_hash(),
+            existing.as_ref(),
+            split_flags,
+            size_multiple,
+            max_commits,
+            &entries,
+        ) {
+            Ok(v) => v,
+            Err(code) => return Ok(code),
+        }
+    } else {
+        Vec::new()
+    };
+    let base = match Base::open(&surviving, existing.as_ref()) {
+        Ok(b) => b,
+        Err(code) => return Ok(code),
+    };
+    let mut entries: Vec<Entry> = match base.as_ref() {
+        // `copy_oids_to_commits()` (commit-graph.c:1782) skips any commit the
+        // chain already carries; only the surviving layers still count.
+        Some(b) => entries.into_iter().filter(|e| b.position(&e.id).is_none()).collect(),
+        None => entries,
+    };
+    if split {
+        // `merge_commit_graphs()` (commit-graph.c:2128) folds every layer the
+        // strategy dropped into the commits being written, so a commit that a
+        // dropped layer held but this run did not reach is still carried over
+        // rather than lost.
+        if let Some(graph) = existing.as_ref() {
+            let from = base.as_ref().map_or(0, |b| b.num_commits);
+            let held: HashSet<ObjectId> = entries.iter().map(|e| e.id).collect();
+            let mut merged: Vec<Entry> = Vec::new();
+            for pos in from..graph.num_commits() {
+                let commit = graph.commit_at(gix::commitgraph::Position(pos));
+                let id = commit.id().to_owned();
+                if held.contains(&id) {
+                    continue;
+                }
+                let parents: Option<Vec<ObjectId>> = commit
+                    .iter_parents()
+                    .map(|p| p.ok().map(|p| graph.commit_at(p).id().to_owned()))
+                    .collect();
+                let Some(parents) = parents else { continue };
+                merged.push(Entry {
+                    id,
+                    tree: commit.root_tree_id().to_owned(),
+                    parents,
+                    time: commit.committer_timestamp(),
+                });
+            }
+            if !merged.is_empty() {
+                entries.extend(merged);
+                entries.sort_by_key(|a| a.id);
+            }
+        }
+    }
+
+    // `if (!ctx->commits.nr && !replace) goto cleanup;` (commit-graph.c): with
+    // nothing new to record a split write leaves the chain exactly as it found
+    // it, rather than stacking an empty layer on top of it. `--split=replace`
+    // is the exception, because collapsing the chain is the whole point of it.
+    if split && entries.is_empty() && split_flags != SplitFlags::Replace {
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // The filters must line up with the entries as they will be stored, and
     // `serialize` writes them in the order it is given, so they are computed
     // against the same slice.
@@ -823,6 +903,7 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             reuse_from,
             max_new_filters,
             write_generation_data,
+            base.as_ref(),
         ))
     } else {
         None
@@ -833,16 +914,206 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         &entries,
         write_generation_data,
         filters.as_ref().map(|f| (f.as_slice(), &bloom_settings)),
+        base.as_ref(),
     ) {
         Ok(b) => b,
         Err(code) => return Ok(code),
     };
+    // `existing` holds the chain's files mapped and `base` borrows it; both are
+    // released before the rename below moves a layer's bytes.
+    drop(base);
+    drop(existing);
     if split {
-        install_split(&objects, &bytes, repo.object_hash())?;
+        install_split(&objects, &bytes, repo.object_hash(), &surviving)?;
     } else {
         install(&objects, &bytes)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `enum commit_graph_split_flags` (commit-graph.h): which layers a `--split`
+/// write is allowed to fold into its new tip.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitFlags {
+    /// Plain `--split`: merge while the size heuristic says to.
+    Unspecified,
+    /// `--split=no-merge`: keep every layer, always add one.
+    MergeProhibited,
+    /// `--split=replace`: fold the whole chain into a single layer.
+    Replace,
+}
+
+/// One layer of the chain as it is on disk right now.
+struct Layer {
+    /// The file's trailing checksum, which is also its name in the chain.
+    checksum: ObjectId,
+    /// Where the bytes are today — `info/commit-graph` for a graph that was
+    /// never split, `info/commit-graphs/graph-<checksum>.graph` otherwise.
+    path: PathBuf,
+    /// Commits stored in this layer alone.
+    num_commits: u32,
+}
+
+/// The chain as `write_commit_graph()` finds it, bottom-first.
+///
+/// A non-split `info/commit-graph` is a one-layer chain: git loads it as
+/// `r->objects->commit_graph` with no base, and `--split` over it keeps its bytes
+/// and moves them under `info/commit-graphs/`.
+fn existing_layers(objects: &Path, hash: gix::hash::Kind) -> Vec<Layer> {
+    let info = objects.join("info");
+    let dir = info.join("commit-graphs");
+    let mut out = Vec::new();
+    let named: Vec<(ObjectId, PathBuf)> = match std::fs::read_to_string(dir.join("commit-graph-chain")) {
+        Ok(chain) => chain
+            .lines()
+            .filter_map(|line| ObjectId::from_hex(line.trim().as_bytes()).ok())
+            .map(|id| (id, dir.join(format!("graph-{id}.graph"))))
+            .collect(),
+        Err(_) => {
+            let single = info.join("commit-graph");
+            match checksum_of(&single, hash) {
+                Some(id) => vec![(id, single)],
+                None => Vec::new(),
+            }
+        }
+    };
+    for (checksum, path) in named {
+        let Ok(file) = gix::commitgraph::File::at(&path) else {
+            // A layer that cannot be read is a chain that cannot be extended;
+            // git's `parse_commit_graph()` would have refused to load it, which
+            // leaves the write with no base at all.
+            return Vec::new();
+        };
+        out.push(Layer { checksum, path, num_commits: file.num_commits() });
+    }
+    out
+}
+
+/// The trailing hash a commit-graph file ends with, which is the name the chain
+/// records it under.
+fn checksum_of(path: &Path, hash: gix::hash::Kind) -> Option<ObjectId> {
+    let bytes = std::fs::read(path).ok()?;
+    let len = hash.len_in_bytes();
+    ObjectId::try_from(bytes.get(bytes.len().checked_sub(len)?..)?).ok()
+}
+
+/// `split_graph_merge_strategy()` (commit-graph.c:2192-2273), reduced to its
+/// answer: the layers that stay underneath the new tip, bottom-first.
+///
+/// ```c
+/// if (flags == COMMIT_GRAPH_SPLIT_REPLACE)
+///         ctx->num_commit_graphs_after = 1;
+/// else
+///         ctx->num_commit_graphs_after = ctx->num_commit_graphs_before + 1;
+///
+/// if (flags != COMMIT_GRAPH_SPLIT_MERGE_PROHIBITED &&
+///     flags != COMMIT_GRAPH_SPLIT_REPLACE) {
+///         while (g && (g->num_commits <= size_mult * num_commits ||
+///                     (max_commits && num_commits > max_commits))) {
+///                 num_commits += g->num_commits;
+///                 g = g->base_graph;
+///                 ctx->num_commit_graphs_after--;
+///         }
+/// }
+/// ```
+///
+/// `num_commit_graphs_after` counts the new tip too, so the survivors are the
+/// bottom `after - 1` layers.
+fn survivors(
+    objects: &Path,
+    hash: gix::hash::Kind,
+    graph: Option<&gix::commitgraph::Graph>,
+    flags: SplitFlags,
+    size_multiple: i64,
+    max_commits: i64,
+    entries: &[Entry],
+) -> std::result::Result<Vec<Layer>, ExitCode> {
+    let mut layers = existing_layers(objects, hash);
+    if layers.is_empty() {
+        return Ok(layers);
+    }
+    // git's `size_mult` defaults to 2 and `max_commits` to "no bound".
+    let size_mult = if size_multiple > 0 { size_multiple } else { 2 };
+
+    let mut after = match flags {
+        SplitFlags::Replace => 1usize,
+        _ => layers.len() + 1,
+    };
+    if flags == SplitFlags::Unspecified {
+        // `num_commits` is `ctx->commits.nr` at the point the strategy runs, i.e.
+        // after `copy_oids_to_commits()` has dropped everything the chain already
+        // holds; each layer folded in then adds its own, which is what makes the
+        // heuristic terminate.
+        let mut num_commits = match graph {
+            Some(g) => entries.iter().filter(|e| g.lookup(e.id).is_none()).count() as i64,
+            None => entries.len() as i64,
+        };
+        while after > 1 {
+            let g = i64::from(layers[after - 2].num_commits);
+            if !(g <= size_mult.saturating_mul(num_commits)
+                || (max_commits != 0 && num_commits > max_commits))
+            {
+                break;
+            }
+            num_commits += g;
+            after -= 1;
+        }
+    }
+    layers.truncate(after - 1);
+    Ok(layers)
+}
+
+/// The surviving layers, read for the three facts the new tip needs from them:
+/// where a commit sits in the whole chain, and the two generation numbers a
+/// child inherits across the layer boundary.
+struct Base<'a> {
+    /// Checksums bottom-first — the `BASE` chunk and the chain file's head.
+    checksums: Vec<ObjectId>,
+    /// Commits below the tip; the tip's first commit takes this position.
+    num_commits: u32,
+    graph: &'a gix::commitgraph::Graph,
+}
+
+impl<'a> Base<'a> {
+    /// `None` when nothing survives, which is every non-split write and the first
+    /// layer of a chain.
+    fn open(
+        surviving: &[Layer],
+        graph: Option<&'a gix::commitgraph::Graph>,
+    ) -> std::result::Result<Option<Self>, ExitCode> {
+        if surviving.is_empty() {
+            return Ok(None);
+        }
+        let Some(graph) = graph else {
+            return Err(error_exit("commit-graph chain vanished while writing"));
+        };
+        Ok(Some(Base {
+            checksums: surviving.iter().map(|l| l.checksum).collect(),
+            num_commits: surviving.iter().map(|l| l.num_commits).sum(),
+            graph,
+        }))
+    }
+
+    /// The chain position of `id`, or `None` when no surviving layer holds it.
+    ///
+    /// The surviving layers are a *prefix* of the chain the graph was opened
+    /// from, so a position below `num_commits` is exactly a surviving one.
+    fn position(&self, id: &ObjectId) -> Option<u32> {
+        let pos = self.graph.lookup(id)?;
+        (pos.0 < self.num_commits).then_some(pos.0)
+    }
+
+    /// The topological level stored for the chain position `pos`.
+    fn level(&self, pos: u32) -> u32 {
+        self.graph.commit_at(gix::commitgraph::Position(pos)).generation()
+    }
+
+    /// The corrected commit date stored for the chain position `pos`, falling
+    /// back to the committer date when the layer carries no `GDA2`.
+    fn corrected(&self, pos: u32) -> u64 {
+        let commit = self.graph.commit_at(gix::commitgraph::Position(pos));
+        commit.corrected_commit_date().unwrap_or_else(|| commit.committer_timestamp())
+    }
 }
 
 /// The half of git's `commit_graph_compatible()` that no `disable_replace_refs()`
@@ -931,6 +1202,7 @@ fn compute_bloom_filters(
     existing: Option<&gix::commitgraph::Graph>,
     max_new_filters: Option<i64>,
     write_generation_data: bool,
+    base: Option<&Base<'_>>,
 ) -> Vec<gix::commitgraph::bloom::Filter> {
     use gix::commitgraph::bloom;
 
@@ -950,7 +1222,11 @@ fn compute_bloom_filters(
     // commit compares equal and the date alone decides.
     let mut order: Vec<usize> = (0..entries.len()).collect();
     let corrected = write_generation_data
-        .then(|| parent_positions(entries).ok().map(|p| generations(entries, &p).1))
+        .then(|| {
+            parent_positions(entries, base)
+                .ok()
+                .map(|p| generations(entries, &p, base).1)
+        })
         .flatten();
     order.sort_by_key(|&i| (corrected.as_ref().map_or(0, |c| c[i]), entries[i].time));
 
@@ -1035,8 +1311,13 @@ fn change_path(change: &gix::object::tree::diff::ChangeDetached) -> &[u8] {
 /// what they count: the level counts commits, the corrected date counts from
 /// each commit's own timestamp so that it never decreases along a parent edge.
 /// An explicit stack keeps a deep history from overflowing the real one.
-fn generations(entries: &[Entry], parents: &[Vec<u32>]) -> (Vec<u32>, Vec<u64>) {
+fn generations(entries: &[Entry], parents: &[Vec<u32>], base: Option<&Base<'_>>) -> (Vec<u32>, Vec<u64>) {
     let n = entries.len();
+    // Positions are chain-wide: a surviving layer owns `0..offset`, this file's
+    // own commits follow. A parent below `offset` already has both numbers
+    // written, and `compute_generation_numbers()` reads them straight out of the
+    // base graph rather than recomputing them.
+    let offset = base.map_or(0, |b| b.num_commits);
     let mut level = vec![0u32; n];
     let mut corrected = vec![0u64; n];
     let mut stack: Vec<(usize, bool)> = Vec::new();
@@ -1053,17 +1334,27 @@ fn generations(entries: &[Entry], parents: &[Vec<u32>]) -> (Vec<u32>, Vec<u64>) 
                 let mut l = 1u32;
                 let mut c = entries[idx].time;
                 for &p in &parents[idx] {
-                    let p = p as usize;
-                    l = l.max(level[p].saturating_add(1));
-                    c = c.max(corrected[p].saturating_add(1));
+                    let (pl, pc) = match (p < offset, base) {
+                        (true, Some(b)) => (b.level(p), b.corrected(p)),
+                        _ => {
+                            let local = (p - offset) as usize;
+                            (level[local], corrected[local])
+                        }
+                    };
+                    l = l.max(pl.saturating_add(1));
+                    c = c.max(pc.saturating_add(1));
                 }
                 level[idx] = l.min(GENERATION_MAX);
                 corrected[idx] = c;
             } else {
                 stack.push((idx, true));
                 for &p in &parents[idx] {
-                    if level[p as usize] == 0 {
-                        stack.push((p as usize, false));
+                    if p < offset {
+                        continue;
+                    }
+                    let local = (p - offset) as usize;
+                    if level[local] == 0 {
+                        stack.push((local, false));
                     }
                 }
             }
@@ -1076,17 +1367,29 @@ fn generations(entries: &[Entry], parents: &[Vec<u32>]) -> (Vec<u32>, Vec<u64>) 
 ///
 /// The format encodes a parent as a position within the same file, so a parent
 /// outside the entry set cannot be stored at all.
-fn parent_positions(entries: &[Entry]) -> std::result::Result<Vec<Vec<u32>>, ObjectId> {
+fn parent_positions(
+    entries: &[Entry],
+    base: Option<&Base<'_>>,
+) -> std::result::Result<Vec<Vec<u32>>, ObjectId> {
+    // In a chain the position is chain-wide, so this file's commit `i` is
+    // `num_commits_in_base + i` and a parent may resolve into a layer below.
+    let offset = base.map_or(0, |b| b.num_commits);
     let mut position: HashMap<ObjectId, u32> = HashMap::with_capacity(entries.len());
     for (i, e) in entries.iter().enumerate() {
-        position.insert(e.id, i as u32);
+        position.insert(e.id, offset + i as u32);
     }
     entries
         .iter()
         .map(|e| {
             e.parents
                 .iter()
-                .map(|p| position.get(p).copied().ok_or(*p))
+                .map(|p| {
+                    position
+                        .get(p)
+                        .copied()
+                        .or_else(|| base.and_then(|b| b.position(p)))
+                        .ok_or(*p)
+                })
                 .collect()
         })
         .collect()
@@ -1144,9 +1447,15 @@ fn collect_seeds(
                 match pack::index::File::at(&path, repo.object_hash()) {
                     Ok(idx) => collect_pack_commits(repo, &idx, &mut seeds),
                     Err(_) => {
+                        // `fill_oids_from_packs` builds the name from
+                        // `ctx->odb->path` (commit-graph.c:1693,1707-1711), which
+                        // inside a repository is git's own spelling of the object
+                        // directory — `.git/objects`. gix hands back the
+                        // discovery-relative `./.git/objects`, whose leading `./`
+                        // git never prints.
                         return Err(error_exit(&format!(
                             "error adding pack {}",
-                            path.display()
+                            display_path(&path)
                         )))
                     }
                 }
@@ -1275,17 +1584,18 @@ fn serialize(
         &[gix::commitgraph::bloom::Filter],
         &gix::commitgraph::bloom::Settings,
     )>,
+    base: Option<&Base<'_>>,
 ) -> std::result::Result<Vec<u8>, ExitCode> {
     let hash_len = hash.len_in_bytes();
     let n = entries.len();
 
     // A missing parent would be a bug in the ancestor closure, since the format
     // cannot encode an absent parent.
-    let parents = parent_positions(entries).map_err(|missing| {
+    let parents = parent_positions(entries, base).map_err(|missing| {
         error_exit(&format!("commit has parent {missing} outside the graph"))
     })?;
 
-    let (level, corrected) = generations(entries, &parents);
+    let (level, corrected) = generations(entries, &parents, base);
 
     // --- chunks ---
     let mut oidf = Vec::with_capacity(FAN_LEN * 4);
@@ -1392,6 +1702,15 @@ fn serialize(
         chunks.push((b"BIDX", bidx));
         chunks.push((b"BDAT", bdat));
     }
+    // `BASE` names the layers this one sits on, bottom-first, and git writes it
+    // last (commit-graph.c's chunk order for a split write).
+    if let Some(b) = base {
+        let mut data = Vec::with_capacity(b.checksums.len() * hash_len);
+        for id in &b.checksums {
+            data.extend_from_slice(id.as_bytes());
+        }
+        chunks.push((b"BASE", data));
+    }
 
     // --- header, chunk lookup, data, trailer ---
     let mut out = Vec::new();
@@ -1399,7 +1718,9 @@ fn serialize(
     out.push(1); // file version
     out.push(hash as u8); // hash version: 1 = SHA-1, 2 = SHA-256
     out.push(chunks.len() as u8);
-    out.push(0); // base graph count: never split here
+    // `<base-graph-count>`: how many layers sit below this one, which is what a
+    // reader adds to a parent position to find the file that holds it.
+    out.push(base.map_or(0, |b| b.checksums.len()) as u8);
 
     let mut offset = (HEADER_LEN + (chunks.len() + 1) * CHUNK_LOOKUP_ENTRY_LEN) as u64;
     for (id, data) in &chunks {
@@ -1466,18 +1787,42 @@ fn install(objects: &Path, bytes: &[u8]) -> Result<()> {
 /// first, tip last — one hash per line. Both are left read-only, as git leaves
 /// them. Only the first layer is written here; see the refusal in [`write`] for
 /// what a chain that already exists would need.
-fn install_split(objects: &Path, bytes: &[u8], hash: gix::hash::Kind) -> Result<()> {
-    let dir = objects.join("info").join("commit-graphs");
+fn install_split(
+    objects: &Path,
+    bytes: &[u8],
+    hash: gix::hash::Kind,
+    surviving: &[Layer],
+) -> Result<()> {
+    let info = objects.join("info");
+    let dir = info.join("commit-graphs");
     std::fs::create_dir_all(&dir)?;
 
     let Ok(checksum) = gix::hash::ObjectId::try_from(&bytes[bytes.len() - hash.len_in_bytes()..])
     else {
         bail!("commit-graph trailer is not a valid object id");
     };
+
+    // A surviving layer keeps its bytes: a chain layer is already where it
+    // belongs, and a graph that was never split is *moved* under
+    // `commit-graphs/` under the name its own checksum gives it.
+    for layer in surviving {
+        let want = dir.join(format!("graph-{}.graph", layer.checksum));
+        if layer.path != want {
+            std::fs::rename(&layer.path, &want)?;
+        }
+    }
+
+    // Bottom-first, one checksum per line, with the new tip last.
+    let mut chain = String::new();
+    for layer in surviving {
+        chain.push_str(&format!("{}\n", layer.checksum));
+    }
+    chain.push_str(&format!("{checksum}\n"));
+
     let pid = std::process::id();
     for (name, body) in [
         (format!("graph-{checksum}.graph"), bytes.to_vec()),
-        ("commit-graph-chain".to_string(), format!("{checksum}\n").into_bytes()),
+        ("commit-graph-chain".to_string(), chain.into_bytes()),
     ] {
         let tmp = dir.join(format!("{name}.tmp-{pid}"));
         std::fs::write(&tmp, &body)?;
@@ -1491,7 +1836,32 @@ fn install_split(objects: &Path, bytes: &[u8], hash: gix::hash::Kind) -> Result<
         let _ = std::fs::remove_file(&target);
         std::fs::rename(&tmp, &target)?;
     }
+
+    // A chain supersedes the single-file graph, and every layer the merge
+    // strategy folded into the new tip is gone from it.
+    let _ = std::fs::remove_file(info.join("commit-graph"));
+    let keep: HashSet<String> = surviving
+        .iter()
+        .map(|l| format!("graph-{}.graph", l.checksum))
+        .chain(std::iter::once(format!("graph-{checksum}.graph")))
+        .collect();
+    if let Ok(read) = std::fs::read_dir(&dir) {
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("graph-") && name.ends_with(".graph") && !keep.contains(&name) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     Ok(())
+}
+
+/// Render a path the way git's `ctx->odb->path` reads: gix records the object
+/// database as the discovery-relative `./.git/objects`, git as `.git/objects`, and
+/// the difference is visible in every message built from it.
+fn display_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    s.strip_prefix("./").unwrap_or(&s).to_string()
 }
 
 // --- object directory ------------------------------------------------------

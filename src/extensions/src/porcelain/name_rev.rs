@@ -33,21 +33,30 @@
 //! is date-based only, so a repository with a commit-graph *and* badly skewed
 //! commit dates can prune a different set.
 //!
-//! One further tie-break is git's and not reproducible in principle: `name_tips`
-//! orders the tip table with `QSORT`, which is unstable, so tips with the same
-//! `from_tag` and the same tagger date are visited in an order libc chooses, and
-//! whichever is visited first claims the commit (`is_better_name` ends with "keep
-//! the current one if we cannot decide"). The stable sort used here is one of the
-//! orders git may pick.
+//! One further tie-break is decided by the C library rather than by git:
+//! `name_tips` orders the tip table with `QSORT`, which is
+//! `sane_qsort` -> the platform's `qsort` (git-compat-util.h:1304-1310) and so is
+//! *unstable*. `cmp_by_tag_and_age` (builtin/name-rev.c:330-344) compares only
+//! `from_tag` and the tagger date, so every tip sharing both is an exact tie, and
+//! whichever the sort happens to place first claims the commit — `is_better_name`
+//! ends with "keep the current one if we cannot decide"
+//! (builtin/name-rev.c:137-138).
 //!
-//! Measured, so that a future reader does not mistake this for a bug worth
-//! chasing: in a repository whose only tie group is `main`, `remotes/origin/main`
-//! and `remotes/origin/HEAD` all at one commit, stock git 2.50.1 answers `main` —
-//! and answers `remotes/origin/main` for the *same* tie group once five unrelated
-//! refs pointing at a different commit exist, because the larger array permutes
-//! differently under the same `QSORT`. The tie group did not change; only the
-//! array around it did. Matching that would mean porting one libc's qsort, and
-//! the answer would then disagree with stock git built against another.
+//! Measured: in a repository whose only tie group is `main`,
+//! `remotes/origin/main` and `remotes/origin/HEAD` all at one commit, stock git
+//! answers `main` — and answers `remotes/origin/main` for the *same* tie group
+//! once five unrelated refs pointing at a different commit exist, because the
+//! larger array permutes differently under the same `qsort`. The tie group did
+//! not change; only the array around it did. A stable Rust sort therefore
+//! disagrees with stock git whenever a tie group exists: the `ambiguous-ref`
+//! fixture carries `refs/tags/ambi`, `refs/tags/ambi-ann` and `refs/tags/top` all
+//! at one commit with one pinned date, and stock names it `tags/ambi-ann^0` while
+//! a stable sort names it `tags/ambi`.
+//!
+//! [`qsort_tips`] therefore calls the very `qsort` git calls, through `libc`,
+//! rather than substituting a different algorithm. That is faithful on every
+//! platform at once: the answer matches whatever git built against the same C
+//! library answers, which is the only sense in which this ordering is defined.
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -193,6 +202,13 @@ struct Pool {
     /// The commit-graph, when one exists and `core.commitGraph` allows it.
     /// `repo_parse_commit` served from it never allocates the commit's tree.
     graph: Option<gix::commitgraph::Graph>,
+    /// `.git/shallow`: the commits git grafts to no parents.
+    ///
+    /// `parse_commit_buffer` consults `lookup_commit_graft` (commit.c) and stops
+    /// at a grafted commit, so in a shallow clone the walk never reaches — and
+    /// `--all` therefore never *lists* — anything past the boundary, even when
+    /// the objects are still on disk from before the clone was reshaped.
+    shallow: HashSet<ObjectId>,
 }
 
 /// git's `hash_obj`: the first `sizeof(unsigned int)` bytes of the object id,
@@ -210,6 +226,12 @@ impl Pool {
             nr: 0,
             index: HashMap::new(),
             graph: repo.commit_graph_if_enabled().ok().flatten(),
+            shallow: repo
+                .shallow_commits()
+                .ok()
+                .flatten()
+                .map(|c| c.iter().copied().collect())
+                .unwrap_or_default(),
         }
     }
 
@@ -350,7 +372,13 @@ impl Pool {
             return;
         };
         let tree = commit.tree();
-        let parents: Vec<ObjectId> = commit.parents().collect();
+        // A grafted commit is parsed with an empty parent list, which is how
+        // `lookup_commit_graft` prunes a shallow clone's boundary.
+        let parents: Vec<ObjectId> = if self.shallow.contains(&self.objs[ix].oid) {
+            Vec::new()
+        } else {
+            commit.parents().collect()
+        };
         let date = commit.committer().ok().map_or(0, |s| s.seconds());
 
         if create_tree {
@@ -612,13 +640,7 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
     )?;
 
     // "Try to set better names first, so that worse ones spread less."
-    let mut order: Vec<usize> = (0..tips.len()).collect();
-    order.sort_by(|&a, &b| {
-        let (a, b) = (&tips[a], &tips[b]);
-        b.from_tag
-            .cmp(&a.from_tag)
-            .then(a.taggerdate.cmp(&b.taggerdate))
-    });
+    let order = qsort_tips(&tips);
 
     let mut names: HashMap<usize, RevName> = HashMap::new();
     for ix in order {
@@ -956,9 +978,12 @@ fn is_better_name(
     let old = effective_distance(name.distance, name.generation);
     let new = effective_distance(distance, generation);
 
-    // If both are tags, we prefer the nearer one.
+    // "When comparing names based on tags, prefer names based on the older tag,
+    // even if it is farther away" (builtin/name-rev.c:110-118) — the distance is
+    // only the tiebreak once the two tagger dates are equal.
     if from_tag && name.from_tag {
-        return old > new;
+        return name.taggerdate > taggerdate
+            || (name.taggerdate == taggerdate && old > new);
     }
     // Favor a tag over a non-tag.
     if name.from_tag != from_tag {
@@ -972,6 +997,70 @@ fn is_better_name(
         return name.taggerdate > taggerdate;
     }
     false
+}
+
+/// `QSORT(tip_table.table, tip_table.nr, cmp_by_tag_and_age)` (builtin/name-rev.c:432),
+/// run through the same `qsort` git runs it through.
+///
+/// `QSORT` is `sane_qsort` -> libc `qsort` (git-compat-util.h:1304-1310), which is
+/// not stable, and `cmp_by_tag_and_age` (builtin/name-rev.c:330-344) leaves every
+/// tip sharing `from_tag` and tagger date exactly tied. The permutation libc picks
+/// for those ties is what decides which tip names the commit, so calling libc's
+/// `qsort` is the port; any other algorithm answers a different (also legal, but
+/// not stock's) name. Only the sort keys travel into the C — the comparator reads
+/// nothing else, exactly as `cmp_by_tag_and_age` reads nothing but these two
+/// fields — and the returned permutation is independent of the element width, so
+/// sorting these keys reproduces the order git's wider `tip_table_entry` array
+/// takes.
+fn qsort_tips(tips: &[Tip]) -> Vec<usize> {
+    /// The two fields `cmp_by_tag_and_age` compares, plus the slot they name.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Key {
+        from_tag: libc::c_int,
+        taggerdate: i64,
+        ix: usize,
+    }
+
+    /// `cmp_by_tag_and_age`: tags first, then older tagger dates first.
+    unsafe extern "C" fn cmp(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+        // SAFETY: `qsort` only ever hands back pointers into the `Key` array
+        // passed to it below, each properly aligned and initialised.
+        let (a, b) = unsafe { (&*a.cast::<Key>(), &*b.cast::<Key>()) };
+        let cmp = b.from_tag - a.from_tag;
+        if cmp != 0 {
+            return cmp;
+        }
+        if a.taggerdate < b.taggerdate {
+            return -1;
+        }
+        libc::c_int::from(a.taggerdate != b.taggerdate)
+    }
+
+    let mut keys: Vec<Key> = tips
+        .iter()
+        .enumerate()
+        .map(|(ix, t)| Key {
+            from_tag: libc::c_int::from(t.from_tag),
+            taggerdate: t.taggerdate,
+            ix,
+        })
+        .collect();
+    // `sane_qsort` skips the call for fewer than two elements; so does `qsort`,
+    // but the guard also keeps the pointer out of libc for an empty `Vec`.
+    if keys.len() > 1 {
+        // SAFETY: `keys` is a live, initialised slice of `Key`, the length and
+        // element size describe it exactly, and `cmp` only reads two `Key`s.
+        unsafe {
+            libc::qsort(
+                keys.as_mut_ptr().cast::<libc::c_void>(),
+                keys.len(),
+                std::mem::size_of::<Key>(),
+                Some(cmp),
+            );
+        }
+    }
+    keys.into_iter().map(|k| k.ix).collect()
 }
 
 /// git's `get_parent_name`: the name a non-first parent inherits, `<base>^<n>`

@@ -1052,6 +1052,38 @@ fn output_indicators_rewrite_the_marker_column() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Plain `--stat` replaces each matched pair's body with the stat of the
+/// diff-of-diffs, and this is the page stock git 2.55.0 writes for the same
+/// fixture -- captured from it, ids and all. The first pair counts four lines
+/// rather than two because `fixture_pairs` hangs a note on each side of it, and
+/// a note is part of the patch the outer diff is taken over.
+///
+/// It is the one format in the stat group this port renders, so it is the one
+/// that must be pinned: every other spelling (`--stat=<width>`, `--stat-count`,
+/// `--compact-summary`) is still deferred, and
+/// [`a_deferred_option_only_stops_a_run_that_would_render_a_body`] holds that
+/// side.
+#[test]
+fn plain_stat_replaces_each_body_with_the_stat_git_writes() {
+    let root = scratch("stat");
+    let (repo, home) = fixture_pairs(&root);
+
+    let (out, err, code) =
+        run(&repo, &home, &["range-diff", "--no-color", "--stat", "v1..main", "v1..feature"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(
+        masked(&out),
+        "1:  <id> ! 1:  <id> patch one\n\
+         \x20    a => b | 4 ++--\n\
+         \x20    1 file changed, 2 insertions(+), 2 deletions(-)\n\
+         2:  <id> ! 2:  <id> patch two\n\
+         \x20    a => b | 2 +-\n\
+         \x20    1 file changed, 1 insertion(+), 1 deletion(-)\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The honesty guard for the options this port does *not* render: a deferred
 /// option can only be seen through `patch_diff()`, which `output()` calls solely
 /// for a matched pair (range-diff.c:567-573). So a run with no matched pair at
@@ -1062,21 +1094,22 @@ fn a_deferred_option_only_stops_a_run_that_would_render_a_body() {
     let root = scratch("guard");
     let (repo, home) = fixture_pairs(&root);
 
-    // Both ranges non-empty and both pairs matched: `--stat` would replace every
-    // body, and this port does not render one, so it refuses rather than print a
-    // page that ignored the flag.
+    // Both ranges non-empty and both pairs matched: `--compact-summary` would
+    // replace every body with a stat this port does not render -- plain `--stat`
+    // IS rendered now, so the guard is shown with a spelling that is still
+    // deferred -- and it refuses rather than print a page that ignored the flag.
     let (out, err, code) = run(
         &repo,
         &home,
-        &["range-diff", "--no-color", "--stat", "v1..main", "v1..feature"],
+        &["range-diff", "--no-color", "--compact-summary", "v1..main", "v1..feature"],
     );
     assert_eq!(code, 128);
     assert_eq!(out, "");
-    assert_eq!(err, "fatal: unsupported flag \"--stat\"\n");
+    assert_eq!(err, "fatal: unsupported flag \"--compact-summary\"\n");
 
     // One range empty: nothing can match, every commit is a bare `>` header, and
     // the flag provably cannot reach the page.
-    let (out, err, code) = run(&repo, &home, &["range-diff", "--no-color", "--stat", "v1...main"]);
+    let (out, err, code) = run(&repo, &home, &["range-diff", "--no-color", "--compact-summary", "v1...main"]);
     assert_eq!(code, 0, "stderr: {err}");
     assert_eq!(
         masked(&out),
@@ -1092,7 +1125,7 @@ fn a_deferred_option_only_stops_a_run_that_would_render_a_body() {
             "range-diff",
             "--no-color",
             "--creation-factor=0",
-            "--stat",
+            "--compact-summary",
             "v1..main",
             "v1..feature",
         ],

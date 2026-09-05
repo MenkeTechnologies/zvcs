@@ -51,7 +51,16 @@
 //! `-E`/ERE and `-P`/Perl pass through, and `-G`/BRE is translated by swapping
 //! which of `( ) { } + ? |` are escaped. A `{`/`}` that forms no valid interval
 //! is literalised, matching git's POSIX leniency; a genuinely malformed pattern
-//! is the `fatal` (exit 128) git makes of it.
+//! is the `fatal` (exit 128) git makes of it. git itself links two engines and
+//! picks by dialect — `regcomp()` for `-E`/`-G`, PCRE2 for `-P` — and their
+//! grammars are not nested: BRE has backreferences and PCRE2 adds look-around,
+//! `\K`, `\A` and `\Z`, none of which a finite automaton can run. A pattern using
+//! one of those compiles through the backtracking engine instead; see [`Engine`].
+//!
+//! The walk is git's, including `look_ahead()`: each line is reached only if some
+//! pattern still matches the *rest of the buffer* from that line's start, which
+//! is what makes `-P '\A…'` and `-P '…\Z'` bind to the file rather than to the
+//! line they would be reported on. See [`Matcher::buffer_has_match`].
 //!
 //! `<tree>`/revision arguments are searched too: each named tree is walked and
 //! its blobs greped, with git's `<rev>:<path>` naming, path-order output, pathspec
@@ -528,10 +537,6 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // appears, which is what switches matching from the flat OR of the pattern
     // list to evaluating the expression tree.
     let mut extended = false;
-    // Whether any `-e`/`-f`/`--file` was given. git suppresses its "no pattern
-    // given" fatal once one was, even if the file contributed no usable pattern,
-    // so an all-blank `-f` file greps for nothing (exit 1) rather than dying.
-    let mut have_pattern_flag = false;
     // `-A`/`-B`/`-C`/`--after-context`/`--before-context`/`--context`/`-NUM`:
     // the number of trailing and leading lines to show around each match. git
     // sets each component independently (last assignment wins; `-C`/`-NUM` set
@@ -723,7 +728,6 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                         }
                         Err(code) => return Ok(code),
                     }
-                    have_pattern_flag = true;
                 }
                 "heading" => opts.heading = true,
                 "break" => opts.brk = true,
@@ -904,7 +908,6 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     let p = short_value!('e');
                     tokens.push(Tok::Atom(p.clone()));
                     patterns.push(p);
-                    have_pattern_flag = true;
                     c = group.len();
                     continue;
                 }
@@ -919,7 +922,6 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                         }
                         Err(code) => return Ok(code),
                     }
-                    have_pattern_flag = true;
                     c = group.len();
                     continue;
                 }
@@ -945,15 +947,26 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // pattern (it may itself start with `-` when it followed the dropped `--`).
     // git only does this when its whole `pattern_list` is empty, so a bare `(`
     // (which makes the list non-empty) means the pattern must come from `-e`.
-    if patterns.is_empty() && tokens.is_empty() && !rest.is_empty() {
+    if tokens.is_empty() && !rest.is_empty() {
         let p = rest.remove(0);
         tokens.push(Tok::Atom(p.clone()));
         patterns.push(p);
     }
-    // git diagnoses a missing pattern here, before it looks at anything else —
-    // but only when no `-e`/`-f` was given at all. A `-f` file that yielded no
-    // usable pattern still counts as "given", and greps for nothing instead.
-    if patterns.is_empty() && !have_pattern_flag {
+    // `if (!opt.pattern_list) die(_("no pattern given"))` (builtin/grep.c:1245-1246),
+    // before it looks at anything else. The list git tests is not the *patterns* —
+    // `--and`, `--not`, `(` and `)` each `append_grep_pattern()` a token of their
+    // own (`:991-1024`), so an invocation carrying nothing but grammar gets past
+    // this and is diagnosed by `compile_pattern_expr()` instead ("--and not
+    // preceded by pattern expression", "unmatched ( for expression group",
+    // "--not not followed by pattern expression"), which runs after the revisions
+    // have been resolved. `--or` is the exception: it is `OPT_BOOL` into a dummy
+    // (`:1148`) because adjacency already means or, so it appends nothing and a
+    // bare `git grep --or` really is "no pattern given".
+    //
+    // A `-f` file that contributed no line appends nothing either, so it dies here
+    // too — this used to be suppressed by a `have_pattern_flag`, which made
+    // `git grep -f /dev/null` exit 0 in silence where git exits 128.
+    if tokens.is_empty() {
         eprintln!("fatal: no pattern given");
         return Ok(ExitCode::from(128));
     }
@@ -1834,7 +1847,12 @@ fn read_pattern_file(path: &str) -> Result<Vec<String>, ExitCode> {
             .map(|line| String::from_utf8_lossy(line).into_owned())
             .collect()),
         Err(e) => {
-            eprintln!("fatal: cannot open '{path}': {e}");
+            // `die_errno(_("cannot open '%s'"), arg)` (builtin/grep.c:974), whose
+            // reason is `strerror(errno)` — no ` (os error N)` tail.
+            eprintln!(
+                "fatal: cannot open '{path}': {}",
+                crate::external::strerror(&e)
+            );
             Err(ExitCode::from(128))
         }
     }
@@ -3522,8 +3540,50 @@ fn search_file(
         && ev.test(b"").0
         && !lines(content).last().is_some_and(|last| ev.test(last).0);
 
-    for (lno, line) in lines(content).chain(phantom_tail.then_some(&b""[..])).enumerate() {
+    // The other half of `look_ahead()`, and the half that decides how far the walk
+    // gets. Before testing a line it hands every pattern the rest of the buffer
+    // from that line's start, and when none of them matches anywhere in what is
+    // left it returns 1 and `grep_source_1()` breaks out of the walk:
+    //
+    // ```c
+    //         if (earliest < 0) {
+    //                 *bol_p = bol + *left_p;
+    //                 *left_p = 0;
+    //                 return 1;
+    //         }
+    // ```
+    //
+    // For an ordinary pattern that is only a shortcut — a line can match only if
+    // the buffer from its start matches — but an anchored one is not ordinary:
+    // `\A`, `\Z` and `\z` bind to the buffer the look-ahead handed the engine, not
+    // to the line the hit would be reported on. Measured against git 2.55.0:
+    //
+    // ```text
+    // $ printf 'int one\nint two\nend\n' >t   && git grep -nP '\Aint' -- t
+    // t:1:int one
+    // t:2:int two
+    // $ printf 'zzz\nint two\nend\n'   >t2  && git grep -nP '\Aint' -- t2
+    // (nothing — the walk stopped at line 1, so line 2 was never tested)
+    // ```
+    //
+    // `should_lookahead()` (grep.c:1441-1454) turns the mechanism off for `-v` and
+    // for the boolean grammar, and the walk skips it inside a post-context window
+    // or a function body — none of which this renderer has, which is why this and
+    // `phantom_tail` above are both confined to it.
+    let try_lookahead = !opts.invert && ev.expr.is_none();
+
+    let tail: Option<(usize, &[u8])> = phantom_tail.then_some((content.len(), &b""[..]));
+    for (lno, (bol, line)) in lines_with_offsets(content)
+        .into_iter()
+        .chain(tail)
+        .enumerate()
+    {
         if count >= limit {
+            break;
+        }
+        // The phantom line is where a look-ahead *jumped* to rather than a line the
+        // walk reached, so it is not itself gated on one.
+        if try_lookahead && bol < content.len() && !ev.matcher.buffer_has_match(content, bol) {
             break;
         }
         let (matched, col1) = ev.test(line);
@@ -3729,11 +3789,75 @@ fn lines(content: &[u8]) -> impl Iterator<Item = &[u8]> {
         .take(if empty { 0 } else { usize::MAX })
 }
 
-/// A compiled search: the `-e` patterns (OR'd) as one byte regex, plus git's
-/// `-w` word-boundary constraint and the empty-pattern "matches every line" rule.
+/// [`lines`] with each line's byte offset in `content` — git's `bol`, which the
+/// walk carries anyway and which `look_ahead()` needs to know where the rest of
+/// the buffer starts.
+fn lines_with_offsets(content: &[u8]) -> Vec<(usize, &[u8])> {
+    let mut out = Vec::new();
+    if content.is_empty() {
+        return out;
+    }
+    let body = content.strip_suffix(b"\n").unwrap_or(content);
+    let mut start = 0usize;
+    for (i, &b) in body.iter().enumerate() {
+        if b == b'\n' {
+            out.push((start, &body[start..i]));
+            start = i + 1;
+        }
+    }
+    out.push((start, &body[start..]));
+    out
+}
+
+/// The engine a pattern compiled through.
+///
+/// git links two of them and picks by dialect: `regcomp()` for `-E`/`-G` and
+/// PCRE2 for `-P` (`compile_regexp()`, grep.c). Their grammars are not nested —
+/// POSIX BRE has backreferences (`\1`) and PCRE2 adds look-around, `\K`, `\A`
+/// and `\Z` — and none of those can be run by a finite automaton, so the `regex`
+/// crate rejects every one of them at compile time to keep its linear-time
+/// guarantee. A pattern that uses one therefore compiles through the
+/// backtracking engine instead. Which engine ran is not observable in the
+/// output; what was observable before was `fatal: invalid regex` on a pattern
+/// stock git answers.
+enum Engine {
+    /// The byte engine, for every pattern the `regex` crate accepts. git greps
+    /// bytes, so this is the preferred one and carries all the ordinary traffic.
+    Bytes(regex::bytes::Regex),
+    /// The backtracking engine. It matches over `&str`, so a haystack that is not
+    /// valid UTF-8 cannot be searched with it and reports no match — a narrowing
+    /// against PCRE2, which git runs over raw bytes unless the pattern is UTF-8.
+    Fancy(Box<fancy_regex::Regex>),
+}
+
+impl Engine {
+    /// The leftmost match at or after `at`, as `(start, end)` byte offsets.
+    fn find_at(&self, hay: &[u8], at: usize) -> Option<(usize, usize)> {
+        match self {
+            Engine::Bytes(re) => re.find_at(hay, at).map(|m| (m.start(), m.end())),
+            Engine::Fancy(re) => {
+                let text = std::str::from_utf8(hay).ok()?;
+                if !text.is_char_boundary(at) {
+                    return None;
+                }
+                let m = re.find_from_pos(text, at).ok().flatten()?;
+                Some((m.start(), m.end()))
+            }
+        }
+    }
+}
+
+/// A compiled search: the `-e` patterns (OR'd) as one regex, plus git's `-w`
+/// word-boundary constraint and the empty-pattern "matches every line" rule.
 struct Matcher {
     /// `None` when every pattern is empty (then `match_all` carries the result).
-    re: Option<regex::bytes::Regex>,
+    re: Option<Engine>,
+    /// The same alternation compiled for a whole-buffer haystack, which is what
+    /// git's `look_ahead()` (grep.c:1456) searches. git compiles its patterns
+    /// with `REG_NEWLINE`/`PCRE2_MULTILINE` (grep.c:300), so `^` and `$` are line
+    /// anchors there while the per-line haystack makes them subject anchors —
+    /// hence a second compilation rather than a second use of `re`.
+    buf_re: Option<Engine>,
     word: bool,
     /// An empty `-e` pattern matches all lines (git's documented behaviour).
     match_all: bool,
@@ -3743,36 +3867,28 @@ impl Matcher {
     fn build(patterns: &[String], dialect: Dialect, ignore_case: bool, word: bool) -> Result<Self> {
         let match_all = patterns.iter().any(|p| p.is_empty());
         let nonempty: Vec<&String> = patterns.iter().filter(|p| !p.is_empty()).collect();
-        let re = if nonempty.is_empty() {
-            None
+        let (re, buf_re) = if nonempty.is_empty() {
+            (None, None)
         } else {
             let combined = nonempty
                 .iter()
                 .map(|p| Ok(format!("(?:{})", translate_pattern(p, dialect)?)))
                 .collect::<Result<Vec<_>>>()?
                 .join("|");
-            let compile = |pat: &str| {
-                regex::bytes::RegexBuilder::new(pat)
-                    .case_insensitive(ignore_case)
-                    .unicode(false) // git greps bytes, not scalar values
-                    .build()
-            };
-            match compile(&combined) {
-                Ok(re) => Some(re),
-                // git's POSIX engine treats a `{`/`}` that does not form a valid
-                // interval as a literal; the regex crate rejects it. Recover that
-                // leniency by literalising braces and retrying — a genuine error
-                // (an unmatched `(` or `[`) still fails and surfaces as fatal.
-                Err(_) => {
-                    let lenient = combined.replace('{', "\\{").replace('}', "\\}");
-                    Some(
-                        compile(&lenient)
-                            .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?,
-                    )
-                }
-            }
+            (
+                Some(compile_engine(&combined, ignore_case, false)?),
+                // A failure here cannot happen once the line engine compiled —
+                // same pattern, one flag apart — but it is reported the same way
+                // rather than unwrapped.
+                Some(compile_engine(&combined, ignore_case, true)?),
+            )
         };
-        Ok(Self { re, word, match_all })
+        Ok(Self {
+            re,
+            buf_re,
+            word,
+            match_all,
+        })
     }
 
     /// The next match in `line` at or after `at`, as `(start, len)`. Ties go to
@@ -3787,8 +3903,7 @@ impl Matcher {
         let re = self.re.as_ref()?;
         let mut from = at;
         loop {
-            let m = re.find_at(line, from)?;
-            let (s, e) = (m.start(), m.end());
+            let (s, e) = re.find_at(line, from)?;
             if !self.word || word_bounded(line, s, e) {
                 return Some((s, e - s));
             }
@@ -3799,6 +3914,58 @@ impl Matcher {
             }
         }
     }
+
+    /// Whether any pattern still matches somewhere in `content` at or after `bol`
+    /// — the question git's `look_ahead()` asks of the rest of the buffer.
+    ///
+    /// It calls `patmatch()` directly, below the `-w` and `-v` handling in
+    /// `match_one_pattern()`, so the word constraint is deliberately not applied
+    /// here either: a raw hit is enough to keep the walk going, and the line it
+    /// lands on is then judged by the ordinary per-line test.
+    fn buffer_has_match(&self, content: &[u8], bol: usize) -> bool {
+        if self.match_all {
+            return true;
+        }
+        match self.buf_re.as_ref() {
+            Some(re) => bol <= content.len() && re.find_at(content, bol).is_some(),
+            None => false,
+        }
+    }
+}
+
+/// Compile one alternation, taking git's two engines in the order git's two
+/// grammars allow.
+///
+/// `multi_line` asks for the `REG_NEWLINE`/`PCRE2_MULTILINE` reading of `^`/`$`,
+/// which git's compile sets and which only matters for the whole-buffer haystack
+/// [`Matcher::buffer_has_match`] searches.
+fn compile_engine(pattern: &str, ignore_case: bool, multi_line: bool) -> Result<Engine> {
+    let bytes = |pat: &str| {
+        regex::bytes::RegexBuilder::new(pat)
+            .case_insensitive(ignore_case)
+            .unicode(false) // git greps bytes, not scalar values
+            .multi_line(multi_line)
+            .build()
+    };
+    if let Ok(re) = bytes(pattern) {
+        return Ok(Engine::Bytes(re));
+    }
+    // git's POSIX engine treats a `{`/`}` that does not form a valid interval as
+    // a literal; the regex crate rejects it. Recover that leniency by literalising
+    // braces and retrying.
+    let lenient = pattern.replace('{', "\\{").replace('}', "\\}");
+    if let Ok(re) = bytes(&lenient) {
+        return Ok(Engine::Bytes(re));
+    }
+    // Neither spelling is a finite automaton, so the pattern is either one of the
+    // backtracking-only constructs or genuinely malformed. The second engine
+    // decides which, and its message is the one reported for the malformed case.
+    fancy_regex::RegexBuilder::new(pattern)
+        .case_insensitive(ignore_case)
+        .multi_line(multi_line)
+        .build()
+        .map(|re| Engine::Fancy(Box::new(re)))
+        .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))
 }
 
 /// Translate a pattern in `dialect` into the byte-regex syntax the `regex` crate

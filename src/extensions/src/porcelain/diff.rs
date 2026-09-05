@@ -315,6 +315,13 @@ struct IgnoreOpts {
     /// `-a`/`--text`: `DIFF_OPT_TEXT`, which diffs content git would otherwise
     /// report as `Binary files ... differ`.
     text: bool,
+    /// `-D`/`--irreversible-delete` (`o->irreversible_delete`). It travels with the
+    /// knobs above because `emit_rewrite_diff()` (diff.c:1938-1951) reads it while
+    /// it *builds* the hunk, not while the hunk is emitted: a `-B` rewrite's header
+    /// says `@@ -?,?` instead of the pre-image line count and its `-` lines are
+    /// never produced. The other half of the flag — a real deletion stopping at its
+    /// header — is a render-time test and lives in [`Render`].
+    irreversible_delete: bool,
 }
 
 /// `diff_opt_output`'s `xfopen(arg, "w")`: create or truncate the file the whole diff
@@ -579,6 +586,21 @@ impl Delta {
         !matches!(self.new, NewSide::Absent)
     }
 
+    /// Whether the pair's two filespecs name different files, which is a weaker
+    /// question than [`Delta::renamed`] and the one the name-printing formats ask.
+    ///
+    /// `diff_flush_stat()` derives the diffstat's `is_renamed` from the paths alone
+    /// — `other = strcmp(name, p->two->path) ? p->two->path : NULL`, and
+    /// `diffstat_add()` (diff.c:2474-2477) sets the flag for a non-NULL `other` —
+    /// and `diff_flush_raw()` (diff.c:5859) prints `p->one->path` for any pair whose
+    /// pre-image has a mode. Every pair a tree, index or worktree walk produces has
+    /// one path, so this and `renamed()` agree there; they part company on the pair
+    /// `builtin_diff_blobs()` queues from two operands that named different files
+    /// without any rename having been detected.
+    fn two_names(&self) -> bool {
+        self.old_path() != &self.path
+    }
+
     /// `true` for a rename or copy, i.e. a pair whose two sides have different paths.
     fn renamed(&self) -> bool {
         matches!(self.status, b'R' | b'C')
@@ -638,6 +660,125 @@ impl Delta {
             NewSide::Blob(_, k) | NewSide::Worktree(k) => k == EntryKind::Commit,
         };
         old_ok && new_ok && (self.old.is_some() || self.new_valid())
+    }
+}
+
+/// `is_submodule_ignored()` (diff.c:7572-7583): whether a gitlink pair is dropped
+/// before `diffcore_std()` ever sees it.
+///
+/// ```c
+/// static int is_submodule_ignored(const char *path, struct diff_options *options)
+/// {
+///         int ignored = 0;
+///         struct diff_flags orig_flags = options->flags;
+///         if (!options->flags.override_submodule_config)
+///                 set_diffopt_flags_from_submodule_config(options, path);
+///         if (options->flags.ignore_submodules)
+///                 ignored = 1;
+///         options->flags = orig_flags;
+///         return ignored;
+/// }
+/// ```
+///
+/// The per-path half is `set_diffopt_flags_from_submodule_config()`
+/// (submodule.c:180-200): it finds the submodule whose `.gitmodules` `path` is this
+/// one, reads `submodule.<name>.ignore` from the superproject config and falls back
+/// to the `.gitmodules` value, and feeds whichever it found back through
+/// `handle_ignore_submodules_arg()`. A submodule with no `ignore` anywhere leaves
+/// the flags exactly as the command line and `diff.ignoreSubmodules` set them.
+#[derive(Default)]
+struct SubmoduleIgnore {
+    /// `options->flags.ignore_submodules`, as `diff.ignoreSubmodules` and
+    /// `--ignore-submodules[=<when>]` left it. Only `all` raises it.
+    default_all: bool,
+    /// `options->flags.override_submodule_config`, which only the command-line flag
+    /// sets — and which makes the whole `.gitmodules` lookup below never happen.
+    overridden: bool,
+    /// Each `.gitmodules` path whose submodule names an `ignore` value, and whether
+    /// that value is `all`. A path absent here is a submodule that names none.
+    per_path: std::collections::HashMap<BString, bool>,
+}
+
+impl SubmoduleIgnore {
+    /// Read `.gitmodules` once, the way `repo_read_gitmodules()` does lazily on the
+    /// first gitlink. Skipped entirely under `override_submodule_config`, which is
+    /// what keeps `git diff --ignore-submodules=none` from touching the file at all.
+    fn load(&mut self, repo: &gix::Repository, deltas: &[Delta]) -> Option<ExitCode> {
+        if self.overridden {
+            return None;
+        }
+        // `repo_read_gitmodules()` is reached from `submodule_from_path()`, which
+        // `is_submodule_ignored()` calls for a gitlink pair and for nothing else —
+        // so a repository whose diff holds no gitlink never opens the file, and a
+        // `.gitmodules` git cannot read is not an error there.
+        if !deltas.iter().any(Self::queued_as_gitlink) {
+            return None;
+        }
+        // `config_from_gitmodules()` (submodule-config.c:784-808) hands the worktree
+        // `.gitmodules` to the ordinary config reader, named by
+        // `repo_worktree_path()` — an absolute path. A line the parser refuses is
+        // therefore `git_parse_source()`'s own
+        // `die("bad config line %d in file %s")`, raised in the middle of the diff.
+        if let Some(wd) = repo.workdir() {
+            let file = wd.join(".gitmodules");
+            if let Ok(bytes) = std::fs::read(&file) {
+                if let Some(line) = crate::config::first_bad_config_line(&bytes) {
+                    // `repo_worktree_path()` builds `repo->worktree` + `/.gitmodules`,
+                    // and `repo->worktree` is the resolved absolute path setup left
+                    // behind — not the relative `.` discovery walked from.
+                    let shown = std::fs::canonicalize(&file).unwrap_or(file);
+                    eprintln!("fatal: bad config line {line} in file {}", shown.display());
+                    return Some(ExitCode::from(128));
+                }
+            }
+        }
+        let Ok(Some(subs)) = repo.submodules() else {
+            return None;
+        };
+        let snap = repo.config_snapshot();
+        for sub in subs {
+            let Ok(path) = sub.path() else { continue };
+            let key = format!("submodule.{}.ignore", sub.name());
+            let ignore = match snap.string(key.as_str()) {
+                Some(v) => v.as_bstr() == "all",
+                None => match sub.ignore() {
+                    Ok(Some(v)) => v == gix::submodule::config::Ignore::All,
+                    _ => continue,
+                },
+            };
+            self.per_path.insert(path.into(), ignore);
+        }
+        None
+    }
+
+    fn ignored(&self, path: &BString) -> bool {
+        if self.overridden {
+            return self.default_all;
+        }
+        self.per_path.get(path).copied().unwrap_or(self.default_all)
+    }
+
+    /// Whether `is_submodule_ignored()` is consulted for this pair at all: the two
+    /// shapes whose `S_ISGITLINK` test in `diff_queue_addremove()` (diff.c:7610) and
+    /// `diff_queue_change()` (diff.c:7663-7664) passes.
+    fn queued_as_gitlink(d: &Delta) -> bool {
+        let old_gitlink = matches!(d.old, Some((_, EntryKind::Commit)));
+        let new_gitlink = match d.new {
+            NewSide::Absent => false,
+            NewSide::Blob(_, k) | NewSide::Worktree(k) => k == EntryKind::Commit,
+        };
+        match (d.old.is_some(), matches!(d.new, NewSide::Absent)) {
+            // `diff_queue_addremove()`: one mode, and it is the surviving side.
+            (false, false) => new_gitlink,
+            (true, true) => old_gitlink,
+            // `diff_queue_change()` wants *both*.
+            _ => old_gitlink && new_gitlink,
+        }
+    }
+
+    /// Whether this pair is one git refuses to queue.
+    fn drops(&self, d: &Delta) -> bool {
+        Self::queued_as_gitlink(d) && self.ignored(&d.path)
     }
 }
 
@@ -1064,6 +1205,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         return super::diff_no_index::run(args);
     }
     let mut cached = false;
+    // `revs->max_count`, as `--base`/`--ours`/`--theirs` set it. `None` is git's
+    // `-1`: stage 2 is compared and the combined diff is free.
+    let mut unmerged_stage: Option<u8> = None;
     let mut ctx: u32 = 3;
     let mut ws = Whitespace::Keep;
     let mut fmt: u32 = 0;
@@ -1126,6 +1270,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // its option scan: an `add -N` entry is a *creation* to the index-vs-worktree
     // walk rather than a modification of the empty blob it stands in for.
     let mut ita_invisible = true;
+    // `flags.ignore_submodules` / `flags.override_submodule_config`, which
+    // `is_submodule_ignored()` (diff.c:7572-7583) reads for every gitlink pair.
+    let mut ignore_submodules = SubmoduleIgnore::default();
     // `--dirstat`'s parameter block (`struct dirstat_opts`), shared with the
     // `diff-files`/`diff-index` port that renders it.
     let mut dirstat = super::diff_files::DirStat::default();
@@ -1140,6 +1287,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // whole queue. On its own it has no effect on the output and is kept only so
     // `diff_setup_done()`'s objfind conflict can be raised.
     let mut pickaxe_all = false;
+    // `--cc` on the command line: `revs->dense_combined_merges`, checked against the
+    // output format once the whole scan is done — see the option's own arm.
+    let mut cc = false;
     // `o->pickaxe` and the `DIFF_PICKAXE_KIND_*` bit, as typed: the kind letter and
     // the raw pattern. Compiled after the scan, since `--pickaxe-regex` may follow
     // the `-S` it promotes and `diff_setup_done()`'s conflicts outrank a bad regex.
@@ -1357,6 +1507,28 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // on the command line simply overwrites it below.
         if let Some(p) = snap.string("diff.orderFile") {
             order_file = Some(p.to_str_lossy().into_owned());
+        }
+        // `diff.ignoreSubmodules` (diff.c:448-451) hands the value straight to
+        // `handle_ignore_submodules_arg(&default_diff_options, value)`, which
+        // `repo_diff_setup()` then copies into every `diff_options`. It does *not*
+        // raise `override_submodule_config` — that bit belongs to the command-line
+        // flag alone — so a `.gitmodules` `submodule.<name>.ignore` still wins
+        // per path. An unparsable value is `crate::diff_config`'s fatal, before
+        // this verb runs.
+        if let Some(v) = snap.string("diff.ignoreSubmodules") {
+            ignore_submodules.default_all = v.as_bstr() == "all";
+        }
+        // `diff.dirstat` (diff.c:521-532, inside `git_diff_basic_config()`): the
+        // parsed parameters land in `default_diff_options`/`diff_dirstat_permille_
+        // default`, which `repo_diff_setup()` copies into every fresh
+        // `diff_options` (diff.c:5138,5150) *before* parse-options runs. So the
+        // config picks the damage model and the cut-off, and a later
+        // `--dirstat=<params>` refines that rather than restarting from git's
+        // built-in defaults. The parse errors are not reported again here:
+        // `crate::diff_config` already wrote the one `warning()` git writes while
+        // the config file is read.
+        if let Some(v) = snap.string("diff.dirstat") {
+            let _ = super::diff_files::parse_dirstat_params(&v.to_str_lossy(), &mut dirstat);
         }
         // `diff.statNameWidth`/`diff.statGraphWidth` cap the `--stat` name/graph
         // columns (`git_diff_ui_config()` -> `diff_stat_name_width` /
@@ -1675,6 +1847,18 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 quiet = true;
                 want_exit_code = true;
             }
+            // `builtin_diff_files()` (builtin/diff.c:252-273) scans the arguments
+            // `setup_revisions()` left behind and turns these three into
+            // `revs->max_count`, which `run_diff_files()` reads as
+            // `diff_unmerged_stage`: the conflict stage the *second* pair of an
+            // unmerged path is taken from. Setting it also takes `max_count` off
+            // `-1`, which is what suppresses the free combined diff
+            // (`diff_merges_set_dense_combined_if_unset()`, builtin/diff.c:280-282)
+            // — so `git diff --ours` prints `* Unmerged path` and a two-way patch
+            // where plain `git diff` prints one `diff --cc` section.
+            "--base" => unmerged_stage = Some(1),
+            "--ours" => unmerged_stage = Some(2),
+            "--theirs" => unmerged_stage = Some(3),
             "--full-index" => full_index = true,
             // `diff_opt_binary()` (diff.c:5613) is not a plain flag: it calls
             // `enable_patch_output()` first, so `--binary` turns the patch on and
@@ -1797,7 +1981,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // header of a pair whose post-image label is `/dev/null` and jumps to the
             // end, so a deletion loses its `---`/`+++` pair and its hunks. The other
             // formats never see the flag.
-            "-D" | "--irreversible-delete" => irreversible_delete = true,
+            "-D" | "--irreversible-delete" => {
+                irreversible_delete = true;
+                ignore.irreversible_delete = true;
+            }
             // `diffcore_rotate()` (diff.c:6763): `--skip-to` drops every pair before
             // the named one, `--rotate-to` wraps them to the end. Both are
             // `OPT_STRING`, so the value may stand as the next argument, and the last
@@ -1918,7 +2105,29 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             }
             "--ws-error-highlight" => pending_value = Some(a.to_string()),
-            s if s == "--ignore-submodules" || s.starts_with("--ignore-submodules=") => {}
+            // `--ignore-submodules[=<when>]` (`diff_opt_ignore_submodules()`,
+            // diff.c:5773-5787): the bare form means `all`, the flag raises
+            // `flags.override_submodule_config` so the per-submodule `.gitmodules`
+            // setting is skipped entirely, and `handle_ignore_submodules_arg()`
+            // (submodule.c:429-444) `die()`s on anything but the four known words.
+            "--ignore-submodules" => {
+                ignore_submodules.overridden = true;
+                ignore_submodules.default_all = true;
+            }
+            s if s.starts_with("--ignore-submodules=") => {
+                ignore_submodules.overridden = true;
+                match &s["--ignore-submodules=".len()..] {
+                    "all" => ignore_submodules.default_all = true,
+                    // `untracked` and `dirty` only relax what counts as a
+                    // *modification* of a checked-out submodule; the gitlink pair
+                    // itself stays in the queue, as does `none`'s.
+                    "none" | "untracked" | "dirty" => ignore_submodules.default_all = false,
+                    v => {
+                        eprintln!("fatal: bad --ignore-submodules argument: {v}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
             // `--submodule[=<format>]` (`diff_opt_submodule()`, diff.c:5916): the
             // bare form is `log`, not `short`.
             "--submodule" => submodule_format = SubmoduleFormat::Log,
@@ -2143,6 +2352,26 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // block on **stderr** at 129 with no `error:` line — diff never
             // routes it to stdout, unlike the parse_options porcelain.
             "-h" => return Ok(usage_error()),
+            // `--cc` raises `revs->combine_merges`/`dense_combined_merges`, which
+            // `builtin_diff_files()` raises for itself anyway on the shape this port
+            // renders:
+            //
+            // ```c
+            //         if (revs->max_count == -1 &&
+            //             (revs->diffopt.output_format & DIFF_FORMAT_PATCH))
+            //                 diff_merges_set_dense_combined_if_unset(revs);
+            // ```
+            //
+            // (builtin/diff.c:279-281). So on a patch-format worktree diff with no
+            // `--base`/`--ours`/`--theirs` the flag asks for what is already set, and
+            // it is a no-op — that combined patch of an unmerged path is what a plain
+            // `git diff` prints too. Off that shape it is *not* a no-op:
+            // `run_diff_files()` routes every unmerged path through
+            // `show_combined_diff()` instead of queueing the ordinary pair, so
+            // `--cc --raw` prints `::`-prefixed combined records and `--cc --stat`
+            // prints nothing at all. Neither is ported; [`cc`]'s check below refuses
+            // those rather than answering them with the uncombined records.
+            "--cc" => cc = true,
             // `--pickaxe-all` is `DIFF_OPT_PICKAXE_ALL`, and on its own it changes
             // nothing: `diffcore_pickaxe()` reads it only once a pickaxe kind is
             // set, so `git diff --pickaxe-all` is a plain diff (measured against
@@ -2209,7 +2438,29 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                             // exactly like `git diff $(git merge-base A B) B`.
                             // `a` and `b` are already what
                             // `lookup_commit_reference()` peeled the endpoints to.
-                            let base = repo.merge_base(a, b)?.detach();
+                            //
+                            // `symdiff_prepare()` (builtin/diff.c:317-390) counts the
+                            // `REV_CMD_MERGE_BASE` entries `handle_dotdot_1()` pended
+                            // and reads the answer off that count: none at all is
+                            // `die(_("%s...%s: no merge base"), sym->left,
+                            // sym->right)` naming the endpoints *as typed*, and more
+                            // than one keeps `rev->pending.objects[basepos]` — the
+                            // first — while `cmd_diff()` (builtin/diff.c:635-637)
+                            // warns which one it settled on, spelled as the full
+                            // object name that pending entry carries.
+                            let bases = repo.merge_bases_many(a, &[b])?;
+                            let Some(base) = bases.first().map(|id| id.detach()) else {
+                                eprintln!("fatal: {}...{}: no merge base", range.a, range.b);
+                                return Ok(ExitCode::from(128));
+                            };
+                            if bases.len() > 1 {
+                                eprintln!(
+                                    "warning: {}...{}: multiple merge bases, using {}",
+                                    range.a,
+                                    range.b,
+                                    base.to_hex()
+                                );
+                            }
                             revs.push(base.to_hex().to_string());
                         } else {
                             revs.push(range.a.to_owned());
@@ -2240,7 +2491,19 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         // `verify_non_filename()`: a name that is simultaneously a
                         // revision and a working-tree path is refused outright rather
                         // than guessed at.
-                        if std::fs::symlink_metadata(bare).is_ok() {
+                        //
+                        // ```c
+                        // if (!cant_be_filename)
+                        //         verify_non_filename(the_repository, revs->prefix, arg);
+                        // ```
+                        // (revision.c:2227-2228, with `cant_be_filename =
+                        // revarg_opt & REVARG_CANNOT_BE_FILENAME` at 2158 and
+                        // `setup_revisions()` raising that bit for the whole line the
+                        // moment its pre-scan finds a `--`, revision.c:3036-3037.) A
+                        // separator anywhere therefore settles the question before it
+                        // is asked: `git diff dual --` diffs the branch, where plain
+                        // `git diff dual` refuses to guess.
+                        if !seen_dashdash && std::fs::symlink_metadata(bare).is_ok() {
                             eprintln!(
                                 "fatal: ambiguous argument '{bare}': both revision and filename"
                             );
@@ -2426,7 +2689,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `revs` holds names already resolved (and already warned about) in the
     // operand loop above, so warning again here made `git diff <40-hex-ref>` say
     // twice what stock says once.
-    let mut blobs = 0usize;
+    let mut blob_ops: Vec<BlobOperand> = Vec::new();
     let mut trees = 0usize;
     for name in &revs {
         let Some(id) = crate::objname::resolve_quiet(&repo, name) else {
@@ -2444,26 +2707,56 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `repo_get_commit_tree()`: a commit *is* its tree from here on.
             gix::object::Kind::Commit | gix::object::Kind::Tree => trees += 1,
             gix::object::Kind::Blob => {
-                if blobs >= 2 {
+                if blob_ops.len() >= 2 {
                     crate::git_fatal!("more than two blobs given: '{name}'");
                 }
-                blobs += 1;
+                blob_ops.push(blob_operand(&repo, name, peeled.id));
             }
             gix::object::Kind::Tag => crate::git_fatal!("unhandled object '{name}' given."),
         }
     }
-    if blobs > 0 {
+    // `builtin_diff_blobs()` (builtin/diff.c:111-134): two blob operands and no
+    // pathspec, queued as one pair and run through the ordinary diffcore.
+    let mut blob_pair: Option<Delta> = None;
+    let mut blob_run = false;
+    if !blob_ops.is_empty() {
         // `paths` is `rev.prune_data.nr`, the pathspec elements — the `--`-separated
         // tail included, which is why this is read after `trailing_paths` merged in.
-        let two_blobs_no_path = trees == 0 && blobs == 2 && paths.is_empty();
-        let blob_vs_file = trees == 0 && blobs == 1 && paths.len() == 1;
+        let two_blobs_no_path = trees == 0 && blob_ops.len() == 2 && paths.is_empty();
+        let blob_vs_file = trees == 0 && blob_ops.len() == 1 && paths.len() == 1;
         if !two_blobs_no_path && !blob_vs_file {
             return Ok(usage_error());
         }
-        // The two arms that *would* have rendered: `builtin_diff_blobs()` and
-        // `builtin_diff_b_f()`. Neither is ported, so they are refused rather than
-        // approximated with the tree machinery below, which cannot express them.
-        bail!("unsupported: diff of a blob operand");
+        if blob_vs_file {
+            // `builtin_diff_b_f()` (builtin/diff.c:76-109) — a blob against a file in
+            // the worktree — is not ported, and is refused rather than approximated
+            // with the tree machinery below, which cannot express it.
+            bail!("unsupported: diff of a blob against a working-tree file");
+        }
+        blob_run = true;
+        let (one, two) = (&blob_ops[0], &blob_ops[1]);
+        // ```c
+        //         if (!is_null_oid(old_oid) && !is_null_oid(new_oid) &&
+        //             oideq(old_oid, new_oid) && (old_mode == new_mode))
+        //                 return;
+        // ```
+        //
+        // `stuff_change()` (builtin/diff.c:53-55) queues nothing for two names of
+        // the same content, so the run prints nothing and exits 0.
+        if !(one.id == two.id && one.kind == two.kind) {
+            let mut d = Delta::plain(
+                two.path.clone(),
+                Some((one.id, one.kind)),
+                NewSide::Blob(two.id, two.kind),
+            );
+            // git's two filespecs carry a path each — `blob_path()`, which is the
+            // operand's `oc.path` or, for a raw object name, the name itself — so a
+            // pair naming two different paths renders `a/<one>` against `b/<two>`.
+            if one.path != two.path {
+                d.src_path = Some(one.path.clone());
+            }
+            blob_pair = Some(d);
+        }
     }
 
     // Apply the `diff.algorithm` default only when no `--minimal`/`--histogram`/
@@ -2503,6 +2796,18 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // there — which is why `git diff --check` prints checkdiff lines and no patch.
     if fmt == 0 && !check {
         fmt = F_PATCH;
+    }
+
+    // `--cc`'s one supported shape, now that the format is settled: exactly the one
+    // `builtin_diff_files()` would have set the same two flags for on its own — the
+    // patch format and no `--base`/`--ours`/`--theirs`. There the flag asks for what
+    // is already true and changes nothing. Any other shape reaches
+    // `run_diff_files()` with `revs->combine_merges` set where this port leaves it
+    // clear, which sends every unmerged path through `show_combined_diff()` — a
+    // renderer this port has only for the patch format — so it is refused rather
+    // than answered with the uncombined records that would otherwise come out.
+    if cc && (unmerged_stage.is_some() || fmt != F_PATCH) {
+        bail!("unsupported option \"--cc\" outside a plain patch of the working tree");
     }
 
     // `builtin_diff_tree()` (builtin/diff.c:196):
@@ -2620,6 +2925,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         fmt &= F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_SUMMARY | F_DIRSTAT;
     }
 
+    // `--base`/`--ours`/`--theirs` are read by `builtin_diff_files()` alone
+    // (builtin/diff.c:252). The other three entry points scan the same leftover
+    // arguments with their own loops — `builtin_diff_index()` accepts only
+    // `--cached`/`--merge-base`, `builtin_diff_tree()` only `-m` — and every one of
+    // them answers an unknown leading `-` with `usage(builtin_diff_usage)`.
+    if unmerged_stage.is_some() && (cached || !revs.is_empty()) {
+        return Ok(usage_error());
+    }
+
     // ---- collect the normalized change list -------------------------------
     let hash_kind = repo.object_hash();
     let mut deltas: Vec<Delta> = Vec::new();
@@ -2629,7 +2943,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // pairs git's tree walk emits under `DIFF_OPT_FIND_COPIES_HARDER`.
     let mut old_tree_id: Option<ObjectId> = None;
 
-    if cached {
+    if blob_run {
+        // `builtin_diff_blobs()` queues the one pair itself and goes straight to
+        // `diffcore_std()`/`diff_flush()`; there is no tree, index or worktree to
+        // walk, and no pathspec — the arity check above already refused one. Two
+        // names for the same content queue nothing at all, which is an empty diff
+        // and exit 0.
+        deltas.extend(blob_pair.take());
+        cache = repo.diff_resource_cache_for_tree_diff()?;
+    } else if cached {
         // No second revision can reach here: `cmd_diff()`'s `--cached` arity check
         // above returns `usage_error()` (129) for `revs.len() >= 2` before any of this
         // runs, so the tree-vs-index collection below always has exactly one endpoint.
@@ -2655,7 +2977,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             old_tree_id = Some(tree_id_for(&repo, revs.first())?);
             collect_tree_worktree(&repo, &revs[0], &paths, &mut deltas)?;
         } else {
-            collect_index_worktree(&repo, &workdir, &paths, &mut deltas, ita_invisible)?;
+            collect_index_worktree(
+                &repo,
+                &workdir,
+                &paths,
+                &mut deltas,
+                ita_invisible,
+                unmerged_stage,
+            )?;
         }
         // The side the platform resolves by *reading the path* rather than by id.
         // `-R` swaps the two filespecs, so the worktree side becomes the pre-image
@@ -2683,6 +3012,18 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         let specs = super::log::PathspecMatcher::new(&repo, &paths)?;
         deltas.retain(|d| specs.matches(&d.path));
     }
+
+    // `diff_queue_addremove()` (diff.c:7610) drops a creation or deletion whose one
+    // side is a gitlink, and `diff_queue_change()` (diff.c:7663-7665) drops a change
+    // whose *both* sides are — in each case only when `is_submodule_ignored()` says
+    // so. A gitlink replaced by a blob (or the reverse) therefore survives whatever
+    // `--ignore-submodules` says, because one of its two modes is not a gitlink.
+    // Both sit inside the tree walk, so the pathspec has already had its say and
+    // the `o->prefix` (`--relative`) test below has not.
+    if let Some(code) = ignore_submodules.load(&repo, &deltas) {
+        return Ok(code);
+    }
+    deltas.retain(|d| !ignore_submodules.drops(d));
 
     // `--relative[=<path>]` narrows the change list to what lives under the
     // prefix. The names are shortened later, once every side has been read:
@@ -3131,10 +3472,37 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     if check && combined {
         return Ok(ExitCode::SUCCESS);
     }
-    if check {
+    // `--quiet` is `flags.quick`, and `diff_setup_done()` acts on it *after* the
+    // `--name-only`/`--name-status`/`--check`/`-s` conflict test: it assigns
+    // `output_format = DIFF_FORMAT_NO_OUTPUT` outright (diff.c:5348-5353), so the
+    // checkdiff format is gone by the time `diff_flush()` runs. `git diff --check
+    // --quiet` therefore prints nothing and never contributes `diff_result_code()`'s
+    // `02` bit — it falls through to the ordinary silent path below, whose exit
+    // status is the `01` bit `flags.quick` also turned on.
+    if check && !quiet {
         let mut found = false;
+        // `diff_flush()` (diff.c:7203-7216) runs checkdiff through the same loop as
+        // the raw and name formats, so `diff_from_contents` filters its pairs the
+        // same way: each is rendered quietly first, dropped when it reports nothing,
+        // and the ones that survive set `o->found_changes`.
+        let mut found_changes = false;
+        let mut scratch: Vec<u8> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
         for (delta, analysis) in deltas.iter().zip(analyses.iter()) {
+            if from_contents {
+                if !pair_reports_change(
+                    &mut scratch,
+                    &repo,
+                    delta,
+                    analysis,
+                    ctx,
+                    &r,
+                    submodule_format,
+                )? {
+                    continue;
+                }
+                found_changes = true;
+            }
             found |= report_whitespace_to(&mut buf, delta, analysis, ws_rule, &colors);
         }
         // `checkdiff_consume()` writes through `emit_line()` like every other
@@ -3142,11 +3510,23 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         let buf = apply_line_prefix(buf, &line_prefix);
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(&buf);
-        return Ok(if found {
-            ExitCode::from(2)
-        } else {
-            ExitCode::SUCCESS
-        });
+        // `diff_result_code()` (diff.c:7536-7556) ORs two independent bits: `01` for
+        // `--exit-code` with changes, `02` for a checkdiff that found a whitespace
+        // error. `git diff --exit-code --check` on a dirty tree exits 3, not 2.
+        let mut code = 0u8;
+        if want_exit_code
+            && (if from_contents {
+                found_changes
+            } else {
+                !deltas.is_empty()
+            })
+        {
+            code |= 1;
+        }
+        if found {
+            code |= 2;
+        }
+        return Ok(ExitCode::from(code));
     }
 
     // ---- render, in `diff_flush()` order ----------------------------------
@@ -3178,7 +3558,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 if fmt & (F_RAW | F_NAME_STATUS) != 0 {
                     // The quiet render above is `run_diff()`, so it has already left
                     // `diff_fill_oid_info()`'s hash on a worktree side.
-                    render_raw(&mut out, delta, fmt, &r, names_need_patch.then(|| &analyses[i]));
+                    render_raw(
+                        &mut out,
+                        &repo,
+                        delta,
+                        fmt,
+                        &r,
+                        names_need_patch.then(|| &analyses[i]),
+                    );
                 } else {
                     out.extend_from_slice(&name_field(&delta.path, r.z));
                     out.push(if r.z { 0 } else { b'\n' });
@@ -3261,8 +3648,20 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // the raw/name/stat formats above print both. The patch format prints
             // only the combined (`--cc`) patch for such a path; the duplicate pair
             // contributes no `diff --git` section of its own.
-            let unmerged: BTreeSet<&BString> =
-                deltas.iter().filter(|d| d.unmerged).map(|d| &d.path).collect();
+            // …but only while `revs->combine_merges` is on. `run_diff_files()`
+            // (diff-lib.c:210-214) emits the combined section and `continue`s
+            // *before* `diff_unmerge()`, so the second pair does not exist at all
+            // there; with `--base`/`--ours`/`--theirs` the free combined diff is
+            // never armed and both pairs reach the patch — a `* Unmerged path`
+            // marker followed by an ordinary `diff --git` section.
+            let unmerged: BTreeSet<&BString> = match unmerged_stage {
+                Some(_) => BTreeSet::new(),
+                None => deltas
+                    .iter()
+                    .filter(|d| d.unmerged)
+                    .map(|d| &d.path)
+                    .collect(),
+            };
             // The whole patch is assembled uncolored and then re-emitted in one
             // pass through git's `fn_out_consume()` chain, carrying each pair's own
             // whitespace state so the blank-at-EOF check never leaks from one file
@@ -3742,14 +4141,23 @@ fn run_diffcore_rename(
             held.push(d);
             continue;
         }
+        // `p->one->path`, which is `p->two->path` for every pair a tree, index or
+        // worktree walk produces and a different name only for a pair queued with two
+        // of them — `builtin_diff_blobs()`'s `git diff <blob> <blob>`. The pre-image
+        // spec has to carry that name or the rename pass hands it back renamed to the
+        // post-image's.
         let one = match d.old {
             Some((id, k)) => {
-                let mut spec =
-                    diffcore_rename::FileSpec::new(d.path.clone(), kind_mode(k), id, !d.old_worktree);
+                let mut spec = diffcore_rename::FileSpec::new(
+                    d.old_path().clone(),
+                    kind_mode(k),
+                    id,
+                    !d.old_worktree,
+                );
                 spec.dirty_submodule = d.old_dirty_submodule;
                 q.add_spec(spec)
             }
-            None => q.add_spec(diffcore_rename::FileSpec::absent(d.path.clone())),
+            None => q.add_spec(diffcore_rename::FileSpec::absent(d.old_path().clone())),
         };
         if d.old_worktree {
             old_worktree_specs.insert(one);
@@ -4047,6 +4455,71 @@ fn collect_tree_worktree(
     Ok(())
 }
 
+/// One blob operand of `git diff <blob> <blob>`, as `cmd_diff()` files it into
+/// its `blob[]` array (builtin/diff.c:583-589).
+struct BlobOperand {
+    id: ObjectId,
+    /// `blob_path()` (builtin/diff.c:37-40): the operand's `oc.path` — the path arm
+    /// it was reached through — or the argument itself when there is none, which is
+    /// why `git diff <sha1> <sha1>` names the two sides by their hex object names.
+    path: BString,
+    /// `blob[i]->mode`, which `add_object_array_with_path()` takes from `oc.mode`,
+    /// and which `builtin_diff_blobs()` defaults for an operand that has none:
+    ///
+    /// ```c
+    ///         const unsigned mode = canon_mode(S_IFREG | 0644);
+    ///         if (blob[0]->mode == S_IFINVALID)
+    ///                 blob[0]->mode = mode;
+    /// ```
+    kind: EntryKind,
+}
+
+/// Resolve one blob operand's `oc.path` and `oc.mode`.
+///
+/// Only the two path spellings record either — `:<stage>:<path>` reads the index
+/// entry and `<tree-ish>:<path>` reads the tree entry — so every other spelling
+/// (a raw object name, a tag that peels to a blob) keeps the argument as its name
+/// and takes `builtin_diff_blobs()`'s `100644` default.
+fn blob_operand(repo: &gix::Repository, name: &str, id: ObjectId) -> BlobOperand {
+    let fallback = BlobOperand {
+        id,
+        path: BString::from(name),
+        kind: EntryKind::Blob,
+    };
+    let Ok(canonical) = crate::objpath::canonical_paths(repo, name) else {
+        return fallback;
+    };
+    match crate::objpath::split(canonical.as_ref()) {
+        crate::objpath::Split::Index { stage, path } => {
+            let mode = repo.index_or_empty().ok().and_then(|index| {
+                index
+                    .entries()
+                    .iter()
+                    .find(|e| e.stage() as u8 == stage && e.path(&index) == path)
+                    .and_then(|e| index_mode_kind(e.mode))
+            });
+            BlobOperand {
+                id,
+                path: BString::from(path),
+                kind: mode.unwrap_or(EntryKind::Blob),
+            }
+        }
+        crate::objpath::Split::Tree { rev, path } => {
+            let kind = rev_object(repo, rev)
+                .ok()
+                .and_then(|o| o.peel_to_tree().ok())
+                .and_then(|tree| tree_entry(&tree, &BString::from(path)).ok().flatten())
+                .map(|(_, k)| k);
+            BlobOperand {
+                id,
+                path: BString::from(path),
+                kind: kind.unwrap_or(EntryKind::Blob),
+            }
+        }
+        _ => fallback,
+    }
+}
+
 /// git's `ignore_untracked_in_submodules` default (`diff_setup_done()`, diff.c:5169):
 /// a diff never counts untracked files inside a submodule as damage, so the status
 /// walk is told the same thing rather than paying for a dirwalk whose result would
@@ -4065,8 +4538,14 @@ fn collect_index_worktree(
     paths: &[String],
     deltas: &mut Vec<Delta>,
     ita_invisible: bool,
+    // `revs->max_count` → `diff_unmerged_stage` (diff-lib.c:107): which conflict
+    // stage the ordinary pair of an unmerged path compares. `None` is git's `-1`,
+    // which `run_diff_files()` reads as stage 2 and which also leaves the free
+    // combined diff in place.
+    unmerged_stage: Option<u8>,
 ) -> Result<()> {
     let index = repo.index_or_empty()?;
+    let stage_table = conflict_stage_table(&index);
     let conflicts = conflict_stages(&index);
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
     let iter = repo
@@ -4139,7 +4618,13 @@ fn collect_index_worktree(
                 None => NewSide::Absent,
             },
             unmerged: true,
-            stages: stages.map(|s| (s.ours.0, s.theirs.0)),
+            // With an explicit stage git never reaches
+            // `diff_merges_set_dense_combined_if_unset()`, so this pair stays the
+            // `* Unmerged path` marker rather than becoming a combined section.
+            stages: match unmerged_stage {
+                Some(_) => None,
+                None => stages.map(|s| (s.ours.0, s.theirs.0)),
+            },
             src_path: None,
             score: 0,
             status: 0,
@@ -4151,8 +4636,20 @@ fn collect_index_worktree(
             drivers: PairDrivers::default(),
             textconv: None,
         });
-        if let (Some(s), Some(k)) = (stages, wt_kind) {
-            deltas.push(Delta::plain(path, Some((s.ours.0, s.ours.1)), NewSide::Worktree(k)));
+        // ```c
+        // pair = diff_unmerge(&revs->diffopt, ce->name);
+        // ...
+        // if (ce_stage(ce) != diff_unmerged_stage)
+        //         continue;
+        // ```
+        // (diff-lib.c:221-226.) `ce` is the *last* entry of the path that matched
+        // the wanted stage, so a path that never carried it — `--base` on a file
+        // both sides created — stops at the `U` pair alone.
+        let wanted = stage_table
+            .get(&path)
+            .and_then(|s| s[usize::from(unmerged_stage.unwrap_or(2)) - 1]);
+        if let (Some(side), Some(k)) = (wanted, wt_kind) {
+            deltas.push(Delta::plain(path, Some(side), NewSide::Worktree(k)));
         }
     }
     Ok(())
@@ -4317,6 +4814,29 @@ fn worktree_new_side(
 struct Stages {
     ours: (ObjectId, EntryKind),
     theirs: (ObjectId, EntryKind),
+}
+
+/// Every conflicted path's three stages, indexed `[base, ours, theirs]`.
+///
+/// `run_diff_files()` walks the entries of one path in index order and keeps the one
+/// whose `ce_stage()` equals `diff_unmerged_stage` (diff-lib.c:203-204), so an absent
+/// stage simply leaves that slot empty — which is the whole of `--base`'s behaviour
+/// on a path both sides created.
+fn conflict_stage_table(
+    index: &gix::index::State,
+) -> BTreeMap<BString, [Option<(ObjectId, EntryKind)>; 3]> {
+    let mut per_path: BTreeMap<BString, [Option<(ObjectId, EntryKind)>; 3]> = BTreeMap::new();
+    for entry in index.entries() {
+        let slot = match entry.stage() {
+            gix::index::entry::Stage::Base => 0,
+            gix::index::entry::Stage::Ours => 1,
+            gix::index::entry::Stage::Theirs => 2,
+            gix::index::entry::Stage::Unconflicted => continue,
+        };
+        let kind = index_mode_kind(entry.mode).unwrap_or(EntryKind::Blob);
+        per_path.entry(entry.path(index).to_owned()).or_default()[slot] = Some((entry.id, kind));
+    }
+    per_path
 }
 
 fn conflict_stages(index: &gix::index::State) -> BTreeMap<BString, Stages> {
@@ -5352,6 +5872,7 @@ pub(crate) fn commit_dirstat(
                 blank_lines: opts.blank_lines,
                 lines: opts.ignore_lines.clone(),
                 inter_hunk_ctx: opts.inter_hunk_ctx,
+                irreversible_delete: opts.irreversible_delete,
             },
         )?;
         let damage = if ds.by_file {
@@ -5556,6 +6077,7 @@ fn commit_patch_with(
                     blank_lines: opts.blank_lines,
                     lines: opts.ignore_lines.clone(),
                     inter_hunk_ctx: opts.inter_hunk_ctx,
+                    irreversible_delete: opts.irreversible_delete,
                 },
             )?;
             let before = plain.len();
@@ -6182,7 +6704,8 @@ fn analyze(
             if delta.complete_rewrite() {
                 let deleted = count_lines(raw_old);
                 let added = count_lines(raw_new);
-                let hunks = want_patch.then(|| emit_rewrite_diff(old_data, new_data));
+                let hunks = want_patch
+                    .then(|| emit_rewrite_diff(old_data, new_data, ignore.irreversible_delete));
                 return Ok(Analysis {
                     old_id,
                     new_id,
@@ -6724,16 +7247,27 @@ fn rewrite_line_count(count: u32) -> String {
 
 /// `emit_rewrite_diff()`: a `-B` rewrite's body — a single hunk spanning both whole
 /// files, every old line removed and every new line added, with no context.
-fn emit_rewrite_diff(old_data: &[u8], new_data: &[u8]) -> Vec<u8> {
+fn emit_rewrite_diff(old_data: &[u8], new_data: &[u8], irreversible_delete: bool) -> Vec<u8> {
     let lc_a = count_lines(old_data);
     let lc_b = count_lines(new_data);
     let mut out = Vec::new();
     push_str(&mut out, "@@ -");
-    push_str(&mut out, &rewrite_line_count(lc_a));
+    // ```c
+    // if (!o->irreversible_delete)
+    //         add_line_count(&out, lc_a);
+    // else
+    //         strbuf_addstr(&out, "?,?");
+    // ```
+    // (diff.c:1939-1943.) `-D` refuses to say how many lines it is throwing away.
+    if irreversible_delete {
+        push_str(&mut out, "?,?");
+    } else {
+        push_str(&mut out, &rewrite_line_count(lc_a));
+    }
     push_str(&mut out, " +");
     push_str(&mut out, &rewrite_line_count(lc_b));
     push_str(&mut out, " @@\n");
-    if lc_a != 0 {
+    if lc_a != 0 && !irreversible_delete {
         emit_rewrite_lines(&mut out, b'-', old_data);
     }
     if lc_b != 0 {
@@ -6992,10 +7526,24 @@ fn mode_str(k: EntryKind) -> &'static str {
 }
 
 /// `--raw` and `--name-status` (`diff_flush_raw()`).
-fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render, filled: Option<&Analysis>) {
+fn render_raw(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    delta: &Delta,
+    fmt: u32,
+    r: &Render,
+    filled: Option<&Analysis>,
+) {
     let status = status_char(delta);
     if fmt & F_NAME_STATUS == 0 {
-        let null = r.hash_kind.null().to_hex_with_len(r.raw_abbrev).to_string();
+        // `diff_flush_raw()` renders each side through `diff_aligned_abbrev()`
+        // (diff.c:6421) → `diff_abbrev_oid()` (diff.c:4842) →
+        // `repo_find_unique_abbrev()`. `--abbrev=<n>` is therefore a *floor*, not a
+        // width: an id that shares its first `n` hex characters with another object
+        // in the database is widened until it does not. The all-zero name is not in
+        // the database, so it has nothing to widen against and stays `n` wide.
+        let abbrev = |id: &ObjectId| crate::abbrev::unique_abbrev(repo, id, r.raw_abbrev);
+        let null = abbrev(&r.hash_kind.null());
         // `diff_fill_oid_info()` (diff.c:4014) hashes a filespec that has no id of
         // its own with `index_path()`, leaving the real object name behind in
         // `p->one->oid`/`p->two->oid`. Only `run_diff()` calls it, so the raw format
@@ -7006,25 +7554,25 @@ fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render, filled: Op
             filled
                 .map(side)
                 .filter(|id| !id.is_null())
-                .map(|id| id.to_hex_with_len(r.raw_abbrev).to_string())
+                .map(|id| abbrev(&id))
         };
         let old_hash = match (delta.old, delta.old_worktree) {
             (None, _) => null.clone(),
-            (Some((id, _)), false) => id.to_hex_with_len(r.raw_abbrev).to_string(),
+            (Some((id, _)), false) => abbrev(&id),
             // A worktree pre-image has no id of its own, which git reports as
             // all-zero — unless the side kept a printable one (`hash_filespec()`, or
             // a submodule sitting where the index says).
             (Some(_), true) => match delta.old_raw_id {
-                Some(id) => id.to_hex_with_len(r.raw_abbrev).to_string(),
+                Some(id) => abbrev(&id),
                 None => hashed(|an| an.old_id).unwrap_or_else(|| null.clone()),
             },
         };
         // Worktree content has no object id yet, which git reports as all-zero —
         // unless rename detection already hashed it (`hash_filespec()`).
         let new_hash = match (&delta.new, delta.unmerged) {
-            (NewSide::Blob(id, _), false) => id.to_hex_with_len(r.raw_abbrev).to_string(),
+            (NewSide::Blob(id, _), false) => abbrev(&id),
             (NewSide::Worktree(k), false) => match delta.new_id {
-                Some(id) => id.to_hex_with_len(r.raw_abbrev).to_string(),
+                Some(id) => abbrev(&id),
                 // A gitlink never goes through the blob platform, so the analysis
                 // has no hash of the worktree to offer for one.
                 None if *k == EntryKind::Commit => null,
@@ -7054,8 +7602,20 @@ fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render, filled: Op
     if matches!(status, b'R' | b'C') {
         out.extend_from_slice(&name_field(delta.old_path(), r.z));
         out.push(if r.z { 0 } else { b'\t' });
+        out.extend_from_slice(&name_field(&delta.path, r.z));
+    } else {
+        // ```c
+        //         name_a = p->one->mode ? p->one->path : p->two->path;
+        // ```
+        //
+        // (diff.c:5859) — the pre-image's name whenever it has one, which differs
+        // from the post-image's only for a `git diff <blob> <blob>` pair.
+        let name = match delta.old {
+            Some(_) => delta.old_path(),
+            None => &delta.path,
+        };
+        out.extend_from_slice(&name_field(name, r.z));
     }
-    out.extend_from_slice(&name_field(&delta.path, r.z));
     out.push(if r.z { 0 } else { b'\n' });
 }
 
@@ -7153,7 +7713,23 @@ fn status_char(d: &Delta) -> u8 {
     match (&d.old, &d.new) {
         (None, _) => b'A',
         (_, NewSide::Absent) => b'D',
-        _ => b'M',
+        // `diff_resolve_rename_copy()` (diff.c:6680) tests `DIFF_PAIR_TYPE_CHANGED`
+        // ahead of every rename and modification verdict, and that macro
+        // (diffcore.h:142-143) compares only the `S_IFMT` halves of the two modes.
+        // A regular file replaced by a symlink or a gitlink — or the reverse — is
+        // therefore `T`, while `100644` becoming `100755` stays `M`.
+        _ => {
+            let class = |k: EntryKind| match k {
+                EntryKind::Blob | EntryKind::BlobExecutable => 0o100_000,
+                EntryKind::Link => 0o120_000,
+                EntryKind::Commit => 0o160_000,
+                EntryKind::Tree => 0o040_000,
+            };
+            match (d.old, d.new_kind()) {
+                (Some((_, ok)), Some(nk)) if class(ok) != class(nk) => b'T',
+                _ => b'M',
+            }
+        }
     }
 }
 
@@ -7206,7 +7782,7 @@ fn render_numstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)], z: bool) {
             push_str(out, &format!("{}\t{}\t", an.added, an.deleted));
         }
         if z {
-            if d.renamed() {
+            if d.two_names() {
                 out.push(0);
                 out.extend_from_slice(d.old_path());
                 out.push(0);
@@ -7214,7 +7790,7 @@ fn render_numstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)], z: bool) {
             out.extend_from_slice(&d.path);
             out.push(0);
         } else {
-            if d.renamed() {
+            if d.two_names() {
                 out.extend_from_slice(&pprint_rename(d.old_path(), &d.path));
             } else {
                 out.extend_from_slice(&quoted_name(&d.path));
@@ -7328,8 +7904,10 @@ fn compact_comment_for_kinds(
 /// The diffstat display name: the C-quoted path, plus the `--compact-summary`
 /// annotation ` (<comment>)` when one applies (`fill_print_name()`).
 fn stat_display_name(d: &Delta, compact: bool) -> Vec<u8> {
-    // `fill_print_name()`: a rename/copy shows the compressed `pfx{a => b}sfx` form.
-    let mut name = if d.renamed() {
+    // `fill_print_name()`: a pair with two names shows the compressed `pfx{a => b}sfx`
+    // form. `diffstat_add()` decides that from the paths, not from the status — see
+    // [`Delta::two_names`].
+    let mut name = if d.two_names() {
         pprint_rename(d.old_path(), &d.path)
     } else {
         quoted_name(&d.path)
@@ -7550,16 +8128,20 @@ fn render_patch(
     } else {
         r.abbrev
     };
-    let null_hash = r.hash_kind.null().to_hex_with_len(hlen).to_string();
+    // `fill_metainfo()` (diff.c:4929-4930) renders both sides with
+    // `diff_abbrev_oid()`, so the `index` line widens past `--abbrev=<n>` on a
+    // colliding prefix exactly as `--raw` does.
+    let abbrev = |id: &ObjectId| crate::abbrev::unique_abbrev(repo, id, hlen);
+    let null_hash = abbrev(&r.hash_kind.null());
     let old_hash = if delta.old.is_some() {
-        an.old_id.to_hex_with_len(hlen).to_string()
+        abbrev(&an.old_id)
     } else {
         null_hash.clone()
     };
     let new_hash = if matches!(delta.new, NewSide::Absent) {
         null_hash.clone()
     } else {
-        an.new_id.to_hex_with_len(hlen).to_string()
+        abbrev(&an.new_id)
     };
     let content_differs = old_hash != new_hash;
     let new_kind = delta.new_kind();
@@ -9271,6 +9853,7 @@ pub(crate) fn commit_check(
                     blank_lines: opts.blank_lines,
                     lines: opts.ignore_lines.clone(),
                     inter_hunk_ctx: opts.inter_hunk_ctx,
+                    irreversible_delete: opts.irreversible_delete,
                 },
             )?;
             found |= report_whitespace_to(out, delta, &an, ws_rule, colors);

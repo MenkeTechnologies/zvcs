@@ -811,6 +811,14 @@ struct Opts {
     /// `default_diff_options`) *before* `repo_config()`, so the config never reaches
     /// this command's options — it is read only to report its own parse errors.
     dirstat: diff_files::DirStat,
+    /// Whether the host command lets `diff.dirstat` seed [`Self::dirstat`]; see
+    /// [`RouteCtx::dirstat_config`].
+    dirstat_config: bool,
+    /// Every parameter list the `--dirstat` family carried, in order. The repository
+    /// is not open while the options are scanned, so a host that *does* let
+    /// `diff.dirstat` through has to fold the config in underneath these afterwards
+    /// — which is the order `repo_diff_setup()` and parse-options run in.
+    dirstat_params: Vec<String>,
     /// `--ignore-submodules[=<when>]`: `all` (and the bare form) drops gitlink pairs
     /// outright. `none`/`untracked`/`dirty` only concern a worktree comparison, which
     /// `diff-pairs` never performs, so they leave the pair in place — as in git.
@@ -967,6 +975,14 @@ pub(crate) struct RouteCtx {
     /// trees. `diffcore_rename()` never considers them — `S_ISREG` gates every
     /// candidate — and only the raw and name emitters ever see one.
     pub allow_trees: bool,
+    /// Whether `diff.dirstat` seeds the `--dirstat` parameter block. `diff-pairs`
+    /// itself never lets it: `builtin/diff-pairs.c` calls `repo_init_revisions()`
+    /// — which copies `default_diff_options` (diff.c:5138) — *before* it reads the
+    /// repository config, so `git -c diff.dirstat=files diff-pairs -z --dirstat`
+    /// answers exactly as the unset config does (measured against 2.55.0). Every
+    /// other command reaches `repo_diff_setup()` the ordinary way round, so a
+    /// routed `diff-tree` says yes here.
+    pub dirstat_config: bool,
 }
 
 pub(crate) fn render_raw_stream(
@@ -1017,6 +1033,8 @@ pub(crate) fn render_raw_stream(
         // once the repository is open, unless a flag already set it.
         ws_error_highlight: diff_color::WSEH_NEW,
         dirstat: diff_files::DirStat::default(),
+        dirstat_config: route.dirstat_config,
+        dirstat_params: Vec::new(),
         ignore_submodules: false,
         ignore_submodules_set: false,
         submodule_format: SubmoduleFormat::Short,
@@ -1734,11 +1752,24 @@ pub(crate) fn render_raw_stream(
     // `default_diff_options` — before `repo_config()`, so the parsed parameters land in
     // a struct the command has already finished copying from. The warning is the whole
     // of the observable effect, and it is emitted whether or not `--dirstat` was given.
-    if let Some(v) = repo.config_snapshot().string("diff.dirstat") {
-        let mut ignored = diff_files::DirStat::default();
-        let errors = diff_files::parse_dirstat_params(&v.to_string(), &mut ignored);
-        if !errors.is_empty() {
-            eprint!("warning: Found errors in 'diff.dirstat' config variable:\n{errors}\n");
+    {
+        let snap = repo.config_snapshot();
+        if let Some(v) = snap.string("diff.dirstat") {
+            let mut seeded = diff_files::DirStat::default();
+            let errors = diff_files::parse_dirstat_params(&v.to_string(), &mut seeded);
+            if !errors.is_empty() {
+                eprint!("warning: Found errors in 'diff.dirstat' config variable:\n{errors}\n");
+            }
+            // A host that reaches `repo_diff_setup()` the ordinary way round — every
+            // command except `diff-pairs` itself — starts from the configured block
+            // and lets each `--dirstat=<params>` refine it, so replay the flags in
+            // the order they were given on top of what the config chose.
+            if opts.dirstat_config {
+                for params in &opts.dirstat_params {
+                    let _ = diff_files::parse_dirstat_params(params, &mut seeded);
+                }
+                opts.dirstat = seeded;
+            }
         }
     }
     // `--color[=<when>]` / `--no-color`, falling back to `color.diff` / `diff.color`
@@ -1944,6 +1975,7 @@ pub(crate) fn render_raw_stream(
 /// `parse_dirstat_opt()` (diff.c:5454): fold one parameter list into the accumulated
 /// `--dirstat` state and turn the format on, or report git's `die()` and its exit code.
 fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<Status> {
+    opts.dirstat_params.push(params.to_owned());
     let errors = diff_files::parse_dirstat_params(params, &mut opts.dirstat);
     if !errors.is_empty() {
         eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
@@ -2613,7 +2645,7 @@ fn flush(
         }
         for p in shown {
             buf.extend_from_slice(lp);
-            render_name(&mut buf, p, &opts.formats, opts.abbrev_explicit);
+            render_name(&mut buf, repo, p, &opts.formats, opts.abbrev_explicit);
         }
     }
 
@@ -3005,7 +3037,13 @@ fn as_creation(p: &Pair) -> Pair {
 
 /// `--raw` / `--name-only` / `--name-status` for one pair (`--name-status` wins when
 /// several are set, matching `flush_one_pair`'s precedence).
-fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats, abbrev: Option<usize>) {
+fn render_name(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    p: &Pair,
+    f: &Formats,
+    abbrev: Option<usize>,
+) {
     let two_paths = matches!(p.kind(), b'R' | b'C');
     // `opt->line_termination`: NUL for both fields under `-z`, otherwise git's
     // `inter_name_termination` TAB between the status and the path and LF at the end.
@@ -3031,8 +3069,8 @@ fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats, abbrev: Option<usize>) 
                 ":{:06o} {:06o} {} {} ",
                 p.old_mode,
                 p.new_mode,
-                hex_or_full(&p.old_id, abbrev),
-                hex_or_full(&p.new_id, abbrev)
+                hex_or_full(repo, &p.old_id, abbrev),
+                hex_or_full(repo, &p.new_id, abbrev)
             )
             .as_bytes(),
         );
@@ -3051,9 +3089,13 @@ fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats, abbrev: Option<usize>) 
 /// full object name — stock 2.55.0 ignores its `--abbrev`, measured — but a routed
 /// `diff-tree` hands its own `o->abbrev` down, and `git diff-tree --raw --abbrev=<n>`
 /// does shorten.
-fn hex_or_full(id: &ObjectId, abbrev: Option<usize>) -> String {
+fn hex_or_full(repo: &gix::Repository, id: &ObjectId, abbrev: Option<usize>) -> String {
     match abbrev {
-        Some(n) => id.to_hex_with_len(n).to_string(),
+        // `diff_abbrev_oid()` (diff.c:4842) hands the request to
+        // `repo_find_unique_abbrev()`, so `--abbrev=<n>` is a floor: an id that
+        // shares its first `n` hex characters with another object widens until it
+        // does not, which is why `git diff-tree --abbrev=4 --raw` can print five.
+        Some(n) => crate::abbrev::unique_abbrev(repo, id, n),
         None => id.to_hex().to_string(),
     }
 }
@@ -5940,7 +5982,10 @@ fn oid_text(
         if id.is_null() {
             "0".repeat(n)
         } else {
-            id.to_hex_with_len(n).to_string()
+            // `fill_metainfo()` (diff.c:4929) renders the `index` line through
+            // `diff_abbrev_oid()` as well, so an explicit `--abbrev=<n>` widens on a
+            // colliding prefix exactly as the raw listing does.
+            crate::abbrev::unique_abbrev(repo, id, n)
         }
     } else if id.is_null() {
         "0".repeat(base)

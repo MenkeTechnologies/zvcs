@@ -8,8 +8,17 @@ impl Action {
         match self {
             Action::Get(ctx) => ctx.write_to(write),
             Action::Store(last) | Action::Erase(last) => {
+                // `run_credential_helper()` (credential.c:462-466) hands the helper
+                // exactly what `credential_write()` produced — one `key=value\n` per
+                // field — and then `fclose(fp)`, so the helper reads EOF rather than a
+                // blank line. A helper that logs its stdin verbatim shows the
+                // difference as a trailing empty line. The newline is still added when
+                // the payload does not end in one, because gix's `store`/`erase`
+                // payload is a previous helper's stdout and may stop mid-line.
                 write.write_all(last).ok();
-                write.write_all(b"\n").ok();
+                if !last.is_empty() && !last.ends_with(b"\n") {
+                    write.write_all(b"\n").ok();
+                }
                 Ok(())
             }
         }

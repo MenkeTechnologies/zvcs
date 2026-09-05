@@ -53,6 +53,19 @@ impl Transaction<'_, '_> {
                                 // Special HACK: no reflog for symref changes as there is no OID involved which the reflog needs.
                                 // Unless, the ref is new and we can obtain a peeled id
                                 // identified by the expectation of what could be there, as is the case when cloning.
+                                //
+                                // git does log one, under the *resolved* value of the new target
+                                // (`parse_and_write_reflog()`, refs/files-backend.c:3079). Closing
+                                // the gap here alone makes it worse rather than better: every
+                                // caller in `src/extensions` that points `HEAD` at a branch
+                                // already writes that line by hand — `switch::attach_head`,
+                                // `branch`'s rename and its worktree repointing,
+                                // `checkout::append_head_log` — precisely because this hack
+                                // predates them, so logging it here too appends it twice. Measured
+                                // over the corpus, that is 53 cases lost across `switch`,
+                                // `checkout`, `branch`, `clone`, `restore`, `stash` and
+                                // `worktree` against 4 gained in `update-ref`. The gap and its
+                                // repairs have to be removed in one change, not this one.
                                 match expected {
                                     PreviousValue::ExistingMustMatch(Target::Object(oid)) => {
                                         Some((Some(gix_hash::ObjectId::null(oid.kind())), oid))

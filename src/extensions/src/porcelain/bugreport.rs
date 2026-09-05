@@ -183,13 +183,22 @@ pub fn bugreport(args: &[String]) -> Result<ExitCode> {
     }
     report_path.push_str(".txt");
 
-    // `safe_create_leading_directories()` — a missing parent is created, an
-    // existing one is fine, anything else is fatal.
-    if let Some(parent) = Path::new(&report_path).parent() {
-        if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
-            eprintln!("fatal: could not create leading directories for '{report_path}'");
-            return Ok(ExitCode::from(EXIT_FATAL));
-        }
+    // ```c
+    // switch (safe_create_leading_directories(the_repository, report_path.buf)) {
+    // case SCLD_OK:
+    // case SCLD_EXISTS:
+    //         break;
+    // default:
+    //         die(_("could not create leading directories for '%s'"), report_path.buf);
+    // }
+    // ```
+    //
+    // (builtin/bugreport.c:144.) `SCLD_EXISTS` is the *non*-directory case, so a
+    // component that is an ordinary file gets past this check and the open below
+    // is what reports it.
+    if !safe_create_leading_directories(&report_path) {
+        eprintln!("fatal: could not create leading directories for '{report_path}'");
+        return Ok(ExitCode::from(EXIT_FATAL));
     }
 
     // Prepare diagnostics, if requested — before the report, as git does, so its
@@ -224,12 +233,18 @@ pub fn bugreport(args: &[String]) -> Result<ExitCode> {
     let mut file = match file {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("fatal: unable to create '{report_path}': {}", errno_text(&e));
+            eprintln!(
+                "fatal: unable to create '{report_path}': {}",
+                crate::errno_text(&e)
+            );
             return Ok(ExitCode::from(EXIT_FATAL));
         }
     };
     if let Err(e) = file.write_all(buffer.as_bytes()) {
-        eprintln!("fatal: unable to write to {report_path}: {}", errno_text(&e));
+        eprintln!(
+            "fatal: unable to write to {report_path}: {}",
+            crate::errno_text(&e)
+        );
         return Ok(ExitCode::from(EXIT_FATAL));
     }
     drop(file);
@@ -565,13 +580,72 @@ pub(crate) fn editor_command(editor: &str, path: &Path) -> Command {
     crate::external::prepare_shell_cmd_str(editor, [path])
 }
 
-/// The `strerror()` text `die_errno()` appends, for the errno values this
-/// command can realistically hit; anything else falls back to Rust's rendering.
-fn errno_text(e: &std::io::Error) -> String {
-    match e.kind() {
-        std::io::ErrorKind::AlreadyExists => "File exists".to_string(),
-        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
-        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
-        _ => e.to_string(),
+/// `safe_create_leading_directories()` (path.c:832), reduced to the two outcomes
+/// `cmd_bugreport` tells apart: `SCLD_OK`/`SCLD_EXISTS` (`true`) and everything
+/// else (`false`).
+///
+/// The C walks every `/`-separated prefix of the path, `stat`s it, and `mkdir`s
+/// the ones that are missing:
+///
+/// ```c
+/// if (!stat(path, &st)) {
+///         /* path exists */
+///         if (!S_ISDIR(st.st_mode)) {
+///                 errno = ENOTDIR;
+///                 ret = SCLD_EXISTS;
+///         }
+/// } else if (mkdir(path, 0777)) {
+///         if (errno == EEXIST && !stat(path, &st) && S_ISDIR(st.st_mode))
+///                 ; /* somebody created it since we checked */
+///         else if (errno == ENOENT)
+///                 ret = SCLD_VANISHED;
+///         else
+///                 ret = SCLD_FAILED;
+/// }
+/// ```
+///
+/// A prefix that exists and is not a directory ends the walk as `SCLD_EXISTS` —
+/// *not* a failure — which is why `git bugreport -o README.md/sub` reaches the
+/// file creation and dies there with git's `unable to create '<path>': Not a
+/// directory` rather than complaining about the directories. `create_dir_all`
+/// cannot express that: it reports the same `NotADirectory` as any other error.
+fn safe_create_leading_directories(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    // `offset_1st_component()`: the leading separator of an absolute path is not
+    // a component that can be created.
+    let mut next = usize::from(bytes.first() == Some(&b'/'));
+    while next < bytes.len() {
+        let Some(offset) = bytes[next..].iter().position(|b| *b == b'/') else {
+            break;
+        };
+        let slash = next + offset;
+        // Skip a run of separators; a path that ends in them has no further
+        // component to create.
+        let mut after = slash + 1;
+        while bytes.get(after) == Some(&b'/') {
+            after += 1;
+        }
+        if after >= bytes.len() {
+            break;
+        }
+        next = after;
+
+        let prefix = &path[..slash];
+        match std::fs::metadata(prefix) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    // `SCLD_EXISTS`, which the caller accepts.
+                    return true;
+                }
+            }
+            Err(_) => match std::fs::create_dir(prefix) {
+                Ok(()) => {}
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AlreadyExists
+                        && std::fs::metadata(prefix).is_ok_and(|meta| meta.is_dir()) => {}
+                Err(_) => return false,
+            },
+        }
     }
+    true
 }

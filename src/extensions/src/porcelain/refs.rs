@@ -18,10 +18,12 @@
 //!
 //!   * `git refs migrate --ref-format=<format>` up to the point where bytes would
 //!     move: the option scan, `usage: too many arguments`, `usage: missing
-//!     --ref-format=<format>`, `error: unknown ref storage format '<x>'`, and
-//!     `error: repository already uses '<x>' format`. `cmd_refs_migrate()` reaches
-//!     `repo_migrate_ref_storage_format()` only after all four, and every one of
-//!     them is a decision about names and the repository's current format.
+//!     --ref-format=<format>`, `error: unknown ref storage format '<x>'`,
+//!     `error: repository already uses '<x>' format`, and — inside
+//!     `repo_migrate_ref_storage_format()` itself, ahead of either backend —
+//!     `error: migrating repositories with worktrees is not supported yet`
+//!     (refs.c:3366) at exit 255. Every one of them is a decision about names,
+//!     the repository's current format, or its worktrees.
 //!
 //! Not covered, and rejected with an error rather than approximated:
 //!   * the migration itself — `git refs migrate --ref-format=reftable` on a repo in
@@ -436,6 +438,25 @@ fn migrate(args: &[String]) -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
     if current_ref_format(&repo) == format_str {
         eprintln!("error: repository already uses '{format_str}' format");
+        return Ok(ExitCode::from(255));
+    }
+
+    // `repo_migrate_ref_storage_format()` (refs.c:3366) refuses a repository with a
+    // linked worktree before it touches either backend:
+    //
+    // ```c
+    // if (has_worktrees()) {
+    //         strbuf_addstr(errbuf, "migrating repositories with worktrees is not supported yet");
+    //         ret = -1;
+    //         goto done;
+    // }
+    // ```
+    //
+    // `cmd_refs_migrate()` reports that through `error("%s", errbuf.buf)` and returns
+    // its `-1`, so the exit code is 255. `has_worktrees()` (refs.c:3314) counts every
+    // worktree that is not the main one, which is what `repo.worktrees()` lists.
+    if !repo.worktrees().map(|w| w.is_empty()).unwrap_or(true) {
+        eprintln!("error: migrating repositories with worktrees is not supported yet");
         return Ok(ExitCode::from(255));
     }
 

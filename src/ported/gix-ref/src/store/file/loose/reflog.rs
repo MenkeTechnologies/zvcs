@@ -107,83 +107,114 @@ pub mod create_or_update {
             mut force_create_reflog: bool,
         ) -> Result<(), Error> {
             let (reflog_base, full_name) = self.reflog_base_and_relative_path(name);
-            match self.write_reflog {
-                WriteReflog::Normal | WriteReflog::Always => {
-                    if self.write_reflog == WriteReflog::Always {
-                        force_create_reflog = true;
+            // `log_ref_setup()` (refs/files-backend.c:1859) has exactly one shape for all
+            // three values of `log_all_ref_updates`, and the policy only decides whether the
+            // file may be *created*:
+            //
+            // ```c
+            // if (force_create || should_autocreate_reflog(log_refs_cfg, refname)) {
+            //         if (raceproof_create_file(logfile, open_or_create_logfile, logfd)) …
+            // } else {
+            //         *logfd = open(logfile, O_APPEND | O_WRONLY);
+            //         if (*logfd < 0) { if (errno == ENOENT || errno == EISDIR) ; … }
+            // }
+            // ```
+            //
+            // So `core.logAllRefUpdates = false` does not mean "no reflog writes", it means
+            // "no *new* reflog files": an existing log keeps being appended to, because git
+            // looks for the file before it consults the setting. That is why `HEAD`'s history
+            // survives a repository that turns logging off, and it is the reason
+            // [`WriteReflog::Disable`] takes the same path here as the other two.
+            if self.write_reflog == WriteReflog::Always {
+                force_create_reflog = true;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.append(true).read(false);
+            let log_path = reflog_base.join(&full_name);
+
+            if force_create_reflog || self.should_autocreate_reflog(&full_name) {
+                let parent_dir = log_path.parent().expect("always with parent directory");
+                gix_tempfile::create_dir::all(parent_dir, Default::default()).map_err(|err| {
+                    Error::CreateLeadingDirectories {
+                        source: err,
+                        reflog_directory: parent_dir.to_owned(),
                     }
-                    let mut options = std::fs::OpenOptions::new();
-                    options.append(true).read(false);
-                    let log_path = reflog_base.join(&full_name);
+                })?;
+                options.create(true);
+            }
 
-                    if force_create_reflog || self.should_autocreate_reflog(&full_name) {
-                        let parent_dir = log_path.parent().expect("always with parent directory");
-                        gix_tempfile::create_dir::all(parent_dir, Default::default()).map_err(|err| {
-                            Error::CreateLeadingDirectories {
-                                source: err,
-                                reflog_directory: parent_dir.to_owned(),
-                            }
-                        })?;
-                        options.create(true);
-                    }
-
-                    let file_for_appending = match options.open(&log_path) {
-                        Ok(f) => Some(f),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(err) => {
-                            // TODO: when Kind::IsADirectory becomes stable, use that.
-                            if log_path.is_dir() {
-                                gix_tempfile::remove_dir::empty_depth_first(log_path.clone())
-                                    .and_then(|_| options.open(&log_path))
-                                    .map(Some)
-                                    .map_err(|_| Error::Append {
-                                        source: err,
-                                        reflog_path: self.reflog_path(name),
-                                    })?
-                            } else {
-                                return Err(Error::Append {
-                                    source: err,
-                                    reflog_path: log_path,
-                                });
-                            }
-                        }
-                    };
-
-                    if let Some(mut file) = file_for_appending {
-                        let committer = committer.ok_or(Error::MissingCommitter)?;
-                        // `ref_transaction_add_update()` stores `normalize_reflog_message(msg)`
-                        // (refs.c:1342), so by the time `log_ref_write_fd()` (refs/files-backend.c:1933)
-                        // writes it every run of whitespace is one space and the ends are trimmed.
-                        // Doing it here covers both callers of this function for the same reason
-                        // the C does it in one place: the reflog format separates the committer
-                        // from the message with a tab, and an unnormalized message can contain one.
-                        let message = crate::log::normalize_message(message);
-                        write!(file, "{} {} ", previous_oid.unwrap_or_else(|| new.kind().null()), new)
-                            .and_then(|_| committer.trim().write_to(&mut file))
-                            .and_then(|_| {
-                                if !message.is_empty() {
-                                    writeln!(file, "\t{message}")
-                                } else {
-                                    writeln!(file)
-                                }
-                            })
-                            .map_err(|err| Error::Append {
+            let file_for_appending = match options.open(&log_path) {
+                Ok(f) => Some(f),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    // TODO: when Kind::IsADirectory becomes stable, use that.
+                    if log_path.is_dir() {
+                        gix_tempfile::remove_dir::empty_depth_first(log_path.clone())
+                            .and_then(|_| options.open(&log_path))
+                            .map(Some)
+                            .map_err(|_| Error::Append {
                                 source: err,
                                 reflog_path: self.reflog_path(name),
-                            })?;
+                            })?
+                    } else {
+                        return Err(Error::Append {
+                            source: err,
+                            reflog_path: log_path,
+                        });
                     }
-                    Ok(())
                 }
-                WriteReflog::Disable => Ok(()),
+            };
+
+            if let Some(mut file) = file_for_appending {
+                let committer = committer.ok_or(Error::MissingCommitter)?;
+                // `ref_transaction_add_update()` stores `normalize_reflog_message(msg)`
+                // (refs.c:1342), so by the time `log_ref_write_fd()` (refs/files-backend.c:1933)
+                // writes it every run of whitespace is one space and the ends are trimmed.
+                // Doing it here covers both callers of this function for the same reason
+                // the C does it in one place: the reflog format separates the committer
+                // from the message with a tab, and an unnormalized message can contain one.
+                let message = crate::log::normalize_message(message);
+                write!(file, "{} {} ", previous_oid.unwrap_or_else(|| new.kind().null()), new)
+                    .and_then(|_| committer.trim().write_to(&mut file))
+                    .and_then(|_| {
+                        if !message.is_empty() {
+                            writeln!(file, "\t{message}")
+                        } else {
+                            writeln!(file)
+                        }
+                    })
+                    .map_err(|err| Error::Append {
+                        source: err,
+                        reflog_path: self.reflog_path(name),
+                    })?;
             }
+            Ok(())
         }
 
+        /// `should_autocreate_reflog()` (refs.c:1056), which decides only whether a *missing*
+        /// log may be created.
+        ///
+        /// ```c
+        /// case LOG_REFS_NORMAL:
+        ///         return starts_with(refname, "refs/heads/") ||
+        ///                 starts_with(refname, "refs/remotes/") ||
+        ///                 starts_with(refname, "refs/notes/") ||
+        ///                 !strcmp(refname, "HEAD");
+        /// ```
+        ///
+        /// `refs/worktree/` is deliberately absent: a worktree-private ref gets no log of its
+        /// own, so `update-ref refs/worktree/pin HEAD` writes the ref and nothing else.
         fn should_autocreate_reflog(&self, full_name: &Path) -> bool {
-            full_name.starts_with("refs/heads/")
-                || full_name.starts_with("refs/remotes/")
-                || full_name.starts_with("refs/notes/")
-                || full_name.starts_with("refs/worktree/") // NOTE: git does not write reflogs for worktree private refs
-                || full_name == Path::new("HEAD")
+            match self.write_reflog {
+                WriteReflog::Always => true,
+                WriteReflog::Disable => false,
+                WriteReflog::Normal => {
+                    full_name.starts_with("refs/heads/")
+                        || full_name.starts_with("refs/remotes/")
+                        || full_name.starts_with("refs/notes/")
+                        || full_name == Path::new("HEAD")
+                }
+            }
         }
 
         /// Returns the base paths for all reflogs

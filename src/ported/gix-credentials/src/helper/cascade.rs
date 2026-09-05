@@ -115,7 +115,21 @@ impl Cascade {
                         password_expiry_utc,
                         url: ctx_url,
                         quit,
-                    } = Context::from_bytes(&stdout, self.context_options)?;
+                    } = {
+                        // `credential_read()` warns about a line without `=` and stops
+                        // there; `credential_fill()` (credential.c:517) discards the
+                        // `-1` that comes back, so the cascade keeps whatever the
+                        // helper printed first and moves on to the next one rather
+                        // than failing the whole run.
+                        let (ctx, invalid) =
+                            Context::from_bytes_until_invalid(&stdout, self.context_options)?;
+                        if let Some(line) = invalid {
+                            if self.stderr {
+                                eprintln!("warning: invalid credential line: {line}");
+                            }
+                        }
+                        ctx
+                    };
                     if let Some(dst_ctx) = action.context_mut() {
                         if let Some(src) = path {
                             dst_ctx.path = Some(src);

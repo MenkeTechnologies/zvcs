@@ -634,13 +634,8 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 ///   * **`incremental-repack`** â [`incremental_repack`], the
 ///     `multi-pack-index write` / `expire` / `repack --batch-size=<n>` sequence.
 ///
-/// # The one task that is still unported, and why
-///
-///   * **`prefetch`**. git runs a fetch that rewrites every refspec into
-///     `refs/prefetch/<remote>/*` so the objects arrive without any
-///     remote-tracking ref moving. Nothing in the tree rewrites a refspec that
-///     way, and a prefetch that moved the tracking refs would be a different
-///     operation wearing the same name, so it bails rather than approximating.
+///   * **`prefetch`**: [`prefetch`], one `git fetch <remote> --prefetch ...` per
+///     configured remote, which is what `fetch_remote()` spawns.
 fn run_tasks(
     repo: &gix::Repository,
     selected: &[String],
@@ -701,16 +696,7 @@ fn run_tasks(
             // so a failing `prune-packed` skips the packing and fails the task.
             "loose-objects" => prune_packed_task(repo, quiet) && pack_loose(repo, quiet),
             "incremental-repack" => incremental_repack(repo, quiet),
-            // Selectable, but blocked on substrate no module in the tree has: a
-            // fetch that rewrites each refspec into `refs/prefetch/<remote>/*`.
-            "prefetch" => {
-                bail!(
-                    "maintenance task 'prefetch' is not ported: it needs a fetch that rewrites \
-                     every refspec into refs/prefetch/<remote>/*, which no module in this tree \
-                     does (ported tasks: pack-refs, reflog-expire, commit-graph, loose-objects, \
-                     incremental-repack, geometric-repack, gc, rerere-gc, worktree-prune)"
-                );
-            }
+            "prefetch" => prefetch(repo, quiet),
             _ => true,
         };
         if !ok {
@@ -815,6 +801,65 @@ fn spawn_git(repo: &gix::Repository, args: &[&str]) -> bool {
         .stdin(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// `maintenance_task_prefetch()` (builtin/gc.c:1236) and the `fetch_remote()`
+/// (builtin/gc.c:1216) it runs over every remote:
+///
+/// ```c
+/// if (remote->skip_default_update)
+///         return 0;
+///
+/// child.git_cmd = 1;
+/// strvec_pushl(&child.args, "fetch", remote->name,
+///              "--prefetch", "--prune", "--no-tags",
+///              "--no-write-fetch-head", "--recurse-submodules=no",
+///              NULL);
+///
+/// if (opts->quiet)
+///         strvec_push(&child.args, "--quiet");
+/// ```
+///
+/// `--prefetch` is what keeps this from moving a single remote-tracking ref:
+/// `filter_prefetch_refspec()` rewrites every destination into
+/// `refs/prefetch/<remote>/*`, so the objects arrive and nothing a caller reads
+/// changes. `for_each_remote()` (remote.c:865) stops at the first callback that
+/// fails, and `maintenance_task_prefetch` then reports
+/// `error: failed to prefetch remotes`. A repository with no remotes configured
+/// runs nothing and succeeds.
+///
+/// `remote.<name>.skipDefaultUpdate` and its alias `remote.<name>.skipFetchAll`
+/// both set `skip_default_update` (remote.c:507-510).
+fn prefetch(repo: &gix::Repository, quiet: bool) -> bool {
+    let config = repo.config_snapshot();
+    for name in repo.remote_names() {
+        let name = name.to_string();
+        let skip = ["skipDefaultUpdate", "skipFetchAll"].iter().any(|key| {
+            config
+                .boolean(&format!("remote.{name}.{key}"))
+                .unwrap_or(false)
+        });
+        if skip {
+            continue;
+        }
+        let mut args = vec![
+            "fetch",
+            name.as_str(),
+            "--prefetch",
+            "--prune",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--recurse-submodules=no",
+        ];
+        if quiet {
+            args.push("--quiet");
+        }
+        if !spawn_git(repo, &args) {
+            eprintln!("error: failed to prefetch remotes");
+            return false;
+        }
+    }
+    true
 }
 
 /// `prune_packed()` (gc.c:1287): `git prune-packed [--quiet]`.

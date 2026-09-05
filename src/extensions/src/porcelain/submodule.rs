@@ -3607,8 +3607,22 @@ fn is_empty_dir(path: &std::path::Path) -> bool {
 }
 
 /// `submodule_name_to_gitdir()` (submodule.c:2736-2768): `<git-dir>/modules/<name>`,
-/// absolute. `modules` is on git's `common_list`, so every linked worktree of a
-/// superproject shares one copy of each submodule.
+/// absolute.
+///
+/// ```c
+///                 repo_git_path_append(r, buf, "modules/%s", submodule_name);
+/// ```
+///
+/// `repo_git_path` is the *per-worktree* git directory unless the leading path
+/// component appears in `common_list` (path.c:98-121), and `modules` does not —
+/// so a linked worktree keeps its own copy of every submodule under
+/// `<common>/worktrees/<id>/modules/<name>`, not the superproject's. Verified on
+/// stock 2.55.0: `git -C wt2 submodule update --init` in a linked worktree clones
+/// into `.git/worktrees/wt2/modules/sub` and writes `wt2/sub/.git` as
+/// `gitdir: ../../.git/worktrees/wt2/modules/sub`. Resolving this against the
+/// common directory instead made the linked worktree adopt the main worktree's
+/// submodule repository, so the clone never happened and the two checkouts shared
+/// one git directory.
 ///
 /// The `extensions.submodulePathConfig` spelling — `submodule.<name>.gitdir`, plus
 /// the containment check `validate_submodule_git_dir()` runs over the result — is
@@ -3627,7 +3641,7 @@ fn submodule_name_to_gitdir(repo: &gix::Repository, name: &BStr) -> Result<std::
     }
     Ok(absolute(
         &repo
-            .common_dir()
+            .git_dir()
             .join("modules")
             .join(gix::path::from_bstr(name).as_ref()),
     ))

@@ -281,31 +281,80 @@ fn blame_date_invalid_is_fatal() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
+/// The `-local` spellings and `format:<strftime>` — the modes that need
+/// `localtime_r()` and the platform `strftime(3)` rather than this file's own
+/// calendar arithmetic.
+///
+/// blame renders them through [`crate::showdate`], the shared port of `date.c`'s
+/// `show_date()`, which is the same renderer every other verb answers `--date=`
+/// with; `blame_date_width` measures `format:` by rendering the epoch through it
+/// (`builtin/blame.c:1023`). They used to be refused outright, and this test
+/// asserted the refusal — so it is the guard against that regressing back.
 #[test]
-fn blame_date_unsupported_modes_rejected() {
+fn blame_date_local_and_strftime_modes_match_git() {
     let (repo, home) = dated_fixture("unsup", "1700000000 +0000");
 
-    // These are valid git modes that need machinery blame.rs lacks
-    // (local-timezone conversion, strftime). They must be rejected rather than
-    // emitting wrong bytes, and must NOT be mislabeled as an unknown-format
-    // fatal (which would be exit 128). `relative` and `human` ARE supported and
-    // are covered by `blame_date_relative_matches_git` and
-    // `blame_date_human_matches_git`.
-    for m in ["iso-local", "default-local", "format:%Y"] {
-        let flag = format!("--date={m}");
-        let z = zvcs_blame(&repo, &home, &[&flag]);
-        assert!(!z.status.success(), "--date={m} must be rejected");
-        assert_ne!(
-            z.status.code(),
-            Some(128),
-            "--date={m} is a valid git mode, not an unknown-format fatal"
-        );
-        let err = String::from_utf8_lossy(&z.stderr);
-        assert!(
-            err.contains("unsupported --date mode"),
-            "--date={m} must be reported as unsupported:\n{err}"
-        );
-    }
+    // `run_blame` pins `TZ=UTC`, so `<mode>-local` renders in the same zone the
+    // object header carries and each pair below has to agree byte for byte. The
+    // oracle is the port's own non-local rendering rather than the `git` on PATH:
+    // on a machine where that `git` is an older zvcs release these modes are the
+    // very ones it refuses, so it answers with nothing and proves nothing.
+    // `iso-local` keeps the zone field, so under `TZ=UTC` it is `iso` exactly.
+    let l = zvcs_blame(&repo, &home, &["--date=iso-local"]);
+    let p = zvcs_blame(&repo, &home, &["--date=iso"]);
+    assert!(
+        l.status.success(),
+        "--date=iso-local failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&p.stdout),
+        String::from_utf8_lossy(&l.stdout),
+        "under TZ=UTC, --date=iso-local renders what --date=iso does"
+    );
+
+    // `default-local` is `DATE_NORMAL` with `local` set, and `show_date()`
+    // (date.c) prints no zone at all for that pair — the column keeps its width,
+    // so the calendar text is `default`'s and the `+0000` is gone. Verified
+    // against git 2.55.0: `Wed Jan 1 00:00:00 2020 +0000 ` vs
+    // `Wed Jan 1 00:00:00 2020       `.
+    let dl = zvcs_blame(&repo, &home, &["--date=default-local"]);
+    let d = zvcs_blame(&repo, &home, &["--date=default"]);
+    assert!(
+        dl.status.success(),
+        "--date=default-local failed: {}",
+        String::from_utf8_lossy(&dl.stderr)
+    );
+    let dl_out = String::from_utf8_lossy(&dl.stdout).into_owned();
+    let d_out = String::from_utf8_lossy(&d.stdout).into_owned();
+    assert!(!dl_out.contains("+0000"), "--date=default-local prints no zone:\n{dl_out}");
+    assert!(d_out.contains("+0000"), "--date=default does print one:\n{d_out}");
+    assert_eq!(
+        d_out.replace("+0000", "     "),
+        dl_out,
+        "--date=default-local is --date=default with the zone field blanked"
+    );
+
+    // `format:<strftime>` reaches the platform `strftime(3)`, and its column is
+    // `strlen(show_date(0, 0, &blame_date_mode))` wide (`builtin/blame.c:1023`) —
+    // so the day it prints is the day `--date=short` prints, re-punctuated.
+    let f = zvcs_blame(&repo, &home, &["--date=format:%Y/%m/%d"]);
+    assert!(
+        f.status.success(),
+        "--date=format:%Y/%m/%d failed: {}",
+        String::from_utf8_lossy(&f.stderr)
+    );
+    let short = zvcs_blame(&repo, &home, &["--date=short"]);
+    let day = String::from_utf8_lossy(&short.stdout)
+        .split_whitespace()
+        .find(|w| w.len() == 10 && w.as_bytes()[4] == b'-')
+        .expect("--date=short prints a YYYY-MM-DD column")
+        .replace('-', "/");
+    assert!(
+        String::from_utf8_lossy(&f.stdout).contains(&day),
+        "--date=format:%Y/%m/%d must render {day}:\n{}",
+        String::from_utf8_lossy(&f.stdout)
+    );
 
     // `format` without a colon is git's missing-separator fatal (exit 128).
     let z = zvcs_blame(&repo, &home, &["--date=format"]);
@@ -469,6 +518,49 @@ fn blame_date_relative_matches_git() {
         zs,
         "--date=relative must match git"
     );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// The `-local` conversion itself, which the test above cannot catch: its
+/// helper pins `TZ=UTC`, where `iso-local` and `iso` agree even if `-local`
+/// were a no-op. Here the zone is the thing under test, so a port that ignored
+/// it would fail on two of the three rows.
+///
+/// POSIX `TZ` strings rather than zoneinfo names, so this holds on a headless
+/// runner with no tzdata installed. `JST-9` is UTC+9 and `EST5` is UTC-5 —
+/// both DST-free, so the expected renderings are fixed. The values are stock
+/// git's, captured byte-for-byte on this fixture's timestamp; `date.c`'s
+/// `show_date()` under `DATE_ISO8601|local` converts with `localtime_r()` and
+/// keeps the zone field, which is why the offset moves with `TZ`.
+#[test]
+fn blame_date_local_converts_to_the_ambient_zone() {
+    let (repo, home) = dated_fixture("tzlocal", "1700000000 +0000");
+
+    for (tz, want) in [
+        ("JST-9", "2023-11-15 07:13:20 +0900"),
+        ("EST5", "2023-11-14 17:13:20 -0500"),
+        ("UTC", "2023-11-14 22:13:20 +0000"),
+    ] {
+        let out = Command::new(BIN)
+            .args(["blame", "--date=iso-local", "f"])
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("ZVCS_HOME", &home)
+            .env("LC_ALL", "C")
+            .env("TZ", tz)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "TZ={tz} --date=iso-local failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = String::from_utf8_lossy(&out.stdout);
+        assert!(got.contains(want), "TZ={tz}: expected {want} in:\n{got}");
+    }
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }

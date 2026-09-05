@@ -434,7 +434,7 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
 /// `determine_protocol_version_server()` (protocol.c:49-84): the greatest
 /// `version=<n>` the client listed in `GIT_PROTOCOL`, which is a `:`-separated
 /// key list. An unparseable or absent value means v0.
-fn protocol_version_from_env() -> u8 {
+pub(crate) fn protocol_version_from_env() -> u8 {
     match std::env::var("GIT_PROTOCOL") {
         Ok(value) => protocol_version_of(&value),
         Err(_) => 0,
@@ -766,7 +766,8 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     // a two-or-three byte varint where an `OBJ_REF_DELTA` spends a full object
     // id, which is 18 bytes per delta of pure overhead.
     let use_ofs_delta = cap_present(&want_caps, b"ofs-delta");
-    let pack = crate::porcelain::pack_objects::pack_bytes_with(repo, &objects, use_ofs_delta)?;
+    let (pack, summary) =
+        crate::porcelain::pack_objects::pack_bytes_with_summary(repo, &objects, use_ofs_delta)?;
     // `data->use_sideband` (upload-pack.c:1135-1138) is the packet size the
     // selected band carries, not a flag: `LARGE_PACKET_MAX` for `side-band-64k`
     // and `DEFAULT_PACKET_MAX` for plain `side-band`. `send_sideband()` chunks at
@@ -779,9 +780,48 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     } else {
         None
     };
+    // ```c
+    // if (!pack_data->no_progress)
+    //         opts.progress = ODB_GENERATE_PACK_PROGRESS_STANDARD;
+    // …
+    // sz = xread(generator->err, progress, sizeof(progress));
+    // if (0 < sz)
+    //         send_client_data(2, progress, sz, pack_data->use_sideband);
+    // ```
+    //
+    // (`create_pack_file()`, upload-pack.c:284/337-345.) The closing
+    // `Total …` line `pack-objects` writes to its stderr is relayed to the
+    // client on band 2, or — with no side-band negotiated — onto this process's
+    // own stderr (`send_client_data()`, upload-pack.c:182-198). `no-progress`
+    // asks for none of it. The progress *meter* is not written at all, here or
+    // by git: `pack-objects` renders it only onto a terminal.
+    let no_progress = cap_present(&want_caps, b"no-progress");
+    if !no_progress {
+        let line = format!("{}\n", summary.line());
+        match use_sideband {
+            Some(_) => {
+                let mut framed = Vec::with_capacity(line.len() + 1);
+                framed.push(2);
+                framed.extend_from_slice(line.as_bytes());
+                write_pkt(&mut out, &framed)?;
+            }
+            None => eprint!("{line}"),
+        }
+    }
     if let Some(band_max) = use_sideband {
         // Multiplex the pack on band 1, then a flush closes the side-band stream.
-        for chunk in pack.chunks(band_max) {
+        //
+        // `relay_pack_data()` (upload-pack.c:221-296) "keeps the last byte to
+        // itself in case we detect broken rev-list, so that we can leave the
+        // stream corrupted", and only lets go of it once the pack source has
+        // reached EOF. The pack here is already complete in memory, so the whole
+        // of that mechanism shows up as one thing on the wire: the final byte
+        // always travels in a packet of its own.
+        let (body, tail) = pack.split_at(pack.len().saturating_sub(1));
+        for chunk in body
+            .chunks(band_max)
+            .chain((!tail.is_empty()).then_some(tail))
+        {
             let mut framed = Vec::with_capacity(chunk.len() + 1);
             framed.push(1);
             framed.extend_from_slice(chunk);
@@ -814,11 +854,19 @@ fn advertisement(repo: &gix::Repository, policy: WantPolicy, no_done: bool) -> R
     let caps = capabilities(head_target.as_deref(), policy, no_done, repo.object_hash());
     let mut sent_caps = false;
 
-    // HEAD first, when it resolves to an object.
-    if let Ok(mut head) = repo.head() {
-        if let Ok(Some(id)) = head.try_peel_to_id() {
-            pkt_line(&mut out, format!("{} HEAD\0{caps}\n", id.detach().to_hex()).as_bytes());
-            sent_caps = true;
+    // HEAD first, when it resolves to an object. `refs_head_ref_namespaced()`
+    // hands it to the same `send_ref` every other ref goes through
+    // (upload-pack.c:1380), so `mark_our_ref()` — and with it `uploadpack.hideRefs`
+    // — applies to `HEAD` as well as to the branches it names.
+    if !super::receive_pack::ref_is_hidden(&hidden, "HEAD") {
+        if let Ok(mut head) = repo.head() {
+            if let Ok(Some(id)) = head.try_peel_to_id() {
+                pkt_line(
+                    &mut out,
+                    format!("{} HEAD\0{caps}\n", id.detach().to_hex()).as_bytes(),
+                );
+                sent_caps = true;
+            }
         }
     }
 
@@ -837,9 +885,17 @@ fn advertisement(repo: &gix::Repository, policy: WantPolicy, no_done: bool) -> R
             format!("{} {name}\0{caps}\n", oid.to_hex())
         };
         pkt_line(&mut out, line.as_bytes());
-        // An annotated tag advertises its peeled target on a `^{}` line.
+        // ```c
+        // if (!reference_get_peeled_oid(the_repository, ref, &peeled))
+        //         packet_fwrite_fmt(stdout, "%s %s^{}\n", oid_to_hex(&peeled), refname_nons);
+        // ```
+        //
+        // (`write_v0_ref()`, upload-pack.c:1230-1231.) The peel unwraps tag
+        // objects until it reaches something that is not a tag — *whatever* that
+        // is. A tag on a blob or on a tree gets a `^{}` line naming that blob or
+        // tree, so peeling only to a commit drops the line entirely for those.
         if let Ok(obj) = repo.find_object(oid) {
-            if let Ok(peeled) = obj.peel_to_kind(gix::objs::Kind::Commit) {
+            if let Ok(peeled) = obj.peel_tags_to_end() {
                 if peeled.id != oid {
                     pkt_line(&mut out, format!("{} {name}^{{}}\n", peeled.id.to_hex()).as_bytes());
                 }
@@ -1582,6 +1638,10 @@ struct V2Config {
     /// `promisor.advertise` and `promisor.sendFields` (`promisor_remote_info()`).
     /// `None` withholds the capability entirely, which is git's default.
     promisor_info: Option<String>,
+    /// `uploadpack.advertiseBundleURIs` — advertise and serve `bundle-uri`
+    /// (`bundle_uri_advertise()`, bundle-uri.c:929-941: a `maybe_bool` read
+    /// once, defaulting to off).
+    bundle_uri: bool,
     /// The repository's hash algorithm, which the client must agree with.
     object_format: String,
 }
@@ -1607,6 +1667,9 @@ impl V2Config {
                 .then(|| crate::trace2::session_id().to_owned()),
             object_info: config.boolean("transfer.advertiseObjectInfo").unwrap_or(false),
             promisor_info: gix::promisor::remote_info(repo),
+            bundle_uri: config
+                .boolean("uploadpack.advertiseBundleURIs")
+                .unwrap_or(false),
             object_format: repo.object_hash().to_string(),
         }
     }
@@ -1650,8 +1713,13 @@ fn v2_advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
     if cfg.object_info {
         pkt_line(&mut out, b"object-info\n");
     }
-    // Last in git's `capabilities[]` table (serve.c:180-183), after the
-    // `bundle-uri` entry this server does not carry.
+    // `bundle-uri` sits between `object-info` and `promisor-remote` in git's
+    // `capabilities[]` table (serve.c:170-183) and is advertised only when
+    // `uploadpack.advertiseBundleURIs` says so.
+    if cfg.bundle_uri {
+        pkt_line(&mut out, b"bundle-uri\n");
+    }
+    // Last in git's `capabilities[]` table (serve.c:180-183).
     if let Some(info) = &cfg.promisor_info {
         pkt_line(&mut out, format!("promisor-remote={info}\n").as_bytes());
     }
@@ -1697,6 +1765,7 @@ enum V2Command {
     LsRefs,
     Fetch,
     ObjectInfo,
+    BundleUri,
 }
 
 /// `process_request()` (serve.c:280-354): read `command=<name>` and the client's
@@ -1733,6 +1802,7 @@ fn process_request(
                         "ls-refs" => V2Command::LsRefs,
                         "fetch" => V2Command::Fetch,
                         "object-info" if cfg.object_info => V2Command::ObjectInfo,
+                        "bundle-uri" if cfg.bundle_uri => V2Command::BundleUri,
                         _ => die!("invalid command '{name}'"),
                     });
                 } else if !receive_client_capability(repo, cfg, &key, &mut client_hash) {
@@ -1771,6 +1841,7 @@ fn process_request(
         V2Command::LsRefs => ls_refs_command(repo, cfg, reader, &mut writer)?,
         V2Command::Fetch => fetch_command(repo, cfg, reader, &mut writer)?,
         V2Command::ObjectInfo => object_info_command(repo, reader, &mut writer)?,
+        V2Command::BundleUri => bundle_uri_command(repo, reader, &mut writer)?,
     }
     Ok(false)
 }
@@ -1987,6 +2058,10 @@ struct FetchArgs {
     /// `pack-objects` as `--delta-base-offset` in `create_pack_file()`, so the
     /// deltas name their base by pack offset rather than by object id.
     ofs_delta: bool,
+    /// `data->no_progress`, set by the `no-progress` argument: it suppresses the
+    /// `progress` option `create_pack_file()` would otherwise pass to the pack
+    /// generator, and with it the `Total …` line relayed on band 2.
+    no_progress: bool,
     filter: Option<String>,
     /// `data->shallows` plus the `deepen*` request, answered by the
     /// `shallow-info` section in [`send_pack_section`].
@@ -2096,8 +2171,12 @@ fn process_fetch_args(
                 args.ofs_delta = true;
                 continue;
             }
-            // No progress is ever written on band 2, so this is already true.
-            "no-progress" => continue,
+            // `if (!strcmp(arg, "no-progress")) { data->no_progress = 1; continue; }`
+            // (`process_args()`, upload-pack.c:1690).
+            "no-progress" => {
+                args.no_progress = true;
+                continue;
+            }
             "include-tag" => {
                 args.include_tag = true;
                 continue;
@@ -2288,10 +2367,20 @@ fn send_pack_section(
     if args.include_tag {
         add_included_tags(repo, &mut objects);
     }
-    let pack = crate::porcelain::pack_objects::pack_bytes_with(repo, &objects, args.ofs_delta)
-        .map_err(|e| Die(format!("{e:#}")))?;
-    // The band byte eats one of the 65516 payload bytes a pkt-line can carry.
-    for chunk in pack.chunks(65515) {
+    let (pack, summary) =
+        crate::porcelain::pack_objects::pack_bytes_with_summary(repo, &objects, args.ofs_delta)
+            .map_err(|e| Die(format!("{e:#}")))?;
+    // The pack is always multiplexed in v2, so the `Total …` line
+    // `create_pack_file()` relays from the pack generator's stderr always goes
+    // to band 2 — unless the client asked for `no-progress`.
+    if !args.no_progress {
+        writer.band(2, format!("{}\n", summary.line()).as_bytes())?;
+    }
+    // The band byte eats one of the 65516 payload bytes a pkt-line can carry,
+    // and `relay_pack_data()` holds the pack's last byte back until EOF, so it
+    // always arrives in a packet of its own.
+    let (body, tail) = pack.split_at(pack.len().saturating_sub(1));
+    for chunk in body.chunks(65515).chain((!tail.is_empty()).then_some(tail)) {
         writer.band(1, chunk)?;
     }
     writer.flush_pkt()?;
@@ -2326,6 +2415,66 @@ fn add_included_tags(repo: &gix::Repository, objects: &mut Vec<ObjectId>) {
             _ => {}
         }
     }
+}
+
+/// `bundle_uri_command()` (bundle-uri.c:954-975): the command takes no
+/// arguments, and the whole answer is this repository's `bundle.*` configuration
+/// relayed as `key=value` pkt-lines.
+///
+/// ```c
+/// while (packet_reader_read(request) == PACKET_READ_NORMAL)
+///         die(_("bundle-uri: unexpected argument: '%s'"), request->line);
+/// if (request->status != PACKET_READ_FLUSH)
+///         die(_("bundle-uri: expected flush after arguments"));
+/// repo_config(r, config_to_packet_line, &writer);
+/// packet_writer_flush(&writer);
+/// ```
+///
+/// `config_to_packet_line()` filters on the `bundle.` prefix and writes the key
+/// exactly as the configuration file spelled it — lowercased section and
+/// variable, subsection verbatim — so a repository with no `bundle.*` keys
+/// answers with a bare flush.
+fn bundle_uri_command(
+    repo: &gix::Repository,
+    reader: &mut PktReader<std::io::Stdin>,
+    writer: &mut PktWriter<std::io::Stdout>,
+) -> Result<(), Die> {
+    loop {
+        match reader.read()? {
+            Pkt::Line(line) => {
+                die!(
+                    "bundle-uri: unexpected argument: '{}'",
+                    String::from_utf8_lossy(&line)
+                )
+            }
+            Pkt::Flush => break,
+            _ => die!("bundle-uri: expected flush after arguments"),
+        }
+    }
+    let config = repo.config_snapshot();
+    for (key, value) in config
+        .sections_by_name("bundle")
+        .into_iter()
+        .flatten()
+        .flat_map(|section| {
+            let subsection = section.header().subsection_name().map(ToOwned::to_owned);
+            section
+                .value_names()
+                .map(move |name| (subsection.clone(), name.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|(subsection, name)| {
+            let key = match &subsection {
+                Some(sub) => format!("bundle.{sub}.{name}"),
+                None => format!("bundle.{name}"),
+            };
+            config.string(key.as_str()).map(|v| (key, v.to_string()))
+        })
+    {
+        writer.write(&format!("{key}={value}"))?;
+    }
+    writer.flush_pkt()?;
+    Ok(())
 }
 
 /// `cap_object_info()` (protocol-caps.c:78-113): answer `size` for each `oid`
@@ -2540,6 +2689,7 @@ mod tests {
             session_id: None,
             object_info: false,
             promisor_info: None,
+            bundle_uri: false,
             object_format: "sha1".into(),
         };
         assert_eq!(base.fetch_values(), "shallow wait-for-done");

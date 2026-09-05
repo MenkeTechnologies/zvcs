@@ -318,6 +318,21 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // `cmd_receive_pack()`'s version switch (builtin/receive-pack.c:2662-2682).
+    // v2 has no push support, so a client asking for it is served v0; v1 is v0
+    // with a `version 1` pkt-line in front, written on exactly the paths that go
+    // on to write an advertisement.
+    if super::upload_pack::protocol_version_from_env() == 1
+        && (opts.advertise_only || !opts.stateless_rpc)
+    {
+        use std::io::Write;
+        let mut line = Vec::new();
+        pkt_line(&mut line, b"version 1\n");
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&line)?;
+        stdout.flush()?;
+    }
+
     // `if (advertise_refs || !stateless_rpc) write_head_info();` — under
     // `--stateless-rpc` the advertisement was served by an earlier process.
     if opts.advertise_only || !opts.stateless_rpc {
@@ -483,23 +498,54 @@ fn advertisement(repo: &gix::Repository, config: &Config) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut sent_capabilities = false;
 
-    for reference in repo.references()?.all()? {
+    // `write_head_info()` (receive-pack.c:343-361) deliberately walks the *whole*
+    // ref store rather than the namespaced view: "We need access to the reference
+    // names both with and without their namespace and thus cannot use
+    // `refs_for_each_namespaced_ref()`." A ref outside the namespace is still
+    // advertised, as a `.have` line deduplicated by object id, so the client can
+    // use it to shrink the pack it sends but otherwise ignores it
+    // (`show_ref_cb()`, receive-pack.c:308-329).
+    let prefix = repo.namespace().map(|ns| ns.as_bstr().to_string());
+    let mut store = repo.clone();
+    store.clear_namespace();
+    let mut seen: std::collections::HashSet<gix::ObjectId> = std::collections::HashSet::new();
+
+    for reference in store.references()?.all()? {
         // Broken refs are skipped, as git's ref iteration does.
-        let Ok(mut reference) = reference else { continue };
-        let name = reference.name().as_bstr().to_string();
+        let Ok(mut reference) = reference else {
+            continue;
+        };
+        let full = reference.name().as_bstr().to_string();
+        // `strip_namespace()` answers NULL for a name that is not under the
+        // current namespace; without a namespace the two names are equal.
+        let stripped = match &prefix {
+            Some(p) => full.strip_prefix(p.as_str()).map(str::to_owned),
+            None => Some(full.clone()),
+        };
         // `show_ref()` runs every candidate through `ref_is_hidden()` first.
-        if config.ref_is_hidden(&name) {
+        if config.ref_is_hidden_qualified(stripped.as_deref(), &full) {
             continue;
         }
         // Symbolic refs resolve to their object; tags are not peeled here.
         let Ok(id) = reference.follow_to_object() else {
             continue;
         };
+        let id = id.detach();
+        let name = match stripped {
+            Some(name) => {
+                seen.insert(id);
+                name
+            }
+            // `if (oidset_insert(seen, ref->oid)) return 0;` — one `.have` per
+            // object, no matter how many refs outside the namespace carry it.
+            None if seen.insert(id) => ".have".to_string(),
+            None => continue,
+        };
         let line = if sent_capabilities {
-            format!("{} {name}\n", id.detach().to_hex())
+            format!("{} {name}\n", id.to_hex())
         } else {
             sent_capabilities = true;
-            format!("{} {name}\0{caps}\n", id.detach().to_hex())
+            format!("{} {name}\0{caps}\n", id.to_hex())
         };
         pkt_line(&mut out, line.as_bytes());
     }
@@ -846,6 +892,16 @@ impl Config {
         ref_is_hidden(&self.hide_refs, name)
     }
 
+    /// The advertisement's spelling of the same question, which has both names
+    /// to hand: `ref_is_hidden(strip_namespace(ref->name), ref->name)`
+    /// (receive-pack.c:311). `stripped` is `None` for a ref outside the current
+    /// namespace, which is exactly the `refname can be NULL` case refs.c:1735
+    /// guards — a `^`-anchored pattern still matches such a ref, a plain one
+    /// cannot.
+    fn ref_is_hidden_qualified(&self, stripped: Option<&str>, full: &str) -> bool {
+        ref_is_hidden_qualified(&self.hide_refs, stripped, full)
+    }
+
     /// `receive-pack.c::update()`'s refusals, in git's order. `Some(reason)` is
     /// the `ng <ref> <reason>` status the client prints; the human-readable
     /// half has already gone back on band 2.
@@ -861,7 +917,20 @@ impl Config {
         let name = cmd.name.as_str();
         let deleting = cmd.new == zero;
 
-        if !deleting && head == Some(name) && !repo.is_bare() {
+        // ```c
+        // const struct worktree *worktree = find_shared_symref(worktrees, "HEAD", name);
+        // …
+        // if (worktree && !worktree->is_bare) {
+        //         switch (deny_current_branch) {
+        // ```
+        //
+        // (receive-pack.c:1506-1541.) The gate is the *worktree*, not the kind of
+        // update: a **delete** of the checked-out branch is refused here, by
+        // `receive.denyCurrentBranch`, and never reaches the
+        // `receive.denyDeleteCurrent` block below — that one only sees deletes of
+        // a branch some worktree has checked out *and* that this check let past,
+        // which is `ignore`, `warn` and `updateInstead`.
+        if head == Some(name) && !repo.is_bare() {
             match self.deny_current_branch {
                 DenyAction::Ignore => {}
                 DenyAction::Warn => band.warning("updating the current branch"),
@@ -939,14 +1008,27 @@ pub fn hide_ref_patterns(config: &gix::config::Snapshot<'_>, protocol_key: &str)
 /// un-hides, a leading `^` matches the fully qualified (namespaced) name, and a
 /// pattern only matches at a `/` boundary or at the end of the name.
 pub fn ref_is_hidden(patterns: &[String], name: &str) -> bool {
+    ref_is_hidden_qualified(patterns, Some(name), name)
+}
+
+/// `refs.c::ref_is_hidden(refname, refname_full, hide_refs)` with both names
+/// spelled out: a `^`-prefixed pattern is matched against the *fully qualified*
+/// name and every other one against the namespace-stripped name, which is
+/// `None` — and therefore matches nothing — for a ref outside the namespace.
+pub fn ref_is_hidden_qualified(patterns: &[String], stripped: Option<&str>, full: &str) -> bool {
     for pattern in patterns.iter().rev() {
         let (negated, pattern) = match pattern.strip_prefix('!') {
             Some(rest) => (true, rest),
             None => (false, pattern.as_str()),
         };
-        // Without a namespace the qualified and unqualified names are equal.
-        let pattern = pattern.strip_prefix('^').unwrap_or(pattern);
-        if let Some(rest) = name.strip_prefix(pattern) {
+        let (subject, pattern) = match pattern.strip_prefix('^') {
+            Some(rest) => (Some(full), rest),
+            None => (stripped, pattern),
+        };
+        // `if (subject && skip_prefix(subject, match, &p) && (!*p || *p == '/'))`
+        // — a NULL subject can never match, negation included.
+        let Some(subject) = subject else { continue };
+        if let Some(rest) = subject.strip_prefix(pattern) {
             if rest.is_empty() || rest.starts_with('/') {
                 return !negated;
             }
@@ -1234,7 +1316,10 @@ fn parse_command(text: &str) -> Result<Command> {
     let mut it = text.splitn(3, ' ');
     let (o, n, name) = match (it.next(), it.next(), it.next()) {
         (Some(o), Some(n), Some(name)) if !name.is_empty() => (o, n, name),
-        _ => crate::git_fatal!("protocol error: expected old/new/ref, got {text:?}"),
+        // `die("protocol error: expected old/new/ref, got '%s'", line)`
+        // (receive-pack.c:2156): git single-quotes the offending line rather
+        // than rendering it as a Rust debug string.
+        _ => crate::git_fatal!("protocol error: expected old/new/ref, got '{text}'"),
     };
     Ok(Command {
         old: gix::ObjectId::from_hex(o.as_bytes())
@@ -1378,13 +1463,85 @@ fn check_command(
             return Err(reason);
         }
     }
-    // `update()`: a delete of a ref this repository does not have is allowed and
-    // reported `ok`, but it is worth saying so — the pusher asked to remove
-    // something that was never here.
-    if cmd.new == zero && repo.try_find_reference(cmd.name.as_str()).ok().flatten().is_none() {
-        band.warning("deleting a non-existent ref");
+    // ```c
+    // if (is_null_oid(new_oid)) {
+    //         if (!parse_object(the_repository, old_oid)) {
+    //                 old_oid = NULL;
+    //                 if (refs_ref_exists(get_main_ref_store(the_repository), name))
+    //                         rp_warning("allowing deletion of corrupt ref");
+    //                 else
+    //                         rp_warning("deleting a non-existent ref");
+    //         }
+    // ```
+    //
+    // (receive-pack.c:1622-1632.) The question is about the *object* the pusher
+    // named as the old value, not about the ref: a delete whose old value this
+    // repository cannot look up is downgraded to an unconditional delete and
+    // warned about, while a delete naming a real object keeps its
+    // compare-and-swap and is silent even when the ref itself is gone — that
+    // case is a lock failure below, not a warning.
+    let mut old = cmd.old;
+    if cmd.new == zero && repo.find_object(old).is_err() {
+        if repo
+            .try_find_reference(cmd.name.as_str())
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            band.warning("allowing deletion of corrupt ref");
+        } else {
+            band.warning("deleting a non-existent ref");
+        }
+        old = zero;
     }
-    ref_edit(&cmd.name, cmd.old, cmd.new, zero)
+    ref_edit(&cmd.name, old, cmd.new, zero)
+}
+
+/// `lock_ref_for_update()` (refs/files-backend.c:2639-2675) and the old-value
+/// comparison it wraps (:2593-2610), reduced to the two ways a push's
+/// compare-and-swap fails.
+///
+/// The pair is the `error: <text>` git prints when `ref_transaction_commit()`
+/// rejects the update and the `ng <ref> <reason>` the client is told, which is
+/// `ref_transaction_error_msg()` of the backend's error code (refs.c:3532-3550).
+/// gitoxide's own wording for the same two refusals is its own, so it is
+/// translated here rather than forwarded.
+fn lock_failure(repo: &gix::Repository, edit: &RefEdit) -> Option<(String, &'static str)> {
+    let expected = match &edit.change {
+        Change::Update { expected, .. } | Change::Delete { expected, .. } => expected,
+    };
+    let name = edit.name.as_bstr().to_string();
+    // The value the ref holds now, with symbolic refs followed and tag objects
+    // left unpeeled — what git compares `old_oid` against.
+    let current = repo
+        .try_find_reference(name.as_str())
+        .ok()
+        .flatten()
+        .and_then(|mut r| r.follow_to_object().ok())
+        .map(|id| id.detach());
+    match expected {
+        // `is_null_oid(&update->old_oid)` with something already there.
+        PreviousValue::MustNotExist => current.map(|_| {
+            (
+                format!("cannot lock ref '{name}': reference already exists"),
+                "reference already exists",
+            )
+        }),
+        PreviousValue::MustExistAndMatch(Target::Object(old)) => match current {
+            // `lock_raw_ref()` with `mustexist`, which is set for any non-null
+            // old value, fails before the value comparison is reached.
+            None => Some((
+                format!("cannot lock ref '{name}': unable to resolve reference '{name}'"),
+                "reference does not exist",
+            )),
+            Some(cur) if cur != *old => Some((
+                format!("cannot lock ref '{name}': is at {cur} but expected {old}"),
+                "incorrect old value provided",
+            )),
+            Some(_) => None,
+        },
+        _ => None,
+    }
 }
 
 /// `execute_commands_non_atomic()`: every command stands or falls alone.
@@ -1400,8 +1557,18 @@ fn execute_commands_non_atomic(
         if cmds[i].error.is_some() || cmds[i].proc_receive {
             continue;
         }
-        let verdict = check_command(repo, config, &cmds[i], zero, head, band)
-            .and_then(|edit| repo.edit_references([edit]).map(|_| ()).map_err(|e| e.to_string()));
+        let verdict = check_command(repo, config, &cmds[i], zero, head, band).and_then(|edit| {
+            // The transaction is what refuses a bad old value, so its diagnostic
+            // is git's — `rp_error("%s", err.buf)` from the commit, then the
+            // per-ref reason out of the rejection list (receive-pack.c:1955-1972).
+            if let Some((text, reason)) = lock_failure(repo, &edit) {
+                band.error(&text);
+                return Err(reason.to_string());
+            }
+            repo.edit_references([edit])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
         if let Err(reason) = verdict {
             cmds[i].error = Some(reason);
         }
@@ -1438,7 +1605,13 @@ fn execute_commands_atomic(
     }
 
     if reported.is_none() && !edits.is_empty() {
-        if let Err(e) = repo.edit_references(edits) {
+        // `if (ref_transaction_commit(transaction, &err)) { rp_error("%s", err.buf); … }`
+        // (receive-pack.c:2010-2014): one message, from the first update the
+        // backend could not lock, and every command then carries the same reason.
+        if let Some((text, _)) = edits.iter().find_map(|edit| lock_failure(repo, edit)) {
+            band.error(&text);
+            reported = Some("atomic transaction failed");
+        } else if let Err(e) = repo.edit_references(edits) {
             band.error(&e.to_string());
             reported = Some("atomic transaction failed");
         }

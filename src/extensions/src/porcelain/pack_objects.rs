@@ -1085,6 +1085,30 @@ pub(crate) struct Packed {
     pub(crate) bytes: Vec<u8>,
     pub(crate) id: ObjectId,
     pub(crate) entries: Vec<PackedEntry>,
+    /// The two counts `pack-objects` closes a run with, for callers that have to
+    /// relay them rather than print them (`upload-pack` puts them on band 2).
+    pub(crate) summary: PackSummary,
+}
+
+/// `written` and `written_delta` as `builtin/pack-objects.c:5520-5527` reports
+/// them. The three reuse counters git prints beside these are always zero here:
+/// nothing is ever copied out of an existing pack, which is the truth about this
+/// writer rather than a stand-in.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PackSummary {
+    pub(crate) written: usize,
+    pub(crate) written_delta: usize,
+}
+
+impl PackSummary {
+    /// The line itself, without a trailing newline — `Total %u (delta %u),
+    /// reused %u (delta %u), pack-reused %u (from %u)`.
+    pub(crate) fn line(&self) -> String {
+        format!(
+            "Total {} (delta {}), reused 0 (delta 0), pack-reused 0 (from 0)",
+            self.written, self.written_delta
+        )
+    }
 }
 
 /// Build a complete packfile from an explicit set of object ids and return its
@@ -1110,15 +1134,29 @@ pub(crate) fn pack_bytes_with(
     ids: &[ObjectId],
     allow_ofs_delta: bool,
 ) -> Result<Vec<u8>> {
-    Ok(packed_for(
+    Ok(pack_bytes_with_summary(repo, ids, allow_ofs_delta)?.0)
+}
+
+/// [`pack_bytes_with`], keeping the closing counts.
+///
+/// `upload-pack` needs them because it does not print the summary itself: the
+/// `pack-objects` child writes it to its stderr and `create_pack_file()` relays
+/// that onto band 2 of the client's connection (upload-pack.c:337-350), so the
+/// line has to travel rather than be emitted where it is computed.
+pub(crate) fn pack_bytes_with_summary(
+    repo: &gix::Repository,
+    ids: &[ObjectId],
+    allow_ofs_delta: bool,
+) -> Result<(Vec<u8>, PackSummary)> {
+    let packed = packed_for(
         repo,
         ids,
         WriteOptions {
             allow_ofs_delta,
             ..WriteOptions::default()
         },
-    )?
-    .bytes)
+    )?;
+    Ok((packed.bytes, packed.summary))
 }
 
 /// What a caller outside this module can steer the pack writer with. Everything
@@ -1611,6 +1649,10 @@ fn write_pack(
     Ok(Packed {
         bytes,
         id,
+        summary: PackSummary {
+            written: entries.len(),
+            written_delta: written_deltas,
+        },
         entries,
     })
 }

@@ -45,7 +45,21 @@ impl ProgramKind {
         }
         match self {
             ProgramKind::Ssh => {
-                if desired_version != Protocol::V1 {
+                // ```c
+                // if (variant == VARIANT_SSH && version > 0) {
+                //         strvec_push(args, "-o");
+                //         strvec_push(args, "SendEnv=" GIT_PROTOCOL_ENVIRONMENT);
+                //         strvec_pushf(env, GIT_PROTOCOL_ENVIRONMENT "=version=%d", version);
+                // }
+                // ```
+                //
+                // (`push_ssh_options()`, connect.c:1284-1291.) The test is on the
+                // version being non-zero, not on it being v2: v0 is the dialect
+                // that predates the variable and says so by not setting it, and
+                // `git_connect()` picks v0 for every service that is not
+                // `upload-pack` — which is how a push over ssh comes out without
+                // these two arguments.
+                if desired_version != Protocol::V0 {
                     prepare = prepare
                         .args(["-o", "SendEnv=GIT_PROTOCOL"])
                         .env("GIT_PROTOCOL", format!("version={}", desired_version as usize));

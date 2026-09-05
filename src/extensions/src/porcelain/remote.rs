@@ -902,17 +902,6 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         moves.push((name, text, dst, target));
     }
 
-    // Carry the reflogs across by moving the directory, so history survives the
-    // create-then-delete below.
-    let logs = repo.git_dir().join("logs").join("refs").join("remotes");
-    let (from, to) = (logs.join(old), logs.join(new));
-    if from.exists() && !to.exists() {
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::rename(&from, &to)?;
-    }
-
     // ```c
     // if (refs_rename_ref(get_main_ref_store(the_repository), item->string, buf.buf, buf2.buf))
     // ```
@@ -921,6 +910,13 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // opens with that value rather than with the null id a freshly created ref would show.
     // gitoxide has no rename — the ref is created and the old one deleted — so its own
     // logging is switched off for the edit and the line is written by hand.
+    //
+    // "Switched off" is the *order* as much as the handle: the create runs while the
+    // destination still has no log, so neither the `Disable` policy nor anything else
+    // has a file to append to; the log is carried across immediately afterwards, and
+    // only then is the single `<tip> <tip>` line written. Moving the logs up front
+    // instead — as this used to — gives the create a file to append to and the rename
+    // two entries where git writes one.
     let mut silent = repo.clone();
     silent.refs.write_reflog = gix::refs::store::WriteReflog::Disable;
 
@@ -956,6 +952,9 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             name: new_name.clone(),
             deref: false,
         })?;
+        // `files_copy_or_rename_ref()` moves the ref's reflog with the ref, so the
+        // carried-over history is what the line below appends to.
+        move_reflog(repo, &old_text, &dst)?;
         if let Some(id) = logged {
             super::symbolic_ref::append_reflog(repo, new_name.as_ref(), Some(id), &id, &message)?;
         }
@@ -2513,4 +2512,32 @@ fn skip_fetch_all(repo: &gix::Repository, name: &str) -> bool {
         }
     }
     skip
+}
+
+/// Move one ref's reflog from `old_full` to `new_full`, the way
+/// `files_copy_or_rename_ref()` renames a ref's log along with the ref.
+///
+/// A ref with no log needs nothing moved, and a destination that somehow has one
+/// already is left alone rather than clobbered — the caller has refused an
+/// occupied destination ref before it gets here.
+fn move_reflog(repo: &gix::Repository, old_full: &str, new_full: &str) -> Result<()> {
+    let logs = repo.git_dir().join("logs");
+    let from = logs.join(old_full);
+    let to = logs.join(new_full);
+    if !from.is_file() || to.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&from, &to)?;
+    // The directory the log came out of is git's to remove once it is empty.
+    let mut dir = from.parent().map(std::path::Path::to_path_buf);
+    while let Some(current) = dir {
+        if current == logs || std::fs::remove_dir(&current).is_err() {
+            break;
+        }
+        dir = current.parent().map(std::path::Path::to_path_buf);
+    }
+    Ok(())
 }

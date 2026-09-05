@@ -179,9 +179,28 @@ impl<'repo> Remote<'repo> {
             Ok(url)
         }
 
-        let version = crate::config::tree::Protocol::VERSION
+        let mut version = crate::config::tree::Protocol::VERSION
             .try_into_protocol_version(self.repo.config.resolved.integer(Protocol::VERSION))
             .map_err(|err| Error::UnknownProtocol { source: err })?;
+        // ```c
+        // /*
+        //  * NEEDSWORK: If we are trying to use protocol v2 and we are planning
+        //  * to perform any operation that doesn't involve upload-pack (i.e. a
+        //  * fetch, ls-remote, etc), then fallback to v0 since we don't know how
+        //  * to do anything else (like push or remote archive) via v2.
+        //  */
+        // if (version == protocol_v2 && service != GIT_CONNECT_UPLOAD_PACK)
+        //         version = protocol_v0;
+        // ```
+        //
+        // (`git_connect()`, connect.c:1408-1417.) There is no v2 receive-pack, so
+        // a push under the default `protocol.version=2` is negotiated as v0 —
+        // which is visible from outside the process, because `push_ssh_options()`
+        // only asks `ssh` to forward `GIT_PROTOCOL` while the version is greater
+        // than zero.
+        if direction == crate::remote::Direction::Push && version == gix_protocol::transport::Protocol::V2 {
+            version = gix_protocol::transport::Protocol::V0;
+        }
 
         let url = self.url(direction).ok_or(Error::MissingUrl { direction })?.to_owned();
         if !self.repo.config.url_scheme()?.allow(&url.scheme) {

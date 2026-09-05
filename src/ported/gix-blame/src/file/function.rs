@@ -539,6 +539,7 @@ pub fn file(
                             &target_file,
                             options.diff_algorithm,
                             options.ignore_whitespace,
+                            options.indent_heuristic,
                             &mut stats,
                             suspect_is_ignored,
                         );
@@ -591,6 +592,7 @@ pub fn file(
                             &target_file,
                             options.diff_algorithm,
                             options.ignore_whitespace,
+                            options.indent_heuristic,
                             &mut stats,
                             suspect_is_ignored,
                         );
@@ -662,6 +664,7 @@ pub fn file(
                     &mut origin_files,
                     options.diff_algorithm,
                     options.ignore_whitespace,
+                    options.indent_heuristic,
                     &mut stats,
                 )?;
             }
@@ -682,6 +685,7 @@ pub fn file(
                     &mut diff_state,
                     options.diff_algorithm,
                     options.ignore_whitespace,
+                    options.indent_heuristic,
                     &mut stats,
                 )?;
             }
@@ -1182,6 +1186,7 @@ fn blob_changes(
     new_data: &[u8],
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
+    indent_heuristic: bool,
     stats: &mut Statistics,
     collect_data: bool,
 ) -> BlobChanges {
@@ -1206,14 +1211,33 @@ fn blob_changes(
     // rather than by `imara-diff`'s postprocessor. The indent heuristic measures the *original*
     // lines even when `-w` had the compared ones stripped, as git's `get_indent()` reads
     // `xdf->recs[i]->ptr`.
-    let compacted = compact::change_compact(
-        &diff,
-        diff_algorithm,
-        &input.before,
-        &input.after,
-        &compact::line_indents(old_data),
-        &compact::line_indents(new_data),
-    );
+    // `xdl_change_compact()`'s indent scoring is `XDF_INDENT_HEURISTIC`, which
+    // `cmd_blame()` takes from `revs.diffopt.xdl_opts` and nothing else
+    // (`builtin/blame.c:952`: `xdl_opts |= revs.diffopt.xdl_opts & XDF_INDENT_HEURISTIC`), so
+    // `--no-indent-heuristic` reaches every diff of the dig. `xdiff/xdiffi.c:876` guards the whole
+    // scoring branch on the flag, which is what `None` here is.
+    let compacted = {
+        let (indent_before, indent_after);
+        let indents = if indent_heuristic {
+            indent_before = compact::line_indents(old_data);
+            indent_after = compact::line_indents(new_data);
+            Some((indent_before.as_slice(), indent_after.as_slice()))
+        } else {
+            None
+        };
+        let mut removed: Vec<bool> =
+            (0..input.before.len() as u32).map(|i| diff.is_removed(i)).collect();
+        let mut added: Vec<bool> = (0..input.after.len() as u32).map(|i| diff.is_added(i)).collect();
+        compact::compact_flags(
+            &mut removed,
+            &mut added,
+            diff_algorithm,
+            &input.before,
+            &input.after,
+            indents,
+        );
+        compact::Changed { removed, added }
+    };
 
     let mut last_seen_after_end = 0;
     let mut changes = compacted

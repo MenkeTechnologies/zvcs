@@ -2872,7 +2872,7 @@ fn show_commit_record(
                     if wrote_block {
                         out.push(b'\n');
                     }
-                    out.extend_from_slice(&super::diff::line_range_patch(repo, pairs, 3)?);
+                    out.extend_from_slice(&super::diff::line_range_patch(repo, pairs, 3, disp.patch.ws)?);
                 }
             }
         }

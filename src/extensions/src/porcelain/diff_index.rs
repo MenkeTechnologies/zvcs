@@ -106,12 +106,19 @@
 //! `provable_noop_option` splits out the entries that set a flag to the value
 //! `cmd_diff_index()` already starts from — `--default-prefix`,
 //! `--ita-visible-in-index`, `--no-diff-merges`, `--no-ext-diff`,
-//! `--no-function-context`, `--no-notes`, `--no-textconv`, `--rename-empty`. They
-//! cannot change any format, so they are not recorded and a content format runs
-//! normally alongside them. Three of the nine are inert only because plumbing runs
-//! `git_diff_basic_config()` and never `git_diff_ui_config()`, which is what leaves
-//! `allow_external`, `allow_textconv` and the prefix config at their off/default
-//! state.
+//! `--no-function-context`, `--no-notes`, `--rename-empty`. They cannot change any
+//! format, so they are not recorded and a content format runs normally alongside
+//! them. Two of them are inert only because plumbing runs `git_diff_basic_config()`
+//! and never `git_diff_ui_config()`, which is what leaves `allow_external` and the
+//! prefix config at their off/default state.
+//!
+//! `--textconv`/`--no-textconv` are parsed for real onto [`Opts::allow_textconv`]:
+//! with the flag on, each side's `diff.<driver>.textconv` program runs and its stdout
+//! is what the patch body is diffed from, while the stat family, `--check` and the
+//! pickaxe keep reading the raw blobs — the split between `builtin_diff()` and
+//! `builtin_diffstat()`. `--ext-diff` remains a refusal for the content formats: the
+//! external-driver protocol is ported in [`super::diff_pairs`] but this module does
+//! not route its pairs through it.
 //!
 //! `--ignore-blank-lines` (`XDF_IGNORE_BLANK_LINES`) and `--no-renames` are honoured
 //! rather than ignored. The first marks a change group whose every pre- and
@@ -323,6 +330,11 @@ struct Opts {
     /// deletion or nothing at all. Off by default — the plumbing commands do not
     /// raise the flag the way `cmd_diff()` does.
     ita_invisible: bool,
+    /// `--textconv` / `--no-textconv` (`o->flags.allow_textconv`). Off by default:
+    /// `cmd_diff_index()` calls `git_diff_basic_config()`, which never raises it the
+    /// way `cmd_diff()`'s `git_diff_ui_config()` does, so a `diff.<driver>.textconv`
+    /// only reaches the patch when the flag is given.
+    allow_textconv: bool,
     format: Format,
     nul: bool,                     // -z: NUL field/record terminators, no path quoting
     abbrev: Option<Option<usize>>, // --abbrev[=N]: None=full, Some(None)=auto, Some(Some(n))=N
@@ -547,12 +559,13 @@ common diff options:
 /// Options that set a flag to the value `cmd_diff_index()` already starts from, so
 /// they cannot change any output in any format and need not be recorded at all.
 ///
-/// Three of them are only inert because `cmd_diff_index()` calls
-/// `git_diff_basic_config()` and never `git_diff_ui_config()`: `allow_external`,
-/// `allow_textconv` and the whole prefix family (`diff.noprefix`,
-/// `diff.srcPrefix`/`dstPrefix`, `diff.mnemonicPrefix`) therefore start off/default,
-/// and turning them off again is a no-op. The rest describe machinery this command
-/// has no path to at all.
+/// Two of them are only inert because `cmd_diff_index()` calls
+/// `git_diff_basic_config()` and never `git_diff_ui_config()`: `allow_external` and
+/// the whole prefix family (`diff.noprefix`, `diff.srcPrefix`/`dstPrefix`,
+/// `diff.mnemonicPrefix`) therefore start off/default, and turning them off again is
+/// a no-op. The rest describe machinery this command has no path to at all.
+/// `--no-textconv` left this list when `--textconv` was ported: both now have their
+/// own arm in the parse loop and write [`Opts::allow_textconv`].
 ///
 /// Measured against stock git 2.55.0: for each entry, `git diff-index <fmt> <opt>
 /// HEAD` is byte-identical to `git diff-index <fmt> HEAD` on stdout, stderr and exit
@@ -580,7 +593,6 @@ fn provable_noop_option(a: &str) -> bool {
             | "--no-ext-diff"
             | "--no-function-context"
             | "--no-notes"
-            | "--no-textconv"
             // `--expand-tabs[=<n>]`/`--no-expand-tabs` (revision.c:2575-2583) set only
             // `revs->expand_tabs_in_log`, which nothing but `pretty.c`'s commit-message
             // indenter reads (pretty.c:2235, 2281). This command never formats a commit
@@ -616,10 +628,8 @@ fn render_only_option(a: &str) -> bool {
         // here, so it cannot change any output this command produces.
         "--no-notes",
         "--no-prefix",
-        "--no-textconv",
         "--submodule",
         "--text",
-        "--textconv",
     ];
     // NB: the value-validated options `--color=`, `--word-diff=`, `--ignore-submodules=`,
     // `--submodule=`, `--diff-algorithm=`, `--diff-merges=`, `--skip-to=` and
@@ -742,6 +752,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         cached: false,
         match_missing: false,
         ita_invisible: false,
+        allow_textconv: false,
         format: Format::Raw,
         nul: false,
         abbrev: None,
@@ -976,6 +987,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // decides whether the `add -N` record is in the queue at all.
             "--ita-invisible-in-index" => opts.ita_invisible = true,
             "--ita-visible-in-index" => opts.ita_invisible = false,
+            // `diff_opt_textconv()` (diff.c:5338-5348), whose `unset` arm clears the
+            // flag and whose set arm raises it. Only the patch reads it:
+            // `builtin_diffstat()`, `builtin_checkdiff()` and `diffcore_pickaxe()`
+            // fill their buffers with `fill_mmfile()`, never `fill_textconv()`.
+            "--textconv" => opts.allow_textconv = true,
+            "--no-textconv" => opts.allow_textconv = false,
             "--raw" => {
                 opts.format = Format::Raw;
                 raw_explicit = true;
@@ -2116,11 +2133,25 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                         .map(|b| b.0)
                 })
                 .collect();
-            deltas
-                .iter()
-                .zip(&driver_binary)
-                .map(|(d, db)| analyze_index_delta(&repo, workdir.as_deref(), d, &opts, *db))
-                .collect::<Result<_>>()?
+            // `userdiff_find_by_path()` for both filespecs of every pair: the funcname
+            // pattern `xdiff_set_find_func()` installs, and — under `--textconv` — the
+            // per-side `diff.<name>.textconv` programs `builtin_diff()` runs.
+            let mut lookup = crate::userdiff::Lookup::new(&repo)?;
+            let drivers = resolve_drivers(&mut lookup, &deltas)?;
+            let mut analyses: Vec<IdxAnalysis> = Vec::with_capacity(deltas.len());
+            for ((d, db), drv) in deltas.iter().zip(&driver_binary).zip(&drivers) {
+                analyses.push(analyze_index_delta(
+                    &repo,
+                    workdir.as_deref(),
+                    d,
+                    &opts,
+                    *db,
+                    drv.funcname(),
+                    opts.allow_textconv.then(|| drv.textconv()).unwrap_or((None, None)),
+                    &mut lookup,
+                )?);
+            }
+            analyses
         } else {
             Vec::new()
         };
@@ -2220,6 +2251,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     files.push(diff_color::FilePaint {
                         ws_rule,
                         blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+                        // This command does not resolve a path's userdiff driver, so no driver word
+                        // regex is available; `diff.wordRegex` still reaches the emitter through
+                        // [`diff_color::ExtraPaint`].
+                        word_regex: None,
                     });
                 }
             }
@@ -3229,6 +3264,70 @@ fn content_of(
     Ok(workdir.and_then(|wd| read_worktree(wd, path)))
 }
 
+/// `userdiff_find_by_path()` + `xdiff_set_find_func()` for every queued pair, in
+/// `builtin_diff()`'s order:
+///
+/// ```text
+/// pe = diff_funcname_pattern(o, one);
+/// if (!pe)
+///         pe = diff_funcname_pattern(o, two);
+/// ```
+///
+/// (diff.c:3622-3624). `diff_funcname_pattern()` (diff.c:3393) loads the filespec's
+/// driver and answers NULL unless it carries a pattern, which is why a driver that
+/// only configures `textconv` still lets the *other* side's driver supply the heading.
+///
+/// The lookup runs on the repository-relative names, before `--relative` shortens
+/// anything — `run_diff()` captures `attr_path` off `p->one->path` ahead of
+/// `strip_prefix()` (diff.c:5036-5038).
+///
+/// A pattern that will not compile is git's
+/// `die(_("Invalid regexp to look for hunk header: %s"))`.
+fn resolve_drivers(
+    lookup: &mut crate::userdiff::Lookup<'_>,
+    deltas: &[Delta],
+) -> Result<Vec<PairDrivers>> {
+    let mut out = Vec::with_capacity(deltas.len());
+    for d in deltas {
+        let one = lookup.for_path(d.src_path().as_ref()).map_err(crate::fatal::die)?;
+        let two = if d.src_path() == &d.path {
+            one.clone()
+        } else {
+            lookup.for_path(d.path.as_ref()).map_err(crate::fatal::die)?
+        };
+        out.push(PairDrivers { one, two });
+    }
+    Ok(out)
+}
+
+/// `userdiff_find_by_path()` for one pair's two filespecs — git's `one->driver` and
+/// `two->driver`. `diff-index` pairs name the same path on both sides unless
+/// `diffcore_rename()` matched a rename or copy across paths.
+#[derive(Default, Clone)]
+struct PairDrivers {
+    one: Option<std::sync::Arc<crate::userdiff::Driver>>,
+    two: Option<std::sync::Arc<crate::userdiff::Driver>>,
+}
+
+impl PairDrivers {
+    /// `pe = diff_funcname_pattern(o, one); if (!pe) pe = diff_funcname_pattern(o, two);`
+    fn funcname(&self) -> Option<&crate::userdiff::FuncName> {
+        self.one
+            .as_ref()
+            .and_then(|d| d.funcname.as_ref())
+            .or_else(|| self.two.as_ref().and_then(|d| d.funcname.as_ref()))
+    }
+
+    /// `textconv_one` / `textconv_two` in `builtin_diff()` (diff.c:3487-3489), each
+    /// from its own side's driver.
+    fn textconv(&self) -> (Option<&str>, Option<&str>) {
+        (
+            self.one.as_ref().and_then(|d| d.settings.textconv.as_deref()),
+            self.two.as_ref().and_then(|d| d.settings.textconv.as_deref()),
+        )
+    }
+}
+
 /// `builtin_diff()`'s internal-diff branch: intern the two sides (folded for the
 /// whitespace family), count the added/removed lines the way `diffstat` does — dropping
 /// change groups every line of which matches `-I` — and render the unified hunks when a
@@ -3241,6 +3340,15 @@ fn analyze_index_delta(
     // `one->driver->binary`: `Some` only when the path's `diff=<driver>` attribute names
     // a driver that configures `diff.<name>.binary`.
     driver_binary: Option<bool>,
+    // `xecfg.find_func`: the compiled `funcname`/`xfuncname` pattern of the driver
+    // [`resolve_drivers`] picked for this pair, or `None` for xdiff's `def_ff`.
+    funcname: Option<&crate::userdiff::FuncName>,
+    // `textconv_one` / `textconv_two` (diff.c:3487-3489), already gated on
+    // `o->flags.allow_textconv` by the caller.
+    textconv: (Option<&str>, Option<&str>),
+    // The driver lookup, which owns the worktree filter pipeline `prep_temp_blob()`
+    // feeds a converter through.
+    lookup: &mut crate::userdiff::Lookup<'_>,
 ) -> Result<IdxAnalysis> {
     if d.unmerged {
         return Ok(IdxAnalysis {
@@ -3265,23 +3373,77 @@ fn analyze_index_delta(
     let old_data = content_of(repo, workdir, d.src_mode, d.src_id, &d.path)?.unwrap_or_default();
     let new_data = content_of(repo, workdir, d.dst_mode, d.dst_id, &d.path)?.unwrap_or_default();
 
-    // `diff_filespec_is_binary()`: a diff is binary if either present side is binary.
-    // The path's `diff=<driver>` attribute is consulted first — when that driver sets
-    // `diff.<name>.binary`, `one->driver->binary != -1` and the verdict is taken from
-    // it verbatim; only an unset (`-1`) driver setting falls through to the NUL sniff.
-    let binary = match driver_binary {
-        Some(v) => v,
-        None => {
-            (d.src_mode != 0 && buffer_is_binary(&old_data))
-                || (d.dst_mode != 0 && buffer_is_binary(&new_data))
+    // `diff_filespec_is_binary()` per side (diff.c:3396): the path's `diff=<driver>`
+    // attribute is consulted first — when that driver sets `diff.<name>.binary`,
+    // `one->driver->binary != -1` and the verdict is taken from it verbatim; only an
+    // unset (`-1`) driver setting falls through to the NUL sniff. A side that does not
+    // exist is never binary, which is why `builtin_diff()` can render an addition of a
+    // text file next to a deleted binary one.
+    let side_binary = |mode: u32, data: &[u8]| {
+        mode != 0 && driver_binary.unwrap_or_else(|| buffer_is_binary(data))
+    };
+    let one_binary = side_binary(d.src_mode, &old_data);
+    let two_binary = side_binary(d.dst_mode, &new_data);
+    let binary = one_binary || two_binary;
+
+    // `fill_textconv()` for each side (diff.c:3619-3620), and `builtin_diff()`'s binary
+    // test around it:
+    //
+    // ```c
+    // } else if (!o->flags.text &&
+    //            ( (!textconv_one && diff_filespec_is_binary(o->repo, one)) ||
+    //              (!textconv_two && diff_filespec_is_binary(o->repo, two)) )) {
+    // ```
+    //
+    // (diff.c:3557-3560) — a *converted* side never vetoes, so a `diff.<name>.textconv`
+    // turns a binary blob into a real patch. `get_textconv()` (diff.c:3377) answers NULL
+    // for an invalid filespec, so an addition's pre-image and a deletion's post-image are
+    // left alone and `fill_textconv()` hands back the empty string for them.
+    //
+    // This substitutes the *patch body only*. `builtin_diffstat()` resolves the drivers
+    // too but then fills its buffers with `fill_mmfile()`, so `--stat`/`--numstat`/
+    // `--shortstat` keep counting the raw blobs and a raw-binary path still reports
+    // `Bin <a> -> <b> bytes` while its patch shows hunks. `builtin_checkdiff()` and
+    // `diffcore_pickaxe()` never call `fill_textconv()` either.
+    let converted = match textconv {
+        (None, None) => None,
+        (tc_one, tc_two) => {
+            let one = match (tc_one, d.src_mode != 0) {
+                (Some(pgm), true) => {
+                    Some(run_textconv(lookup, pgm, d.src_path().as_ref(), &old_data)?)
+                }
+                _ => None,
+            };
+            let two = match (tc_two, d.dst_mode != 0) {
+                (Some(pgm), true) => Some(run_textconv(lookup, pgm, d.path.as_ref(), &new_data)?),
+                _ => None,
+            };
+            match (&one, &two) {
+                (None, None) => None,
+                _ if (one.is_none() && one_binary) || (two.is_none() && two_binary) => None,
+                _ => Some((
+                    one.unwrap_or_else(|| old_data.clone()),
+                    two.unwrap_or_else(|| new_data.clone()),
+                )),
+            }
         }
     };
+
     if binary {
+        // The counts stay at zero — `builtin_diffstat()` prints `Bin` for this pair —
+        // but the patch body is the converter's output when one ran.
+        let hunks = match (&converted, opts.patch || opts.format == Format::Check) {
+            (Some((o, n)), true) => {
+                let (add, del, buf) = index_hunks(o, n, opts, funcname);
+                (add != 0 || del != 0).then_some(buf)
+            }
+            _ => None,
+        };
         return Ok(IdxAnalysis {
             added: 0,
             deleted: 0,
             binary: true,
-            hunks: None,
+            hunks,
             old_data,
             new_data,
             changed: true,
@@ -3290,7 +3452,68 @@ fn analyze_index_delta(
         });
     }
 
-    let before = diff_pickaxe::split_lines(&old_data);
+    let (added, deleted, buf) = index_hunks(&old_data, &new_data, opts, funcname);
+    // `builtin_diff()` diffs the converted images; every other consumer of this
+    // analysis keeps the raw ones, so only the rendered body is replaced.
+    let buf = match &converted {
+        Some((o, n)) => index_hunks(o, n, opts, funcname).2,
+        None => buf,
+    };
+    // `--check` walks the hunk stream too, so it is rendered for that format as well.
+    let hunks = ((opts.patch || opts.format == Format::Check) && (added != 0 || deleted != 0))
+        .then_some(buf);
+    Ok(IdxAnalysis {
+        added,
+        deleted,
+        binary: false,
+        hunks,
+        old_data,
+        new_data,
+        changed: added != 0 || deleted != 0,
+        src_id,
+        dst_id,
+    })
+}
+
+/// `run_textconv()` (diff.c:7030): materialise the blob the way `prep_temp_blob()`
+/// does — its worktree form, under its own basename in a private directory — run the
+/// program over it through the shell, and take its stdout.
+///
+/// `if (!*outbuf) die(_("unable to read files to diff"))` (diff.c:7052-7056): a program
+/// that could not be started, or that exited non-zero, is fatal.
+///
+/// Not reproduced here: `diff.<driver>.cachetextconv`. `fill_textconv()` consults and
+/// fills a `refs/notes/textconv/<driver>` cache for an oid-valid filespec
+/// (diff.c:7086-7108); `git diff` runs that cache through
+/// [`super::notes::Cache`], but this command re-runs the converter every time. The
+/// patch is the same and the notes ref is left unwritten.
+fn run_textconv(
+    lookup: &mut crate::userdiff::Lookup<'_>,
+    program: &str,
+    path: &gix::bstr::BStr,
+    raw: &[u8],
+) -> Result<Vec<u8>> {
+    match lookup.run_program(program, path, raw)? {
+        Some(text) => Ok(text),
+        None => Err(crate::fatal::die("unable to read files to diff")),
+    }
+}
+
+/// `xdl_diff()` over two in-core images with this command's `xpparam_t`/`xdemitconf_t`:
+/// the whitespace folding, `--ignore-blank-lines`/`-I<re>`, the algorithm, the indent
+/// heuristic, `-U<n>`, `--inter-hunk-context=<n>` and the funcname pattern.
+///
+/// Returns `xdl_emit_diff()`'s `(added, removed, body)`. It is called twice for a pair
+/// whose driver configures `textconv` — once on the raw images for the counts, once on
+/// the converted ones for the body — which is exactly the split between
+/// `builtin_diffstat()` and `builtin_diff()`.
+fn index_hunks(
+    old_data: &[u8],
+    new_data: &[u8],
+    opts: &Opts,
+    funcname: Option<&crate::userdiff::FuncName>,
+) -> (u32, u32, Vec<u8>) {
+    let before = diff_pickaxe::split_lines(old_data);
     let after = diff_pickaxe::split_lines(&new_data);
     let fold = opts.ws.any();
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
@@ -3345,29 +3568,13 @@ fn analyze_index_delta(
             ctx: opts.ctx as usize,
             inter_hunk_ctx: opts.inter_hunk_ctx,
             func_context: false,
-            // `diff-index`/`diff-files` honour a driver's `textconv` and its
-            // `command` under `--ext-diff`, but the funcname pattern is not
-            // threaded this far yet, so hunk headings use git's built-in `def_ff`.
-            funcname: None,
+            // `xdiff_set_find_func(&xecfg, pe->pattern, pe->cflags)` (diff.c:3629-3630):
+            // the pair's driver pattern when it has one, and xdiff's `def_ff` when it
+            // does not.
+            funcname,
         },
     );
-    // `--check` walks the hunk stream too, so it is rendered for that format as well.
-    let hunks = ((opts.patch || opts.format == Format::Check) && (added != 0 || deleted != 0))
-        .then_some(buf);
-    // `before`/`after` borrow the two buffers, so release them before the move.
-    drop(before);
-    drop(after);
-    Ok(IdxAnalysis {
-        added,
-        deleted,
-        binary: false,
-        hunks,
-        old_data,
-        new_data,
-        changed: added != 0 || deleted != 0,
-        src_id,
-        dst_id,
-    })
+    (added, deleted, buf)
 }
 
 /// `xdl_blankline()` (`xdiff/xutils.c`): with no whitespace flag in force a record is
@@ -3797,7 +4004,12 @@ fn render_patch(
         b"/dev/null".to_vec()
     };
 
-    if an.binary {
+    // A pair whose driver converted both sides is not binary as far as
+    // `builtin_diff()` is concerned (diff.c:3557-3560), even though
+    // `diff_filespec_is_binary()` still says so — which is why the stat family keeps
+    // calling it `Bin` while the patch shows hunks. [`analyze_index_delta`] records
+    // that by handing back a hunk body beside `binary: true`.
+    if an.binary && an.hunks.is_none() {
         if opts.binary {
             // `emit_binary_diff()`: the payload replaces the whole `Binary files …`
             // line, and there is no `---`/`+++` pair in front of it.

@@ -1647,6 +1647,10 @@ fn compare(
             paints.push(diff_color::FilePaint {
                 ws_rule,
                 blank_at_eof: diff_color::check_blank_at_eof(&old_data, &new_data),
+                // This command does not resolve a path's userdiff driver, so no driver word
+                // regex is available; `diff.wordRegex` still reaches the emitter through
+                // [`diff_color::ExtraPaint`].
+                word_regex: None,
             });
             emit_header(&mut patch, a, b, &old_data, &new_data, &opts, same_content, binary, &pair);
             // `builtin_diff()` (diff.c:3596): with `-D`, a pair whose post-image label

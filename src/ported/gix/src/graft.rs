@@ -101,6 +101,61 @@ impl Repository {
         }
         table
     }
+
+    /// `read_ancestry()` (commit.c:316-330) — `git blame -S <revs-file>`'s ancestry
+    /// file, registered into *this* repository's table.
+    ///
+    /// ```c
+    /// int read_ancestry(const char *graft_file)
+    /// {
+    ///         FILE *fp = fopen(graft_file, "r");
+    ///         struct strbuf buf = STRBUF_INIT;
+    ///         if (!fp)
+    ///                 return -1;
+    ///         while (!strbuf_getwholeline(&buf, fp, '\n')) {
+    ///                 /* The format is just "Commit Parent1 Parent2 ...\n" */
+    ///                 struct commit_graft *graft = read_graft_line(&buf);
+    ///                 if (graft)
+    ///                         register_commit_graft(the_repository, graft, 0);
+    ///         }
+    ///         fclose(fp);
+    ///         strbuf_release(&buf);
+    ///         return 0;
+    /// }
+    /// ```
+    ///
+    /// Three things separate it from [`read_commit_grafts`](Self::commit_grafts)'s
+    /// `read_graft_file()`, and all three are visible: a file that cannot be opened
+    /// is an error rather than silence (`cmd_blame()` turns it into
+    /// `die_errno("reading graft file '%s' failed")`), registration is
+    /// `ignore_dups = 0` so a later line *replaces* an earlier one for the same
+    /// commit, and there is no deprecation advice and no `duplicate graft data`
+    /// report — only `error: bad graft data: <line>` per rejected line, which is
+    /// returned here for the caller to print.
+    ///
+    /// git registers into the repository's own table, so the entries stack on top
+    /// of `info/grafts` and `shallow` rather than replacing them; the table is read
+    /// first for exactly that reason.
+    pub fn read_ancestry(&mut self, graft_file: &std::path::Path) -> std::io::Result<Vec<String>> {
+        let data = std::fs::read(graft_file)?;
+        let mut table = (**self.commit_grafts()).clone();
+        let mut complaints = Vec::new();
+        // `strbuf_getwholeline(…, '\n')` yields the last line even without a
+        // trailing newline, and yields nothing at all for an empty file.
+        for line in data.split_inclusive(|b| *b == b'\n') {
+            match gix_revwalk::graft::parse_line(line, self.object_hash()) {
+                Ok(None) => {}
+                Ok(Some((id, graft))) => {
+                    table.register(id, graft, false);
+                }
+                Err(()) => complaints.push(
+                    String::from_utf8_lossy(gix_revwalk::graft::rtrim_line(line)).into_owned(),
+                ),
+            }
+        }
+        self.grafts = TableStorage::from(std::sync::Arc::new(table));
+        Ok(complaints)
+    }
 }
 
 /// git suppresses the deprecation advice for the one command whose whole job is

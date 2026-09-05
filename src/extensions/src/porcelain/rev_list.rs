@@ -277,6 +277,10 @@ enum Missing {
     AllowAny,
     /// `MA_PRINT`: skipped, then listed as `?<oid>` in a section of its own.
     Print,
+    /// `MA_PRINT_INFO`: the same section, with `path=` and `type=` appended to
+    /// each line — "same as MA_PRINT but also prints missing object info"
+    /// (builtin/rev-list.c:109).
+    PrintInfo,
     /// `MA_ALLOW_PROMISOR`: skipped when the object is one a promisor pack
     /// promises, fatal otherwise — the shape a partial clone is expected to be
     /// in, where every absence is explained by the remote that still has it.
@@ -519,6 +523,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `--since`/`--until` are git's `max_age`/`min_age`, both committer-date.
     let mut max_age: Option<i64> = None;
     let mut min_age: Option<i64> = None;
+    // `revs->max_age_as_filter` (`--since-as-filter`): the same bound as
+    // `max_age`, applied as an output filter rather than as a walk cut.
+    let mut max_age_as_filter: Option<i64> = None;
     // `revs->dense` (revision.c:2462-2465), which `repo_init_revisions()` starts
     // at 1. `--sparse` clears it and `--dense` puts it back.
     let mut dense = true;
@@ -529,6 +536,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `revs->simplify_merges`, which also clears `simplify_history` and sets
     // `topo_order` and `rewrite_parents` (revision.c).
     let mut simplify_merges_opt = false;
+    // `revs->remove_empty_trees` (revision.c). Listed in `rev-list`'s own usage
+    // block since the beginning, and parsed by `handle_revision_opt()` for every
+    // revision-walking command, but this file never read it — so a command stock
+    // git answers was a 129 usage error here.
+    let mut remove_empty = false;
     // `revs->graph`: `--graph` is a `revision.c` option, so `rev-list` draws the
     // same ASCII graph in front of its object names that `log` does.
     let mut graph = false;
@@ -647,6 +659,24 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 i += v.consumed;
                 continue 'args;
             }
+        }
+        // ```c
+        // } else if ((argcount = parse_long_opt("since-as-filter", argv, &optarg))) {
+        //         revs->max_age_as_filter = approxidate(optarg);
+        //         return argcount;
+        // }
+        // ```
+        //
+        // (revision.c:2282-2285.) `revs->max_age_as_filter` reads the same clock as
+        // `--since` and takes the same `approxidate()` value, but it is applied
+        // where `--until` is — `limit_list()` skips the commit and keeps walking
+        // (revision.c:1446-1448) — instead of marking it UNINTERESTING. So an old
+        // commit drops out of the output without taking its ancestors' *newer*
+        // side of a merge with it, which is the whole point of the flag.
+        if let Some(v) = long_opt_value(&argv, i, "since-as-filter") {
+            max_age_as_filter = Some(approxidate(&v.value));
+            i += v.consumed;
+            continue 'args;
         }
         // `--max-age`/`--min-age` set the very same `revs->max_age`/`revs->min_age`
         // as `--since`/`--until` (revision.c:2379-2393); only the value parser
@@ -829,6 +859,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             "--sparse" => dense = false,
             "--dense" => dense = true,
+            // ```c
+            // } else if (!strcmp(arg, "--remove-empty")) {
+            //         revs->remove_empty_trees = 1;
+            // }
+            // ```
+            //
+            // (revision.c.) Read where `try_to_simplify_commit()` compares a
+            // parent, so like `--sparse`/`--dense` it says nothing without a
+            // pathspec.
+            "--remove-empty" => remove_empty = true,
             // ```c
             // } else if (!strcmp(arg, "--full-history")) {
             //         revs->simplify_history = 0;
@@ -1223,18 +1263,24 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     gix::odb::store::set_fetch_if_missing(false);
                     missing = Missing::Print;
                 }
-                // `print-info` reports each missing object's path and type through
-                // `quote_path`, and `allow-promisor` consults the promisor remote;
-                // neither has plumbing here.
+                // ```c
+                // if (!strcmp(value, "print-info")) {
+                //         arg_missing_action = MA_PRINT_INFO;
+                //         fetch_if_missing = 0;
+                //         return 1;
+                // }
+                // ```
+                //
+                // (`parse_missing_action_value()`, builtin/rev-list.c:523-527.)
+                // It records the same objects `print` does; the difference is
+                // only in how [`print_missing_object`] renders them.
+                "print-info" => {
+                    gix::odb::store::set_fetch_if_missing(false);
+                    missing = Missing::PrintInfo;
+                }
                 "allow-promisor" => {
                     gix::odb::store::set_fetch_if_missing(false);
                     missing = Missing::AllowPromisor;
-                }
-                // `print-info` reports each missing object's path and type through
-                // `quote_path`, in the order git's `oidmap` iterates — a hash
-                // order this port does not reproduce.
-                "print-info" => {
-                    return Ok(fatal(&format!("--missing={} is not supported", &s[10..])))
                 }
                 // git leaves an unrecognised value on the default action.
                 _ => missing = Missing::Error,
@@ -1559,6 +1605,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if let Some(bound) = min_age {
         commits.retain(|id| commit_date(&repo, *id) <= bound);
     }
+    if let Some(bound) = max_age_as_filter {
+        commits.retain(|id| commit_date(&repo, *id) >= bound);
+    }
 
     // `SYMMETRIC_LEFT` reaches every ancestor of the left tip: `process_parents`
     // ORs it onto each parent it walks through, so membership is reachability.
@@ -1629,6 +1678,28 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut simplified_display: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     if !pathspecs.is_empty() {
         let mut specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
+        // `--remove-empty` runs ahead of the TREESAME classification below because
+        // what it does is cut a parent's ancestry off the walk: the commits it
+        // removes are ones `limit_list()` never reached, so they are never
+        // classified and never counted anywhere downstream.
+        if remove_empty {
+            let roots = empty_tree_roots(
+                &repo,
+                &commits,
+                &parents_of,
+                first_parent,
+                dense,
+                !full_history,
+                &mut specs,
+            )?;
+            if !roots.is_empty() {
+                for root in &roots {
+                    parents_of.insert(*root, Vec::new());
+                }
+                let reachable = reachable_from(&tips, &parents_of);
+                commits.retain(|id| reachable.contains(id));
+            }
+        }
         if full_history {
             // `--full-history` clears `revs->simplify_history`, so
             // `try_to_simplify_commit()` compares every parent, records a
@@ -2083,7 +2154,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         collect_omits: print_omitted,
         pathspecs: object_specs.as_ref(),
     };
-    let mut absent: Vec<ObjectId> = Vec::new();
+    let mut absent: Vec<MissingObject> = Vec::new();
     // `--filter-print-omitted`'s `omitted_objects` set, filled by the filter and
     // printed once the walk is over.
     let mut omitted: Vec<ObjectId> = Vec::new();
@@ -2145,7 +2216,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                         return Ok(code);
                     }
                 }
-                gix::object::Kind::Blob => match blob_filtered(&repo, entry.id, &mut absent, &walk)?
+                gix::object::Kind::Blob => match blob_filtered(&repo, entry.id, &entry.name, &mut absent, &walk)?
                 {
                     Ok(BlobVerdict::Filtered) => omitted.push(entry.id),
                     Ok(BlobVerdict::Absent) => {}
@@ -2484,8 +2555,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             writeln!(sink, "~{id}")?;
         }
     }
-    for id in crate::oidhash::hashmap_order(&absent) {
-        writeln!(sink, "?{id}")?;
+    // The map is keyed by id, so the order comes from the ids alone; the entry
+    // each one names supplies the two fields `print-info` appends.
+    let absent_ids: Vec<ObjectId> = absent.iter().map(|entry| entry.id).collect();
+    for id in crate::oidhash::hashmap_order(&absent_ids) {
+        let Some(entry) = absent.iter().find(|entry| entry.id == id) else {
+            continue;
+        };
+        sink.write_all(&print_missing_object(entry, missing == Missing::PrintInfo))?;
     }
     if disk_usage {
         if disk_usage_human {
@@ -2779,6 +2856,14 @@ fn seed_ref_set(
                 Err(_) => continue,
             },
         };
+        // `handle_one_ref()` hands every selected ref to `get_reference()`, which
+        // `die(_("bad object %s"), path)`s when `parse_object()` cannot read the
+        // id (revision.c:389-400). `path` is the name the iterator reported — the
+        // full ref for `--all`, the trimmed one for `--branches`/`--tags`/
+        // `--remotes`, which is `sel.selects()`'s answer here.
+        if repo.find_object(target).is_err() {
+            return Err(format!("fatal: bad object {name}\n"));
+        }
         if let Some(id) = peel_recording_tags(repo, target, pending) {
             seeds.push(Seed {
                 id,
@@ -2875,6 +2960,16 @@ fn seed_revision(
 
     // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }`, which
     // `handle_revision_arg_1()` reaches only after the marks are done with.
+    // `verify_non_filename()` (setup.c:281-291) as `handle_revision_arg_1()` runs
+    // it: after the name resolved and before `get_reference()`. `rev-list` shares
+    // `setup_revisions()` with `log`, so the message and the `cant_be_filename`
+    // gate are the shared ones.
+    let non_filename = |name: &str| -> Option<String> {
+        if cant_be_filename {
+            return None;
+        }
+        crate::setup::verify_non_filename(repo, name).map(|m| format!("fatal: {m}\n"))
+    };
     if let Some(rest) = spec.strip_prefix('^') {
         let Some(id) = resolve(repo, rest, pending) else {
             // `handle_commit()`'s tree/blob arms again: an excluded non-commit
@@ -2885,6 +2980,10 @@ fn seed_revision(
             }
             return Err(unknown(spec));
         };
+        // The `^` is already consumed, so the name git checks is what follows it.
+        if let Some(message) = non_filename(rest) {
+            return Err(message);
+        }
         seeds.push(Seed {
             id,
             uninteresting: !negate,
@@ -2898,6 +2997,11 @@ fn seed_revision(
         let right_spec = if r.is_empty() { "HEAD" } else { r };
         let left = resolve(repo, left_spec, pending).ok_or_else(|| unknown(spec))?;
         let right = resolve(repo, right_spec, pending).ok_or_else(|| unknown(spec))?;
+        // `handle_dotdot_1()` restores the separator first, so the token is
+        // checked as written rather than endpoint by endpoint.
+        if let Some(message) = non_filename(spec) {
+            return Err(message);
+        }
         let bases = repo
             .merge_bases_many(left, &[right])
             .map_err(|e| e.to_string())?;
@@ -2928,6 +3032,10 @@ fn seed_revision(
         let right_spec = if r.is_empty() { "HEAD" } else { r };
         let left = resolve(repo, left_spec, pending).ok_or_else(|| unknown(spec))?;
         let right = resolve(repo, right_spec, pending).ok_or_else(|| unknown(spec))?;
+        // Same restore-then-check as the symmetric form above.
+        if let Some(message) = non_filename(spec) {
+            return Err(message);
+        }
         seeds.push(Seed {
             id: left,
             uninteresting: !negate,
@@ -2979,6 +3087,20 @@ fn seed_plain(
     pending: &mut Vec<Pending>,
 ) -> Result<(), String> {
     let Some(id) = resolve(repo, spec, pending) else {
+        // `get_oid_basic()` reads a ref without touching the object it names, so a
+        // ref pointing at something the database does not have resolves and then
+        // dies in `get_reference()`: `die(_("bad object %s"), name)`
+        // (revision.c:389-400), naming the operand. That beats the unresolvable
+        // text below, which is for a name `get_oid_basic()` itself refused.
+        if let Some(named) = repo
+            .rev_parse_single(crate::objname::canonical_spec(repo, spec).as_ref())
+            .ok()
+            .map(|id| id.detach())
+        {
+            if repo.find_object(named).is_err() {
+                return Err(format!("fatal: bad object {spec}\n"));
+            }
+        }
         // `get_reference()` answers for any object type; only `handle_commit()`
         // insists on a commit, and its tree and blob arms pend rather than fail.
         // So `git rev-list main^{tree}` and `git rev-list main:base.txt` are not
@@ -2988,6 +3110,14 @@ fn seed_plain(
         }
         return Err(unresolvable_in(repo, spec, cant_be_filename));
     };
+    // `verify_non_filename()` (revision.c:2156-2157), between the name resolving
+    // and `get_reference()`: an operand that is both a revision and a working-tree
+    // path is ambiguous unless a `--` was seen.
+    if !cant_be_filename {
+        if let Some(message) = crate::setup::verify_non_filename(repo, spec) {
+            return Err(format!("fatal: {message}\n"));
+        }
+    }
     seeds.push(Seed {
         id,
         uninteresting: negate,
@@ -3898,7 +4028,7 @@ fn collect_commit_objects(
     commit: ObjectId,
     seen: &mut HashSet<ObjectId>,
     lines: &mut Vec<(ObjectId, Vec<u8>)>,
-    absent: &mut Vec<ObjectId>,
+    absent: &mut Vec<MissingObject>,
     omitted: &mut Vec<ObjectId>,
     walk: &ObjectWalk<'_>,
 ) -> Result<Result<(), ExitCode>> {
@@ -3943,6 +4073,77 @@ impl super::simplify::TreeDiff for PathDiff<'_> {
         let parent_tree = parent.and_then(|id| commit_tree(self.repo, id));
         diff_touches_path(self.repo, parent_tree, tree, self.specs)
     }
+}
+
+/// The `REV_TREE_NEW` arm of `try_to_simplify_commit()` (revision.c):
+///
+/// ```c
+/// case REV_TREE_NEW:
+///         if (revs->remove_empty_trees &&
+///             rev_same_tree_as_empty(revs, p)) {
+///                 /* We are adding all the specified paths from this parent, so
+///                  * the history beyond this parent is not interesting. Remove
+///                  * its parents (they are grandparents for us). IOW, we pretend
+///                  * this parent is a "root" commit. */
+///                 p->parents = NULL;
+///         }
+/// ```
+///
+/// Returns every parent that is turned into a root that way. A parent that
+/// *differs* from its child over the pathspec while carrying nothing the pathspec
+/// matches can only differ by additions, which is exactly `REV_TREE_NEW` — so the
+/// two-sided test here is the same decision, expressed with the tree comparison
+/// this file already has.
+///
+/// The parent loop reproduces the shape of the C one, because which parents are
+/// reached is part of the answer: `--first-parent` breaks at the second parent,
+/// `!revs->dense` returns before a single-parent commit is compared at all, and a
+/// TREESAME relevant parent ends the loop with a `return` while
+/// `revs->simplify_history` is on (`--full-history` clears it and the loop runs on).
+fn empty_tree_roots(
+    repo: &gix::Repository,
+    commits: &[ObjectId],
+    parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
+    first_parent: bool,
+    dense: bool,
+    simplify_history: bool,
+    specs: &mut super::log::PathspecMatcher,
+) -> Result<HashSet<ObjectId>> {
+    let walked: HashSet<ObjectId> = commits.iter().copied().collect();
+    let mut roots: HashSet<ObjectId> = HashSet::new();
+    for id in commits {
+        let Some(tree) = commit_tree(repo, *id) else { continue };
+        let parents = parents_of.get(id).map(Vec::as_slice).unwrap_or(&[]);
+        // `if (!commit->parents) { … return; }` — a root has nothing to cut.
+        if parents.is_empty() {
+            continue;
+        }
+        // `if (!revs->dense && !commit->parents->next) return;`
+        if !dense && parents.len() == 1 {
+            continue;
+        }
+        let considered = if first_parent { &parents[..1] } else { parents };
+        for p in considered {
+            let parent_tree = commit_tree(repo, *p);
+            if !diff_touches_path(repo, parent_tree, tree, specs)? {
+                // REV_TREE_SAME. `relevant_commit(p)` is the walked set here, as
+                // it is for [`treesame_parent`].
+                if simplify_history && walked.contains(p) {
+                    break;
+                }
+                continue;
+            }
+            match parent_tree {
+                // `rev_same_tree_as_empty(revs, p)`: the parent against the empty
+                // tree, under the same pathspec.
+                Some(pt) if diff_touches_path(repo, None, pt, specs)? => {}
+                _ => {
+                    roots.insert(*p);
+                }
+            }
+        }
+    }
+    Ok(roots)
 }
 
 /// git's TREESAME test for one commit under a path limit.
@@ -4077,7 +4278,7 @@ fn walk_tree(
     depth: u64,
     seen: &mut HashSet<ObjectId>,
     lines: &mut Vec<(ObjectId, Vec<u8>)>,
-    absent: &mut Vec<ObjectId>,
+    absent: &mut Vec<MissingObject>,
     omitted: &mut Vec<ObjectId>,
     walk: &ObjectWalk<'_>,
 ) -> Result<Result<(), ExitCode>> {
@@ -4105,7 +4306,16 @@ fn walk_tree(
         return Ok(Ok(()));
     }
     let Some(object) = tree_object(repo, tree) else {
-        if let Some(code) = note_missing(repo, tree, absent, walk.missing) {
+        // `base` is this tree's own path — the `path->buf` `process_tree()` hands
+        // `show_object()` — and is empty for the root tree.
+        if let Some(code) = note_missing(
+            repo,
+            tree,
+            base,
+            gix::object::Kind::Tree,
+            absent,
+            walk.missing,
+        ) {
             return Ok(Err(code));
         }
         return Ok(Ok(()));
@@ -4148,7 +4358,7 @@ fn walk_tree(
             omitted.push(id);
             continue;
         }
-        match blob_filtered(repo, id, absent, walk)? {
+        match blob_filtered(repo, id, &path, absent, walk)? {
             Ok(BlobVerdict::Filtered) => {
                 omitted.push(id);
                 continue;
@@ -4162,20 +4372,127 @@ fn walk_tree(
     Ok(Ok(()))
 }
 
+/// git's `missing_objects_map_entry`: one object the walk could not read, with
+/// the two fields `--missing=print-info` renders beside its id.
+///
+/// ```c
+/// struct missing_objects_map_entry {
+///         struct oidmap_entry entry;
+///         char *path;
+///         unsigned type;
+/// };
+/// ```
+///
+/// (builtin/rev-list.c:90-94.) `path` is the name `show_object()` was called
+/// with, and is empty for an object reached through no path at all — a root
+/// tree, or a tip named on the command line — which is git's `NULL`. `type` is
+/// `obj->type`, and git's `0` (nothing has looked the object up) is [`None`]
+/// here; `print_missing_object` prints neither field when it is unset.
+struct MissingObject {
+    id: ObjectId,
+    path: Vec<u8>,
+    kind: Option<gix::object::Kind>,
+}
+
+/// One line of the missing-object section, as git's `print_missing_object()`.
+///
+/// ```c
+/// if (line_term)
+///         printf("?%s", oid_to_hex(&entry->entry.oid));
+/// else
+///         printf("%s%cmissing=yes", oid_to_hex(&entry->entry.oid), info_term);
+///
+/// if (!print_missing_info) {
+///         putchar(line_term);
+///         return;
+/// }
+///
+/// if (entry->path && *entry->path) {
+///         strbuf_addf(&sb, "%cpath=", info_term);
+///         if (line_term) {
+///                 quote_path(entry->path, NULL, &path, QUOTE_PATH_QUOTE_SP);
+///                 strbuf_addbuf(&sb, &path);
+///         } else {
+///                 strbuf_addstr(&sb, entry->path);
+///         }
+/// }
+/// if (entry->type)
+///         strbuf_addf(&sb, "%ctype=%s", info_term, type_name(entry->type));
+/// ```
+///
+/// (builtin/rev-list.c:154-190.) Only the `line_term` half is reachable here:
+/// the `-z` that clears both terminators is `rev-list`'s own option and this
+/// port does not carry it, so the separator is a space and every line ends in a
+/// newline. An empty `path` prints no `path=` field at all — git's
+/// `entry->path && *entry->path` — which is what a root tree or a tip named on
+/// the command line leaves behind.
+fn print_missing_object(entry: &MissingObject, print_missing_info: bool) -> Vec<u8> {
+    let mut out = format!("?{}", entry.id).into_bytes();
+    if !print_missing_info {
+        out.push(b'\n');
+        return out;
+    }
+    if !entry.path.is_empty() {
+        out.extend_from_slice(b" path=");
+        out.extend_from_slice(&quote_path_sp(&entry.path));
+    }
+    if let Some(kind) = entry.kind {
+        out.extend_from_slice(b" type=");
+        out.extend_from_slice(kind.as_bytes());
+    }
+    out.push(b'\n');
+    out
+}
+
+/// `quote_path(in, NULL, out, QUOTE_PATH_QUOTE_SP)` (quote.c:350-372).
+///
+/// A `NULL` prefix leaves `relative_path()` returning the path unchanged, so the
+/// only thing the flag adds over ordinary `write_name_quoted()` output is the
+/// double-quote pair a path containing a space gets even when nothing in it
+/// needs escaping — git wraps it itself and passes `CQUOTE_NODQ` so the escaper
+/// does not add a second pair.
+fn quote_path_sp(path: &[u8]) -> Vec<u8> {
+    if !path.contains(&b' ') {
+        return crate::quote::quoted_name_bytes(path);
+    }
+    let mut out = vec![b'"'];
+    crate::quote::cq_body(path, &mut out);
+    out.push(b'"');
+    out
+}
+
 /// git's `finish_object__ma`: record or reject an object the repository lacks.
 /// `Some(code)` means the walk must stop with that exit code.
 fn note_missing(
     repo: &gix::Repository,
     id: ObjectId,
-    absent: &mut Vec<ObjectId>,
+    path: &[u8],
+    kind: gix::object::Kind,
+    absent: &mut Vec<MissingObject>,
     missing: Missing,
 ) -> Option<ExitCode> {
     match missing {
         Missing::Error => Some(fatal(&format!("missing object '{id}'"))),
         Missing::AllowAny => None,
-        Missing::Print => {
-            if !absent.contains(&id) {
-                absent.push(id);
+        // ```c
+        // case MA_PRINT:
+        // case MA_PRINT_INFO:
+        //         add_missing_object_entry(&obj->oid, name, obj->type);
+        //         return;
+        // ```
+        //
+        // (builtin/rev-list.c:210-213.) One arm for both: the two actions record
+        // the same entry and differ only where it is printed.
+        Missing::Print | Missing::PrintInfo => {
+            // `add_missing_object_entry()` returns early on an id the map already
+            // holds, so the first path and type an object was seen under are the
+            // ones reported.
+            if !absent.iter().any(|entry| entry.id == id) {
+                absent.push(MissingObject {
+                    id,
+                    path: path.to_vec(),
+                    kind: Some(kind),
+                });
             }
             None
         }
@@ -4324,7 +4641,8 @@ fn entry_interesting(
 fn blob_filtered(
     repo: &gix::Repository,
     id: ObjectId,
-    absent: &mut Vec<ObjectId>,
+    path: &[u8],
+    absent: &mut Vec<MissingObject>,
     walk: &ObjectWalk<'_>,
 ) -> Result<Result<BlobVerdict, ExitCode>> {
     // ```c
@@ -4346,7 +4664,14 @@ fn blob_filtered(
     }
     let header = repo.find_header(id).ok();
     let Some(header) = header else {
-        if let Some(code) = note_missing(repo, id, absent, walk.missing) {
+        if let Some(code) = note_missing(
+            repo,
+            id,
+            path,
+            gix::object::Kind::Blob,
+            absent,
+            walk.missing,
+        ) {
             return Ok(Err(code));
         }
         // A missing object is skipped rather than listed — and it is *not* one

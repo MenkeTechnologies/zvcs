@@ -897,12 +897,20 @@ impl<'repo> Textconv<'repo> {
     /// temporary directory under its own basename — the name the program is handed
     /// — and capture the program's stdout. `None` when the program could not be
     /// started or exited non-zero, which is git's NULL return.
+    ///
+    /// `run_textconv()` (diff.c:7758-7772) builds its `child_process` with `child.out
+    /// = -1` alone: only stdout is a pipe, so the program's *stderr* is the one git
+    /// itself is writing to and its complaints reach the terminal. Measured against
+    /// git 2.55.0, `git -c diff.markdown.textconv='tr a-z A-Z' diff HEAD~2 HEAD~1 --
+    /// docs/manual.md` prints `tr`'s own four-line usage ahead of `fatal: unable to
+    /// read files to diff`; capturing stderr here swallowed it.
     pub(crate) fn run(&mut self, program: &str, path: &BStr, blob: &[u8]) -> Result<Option<Vec<u8>>> {
         let dir = temp_blob_dir()?;
         let file = self.prep_temp_blob(&dir, path, blob)?;
 
-        let output =
-            crate::external::prepare_shell_cmd_str(program, [&file]).output();
+        let output = crate::external::prepare_shell_cmd_str(program, [&file])
+            .stderr(std::process::Stdio::inherit())
+            .output();
         let _ = std::fs::remove_dir_all(&dir);
 
         match output {

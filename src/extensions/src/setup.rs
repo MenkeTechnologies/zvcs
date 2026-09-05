@@ -916,7 +916,19 @@ pub fn no_lazy_fetch_environment_gate(sub: &str) {
     if !creates_repository && gix::discover(".").is_err() {
         return;
     }
-    let _ = git_env_bool("GIT_NO_LAZY_FETCH", false);
+    // The assignment the two lines above only validated the input for. Without
+    // it the flag stayed on and every incidental read of an object a partial
+    // clone had skipped still went back to the promisor remote, so
+    // `git --no-lazy-fetch cat-file -p <missing>` answered with the warning
+    // `fetch_objects()` prints on its way to refusing — where stock, whose
+    // `fetch_if_missing` is 0 by then, never reaches the promisor code at all
+    // and says only that the name does not resolve. The *explicit*
+    // `promisor_remote_get_direct()` callers are unaffected: that entry point
+    // reads no flag, which is why the warning is still stock's answer to
+    // `git --no-lazy-fetch log -p`.
+    if git_env_bool("GIT_NO_LAZY_FETCH", false) {
+        gix::odb::store::set_fetch_if_missing(false);
+    }
 }
 
 /// Returns the exit code to leave with, or `None` to continue.

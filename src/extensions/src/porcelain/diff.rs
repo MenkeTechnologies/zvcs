@@ -189,8 +189,11 @@
 //!   - `textconv` converts each side before xdiff ([`apply_textconv`]); the counts
 //!     `--stat`/`--numstat` print still come from the unconverted images, because
 //!     `builtin_diffstat()` never calls `fill_textconv()`. `--no-textconv` turns it
-//!     off, and `diff.<driver>.cachetextconv`'s notes cache is not written — the
-//!     patch is the same, the converter just runs every time.
+//!     off, and `diff.<driver>.cachetextconv` memoises each oid-valid side's converted
+//!     bytes in the `refs/notes/textconv/<driver>` cache
+//!     ([`super::notes::Cache`]), exactly as `notes_cache_get()`/`notes_cache_put()`
+//!     do — a stale converter command invalidates the whole cache, and a worktree
+//!     side, having no valid id, is converted afresh every time.
 //!   - `command`, plus `GIT_EXTERNAL_DIFF` and `diff.external`, replace the whole
 //!     section with the program's stdout, through the `run_external_diff()` port in
 //!     [`super::diff_pairs`] that `diff-files`, `diff-index` and `diff-pairs` share.
@@ -504,6 +507,57 @@ impl PairDrivers {
             .and_then(|d| d.funcname.as_ref())
             .or_else(|| self.two.as_ref().and_then(|d| d.funcname.as_ref()))
     }
+
+    /// `init_diff_words_data()` (diff.c:2347-2348), which asks the two sides in the
+    /// same order and for the same reason the funcname pattern is asked for above:
+    ///
+    /// ```c
+    /// if (!o->word_regex) o->word_regex = userdiff_word_regex(one, o->repo->index);
+    /// if (!o->word_regex) o->word_regex = userdiff_word_regex(two, o->repo->index);
+    /// ```
+    ///
+    /// The assignment lands in a `memcpy`'d *copy* of the options (diff.c:2336-2337),
+    /// so a pattern found for one pair does not carry over to the next one — which is
+    /// why this is answered per pair rather than latched.
+    fn word_regex(&self) -> Option<&str> {
+        self.one
+            .as_ref()
+            .and_then(|d| d.settings.word_regex.as_deref())
+            .or_else(|| self.two.as_ref().and_then(|d| d.settings.word_regex.as_deref()))
+    }
+}
+
+/// One pair's driver word regex, compiled the way `init_diff_words_data()` compiles
+/// it — `regcomp(…, REG_EXTENDED | REG_NEWLINE)` — and memoised per pattern, since a
+/// run over a thousand files of one language would otherwise compile the same text a
+/// thousand times.
+///
+/// `None` whenever the driver regex cannot be reached at all: no `--word-diff`, or a
+/// `--word-diff-regex`/`--color-words=<re>` on the command line, which is the state
+/// in which git never calls `userdiff_word_regex()` and therefore never notices that
+/// the driver's pattern would not have compiled.
+///
+/// `die(_("invalid regular expression: %s"))` (diff.c:2358) is the refusal.
+fn driver_word_regex(
+    cache: &mut std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>>,
+    drivers: &PairDrivers,
+    want: bool,
+) -> Result<Option<std::sync::Arc<regex::bytes::Regex>>> {
+    if !want {
+        return Ok(None);
+    }
+    let Some(pat) = drivers.word_regex() else {
+        return Ok(None);
+    };
+    if let Some(hit) = cache.get(pat) {
+        return Ok(Some(hit.clone()));
+    }
+    let re = std::sync::Arc::new(
+        diff_color::compile_word_regex(pat)
+            .map_err(|_| crate::fatal::die(format!("invalid regular expression: {pat}")))?,
+    );
+    cache.insert(pat.to_string(), re.clone());
+    Ok(Some(re))
 }
 
 impl Delta {
@@ -702,16 +756,20 @@ fn ext_context<'a, 'repo>(
 /// stat block and then the fatal, while this prints the fatal alone. Both exit 128,
 /// and a run whose *first* rendered pair is the failing one agrees byte for byte.
 ///
-/// Not reproduced: `diff.<driver>.cachetextconv`. git memoises the converted bytes in
-/// a `refs/notes/textconv/<driver>` notes cache keyed by blob id (`notes_cache_get()`
-/// / `notes_cache_put()`); this port re-runs the converter every time, which produces
-/// the same patch and leaves the notes ref unwritten.
+/// `diff.<driver>.cachetextconv` is honoured: a converted side whose filespec is
+/// oid-valid is looked up in, and written back to, the `refs/notes/textconv/<driver>`
+/// cache [`super::notes::Cache`] ports.
 fn apply_textconv(
     repo: &gix::Repository,
     drivers: &mut DriverCache<'_>,
     deltas: &mut [Delta],
     workdir: Option<&std::path::Path>,
 ) -> Result<()> {
+    // `driver->textconv_cache`: git hangs one off each `struct userdiff_driver`, which
+    // is process-global, so a run builds at most one per driver name
+    // (`userdiff_get_textconv()`, userdiff.c:432-439).
+    let mut caches: std::collections::HashMap<String, super::notes::Cache> =
+        std::collections::HashMap::new();
     for d in deltas.iter_mut() {
         // `builtin_diff()` returns from its submodule branches (diff.c:3870-3887)
         // before `get_textconv()` is ever called, and an unmerged pair never reaches
@@ -719,8 +777,10 @@ fn apply_textconv(
         if d.unmerged || d.is_submodule_pair() {
             continue;
         }
-        let one = d.drivers.one.as_ref().and_then(|x| x.settings.textconv.clone());
-        let two = d.drivers.two.as_ref().and_then(|x| x.settings.textconv.clone());
+        let one_drv = d.drivers.one.clone();
+        let two_drv = d.drivers.two.clone();
+        let one = one_drv.as_ref().and_then(|x| x.settings.textconv.clone());
+        let two = two_drv.as_ref().and_then(|x| x.settings.textconv.clone());
         if one.is_none() && two.is_none() {
             continue;
         }
@@ -734,7 +794,19 @@ fn apply_textconv(
                     true => read_worktree_bytes(workdir, &old_path).unwrap_or_default(),
                     false => read_blob(&repo.objects, id)?,
                 };
-                run_textconv(drivers, pgm, old_path.as_bstr(), &raw)?
+                // `df->oid_valid`: the worktree side of a `git diff` pair reaches
+                // `fill_textconv()` with a null id and is never cached.
+                let key = (!d.old_worktree).then_some(id);
+                cached_textconv(
+                    repo,
+                    drivers,
+                    &mut caches,
+                    one_drv.as_deref(),
+                    pgm,
+                    old_path.as_bstr(),
+                    key,
+                    &raw,
+                )?
             }
             (_, Some((id, _))) => match d.old_worktree {
                 true => read_worktree_bytes(workdir, &old_path).unwrap_or_default(),
@@ -744,17 +816,83 @@ fn apply_textconv(
         };
         let new_raw = match &d.new {
             NewSide::Absent => None,
-            NewSide::Blob(id, _) => Some(read_blob(&repo.objects, *id)?),
-            NewSide::Worktree(_) => Some(read_worktree_bytes(workdir, &d.path).unwrap_or_default()),
+            NewSide::Blob(id, _) => Some((Some(*id), read_blob(&repo.objects, *id)?)),
+            NewSide::Worktree(_) => {
+                Some((None, read_worktree_bytes(workdir, &d.path).unwrap_or_default()))
+            }
         };
         let new_img = match (&two, new_raw) {
-            (Some(pgm), Some(raw)) => run_textconv(drivers, pgm, d.path.as_bstr(), &raw)?,
-            (_, Some(raw)) => raw,
+            (Some(pgm), Some((key, raw))) => cached_textconv(
+                repo,
+                drivers,
+                &mut caches,
+                two_drv.as_deref(),
+                pgm,
+                d.path.as_bstr(),
+                key,
+                &raw,
+            )?,
+            (_, Some((_, raw))) => raw,
             (_, None) => Vec::new(),
         };
         d.textconv = Some((old_img, new_img));
     }
     Ok(())
+}
+
+/// `fill_textconv()`'s cache arms around [`run_textconv`] (diff.c:7086-7108):
+///
+/// ```c
+/// if (driver->textconv_cache && df->oid_valid) {
+///         *outbuf = notes_cache_get(driver->textconv_cache, &df->oid, &size);
+///         if (*outbuf)
+///                 return size;
+/// }
+/// *outbuf = run_textconv(r, driver->textconv, df, &size);
+/// if (!*outbuf)
+///         die("unable to read files to diff");
+/// if (driver->textconv_cache && df->oid_valid) {
+///         notes_cache_put(driver->textconv_cache, &df->oid, *outbuf, size);
+///         notes_cache_write(driver->textconv_cache);
+/// }
+/// ```
+///
+/// `driver->textconv_cache` exists only when the driver set
+/// `diff.<name>.cachetextconv` (`textconv_want_cache`, userdiff.c:432), and `key` is
+/// `Some` only for an oid-valid filespec — a worktree side is converted afresh every
+/// time. The write is best-effort: git ignores the error "as we might be in a
+/// readonly repository".
+#[allow(clippy::too_many_arguments)]
+fn cached_textconv(
+    repo: &gix::Repository,
+    drivers: &mut DriverCache<'_>,
+    caches: &mut std::collections::HashMap<String, super::notes::Cache>,
+    driver: Option<&crate::userdiff::Driver>,
+    program: &str,
+    path: &gix::bstr::BStr,
+    key: Option<gix::hash::ObjectId>,
+    raw: &[u8],
+) -> Result<Vec<u8>> {
+    let cache_key = match (driver, key) {
+        (Some(drv), Some(_)) if drv.settings.cache_textconv => Some(drv.name.clone()),
+        _ => None,
+    };
+    let Some(name) = cache_key else {
+        return run_textconv(drivers, program, path, raw);
+    };
+    let key = key.expect("cache_key is None without an oid");
+    if !caches.contains_key(&name) {
+        // `userdiff_get_textconv()` (userdiff.c:436): `textconv/<driver>`, validity
+        // string the converter command.
+        let cache = super::notes::Cache::init(repo, &format!("textconv/{name}"), program)?;
+        caches.insert(name.clone(), cache);
+    }
+    if let Some(hit) = caches[&name].get(repo, &key) {
+        return Ok(hit);
+    }
+    let out = run_textconv(drivers, program, path, raw)?;
+    caches.get_mut(&name).expect("just inserted").put(repo, key, &out);
+    Ok(out)
 }
 
 /// `run_textconv()` (diff.c:7758): materialise the blob the way `prepare_temp_file()`
@@ -2626,11 +2764,59 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `-S`/`-G` fill both filespecs, so each surviving pair is read once here.
             let objects = repo.objects.clone();
             let pickaxe_workdir = repo.workdir().map(|p| p.to_owned());
+            // `pickaxe_match()` (diffcore-pickaxe.c:148-170) resolves each side's
+            // `get_textconv()` before it reads anything and then searches
+            // `fill_textconv()`'s images, not the raw blobs:
+            //
+            // ```c
+            // if (o->flags.allow_textconv) {
+            //         textconv_one = get_textconv(o->repo, p->one);
+            //         textconv_two = get_textconv(o->repo, p->two);
+            // }
+            // …
+            // mf1.size = fill_textconv(o->repo, textconv_one, p->one, &mf1.ptr);
+            // mf2.size = fill_textconv(o->repo, textconv_two, p->two, &mf2.ptr);
+            // ```
+            //
+            // So `git -c diff.markdown.textconv='tr a-z A-Z <' log -S 'MORE PROSE'`
+            // finds the commit and `-S 'more prose'` does not — measured against git
+            // 2.55.0, which is the reverse of what searching the blobs answers.
+            //
+            // This is a second converter pass over the queue: `apply_textconv()`
+            // below runs for the *patch*, which is downstream of the filter and sees
+            // only the pairs that survived it. git pays the same price — the images
+            // `pickaxe_match()` allocates are freed before `diff_flush()` converts
+            // again.
+            //
+            // Not modelled here: `if (textconv_one == textconv_two &&
+            // diff_unmodified_pair(p)) return 0;` (diffcore-pickaxe.c:160). It is
+            // unreachable in this port — the tree and worktree walks only queue
+            // changed pairs, and the unmodified pairs `--find-copies-harder` adds are
+            // dropped again by `diffcore_rename()`'s write-back above.
+            // One attribute stack for both jobs, the way `diff_filespec_load_driver()`
+            // reaches one `attr_check`: `get_textconv()` needs it to find a converter
+            // and `diff_filespec_is_binary()` needs it for the driver's `binary`
+            // tri-state, whether or not conversion is allowed.
+            let mut conv = super::cat_file::Textconv::new(&repo)?;
             let mut hits = Vec::with_capacity(deltas.len());
             for d in deltas.iter() {
-                let one = pickaxe_side(&objects, pickaxe_workdir.as_deref(), d, true)?;
-                let two = pickaxe_side(&objects, pickaxe_workdir.as_deref(), d, false)?;
-                hits.push(pickaxe.content_hit(one.as_deref(), two.as_deref()));
+                let one_raw = pickaxe_side(&objects, pickaxe_workdir.as_deref(), d, true)?;
+                let two_raw = pickaxe_side(&objects, pickaxe_workdir.as_deref(), d, false)?;
+                let one = pickaxe_textconv(&mut conv, allow_textconv, d.old_path(), one_raw)?;
+                let two = pickaxe_textconv(&mut conv, allow_textconv, &d.path, two_raw)?;
+                // `if ((o->pickaxe_opts & DIFF_PICKAXE_KIND_G) && !o->flags.text &&
+                //  ((!textconv_one && diff_filespec_is_binary(o->repo, p->one)) ||
+                //   (!textconv_two && diff_filespec_is_binary(o->repo, p->two))))
+                //         return 0;` (diffcore-pickaxe.c:164-168).
+                //
+                // `-S` has no such guard: measured against git 2.55.0 over a pair
+                // whose post-image carries a NUL byte, `diff --name-only -S NEEDLE`
+                // listed it and `-G NEEDLE` did not.
+                let skip_binary = matches!(pickaxe, super::diff_pickaxe::Kind::Grep(_))
+                    && !ignore.text
+                    && (pickaxe_binary_side(&repo, &mut conv, d.old_path(), &one)?
+                        || pickaxe_binary_side(&repo, &mut conv, &d.path, &two)?);
+                hits.push(!skip_binary && pickaxe.content_hit(one.side.as_deref(), two.side.as_deref()));
             }
             // `DIFF_OPT_PICKAXE_ALL`: one hit keeps the whole queue.
             if !(pickaxe_all && hits.iter().any(|h| *h)) {
@@ -3091,6 +3277,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             };
             let mut plain: Vec<u8> = Vec::new();
             let mut files: Vec<diff_color::FilePaint> = Vec::new();
+            // `init_diff_words_data()` compiles the pair's driver word regex once
+            // per pair; one compilation per distinct pattern is the same answer.
+            let mut word_res: std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>> =
+                std::collections::HashMap::new();
+            let want_driver_words = extra.wants_driver_word_regex();
             // `--submodule=log`/`=diff` write their lines through
             // `diff_emit_submodule_*()`, which paints each one itself instead of
             // handing it to `fn_out_consume()`. Draining the assembled patch at
@@ -3216,7 +3407,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     let before = plain.len();
                     render_patch(&mut plain, &repo, delta, an, ctx, &r)?;
                     if plain.len() != before {
-                        files.push(diff_color::FilePaint { ws_rule, blank_at_eof: an.blank_at_eof });
+                        files.push(diff_color::FilePaint {
+                            ws_rule,
+                            blank_at_eof: an.blank_at_eof,
+                            word_regex: driver_word_regex(
+                                &mut word_res,
+                                &delta.drivers,
+                                want_driver_words,
+                            )?,
+                        });
                         // Every `builtin_diff()` arm that emits a header or a hunk sets
                         // `o->found_changes`, so having written anything is the answer.
                         found_changes = true;
@@ -5239,6 +5438,10 @@ fn commit_patch_with(
     };
     let mut plain: Vec<u8> = Vec::new();
     let mut files: Vec<diff_color::FilePaint> = Vec::new();
+    // As above: one compiled regex per distinct driver pattern, for the whole commit.
+    let mut word_res: std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>> =
+        std::collections::HashMap::new();
+    let want_driver_words = opts.extra.wants_driver_word_regex();
     for queued in &deltas {
         // `run_diff()` (diff.c:5052) renders a type change as a deletion followed by
         // a creation; every other pair is one section.
@@ -5358,7 +5561,11 @@ fn commit_patch_with(
             let before = plain.len();
             render_patch(&mut plain, repo, delta, &an, opts.ctx, r)?;
             if plain.len() != before {
-                files.push(diff_color::FilePaint { ws_rule, blank_at_eof: an.blank_at_eof });
+                files.push(diff_color::FilePaint {
+                    ws_rule,
+                    blank_at_eof: an.blank_at_eof,
+                    word_regex: driver_word_regex(&mut word_res, &delta.drivers, want_driver_words)?,
+                });
             }
         }
     }
@@ -5383,8 +5590,9 @@ pub(crate) fn line_range_patch(
     repo: &gix::Repository,
     pairs: &[(super::line_log::Pair, Vec<super::line_log::Range>)],
     ctx: u32,
+    ws: Whitespace,
 ) -> Result<Vec<u8>> {
-    let r = patch_render(repo, &PatchOpts { ctx, ..Default::default() });
+    let r = patch_render(repo, &PatchOpts { ctx, ws, ..Default::default() });
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
     let hash_kind = repo.object_hash();
     let mut out: Vec<u8> = Vec::new();
@@ -5408,7 +5616,13 @@ pub(crate) fn line_range_patch(
             &repo.objects,
             &delta,
             ctx,
-            Whitespace::Keep,
+            // `dump_diff_hacky_one()` renders through `rev->diffopt`, so a
+            // whitespace rule reaches the `-L` patch the way it reaches every
+            // other one — and a commit whose only change is whitespace then has
+            // no hunk left to print, which is what stock does with `git log -L
+            // <range>:<file> -w` (verified against git 2.55.0: the commit's
+            // header still prints, its patch does not).
+            ws,
             true,
             hash_kind,
             None,
@@ -6249,6 +6463,86 @@ fn pickaxe_side(
         }
         NewSide::Worktree(_) => Ok(read_worktree_bytes(workdir, &d.path)),
     }
+}
+
+/// One side of a pair as `pickaxe_match()` (diffcore-pickaxe.c:130) hands it to the
+/// search function.
+struct PickaxeSide {
+    /// `fill_textconv()`'s image, or the raw blob when no converter applies. `None`
+    /// is a side that does not exist, which `has_changes()` counts as zero
+    /// occurrences and `diff_grep()` treats as a whole-file add or delete.
+    side: Option<Vec<u8>>,
+    /// Whether `textconv_one`/`textconv_two` came back non-NULL, which is what the
+    /// `-G` binary guard reads rather than "did the bytes change".
+    converted: bool,
+}
+
+/// `get_textconv()` + `fill_textconv()` for one side of a pickaxe pair
+/// (diffcore-pickaxe.c:148-170).
+///
+/// `get_textconv()` (diff.c:3762) answers NULL for a side that does not exist, so a
+/// missing side is handed through as it is; a converter that could not be run is
+/// `run_textconv()`'s NULL return, which `fill_textconv()` turns into
+/// `die(_("unable to read files to diff"))` — the same fatal the patch pass raises,
+/// only earlier, because the filter runs before anything is rendered.
+fn pickaxe_textconv(
+    conv: &mut super::cat_file::Textconv<'_>,
+    allow: bool,
+    path: &BString,
+    raw: Option<Vec<u8>>,
+) -> Result<PickaxeSide> {
+    let Some(raw) = raw else {
+        return Ok(PickaxeSide { side: None, converted: false });
+    };
+    if !allow {
+        return Ok(PickaxeSide { side: Some(raw), converted: false });
+    }
+    match conv.convert(path.as_bstr(), &raw)? {
+        super::cat_file::Converted::Text(t) => Ok(PickaxeSide { side: Some(t), converted: true }),
+        super::cat_file::Converted::NoDriver => {
+            Ok(PickaxeSide { side: Some(raw), converted: false })
+        }
+        super::cat_file::Converted::Failed => {
+            Err(crate::fatal::die("unable to read files to diff"))
+        }
+    }
+}
+
+/// `!textconv_<side> && diff_filespec_is_binary(o->repo, p-><side>)`, the half of the
+/// `-G` guard that applies to one side (diffcore-pickaxe.c:166-167).
+///
+/// `diff_filespec_is_binary()` (diff.c:3712-3733) takes the driver's `binary`
+/// tri-state when it is not `-1` and otherwise sniffs the buffer for a NUL in the
+/// first 8000 bytes; a side with no data at all is not binary.
+///
+/// Not modelled: the boolean attribute forms. `userdiff_find_by_path()`
+/// (userdiff.c:540-542) answers `driver_false`, whose `.binary` is 1, for a path
+/// marked `-diff`, so git calls such a path binary whatever its bytes are. The
+/// attribute reader behind [`super::cat_file::Textconv::driver_name`] reports only
+/// *named* drivers, so a `-diff` path is sniffed here instead — visible only as
+/// `git log -G<re>` still considering a `-diff` text file.
+fn pickaxe_binary_side(
+    repo: &gix::Repository,
+    conv: &mut super::cat_file::Textconv<'_>,
+    path: &BString,
+    side: &PickaxeSide,
+) -> Result<bool> {
+    if side.converted {
+        return Ok(false);
+    }
+    let Some(data) = side.side.as_deref() else {
+        return Ok(false);
+    };
+    if let Some(name) = conv.driver_name(path.as_bstr())? {
+        // `parse_tristate()` (userdiff.c:471): `auto` is the `-1` that means "work it
+        // out", anything else is `git_config_bool`.
+        if let Some(v) = super::cat_file::diff_driver_config(repo, &name, "binary") {
+            if !v.trim().eq_ignore_ascii_case("auto") {
+                return Ok(crate::userdiff::config_bool(&v));
+            }
+        }
+    }
+    Ok(looks_binary(data))
 }
 
 /// The bytes of a worktree path, with a symlink contributing its target — which is

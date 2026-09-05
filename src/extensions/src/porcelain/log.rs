@@ -1960,12 +1960,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             until = Some(approxidate(&args.get(i).cloned().unwrap_or_default()));
         } else if a == "-S" {
             i += 1;
-            pickaxe_s = Some(args.get(i).cloned().unwrap_or_default());
+            let v = args.get(i).cloned().unwrap_or_default();
+            if let Some(code) = pickaxe_non_empty('S', &v)? {
+                return Ok(code);
+            }
+            pickaxe_s = Some(v);
         } else if let Some(v) = a.strip_prefix("-S") {
             pickaxe_s = Some(v.to_string());
         } else if a == "-G" {
             i += 1;
-            pickaxe_g = Some(args.get(i).cloned().unwrap_or_default());
+            let v = args.get(i).cloned().unwrap_or_default();
+            if let Some(code) = pickaxe_non_empty('G', &v)? {
+                return Ok(code);
+            }
+            pickaxe_g = Some(v);
         } else if a == "--pickaxe-all" {
             pickaxe_all = true;
         } else if a == "--pickaxe-regex" {
@@ -2487,7 +2495,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         // `if (!revs->diffopt.output_format) output_format = DIFF_FORMAT_PATCH;`
-        if !patch && !name_only && !name_status && !saw_no_patch && !quiet {
+        //
+        // `--raw` is one of the formats that satisfies that `if`, so it *replaces*
+        // the implied patch instead of stacking with it: `git log -L … --raw`
+        // prints raw records alone, and only an explicit `-p` beside it brings the
+        // patch back (both verified against git 2.55.0).
+        if !patch && !raw && !name_only && !name_status && !saw_no_patch && !quiet {
             patch = true;
         }
     }
@@ -2593,6 +2606,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut resolve_neg = |spec: &str, token: &str, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
         match resolve_rev(&repo, crate::objname::canonical_spec(&repo, spec).as_ref()) {
             Ok(id) => {
+                // `get_reference()`'s `die(_("bad object %s"), name)`
+                // (revision.c:389-400): the excluded side is pended through the
+                // same function, so a name that resolved onto an absent object
+                // ends the command here too.
+                if repo.find_object(id).is_err() {
+                    eprintln!("fatal: bad object {spec}");
+                    return Some(ExitCode::from(128));
+                }
                 // `handle_commit()` drops an UNINTERESTING tree or blob rather
                 // than excluding anything by it, so `<tree>..HEAD` walks the
                 // whole history instead of failing.
@@ -2733,6 +2754,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             parsed.extend(navigation_path(&repo, bare));
             if spec.starts_with('^') != negated {
                 if let Some(code) = resolve_neg(bare, spec, &mut neg_ids) {
+                    return Ok(code);
+                }
+                // `handle_revision_arg_1()` runs `verify_non_filename()` between
+                // the name resolving and `get_reference()` (revision.c:2156-2157),
+                // on the operand with its leading `^` already stripped — so
+                // `git log ^dual` and `git log --not dual` are as ambiguous as
+                // `git log dual` when a file named `dual` is sitting there.
+                if let Some(code) = non_filename_fatal(&repo, bare, seen_dashdash) {
                     return Ok(code);
                 }
                 // `revs->rev_input_given` is set by `handle_revision_arg()` as
@@ -2926,6 +2955,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut in_paths = false;
     let mut specs = pos_specs.iter().peekable();
     for at in 0..=revs.len() {
+        // One `verify_non_filename()` per operand, not per endpoint: a range is
+        // split into two specs here and git checks the token once.
+        let mut token_checked = false;
         let mut bad_object: Option<String> = None;
         push_ref_tips(
             at,
@@ -2985,6 +3017,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             } else {
                 repo.rev_parse_single(crate::objname::canonical_spec(&repo, spec).as_ref())
                     .map(|id| id.detach())
+                    // `GET_OID_COMMITTISH`, which `cmd_log_init()` asks for and
+                    // gitoxide's parser has no equivalent of — see
+                    // [`committish_short_oid`].
+                    .or_else(|_| committish_short_oid(&repo, spec).ok_or(()))
                     .map_err(|_| ())
             };
             match resolved {
@@ -3001,6 +3037,30 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     // as `handle_revision_arg_1()` returns 0, which is long
                     // before the walk drops the entry. So `git log <tree>` walks
                     // nothing at all rather than falling back to `revs->def`.
+                    // `verify_non_filename()` again (revision.c:2156-2157), for the
+                    // side that pends rather than excludes. The name git hands it
+                    // is the operand as written — `handle_dotdot_1()` puts the
+                    // `..` back before its own call (revision.c:2024-2028) — so
+                    // the check is on the whole token, once, and not on the
+                    // endpoints a range was split into.
+                    if !token_checked {
+                        token_checked = true;
+                        let token = revs.get(at).map(String::as_str).unwrap_or(spec.as_str());
+                        if let Some(code) =
+                            non_filename_fatal(&repo, non_filename_name(token), seen_dashdash)
+                        {
+                            return Ok(code);
+                        }
+                    }
+                    // `get_reference()` (revision.c:389-400) `parse_object()`s the
+                    // id straight after and `die(_("bad object %s"), name)`s when
+                    // the database does not have it, naming the operand rather
+                    // than the id. A ref file written by hand can point anywhere,
+                    // so this is reachable from a name that resolved perfectly.
+                    if repo.find_object(id).is_err() {
+                        eprintln!("fatal: bad object {name}");
+                        return Ok(ExitCode::from(128));
+                    }
                     rev_input_given = true;
                     let Some(commit) = crate::objname::walk_pending(&repo, id) else {
                         continue;
@@ -3313,9 +3373,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         }
         // `line_log_filter` finishes with `rewrite_parents()`, which git runs only
-        // when the caller wants ancestry — `--graph` and `--parents` are what set
-        // `rewrite_parents` here. Every other format never prints a parent.
-        if graph || show_parents {
+        // when the caller wants ancestry:
+        //
+        // ```c
+        // static inline int want_ancestry(const struct rev_info *revs)
+        // {
+        //         return (revs->rewrite_parents || revs->children.name);
+        // }
+        // ```
+        //
+        // (revision.c:3914-3917, read at revision.c:3765.) `--graph` and
+        // `--parents` set `rewrite_parents`; `--children` sets `children.name`,
+        // and it reads the rewritten list too — `set_children()` walks the same
+        // `commit->parents`. Leaving it out lost every child link a `-L` history
+        // had: `git log -L 1,3:<file> --children` named no children at all where
+        // stock names the rewritten one.
+        if graph || show_parents || show_children {
             for node in &mut kept {
                 let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
                 for p in &node.parents {
@@ -3454,7 +3527,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         }
         nodes = shown;
-    } else if !pathspecs.is_empty() {
+    }
+    // `--children`: `set_children()` builds this, and where it is built is the
+    // whole of its behaviour — see the two sites that fill it below.
+    let mut children_map: Option<HashMap<ObjectId, Vec<ObjectId>>> = None;
+    if !pathspecs.is_empty() && !follow {
         // `rev_compare_tree()` answers `REV_TREE_DIFFERENT` for a decorated commit
         // before it looks at any tree, so under `--simplify-by-decoration` a tagged
         // commit is "changed" against every parent. The map is needed here, ahead
@@ -3709,6 +3786,35 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 }
             }
         } else {
+            // `set_children()` (revision.c:4038-4040) is the last thing
+            // `prepare_revision_walk()` does, so it runs over the *limited* list —
+            // every commit `limit_list()` kept, including the ones
+            // `get_commit_action()` is about to drop for being TREESAME. Building
+            // the map from the printed nodes instead lost exactly those: `git log
+            // --children -- <path>` left off the merge that a pathspec had
+            // simplified away, even though git names it as a child.
+            //
+            // The parent list it reads is the one `try_to_simplify_commit()`
+            // rewrote *in place* (`pruned` here), not `rewrite_parents()`'s
+            // display list, so a merge collapsed onto one parent contributes a
+            // child to that parent alone.
+            if show_children {
+                let mut map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+                for node in &nodes {
+                    if !reachable.contains(&node.id) {
+                        continue;
+                    }
+                    let parents = pruned
+                        .get(&node.id)
+                        .or_else(|| simplified.get(&node.id).map(|(p, _)| p))
+                        .map_or(&node.parents[..], Vec::as_slice);
+                    for parent in parents {
+                        // `push_children()` splices each child onto the front.
+                        map.entry(*parent).or_default().insert(0, node.id);
+                    }
+                }
+                children_map = Some(map);
+            }
             nodes.retain(|n| {
                 reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
             });
@@ -3757,6 +3863,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 node.parents = rewritten;
             }
         }
+    }
+
+    // `set_children()` runs before every output-time filter, so when the
+    // simplification pass above did not already build the map, it is built here —
+    // ahead of the parent-count bounds, the header greps, `--skip` and
+    // `--max-count`, all of which git applies afterwards and none of which may
+    // remove a child from the map. Reading it off the printed nodes dropped the
+    // merge from `git log --children --no-merges`, which stock still names.
+    if show_children && children_map.is_none() {
+        let mut map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for node in &nodes {
+            for parent in &node.parents {
+                map.entry(*parent).or_default().insert(0, node.id);
+            }
+        }
+        children_map = Some(map);
     }
 
     // `--merges`/`--no-merges` are git's aliases for `--min-parents=2` /
@@ -4235,27 +4357,31 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
     }
 
-    // `--boundary`: the excluded commits the shown history hangs off — every
-    // parent that the exclusion hid — appended after the walk with a `-` mark.
-    // git emits them from `revs->boundary_commits` once the main walk is done, so
-    // they come last regardless of their dates and skip the filters above.
-    if boundary && !hidden.is_empty() {
-        let shown: HashSet<ObjectId> = nodes.iter().map(|n| n.id).collect();
-        let mut seen: HashSet<ObjectId> = HashSet::new();
-        let mut edge: Vec<Node> = Vec::new();
+    // `--boundary`: the commits the shown history hangs off, appended after the
+    // walk with a `-` mark. git emits them from `revs->boundary_commits` once the
+    // main walk is done, so they come last regardless of their dates and skip the
+    // filters above.
+    //
+    // Membership is *every* parent of a returned commit that was not itself
+    // returned (revision.c:4583-4591 marking, revision.c:4494-4497 filtering), not
+    // only the ones a `^rev` hid — a parent dropped by history simplification, by
+    // `--no-merges` or by a date bound is a boundary just the same. Restricting
+    // this to the excluded set printed nothing at all for `git log --boundary --
+    // <path>`, where stock prints the TREESAME ancestor the shown history stops
+    // at. [`super::rev_list::boundary_list`] is the shared rule, and it also owns
+    // the reverse-marking order and the topological sort that follow.
+    if boundary {
+        let shown: Vec<ObjectId> = nodes.iter().map(|n| n.id).collect();
+        let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> =
+            nodes.iter().map(|n| (n.id, n.parents.clone())).collect();
+        let edge_ids =
+            super::rev_list::boundary_list(&repo, &shown, &mut parents_of, order == Order::Date);
         let reader = NodeReader::new(&repo);
-        for node in &nodes {
-            for parent in &node.parents {
-                if shown.contains(parent) || !hidden.contains(parent) || !seen.insert(*parent) {
-                    continue;
-                }
-                let mut n = reader.read(&repo, *parent)?;
-                n.boundary = true;
-                edge.push(n);
-            }
+        for id in edge_ids {
+            let mut n = reader.read(&repo, id)?;
+            n.boundary = true;
+            nodes.push(n);
         }
-        edge.sort_by_key(|n| std::cmp::Reverse(n.time));
-        nodes.extend(edge);
     }
 
     // `--boundary`: every parent of a commit the walk *returned* carries
@@ -4280,19 +4406,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         measure_graph_widths(&mut nodes, first_parent, &interest);
     }
 
-    // `--children`: git records a child on every parent as it walks, so the list
-    // names only commits this run reached.
-    let children: Option<HashMap<ObjectId, Vec<ObjectId>>> = show_children.then(|| {
-        let mut map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-        for node in &nodes {
-            for parent in &node.parents {
-                // `push_children()` splices each child onto the *front* of the
-                // list, so the ids come out in reverse walk order.
-                map.entry(*parent).or_default().insert(0, node.id);
-            }
-        }
-        map
-    });
+    // `--children`: the map `set_children()` built while the walk was still being
+    // limited, which is ahead of every filter that has run since.
+    let children = children_map;
 
     // `--abbrev=<n>` is `revs->abbrev`, which every abbreviation in the run reads.
     // Pushing it into the repository's config as `core.abbrev` puts it in front of
@@ -4570,8 +4686,50 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     diff.extend_from_slice(&pair.path);
                     diff.push(b'\n');
                 }
-            } else if emit_patch && !pairs.is_empty() {
-                diff = super::diff::line_range_patch(&repo, pairs, 3)?;
+            } else {
+                // `--raw` under `-L`, which git 2.55 renders from the same pair
+                // queue as `--name-status` and through the ordinary
+                // `diff_flush_raw()`: `:<old mode> <new mode> <old sha> <new sha>
+                // <status>\t<path>`. Verified against git 2.55.0 on the corpus's
+                // `Shape::Whitespace`, including `--abbrev=<n>` and `-z`.
+                //
+                // The letter and path are `line_log_name_status()`'s — the queued
+                // `diff_filepair_dup()` carries no rename flag, so a pair whose
+                // sides name different files still reports `M` against its
+                // pre-image path, and no `R<score>` field is ever written.
+                if raw {
+                    let files: Vec<FileChange> = pairs
+                        .iter()
+                        .map(|(pair, _)| {
+                            let (status, path) = line_log_name_status(pair);
+                            FileChange {
+                                path: path.to_vec(),
+                                status,
+                                added: 0,
+                                deleted: 0,
+                                is_binary: false,
+                                old_size: 0,
+                                new_size: 0,
+                                source: None,
+                                score: 0,
+                                old_side: pair.old.map(|(id, kind)| (line_log::kind_mode(kind), id)),
+                                new_side: pair.new.map(|(id, kind)| (line_log::kind_mode(kind), id)),
+                            }
+                        })
+                        .collect();
+                    // `strip_prefix()` reaches the raw writer here as everywhere
+                    // else, so `--relative` shortens these names too.
+                    let rel = patch_opts.relative.as_deref().unwrap_or("");
+                    emit_raw(&repo, &mut diff, &files, z, rel)?;
+                }
+                // `--raw -p` prints both, in that order, with a blank line between
+                // — the one `dump_diff_hacky()` writes before its own output.
+                if emit_patch && !pairs.is_empty() {
+                    if !diff.is_empty() {
+                        diff.push(b'\n');
+                    }
+                    diff.extend_from_slice(&super::diff::line_range_patch(&repo, pairs, 3, patch_opts.ws)?);
+                }
             }
             if !diff.is_empty() {
                 // A merge's combined diff is separated from the header even under
@@ -5683,6 +5841,54 @@ pub(super) fn bad_revision_message_in_gated(
 /// `dotdot_missing()`. This port takes the range branch first and so misses that
 /// ordering; the shape needs a file literally named `<rev>..<rev>`, and no case
 /// in the differential or the parity corpus reaches it.
+/// The name `handle_revision_arg_1()` hands `verify_non_filename()` for one
+/// operand.
+///
+/// `handle_dotdot_1()` restores the separator before its own call
+/// (`revision.c:2024-2028`):
+///
+/// ```c
+/// if (!cant_be_filename) {
+///         *dotdot = '.';
+///         verify_non_filename(revs->prefix, arg);
+///         *dotdot = '\0';
+/// }
+/// ```
+///
+/// — so a range is checked as it was written, and `dual..main` is not a filename
+/// even where `dual` is. Every other shape reaches the call at
+/// `revision.c:2156-2157` with `arg` already advanced past the parent mark
+/// (`arg = arg_minus_dash`) and past a leading `^`.
+pub(super) fn non_filename_name(token: &str) -> &str {
+    if token.contains("..") {
+        return token;
+    }
+    let base = match crate::objname::parents_only(token) {
+        crate::objname::ParentsOnly::Mark { base, .. } => base,
+        _ => token,
+    };
+    base.strip_prefix('^').unwrap_or(base)
+}
+
+/// `verify_non_filename()` at the one place `setup_revisions()` runs it: after an
+/// operand has resolved as a revision and before it is pended.
+///
+/// `cant_be_filename` is `REVARG_CANNOT_BE_FILENAME`, which `setup_revisions()`
+/// derives from its own scan for a `--` (`revision.c:2852-2854`), so a separator
+/// anywhere on the line stands the check down for every operand.
+pub(super) fn non_filename_fatal(
+    repo: &gix::Repository,
+    name: &str,
+    cant_be_filename: bool,
+) -> Option<ExitCode> {
+    if cant_be_filename {
+        return None;
+    }
+    let message = crate::setup::verify_non_filename(repo, name)?;
+    eprintln!("fatal: {message}");
+    Some(ExitCode::from(128))
+}
+
 pub(super) fn early_revision_fatal(
     repo: &gix::Repository,
     spec: &str,
@@ -6951,7 +7157,52 @@ pub(super) fn revision_endpoints(spec: &str) -> Vec<&str> {
 }
 
 fn resolve_rev(repo: &gix::Repository, spec: &str) -> Result<ObjectId, ()> {
-    repo.rev_parse_single(spec).map(|id| peel_to_commit(repo, id.detach())).map_err(|_| ())
+    repo.rev_parse_single(spec)
+        .map(|id| id.detach())
+        .or_else(|_| committish_short_oid(repo, spec).ok_or(()))
+        .map(|id| peel_to_commit(repo, id))
+}
+
+/// `repo_get_oid_committish()`: the short-id lookup `log` runs and `rev-list`
+/// does not.
+///
+/// `cmd_log_init()` sets `opt.revarg_opt = REVARG_COMMITTISH` (`builtin/log.c`),
+/// which `handle_revision_arg_1()` turns into `GET_OID_COMMITTISH`
+/// (`revision.c:2151-2152`):
+///
+/// ```c
+/// if (revarg_opt & REVARG_COMMITTISH)
+///         get_sha1_flags |= GET_OID_COMMITTISH;
+/// ```
+///
+/// `get_short_oid()` then installs `disambiguate_committish_only` as `ds.fn`
+/// (`object-name.c:527-537`), so a prefix shared by a commit and a blob resolves
+/// to the commit instead of being ambiguous. `cmd_rev_list()` sets no such
+/// option, which is why the same prefix is `short object ID … is ambiguous`
+/// there and a walk here.
+///
+/// Only the bare-prefix spelling is covered: every suffixed form goes through
+/// gitoxide's revspec parser, which has no hook for a type-preferring lookup.
+fn committish_short_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    if spec.len() < crate::abbrev::MINIMUM_ABBREV
+        || spec.len() >= repo.object_hash().len_in_hex()
+        || !spec.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let prefix = gix::hash::Prefix::from_hex(&spec.to_ascii_lowercase()).ok()?;
+    let mut candidates = std::collections::HashSet::new();
+    repo.objects.lookup_prefix(prefix, Some(&mut candidates)).ok()?;
+    // `disambiguate_committish_only()` keeps a commit, and a tag because a tag
+    // peels towards one (`object-name.c:340-360`).
+    let mut committish = candidates.iter().copied().filter(|id| {
+        matches!(
+            repo.find_header(*id).ok().map(|h| h.kind()),
+            Some(gix::object::Kind::Commit) | Some(gix::object::Kind::Tag)
+        )
+    });
+    let only = committish.next()?;
+    committish.next().is_none().then_some(only)
 }
 
 /// The commit a revision names, following annotated tags.
@@ -13439,11 +13690,33 @@ enum ColorWhen {
     Auto,
 }
 
+/// The empty-argument refusal `-S`/`-G` share (`diff_opt_pickaxe_string()`,
+/// `diff.c`): ``error: -<c> requires a non-empty argument``, exit 129, with no
+/// usage block. Measured against git 2.55.0 — `git log -S "" --oneline` writes
+/// exactly that one line to stderr, nothing to stdout, and exits 129.
+///
+/// Only the *detached* spelling can be empty: `-S` with nothing attached takes
+/// the next argv slot, and `-S""` is the same empty string arriving the same way,
+/// so both reach this. An attached non-empty value never does.
+fn pickaxe_non_empty(short: char, value: &str) -> Result<Option<ExitCode>> {
+    if !value.is_empty() {
+        return Ok(None);
+    }
+    let mut err = std::io::stderr().lock();
+    writeln!(err, "error: -{short} requires a non-empty argument")?;
+    err.flush()?;
+    Ok(Some(ExitCode::from(129)))
+}
+
 /// Map a `--date=` value to a [`DateMode`]. `None` for a value git accepts but
 /// this port renders time/zone-dependently (surfaced terse) or does not know.
 pub(crate) fn parse_date_mode(spec: &str) -> Option<DateMode> {
     Some(match spec {
-        "default" | "normal" => DateMode::Default,
+        // `parse_date_type()` (date.c:990-1019) spells `DATE_NORMAL` `default` and
+        // nothing else: `--date=normal` is `die("unknown date format normal")`, the
+        // same as any other unrecognized word. Accepting it here rendered a date
+        // where git refuses to run at all.
+        "default" => DateMode::Default,
         "short" => DateMode::Short,
         "iso" | "iso8601" => DateMode::Iso,
         "iso-strict" | "iso8601-strict" => DateMode::IsoStrict,

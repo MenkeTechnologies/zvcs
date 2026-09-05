@@ -130,6 +130,7 @@ fn find_copy_in_parent(
     diff_state: &mut gix_diff::tree::State,
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
+    indent_heuristic: bool,
     stats: &mut Statistics,
 ) -> Result<(), Error> {
     if unblamed.is_empty() {
@@ -174,6 +175,7 @@ fn find_copy_in_parent(
                     starts,
                     diff_algorithm,
                     ignore_whitespace,
+                    indent_heuristic,
                     stats,
                 ) else {
                     continue;
@@ -231,6 +233,7 @@ pub(super) fn find_copies_in_parents(
     diff_state: &mut gix_diff::tree::State,
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
+    indent_heuristic: bool,
     stats: &mut Statistics,
 ) -> Result<Vec<UnblamedHunk>, Error> {
     let mut out = Vec::with_capacity(hunks_to_blame.len());
@@ -269,6 +272,7 @@ pub(super) fn find_copies_in_parents(
             diff_state,
             diff_algorithm,
             ignore_whitespace,
+            indent_heuristic,
             stats,
         )?;
     }

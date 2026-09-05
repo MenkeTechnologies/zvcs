@@ -788,6 +788,101 @@ fn commit_notes(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// notes-cache.c — a notes tree used as a memo rather than as annotation
+// ---------------------------------------------------------------------------
+
+/// Port of `struct notes_cache` (notes-cache.h): a notes tree keyed by *blob* id and
+/// used as a content-addressed cache. `diff.<driver>.cachetextconv` is its only user
+/// in git — `userdiff_get_textconv()` (userdiff.c:432-439) builds one named
+/// `textconv/<driver>` whose validity string is the converter command itself.
+///
+/// It differs from the annotation trees the `git notes` subcommands write in three
+/// ways, all of them in `notes_cache_write()` (notes-cache.c:50):
+///
+/// * the commit is always a **root** commit — `commit_tree(…, NULL, …)` — so a
+///   rewritten cache does not chain onto the old one;
+/// * its message is the validity string verbatim, with no trailing newline, which is
+///   what `notes_cache_match_validity()` reads back with `%s`; and
+/// * the ref moves with `UPDATE_REFS_QUIET_ON_ERR` and no expected old value, under
+///   the reflog message `update notes cache`.
+pub(crate) struct Cache {
+    notes_ref: String,
+    /// `c->validity`: the converter command. A cache whose ref names a different one
+    /// is not this cache and is discarded rather than read.
+    validity: String,
+    notes: Notes,
+}
+
+impl Cache {
+    /// `notes_cache_init()` (notes-cache.c:35): load the tree only when the ref's
+    /// commit subject is the validity string, and start empty otherwise —
+    /// `NOTES_INIT_EMPTY`. A converter whose command changed therefore silently
+    /// invalidates every entry it wrote before.
+    pub(crate) fn init(repo: &gix::Repository, name: &str, validity: &str) -> Result<Self> {
+        let notes_ref = format!("refs/notes/{name}");
+        let (notes, tip) = load(repo, &notes_ref)?;
+        // `notes_cache_match_validity()` (notes-cache.c:9): `format_commit_message(…,
+        // "%s", …)` then `strbuf_trim()`, i.e. the trimmed subject line.
+        let valid = match tip {
+            Some(tip) => repo
+                .find_commit(tip)
+                .ok()
+                .and_then(|c| c.message().ok().map(|m| m.summary().to_string()))
+                .is_some_and(|s| s.trim() == validity),
+            None => false,
+        };
+        Ok(Self {
+            notes_ref,
+            validity: validity.to_owned(),
+            notes: if valid {
+                notes
+            } else {
+                Notes { map: BTreeMap::new(), non_notes: Vec::new() }
+            },
+        })
+    }
+
+    /// `notes_cache_get()` (notes-cache.c:71): the note blob's content for `key`, or
+    /// `None` when the tree has no note for it.
+    pub(crate) fn get(&self, repo: &gix::Repository, key: &ObjectId) -> Option<Vec<u8>> {
+        let value = self.notes.map.get(key)?;
+        repo.find_object(*value).ok().map(|o| o.data.clone())
+    }
+
+    /// `notes_cache_put()` (notes-cache.c:88) followed immediately by
+    /// `notes_cache_write()` (notes-cache.c:50), which is how `fill_textconv()` uses
+    /// them: "we could save up changes and flush them all at the end, but we would
+    /// need an extra call after all diffing is done" (diff.c:7101-7105). Every miss
+    /// therefore writes one more root commit.
+    ///
+    /// git ignores errors here — "we might be in a readonly repository" (diff.c:7098)
+    /// — so a failure to write leaves the patch alone.
+    pub(crate) fn put(&mut self, repo: &gix::Repository, key: ObjectId, data: &[u8]) {
+        let Ok(blob) = repo.write_blob(data) else { return };
+        self.notes.map.insert(key, blob.detach());
+        let Ok(tree_id) = write_tree(repo, &self.notes) else { return };
+        let Ok(commit) = repo.new_commit(&self.validity, tree_id, None::<ObjectId>) else {
+            return;
+        };
+        let Ok(name) = self.notes_ref.as_str().try_into() else { return };
+        let _ = repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "update notes cache".into(),
+                },
+                // `update_ref(…, NULL, 0, …)`: no expected old value.
+                expected: PreviousValue::Any,
+                new: Target::Object(commit.id().detach()),
+            },
+            name,
+            deref: false,
+        });
+    }
+}
+
 /// Writing subcommands refuse to touch anything outside `refs/notes/`.
 fn check_writable(notes_ref: &str, sub: &str) -> Result<Option<ExitCode>> {
     if !notes_ref.starts_with("refs/notes/") {

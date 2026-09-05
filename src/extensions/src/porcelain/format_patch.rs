@@ -8124,7 +8124,10 @@ fn emit_change(
             comment: comment.flatten(),
             binary,
         },
-        FilePaint { ws_rule: opts.ws_rule, blank_at_eof },
+        // `format-patch` does not resolve a path's userdiff driver, so no driver word
+        // regex is available here; `diff.wordRegex` still reaches the emitter through
+        // [`ExtraPaint`].
+        FilePaint { ws_rule: opts.ws_rule, blank_at_eof, word_regex: None },
     ))
 }
 

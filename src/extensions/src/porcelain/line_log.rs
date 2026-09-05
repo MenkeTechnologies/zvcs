@@ -1315,7 +1315,10 @@ fn tree_change_sides(
 }
 
 /// `EntryKind` as the full octal mode git's filespecs carry.
-fn kind_mode(kind: EntryKind) -> u32 {
+///
+/// `pub(crate)` because `log`'s `-L --raw` writer needs the same mode bytes
+/// `diff_flush_raw()` prints.
+pub(crate) fn kind_mode(kind: EntryKind) -> u32 {
     u32::from(gix::objs::tree::EntryMode::from(kind).value())
 }
 
@@ -1578,8 +1581,16 @@ impl gix::diff::blob::unified_diff::ConsumeHunk for RangeSink<'_> {
         let mut rec: Vec<u8> = Vec::new();
         for (kind, fallback) in lines {
             let (marker, content): (u8, &[u8]) = match kind {
+                // `xdl_emit_diff()` emits every context record from `xe->xdf2`, the
+                // *post-image* — all three context loops call
+                // `xdl_emit_record(&xe->xdf2, s2, " ", ecb)`. It only matters when
+                // the two sides hold different bytes for a record the comparison
+                // called equal, which is exactly what `-w`/`-b`/
+                // `--ignore-space-at-eol` do; reading it off `before` here made
+                // `git log -L <range>:<file> -w` print the pre-image's indentation
+                // for its context lines where stock prints the post-image's.
                 DiffLineKind::Context => {
-                    let c = self.before.get(bi).copied().unwrap_or(*fallback);
+                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
                     bi += 1;
                     ai += 1;
                     (b' ', c)

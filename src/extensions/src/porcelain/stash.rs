@@ -2859,9 +2859,23 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         other: Some(BStr::new(b"Stashed changes")),
     };
     let should_interrupt = AtomicBool::new(false);
-    // `apply_autostash()` re-applies with `git stash apply --index --quiet`, so the
-    // merge's own `Auto-merging`/`CONFLICT` block is suppressed; the caller reports
-    // the outcome in git's own words.
+    // ```c
+    // if (attempt_apply) {
+    //         child.git_cmd = 1;
+    //         child.no_stdout = 1;
+    //         child.no_stderr = 1;
+    //         strvec_push(&child.args, "stash");
+    //         strvec_push(&child.args, "apply");
+    //         strvec_push(&child.args, stash_oid);
+    //         ret = run_command(&child);
+    // }
+    // ```
+    //
+    // (`apply_save_autostash_oid()`, sequencer.c:4433-4445.) The re-apply child
+    // runs with BOTH streams closed, so a conflicting autostash never shows the
+    // merge's own `Auto-merging <path>` / `CONFLICT (content): …` block — only
+    // the notice below. This is not the `-q` of the surrounding command: the
+    // child is silenced whether or not the rebase was quiet.
     let applied = crate::merge_apply::three_way_merge_verbose(
         repo,
         base,
@@ -2870,7 +2884,7 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         &old_index,
         labels,
         &should_interrupt,
-        !quiet,
+        false,
     )?;
     // The re-apply is a `git stash apply` child like any other, so it records
     // the merged tree as `AUTO_MERGE` too. It only outlives the command when
@@ -2912,10 +2926,35 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         let mut index = applied.index;
         crate::index_racy::write(repo, &mut index)?;
         if !quiet {
-            // git keeps the changes recoverable in the stash on a conflicting apply.
-            eprintln!("Applying autostash resulted in conflicts.");
-            eprintln!("Your changes are safe in the stash.");
-            eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+            // ```c
+            // struct child_process store = CHILD_PROCESS_INIT;
+            //
+            // store.git_cmd = 1;
+            // strvec_push(&store.args, "stash");
+            // strvec_push(&store.args, "store");
+            // strvec_push(&store.args, "-m");
+            // strvec_push(&store.args, "autostash");
+            // strvec_push(&store.args, "-q");
+            // strvec_push(&store.args, stash_oid);
+            // ```
+            //
+            // (`apply_save_autostash_oid()`, sequencer.c:4451-4460.) A conflicting
+            // re-apply promotes the snapshot to a real stash entry — that is what
+            // makes the advice below actionable, and it is the only reason
+            // `refs/stash` exists after `git pull --rebase --autostash` hit a
+            // conflict. Leaving it out stranded the changes in a commit no ref
+            // named.
+            //
+            // The two callers that pass `quiet` — `merge`'s `end_autostash()` and
+            // the `MERGE_AUTOSTASH` apply that closes a conflicted merge's commit
+            // — run this sequence themselves, because both have to drop
+            // `MERGE_AUTOSTASH` in the middle of it.
+            store_commit(repo, commit_id, "autostash")?;
+            eprintln!("Your local changes are stashed, however applying them");
+            eprintln!("resulted in conflicts.  You can either resolve the conflicts");
+            eprintln!("and then discard the stash with \"git stash drop\", or, if you");
+            eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
+            eprintln!("apply the local changes later by running \"git stash pop\".");
         }
     }
     Ok(applied.conflicts)

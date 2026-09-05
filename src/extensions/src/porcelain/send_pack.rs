@@ -158,6 +158,10 @@ struct State {
     dry_run: bool,
     verbose: bool,
     atomic: bool,
+    /// `--progress`: forced on, `--no-progress` off, unset follows `isatty(2)`
+    /// on stderr — `send_pack()`'s `args.progress`, which reaches `pack-objects`
+    /// and is what makes it print its `Total …` summary.
+    progress: Option<bool>,
     /// `--stdin`: read the refspec list from stdin instead of argv.
     from_stdin: bool,
     /// `--helper-status`: the `remote-helper` status block on **stdout** in
@@ -273,6 +277,10 @@ fn push(st: &State) -> Result<ExitCode> {
         // `send-pack` has no matching refspec: `--all`/`--mirror` are its
         // wholesale modes and every other invocation names its refs.
         matching: None,
+        progress: st.progress.unwrap_or_else(|| {
+            use std::io::IsTerminal;
+            std::io::stderr().is_terminal()
+        }),
     };
 
     // `git_connect()` for a local destination runs `git-receive-pack '<dest>'`,
@@ -864,10 +872,12 @@ fn resolve_rev(spec: &str) -> bool {
 /// and `value` is whatever the option consumed (always `None` for a boolean and
 /// for a negation, which parse-options never lets carry one).
 ///
-/// `--progress`, `--thin` and `--stateless-rpc` are accepted and dropped: the
-/// first two only change how the pack is produced (this one is never thin and
-/// reports no progress, and both are the sender's choice, not the receiver's),
-/// and the third is the smart-HTTP framing, which has no local destination.
+/// `--thin` and `--stateless-rpc` are accepted and dropped: the first only
+/// changes how the pack is produced (this one is never thin, and that is the
+/// sender's choice, not the receiver's), and the second is the smart-HTTP
+/// framing, which has no local destination. `--progress` is recorded: it is
+/// `args.progress`, which `send_pack()` hands to `pack-objects` and which makes
+/// the pack summary line appear.
 fn set_long(long: &str, on: bool, value: Option<&str>, st: &mut State) {
     match long {
         "all" => st.send_all = on,
@@ -877,6 +887,7 @@ fn set_long(long: &str, on: bool, value: Option<&str>, st: &mut State) {
         "verbose" => st.verbose = on,
         "quiet" => st.verbose = st.verbose && !on,
         "atomic" => st.atomic = on,
+        "progress" => st.progress = Some(on),
         "stdin" => st.from_stdin = on,
         "helper-status" => st.helper_status = on,
         "force-if-includes" => st.force_if_includes = on,

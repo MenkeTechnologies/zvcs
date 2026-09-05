@@ -194,9 +194,14 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             // `--quiet` drives `transport->verbose` negative, which is what
             // `set_upstreams()` tests before printing its notice (transport.c:120).
             "-q" | "--quiet" => f.quiet = true,
-            "--progress" | "--no-progress"
-            | "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6"
-            => {}
+            // `transport_set_verbosity(transport, verbosity, progress)`: the flag
+            // forces the meter on, `--no-progress` off, and with neither it
+            // follows `isatty(2)` (transport.c). `send_pack()` passes it to
+            // `pack-objects`, whose `Total …` summary is the only progress this
+            // port produces.
+            "--progress" => f.progress = Some(true),
+            "--no-progress" => f.progress = Some(false),
+            "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6" => {}
             // `--no-verify` sets `TRANSPORT_PUSH_NO_HOOK`, which is the only
             // thing that suppresses the `pre-push` hook in `transport_push()`
             // (transport.c): `if (!(flags & TRANSPORT_PUSH_NO_HOOK)) run_pre_push_hook(…)`.
@@ -766,18 +771,38 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         // push like `git push --prune origin main` covers exactly that one ref,
         // so it prunes nothing; deleting the rest of the namespace there would
         // destroy remote branches stock git leaves alone.
-        let mut prefixes: Vec<String> = specs
+        //
+        // ```c
+        // if (item->pattern) {
+        //         const char *dst_side = item->dst ? item->dst : item->src;
+        //         …
+        //         match = match_name_with_pattern(dst_side, ref->name, item->src, &name);
+        // ```
+        //
+        // (`get_ref_match()`, remote.c:1381-1391.) Only a *pattern* refspec and
+        // the matching refspec answer the prune scan, so a plain
+        // `git push --prune origin main` still prunes nothing. The refspecs are
+        // carried across as written — the reverse mapping needs both sides, not
+        // the destination prefix alone.
+        let mut prune_specs: Vec<push_proto::PruneSpec> = specs
             .iter()
-            .filter(|s| s.contains('*'))
             .filter_map(|s| {
-                let dst = s.rsplit_once(':').map(|(_, d)| d).unwrap_or(s.as_str());
-                dst.split_once('*').map(|(prefix, _)| full_ref_name(prefix))
+                let body = s.strip_prefix('+').unwrap_or(s);
+                let (src, dst) = body.split_once(':').unwrap_or((body, body));
+                (src.contains('*') && dst.contains('*')).then(|| push_proto::PruneSpec::Pattern {
+                    src: src.to_string(),
+                    dst: dst.to_string(),
+                })
             })
             .collect();
         if f.all {
-            prefixes.push("refs/heads/".to_string());
+            prune_specs.push(push_proto::PruneSpec::Matching);
         }
-        if prefixes.is_empty() { None } else { Some(push_proto::DeleteScope::Prefixes(prefixes)) }
+        if prune_specs.is_empty() {
+            None
+        } else {
+            Some(push_proto::DeleteScope::Prune(prune_specs))
+        }
     } else {
         None
     };
@@ -815,6 +840,10 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             force,
             branches: local_branch_tips(&repo),
         }),
+        progress: f.progress.unwrap_or_else(|| {
+            use std::io::IsTerminal;
+            std::io::stderr().is_terminal()
+        }) && !f.quiet,
     };
     let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run, &send_opts)?;
 
@@ -845,6 +874,9 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
 struct Flags {
     force: bool,
     dry_run: bool,
+    /// `--progress` forced on / `--no-progress` forced off / unset = follow
+    /// `isatty(2)` on stderr, as `transport_set_verbosity()` does.
+    progress: Option<bool>,
     /// `--no-verify`, git's `TRANSPORT_PUSH_NO_HOOK`: skip the `pre-push` hook.
     /// Independent of `dry_run` — a dry run still runs the hook.
     no_verify: bool,
@@ -2028,8 +2060,29 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
                 } else {
                     "! [rejected]       "
                 };
+                // ```c
+                // case REF_STATUS_REMOTE_REJECT:
+                //         print_ref_status('!', "[remote rejected]", ref,
+                //                          ref->deletion ? NULL : ref->peer_ref,
+                //                          ref->remote_status,
+                //                          report, porcelain, summary_width);
+                // ```
+                //
+                // (`print_one_push_report()`, transport.c:701-706.) A rejected
+                // *deletion* is printed with `from = NULL`, so it names the
+                // remote ref alone. `print_ref_status()` prints `<from> -> <to>`
+                // only when `from` is non-NULL, and a deletion has no local side
+                // worth naming — `git push --delete . main` refused by
+                // `receive.denyCurrentBranch` reads `main`, never `main -> main`.
+                // The locally decided rejections above keep `peer_ref` whatever
+                // the update is, which is why this is scoped to the remote's.
+                let shown = if s.remote_rejected && s.new.is_null() {
+                    short_ref(dst).to_string()
+                } else {
+                    src_dst.clone()
+                };
                 let summary = super::color::PushColors::paint(&colors.rejected, label);
-                eprintln!(" {summary} {src_dst} ({reason})");
+                eprintln!(" {summary} {shown} ({reason})");
             }
         }
     }

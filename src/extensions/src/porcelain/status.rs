@@ -439,10 +439,17 @@ fn status_report(
             }
             // `--column[=<opts>]` / `--no-column`: lay the long-format untracked and
             // ignored file listings out in columns (git's `OPT_COLUMN`).
+            //
+            // A bad style is `column.c:282`'s `error("unsupported option '%s'", arg)`,
+            // which `parseopt_column_callback()` hands back to `get_value()` as -1;
+            // `parse_options_step()` turns that into `PARSE_OPT_ERROR` and
+            // `parse_options()` answers it with a bare `exit(129)`
+            // (parse-options.c:975-977) — *no* `usage_with_options()`. Printing the
+            // usage block here made `git status --column=bogus` write it where stock
+            // writes only the one error line.
             "--column" => {
                 if let Err(m) = super::column::parseopt_column(&mut colopts, None, false) {
                     eprintln!("error: {m}");
-                    eprint!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
             }
@@ -454,7 +461,6 @@ fn status_report(
                     super::column::parseopt_column(&mut colopts, Some(&s["--column=".len()..]), false)
                 {
                     eprintln!("error: {m}");
-                    eprint!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
             }
@@ -636,6 +642,22 @@ fn status_report(
     // a bare repository, or a cwd inside the git directory — dies here rather than in the walk.
     if repo.workdir().is_none() {
         return Err(crate::fatal::need_work_tree());
+    }
+
+    // Every gitlink the walk meets goes through `get_submodule_from_ce()`
+    // (submodule.c:761) → `submodule_from_path()` (submodule-config.c:724-729),
+    // whose first act is `repo_read_gitmodules(r, 1)`; that reads the work-tree
+    // `.gitmodules` with `git_config_from_file()`, whose parser `die()`s on a line
+    // it cannot read. So a malformed `.gitmodules` is fatal for `git status` in a
+    // repository that has a submodule — and is silently irrelevant in one that
+    // does not, because nothing ever asks for it (measured against git 2.55.0:
+    // the same broken file, tracked or untracked, changes nothing in a repository
+    // with no gitlink in the index).
+    //
+    // Reading it here rather than mid-walk is the same observable behaviour: the
+    // report is buffered, so stock's `die()` also lands with nothing printed.
+    if let Some(code) = refuse_bad_gitmodules(&repo)? {
+        return Ok(code);
     }
 
     // `status.displayCommentPrefix` (git's `git_status_config`): when true the
@@ -1830,6 +1852,55 @@ enum WorkKind {
     /// `short_submodule_status()`'s `?` (wt-status.c:455): the same, for untracked
     /// content only.
     SubmoduleUntracked,
+}
+
+/// `repo_read_gitmodules()` (submodule-config.c:684-698) as a gate: when the
+/// index holds at least one gitlink — the only thing that makes git open the
+/// file at all — refuse a `.gitmodules` its config parser would not read.
+///
+/// ```c
+/// static void config_from_gitmodules(config_fn_t fn, struct repository *repo, void *data)
+/// {
+///         …
+///         if (repo->worktree) {
+///                 char *file = repo_worktree_path(repo, GITMODULES_FILE);
+///                 …
+///                 config_source.file = file;
+///                 …
+///                 config_with_options(fn, data, &config_source, repo, &opts);
+/// ```
+///
+/// The path is `repo_worktree_path()`'s, i.e. absolute, which is how git's
+/// `bad config line <n> in file <path>` names it here (and why this one message
+/// is not `$GIT_DIR`-relative the way `.git/config`'s is).
+fn refuse_bad_gitmodules(repo: &gix::Repository) -> Result<Option<ExitCode>> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(None);
+    };
+    let index = repo.index_or_empty()?;
+    if !index
+        .entries()
+        .iter()
+        .any(|e| e.mode.contains(gix::index::entry::Mode::COMMIT))
+    {
+        return Ok(None);
+    }
+    // `repo_worktree_path()` builds on `repo->worktree`, which
+    // `repo_set_worktree()` stored as `real_pathdup(path, 1)`
+    // (repository.c:112) — so the name in the message is absolute and
+    // symlink-resolved, not the relative `.` discovery left behind.
+    let path = crate::setup::realpath_forgiving(workdir).join(".gitmodules");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(None);
+    };
+    let Some(line) = crate::config::first_bad_config_line(&bytes) else {
+        return Ok(None);
+    };
+    eprintln!(
+        "fatal: bad config line {line} in file {}",
+        super::worktree::path_to_string(&path)
+    );
+    Ok(Some(ExitCode::from(128)))
 }
 
 /// The two `wt_status_change_data` fields a *gitlink* worktree change carries
@@ -4152,7 +4223,23 @@ fn render_long(
         out.push_str(&submodule_summary(workdir, true, limit, reference));
     }
 
-    let committable = !staged.is_empty();
+    // `s->committable`. Staged changes set it (wt-status.c:693, :837 …), and so
+    // does a merge that has nothing left to resolve:
+    //
+    // ```c
+    // wt_status_get_state(s->repo, &s->state, s->branch && !strcmp(s->branch, "HEAD"));
+    // if (s->state.merge_in_progress && !has_unmerged(s))
+    //         s->committable = 1;
+    // ```
+    //
+    // (wt-status.c:835-837; `has_unmerged()` walks the same pathspec-filtered
+    // change list this `unmerged` slice holds.) Missing it made
+    // `git status --long -- <path>` on a fully-resolved merge print
+    // `nothing to commit, working tree clean` under the
+    // `All conflicts fixed but you are still merging.` banner, where stock —
+    // committable, so the whole `if (!s->committable)` block at wt-status.c:1888
+    // is skipped — prints nothing after it.
+    let committable = !staged.is_empty() || (progress.merge && unmerged.is_empty());
 
     if untracked_mode == Untracked::No {
         // git only mentions the suppressed listing when the run is committable —

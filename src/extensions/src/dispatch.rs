@@ -1174,6 +1174,18 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     let help_only = args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all");
     if !help_only && NEED_WORK_TREE.contains(&sub) {
         if let Ok(repo) = crate::setup::discover() {
+            // A relative `core.worktree` is installed by walking to it —
+            // `if (chdir(git_work_tree_cfg)) die_errno(_("cannot chdir to '%s'"), …)`
+            // (setup.c:936-937) — inside `setup_git_directory()`, which runs
+            // *before* `run_builtin()` reaches `setup_work_tree()`. So a value
+            // naming a directory that is not there is reported by its own message
+            // and never gets as far as the work-tree gate below; without this
+            // `git status` in such a repository answered
+            // `this operation must be run in a work tree` where stock answers
+            // `cannot chdir to 'nosuch': No such file or directory`.
+            if let Some(message) = crate::setup::core_worktree_chdir_error(&repo) {
+                return Err(crate::fatal::die(message));
+            }
             // `setup_work_tree()` dies the same way for a work tree that is not
             // configured and for one it cannot `chdir()` into (setup.c:503-505).
             if !repo.workdir().is_some_and(|wt| wt.is_dir()) {

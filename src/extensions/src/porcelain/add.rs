@@ -142,6 +142,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // `add_interactive`; both are `OPT_BOOL`, so the `--no-` forms clear them).
     let mut patch_interactive = false;
     let mut add_interactive = false;
+    // `-e`/`--edit` (git's `edit_interactive`, also an `OPT_BOOL`).
+    let mut edit_interactive = false;
     let mut pathspecs: Vec<String> = Vec::new();
     let mut positional_only = false;
 
@@ -269,18 +271,16 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // pathspecs come from argv again.
             "--no-pathspec-from-file" => from_file = None,
             // Interactive hunk selection (`add-patch.c`), served by
-            // [`super::add_patch`]. `-e`/`--edit` (diff the worktree into an
-            // editor and `apply --recount --cached` the result) is a separate
-            // machine and stays unported.
+            // [`super::add_patch`]. `-e`/`--edit` is the other machine:
+            // [`edit_patch`] below.
             "-p" | "--patch" => patch_interactive = true,
             "--no-patch" => patch_interactive = false,
             "-i" | "--interactive" => add_interactive = true,
             "--no-interactive" => add_interactive = false,
-            "-e" | "--edit" => bail!("edit mode (-e/--edit) needs an interactive editor; not ported"),
-            // `edit_interactive` is an `OPT_BOOL`, so its unset writes 0 — which is
-            // the state this command already starts in. Nothing to refuse: git runs
-            // the ordinary add for `--no-edit`, and so does this.
-            "--no-edit" => {}
+            "-e" | "--edit" => edit_interactive = true,
+            // `edit_interactive` is an `OPT_BOOL`, so its unset writes 0 — the
+            // ordinary add, whatever an earlier `-e` asked for.
+            "--no-edit" => edit_interactive = false,
             // `-h` is handled by `parse_options()` before any other switch in the
             // same bundle, so `git add -hv` still prints the table.
             other if other.starts_with('-')
@@ -301,6 +301,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                         'N' => intent_to_add = true,
                         'p' => patch_interactive = true,
                         'i' => add_interactive = true,
+                        'e' => edit_interactive = true,
                         _ => return usage_error(format!("unknown switch `{c}'")),
                     }
                 }
@@ -355,6 +356,27 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             patch_opts.to_interactive(false),
             &pathspecs,
         );
+    }
+
+    // ```c
+    // if (edit_interactive) {
+    //         if (pathspec_from_file)
+    //                 die(_("options '%s' and '%s' cannot be used together"),
+    //                     "--pathspec-from-file", "--edit");
+    //         return(edit_patch(argc, argv, prefix));
+    // }
+    // ```
+    //
+    // (builtin/add.c:518-522.) It sits after the `-i`/`-p` hand-off and before
+    // every check below, so `-e` never reaches the `-A`/`-u` conflict or the
+    // `--chmod` validation.
+    if edit_interactive {
+        if from_file.is_some() {
+            return usage_fatal(
+                "options '--pathspec-from-file' and '--edit' cannot be used together".into(),
+            );
+        }
+        return edit_patch(&repo, &pathspecs);
     }
 
     // `if (addremove && take_worktree_changes) die(...)` (builtin/add.c): `-A` stages
@@ -1393,6 +1415,89 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         chmod_errors: &chmod_errors,
         index_failed,
     }))
+}
+
+/// `edit_patch()` (builtin/add.c:305-349), the whole of `git add -e`:
+///
+/// ```c
+/// char *file = git_pathdup("ADD_EDIT.patch");
+/// …
+/// repo_init_revisions(the_repository, &rev, prefix);
+/// rev.diffopt.context = 7;
+/// argc = setup_revisions(argc, argv, &rev, NULL);
+/// rev.diffopt.output_format = DIFF_FORMAT_PATCH;
+/// rev.diffopt.use_color = 0;
+/// rev.diffopt.flags.ignore_dirty_submodules = 1;
+/// out = xopen(file, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+/// rev.diffopt.file = xfdopen(out, "w");
+/// rev.diffopt.close_file = 1;
+/// if (run_diff_files(&rev, 0))
+///         die(_("could not write patch"));
+/// if (launch_editor(file, NULL, NULL))
+///         die(_("editing patch failed"));
+/// if (stat(file, &st))
+///         die_errno(_("could not stat '%s'"), file);
+/// if (!st.st_size)
+///         die(_("empty patch. aborted"));
+/// child.git_cmd = 1;
+/// strvec_pushl(&child.args, "apply", "--recount", "--cached", file, NULL);
+/// if (run_command(&child))
+///         die(_("could not apply '%s'"), file);
+/// unlink(file);
+/// ```
+///
+/// (Message casing is git 2.55.0's, verified against the installed binary — the
+/// strings were lowercased after the tree in `~/forkedRepos/git`, which still
+/// has `"Empty patch. Aborted."`.)
+///
+/// The diff is `run_diff_files()` in-process there and a `diff-files` child here,
+/// which is the same walk with the same four settings spelled on a command line;
+/// the apply is a `git` child in both. `$GIT_DIR/ADD_EDIT.patch` is deliberately
+/// *not* removed on any of the failure paths — git's `unlink()` is only reached
+/// after a successful apply, so a run that aborts on an empty patch leaves the
+/// empty file behind (measured against git 2.55.0).
+fn edit_patch(repo: &gix::Repository, pathspecs: &[String]) -> Result<ExitCode> {
+    let file = repo.git_dir().join("ADD_EDIT.patch");
+    let exe = crate::hosted::git_exe()?;
+
+    let mut diff = std::process::Command::new(&exe);
+    // `rev.diffopt`: patch output, seven lines of context, no color, and a dirty
+    // submodule is not a change. `--` keeps a pathspec that looks like an option
+    // out of the option parser, as `setup_revisions()`'s own scan does.
+    diff.args(["diff-files", "-p", "-U7", "--no-color", "--ignore-submodules=dirty", "--"]);
+    diff.args(pathspecs);
+    let out = std::fs::File::create(&file)?;
+    diff.stdout(std::process::Stdio::from(out));
+    let wrote = diff.status()?;
+    if !wrote.success() {
+        crate::git_fatal!("could not write patch");
+    }
+
+    if super::commit::launch_editor(&repo.config_snapshot(), &file).is_err() {
+        crate::git_fatal!("editing patch failed");
+    }
+
+    let meta = match std::fs::metadata(&file) {
+        Ok(m) => m,
+        Err(err) => crate::git_fatal!(
+            "could not stat '{}': {}",
+            super::worktree::path_to_string(&file),
+            crate::external::strerror(&err)
+        ),
+    };
+    if meta.len() == 0 {
+        crate::git_fatal!("empty patch. aborted");
+    }
+
+    let applied = std::process::Command::new(&exe)
+        .args(["apply", "--recount", "--cached"])
+        .arg(&file)
+        .status()?;
+    if !applied.success() {
+        crate::git_fatal!("could not apply '{}'", super::worktree::path_to_string(&file));
+    }
+    let _ = std::fs::remove_file(&file);
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The sparse-checkout definition `path_in_sparse_checkout()` (sparse-index.c)

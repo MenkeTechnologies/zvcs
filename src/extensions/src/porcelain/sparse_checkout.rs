@@ -1357,7 +1357,27 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
         .to_owned();
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    // `update_working_directory()` (builtin/sparse-checkout.c:203-210):
+    //
+    // ```c
+    // /* If no branch has been checked out, there are no updates to make. */
+    // if (is_index_unborn(r->index))
+    //         return UPDATE_SPARSITY_SUCCESS;
+    // ```
+    //
+    // — and `is_index_unborn()` is `!istate->cache_nr && !istate->timestamp.sec`
+    // (read-cache.c:2529-2532), i.e. no entries *and* no index file was read from
+    // disk. An index file that exists and happens to be empty is not unborn; a
+    // missing one is. Without the guard a `clone -n --sparse` (and a `--sparse`
+    // whose remote `HEAD` cannot be resolved, which checks nothing out either)
+    // grew a 65-byte index whose only content was a cache tree for the empty
+    // tree, an object no repository stores — which stock `git fsck --strict`
+    // then reports as `missing tree 4b825dc…` and exits 2 on.
+    let index_file_exists = repo.index_path().exists();
     let mut index = crate::index_open::or_empty(repo)?;
+    if index.entries().is_empty() && !index_file_exists {
+        return Ok(());
+    }
 
     let snapshot: Vec<Snapshot> = {
         let backing = index.path_backing();

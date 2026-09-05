@@ -1085,7 +1085,17 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         let mut alternates: Vec<PathBuf> = Vec::new();
         // git only shares "when the repository to clone is on the local machine",
         // so a URL that names no openable local repository leaves `-s` a no-op.
-        if shared {
+        //
+        // `is_local` is the same gate git uses. `--shared` is one arm of
+        // `clone_local()` (builtin/clone.c:380-402), and `clone_local()` is only
+        // ever reached through `if (is_local) clone_local(path, git_dir);`
+        // (builtin/clone.c:1354-1355) — so every reason `is_local` was taken away
+        // takes `--shared` with it. The one that bites is a *shallow* source
+        // (clone.c:1334-1340, ported above): borrowing its object store would give
+        // this repository objects whose history is cut off without the `shallow`
+        // file that says where, so git falls back to the transport, which
+        // negotiates the boundary and writes `shallow` here.
+        if shared && is_local {
             if let Some(objects) = local_path_of(&url).and_then(|p| objects_dir_of(&p).ok()) {
                 alternates.push(objects);
             }
@@ -1897,6 +1907,56 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // progress meter printed and nothing more, so `--no-local` ends after the banner.
     if is_local && !quiet {
         eprintln!("done.");
+    }
+
+    // `--mirror` together with `--branch` maps every tag twice, and the ref
+    // transaction that would write them refuses:
+    //
+    // ```text
+    // $ git clone --bare --mirror -b feature . mirror.git
+    // Cloning into bare repository 'mirror.git'...
+    // done.
+    // fatal: multiple updates for ref 'refs/tags/v0.1.0' not allowed
+    // ```
+    //
+    // The mirror refspec `+refs/*:refs/*` already maps `refs/tags/<t>` onto
+    // itself, and `wanted_peer_refs()` appends `tag_refspec`
+    // (`refs/tags/*:refs/tags/*`) a second time when `--branch` is given, so each
+    // tag reaches `ref_transaction_commit()` as two updates of one name and
+    // `ref_update_reject_duplicates()` (refs.c) reports the first of them in
+    // sorted order.
+    //
+    // The vendored spec tree is git v2.39, whose `wanted_peer_refs()` guards that
+    // append with `if (!option_mirror && !option_single_branch && !option_no_tags)`
+    // (builtin/clone.c:510-511) and so cannot produce the duplicate. The
+    // condition below is therefore taken from the *binaries*, not from that
+    // source: git 2.55.0 and git 2.50.1 both die here, and both accept the same
+    // invocation once `--single-branch` is added (which takes the branch down the
+    // `if (option_single_branch)` arm, where the tag refspec is applied to the one
+    // fetched head only) or once the source carries no `refs/tags/*` at all.
+    // Measured on four fixtures: no tags is clean, `refs/namespaces/*/refs/tags/*`
+    // is clean (the refspec is literal), and a source with seven tags names the
+    // alphabetically first.
+    if mirror && branch.is_some() && single_branch != Some(true) {
+        let first_tag = gix::open(&git_dir).ok().and_then(|repo| {
+            let mut names: Vec<String> = repo
+                .references()
+                .ok()?
+                .prefixed("refs/tags/")
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|r| r.name().as_bstr().to_string())
+                .collect();
+            names.sort();
+            names.into_iter().next()
+        });
+        if let Some(name) = first_tag {
+            eprintln!("fatal: multiple updates for ref '{name}' not allowed");
+            if created_destination {
+                let _ = std::fs::remove_dir_all(dst);
+            }
+            return Ok(ExitCode::from(128));
+        }
     }
 
     // ```c

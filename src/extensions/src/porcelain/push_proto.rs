@@ -676,6 +676,27 @@ pub fn send_pack(
         forced: bool,
     }
     let mut wire: Vec<Wire> = Vec::new();
+    // Every matched ref's new value, whether or not the update survived the
+    // pre-flight checks above. `send_pack()` filters the *command list* with
+    // `check_to_send_update()` (send-pack.c:593-621) and then hands
+    // `pack_objects()` the whole `remote_refs` list anyway
+    // (send-pack.c:689-690), whose loop is
+    //
+    // ```c
+    // while (refs) {
+    //         if (!is_null_oid(&refs->old_oid))
+    //                 feed_object(&refs->old_oid, po_in, 1);
+    //         if (!is_null_oid(&refs->new_oid))
+    //                 feed_object(&refs->new_oid, po_in, 0);
+    //         refs = refs->next;
+    // }
+    // ```
+    //
+    // — so a ref git refused to update still contributes its tip as a `want`,
+    // and the pack a `--mirror` push sends carries the objects behind every
+    // rejected branch as well as the accepted ones. Building the pack from the
+    // command list alone left the peer three objects short of stock's.
+    let mut pack_tips: Vec<ObjectId> = Vec::new();
     let mut statuses: Vec<RefStatus> = Vec::new();
     // ```c
     // if (!ref->peer_ref)
@@ -750,6 +771,9 @@ pub fn send_pack(
         // `cannot lock ref … but expected <lease>` reported as
         // `[remote rejected] … (incorrect old value provided)`.
         let remote_current = advertised.get(&req.name).copied().unwrap_or(null);
+        if req.new != null {
+            pack_tips.push(req.new);
+        }
         let old = remote_current;
         let mut force = req.force;
         let deletion = req.new == null;
@@ -1095,11 +1119,7 @@ pub fn send_pack(
     // pack.
     let need_pack = wire.iter().any(|w| w.new != null);
     let pack_bytes = if need_pack {
-        let wants: Vec<ObjectId> = wire
-            .iter()
-            .filter(|w| w.new != null)
-            .map(|w| w.new)
-            .collect();
+        let wants: Vec<ObjectId> = pack_tips.clone();
         // Haves are everything the remote advertised plus the old tips, restricted
         // to objects we actually hold locally (git's `feed_object(negative)` skips
         // objects the local odb lacks).

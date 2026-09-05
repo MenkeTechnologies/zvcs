@@ -34,10 +34,15 @@
 //!
 //! Not covered:
 //!
-//!   * **`--stateless-rpc`.** The smart-HTTP framing has no local destination to
-//!     connect to, and its `--stdin` variant reads the refspec list as pkt-lines
-//!     rather than plain lines. The flag is accepted and dropped; a caller that
-//!     needs the HTTP transport goes through `http_backend`/`remote_ext`.
+//!   * **`--stateless-rpc` past the ref advertisement.** The flag itself is
+//!     honoured: `cmd_send_pack` skips `git_connect()` for it and reads the
+//!     advertisement off descriptor 0 (send-pack.c:273-276), which is what this
+//!     does, including the `--stdin` pkt-line spelling of the refspec list. A
+//!     hang-up there is git's `die_initial_contact(0)`. What is missing is the
+//!     rest of the conversation over descriptors 0 and 1: the wire layer opens
+//!     its own connection from the remote's URL and cannot be handed a pair of
+//!     streams, so an advertisement that really arrives is refused rather than
+//!     silently redirected to `<directory>`.
 //!   * **`--thin` and `--progress`.** Both describe how the sender builds and
 //!     narrates its pack, not what the receiver is asked to do. The pack this
 //!     sends is never thin and reports no progress, which is a valid choice for
@@ -164,6 +169,10 @@ struct State {
     progress: Option<bool>,
     /// `--stdin`: read the refspec list from stdin instead of argv.
     from_stdin: bool,
+    /// `--stateless-rpc`: the smart-HTTP framing. `cmd_send_pack` skips
+    /// `git_connect()` entirely for it and drives the conversation over the
+    /// process's own descriptors — `fd[0] = 0; fd[1] = 1` (send-pack.c:273-276).
+    stateless_rpc: bool,
     /// `--helper-status`: the `remote-helper` status block on **stdout** in
     /// place of the human-readable one on stderr.
     helper_status: bool,
@@ -219,14 +228,39 @@ pub fn send_pack(args: &[String]) -> Result<ExitCode> {
     };
 
     // `if (from_stdin)`: the refspec list continues on stdin, one per line
-    // (send-pack.c:238-249). The `--stateless-rpc` pkt-line spelling of the same
-    // list is not read here — see the module header.
+    // (send-pack.c:238-249):
+    //
+    // ```c
+    // if (from_stdin) {
+    //         if (args.stateless_rpc) {
+    //                 const char *buf;
+    //                 while ((buf = packet_read_line(0, NULL)))
+    //                         refspec_append(&rs, buf);
+    //         } else {
+    //                 struct strbuf line = STRBUF_INIT;
+    //                 while (strbuf_getline(&line, stdin) != EOF)
+    //                         refspec_append(&rs, line.buf);
+    //         }
+    // }
+    // ```
+    //
+    // Under `--stateless-rpc` the same list arrives as pkt-lines, and the loop
+    // ends at the first flush packet rather than at end of file — the rest of
+    // stdin is the ref advertisement the transport still has to read.
     if state.from_stdin {
-        for line in std::io::stdin().lock().lines() {
-            let line = line?;
-            if !line.is_empty() {
-                state.refspecs.push(line);
+        if state.stateless_rpc {
+            let mut stdin = std::io::stdin().lock();
+            while let Pkt::Line(line) = read_pkt_line(&mut stdin)? {
+                state.refspecs.push(String::from_utf8_lossy(&line).into_owned());
                 state.positionals += 1;
+            }
+        } else {
+            for line in std::io::stdin().lock().lines() {
+                let line = line?;
+                if !line.is_empty() {
+                    state.refspecs.push(line);
+                    state.positionals += 1;
+                }
             }
         }
     }
@@ -262,6 +296,38 @@ fn push(st: &State) -> Result<ExitCode> {
         }
         None => repo.remote_at(dest)?,
     };
+
+    // `if (args.stateless_rpc) { conn = NULL; fd[0] = 0; fd[1] = 1; }`
+    // (send-pack.c:273-276), then:
+    //
+    // ```c
+    // packet_reader_init(&reader, fd[0], NULL, 0, ...);
+    // switch (discover_version(&reader)) { ... }
+    // ```
+    //
+    // There is nothing to connect to: the smart-HTTP caller has already put the
+    // `git-receive-pack` advertisement on this process's stdin and expects the
+    // request body back on its stdout, so the destination is only ever a label.
+    // `discover_version()` therefore reads the very first packet off descriptor
+    // 0, and a hang-up before any response at all is `die_initial_contact(0)`
+    // (connect.c:130-142), which is what an unconnected `--stateless-rpc`
+    // invocation always ends in.
+    if st.stateless_rpc {
+        let mut stdin = std::io::stdin().lock();
+        return match read_pkt_line(&mut stdin)? {
+            Pkt::Eof => Ok(crate::transport_err::initial_contact_fatal()),
+            // An advertisement really is on stdin. Driving the rest of the
+            // conversation over descriptors 0 and 1 needs the wire layer to
+            // accept a caller-supplied pair of streams, which it does not: it
+            // opens its own connection from the remote's URL. Say so rather than
+            // pushing to `<directory>` behind the caller's back, which is what
+            // ignoring the flag amounted to.
+            _ => bail!(
+                "--stateless-rpc is not ported past the ref advertisement: the vendored \
+                 transport connects by URL and cannot be handed this process's stdin and stdout"
+            ),
+        };
+    }
 
     let requests = build_requests(&repo, st)?;
     let opts = push_proto::SendOptions {
@@ -326,6 +392,53 @@ fn push(st: &State) -> Result<ExitCode> {
     }
 
     Ok(if bad { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// One packet as `packet_read()` sees it under `PACKET_READ_GENTLE_ON_EOF`
+/// (pkt-line.c): a normal line, one of the three control packets, or the end of
+/// the stream. The control packets are not told apart here — no caller in this
+/// module needs to — but end-of-stream is, because it is the one `discover_version()`
+/// turns into `die_initial_contact(0)`.
+enum Pkt {
+    /// `PACKET_READ_EOF`: the peer hung up before writing a length header.
+    Eof,
+    /// `PACKET_READ_FLUSH`/`DELIM`/`RESPONSE_END`: a length of 0, 1 or 2.
+    Control,
+    /// `PACKET_READ_NORMAL`, with the 4-byte length header already stripped and
+    /// the trailing newline chomped (`PACKET_READ_CHOMP_NEWLINE`).
+    Line(Vec<u8>),
+}
+
+/// Read one pkt-line off `r`, git's `packet_read_line()` framing: four hex
+/// digits of total length, then `length - 4` payload bytes.
+///
+/// A short or absent header is [`Pkt::Eof`] rather than an error, which is what
+/// `PACKET_READ_GENTLE_ON_EOF` asks for; the caller decides what a hang-up means.
+fn read_pkt_line(r: &mut impl std::io::Read) -> Result<Pkt> {
+    let mut header = [0u8; 4];
+    let mut filled = 0;
+    while filled < header.len() {
+        match r.read(&mut header[filled..])? {
+            0 => return Ok(Pkt::Eof),
+            n => filled += n,
+        }
+    }
+    let len = std::str::from_utf8(&header)
+        .ok()
+        .and_then(|h| usize::from_str_radix(h, 16).ok())
+        .with_context(|| {
+            format!("protocol error: bad line length character: {}", String::from_utf8_lossy(&header))
+        })?;
+    if len < 4 {
+        return Ok(Pkt::Control);
+    }
+    let mut payload = vec![0u8; len - 4];
+    r.read_exact(&mut payload)?;
+    // `PACKET_READ_CHOMP_NEWLINE`.
+    if payload.last() == Some(&b'\n') {
+        payload.pop();
+    }
+    Ok(Pkt::Line(payload))
 }
 
 /// The destination as `enter_repo()` sees it, when it names a local path that is
@@ -889,6 +1002,7 @@ fn set_long(long: &str, on: bool, value: Option<&str>, st: &mut State) {
         "atomic" => st.atomic = on,
         "progress" => st.progress = Some(on),
         "stdin" => st.from_stdin = on,
+        "stateless-rpc" => st.stateless_rpc = on,
         "helper-status" => st.helper_status = on,
         "force-if-includes" => st.force_if_includes = on,
         "receive-pack" | "exec" => st.receive_pack = on.then(|| value.unwrap_or("").to_string()),

@@ -29,7 +29,10 @@
 //!     (`ip.git_cmd = 1`, `ip.in = bundle_fd`, `ip.no_stdout = 1` in
 //!     `bundle.c`), and so does this, which is why the header is read one byte
 //!     at a time: the child inherits the very same descriptor, positioned at the
-//!     first byte of the pack
+//!     first byte of the pack. A bundle whose header carries `@filter` adds
+//!     `--promisor=from-bundle` to that child (bundle.c:632-634), so the
+//!     installed pack gets its `.promisor` marker and the objects the filter
+//!     dropped read as absent-on-purpose rather than as corruption
 //!   * `-h` for `bundle` itself and for each of the four subcommands (usage to
 //!     stdout, exit 129), plus `need a subcommand`, `unknown subcommand`,
 //!     `unknown option`/`unknown switch` and `need a <file> argument`
@@ -1715,12 +1718,24 @@ fn unbundle(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
-    let extra: &[&str] = if progress {
-        &["-v", "--progress-title", "Unbundling objects"]
-    } else {
-        &[]
-    };
-    if !index_pack(source, &repo, extra)? {
+    let mut extra: Vec<&str> = Vec::new();
+    // ```c
+    // /* If there is a filter, then we need to create the promisor pack. */
+    // if (header->filter.choice)
+    //         strvec_push(&ip.args, "--promisor=from-bundle");
+    // ```
+    //
+    // (bundle.c:632-634, in `unbundle()`.) A filtered bundle's pack is missing
+    // the objects the filter dropped, so it has to be installed as a promisor
+    // pack — otherwise every later reader treats those absences as corruption
+    // rather than as objects to be fetched from the promisor remote.
+    if header.filter.is_some() {
+        extra.push("--promisor=from-bundle");
+    }
+    if progress {
+        extra.extend(["-v", "--progress-title", "Unbundling objects"]);
+    }
+    if !index_pack(source, &repo, &extra)? {
         eprintln!("error: index-pack died");
         return Ok(ExitCode::from(1));
     }

@@ -8,6 +8,12 @@
 //!     the `-o` path), writes the matching `.rev` unless `--no-rev-index` /
 //!     `pack.writeReverseIndex=false`, drops a `<pack>.keep` under `--keep`, and
 //!     prints the pack hash plus `\n`.
+//!   * `--promisor[=<msg>]` — `write_special_file("promisor", …)`
+//!     (builtin/index-pack.c:1452-1482, called from `final()` at :1523-1526):
+//!     a `<pack>.promisor` holding `<msg>\n`, or empty for the bare flag. Unlike
+//!     `.keep` it never changes the word `--stdin` prints. `git bundle unbundle`
+//!     is the caller that needs it: a filtered bundle installs its pack as a
+//!     promisor pack with `--promisor=from-bundle` (bundle.c:632-634).
 //!   * `git index-pack --stdin [--fix-thin] [--keep[=<msg>]] [--[no-]rev-index]
 //!     [--max-input-size=<n>] [<pack-file>]` — streams the pack from stdin into
 //!     `objects/pack/pack-<hash>.{pack,idx,rev}` (or into `<pack-file>` when one
@@ -94,7 +100,7 @@
 //! are not applied — the checks run at git's defaults),
 //! `--check-self-contained-and-connected` (git's connectivity pass over the
 //! whole reachable set, which exceeds the vendored `gix-fsck` primitive),
-//! `--promisor`, `--pack_header`, `--index-version` other than a plain `2`,
+//! `--pack_header`, `--index-version` other than a plain `2`,
 //! `--verify` combined with `--stdin`, and a `<pack-file>` on disk (or a self-contained pack read
 //! from stdin without `--fix-thin`) holding REF_DELTA entries — which stock git
 //! resolves in-pack — since `gix_pack::index::write_data_iter_to_stream` refuses
@@ -153,7 +159,11 @@ struct Opts {
     fsck_objects: bool,           // --fsck-objects[=...]
     msg_types: Option<String>,    // the `<msg-id>=<severity>...` list, if one was given
     self_contained: bool,         // --check-self-contained-and-connected
-    promisor: bool,               // --promisor[=<msg>]
+    /// `--promisor[=<msg>]`: `None` when the flag was not given, otherwise the
+    /// message for the `.promisor` file. `skip_to_optional_arg()` defaults the
+    /// value to the empty string, which `write_special_file()` writes as an
+    /// empty file (index-pack.c:1472-1475).
+    promisor: Option<String>,
     index_version: Option<(u64, Option<u64>)>, // --index-version=<v>[,<limit>]
     max_input_size: Option<u64>,  // --max-input-size=<n> (None or 0 = no bound)
     object_format: Option<String>, // --object-format=<algo>
@@ -175,7 +185,7 @@ impl Opts {
             fsck_objects: false,
             msg_types: None,
             self_contained: false,
-            promisor: false,
+            promisor: None,
             index_version: None,
             max_input_size: None,
             object_format: None,
@@ -244,7 +254,7 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
             "--keep" => opts.keep = Some(None),
             "--rev-index" => opts.rev_index = Some(true),
             "--no-rev-index" => opts.rev_index = Some(false),
-            "--promisor" => opts.promisor = true,
+            "--promisor" => opts.promisor = Some(String::new()),
             "--strict" => opts.strict = true,
             "--fsck-objects" => opts.fsck_objects = true,
             "--check-self-contained-and-connected" => opts.self_contained = true,
@@ -269,7 +279,9 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--keep=") => {
                 opts.keep = Some(Some(a["--keep=".len()..].to_string()));
             }
-            _ if a.starts_with("--promisor=") => opts.promisor = true,
+            _ if a.starts_with("--promisor=") => {
+                opts.promisor = Some(a["--promisor=".len()..].to_string());
+            }
             _ if a.starts_with("--strict=") => {
                 // git parses the fsck message-type list here, in the argument
                 // loop, and dies before any positional check when it is
@@ -331,7 +343,7 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
     if opts.fix_thin && !opts.stdin {
         return Ok(fatal("the option '--fix-thin' requires '--stdin'"));
     }
-    if opts.promisor && opts.pack.is_some() {
+    if opts.promisor.is_some() && opts.pack.is_some() {
         return Ok(fatal("--promisor cannot be used with a pack name"));
     }
     if opts.stdin {
@@ -542,7 +554,21 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     // so `--keep` leaves a `.keep` beside the pack that was indexed; only the `report` word it
     // sets is `--stdin`-only, because the non-stdin arm prints the bare hash.
     if let Some(msg) = &opts.keep {
-        if let Some(code) = write_keep_file(pack_path, msg.as_deref()) {
+        if let Some(code) = write_special_file(pack_path, "keep", msg.as_deref()) {
+            return Ok(code);
+        }
+    }
+    // ```c
+    // if (promisor_msg)
+    //         write_special_file("promisor", promisor_msg, final_pack_name,
+    //                            hash, NULL);
+    // ```
+    //
+    // (builtin/index-pack.c:1523-1526, in `final()`, right after the `.keep`.)
+    // `NULL` for the `report` slot is why a `.promisor` never changes the word
+    // `--stdin` prints, where a `.keep` does.
+    if let Some(msg) = &opts.promisor {
+        if let Some(code) = write_special_file(pack_path, "promisor", Some(msg)) {
             return Ok(code);
         }
     }
@@ -551,23 +577,24 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     Ok(ExitCode::SUCCESS)
 }
 
-/// `write_special_file("keep", ...)`: the `.keep` beside `pack_path`, named by
-/// `derive_filename(pack_name, "pack", "keep")` and opened `O_CREAT|O_EXCL, 0600`.
+/// `write_special_file(suffix, ...)` (builtin/index-pack.c:1452-1482): the
+/// `<pack>.<suffix>` beside `pack_path`, named by `derive_filename(pack_name,
+/// "pack", suffix)` and opened `O_CREAT|O_EXCL, 0600`.
 ///
 /// An empty message writes an empty file — git only appends the trailing newline
 /// when `msg_len > 0`. `Some` is the exit code to die with, which is git's death
 /// when the pack it was asked to index is not named `*.pack`.
-fn write_keep_file(pack_path: &Path, msg: Option<&str>) -> Option<ExitCode> {
+fn write_special_file(pack_path: &Path, suffix: &str, msg: Option<&str>) -> Option<ExitCode> {
     let name = pack_path.to_string_lossy();
     let Some(stem) = name.strip_suffix(".pack").filter(|s| !s.is_empty()) else {
         return Some(fatal(format!(
             "packfile name '{name}' does not end with '.pack'"
         )));
     };
-    let keep_path = PathBuf::from(format!("{stem}.keep"));
+    let path = PathBuf::from(format!("{stem}.{suffix}"));
     let body = msg.filter(|m| !m.is_empty()).map(|m| format!("{m}\n"));
-    if fs::write(&keep_path, body.unwrap_or_default()).is_ok() {
-        let _ = fs::set_permissions(&keep_path, fs::Permissions::from_mode(0o600));
+    if fs::write(&path, body.unwrap_or_default()).is_ok() {
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     }
     None
 }
@@ -936,9 +963,15 @@ fn index_from_stdin(
     set_read_only(&index_path)?;
     set_read_only(&data_path)?;
 
+    if let Some(msg) = &opts.promisor {
+        if let Some(code) = write_special_file(&data_path, "promisor", Some(msg)) {
+            return Ok(code);
+        }
+    }
+
     match &opts.keep {
         Some(msg) => {
-            if let Some(code) = write_keep_file(&data_path, msg.as_deref()) {
+            if let Some(code) = write_special_file(&data_path, "keep", msg.as_deref()) {
                 return Ok(code);
             }
             // `*report = suffix` in `write_special_file()`: the word `final()` prints changes
@@ -1320,9 +1353,6 @@ fn reject_unported(opts: &Opts) -> Result<()> {
     }
     if opts.self_contained {
         bail!("unsupported flag \"--check-self-contained-and-connected\" (no connectivity pass is run here)");
-    }
-    if opts.promisor {
-        bail!("unsupported flag \"--promisor\" (no .promisor file is written here)");
     }
     if opts.pack_header {
         bail!("unsupported flag \"--pack_header\" (internal fetch fast-path is not ported)");

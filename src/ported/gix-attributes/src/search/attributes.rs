@@ -127,9 +127,24 @@ impl Pattern for Attributes {
     type Value = Value;
 
     fn bytes_to_patterns(&self, bytes: &[u8], _source: &std::path::Path) -> Vec<pattern::Mapping<Self::Value>> {
-        fn into_owned_assignments<'a>(
-            attrs: impl Iterator<Item = Result<crate::AssignmentRef<'a>, crate::name::Error>>,
-        ) -> Option<Assignments> {
+        // `report_invalid_attr()` (attr.c:281-288):
+        //
+        // ```c
+        // strbuf_addf(&err, _("%.*s is not a valid attribute name"), (int) len, name);
+        // fprintf(stderr, "%s: %s:%d\n", err.buf, src, lineno);
+        // ```
+        //
+        // No `warning:`/`error:` prefix, and the line it was found on is dropped:
+        // `parse_attr()`'s first pass returns NULL on the first bad name and
+        // `parse_attr_line()` `goto fail_return`s (attr.c:302-310, :409-410). The
+        // `collect()` below stops at that same first error for the same reason.
+        let report_invalid_attr = |name: &bstr::BStr, line_number: usize| {
+            eprintln!(
+                "{name} is not a valid attribute name: {}:{line_number}",
+                _source.display()
+            );
+        };
+        let into_owned_assignments = |attrs: crate::parse::Iter<'_>, line_number: usize| {
             let res = attrs
                 .map(|res| {
                     res.map(|a| TrackedAssignment {
@@ -140,16 +155,41 @@ impl Pattern for Attributes {
                 .collect::<Result<Assignments, _>>();
             match res {
                 Ok(res) => Some(res),
-                Err(_err) => {
-                    gix_trace::warn!("{}", _err);
+                Err(err) => {
+                    gix_trace::warn!("{}", err);
+                    report_invalid_attr(err.attribute.as_ref(), line_number);
                     None
                 }
             }
-        }
+        };
 
         crate::parse(bytes)
             .filter_map(|res| match res {
                 Ok(pattern) => Some(pattern),
+                // `parse_attr_line()` (attr.c:398-402) is the one parse failure git
+                // reports to the user rather than swallowing: a leading `!` is not a
+                // negation here, and the line is dropped. `warning()` prefixes only
+                // the first of the two lines, and the file is re-read — and so
+                // re-warned about — every time it is pushed back onto the attribute
+                // stack, which is what makes the count observable.
+                Err(err @ crate::parse::Error::PatternNegation { .. }) => {
+                    gix_trace::warn!("{}: {}", _source.display(), err);
+                    eprintln!(
+                        "warning: Negative patterns are ignored in git attributes\n\
+                         Use '\\!' for literal leading exclamation."
+                    );
+                    None
+                }
+                // `parse_attr_line()`'s macro arm validates the name with the
+                // same `attr_name_valid()` and reports it the same way
+                // (attr.c:369-373).
+                Err(crate::parse::Error::MacroName {
+                    line_number,
+                    ref macro_name,
+                }) => {
+                    report_invalid_attr(macro_name.as_ref(), line_number);
+                    None
+                }
                 Err(_err) => {
                     gix_trace::warn!("{}: {}", _source.display(), _err);
                     None
@@ -165,12 +205,12 @@ impl Pattern for Attributes {
                         },
                         Value::MacroAssignments {
                             id: Default::default(),
-                            assignments: into_owned_assignments(assignments)?,
+                            assignments: into_owned_assignments(assignments, line_number)?,
                         },
                     ),
                     crate::parse::Kind::Pattern(p) => (
                         (!p.is_negative()).then_some(p)?,
-                        Value::Assignments(into_owned_assignments(assignments)?),
+                        Value::Assignments(into_owned_assignments(assignments, line_number)?),
                     ),
                 };
                 pattern::Mapping {

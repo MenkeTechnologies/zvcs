@@ -89,6 +89,29 @@ impl Ignore {
     pub fn set_exclude_file_name_for_directories(&mut self, name: &BStr) {
         self.exclude_file_name_for_directories = name.to_owned();
     }
+
+    /// Append the patterns in `bytes` to the *globals* group — git's `EXC_FILE`
+    /// (dir.h:309-318), the lowest-priority of its three, which holds
+    /// `core.excludesFile`, `$GIT_DIR/info/exclude` **and** every file named by
+    /// `--exclude-from`/`-X` (`add_patterns_from_file()`, dir.c:1197-1210).
+    ///
+    /// That group is the reason `-X` is not an override: it is consulted only
+    /// after the per-directory `.gitignore` files, so a `!pattern` in a `-X` file
+    /// cannot un-ignore what a `.gitignore` excluded. Within the group the last
+    /// list added is consulted first (`for (j = group->nr - 1; j >= 0; j--)`,
+    /// dir.c:1517), which is what appending here reproduces.
+    ///
+    /// `source` names the file for diagnostics; `root`, when given, is the
+    /// directory the patterns are relative to.
+    pub fn add_global_patterns_buffer(
+        &mut self,
+        bytes: &[u8],
+        source: std::path::PathBuf,
+        root: Option<&std::path::Path>,
+    ) {
+        let parse = self.parse;
+        self.globals.add_patterns_buffer(bytes, source, root, parse);
+    }
 }
 
 impl Ignore {

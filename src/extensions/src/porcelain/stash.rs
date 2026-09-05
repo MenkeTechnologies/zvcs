@@ -1278,6 +1278,22 @@ fn collect_untracked(repo: &gix::Repository, opts: &PushOpts) -> Result<Vec<BStr
     let options = repo
         .dirwalk_options()?
         .emit_ignored(want_ignored.then_some(gix::dir::walk::EmissionMode::Matching))
+        // ```c
+        // if (include_untracked != INCLUDE_ALL_FILES)
+        //         setup_standard_excludes(&dir);
+        // fill_directory(&dir, the_repository->index, ps);
+        // ```
+        //
+        // (`get_untracked_files()`, builtin/stash.c:1052-1055.) `-a` installs *no*
+        // exclude rules, so `fill_directory()` sees no ignored paths at all and
+        // descends into `build/` and `sub/deep-ignored/` like any other untracked
+        // directory, listing the blobs inside them one by one. This walker keeps
+        // the rules and asks for ignored entries instead, and an ignored
+        // *directory* is then emitted whole — a `Kind::Directory` entry the loop
+        // below drops, so every file under it was silently left out of the
+        // untracked commit and left on disk by the reset. Recursing into them
+        // restores git's file list.
+        .recurse_ignored_directories(want_ignored)
         .emit_untracked(gix::dir::walk::EmissionMode::Matching);
 
     let mut out: Vec<BString> = Vec::new();
@@ -1700,13 +1716,29 @@ fn revert_staged_in_worktree(
         return Ok(Ok(head_tree));
     }
     let labels = gix::merge::blob::builtin_driver::text::Labels::default();
-    let mut merge = repo.merge_trees(
-        index_tree,
-        worktree_tree,
-        head_tree,
-        labels,
-        repo.tree_merge_options()?,
-    )?;
+    // ```c
+    // strvec_pushl(&cp_diff.args, "diff-index", "-p", "--cached", "--binary", ...
+    // ...
+    // strvec_pushl(&cp.args, "apply", "-R", NULL);
+    // ```
+    //
+    // (`do_create_stash()`'s `stash_staged()` and `do_push_stash()`'s
+    // `patch_mode || only_staged` tail, builtin/stash.c:1665-1673.) The patch git
+    // reverses is a `diff-index` with **no** `-M`, so a staged `git mv` is a
+    // deletion plus an addition and `git apply -R` has to delete the new path
+    // byte-for-byte as it was staged. An unstaged edit on top of that path makes
+    // the reverse hunk not apply — stock's `error: patch failed: <path>:1` and
+    // `Cannot remove worktree changes`.
+    //
+    // This three-way merge stands in for that apply, and it has to be handed the
+    // same blindness: with rename tracking on, `merge_trees` pairs `I`'s
+    // `near-renamed.txt` with `HEAD`'s `near.txt`, calls it a rename the other
+    // side modified, and resolves cleanly — the port then reset the worktree and
+    // exited 0 where both gits refuse. `rewrites = None` turns the pair back into
+    // the modify/delete conflict `apply -R` sees.
+    let merge_options = repo.tree_merge_options()?.with_rewrites(None);
+    let mut merge =
+        repo.merge_trees(index_tree, worktree_tree, head_tree, labels, merge_options)?;
     let unresolved = gix::merge::tree::TreatAsUnresolved::git();
     let blocked: Vec<BString> = merge
         .conflicts
@@ -1739,7 +1771,15 @@ fn first_hunk_line(
         let id = tree_map(repo, tree).ok()?.get(path).map(|(id, _)| *id)?;
         Some(repo.find_object(id).ok()?.detach().data)
     };
-    let (old, new) = (blob(head_tree)?, blob(index_tree)?);
+    let new = blob(index_tree)?;
+    // A path the staged change *created* has no old side: the forward hunk is
+    // `@@ -0,0 +1,<n> @@` and the reversed one `@@ -1,<n> +0,0 @@`, so the line
+    // `git apply` names is 1. Measured on stock 2.55.0 against a staged
+    // `git mv` whose destination was then edited in the worktree —
+    // `error: patch failed: near-renamed.txt:1`.
+    let Some(old) = blob(head_tree) else {
+        return Some(1);
+    };
     let worktree = repo
         .workdir_path(path.as_bstr())
         .and_then(|full| std::fs::read(full).ok())?;
@@ -3580,9 +3620,22 @@ fn resolve_stash(
         return Ok(Err(ExitCode::FAILURE));
     };
 
-    let id = match repo.rev_parse_single(revision.as_str()) {
-        Ok(id) => id.detach(),
-        Err(_) => {
+    // ```c
+    // if (get_oid(revision, &info->w_commit))
+    //         return error(_("%s is not a valid reference"), revision);
+    // ```
+    //
+    // (`get_stash_info()`, builtin/stash.c:203-204.) `repo_get_oid()` — this
+    // port's [`crate::objname::resolve`] — is git's grammar, and it is not
+    // `gix`'s: `@{<selector>}` whose payload is not a run of digits is an
+    // *approxidate*, not a number (`get_oid_basic()`, object-name.c:975-996),
+    // so `stash@{+1}` asks for "the entry current at approxidate('+1')" and
+    // lands on the newest one. `rev_parse_single()` read the `+1` as the index
+    // 1 instead, which is a different entry — `git stash show stash@{+1}`
+    // printed entry 1's (empty) tracked diff where stock prints entry 0's.
+    let id = match crate::objname::resolve(repo, revision.as_str()) {
+        Some(id) => id,
+        None => {
             // An `@{<n>}` past the end of the log never reaches `get_stash_info`:
             // `get_oid_basic()` dies on it while parsing the name.
             if let Some(Some(n)) = reflog_recno(&revision) {

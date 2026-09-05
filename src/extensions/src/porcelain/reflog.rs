@@ -578,8 +578,9 @@ struct Opts {
     /// count form unless an explicit `--date=` or a `@{<date>}` argument switches
     /// it to date form.
     log_date: Option<DateFormat>,
-    /// A recognized but unrenderable `log.date` mode (`relative`/`human`/
-    /// `format:...`). Deferred like the other unimplemented options: it only fails
+    /// A recognized but unrenderable `log.date` mode — `relative` and `human`,
+    /// the two that need the current time.
+    /// Deferred like the other unimplemented options: it only fails
     /// when an entry is actually printed in a format that renders a field date,
     /// and only when no `--date=` overrode it.
     log_date_unsupported: Option<String>,
@@ -606,6 +607,26 @@ struct Opts {
     /// Pathspecs after `--`: keep an entry only when its commit's diff against its
     /// first parent touches at least one of them.
     pathspecs: Vec<Vec<u8>>,
+    /// `-z`: `diff_opt_parse()`'s `options->line_termination = 0`, which
+    /// `show_log()` writes after each record instead of a newline:
+    ///
+    /// ```c
+    /// if (opt->use_terminator && !commit_format_is_empty(opt->commit_format)) {
+    ///         if (!opt->missing_newline)
+    ///                 graph_show_padding(opt->graph);
+    ///         putc(opt->diffopt.line_termination, opt->diffopt.file);
+    /// }
+    /// ```
+    ///
+    /// (log-tree.c:808-812.) `use_terminator` is `commit_format->is_tformat`
+    /// (pretty.c:187), which is set for `--format=`/`--pretty=tformat:` and *not*
+    /// for the built-in named formats — so `-z` moves the terminator of a user
+    /// format only. Measured on stock 2.55.0 over `refs/stash`'s reflog:
+    /// `log -g -z --format=%gd` writes `stash@{0}\0stash@{1}\0stash@{2}\0`
+    /// while `log -g -z --oneline` and `log -g -z` (medium) still write `\n`,
+    /// in either argument order. `git stash list -z --format=%gd` is the
+    /// reachable spelling.
+    line_term_nul: bool,
 }
 
 /// `--decorate` rendering mode. `Short` strips the ref namespace prefix, `Full`
@@ -775,6 +796,7 @@ impl Default for Opts {
             since: None,
             until: None,
             pathspecs: Vec::new(),
+            line_term_nul: false,
         }
     }
 }
@@ -1169,6 +1191,16 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
             // ---- recognized, no effect on reflog output ---------------------
             // Each of these was verified byte-identical to plain `git reflog`.
             "--first-parent" => opts.first_parent = true,
+            // `--no-walk[=(sorted|unsorted)]` and `--do-walk` set `revs->no_walk`
+            // (revision.c), which decides whether the *commit* walk descends from
+            // the pending objects. A reflog walk has no pending objects to limit:
+            // `add_reflog_for_walk()` hands out the log's own entries whatever
+            // `no_walk` says. Measured on stock 2.55.0 —
+            // `git stash list --no-walk` prints exactly what `git stash list`
+            // prints, at exit 0, where this port answered
+            // `fatal: unrecognized argument: --no-walk`.
+            "--no-walk" | "--no-walk=sorted" | "--no-walk=unsorted" | "--do-walk" => {}
+            "-z" => opts.line_term_nul = true,
             "--walk-reflogs" | "-g" | "--single-worktree" | "--boundary"
             | "--source" | "--no-color" => {}
 
@@ -1273,7 +1305,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
                 // One operand can contribute more than one section: `<rev>^@`
                 // queues every parent under the base's name, so a merge's `^@`
                 // walks that reflog once per parent, as stock 2.55.0 does.
-                if let Some(code) = resolve_operand(repo, s, &mut sections)? {
+                if let Some(code) = resolve_operand(repo, s, &mut sections, seen_dashdash)? {
                     return Ok(code);
                 }
             }
@@ -1361,7 +1393,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
                 return Ok(128);
             }
         }
-        match resolve_spec(repo, "HEAD")? {
+        match resolve_spec(repo, "HEAD", seen_dashdash)? {
             Resolved::Section(section) => sections.push(section),
             Resolved::Empty => {}
             Resolved::Fatal(code) => return Ok(code),
@@ -1562,7 +1594,9 @@ fn render(
                     // string (`--pretty=`) prints nothing at all.
                     if !fmt.is_empty() {
                         out.extend_from_slice(&line);
-                        out.push(b'\n');
+                        // `putc(opt->diffopt.line_termination, …)` — NUL under
+                        // `-z`; see [`Opts::line_term_nul`].
+                        out.push(if opts.line_term_nul { 0 } else { b'\n' });
                         // A user format is separated from the diff by a blank line,
                         // emitted whenever the diff queue is non-empty — even when
                         // the selected format renders none of those changes. With a
@@ -1709,6 +1743,7 @@ fn resolve_operand(
     repo: &gix::Repository,
     spec: &str,
     sections: &mut Vec<Section>,
+    seen_dashdash: bool,
 ) -> Result<Option<u8>> {
     // ---- handle_dotdot() ---------------------------------------------------
     //
@@ -1743,7 +1778,7 @@ fn resolve_operand(
         return Ok(Some(128));
     }
     if let Some((r, crate::objname::Dotdot::Ok { a, b })) = range {
-        return dotdot_walks(repo, &r, a, b, sections);
+        return dotdot_walks(repo, &r, a, b, sections, seen_dashdash);
     }
 
     // ---- handle_revision_arg_1()'s three-mark block -----------------------
@@ -1793,7 +1828,7 @@ fn resolve_operand(
                     // was already printed by `add_parents_only()` above.
                     let _quiet = crate::objname::AmbiguityWarnings::off();
                     for name in &walks {
-                        match resolve_spec(repo, name)? {
+                        match resolve_spec(repo, name, seen_dashdash)? {
                             Resolved::Section(section) => sections.push(section),
                             Resolved::Empty => {}
                             Resolved::Fatal(code) => return Ok(Some(code)),
@@ -1842,7 +1877,7 @@ fn resolve_operand(
         return Ok(None);
     }
 
-    Ok(match resolve_spec(repo, spec)? {
+    Ok(match resolve_spec(repo, spec, seen_dashdash)? {
         Resolved::Section(section) => {
             sections.push(section);
             None
@@ -1895,6 +1930,7 @@ fn dotdot_walks(
     a: gix::hash::ObjectId,
     b: gix::hash::ObjectId,
     sections: &mut Vec<Section>,
+    seen_dashdash: bool,
 ) -> Result<Option<u8>> {
     // `add_reflog_for_walk()` reads its log by *name* and resolves nothing, so
     // none of the lookups below warn. The one warning git prints for the operand
@@ -1925,7 +1961,7 @@ fn dotdot_walks(
         if !is_commit(repo, name) {
             continue;
         }
-        match resolve_spec(repo, name)? {
+        match resolve_spec(repo, name, seen_dashdash)? {
             Resolved::Section(section) => sections.push(section),
             Resolved::Empty => {}
             Resolved::Fatal(code) => return Ok(Some(code)),
@@ -1946,7 +1982,7 @@ fn is_commit(repo: &gix::Repository, name: &str) -> bool {
 
 /// Resolve a `<ref>`, `<ref>@{<n>}` or `<ref>@{<date>}` argument the way git's
 /// revision parser does, reporting git's own fatal text at the failure points.
-fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
+fn resolve_spec(repo: &gix::Repository, spec: &str, seen_dashdash: bool) -> Result<Resolved> {
     // `cmd_log_reflog()` hands every operand to `setup_revisions()`, so
     // `get_oid_basic()` sees it before the reflog is ever opened — and a
     // full-length hex takes that function's *first* branch, warning about a
@@ -2007,12 +2043,12 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
     match selector {
         Some(_) if base.is_empty() => {
             if crate::refname::resolve_ref_reading(repo, "HEAD").is_none() {
-                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec, seen_dashdash)));
             }
         }
         Some(_) => {
             if dwim_log(repo, base).is_none() {
-                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec, seen_dashdash)));
             }
         }
         None => {
@@ -2032,7 +2068,7 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
                 return Ok(Resolved::Fatal(128));
             }
             if crate::objname::resolve_quiet(repo, base).is_none() {
-                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec, seen_dashdash)));
             }
         }
     }
@@ -2114,7 +2150,7 @@ fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
             // every non-alphanumeric byte, so `2.days.ago` is native to it.
             let (target, error) = crate::date::approxidate_careful(text);
             if error {
-                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec, seen_dashdash)));
             }
 
             // Entries are newest-first; the answer is the newest one that was
@@ -2494,8 +2530,38 @@ enum DateMode {
 
 /// Classify a `--date=` value. Anything git would reject outright is `Unknown`.
 fn parse_date_mode(value: &str) -> DateMode {
-    if value.starts_with("format:") || value.starts_with("format-local:") {
-        return DateMode::Unimplemented;
+    // ```c
+    // if (skip_prefix(format, "format:", &p)) {
+    //         mode->type = DATE_STRFTIME;
+    //         mode->strftime_fmt = xstrdup(p);
+    //         return;
+    // }
+    // ```
+    //
+    // (`parse_date_format()`, date.c.) The payload is a `strftime(3)` template,
+    // and `-local` renders it in the local zone. `gix::date::time::CustomFormat`
+    // is the same grammar — every layout in `gix_date::time::format` is written
+    // as one (`%Y-%m-%d`, `%a %b %-d %H:%M:%S %Y %z`) — so the value goes
+    // straight through. It wants a `&'static str`, and the template lives for the
+    // rest of the process either way, so it is leaked rather than threaded
+    // through `DateFormat` as an owned string.
+    //
+    // Reachable as `git stash list --date=format:%Y-%m-%d`, which stock 2.55.0
+    // renders as `stash@{2023-11-14} 2023-11-14 On main: …` — the selector column
+    // switches to date form for any explicit `--date=`, which this port already
+    // does for the layouts it knew.
+    if let Some(template) = value
+        .strip_prefix("format:")
+        .map(|t| (t, false))
+        .or_else(|| value.strip_prefix("format-local:").map(|t| (t, true)))
+    {
+        let (template, local) = template;
+        let leaked: &'static str = Box::leak(template.to_owned().into_boxed_str());
+        return DateMode::Known(DateFormat {
+            fmt: gix::date::time::CustomFormat::new(leaked).into(),
+            local,
+            iso_strict: false,
+        });
     }
     let (base, local) = match value.strip_suffix("-local") {
         Some(base) => (base, true),
@@ -3959,7 +4025,29 @@ fn exists(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 /// Emit git's "unknown revision" fatal block verbatim and return its exit code.
-fn fatal_ambiguous(spec: &str) -> u8 {
+fn fatal_ambiguous(spec: &str, seen_dashdash: bool) -> u8 {
+    // ```c
+    // if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+    //         int j;
+    //         if (seen_dashdash || *arg == '^')
+    //                 die("bad revision '%s'", arg);
+    //         …
+    // ```
+    //
+    // (`setup_revisions()`, revision.c:2895-2899.) The `ambiguous argument` block
+    // below is the *filename fallback*, and a `--` anywhere in argv closes it:
+    // every operand then carries `REVARG_CANNOT_BE_FILENAME`, so a name that
+    // resolves to nothing is a bad revision rather than a candidate pathspec.
+    //
+    // `git stash list -- <path>` is what makes this reachable. `list_stash()`
+    // appends `refs/stash --` of its own (builtin/stash.c), so the operand the
+    // user typed always sits in front of a `--` and stock answers
+    // `fatal: bad revision 'counter.txt'` where this port answered with the
+    // three-line advice.
+    if seen_dashdash {
+        eprintln!("fatal: bad revision '{spec}'");
+        return 128;
+    }
     eprintln!(
         "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree."
     );
@@ -4370,12 +4458,24 @@ fn read_raw_log(path: &Path) -> Result<Option<Vec<RawLine>>> {
 /// empty file rather than removing it, which is what `git reflog expire` leaves behind.
 fn write_raw_log(path: &Path, lines: &[RawLine], rewrite: bool) -> Result<()> {
     let mut out: Vec<u8> = Vec::new();
+    // ```c
+    // if (cb->rewrite)
+    //         ooid = &cb->last_kept_oid;
+    // …
+    // oidcpy(&cb->last_kept_oid, noid);
+    // ```
+    //
+    // (`expire_reflog_ent()`, refs/files-backend.c.) `last_kept_oid` lives in a
+    // zero-initialised `struct expire_reflog_policy_cb`, and the substitution is
+    // unconditional under `--rewrite` — so it applies to the *first* surviving
+    // entry too, whose predecessor is nothing at all. Dropping the oldest entry
+    // therefore leaves the new oldest one starting from the null id, the same
+    // way a freshly created ref's first entry does; keeping whatever it recorded
+    // would leave the log claiming a predecessor that is no longer in it.
     let mut previous: Option<ObjectId> = None;
     for line in lines {
-        // `--rewrite`: a survivor whose predecessor was dropped starts from what is now
-        // the previous entry's new id, so the chain reads continuously again.
-        if rewrite && previous.is_some_and(|p| p != line.old) {
-            let want = previous.expect("checked");
+        let want = previous.unwrap_or_else(|| ObjectId::null(line.old.kind()));
+        if rewrite && want != line.old {
             let mut fixed = want.to_hex().to_string().into_bytes();
             fixed.extend_from_slice(&line.bytes[want.to_hex().to_string().len()..]);
             out.extend_from_slice(&fixed);
@@ -4549,10 +4649,43 @@ fn delete_one(
     // lockfile, so the update leaves no reflog entry of its own.
     if updateref {
         if let Some(newest) = lines.last() {
-            update_ref_to(repo, &full, newest.new)?;
+            if !is_symref(repo, &full) {
+                update_ref_to(repo, &full, newest.new)?;
+            }
         }
     }
     Ok(true)
+}
+
+/// ```c
+/// /*
+///  * It doesn't make sense to adjust a reference pointed
+///  * to by a symbolic ref based on expiring entries in
+///  * the symbolic reference's reflog. …
+///  */
+/// int update = 0;
+///
+/// if ((expire_flags & EXPIRE_REFLOGS_UPDATE_REF) &&
+///     !is_null_oid(&cb.last_kept_oid)) {
+///         int type;
+///         const char *ref;
+///
+///         ref = refs_resolve_ref_unsafe(&refs->base, refname,
+///                                       RESOLVE_REF_NO_RECURSE,
+///                                       NULL, &type);
+///         update = !!(ref && !(type & REF_ISSYMREF));
+/// }
+/// ```
+///
+/// (`files_reflog_expire()`, refs/files-backend.c:3205-3224.) `RESOLVE_REF_NO_RECURSE`
+/// is what makes this a test of the ref *itself* rather than of what it points at, so
+/// `git reflog delete --updateref HEAD@{0}` on an attached `HEAD` leaves both `HEAD`
+/// and the branch alone — where dereferencing would move the branch and writing
+/// `HEAD` directly would detach it.
+fn is_symref(repo: &gix::Repository, full_name: &str) -> bool {
+    std::fs::read(ref_file(repo, full_name))
+        .map(|body| body.starts_with(b"ref:"))
+        .unwrap_or(false)
 }
 
 /// Point `full_name` at `oid` without adding a reflog entry of its own, which is
@@ -4821,7 +4954,9 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         write_raw_log(&path, &kept, rewrite)?;
         if updateref {
             if let Some(newest) = kept.last() {
-                update_ref_to(repo, &full, newest.new)?;
+                if !is_symref(repo, &full) {
+                    update_ref_to(repo, &full, newest.new)?;
+                }
             }
         }
     }

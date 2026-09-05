@@ -151,8 +151,44 @@ enum Format {
     Long,
 }
 
+/// Whether `GIT_NO_REPLACE_OBJECTS` was already in the environment when
+/// [`replace`] started, as opposed to being the one this command sets for
+/// itself. Only [`launch_editor`] reads it.
+static INHERITED_NO_REPLACE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// `git replace` — see the module docs for the covered surface.
 pub fn replace(args: &[String]) -> Result<ExitCode> {
+    // ```c
+    // read_replace_refs = 0;
+    // git_config(git_default_config, NULL);
+    // ```
+    //
+    // (`cmd_replace`, builtin/replace.c:562.) The whole command runs with the
+    // replacement map *off*: every object this verb reads is the object named,
+    // never the object `refs/replace/<oid>` substitutes for it. That is what
+    // makes `git replace --graft <commit>` graft the original commit's buffer —
+    // `create_graft()`'s `get_commit_buffer(commit, &size)` — rather than the
+    // buffer of a replacement that already stands in for it, and what makes
+    // `--edit` export the original bytes. Without it, grafting an
+    // already-replaced commit produced a replacement built from the *previous*
+    // replacement's message.
+    //
+    // git flips a process-global; the equivalent here is the environment
+    // variable `gix`'s open path tests for presence of (`open/repository.rs`,
+    // `GIT_NO_REPLACE_OBJECTS`), set before any [`crate::setup::discover`] call
+    // below opens the repository. `git --no-replace-objects` sets the same
+    // variable (`lib.rs`), so this is the spelling the rest of the port already
+    // uses for "read objects unsubstituted".
+    //
+    // Whether the *caller* already had it set is remembered so the one child this
+    // command launches — `--edit`'s editor — sees the environment stock would
+    // have given it; see [`launch_editor`].
+    INHERITED_NO_REPLACE.store(
+        std::env::var_os("GIT_NO_REPLACE_OBJECTS").is_some(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    std::env::set_var("GIT_NO_REPLACE_OBJECTS", "1");
     let mut force = false;
     let mut raw = false;
     let mut format: Option<String> = None;
@@ -517,7 +553,16 @@ fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> bool {
     if editor == ":" {
         return true;
     }
-    match super::bugreport::editor_command(&editor, path).status() {
+    // `cmd_replace`'s `read_replace_refs = 0` is a process-global in git, so the
+    // editor it launches inherits nothing from it. Here it is an environment
+    // variable, which a child *would* inherit — so the one this command set for
+    // itself is taken back out. A `GIT_NO_REPLACE_OBJECTS` the caller set (or
+    // `git --no-replace-objects`) is left in place, because stock passes that on.
+    let mut command = super::bugreport::editor_command(&editor, path);
+    if !INHERITED_NO_REPLACE.load(std::sync::atomic::Ordering::Relaxed) {
+        command.env_remove("GIT_NO_REPLACE_OBJECTS");
+    }
+    match command.status() {
         Ok(s) if s.success() => true,
         Ok(_) | Err(_) => {
             error_line(&format!("there was a problem with the editor '{editor}'"));

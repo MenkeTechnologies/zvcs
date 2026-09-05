@@ -287,11 +287,67 @@ pub fn fetch(repo: &crate::Repository, promisor: &Remote, ids: &[gix_hash::Objec
     if let Some(index_path) = bundle.index_path.as_deref() {
         let path = index_path.with_extension("promisor");
         std::fs::write(&path, "").map_err(|err| Error::WritePromisorFile { path, source: err })?;
+        write_reverse_index(repo, index_path);
     }
     if let Some(keep_path) = bundle.keep_path.as_deref() {
         std::fs::remove_file(keep_path).ok();
     }
     Ok(bundle.index.num_objects > 0)
+}
+
+/// Write the `.rev` beside the pack `index_path` indexes, as `index-pack` does for the pack a
+/// lazy fetch receives.
+///
+/// The fetch git spawns is an ordinary one, so its pack goes through `index-pack`, and
+/// ```c
+/// if (!strcmp(k, "pack.writereverseindex")) {
+///         if (git_config_bool(k, v))
+///                 opts->flags |= WRITE_REV;
+///         else
+///                 opts->flags &= ~WRITE_REV;
+/// }
+/// ```
+///
+/// (`git_index_pack_config()`, builtin/index-pack.c:1592-1597) is what decides whether it
+/// writes one — on by default since git 2.41. gitoxide's bundle writer produces `.idx` and
+/// `.pack` only, so the third file is written here, and a repository that lazily fetched a
+/// blob ends up with the same three files per pack that git leaves behind.
+///
+/// Failure is silent for the same reason the `.keep` removal above is: the objects are
+/// already readable without it, and a `.rev` is an accelerator, not a record.
+#[cfg(feature = "blocking-network-client")]
+fn write_reverse_index(repo: &crate::Repository, index_path: &std::path::Path) {
+    if !repo
+        .config_snapshot()
+        .boolean("pack.writeReverseIndex")
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let Ok(index) = gix_pack::index::File::at(index_path, repo.object_hash()) else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    if gix_pack::index::write_reverse_index(&index, &mut bytes).is_err() {
+        return;
+    }
+    // `rename_tmp_packfile()` moves each of the three files into place from a temporary
+    // name, so a reader never sees a half-written `.rev`.
+    let path = index_path.with_extension("rev");
+    let tmp = index_path.with_extension("rev.tmp");
+    if std::fs::write(&tmp, &bytes).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        std::fs::remove_file(&tmp).ok();
+        return;
+    }
+    // `finish_tmp_packfile()` chmods what it writes to 0444; the `.rev` is one of them.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        let mut perm = meta.permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&path, perm).ok();
+    }
 }
 
 /// A [negotiator](gix_protocol::fetch::Negotiate) that asks for a fixed set of objects and nothing else.

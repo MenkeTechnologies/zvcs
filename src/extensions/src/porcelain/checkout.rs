@@ -1441,7 +1441,7 @@ pub(crate) fn switch_to_branch_opts(
     let mut autostashed = false;
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
-    } else if target_tree != cur_tree {
+    } else if target_tree != cur_tree || index_unborn(repo)? {
         match move_worktree(repo, cur_tree, target_tree, merge)? {
             Moved::Refused(code) => return Ok(code),
             Moved::Autostashed => autostashed = true,
@@ -1519,7 +1519,7 @@ fn detached_checkout(
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else {
-        if target_tree != cur_tree {
+        if target_tree != cur_tree || index_unborn(repo)? {
             match move_worktree(repo, cur_tree, target_tree, merge)? {
                 Moved::Refused(code) => return Ok(code),
                 Moved::Autostashed => autostashed = true,
@@ -1688,7 +1688,7 @@ fn create_and_switch(
     }
 
     let mut autostashed = false;
-    if target_tree != cur_tree {
+    if target_tree != cur_tree || index_unborn(repo)? {
         match move_worktree(repo, cur_tree, target_tree, merge)? {
             Moved::Refused(code) => return Ok(code),
             Moved::Autostashed => autostashed = true,
@@ -1848,7 +1848,7 @@ fn orphan_checkout(
     let cur_tree = head_tree_or_empty(repo)?;
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
-    } else if target_tree != cur_tree {
+    } else if target_tree != cur_tree || index_unborn(repo)? {
         if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
             return Ok(code);
         }
@@ -2857,13 +2857,35 @@ fn merge_opt<'a>(merge: bool, style: &'a str, name: &'a str) -> Option<MergeOpt<
     merge.then_some(MergeOpt { style, name })
 }
 
+/// `is_index_unborn()`: an index file that was never written. git reads it once,
+/// as `topts.initial_checkout = is_index_unborn(the_repository->index)`
+/// (builtin/checkout.c), and hands it to `twoway_merge()`, which is where it
+/// decides that a path the two trees agree on is still `merged_entry()`d rather
+/// than kept — see [`update_worktree_to_tree`].
+///
+/// It is also the one state in which a switch whose two trees are *identical*
+/// still has work to do, which is why every `target_tree != cur_tree` gate in
+/// this file is `||`'d with it: `git clone --no-checkout` leaves `HEAD` at a
+/// commit with no index and an empty worktree, and the `checkout` after it is
+/// what materializes that worktree. Skipping the move on tree equality left the
+/// clone empty, and CMake's `FetchContent` populate step — `clone --no-checkout`
+/// then `checkout <sha>` — is exactly that sequence.
+///
+/// `index_or_empty()`, not `index_or_load_from_head_or_empty()`: the latter
+/// fabricates `HEAD`'s tree when the file is missing, which is the very case
+/// being tested for.
+pub(super) fn index_unborn(repo: &gix::Repository) -> Result<bool> {
+    Ok(repo.index_or_empty()?.entries().is_empty())
+}
+
 /// `merge_working_tree()` as every switch in this file runs it: gate the move,
 /// write the target tree out, and put back whatever `-m` had to stash to get
 /// there. Returns the exit code of a refusal, or `None` when the worktree moved.
 ///
-/// Called only when the two trees actually differ, which is the caller's own
-/// `target_tree != cur_tree` test: an identical-tree switch has no path for
-/// `twoway_merge()` to reject and nothing to carry.
+/// Called when the two trees differ, which is the caller's own
+/// `target_tree != cur_tree` test — an identical-tree switch has no path for
+/// `twoway_merge()` to reject and nothing to carry — or when [`index_unborn`]
+/// says the worktree has yet to be written at all.
 pub(super) fn move_worktree(
     repo: &gix::Repository,
     cur_tree: ObjectId,
@@ -3045,7 +3067,20 @@ pub(super) fn update_worktree_to_tree(
     // file untouched. That is what carries a staged change to a file both
     // branches share across the switch — rebuilding the index from the target
     // tree instead would silently throw that work away.
-    let old_flat = flatten_tree(repo, old_tree)?;
+    //
+    // `keep_entry()` is reached from `if (current)`, though, so it only decides
+    // paths the *index* holds. Under [`index_unborn`] there is no `current` for
+    // any of them and every path the new tree names falls through to
+    // `merged_entry()` — the old tree carries nothing, because there is nothing
+    // to carry it into. Both sides of the run therefore start empty here, which
+    // makes `touched` the whole new tree and writes out the worktree a
+    // `clone --no-checkout` left unpopulated.
+    let initial_checkout = index_unborn(repo)?;
+    let old_flat = if initial_checkout {
+        HashMap::new()
+    } else {
+        flatten_tree(repo, old_tree)?
+    };
     let new_flat = flatten_tree(repo, new_tree)?;
     let touched: HashSet<BString> = old_flat
         .keys()
@@ -3058,8 +3093,15 @@ pub(super) fn update_worktree_to_tree(
     // checkout of a repository has neither index nor `HEAD`: a freshly `init`ed
     // repo that has only fetched objects is exactly the state
     // `git init && git fetch <url> <sha> && git checkout <sha>` checks out from,
-    // the sequence tree-sitter grammar fetchers use.
-    let old = repo.index_or_load_from_head_or_empty()?.into_owned();
+    // the sequence tree-sitter grammar fetchers use. An unborn index starts
+    // genuinely empty instead: `_or_load_from_head_` would fabricate `HEAD`'s
+    // tree, and every path of it the new tree drops would then survive into the
+    // index as an entry no worktree file backs.
+    let old = if initial_checkout {
+        gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
+    } else {
+        repo.index_or_load_from_head_or_empty()?.into_owned()
+    };
     let old_stats: HashMap<BString, (ObjectId, Mode, Stat)> = {
         let backing = old.path_backing();
         old.entries()

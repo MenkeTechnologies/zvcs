@@ -1826,6 +1826,29 @@ mod tests {
     }
 
     /// git resolves `.` and a `prefix`, and refuses a path that climbs out.
+    /// The three shape refusals `sanitize_paths()` applies in cone mode, and the
+    /// two ways out of them. Measured against stock 2.55.0, each of these dies at
+    /// 128: `specify directories rather than patterns (no leading slash)`, and the
+    /// `'!'` and `'*?[]'` variants that name `--skip-checks`.
+    #[test]
+    fn cone_shapes_are_refused_by_sanitize_paths() {
+        let dir = std::env::temp_dir().join(format!("zvcs-sparse-vet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let repo = gix::init(&dir).expect("init a repository to vet against");
+        for rejected in ["/a", "!a", "a*b"] {
+            let got = sanitize_paths(&repo, &[rejected.to_owned()], "", true, false).unwrap();
+            assert!(got.is_some(), "{rejected} should be refused in cone mode");
+        }
+        // `if (skip_checks) return;` sits above the refusals, and `if (!args->nr)
+        // return;` above that, so neither shape is reached.
+        let bypassed = sanitize_paths(&repo, &["a*b".to_owned()], "", true, true).unwrap();
+        assert!(bypassed.is_none(), "--skip-checks must bypass the shape refusals");
+        let empty = sanitize_paths(&repo, &[], "", true, false).unwrap();
+        assert!(empty.is_none(), "an empty argument list is not checked at all");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn paths_normalize_against_the_prefix() {
         assert_eq!(normalize_dir("", "./a/"), Some("a".to_owned()));
@@ -1834,16 +1857,14 @@ mod tests {
         assert_eq!(normalize_dir("", "../a"), None);
     }
 
-    /// The sanity checks git applies to cone arguments, and their bypass.
+    /// git vets a cone argument in `sanitize_paths()` — a pass over the whole
+    /// argument list that runs before any argument becomes a pattern — not in the
+    /// per-argument conversion, so `cone_argument()` only normalizes and unquotes.
+    /// The refusals themselves are covered by
+    /// [`cone_shapes_are_refused_by_sanitize_paths`].
     /// `ExitCode` is not comparable, so accepted arguments are matched by shape.
     #[test]
-    fn cone_arguments_are_vetted() {
-        for rejected in ["/a", "!a", "a*b"] {
-            assert!(
-                cone_argument(rejected, "", false).unwrap().is_err(),
-                "{rejected} should be rejected"
-            );
-        }
+    fn cone_arguments_normalize_and_unquote() {
         for (raw, skip_checks, want) in [("a*b", true, "a*b"), ("\"w x\"", false, "w x")] {
             match cone_argument(raw, "", skip_checks).unwrap() {
                 Ok(Some(dir)) => assert_eq!(dir, want),

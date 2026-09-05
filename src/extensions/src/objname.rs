@@ -3182,13 +3182,18 @@ pub fn short_oid_ambiguous(repo: &gix::Repository, name: &str, quietly: bool) ->
     // and blobs; inside one type, `oidcmp()`.
     listed.sort_by_key(|id| (type_sort_order(kind_of(id)), *id));
 
+    let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
     eprintln!("error: short object ID {name} is ambiguous");
     eprintln!("hint: The candidates are:");
     for id in &listed {
         let kind = kind_of(id);
         // `repo_find_unique_abbrev(oid, DEFAULT_ABBREV)`, which widens past a
-        // collision rather than cutting at the requested width.
-        let hex = crate::abbrev::unique_abbrev(repo, id, crate::abbrev::FALLBACK_DEFAULT_ABBREV);
+        // collision rather than cutting at the requested width. `DEFAULT_ABBREV`
+        // is `default_abbrev` (cache.h:1417), the resolved `core.abbrev` — not
+        // the `FALLBACK_DEFAULT_ABBREV` of 7 that `auto` lands on only when the
+        // object database gives nothing to size against, so a repository whose
+        // config sets `core.abbrev = 10` lists ten-hex candidates.
+        let hex = crate::abbrev::unique_abbrev(repo, id, abbrev);
         let type_name = match kind {
             Some(gix::object::Kind::Tag) => "tag",
             Some(gix::object::Kind::Commit) => "commit",

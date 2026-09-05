@@ -161,8 +161,6 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--flags",
     "--no-flags",
     "--output-object-format",
-    "--is-shallow-repository",
-    "--show-superproject-working-tree",
     "--bisect",
     "--end-of-options",
     "--all-objects",
@@ -264,6 +262,14 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+
+    // `setup_explicit_git_dir()` walks to a relative `core.worktree` rather than
+    // computing it, so a value naming a directory that is not there ends the command
+    // before it prints anything.
+    if let Some(message) = crate::setup::core_worktree_chdir_error(&repo) {
+        eprintln!("fatal: {message}");
+        return Ok(ExitCode::from(128));
+    }
 
     // Everything `print_path()` needs out of a setup this port does not perform.
     let paths = PathCtx::new(&repo);
@@ -370,8 +376,19 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                         std::mem::take(&mut ref_excludes),
                         false,
                     );
-                    for (echo, full, id) in collect_refs(&repo, &selection)? {
-                        show_rev(&mut out, &repo, &o, &id, Some(echo.as_bstr()), Some(full.as_bstr()), false)?;
+                    // `show_reference()` is `show_rev(NORMAL, oid, refname)` and
+                    // nothing else (`builtin/rev-parse.c:198-204`), where `refname`
+                    // is the name the walk *trimmed*: `for_each_ref_in(prefix, …)`
+                    // passes `trim = strlen(prefix)`, so `--branches` hands
+                    // `show_rev()` `main`, not `refs/heads/main`. That matters under
+                    // `--symbolic-full-name`/`--abbrev-ref`, which then re-resolve
+                    // the short name through `dwim_ref()` — and a short name that
+                    // more than one `ref_rev_parse_rules` spelling matches is
+                    // `error("refname '%s' is ambiguous")` with nothing on stdout.
+                    // Handing the full name straight through would have skipped that
+                    // resolution and printed a ref stock git refuses to name.
+                    for (echo, _full, id) in collect_refs(&repo, &selection)? {
+                        show_rev(&mut out, &repo, &o, &id, Some(echo.as_bstr()), None, false)?;
                     }
                 }
                 Opt::Unknown => {
@@ -788,8 +805,34 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
         }
         // `repo_dwim_ref` records what `resolve_ref_unsafe` resolved *to*, so a
         // symbolic `HEAD` contributes the branch it points at.
+        //
+        // ```c
+        // r = refs_resolve_ref_unsafe(refs, fullref.buf, RESOLVE_REF_READING, this_result, &flag);
+        // if (r) {
+        //         if (!refs_found++) *ref = xstrdup(r);
+        //         if (!warn_ambiguous_refs) break;
+        // } else if ((flag & REF_ISSYMREF) && strcmp(fullref.buf, "HEAD")) {
+        //         warning(_("ignoring dangling symref %s"), fullref.buf);
+        // }
+        // ```
+        //
+        // (`expand_ref()`, `refs.c:733-765`.) `RESOLVE_REF_READING` means the chain
+        // has to *end somewhere real*: a symref whose target does not exist resolves
+        // to NULL, so it is not counted — and the else-arm says so on stderr, once
+        // per `expand_ref()` call, naming the expansion rather than the operand.
+        // `HEAD` is exempt because an unborn branch is the ordinary state of a fresh
+        // repository. Recording the symref's target name without following it
+        // counted a dangling symref as a found ref and printed nothing.
         found.push(match r.target() {
-            TargetRef::Symbolic(full) => full.as_bstr().to_string(),
+            TargetRef::Symbolic(full) => match resolve_symref_chain(repo, full.as_bstr()) {
+                Some(resolved) => resolved,
+                None => {
+                    if rule != "HEAD" {
+                        eprintln!("warning: ignoring dangling symref {rule}");
+                    }
+                    continue;
+                }
+            },
             TargetRef::Object(_) => r.name().as_bstr().to_string(),
         });
         if stop_at_first {
@@ -797,6 +840,27 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
         }
     }
     found
+}
+
+/// `refs_resolve_ref_unsafe(..., RESOLVE_REF_READING, ...)` for a symbolic target:
+/// the name of the last ref in the chain, or `None` when the chain runs out before
+/// it reaches one that holds an object id.
+///
+/// The depth limit is git's `SYMREF_MAXDEPTH` (5, `refs/files-backend.c`); a longer
+/// chain is `ELOOP` and also resolves to nothing.
+fn resolve_symref_chain(repo: &gix::Repository, target: &BStr) -> Option<String> {
+    let mut current = target.to_owned();
+    for _ in 0..5 {
+        let r = repo.try_find_reference(current.as_bstr()).ok()??;
+        if r.name().as_bstr() != current {
+            return None;
+        }
+        match r.target() {
+            TargetRef::Object(_) => return Some(current.to_string()),
+            TargetRef::Symbolic(next) => current = next.as_bstr().to_owned(),
+        }
+    }
+    None
 }
 
 /// Everything `get_oid_basic()`'s reflog branch has to say about one operand
@@ -1139,9 +1203,15 @@ enum Query {
     /// All three modes read the same algorithm here — this port stores, reads and
     /// writes one hash, so there is no compatibility algorithm to differ from.
     ObjectFormat,
-    /// `--show-ref-format`: how refs are stored, which is always the loose-plus-
-    /// packed `files` backend; `reftable` is not implemented.
+    /// `--show-ref-format`: how refs are stored — `extensions.refStorage`, or the
+    /// loose-plus-packed `files` backend when the extension is absent.
     RefFormat,
+    /// `--is-shallow-repository`: whether `$GIT_DIR/shallow` exists
+    /// (`is_repository_shallow()`, `shallow.c:55-88`).
+    IsShallowRepository,
+    /// `--show-superproject-working-tree`: the work tree of the repository that has
+    /// this one registered as a submodule, printed only when there is one.
+    SuperprojectWorkingTree,
 }
 
 fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
@@ -1186,6 +1256,10 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
         "--is-bare-repository" => return Ok(Opt::Query(Query::IsBareRepository)),
         "--show-object-format" => return Ok(Opt::Query(Query::ObjectFormat)),
         "--show-ref-format" => return Ok(Opt::Query(Query::RefFormat)),
+        "--is-shallow-repository" => return Ok(Opt::Query(Query::IsShallowRepository)),
+        "--show-superproject-working-tree" => {
+            return Ok(Opt::Query(Query::SuperprojectWorkingTree))
+        }
         _ if crate::porcelain::log::ref_selector(arg).is_some() => {
             let (kind, pattern) = crate::porcelain::log::ref_selector(arg).expect("checked above");
             return Ok(Opt::Refs(kind, pattern.map(str::to_string)));
@@ -1345,9 +1419,156 @@ fn query(
         Query::IsInsideGitDir => emit(out, yes_no(is_inside_git_dir(repo)))?,
         Query::IsBareRepository => emit(out, yes_no(repo.is_bare()))?,
         Query::ObjectFormat => emit(out, repo.object_hash().to_string().as_bytes())?,
-        Query::RefFormat => emit(out, b"files")?,
+        Query::RefFormat => emit(out, ref_storage_format(repo).as_bytes())?,
+        // ```c
+        // if (!strcmp(arg, "--is-shallow-repository")) {
+        //         printf("%s\n", is_repository_shallow(the_repository) ? "true" : "false");
+        //         continue;
+        // }
+        // ```
+        //
+        // (`builtin/rev-parse.c:1003-1008`.) `is_repository_shallow()` is a
+        // successful `fopen()` on the shallow file and nothing more
+        // (`shallow.c:55-88`); the lines inside it only matter to the graft table.
+        // The path is `$GIT_SHALLOW_FILE` when that names something, and otherwise
+        // `git_path_shallow()` — which is `repo_git_path(r, "shallow")`, so a linked
+        // worktree reads the main checkout's file through [`adjust_git_path`].
+        Query::IsShallowRepository => {
+            let path = match std::env::var_os("GIT_SHALLOW_FILE") {
+                Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+                _ => git_path(repo, paths, "shallow"),
+            };
+            let path = if path.is_absolute() {
+                path
+            } else {
+                paths.root.join(path)
+            };
+            emit(out, yes_no(std::fs::File::open(&path).is_ok()))?;
+        }
+        // ```c
+        // if (!strcmp(arg, "--show-superproject-working-tree")) {
+        //         struct strbuf superproject = STRBUF_INIT;
+        //         if (get_superproject_working_tree(&superproject))
+        //                 print_path(superproject.buf, prefix, format, DEFAULT_UNMODIFIED);
+        //         strbuf_release(&superproject);
+        //         continue;
+        // }
+        // ```
+        //
+        // (`builtin/rev-parse.c:916-922`.) Nothing at all is printed when there is
+        // no superproject — not even a blank line — and the exit code stays 0.
+        Query::SuperprojectWorkingTree => {
+            if let Some(top) = superproject_working_tree(repo) {
+                print_path(out, paths, &top, o.format, DefaultType::Unmodified)?;
+            }
+        }
     }
     Ok(None)
+}
+
+/// `the_repository->ref_storage_format` as `--show-ref-format` names it.
+///
+/// `extensions.refStorage` is a v1 extension, so it is only read once
+/// `core.repositoryFormatVersion` is at least 1 (`setup.c`'s
+/// `check_repo_format()`); at version 0 git ignores the key outright. The port
+/// stores refs the `files` way whatever the answer here is — reporting the
+/// recorded format is a question about the repository, not about this binary.
+fn ref_storage_format(repo: &gix::Repository) -> String {
+    let config = repo.config_snapshot();
+    if config.integer("core.repositoryFormatVersion").unwrap_or(0) < 1 {
+        return "files".into();
+    }
+    match config.string("extensions.refStorage") {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => "files".into(),
+    }
+}
+
+/// `get_superproject_working_tree()` (`submodule.c:2392-2470`).
+///
+/// ```c
+/// if (!is_inside_work_tree())
+///         return 0;
+/// if (!strbuf_realpath(&one_up, "../", 0))
+///         return 0;
+/// subpath = relative_path(cwd, one_up.buf, &sb);
+/// …
+/// strvec_pushl(&cp.args, "--literal-pathspecs", "-C", "..",
+///              "ls-files", "-z", "--stage", "--full-name", "--", subpath, NULL);
+/// …
+/// if (starts_with(sb.buf, "160000")) {
+///         super_sub = strchr(sb.buf, '\t') + 1;
+///         super_sub_len = strlen(super_sub);
+///         …
+///         super_wt = xstrdup(cwd);
+///         super_wt[cwd_len - super_sub_len] = '\0';
+///         strbuf_realpath(buf, super_wt, 1);
+///         ret = 1;
+/// }
+/// ```
+///
+/// The child is the parent directory's own `ls-files`, so the answer is "does the
+/// repository one level up have a **gitlink** at the path this directory sits at".
+/// Reading that repository's index directly asks the same question: the first entry
+/// the pathspec matches, in index order, and whether its mode is `160000`. git's
+/// three exits — `..` is not a repository, `..` is an unrelated repository, the
+/// match is an ordinary file — all land on "print nothing".
+///
+/// The child also runs with `prepare_submodule_repo_env()`, which clears
+/// `$GIT_DIR`/`$GIT_WORK_TREE`; discovery from `..` here is likewise unaffected by
+/// this repository's environment, which is what makes the answer the same under
+/// `GIT_DIR=…/modules/sub`.
+fn superproject_working_tree(repo: &gix::Repository) -> Option<std::path::PathBuf> {
+    if !is_inside_work_tree(repo) {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let one_up = std::fs::canonicalize(cwd.join("..")).ok()?;
+    // `relative_path(cwd, one_up)`: the path of this directory below its parent.
+    let subpath = relative_path(
+        cwd.as_os_str().as_encoded_bytes(),
+        Some(one_up.as_os_str().as_encoded_bytes()),
+    );
+    let subpath = String::from_utf8(subpath).ok()?;
+    let subpath = subpath.trim_end_matches('/');
+    if subpath.is_empty() || subpath.starts_with('/') || subpath.starts_with("..") {
+        return None;
+    }
+
+    let _clean_env = WithoutLocalRepoEnv::new();
+    let super_repo = gix::discover(&one_up).ok()?;
+    let super_top = super_repo.workdir()?.to_owned();
+    // `--full-name` output is measured from the top of the superproject, so the
+    // pathspec `..` was handed has to be rebased the same way.
+    let full = match std::fs::canonicalize(&one_up)
+        .ok()?
+        .strip_prefix(std::fs::canonicalize(&super_top).ok()?)
+    {
+        Ok(rel) if rel.as_os_str().is_empty() => subpath.to_string(),
+        Ok(rel) => format!("{}/{subpath}", rel.display()),
+        Err(_) => return None,
+    };
+
+    let index = super_repo.index_or_empty().ok()?;
+    let entry = index.entries().iter().find(|e| {
+        let path = e.path(&index);
+        path == full.as_bytes()
+            || (path.starts_with(full.as_bytes()) && path.get(full.len()) == Some(&b'/'))
+    })?;
+    if entry.mode != gix::index::entry::Mode::COMMIT {
+        return None;
+    }
+
+    // `super_wt = cwd; super_wt[cwd_len - super_sub_len] = '\0'` — the superproject
+    // work tree is the current directory with the entry's own path cut off its tail.
+    let super_sub = entry.path(&index).to_string();
+    let cwd_text = cwd.to_string_lossy().into_owned();
+    let cut = cwd_text.len().checked_sub(super_sub.len())?;
+    if !cwd_text[cut..].eq(&super_sub) {
+        return None;
+    }
+    let super_wt = std::path::PathBuf::from(&cwd_text[..cut]);
+    Some(std::fs::canonicalize(&super_wt).unwrap_or(super_wt))
 }
 
 fn yes_no(b: bool) -> &'static [u8] {
@@ -1359,9 +1580,13 @@ fn yes_no(b: bool) -> &'static [u8] {
 }
 
 /// The worktree root as git reports it: symlink-resolved, absolute.
+///
+/// `repo_get_work_tree()` hands back what `set_git_work_tree()` stored, and that is
+/// `real_pathdup()` — which resolves as far as the filesystem goes and keeps the
+/// rest. A work tree that does not exist is still a work tree here, which is what
+/// `GIT_WORK_TREE=nosuch git rev-parse --show-toplevel` prints.
 fn toplevel(repo: &gix::Repository) -> Option<std::path::PathBuf> {
-    let wd = repo.workdir()?;
-    std::fs::canonicalize(wd).ok()
+    Some(crate::setup::realpath_forgiving(repo.workdir()?))
 }
 
 /// `path` symlink-resolved and absolute, or unchanged when it cannot be resolved.
@@ -2115,27 +2340,65 @@ fn show_datestring(out: &mut impl Write, o: &Opts, flag: &str, datestr: &str) ->
     Ok(())
 }
 
-/// `local_repo_env[]` (`environment.c:101-118`) — the repository-local environment
-/// variables `git` clears before it recurses into a submodule, printed one per line.
-/// The order is the array's, not alphabetical.
+/// `local_repo_env[]` (`environment.c:101-118`): the repository-local environment
+/// variables. `--local-env-vars` prints them, and `prepare_submodule_repo_env()`
+/// clears exactly this set before running a command against a *different*
+/// repository — see [`WithoutLocalRepoEnv`].
+const LOCAL_REPO_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// `prepare_submodule_repo_env()` (`submodule.c:189-206`) for an in-process reader.
+///
+/// git asks its questions about another repository by *spawning* a child, and the
+/// child's environment has every `local_repo_env[]` entry cleared — otherwise this
+/// repository's `$GIT_DIR` and `$GIT_WORK_TREE` would follow the command into a
+/// repository they do not describe. Reading that other repository in-process needs
+/// the same isolation: `gix`'s open path resolves `core.worktree` through a config
+/// layer that `$GIT_WORK_TREE` overrides, so without this the superproject one
+/// directory up came back wearing *this* repository's work tree.
+///
+/// The variables are restored on drop, including on an early return.
+struct WithoutLocalRepoEnv(Vec<(&'static str, std::ffi::OsString)>);
+
+impl WithoutLocalRepoEnv {
+    fn new() -> Self {
+        let saved: Vec<_> = LOCAL_REPO_ENV
+            .iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
+            .collect();
+        for (name, _) in &saved {
+            std::env::remove_var(name);
+        }
+        WithoutLocalRepoEnv(saved)
+    }
+}
+
+impl Drop for WithoutLocalRepoEnv {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            std::env::set_var(name, value);
+        }
+    }
+}
+
+/// `--local-env-vars`: [`LOCAL_REPO_ENV`] one per line, in the array's order rather
+/// than alphabetically.
 fn print_local_env_vars(out: &mut impl Write) -> Result<()> {
-    const LOCAL_REPO_ENV: &[&str] = &[
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_GRAFT_FILE",
-        "GIT_INDEX_FILE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_PREFIX",
-        "GIT_SHALLOW_FILE",
-        "GIT_COMMON_DIR",
-    ];
     for name in LOCAL_REPO_ENV {
         writeln!(out, "{name}")?;
     }
@@ -2542,11 +2805,19 @@ fn print_path(
         // would produce.
         match ctx.prefix.as_deref() {
             Some(prefix) if !ctx.different_commondir => {
-                let abs = ctx.realpath(path);
-                let base = ctx.root.join(prefix);
+                // Both operands go to `relative_path()` exactly as git holds them:
+                // the *stored* git-directory string on one side (see
+                // [`repo_gitdir_string`]) and git's own `prefix` on the other. That
+                // is what `have_same_root()` (`path.c:926-934`) is deciding on, and
+                // it is why the answer flips with how the repository was addressed:
+                // a discovered `.git` is the relative string `.git`, shares a root
+                // with the relative prefix `sub/`, and comes out `../.git`, while a
+                // `$GIT_DIR` that `set_git_dir(gitdirenv, 1)` realpath'd is absolute,
+                // shares no root with a relative prefix, and is handed back whole.
+                // Absolutizing either side here erases that distinction.
                 relative_path(
-                    abs.as_os_str().as_encoded_bytes(),
-                    Some(base.as_os_str().as_encoded_bytes()),
+                    path.as_os_str().as_encoded_bytes(),
+                    Some(prefix.as_bytes()),
                 )
             }
             _ => text,
@@ -2664,7 +2935,7 @@ fn relative_path(input: &[u8], prefix: Option<&[u8]>) -> Vec<u8> {
 /// plain checkout, `HEAD` in a bare repository (where the gitdir is `.` and
 /// `cleanup_path()` strips the `./`), and an absolute path in a linked worktree.
 fn git_path(repo: &gix::Repository, ctx: &PathCtx, name: &str) -> std::path::PathBuf {
-    let gitdir = gitdir_string(repo, ctx);
+    let gitdir = repo_gitdir_string(repo, ctx);
     let mut buf = format!("{}", gitdir.display());
     if !buf.is_empty() && !buf.ends_with('/') {
         buf.push('/');
@@ -2707,7 +2978,37 @@ fn gitdir_string(repo: &gix::Repository, _ctx: &PathCtx) -> std::path::PathBuf {
             let stored = read_gitfile(&env).unwrap_or(env);
             explicit_gitdir_string(repo, stored, &cwd)
         }
-        None => discovered_gitdir_string(repo, &cwd),
+        None => discovered_gitdir_string(repo, &cwd, false),
+    }
+}
+
+/// The string that is actually in `repo->gitdir`, which `--git-common-dir` and
+/// `--git-path` print and `--git-dir` does **not**.
+///
+/// `--git-dir` never reads the field: it prints `$GIT_DIR`, else `.git` when there
+/// is no prefix, else `<cwd>/.git` (`builtin/rev-parse.c:1037-1070`) — and that
+/// last fallback is why a plain checkout answers an absolute path from a
+/// subdirectory. The field itself is set only where `set_git_dir()` is called, and
+/// `setup_discovered_git_dir()` skips the call for the ordinary case:
+///
+/// ```c
+/// set_git_work_tree(repo, ".");
+/// if (strcmp(gitdir, DEFAULT_GIT_DIR_ENVIRONMENT))
+///         set_git_dir(repo, gitdir, 0);
+/// ```
+///
+/// (`setup.c:1238-1241`) — `gitdir` *is* `.git` there, so the field keeps its
+/// default `.git` however far the walk had to climb. That relative string is what
+/// makes `--git-common-dir` answer `../.git` from a subdirectory while `--git-dir`
+/// answers the absolute path in the very same invocation.
+///
+/// Everywhere else `set_git_dir()` does run, and it re-exports its result through
+/// `setenv(GIT_DIR_ENVIRONMENT, repo->gitdir, 1)`, so the field and `$GIT_DIR`
+/// agree and [`gitdir_string`]'s rules describe both.
+fn repo_gitdir_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
+    match std::env::var_os("GIT_DIR") {
+        Some(_) => gitdir_string(repo, ctx),
+        None => discovered_gitdir_string(repo, &setup_cwd(), true),
     }
 }
 
@@ -2795,6 +3096,7 @@ fn explicit_work_tree(
 fn discovered_gitdir_string(
     repo: &gix::Repository,
     cwd: &std::path::Path,
+    repo_field: bool,
 ) -> std::path::PathBuf {
     let git_dir = absolute(repo.git_dir());
     let dot_git = git_dir.file_name() == Some(std::ffi::OsStr::new(".git"));
@@ -2806,19 +3108,58 @@ fn discovered_gitdir_string(
     match root {
         Some(root) if dot_git && !inside_git_dir && cwd.starts_with(&root) => {
             let climbed = cwd != root;
-            let has_work_tree_override = std::env::var_os("GIT_WORK_TREE").is_some()
-                || repo.config_snapshot().string("core.worktree").is_some();
-            let stored: std::path::PathBuf =
-                if climbed { root.join(".git") } else { ".git".into() };
+            let has_work_tree_override = work_tree_override(repo);
+            // With a work-tree override the C realpaths the discovered name before
+            // handing over — `if (offset != cwd->len && !is_absolute_path(gitdir))
+            // gitdir = real_pathdup(gitdir, 1);` (`setup.c:1221-1222`) — and
+            // `setup_explicit_git_dir()` decides from there, so the field and
+            // `--git-dir` agree on that path.
+            //
+            // Without one, `set_git_dir()` is skipped entirely (the discovered name
+            // *is* `.git`), so `repo->gitdir` keeps that relative spelling however
+            // far the walk climbed. `--git-dir` reports the climb instead, through
+            // its own `<cwd>/.git` fallback — see [`repo_gitdir_string`].
+            let stored: std::path::PathBuf = if climbed && !(repo_field && !has_work_tree_override)
+            {
+                root.join(".git")
+            } else {
+                ".git".into()
+            };
             if has_work_tree_override {
                 return explicit_gitdir_string(repo, stored, cwd);
             }
             stored
         }
-        // `setup_bare_git_dir()`.
-        _ if cwd == git_dir => ".".into(),
-        _ => git_dir,
+        // `setup_bare_git_dir()`, which hands a work-tree override straight on:
+        //
+        // ```c
+        // if (getenv(GIT_WORK_TREE_ENVIRONMENT) || git_work_tree_cfg) {
+        //         gitdir = offset == cwd->len ? "." : xmemdupz(cwd->buf, offset);
+        //         if (chdir(cwd->buf)) die_errno(_("cannot come back to cwd"));
+        //         return setup_explicit_git_dir(repo, gitdir, cwd, repo_fmt, nongit_ok);
+        // }
+        // ```
+        //
+        // (`setup.c:1266-1274`), so standing in a `.git` whose work tree was named
+        // by `$GIT_WORK_TREE` stores the absolute path, not the `.` the un-handed
+        // arm would leave.
+        _ if cwd == git_dir => match work_tree_override(repo) {
+            true => explicit_gitdir_string(repo, ".".into(), cwd),
+            false => ".".into(),
+        },
+        _ => match work_tree_override(repo) {
+            true => explicit_gitdir_string(repo, git_dir.clone(), cwd),
+            false => git_dir,
+        },
     }
+}
+
+/// Whether a work tree was named independently of the git directory, which is the
+/// condition `setup_discovered_git_dir()` and `setup_bare_git_dir()` both open with
+/// before handing over to `setup_explicit_git_dir()`.
+fn work_tree_override(repo: &gix::Repository) -> bool {
+    std::env::var_os("GIT_WORK_TREE").is_some()
+        || repo.config_snapshot().string("core.worktree").is_some()
 }
 
 /// ```c
@@ -2847,9 +3188,20 @@ fn adjust_git_path(repo: &gix::Repository, ctx: &PathCtx, buf: &mut String, git_
     let replace_whole = |buf: &mut String, with: std::ffi::OsString| {
         *buf = std::path::PathBuf::from(with).display().to_string();
     };
+    // `repo->graft_file`, `repo->objects->odb->path` and `repo->index_file` are all
+    // `expand_base_dir(&out, <env>, base_dir, def_in)` (`repository.c:33-41` and
+    // `:75-90`): the environment variable when it is set, and otherwise
+    // `<base_dir>/<def_in>` — where the base directory is the **common** directory
+    // for the graft file and the object directory, and the git directory only for
+    // the index. So these three arms relocate a linked worktree's paths back to the
+    // main checkout even with no environment variable in play, which is why
+    // `--git-path objects/info/alternates` in a worktree answers
+    // `<main>/.git/objects/info/alternates` and not the worktree's private
+    // directory.
     if base == "info/grafts" {
-        if let Some(v) = std::env::var_os("GIT_GRAFT_FILE") {
-            replace_whole(buf, v);
+        match std::env::var_os("GIT_GRAFT_FILE") {
+            Some(v) => replace_whole(buf, v),
+            None => *buf = join_str(&gitdir_common_string(repo, ctx), "info/grafts"),
         }
         return;
     }
@@ -2861,9 +3213,16 @@ fn adjust_git_path(repo: &gix::Repository, ctx: &PathCtx, buf: &mut String, git_
     }
     // `dir_prefix(base, "objects")`: the name itself or anything under it.
     if base == "objects" || base.starts_with("objects/") {
-        if let Some(v) = std::env::var_os("GIT_OBJECT_DIRECTORY") {
-            let rest = &base["objects".len()..];
-            *buf = format!("{}{}", std::path::PathBuf::from(v).display(), rest);
+        let rest = &base["objects".len()..];
+        match std::env::var_os("GIT_OBJECT_DIRECTORY") {
+            Some(v) => *buf = format!("{}{}", std::path::PathBuf::from(v).display(), rest),
+            None => {
+                *buf = format!(
+                    "{}{}",
+                    join_str(&gitdir_common_string(repo, ctx), "objects"),
+                    rest
+                );
+            }
         }
         return;
     }
@@ -2885,6 +3244,16 @@ fn adjust_git_path(repo: &gix::Repository, ctx: &PathCtx, buf: &mut String, git_
         replaced.push_str(&base);
         *buf = replaced;
     }
+}
+
+/// `xstrfmt("%s/%s", base_dir, def_in)` (`expand_base_dir()`, `repository.c:33-41`):
+/// a plain textual join, so a relative base directory stays relative.
+fn join_str(base: &std::path::Path, name: &str) -> String {
+    let base = base.display().to_string();
+    if base.is_empty() {
+        return name.to_string();
+    }
+    format!("{}/{name}", base.trim_end_matches('/'))
 }
 
 /// The string git holds in `repo->commondir` (`repo_setup_env()`, `repository.c`).
@@ -2916,7 +3285,7 @@ fn gitdir_common_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::Pat
     }
     match commondir_file_target(&absolute(repo.git_dir())) {
         Some(target) => target,
-        None => gitdir_string(repo, ctx),
+        None => repo_gitdir_string(repo, ctx),
     }
 }
 

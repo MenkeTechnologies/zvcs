@@ -245,7 +245,16 @@ fn set_symref(
     }
 
     let name_full = full_name(name)?;
-    let target_full = full_name(target)?;
+    // `check_refname_format(argv[1], REFNAME_ALLOW_ONELEVEL)` (builtin/symbolic-ref.c:120)
+    // is git's only constraint on the target, and the `name_partial` check above
+    // is its port — so a slash-free lower-case target such as a stray 64-hex
+    // string is a legal symref target that stock writes and reads back happily.
+    // `FullName` is stricter than that (a one-level name has to be all upper
+    // case, like `HEAD`), so a target gitoxide cannot spell is written straight
+    // into the loose ref file instead of through the transaction.
+    let Ok(target_full) = FullName::try_from(target) else {
+        return set_symref_raw(repo, name_full.as_ref(), target, message, prefer_symlink);
+    };
 
     // Capture the pre-edit resolution so the reflog line carries the same
     // `<old> <new>` pair git writes. A target that resolves to no object is
@@ -282,6 +291,59 @@ fn set_symref(
             &new,
             message.unwrap_or_default(),
         )?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `create_symref_locked()` for a target the reference transaction cannot carry.
+///
+/// ```c
+/// if (!fdopen_lock_file(&lock->lk, "w"))
+///         return error("unable to fdopen %s: %s", ...);
+/// update_symref_reflog(refs, lock, refname, target, logmsg);
+/// fprintf(get_lock_file_fp(&lock->lk), "ref: %s\n", target);
+/// if (commit_ref(lock) < 0)
+///         return error("unable to write symref for %s: %s", refname, strerror(errno));
+/// ```
+///
+/// (refs/files-backend.c:1900-1921) — the file is the whole write, and the reflog
+/// line only happens when the target resolves to an object, which a target this
+/// path is reached for does not.
+fn set_symref_raw(
+    repo: &gix::Repository,
+    name: &FullNameRef,
+    target: &str,
+    message: Option<&str>,
+    prefer_symlink: bool,
+) -> Result<ExitCode> {
+    let previous = leaf_object_id(repo, name.as_bstr())?;
+
+    // `files_ref_path()`: `HEAD` and the other per-worktree names live in the
+    // worktree's git dir, `refs/…` in the common one.
+    let base = match name.category() {
+        Some(
+            Category::PseudoRef
+            | Category::Bisect
+            | Category::Rewritten
+            | Category::WorktreePrivate,
+        ) => repo.git_dir(),
+        _ => repo.common_dir(),
+    };
+    let path = base.join(gix::path::from_bstr(name.as_bstr()));
+    let mut lock = gix::lock::File::acquire_to_update_resource(
+        &path,
+        gix::lock::acquire::Fail::Immediately,
+        Some(base.to_path_buf()),
+    )?;
+    lock.with_mut(|file| writeln!(file, "ref: {target}"))?;
+    lock.commit()?;
+
+    if prefer_symlink {
+        write_ref_symlink(repo, name, target);
+    }
+
+    if let Some(new) = leaf_object_id(repo, BStr::new(target)).unwrap_or(None) {
+        append_reflog(repo, name, previous, &new, message.unwrap_or_default())?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -510,7 +572,7 @@ fn valid_refname(name: &str) -> bool {
 /// The object id stored in the leaf of `name`'s symref chain, if any. This is
 /// the raw id of the terminal reference — annotated tags are not peeled, which
 /// is what git records in the reflog.
-fn leaf_object_id(repo: &gix::Repository, name: &BStr) -> Result<Option<ObjectId>> {
+pub(super) fn leaf_object_id(repo: &gix::Repository, name: &BStr) -> Result<Option<ObjectId>> {
     let mut current = name.to_owned();
     for _ in 0..=SYMREF_MAXDEPTH {
         // A leaf whose file will not parse resolves to nothing, exactly as one
@@ -600,8 +662,12 @@ pub(super) fn append_reflog(
 ) -> Result<()> {
     use gix::refs::store::WriteReflog;
 
+    // `log_ref_setup()` (refs/files-backend.c:1859) only lets the policy decide whether a
+    // *missing* log may be created; when it may not, the file is still opened `O_APPEND` and
+    // an existing log gains the line. `core.logAllRefUpdates = false` therefore keeps
+    // appending to logs that already exist.
     let force_create = match repo.refs.write_reflog {
-        WriteReflog::Disable => return Ok(()),
+        WriteReflog::Disable => false,
         WriteReflog::Always => true,
         WriteReflog::Normal => auto_creates_reflog(name),
     };
@@ -649,15 +715,16 @@ pub(super) fn append_reflog(
     Ok(())
 }
 
-/// git's default `core.logAllRefUpdates` set: `HEAD` plus the branch, remote,
-/// note and worktree ref hierarchies.
+/// git's default `core.logAllRefUpdates` set: `HEAD` plus the branch, remote and
+/// note ref hierarchies — `should_autocreate_reflog()`'s `LOG_REFS_NORMAL` arm
+/// (refs.c:1062). `refs/worktree/` is not in it, so a worktree-private ref never
+/// gets a log created for it.
 fn auto_creates_reflog(name: &FullNameRef) -> bool {
     let name = name.as_bstr();
     name == BStr::new("HEAD")
         || name.starts_with(b"refs/heads/")
         || name.starts_with(b"refs/remotes/")
         || name.starts_with(b"refs/notes/")
-        || name.starts_with(b"refs/worktree/")
 }
 
 /// Convert a literal ref name into a `FullName`, which is what the reference

@@ -49,8 +49,24 @@
 //! git's other branch (`refname_is_safe()`), which refuses such a name, and no
 //! reflog is autocreated for one.
 //!
+//! Every `parse_cmd_*` that takes arguments ends with
+//! `if (*next != line_termination) die("<cmd> %s: extra input: %s", refname, next)`,
+//! so a final line the stream never terminated is refused and nothing is
+//! applied: `create refs/heads/g HEAD` without its `\n` is
+//! `fatal: create refs/heads/g: extra input: `. The argless verbs never get
+//! that far — the command table demands the terminator right after the prefix,
+//! so an unterminated `start` is `unknown command` instead.
+//!
 //! Not covered: `--create-reflog` on a one-level name, which would have to write
 //! `$GIT_DIR/logs/<name>` by hand; it keeps the bad-name refusal instead.
+//!
+//! Also not covered: the `HEAD` reflog line a `verify` of the checked-out branch
+//! leaves behind. `ref_transaction_verify()` (refs.c) passes `new_oid = NULL`, so
+//! `split_head_update()` mirrors a *null* new value onto `HEAD` and
+//! `.git/logs/HEAD` gains `<old> <null>` — while `update <ref> <X> <X>` on the
+//! same ref, which is otherwise indistinguishable once staged, gains `<X> <X>`.
+//! `gix_ref`'s `Change::Update` has no way to say "no new value", so the two
+//! cannot be told apart at the point the mirror is built.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::Read;
@@ -724,12 +740,139 @@ struct Batch {
     edits: Vec<RefEdit>,
     /// Refs a `verify` with a zero/absent old value requires to not exist.
     absent: Vec<String>,
+    /// The reflog lines a `symref-create`/`symref-update` owes, paired with the
+    /// index of the edit in `edits` that has to succeed first. gitoxide writes no
+    /// reflog for a symbolic-target update at all (its transaction has no oid to
+    /// log), so [`SymrefLog`] carries what git's `parse_and_write_reflog()` would
+    /// have written and [`apply`] appends it once the edit has landed.
+    symref_logs: Vec<(usize, SymrefLog)>,
 }
 
 impl Batch {
     fn is_empty(&self) -> bool {
         self.edits.is_empty() && self.absent.is_empty()
     }
+}
+
+/// The reflog lines one `symref-create`/`symref-update` leaves behind.
+///
+/// `ref_transaction_prepare()` turns a single symref command into a *chain* of
+/// updates: `split_symref_update()` (refs/files-backend.c:2502-2551, git 2.55.0)
+/// re-points the update at the symref's referent and demotes the original to
+/// `REF_LOG_ONLY | REF_NO_DEREF`, and repeats for as long as the referent is
+/// itself symbolic. Every one of those updates still carries `new_target`, so
+/// every one of them earns a reflog line — which is why `chain` is a list and not
+/// a single name.
+struct SymrefLog {
+    /// One entry per update in that chain, outermost first: the ref's full name
+    /// and the object id it resolved to *before* the transaction, which is the
+    /// `lock->old_oid` `parse_and_write_reflog()` opens its line with.
+    chain: Vec<(FullName, Option<ObjectId>)>,
+    /// `split_head_update()`'s extra `REF_LOG_ONLY` update for `HEAD`
+    /// (refs/files-backend.c:2446-2491): present when the ref at the end of the
+    /// chain is the one `HEAD` points at. It is added with `&update->new_oid` and
+    /// a NULL `new_target`, and a symref update never sets `new_oid`, so this
+    /// line's new value is the null id rather than the resolved target.
+    head_mirror: Option<Option<ObjectId>>,
+    /// The `new_target` every chain line resolves for its new value.
+    target: FullName,
+    /// `update->msg` — `update-ref -m <reason>`, empty without one.
+    message: String,
+}
+
+/// `refs_resolve_ref_unsafe(refs, "HEAD", RESOLVE_REF_NO_RECURSE, …)` — the
+/// `head_ref` `ref_transaction_prepare()` compares every update against. `None`
+/// when `HEAD` is detached, which is when `split_head_update()` has nothing to
+/// mirror onto.
+fn head_referent(repo: &gix::Repository) -> Option<FullName> {
+    repo.refs.try_find("HEAD").ok().flatten().and_then(|r| match r.target {
+        Target::Symbolic(name) => Some(name),
+        Target::Object(_) => None,
+    })
+}
+
+/// Plan the reflog [`apply`] owes for one `symref-create`/`symref-update`.
+///
+/// Reads the pre-transaction state only: the old ids the lines open with are the
+/// ones the ref store holds now, and the new id is resolved at write time the way
+/// `parse_and_write_reflog()` resolves `update->new_target` during the commit.
+fn plan_symref_log(
+    repo: &gix::Repository,
+    name: &FullName,
+    target: &FullName,
+    deref: bool,
+    msg: Option<&str>,
+) -> Result<SymrefLog> {
+    use gix::bstr::ByteSlice;
+
+    let head_ref = head_referent(repo);
+
+    let mut chain = Vec::new();
+    let mut current = name.clone();
+    // git's `SYMREF_MAXDEPTH`; a cycle stops splitting rather than looping.
+    for _ in 0..5 {
+        let old = super::symbolic_ref::leaf_object_id(repo, current.as_bstr())?;
+        chain.push((current.clone(), old));
+        if !deref {
+            break;
+        }
+        // A split happens only while the ref actually *is* a symref.
+        let referent = repo
+            .refs
+            .try_find(current.as_bstr().to_str_lossy().as_ref())
+            .ok()
+            .flatten();
+        match referent.map(|r| r.target) {
+            Some(Target::Symbolic(next)) => current = next,
+            _ => break,
+        }
+    }
+
+    // `split_head_update()` fires for the one update in the chain that is not
+    // `REF_LOG_ONLY` — the last — and never when `split_symref_update()` marked
+    // the chain `REF_UPDATE_VIA_HEAD`, which it does exactly when the command
+    // named `HEAD` and was then split.
+    let via_head = chain.len() > 1 && chain[0].0.as_bstr() == b"HEAD".as_bstr();
+    let head_mirror = match (&head_ref, chain.last()) {
+        (Some(head_ref), Some((last, _))) if !via_head && last == head_ref => Some(
+            super::symbolic_ref::leaf_object_id(repo, b"HEAD".as_bstr())?,
+        ),
+        _ => None,
+    };
+
+    Ok(SymrefLog {
+        chain,
+        head_mirror,
+        target: target.clone(),
+        message: msg.unwrap_or_default().to_string(),
+    })
+}
+
+/// Write one planned symref reflog, after its edit has landed.
+///
+/// ```c
+/// if (update->new_target) {
+///         if (!refs_resolve_ref_unsafe(&refs->base, update->new_target,
+///                                      RESOLVE_REF_READING, &update->new_oid, NULL))
+///                 return 0;
+/// }
+/// ```
+/// (refs/files-backend.c:3101-3116, git 2.55.0) — a dangling target is not logged
+/// at all. The `HEAD` mirror is exempt because `split_head_update()` gives it no
+/// `new_target`, so it is written with the null id whatever the target resolves to.
+fn write_symref_log(repo: &gix::Repository, plan: &SymrefLog) -> Result<()> {
+    let new = super::symbolic_ref::leaf_object_id(repo, plan.target.as_bstr())?;
+    if let Some(new) = new {
+        for (name, old) in &plan.chain {
+            super::symbolic_ref::append_reflog(repo, name.as_ref(), *old, &new, &plan.message)?;
+        }
+    }
+    if let Some(old) = plan.head_mirror {
+        let zero = ObjectId::null(repo.object_hash());
+        let head = refname("HEAD")?;
+        super::symbolic_ref::append_reflog(repo, head.as_ref(), old, &zero, &plan.message)?;
+    }
+    Ok(())
 }
 
 /// The `--stdin` transaction state, mirroring git's `enum update_refs_state`.
@@ -937,6 +1080,11 @@ fn run_stdin(
             None => tokenize(raw.strip_suffix(terminator).unwrap_or(&raw))?,
         };
         let args = &fields[1..];
+        // Whether `*next` will land on `line_termination` once the arguments are
+        // read, which is what every `parse_cmd_*` asserts before it stages
+        // anything. `-z` records come out of [`split_nul_records`] with their NUL
+        // restored, so only the line form can ever be short one.
+        let terminated = raw.ends_with(terminator);
 
         // State guard, matching git's per-state restrictions. Each violation is a
         // fatal error exiting 128.
@@ -992,6 +1140,19 @@ fn run_stdin(
                 if opt != "no-deref" {
                     return fatal(anyhow!("unknown option: {opt}"));
                 }
+                // `parse_cmd_option()` (builtin/update-ref.c:601) accepts the option
+                // only when the terminator follows it:
+                //
+                //     if (skip_prefix(next, "no-deref", &rest) && *rest == line_termination)
+                //             update_flags |= REF_NO_DEREF;
+                //     else
+                //             die("option unknown: %s", next);
+                //
+                // so a last line the stream never terminated is an unknown option
+                // rather than a `no-deref` that takes effect.
+                if !terminated {
+                    return fatal(anyhow!("option unknown: {opt}"));
+                }
                 next_no_deref = true;
                 consumed_option = true;
             }
@@ -1017,6 +1178,27 @@ fn run_stdin(
                 }
             }
             _ => unreachable!("categorize accepts exactly this command set"),
+        }
+
+        // Every `parse_cmd_*` that takes arguments closes with
+        //
+        //     if (*next != line_termination)
+        //             die("<cmd> %s: extra input: %s", refname, next);
+        //
+        // (builtin/update-ref.c:325, 382, 421, 452, 488, 518, 546, 581). A final
+        // line the stream never terminated leaves `*next` on the string's own NUL
+        // rather than on the newline, so the batch is refused and the remainder
+        // interpolated is empty: `create refs/heads/g HEAD` without its `\n` is
+        // `fatal: create refs/heads/g: extra input: `. Staging first and refusing
+        // here is the same observable order git has, because the batch only
+        // reaches the ref store at `commit` or at end of input, and because the
+        // value errors `parse_next_oid()` raises come before this check in the C
+        // too. The argless verbs never arrive: the command table demands the
+        // terminator right after their prefix, so [`match_command`] has already
+        // called an unterminated `start` an unknown command.
+        if !terminated && cmd != "option" {
+            let refname = args.first().map(String::as_str).unwrap_or_default();
+            return fatal(anyhow!("{cmd} {refname}: extra input: "));
         }
 
         if !consumed_option {
@@ -1053,16 +1235,25 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
         if let Err(e) = repo.edit_references(batch.edits) {
             crate::git_fatal!("{}", lock_error(repo, &e));
         }
+        for (_, plan) in &batch.symref_logs {
+            write_symref_log(repo, plan)?;
+        }
         return Ok(());
     }
     let zero = ObjectId::null(repo.object_hash());
-    for edit in batch.edits {
+    for (index, edit) in batch.edits.into_iter().enumerate() {
         let name = edit.name.to_string();
         let (new, old) = edit_oids(&edit, &zero);
         if let Err(e) = repo.edit_reference(edit) {
             let msg = lock_error(repo, &e);
             eprintln!("error: {msg}");
             println!("rejected {name} {new} {old} {msg}");
+            continue;
+        }
+        // `--batch-updates` runs each update as its own transaction, so a
+        // symref's reflog is owed only when *its* update was the one that landed.
+        if let Some((_, plan)) = batch.symref_logs.iter().find(|(at, _)| *at == index) {
+            write_symref_log(repo, plan)?;
         }
     }
     Ok(())
@@ -1174,21 +1365,80 @@ fn stage_oid_command(
             // `verify` is an update to the value it already has: gitoxide skips
             // the reflog when old == new, so nothing is logged, as in git.
             match parse_slot(repo, slot(1), nul, Slot::Old)? {
-                Val::Oid(id) => batch.edits.push(RefEdit {
-                    change: Change::Update {
-                        log: log_change(create_reflog, msg),
-                        expected: PreviousValue::MustExistAndMatch(Target::Object(id)),
-                        new: Target::Object(id),
-                    },
-                    name: refname(name)?,
-                    deref,
-                }),
+                Val::Oid(id) => {
+                    batch.edits.push(RefEdit {
+                        change: Change::Update {
+                            log: log_change(create_reflog, msg),
+                            expected: PreviousValue::MustExistAndMatch(Target::Object(id)),
+                            new: Target::Object(id),
+                        },
+                        name: refname(name)?,
+                        deref,
+                    });
+                    stage_verify_head_mirror(repo, batch, name, create_reflog, msg)?;
+                }
                 // Zero or missing old value: the ref must not exist.
                 Val::Zero | Val::Missing => batch.absent.push(name.to_string()),
             }
         }
         _ => unreachable!("caller filters the command set"),
     }
+    Ok(())
+}
+
+/// `split_head_update()`'s `HEAD` mirror for a `verify` of the checked-out branch.
+///
+/// ```c
+/// int ref_transaction_verify(struct ref_transaction *transaction,
+///                            const char *refname, const struct object_id *old_oid,
+///                            const char *old_target, unsigned int flags, struct strbuf *err)
+/// {
+///         return ref_transaction_update(transaction, refname, NULL, old_oid,
+///                                       NULL, old_target, flags | REF_NO_DEREF, NULL, err);
+/// }
+/// ```
+///
+/// (refs.c) — `new_oid` is NULL, so `REF_HAVE_NEW` never gets set and
+/// `update->new_oid` stays the null id. `split_head_update()` then mirrors *that*
+/// (`&update->new_oid`, refs/files-backend.c:2476-2479), which is why verifying the
+/// branch `HEAD` points at leaves `<old> <null>` in `.git/logs/HEAD` rather than
+/// the `<old> <old>` a real no-op update would leave.
+///
+/// gitoxide's `Change::Update` has no way to spell "no new value", so its own
+/// mirror copies the value the verify was written with. Staging `HEAD` explicitly
+/// takes the mirror's place — the transaction already carries `HEAD`, so
+/// `split_head_update()`'s port skips adding a second one — and `RefLog::Only`
+/// keeps the reference itself untouched. `PreviousValue::Any` is what the old id
+/// comes from: `prepare` resolves a symbolic `HEAD` down to its leaf and records it
+/// as the edit's `leaf_referent_previous_oid`, which is the same `lock->old_oid`
+/// git opens the line with.
+fn stage_verify_head_mirror(
+    repo: &gix::Repository,
+    batch: &mut Batch,
+    name: &str,
+    create_reflog: bool,
+    msg: Option<&str>,
+) -> Result<()> {
+    let head = refname("HEAD")?;
+    if head_referent(repo) != Some(refname(name)?) {
+        return Ok(());
+    }
+    if batch.edits.iter().any(|e| e.name == head) {
+        return Ok(());
+    }
+    batch.edits.push(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::Only,
+                force_create_reflog: create_reflog,
+                message: msg.unwrap_or_default().into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(ObjectId::null(repo.object_hash())),
+        },
+        name: head,
+        deref: false,
+    });
     Ok(())
 }
 
@@ -1228,13 +1478,16 @@ fn stage_symref_command(
     match cmd {
         "symref-create" => {
             let target = slot(1).ok_or_else(|| anyhow!("symref-create: missing <new-target>"))?;
+            let (name, target) = (refname(name)?, refname(target)?);
+            let plan = plan_symref_log(repo, &name, &target, deref, msg)?;
+            batch.symref_logs.push((batch.edits.len(), plan));
             batch.edits.push(RefEdit {
                 change: Change::Update {
                     log: log_change(create_reflog, msg),
                     expected: PreviousValue::MustNotExist,
-                    new: Target::Symbolic(refname(target)?),
+                    new: Target::Symbolic(target),
                 },
-                name: refname(name)?,
+                name,
                 deref,
             });
         }
@@ -1254,13 +1507,16 @@ fn stage_symref_command(
                 },
                 Some(kind) => crate::git_fatal!("symref-update {name}: invalid old value kind '{kind}'"),
             };
+            let (name, target) = (refname(name)?, refname(target)?);
+            let plan = plan_symref_log(repo, &name, &target, deref, msg)?;
+            batch.symref_logs.push((batch.edits.len(), plan));
             batch.edits.push(RefEdit {
                 change: Change::Update {
                     log: log_change(create_reflog, msg),
                     expected,
-                    new: Target::Symbolic(refname(target)?),
+                    new: Target::Symbolic(target),
                 },
-                name: refname(name)?,
+                name,
                 deref,
             });
         }

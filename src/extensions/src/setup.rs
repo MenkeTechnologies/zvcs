@@ -16,9 +16,46 @@ pub fn realpath(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
+/// `strbuf_realpath()` in its forgiving form: resolve the longest prefix of `path`
+/// that exists and keep the rest verbatim.
+///
+/// `repo_set_worktree()` stores `real_pathdup(path, 1)` (`repository.c:112`), and
+/// `strbuf_realpath()` resolves symlinks only through the components that are
+/// actually there — a work tree that does not exist yet still gets a resolved,
+/// absolute name rather than no name at all. `GIT_WORK_TREE=nosuch git rev-parse
+/// --show-toplevel` prints `<cwd>/nosuch`; refusing to resolve it turned that into
+/// `fatal: this operation must be run in a work tree`.
+pub fn realpath_forgiving(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_owned(), |cwd| cwd.join(path))
+    };
+    if let Ok(resolved) = std::fs::canonicalize(&absolute) {
+        return resolved;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut head = absolute.clone();
+    while let Some(parent) = head.parent().map(Path::to_path_buf) {
+        let Some(name) = head.file_name().map(std::ffi::OsString::from) else {
+            break;
+        };
+        head = parent;
+        tail.push(name);
+        if let Ok(resolved) = std::fs::canonicalize(&head) {
+            let mut out = resolved;
+            for name in tail.iter().rev() {
+                out.push(name);
+            }
+            return out;
+        }
+    }
+    absolute
+}
+
 /// The work tree, symlink-resolved, or `None` when the repository has none.
 fn work_tree(repo: &gix::Repository) -> Option<PathBuf> {
-    std::fs::canonicalize(repo.workdir()?).ok()
+    Some(realpath_forgiving(repo.workdir()?))
 }
 
 /// git's `startup_info->prefix`: the path from the top of the work tree down to
@@ -174,6 +211,35 @@ fn is_inside_dir(dir: &Path) -> bool {
         .is_some_and(|cwd| cwd.starts_with(dir))
 }
 
+/// The directory git is standing in by the time a command asks
+/// `is_inside_git_dir()` — which is not always the one the process was started in.
+///
+/// `setup_explicit_git_dir()` ends with
+///
+/// ```c
+/// offset = dir_inside_of(cwd->buf, worktree);
+/// if (offset >= 0) {      /* cwd inside worktree? */
+///         set_git_dir(gitdirenv, 1);
+///         if (chdir(worktree))
+///                 die_errno(_("cannot chdir to '%s'"), worktree);
+/// ```
+///
+/// (setup.c:960-971), and `setup_discovered_git_dir()` states the same conclusion
+/// as a pair of assignments (`inside_git_dir = 0; inside_work_tree = 1;`,
+/// setup.c:1014-1015). So a command started *below* the top of the work tree
+/// answers both questions from the top, never from where the user typed.
+///
+/// It only shows up where the two directories overlap: `GIT_DIR=. GIT_WORK_TREE=<repo>`
+/// run from `<repo>/.git` is inside the git directory as the shell sees it and
+/// outside it as git does, because git moved to `<repo>` first.
+fn setup_cwd(repo: &gix::Repository) -> Option<PathBuf> {
+    let cwd = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
+    Some(match work_tree(repo) {
+        Some(top) if cwd.starts_with(&top) => top,
+        _ => cwd,
+    })
+}
+
 /// git's `is_inside_git_dir()` (setup.c:472-478): whether the cwd is the git
 /// directory or below it.
 /// `git_path()`'s rendering of a path inside the git directory.
@@ -199,7 +265,8 @@ pub fn git_path_display(repo: &gix::Repository, path: &Path) -> String {
 }
 
 pub fn is_inside_git_dir(repo: &gix::Repository) -> bool {
-    is_inside_dir(&realpath(repo.git_dir()))
+    let git_dir = realpath(repo.git_dir());
+    setup_cwd(repo).is_some_and(|cwd| cwd.starts_with(&git_dir))
 }
 
 /// git's `is_inside_work_tree()` (setup.c:480-494): whether the cwd sits in the
@@ -1037,6 +1104,114 @@ pub fn object_directory_gate(sub: &str) -> Option<ExitCode> {
     // named: `$GIT_DIR` is the explicit form and reports the directory it was
     // handed (setup.c:1127-1133), everything else walked up and hit the ceiling
     // (setup.c:1966-1969).
+    let msg = match std::env::var_os("GIT_DIR") {
+        Some(git_dir) => {
+            format!("not a git repository: '{}'", Path::new(&git_dir).display())
+        }
+        None => crate::fatal::no_repository_walked(),
+    };
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
+/// `setup_explicit_git_dir()`'s `core.worktree` arm (setup.c:929-944):
+///
+/// ```c
+/// else if (git_work_tree_cfg) { /* #6, #14 */
+///         if (is_absolute_path(git_work_tree_cfg))
+///                 set_git_work_tree(git_work_tree_cfg);
+///         else {
+///                 char *core_worktree;
+///                 if (chdir(gitdirenv))
+///                         die_errno(_("cannot chdir to '%s'"), gitdirenv);
+///                 if (chdir(git_work_tree_cfg))
+///                         die_errno(_("cannot chdir to '%s'"), git_work_tree_cfg);
+///                 core_worktree = xgetcwd();
+///                 …
+/// ```
+///
+/// A *relative* `core.worktree` is resolved by actually walking there, so a value
+/// naming a directory that does not exist is fatal for every command, not merely
+/// ignored: `git rev-parse --show-toplevel` in a repository whose config says
+/// `worktree = nosuch` prints nothing and dies with
+/// `cannot chdir to 'nosuch': No such file or directory`.
+///
+/// The arm is only reached when `$GIT_WORK_TREE` named nothing (it wins outright)
+/// and `core.bare` is not true (that arm returns before this one, with a warning).
+/// An absolute value is installed without a `chdir` and so cannot fail here.
+///
+/// Returns the message git would `die_errno()` with, or `None` to continue.
+///
+/// Callers hold an already-opened repository, so this is a check the verb makes
+/// rather than a gate in `lib.rs`: the git directory it needs is not known until
+/// discovery has run.
+pub fn core_worktree_chdir_error(repo: &gix::Repository) -> Option<String> {
+    if std::env::var_os("GIT_WORK_TREE").is_some() {
+        return None;
+    }
+    let config = repo.config_snapshot();
+    if config.boolean("core.bare") == Some(true) {
+        return None;
+    }
+    let value = config.string("core.worktree")?;
+    let value = value.to_string();
+    let path = Path::new(&value);
+    if value.is_empty() || path.is_absolute() {
+        return None;
+    }
+    let target = repo.git_dir().join(path);
+    match std::fs::read_dir(&target) {
+        Ok(_) => None,
+        Err(err) => Some(format!(
+            "cannot chdir to '{value}': {}",
+            crate::external::strerror(&err)
+        )),
+    }
+}
+
+/// `$GIT_COMMON_DIR`'s half of `is_git_directory()` (setup.c:433-447).
+///
+/// ```c
+/// strbuf_reset(&path);
+/// get_common_dir(&path, suspect);
+/// len = path.len;
+///
+/// /* Check non-worktree-related signatures */
+/// if (getenv(DB_ENVIRONMENT)) {
+///         if (access(getenv(DB_ENVIRONMENT), X_OK)) goto done;
+/// } else {
+///         strbuf_setlen(&path, len);
+///         strbuf_addstr(&path, "/objects");
+///         if (access(path.buf, X_OK)) goto done;
+/// }
+///
+/// strbuf_setlen(&path, len);
+/// strbuf_addstr(&path, "/refs");
+/// if (access(path.buf, X_OK)) goto done;
+/// ```
+///
+/// `get_common_dir()` answers `$GIT_COMMON_DIR` outright when it is set, so the
+/// `objects` and `refs` that decide whether a `.git` is a repository are looked for
+/// **there**, not in the directory being tested. A variable naming a directory
+/// without them makes every candidate fail — the walk climbs to the ceiling and
+/// reports a failed search, exactly as [`object_directory_gate`] does for the other
+/// variable in the same test.
+///
+/// Returns the exit code to leave with, or `None` to continue.
+pub fn common_dir_gate(sub: &str) -> Option<ExitCode> {
+    if crate::NO_SETUP_VERBS.contains(&sub) {
+        return None;
+    }
+    let common = PathBuf::from(std::env::var_os("GIT_COMMON_DIR")?);
+    // `$GIT_OBJECT_DIRECTORY` replaces the `objects` half; [`object_directory_gate`]
+    // has already refused an unusable one, so only the `refs` half can fail here.
+    let objects = match std::env::var_os("GIT_OBJECT_DIRECTORY") {
+        Some(v) => PathBuf::from(v),
+        None => common.join("objects"),
+    };
+    if access_x_ok(&objects) && access_x_ok(&common.join("refs")) {
+        return None;
+    }
     let msg = match std::env::var_os("GIT_DIR") {
         Some(git_dir) => {
             format!("not a git repository: '{}'", Path::new(&git_dir).display())

@@ -865,6 +865,16 @@ fn parse_args(
             if rest.is_empty() || repo.rev_parse(rest).is_err() {
                 return Err(Fatal::die(format!("bad revision '{a}'")));
             }
+            // `verify_non_filename()` (revision.c:2156-2157) with the `^` already
+            // consumed, so `git whatchanged ^dual` is as ambiguous as `dual`.
+            // `setup_revisions()` scans the whole vector for the separator
+            // (revision.c:2830-2854), so a `--` written later still stands the
+            // check down — the running flag above would not see it yet.
+            if !args.iter().any(|x| x == "--") {
+                if let Some(message) = crate::setup::verify_non_filename(repo, rest) {
+                    return Err(Fatal::die(message));
+                }
+            }
             accept_rev(repo, &st, a, &mut p)?;
             accepted.push(a);
             i += 1;
@@ -877,6 +887,17 @@ fn parse_args(
         // [`crate::objname::is_parent_directory_pathspec`].
         let parent_dir = crate::objname::is_parent_directory_pathspec(a, args.iter().any(|x| x == "--"));
         if !parent_dir && !a.is_empty() && repo.rev_parse(a).is_ok() {
+            // `verify_non_filename()`, on the operand as written: a range keeps its
+            // separator (`handle_dotdot_1()` puts it back, revision.c:2024-2028),
+            // so only a token that is itself a path is ambiguous. The separator is
+            // looked for across the whole vector, as `setup_revisions()` does.
+            if !args.iter().any(|x| x == "--") {
+                if let Some(message) =
+                    crate::setup::verify_non_filename(repo, super::log::non_filename_name(a))
+                {
+                    return Err(Fatal::die(message));
+                }
+            }
             accept_rev(repo, &st, a, &mut p)?;
             accepted.push(a);
             i += 1;

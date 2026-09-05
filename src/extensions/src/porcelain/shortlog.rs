@@ -770,7 +770,13 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             RevAction::Not => negate = !negate,
             RevAction::Exclude(pattern) => excludes.push(pattern.clone()),
             RevAction::Refs { kind, pattern } => {
-                let selected = select_refs(repo, *kind, pattern.as_deref(), &excludes)?;
+                let selected = match select_refs(repo, *kind, pattern.as_deref(), &excludes)? {
+                    Ok(ids) => ids,
+                    Err(name) => {
+                        eprintln!("fatal: bad object {name}");
+                        return Ok(ExitCode::from(128));
+                    }
+                };
                 let sink = if negate { &mut hidden } else { &mut tips };
                 sink.extend(selected);
                 excludes.clear();
@@ -851,6 +857,14 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 if let Some(rest) = spec.strip_prefix('^') {
                     match resolve(repo, rest) {
                         Some(id) => {
+                            // `verify_non_filename()` (revision.c:2156-2157) with
+                            // the `^` already consumed by
+                            // `handle_revision_arg_1()`.
+                            if let Some(code) =
+                                super::log::non_filename_fatal(repo, rest, seen_dashdash)
+                            {
+                                return Ok(code);
+                            }
                             if negate {
                                 tips.push(id)
                             } else {
@@ -869,6 +883,12 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         }
                         return Ok(fatal_rev(repo, spec));
                     };
+                    // `handle_dotdot_1()` restores the separator before its own
+                    // `verify_non_filename()` (revision.c:2024-2028), so the whole
+                    // token is checked rather than either endpoint.
+                    if let Some(code) = super::log::non_filename_fatal(repo, spec, seen_dashdash) {
+                        return Ok(code);
+                    }
                     // `a...b` is both tips with every merge base excluded.
                     for base in repo.merge_bases_many(a, &[b])? {
                         hidden.push(base.detach());
@@ -884,6 +904,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         }
                         return Ok(fatal_rev(repo, spec));
                     };
+                    if let Some(code) = super::log::non_filename_fatal(repo, spec, seen_dashdash) {
+                        return Ok(code);
+                    }
                     if negate {
                         tips.push(a);
                         hidden.push(b);
@@ -894,6 +917,11 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 } else {
                     match resolve(repo, spec) {
                         Some(id) => {
+                            if let Some(code) =
+                                super::log::non_filename_fatal(repo, spec, seen_dashdash)
+                            {
+                                return Ok(code);
+                            }
                             if negate {
                                 hidden.push(id)
                             } else {
@@ -1142,6 +1170,18 @@ fn resolve_range(
 /// `--` puts every following argument in `pathspecs` before this is reached, so
 /// `cant_be_filename` is never set here.
 fn fatal_rev(repo: &gix::Repository, spec: &str) -> ExitCode {
+    // `get_oid_basic()` reads a ref without touching the object it names, so a ref
+    // pointing at something the database does not have resolves and then dies in
+    // `get_reference()`: `die(_("bad object %s"), name)` (revision.c:389-400).
+    // [`super::log::early_revision_fatal`] only knows the full-hex spelling of that
+    // shape, because that is the one every other verb can reach.
+    let bare = spec.strip_prefix('^').unwrap_or(spec);
+    if let Some(id) = crate::objname::resolve_quiet(repo, bare) {
+        if repo.find_object(id).is_err() {
+            eprintln!("fatal: bad object {bare}");
+            return ExitCode::from(128);
+        }
+    }
     let message = super::log::early_revision_fatal(repo, spec, false)
         .unwrap_or_else(|| super::log::bad_revision_message_in(repo, spec));
     eprint!("{message}");
@@ -1233,12 +1273,17 @@ use crate::date::approxidate;
 
 /// git's `--glob`/`--branches`/`--tags`/`--remotes` ref expansion, including
 /// the implicit `/*` `for_each_glob_ref_in()` appends to a plain prefix.
+///
+/// `Err(<name>)` is `handle_one_ref()`'s `get_reference()` refusing a ref whose
+/// object `parse_object()` cannot read — `die(_("bad object %s"), path)`. `path`
+/// is the name the iterator reported, which `for_each_branch_ref()` and its
+/// siblings trim of their namespace while `--all` and `--glob` do not.
 fn select_refs(
     repo: &gix::Repository,
     kind: RefKind,
     pattern: Option<&str>,
     excludes: &[String],
-) -> Result<Vec<ObjectId>> {
+) -> Result<std::result::Result<Vec<ObjectId>, String>> {
     let namespace = match kind {
         RefKind::Branches => Some("refs/heads/"),
         RefKind::Tags => Some("refs/tags/"),
@@ -1282,6 +1327,17 @@ fn select_refs(
         {
             continue;
         }
+        let reported = match namespace {
+            Some(ns) => name.to_str_lossy().strip_prefix(ns).unwrap_or_default().to_string(),
+            None => name.to_str_lossy().into_owned(),
+        };
+        // `get_reference()` before any peeling: a ref whose id the database does
+        // not have ends the command, naming the ref.
+        if let Some(target) = reference.try_id() {
+            if repo.find_object(target.detach()).is_err() {
+                return Ok(Err(reported));
+            }
+        }
         let Ok(id) = reference.into_fully_peeled_id() else {
             continue;
         };
@@ -1298,7 +1354,7 @@ fn select_refs(
             }
         }
     }
-    Ok(out)
+    Ok(Ok(out))
 }
 
 /// git's `add_reflogs_to_pending()`: the old and the new id of every entry of

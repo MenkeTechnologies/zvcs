@@ -63,6 +63,14 @@ encoding_rs = "0.8"
 # POSIX-ERE value-pattern matching for `git config <name> <value> <value-pattern>`.
 # Foundational, vendorable crate; byte-oriented `regex::bytes` mirrors git's regexec.
 regex = "1"
+# The second regex engine, for what the first cannot express. git links two of
+# them as well: `regcomp()` for `-E`/`-G` and PCRE2 for `-P`, and PCRE2's grammar
+# has constructs a finite automaton cannot run — backreferences, look-around,
+# `\K`, `\Z` — which `regex` rejects at compile time by construction. Patterns
+# using one of those compile through this backtracking engine instead, which is
+# the same division of labour git makes. Pure Rust, and it shares `regex`'s own
+# `regex-automata`/`regex-syntax` back end, so it adds no new C dependency.
+fancy-regex = "0.18"
 # File-watch autonomy: the daemon reacts to local ref changes (a `git pull`/commit
 # updates `logs/HEAD` / remote-tracking refs) and never polls a remote.
 notify = "6"

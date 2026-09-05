@@ -185,8 +185,16 @@
 //!     `warning: minimum pack size limit is 1 MiB`, and `pack.packSizeLimit`
 //!     supplies the default (validated ahead of parse-options, so an unreadable
 //!     value is fatal even for `-h`).
-//!   * **`--geometric`** repacks everything rather than selecting the subset of
-//!     packs that restores a geometric size progression.
+//!   * **`--geometric`** selects the subset of packs that restores a geometric
+//!     size progression, through the ported `init_pack_geometry()` /
+//!     `split_pack_geometry()` (builtin/repack.c:323-445): the new pack holds
+//!     the objects of every pack below the split plus every loose object, minus
+//!     anything a surviving pack already holds, and `-d` removes the rolled-up
+//!     packs alone. What it does *not* model is git's overflow deaths (`pack %s
+//!     too large to consider in geometric progression` / `to roll up`), which
+//!     need a pack whose object count overflows `uint32_t` times the factor —
+//!     the arithmetic here is 64-bit and saturating, so those packs are simply
+//!     weighed.
 //!   * **`--write-midx`** writes `objects/pack/multi-pack-index` over the packs
 //!     the run leaves behind, through the same writer `git multi-pack-index
 //!     write` uses. `--write-midx=incremental` asks for a MIDX *chain* instead
@@ -696,6 +704,24 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     let reachable = super::prune::close_over_excluding(&repo, roots, &promisor_held);
 
     let existing = super::prune::pack_indices(&repo, &objdir);
+    // ```c
+    // if (geometric_factor) {
+    //         [...]
+    //         init_pack_geometry(&geometry, &existing_kept_packs);
+    //         split_pack_geometry(geometry, geometric_factor);
+    // ```
+    //
+    // (`cmd_repack()`, builtin/repack.c:872-875.) The split is what turns
+    // `--geometric` from "repack everything" into "repack only the light end".
+    let geometry = match st.geometric_factor != 0.0 {
+        true => Some(Geometry::compute(
+            st,
+            &existing,
+            &pack_dir,
+            st.geometric_factor,
+        )),
+        false => None,
+    };
     let candidates: Vec<ObjectId> = reachable
         .into_iter()
         // Without `-a`/`-A`/`--cruft`, a repack is incremental: anything an
@@ -745,7 +771,33 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // loose object that made it into the pack is deleted while one that did not stays
     // loose. `--cruft` is deliberately not here: it writes the unreachable objects to a
     // cruft pack of its own.
-    if (st.keep_unreachable || st.geometric_factor != 0.0) && !st.cruft {
+    if let Some(geo) = geometry.as_ref().filter(|_| !st.cruft) {
+        // ```c
+        // } else if (geometry) {
+        //         strvec_push(&cmd.args, "--stdin-packs");
+        //         strvec_push(&cmd.args, "--unpacked");
+        // ```
+        //
+        // (`cmd_repack()`, builtin/repack.c:936-938), fed the packs below the
+        // split as includes and the ones above it as `^` excludes
+        // (:953-965). `read_packs_list_from_stdin()` marks every excluded pack
+        // `pack_keep_in_core` with `ignore_packed_keep_in_core` set, so an
+        // object one of them holds is dropped however it was reached, and
+        // `--unpacked` adds `add_unreachable_loose_objects()` on top —
+        // *every* loose object, reachable or not
+        // (builtin/pack-objects.c:4465-4470, :3826-3834).
+        let survivors = geo.surviving_objects(&existing);
+        let mut packed: HashSet<ObjectId> = to_pack.iter().copied().collect();
+        let rolled = geo.rolled_up_objects(&existing);
+        for id in rolled
+            .into_iter()
+            .chain(super::prune::loose_object_ids(&repo, &objdir))
+        {
+            if !survivors.contains(&id) && packed.insert(id) {
+                to_pack.push(id);
+            }
+        }
+    } else if st.keep_unreachable && !st.cruft {
         let packed: HashSet<ObjectId> = to_pack.iter().copied().collect();
         for id in super::prune::all_object_ids(&repo, &objdir) {
             if !packed.contains(&id) {
@@ -785,10 +837,26 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // Which packs `-d` may drop: everything that existed before this run, minus
     // any protected by a `.keep` or named by `--keep-pack`. Captured before the
     // new pack lands so it is never a candidate for its own removal.
-    let superseded: Vec<PathBuf> = if st.delete_redundant && st.all_into_one {
-        existing.iter().map(|f| f.path().to_path_buf()).filter(|p| droppable(st, p)).collect()
-    } else {
-        Vec::new()
+    let superseded: Vec<PathBuf> = match (st.delete_redundant, st.all_into_one, geometry.as_ref()) {
+        (false, _, _) => Vec::new(),
+        (true, true, _) => existing
+            .iter()
+            .map(|f| f.path().to_path_buf())
+            .filter(|p| droppable(st, p))
+            .collect(),
+        // ```c
+        // for (i = 0; i < geometry->split; i++) {
+        //         struct packed_git *p = geometry->pack[i];
+        //         [...]
+        //         remove_redundant_pack(packdir, buf.buf);
+        // }
+        // ```
+        //
+        // (`cmd_repack()`, builtin/repack.c:1133-1149.) Only the packs that were
+        // rolled into the new one go; everything above the split is what the
+        // progression is made of and stays where it is.
+        (true, false, Some(geo)) => geo.rolled_up_paths(&existing, &pack_dir),
+        (true, false, None) => Vec::new(),
     };
     // What `write_cruft_pack()` (repack-cruft.c:40-98) feeds `pack-objects
     // --cruft`: every local pack, the kept ones as INCLUDE and the rest — the
@@ -1529,6 +1597,126 @@ fn keeps_object(st: &State, id: &ObjectId, repo: &gix::Repository) -> bool {
 
 /// Whether `-d` may remove the pack whose index is at `index_path`: a `.keep`
 /// beside it, or a `--keep-pack` naming it, pins it in place.
+/// `struct pack_geometry` (builtin/repack.c:298-302): the packs a
+/// `--geometric=<factor>` run weighs, ordered by object count, and the index
+/// that separates the ones being rolled into a new pack from the ones left
+/// alone.
+///
+/// The entries are positions in the caller's `existing` slice rather than the
+/// index files themselves, so nothing here borrows the pack set the rest of
+/// [`execute`] still needs to move around.
+struct Geometry {
+    /// `geometry->pack`: positions into `existing`, sorted by
+    /// `geometry_cmp()` — ascending object count.
+    packs: Vec<usize>,
+    /// `geometry->split`. `packs[..split]` roll up; `packs[split..]` survive.
+    split: usize,
+}
+
+/// `geometry_pack_weight()` (builtin/repack.c:304-309): a pack weighs what its
+/// index says it holds.
+fn geometry_pack_weight(index: &pack::index::File) -> u64 {
+    u64::from(index.num_objects())
+}
+
+impl Geometry {
+    /// `init_pack_geometry()` (builtin/repack.c:323-368) followed by
+    /// `split_pack_geometry()` (:370-445).
+    fn compute(st: &State, existing: &[pack::index::File], pack_dir: &Path, factor: f64) -> Self {
+        // `for (p = get_all_packs(...))`, minus the two skips the loop makes:
+        // a kept pack — `p->pack_keep` or a `--keep-pack` name, which is
+        // exactly what [`droppable`] answers — and a cruft pack, which is the
+        // one carrying a `.mtimes` sidecar.
+        let mut packs: Vec<usize> = (0..existing.len())
+            .filter(|&i| {
+                let path = existing[i].path();
+                path.parent() == Some(pack_dir)
+                    && droppable(st, path)
+                    && !path.with_extension("mtimes").exists()
+            })
+            .collect();
+        // `QSORT(geometry->pack, geometry->pack_nr, geometry_cmp)`. git's
+        // comparator looks at the weight alone and leaves ties in whatever
+        // order the pack list had; the path breaks them here so a run is
+        // reproducible.
+        packs.sort_by_key(|&i| {
+            (
+                geometry_pack_weight(&existing[i]),
+                existing[i].path().to_path_buf(),
+            )
+        });
+
+        // `--geometric=<n>` is an integer option in git, so the factor is whole;
+        // a negative one cannot reach here because `if (geometric_factor)` is
+        // the gate and the parser has already rejected what is not a number.
+        let factor = factor.max(0.0) as u64;
+        let weight = |slot: usize| geometry_pack_weight(&existing[packs[slot]]);
+
+        let split = if packs.is_empty() {
+            0
+        } else {
+            // "First, count the number of packs (in descending order of size)
+            // which already form a geometric progression." (:383-395)
+            let mut i = packs.len() - 1;
+            while i > 0 {
+                if weight(i) < factor.saturating_mul(weight(i - 1)) {
+                    break;
+                }
+                i -= 1;
+            }
+            let mut split = i;
+            // "Move the split one to the right, since the top element in the
+            // last-compared pair can't be in the progression." (:397-406)
+            if split > 0 {
+                split += 1;
+            }
+            // "creating that new pack may cause packs in the heavy half to no
+            // longer form a geometric progression" — roll up as many of them as
+            // it takes to restore it. (:408-443)
+            let mut total: u64 = (0..split).map(weight).sum();
+            for slot in split..packs.len() {
+                if weight(slot) >= factor.saturating_mul(total) {
+                    break;
+                }
+                total += weight(slot);
+                split += 1;
+            }
+            split
+        };
+
+        Geometry { packs, split }
+    }
+
+    /// Every object the packs below the split hold: the include half of what
+    /// `cmd_repack()` writes to `pack-objects --stdin-packs`
+    /// (builtin/repack.c:960-961).
+    fn rolled_up_objects(&self, existing: &[pack::index::File]) -> Vec<ObjectId> {
+        self.packs[..self.split]
+            .iter()
+            .flat_map(|&i| existing[i].iter().map(|e| e.oid))
+            .collect()
+    }
+
+    /// Every object the packs at or above the split hold: the `^` half of the
+    /// same list (builtin/repack.c:962-963), which `pack-objects` turns into
+    /// kept-in-core packs so their objects stay out of the new pack.
+    fn surviving_objects(&self, existing: &[pack::index::File]) -> HashSet<ObjectId> {
+        self.packs[self.split..]
+            .iter()
+            .flat_map(|&i| existing[i].iter().map(|e| e.oid))
+            .collect()
+    }
+
+    /// The index paths `-d` may remove: the rolled-up packs, and only those.
+    fn rolled_up_paths(&self, existing: &[pack::index::File], pack_dir: &Path) -> Vec<PathBuf> {
+        self.packs[..self.split]
+            .iter()
+            .map(|&i| existing[i].path().to_path_buf())
+            .filter(|p| p.parent() == Some(pack_dir))
+            .collect()
+    }
+}
+
 fn droppable(st: &State, index_path: &Path) -> bool {
     if index_path.with_extension("keep").exists() {
         return false;

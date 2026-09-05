@@ -79,7 +79,7 @@ pub fn apply(src: &[u8], object_hash: gix_hash::Kind, buf: &mut Vec<u8>) -> Resu
         buf.push_str(&src[ofs..][..pos + 3]);
         buf.push_str(b": ");
         id.write_hex_to(&mut *buf).expect("writes to memory always work");
-        buf.push(b'$');
+        buf.push_str(b" $");
 
         ofs += pos + 4;
     }

@@ -32,6 +32,15 @@
 //! detached), matching git-restore(1). `-p`/`--patch` runs the interactive hunk
 //! selector ([`super::add_patch`]) against whichever of the index / worktree the
 //! `--staged` / `--worktree` flags select.
+//!
+//! Every worktree file this verb writes goes through the repository's smudge
+//! pipeline (`convert_to_working_tree()`, entry.c:280-330), so `text`/`eol`,
+//! `ident`, `working-tree-encoding` and external filter drivers apply exactly as
+//! they do for stock git. The attributes come from the *whole* index — git's
+//! `state.istate = &the_index` (builtin/checkout.c:382), not the pathspec-matched
+//! subset being written — under `GIT_ATTR_CHECKOUT`'s "index first, worktree file
+//! as the fallback" rule; see
+//! [`crate::worktree::checkout_subset_with_attributes`].
 
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
@@ -253,8 +262,11 @@ pub(super) fn restore_submodule_worktree(
     // Check out the full target index over the existing worktree (a separate copy
     // is passed since `checkout` takes the index's path backing out).
     let mut subset = target_index.clone();
-    let mut opts =
-        sm_repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    // `GIT_ATTR_CHECKOUT`: the index first, the worktree file as the fallback
+    // (attr.c:784-787). The whole target index is checked out here, so its
+    // `.gitattributes` entries are already all present.
+    let mut opts = sm_repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMappingThenWorktree)?;
     opts.destination_is_initially_empty = false;
     opts.overwrite_existing = true;
     let odb = sm_repo.objects.clone().into_arc()?;
@@ -1075,15 +1087,25 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             subset.sort_entries();
         }
 
-        let mut opts =
-            repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+        // `git_attr_set_direction(GIT_ATTR_CHECKOUT)` — the index first, the worktree
+        // file only when the index has none (attr.c:784-787). `Source::IdMapping` alone
+        // is `GIT_ATTR_INDEX`, the direction `check-attr` sets, not a checkout's.
+        let mut opts = repo.checkout_options(
+            gix::worktree::stack::state::attributes::Source::IdMappingThenWorktree,
+        )?;
         opts.destination_is_initially_empty = false;
         opts.overwrite_existing = true;
         let odb = repo.objects.clone().into_arc()?;
         let discard_files = gix::progress::Discard;
         let discard_bytes = gix::progress::Discard;
-        crate::worktree::checkout_subset(
+        // `checkout_entry()` reads attributes from `state.istate =
+        // the_repository->index` (builtin/checkout.c:412) — the whole index, not the
+        // pathspec-matched subset being written. `cur` supplies the `.gitattributes`
+        // files the subset dropped; see
+        // [`crate::worktree::checkout_subset_with_attributes`].
+        crate::worktree::checkout_subset_with_attributes(
             &mut subset,
+            &cur,
             workdir.as_path(),
             odb,
             &discard_files,

@@ -3,8 +3,11 @@
 //! Lives outside `porcelain` on purpose: that module is generated from its
 //! directory listing, where every file is taken to be a subcommand.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+
+use gix::bstr::{BString, ByteSlice};
 
 /// `DEFAULT_NUM_WORKERS` (`parallel-checkout.c:41`).
 const DEFAULT_NUM_WORKERS: i64 = 1;
@@ -61,6 +64,102 @@ pub fn parallel_checkout_configs(repo: &gix::Repository) -> Result<(i64, i64), S
     )?
     .unwrap_or(DEFAULT_THRESHOLD_FOR_PARALLELISM);
     Ok((workers, threshold))
+}
+
+/// [`checkout_subset`] with the `.gitattributes` files of `attr_source` carried
+/// along, which is what makes the smudge pipeline fire on a *partial* checkout.
+///
+/// `convert_to_working_tree()` (convert.c:1467) asks `convert_attrs()` for the
+/// path's `text`/`eol`/`ident`/`working-tree-encoding`/`filter` settings, and
+/// `checkout_entry()` reaches it with `state->istate`:
+///
+/// ```c
+/// state.istate = index;
+/// [...]
+/// git_attr_set_direction(GIT_ATTR_CHECKOUT);
+/// ```
+///
+/// (`check_updates()`, unpack-trees.c:399/438; `checkout_paths()` passes
+/// `the_repository->index` the same way.) That index is the **whole** one, never
+/// the subset of paths being written — so `.gitattributes` governs a checkout of
+/// `f.txt` even when the checkout touches nothing else.
+///
+/// This port has no such global: `gix_worktree_state::checkout` builds its
+/// attribute stack out of exactly the entries it is handed
+/// (`Stack::from_state_and_ignore_case()` → `State::id_mappings_from_index()`),
+/// and every caller here hands it a subset. A `.gitattributes` outside that
+/// subset was therefore invisible, and `checkout`/`restore` wrote raw blob bytes
+/// where stock git wrote filtered ones.
+///
+/// The fix is to put the missing attribute files back into the entry list with
+/// `SKIP_WORKTREE` set: `chunk::process()` (gix-worktree-state) skips writing
+/// such an entry, while `id_mappings_from_index()` — which filters on mode and
+/// stage only — still sees it. They are removed again before returning, so the
+/// caller's view of the subset (and the fresh stat data it harvests from it) is
+/// unchanged.
+#[allow(clippy::result_large_err)] // mirrors `checkout_subset`
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_subset_with_attributes<Find>(
+    index: &mut gix::index::State,
+    attr_source: &gix::index::State,
+    dir: impl Into<PathBuf>,
+    objects: Find,
+    files: &dyn gix::features::progress::Count,
+    bytes: &dyn gix::features::progress::Count,
+    should_interrupt: &AtomicBool,
+    options: gix::worktree::state::checkout::Options,
+) -> Result<(), gix::worktree::state::checkout::Error>
+where
+    Find: gix::objs::Find + Send + Clone,
+{
+    if index.entries().is_empty() {
+        return Ok(());
+    }
+    let carried = carry_attribute_files(index, attr_source);
+    let res = checkout_subset(index, dir, objects, files, bytes, should_interrupt, options);
+    if !carried.is_empty() {
+        index.remove_entries(|_, path, _| carried.iter().any(|p| p[..] == path[..]));
+    }
+    res
+}
+
+/// Append every `.gitattributes` entry of `source` that `subset` lacks, marked
+/// `SKIP_WORKTREE` so the checkout reads it but never writes it. Returns the
+/// paths added, for the caller to drop again.
+///
+/// The selection is `id_mappings_from_index()`'s own: a blob entry at stage 0 or
+/// stage 2 ("ours" during a merge), matched on the basename.
+fn carry_attribute_files(subset: &mut gix::index::State, source: &gix::index::State) -> Vec<BString> {
+    use gix::index::entry::{Flags, Mode, Stat};
+
+    let have: HashSet<BString> = {
+        let backing = subset.path_backing();
+        subset.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+    };
+    let missing: Vec<(BString, gix::hash::ObjectId, Mode)> = {
+        let backing = source.path_backing();
+        source
+            .entries()
+            .iter()
+            .filter(|e| e.mode == Mode::FILE && matches!(e.stage_raw(), 0 | 2))
+            .filter_map(|e| {
+                let path = e.path_in(backing);
+                let basename = path.rfind_byte(b'/').map_or(path, |pos| path[pos + 1..].as_bstr());
+                (basename == ".gitattributes" && !have.contains(path.as_bstr()))
+                    .then(|| (path.to_owned(), e.id, e.mode))
+            })
+            .collect()
+    };
+    for (path, id, mode) in &missing {
+        subset.dangerously_push_entry(Stat::default(), *id, Flags::SKIP_WORKTREE, *mode, path.as_ref());
+    }
+    if !missing.is_empty() {
+        // `id_mappings_from_index()` walks the entries in order and the lookup that
+        // consumes the result is a binary search, so the appended entries have to be
+        // sorted back into place.
+        subset.sort_entries();
+    }
+    missing.into_iter().map(|(path, _, _)| path).collect()
 }
 
 /// Check out `index` into `dir`, skipping the call entirely when the index has
@@ -185,6 +284,14 @@ fn is_up_to_date(
     stat_options: gix::index::entry::stat::Options,
 ) -> bool {
     use gix::index::entry::Mode;
+    // A `SKIP_WORKTREE` entry is never written — `chunk::process()` (gix-worktree-state)
+    // skips it before it reaches `checkout_entry()` — but it still has to reach the
+    // checkout, because the attribute id-mapping is built from exactly the entries handed
+    // over. Calling it "up to date" here would drop the `.gitattributes` files
+    // [`carry_attribute_files`] just carried in, which is the whole point of carrying them.
+    if entry.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE) {
+        return false;
+    }
     if !matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK) {
         return false;
     }

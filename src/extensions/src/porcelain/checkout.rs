@@ -105,6 +105,15 @@
 //!     option absent the style is `merge.conflictStyle`'s, which implies nothing
 //!     on its own.
 //! ```
+//!
+//! Every file this verb writes goes through the repository's smudge pipeline
+//! (`convert_to_working_tree()`, entry.c:280-330), so `text`/`eol`, `ident`,
+//! `working-tree-encoding` and external filter drivers apply exactly as they do
+//! for stock git — on a branch switch, on `-f`, and on the pathspec forms alike.
+//! The attributes are read the way `git_attr_set_direction(GIT_ATTR_CHECKOUT)`
+//! reads them (the index first, the worktree file as the fallback) and from the
+//! *whole* index rather than the paths being written; see
+//! [`crate::worktree::checkout_subset_with_attributes`] for what that costs here.
 
 use anyhow::{anyhow, bail, Result};
 // Every `print!`/`println!` below goes through git's stdout buffer; see
@@ -253,6 +262,10 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // Which conflict stage `--ours`/`--theirs` writes out (2 = ours, 3 = theirs);
     // the last of the two flags wins, exactly like git's `opts.writeout_stage`.
     let mut writeout_stage: Option<u8> = None;
+    // Storage for the `-` / `@{-N}` rewrite `parse_branchname_arg()` applies to
+    // the reference operand. Declared ahead of `pre` so the expanded name can be
+    // borrowed into it; see the rewrite itself below the option loop.
+    let mut prev_branch_expansion: Option<String> = None;
     let mut pre: Vec<&str> = Vec::new(); // positionals before `--`
     let mut post: Vec<&str> = Vec::new(); // pathspecs after `--`
     let mut has_dashdash = false;
@@ -477,6 +490,32 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     if let Err(code) = patch_opts.finish() {
         return Ok(code);
+    }
+    // `parse_branchname_arg()` rewrites the reference operand twice before it is
+    // resolved:
+    //
+    // ```c
+    // if (!strcmp(arg, "-"))
+    //         arg = "@{-1}";
+    // ```
+    //
+    // (builtin/checkout.c:1320-1321), and then `setup_branch_path()`, reached
+    // from `setup_new_branch_info_and_source_tree()` (builtin/checkout.c:1373),
+    // runs the result through
+    // `strbuf_branchname(&buf, branch->name, INTERPRET_BRANCH_LOCAL)`
+    // (builtin/checkout.c:705), whose `interpret_nth_prior_checkout()` turns
+    // `@{-N}` into the branch that was left N checkouts ago. Both rewrites are
+    // local to the *reference* interpretation, so an operand that expands to
+    // nothing still reaches the pathspec fallback as the literal the user typed.
+    //
+    // Without this `git checkout -` reported `pathspec '-' did not match any
+    // file(s)` and `git checkout @{-1}` detached instead of switching, because
+    // neither spelling names a `refs/heads/` entry.
+    if let Some(first) = pre.first() {
+        prev_branch_expansion = expand_prev_branch(&repo, first);
+    }
+    if let Some(name) = prev_branch_expansion.as_deref() {
+        pre[0] = name;
     }
     // `if (conflict_style) { opts->merge = 1; git_xmerge_config(…); }`, run after
     // the whole command line has been parsed — which is why a `--no-conflict`
@@ -1323,6 +1362,25 @@ pub(crate) fn refuse_branch_in_other_worktree(
     Some(ExitCode::from(128))
 }
 
+/// `parse_branchname_arg()`'s `-` rewrite (builtin/checkout.c:1320-1321)
+/// followed by `setup_branch_path()`'s
+/// `strbuf_branchname(&buf, branch->name, INTERPRET_BRANCH_LOCAL)`
+/// (builtin/checkout.c:705).
+///
+/// Returns the branch `-` / `@{-N}` names, with anything that trailed the
+/// `@{-N}` kept (`@{-1}~2` → `<branch>~2`, which is `strbuf_branchname()`'s
+/// `strbuf_add(sb, name + used, len - used)`). `None` when the operand is not
+/// the shorthand at all, or when HEAD's reflog does not hold that many branch
+/// switches — `interpret_nth_prior_checkout()` returns -1 there and git leaves
+/// the operand alone.
+fn expand_prev_branch(repo: &gix::Repository, arg: &str) -> Option<String> {
+    let dashed = if arg == "-" { "@{-1}" } else { arg };
+    let (nth, used) = super::check_ref_format::parse_nth_prior(dashed.as_bytes())?;
+    let mut branch = super::check_ref_format::nth_branch_switch(repo, nth)?;
+    branch.extend_from_slice(&dashed.as_bytes()[used..]);
+    String::from_utf8(branch).ok()
+}
+
 /// The commit `HEAD` names, or `None` on an unborn branch — git's
 /// `old_branch_info.commit` / `new_branch_info->commit`.
 pub(crate) fn head_commit_id(repo: &gix::Repository) -> Option<ObjectId> {
@@ -1978,7 +2036,9 @@ fn restore_conflict_stage(
             e.flags.remove(Flags::STAGE_MASK);
         }
         let should_interrupt = AtomicBool::new(false);
-        checkout_subset(repo, &mut subset, &should_interrupt)?;
+        // `checkout_paths()` writes through `state.istate = the_repository->index`
+        // (builtin/checkout.c:412), so the attributes come from the full index.
+        checkout_subset(repo, &mut subset, &index, &should_interrupt)?;
     }
 
     if had_error {
@@ -2433,7 +2493,8 @@ fn restore_from_index(
         }
     }
     let should_interrupt = AtomicBool::new(false);
-    checkout_subset(repo, &mut subset, &should_interrupt)?;
+    // `state.istate = the_repository->index` (builtin/checkout.c:412).
+    checkout_subset(repo, &mut subset, &index, &should_interrupt)?;
 
     // Refresh stat info in the real index for the restored paths so a later
     // status stays cheap; content ids are unchanged. An unmerged path has no
@@ -2583,10 +2644,17 @@ fn restore_from_tree(
         let (idx_matched, idx_hit) = matches_in_excluding(&cur, paths, &sparse);
         // A pathspec must match in the tree or the index; else git's "did not match".
         if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !idx_hit[si]) {
-            bail!(
-                "pathspec '{}' did not match any file(s) known to git",
+            // `report_path_error()` (pathspec.c) writes
+            // `error: pathspec '%s' did not match any file(s) known to git` and
+            // `checkout_paths()` returns 1 on it (builtin/checkout.c:642-643) —
+            // an `error:`, not a `fatal:`. Bailing here instead put the port's
+            // own `zvcs: checkout: ` prefix in front of the same sentence, which
+            // the overlay arm a few lines above already avoids.
+            eprintln!(
+                "error: pathspec '{}' did not match any file(s) known to git",
                 paths[si]
             );
+            return Ok(ExitCode::from(1));
         }
         let tset: HashSet<BString> = tree_matched.iter().cloned().collect();
         let rm: Vec<BString> = idx_matched.into_iter().filter(|p| !tset.contains(p)).collect();
@@ -2606,11 +2674,15 @@ fn restore_from_tree(
     let mut subset = repo.index_from_tree(&tree_id)?;
     keep_only(&mut subset, &matched);
     let should_interrupt = AtomicBool::new(false);
-    checkout_subset(repo, &mut subset, &should_interrupt)?;
+    let mut index = repo.open_index()?;
+    // `checkout_paths()` runs `read_tree()`/`update_some()` over `the_repository->index`
+    // *before* it writes anything (builtin/checkout.c:400-412), so the attributes a
+    // matched path sees are the tree's and every other path's are the index's — which is
+    // exactly "the subset first, the index for what it lacks".
+    checkout_subset(repo, &mut subset, &index, &should_interrupt)?;
 
     // Fold the tree's blobs (with fresh checkout stats) into the real index.
     let fresh = stats_by_path(&subset);
-    let mut index = repo.open_index()?;
     let mut pushed = false;
     // `add_index_entry()` replaces *every* stage of the path it writes (`ADD_CACHE_OK_TO_REPLACE`,
     // builtin/checkout.c:231), so `git checkout HEAD -- <conflicted>` resolves the conflict: the
@@ -3110,13 +3182,25 @@ pub(super) fn update_worktree_to_tree(
             .collect()
     };
 
-    // `merged_entry()`: the touched paths the new tree has are written out.
-    let mut subset = repo.index_from_tree(&new_tree)?;
-    subset.remove_entries(|_, path, _| !touched.contains(&path.to_owned()));
-    checkout_subset(repo, &mut subset, &should_interrupt)?;
-
-    // `deleted_entry()`: the touched paths it does not have are removed — through
-    // `unlink_entry()`, which schedules the directory each removal empties.
+    // `deleted_entry()`: the touched paths the new tree does not have are removed —
+    // through `unlink_entry()`, which schedules the directory each removal empties.
+    //
+    // ```c
+    // for (i = 0; i < index->cache_nr; i++) {
+    //         const struct cache_entry *ce = index->cache[i];
+    //         if (ce->ce_flags & CE_WT_REMOVE) { [...] unlink_entry(ce); }
+    // }
+    // remove_marked_cache_entries(index, 0);
+    // remove_scheduled_dirs();
+    // [...]
+    // for (i = 0; i < index->cache_nr; i++) { [...] checkout_entry(ce, &state, ...); }
+    // ```
+    //
+    // (`check_updates()`, unpack-trees.c:443-481.) The removals come *first*, and the
+    // order is observable: `git_attr_set_direction(GIT_ATTR_CHECKOUT)` falls back to the
+    // worktree's `.gitattributes` when the result index has none (attr.c:784-787), so a
+    // switch to a branch without one must delete it before it writes anything — else the
+    // outgoing branch's attributes would still be smudging files that no longer have any.
     for path in touched.iter().filter(|p| !new_flat.contains_key(*p)) {
         if let Some(full) = repo.workdir_path(path.as_bstr()) {
             let _ = std::fs::remove_file(&full);
@@ -3125,6 +3209,20 @@ pub(super) fn update_worktree_to_tree(
             }
         }
     }
+
+    // `merged_entry()`: the touched paths the new tree has are written out.
+    let mut subset = repo.index_from_tree(&new_tree)?;
+    subset.remove_entries(|_, path, _| !touched.contains(&path.to_owned()));
+    // `check_updates()` sets `state.istate = index` — `&o->result`, the index the
+    // two-way merge just produced (unpack-trees.c:399), not the paths it is about to
+    // write. `o->result` holds `merged_entry()`'s new-tree entry for a path the two
+    // trees disagree on — those are `subset`, which takes precedence — and
+    // `keep_entry()`'s *index* entry for every other one. A touched path the new tree
+    // drops is `deleted_entry()`: absent from the result, so the old index's copy must
+    // not stand in for it, which is what removing the touched paths here ensures.
+    let mut result_attrs = old.clone();
+    result_attrs.remove_entries(|_, path, _| touched.contains(&path.to_owned()));
+    checkout_subset(repo, &mut subset, &result_attrs, &should_interrupt)?;
 
     // The index moves with the worktree, one path at a time: the touched entries
     // are replaced by the new tree's, the rest stay exactly as they were.
@@ -3219,10 +3317,12 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         }
         None => false,
     });
-    checkout_subset(repo, &mut subset, &should_interrupt)?;
-
     // Paths the tree drops: `deleted_entry()` removes them from the worktree too
-    // (`verify_uptodate` is a no-op under `--reset`).
+    // (`verify_uptodate` is a no-op under `--reset`). `check_updates()` runs its
+    // `CE_WT_REMOVE` loop *before* the checkout loop (unpack-trees.c:443-481), and the
+    // order shows: with `GIT_ATTR_CHECKOUT` the worktree's `.gitattributes` is the
+    // fallback when the result index has none (attr.c:784-787), so one the target tree
+    // drops must be off the disk before any file is written through it.
     let new_paths: HashSet<BString> = {
         let backing = new_index.path_backing();
         new_index
@@ -3246,6 +3346,10 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
             }
         }
     }
+
+    // `oneway_merge()` builds `o->result` out of the tree alone, so the index
+    // `check_updates()` reads attributes from is the new tree's (unpack-trees.c:399).
+    checkout_subset(repo, &mut subset, &new_index, &should_interrupt)?;
 
     // "Take the stat information from stage0, take the data from stage1": an entry
     // that was not rewritten keeps the stat cache it already had.
@@ -3326,19 +3430,37 @@ pub(super) fn show_local_changes(rev: &str, quiet: bool) -> Result<()> {
 fn checkout_subset(
     repo: &gix::Repository,
     index: &mut gix::index::File,
+    attr_source: &gix::index::State,
     should_interrupt: &AtomicBool,
 ) -> Result<()> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("bare repository has no worktree to update"))?
         .to_owned();
-    let mut opts =
-        repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    // `git_attr_set_direction(GIT_ATTR_CHECKOUT)` (unpack-trees.c:438), which
+    // `read_attr()` (attr.c:784-787) reads as "the index first, the worktree file
+    // only when the index has none":
+    //
+    // ```c
+    // if (direction == GIT_ATTR_CHECKOUT) {
+    //         res = read_attr_from_index(istate, path, flags);
+    //         if (!res)
+    //                 res = read_attr_from_file(path, flags);
+    // ```
+    //
+    // `Source::IdMapping` alone is `GIT_ATTR_INDEX`, which is the direction
+    // `check-attr` and `archive` set, not the one a checkout runs under.
+    let mut opts = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMappingThenWorktree)?;
     opts.destination_is_initially_empty = false;
     opts.overwrite_existing = true;
     let odb = repo.objects.clone().into_arc()?;
-    crate::worktree::checkout_subset(
+    // `state->istate` is the whole index, never the paths being written, so the
+    // attribute files of `attr_source` ride along — see
+    // [`crate::worktree::checkout_subset_with_attributes`].
+    crate::worktree::checkout_subset_with_attributes(
         index,
+        attr_source,
         workdir.as_path(),
         odb,
         &gix::progress::Discard,

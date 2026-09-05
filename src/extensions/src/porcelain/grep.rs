@@ -2935,6 +2935,13 @@ impl<'r> DiffAttrs<'r> {
 /// converter over it via the shell (`<cmd> "$@"` with the temp path as `$1`),
 /// returning its stdout as the bytes to search. A failing converter is the fatal
 /// git makes of it.
+///
+/// `run_textconv()` (diff.c:7758-7772) pipes only stdout (`child.out = -1`), so the
+/// program's stderr is git's own and its complaints reach the terminal; and the
+/// failure `fill_textconv()` turns that NULL into is `die(_("unable to read files to
+/// diff"))` with nothing appended. Measured against git 2.55.0,
+/// `git -c diff.markdown.textconv='tr a-z A-Z' grep --textconv -n prose --
+/// docs/manual.md` prints `tr`'s four-line usage and then exactly that fatal.
 fn run_textconv(cmd: &str, content: &[u8]) -> Result<Vec<u8>> {
     let mut path = std::env::temp_dir();
     path.push(format!(
@@ -2948,13 +2955,13 @@ fn run_textconv(cmd: &str, content: &[u8]) -> Result<Vec<u8>> {
     }
     // git's `use_shell` invocation, with the temp path as the command's single
     // positional argument.
-    let output = crate::external::prepare_shell_cmd_str(cmd, [&path]).output();
+    let output = crate::external::prepare_shell_cmd_str(cmd, [&path])
+        .stderr(std::process::Stdio::inherit())
+        .output();
     let _ = std::fs::remove_file(&path);
     match output {
         Ok(o) if o.status.success() => Ok(o.stdout),
-        Ok(_) | Err(_) => {
-            crate::git_fatal!("unable to read files to diff: textconv command '{cmd}' failed")
-        }
+        Ok(_) | Err(_) => crate::git_fatal!("unable to read files to diff"),
     }
 }
 

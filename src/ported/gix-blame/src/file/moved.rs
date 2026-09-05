@@ -103,6 +103,7 @@ pub(super) fn find_copy_in_blob(
     starts: &[usize],
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
+    indent_heuristic: bool,
     stats: &mut Statistics,
 ) -> Option<(Split, u32)> {
     let range_in_blamed = hunk.range_in_blamed_file.clone();
@@ -119,14 +120,30 @@ pub(super) fn find_copy_in_blob(
         gix_diff::blob::InternedInput::new(parent_blob, target)
     };
     let diff = gix_diff::blob::Diff::compute(diff_algorithm, &input);
-    let compacted = compact::change_compact(
-        &diff,
-        diff_algorithm,
-        &input.before,
-        &input.after,
-        &compact::line_indents(parent_blob),
-        &compact::line_indents(target),
-    );
+    // `XDF_INDENT_HEURISTIC` reaches this diff too: `cmd_blame()` keeps one `xdl_opts` and
+    // `find_copy_in_blob()` passes it to `xdi_diff_hunks()` unchanged (`blame.c:1189-1196`).
+    let compacted = {
+        let (indent_parent, indent_target);
+        let indents = if indent_heuristic {
+            indent_parent = compact::line_indents(parent_blob);
+            indent_target = compact::line_indents(target);
+            Some((indent_parent.as_slice(), indent_target.as_slice()))
+        } else {
+            None
+        };
+        let mut removed: Vec<bool> =
+            (0..input.before.len() as u32).map(|i| diff.is_removed(i)).collect();
+        let mut added: Vec<bool> = (0..input.after.len() as u32).map(|i| diff.is_added(i)).collect();
+        compact::compact_flags(
+            &mut removed,
+            &mut added,
+            diff_algorithm,
+            &input.before,
+            &input.after,
+            indents,
+        );
+        compact::Changed { removed, added }
+    };
     stats.blobs_diffed += 1;
 
     // Between two change hunks everything matches, which is what `handle_split_cb()` reports.
@@ -227,6 +244,7 @@ pub(super) fn find_moves_in_parents(
     origin_files: &mut OriginFiles,
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
+    indent_heuristic: bool,
     stats: &mut Statistics,
 ) -> Result<Vec<UnblamedHunk>, Error> {
     let mut out = Vec::with_capacity(hunks_to_blame.len());
@@ -263,6 +281,7 @@ pub(super) fn find_moves_in_parents(
                     starts,
                     diff_algorithm,
                     ignore_whitespace,
+                    indent_heuristic,
                     stats,
                 );
                 match best {

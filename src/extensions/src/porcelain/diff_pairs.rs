@@ -871,6 +871,12 @@ struct Pair {
     /// no `diff_resolve_rename_copy()` ran to give it a status letter, which is fatal
     /// in every format that consults the status (all of them except `--summary`).
     unresolved: bool,
+    /// `pe` in `builtin_diff()` (diff.c:3622-3624): the userdiff driver whose
+    /// `funcname`/`xfuncname` pattern supplies this pair's `@@ … @@ <section>`
+    /// headings, resolved by [`resolve_funcnames`] after `diffcore_std()` has settled
+    /// the queue and before `strip_prefix()` shortens any path. `None` leaves
+    /// `xecfg.find_func` NULL, which is xdiff's `def_ff` heuristic.
+    ff: Option<std::sync::Arc<crate::userdiff::Driver>>,
 }
 
 impl Pair {
@@ -1833,6 +1839,11 @@ pub(crate) fn render_raw_stream(
     let mut check_failed = false;
     // `o->found_changes`: only consulted when `diff_from_contents` is on.
     let mut found_changes = false;
+    // `userdiff_find_by_path()`'s state — the gitattributes stack and the driver list —
+    // built once for the whole stream, as git builds its one static `attr_check`. Every
+    // batch resolves through it, so a driver's pattern is compiled once no matter how
+    // many pairs or `--flush` batches name it.
+    let mut ffs = crate::userdiff::Lookup::new(&repo)?;
     let mut cursor = 0usize;
 
     // Records are NUL-terminated fields; a zero-length header field closes a batch.
@@ -1848,7 +1859,7 @@ pub(crate) fn render_raw_stream(
     while let Some(header) = getwholeline(&input, &mut cursor) {
         let header = header.as_slice();
         if header.is_empty() {
-            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes, &mut has_changes)? {
+            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes, &mut has_changes, &mut ffs)? {
                 Ok(()) => {}
                 Err(code) => return Ok(code),
             }
@@ -1901,7 +1912,7 @@ pub(crate) fn render_raw_stream(
         batch.push(pair);
     }
 
-    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes, &mut has_changes)? {
+    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes, &mut has_changes, &mut ffs)? {
         Ok(()) => {}
         Err(code) => return Ok(code),
     }
@@ -2243,6 +2254,7 @@ fn parse_header(header: &[u8], hexsz: usize, allow_trees: bool) -> Result<(u8, P
             old_path: BString::default(),
             new_path: BString::default(),
             unresolved: false,
+            ff: None,
         },
     ))
 }
@@ -2352,6 +2364,7 @@ fn run_rename_detection(
             old_path: one.path.clone(),
             new_path: two.path.clone(),
             unresolved,
+            ff: None,
         });
     }
     Ok(warnings)
@@ -2410,6 +2423,10 @@ fn flush(
     // not accumulated: `builtin/diff-pairs.c:111` runs one `diffcore_std()` per
     // explicit batch flush, so the last batch is the one `diff_result_code()` sees.
     has_changes: &mut bool,
+    // `userdiff_find_by_path()`'s driver list and gitattributes stack, built once for
+    // the whole stream the way git builds its one static `attr_check` — every batch
+    // resolves its pairs' funcname patterns through it.
+    ffs: &mut crate::userdiff::Lookup<'_>,
 ) -> Result<std::result::Result<(), Status>> {
     let from_contents = opts.diff_from_contents();
     // `diffcore_std()` runs whatever the output format is, so its trailing
@@ -2498,6 +2515,11 @@ fn flush(
     }
 
     // `--relative` re-anchors the rendered paths and drops what falls outside.
+    // `run_diff()` captures `attr_path` off `p->one->path` before `strip_prefix()`
+    // shortens the printed name (diff.c:5036-5038), so the driver lookup runs on the
+    // repository-relative paths — i.e. ahead of `--relative`.
+    resolve_funcnames(ffs, &mut pairs)?;
+
     apply_relative(repo, &mut pairs, &opts.relative)?;
 
     // `-R`: swap each pair's two sides for display (the prefixes were swapped globally).
@@ -2911,6 +2933,42 @@ fn apply_relative(
     Ok(())
 }
 
+/// `userdiff_find_by_path()` + `xdiff_set_find_func()` for a whole batch, in
+/// `builtin_diff()`'s order:
+///
+/// ```text
+/// pe = diff_funcname_pattern(o, one);
+/// if (!pe)
+///         pe = diff_funcname_pattern(o, two);
+/// ```
+///
+/// (diff.c:3622-3624). `diff_funcname_pattern()` (diff.c:3393) loads the filespec's
+/// driver and answers NULL unless it carries a pattern, which is why a driver that
+/// configures only `textconv` still lets the post-image path's driver supply the
+/// heading. A rename or copy is the only pair whose two sides name different paths,
+/// and therefore the only one where the fall-back is observable.
+///
+/// A pattern that will not compile is git's
+/// `die(_("Invalid regexp to look for hunk header: %s"))`, raised as this port's
+/// fatal rather than at the first pair that would have used it.
+fn resolve_funcnames(ffs: &mut crate::userdiff::Lookup<'_>, pairs: &mut [Pair]) -> Result<()> {
+    for p in pairs.iter_mut() {
+        let one = ffs
+            .for_path(p.old_path.as_ref())
+            .map_err(crate::fatal::die)?
+            .filter(|drv| drv.funcname.is_some());
+        p.ff = match one {
+            Some(drv) => Some(drv),
+            None if p.old_path == p.new_path => None,
+            None => ffs
+                .for_path(p.new_path.as_ref())
+                .map_err(crate::fatal::die)?
+                .filter(|drv| drv.funcname.is_some()),
+        };
+    }
+    Ok(())
+}
+
 /// The "delete the old side" half of a type-change patch.
 fn as_deletion(p: &Pair) -> Pair {
     Pair {
@@ -2922,6 +2980,9 @@ fn as_deletion(p: &Pair) -> Pair {
         old_path: p.old_path.clone(),
         new_path: p.old_path.clone(),
         unresolved: false,
+        // Both halves name a path the parent pair already carried, so they inherit
+        // the driver `userdiff_find_by_path()` gave it.
+        ff: p.ff.clone(),
     }
 }
 
@@ -2936,6 +2997,9 @@ fn as_creation(p: &Pair) -> Pair {
         old_path: p.new_path.clone(),
         new_path: p.new_path.clone(),
         unresolved: false,
+        // Both halves name a path the parent pair already carried, so they inherit
+        // the driver `userdiff_find_by_path()` gave it.
+        ff: p.ff.clone(),
     }
 }
 
@@ -4281,6 +4345,9 @@ fn analyze(
     opts: &Opts,
     tc: TextconvRef<'_, '_>,
 ) -> std::result::Result<Analysis, Status> {
+    // `pe` (diff.c:3622-3624), resolved onto the pair by [`resolve_funcnames`] before
+    // any format ran, and handed to `xdiff_set_find_func()` here.
+    let ff = p.ff.as_ref().and_then(|drv| drv.funcname.as_ref());
     if is_gitlink(p) {
         let (add, del) = gitlink_counts(p);
         return Ok(Analysis {
@@ -4400,6 +4467,7 @@ fn analyze(
                     &new_data,
                     opts,
                     opts.algo.unwrap_or(gix::diff::blob::Algorithm::Myers),
+                    ff,
                 )?
                 .2
             } else {
@@ -4439,7 +4507,7 @@ fn analyze(
             }
             // `--diff-algorithm`/`--minimal`/`--histogram` override gitoxide's pick.
             let (add, del, hunks) =
-                text_analysis(&old_data, &new_data, opts, opts.algo.unwrap_or(algorithm))?;
+                text_analysis(&old_data, &new_data, opts, opts.algo.unwrap_or(algorithm), ff)?;
             Ok(Analysis {
                 add,
                 del,
@@ -4462,7 +4530,7 @@ fn analyze(
         raw.hunks = if p.kind() == b'M' && p.score() != 0 {
             emit_rewrite_diff(&old_txt, &new_txt, opts)
         } else {
-            text_analysis(&old_txt, &new_txt, opts, algorithm)?.2
+            text_analysis(&old_txt, &new_txt, opts, algorithm, ff)?.2
         };
         raw.converted = Some((old_txt, new_txt));
     }
@@ -4711,6 +4779,9 @@ fn text_analysis(
     new_data: &[u8],
     opts: &Opts,
     algorithm: gix::diff::blob::Algorithm,
+    // `xecfg.find_func` (diff.c:3629-3630): the pair driver funcname pattern, or
+    // `None` for xdiff def_ff heuristic.
+    funcname: Option<&crate::userdiff::FuncName>,
 ) -> std::result::Result<(u32, u32, Vec<u8>), Status> {
     let before: Vec<&[u8]> = byte_lines(old_data);
     let after: Vec<&[u8]> = byte_lines(new_data);
@@ -4757,10 +4828,10 @@ fn text_analysis(
             ctx: opts.ctx as usize,
             inter_hunk_ctx: opts.inter_hunk_ctx,
             func_context: opts.func_context,
-            // `diff-pairs` resolves a path's driver for `--textconv` and
-            // `--ext-diff`, but its funcname pattern is not threaded into
-            // `text_analysis` yet, so hunk headings use git's built-in `def_ff`.
-            funcname: None,
+            // `xdiff_set_find_func(&xecfg, pe->pattern, pe->cflags)` (diff.c:3629-3630):
+            // the pair's driver pattern when it has one, and xdiff's `def_ff` when it
+            // does not.
+            funcname,
         },
     );
     Ok((add, del, hunks))
@@ -5607,6 +5678,10 @@ fn render_patch(
             sink.files.push(diff_color::FilePaint {
                 ws_rule,
                 blank_at_eof: diff_color::check_blank_at_eof(bof_old, bof_new),
+                // This command does not resolve a path's userdiff driver, so no driver word
+                // regex is available; `diff.wordRegex` still reaches the emitter through
+                // [`diff_color::ExtraPaint`].
+                word_regex: None,
             });
         }
     }

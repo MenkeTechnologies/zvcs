@@ -468,7 +468,57 @@ pub fn send_pack(
         None
     };
     let allow_deleting_refs = caps.contains("delete-refs");
-    let object_format_supported = caps.contains("object-format");
+    // `server_supports_hash(the_hash_algo->name, &object_format_supported)`
+    // (`connect.c:661-681`), whose contract is two answers from one walk of the
+    // advertisement:
+    //
+    // ```c
+    // hash = next_server_feature_value("object-format", &len, &offset);
+    // if (feature_supported)
+    //         *feature_supported = !!hash;
+    // if (!hash) {
+    //         hash = hash_algos[GIT_HASH_SHA1_LEGACY].name;
+    //         len = strlen(hash);
+    // }
+    // while (hash) {
+    //         if (!xstrncmpz(desired, hash, len))
+    //                 return 1;
+    //         hash = next_server_feature_value("object-format", &len, &offset);
+    // }
+    // return 0;
+    // ```
+    //
+    // — `object_format_supported` is whether the server named *any* algorithm,
+    // and the return is whether one of the names it gave is this repository's.
+    // A server that names none is a v0 peer and can only mean `sha1`, which is
+    // why the fallback is a name rather than a "yes".
+    let advertised_formats: Vec<String> = caps
+        .iter()
+        .filter(|c| c.name() == b"object-format".as_slice())
+        .filter_map(|c| c.value().map(ToString::to_string))
+        .collect();
+    let object_format_supported = !advertised_formats.is_empty();
+    let desired_hash = repo.object_hash().to_string();
+    let server_supports_hash = if advertised_formats.is_empty() {
+        desired_hash == gix::hash::Kind::Sha1.to_string()
+    } else {
+        advertised_formats.iter().any(|h| *h == desired_hash)
+    };
+    // `send-pack.c:588-589`, immediately after the capability probes above and
+    // before a single command line is written:
+    //
+    // ```c
+    // if (!server_supports_hash(r->hash_algo->name, &object_format_supported))
+    //         die(_("the receiving end does not support this repository's hash algorithm"));
+    // ```
+    //
+    // Without it a SHA-256 repository pushing to a SHA-1 peer walked on into
+    // `set_ref_status_for_push()`, looked the peer's 40-hex `old` values up in a
+    // 32-byte object store, and aborted the process on gix-odb's
+    // `debug_assert_eq!(object_hash, id.kind())` (exit 101) instead of refusing.
+    if !server_supports_hash {
+        crate::git_fatal!("the receiving end does not support this repository's hash algorithm");
+    }
     // `if (server_supports("side-band-64k")) use_sideband = 1;` (send-pack.c:573).
     // git asks for it unconditionally, and it is what carries every `remote:` line
     // back — including everything the server's hooks wrote — and what keeps the

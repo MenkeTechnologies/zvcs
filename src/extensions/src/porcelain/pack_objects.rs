@@ -1161,6 +1161,7 @@ pub(crate) fn packed_for(
     ids: &[ObjectId],
     options: WriteOptions,
 ) -> Result<Packed> {
+    prefetch_to_pack(repo, ids)?;
     let counts: Vec<pack::data::output::Count> = ids
         .iter()
         .map(|id| pack::data::output::Count {
@@ -1191,6 +1192,93 @@ pub(crate) fn packed_for(
         &delta,
         options.progress,
     )
+}
+
+/// git's `prefetch_to_pack()` followed by `promisor_remote_get_direct()`: obtain
+/// every object the pack is to contain that this repository does not hold, and
+/// die on the ones no promisor remote would supply.
+///
+/// ```c
+/// static void prefetch_to_pack(uint32_t object_index_start) {
+///         struct oid_array to_fetch = OID_ARRAY_INIT;
+///         uint32_t i;
+///
+///         for (i = object_index_start; i < to_pack.nr_objects; i++) {
+///                 struct object_entry *entry = to_pack.objects + i;
+///
+///                 if (!odb_read_object_info_extended(the_repository->objects,
+///                                                    &entry->idx.oid,
+///                                                    NULL,
+///                                                    OBJECT_INFO_FOR_PREFETCH))
+///                         continue;
+///                 oid_array_append(&to_fetch, &entry->idx.oid);
+///         }
+///         promisor_remote_get_direct(the_repository,
+///                                    to_fetch.oid, to_fetch.nr);
+///         oid_array_clear(&to_fetch);
+/// }
+/// ```
+///
+/// (builtin/pack-objects.c:2234-2252, reached from `get_object_details()` on
+/// every `pack-objects` run.) `OBJECT_INFO_FOR_PREFETCH` is
+/// `OBJECT_INFO_SKIP_FETCH_OBJECT | OBJECT_INFO_QUICK` (odb.h:339), so the
+/// survey itself must not fetch — one round trip per object is exactly what the
+/// batch exists to avoid. That is the `fetch_if_missing` flag turned off for the
+/// survey and back on for the batch, which is the shape `backfill` already uses.
+///
+/// The batch is `promisor_remote_get_direct()`, and it is *not* gated on
+/// `fetch_if_missing`: a caller that asked for these objects by name gets a
+/// request even where an incidental read would not. What it does when the
+/// request comes back empty is the point:
+///
+/// ```c
+/// for (i = 0; i < remaining_nr; i++) {
+///         if (is_promisor_object(repo, &remaining_oids[i]))
+///                 die(_("could not fetch %s from promisor remote"),
+///                     oid_to_hex(&remaining_oids[i]));
+/// }
+/// ```
+///
+/// (promisor-remote.c:320-324.) An object a promisor pack promised and no
+/// remote will hand over ends the command, so `upload-pack` serving a partial
+/// clone answers a request it cannot satisfy with a failure rather than with a
+/// pack that quietly lacks the objects — which is what
+/// `git clone --no-local <partial-repo>` gets from stock, and what it used to
+/// get from here was a clone missing three blobs and an exit status of 0.
+///
+/// An object that is merely absent and was never promised is left alone, as it
+/// is in git: the pack writer reports that one itself.
+fn prefetch_to_pack(repo: &gix::Repository, ids: &[ObjectId]) -> Result<()> {
+    // `OBJECT_INFO_SKIP_FETCH_OBJECT` for the survey.
+    let restore = gix::odb::store::fetch_if_missing();
+    gix::odb::store::set_fetch_if_missing(false);
+    let mut missing: Vec<ObjectId> = Vec::new();
+    for id in ids {
+        if !repo.has_object(id) && !missing.contains(id) {
+            missing.push(*id);
+        }
+    }
+    gix::odb::store::set_fetch_if_missing(restore);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    // `promisor_remote_get_direct()` reads no flag of its own, so the request is
+    // made whatever the survey above was told. `fetch_objects()` is still the
+    // one place `GIT_NO_LAZY_FETCH` is consulted, and it is what warns.
+    gix::odb::store::set_fetch_if_missing(true);
+    repo.objects.store_ref().fetch_from_promisor(&missing);
+    gix::odb::store::set_fetch_if_missing(false);
+    for id in &missing {
+        if repo.has_object(id) {
+            continue;
+        }
+        if super::rev_list::promisor_objects(repo).contains(id) {
+            gix::odb::store::set_fetch_if_missing(restore);
+            crate::git_fatal!("could not fetch {id} from promisor remote");
+        }
+    }
+    gix::odb::store::set_fetch_if_missing(restore);
+    Ok(())
 }
 
 /// git's delta-search knobs, resolved the way `cmd_pack_objects` resolves them:
@@ -3907,10 +3995,32 @@ fn expand_tree(repo: &gix::Repository, id: ObjectId, seen: &mut HashSet<ObjectId
         .map(|e| (e.oid.to_owned(), e.mode.is_tree()))
         .collect();
     drop(object);
-    for (child, _) in entries {
-        if seen.insert(child) {
-            expand_tree(repo, child, seen, out);
+    for (child, child_is_tree) in entries {
+        if !seen.insert(child) {
+            continue;
         }
+        if child_is_tree {
+            expand_tree(repo, child, seen, out);
+            continue;
+        }
+        // ```c
+        // else {
+        //         struct blob *b = lookup_blob(ctx->revs->repo, &entry.oid);
+        //         ...
+        //         process_blob(ctx, b, base, entry.path);
+        // }
+        // ```
+        //
+        // (`process_tree_contents()`, list-objects.c:136-145, and `process_blob()`
+        // at :51-93.) Neither `lookup_blob()` nor `process_blob()` reads the
+        // object: the blob is *listed* on the strength of the tree entry that
+        // names it, and only whoever consumes the list finds out whether it is
+        // here. That is what puts a partial clone's filtered-out blobs in front
+        // of `pack-objects`, where [`prefetch_to_pack`] either obtains them or
+        // refuses to build the pack — where dropping them here made
+        // `upload-pack` answer a clone with a pack that silently lacked three
+        // blobs.
+        out.push(child);
     }
 }
 

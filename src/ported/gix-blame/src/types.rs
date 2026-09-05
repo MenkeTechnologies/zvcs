@@ -151,7 +151,10 @@ impl BlameRanges {
 }
 
 /// Options to be passed to [`file()`](crate::file()).
-#[derive(Default, Debug, Clone)]
+///
+/// `Default` is hand-written rather than derived because one field does not start at its type's
+/// default: `indent_heuristic` is git's `diff_indent_heuristic`, seeded to 1 at `diff.c:57`.
+#[derive(Debug, Clone)]
 pub struct Options {
     /// The algorithm to use for diffing.
     pub diff_algorithm: gix_diff::blob::Algorithm,
@@ -194,6 +197,20 @@ pub struct Options {
     /// Ignore whitespace when diffing revisions (`git blame -w`): a line that changed only in
     /// whitespace is attributed to the earlier commit, not the whitespace-only change.
     pub ignore_whitespace: bool,
+    /// `XDF_INDENT_HEURISTIC`, git's default and `git blame --no-indent-heuristic`'s absence.
+    ///
+    /// `cmd_blame()` keeps exactly one xdiff bit out of the revision options
+    /// (`builtin/blame.c:952`):
+    ///
+    /// ```c
+    /// xdl_opts |= revs.diffopt.xdl_opts & XDF_INDENT_HEURISTIC;
+    /// ```
+    ///
+    /// so `--no-indent-heuristic` is the one whitespace-ish diff option a blame does react to. It
+    /// decides which of several equally minimal placements a slidable hunk lands in, and therefore
+    /// which commit a line is blamed on — see `xdiff/xdiffi.c:876`, where the whole scoring branch
+    /// is guarded by the flag.
+    pub indent_heuristic: bool,
     /// Also blame the parents for lines that moved within the file (`git blame -M[<score>]`).
     ///
     /// The value is git's `sb->move_score` (`BLAME_DEFAULT_MOVE_SCORE`, 20, for a bare `-M`): the
@@ -265,6 +282,29 @@ pub struct Options {
     /// Ignored under [`Self::children`], where the walk runs forwards over a
     /// caller-built children map instead of reading parents at all.
     pub grafts: Option<std::sync::Arc<gix_revwalk::graft::Table>>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            diff_algorithm: gix_diff::blob::Algorithm::default(),
+            ranges: BlameRanges::default(),
+            since: None,
+            bottom: std::collections::HashSet::new(),
+            rewrites: None,
+            debug_track_path: false,
+            ignore_whitespace: false,
+            // `diff.c:57`: `static int diff_indent_heuristic = 1;`
+            indent_heuristic: true,
+            detect_moved: None,
+            ignore_revs: std::collections::HashSet::new(),
+            detect_copied: None,
+            first_parent: false,
+            children: None,
+            fake_commit: None,
+            grafts: None,
+        }
+    }
 }
 
 /// git's `revs->children`: the commits of the walked range that have a given commit as a parent,

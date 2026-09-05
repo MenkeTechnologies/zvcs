@@ -2545,6 +2545,46 @@ fn fetch_one(
             .unwrap_or(false)
     };
 
+    // ```c
+    // static inline void fetch_one_setup_partial(struct remote *remote)
+    // {
+    //         if (filter_options.no_filter)
+    //                 return;
+    //         if (!has_promisor_remote() && !filter_options.choice)
+    //                 return;
+    //         if (filter_options.choice) {
+    //                 partial_clone_register(remote->name, &filter_options);
+    //                 return;
+    //         }
+    //         [...]
+    // }
+    // ```
+    //
+    // (builtin/fetch.c:1996-2031, which `cmd_fetch()` calls at 2256 before `fetch_one()`.)
+    // A `--filter` on the command line does more than shape this one request: it makes the
+    // repository a partial clone, so the objects the filter withheld stay reachable through
+    // the remote that withheld them. Without the registration `git fetch --filter=blob:none`
+    // left a promisor pack behind with no promisor remote named anywhere, and every later
+    // read of a withheld blob was a hard miss.
+    if !opts.no_filter {
+        if let Some(spec) = opts.filter.as_ref().map(|f| f.as_str().to_owned()) {
+            // `remote->name`, which for a URL that was never configured is the URL as typed —
+            // the same string the `--set-upstream` diagnostic below uses for the same reason.
+            if let Some(name) =
+                remote_name.clone().or_else(|| name_or_url.map(ToString::to_string))
+            {
+                partial_clone_register(repo, &name, &spec)?;
+            }
+        }
+    }
+
+    // The filter this fetch actually sends, and with it git's `args->from_promisor`:
+    // `transport_set_option(TRANS_OPT_FROM_PROMISOR, "1")` sits in the same `if
+    // (filter_options.choice)` that sets the filter (builtin/fetch.c:1529-1535), so the two
+    // are one condition. It decides more than the wire — see the `index-pack` choice below.
+    let fetch_filter = partial_fetch_filter(repo, remote_name.as_deref(), opts);
+    let from_promisor = fetch_filter.is_some();
+
     let outcome = prepared
         .with_dry_run(opts.dry_run)
         .with_shallow(opts.shallow.clone().unwrap_or_default())
@@ -2555,7 +2595,7 @@ fn fetch_one(
         })
         .with_negotiation_restrictions(restrictions)
         .with_refetch(opts.refetch)
-        .with_filter(partial_fetch_filter(repo, remote_name.as_deref(), opts))
+        .with_filter(fetch_filter.clone())
         .with_atomic(opts.atomic)
         .with_reflog_message(RefLogMessage::Prefixed {
             action: opts.reflog_action.clone().into(),
@@ -2586,6 +2626,38 @@ fn fetch_one(
         // 0
         // ```
         Err(gix::remote::fetch::Error::NoMapping { .. }) => return Ok(Verdict::Ok),
+        // `write_fetch_command_and_capabilities()` (`fetch-pack.c:1398-1407`)
+        // compares the two algorithms while it is still composing the request:
+        //
+        // ```c
+        // if (server_feature_v2("object-format", &hash_name)) {
+        //         int hash_algo = hash_algo_by_name(hash_name);
+        //         if (hash_algo_by_ptr(the_hash_algo) != hash_algo)
+        //                 die(_("mismatched algorithms: client %s; server %s"),
+        //                     the_hash_algo->name, hash_name);
+        //         packet_buf_write(req_buf, "object-format=%s", the_hash_algo->name);
+        // } else if (hash_algo_by_ptr(the_hash_algo) != GIT_HASH_SHA1_LEGACY) {
+        //         die(_("the server does not support algorithm '%s'"),
+        //             the_hash_algo->name);
+        // }
+        // ```
+        //
+        // It is a `die()`, so a SHA-256 repository fetching from a SHA-1 peer
+        // ends at 128 in git's words, not at 1 in gitoxide's. `pull` still ends
+        // at 1: it renders this `Fatal` itself and flattens the status, which is
+        // what `cmd_pull()` does with a `run_fetch()` that failed.
+        //
+        // Only the first of git's two sentences is reachable here. gitoxide's
+        // `extract_object_hash()` (`gix-protocol/src/fetch/refmap/init.rs:177`)
+        // has already substituted `sha1` for a peer that advertised no
+        // `object-format` at all, so the two cases arrive as one error and the
+        // v0 wording (`the server does not support algorithm '<x>'`) has no
+        // input that could select it.
+        Err(gix::remote::fetch::Error::IncompatibleObjectHash { local, remote }) => {
+            return Err(crate::fatal::die(format!(
+                "mismatched algorithms: client {local}; server {remote}"
+            )));
+        }
         Err(e) => {
             // `ERR <message>` mid-response: the server's own refusal (an
             // unreachable want, a hidden ref), which git reports verbatim.
@@ -2629,8 +2701,22 @@ fn fetch_one(
 
     // `fetch_pack()` chooses `unpack-objects` over `index-pack` for a small pack, so a
     // fetch of a handful of objects leaves them loose rather than packed.
+    // ```c
+    // if (do_keep || args->from_promisor || index_pack_args || fsck_objects) {
+    //         [...]
+    //         cmd_name = "index-pack";
+    // }
+    // else {
+    //         cmd_name = "unpack-objects";
+    // ```
+    //
+    // (`get_pack()`, fetch-pack.c:963-994.) A *promisor* fetch is on the `index-pack` side of
+    // that test whatever the pack's size, which is what the `write_promisor_file()` above
+    // depends on: exploding the pack deleted the very file its `.promisor` marker names, so a
+    // `git fetch --refetch` on a partial clone left an orphaned marker, the history loose, and
+    // `fsck` reporting broken links into the blobs the filter had skipped.
     if let Status::Change { write_pack_bundle, .. } = &outcome.status {
-        if !fsck_objects {
+        if !fsck_objects && !from_promisor {
             explode_small_pack(repo, write_pack_bundle)?;
         }
     }
@@ -3885,6 +3971,66 @@ fn explode_small_pack(
     {
         let _ = std::fs::remove_file(path);
     }
+    Ok(())
+}
+
+/// `partial_clone_register()` (list-objects-filter-options.c:339-377): make `remote` this
+/// repository's promisor remote, recording the filter it was asked for.
+///
+/// ```c
+/// if ((promisor_remote = promisor_remote_find(remote))) {
+///         if (promisor_remote->partial_clone_filter)
+///                 return;
+/// } else {
+///         if (upgrade_repository_format(1) < 0)
+///                 die(_("unable to upgrade repository format to support partial clone"));
+///         cfg_name = xstrfmt("remote.%s.promisor", remote);
+///         git_config_set(cfg_name, "true");
+///         free(cfg_name);
+/// }
+/// filter_name = xstrfmt("remote.%s.partialclonefilter", remote);
+/// git_config_set(filter_name, expand_list_objects_filter_spec(filter_options));
+/// ```
+///
+/// The two halves are separate on purpose: a remote that is already a promisor *and* already
+/// carries a filter is left entirely alone, while one that is a promisor without a filter has
+/// the filter written and its `core.repositoryformatversion` left where it is.
+///
+/// `spec` arrives already expanded — [`gix::protocol::fetch::filter::Filter::as_str()`] is
+/// `expand_list_objects_filter_spec()`, so `blob:limit=1k` is recorded as `blob:limit=1024`.
+fn partial_clone_register(repo: &gix::Repository, remote: &str, spec: &str) -> Result<()> {
+    let known = gix::promisor::remotes(repo).into_iter().find(|r| r.name == remote);
+    if known.as_ref().is_some_and(|r| r.filter.is_some()) {
+        return Ok(());
+    }
+
+    let path = repo.common_dir().join("config");
+    let mut file = gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let sub = BStr::new(remote.as_bytes());
+    if known.is_none() {
+        // `upgrade_repository_format(1)`: the version is bumped and no `[extensions]` section
+        // is added, which is what a `--filter` clone leaves behind too (clone.rs records the
+        // same pair).
+        file.set_raw_value_by("core", None, "repositoryformatversion", "1")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        file.set_raw_value_by("remote", Some(sub), "promisor", "true")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    file.set_raw_value_by("remote", Some(sub), "partialclonefilter", spec)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Atomic, like every other config write here: a sibling temp file renamed over the
+    // target, so a crash never leaves a half-written config behind.
+    let bytes = file.to_bstring();
+    let tmp = path.with_extension("zvcs-tmp");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 

@@ -203,6 +203,13 @@ pub fn parse_line(line: &[u8], hash_kind: gix_hash::Kind) -> Result<Option<(Obje
     Ok(Some((id, Graft::Parents(parents))))
 }
 
+/// [`rtrim`] for a caller that has to report a rejected line the way git does —
+/// `error("bad graft data: %s", line->buf)` prints the buffer *after*
+/// `read_graft_line()` has trimmed it in place.
+pub fn rtrim_line(line: &[u8]) -> &[u8] {
+    rtrim(line)
+}
+
 /// `strbuf_rtrim()`: drop trailing whitespace, which includes the `\n` and the
 /// `\r` of a CRLF file.
 fn rtrim(mut line: &[u8]) -> &[u8] {

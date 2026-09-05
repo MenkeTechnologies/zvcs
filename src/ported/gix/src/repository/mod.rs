@@ -92,7 +92,10 @@ mod new_commit_as {
 #[cfg(feature = "blame")]
 pub mod blame_file {
     /// Options to be passed to [Repository::blame_file()](crate::Repository::blame_file()).
-    #[derive(Default, Debug, Clone)]
+    ///
+    /// `Default` is hand-written rather than derived: `indent_heuristic` is git's
+    /// `diff_indent_heuristic`, which `diff.c:57` seeds to 1.
+    #[derive(Debug, Clone)]
     pub struct Options {
         /// The algorithm to use for diffing. If `None`, `diff.algorithm` will be used.
         pub diff_algorithm: Option<gix_diff::blob::Algorithm>,
@@ -107,6 +110,8 @@ pub mod blame_file {
         pub rewrites: Option<gix_diff::Rewrites>,
         /// Ignore whitespace differences when diffing revisions (`git blame -w`).
         pub ignore_whitespace: bool,
+        /// `XDF_INDENT_HEURISTIC`, on by default (`git blame --no-indent-heuristic` turns it off).
+        pub indent_heuristic: bool,
         /// Also blame parents for lines that moved within the file (`git blame -M[<score>]`),
         /// carrying git's `sb->move_score`.
         pub detect_moved: Option<u32>,
@@ -123,6 +128,26 @@ pub mod blame_file {
         /// The synthetic commit holding the final image, when it does not come from `suspect`'s
         /// tree (git's `fake_working_tree_commit()`).
         pub fake_commit: Option<gix_blame::FakeCommit>,
+    }
+
+    impl Default for Options {
+        fn default() -> Self {
+            Options {
+                diff_algorithm: None,
+                ranges: gix_blame::BlameRanges::default(),
+                since: None,
+                bottom: std::collections::HashSet::new(),
+                rewrites: None,
+                ignore_whitespace: false,
+                indent_heuristic: true,
+                detect_moved: None,
+                ignore_revs: std::collections::HashSet::new(),
+                detect_copied: None,
+                first_parent: false,
+                children: None,
+                fake_commit: None,
+            }
+        }
     }
 
     /// The error returned by [Repository::blame_file()](crate::Repository::blame_file()).

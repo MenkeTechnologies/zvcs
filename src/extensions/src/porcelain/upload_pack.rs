@@ -193,6 +193,33 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // ```c
+    // packet_trace_identity("upload-pack");
+    // disable_replace_refs();
+    // save_commit_buffer = 0;
+    // xsetenv(NO_LAZY_FETCH_ENVIRONMENT, "1", 0);
+    // ```
+    //
+    // (`cmd_upload_pack()`, builtin/upload-pack.c:46-49, before the options are
+    // even parsed.) A server must answer out of what it holds: serving a
+    // repository that is itself a partial clone would otherwise make every
+    // request for a filtered-out object a lazy fetch *into the server*, so
+    // `git clone <partial-repo>` grew the source by the blobs it was missing.
+    // git therefore refuses the fetch and lets pack generation fail instead —
+    // `git-upload-pack(1)`: "Since Git 2.34 … `git upload-pack` sets the
+    // `GIT_NO_LAZY_FETCH` variable to 1."
+    //
+    // `xsetenv` with an overwrite of `0` leaves an existing value alone, which
+    // is what lets an operator who trusts the client set `GIT_NO_LAZY_FETCH=0`
+    // and get the old behaviour back.
+    if std::env::var_os("GIT_NO_LAZY_FETCH").is_none() {
+        std::env::set_var("GIT_NO_LAZY_FETCH", "1");
+    }
+    // The same line `setup_git_env_internal()` reaches once a git directory is
+    // established (setup.c:1066); `upload-pack` sets the variable after that
+    // point has already passed for this process, so the flag is set here too.
+    gix::odb::store::set_fetch_if_missing(false);
+
     let mut strict = false;
     let mut directories: Vec<&str> = Vec::new();
     let mut end_of_opts = false;
@@ -784,7 +811,7 @@ fn advertisement(repo: &gix::Repository, policy: WantPolicy, no_done: bool) -> R
         .ok()
         .flatten()
         .map(|r| r.name().as_bstr().to_string());
-    let caps = capabilities(head_target.as_deref(), policy, no_done);
+    let caps = capabilities(head_target.as_deref(), policy, no_done, repo.object_hash());
     let mut sent_caps = false;
 
     // HEAD first, when it resolves to an object.
@@ -908,7 +935,12 @@ const V0_CAPABILITIES: &str =
 /// `no-done` follows `data->no_done`, which `cmd_main` sets only under
 /// `--advertise-refs` (upload-pack.c:1420-1421) — see [`serve`] for the branch
 /// that honours a client asking for it back.
-fn capabilities(head_target: Option<&str>, policy: WantPolicy, no_done: bool) -> String {
+fn capabilities(
+    head_target: Option<&str>,
+    policy: WantPolicy,
+    no_done: bool,
+    object_format: gix::hash::Kind,
+) -> String {
     let mut caps = String::from(V0_CAPABILITIES);
     if policy.tip {
         caps.push_str(" allow-tip-sha1-in-want");
@@ -932,7 +964,16 @@ fn capabilities(head_target: Option<&str>, policy: WantPolicy, no_done: bool) ->
     // `git/<version>-<uname -s>`. Deriving it keeps `upload-pack` and
     // `receive-pack` from disagreeing about what this binary is, and keeps the
     // platform suffix honest off Darwin, which a literal cannot do.
-    caps.push_str(&format!(" object-format=sha1 agent={}", super::receive_pack::agent()));
+    // `object-format=%s` is filled with `the_hash_algo->name`
+    // (`upload-pack.c:1249-1261`), so it names the *repository being served*.
+    // A literal `sha1` here told every protocol-v0 client that a SHA-256
+    // repository was SHA-1 — the v2 advertisement (`serve.c`) and
+    // `receive-pack` both already derived it, so the same server contradicted
+    // itself depending on which protocol the client spoke.
+    caps.push_str(&format!(
+        " object-format={object_format} agent={}",
+        super::receive_pack::agent()
+    ));
     caps
 }
 
@@ -2385,11 +2426,12 @@ mod tests {
     /// `object-format=` (upload-pack.c:1249-1261).
     #[test]
     fn filter_capability_is_gated_and_positioned() {
-        let off = capabilities(Some("refs/heads/main"), WantPolicy::default(), false);
+        let sha1 = gix::hash::Kind::Sha1;
+        let off = capabilities(Some("refs/heads/main"), WantPolicy::default(), false, sha1);
         assert!(!off.contains(" filter"), "{off}");
 
         let policy = WantPolicy { filter: true, ..WantPolicy::default() };
-        let on = capabilities(Some("refs/heads/main"), policy, false);
+        let on = capabilities(Some("refs/heads/main"), policy, false, sha1);
         assert!(on.contains(" symref=HEAD:refs/heads/main filter object-format=sha1 "), "{on}");
     }
 
@@ -2401,8 +2443,9 @@ mod tests {
     #[test]
     fn no_done_is_advertised_only_for_advertise_refs() {
         let policy = WantPolicy::default();
-        assert!(!capabilities(Some("refs/heads/main"), policy, false).contains(" no-done"));
-        let adv = capabilities(Some("refs/heads/main"), policy, true);
+        let sha1 = gix::hash::Kind::Sha1;
+        assert!(!capabilities(Some("refs/heads/main"), policy, false, sha1).contains(" no-done"));
+        let adv = capabilities(Some("refs/heads/main"), policy, true, sha1);
         assert!(adv.contains(" no-done symref=HEAD:refs/heads/main "), "{adv}");
     }
 
@@ -2413,7 +2456,7 @@ mod tests {
     /// [`crate::shallow_serve`] produces.
     #[test]
     fn advertised_capabilities_are_the_honoured_ones() {
-        let caps = capabilities(None, WantPolicy::default(), true);
+        let caps = capabilities(None, WantPolicy::default(), true, gix::hash::Kind::Sha1);
         for present in [
             "multi_ack",
             "multi_ack_detailed",
@@ -2430,6 +2473,19 @@ mod tests {
         ] {
             assert!(caps.split(' ').any(|tok| tok == present), "{present} missing: {caps}");
         }
+    }
+
+    /// `object-format=%s` takes `the_hash_algo->name` (upload-pack.c:1249-1261),
+    /// so the token names the repository being served rather than a compiled-in
+    /// default. Measured against stock 2.55.0 serving an
+    /// `init --object-format=sha256` repository, whose v0 advertisement ends
+    /// `… symref=HEAD:refs/heads/main object-format=sha256 agent=…`.
+    #[test]
+    fn object_format_names_the_served_repository() {
+        let sha1 = capabilities(None, WantPolicy::default(), false, gix::hash::Kind::Sha1);
+        assert!(sha1.contains(" object-format=sha1 agent="), "{sha1}");
+        let sha256 = capabilities(None, WantPolicy::default(), false, gix::hash::Kind::Sha256);
+        assert!(sha256.contains(" object-format=sha256 agent="), "{sha256}");
     }
 
     /// The dialect is picked off the client's first `want` line, and

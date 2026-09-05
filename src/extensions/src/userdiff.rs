@@ -59,49 +59,66 @@ use gix::bstr::{BStr, ByteSlice};
 // the built-in driver table (userdiff.c:45-372)
 // ---------------------------------------------------------------------------
 
-/// One entry of `builtin_drivers[]`, reduced to the two fields a hunk header needs.
+/// One entry of `builtin_drivers[]`, reduced to the fields this port reads.
 ///
-/// `word_regex` (`--word-diff`) and the `binary` tri-state are the table's other
-/// columns; neither is read here.
+/// The `binary` tri-state is the table's remaining column; it is not read here,
+/// because every built-in entry carries `.binary = -1` (the `PATTERNS`/`IPATTERN`
+/// macros, userdiff.c:14 and :27) — the value that means "work it out from the
+/// content", which is what the blob pipeline already does.
 struct Builtin {
     name: &'static str,
     /// The `funcname.pattern` field, verbatim from `userdiff.c`.
     pattern: &'static str,
     /// `IPATTERN` adds `REG_ICASE` to `REG_EXTENDED`; `PATTERNS` does not.
     icase: bool,
+    /// `word_regex`: the macro's third argument with the tail both macros append,
+    /// `"|[^[:space:]]|[\xc0-\xff][\x80-\xbf]+"` (userdiff.c:22).
+    ///
+    /// git also carries a `word_regex_multi_byte` twin — the same pattern without
+    /// the UTF-8 continuation alternative — and `userdiff_find_by_name()`
+    /// (userdiff.c:518-527) swaps it in when `regexec_supports_multi_byte_chars()`
+    /// says the locale can do it. That swap is what makes `diff.<name>.wordregex`
+    /// silently ineffective on a built-in driver under a UTF-8 locale: it overwrites
+    /// `word_regex` after `userdiff_config()` has already written the configured
+    /// value into it. Measured against git 2.55.0, `-c diff.python.wordregex=...`
+    /// changes nothing under `LC_ALL=en_US.UTF-8` and takes effect under `LC_ALL=C`.
+    /// This port carries the C-locale spelling only: the `regex` crate matches on
+    /// bytes regardless of locale, so the byte-range alternative reproduces the
+    /// multi-byte behaviour, and configuration is never clobbered.
+    word_regex: &'static str,
 }
 
 /// `builtin_drivers[]` (userdiff.c:45-372), in git's order. Only drivers carrying a
 /// funcname pattern appear — `default`, `driver_true` (`diff`) and `driver_false`
 /// (`-diff`) have none, and answer `None` here as they do in git.
 const BUILTIN: &[Builtin] = &[
-    Builtin { name: "ada", pattern: "!^(.*[ \t])?(is[ \t]+new|renames|is[ \t]+separate)([ \t].*)?$\n!^[ \t]*with[ \t].*$\n^[ \t]*((procedure|function)[ \t]+.*)$\n^[ \t]*((package|protected|task)[ \t]+.*)$", icase: true },
-    Builtin { name: "bash", pattern: "^[ \t]*((([a-zA-Z_][a-zA-Z0-9_]*[ \t]*\\([ \t]*\\))|(function[ \t]+[a-zA-Z_][a-zA-Z0-9_]*(([ \t]*\\([ \t]*\\))|([ \t]+)))).*$)", icase: false },
-    Builtin { name: "bibtex", pattern: "(@[a-zA-Z]{1,}[ \t]*\\{{0,1}[ \t]*[^ \t\"@',\\#}{~%]*).*$", icase: false },
-    Builtin { name: "cpp", pattern: "!^[ \t]*[A-Za-z_][A-Za-z_0-9]*:[[:space:]]*($|/[/*])\n^((::[[:space:]]*)?[A-Za-z_].*)$", icase: false },
-    Builtin { name: "csharp", pattern: "!(^|[ \t]+)(do|while|for|foreach|if|else|new|default|return|switch|case|throw|catch|using|lock|fixed)([ \t(]+|$)\n^[ \t]*(([][[:alnum:]@_.](<[][[:alnum:]@_, \t<>]+>)?)+([ \t]+([][[:alnum:]@_.](<[][[:alnum:]@_, \t<>]+>)?)+)+[ \t]*\\([^;]*)$\n^[ \t]*(([][[:alnum:]@_.](<[][[:alnum:]@_, \t<>]+>)?)+([ \t]+([][[:alnum:]@_.](<[][[:alnum:]@_, \t<>]+>)?)+)+[^;=:,()]*)$\n^[ \t]*(((static|public|internal|private|protected|new|unsafe|sealed|abstract|partial)[ \t]+)*(class|enum|interface|struct|record)[ \t]+.*)$\n^[ \t]*(namespace[ \t]+.*)$", icase: false },
-    Builtin { name: "css", pattern: "![:;][[:space:]]*$\n^[:[@.#]?[_a-z0-9].*$", icase: true },
-    Builtin { name: "dts", pattern: "!;\n!=\n^[ \t]*((/[ \t]*\\{|&?[a-zA-Z_]).*)", icase: false },
-    Builtin { name: "elixir", pattern: "^[ \t]*((def(macro|module|impl|protocol|p)?|test)[ \t].*)$", icase: false },
-    Builtin { name: "fortran", pattern: "!^([C*]|[ \t]*!)\n!^[ \t]*MODULE[ \t]+PROCEDURE[ \t]\n^[ \t]*((END[ \t]+)?(PROGRAM|MODULE|BLOCK[ \t]+DATA|([^!'\" \t]+[ \t]+)*(SUBROUTINE|FUNCTION))[ \t]+[A-Z].*)$", icase: true },
-    Builtin { name: "fountain", pattern: "^((\\.[^.]|(int|ext|est|int\\.?/ext|i/e)[. ]).*)$", icase: true },
-    Builtin { name: "golang", pattern: "^[ \t]*(func[ \t]*.*(\\{[ \t]*)?)\n^[ \t]*(type[ \t].*(struct|interface)[ \t]*(\\{[ \t]*)?)", icase: false },
-    Builtin { name: "html", pattern: "^[ \t]*(<[Hh][1-6]([ \t].*)?>.*)$", icase: false },
-    Builtin { name: "ini", pattern: "^[ \t]*\\[[^]]+\\]", icase: false },
-    Builtin { name: "java", pattern: "!^[ \t]*(catch|do|for|if|instanceof|new|return|switch|throw|while)\n^[ \t]*(([a-z-]+[ \t]+)*(class|enum|interface|record)[ \t]+.*)$\n^[ \t]*(([A-Za-z_<>&][][?&<>.,A-Za-z_0-9]*[ \t]+)+[A-Za-z_][A-Za-z_0-9]*[ \t]*\\([^;]*)$", icase: false },
-    Builtin { name: "kotlin", pattern: "^[ \t]*(([a-z]+[ \t]+)*(fun|class|interface)[ \t]+.*)$", icase: false },
-    Builtin { name: "markdown", pattern: "^ {0,3}#{1,6}[ \t].*", icase: false },
-    Builtin { name: "matlab", pattern: "^[[:space:]]*((classdef|function)[[:space:]].*)$|^(%%%?|##)[[:space:]].*$", icase: false },
-    Builtin { name: "objc", pattern: "!^[ \t]*(do|for|if|else|return|switch|while)\n^[ \t]*([-+][ \t]*\\([ \t]*[A-Za-z_][A-Za-z_0-9* \t]*\\)[ \t]*[A-Za-z_].*)$\n^[ \t]*(([A-Za-z_][A-Za-z_0-9]*[ \t]+)+[A-Za-z_][A-Za-z_0-9]*[ \t]*\\([^;]*)$\n^(@(implementation|interface|protocol)[ \t].*)$", icase: false },
-    Builtin { name: "pascal", pattern: "^(((class[ \t]+)?(procedure|function)|constructor|destructor|interface|implementation|initialization|finalization)[ \t]*.*)$\n^(.*=[ \t]*(class|record).*)$", icase: false },
-    Builtin { name: "perl", pattern: "^package .*\n^sub [[:alnum:]_':]+[ \t]*(\\([^)]*\\)[ \t]*)?(:[^;#]*)?(\\{[ \t]*)?(#.*)?$\n^(BEGIN|END|INIT|CHECK|UNITCHECK|AUTOLOAD|DESTROY)[ \t]*(\\{[ \t]*)?(#.*)?$\n^=head[0-9] .*", icase: false },
-    Builtin { name: "php", pattern: "^[\t ]*(((public|protected|private|static|abstract|final)[\t ]+)*function.*)$\n^[\t ]*((((final|abstract)[\t ]+)?class|enum|interface|trait).*)$", icase: false },
-    Builtin { name: "python", pattern: "^[ \t]*((class|(async[ \t]+)?def)[ \t].*)$", icase: false },
-    Builtin { name: "r", pattern: "^[ \t]*([a-zA-z][a-zA-Z0-9_.]*[ \t]*(<-|=)[ \t]*function.*)$", icase: false },
-    Builtin { name: "ruby", pattern: "^[ \t]*((class|module|def)[ \t].*)$", icase: false },
-    Builtin { name: "rust", pattern: "^[\t ]*((pub(\\([^\\)]+\\))?[\t ]+)?((async|const|unsafe|extern([\t ]+\"[^\"]+\"))[\t ]+)?(struct|enum|union|mod|trait|fn|impl|macro_rules!)[< \t]+[^;]*)$", icase: false },
-    Builtin { name: "scheme", pattern: "^(\\(.*)$\n^[\t ]*(\\(((define|def(struct|syntax|class|method|rules|record|proto|alias)?)[-*/ \t]|(library|module|struct|class)[*+ \t]).*)$\n^  ?(\\([Dd][Ee][Ff].*)$", icase: false },
-    Builtin { name: "tex", pattern: "^(\\\\((sub)*section|chapter|part)\\*{0,1}\\{.*)$", icase: false },
+    Builtin { name: "ada", pattern: "!^(.*[ \t])?(is[ \t]+new|renames|is[ \t]+separate)([ \t].*)?$\n!^[ \t]*with[ \t].*$\n^[ \t]*((procedure|function)[ \t]+.*)$\n^[ \t]*((package|protected|task)[ \t]+.*)$", icase: true, word_regex: "[a-zA-Z][a-zA-Z0-9_]*|[-+]?[0-9][0-9#_.aAbBcCdDeEfF]*([eE][+-]?[0-9_]+)?|=>|\\.\\.|\\*\\*|:=|/=|>=|<=|<<|>>|<>|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "bash", pattern: "^[ \t]*((([a-zA-Z_][a-zA-Z0-9_]*[ \t]*\\([ \t]*\\))|(function[ \t]+[a-zA-Z_][a-zA-Z0-9_]*(([ \t]*\\([ \t]*\\))|([ \t]+)))).*$)", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|\\$[a-zA-Z0-9_]+|\\$\\{|\\|\\||&&|<<|>>|==|!=|<=|>=|[-+*/%&|^]=|:=|:-|:\\+|:\\?|##|%%|\\^\\^|,,|[-a-zA-Z0-9_]+|\\(|\\)|\\{|\\}|\\[|\\]|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "bibtex", pattern: "(@[a-zA-Z]{1,}[ \t]*\\{{0,1}[ \t]*[^ \t\"@',\\#}{~%]*).*$", icase: false, word_regex: "[={}\"]|[^={}\" \t]+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "cpp", pattern: "!^[ \t]*[A-Za-z_][A-Za-z_0-9]*:[[:space:]]*($|/[/*])\n^((::[[:space:]]*)?[A-Za-z_].*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[0-9][0-9.]*([Ee][-+]?[0-9]+)?[fFlLuU]*|0[xXbB][0-9a-fA-F]+[lLuU]*|\\.[0-9][0-9]*([Ee][-+]?[0-9]+)?[fFlL]?|[-+*/<>%&^|=!]=|--|\\+\\+|<<=?|>>=?|&&|\\|\\||::|->\\*?|\\.\\*|<=>|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "csharp", pattern: "!(^|[ \t]+)(do|while|for|foreach|if|else|new|default|return|switch|case|throw|catch|using|lock|fixed)([ \t(]+|$)\n^[ \t]*(([][[:alnum:]@_.](<[][[:alnum:]@_, \t<>]+>)?)+([ \t]+([][[:alnum:]@_.](<[][[:alnum:]@_, \t<>]+>)?)+)+[ \t]*\\([^;]*)$\n^[ \t]*(([][[:alnum:]@_.](<[][[:alnum:]@_, \t<>]+>)?)+([ \t]+([][[:alnum:]@_.](<[][[:alnum:]@_, \t<>]+>)?)+)+[^;=:,()]*)$\n^[ \t]*(((static|public|internal|private|protected|new|unsafe|sealed|abstract|partial)[ \t]+)*(class|enum|interface|struct|record)[ \t]+.*)$\n^[ \t]*(namespace[ \t]+.*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+[fFlL]?|0[xXbB]?[0-9a-fA-F]+[lL]?|[-+*/<>%&^|=!]=|--|\\+\\+|<<=?|>>=?|&&|\\|\\||::|->|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "css", pattern: "![:;][[:space:]]*$\n^[:[@.#]?[_a-z0-9].*$", icase: true, word_regex: "-?[_a-zA-Z][-_a-zA-Z0-9]*|-?[0-9]+|\\#[0-9a-fA-F]+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "dts", pattern: "!;\n!=\n^[ \t]*((/[ \t]*\\{|&?[a-zA-Z_]).*)", icase: false, word_regex: "[a-zA-Z0-9,._+?#-]+|[-+*/%&^|!~]|>>|<<|&&|\\|\\||[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "elixir", pattern: "^[ \t]*((def(macro|module|impl|protocol|p)?|test)[ \t].*)$", icase: false, word_regex: "[@:]?[a-zA-Z0-9@_?!]+|[-+]?0[xob][0-9a-fA-F]+|[-+]?[0-9][0-9_.]*([eE][-+]?[0-9_]+)?|:?(\\+\\+|--|\\.\\.|~~~|<>|\\^\\^\\^|<?\\|>|<<<?|>?>>|<<?~|~>?>|<~>|<=|>=|===?|!==?|=~|&&&?|\\|\\|\\|?|=>|<-|\\\\\\\\|->)|:?%[A-Za-z0-9_.]\\{\\}?|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "fortran", pattern: "!^([C*]|[ \t]*!)\n!^[ \t]*MODULE[ \t]+PROCEDURE[ \t]\n^[ \t]*((END[ \t]+)?(PROGRAM|MODULE|BLOCK[ \t]+DATA|([^!'\" \t]+[ \t]+)*(SUBROUTINE|FUNCTION))[ \t]+[A-Z].*)$", icase: true, word_regex: "[a-zA-Z][a-zA-Z0-9_]*|\\.([Ee][Qq]|[Nn][Ee]|[Gg][TtEe]|[Ll][TtEe]|[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee]|[Aa][Nn][Dd]|[Oo][Rr]|[Nn]?[Ee][Qq][Vv]|[Nn][Oo][Tt])\\.|[-+]?[0-9.]+([AaIiDdEeFfLlTtXx][Ss]?[-+]?[0-9.]*)?(_[a-zA-Z0-9][a-zA-Z0-9_]*)?|//|\\*\\*|::|[/<>=]=|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "fountain", pattern: "^((\\.[^.]|(int|ext|est|int\\.?/ext|i/e)[. ]).*)$", icase: true, word_regex: "[^ \t-]+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "golang", pattern: "^[ \t]*(func[ \t]*.*(\\{[ \t]*)?)\n^[ \t]*(type[ \t].*(struct|interface)[ \t]*(\\{[ \t]*)?)", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.eE]+i?|0[xX]?[0-9a-fA-F]+i?|[-+*/<>%&^|=!:]=|--|\\+\\+|<<=?|>>=?|&\\^=?|&&|\\|\\||<-|\\.{3}|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "html", pattern: "^[ \t]*(<[Hh][1-6]([ \t].*)?>.*)$", icase: false, word_regex: "[^<>= \t]+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "ini", pattern: "^[ \t]*\\[[^]]+\\]", icase: false, word_regex: "[^ \t]+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "java", pattern: "!^[ \t]*(catch|do|for|if|instanceof|new|return|switch|throw|while)\n^[ \t]*(([a-z-]+[ \t]+)*(class|enum|interface|record)[ \t]+.*)$\n^[ \t]*(([A-Za-z_<>&][][?&<>.,A-Za-z_0-9]*[ \t]+)+[A-Za-z_][A-Za-z_0-9]*[ \t]*\\([^;]*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+[fFlL]?|0[xXbB]?[0-9a-fA-F]+[lL]?|[-+*/<>%&^|=!]=|--|\\+\\+|<<=?|>>>?=?|&&|\\|\\||[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "kotlin", pattern: "^[ \t]*(([a-z]+[ \t]+)*(fun|class|interface)[ \t]+.*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|0[xXbB][0-9a-fA-F_]+[lLuU]*|[0-9][0-9_]*([.][0-9_]*)?([Ee][-+]?[0-9]+)?[fFlLuU]*|[.][0-9][0-9_]*([Ee][-+]?[0-9]+)?[fFlLuU]?|[-+*/<>%&^|=!]==?|--|\\+\\+|<<=|>>=|&&|\\|\\||->|\\.\\*|!!|[?:.][.:]|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "markdown", pattern: "^ {0,3}#{1,6}[ \t].*", icase: false, word_regex: "[^<>= \t]+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "matlab", pattern: "^[[:space:]]*((classdef|function)[[:space:]].*)$|^(%%%?|##)[[:space:]].*$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|[=~<>]=|\\.[*/\\^']|\\|\\||&&|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "objc", pattern: "!^[ \t]*(do|for|if|else|return|switch|while)\n^[ \t]*([-+][ \t]*\\([ \t]*[A-Za-z_][A-Za-z_0-9* \t]*\\)[ \t]*[A-Za-z_].*)$\n^[ \t]*(([A-Za-z_][A-Za-z_0-9]*[ \t]+)+[A-Za-z_][A-Za-z_0-9]*[ \t]*\\([^;]*)$\n^(@(implementation|interface|protocol)[ \t].*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+[fFlL]?|0[xXbB]?[0-9a-fA-F]+[lL]?|[-+*/<>%&^|=!]=|--|\\+\\+|<<=?|>>=?|&&|\\|\\||::|->|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "pascal", pattern: "^(((class[ \t]+)?(procedure|function)|constructor|destructor|interface|implementation|initialization|finalization)[ \t]*.*)$\n^(.*=[ \t]*(class|record).*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+|<>|<=|>=|:=|\\.\\.|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "perl", pattern: "^package .*\n^sub [[:alnum:]_':]+[ \t]*(\\([^)]*\\)[ \t]*)?(:[^;#]*)?(\\{[ \t]*)?(#.*)?$\n^(BEGIN|END|INIT|CHECK|UNITCHECK|AUTOLOAD|DESTROY)[ \t]*(\\{[ \t]*)?(#.*)?$\n^=head[0-9] .*", icase: false, word_regex: "[[:alpha:]_'][[:alnum:]_']*|0[xb]?[0-9a-fA-F_]*|[0-9a-fA-F_]+(\\.[0-9a-fA-F_]+)?([eE][-+]?[0-9_]+)?|=>|-[rwxoRWXOezsfdlpSugkbctTBMAC>]|~~|::|&&=|\\|\\|=|//=|\\*\\*=|&&|\\|\\||//|\\+\\+|--|\\*\\*|\\.\\.\\.?|[-+*/%.^&<>=!|]=|=~|!~|<<|<>|<=>|>>|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "php", pattern: "^[\t ]*(((public|protected|private|static|abstract|final)[\t ]+)*function.*)$\n^[\t ]*((((final|abstract)[\t ]+)?class|enum|interface|trait).*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+|[-+*/<>%&^|=!.]=|--|\\+\\+|<<=?|>>=?|===|&&|\\|\\||::|->|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "python", pattern: "^[ \t]*((class|(async[ \t]+)?def)[ \t].*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+[jJlL]?|0[xX]?[0-9a-fA-F]+[lL]?|[-+*/<>%&^|=!]=|//=?|<<=?|>>=?|\\*\\*=?|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "r", pattern: "^[ \t]*([a-zA-z][a-zA-Z0-9_.]*[ \t]*(<-|=)[ \t]*function.*)$", icase: false, word_regex: "[^ \t]+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "ruby", pattern: "^[ \t]*((class|module|def)[ \t].*)$", icase: false, word_regex: "(@|@@|\\$)?[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+|\\?(\\\\C-)?(\\\\M-)?.|//=?|[-+*/<>%&^|=!]=|<<=?|>>=?|===|\\.{1,3}|::|[!=]~|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "rust", pattern: "^[\t ]*((pub(\\([^\\)]+\\))?[\t ]+)?((async|const|unsafe|extern([\t ]+\"[^\"]+\"))[\t ]+)?(struct|enum|union|mod|trait|fn|impl|macro_rules!)[< \t]+[^;]*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[0-9][0-9_a-fA-Fiosuxz]*(\\.([0-9]*[eE][+-]?)?[0-9_fF]*)?|[-+*\\/<>%&^|=!:]=|<<=?|>>=?|&&|\\|\\||->|=>|\\.{2}=|\\.{3}|::|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "scheme", pattern: "^(\\(.*)$\n^[\t ]*(\\(((define|def(struct|syntax|class|method|rules|record|proto|alias)?)[-*/ \t]|(library|module|struct|class)[*+ \t]).*)$\n^  ?(\\([Dd][Ee][Ff].*)$", icase: false, word_regex: "\\|([^|\\\\]|\\\\.)*\\||([^][)(}{ \t])+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "tex", pattern: "^(\\\\((sub)*section|chapter|part)\\*{0,1}\\{.*)$", icase: false, word_regex: "\\\\[a-zA-Z@]+|\\\\.|([a-zA-Z0-9]|[^\x01-\x7f])+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -133,6 +150,12 @@ pub struct Settings {
     pub external: Option<String>,
     /// `drv->external.trust_exit_code`, i.e. `diff.<name>.trustExitCode`.
     pub trust_exit_code: bool,
+    /// `drv->word_regex`, i.e. the built-in table column overlaid with
+    /// `diff.<name>.wordregex`. Kept as text: git compiles it in
+    /// `init_diff_words_data()` (diff.c:2352-2359), at the first pair that is
+    /// actually word-diffed, so a pattern that will not compile is only fatal under
+    /// `--word-diff`.
+    pub word_regex: Option<String>,
 }
 
 impl Settings {
@@ -151,6 +174,7 @@ impl Settings {
                 extended: true,
                 icase: b.icase,
             });
+            out.word_regex = Some(b.word_regex.to_string());
         }
         let snapshot = repo.config_snapshot();
         for section in snapshot.sections() {
@@ -177,6 +201,7 @@ impl Settings {
                     "cachetextconv" => out.cache_textconv = config_bool(&text()),
                     "command" => out.external = Some(text()),
                     "trustexitcode" => out.trust_exit_code = config_bool(&text()),
+                    "wordregex" => out.word_regex = Some(text()),
                     _ => {}
                 }
             }
@@ -197,7 +222,7 @@ impl Settings {
 /// `git_config_bool()` for the two boolean driver keys. An empty value is git's
 /// "implicit true" (`-c diff.d.cachetextconv` with no `=`), which reaches the
 /// config reader as a valueless key rather than an empty string.
-fn config_bool(v: &str) -> bool {
+pub fn config_bool(v: &str) -> bool {
     let v = v.trim();
     !(v.eq_ignore_ascii_case("false")
         || v.eq_ignore_ascii_case("no")
@@ -399,7 +424,7 @@ fn bre_to_ere(bre: &str) -> String {
 ///   literal `[`; the built-in `css` pattern relies on it (`^[:[@.#]?`).
 ///
 /// Everything outside a bracket expression is copied through byte for byte.
-fn posix_class_fixups(ere: &str) -> String {
+pub fn posix_class_fixups(ere: &str) -> String {
     // Walked as characters, not bytes: a pattern is UTF-8 text and re-encoding a
     // multi-byte character one byte at a time would change what it matches.
     let src: Vec<char> = ere.chars().collect();
@@ -491,6 +516,10 @@ fn find_class_end(src: &[char], at: usize) -> Option<usize> {
 /// two drivers, and compiling a pattern per pair is exactly the work git's
 /// `userdiff_find_by_name()` lookup avoids.
 pub struct Driver {
+    /// `drv->name` — the value of the path's `diff` attribute. `userdiff_get_textconv()`
+    /// (userdiff.c:436) builds the textconv cache's ref out of it
+    /// (`refs/notes/textconv/<name>`), which is the only thing that reads it here.
+    pub name: String,
     pub settings: Settings,
     /// `xdiff_set_find_func()` over `settings.funcname`.
     pub funcname: Option<FuncName>,
@@ -536,9 +565,12 @@ impl<'repo> Lookup<'repo> {
         }
         let settings = Settings::for_driver(self.repo, &name);
         let funcname = settings.compile_funcname()?;
-        let interesting =
-            funcname.is_some() || settings.textconv.is_some() || settings.external.is_some();
-        let drv = interesting.then(|| std::sync::Arc::new(Driver { settings, funcname }));
+        let interesting = funcname.is_some()
+            || settings.textconv.is_some()
+            || settings.external.is_some()
+            || settings.word_regex.is_some();
+        let drv = interesting
+            .then(|| std::sync::Arc::new(Driver { name: name.clone(), settings, funcname }));
         self.cache.insert(name, drv.clone());
         Ok(drv)
     }
@@ -573,6 +605,34 @@ mod tests {
             let p = FuncPattern { pattern: b.pattern.to_string(), extended: true, icase: b.icase };
             FuncName::compile(&p).unwrap_or_else(|e| panic!("{}: {e}", b.name));
         }
+    }
+
+    /// Every built-in `word_regex` has to survive the same translation, or
+    /// `--word-diff` over a path naming that driver would die where git renders.
+    /// The byte-range alternative both macros append
+    /// (`[\xc0-\xff][\x80-\xbf]+`) is the part most likely to be rejected by an
+    /// engine that reads the pattern as UTF-8, so it is what this test is really
+    /// asking about.
+    #[test]
+    fn every_builtin_word_regex_compiles() {
+        for b in BUILTIN {
+            crate::porcelain::diff_color::compile_word_regex(b.word_regex)
+                .unwrap_or_else(|e| panic!("{}: {e}", b.name));
+        }
+    }
+
+    /// The `python` driver splits `alpha_beta+gamma` into three words, which is what
+    /// a driver word regex is *for*: without one the whole run of non-space bytes is
+    /// a single word. Measured against git 2.55.0 under `LC_ALL=C`,
+    /// `git diff --word-diff=plain` over a `diff=python` path printed
+    /// `x = alpha_beta+[-gamma-]{+delta+}`.
+    #[test]
+    fn a_driver_word_regex_splits_where_whitespace_would_not() {
+        let b = BUILTIN.iter().find(|b| b.name == "python").expect("python driver");
+        let re = crate::porcelain::diff_color::compile_word_regex(b.word_regex).expect("compiles");
+        let words: Vec<&[u8]> =
+            re.find_iter(b"alpha_beta+gamma").map(|m| m.as_bytes()).collect();
+        assert_eq!(words, vec![&b"alpha_beta"[..], &b"+"[..], &b"gamma"[..]]);
     }
 
     /// The built-in `markdown` driver's heading is the whole match, since its

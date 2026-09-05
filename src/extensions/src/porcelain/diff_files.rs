@@ -394,6 +394,10 @@ struct Opts {
     /// `-D`/`--irreversible-delete`: a deletion shows its header and nothing else.
     irreversible_delete: bool,
     reverse: bool,
+    /// `--textconv` / `--no-textconv` (`o->flags.allow_textconv`). Off by default:
+    /// `cmd_diff_files()` calls `git_diff_basic_config()`, never `git_diff_ui_config()`,
+    /// so a `diff.<driver>.textconv` reaches the patch only when the flag is given.
+    allow_textconv: bool,
     filter: Option<Filter>,
     /// The finalized pickaxe, built after the whole line is read so `--pickaxe-regex`
     /// and `--pickaxe-all` (which may follow the `-S`/`-G`) can fold in.
@@ -921,6 +925,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         ind_ctx: b' ',
         irreversible_delete: false,
         reverse: false,
+        allow_textconv: false,
         filter: None,
         pickaxe: None,
         pickaxe_pending: None,
@@ -1299,8 +1304,6 @@ const ACCEPTED_NOOP: &[&str] = &[
     "-W",
     "--ext-diff",
     "--no-ext-diff",
-    "--textconv",
-    "--no-textconv",
     "--no-prefix",
     "--default-prefix",
     // `revision.c`'s `--no-notes` turns off a display that is off by default here,
@@ -1465,6 +1468,11 @@ fn classify(
         }
         "--no-full-index" => opts.full_index = false,
         "-R" => opts.reverse = true,
+        // `diff_opt_textconv()` (diff.c:5338-5348). Only `builtin_diff()` reads the
+        // flag: `builtin_diffstat()`, `builtin_checkdiff()` and `diffcore_pickaxe()`
+        // fill their buffers with `fill_mmfile()`, never `fill_textconv()`.
+        "--textconv" => opts.allow_textconv = true,
+        "--no-textconv" => opts.allow_textconv = false,
         "-D" | "--irreversible-delete" => opts.irreversible_delete = true,
         "--no-prefix" => {
             opts.src_prefix.clear();
@@ -2077,9 +2085,19 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     } else {
         None
     };
+    // `userdiff_find_by_path()` for every queued pair, resolved once for the batch: one
+    // gitattributes stack and one compiled pattern per driver name rather than per
+    // pair. It supplies both `pe` (diff.c:3622-3624) and, under `--textconv`, the
+    // `diff.<driver>.textconv` program `builtin_diff()` runs.
+    let mut lookup = crate::userdiff::Lookup::new(repo)?;
+    let funcnames = resolve_drivers(&mut lookup, &deltas)?;
     let mut analyses: Vec<Analysis> = Vec::with_capacity(deltas.len());
     if let Some(cache) = cache.as_mut() {
-        for d in &deltas {
+        for (d, drv) in deltas.iter().zip(&funcnames) {
+            let tc = opts
+                .allow_textconv
+                .then(|| drv.as_ref().and_then(|x| x.settings.textconv.as_deref()))
+                .flatten();
             analyses.push(analyze(
                 cache,
                 &repo.objects,
@@ -2088,6 +2106,9 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                 hash_kind,
                 &workdir,
                 want_patch,
+                drv.as_ref().and_then(|x| x.funcname.as_ref()),
+                tc,
+                &mut lookup,
             )?);
         }
     } else {
@@ -2267,7 +2288,14 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         // and `--diff-filter` have finished rearranging the queue.
         let mut splits: Vec<Option<(Delta, Analysis, Delta, Analysis)>> =
             Vec::with_capacity(deltas.len());
-        for d in &deltas {
+        for (d, drv) in deltas.iter().zip(&funcnames) {
+            // Both halves of the split name the same path as the pair they came from,
+            // so `userdiff_find_by_path()` gives them the pair's own driver.
+            let ff = drv.as_ref().and_then(|x| x.funcname.as_ref());
+            let tc = opts
+                .allow_textconv
+                .then(|| drv.as_ref().and_then(|x| x.settings.textconv.as_deref()))
+                .flatten();
             splits.push(match (split_type_change(d), cache.as_mut()) {
                 (Some((del, add)), Some(cache)) => {
                     let del_an = analyze(
@@ -2278,9 +2306,22 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                         hash_kind,
                         &workdir,
                         true,
+                        ff,
+                        tc,
+                        &mut lookup,
                     )?;
-                    let add_an =
-                        analyze(cache, &repo.objects, &add, &opts, hash_kind, &workdir, true)?;
+                    let add_an = analyze(
+                        cache,
+                        &repo.objects,
+                        &add,
+                        &opts,
+                        hash_kind,
+                        &workdir,
+                        true,
+                        ff,
+                        tc,
+                        &mut lookup,
+                    )?;
                     Some((del, del_an, add, add_an))
                 }
                 _ => None,
@@ -2353,6 +2394,10 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                     files.push(diff_color::FilePaint {
                         ws_rule,
                         blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+                        // This command does not resolve a path's userdiff driver, so no driver word
+                        // regex is available; `diff.wordRegex` still reaches the emitter through
+                        // [`diff_color::ExtraPaint`].
+                        word_regex: None,
                     });
                 }
             }
@@ -3027,6 +3072,64 @@ fn mode_str(mode: u32) -> String {
     format!("{mode:06o}")
 }
 
+/// `userdiff_find_by_path()` + `xdiff_set_find_func()` for every queued pair.
+///
+/// `builtin_diff()` asks the pre-image's filespec first and only falls back to the
+/// post-image's when that driver carries no pattern (diff.c:3622-3624); a
+/// `diff-files` pair names one path on both sides, so the two questions collapse into
+/// one lookup. It runs on the repository-relative name (`Delta::disk`), which is what
+/// `run_diff()` captures as `attr_path` before `strip_prefix()` shortens the printed
+/// one (diff.c:5036-5038).
+///
+/// A pattern that will not compile is git's
+/// `die(_("Invalid regexp to look for hunk header: %s"))`.
+fn resolve_drivers(
+    lookup: &mut crate::userdiff::Lookup<'_>,
+    deltas: &[Delta],
+) -> Result<Vec<Option<std::sync::Arc<crate::userdiff::Driver>>>> {
+    let mut out = Vec::with_capacity(deltas.len());
+    for d in deltas {
+        out.push(lookup.for_path(d.disk.as_ref()).map_err(crate::fatal::die)?);
+    }
+    Ok(out)
+}
+
+/// `fill_textconv()` (diff.c:7065) for both sides of a pair.
+///
+/// `get_textconv()` (diff.c:3377) answers NULL for an invalid filespec, so an
+/// addition's pre-image and a deletion's post-image are never handed to the program;
+/// `fill_textconv()` then returns the empty string for them, which is what
+/// `old_valid`/`new_valid` reproduce here.
+///
+/// `None` means nothing was converted and the raw images stand.
+///
+/// Not reproduced here: `diff.<driver>.cachetextconv`. `fill_textconv()` consults and
+/// fills a `refs/notes/textconv/<driver>` cache for an oid-valid filespec
+/// (diff.c:7086-7108); `git diff` runs that cache through [`super::notes::Cache`], but
+/// this command re-runs the converter every time. The patch is the same and the notes
+/// ref is left unwritten.
+fn convert(
+    lookup: &mut crate::userdiff::Lookup<'_>,
+    program: Option<&str>,
+    path: &gix::bstr::BStr,
+    old_data: &[u8],
+    new_data: &[u8],
+    old_valid: bool,
+    new_valid: bool,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let Some(pgm) = program else { return Ok(None) };
+    let run = |lookup: &mut crate::userdiff::Lookup<'_>, raw: &[u8]| -> Result<Vec<u8>> {
+        // `if (!*outbuf) die(_("unable to read files to diff"))` (diff.c:7052-7056).
+        match lookup.run_program(pgm, path, raw)? {
+            Some(text) => Ok(text),
+            None => Err(crate::fatal::die("unable to read files to diff")),
+        }
+    };
+    let one = if old_valid { run(lookup, old_data)? } else { Vec::new() };
+    let two = if new_valid { run(lookup, new_data)? } else { Vec::new() };
+    Ok(Some((one, two)))
+}
+
 /// Diff one delta's staged blob against its worktree file.
 fn analyze(
     cache: &mut gix::diff::blob::Platform,
@@ -3036,6 +3139,15 @@ fn analyze(
     hash_kind: gix::hash::Kind,
     workdir: &Path,
     want_patch: bool,
+    // `xecfg.find_func` for this pair, from [`resolve_drivers`].
+    funcname: Option<&crate::userdiff::FuncName>,
+    // `diff.<driver>.textconv`, already gated on `o->flags.allow_textconv` by the
+    // caller. A `diff-files` pair names one path on both sides, so `textconv_one` and
+    // `textconv_two` (diff.c:3487-3489) are the same program.
+    textconv: Option<&str>,
+    // The driver lookup, which owns the filter pipeline `prep_temp_blob()` feeds a
+    // converter through.
+    lookup: &mut crate::userdiff::Lookup<'_>,
 ) -> Result<Analysis> {
     let null = hash_kind.null();
     if d.unmerged {
@@ -3177,6 +3289,7 @@ fn analyze(
             old_mode != 0 && new_mode != 0 && old_mode != new_mode,
             opts,
             want_patch,
+            funcname,
         ));
     }
 
@@ -3238,8 +3351,10 @@ fn analyze(
         Operation::SourceOrDestinationIsBinary => {
             // The blob pipeline hands back only the *size* of content it classified as
             // binary, so `prep.*.data` is empty here. `--binary` needs the real bytes,
-            // and only `--binary` does, so they are read back just for it.
-            let (old_data, new_data) = if opts.binary {
+            // and so does a `textconv` converter, whose stdout is what `builtin_diff()`
+            // diffs in place of the blob (diff.c:3557-3560 lets a converted side through
+            // the binary veto).
+            let (old_data, new_data) = if opts.binary || textconv.is_some() {
                 let staged = if blob_mode == 0 {
                     Vec::new()
                 } else {
@@ -3261,13 +3376,31 @@ fn analyze(
             } else {
                 (old_data, new_data)
             };
+            // A converted side is never binary in `builtin_diff()`'s test, so the pair
+            // renders real hunks. The counts stay at zero: `builtin_diffstat()` never
+            // calls `fill_textconv()` and prints `Bin <a> -> <b> bytes` for this pair.
+            let hunks = match &convert(
+                lookup,
+                textconv,
+                path,
+                &old_data,
+                &new_data,
+                // `DIFF_FILE_VALID()` in the *pair's* orientation. `old_mode`/`new_mode`
+                // above name the index and worktree sides, which `-R` has already
+                // swapped out of that order, while the two buffers are in the pair's.
+                d.old_valid(),
+                d.new_valid(),
+            )? {
+                Some((o, n)) => internal_diff(o, n, opts, want_patch, funcname).2,
+                None => None,
+            };
             Ok(Analysis {
                 src_id,
                 dst_id,
                 added: 0,
                 deleted: 0,
                 binary: true,
-                hunks: None,
+                hunks,
                 old_data,
                 new_data,
                 changed: old_mode == 0 || new_mode == 0 || mode_changed || src_id != dst_id,
@@ -3285,7 +3418,26 @@ fn analyze(
             changed: true,
         }),
         Operation::InternalDiff { algorithm: _ } => {
-            let (added, deleted, hunks) = internal_diff(&old_data, &new_data, opts, want_patch);
+            let (added, deleted, hunks) =
+                internal_diff(&old_data, &new_data, opts, want_patch, funcname);
+            // `builtin_diff()` hands `xdl_diff()` the converter's stdout; every other
+            // reader of this analysis — the stat family, `--check`, the pickaxe,
+            // `--dirstat` — keeps the raw images, so only the body is replaced.
+            let hunks = match &convert(
+                lookup,
+                textconv,
+                path,
+                &old_data,
+                &new_data,
+                // `DIFF_FILE_VALID()` in the *pair's* orientation. `old_mode`/`new_mode`
+                // above name the index and worktree sides, which `-R` has already
+                // swapped out of that order, while the two buffers are in the pair's.
+                d.old_valid(),
+                d.new_valid(),
+            )? {
+                Some((o, n)) => internal_diff(o, n, opts, want_patch, funcname).2,
+                None => hunks,
+            };
             Ok(Analysis {
                 src_id,
                 dst_id,
@@ -3312,6 +3464,9 @@ fn internal_diff(
     new_data: &[u8],
     opts: &Opts,
     want_patch: bool,
+    // `xecfg.find_func`: the pair's driver funcname pattern as [`resolve_funcnames`]
+    // picked it, or `None` for xdiff's `def_ff` heuristic.
+    funcname: Option<&crate::userdiff::FuncName>,
 ) -> (u32, u32, Option<Vec<u8>>) {
     let before: Vec<&[u8]> = byte_lines(old_data);
     let after: Vec<&[u8]> = byte_lines(new_data);
@@ -3378,10 +3533,10 @@ fn internal_diff(
             ctx: opts.ctx as usize,
             inter_hunk_ctx: opts.inter_hunk_ctx,
             func_context: false,
-            // `diff-index`/`diff-files` honour a driver's `textconv` and its
-            // `command` under `--ext-diff`, but the funcname pattern is not
-            // threaded this far yet, so hunk headings use git's built-in `def_ff`.
-            funcname: None,
+            // `xdiff_set_find_func(&xecfg, pe->pattern, pe->cflags)` (diff.c:3629-3630):
+            // the pair's driver pattern when it has one, and xdiff's `def_ff` when it
+            // does not.
+            funcname,
         },
     );
     let hunks = (want_patch && (added != 0 || deleted != 0)).then_some(buf);
@@ -3401,10 +3556,11 @@ fn analyze_images(
     mode_changed: bool,
     opts: &Opts,
     want_patch: bool,
+    funcname: Option<&crate::userdiff::FuncName>,
 ) -> Analysis {
     let old_data = old_data.unwrap_or_default();
     let new_data = new_data.unwrap_or_default();
-    let (added, deleted, hunks) = internal_diff(&old_data, &new_data, opts, want_patch);
+    let (added, deleted, hunks) = internal_diff(&old_data, &new_data, opts, want_patch, funcname);
     Analysis {
         src_id,
         dst_id,
@@ -4338,7 +4494,12 @@ fn render_patch(
         b"/dev/null".to_vec()
     };
 
-    if an.binary {
+    // A pair whose driver converted both sides is not binary as far as
+    // `builtin_diff()` is concerned (diff.c:3557-3560), even though
+    // `diff_filespec_is_binary()` still says so — which is why the stat family keeps
+    // calling it `Bin` while the patch shows hunks. [`analyze`] records that by
+    // handing back a hunk body beside `binary: true`.
+    if an.binary && an.hunks.is_none() {
         if opts.binary {
             // `emit_binary_diff()`: the payload replaces the whole `Binary files …`
             // line, and there is no `---`/`+++` pair in front of it.

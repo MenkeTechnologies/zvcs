@@ -724,7 +724,12 @@ pub(crate) fn word_regex_cfg(cfg: &gix::config::File) -> Option<String> {
 /// does: on bytes, without Unicode mode, and with `^`/`$` anchoring at embedded
 /// newlines while `.` stops at them.
 pub(crate) fn compile_word_regex(pat: &str) -> Result<regex::bytes::Regex, String> {
-    regex::bytes::RegexBuilder::new(pat)
+    // The bracket-expression spellings POSIX gives a literal meaning and the `regex`
+    // crate rejects, rewritten as [`crate::userdiff::posix_class_fixups`] rewrites
+    // them for a funcname pattern. The built-in `scheme` word regex needs it —
+    // `([^][)(}{ \t])+` opens its class with a literal `]` — and so does any
+    // `diff.wordRegex` written the same way, which `regcomp()` accepts.
+    regex::bytes::RegexBuilder::new(&crate::userdiff::posix_class_fixups(pat))
         .unicode(false)
         .multi_line(true)
         .build()
@@ -741,8 +746,19 @@ pub(crate) struct ExtraPaint {
     pub(crate) color_moved_ws: u32,
     /// `o->word_diff`.
     pub(crate) word_diff: Option<WordDiff>,
-    /// `o->word_regex`, already compiled.
+    /// `o->word_regex`, already compiled: what `--word-diff-regex`/`--color-words=<re>`
+    /// spelled, or `diff.wordRegex` when they did not.
     pub(crate) word_regex: Option<regex::bytes::Regex>,
+    /// Whether [`Self::word_regex`] came from the command line rather than from
+    /// `diff.wordRegex`.
+    ///
+    /// `init_diff_words_data()` (diff.c:2346-2351) consults four sources in order —
+    /// `o->word_regex` as the option parser left it, the *old* side's driver, the
+    /// *new* side's driver, and only then `diff.wordRegex` — so a driver's pattern
+    /// outranks the configuration file but not the command line. Merging the two
+    /// ends of that order into one field would put a driver either above both or
+    /// below both; this flag keeps them apart.
+    pub(crate) word_regex_explicit: bool,
 }
 
 impl ExtraPaint {
@@ -759,6 +775,14 @@ impl ExtraPaint {
     /// Whether the assembled patch has to be re-emitted even with color off.
     pub(crate) fn rewrites_uncolored(&self) -> bool {
         self.words() != WordDiff::None
+    }
+
+    /// Whether a pair's own driver regex can still be reached: `--word-diff` is on
+    /// and the command line did not already fill `o->word_regex`, which is the only
+    /// state in which `init_diff_words_data()` calls `userdiff_word_regex()` at all
+    /// (diff.c:2346-2348).
+    pub(crate) fn wants_driver_word_regex(&self) -> bool {
+        self.words() != WordDiff::None && !self.word_regex_explicit
     }
 }
 
@@ -940,9 +964,11 @@ impl MoveWordOpts {
         };
         let color_moved_ws = self.moved_ws.unwrap_or(cfg_ws);
 
-        // `init_diff_words_data()`: the command line first, then the userdiff
-        // driver — which is the `default` driver with no word regex for every path
-        // this port resolves — and only then `diff.wordRegex`.
+        // `init_diff_words_data()`: the command line first, then the two sides.
+        // drivers, and only then `diff.wordRegex`. The middle two are per pair and
+        // are resolved by the renderer into [`FilePaint::word_regex`]; what is
+        // compiled here is the pair of ends, with [`ExtraPaint::word_regex_explicit`]
+        // recording which one it is.
         let regex_src = self.word_regex.clone().or_else(|| word_regex_cfg(cfg));
         let word_regex = match regex_src {
             Some(pat) => Some(
@@ -957,6 +983,7 @@ impl MoveWordOpts {
             color_moved_ws,
             word_diff: Some(self.word_diff),
             word_regex,
+            word_regex_explicit: self.word_regex.is_some(),
         })
     }
 }
@@ -1171,12 +1198,22 @@ pub(crate) fn is_c_space(b: u8) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Everything `builtin_diff()` computes per file pair that the emit layer needs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Default)]
 pub(crate) struct FilePaint {
     /// `whitespace_rule()` for the file.
     pub(crate) ws_rule: u32,
     /// `blank_at_eof_in_preimage` / `blank_at_eof_in_postimage`.
     pub(crate) blank_at_eof: (usize, usize),
+    /// The word regex this pair's own userdiff drivers supply —
+    /// `userdiff_word_regex(one)` and then `userdiff_word_regex(two)`
+    /// (diff.c:2347-2348), already compiled.
+    ///
+    /// Consulted only when the command line did not spell one
+    /// ([`ExtraPaint::word_regex_explicit`]), and falling back to
+    /// [`ExtraPaint::word_regex`] — `diff.wordRegex` — when the pair has no driver
+    /// pattern. Shared behind an `Arc` because a run's pairs almost always name the
+    /// same one or two drivers.
+    pub(crate) word_regex: Option<std::sync::Arc<regex::bytes::Regex>>,
 }
 
 impl FilePaint {
@@ -1184,7 +1221,7 @@ impl FilePaint {
     /// `check_blank_at_eof()` leaves both counters at zero in that case, which
     /// disables the blank-at-EOF check for the file.
     pub(crate) fn new(ws_rule: u32) -> Self {
-        FilePaint { ws_rule, blank_at_eof: (0, 0) }
+        FilePaint { ws_rule, blank_at_eof: (0, 0), word_regex: None }
     }
 }
 
@@ -1364,7 +1401,7 @@ fn build_syms(
 
     let mut syms: Vec<Sym> = Vec::new();
     let mut file_no: usize = 0;
-    let mut cur = default_file;
+    let mut cur = default_file.clone();
     let mut in_hunk = false;
     let mut lno_pre = 0usize;
     let mut lno_post = 0usize;
@@ -1380,7 +1417,12 @@ fn build_syms(
         }
         if !in_hunk {
             if line.starts_with(b"diff --git ") || line.starts_with(b"diff --cc ") {
-                cur = files.get(file_no).copied().unwrap_or(default_file);
+                // `free_diff_words_data()` runs at the end of the *previous* pair,
+                // with that pair's `diff_words` still in hand, so whatever the last
+                // hunk left over is flushed under the driver regex it was collected
+                // under and not under the incoming pair's.
+                words.flush(&mut syms, &style, extra, &cur);
+                cur = files.get(file_no).cloned().unwrap_or_else(|| default_file.clone());
                 file_no += 1;
             }
             if first == b'@' {
@@ -1390,13 +1432,13 @@ fn build_syms(
                 lno_post = b;
                 last_kind = ind_ctx;
                 // `if (ecbdata->diff_words) diff_words_flush(ecbdata);`
-                words.flush(&mut syms, &style, extra);
+                words.flush(&mut syms, &style, extra, &cur);
                 syms.push(Sym::plain(Kind::Frag, line));
                 continue;
             }
             // A header ends the file pair, which is where `free_diff_words_data()`
             // flushes whatever the last hunk left behind.
-            words.flush(&mut syms, &style, extra);
+            words.flush(&mut syms, &style, extra, &cur);
             syms.push(Sym::plain(Kind::Meta, line));
             continue;
         }
@@ -1414,7 +1456,7 @@ fn build_syms(
                 lno_pre = a;
                 lno_post = b;
                 last_kind = ind_ctx;
-                words.flush(&mut syms, &style, extra);
+                words.flush(&mut syms, &style, extra, &cur);
                 syms.push(Sym::plain(Kind::Frag, line));
                 continue;
             }
@@ -1429,7 +1471,7 @@ fn build_syms(
             if line.starts_with(b"\\ ") {
                 continue;
             }
-            words.flush(&mut syms, &style, extra);
+            words.flush(&mut syms, &style, extra, &cur);
             let kind = if word_diff == WordDiff::Porcelain {
                 Kind::WordsPorcelainCtx
             } else {
@@ -1507,7 +1549,7 @@ fn build_syms(
             _ => syms.push(Sym::plain(Kind::Raw, line)),
         }
     }
-    words.flush(&mut syms, &style, extra);
+    words.flush(&mut syms, &style, extra, &cur);
     syms
 }
 
@@ -1618,7 +1660,13 @@ struct WordsPair {
 
 impl WordsPair {
     /// `diff_words_flush()`: run the word diff if either side holds anything.
-    fn flush(&mut self, syms: &mut Vec<Sym>, style: &WordStyle, extra: &ExtraPaint) {
+    fn flush(
+        &mut self,
+        syms: &mut Vec<Sym>,
+        style: &WordStyle,
+        extra: &ExtraPaint,
+        file: &FilePaint,
+    ) {
         if extra.words() == WordDiff::None {
             return;
         }
@@ -1626,7 +1674,13 @@ impl WordsPair {
             return;
         }
         let mut out: Vec<u8> = Vec::new();
-        self.show(&mut out, style, extra.word_regex.as_ref());
+        // `init_diff_words_data()` (diff.c:2346-2351): the command line wins
+        // outright; otherwise the pair's own driver, and `diff.wordRegex` last.
+        let re = match extra.word_regex_explicit {
+            true => extra.word_regex.as_ref(),
+            false => file.word_regex.as_deref().or(extra.word_regex.as_ref()),
+        };
+        self.show(&mut out, style, re);
         if !out.is_empty() {
             syms.push(Sym::plain(Kind::WordRaw, &out));
         }

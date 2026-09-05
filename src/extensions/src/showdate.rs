@@ -104,10 +104,30 @@ fn parse_date_type(format: &str) -> Option<(DateType, &str)> {
 
 /// `parse_date_format()` (date.c:1022-1049).
 ///
-/// The `auto:` prefix is deliberately *not* handled here: it is resolved against
-/// `isatty(1) || pager_in_use()` at the call site that has that context, and no
-/// caller in this crate has one yet.
+/// ```c
+/// /* "auto:foo" is "if tty/pager, then foo, otherwise normal" */
+/// if (skip_prefix(format, "auto:", &p)) {
+///         if (isatty(1) || pager_in_use())
+///                 format = p;
+///         else
+///                 format = "default";
+/// }
+/// ```
+///
+/// The `auto:` arm is part of this function in git, so it is part of it here: the
+/// tail is never validated when it is not taken, which is why `auto:bogus` is a
+/// silent `default` in a pipe rather than the fatal a bare `bogus` would be.
 pub(crate) fn parse_date_format(format: &str) -> Result<DateMode, DateFormatError> {
+    let format = match format.strip_prefix("auto:") {
+        Some(rest) => {
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) || crate::pager::in_use() {
+                rest
+            } else {
+                "default"
+            }
+        }
+        None => format,
+    };
     // "historical alias": `local` alone is `default-local`.
     let format = if format == "local" { "default-local" } else { format };
 
@@ -258,7 +278,23 @@ fn addftime(fmt: &str, tm: &libc::tm, tz: i32, suppress_tz_name: bool) -> String
             munged.push_str("%%");
             rest = r;
         } else if let Some(r) = rest.strip_prefix('s') {
-            let secs = tm_to_time_t(tm) - 3600 * i64::from(tz / 100) - 60 * i64::from(tz % 100);
+            // ```c
+            // case 's':
+            //         strbuf_addf(&munged_fmt, "%"PRItime,
+            //                     (timestamp_t)tm_to_time_t(tm) -
+            //                     3600 * (tz_offset / 100) -
+            //                     60 * (tz_offset % 100));
+            // ```
+            //
+            // `timestamp_t` is `uintmax_t` and `PRItime` is `PRIuMAX`, so the whole
+            // expression is *unsigned*: a broken-down time `tm_to_time_t()` cannot
+            // represent gives -1, and git prints that as `18446744073709551615`
+            // rather than `-1`. `--date=format-local:%s` on the epoch is exactly
+            // that case (verified against git 2.55.0), and in `git blame` its
+            // twenty digits are also what `blame_date_width` measures.
+            let secs = (tm_to_time_t(tm) as u64)
+                .wrapping_sub(3600u64.wrapping_mul((tz / 100) as u64))
+                .wrapping_sub(60u64.wrapping_mul((tz % 100) as u64));
             munged.push_str(&secs.to_string());
             rest = r;
         } else if let Some(r) = rest.strip_prefix('z') {

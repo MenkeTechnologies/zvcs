@@ -440,18 +440,35 @@ use crate::date::approxidate;
 /// of losing the option's name to `overwrite_argv()` once an earlier option has
 /// consumed an argv slot (see [`unknown_option_name`]).
 ///
+/// `-S <revs-file>` is implemented: it is git's `read_ancestry()` (commit.c),
+/// which registers each `<commit> [<parent>…]` line as a *graft* in the
+/// repository's table, and the walk then reads the substituted parents — which is
+/// why a file of bare object names (`git rev-list` output, no parents) turns every
+/// commit it lists into a root and stops the dig there. `gix-blame` already reads
+/// `Options::grafts`; what was missing was the reader, now
+/// [`gix::Repository::read_ancestry`].
+///
 /// Flags git *does* know but this port has not implemented are rejected with a
 /// terse message rather than emitting wrong output, each for a concrete reason:
-///   * `-S <revs-file>` — installs commit grafts that rewrite the ancestry the
-///     walk follows.
-///   * `--no-indent-heuristic` — the blame diffs run through
-///     `gix_diff::blob::compact::change_compact`, git's `xdl_change_compact()`
-///     with `XDF_INDENT_HEURISTIC` applied unconditionally, so the heuristic
-///     cannot be switched off. The positive `--indent-heuristic` *is* accepted:
-///     `diff.c:57` seeds `diff_indent_heuristic = 1`, so it asks for the state
-///     the engine is already in.
-///   * the `-local` date variants, which need the recorded stamp folded into the
-///     process's own zone.
+///   * `--output=<file>`, whose side effect is on the filesystem rather than on
+///     stdout, so dropping it would leave the worktree different from git's.
+///
+/// `--no-follow` is a known divergence rather than a refusal: git reads
+/// `revs.diffopt.flags.follow_renames` back at `builtin/blame.c:951` into
+/// `no_whole_file_rename`, and `gix-blame` has no equivalent switch, so the flag
+/// is accepted and ignored and a blame that crosses a rename still follows it.
+///
+/// Every *other* option `handle_revision_opt()` and `diff_opt_parse()` accept is
+/// accepted and dropped, which is what git does with them: `cmd_blame()` reads
+/// only `revs.pending`, `revs.date_mode`, `revs.first_parent_only`,
+/// `revs.children`, `revs.max_age` and four fields of `revs.diffopt` back out
+/// (see the parse loop's catch-all arm), and `builtin/blame.c:952` masks every
+/// xdiff bit but `XDF_INDENT_HEURISTIC` off — which is why `--ignore-all-space`
+/// changes nothing while `-w` does.
+///
+/// `--date=<mode>` is the whole of `parse_date_format()`, rendered by the shared
+/// `date.c` port in [`crate::showdate`]: `human`, `format:<strftime>`,
+/// `format-local:`, every `-local` spelling and the `auto:` prefix included.
 ///
 /// `--first-parent` and `--minimal` are implemented: the first truncates every
 /// commit's parent list to one entry inside `gix-blame`, which is what git's
@@ -544,7 +561,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             DateOutcome::Mode(m) => m,
             DateOutcome::Fatal(code) => return Ok(code),
         },
-        None => DateMode::Iso8601,
+        None => DateMode::iso8601(),
     };
 
     // git's `setup_default_color_by_age()` and the three coloring config keys,
@@ -649,19 +666,86 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     };
     let progress_started = std::time::Instant::now();
 
+    // ```c
+    // if (revs_file && read_ancestry(revs_file))
+    //         die_errno("reading graft file '%s' failed", revs_file);
+    // ```
+    //
+    // (`builtin/blame.c:970-971`.) `-S <revs-file>` is a *graft* file, not a list
+    // of revisions: `read_ancestry()` (commit.c:316-330) registers each
+    // `<commit> [<parent>…]` line into the repository's graft table, and from then
+    // on `parse_commit_buffer()` hands blame the substituted parents. A line with
+    // no parents therefore makes that commit a root, which is why feeding it plain
+    // `git rev-list` output stops every dig at the first commit listed.
+    //
+    // It runs here, after the option scan and before the revision operands are
+    // resolved, because the table has to be in place before anything reads a
+    // parent — including `resolve_targets` below.
+    if let Some(path) = opts.revs_file.clone() {
+        match repo.read_ancestry(std::path::Path::new(&path)) {
+            Ok(complaints) => {
+                // `error("bad graft data: %s", line->buf)` per rejected line, on
+                // stderr, without failing the command.
+                let mut err = std::io::stderr().lock();
+                for line in &complaints {
+                    writeln!(err, "error: bad graft data: {line}")?;
+                }
+                err.flush()?;
+            }
+            Err(e) => {
+                let mut err = std::io::stderr().lock();
+                writeln!(
+                    err,
+                    "fatal: reading graft file '{path}' failed: {}",
+                    errno_text(&e)
+                )?;
+                err.flush()?;
+                return Ok(ExitCode::from(128));
+            }
+        }
+    }
+
     // `--date=<mode>` overrides blame.date; git validates it the same way.
-    opts.date_mode = match opts.date_arg.take() {
+    // ```c
+    // if (cmd_is_annotate) {
+    //         output_option |= OUTPUT_ANNOTATE_COMPAT;
+    //         blame_date_mode.type = DATE_ISO8601;
+    // } else {
+    //         blame_date_mode = revs.date_mode;
+    // }
+    // ```
+    //
+    // (`builtin/blame.c:975-980`.) `git annotate` therefore ignores `--date=`
+    // entirely — `parse_date_format()` wrote it into `revs.date_mode`, and this
+    // branch never copies that over. What it does keep is the *config* value's
+    // `.local` and `.strftime_fmt`, because only `.type` is assigned: verified
+    // against git 2.55.0, where `git -c blame.date=iso-local annotate` prints the
+    // local zone while `git annotate --date=iso-local` prints the recorded one.
+    // `git blame -c` is not this case; `cmd_is_annotate` is `argv[0]`, not `-c`.
+    //
+    // The value is still parsed under `annotate`, because `parse_date_format()`
+    // runs from `handle_revision_opt()` and dies there on a format it cannot
+    // read — `git annotate --date=bogus` is fatal even though the mode it would
+    // have produced is then discarded.
+    let from_argv = match opts.date_arg.take() {
         Some(s) => match resolve_date_mode(&s)? {
-            DateOutcome::Mode(m) => m,
+            DateOutcome::Mode(m) => Some(m),
             DateOutcome::Fatal(code) => return Ok(code),
         },
-        None => date_default,
+        None => None,
+    };
+    opts.date_mode = if cmd == "annotate" {
+        let mut mode = date_default.mode.clone();
+        mode.kind = crate::showdate::DateType::Iso8601;
+        DateMode::new(mode)
+    } else {
+        from_argv.unwrap_or(date_default)
     };
     // `-t` (OUTPUT_RAW_TIMESTAMP) makes git's `format_time` ignore the date mode
     // and print the raw `<seconds> <tz>`. Modelling it as the raw mode reproduces
     // that byte-for-byte, including the fixed column width.
     if opts.raw_timestamp {
-        opts.date_mode = DateMode::Raw;
+        opts.date_mode = DateMode::raw();
     }
 
     // Split the positional arguments into a revision and a single path following
@@ -983,10 +1067,16 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     let blame_options = gix::repository::blame_file::Options {
         diff_algorithm: opts.diff_algorithm,
         ranges,
-        since: None,
+        // `revs->max_age`. `assign_blame()` guards the whole test with
+        // `sb->reverse ||` (`blame.c:2596`), so a reverse walk ignores the bound.
+        since: match (opts.reverse_from, opts.max_age) {
+            (None, Some(seconds)) => Some(gix::date::Time { seconds, offset: 0 }),
+            _ => None,
+        },
         bottom: opts.bottom.clone(),
         rewrites: Some(gix::diff::Rewrites::default()),
         ignore_whitespace: opts.ignore_whitespace,
+        indent_heuristic: opts.indent_heuristic,
         detect_moved: opts.detect_moved,
         ignore_revs: ignore_revs.clone(),
         detect_copied: opts.detect_copied,
@@ -1029,6 +1119,11 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // would share one entry while producing different attributions — and the cache lives in
     // `~/.zvcs/cache` keyed by commit id alone, so the collision is not even confined to the
     // repository that caused it.
+    //
+    // `--since`/`--after`/`--max-age` and `-S <revs-file>` are the same case once more: the first
+    // stops the dig at a date the key does not name (and one `approxidate()` resolves against the
+    // wall clock, so it is not even stable within a day), the second substitutes the ancestry the
+    // walk follows. Both would share an entry with the plain blame they are not.
     let algo_key = format!(
         "{:?}|w={}|M={:?}|C={:?}|1p={}",
         opts.diff_algorithm,
@@ -1046,6 +1141,8 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         && !opts.reverse
         && !opts.porcelain
         && !opts.line_porcelain
+        && opts.max_age.is_none()
+        && opts.revs_file.is_none()
         && opts.bottom.is_empty())
         .then(|| (suspect.to_string(), rel_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
@@ -1683,9 +1780,18 @@ fn collect_commit_info(
             // blame from, and `emit_other()` reads that one flag for the marker — so
             // `git blame A..B` prints `^` against whichever of `A`'s ancestors ended
             // up holding a line the range did not touch.
+            // `--since`/`--max-age` sets the same flag on the commit it stops at:
+            // `commit->object.flags |= UNINTERESTING` in `assign_blame()`'s else
+            // branch (`blame.c:2601`). The date compared is `commit->date`, the
+            // *committer* date, and the bound is ignored under `--reverse`.
+            let date_cut = opts.reverse_from.is_none()
+                && opts.max_age.is_some_and(|bound| {
+                    committer_time.map(|t| t.seconds).unwrap_or(0) < bound
+                });
             let boundary = (!opts.show_root && commit.parent_ids().next().is_none())
                 || opts.reverse_from.is_some_and(|from| from == line.commit_id)
-                || opts.bottom.contains(&line.commit_id);
+                || opts.bottom.contains(&line.commit_id)
+                || date_cut;
             let summary = Vec::from(commit.message()?.summary().into_owned());
             CommitInfo {
                 display_author: display_author(
@@ -1852,8 +1958,9 @@ fn emit_annotate_compat(
 
         emit_object_name(&mut buf, ci, line, name_width, opts);
 
-        // format_time pads the date to `blame_date_width` first; the trailing
-        // `%10s` then never fires because every mode's width is >= 10.
+        // `format_time()` pads the date to `blame_date_width` first; the `%10s`
+        // in `printf("\t(%10s\t%10s\t%d)", …)` then right-justifies that, which
+        // only shows for a `format:<strftime>` narrower than ten columns.
         let mut date = ci.display_date.clone().into_bytes();
         pad(&mut date, opts.date_mode.width().saturating_sub(ci.display_date.chars().count()));
 
@@ -1989,15 +2096,21 @@ fn emit_human(
             buf.extend_from_slice(&ci.display_author);
             pad(&mut buf, w_author.saturating_sub(ci.display_author.len()));
             buf.push(b' ');
-            // The date column is left-justified in a fixed, per-mode width
-            // (git's `blame_date_width`), so shorter renderings are padded out.
-            buf.extend_from_slice(ci.display_date.as_bytes());
+            // `printf(" (%s%*s %10s", name, pad, "", format_time(…))`
+            // (`builtin/blame.c:380-384`): `format_time()` left-justifies the
+            // rendering in `blame_date_width` first, and the `%10s` then
+            // right-justifies *that* in a minimum of ten. The second step is
+            // invisible for every fixed-width mode — all nine are at least ten
+            // columns — and fires only for a `format:<strftime>` narrower than
+            // that, e.g. `--date=format:%H:%M`.
+            let mut date = ci.display_date.clone().into_bytes();
             pad(
-                &mut buf,
+                &mut date,
                 opts.date_mode
                     .width()
                     .saturating_sub(ci.display_date.chars().count()),
             );
+            pad_left(&mut buf, &date, 10);
         }
 
         // Final line number (right-justified) + content.
@@ -4294,215 +4407,93 @@ fn reverse_first_parent_children(
     }
 }
 
-/// The date-formatting modes zvcs blame reproduces byte-for-byte from git's
-/// `show_date`. git accepts a few more (`human`, `format:<strftime>`, and every
-/// `-local` variant); those need machinery blame.rs does not have (an strftime
-/// renderer, per-timestamp local-timezone conversion), so they are rejected
-/// rather than emitting wrong bytes — matching this file's policy for
-/// unimplemented features. `relative` is fully supported.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DateMode {
-    /// git `DATE_NORMAL` (`default`): `Thu Oct 19 16:00:04 2006 -0700`.
-    Normal,
-    /// git `DATE_ISO8601` (`iso`/`iso8601`): `2006-10-19 16:00:04 -0700`. blame's default.
-    Iso8601,
-    /// git `DATE_ISO8601_STRICT` (`iso-strict`): `2006-10-19T16:00:04-07:00` (`Z` at UTC).
-    Iso8601Strict,
-    /// git `DATE_RFC2822` (`rfc`): `Thu, 19 Oct 2006 16:00:04 -0700`.
-    Rfc2822,
-    /// git `DATE_SHORT` (`short`): `2006-10-19`.
-    Short,
-    /// git `DATE_RAW` (`raw`): `1161298804 -0700`.
-    Raw,
-    /// git `DATE_UNIX` (`unix`): `1161298804`.
-    Unix,
-    /// git `DATE_RELATIVE` (`relative`): `3 days ago`, computed against the current
-    /// time. Independent of the recorded timezone offset.
-    Relative,
-    /// git `DATE_HUMAN` (`human`): the shared `show_date()` renderer, which drops
-    /// the parts of the stamp that are obvious from the current wall clock.
-    Human,
+/// git's `blame_date_mode` (`builtin/blame.c:68`): the `struct date_mode` every
+/// timestamp in the human-format output is rendered through, plus the fixed
+/// column width git derives from it.
+///
+/// The renderer is the shared port of `date.c`'s `show_date()`
+/// ([`crate::showdate`]) rather than a second copy of the calendar, so blame
+/// answers `--date=` with exactly the vocabulary every other command does —
+/// `human`, `format:<strftime>`, and every `-local` spelling included. Before
+/// this it carried its own nine-variant enum and rejected the three modes that
+/// need `strftime(3)` or the process's own zone.
+#[derive(Clone, PartialEq, Eq)]
+struct DateMode {
+    mode: crate::showdate::DateMode,
+    /// `blame_date_width` (`builtin/blame.c:983-1025`), already less the NUL that
+    /// the shared `blame_date_width -= 1` strips.
+    width: usize,
 }
 
 impl DateMode {
-    /// git's fixed `blame_date_width` per mode: the width the date column is
-    /// left-justified into (`sizeof(reference) - 1`, i.e. the reference length).
-    fn width(self) -> usize {
-        match self {
-            DateMode::Normal => "Thu Oct 19 16:00:04 2006 -0700".len(),
-            DateMode::Iso8601 => "2006-10-19 16:00:04 -0700".len(),
-            DateMode::Iso8601Strict => "2006-10-19T16:00:04-07:00".len(),
-            DateMode::Rfc2822 => "Thu, 19 Oct 2006 16:00:04 -0700".len(),
-            DateMode::Short => "2006-10-19".len(),
-            DateMode::Raw => "1161298804 -0700".len(),
-            DateMode::Unix => "1161298804".len(),
-            // git: `utf8_strwidth("4 years, 11 months ago") + 1`, then the shared
-            // `blame_date_width -= 1` (strip the NUL) leaves the string width.
-            DateMode::Relative => "4 years, 11 months ago".len(),
-            // `case DATE_HUMAN: /* If the year is shown, no time is shown */
-            // blame_date_width = sizeof("Thu Oct 19 16:00");` (builtin/blame.c),
-            // less the NUL the shared `-= 1` strips.
-            DateMode::Human => "Thu Oct 19 16:00".len(),
-        }
+    /// The `switch (blame_date_mode.type)` that sets `blame_date_width`
+    /// (`builtin/blame.c:983-1025`), verbatim. It reads only `.type`, so a
+    /// `-local` mode is as wide as the mode it is a variant of, and `format:`
+    /// measures its own rendering of the epoch.
+    fn new(mode: crate::showdate::DateMode) -> Self {
+        use crate::showdate::DateType;
+        let width = match mode.kind {
+            DateType::Rfc2822 => "Thu, 19 Oct 2006 16:00:04 -0700".len(),
+            DateType::Iso8601Strict => "2006-10-19T16:00:04-07:00".len(),
+            DateType::Iso8601 => "2006-10-19 16:00:04 -0700".len(),
+            DateType::Raw => "1161298804 -0700".len(),
+            DateType::Unix => "1161298804".len(),
+            DateType::Short => "2006-10-19".len(),
+            // `utf8_strwidth(_("4 years, 11 months ago")) + 1`, less the shared
+            // `-= 1`, i.e. the display width of the longest relative rendering.
+            DateType::Relative => "4 years, 11 months ago".len(),
+            // `/* If the year is shown, no time is shown */`
+            DateType::Human => "Thu Oct 19 16:00".len(),
+            DateType::Normal => "Thu Oct 19 16:00:04 2006 -0700".len(),
+            // `strlen(show_date(0, 0, &blame_date_mode)) + 1`, less the shared
+            // `-= 1`: the format applied to the epoch at UTC, measured.
+            DateType::Strftime => crate::showdate::show_date(0, 0, &mode, 0).len(),
+        };
+        DateMode { mode, width }
     }
 
-    /// Render `<seconds> @ <offset>` the way git's `show_date` does for this mode.
-    fn format_time(self, seconds: i64, offset: i32) -> String {
-        use gix::date::time::format;
-        let t = gix::date::Time { seconds, offset };
-        match self {
-            DateMode::Normal => t.format_or_unix(format::DEFAULT),
-            DateMode::Iso8601 => t.format_or_unix(format::ISO8601),
-            DateMode::Iso8601Strict => {
-                // git prints `Z` for a zero UTC offset; jiff's `%:z` (used by gix)
-                // would print `+00:00`, so fix that one case up to match.
-                let s = t.format_or_unix(format::ISO8601_STRICT);
-                if offset == 0 {
-                    if let Some(head) = s.strip_suffix("+00:00") {
-                        return format!("{head}Z");
-                    }
-                }
-                s
-            }
-            // gix's `RFC2822` zero-pads the day; git's `%-d` form (`GIT_RFC2822`)
-            // matches git's `show_date` exactly.
-            DateMode::Rfc2822 => t.format_or_unix(format::GIT_RFC2822),
-            DateMode::Short => t.format_or_unix(format::SHORT),
-            DateMode::Raw => t.format_or_unix(format::RAW),
-            DateMode::Unix => t.format_or_unix(format::UNIX),
-            DateMode::Relative => show_date_relative(seconds),
-            // The `human` renderer needs the process's own clock and zone, which
-            // is exactly what the shared `show_date()` does for `git log`.
-            DateMode::Human => crate::showdate::show_date(
-                seconds,
-                offset,
-                &crate::showdate::DateMode::new(crate::showdate::DateType::Human),
-                crate::date::now_seconds(),
-            ),
-        }
+    /// blame's default (`static struct date_mode blame_date_mode = { DATE_ISO8601 }`).
+    fn iso8601() -> Self {
+        DateMode::new(crate::showdate::DateMode::new(crate::showdate::DateType::Iso8601))
+    }
+
+    /// `-t` (`OUTPUT_RAW_TIMESTAMP`) makes `format_time()` print `"%"PRItime" %s"`
+    /// and skip the padding loop entirely. `DATE_RAW` renders the same two fields,
+    /// and its width equals their length for every timestamp git can record, so
+    /// the substitution reproduces the column byte-for-byte.
+    fn raw() -> Self {
+        DateMode::new(crate::showdate::DateMode::new(crate::showdate::DateType::Raw))
+    }
+
+    fn width(&self) -> usize {
+        self.width
+    }
+
+    /// `show_date(time, tz, &blame_date_mode)`. The offset arrives in seconds — the
+    /// form `gix::date::Time` records — and `show_date` wants git's `[-+]HHMM`
+    /// decimal, which is what the object header holds and what `%+05d` prints.
+    fn format_time(&self, seconds: i64, offset_seconds: i32) -> String {
+        let tz = (offset_seconds / 3600) * 100 + (offset_seconds % 3600) / 60;
+        crate::showdate::show_date(seconds, tz, &self.mode, crate::date::now_seconds())
     }
 }
 
-/// git's `show_date_relative` (date.c), via the shared port — so `--date=relative`
-/// in blame honors `GIT_TEST_DATE_NOW` and matches every other command exactly.
-/// The recorded timezone offset is irrelevant, as in git.
-fn show_date_relative(seconds: i64) -> String {
-    crate::date::show_date_relative(seconds, crate::date::now_seconds())
-}
-
-/// git's `date_mode_type`, restricted to what the parser needs to classify.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DateType {
-    Relative,
-    Human,
-    IsoStrict,
-    Iso,
-    Rfc,
-    Short,
-    Normal,
-    Raw,
-    Unix,
-    Strftime,
-}
-
-/// The result of classifying a `--date` / blame.date value against git's grammar.
+/// The result of classifying a `--date` / `blame.date` value against git's grammar.
 enum DateClass {
-    /// A mode blame.rs renders byte-for-byte.
     Supported(DateMode),
-    /// A mode git accepts but blame.rs does not implement; carries the effective
-    /// format string for the diagnostic.
-    Unsupported(String),
     /// Not a recognized git date format → `fatal: unknown date format <s>`.
     UnknownFormat(String),
     /// A `format`/`format-local` mode with no `:` → git's missing-colon fatal.
     MissingColon(String),
 }
 
-/// Classify a date-format string exactly the way git's `parse_date_format` /
-/// `parse_date_type` do: prefix-match the type in git's order, consume an
-/// optional `-local` suffix, then require the remainder to be empty (or a `:`
-/// for `format`). `auto:` and the `local` alias are handled first as git does.
+/// `parse_date_format()` (date.c:1022-1049) through the shared port, which owns
+/// the `auto:` prefix, the `local` alias, the type table and both `die()`s.
 fn classify_date(input: &str) -> DateClass {
-    // `auto:foo` → foo when stdout is a terminal, else `default`.
-    let format = if let Some(rest) = input.strip_prefix("auto:") {
-        if std::io::stdout().is_terminal() {
-            rest.to_string()
-        } else {
-            "default".to_string()
-        }
-    } else {
-        input.to_string()
-    };
-    // Historical alias: `local` means `default-local`.
-    let format = if format == "local" {
-        "default-local".to_string()
-    } else {
-        format
-    };
-
-    // parse_date_type: first matching prefix wins, in git's exact order.
-    let f = format.as_str();
-    let (ty, rest) = if let Some(r) = f.strip_prefix("relative") {
-        (DateType::Relative, r)
-    } else if let Some(r) = f.strip_prefix("iso8601-strict").or_else(|| f.strip_prefix("iso-strict"))
-    {
-        (DateType::IsoStrict, r)
-    } else if let Some(r) = f.strip_prefix("iso8601").or_else(|| f.strip_prefix("iso")) {
-        (DateType::Iso, r)
-    } else if let Some(r) = f.strip_prefix("rfc2822").or_else(|| f.strip_prefix("rfc")) {
-        (DateType::Rfc, r)
-    } else if let Some(r) = f.strip_prefix("short") {
-        (DateType::Short, r)
-    } else if let Some(r) = f.strip_prefix("default") {
-        (DateType::Normal, r)
-    } else if let Some(r) = f.strip_prefix("human") {
-        (DateType::Human, r)
-    } else if let Some(r) = f.strip_prefix("raw") {
-        (DateType::Raw, r)
-    } else if let Some(r) = f.strip_prefix("unix") {
-        (DateType::Unix, r)
-    } else if let Some(r) = f.strip_prefix("format") {
-        (DateType::Strftime, r)
-    } else {
-        return DateClass::UnknownFormat(format);
-    };
-
-    // Optional `-local` suffix sets local mode on any type.
-    let (local, rest) = match rest.strip_prefix("-local") {
-        Some(r) => (true, r),
-        None => (false, rest),
-    };
-
-    if ty == DateType::Strftime {
-        // `format:<strftime>` requires a colon; the strftime renderer is not
-        // implemented, so a valid one is still "unsupported".
-        if !rest.starts_with(':') {
-            return DateClass::MissingColon(format);
-        }
-        return DateClass::Unsupported(format);
-    }
-
-    // Any other trailing text is not a valid format.
-    if !rest.is_empty() {
-        return DateClass::UnknownFormat(format);
-    }
-
-    // `-local` needs timezone conversion blame.rs does not do.
-    if local {
-        return DateClass::Unsupported(format);
-    }
-
-    match ty {
-        DateType::Iso => DateClass::Supported(DateMode::Iso8601),
-        DateType::IsoStrict => DateClass::Supported(DateMode::Iso8601Strict),
-        DateType::Rfc => DateClass::Supported(DateMode::Rfc2822),
-        DateType::Short => DateClass::Supported(DateMode::Short),
-        DateType::Normal => DateClass::Supported(DateMode::Normal),
-        DateType::Raw => DateClass::Supported(DateMode::Raw),
-        DateType::Unix => DateClass::Supported(DateMode::Unix),
-        DateType::Relative => DateClass::Supported(DateMode::Relative),
-        DateType::Human => DateClass::Supported(DateMode::Human),
-        DateType::Strftime => unreachable!("strftime handled above"),
+    match crate::showdate::parse_date_format(input) {
+        Ok(mode) => DateClass::Supported(DateMode::new(mode)),
+        Err(crate::showdate::DateFormatError::Unknown(f)) => DateClass::UnknownFormat(f),
+        Err(crate::showdate::DateFormatError::MissingColon(f)) => DateClass::MissingColon(f),
     }
 }
 
@@ -4518,7 +4509,6 @@ enum DateOutcome {
 fn resolve_date_mode(input: &str) -> Result<DateOutcome> {
     match classify_date(input) {
         DateClass::Supported(m) => Ok(DateOutcome::Mode(m)),
-        DateClass::Unsupported(f) => anyhow::bail!("unsupported --date mode: {f}"),
         DateClass::UnknownFormat(f) => {
             let mut err = std::io::stderr().lock();
             writeln!(err, "fatal: unknown date format {f}")?;
@@ -4609,6 +4599,17 @@ struct Options {
     incremental: bool,
     /// `-w`: ignore whitespace differences when diffing revisions.
     ignore_whitespace: bool,
+    /// `XDF_INDENT_HEURISTIC` — on unless `--no-indent-heuristic` turned it off.
+    ///
+    /// `cmd_blame()` keeps this one xdiff bit out of `revs.diffopt.xdl_opts`
+    /// (`builtin/blame.c:952`) and threads it through every diff of the dig, so it
+    /// is the only whitespace-ish diff option a blame reacts to.
+    indent_heuristic: bool,
+    /// `revs->max_age` from `--since`/`--after`/`--max-age`: the commit date below
+    /// which `assign_blame()` stops digging and marks the commit UNINTERESTING.
+    max_age: Option<i64>,
+    /// `-S <revs-file>`: git's `revs_file`, a graft file read by `read_ancestry()`.
+    revs_file: Option<String>,
     /// `-M[<score>]`: the value is git's `sb->move_score`.
     detect_moved: Option<u32>,
     /// `-C[<score>]`, `-C -C` and `-C -C -C`: git's `PICKAXE_BLAME_COPY*` bits together with
@@ -4897,6 +4898,13 @@ impl Options {
         let mut show_progress: Option<bool> = None;
         let mut incremental = false;
         let mut ignore_whitespace = false;
+        // `diff.c:57`: `static int diff_indent_heuristic = 1`.
+        let mut indent_heuristic = true;
+        // `revs->max_age`, from `--since`/`--after`/`--max-age`. `-1` in git means
+        // "no bound", which is `None` here.
+        let mut max_age: Option<i64> = None;
+        // `-S <revs-file>` (git's `revs_file`), an `OPT_STRING` so the last one wins.
+        let mut revs_file: Option<String> = None;
         let mut detect_moved: Option<u32> = None;
         // How many `-C`s were given and the last explicit `-C<score>` / `-M<score>`, which git
         // keeps in `blame_copy_score` / `blame_move_score` and only applies when non-zero.
@@ -4974,6 +4982,24 @@ impl Options {
                 // git's `OPT_BOOL(0, "incremental", &incremental, …)`.
                 "--incremental" => incremental = true,
                 "-w" => ignore_whitespace = true,
+                // `OPT_STRING('S', NULL, &revs_file, N_("file"), …)`: an ancestry
+                // (graft) file, taken from the next slot or attached. The read
+                // itself is `read_ancestry()`, run after the scan — see
+                // [`blame_with`] — so a `-S` that cannot be opened is fatal *after*
+                // every other option has been validated, exactly as in git.
+                "-S" => match args.get(i + 1) {
+                    Some(v) => {
+                        revs_file = Some(v.clone());
+                        i += 1;
+                    }
+                    // ``error: switch `S' requires a value``, 129.
+                    None => {
+                        let code = trailing_option_missing_value(a)?
+                            .unwrap_or_else(|| ExitCode::from(129));
+                        return Ok(ParseOutcome::Reported(code));
+                    }
+                },
+                _ if a.starts_with("-S") => revs_file = Some(a["-S".len()..].to_string()),
                 // git's `--porcelain` and `--line-porcelain` are bit flags on one
                 // field, so `--line-porcelain` wins no matter the order.
                 "-p" | "--porcelain" => porcelain = true,
@@ -5024,16 +5050,13 @@ impl Options {
                 // two on the command line wins — the exact shape of `--minimal`
                 // above.
                 "--patience" => diff_algorithm = Some(gix::diff::blob::Algorithm::Patience),
-                // `--indent-heuristic` sets `XDF_INDENT_HEURISTIC`, which
-                // `diff.indentHeuristic` already sets by default
-                // (`diff.c:57 static int diff_indent_heuristic = 1;`), so the
-                // flag asks for the state the engine is already in: the blame
-                // diffs run through `gix_diff::blob::compact::change_compact`,
-                // git's `xdl_change_compact()` with the heuristic applied
-                // unconditionally. `--no-indent-heuristic` would turn it *off*
-                // and has no path through that code, so it stays refused below
-                // rather than being accepted as a no-op.
-                "--indent-heuristic" => {}
+                // `xdl_opts |= revs.diffopt.xdl_opts & XDF_INDENT_HEURISTIC`
+                // (`builtin/blame.c:952`) is the one xdiff bit `cmd_blame()` keeps,
+                // so both spellings reach the dig's diffs. `diff.c:57`'s
+                // `static int diff_indent_heuristic = 1` is the default the
+                // positive form asks for.
+                "--indent-heuristic" => indent_heuristic = true,
+                "--no-indent-heuristic" => indent_heuristic = false,
                 // The same shape: `--no-textconv` asks for the state this port is
                 // already in, since the blame here never runs a textconv filter.
                 // `-L :<funcname>` *does* read the path's driver — see
@@ -5219,6 +5242,83 @@ impl Options {
                 _ if a.starts_with("--") && !git_knows_long_option(a) => {
                     return Ok(ParseOutcome::Unknown(unknown_option_name(args, i, pre.len())));
                 }
+                // `--since=<date>` / `--after=<date>` / `--max-age=<epoch>`, which
+                // are one field: `revs->max_age`. `handle_revision_opt()` reads the
+                // first two through `approxidate()` and the third through `atoi()`,
+                // and `assign_blame()` (`blame.c:2596-2604`) is the only place blame
+                // looks at it:
+                //
+                // ```c
+                // if (sb->reverse ||
+                //     (!(commit->object.flags & UNINTERESTING) &&
+                //      !(revs->max_age != -1 && commit->date < revs->max_age)))
+                //         pass_blame(sb, suspect, opt);
+                // else {
+                //         commit->object.flags |= UNINTERESTING;
+                //         …
+                // ```
+                //
+                // So a commit older than the bound stops the dig and keeps what is
+                // still suspected of it — the same thing a `^<rev>` bottom does,
+                // which is why it also prints blame's boundary marker.
+                _ if matches!(a, "--since" | "--after" | "--max-age")
+                    || a.starts_with("--since=")
+                    || a.starts_with("--after=")
+                    || a.starts_with("--max-age=") =>
+                {
+                    let (name, value) = match a.split_once('=') {
+                        Some((n, v)) => (n, v.to_string()),
+                        None => {
+                            i += 1;
+                            (a, super::value_at(args, i, a)?.to_string())
+                        }
+                    };
+                    max_age = Some(if name == "--max-age" {
+                        // `revs->max_age = atoi(optarg)` — a raw epoch, not a date.
+                        value.trim().parse::<i64>().unwrap_or(0)
+                    } else {
+                        crate::date::approxidate(&value)
+                    });
+                }
+                // `if (revs.diffopt.flags.find_copies_harder) opt |=
+                // (PICKAXE_BLAME_COPY | PICKAXE_BLAME_MOVE | PICKAXE_BLAME_COPY_HARDER);`
+                // (`builtin/blame.c:1027-1029`) — the diff option reaches blame as
+                // a second `-C` — the three bits it sets are exactly `-C -C`'s, and
+                // the `-M` that comes with any copy detection is turned on by the
+                // shared `if detect_copied.is_some()` below.
+                "--find-copies-harder" => copy_levels = copy_levels.max(2),
+                // Every other option one of git's own tables knows.
+                //
+                // `cmd_blame()` reads exactly six things back out of the `rev_info`
+                // it hands to `parse_revision_opt()`: `revs.pending` (the
+                // operands), `revs.date_mode`, `revs.first_parent_only`,
+                // `revs.children` (`--reverse`), `revs.max_age`, and out of
+                // `revs.diffopt` only `flags.follow_renames`,
+                // `flags.find_copies_harder`, `flags.allow_textconv` and
+                // `xdl_opts & XDF_INDENT_HEURISTIC` — the mask at
+                // `builtin/blame.c:952` is what drops every *other* xdiff bit on
+                // the floor. Each of those has its own arm above. Everything else
+                // git stores and blame never looks at, so accepting and dropping it
+                // is what git does, not a shortcut: verified against git 2.55.0,
+                // where `--ignore-all-space`, `--ignore-space-change` and
+                // `--ignore-cr-at-eol` all leave a blame that `-w` changes
+                // untouched, and `--topo-order`, `--merges`, `--grep`, `--parents`,
+                // `--boundary`, `--objects` and the rest print what a bare `git
+                // blame` prints.
+                //
+                // One exception stays refused rather than dropped, because for it
+                // dropping *would* change the bytes: `--output=<file>` is the only
+                // knob here with a side effect outside stdout (`diff.c`'s
+                // `xfopen(path, "w")` creates and truncates the file), so dropping
+                // it would leave the worktree different from git's.
+                _ if a.starts_with("--")
+                    && a != "--output"
+                    && !a.starts_with("--output=") =>
+                {
+                    if takes_next_slot(a) && i + 1 < args.len() {
+                        i += 1;
+                    }
+                }
                 // A short option that git's *revision* parser owns and whose value
                 // is simply absent — `-S`, `-G`, `-I`, `-O`, `-n`. `get_arg()`
                 // reports it as ``switch `<c>' requires a value`` at 129 (and `-n`
@@ -5293,6 +5393,9 @@ impl Options {
             show_progress,
             incremental,
             ignore_whitespace,
+            indent_heuristic,
+            max_age,
+            revs_file,
             detect_moved,
             detect_copied,
             diff_algorithm,
@@ -5303,7 +5406,7 @@ impl Options {
             mark_ignored_lines,
             date_arg,
             // Overwritten in `blame` once blame.date / `--date` are resolved.
-            date_mode: DateMode::Iso8601,
+            date_mode: DateMode::iso8601(),
         })))
     }
 }

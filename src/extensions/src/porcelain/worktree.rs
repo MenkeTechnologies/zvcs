@@ -74,11 +74,14 @@ use gix::refs::FullName;
 /// is created` (128) — after the `Preparing worktree` line, and not for the DWIM
 /// branch named after the path, which *is* a new branch.
 ///
-/// `--guess-remote` and `--relative-paths` are refused rather than approximated.
-/// `--orphan` is too, but its check against `--track` comes first
-/// (worktree.c:839-841), so the combination reports
-/// `options '--orphan' and '--track' cannot be used together` — naming `--track`
-/// whichever spelling was given — before the floor is reached.
+/// `--guess-remote` (and `worktree.guessRemote`) reaches the one decision git gives
+/// it, `dwim_branch()`'s remote guess for the branch named after the path; it can
+/// neither move an explicit `<commit-ish>` nor apply once `-b` named the branch.
+/// `--relative-paths` (and `worktree.useRelativePaths`) makes each side name the
+/// other relatively. `--orphan` creates the unborn branch, with its option-conflict
+/// checks in git's order — the `--track` pair first (worktree.c:839-841), so
+/// `--orphan --track` reports `options '--orphan' and '--track' cannot be used
+/// together`, naming `--track` whichever spelling was given.
 ///
 /// git creates the `-b` branch by running `git branch` in the new worktree, so
 /// an option-shaped name is refused by that child rather than by `worktree`
@@ -87,11 +90,10 @@ use gix::refs::FullName;
 /// `git worktree add -b --zzbogus <path>` from creating a ref and a checkout
 /// from a typo.
 ///
-/// NOT ported, and reported as such rather than approximated: `move` and
-/// `remove`. Both need git's `check_clean_worktree()` (a `git status --porcelain`
-/// of the linked tree) plus `validate_worktree()`/`update_worktree_location()`;
-/// the vendored crates expose `gix_worktree_state::checkout` but not that
-/// bookkeeping, so a faithful port is not possible here.
+/// `move` and `remove` are ported, `check_clean_worktree()` included: both refuse a
+/// linked worktree whose `git status --porcelain` is not empty unless `--force` is
+/// given, and `move` rewrites the linking files on both sides
+/// (`update_worktree_location()`).
 ///
 /// A single documented deviation: `repair <nonexistent-path>` dies (exit 128) as
 /// git does, but git's `strbuf_realpath()` names the deepest resolvable path
@@ -300,6 +302,23 @@ struct Wt {
     locked: Option<String>,
     /// `Some(reason)` when git would report the worktree as prunable.
     prunable: Option<String>,
+    /// `wt->is_current` — `is_current_worktree()` (worktree.c:57-65), which
+    /// compares the repository's **git directory** against this entry's:
+    ///
+    /// ```c
+    ///         char *git_dir = absolute_pathdup(repo_get_git_dir(wt->repo));
+    ///         char *wt_git_dir = get_worktree_git_dir(wt);
+    ///         int is_current = !fspathcmp(git_dir, absolute_path(wt_git_dir));
+    /// ```
+    ///
+    /// Not the checkout path: a repository whose git directory is not `<path>/.git`
+    /// — a submodule's `modules/<name>`, or any `--separate-git-dir` — has a main
+    /// worktree whose `path` (`realpath(common_dir)` minus a `/.git` suffix) is not
+    /// where the checkout lives, so comparing checkouts reports the current
+    /// worktree as somebody else. That is what made
+    /// `git submodule add -b main ./sub other` die with
+    /// `'main' is already used by worktree at '…/.git/modules/other'`.
+    is_current: bool,
 }
 
 impl Wt {
@@ -334,7 +353,9 @@ pub(super) fn path_to_string(p: &Path) -> String {
 /// worktree's own ref store, keeping the symref target unpeeled.
 fn head_info(repo: &gix::Repository) -> HeadInfo {
     let Ok(head) = repo.head() else {
-        return HeadInfo::Unknown;
+        // gitoxide refuses a `HEAD` git's zero-flag resolve forgives; see
+        // [`head_info_of_git_dir`] for which failures are which.
+        return head_info_of_git_dir(repo, repo.git_dir());
     };
     let null = ObjectId::null(repo.object_hash());
     if head.is_detached() {
@@ -346,6 +367,66 @@ fn head_info(repo: &gix::Repository) -> HeadInfo {
             name: name.to_owned(),
         },
         None => HeadInfo::Unknown,
+    }
+}
+
+/// `add_head_info()` for a worktree whose ref store would not open at all —
+/// an administrative directory holding a `gitdir` file and little else.
+///
+/// The resolve flags git passes are *zero*, not `RESOLVE_REF_READING`
+/// (worktree.c:45-48), and that is the whole difference:
+///
+/// ```c
+///                 /* In reading mode, refs must eventually resolve */
+///                 if (resolve_flags & RESOLVE_REF_READING)
+///                         return NULL;
+///                 /*
+///                  * Otherwise a missing ref is OK. …
+///                  */
+///                 if (failure_errno != ENOENT &&
+///                     failure_errno != EISDIR &&
+///                     failure_errno != ENOTDIR)
+///                         return NULL;
+///                 oidclr(oid, refs->repo->hash_algo);
+/// ```
+/// (refs.c:2144-2160)
+///
+/// So a `HEAD` that is simply absent resolves *successfully* to the null id with
+/// `REF_ISSYMREF` unset, which leaves `wt->is_detached = 1` — and
+/// `builtin/worktree.c:1013` prints `(detached HEAD)`, `show_worktree_porcelain`
+/// prints the `detached` line. `(error)` is the `else` at builtin/worktree.c:1021
+/// and is reached only when the resolve really returned NULL, i.e. the read
+/// failed for some *other* reason, or a symref named something `HEAD` may not
+/// point at.
+fn head_info_of_git_dir(repo: &gix::Repository, git_dir: &Path) -> HeadInfo {
+    let null = ObjectId::null(repo.object_hash());
+    let raw = match std::fs::read(git_dir.join("HEAD")) {
+        Ok(raw) => raw,
+        Err(e) => {
+            // The three errnos refs.c:2153-2155 forgives. Everything else is the
+            // NULL return, i.e. `(error)`.
+            let forgiven = e.kind() == std::io::ErrorKind::NotFound
+                || matches!(e.raw_os_error(), Some(libc::EISDIR) | Some(libc::ENOTDIR));
+            return if forgiven { HeadInfo::Detached(null) } else { HeadInfo::Unknown };
+        }
+    };
+    let text = String::from_utf8_lossy(rtrim(&raw)).into_owned();
+    match text.strip_prefix("ref:") {
+        // A symref whose target does not exist still resolves: the loop's second
+        // pass forgives the missing ref and `*flags` keeps the `REF_ISSYMREF` the
+        // first pass set, so the worktree shows the branch name at the null id.
+        Some(target) => match FullName::try_from(target.trim().to_owned()) {
+            Ok(name) => {
+                let oid = repo
+                    .find_reference(name.as_ref())
+                    .ok()
+                    .and_then(|r| r.target().try_id().map(ObjectId::from))
+                    .unwrap_or(null);
+                HeadInfo::Branch { oid, name }
+            }
+            Err(_) => HeadInfo::Unknown,
+        },
+        None => ObjectId::from_hex(text.as_bytes()).map_or(HeadInfo::Unknown, HeadInfo::Detached),
     }
 }
 
@@ -361,6 +442,10 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
     } else {
         common.clone()
     };
+    // `is_current_worktree()` (worktree.c:57-65) compares git directories, and
+    // `get_worktree_git_dir()` (:437-445) is the common directory for the main
+    // worktree and `worktrees/<id>` for a linked one.
+    let this_git_dir = gix::path::realpath(repo.git_dir()).unwrap_or_else(|_| repo.git_dir().to_owned());
     let is_bare = repo.is_bare();
     // `add_head_info()` reads each entry's `HEAD` from *that worktree's* ref store
     // (worktree.c:46), and the main worktree's is the common one. Reading the current repository's
@@ -381,6 +466,7 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
         head: main_head,
         locked: None,
         prunable: None,
+        is_current: this_git_dir == common,
     }];
 
     let mut linked = Vec::new();
@@ -447,9 +533,9 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
         let head = match repo.worktree_proxy_by_id(BStr::new(id.as_str())) {
             Some(proxy) => match proxy.into_repo_with_possibly_inaccessible_worktree() {
                 Ok(wt_repo) => head_info(&wt_repo),
-                Err(_) => HeadInfo::Unknown,
+                Err(_) => head_info_of_git_dir(repo, &admin),
             },
-            None => HeadInfo::Unknown,
+            None => head_info_of_git_dir(repo, &admin),
         };
 
         linked.push(Wt {
@@ -459,6 +545,8 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
             head,
             locked,
             prunable,
+            is_current: this_git_dir
+                == gix::path::realpath(&admin).unwrap_or_else(|_| admin.clone()),
         });
     }
 
@@ -498,7 +586,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
             "--no-expire" => expire = 0,
             "--expire" => {
                 let Some(v) = args.get(i + 1) else {
-                    return usage(Some("error: option `expire' requires a value"), LIST_USAGE);
+                    return Ok(crate::parseopt::requires_value(crate::parseopt::OptName::Long("expire")));
                 };
                 let Some(parsed) = parse_expiry(v) else {
                     return die(&format!("malformed expiration date '{v}'"));
@@ -722,7 +810,9 @@ fn lock(args: &[String]) -> Result<ExitCode> {
             }
             "--reason" => {
                 let Some(v) = args.get(i + 1) else {
-                    return usage(None, LOCK_USAGE);
+                    return Ok(crate::parseopt::requires_value(crate::parseopt::OptName::Long(
+                        "reason",
+                    )));
                 };
                 reason = Some(v.clone());
                 i += 1;
@@ -957,7 +1047,7 @@ fn prune(args: &[String]) -> Result<ExitCode> {
             "--no-expire" => expire = 0,
             "--expire" => {
                 let Some(v) = args.get(i + 1) else {
-                    return usage(Some("error: option `expire' requires a value"), PRUNE_USAGE);
+                    return Ok(crate::parseopt::requires_value(crate::parseopt::OptName::Long("expire")));
                 };
                 let Some(parsed) = parse_expiry(v) else {
                     return die(&format!("malformed expiration date '{v}'"));
@@ -1821,7 +1911,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
             }
             "-b" | "-B" => {
                 let Some(v) = args.get(i + 1) else {
-                    return usage(Some(&format!("error: switch `{}' requires a value", &a[1..])), ADD_USAGE);
+                    return Ok(crate::parseopt::requires_value(crate::parseopt::OptName::Short(a[1..].chars().next().unwrap_or('-'))));
                 };
                 new_branch = Some(v.clone());
                 force_branch = a == "-B";
@@ -1840,7 +1930,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
             "--lock" => lock_it = true,
             "--reason" => {
                 let Some(v) = args.get(i + 1) else {
-                    return usage(Some("error: option `reason' requires a value"), ADD_USAGE);
+                    return Ok(crate::parseopt::requires_value(crate::parseopt::OptName::Long("reason")));
                 };
                 lock_reason = Some(v.clone());
                 i += 1;
@@ -1870,6 +1960,14 @@ fn add(args: &[String]) -> Result<ExitCode> {
             // `worktree.useRelativePaths` initialises.
             "--relative-paths" => relative_paths = Some(true),
             "--no-relative-paths" => relative_paths = Some(false),
+            // `add()` calls `parse_options()` without `PARSE_OPT_KEEP_DASHDASH`,
+            // so `--` is consumed and everything after it is a non-option
+            // argument. Three of those is `ac > 2`, which is the usage block —
+            // not an unknown option named by the empty string.
+            "--" => {
+                positional.extend(args[i + 1..].iter().map(String::as_str));
+                break;
+            }
             // Named as parse-options names it: a long one keeps whatever
             // followed its `=`, a short one is reported as a switch by its first
             // character alone.
@@ -1913,8 +2011,12 @@ fn add(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // `if (ac < 1 || ac > 2) usage_with_options(…)` (worktree.c:643) — the block
+    // alone, no `error:` line, for either side of the range.
+    if positional.len() > 2 {
+        return usage(None, ADD_USAGE);
+    }
     let Some(path_arg) = positional.first().copied() else {
-        // `if (ac < 1) usage_with_options(...)` — the block alone, no `error:` line.
         return usage(None, ADD_USAGE);
     };
     let commit_ish = positional.get(1).copied();
@@ -1933,6 +2035,34 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // `print_preparing_worktree_line()`:641/:657, and `add_worktree()`:490. Stock
     // prints `warning: refname 'dup' is ambiguous.` three times for
     // `git worktree add <path> dup`, whichever of `--detach`/`-b` is in play.
+    // ```c
+    // if (new_branch_force) {
+    //         new_branch = new_branch_force;
+    //         if (!opts.force && !strbuf_check_branch_ref(&symref, new_branch) &&
+    //             ref_exists(symref.buf))
+    //                 die_if_checked_out(symref.buf, 0);
+    // }
+    // ```
+    // worktree.c:659-666 — `-B` is the one spelling that would *reset* a branch
+    // another worktree has checked out, so it is refused here, before the DWIM
+    // lookups and before `print_preparing_worktree_line()`. `-b` needs no such
+    // check: it refuses an existing branch outright.
+    if force_branch && !force {
+        if let Some(name) = new_branch.as_deref() {
+            if let Ok(full) = FullName::try_from(format!("refs/heads/{name}")) {
+                if repo.try_find_reference(full.as_bstr()).ok().flatten().is_some() {
+                    if let Some(other) = checked_out_in(&repo, &full)? {
+                        eprintln!(
+                            "fatal: '{name}' is already used by worktree at '{}'",
+                            path_to_string(&other)
+                        );
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
+        }
+    }
+
     let branch_arg = commit_ish.unwrap_or("HEAD");
     if commit_ish.is_some() && !detach {
         crate::objname::warn_ambiguous_refname(&repo, branch_arg);
@@ -1964,7 +2094,11 @@ fn add(args: &[String]) -> Result<ExitCode> {
         && new_branch.is_none()
         && !detach
         && !dwim_name.is_empty()
-        && repo.try_find_reference(format!("refs/heads/{dwim_name}").as_str())?.is_none())
+        && repo
+            .try_find_reference(format!("refs/heads/{dwim_name}").as_str())
+            .ok()
+            .flatten()
+            .is_none())
     .then(|| unique_tracking_name(&repo, &dwim_name))
     .flatten();
 
@@ -2034,8 +2168,16 @@ fn add(args: &[String]) -> Result<ExitCode> {
     //         else { commit = lookup_commit_reference_by_name(branch); … }
     // }
     // ```
-    let branch_ref_exists =
-        repo.try_find_reference(format!("refs/heads/{branch_arg}").as_str())?.is_some();
+    // `check_branch_ref()` is `strbuf_check_branch_ref()`, which *returns* non-zero
+    // for a name `refs/heads/<name>` may not be built from — the `!check_branch_ref(…)`
+    // guard then simply falls through to the detached arm. A `<commit-ish>` that is a
+    // revision expression (`HEAD~1`, `main@{1}`) is exactly that case, so the invalid
+    // ref name has to answer "no branch", never propagate as an error.
+    let branch_ref_exists = repo
+        .try_find_reference(format!("refs/heads/{branch_arg}").as_str())
+        .ok()
+        .flatten()
+        .is_some();
     if force_branch {
         if let Some(name) = new_branch.as_deref() {
             crate::objname::warn_ambiguous_refname(&repo, name);
@@ -2205,6 +2347,29 @@ fn add(args: &[String]) -> Result<ExitCode> {
     };
     std::fs::write(admin.join("HEAD"), head_line)?;
 
+    // builtin/worktree.c:570-583, in this order and at this point — after `HEAD`
+    // exists and before the checkout child runs, because the child reads both
+    // files out of the administrative directory it is handed as `GIT_DIR`.
+    //
+    // ```c
+    //      if (cfg->apply_sparse_checkout)
+    //              copy_sparse_checkout(sb_repo.buf);
+    //      …
+    //      if (the_repository->repository_format_worktree_config)
+    //              copy_filtered_worktree_config(sb_repo.buf);
+    // ```
+    //
+    // `info/sparse-checkout` is per-worktree (path.c:103 lists it with
+    // `is_common = 0`), so without the copy the new worktree has no definition at
+    // all and checks the whole tree out — which is what this port used to do.
+    let sparsity = super::sparse_checkout::load_sparsity_if_enabled(&repo)?;
+    if sparsity.is_some() {
+        copy_sparse_checkout(&repo, &admin);
+    }
+    if repo.config_snapshot().boolean("extensions.worktreeConfig").unwrap_or(false) {
+        copy_filtered_worktree_config(&repo, &admin);
+    }
+
     // `--orphan` stops here. `add_worktree()` writes no reflog for it (there is no id to log),
     // `make_worktree_orphan()` only points `HEAD` at the unborn branch, and the `reset --hard`
     // that follows leaves an empty index and an empty worktree — no `ORIG_HEAD`, no
@@ -2251,7 +2416,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
     }
 
     if checkout {
-        checkout_into(&repo, &admin, &path, start.oid())?;
+        checkout_into(&repo, &admin, &path, start.oid(), sparsity.as_ref())?;
     }
 
     // The `HEAD is now at …` line comes from the checkout itself, so
@@ -2583,18 +2748,24 @@ fn state_branch(path: &Path) -> Option<String> {
 /// why `git checkout -B <current-branch>` is not a refusal.
 pub(super) fn used_by_other_worktree(repo: &gix::Repository, branch: &str) -> Option<PathBuf> {
     let full = format!("refs/heads/{branch}");
-    let here = repo
-        .workdir()
-        .map(|p| gix::path::realpath(p).unwrap_or_else(|_| p.to_owned()));
     for wt in collect(repo, u64::MAX).ok()? {
+        // `die_if_checked_out(branch, ignore_current_worktree = 1)` (branch.c:847-862):
+        // ```c
+        //         if (worktrees[i]->is_current && ignore_current_worktree)
+        //                 continue;
+        // ```
+        // — `wt->is_current`, not "the checkout is where I am". See [`Wt::is_current`].
+        if wt.is_current {
+            continue;
+        }
+        // `is_shared_symref()` (worktree.c:494-518) never answers for a bare one.
+        if wt.is_bare {
+            continue;
+        }
         let HeadInfo::Branch { name, .. } = &wt.head else {
             continue;
         };
         if name.as_bstr() != full.as_bytes() {
-            continue;
-        }
-        let candidate = gix::path::realpath(&wt.path).unwrap_or_else(|_| wt.path.clone());
-        if here.as_deref() == Some(candidate.as_path()) {
             continue;
         }
         return Some(wt.path);
@@ -2703,9 +2874,116 @@ fn unique_admin_id(common: &Path, base: &str) -> String {
 
 /// Populate the new worktree: build its index from the commit's tree, write it as
 /// the administrative `index`, and lay the files down.
-fn checkout_into(repo: &gix::Repository, admin: &Path, path: &Path, oid: ObjectId) -> Result<()> {
+/// Port of `copy_sparse_checkout()` (builtin/worktree.c:345-359).
+///
+/// ```c
+///         char *from_file = repo_git_path(the_repository, "info/sparse-checkout");
+///         char *to_file = xstrfmt("%s/info/sparse-checkout", worktree_git_dir);
+///         if (file_exists(from_file)) {
+///                 if (safe_create_leading_directories(the_repository, to_file) ||
+///                         copy_file(to_file, from_file, 0666))
+///                         error(_("failed to copy '%s' to '%s'; sparse-checkout may not work correctly"), …);
+///         }
+/// ```
+///
+/// `repo_git_path` is the *current* worktree's git directory, not the common one,
+/// because `info/sparse-checkout` is per-worktree (path.c:103). The failure is an
+/// `error:` line and nothing more — `add_worktree()` never looks at the result, so
+/// a worktree whose patterns could not be copied is still created.
+fn copy_sparse_checkout(repo: &gix::Repository, admin: &Path) {
+    let from = repo.git_dir().join("info").join("sparse-checkout");
+    if !from.exists() {
+        return;
+    }
+    let to = admin.join("info").join("sparse-checkout");
+    let copied = std::fs::create_dir_all(admin.join("info")).and_then(|()| std::fs::copy(&from, &to));
+    if copied.is_err() {
+        eprintln!(
+            "error: failed to copy '{}' to '{}'; sparse-checkout may not work correctly",
+            path_to_string(&from),
+            path_to_string(&to)
+        );
+    }
+}
+
+/// Port of `copy_filtered_worktree_config()` (builtin/worktree.c:361-397).
+///
+/// The copy is verbatim except for two keys the new worktree must not inherit:
+/// a `core.bare = true` is unset (`repo_config_set_multivar_in_file_gently` with a
+/// NULL value and the pattern `true`), and `core.worktree` is unset outright —
+/// both would point the new checkout at the old one's tree.
+fn copy_filtered_worktree_config(repo: &gix::Repository, admin: &Path) {
+    let from = repo.git_dir().join("config.worktree");
+    if !from.exists() {
+        return;
+    }
+    let to = admin.join("config.worktree");
+    if std::fs::create_dir_all(admin).and_then(|()| std::fs::copy(&from, &to)).is_err() {
+        eprintln!(
+            "error: failed to copy worktree config from '{}' to '{}'",
+            path_to_string(&from),
+            path_to_string(&to)
+        );
+        return;
+    }
+    let Ok(mut file) = gix::config::File::from_path_no_includes(to.clone(), gix::config::Source::Local)
+    else {
+        return;
+    };
+    let bare_is_true = file
+        .raw_value_by("core", None, "bare")
+        .ok()
+        .is_some_and(|v| v.to_str_lossy().eq_ignore_ascii_case("true"));
+    let has_worktree = file.raw_value_by("core", None, "worktree").is_ok();
+    let mut changed = false;
+    if bare_is_true || has_worktree {
+        if let Ok(mut section) = file.section_mut("core", None) {
+            if bare_is_true {
+                while section.remove("bare").is_some() {
+                    changed = true;
+                }
+            }
+            if has_worktree {
+                while section.remove("worktree").is_some() {
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed && std::fs::write(&to, file.to_bstring()).is_err() {
+        eprintln!("error: failed to unset '{}' in '{}'", "core.bare", path_to_string(&to));
+    }
+}
+
+fn checkout_into(
+    repo: &gix::Repository,
+    admin: &Path,
+    path: &Path,
+    oid: ObjectId,
+    sparsity: Option<&super::sparse_checkout::Sparsity>,
+) -> Result<()> {
     let tree = repo.find_commit(oid)?.tree_id()?.detach();
     let mut index = repo.index_from_tree(&tree)?;
+    // The checkout child runs with `GIT_DIR` pointing at the administrative
+    // directory the copy above just populated, so `unpack_trees()` runs with
+    // `o->internal.cfg.apply_sparse_checkout` set and `apply_sparse_checkout()`
+    // (unpack-trees.c:523-568) marks every excluded path `SKIP_WORKTREE` rather
+    // than writing it out. `EXTENDED` is what carries the bit through
+    // serialization, and forces index version 3 — the same widening git's own
+    // index gets.
+    if let Some(sparsity) = sparsity {
+        let paths: Vec<gix::bstr::BString> = {
+            let backing = index.path_backing();
+            index.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+        };
+        for (entry, entry_path) in index.entries_mut().iter_mut().zip(paths.iter()) {
+            if !sparsity.includes(&entry_path.to_str_lossy()) {
+                entry.flags.insert(
+                    gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED,
+                );
+            }
+        }
+    }
     let opts = repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
     let odb = repo.objects.clone().into_arc()?;
     crate::worktree::checkout_subset(

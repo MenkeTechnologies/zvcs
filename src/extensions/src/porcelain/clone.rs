@@ -1109,6 +1109,42 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `clone_local()` runs *instead of* the transport fetch — git never asks a local
+    // source for a pack:
+    // ```c
+    // if (is_local)
+    //         clone_local(path, git_dir);
+    // else if (mapped_refs && complete_refs_before_fetch) {
+    //         if (transport_fetch_refs(transport, mapped_refs))
+    //                 die(_("remote transport reported error"));
+    // }
+    // ```
+    //
+    // (builtin/clone.c:1354-1359 — the two are the arms of one `if`.) gitoxide has no
+    // local-clone shortcut, so the fetch machinery is still what maps the refs here;
+    // what changes is the order. Adopting the source's objects *before* the fetch
+    // leaves every commit the refspec wants already present, which is
+    // `mark_complete_and_common_ref()`'s `SkipToRefUpdate`
+    // (gix-protocol/src/fetch/negotiate.rs): the wants are never sent, the source's
+    // `upload-pack` never starts a `pack-objects`, and the refs are updated from the
+    // ref map alone.
+    //
+    // Leaving the source alone is the point on a *promisor* source. Answering a pack
+    // request makes `upload-pack` read every object it was asked to send, and the ones
+    // a partial clone deliberately left behind are fetched from its promisor remote to
+    // answer with — so a local clone that requested a pack grew the *source* by the
+    // blobs it was missing, where `git clone . <dst>` leaves both sides untouched.
+    //
+    // `-s`/`--shared` is `clone_local()`'s other arm and copies nothing: the alternates
+    // line written just above already makes the source's objects readable from here, so
+    // that spelling skips the pack for the same reason.
+    let adopted_pack_files = (is_local && !shared)
+        .then(|| {
+            adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)
+                .map(|()| pack_dir_entries(&git_dir))
+        })
+        .transpose()?;
+
     // Apply the parsed options. `--origin` renames the remote (and its tracking
     // refspec), `--branch` selects the ref to fetch and check out,
     // `--depth`/`--shallow-*` set the shallow boundary, and `--reject-shallow` /
@@ -1450,7 +1486,22 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 handshake.server_protocol_version,
                 &handshake.capabilities,
             );
-            if filter.is_some() && !filter_supported {
+            // ```c
+            // if (server_supports("filter")) {
+            //         server_supports_filtering = 1;
+            //         print_verbose(args, _("Server supports %s"), "filter");
+            // } else if (args->filter_options.choice) {
+            //         warning("filtering not recognized by server, ignoring");
+            // }
+            // ```
+            //
+            // (fetch-pack.c:1173-1178, and the v2 spelling at 305-313.) The warning belongs
+            // to `fetch-pack`, which a local clone never reaches — `clone_local()` runs in
+            // place of `transport_fetch_refs()` — so a local source that would not have
+            // understood the filter says nothing about it. The `--filter is ignored in local
+            // clones` warning at the banner has already covered that case, and the filter was
+            // never put on the wire here either (see `with_filter` above).
+            if filter.is_some() && !filter_supported && !is_local {
                 eprintln!("warning: filtering not recognized by server, ignoring");
             }
         };
@@ -1629,8 +1680,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // behind is dropped either way, since git's transport never ran.
     if is_local && shared {
         drop_fetched_pack(&git_dir);
-    } else if is_local {
-        adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)?;
+    } else if let Some(adopted) = adopted_pack_files {
+        // The objects were adopted above, before the fetch, so this is only the
+        // clean-up for a source the negotiation could not skip after all — a pack the
+        // transport wrote is not part of what `copy_or_link_directory()` leaves behind.
+        remove_pack_files_other_than(&git_dir, &adopted);
     } else if let Some(cloned) = gix::open(&git_dir)
         .ok()
         .filter(|repo| repo.config_snapshot().boolean("pack.writeReverseIndex").unwrap_or(true))
@@ -2450,6 +2504,28 @@ fn short_pack(err: gix::clone::fetch::Error, branch: Option<&str>, remote_name: 
         gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::NotConnected) => {
             anyhow::anyhow!("remote did not send all necessary objects")
         }
+        // ```c
+        // if (do_keep && (pack_lockfiles || fsck_objects)) {
+        //         int is_well_formed;
+        //         char *pack_lockfile = index_pack_lockfile(the_repository,
+        //                                                   cmd.out,
+        //                                                   &is_well_formed);
+        //
+        //         if (!is_well_formed)
+        //                 die(_("fetch-pack: invalid index-pack output"));
+        // ```
+        //
+        // (`get_pack()`, fetch-pack.c:1074-1081.) A server whose `pack-objects`
+        // died mid-stream leaves the receiver with a pack that stops in the
+        // middle of an entry, and git ends the whole clone at 128 on it — where
+        // gitoxide's `ConsumePack` arrived here as an ordinary error and left
+        // this port reporting 1. Reached whenever the far side gives up while
+        // writing: an `upload-pack` serving a partial clone it cannot complete
+        // (`fatal: could not fetch <oid> from promisor remote`) is the one this
+        // corpus exercises.
+        gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::Fetch(
+            gix::protocol::fetch::Error::ConsumePack(_),
+        )) => crate::fatal::die("fetch-pack: invalid index-pack output"),
         gix::clone::fetch::Error::RefNameMissing { ref wanted } => {
             let wanted = branch.map_or_else(|| wanted.as_ref().as_bstr().to_string(), ToOwned::to_owned);
             crate::fatal::die(format!("Remote branch {wanted} not found in upstream {remote_name}"))
@@ -2653,6 +2729,47 @@ fn looks_like_bundle(path: &Path) -> bool {
 fn local_path_of(url: &gix::Url) -> Option<PathBuf> {
     (url.scheme == gix::url::Scheme::File)
         .then(|| gix::path::from_bstr(url.path.as_bstr()).into_owned())
+}
+
+/// The object store `clone_local()` copies from.
+///
+/// ```c
+///                 get_common_dir(&src, src_repo);
+///                 strbuf_addstr(&src, "/objects");
+///                 copy_or_link_directory(&src, &dest, src_repo);
+/// ```
+/// (builtin/clone.c:411-423)
+///
+/// `src_repo` is not the path the user typed: it is what `get_repo_path_1()`
+/// (builtin/clone.c:127-165) resolved it to, and that function reads a `<path>/.git`
+/// **gitfile** and returns its target —
+///
+/// ```c
+///                 } else if (S_ISREG(st.st_mode) && st.st_size > 8) {
+///                         /* Is it a "gitfile"? */
+///                         …
+///                         dst = read_gitfile(path->buf);
+///                         if (dst) { *is_bundle = 0; return dst; }
+///                 }
+/// ```
+///
+/// — which is what a submodule's checkout and a `--separate-git-dir` worktree have
+/// instead of a `.git` directory. Testing `<path>/.git` for *directory*-ness and
+/// falling back to `<path>/objects` finds nothing on those, and a local clone that
+/// adopts nothing reports `done.` and leaves a repository whose `HEAD` names an
+/// object it does not have: `git clone ./sub other` produced
+/// `fatal: bad object HEAD`, and `git submodule add ./sub other` failed in the
+/// checkout that followed. `get_common_dir` is the second half — a source that is
+/// itself a linked worktree keeps its objects in the common directory.
+fn local_source_objects(source: &Path) -> PathBuf {
+    match gix::open(source) {
+        Ok(repo) => repo.common_dir().join("objects"),
+        // `get_repo_path_1` accepts a few spellings gitoxide's discovery does not
+        // (`<path>.git`, `<path>/.git/.git`); the plain layouts stay reachable
+        // without it.
+        Err(_) if source.join(".git").is_dir() => source.join(".git").join("objects"),
+        Err(_) => source.join("objects"),
+    }
 }
 
 /// The object directory to borrow from for `--shared`/`--reference`: the
@@ -3007,17 +3124,48 @@ fn drop_fetched_pack(git_dir: &Path) {
     }
 }
 
-fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result<()> {
-    let src_objects = match source.join(".git").is_dir() {
-        true => source.join(".git").join("objects"),
-        false => source.join("objects"),
+/// The names of the files currently in `objects/pack`, which is how a pack the local
+/// adoption brought in is told apart from one the transport wrote afterwards.
+fn pack_dir_entries(git_dir: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+    std::fs::read_dir(git_dir.join("objects").join("pack"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect()
+}
+
+/// Remove everything in `objects/pack` whose name is not in `keep`.
+fn remove_pack_files_other_than(
+    git_dir: &Path,
+    keep: &std::collections::BTreeSet<std::ffi::OsString>,
+) {
+    let Ok(entries) = std::fs::read_dir(git_dir.join("objects").join("pack")) else {
+        return;
     };
+    for entry in entries.flatten() {
+        if keep.contains(&entry.file_name()) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
+/// Copy (or hardlink) the source's object store into the clone: `copy_or_link_directory()`
+/// under `clone_local()`.
+///
+/// Called *before* the fetch, so `objects/pack` is empty when it runs and the
+/// `drop_fetched_pack()` below has nothing to remove. That call stays because it states the
+/// invariant `clone_local()` leaves behind — nothing but the source's own store lives here —
+/// and because it is what makes a repeated adoption idempotent.
+fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result<()> {
+    let src_objects = local_source_objects(source);
     if !src_objects.is_dir() {
         return Ok(());
     }
     let dst_objects = git_dir.join("objects");
 
-    // The fetch's own pack is what the adoption replaces.
+    // Nothing of the clone's own may survive beside the adopted store.
     drop_fetched_pack(git_dir);
 
     let mut stack = vec![(src_objects.clone(), dst_objects.clone())];

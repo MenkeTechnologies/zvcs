@@ -24,6 +24,13 @@
 //! only, whether the pathspec is "seen" in the index and so exempt from the exclude
 //! lookup (see [`index_has`]).
 //!
+//! The one shape the stack cannot serve is a `:(top)` element that walks out of
+//! the work tree. `prefix_pathspec()` hands a `FROMTOP` element through
+//! untouched (`pathspec.c:455-457`), so `:(top)../build/output.o` is matched as
+//! the literal `../build/output.o` — no `..`-folding, no "outside repository"
+//! refusal — and gitoxide's stack only speaks normalised repository-relative
+//! paths. [`escaping_hit`] runs git's own `prep_exclude()` descent for those.
+//!
 //! Not covered — refused, never faked: pathspec magic (`:(glob)…`), which git
 //! resolves through the full pathspec machinery; and unique-prefix option
 //! abbreviation (`--verb`), whose ambiguity diagnostics depend on `parse-options`'
@@ -69,6 +76,11 @@ struct Opts {
 /// `gix_ignore::search::Match` so the exclude stack can be re-borrowed.
 struct Hit {
     source: Option<PathBuf>,
+    /// The source is already spelled the way git prints it (`pl->src`) and must
+    /// not be re-based against the work tree. Only the `:(top)../…` walk sets
+    /// this: it names `.gitignore` files *above* the root, which no prefix strip
+    /// can express.
+    source_verbatim: bool,
     line: usize,
     /// The pattern as git prints it: `!` prefix and `/` suffix restored.
     pattern: BString,
@@ -277,15 +289,35 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         }
 
         // `:(top)` measures the path from the repository root rather than from
-        // the current directory, which is what `prefix_pathspec()` does by
-        // skipping the prefix for a `FROMTOP` element.
-        let from = if fromtop { BStr::new(b"") } else { prefix_b.as_bstr() };
-        let rel = match to_repo_relative(path.as_bstr(), from, root_b.as_bstr()) {
-            Some(rel) => rel,
-            None => {
-                return Ok(fatal(&format!(
-                    "{orig}: '{path}' is outside repository at '{root_b}'"
-                )))
+        // the current directory. `prefix_pathspec()` does that by not calling
+        // `prefix_path_gently()` at all for a `FROMTOP` element — the text after
+        // the magic *becomes* `item->match`, untouched (`pathspec.c:455-457`):
+        //
+        // ```c
+        // } else if (magic & PATHSPEC_FROMTOP) {
+        //         match = xstrdup(copyfrom);
+        //         prefixlen = 0;
+        // } else {
+        //         match = prefix_path_gently(prefix, prefixlen, &prefixlen, copyfrom);
+        //         if (!match) { ... die("… is outside repository …") }
+        // }
+        // ```
+        //
+        // So the `..`-folding and the escapes-the-root fatal are both part of
+        // `prefix_path_gently()` and neither applies here: `:(top)../build/x`
+        // from a subdirectory is matched as the literal `../build/x`, and git
+        // reports `.gitignore:3:build/` for it because `prep_exclude()` finds the
+        // leading directory `build` excluded (`dir.c`), rather than dying.
+        let rel = if fromtop {
+            path.clone()
+        } else {
+            match to_repo_relative(path.as_bstr(), prefix_b.as_bstr(), root_b.as_bstr()) {
+                Some(rel) => rel,
+                None => {
+                    return Ok(fatal(&format!(
+                        "{orig}: '{path}' is outside repository at '{root_b}'"
+                    )))
+                }
             }
         };
 
@@ -299,24 +331,40 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
             None
         } else {
             // Trailing `/` forces directory semantics; otherwise git lstat()s the
-            // path, so a symlink-to-directory is *not* a directory here.
-            let on_disk = gix::path::from_bstr(path.as_bstr());
+            // path — so a symlink-to-directory is *not* a directory here. git
+            // lstat()s it from the top of the work tree, which is where
+            // `setup_git_directory()` left it, so a `:(top)` path is resolved
+            // there and everything else against the prefix-joined `rel`.
+            let on_disk = if fromtop {
+                root_abs.join(gix::path::from_bstr(path.as_bstr()))
+            } else {
+                root_abs.join(gix::path::from_bstr(rel.as_bstr()))
+            };
             let is_dir = path.ends_with(b"/")
-                || std::fs::symlink_metadata(&*on_disk)
+                || std::fs::symlink_metadata(&on_disk)
                     .map(|m| m.is_dir())
                     .unwrap_or(false);
-            let mode = if is_dir {
-                gix::index::entry::Mode::DIR
+            // A `:(top)` element that walks out of the work tree cannot go
+            // through the stack: gitoxide's worktree stack only accepts
+            // normalised repository-relative paths, while git's `prep_exclude()`
+            // happily descends into `../…`. [`escaping_hit`] is that walk.
+            if rel.split(|&b| b == b'/').any(|c| c == b"..") {
+                escaping_hit(&repo, &root_abs, rel.as_bstr(), is_dir)?
             } else {
-                gix::index::entry::Mode::FILE
-            };
-            let plat = stack.at_entry(rel.as_bstr(), Some(mode))?;
-            plat.matching_exclude_pattern().map(|m| Hit {
-                source: m.source.map(Path::to_path_buf),
-                line: m.sequence_number,
-                pattern: render_pattern(m.pattern),
-                negative: m.pattern.is_negative(),
-            })
+                let mode = if is_dir {
+                    gix::index::entry::Mode::DIR
+                } else {
+                    gix::index::entry::Mode::FILE
+                };
+                let plat = stack.at_entry(rel.as_bstr(), Some(mode))?;
+                plat.matching_exclude_pattern().map(|m| Hit {
+                    source: m.source.map(Path::to_path_buf),
+                    source_verbatim: false,
+                    line: m.sequence_number,
+                    pattern: render_pattern(m.pattern),
+                    negative: m.pattern.is_negative(),
+                })
+            }
         };
 
         // Without -v a negated pattern is reported as "no match at all"; with -v
@@ -653,7 +701,12 @@ fn render_pattern(p: &gix::glob::Pattern) -> BString {
 /// The `<source>` column: repository-root relative for in-tree `.gitignore`
 /// files and `.git/info/exclude`, left as configured (typically absolute) for
 /// `core.excludesFile`, exactly as git prints it.
-fn source_display(src: &Path, workdir: &Path, root_abs: &Path) -> BString {
+fn source_display(hit: &Hit, src: &Path, workdir: &Path, root_abs: &Path) -> BString {
+    // `pl->src` for a per-directory list built by the `:(top)../…` walk is
+    // already relative to the work tree root; re-basing it would eat the `../`.
+    if hit.source_verbatim {
+        return gix::path::into_bstr(src).into_owned();
+    }
     for base in [workdir, root_abs] {
         if let Ok(rel) = src.strip_prefix(base) {
             return gix::path::into_bstr(rel).into_owned();
@@ -677,7 +730,7 @@ fn emit(
             match hit {
                 Some(h) => {
                     if let Some(src) = &h.source {
-                        out.extend_from_slice(&source_display(src, workdir, root_abs));
+                        out.extend_from_slice(&source_display(h, src, workdir, root_abs));
                     }
                     out.push(0);
                     out.extend_from_slice(h.line.to_string().as_bytes());
@@ -699,7 +752,7 @@ fn emit(
                 let src = h
                     .source
                     .as_deref()
-                    .map(|s| source_display(s, workdir, root_abs))
+                    .map(|s| source_display(h, s, workdir, root_abs))
                     .unwrap_or_default();
                 out.extend_from_slice(&quote_c_style(&src));
                 out.extend_from_slice(format!(":{}:", h.line).as_bytes());
@@ -719,4 +772,164 @@ fn emit(
 /// other verb that prints a path.
 fn quote_c_style(path: &[u8]) -> Vec<u8> {
     crate::quote::quoted_name_bytes(path)
+}
+
+/// git's `last_matching_pattern()` (`dir.c:1687-1697`) for a path that walks
+/// *out* of the work tree — which only a `:(top)../…` pathspec can produce,
+/// since `prefix_pathspec()` hands a `FROMTOP` element straight through without
+/// the `..`-folding and the escapes-the-root refusal that `prefix_path_gently()`
+/// applies to everything else (`pathspec.c:455-457`).
+///
+/// git does not treat that as an error. `check_ignore()` passes the literal text
+/// to `last_matching_pattern()`, which calls `prep_exclude()` over the leading
+/// directories and then matches the path itself:
+///
+/// ```c
+/// prep_exclude(dir, istate, pathname, basename-pathname);
+/// if (dir->pattern)
+///         return dir->pattern;
+/// return last_matching_pattern_from_lists(dir, istate, pathname, pathlen, basename, dtype);
+/// ```
+///
+/// `prep_exclude()` descends one component at a time from the work tree root,
+/// reading `<base>.gitignore` for the base it just entered and then asking
+/// whether the *next* directory is itself excluded — and a directory that is
+/// excluded ends the search right there, its pattern becoming the answer for the
+/// whole path (`dir.c:1595-1614`). That is why
+///
+/// ```console
+/// $ cd sub && git check-ignore -v -- ':(top)../build/output.o'
+/// .gitignore:3:build/	:(top)../build/output.o
+/// ```
+///
+/// reports `build/`: the leading directory `../build` matched by basename, from
+/// the work tree root's own `.gitignore`. Nothing ever resolved the `..`, which
+/// is also why `:(top)../notes.tmp` is *not* caught by the anchored `/notes.tmp`
+/// in that same file — anchored patterns are matched against the path as written.
+///
+/// The pattern lists are assembled here rather than taken from
+/// [`gix::worktree::Stack`] because the stack is defined over normalised
+/// repository-relative paths and cannot represent a base of `../`.
+fn escaping_hit(
+    repo: &gix::Repository,
+    root_abs: &Path,
+    rel: &BStr,
+    is_dir: bool,
+) -> Result<Option<Hit>> {
+    let case = if repo
+        .config_snapshot()
+        .boolean("core.ignoreCase")
+        .unwrap_or(false)
+    {
+        gix::glob::pattern::Case::Fold
+    } else {
+        gix::glob::pattern::Case::Sensitive
+    };
+    let parse = gix::ignore::search::Ignore::default();
+
+    // git's `EXC_FILE`: `core.excludesFile` (defaulting to
+    // `$XDG_CONFIG_HOME/git/ignore`) and `$GIT_DIR/info/exclude`
+    // (`setup_standard_excludes()`, dir.c). `Search::from_git_dir` loads both in
+    // that order, and matches them back to front, which is the order
+    // `last_matching_pattern_from_lists()` walks the group in.
+    let excludes_file = repo
+        .config_snapshot()
+        .trusted_path("core.excludesFile")
+        .ok()
+        .flatten()
+        .or_else(|| gix::path::env::xdg_config("ignore", &mut |name: &str| std::env::var_os(name)));
+    let mut buf = Vec::with_capacity(512);
+    let file_group =
+        gix::ignore::Search::from_git_dir(repo.git_dir(), excludes_file, &mut buf, parse)?;
+
+    // git's `EXC_DIRS`, pushed shallowest-first as `prep_exclude()` descends.
+    let mut dirs: Vec<(BString, gix::ignore::Search)> = Vec::new();
+    let comps: Vec<&[u8]> = rel.split(|&b| b == b'/').collect();
+    let mut base = BString::default();
+    for (i, comp) in comps.iter().enumerate() {
+        push_per_directory(&mut dirs, root_abs, base.as_bstr(), parse);
+        // The last component is the path itself, not a directory to descend into.
+        if i + 1 == comps.len() {
+            break;
+        }
+        let mut dir_path = base.clone();
+        dir_path.extend_from_slice(comp);
+        // "Abort if the directory is excluded" — but a *negative* match only
+        // clears `dir->pattern`, it does not stop the descent (dir.c:1608-1612).
+        if let Some(h) = match_lists(&dirs, &file_group, dir_path.as_bstr(), true, case) {
+            if !h.negative {
+                return Ok(Some(h));
+            }
+        }
+        base = dir_path;
+        base.push(b'/');
+    }
+    Ok(match_lists(&dirs, &file_group, rel, is_dir, case))
+}
+
+/// Load `<base>.gitignore` as one `EXC_DIRS` list, recording `base` so the path
+/// can be made relative to it at match time.
+///
+/// `pl->src` is `basebuf + dir->exclude_per_dir` (`dir.c:1637-1641`) — a path
+/// relative to the work tree root, and the one `check-ignore -v` prints — so the
+/// list's source is stored in exactly that spelling while the bytes are read from
+/// the work tree. A missing or empty file contributes nothing: `add_patterns()`
+/// returns before it reads a zero-sized file (dir.c:1083-1091).
+fn push_per_directory(
+    dirs: &mut Vec<(BString, gix::ignore::Search)>,
+    root_abs: &Path,
+    base: &BStr,
+    parse: gix::ignore::search::Ignore,
+) {
+    let mut src = base.to_owned();
+    src.extend_from_slice(b".gitignore");
+    let rel_src = gix::path::from_bstr(src.as_bstr()).into_owned();
+    let Ok(bytes) = std::fs::read(root_abs.join(&rel_src)) else {
+        return;
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    let mut search = gix::ignore::Search::default();
+    search.add_patterns_buffer(&bytes, rel_src, None, parse);
+    dirs.push((base.to_owned(), search));
+}
+
+/// `last_matching_pattern_from_lists()` (`dir.c`): the `EXC_DIRS` lists deepest
+/// first, then `EXC_FILE`. The first list that matches decides — within a list
+/// the last matching pattern wins, which is what gitoxide's search already does.
+///
+/// A list read from `<base>.gitignore` matches against the path relative to
+/// `base` (git's `match_pathname()` skips `baselen` bytes), and a path that does
+/// not lie under `base` cannot match that list at all.
+fn match_lists(
+    dirs: &[(BString, gix::ignore::Search)],
+    file_group: &gix::ignore::Search,
+    path: &BStr,
+    is_dir: bool,
+    case: gix::glob::pattern::Case,
+) -> Option<Hit> {
+    // `verbatim` tells the two groups apart: a per-directory list carries the
+    // `<base>.gitignore` spelling git prints for `pl->src`, while an `EXC_FILE`
+    // source comes from gitoxide and is named the way every other lookup in this
+    // command names it.
+    let to_hit = |m: &gix::ignore::search::Match<'_>, verbatim: bool| Hit {
+        source: m.source.map(Path::to_path_buf),
+        source_verbatim: verbatim,
+        line: m.sequence_number,
+        pattern: render_pattern(m.pattern),
+        negative: m.pattern.is_negative(),
+    };
+    for (base, search) in dirs.iter().rev() {
+        let Some(under) = path.strip_prefix(base.as_slice()) else {
+            continue;
+        };
+        if let Some(m) = search.pattern_matching_relative_path(under.as_bstr(), Some(is_dir), case) {
+            return Some(to_hit(&m, true));
+        }
+    }
+    file_group
+        .pattern_matching_relative_path(path, Some(is_dir), case)
+        .as_ref()
+        .map(|m| to_hit(m, false))
 }

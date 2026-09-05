@@ -151,34 +151,107 @@ fn read_autocorrect() -> i32 {
     let Ok(repo) = crate::setup::discover() else {
         return 0;
     };
-    match repo.config_snapshot().string("help.autocorrect") {
-        Some(raw) => parse_autocorrect(&raw.to_string()),
-        None => 0,
+    let Some(raw) = repo.config_snapshot().string("help.autocorrect") else {
+        return 0;
+    };
+    let value = raw.to_string();
+    match parse_autocorrect(&value) {
+        Ok(v) => v,
+        Err(error_type) => {
+            // `die_bad_number()`'s no-source arm (`config.c:1278-1279`): the `-c`
+            // parameters git reports this against carry no `cf->name`, so there
+            // is no ` in file …` / ` in command line …` tail. This is a `die()`
+            // in git too, and `correct()`'s result type belongs to the
+            // dispatcher, so it exits here rather than unwinding — nothing has
+            // been written to stdout on the unknown-verb path yet.
+            eprintln!(
+                "fatal: bad numeric config value '{value}' for 'help.autocorrect': {error_type}"
+            );
+            std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
+        }
     }
 }
 
 /// Port of git's `parse_autocorrect` + the integer fallback in
 /// `git_unknown_cmd_config`: a boolean, one of the keywords, or a decisecond
-/// count (with `<0` and `1` collapsing to "immediate"). Unrecognized text is `0`
-/// (undecided → no autocorrection).
-fn parse_autocorrect(value: &str) -> i32 {
+/// count (with `<0` and `1` collapsing to "immediate").
+///
+/// Text that is none of those is *not* "undecided": `git_unknown_cmd_config`
+/// hands it to `git_config_int()` (`help.c:557-559`),
+///
+/// ```c
+/// } else {
+///         int v = git_config_int(var, value);
+///         autocorrect = (v < 0) ? AUTOCORRECT_IMMEDIATELY : v;
+/// }
+/// ```
+///
+/// and `git_config_int()` calls `die_bad_number()` when the parse fails
+/// (`config.c:1305-1308`), so a bad setting takes the whole command down with
+/// exit 128 before the typo is ever ranked:
+///
+/// ```console
+/// $ git -c help.autoCorrect=bogus stauts
+/// fatal: bad numeric config value 'bogus' for 'help.autocorrect': invalid unit
+/// ```
+///
+/// The `Err` payload is `die_bad_number()`'s `error_type`; [`read_autocorrect`]
+/// turns it into the `fatal:` line and the exit.
+fn parse_autocorrect(value: &str) -> Result<i32, &'static str> {
     match maybe_bool(value) {
-        Some(true) => return IMMEDIATELY,
-        Some(false) => return SHOW,
+        Some(true) => return Ok(IMMEDIATELY),
+        Some(false) => return Ok(SHOW),
         None => {}
     }
     match value {
-        "prompt" => return PROMPT,
-        "never" => return NEVER,
-        "immediate" => return IMMEDIATELY,
-        "show" => return SHOW,
+        "prompt" => return Ok(PROMPT),
+        "never" => return Ok(NEVER),
+        "immediate" => return Ok(IMMEDIATELY),
+        "show" => return Ok(SHOW),
         _ => {}
     }
-    match value.trim().parse::<i32>() {
-        Ok(v) if v < 0 || v == 1 => IMMEDIATELY,
-        Ok(v) => v,
-        Err(_) => 0,
+    config_int(value).map(|v| if v < 0 || v == 1 { IMMEDIATELY } else { v })
+}
+
+/// `git_parse_signed()` (`config.c:1158-1191`) narrowed to `int`: `strtoimax()`
+/// with base detection, then a `k`/`m`/`g` unit factor, then a range check.
+///
+/// The `Err` payload is `die_bad_number()`'s `error_type` — `out of range` for
+/// `ERANGE`, `invalid unit` for everything else, which is why trailing garbage
+/// reports a *unit* problem (`config.c:1271-1272`).
+fn config_int(value: &str) -> Result<i32, &'static str> {
+    let s = value.trim_start();
+    // `strtoimax(value, &end, 0)`: an optional sign, then `0x…` hex, `0…` octal,
+    // or decimal. `end` is whatever it stopped on.
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1i64, r),
+        None => (1i64, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (radix, digits) = match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        Some(hex) => (16, hex),
+        None if rest.len() > 1 && rest.starts_with('0') => (8, &rest[1..]),
+        None => (10, rest),
+    };
+    let end = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    // `end == value` — nothing numeric at all, so EINVAL, not ERANGE.
+    if end == 0 && !(radix == 8 && rest.starts_with('0')) {
+        return Err("invalid unit");
     }
+    let factor: i64 = match digits[end..].to_ascii_lowercase().as_str() {
+        "" => 1,
+        "k" => 1024,
+        "m" => 1024 * 1024,
+        "g" => 1024 * 1024 * 1024,
+        _ => return Err("invalid unit"),
+    };
+    let magnitude =
+        i64::from_str_radix(&digits[..end], radix).map_err(|_| "out of range")?;
+    sign.checked_mul(magnitude)
+        .and_then(|v| v.checked_mul(factor))
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or("out of range")
 }
 
 /// git's `git_parse_maybe_bool_text` for the values relevant here: the canonical
@@ -291,17 +364,39 @@ mod tests {
 
     #[test]
     fn parses_autocorrect_values() {
-        assert_eq!(parse_autocorrect("1"), IMMEDIATELY);
-        assert_eq!(parse_autocorrect("true"), IMMEDIATELY);
-        assert_eq!(parse_autocorrect("immediate"), IMMEDIATELY);
-        assert_eq!(parse_autocorrect("0"), SHOW);
-        assert_eq!(parse_autocorrect("false"), SHOW);
-        assert_eq!(parse_autocorrect("show"), SHOW);
-        assert_eq!(parse_autocorrect("never"), NEVER);
-        assert_eq!(parse_autocorrect("prompt"), PROMPT);
-        assert_eq!(parse_autocorrect("2"), 2); // deciseconds
-        assert_eq!(parse_autocorrect("30"), 30);
-        assert_eq!(parse_autocorrect("-1"), IMMEDIATELY);
-        assert_eq!(parse_autocorrect("garbage"), 0);
+        assert_eq!(parse_autocorrect("1"), Ok(IMMEDIATELY));
+        assert_eq!(parse_autocorrect("true"), Ok(IMMEDIATELY));
+        assert_eq!(parse_autocorrect("immediate"), Ok(IMMEDIATELY));
+        assert_eq!(parse_autocorrect("0"), Ok(SHOW));
+        assert_eq!(parse_autocorrect("false"), Ok(SHOW));
+        assert_eq!(parse_autocorrect("show"), Ok(SHOW));
+        assert_eq!(parse_autocorrect("never"), Ok(NEVER));
+        assert_eq!(parse_autocorrect("prompt"), Ok(PROMPT));
+        assert_eq!(parse_autocorrect("2"), Ok(2)); // deciseconds
+        assert_eq!(parse_autocorrect("30"), Ok(30));
+        assert_eq!(parse_autocorrect("-1"), Ok(IMMEDIATELY));
+    }
+
+    /// Text that is neither a keyword nor a number reaches `git_config_int()`,
+    /// which `die()`s rather than defaulting — verified against the oracle:
+    ///
+    /// ```console
+    /// $ git -c help.autoCorrect=bogus stauts
+    /// fatal: bad numeric config value 'bogus' for 'help.autocorrect': invalid unit
+    /// $ echo $?
+    /// 128
+    /// ```
+    ///
+    /// The two `error_type` spellings come from `die_bad_number()`
+    /// (`config.c:1271-1272`): `ERANGE` is `out of range`, every other failure —
+    /// including trailing text that is not a `k`/`m`/`g` unit — is `invalid unit`.
+    #[test]
+    fn rejects_values_git_config_int_rejects() {
+        assert_eq!(parse_autocorrect("garbage"), Err("invalid unit"));
+        assert_eq!(parse_autocorrect("12x"), Err("invalid unit"));
+        assert_eq!(parse_autocorrect("99999999999999999999"), Err("out of range"));
+        // Units are part of `git_parse_signed()`, so they parse rather than fail.
+        assert_eq!(parse_autocorrect("2k"), Ok(2048));
+        assert_eq!(parse_autocorrect("0x10"), Ok(16));
     }
 }

@@ -15,8 +15,10 @@
 //!   * `git hook run [--allow-unknown-hook-name] [--ignore-missing]
 //!     [--to-stdin=<path>] [-j|--jobs <n>] <event> [-- <hook-args>]` — serial
 //!     execution, git's `prepare_shell_cmd` argv construction, hook stdout
-//!     redirected to stderr, and the bitwise-OR of every hook's exit status as
-//!     the command's own exit code.
+//!     redirected to stderr, the top of the work tree as every hook's working
+//!     directory (git's own, since `setup_git_directory()` has `chdir`'d there
+//!     and `run_hooks_opt()` leaves `cp->dir` NULL), and the bitwise-OR of every
+//!     hook's exit status as the command's own exit code.
 //!   * Config semantics: last-`command`-wins, `event` accumulation with an empty
 //!     value resetting the list, a repeated event moving the hook to the end of
 //!     the order, `hook.<name>.enabled`, `hook.<event>.enabled` (which does not
@@ -405,6 +407,16 @@ fn run(args: &[String]) -> Result<ExitCode> {
 
     // Hooks inherit stderr, and their stdout is pointed at it too.
     let stderr = stderr_dup()?;
+    // `pick_next_hook()` leaves `cp->dir` at `options->dir`, which `git hook run`
+    // never sets (`builtin/hook.c:24` takes `RUN_HOOKS_OPT_INIT`, whose `dir` is
+    // NULL — hook.h:37-40), so the child simply inherits git's own current
+    // directory. That directory is the top of the work tree, not wherever the
+    // user typed the command: `setup_git_directory()` has already `chdir`'d
+    // there and handed the builtin a `prefix` instead. zvcs stays where it was
+    // invoked, so the child's cwd has to be moved there explicitly — otherwise
+    // `git hook run pre-commit` from `sub/` writes the hook's output into `sub/`
+    // while git writes it into the work tree root.
+    let workdir = crate::hooks::absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir()));
     let mut rc: i32 = 0;
     for (idx, cmd) in commands.iter().enumerate() {
         // `pick_next_hook` (hook.c:611-622) runs the two kinds differently: a
@@ -428,13 +440,25 @@ fn run(args: &[String]) -> Result<ExitCode> {
             None => Stdio::null(),
         };
         let mut child = if traditional {
-            let mut c = Command::new(std::ffi::OsStr::from_bytes(cmd));
+            // The path `find_hook()` returns is `$GIT_DIR/hooks/<event>`, which
+            // git may spell relative (`.git/hooks/pre-commit`) because it means
+            // the same thing before and after the spawn — git is already at the
+            // work tree root. zvcs discovered the repository from a subdirectory,
+            // so the same file reaches it as `../.git/hooks/pre-commit`; handing
+            // that to a child whose cwd is being moved to the root would exec one
+            // directory too high. Absolutize first, as `crate::hooks::run_with_env`
+            // already does for every other hook site.
+            let path = crate::hooks::absolutize(std::path::Path::new(
+                std::ffi::OsStr::from_bytes(cmd),
+            ));
+            let mut c = Command::new(path);
             c.args(&hook_args);
             c
         } else {
             shell_command(cmd, &hook_args)
         };
         child
+            .current_dir(&workdir)
             .stdin(stdin)
             .stdout(Stdio::from(stderr.try_clone()?))
             .stderr(Stdio::inherit());

@@ -203,7 +203,7 @@ fn word_fallback(args: &[String]) -> Result<ExitCode> {
     if is_marking {
         mark(word, &args[1..])
     } else {
-        unknown_command(word)
+        Ok(state_exit(unknown_command(word)?))
     }
 }
 
@@ -450,7 +450,7 @@ fn check_term_format(term: &str, orig_term: &str) -> std::result::Result<(), Str
 
 /// git prints the "you're currently in a X/Y bisect" hint only when terms exist,
 /// then the fatal line and the usage block, and exits 129.
-fn unknown_command(word: &str) -> Result<ExitCode> {
+fn unknown_command(word: &str) -> Result<u8> {
     let ctx = Ctx::open()?;
     if let Some(terms) = read_terms(&ctx)? {
         eprintln!(
@@ -459,7 +459,7 @@ fn unknown_command(word: &str) -> Result<ExitCode> {
         );
     }
     eprint!("fatal: unknown command: '{word}'\n\n{USAGE}");
-    Ok(ExitCode::from(129))
+    Ok(USAGE_EXIT)
 }
 
 // --- subcommands gated on an active session ----------------------------------
@@ -492,11 +492,17 @@ fn next_check_silent(ctx: &Ctx, terms: &Terms) -> Result<bool> {
 /// skipped: `BISECT_HEAD` when the session was opened `--no-checkout`, and
 /// `HEAD` otherwise.
 fn skip_cmd(args: &[String]) -> Result<ExitCode> {
+    Ok(state_exit(bisect_skip(args)?))
+}
+
+/// `bisect_skip()` proper, answering with a `bisect_error` so that [`run_cmd`]
+/// can drive it the way `bisect_run()` drives `bisect_state("skip")`.
+fn bisect_skip(args: &[String]) -> Result<u8> {
     let ctx = Ctx::open()?;
     // `bisect_state()`'s first act, and the reason an unstarted session fails
     // here rather than at the revision parsing below.
     if !autostart(&ctx) {
-        return Ok(ExitCode::from(1));
+        return Ok(BISECT_FAILED);
     }
     let terms = current_terms(&ctx)?;
 
@@ -543,7 +549,7 @@ fn skip_cmd(args: &[String]) -> Result<ExitCode> {
             Ok(id) => ids.push(id),
             Err(_) => {
                 eprintln!("error: Bad rev input: {spec}");
-                return Ok(ExitCode::from(1));
+                return Ok(BISECT_FAILED);
             }
         }
     }
@@ -554,7 +560,7 @@ fn skip_cmd(args: &[String]) -> Result<ExitCode> {
         // `bisect_write()`, so the ref and the log line name the hex — unlike `replay`,
         // which passes the log's own word through untouched.
         if !write_skip(&ctx, &id.to_hex().to_string(), *id)? {
-            return Ok(ExitCode::from(1));
+            return Ok(BISECT_FAILED);
         }
         // `bisect_state()`: marking anything other than the commit the last step
         // asked for invalidates both cached answers, once.
@@ -575,10 +581,14 @@ fn write_skip(ctx: &Ctx, rev: &str, id: ObjectId) -> Result<bool> {
     if !update_bisect_ref(ctx, &format!("skip-{rev}"), id)? {
         return Ok(false);
     }
+    // `log_commit(fp, "%s", state, lookup_commit_reference(the_repository, &oid))`
+    // prints `oid_to_hex(&commit->object.oid)` — the *peeled* commit, even when
+    // the ref just written names an annotated tag.
+    let logged = peel_to_commit(&ctx.repo, id);
     ctx.append_log(&format!(
         "# skip: [{}] {}\n",
-        id.to_hex(),
-        subject(&ctx.repo, id)?
+        logged.to_hex(),
+        subject(&ctx.repo, logged)?
     ))?;
     ctx.append_log(&format!("git bisect skip {rev}\n"))?;
     Ok(true)
@@ -599,6 +609,17 @@ fn update_bisect_ref(ctx: &Ctx, leaf: &str, id: ObjectId) -> Result<bool> {
         );
         return Ok(false);
     }
+    // refs.c's second refusal, and the one a replay reaches when the log names a
+    // commit this repository no longer has: `get_oid()` handed the hex straight
+    // back without consulting the odb, so the transaction is where the object's
+    // absence is noticed.
+    if ctx.repo.find_object(id).is_err() {
+        eprintln!(
+            "error: update_ref failed for ref '{full}': trying to write ref '{full}' with nonexistent object {}",
+            id.to_hex()
+        );
+        return Ok(false);
+    }
     write_ref(&ctx.refs_dir().join(leaf), id)?;
     Ok(true)
 }
@@ -614,8 +635,178 @@ fn visualize_cmd(_args: &[String]) -> Result<ExitCode> {
     bail!("`bisect visualize` is not supported (it shells out to gitk/git log)")
 }
 
+/// ```c
+/// static int do_bisect_run(const char *command)
+/// {
+///         struct child_process cmd = CHILD_PROCESS_INIT;
+///
+///         printf(_("running %s\n"), command);
+///         cmd.use_shell = 1;
+///         strvec_push(&cmd.args, command);
+///         return run_command(&cmd);
+/// }
+/// ```
+///
+/// (builtin/bisect.c:1144.) The command line is always sq-quoted before it gets
+/// here, so it always holds a `'` and `use_shell` therefore always takes the
+/// `sh -c` path rather than `prepare_shell_cmd`'s direct-exec shortcut.
+///
+/// `run_command()`'s answer is `wait_or_whine()`'s: `WEXITSTATUS` for a normal
+/// exit, `128 + WTERMSIG` for a signal (run-command.c) — which is what makes the
+/// `128 <= res` guard in [`run_cmd`] a signal test, and `-1` when the child could
+/// not be started at all.
+fn do_bisect_run(command: &str) -> Result<i32> {
+    println!("running {command}");
+    // The child inherits fd 1, and in `run_cmd` fd 1 is the process's own again
+    // by this point — but a previous iteration left buffered bytes behind, so
+    // flush before handing the descriptor over.
+    std::io::stdout().flush()?;
+    // `prepare_shell_cmd()` pushes `SHELL_PATH`, `-c` and the command, then
+    // `strvec_pushv(out, argv)` appends the caller's argv *after* it — so the
+    // command string is handed to `sh` a second time as `$0`, and that is the
+    // name `sh` puts in front of its own diagnostics ("'no-such-cmd':
+    // no-such-cmd: command not found", not "sh: …").
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .arg(command)
+        .status();
+    Ok(match status {
+        Ok(st) => match st.code() {
+            Some(code) => code,
+            None => {
+                // ```c
+                // code = WTERMSIG(status);
+                // if (code != SIGINT && code != SIGQUIT && code != SIGPIPE)
+                //         error("%s died of signal %d", argv0, code);
+                // code += 128;
+                // ```
+                //
+                // (`wait_or_whine()`, run-command.c.) `argv0` is `cmd->args.v[0]`,
+                // which is the command line before `prepare_shell_cmd()` wrapped it.
+                let sig = std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0);
+                if sig != libc::SIGINT && sig != libc::SIGQUIT && sig != libc::SIGPIPE {
+                    eprintln!("error: {command} died of signal {sig}");
+                }
+                128 + sig
+            }
+        },
+        // `start_command()` failed: `run_command()` answers -1.
+        Err(_) => -1,
+    })
+}
+
+/// git's `verify_good()` (builtin/bisect.c:1154): 126/127 from the *first* run
+/// could be the shell failing to find or exec the script rather than a verdict,
+/// so the command is re-run on a known-good revision to tell the two apart.
+///
+/// ```c
+/// char *good_glob = xstrfmt("%s-*", terms->term_good);
+/// int no_checkout = ref_exists("BISECT_HEAD");
+///
+/// for_each_glob_ref_in(get_first_good, good_glob, "refs/bisect/", &good_rev);
+/// ```
+///
+/// `get_first_good` stops at the first match in ref iteration order, which is
+/// sorted, so the good end tested here is the lowest-named `refs/bisect/<good>-*`.
+fn verify_good(ctx: &Ctx, terms: &Terms, command: &str) -> Result<i32> {
+    let mut goods: Vec<(String, ObjectId)> = Vec::new();
+    let dir = ctx.refs_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&format!("{}-", terms.good)) {
+                continue;
+            }
+            if let Some(id) = read_ref(&entry.path())? {
+                goods.push((name, id));
+            }
+        }
+    }
+    goods.sort_by(|a, b| a.0.cmp(&b.0));
+    let Some(good_rev) = goods.first().map(|(_, id)| *id) else {
+        return Ok(-1);
+    };
+
+    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    let head_file = if no_checkout { "BISECT_HEAD" } else { "HEAD" };
+    // `if (read_ref(no_checkout ? "BISECT_HEAD" : "HEAD", &current_rev)) return -1;`
+    let Some(current_rev) = (match no_checkout {
+        true => read_ref(&ctx.file(head_file))?,
+        false => resolve(&ctx.repo, "HEAD").ok(),
+    }) else {
+        return Ok(-1);
+    };
+
+    // `res = bisect_checkout(&good_rev, no_checkout); if (res != BISECT_OK) return -1;`
+    if bisect_checkout(ctx, good_rev, no_checkout)? != BISECT_OK {
+        return Ok(-1);
+    }
+    let rc = do_bisect_run(command)?;
+    if bisect_checkout(ctx, current_rev, no_checkout)? != BISECT_OK {
+        return Ok(-1);
+    }
+    Ok(rc)
+}
+
+/// git's `bisect_checkout()` (bisect.c:727-758):
+///
+/// ```c
+/// update_ref(NULL, "BISECT_EXPECTED_REV", bisect_rev, NULL, 0, UPDATE_REFS_DIE_ON_ERR);
+/// if (no_checkout) {
+///         update_ref(NULL, "BISECT_HEAD", bisect_rev, NULL, 0, UPDATE_REFS_DIE_ON_ERR);
+/// } else {
+///         … "checkout", "-q", oid_to_hex(bisect_rev), "--" …
+/// }
+/// commit = lookup_commit_reference(the_repository, bisect_rev);
+/// format_commit_message(commit, "[%H] %s%n", &commit_msg, &pp);
+/// fputs(commit_msg.buf, stdout);
+/// ```
+///
+/// Both the `BISECT_EXPECTED_REV` write and the `[<hex>] <subject>` line are part
+/// of it, which is why [`verify_good`]'s two moves are visible in the transcript
+/// and leave the file pointing at the revision it moved back to.
+/// Answers `BISECT_OK` or `BISECT_FAILED`: a `git checkout` that refuses — a
+/// worktree change the move would overwrite is the reachable case — stops the
+/// step before the `[<hex>] <subject>` line is printed.
+///
+/// ```c
+/// if (run_command(&cmd))
+///         /*
+///          * Errors in `run_command()` itself, signaled by res < 0,
+///          * and errors in the child process, signaled by res > 0
+///          * can both be treated as regular BISECT_FAILED (-1).
+///          */
+///         return BISECT_FAILED;
+/// ```
+fn bisect_checkout(ctx: &Ctx, id: ObjectId, no_checkout: bool) -> Result<u8> {
+    write_ref(&ctx.file("BISECT_EXPECTED_REV"), id)?;
+    if no_checkout {
+        write_ref(&ctx.file("BISECT_HEAD"), id)?;
+    } else {
+        // Through `run_command()` in git; see `crate::cstdio::run_command`.
+        let _child = crate::cstdio::run_command();
+        let code = super::checkout::checkout(&["-q".to_string(), id.to_hex().to_string()])?;
+        if code != ExitCode::SUCCESS {
+            return Ok(BISECT_FAILED);
+        }
+    }
+    println!("[{}] {}", id.to_hex(), subject(&ctx.repo, id)?);
+    Ok(BISECT_OK)
+}
+
 /// `git bisect run`: `cmd_bisect__run` rejects an empty command line, then
-/// `bisect_run` gates on `bisect_next_check(terms, NULL)`.
+/// `bisect_run` (builtin/bisect.c:1183) gates on `bisect_next_check(terms, NULL)`
+/// and drives the search from one invocation.
+///
+/// Each iteration runs the command, reads its exit status as the verdict — 125 is
+/// `skip`, 0 is the good term, anything else the bad one — and feeds that to
+/// [`bisect_state`]. git redirects `bisect_state`'s stdout into
+/// `$GIT_DIR/BISECT_RUN` for the duration and then copies the file back out, so
+/// the step's own output lands *after* the `running …` line rather than
+/// interleaved with it; the file it leaves behind is part of the state a parity
+/// run compares, so the redirect is reproduced rather than emulated with an
+/// in-process buffer.
 fn run_cmd(args: &[String]) -> Result<ExitCode> {
     if args.is_empty() {
         eprintln!("error: 'git bisect run' failed: no command provided.");
@@ -626,11 +817,134 @@ fn run_cmd(args: &[String]) -> Result<ExitCode> {
     if !next_check_silent(&ctx, &terms)? {
         return Ok(ExitCode::from(1));
     }
-    bail!(
-        "`bisect run` is not supported: it drives an external command per step, reading its \
-         exit status to mark, skip (125) or abort the session; the child-process driver is \
-         not ported"
-    )
+
+    // `sq_quote_argv(&command, argv)`: every operand is quoted unconditionally
+    // (so `sh -c 'exit 125'` survives as three words) and they are joined by a
+    // single space.
+    let command = args
+        .iter()
+        .map(|a| sq_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut is_first_run = true;
+    loop {
+        let rc = do_bisect_run(&command)?;
+
+        // Exit code 126 and 127 can either come from the shell if it was unable
+        // to execute or even find the script, or from the script itself.
+        if is_first_run && (rc == 126 || rc == 127) {
+            let verified = verify_good(&ctx, &terms, &command)?;
+            is_first_run = false;
+            if verified < 0 {
+                eprintln!(
+                    "error: unable to verify {command} on '{}' revision",
+                    terms.good
+                );
+                return Ok(ExitCode::from(BISECT_FAILED));
+            }
+            if verified == rc {
+                eprintln!(
+                    "error: bogus exit code {verified} for '{}' revision",
+                    terms.good
+                );
+                return Ok(ExitCode::from(BISECT_FAILED));
+            }
+        }
+
+        if rc < 0 || 128 <= rc {
+            eprintln!(
+                "error: bisect run failed: exit code {rc} from {command} is < 0 or >= 128"
+            );
+            // `break` with `res` still holding the child's status; `cmd_bisect`
+            // then answers `-res`, which the shell sees modulo 256.
+            return Ok(ExitCode::from(((-rc) & 0xff) as u8));
+        }
+
+        let new_state = if rc == 125 {
+            "skip".to_string()
+        } else if rc == 0 {
+            terms.good.clone()
+        } else {
+            terms.bad.clone()
+        };
+
+        // `bisect_state()` in git covers `skip` alongside the two terms; this port
+        // splits the skip half into `bisect_skip()`, which is the same code path
+        // down to the shared `bisect_auto_next()`.
+        let res = with_stdout_to(&ctx.file("BISECT_RUN"), || match rc {
+            125 => bisect_skip(&[]),
+            _ => bisect_state(&new_state, &[]),
+        })?;
+        print_file_to_stdout(&ctx.file("BISECT_RUN"))?;
+
+        match res {
+            BISECT_ONLY_SKIPPED_LEFT => {
+                eprintln!("error: bisect run cannot continue any more");
+                return Ok(ExitCode::from(BISECT_ONLY_SKIPPED_LEFT));
+            }
+            BISECT_INTERNAL_SUCCESS_MERGE_BASE => {
+                println!("bisect run success");
+                return Ok(ExitCode::SUCCESS);
+            }
+            BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND => {
+                println!("bisect found first '{}' commit", terms.bad);
+                return Ok(ExitCode::SUCCESS);
+            }
+            BISECT_OK => continue,
+            other => {
+                eprintln!(
+                    "error: bisect run failed: 'git bisect--helper --bisect-state \
+                     {new_state}' exited with error code {other}"
+                );
+                return Ok(ExitCode::from(other));
+            }
+        }
+    }
+}
+
+/// git's
+/// ```c
+/// temporary_stdout_fd = open(git_path_bisect_run(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+/// fflush(stdout);
+/// saved_stdout = dup(1);
+/// dup2(temporary_stdout_fd, 1);
+/// res = bisect_state(terms, &new_state, 1);
+/// fflush(stdout);
+/// dup2(saved_stdout, 1);
+/// ```
+///
+/// The redirect is on the *descriptor*, not on a stream object, so it also
+/// captures what the `git checkout` the step spawns writes — which is why it is
+/// reproduced with `dup2` here rather than by threading a sink through the state
+/// machine.
+fn with_stdout_to<T>(path: &Path, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    let file = std::fs::File::create(path)?;
+    std::io::stdout().flush()?;
+    // SAFETY: `saved` is a fresh descriptor this function owns and closes; the
+    // dup2 pair is balanced on every exit path, including the one that carries
+    // an error out of `body`.
+    let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if saved < 0 {
+        return body();
+    }
+    unsafe {
+        libc::dup2(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::STDOUT_FILENO);
+    }
+    let out = body();
+    let _ = std::io::stdout().flush();
+    unsafe {
+        libc::dup2(saved, libc::STDOUT_FILENO);
+        libc::close(saved);
+    }
+    out
+}
+
+/// git's `print_file_to_stdout()`: copy the captured step output back out.
+fn print_file_to_stdout(path: &Path) -> Result<()> {
+    let data = std::fs::read(path)?;
+    std::io::stdout().write_all(&data)?;
+    Ok(())
 }
 
 // --- subcommand: terms -------------------------------------------------------
@@ -702,8 +1016,20 @@ fn reset_cmd(args: &[String]) -> Result<ExitCode> {
         },
     };
 
+    // ```c
+    // if (!ref_exists("BISECT_HEAD")) {
+    //         … "checkout", branch.buf, "--" …
+    // }
+    // ```
+    //
+    // (`bisect_reset()`, builtin/bisect.c:222-235.) A `--no-checkout` session never
+    // moved the worktree, so there is nothing to move back and `git checkout` is
+    // not run at all — running it anyway reports the transition git stays silent
+    // about.
     if let Some(target) = target {
-        checkout_and_report(&ctx, &target)?;
+        if !ctx.file("BISECT_HEAD").exists() {
+            checkout_and_report(&ctx, &target)?;
+        }
     }
     clean_state(&ctx)?;
     Ok(ExitCode::SUCCESS)
@@ -711,12 +1037,28 @@ fn reset_cmd(args: &[String]) -> Result<ExitCode> {
 
 /// Remove every trace of the session: the state files and the `refs/bisect` tree.
 fn clean_state(ctx: &Ctx) -> Result<()> {
+    // ```c
+    // unlink_or_warn(git_path_bisect_ancestors_ok());
+    // unlink_or_warn(git_path_bisect_log());
+    // unlink_or_warn(git_path_bisect_names());
+    // unlink_or_warn(git_path_bisect_run());
+    // unlink_or_warn(git_path_bisect_terms());
+    // unlink_or_warn(git_path_bisect_first_parent());
+    // ```
+    //
+    // (`bisect_clean_state()`, bisect.c.) `BISECT_RUN` and `BISECT_FIRST_PARENT`
+    // belong on the list: the first is written by every `bisect run` step, the
+    // second by `bisect start --first-parent`, and either one left behind
+    // changes what the *next* session does — a stale `BISECT_FIRST_PARENT`
+    // silently makes an ordinary `bisect start` walk first parents only.
     for name in [
         "BISECT_ANCESTORS_OK",
         "BISECT_EXPECTED_REV",
         "BISECT_LOG",
         "BISECT_NAMES",
+        "BISECT_RUN",
         "BISECT_TERMS",
+        "BISECT_FIRST_PARENT",
         "BISECT_HEAD",
         "BISECT_START",
     ] {
@@ -782,9 +1124,22 @@ fn checkout_and_report(ctx: &Ctx, target: &str) -> Result<()> {
         super::checkout::checkout(&["-q".to_string(), target.to_string()])?;
     }
 
+    // ```c
+    // if (!opts->quiet && !old_branch_info->path && old_branch_info->commit &&
+    //     new_branch_info->commit != old_branch_info->commit)
+    //         orphaned_commit_warning(old_branch_info->commit, new_branch_info->commit);
+    // ```
+    //
+    // (`update_refs_for_switch()`, builtin/checkout.c.) The warning is skipped when
+    // the move does not change the commit — leaving a detached HEAD that already
+    // sits on the branch's tip orphans nothing, so git prints only the
+    // `Switched to branch` line.
     if was_detached {
+        let new_id = ctx.repo.head_id().ok().map(|id| id.detach());
         if let Some(id) = old_id {
-            eprintln!("Previous HEAD position was {}", describe(&ctx.repo, id)?);
+            if new_id != Some(id) {
+                eprintln!("Previous HEAD position was {}", describe(&ctx.repo, id)?);
+            }
         }
     }
     if already_on {
@@ -995,10 +1350,10 @@ fn start(args: &[String]) -> Result<ExitCode> {
     // taken — the two ends inconsistent, or a pathspec no commit in the range touched —
     // leaves no session behind at all, so the next `git bisect` starts from nothing.
     let code = auto_next(&ctx, &terms, no_checkout)?;
-    if code != ExitCode::SUCCESS {
+    if !is_bisect_success(code) {
         clean_state(&ctx)?;
     }
-    Ok(code)
+    Ok(state_exit(code))
 }
 
 /// The whole contents of `BISECT_NAMES`, including its terminating newline.
@@ -1061,8 +1416,19 @@ fn sq_quote(s: &str) -> String {
 
 // --- subcommand: bad / good / new / old --------------------------------------
 
-/// Mark one or more revisions, then advance the bisection.
+/// Mark one or more revisions, then advance the bisection: `cmd_bisect`'s
+/// wrapper around [`bisect_state`], which turns the `bisect_error` it answers
+/// with into the exit status the shell sees.
 fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
+    Ok(state_exit(bisect_state(word, args)?))
+}
+
+/// git's `bisect_state()` (builtin/bisect.c:894), which answers with a
+/// `bisect_error` rather than an exit status — [`run_cmd`] has to tell
+/// `BISECT_INTERNAL_SUCCESS_MERGE_BASE` from
+/// `BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND` from a plain step, and all three are
+/// exit 0 to everyone else.
+fn bisect_state(word: &str, args: &[String]) -> Result<u8> {
     let ctx = Ctx::open()?;
 
     // `check_and_set_terms()` runs in `cmd_bisect`'s fallback branch
@@ -1096,7 +1462,7 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
         // newline and `fprintf_ln` adds another, so the blank line is git's. Without a
         // terminal there is no prompt to offer and the command stops here.
         eprint!("You need to start by \"git bisect start\"\n\n");
-        return Ok(ExitCode::from(1));
+        return Ok(BISECT_FAILED);
     }
 
     // git treats every argument as a revision; a leading `-` is not a flag, it is
@@ -1106,11 +1472,31 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
             "error: 'git bisect {}' can take only one argument.",
             terms.bad
         );
-        return Ok(ExitCode::from(1));
+        return Ok(BISECT_FAILED);
     }
 
     let specs: Vec<String> = if args.is_empty() {
-        vec!["HEAD".to_string()]
+        // ```c
+        // const char *head = "BISECT_HEAD";
+        // enum get_oid_result res_head = get_oid(head, &oid);
+        //
+        // if (res_head == MISSING_OBJECT) {
+        //         head = "HEAD";
+        //         res_head = get_oid(head, &oid);
+        // }
+        // ```
+        //
+        // (`bisect_state()`, builtin/bisect.c:919-927.) `BISECT_HEAD` exists only
+        // in a `--no-checkout` session, and there the worktree still holds the
+        // branch the session started from — so marking `HEAD` would mark the
+        // wrong commit, and with the bad end still checked out it marks the
+        // *bad* one, which answers `<oid> was both 'good' and 'bad'`.
+        vec![if ctx.file("BISECT_HEAD").exists() {
+            "BISECT_HEAD"
+        } else {
+            "HEAD"
+        }
+        .to_string()]
     } else {
         args.to_vec()
     };
@@ -1120,7 +1506,7 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
             Ok(id) => ids.push(id),
             Err(_) => {
                 eprintln!("error: Bad rev input: {spec}");
-                return Ok(ExitCode::from(1));
+                return Ok(BISECT_FAILED);
             }
         }
     }
@@ -1140,7 +1526,7 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
                 terms.good,
                 terms.bad
             );
-            return Ok(ExitCode::from(1));
+            return Ok(BISECT_FAILED);
         }
     }
 
@@ -1192,13 +1578,63 @@ fn write_mark(ctx: &Ctx, term: &str, side: Side, rev: &str, id: ObjectId) -> Res
     if !update_bisect_ref(ctx, &leaf, id)? {
         return Ok(false);
     }
+    // `log_commit()` prints `oid_to_hex(&commit->object.oid)` of
+    // `lookup_commit_reference(&oid)`, so the log line names the commit even when
+    // the ref just written names an annotated tag.
+    let logged = peel_to_commit(&ctx.repo, id);
     ctx.append_log(&format!(
         "# {term}: [{}] {}\n",
-        id.to_hex(),
-        subject(&ctx.repo, id)?
+        logged.to_hex(),
+        subject(&ctx.repo, logged)?
     ))?;
     ctx.append_log(&format!("git bisect {term} {rev}\n"))?;
     Ok(true)
+}
+
+// --- git's enum bisect_error -------------------------------------------------
+
+/// git's `enum bisect_error` (bisect.h:55-63), carried as the non-negative number
+/// `cmd_bisect` turns it into: `return is_bisect_success(res) ? 0 : -res`.
+///
+/// `BISECT_OK` is 0; `BISECT_FAILED` (-1), `BISECT_ONLY_SKIPPED_LEFT` (-2),
+/// `BISECT_MERGE_BASE_CHECK` (-3) and `BISECT_NO_TESTABLE_COMMIT` (-4) are 1..4.
+/// The two *internal* successes keep values of their own rather than collapsing
+/// to 0, because `bisect_run()` reads them apart from each other and from a plain
+/// step: one prints `bisect run success`, the other `bisect found first '<term>'
+/// commit`, and 0 means keep going.
+const BISECT_OK: u8 = 0;
+const BISECT_FAILED: u8 = 1;
+const BISECT_ONLY_SKIPPED_LEFT: u8 = 2;
+const BISECT_MERGE_BASE_CHECK: u8 = 3;
+const BISECT_NO_TESTABLE_COMMIT: u8 = 4;
+const BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND: u8 = 10;
+const BISECT_INTERNAL_SUCCESS_MERGE_BASE: u8 = 11;
+/// Not one of git's codes: `usage_with_options()` leaves the process with 129
+/// before `cmd_bisect` ever gets to map a `bisect_error`, and [`unknown_command`]
+/// is reached from inside the state machine as well as from the dispatcher.
+const USAGE_EXIT: u8 = 129;
+
+/// ```c
+/// static int is_bisect_success(enum bisect_error res)
+/// {
+///         return !res ||
+///                 res == BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND ||
+///                 res == BISECT_INTERNAL_SUCCESS_MERGE_BASE;
+/// }
+/// ```
+fn is_bisect_success(res: u8) -> bool {
+    res == BISECT_OK
+        || res == BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND
+        || res == BISECT_INTERNAL_SUCCESS_MERGE_BASE
+}
+
+/// `cmd_bisect`'s `return is_bisect_success(res) ? 0 : -res` (builtin/bisect.c:1493).
+fn state_exit(res: u8) -> ExitCode {
+    if is_bisect_success(res) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(res)
+    }
 }
 
 // --- subcommand: next --------------------------------------------------------
@@ -1219,11 +1655,11 @@ fn next_cmd() -> Result<ExitCode> {
     let goods = ctx.goods(&terms)?;
 
     match (bad, goods.is_empty()) {
-        (Some(bad), false) => take_step(&ctx, &terms, bad, goods, no_checkout),
+        (Some(bad), false) => Ok(state_exit(take_step(&ctx, &terms, bad, goods, no_checkout)?)),
         (Some(bad), true) => {
             // Have the bad side only: git bisects anyway, less optimally.
             eprintln!("warning: bisecting only with a {} commit", terms.bad);
-            take_step(&ctx, &terms, bad, goods, no_checkout)
+            Ok(state_exit(take_step(&ctx, &terms, bad, goods, no_checkout)?))
         }
         (None, false) => {
             eprint!(
@@ -1462,7 +1898,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         }
 
         if cmd == "skip" {
-            let Some(id) = resolve(&ctx.repo, rev).ok() else {
+            let Some(id) = get_oid(&ctx.repo, rev) else {
                 eprintln!("error: couldn't get the oid of the rev '{rev}'");
                 return Ok(ExitCode::from(1));
             };
@@ -1482,7 +1918,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         // `if (repo_get_oid(the_repository, rev, &oid)) { res = error(_("couldn't get the
         // oid of the rev '%s'"), rev); … }` (builtin/bisect.c:309-312), and
         // `bisect_replay()` stops on the first line that fails.
-        let Some(id) = resolve(&ctx.repo, rev).ok() else {
+        let Some(id) = get_oid(&ctx.repo, rev) else {
             eprintln!("error: couldn't get the oid of the rev '{rev}'");
             return Ok(ExitCode::from(1));
         };
@@ -1495,7 +1931,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
 
     let terms = current_terms(&ctx)?;
     let no_checkout = ctx.file("BISECT_HEAD").exists();
-    auto_next(&ctx, &terms, no_checkout)
+    Ok(state_exit(auto_next(&ctx, &terms, no_checkout)?))
 }
 
 fn resolve(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
@@ -1503,10 +1939,61 @@ fn resolve(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
     Ok(commit.id)
 }
 
+/// git's `repo_get_oid()` as `bisect_write()` calls it — **without** the peel
+/// `bisect_state()` applies before it.
+///
+/// ```c
+/// if (get_oid(rev, &oid)) {
+///         res = error(_("couldn't get the oid of the rev '%s'"), rev);
+///         goto finish;
+/// }
+///
+/// if (update_ref(NULL, tag.buf, &oid, NULL, 0, UPDATE_REFS_MSG_ON_ERR)) {
+/// ```
+///
+/// (builtin/bisect.c:273-281.) Two consequences that only the replay path sees,
+/// because it is the only caller that hands `bisect_write()` a name rather than
+/// `oid_to_hex()` of something already resolved:
+///
+///   * an annotated tag resolves to the **tag object**, so a log line
+///     `git bisect good v0.2.0` recreates `refs/bisect/good-v0.2.0` pointing at
+///     the tag — which then never compares equal to any commit the bisection
+///     walk produces;
+///   * a full-length hex is accepted verbatim (`get_oid_basic()` returns it
+///     without asking the odb whether the object is there), so a log naming a
+///     commit that no longer exists gets past this check and is refused by
+///     `update_ref` instead, with a different message.
+fn get_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    if spec.len() == repo.object_hash().len_in_hex() {
+        if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
+            return Some(id);
+        }
+    }
+    repo.rev_parse_single(spec).ok().map(|id| id.detach())
+}
+
+/// `lookup_commit_reference()`: peel an annotated tag down to the commit it
+/// names, and leave a commit alone. The revision machinery does this implicitly
+/// for every rev it is given, which is why a `refs/bisect/*` ref that points at a
+/// tag still bisects — while the *comparisons* git makes against that ref's raw
+/// value do not.
+fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> ObjectId {
+    match repo.find_object(id) {
+        Ok(obj) => match obj.peel_to_commit() {
+            Ok(commit) => commit.id,
+            Err(_) => id,
+        },
+        Err(_) => id,
+    }
+}
+
 /// First line of the commit message, with git's subject folding: the leading
 /// paragraph, line breaks collapsed into single spaces.
 fn subject(repo: &gix::Repository, id: ObjectId) -> Result<String> {
-    let commit = repo.find_object(id)?.try_into_commit()?;
+    // `log_commit()` is handed `lookup_commit_reference(the_repository, &oid)`,
+    // so a `refs/bisect/*` value that is an annotated tag still logs the subject
+    // of the commit behind it.
+    let commit = repo.find_object(id)?.peel_to_commit()?;
     let raw = commit.message_raw()?.to_str_lossy().into_owned();
     let mut out = String::new();
     for line in raw.lines() {
@@ -1532,7 +2019,7 @@ fn subject(repo: &gix::Repository, id: ObjectId) -> Result<String> {
 /// With `no_checkout` the chosen commit is recorded in the per-worktree
 /// `BISECT_HEAD` ref instead of being checked out, matching `git bisect start
 /// --no-checkout`.
-fn auto_next(ctx: &Ctx, terms: &Terms, no_checkout: bool) -> Result<ExitCode> {
+fn auto_next(ctx: &Ctx, terms: &Terms, no_checkout: bool) -> Result<u8> {
     let bad = ctx.bad(&terms)?;
     let goods = ctx.goods(&terms)?;
 
@@ -1557,7 +2044,7 @@ fn auto_next(ctx: &Ctx, terms: &Terms, no_checkout: bool) -> Result<ExitCode> {
         };
         println!("{status}");
         ctx.append_log(&format!("# {status}\n"))?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(BISECT_OK);
     }
 
     let bad = bad.expect("checked above");
@@ -1573,8 +2060,14 @@ fn take_step(
     bad: ObjectId,
     goods: Vec<ObjectId>,
     no_checkout: bool,
-) -> Result<ExitCode> {
-    if let Some(code) = check_good_are_ancestors_of_bad(ctx, bad, &goods, terms, no_checkout)? {
+) -> Result<u8> {
+    // `check_ancestors()` is the only walk that runs before the bisection's own,
+    // and whether it ran decides what the bisection sees — see
+    // [`bad_ref_leaks_uninteresting`].
+    let mut ancestors_walked = false;
+    if let Some(code) =
+        check_good_are_ancestors_of_bad(ctx, bad, &goods, terms, no_checkout, &mut ancestors_walked)?
+    {
         return Ok(code);
     }
 
@@ -1586,7 +2079,9 @@ fn take_step(
     // with anything skipped the whole list is sorted and then filtered, so a
     // skipped best candidate can be stepped away from.
     let skipped = ctx.skipped()?;
-    let (best, reaches, tried) = if candidates.list.is_empty() {
+    let (best, reaches, tried) = if bad_ref_leaks_uninteresting(ctx, bad, ancestors_walked) {
+        (None, 0, Vec::new())
+    } else if candidates.list.is_empty() {
         (None, 0, Vec::new())
     } else if skipped.is_empty() {
         match candidates.all {
@@ -1614,7 +2109,7 @@ fn take_step(
         // `printf(_("%s was both '%s' and '%s'\n"), …)` (bisect.c:1093-1096) — the terms
         // are quoted here, unlike in the status lines above.
         println!("{} was both '{}' and '{}'", bad.to_hex(), terms.good, terms.bad);
-        return Ok(ExitCode::from(1));
+        return Ok(BISECT_FAILED);
     };
 
     // ```c
@@ -1632,7 +2127,7 @@ fn take_step(
     // exit code says so rather than naming a commit at random.
     if candidates.all == 0 {
         eprint!("No testable commit found.\nMaybe you started with bad path arguments?\n");
-        return Ok(ExitCode::from(4));
+        return Ok(BISECT_NO_TESTABLE_COMMIT);
     }
 
     if best == bad {
@@ -1646,7 +2141,17 @@ fn take_step(
 
     // `bisect_rev_setup()` prints how many candidates remain *after* the one about
     // to be tested: everything it reaches, minus itself.
-    let left = n - reaches - 1;
+    //
+    // ```c
+    // nr = all - reaches - 1;
+    // ```
+    //
+    // (`bisect_next_all()`, bisect.c.) `nr` is an `int` and git prints it with
+    // `%d`, so the count really can come out negative — `git bisect next` on a
+    // one-commit interval whose `refs/bisect/bad` is an annotated tag answers
+    // `Bisecting: -1 revisions left to test after this`, because the candidate
+    // it picked is the whole interval and never compares equal to the tag.
+    let left = n as i64 - reaches as i64 - 1;
     let steps = estimate_bisect_steps(n);
     println!(
         "Bisecting: {left} revision{} left to test after this (roughly {steps} step{})",
@@ -1654,17 +2159,11 @@ fn take_step(
         if steps == 1 { "" } else { "s" }
     );
 
-    write_ref(&ctx.file("BISECT_EXPECTED_REV"), best)?;
-    let hex = best.to_hex().to_string();
-    if no_checkout {
-        write_ref(&ctx.file("BISECT_HEAD"), best)?;
-    } else {
-        // Through `run_command()` in git; see `crate::cstdio::run_command`.
-        let _child = crate::cstdio::run_command();
-        super::checkout::checkout(&["-q".to_string(), hex.clone()])?;
-    }
-    println!("[{hex}] {}", subject(&ctx.repo, best)?);
-    Ok(ExitCode::SUCCESS)
+    // `return bisect_checkout(bisect_rev, no_checkout);` — a refused checkout is
+    // `BISECT_FAILED`, and `bisect_start()` then wipes the session it had just
+    // written, so a `bisect start` into a worktree the first step cannot be
+    // checked out over leaves no bisection behind at all.
+    bisect_checkout(ctx, best, no_checkout)
 }
 
 /// git's `check_merge_bases`: when a good end is not an ancestor of the bad one,
@@ -1684,10 +2183,12 @@ fn check_merge_bases(
     goods: &[ObjectId],
     terms: &Terms,
     no_checkout: bool,
-) -> Result<Option<ExitCode>> {
+) -> Result<Option<u8>> {
+    let peeled_goods: Vec<ObjectId> =
+        goods.iter().map(|g| peel_to_commit(&ctx.repo, *g)).collect();
     let bases: Vec<ObjectId> = ctx
         .repo
-        .merge_bases_many(bad, goods)?
+        .merge_bases_many(peel_to_commit(&ctx.repo, bad), &peeled_goods)?
         .into_iter()
         .map(|id| id.detach())
         .collect();
@@ -1701,19 +2202,19 @@ fn check_merge_bases(
         // A merge base that is neither the bad rev nor already good has to be
         // tested; git checks it out and stops the step here.
         println!("Bisecting: a merge base must be tested");
-        write_ref(&ctx.file("BISECT_EXPECTED_REV"), mb)?;
-        let hex = mb.to_hex().to_string();
-        if no_checkout {
-            write_ref(&ctx.file("BISECT_HEAD"), mb)?;
-        } else {
-            // Through `run_command()` in git; see `crate::cstdio::run_command`.
-            let _child = crate::cstdio::run_command();
-            super::checkout::checkout(&["-q".to_string(), hex.clone()])?;
+        // ```c
+        // res = bisect_checkout(mb, no_checkout);
+        // if (!res)
+        //         /* indicate early success */
+        //         res = BISECT_INTERNAL_SUCCESS_MERGE_BASE;
+        // ```
+        let res = bisect_checkout(ctx, mb, no_checkout)?;
+        if res != BISECT_OK {
+            return Ok(Some(res));
         }
-        println!("[{hex}] {}", subject(&ctx.repo, mb)?);
         // `BISECT_INTERNAL_SUCCESS_MERGE_BASE`; see [`STEP_COMPLETED`].
         STEP_COMPLETED.store(true, std::sync::atomic::Ordering::Relaxed);
-        return Ok(Some(ExitCode::SUCCESS));
+        return Ok(Some(BISECT_INTERNAL_SUCCESS_MERGE_BASE));
     }
     Ok(None)
 }
@@ -1746,10 +2247,12 @@ fn check_good_are_ancestors_of_bad(
     goods: &[ObjectId],
     terms: &Terms,
     no_checkout: bool,
-) -> Result<Option<ExitCode>> {
+    walked: &mut bool,
+) -> Result<Option<u8>> {
     if ctx.file("BISECT_ANCESTORS_OK").exists() || goods.is_empty() {
         return Ok(None);
     }
+    *walked = true;
     if check_ancestors(ctx, bad, goods)? {
         if let Some(code) = check_merge_bases(ctx, bad, goods, terms, no_checkout)? {
             return Ok(Some(code));
@@ -1761,13 +2264,56 @@ fn check_good_are_ancestors_of_bad(
     Ok(None)
 }
 
+/// Whether git's `check_ancestors()` left `refs/bisect/<term-bad>`'s object marked
+/// `UNINTERESTING` for the bisection walk that follows it in the same process.
+///
+/// `check_ancestors()` walks `^<bad> <good>…` and then cleans up with
+///
+/// ```c
+/// clear_commit_marks_many(rev_nr, rev, ALL_REV_FLAGS);
+/// ```
+///
+/// where `rev` is `get_bad_and_good_commits()`'s array — and that array holds
+/// `lookup_commit_reference()` of each ref, i.e. the *peeled* commits. When
+/// `refs/bisect/<term-bad>` names an annotated tag, the tag object itself is not
+/// in it, so the `UNINTERESTING` bit `^<bad>` set on the tag survives the
+/// cleanup. `bisect_next_all()`'s own `bisect_rev_setup()` then pushes the same
+/// tag as a *positive* tip, and `handle_commit()` opens with
+///
+/// ```c
+/// unsigned long flags = object->flags;
+/// while (object->type == OBJ_TAG) {
+///         …
+///         object = parse_object(revs->repo, get_tagged_oid(tag));
+///         object->flags |= flags;
+/// ```
+///
+/// so the stale `UNINTERESTING` is copied onto the commit behind the tag and the
+/// candidate list comes out empty. git therefore answers
+/// `<tag oid> was both '<good>' and '<bad>'` at exit 1 — and answers it *only*
+/// on the invocation that ran the ancestors check: a second `git bisect next`,
+/// with `BISECT_ANCESTORS_OK` already on disk, skips that walk, leaks nothing and
+/// bisects normally. Both halves are reproduced here rather than smoothed over,
+/// because a replayed log that marks `bad` with a tag is a session stock cannot
+/// run and a port that runs it reports a verdict stock never reaches.
+fn bad_ref_leaks_uninteresting(ctx: &Ctx, bad: ObjectId, ancestors_walked: bool) -> bool {
+    ancestors_walked
+        && ctx
+            .repo
+            .find_object(bad)
+            .map(|o| o.kind != gix::object::Kind::Commit)
+            .unwrap_or(false)
+}
+
 /// git's `check_ancestors`: walk `<good>... ^<bad>` and report whether anything
 /// came out of it — i.e. whether some good end is not an ancestor of the bad one.
 ///
 /// The walk is empty exactly when every good is `bad` itself or reachable from it,
 /// which is what the merge base of the pair being the good end says.
 fn check_ancestors(ctx: &Ctx, bad: ObjectId, goods: &[ObjectId]) -> Result<bool> {
+    let bad = peel_to_commit(&ctx.repo, bad);
     for good in goods {
+        let good = &peel_to_commit(&ctx.repo, *good);
         let is_ancestor = ctx
             .repo
             .merge_base(*good, bad)
@@ -1789,7 +2335,7 @@ fn handle_bad_merge_base(
     bad: ObjectId,
     goods: &[ObjectId],
     terms: &Terms,
-) -> Result<ExitCode> {
+) -> Result<u8> {
     let bad_hex = bad.to_hex().to_string();
     let good_hex = goods
         .iter()
@@ -1810,7 +2356,7 @@ fn handle_bad_merge_base(
                 terms.good
             );
         }
-        return Ok(ExitCode::from(3));
+        return Ok(BISECT_MERGE_BASE_CHECK);
     }
     eprintln!(
         "Some '{}' revs are not ancestors of the '{}' rev.",
@@ -1818,7 +2364,7 @@ fn handle_bad_merge_base(
     );
     eprintln!("git bisect cannot work properly in this case.");
     eprintln!("Maybe you mistook '{}' and '{}' revs?", terms.good, terms.bad);
-    Ok(ExitCode::from(1))
+    Ok(BISECT_FAILED)
 }
 
 /// Whether `id` is the commit the last step asked to be tested, per
@@ -1862,7 +2408,19 @@ fn candidate_list(
     first_parent: bool,
 ) -> Result<Candidates> {
     let mut list = Vec::new();
-    let mut walk = ctx.repo.rev_walk(Some(bad)).with_hidden(goods.to_vec());
+    // `bisect_rev_setup()` hands `oid_to_hex(current_bad_oid)` and `^<good>` to
+    // `setup_revisions()`, which peels each to a commit before walking. The refs
+    // themselves may point at annotated tags (a replayed `git bisect good v0.2.0`
+    // records the tag object), so the peel belongs here rather than at the read.
+    let mut walk = ctx
+        .repo
+        .rev_walk(Some(peel_to_commit(&ctx.repo, bad)))
+        .with_hidden(
+            goods
+                .iter()
+                .map(|g| peel_to_commit(&ctx.repo, *g))
+                .collect::<Vec<_>>(),
+        );
     // `bisect_rev_setup` sets `revs.first_parent_only` from BISECT_FIRST_PARENT,
     // so the candidate set itself is the first-parent chain (bisect.c:1077).
     if first_parent {
@@ -2305,7 +2863,7 @@ fn error_if_skipped_commits(
     bad: Option<ObjectId>,
     terms: &Terms,
     candidates: &[ObjectId],
-) -> Result<Option<ExitCode>> {
+) -> Result<Option<u8>> {
     if tried.is_empty() {
         return Ok(None);
     }
@@ -2328,7 +2886,7 @@ fn error_if_skipped_commits(
             subject(&ctx.repo, *id)?
         ))?;
     }
-    Ok(Some(ExitCode::from(2)))
+    Ok(Some(BISECT_ONLY_SKIPPED_LEFT))
 }
 
 /// git's `estimate_bisect_steps`.
@@ -2347,7 +2905,7 @@ fn estimate_bisect_steps(all: usize) -> usize {
 }
 
 /// The bisection is over: name the culprit and show it, as git does.
-fn report_first_bad(ctx: &Ctx, bad: ObjectId, terms: &Terms) -> Result<ExitCode> {
+fn report_first_bad(ctx: &Ctx, bad: ObjectId, terms: &Terms) -> Result<u8> {
     let hex = bad.to_hex().to_string();
     let subj = subject(&ctx.repo, bad)?;
     // Rendered before anything is printed, so an unsupported diff bails cleanly.
@@ -2358,7 +2916,7 @@ fn report_first_bad(ctx: &Ctx, bad: ObjectId, terms: &Terms) -> Result<ExitCode>
     std::io::stdout().write_all(&report)?;
     // `BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND`; see [`STEP_COMPLETED`].
     STEP_COMPLETED.store(true, std::sync::atomic::Ordering::Relaxed);
-    Ok(ExitCode::SUCCESS)
+    Ok(BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND)
 }
 
 // --- `git diff-tree --pretty --stat --summary` --------------------------------

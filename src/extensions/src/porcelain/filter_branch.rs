@@ -921,6 +921,23 @@ fn rewrite(
     opts: &Opts,
     rev_args: &[String],
 ) -> Result<ExitCode> {
+    // ```sh
+    // git for-each-ref > "$tempdir"/backup-refs || exit
+    // ```
+    //
+    // (line 254.) This is the first child process after `-f`'s
+    // `rm -rf "$tempdir"`, and `-d .git` makes that removal delete the
+    // *repository*: `git-sh-setup` exported `GIT_DIR` as an absolute path, so
+    // the child then looks for a repository that is no longer there and the
+    // `|| exit` propagates its 128. Nothing in the port notices on its own —
+    // the repository was opened before the removal and its handle keeps
+    // answering — so the check is explicit.
+    if !ctx.git_dir.join("HEAD").exists() {
+        return die_with_status(
+            128,
+            &format!("fatal: not a git repository: '{}'", ctx.git_dir.display()),
+        );
+    }
     // Lines 252-266: refs/original must be empty, or `-f` clears it.
     let mut backup_refs: Vec<(String, ObjectId)> = Vec::new();
     for reference in repo.references()?.all()?.flatten() {
@@ -966,6 +983,11 @@ fn rewrite(
     }
     if heads.is_empty() {
         return die("You must specify a ref to rewrite.");
+    }
+    // Line 313's `nonrevs=$(git rev-parse --no-revs "$@") || exit`, which the
+    // script reaches only once the ref list is known to be non-empty.
+    if let Some(arg) = &selection.ambiguous {
+        return die_ambiguous(arg);
     }
 
     fs::create_dir(&ctx.map_dir).or_else(|_| die("Could not create map/ directory"))?;
@@ -2025,6 +2047,21 @@ struct Selection {
     /// emits the tip before `^<base>`, which is the order the parser below
     /// records them in.
     bad_object: Option<ObjectId>,
+    /// The first argument no `rev-parse` pass can turn into an object and that is
+    /// not an existing file — the one that ends the run with
+    /// `fatal: ambiguous argument '<arg>'` and exit 128.
+    ///
+    /// It is recorded rather than raised on the spot because the script asks two
+    /// different `rev-parse` questions in two different modes, and the fatal
+    /// belongs to the *second* one. Line 269's pass carries `--revs-only`, and
+    /// `cmd_rev_parse()`'s `if (!show_file(arg, output_prefix)) continue;` makes
+    /// `show_file()` a no-op in that mode — so the argument is skipped in
+    /// silence and `verify_filename()` is never reached. The fatal comes from
+    /// line 313's `nonrevs=$(git rev-parse --no-revs "$@") || exit`, which runs
+    /// *after* `test -s "$tempdir"/heads`. So an argument that is neither a
+    /// revision nor a file, in a run whose ref list came out empty, reports
+    /// `You must specify a ref to rewrite.` at exit 1 — not the ambiguity.
+    ambiguous: Option<String>,
 }
 
 /// What one revision argument resolved to, splitting the case
@@ -2251,6 +2288,19 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
                 }
                 saw_rev = true;
             }
+            // A name `rev-parse` resolves to an object that is *not* a
+            // committish — `refs/tags/blobtag` on a tag that points at a blob —
+            // is still a revision to `git rev-parse --revs-only
+            // --symbolic-full-name`, which prints its full ref name and exits 0.
+            // Nothing peels it, so it contributes no tip; the script's own
+            // `git rev-parse --verify "$ref"^0` is what rejects it, one loop
+            // later, with `WARNING: not rewriting '<ref>' (not a committish)`.
+            Resolved::Unresolvable if repo.rev_parse_single(arg.as_str()).is_ok() => {
+                if let Some(name) = symbolic_full_name(repo, arg) {
+                    sel.head_refs.push(name);
+                }
+                saw_rev = true;
+            }
             Resolved::Unresolvable if Path::new(arg).exists() => {
                 sel.pathspecs.push(arg.clone());
                 sel.saw_nonrev = true;
@@ -2258,8 +2308,10 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
             // `nonrevs=$(git rev-parse --no-revs "$@") || exit`: the message and
             // the 128 both come from `rev-parse`'s `die_verify_filename`, and
             // the bare `exit` propagates its status rather than the script's
-            // own 1.
-            Resolved::Unresolvable => return die_ambiguous(arg),
+            // own 1. Deferred — see [`Selection::ambiguous`].
+            Resolved::Unresolvable => {
+                sel.ambiguous.get_or_insert_with(|| arg.clone());
+            }
         }
     }
     if !sel.pathspecs.is_empty() {
@@ -2272,10 +2324,37 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
     }
 
     // `--default HEAD` on both the ref list and the walk.
+    //
+    // ```c
+    // static int show_default(void)
+    // {
+    //         const char *s = def;
+    //
+    //         if (s) {
+    //                 struct object_id oid;
+    //
+    //                 def = NULL;
+    //                 if (!repo_get_oid(the_repository, s, &oid)) {
+    //                         show_rev(NORMAL, &oid, s);
+    //                         return 1;
+    //                 }
+    //         }
+    //         return 0;
+    // }
+    // ```
+    //
+    // (builtin/rev-parse.c.) A default that does not resolve is *skipped*, not
+    // fatal — `rev-parse` prints nothing and exits 0. That is reachable here:
+    // `--original refs/heads` makes the backup namespace the branch namespace,
+    // so `-f` deletes every branch before this runs and leaves `HEAD` dangling.
+    // The run then stops at `You must specify a ref to rewrite.` (exit 1), not
+    // at an ambiguous-argument fatal (exit 128).
     if !saw_rev {
-        sel.tips.push(rev_parse_commit(repo, "HEAD")?);
-        if let Some(name) = symbolic_full_name(repo, "HEAD") {
-            sel.head_refs.push(name);
+        if let Ok(id) = rev_parse_commit(repo, "HEAD") {
+            sel.tips.push(id);
+            if let Some(name) = symbolic_full_name(repo, "HEAD") {
+                sel.head_refs.push(name);
+            }
         }
     }
     Ok(sel)

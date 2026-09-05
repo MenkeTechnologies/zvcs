@@ -3479,12 +3479,48 @@ fn write_head_log(
 }
 
 /// Detach `HEAD` at object `id`, logging the move.
+///
+/// ```c
+/// if (!(update->flags & REF_FORCE_CREATE_REFLOG) &&
+///     oideq(&lock->old_oid, &update->new_oid)) {
+///         /*
+///          * The reference already has the desired
+///          * value, so we don't need to write it.
+///          */
+/// } else if (write_ref_to_lockfile(...)) {
+///         …
+///         update->flags |= REF_NEEDS_COMMIT;
+/// }
+/// ```
+///
+/// (`lock_ref_for_update()`, refs/files-backend.c.) An update that writes the
+/// value the reference already holds is dropped whole: the ref file is not
+/// rewritten and — because the reflog is appended from the same
+/// `REF_NEEDS_COMMIT` path — **no reflog line is written either**. So
+/// `git checkout <hex>` while `HEAD` is already detached at that object leaves
+/// `logs/HEAD` untouched, where writing an entry would record a move that did not
+/// happen and renumber every older `HEAD@{n}`.
+///
+/// The comparison is against the ref's *own* value, so this can only fire on an
+/// already-detached `HEAD`: an attached one holds `ref: refs/heads/<name>`, which
+/// is never equal to an object id, and detaching it is a real update.
+///
+/// `git bisect` is where it is load-bearing — `bisect_replay` runs
+/// `bisect_auto_next()` once for its `start` line and once more at the end, so
+/// the same commit is checked out twice in a row.
 fn set_head_detached(
     repo: &gix::Repository,
     id: ObjectId,
     message: &str,
     from: Option<ObjectId>,
 ) -> Result<()> {
+    let unchanged = matches!(
+        repo.head(),
+        Ok(head) if head.is_detached() && head.id().map(|i| i.detach()) == Some(id)
+    );
+    if unchanged {
+        return Ok(());
+    }
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {

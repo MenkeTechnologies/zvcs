@@ -1,6 +1,6 @@
 //! `git daemon` — the `git://` protocol server.
-//! **The server itself is not ported: every path that would serve a client
-//! bails.**
+//! **`--inetd` — one request off stdin, answered — is ported end to end. The
+//! listening accept loop is not.**
 //!
 //! `daemon` binds TCP port 9418, accepts connections, reads a `git-upload-pack`
 //! / `git-upload-archive` / `git-receive-pack` request line, and runs that
@@ -36,6 +36,23 @@
 //!     `--group supplied without --user`,
 //!     `option --strict-paths requires '<directory>' arguments`,
 //!     `base-path '<p>' does not exist or is not a directory`.
+//!   * `--inetd`, up to the service call: `execute()` reads the request packet
+//!     off stdin, `run_service()` applies every check ahead of the service —
+//!     the `--enable`/`--disable`/`--allow-override`/`--forbid-override` table,
+//!     `path_ok()` (`daemon_avoid_alias()`, `--user-path`, `--base-path`,
+//!     `--base-path-relaxed`, `enter_repo()`, `--strict-paths` and the trailing
+//!     `<directory>` list), the `git-daemon-export-ok` test that `--export-all`
+//!     waives, and the per-repository `daemon.uploadpack`/`daemon.uploadarch`/
+//!     `daemon.receivepack` override — and `daemon_error()` writes the one `ERR`
+//!     packet git writes, with `--informative-errors` deciding whether it names
+//!     the real reason. Every refusal exits 255, as `cmd_main` returning
+//!     `execute()`'s `-1` does. A request that survives all of it is ANSWERED:
+//!     `run_service_command()` runs the service as a `git` child over the
+//!     client's own stdin and stdout with its stderr drained into the log, and
+//!     the daemon exits with the child's status. `parse_extra_args()` turns the
+//!     blocks behind the request's NUL into the child's `GIT_PROTOCOL`, so a v2
+//!     client gets the v2 capability advertisement and a v0 one the ref
+//!     advertisement.
 //!   * `serve()`'s socket setup: the wildcard bind (`::` then `0.0.0.0`) or one
 //!     bind per `--listen=`, each failure logged as
 //!     `[<pid>] Could not bind to <addr>: <strerror>` and tolerated, and
@@ -57,33 +74,29 @@
 //!
 //! NOT ported — these `bail!` instead of pretending to have run:
 //!
-//!   1. **Serving.** There is no server-side protocol implementation in the
-//!      vendored crates. `src/ported/gix-transport/src/` contains only
-//!      `client/`; `gix-protocol/src/` is `handshake`, `fetch`, `ls_refs` and
-//!      `command`, all of it the client talking to a remote, and its
-//!      `Cargo.toml` gates everything behind `blocking-client`/`async-client`
-//!      with no server feature. Nothing implements the serving side of
-//!      `want`/`have`/`ACK`/`NAK`, nothing turns a negotiated set into a
-//!      side-band-multiplexed pack, and nothing parses the daemon request line
-//!      or its `host=`/`extra` NUL-separated arguments.
-//!   2. **The accept loop.** `poll()` over the listen sockets, forking a child
+//!   1. **The accept loop.** `poll()` over the listen sockets, forking a child
 //!      per connection, `--max-connections` child reaping, `--timeout`/
-//!      `--init-timeout` alarm handling, `--detach` daemonisation, `--pid-file`
-//!      and `--inetd` stdin/stdout service are process-level work with no
-//!      substrate in gitoxide, which is a repository-format library — and each
-//!      of them exists only to reach the serving code in (1), which does not.
+//!      `--init-timeout` alarm handling, `--detach` daemonisation and
+//!      `--pid-file` are process-level work with no substrate in gitoxide,
+//!      which is a repository-format library. `--inetd` reaches the same
+//!      `execute()` without any of it, which is why the request path is ported
+//!      and the listening one is not.
+//!   2. **`--interpolated-path=` and `--access-hook=`.** `%CH` and `%IP` expand
+//!      to the canonical hostname and IP address of the accepted connection,
+//!      and the hook is handed the same; neither exists without a connection to
+//!      resolve, so a request that would use one bails.
 //!   3. **`--user=`/`--group=` privilege drop.** `getpwnam(3)`/`getgrnam(3)`
-//!      are not called: they are POSIX identity lookups this port has no use
-//!      for while it cannot serve. The lookup cannot be faked from
-//!      `/etc/passwd` either —
+//!      are not called: they are POSIX identity lookups that only the listening
+//!      daemon performs, and `--inetd` refuses `--user` before reaching them.
+//!      The lookup cannot be faked from `/etc/passwd` either —
 //!      Darwin resolves users through Directory Services, so a file scan would
 //!      report `user not found` for users that exist. `--group` without
 //!      `--user` needs no lookup and is checked faithfully; a present `--user`
 //!      bails at exactly the point git would call `getpwnam`.
 //!
 //! These are deliberately not approximated. A `daemon` that exited 0 without
-//! listening, or that served a wrong advertisement, would look like a success
-//! to a harness comparing exit codes while corrupting whoever fetched from it.
+//! listening would look like a success to a harness comparing exit codes while
+//! corrupting whoever fetched from it.
 
 use anyhow::{bail, Result};
 use std::process::ExitCode;
@@ -131,8 +144,29 @@ struct Opts {
     user: Option<String>,
     group: Option<String>,
     base_path: Option<String>,
+    /// `--base-path-relaxed`: retry `enter_repo()` without the base path.
+    base_path_relaxed: bool,
+    /// `--export-all`, git's `export_all_trees`.
+    export_all: bool,
+    /// `--informative-errors` / `--no-informative-errors`, git's
+    /// `informative_errors`: whether a refusal names its real reason or the
+    /// single generic one.
+    informative_errors: bool,
+    /// `--user-path` (empty) or `--user-path=<path>`; `None` means `~` requests
+    /// are refused outright.
+    user_path: Option<String>,
+    /// `--interpolated-path=<format>`.
+    interpolated_path: Option<String>,
+    /// `--access-hook=<path>`.
+    access_hook: Option<String>,
+    /// `enabled` and `overridable` per entry of [`SERVICES`], in that order.
+    enabled: [bool; 3],
+    overridable: [bool; 3],
+    /// `--timeout=<n>`, git's `static unsigned int timeout`. Handed on to
+    /// `upload-pack` as `--timeout=%u` (daemon.c:485), and 0 unless given.
+    timeout: u32,
     /// Trailing `<directory>...`, i.e. git's `ok_paths`.
-    ok_paths: usize,
+    ok_paths: Vec<String>,
 }
 
 /// `git daemon` — parse the command line and run every startup check, then bail
@@ -158,7 +192,18 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
         user: None,
         group: None,
         base_path: None,
-        ok_paths: 0,
+        base_path_relaxed: false,
+        export_all: false,
+        informative_errors: false,
+        user_path: None,
+        interpolated_path: None,
+        access_hook: None,
+        // `daemon_service[]` (daemon.c:499): only `upload-pack` is on by
+        // default, and all three may be turned on and off per repository.
+        enabled: [false, true, false],
+        overridable: [true, true, true],
+        timeout: 0,
+        ok_paths: Vec::new(),
     };
 
     let mut i = 0;
@@ -187,12 +232,32 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
                 o.inetd = true;
                 continue;
             }
-            "--verbose" | "--reuseaddr" | "--base-path-relaxed" | "--export-all"
-            | "--informative-errors" | "--no-informative-errors" | "--user-path"
+            "--verbose" | "--reuseaddr"
             // `--serve` is git's undocumented per-connection child mode; it is
             // accepted by the parser and, unlike --inetd/--detach, does not
             // change the default log destination.
             | "--serve" => continue,
+            "--base-path-relaxed" => {
+                o.base_path_relaxed = true;
+                continue;
+            }
+            "--export-all" => {
+                o.export_all = true;
+                continue;
+            }
+            "--informative-errors" => {
+                o.informative_errors = true;
+                continue;
+            }
+            "--no-informative-errors" => {
+                o.informative_errors = false;
+                continue;
+            }
+            // `else if (!strcmp(arg, "--user-path")) { user_path = ""; }`
+            "--user-path" => {
+                o.user_path = Some(String::new());
+                continue;
+            }
             "--syslog" => {
                 o.log_dest = LogDest::Syslog;
                 continue;
@@ -218,7 +283,10 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
         }
         if let Some(v) = arg.strip_prefix("--timeout=") {
             match strtoul_ui(v) {
-                Some(_) => continue,
+                Some(n) => {
+                    o.timeout = n;
+                    continue;
+                }
                 None => {
                     return Ok(die(&format!(
                         "invalid timeout '{v}', expecting a non-negative integer"
@@ -247,17 +315,25 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
             }
         }
         // The four service switches share one lookup and one message.
-        if let Some(name) = [
+        if let Some((prefix, name)) = [
             "--enable=",
             "--disable=",
             "--allow-override=",
             "--forbid-override=",
         ]
         .iter()
-        .find_map(|p| arg.strip_prefix(*p))
+        .find_map(|p| arg.strip_prefix(*p).map(|name| (*p, name)))
         {
-            if !SERVICES.contains(&name) {
+            let Some(index) = SERVICES.iter().position(|s| *s == name) else {
                 return Ok(die(&format!("No such service {name}")));
+            };
+            // `enable_service()` / `make_service_overridable()` (daemon.c:505),
+            // which set the flag on the named entry and return.
+            match prefix {
+                "--enable=" => o.enabled[index] = true,
+                "--disable=" => o.enabled[index] = false,
+                "--allow-override=" => o.overridable[index] = true,
+                _ => o.overridable[index] = false,
             }
             continue;
         }
@@ -265,11 +341,19 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
             o.base_path = Some(v.to_string());
             continue;
         }
-        if arg.starts_with("--interpolated-path=")
-            || arg.starts_with("--access-hook=")
-            || arg.starts_with("--pid-file=")
-            || arg.starts_with("--user-path=")
-        {
+        if let Some(v) = arg.strip_prefix("--interpolated-path=") {
+            o.interpolated_path = Some(v.to_string());
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--access-hook=") {
+            o.access_hook = Some(v.to_string());
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--user-path=") {
+            o.user_path = Some(v.to_string());
+            continue;
+        }
+        if arg.starts_with("--pid-file=") {
             continue;
         }
         if let Some(v) = arg.strip_prefix("--user=") {
@@ -283,13 +367,13 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
         if arg == "--" {
             // Everything after `--` is the directory list; `--` as the final
             // argument leaves it empty.
-            o.ok_paths = args.len() - i;
+            o.ok_paths = args[i..].to_vec();
             break;
         }
         if !arg.starts_with('-') {
             // The first non-option argument starts the directory list and ends
             // option parsing — later `-…` arguments are paths, not options.
-            o.ok_paths = args.len() - (i - 1);
+            o.ok_paths = args[i - 1..].to_vec();
             break;
         }
         return Ok(usage());
@@ -328,7 +412,7 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
              serving process this port does not have, so getpwnam(3)/getgrnam(3) are not called"
         );
     }
-    if o.strict_paths && o.ok_paths == 0 {
+    if o.strict_paths && o.ok_paths.is_empty() {
         return Ok(die_maybe_quiet(
             "option --strict-paths requires '<directory>' arguments",
             quiet,
@@ -346,11 +430,7 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
     // Past this point git either services one request from stdin (--inetd /
     // --serve) or enters the accept loop.
     if o.inetd {
-        bail!(
-            "serving a request over stdin (--inetd) is not ported: the vendored crates implement \
-             only the client side of the git protocol (gix-transport/src/client, \
-             gix-protocol handshake/fetch/ls_refs)"
-        );
+        return execute(&o);
     }
     // `if (detach) { if (daemonize()) die(...) }` — before the sockets, so a
     // daemon that cannot fork never takes the port.
@@ -663,4 +743,524 @@ fn strtol_i(s: &str) -> Option<i32> {
         i128::from(value)
     };
     i32::try_from(signed).ok()
+}
+
+// ---------------------------------------------------------------------------
+// `--inetd`: one request, read from stdin (daemon.c's `execute()`).
+// ---------------------------------------------------------------------------
+
+/// The config key each entry of [`SERVICES`] reads for its per-repository
+/// override, in the same order — `daemon_service[]`'s `config_name` column
+/// (daemon.c:499).
+const SERVICE_CONFIG_NAMES: [&str; 3] = ["uploadarch", "uploadpack", "receivepack"];
+
+/// `execute()` (daemon.c:747): read one request off stdin and answer it.
+///
+/// ```c
+/// pktlen = packet_read(0, packet_buffer, sizeof(packet_buffer), 0);
+/// len = strlen(line);
+/// if (len && line[len-1] == '\n')
+///         line[len-1] = 0;
+/// …
+/// if (skip_prefix(line, "git-", &arg) &&
+///     skip_prefix(arg, s->name, &arg) &&
+///     *arg++ == ' ')
+///         return run_service(arg, s, &hi, &env);
+/// …
+/// logerror("Protocol error: '%s'", line);
+/// return -1;
+/// ```
+///
+/// `cmd_main` returns that `-1` straight out of `main`, so every refusal here
+/// exits 255. Under `--inetd` the log destination defaults to syslog and
+/// `cmd_main` has already redirected stderr to `/dev/null`, so nothing this
+/// function logs is visible — only the `ERR` packet on stdout and the status.
+fn execute(o: &Opts) -> Result<ExitCode> {
+    let (line, pktlen) = match read_request_packet() {
+        Some(request) => request,
+        // A read error is git's `packet_read()` dying; there is no request to
+        // answer either way.
+        None => return Ok(ExitCode::from(255)),
+    };
+
+    // `len = strlen(line)`: the request line ends at the first NUL, and the
+    // extra arguments live behind it. git overwrites a trailing newline with a
+    // NUL but leaves `len` alone, so the extras still start at `line + len + 1`.
+    let len = line.iter().position(|b| *b == 0).unwrap_or(line.len());
+    let mut request = &line[..len];
+    if request.last() == Some(&b'\n') {
+        request = &request[..request.len() - 1];
+    }
+    let saw_extended_args = len != pktlen;
+    let request = String::from_utf8_lossy(request).into_owned();
+
+    // ```c
+    // if (len != pktlen)
+    //         parse_extra_args(&hi, &env, line + len + 1, pktlen - len - 1);
+    // ```
+    //
+    // (daemon.c:772-773.) The extras behind the request's NUL become the
+    // `GIT_PROTOCOL` value the service is run with, which is how a v2 client
+    // negotiates over `git://` — without it `upload-pack` answers a v2 request
+    // with the v0 advertisement.
+    let git_protocol = if saw_extended_args {
+        match parse_extra_args(&line[len + 1..pktlen], o) {
+            Ok(v) => v,
+            Err(code) => return Ok(code),
+        }
+    } else {
+        None
+    };
+
+    for (index, name) in SERVICES.iter().enumerate() {
+        let Some(rest) = request
+            .strip_prefix("git-")
+            .and_then(|a| a.strip_prefix(*name))
+        else {
+            continue;
+        };
+        let Some(dir) = rest.strip_prefix(' ') else {
+            continue;
+        };
+        return run_service(o, index, dir, saw_extended_args, git_protocol.as_deref());
+    }
+
+    // `logerror("Protocol error: '%s'", line)` and `return -1`: no packet is
+    // written, and under `--inetd` the log line goes to syslog.
+    Ok(ExitCode::from(255))
+}
+
+/// One pkt-line off stdin, as `packet_read(0, …, 0)` reads it.
+///
+/// Returns the payload and its length. A flush packet reads back as an empty
+/// payload, which is what makes a client that connected and left a protocol
+/// error rather than a request.
+fn read_request_packet() -> Option<(Vec<u8>, usize)> {
+    use std::io::Read;
+
+    let mut header = [0u8; 4];
+    let mut stdin = std::io::stdin().lock();
+    stdin.read_exact(&mut header).ok()?;
+    let size = usize::from_str_radix(std::str::from_utf8(&header).ok()?, 16).ok()?;
+    if size == 0 {
+        return Some((Vec::new(), 0));
+    }
+    if size < 4 {
+        return None;
+    }
+    let mut payload = vec![0u8; size - 4];
+    stdin.read_exact(&mut payload).ok()?;
+    Some((payload.clone(), payload.len()))
+}
+
+/// `parse_extra_args()` (daemon.c:638) over the bytes behind the request line's
+/// NUL, returning the `GIT_PROTOCOL` value it builds.
+///
+/// ```c
+/// extra_args = parse_host_arg(hi, extra_args, buflen);
+/// for (; extra_args < end; extra_args += strlen(extra_args) + 1) {
+///         const char *arg = extra_args;
+///         if (*arg) {
+///                 if (git_protocol.len > 0)
+///                         strbuf_addch(&git_protocol, ':');
+///                 strbuf_addstr(&git_protocol, arg);
+///         }
+/// }
+/// ```
+///
+/// The first NUL-terminated block is the `host=` attribute, consumed by
+/// `parse_host_arg()` (`:605`) and never forwarded; anything else in that first
+/// position is `die("Invalid request")`. Every block after it joins the value
+/// with `:`, so `\0version=2\0` — the block a v2 client sends behind an empty
+/// second NUL — arrives as `GIT_PROTOCOL=version=2`.
+///
+/// The hostname itself is only logged and used by `--interpolated-path=`, which
+/// is not ported, so it is parsed for its length and dropped.
+fn parse_extra_args(extra: &[u8], o: &Opts) -> std::result::Result<Option<String>, ExitCode> {
+    /// One NUL-terminated block, and what is left after it. A block with no NUL
+    /// runs to the end, as C's `strlen` over a buffer git NUL-terminates does.
+    fn split_block(buf: &[u8]) -> (&[u8], &[u8]) {
+        match buf.iter().position(|b| *b == 0) {
+            Some(at) => (&buf[..at], &buf[at + 1..]),
+            None => (buf, &buf[buf.len()..]),
+        }
+    }
+
+    let mut rest = extra;
+    // `if (extra_args < end && *extra_args)` — an empty first block is not a
+    // host attribute and is left for the loop below.
+    if rest.first().is_some_and(|b| *b != 0) {
+        if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"host=") {
+            rest = split_block(rest).1;
+        }
+        // `if (extra_args < end && *extra_args) die("Invalid request");` — a
+        // first block that is not `host=`, or a second block crowding straight
+        // up against it, is refused before any service runs.
+        if rest.first().is_some_and(|b| *b != 0) {
+            return Err(die_maybe_quiet(
+                "Invalid request",
+                o.log_dest == LogDest::Syslog,
+            ));
+        }
+    }
+
+    let mut protocol = String::new();
+    while !rest.is_empty() {
+        let (block, after) = split_block(rest);
+        rest = after;
+        if block.is_empty() {
+            continue;
+        }
+        if !protocol.is_empty() {
+            protocol.push(':');
+        }
+        protocol.push_str(&String::from_utf8_lossy(block));
+    }
+    Ok((!protocol.is_empty()).then_some(protocol))
+}
+
+/// `run_service()` (daemon.c:367), up to the point where the service itself
+/// would run.
+///
+/// Every refusal below is `daemon_error()`, which writes one `ERR` packet and
+/// returns -1:
+///
+/// ```c
+/// static int daemon_error(const char *dir, const char *msg)
+/// {
+///         if (!informative_errors)
+///                 msg = "access denied or repository not exported";
+///         packet_write_fmt(1, "ERR %s: %s", msg, dir);
+///         return -1;
+/// }
+/// ```
+fn run_service(
+    o: &Opts,
+    index: usize,
+    dir: &str,
+    saw_extended_args: bool,
+    git_protocol: Option<&str>,
+) -> Result<ExitCode> {
+    let mut enabled = o.enabled[index];
+    let overridable = o.overridable[index];
+
+    // `if (!enabled && !service->overridable)` — a service turned off by name
+    // that no repository may turn back on.
+    if !enabled && !overridable {
+        return Ok(daemon_error(o, dir, "service not enabled"));
+    }
+
+    let Some(_path) = path_ok(o, dir, saw_extended_args)? else {
+        return Ok(daemon_error(o, dir, "no such repository"));
+    };
+
+    // `path_ok()` left the process inside the repository, so this is git's
+    // `access("git-daemon-export-ok", F_OK)` verbatim.
+    if !o.export_all && !std::path::Path::new("git-daemon-export-ok").exists() {
+        return Ok(daemon_error(o, dir, "repository not exported"));
+    }
+
+    if overridable {
+        // `repo_config_get_bool(the_repository, "daemon.<config_name>", &enabled)`
+        // leaves `enabled` alone when the key is unset, which is how a service
+        // that is off by default stays off.
+        let repo = gix::open_opts(".", gix::open::Options::default().open_path_as_is(true))?;
+        if let Some(value) = repo
+            .config_snapshot()
+            .boolean(&format!("daemon.{}", SERVICE_CONFIG_NAMES[index]))
+        {
+            enabled = value;
+        }
+    }
+    if !enabled {
+        return Ok(daemon_error(o, dir, "service not enabled"));
+    }
+
+    if let Some(hook) = &o.access_hook {
+        bail!(
+            "--access-hook={hook:?} is not ported: it runs per accepted request, and the request \
+             itself is only answered as far as the refusals above (see the module docs)"
+        );
+    }
+
+    // `return service->fn(env);` (daemon.c:441). Each of the three is one
+    // `run_service_command()` call with the service's own flags
+    // (daemon.c:481-510):
+    //
+    // ```c
+    // static int upload_pack(const struct strvec *env)
+    // {
+    //         struct child_process cld = CHILD_PROCESS_INIT;
+    //         strvec_pushl(&cld.args, "upload-pack", "--strict", NULL);
+    //         strvec_pushf(&cld.args, "--timeout=%u", timeout);
+    //         strvec_pushv(&cld.env, env->v);
+    //         return run_service_command(&cld);
+    // }
+    // ```
+    //
+    // `upload_archive()` and `receive_pack()` are the same with no flags.
+    let timeout = format!("--timeout={}", o.timeout);
+    let args: &[&str] = match SERVICES[index] {
+        "upload-pack" => &["upload-pack", "--strict", &timeout],
+        "upload-archive" => &["upload-archive"],
+        _ => &["receive-pack"],
+    };
+    run_service_command(args, git_protocol, o.log_dest)
+}
+
+/// ```c
+/// static int run_service_command(struct child_process *cld)
+/// {
+///         strvec_push(&cld->args, ".");
+///         cld->git_cmd = 1;
+///         cld->err = -1;
+///         if (start_command(cld))
+///                 return -1;
+///         close(0);
+///         close(1);
+///         copy_to_log(cld->err);
+///         return finish_command(cld);
+/// }
+/// ```
+///
+/// (daemon.c:465-479.) The service is a `git` CHILD, not an in-process call:
+/// `path_ok()` has already left the process inside the repository, so the
+/// directory argument is `.`; stdin and stdout are the client's and are
+/// inherited untouched; the child's stderr is a pipe drained into the daemon's
+/// log by `copy_to_log()` (`:444`), which is why a served request prints nothing
+/// on the daemon's own stderr under `--inetd` — git has pointed that at
+/// `/dev/null` (`:1454`) and only `--log-destination=stderr` brings it back.
+///
+/// The exit status is the child's, which `cmd_main` returns as the daemon's own
+/// (`:1459`): `upload-pack` and `receive-pack` answering a client that hangs up
+/// after the advertisement exit 128, and a v2 `upload-pack` that reaches the end
+/// of its command loop exits 0.
+fn run_service_command(
+    args: &[&str],
+    git_protocol: Option<&str>,
+    log_dest: LogDest,
+) -> Result<ExitCode> {
+    use std::io::BufRead;
+
+    let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
+    cmd.args(args)
+        .arg(".")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped());
+    // `strvec_pushv(&cld.env, env->v)` — the only variable `parse_extra_args()`
+    // ever builds, and the one a v2 client's `version=2` block turns into.
+    if let Some(protocol) = git_protocol {
+        cmd.env("GIT_PROTOCOL", protocol);
+    }
+    let mut child = cmd.spawn()?;
+    if let Some(err) = child.stderr.take() {
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            logerror(&line, log_dest);
+        }
+    }
+    let status = child.wait()?;
+    // `finish_command()` reports a signalled child as `128 + signal`
+    // (run-command.c's `wait_or_whine`), which is the status git returns.
+    let code = match status.code() {
+        Some(code) => code,
+        None => {
+            use std::os::unix::process::ExitStatusExt;
+            128 + status.signal().unwrap_or(0)
+        }
+    };
+    Ok(ExitCode::from(code as u8))
+}
+
+/// `daemon_error()` (daemon.c:301): one `ERR` pkt-line on stdout, exit 255.
+fn daemon_error(o: &Opts, dir: &str, msg: &str) -> ExitCode {
+    use std::io::Write;
+
+    let msg = if o.informative_errors {
+        msg
+    } else {
+        "access denied or repository not exported"
+    };
+    let payload = format!("ERR {msg}: {dir}");
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "{:04x}{payload}", payload.len() + 4);
+    let _ = out.flush();
+    ExitCode::from(255)
+}
+
+/// `path_ok()` (daemon.c:147): turn the requested virtual path into a real
+/// repository, entering it, or `None` when it must be refused.
+///
+/// `enter_repo()` chdirs into whatever it settles on, which is what makes the
+/// `git-daemon-export-ok` test and the `daemon.*` config read in
+/// [`run_service`] relative lookups.
+fn path_ok(o: &Opts, directory: &str, saw_extended_args: bool) -> Result<Option<String>> {
+    // `if (daemon_avoid_alias(dir)) return NULL` — the request must be absolute
+    // or a `~` path, and may not contain `//`, `/./` or `/../`.
+    if daemon_avoid_alias(directory) {
+        return Ok(None);
+    }
+
+    let mut dir = directory.to_string();
+    if directory.starts_with('~') {
+        let Some(user_path) = &o.user_path else {
+            // `logerror("'%s': User-path not allowed", dir)`.
+            return Ok(None);
+        };
+        if !user_path.is_empty() {
+            // `snprintf(rpath, …, "%.*s/%s%.*s", namlen, dir, user_path, restlen, slash)`.
+            let namlen = directory.find('/').unwrap_or(directory.len());
+            dir = format!(
+                "{}/{}{}",
+                &directory[..namlen],
+                user_path,
+                &directory[namlen..]
+            );
+        }
+    } else if o.interpolated_path.is_some() && saw_extended_args {
+        bail!(
+            "--interpolated-path= is not ported: %CH and %IP expand to the canonical hostname and \
+             IP address of the accepted connection, which this port has no connection to resolve"
+        );
+    } else if let Some(base) = &o.base_path {
+        // `if (*dir != '/') return NULL` — only absolute virtual paths may be
+        // prefixed with the base path.
+        if !dir.starts_with('/') {
+            return Ok(None);
+        }
+        dir = format!("{base}{dir}");
+    }
+
+    let mut path = enter_repo(&dir, o.strict_paths);
+    if path.is_none() && o.base_path.is_some() && o.base_path_relaxed {
+        // "if we fail and base_path_relaxed is enabled, try without prefixing
+        // the base path".
+        path = enter_repo(directory, o.strict_paths);
+    }
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    // The `ok_paths` gate: a request must live under one of the trailing
+    // `<directory>` arguments, and without `--strict-paths` a repository below
+    // one of them counts too. With no directory list at all, only
+    // `--strict-paths` denies.
+    if !o.ok_paths.is_empty() {
+        for ok in &o.ok_paths {
+            if path.starts_with(ok.as_str())
+                && (path.len() == ok.len()
+                    || (!o.strict_paths && path.as_bytes().get(ok.len()) == Some(&b'/')))
+            {
+                return Ok(Some(path));
+            }
+        }
+    } else if !o.strict_paths {
+        return Ok(Some(path));
+    }
+
+    // `logerror("'%s': not in directory list", path)` — deny by default.
+    Ok(None)
+}
+
+/// `enter_repo()` (setup.c:1817), reduced to what the daemon asks of it: settle
+/// on one of git's four suffixes, chdir into it, and confirm what we landed in
+/// is a git directory.
+///
+/// ```c
+/// static const char *suffix[] = { "/.git", "", ".git/.git", ".git", NULL };
+/// ```
+///
+/// Trailing slashes are trimmed off the request first (all but a leading one),
+/// and the *validated* path git returns is the request plus the suffix that
+/// matched — not the directory it entered, which is why a gitfile still reports
+/// the name the client asked for.
+///
+/// The `~` expansion `enter_repo()` performs is [`super::upload_pack`]'s: `~/`
+/// against `$HOME`, and `~user` refused rather than passed through, because a
+/// passwd lookup is not available in the vendored crates.
+fn enter_repo(path: &str, strict: bool) -> Option<String> {
+    let candidates: Vec<(String, String)> = if strict {
+        vec![(path.to_string(), path.to_string())]
+    } else {
+        let bytes = path.as_bytes();
+        let mut len = path.len();
+        while len > 1 && bytes[len - 1] == b'/' {
+            len -= 1;
+        }
+        let base = &path[..len];
+        let used_base = match base.strip_prefix('~') {
+            None => base.to_string(),
+            Some(rest) => {
+                if !rest.is_empty() && !rest.starts_with('/') {
+                    // `interpolate_path()` would consult the passwd database.
+                    return None;
+                }
+                match std::env::var_os("HOME") {
+                    Some(home) => format!("{}{rest}", home.to_string_lossy()),
+                    None => base.to_string(),
+                }
+            }
+        };
+        ["/.git", "", ".git/.git", ".git"]
+            .iter()
+            .map(|suffix| (format!("{used_base}{suffix}"), format!("{base}{suffix}")))
+            .collect()
+    };
+
+    let options = gix::open::Options::default().open_path_as_is(true);
+    for (used, validated) in candidates {
+        if gix::open_opts(&used, options.clone()).is_err() {
+            continue;
+        }
+        // `if (chdir(used_path.buf)) return NULL;` then `is_git_directory(".")`.
+        if std::env::set_current_dir(&used).is_err() {
+            return None;
+        }
+        return Some(validated);
+    }
+    None
+}
+
+/// `daemon_avoid_alias()` (path.c:1331): refuse a request that is neither
+/// absolute nor `~`-rooted, and any that contains `//`, `/./`, `/../`, `/.` or
+/// `/..` at the end.
+///
+/// "sl becomes true immediately after seeing '/' and continues to be true as
+/// long as dots continue after that without intervening non-dot character."
+fn daemon_avoid_alias(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if !matches!(bytes.first(), Some(b'/') | Some(b'~')) {
+        return true;
+    }
+    let (mut sl, mut ndot) = (true, 0usize);
+    for index in 1..=bytes.len() {
+        // The C reads the NUL terminator as the final character.
+        let ch = bytes.get(index).copied().unwrap_or(0);
+        if sl {
+            match ch {
+                b'.' => ndot += 1,
+                b'/' => {
+                    if ndot < 3 {
+                        // reject //, /./ and /../
+                        return true;
+                    }
+                    ndot = 0;
+                }
+                0 => {
+                    // reject /.$ and /..$
+                    return 0 < ndot && ndot < 3;
+                }
+                _ => {
+                    sl = false;
+                    ndot = 0;
+                }
+            }
+        } else if ch == 0 {
+            return false;
+        } else if ch == b'/' {
+            sl = true;
+            ndot = 0;
+        }
+    }
+    false
 }

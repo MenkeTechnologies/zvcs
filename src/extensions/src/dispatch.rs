@@ -1361,9 +1361,21 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // short budget to clear before running, so the usual millisecond overlap
     // becomes a wait rather than the error it used to be. A queued job's re-run
     // waits too — by then it owns the lane, and only a foreign holder is left.
+    //
+    // The wait guards ONE file: `<git-dir>/index`. A process whose index is
+    // somewhere else — a commit hook, which git spawns with `GIT_INDEX_FILE` set
+    // to the index the commit is being built from (`commit.c:1744`,
+    // `strvec_pushf(&opt.env, "GIT_INDEX_FILE=%s", index_file)`) — writes another
+    // file entirely, and `<git-dir>/index.lock` is not its lock. For `-a`/`-i`
+    // that variable names `<git-dir>/index.lock` itself (builtin/commit.c:451,
+    // `ret = get_lock_file_path(&index_lock)`), so waiting for it to disappear
+    // would be a hook waiting out the parent that spawned it, for the whole
+    // budget, before being queued as a job the parent never sees.
     if is_lock_verb {
         if let Ok(repo) = crate::setup::discover() {
-            crate::lock::wait_for_foreign_index_lock(repo.git_dir());
+            if repo.index_path() == repo.git_dir().join("index") {
+                crate::lock::wait_for_foreign_index_lock(repo.git_dir());
+            }
         }
     }
 

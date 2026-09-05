@@ -807,7 +807,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     crate::objname::ParentsOnly::Absent => spec,
                     // `strtol_i()` refused the `<n>` before `add_parents_only()`
                     // was reached, so nothing is resolved and nothing is pended.
-                    crate::objname::ParentsOnly::BadParent => return Ok(fatal_rev(repo, spec)),
+                    crate::objname::ParentsOnly::BadParent => return Ok(fatal_rev(repo, spec, seen_dashdash)),
                     crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
                         let sense = if replaces { negate } else { !negate };
                         let mut queued: Vec<(ObjectId, bool)> = Vec::new();
@@ -827,7 +827,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                                 if ignore_missing {
                                     continue;
                                 }
-                                return Ok(fatal_rev(repo, spec));
+                                return Ok(fatal_rev(repo, spec, seen_dashdash));
                             }
                             crate::objname::Parents::Queued => {}
                         }
@@ -872,7 +872,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                             }
                         }
                         None if ignore_missing => {}
-                        None => return Ok(fatal_rev(repo, spec)),
+                        None => return Ok(fatal_rev(repo, spec, seen_dashdash)),
                     }
                 } else if let Some((left, right)) = spec.split_once("...") {
                     let left = if left.is_empty() { "HEAD" } else { left };
@@ -881,7 +881,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         if ignore_missing {
                             continue;
                         }
-                        return Ok(fatal_rev(repo, spec));
+                        return Ok(fatal_rev(repo, spec, seen_dashdash));
                     };
                     // `handle_dotdot_1()` restores the separator before its own
                     // `verify_non_filename()` (revision.c:2024-2028), so the whole
@@ -902,7 +902,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         if ignore_missing {
                             continue;
                         }
-                        return Ok(fatal_rev(repo, spec));
+                        return Ok(fatal_rev(repo, spec, seen_dashdash));
                     };
                     if let Some(code) = super::log::non_filename_fatal(repo, spec, seen_dashdash) {
                         return Ok(code);
@@ -929,7 +929,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                             }
                         }
                         None if ignore_missing => {}
-                        None => return Ok(fatal_rev(repo, spec)),
+                        None => return Ok(fatal_rev(repo, spec, seen_dashdash)),
                     }
                 }
             }
@@ -1166,10 +1166,11 @@ fn resolve_range(
 ///
 /// [`super::log::early_revision_fatal`] comes first because it covers the two
 /// shapes git dies on *inside* `handle_revision_arg()` — where shortlog's
-/// resolver, which asks the object database, reports a failure git never had. A
-/// `--` puts every following argument in `pathspecs` before this is reached, so
-/// `cant_be_filename` is never set here.
-fn fatal_rev(repo: &gix::Repository, spec: &str) -> ExitCode {
+/// resolver, which asks the object database, reports a failure git never had.
+/// `cant_be_filename` is `setup_revisions()`'s own `seen_dashdash`, scanned over
+/// the whole vector (revision.c:2852-2854): a `--` written after the operand
+/// still stands the filename check down for it.
+fn fatal_rev(repo: &gix::Repository, spec: &str, cant_be_filename: bool) -> ExitCode {
     // `get_oid_basic()` reads a ref without touching the object it names, so a ref
     // pointing at something the database does not have resolves and then dies in
     // `get_reference()`: `die(_("bad object %s"), name)` (revision.c:389-400).
@@ -1178,11 +1179,18 @@ fn fatal_rev(repo: &gix::Repository, spec: &str) -> ExitCode {
     let bare = spec.strip_prefix('^').unwrap_or(spec);
     if let Some(id) = crate::objname::resolve_quiet(repo, bare) {
         if repo.find_object(id).is_err() {
+            // The name RESOLVED, so `handle_revision_arg_1()` has already run
+            // `verify_non_filename()` on it (revision.c:2156-2157) by the time
+            // `get_reference()` misses the object: a worktree file of the same
+            // name is "both revision and filename", not `bad object`.
+            if let Some(code) = super::log::non_filename_fatal(repo, bare, cant_be_filename) {
+                return code;
+            }
             eprintln!("fatal: bad object {bare}");
             return ExitCode::from(128);
         }
     }
-    let message = super::log::early_revision_fatal(repo, spec, false)
+    let message = super::log::early_revision_fatal(repo, spec, cant_be_filename)
         .unwrap_or_else(|| super::log::bad_revision_message_in(repo, spec));
     eprint!("{message}");
     ExitCode::from(128)

@@ -860,7 +860,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--dirstat[=<params>]` / `--dirstat-by-file[=<params>]` / `--cumulative`
     // (`diff_opt_dirstat()`, diff.c), and the `diff.dirstat` config behind them.
     let mut dirstat_on = false;
-    let mut dirstat = super::diff_files::DirStat::default();
+    let mut dirstat = {
+        let mut ds = super::diff_files::DirStat::default();
+        super::diff_files::config_dirstat(&repo, &mut ds);
+        ds
+    };
     let mut patch = false;
     // `-q`/`--quiet`: git pre-sets DIFF_FORMAT_NO_OUTPUT before the other diff-format
     // flags parse, so it is position-independent. On `git log` (which shows no diff by

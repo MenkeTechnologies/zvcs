@@ -508,7 +508,9 @@ fn describe_commit_to_string(
     // without any search, and everything below it is the candidate walk. The gate
     // is exactly "is this commit in the name map", because the map only ever holds
     // the priorities the selector admits.
-    if opts.debug && !build_names(repo, opts.select, filter)?.contains_key(&commit_oid) {
+    let exact_match =
+        opts.debug && build_names(repo, opts.select, filter)?.contains_key(&commit_oid);
+    if opts.debug && !exact_match {
         eprintln!("No exact match on refs or tags, searching to describe");
     }
     let outcome = resolve(
@@ -563,7 +565,89 @@ fn describe_commit_to_string(
         }
     };
 
+    // Both halves of `describe_commit()` that print nothing get here too: the exact
+    // match returns at `builtin/describe.c:582` before the narration starts, and
+    // `--always` with no candidate returns at `:420` before the block below it. Only
+    // a walk that actually produced a candidate table is narrated.
+    if opts.debug && !exact_match && !outcome.candidates.is_empty() {
+        narrate(repo, &outcome, opts, filter)?;
+    }
     Ok(Ok(format_outcome(repo, outcome, &id, opts)?))
+}
+
+/// `--debug`'s second half: the candidate table and the walk's totals.
+///
+/// ```c
+/// if (debug) {
+///         static int label_width = -1;
+///         if (label_width < 0) {
+///                 int i, w;
+///                 for (i = 0; i < ARRAY_SIZE(prio_names); i++) {
+///                         w = strlen(_(prio_names[i]));
+///                         if (label_width < w) label_width = w;
+///                 }
+///         }
+///         for (cur_match = 0; cur_match < match_cnt; cur_match++) {
+///                 struct possible_tag *t = &all_matches[cur_match];
+///                 fprintf(stderr, " %-*s %8d %s\n",
+///                         label_width, _(prio_names[t->name->prio]),
+///                         t->depth, t->name->path);
+///         }
+///         fprintf(stderr, _("traversed %lu commits\n"), seen_commits);
+///         if (gave_up_on) {
+///                 fprintf(stderr,
+///                         _("more than %i tags found; listed %i most recent\n"
+///                         "gave up search at %s\n"),
+///                         max_candidates, max_candidates,
+///                         oid_to_hex(&gave_up_on->object.oid));
+///         }
+/// }
+/// ```
+///
+/// (`builtin/describe.c:444-467`, with `prio_names[] = { "head", "lightweight",
+/// "annotated" }` at `:63-65`.) `label_width` is the widest of those three, so the
+/// column is eleven characters wide; the depth column is eight, right aligned.
+///
+/// `finished search at` is printed earlier, from inside the walk (`:398-400`), and
+/// the walk reports the commit it broke on so the line can be replayed here in
+/// git's order — ahead of the table, which is written after the walk has ended.
+///
+/// The name in each row is `t->name->path`: the ref path with `refs/tags/` stripped,
+/// or under `--all` only `refs/`. It is *not* the name inside an annotated tag
+/// object, which is what the describe string itself uses — a lightweight ref at an
+/// annotated tag shows as the ref here and as the tag's own name in the output.
+fn narrate(
+    repo: &gix::Repository,
+    outcome: &Outcome<'static>,
+    opts: &Options,
+    filter: &Filter,
+) -> Result<()> {
+    if let Some(id) = &outcome.finished_search_at {
+        eprintln!("finished search at {id}");
+    }
+    let prio_by_oid = build_names_with_prio(repo, opts.select, filter)?;
+    for candidate in &outcome.candidates {
+        let prio = prio_by_oid.get(&candidate.id).map_or(0, |(_, prio)| *prio);
+        let label = match prio {
+            2 => "annotated",
+            1 => "lightweight",
+            _ => "head",
+        };
+        let path = match opts.prefix_names {
+            true => prefixed_name(repo, candidate.name.as_ref())
+                .unwrap_or_else(|| candidate.name.as_ref().to_owned()),
+            false => candidate.name.as_ref().to_owned(),
+        };
+        eprintln!(" {label:<11} {:>8} {path}", candidate.depth);
+    }
+    eprintln!("traversed {} commits", outcome.commits_seen);
+    if let Some(id) = &outcome.gave_up_on {
+        eprintln!(
+            "more than {0} tags found; listed {0} most recent\ngave up search at {id}",
+            opts.max_candidates
+        );
+    }
+    Ok(())
 }
 
 /// Whether this walk is the one whose object lookups git would have reported on.
@@ -671,28 +755,52 @@ fn resolve(
 /// rejects. This mirrors gix's `SelectRef::names()` (the priority/time tie-breaks and
 /// the "more recent wins on id collision" hashmap semantics are load-bearing) with
 /// `Filter::accepts()` — git's `get_name()` accept test — spliced into the iteration.
-fn build_names(
+///
+/// The priority rides along because `--debug` prints it: git's candidate table names
+/// each entry `head`/`lightweight`/`annotated` from `n->prio`, and the walk itself
+/// only ever sees the name.
+fn build_names_with_prio(
     repo: &gix::Repository,
     select: SelectRef,
     filter: &Filter,
-) -> Result<gix::hashtable::HashMap<ObjectId, Cow<'static, BStr>>> {
+) -> Result<gix::hashtable::HashMap<ObjectId, (Cow<'static, BStr>, u8)>> {
     let platform = repo.references()?;
     let map = match select {
         SelectRef::AnnotatedTags => {
-            // Only annotated tags become prio-2 candidates; lightweight tags fail
-            // try_into_tag and drop out.
+            // Only annotated tags become prio-2 candidates. git's test is
+            // `peel_iterated_oid()` followed by `is_annotated = !oideq(oid, &peeled)`
+            // (`builtin/describe.c:198-204`): the ref is annotated when the object it
+            // names is *not* the object it peels to, and the peel runs all the way
+            // down. A tag object whose target is another tag object — the `outer` →
+            // `inner` chain — therefore still records the commit at the bottom, and a
+            // *lightweight* ref pointing at a tag object counts as annotated too.
+            // Stopping after a single `tag.target_id()` hop lost both, which is why
+            // `describe --match 'outer*'` used to answer "No annotated tags can
+            // describe" where stock answers `outer-2-g<oid>`.
             let mut tags: Vec<(ObjectId, i64, Cow<'static, BStr>)> = platform
                 .tags()?
                 .filter_map(Result::ok)
-                .filter_map(|r| {
+                .filter_map(|mut r| {
                     if !filter.admits(r.name().as_bstr()) {
                         return None;
                     }
-                    let tag = r.try_id()?.object().ok()?.try_into_tag().ok()?;
-                    let tag_time = tag.tagger().ok().and_then(|s| s.map(|s| s.seconds())).unwrap_or(0);
-                    let commit_id = tag.target_id().ok()?.object().ok()?.try_into_commit().ok()?.id;
+                    let target_id = r.target().try_id().map(ToOwned::to_owned)?;
+                    let peeled = r.peel_to_id().ok()?.detach();
+                    if peeled == target_id {
+                        return None;
+                    }
+                    // `lookup_commit_reference_gently()` in `describe_commit()`: only a
+                    // peel that lands on a commit ever enters the walk's name map, so a
+                    // tag on a blob or a tree drops out here.
+                    repo.find_object(peeled).ok()?.try_into_commit().ok()?;
+                    let tag = repo.find_object(target_id).ok()?.try_into_tag().ok()?;
+                    let tag_time = tag
+                        .tagger()
+                        .ok()
+                        .and_then(|s| s.map(|s| s.seconds()))
+                        .unwrap_or(0);
                     let name: Cow<'static, BStr> = Cow::Owned(r.name().shorten().to_owned());
-                    Some((commit_id, tag_time, name))
+                    Some((peeled, tag_time, name))
                 })
                 .collect();
             // Sort by time ascending, then name descending; later entries overwrite
@@ -700,7 +808,9 @@ fn build_names(
             tags.sort_by(|(_, a_time, a_name), (_, b_time, b_name)| {
                 a_time.cmp(b_time).then_with(|| b_name.cmp(a_name))
             });
-            tags.into_iter().map(|(id, _, name)| (id, name)).collect()
+            tags.into_iter()
+                .map(|(id, _, name)| (id, (name, 2u8)))
+                .collect()
         }
         SelectRef::AllTags | SelectRef::AllRefs => {
             let mut refs: Vec<(ObjectId, u8, i64, Cow<'static, BStr>)> = match select {
@@ -746,10 +856,24 @@ fn build_names(
                     .then_with(|| a_time.cmp(b_time))
                     .then_with(|| b_name.cmp(a_name))
             });
-            refs.into_iter().map(|(id, _, _, name)| (id, name)).collect()
+            refs.into_iter()
+                .map(|(id, prio, _, name)| (id, (name, prio)))
+                .collect()
         }
     };
     Ok(map)
+}
+
+/// [`build_names_with_prio`] reduced to the `name_by_oid` map the walk takes.
+fn build_names(
+    repo: &gix::Repository,
+    select: SelectRef,
+    filter: &Filter,
+) -> Result<gix::hashtable::HashMap<ObjectId, Cow<'static, BStr>>> {
+    Ok(build_names_with_prio(repo, select, filter)?
+        .into_iter()
+        .map(|(id, (name, _))| (id, name))
+        .collect())
 }
 
 /// Format an already-resolved outcome into git's describe string.
@@ -1095,6 +1219,19 @@ fn run_contains(
     match_pats: &[BString],
     exclude_pats: &[BString],
 ) -> Result<ExitCode> {
+    // Under `--all`, stock 2.55.0 applies describe's own accept test to the ref set
+    // instead of handing the patterns to name-rev: measured against 2.55.0 on an
+    // octopus fixture, `describe --contains --all --exclude 'oct-*' HEAD^3` answers
+    // `main^3` where the branches are still visible it answers `oct-b`, and
+    // `--match heads/oct-b` matches nothing while `--match oct-b` matches — so the
+    // pattern is tested against the name with `refs/heads/`, `refs/remotes/` or
+    // `refs/tags/` stripped, which is `Filter::accepts()`. git 2.50.1 ignores the
+    // patterns under `--all` entirely and answers `oct-b`.
+    let filter = Filter {
+        all,
+        match_pats: match_pats.to_vec(),
+        exclude_pats: exclude_pats.to_vec(),
+    };
     let mut repo = crate::setup::discover()?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
 
@@ -1156,7 +1293,14 @@ fn run_contains(
     }
 
     // Collect and rank the ref tips (`name_ref` + `cmp_by_tag_and_age`).
-    let mut tips = collect_tips(&repo, all, &ref_filters, &exclude_filters, &mut cache)?;
+    let mut tips = collect_tips(
+        &repo,
+        all,
+        &ref_filters,
+        &exclude_filters,
+        &filter,
+        &mut cache,
+    )?;
     tips.sort_by(|a, b| {
         // Prefer tags, then older tagger date; git's QSORT is unstable on ties.
         b.from_tag.cmp(&a.from_tag).then(a.taggerdate.cmp(&b.taggerdate))
@@ -1203,6 +1347,7 @@ fn collect_tips(
     all: bool,
     ref_filters: &[BString],
     exclude_filters: &[BString],
+    describe_filter: &Filter,
     cache: &mut std::collections::HashMap<ObjectId, CommitInfo>,
 ) -> Result<Vec<Tip>> {
     let platform = repo.references()?;
@@ -1213,6 +1358,12 @@ fn collect_tips(
     for r in iter.filter_map(Result::ok) {
         let full = r.name().as_bstr().to_owned();
 
+        // Under `--all` the patterns never reach name-rev: describe applies its own
+        // accept test to the ref set (see `run_contains`), and `ref_filters` and
+        // `exclude_filters` are empty.
+        if all && !describe_filter.admits(full.as_bstr()) {
+            continue;
+        }
         // exclude filters win first.
         if exclude_filters
             .iter()

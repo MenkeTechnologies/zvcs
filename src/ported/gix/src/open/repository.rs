@@ -311,11 +311,23 @@ impl ThreadSafeRepository {
                 }
                 // ignore worktree settings that aren't from our repository. This can happen
                 // with worktrees of submodules for instance.
+                //
+                // Both sides have to be normalized or the comparison answers "not ours" for
+                // a repository that plainly is: the config path is absolutized here, while
+                // the git directory arrives as whatever named it — `../.git` from an upwards
+                // search or from `--git-dir`, and `<worktree>/../.git/modules/<name>` from a
+                // `.git` file resolved against the directory holding it. `../.git/config`
+                // does not start with `../.git` once only one of the two has been resolved,
+                // so `core.worktree` was silently dropped whenever the git directory was not
+                // already a clean absolute path — which is every submodule reached through
+                // `$GIT_DIR`, and every `core.worktree` read from a subdirectory.
+                let git_dir = gix_path::normalize(git_dir.into(), current_dir);
                 section
                     .path
                     .as_deref()
                     .and_then(|p| gix_path::normalize(p.into(), current_dir))
-                    .is_some_and(|config_path| config_path.starts_with(git_dir))
+                    .zip(git_dir)
+                    .is_some_and(|(config_path, git_dir)| config_path.starts_with(git_dir))
             }
             let worktree_path = config
                 .resolved

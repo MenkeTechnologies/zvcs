@@ -22,6 +22,30 @@ pub struct Outcome<'name> {
     pub name_by_oid: HashMap<gix_hash::ObjectId, Cow<'name, BStr>>,
     /// The amount of commits we traversed.
     pub commits_seen: u32,
+    /// Every candidate the walk kept, ordered the way `git describe` orders them: by depth, then
+    /// by the order they were found in. The first is the one `name` and `depth` come from.
+    ///
+    /// `git describe --debug` narrates this table on stderr, and there is no way to recompute it
+    /// from `name` and `depth` alone.
+    pub candidates: Vec<CandidateName<'name>>,
+    /// The commit the walk stopped at because a candidate beyond `max_candidates` was found there,
+    /// which is `git describe --debug`'s "gave up search at".
+    pub gave_up_on: Option<gix_hash::ObjectId>,
+    /// The commit the walk stopped at because the best candidates already cover it, which is
+    /// `git describe --debug`'s "finished search at".
+    pub finished_search_at: Option<gix_hash::ObjectId>,
+}
+
+/// One entry of [`Outcome::candidates`]: a name the walk found and how far the described commit is
+/// in front of it.
+#[derive(Debug, Clone)]
+pub struct CandidateName<'name> {
+    /// The commit the name was found on, which is the key it had in `name_by_oid`.
+    pub id: gix_hash::ObjectId,
+    /// The name, as it was given in `name_by_oid`.
+    pub name: Cow<'name, BStr>,
+    /// The number of commits between this name and the commit being described.
+    pub depth: u32,
 }
 
 impl<'a> Outcome<'a> {
@@ -137,7 +161,7 @@ pub(crate) mod function {
     use gix_error::{Exn, ResultExt, message};
     use gix_hash::oid;
 
-    use super::{Error, Outcome};
+    use super::{CandidateName, Error, Outcome};
     use crate::{
         Graph, PriorityQueue,
         describe::{CommitTime, Flags, MAX_CANDIDATES, Options},
@@ -173,6 +197,9 @@ pub(crate) mod function {
                 depth: 0,
                 name_by_oid,
                 commits_seen: 0,
+                candidates: Vec::new(),
+                gave_up_on: None,
+                finished_search_at: None,
             }));
         }
 
@@ -184,6 +211,9 @@ pub(crate) mod function {
                     name_by_oid,
                     depth: 0,
                     commits_seen: 0,
+                    candidates: Vec::new(),
+                    gave_up_on: None,
+                    finished_search_at: None,
                 }))
             } else {
                 Ok(None)
@@ -194,6 +224,9 @@ pub(crate) mod function {
         let mut candidates = Vec::new();
         let mut commits_seen = 0;
         let mut gave_up_on_commit = None;
+        // `git describe --debug`'s "finished search at <oid>": the commit the early-stop below
+        // broke on (`builtin/describe.c:396-401`).
+        let mut finished_search_at = None;
         graph.clear();
         graph.insert(commit.to_owned(), 0u32);
 
@@ -203,6 +236,7 @@ pub(crate) mod function {
                 if candidates.len() < max_candidates {
                     let identity_bit = 1 << candidates.len();
                     candidates.push(Candidate {
+                        id: commit,
                         name: name.clone(),
                         commits_in_its_future: commits_seen - 1,
                         identity_bit,
@@ -245,6 +279,7 @@ pub(crate) mod function {
                 }
 
                 if (flags & best_candidates_at_same_depth) == best_candidates_at_same_depth {
+                    finished_search_at = Some(commit);
                     break;
                 }
             }
@@ -260,6 +295,9 @@ pub(crate) mod function {
                     name_by_oid,
                     depth: 0,
                     commits_seen,
+                    candidates: Vec::new(),
+                    gave_up_on: gave_up_on_commit,
+                    finished_search_at,
                 }))
             } else {
                 Ok(None)
@@ -284,12 +322,24 @@ pub(crate) mod function {
             first_parent,
         )?;
 
+        let table: Vec<CandidateName<'name>> = candidates
+            .iter()
+            .map(|c| CandidateName {
+                id: c.id,
+                name: c.name.clone(),
+                depth: c.commits_in_its_future,
+            })
+            .collect();
+
         Ok(candidates.into_iter().next().map(|c| Outcome {
             name: c.name.into(),
             id: commit.to_owned(),
             depth: c.commits_in_its_future,
             name_by_oid,
             commits_seen,
+            candidates: table,
+            gave_up_on: gave_up_on_commit,
+            finished_search_at,
         }))
     }
 
@@ -342,6 +392,8 @@ pub(crate) mod function {
 
     #[derive(Debug)]
     struct Candidate<'a> {
+        /// The commit this candidate name sits on.
+        id: gix_hash::ObjectId,
         name: Cow<'a, BStr>,
         commits_in_its_future: Flags,
         /// A single bit identifying this candidate uniquely in a bitset

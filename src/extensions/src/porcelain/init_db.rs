@@ -26,8 +26,12 @@ use std::process::ExitCode;
 ///     default `--ref-format=files` is likewise a no-op, while
 ///     `--ref-format=reftable` is rejected with an honest "not supported" error
 ///     (no vendored reftable backend) rather than being silently ignored, so no
-///     run ever produces a repo that differs from what the flag asked for. An
-///     otherwise unrecognized value reproduces git's exact error text.
+///     run ever produces a repo that differs from what the flag asked for — but
+///     only after git's own diagnostics have had their turn, so reinitializing
+///     an existing repository under a different ref storage format still dies
+///     with git's `attempt to reinitialize repository with different reference
+///     storage format`. An otherwise unrecognized value reproduces git's exact
+///     error text.
 ///   * Every configuration source `init` consults is consulted here too:
 ///     `init.defaultBranch`, `init.templateDir`, `init.defaultObjectFormat`,
 ///     `init.defaultRefFormat` (each behind its `GIT_DEFAULT_HASH` /

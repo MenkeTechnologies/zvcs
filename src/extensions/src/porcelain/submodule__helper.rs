@@ -125,6 +125,36 @@ use gix::config::KeyRef;
 /// The dispatcher's usage block: one line plus a blank line, 40 bytes.
 const USAGE: &str = "usage: git submodule--helper <command>\n\n";
 
+/// parse-options' built-in help, which every `OPT_SUBCOMMAND`-less option table
+/// carries whether or not it lists one.
+///
+/// `parse_options_step()` matches `--help-all` (parse-options.c:900) and `--help`
+/// (parse-options.c:903) with a `strcmp()` of its own — neither abbreviates and
+/// neither takes an `=<value>` — and both jump to `show_usage`, which is
+/// `usage_with_options_internal(ctx, usagestr, options, 0, 0)` (parse-options.c:943).
+/// The last argument is `err`, so the block goes to **stdout**, and the
+/// `PARSE_OPT_HELP` it returns is `exit(129)` (parse-options.c:974-976).
+///
+/// The distinction that matters: an unknown option is an `error:` line on stderr
+/// followed by the same block on stderr, while `--help` is the block alone on
+/// stdout. Both exit 129, so only the streams tell them apart.
+fn parse_options_help(arg: &str, usage: &str) -> Option<Result<ExitCode>> {
+    (arg == "--help" || arg == "--help-all").then(|| {
+        print!("{usage}");
+        Ok(ExitCode::from(129))
+    })
+}
+
+/// The short-option half of the same thing: `if (internal_help && *ctx->opt == \'h\')
+/// goto show_usage;` (parse-options.c:822), tested per character as the cluster is
+/// consumed, so `-qh` prints help just as `-h` does.
+fn parse_options_help_short(c: char, usage: &str) -> Option<Result<ExitCode>> {
+    (c == 'h').then(|| {
+        print!("{usage}");
+        Ok(ExitCode::from(129))
+    })
+}
+
 /// `git submodule--helper` — dispatch to a submodule subcommand.
 ///
 /// Reproduces `parse_options`' `PARSE_OPT_SUBCOMMAND` behaviour exactly (this
@@ -513,6 +543,9 @@ fn add(args: &[String]) -> Result<ExitCode> {
             end_of_options = true;
             continue;
         }
+        if let Some(help) = parse_options_help(a, ADD_USAGE) {
+            return help;
+        }
         if let Some(long) = a.strip_prefix("--") {
             // `--no-<name>` unsets; for a valued option it simply clears it.
             let (name, inline) = match long.split_once('=') {
@@ -526,8 +559,10 @@ fn add(args: &[String]) -> Result<ExitCode> {
             if VALUED.contains(&name) {
                 if inline.is_none() && !long.starts_with("no-") {
                     if args.get(i).is_none() {
+                        // `get_arg()`'s bare `error()` (parse-options.c:104): the
+                        // `PARSE_OPT_ERROR` it returns is `exit(129)` with no usage
+                        // block, unlike the unknown-option path just below.
                         eprintln!("error: option `{name}' requires a value");
-                        eprint!("{ADD_USAGE}");
                         return Ok(ExitCode::from(129));
                     }
                     i += 1;
@@ -541,6 +576,9 @@ fn add(args: &[String]) -> Result<ExitCode> {
         // A short cluster: `-qf`, `-bmain`, `-b main`.
         let mut chars = a[1..].char_indices();
         while let Some((at, c)) = chars.next() {
+            if let Some(help) = parse_options_help_short(c, ADD_USAGE) {
+                return help;
+            }
             match c {
                 'f' | 'q' => {}
                 'b' => {
@@ -550,7 +588,6 @@ fn add(args: &[String]) -> Result<ExitCode> {
                     if rest.is_empty() {
                         if args.get(i).is_none() {
                             eprintln!("error: switch `b' requires a value");
-                            eprint!("{ADD_USAGE}");
                             return Ok(ExitCode::from(129));
                         }
                         i += 1;
@@ -696,6 +733,9 @@ fn clone(args: &[String]) -> Result<ExitCode> {
             end_of_options = true;
             continue;
         }
+        if let Some(help) = parse_options_help(a, CLONE_USAGE) {
+            return help;
+        }
         if let Some(long) = a.strip_prefix("--") {
             let (name, inline) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v.to_string())),
@@ -719,8 +759,9 @@ fn clone(args: &[String]) -> Result<ExitCode> {
                             Some(next.clone())
                         }
                         None => {
+                            // `get_arg()`'s bare `error()`: no usage block here.
                             eprintln!("error: option `{name}' requires a value");
-                            return usage();
+                            return Ok(ExitCode::from(129));
                         }
                     },
                 };
@@ -734,8 +775,11 @@ fn clone(args: &[String]) -> Result<ExitCode> {
             eprintln!("error: unknown option `{long}'");
             return usage();
         }
-        // The only short option in the table is `-q`.
+        // The only short option in the table is `-q`, plus parse-options' own `-h`.
         for c in a[1..].chars() {
+            if let Some(help) = parse_options_help_short(c, CLONE_USAGE) {
+                return help;
+            }
             if c != 'q' {
                 eprintln!("error: unknown switch `{c}'");
                 return usage();
@@ -783,6 +827,9 @@ fn create_branch(args: &[String]) -> Result<ExitCode> {
             end_of_options = true;
             continue;
         }
+        if let Some(help) = parse_options_help(a, CREATE_BRANCH_USAGE) {
+            return help;
+        }
         if let Some(long) = a.strip_prefix("--") {
             let name = match long.split_once('=') {
                 Some((n, _)) => n,
@@ -798,6 +845,9 @@ fn create_branch(args: &[String]) -> Result<ExitCode> {
             return usage();
         }
         for (at, c) in a[1..].char_indices() {
+            if let Some(help) = parse_options_help_short(c, CREATE_BRANCH_USAGE) {
+                return help;
+            }
             match c {
                 'q' | 'f' | 'n' => {}
                 // A short `PARSE_OPT_OPTARG` takes the rest of the cluster as

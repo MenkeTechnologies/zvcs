@@ -806,6 +806,13 @@ fn run_command(argv: &[String]) -> ExitCode {
     if let Some(code) = setup::object_directory_gate(&sub) {
         return code;
     }
+    // `$GIT_COMMON_DIR` is the other half of that same test: `is_git_directory()`
+    // looks for `objects` and `refs` under the *common* directory, so a variable
+    // naming a directory that has neither disqualifies every candidate the walk
+    // would try.
+    if let Some(code) = setup::common_dir_gate(&sub) {
+        return code;
+    }
     // Then the first read of configuration, which `get_allowed_bare_repo()` and
     // `ensure_valid_ownership()` both make: a bad `-c` / `GIT_CONFIG_COUNT` triple
     // is reported before either policy refusal below.

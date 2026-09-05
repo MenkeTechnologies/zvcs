@@ -323,6 +323,23 @@ pub(crate) fn parse_dirstat_params(params: &str, ds: &mut DirStat) -> String {
     errors
 }
 
+/// `diff.dirstat` (diff.c:521-532), which lives in `git_diff_basic_config()` and so
+/// seeds *every* diff family, plumbing included: the parsed parameters land in
+/// `default_diff_options` and `diff_dirstat_permille_default`, both of which
+/// `repo_diff_setup()` (diff.c:5138,5150) copies into each fresh `diff_options`
+/// before parse-options runs. A `--dirstat=<params>` flag therefore refines what
+/// the config already chose rather than starting from git's own defaults.
+///
+/// The complaint text is discarded here: `crate::diff_config`'s `diff.dirstat` arm
+/// already printed the one `warning()` git prints while the config is read, and a
+/// second copy at diff-setup time would be a line stock never writes.
+pub(crate) fn config_dirstat(repo: &gix::Repository, ds: &mut DirStat) {
+    let snap = repo.config_snapshot();
+    if let Some(v) = snap.string("diff.dirstat") {
+        let _ = parse_dirstat_params(&v.to_str_lossy(), ds);
+    }
+}
+
 /// A dirstat cut-off percentage: a whole number plus at most one significant decimal
 /// digit, with any further digits read and discarded, and nothing left over — exactly
 /// what `parse_dirstat_params()`'s `strtoul` walk accepts.
@@ -937,7 +954,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         pickaxe_kinds: 0,
         stat: StatWidths::plumbing(),
         compact_summary: false,
-        dirstat: DirStat::default(),
+        // `diff.dirstat` reaches the plumbing too: it is read by
+        // `git_diff_basic_config()`, not the `_ui_` one (diff.c:521).
+        dirstat: {
+            let mut ds = DirStat::default();
+            config_dirstat(repo, &mut ds);
+            ds
+        },
         unmerged_stage: 2,
         find_copies: false,
         combine_merges: false,

@@ -2310,8 +2310,12 @@ fn absorbgitdirs(args: &[String]) -> Result<ExitCode> {
                     i += 1;
                 }
                 None => {
+                    // `get_arg()` (parse-options.c:104) ends on a bare
+                    // `error(_("%s requires a value"), …)` and `parse_options()`
+                    // turns the `PARSE_OPT_ERROR` it produces straight into
+                    // `exit(129)` (parse-options.c:974-976). No usage block: only
+                    // the *unknown*-option path reaches `parse_options_usage()`.
                     eprintln!("error: option `super-prefix' requires a value");
-                    eprint!("{ABSORB_USAGE}");
                     return Ok(ExitCode::from(129));
                 }
             },
@@ -2499,9 +2503,7 @@ enum UpdateStrategy {
     Rebase,
 }
 
-/// The flags of `git submodule update` this port honors. `--filter` (the
-/// partial-clone shaping flag) still bails in `update` before any repository is
-/// touched, so it never reaches here.
+/// The flags of `git submodule update` this port honors.
 #[derive(Clone)]
 struct UpdateOpts {
     quiet: bool,
@@ -2542,7 +2544,25 @@ struct UpdateOpts {
     /// `--require-init`: refuse to clone into a worktree directory that is not
     /// empty, and refuse to keep one that gained anything besides `.git`.
     require_init: bool,
+    /// `--filter=<spec>`, git's `update_data->filter_options`: the partial-clone
+    /// filter every submodule this run *clones* is cloned with
+    /// (`prepare_to_clone_next_submodule`, submodule--helper.c:2042-2044). It says
+    /// nothing about a submodule that is already there, which is why git refuses the
+    /// flag without `--init` (submodule--helper.c:2695-2698).
+    ///
+    /// Held parsed rather than as text so an invalid spec dies here with git's own
+    /// `invalid filter-spec '<spec>'`, and so the child is given
+    /// `expand_list_objects_filter_spec()`'s rendering — which is what
+    /// [`gix::protocol::fetch::filter::Filter::as_str`] holds.
+    filter: Option<gix::protocol::fetch::filter::Filter>,
 }
+
+/// `usage_with_options(git_submodule_helper_usage, module_update_options)` for the
+/// `update` subcommand: the one usage text in this file that is *not*
+/// [`usage_exit`]'s whole-verb synopsis. Reached only by `--filter` without `--init`
+/// (submodule--helper.c:2695-2698), which is the single place `module_update()`
+/// calls it. Captured from stock 2.55.0 byte for byte, trailing blank line included.
+const UPDATE_USAGE: &str = "usage: git submodule [--quiet] update [--init [--filter=<filter-spec>]] [--remote] [-N|--no-fetch] [-f|--force] [--checkout|--merge|--rebase] [--[no-]recommend-shallow] [--reference <repository>] [--recursive] [--[no-]single-branch] [--] [<path>...]\n\n    -f, --[no-]force      force checkout updates\n    --[no-]init           initialize uninitialized submodules before update\n    --[no-]remote         use SHA-1 of submodule's remote tracking branch\n    --[no-]recursive      traverse submodules recursively\n    -N, --no-fetch        don't fetch new objects from the remote site\n    --fetch               opposite of --no-fetch\n    --[no-]checkout       use the 'checkout' update strategy (default)\n    -m, --[no-]merge      use the 'merge' update strategy\n    -r, --[no-]rebase     use the 'rebase' update strategy\n    --[no-]reference <repo>\n                          reference repository\n    --[no-]ref-format <format>\n                          specify the reference format to use\n    --[no-]dissociate     use --reference only while cloning\n    --[no-]depth <n>      create a shallow clone truncated to the specified number of revisions\n    -j, --[no-]jobs <n>   parallel jobs\n    --[no-]recommend-shallow\n                          whether the initial clone should follow the shallow recommendation\n    -q, --[no-]quiet      don't print cloning progress\n    --[no-]progress       force cloning progress\n    --[no-]require-init   disallow cloning into non-empty directory, implies --init\n    --[no-]single-branch  clone only one branch, HEAD or --branch\n    --[no-]filter <args>  object filtering\n\n";
 
 fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
     let mut opts = UpdateOpts {
@@ -2561,6 +2581,7 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
         dissociate: false,
         single_branch: None,
         require_init: false,
+        filter: None,
     };
     let mut patterns: Vec<BString> = Vec::new();
     let mut no_more_opts = false;
@@ -2635,14 +2656,19 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
             "--single-branch" => opts.single_branch = Some(true),
             "--no-single-branch" => opts.single_branch = Some(false),
             "--require-init" => opts.require_init = true,
-            // Partial clone still needs machinery this port does not carry, so it
-            // bails rather than clone a submodule without the filter it asked for.
-            s if s.starts_with("--filter=") => bail!(
-                "`submodule update {s}` shapes the partial-clone fetch, which is not ported"
-            ),
-            "--filter" => bail!(
-                "`submodule update --filter` shapes the partial-clone fetch, which is not ported"
-            ),
+            // `OPT_PARSE_LIST_OBJECTS_FILTER(&filter_options)`
+            // (submodule--helper.c:2673). `parse_list_objects_filter()` validates the
+            // spec as it is read, so a bad one is fatal here rather than at the clone.
+            s if s.starts_with("--filter=") => {
+                opts.filter = Some(parse_filter_spec(&s["--filter=".len()..])?);
+            }
+            "--filter" => {
+                let Some(v) = args.get(i + 1) else {
+                    return usage_exit();
+                };
+                opts.filter = Some(parse_filter_spec(v)?);
+                i += 1;
+            }
             s if s.starts_with('-') && s.len() > 1 => return usage_exit(),
             // `PARSE_OPT_STOP_AT_NON_OPTION`-style: the first operand ends option
             // parsing (git permutes here, but real invocations put flags first).
@@ -2659,6 +2685,21 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
     // never passes `--init` alongside it.
     if opts.require_init {
         opts.init = true;
+    }
+
+    // ```c
+    // if (filter_options.choice && !opt.init) {
+    //         usage_with_options(git_submodule_helper_usage,
+    //                            module_update_options);
+    // }
+    // ```
+    // (submodule--helper.c:2695-2698). A filter only shapes a *clone*, so asking for
+    // one without the flag that may clone is a usage error — and it is
+    // `usage_with_options()`, which prints the `update` option list rather than the
+    // whole `git submodule` synopsis [`usage_exit`] gives, and exits 129 rather than 1.
+    if opts.filter.is_some() && !opts.init {
+        eprint!("{UPDATE_USAGE}");
+        return Ok(ExitCode::from(129));
     }
 
     if let Some(code) = reject_empty_pathspec(&patterns) {
@@ -2900,6 +2941,18 @@ fn update_repo(
     }
 
     Ok(0)
+}
+
+/// `parse_list_objects_filter()` (list-objects-filter-options.c): validate the spec
+/// where it is read, so `--filter=bogus` is `fatal: invalid filter-spec 'bogus'`
+/// before any submodule is looked at rather than a clone child's error later.
+///
+/// The parsed value carries `expand_list_objects_filter_spec()`'s rendering of the
+/// text, which is what the clone child is handed (submodule--helper.c:1687-1690).
+fn parse_filter_spec(spec: &str) -> Result<gix::protocol::fetch::filter::Filter> {
+    spec.parse()
+        .map_err(|err| crate::fatal::die(format!("{err}")))
+        .map_err(Into::into)
 }
 
 /// `OPT_INTEGER`'s value for `-j`/`--jobs`.
@@ -3315,6 +3368,17 @@ fn clone_submodule(
             cmd.arg("--depth=1");
         } else if let Some(depth) = opts.depth {
             cmd.arg(format!("--depth={depth}"));
+        }
+        // ```c
+        // if (suc->update_data->filter_options && suc->update_data->filter_options->choice)
+        //         strvec_pushf(&child->args, "--filter=%s",
+        //                      expand_list_objects_filter_spec(suc->update_data->filter_options));
+        // ```
+        // (submodule--helper.c:2042-2044), which `clone_submodule()` forwards to the
+        // clone itself (submodule--helper.c:1687-1690). Only a submodule this run
+        // *clones* sees it; one that is already checked out is fetched, not filtered.
+        if let Some(filter) = &opts.filter {
+            cmd.arg(format!("--filter={}", filter.as_str()));
         }
         for reference in &references {
             cmd.arg("--reference").arg(reference);

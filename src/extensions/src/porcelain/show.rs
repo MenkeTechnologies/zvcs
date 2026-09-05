@@ -1576,6 +1576,25 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 Err(_) => return Ok(bad_revision(&repo, spec, seen_dashdash)),
             },
         };
+        // ```c
+        // if (get_oid_with_context(revs->repo, arg, get_sha1_flags, &oid, &oc))
+        //         …
+        // if (!cant_be_filename)
+        //         verify_non_filename(the_repository, revs->prefix, arg);
+        // object = get_reference(revs, arg, &oid, flags ^ local_flags);
+        // ```
+        // (revision.c:2223-2229.) The check runs *after* the operand resolves and
+        // *before* it is pended, so a name that is both a revision and a
+        // working-tree path is refused rather than guessed at — and only while no
+        // `--` anywhere on the line has already settled the question
+        // (`REVARG_CANNOT_BE_FILENAME`, revision.c:3036-3037).
+        if let Some(code) = super::log::non_filename_fatal(
+            &repo,
+            super::log::non_filename_name(spec),
+            seen_dashdash,
+        ) {
+            return Ok(code);
+        }
         match parsed {
             // `--not <rev>` and `^<rev>` are the same thing twice: `handle_revision_arg_1`
             // flips `UNINTERESTING` once for the `^` and `setup_revisions` flips it once
@@ -2105,7 +2124,16 @@ fn fatal(msg: &str) -> ExitCode {
 /// `if (seen_dashdash || *arg == '^') die(_("bad revision '%s'"), arg);`
 /// (revision.c:3035-3036) prints the one-line form without the pathspec advice.
 fn bad_revision(repo: &gix::Repository, spec: &str, seen_dashdash: bool) -> ExitCode {
-    eprint!("{}", super::log::bad_revision_message_in_gated(repo, spec, seen_dashdash));
+    // `get_short_oid()` is the last thing `get_oid_1()` tries (object-name.c:1134),
+    // so a hex prefix that names more than one object earns its own
+    // `error: short object ID <p> is ambiguous` and the `hint:` list *before*
+    // `setup_revisions()` gives up on the operand. Both lines are printed for the
+    // same argument, in that order — measured against 2.55.0.
+    crate::objname::short_oid_ambiguous(repo, crate::objname::ambiguity_base_of(spec), false);
+    eprint!(
+        "{}",
+        super::log::bad_revision_message_in_gated(repo, spec, seen_dashdash)
+    );
     ExitCode::from(128)
 }
 

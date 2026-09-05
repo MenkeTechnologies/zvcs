@@ -408,6 +408,11 @@ struct Opts {
     irreversible_delete: bool,
     /// `--dirstat`/`-X`/`--dirstat-by-file`/`--cumulative`, once any of them is seen.
     dirstat: Option<DirStat>,
+    /// Every parameter list those flags carried, in the order they were given.
+    /// The repository is not open while the options are scanned, so `diff.dirstat`
+    /// — which `repo_diff_setup()` applies *before* parse-options (diff.c:5138,
+    /// 5150) — is folded in once discovery succeeds and these are replayed on top.
+    dirstat_params: Vec<String>,
     /// Whether the pair listing itself is printed. git defaults `output_format` to
     /// `DIFF_FORMAT_RAW` only when nothing else was asked for, so a bare `--dirstat`
     /// prints directories alone while `--raw --dirstat` prints both.
@@ -510,6 +515,19 @@ struct IdxInfo {
     stat: gix::index::entry::Stat,
     intent_to_add: bool,
     unmerged: bool,
+    /// The per-entry half of `do_oneway_diff()`'s `cached` (diff-lib.c:462-463):
+    ///
+    /// ```c
+    /// /* if the entry is not checked out, don't examine work tree */
+    /// cached = o->index_only ||
+    ///         (idx && ((idx->ce_flags & CE_VALID) || ce_skip_worktree(idx)));
+    /// ```
+    ///
+    /// An `--assume-unchanged` entry and a sparse-checkout entry both have no file
+    /// on disk to compare against, so the comparison stops at the index — which is
+    /// why `git diff-index HEAD` is silent in a cone checkout instead of reporting
+    /// every excluded path as deleted.
+    cached_entry: bool,
 }
 
 
@@ -786,6 +804,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         dst_prefix: "b/".to_owned(),
         irreversible_delete: false,
         dirstat: None,
+        dirstat_params: Vec::new(),
         emit_pairs: true,
         color_when: None,
         // git's `ws_error_highlight_default`; `diff.wsErrorHighlight` replaces it
@@ -1719,6 +1738,18 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     if !ih_explicit {
         opts.indent_heuristic = super::diff_pairs::indent_heuristic_default(&repo);
     }
+    // `diff.dirstat` lives in `git_diff_basic_config()` (diff.c:521), which the
+    // plumbing runs too, and `repo_diff_setup()` seeds `diff_options` from it before
+    // a single flag is read. Rebuild the block in that order: git's defaults, the
+    // config, then each `--dirstat=<params>` in the order it appeared.
+    if opts.dirstat.is_some() {
+        let mut ds = DirStat::default();
+        super::diff_files::config_dirstat(&repo, &mut ds);
+        for params in &opts.dirstat_params {
+            let _ = super::diff_files::parse_dirstat_params(params, &mut ds);
+        }
+        opts.dirstat = Some(ds);
+    }
 
     // `diff_opt_find_object()` — the shared port in [`crate::objname::find_object`],
     // which is `repo_get_oid()` and so keeps the full-length-hex rule: an id the
@@ -2298,6 +2329,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
 /// state, turning the format on. Returns git's exit code when a parameter is bad,
 /// having already written the `die()` text `parse_dirstat_params()` builds.
 fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<ExitCode> {
+    opts.dirstat_params.push(params.to_owned());
     let ds = opts.dirstat.get_or_insert_with(DirStat::default);
     let errors = super::diff_files::parse_dirstat_params(params, ds);
     if errors.is_empty() {
@@ -2457,6 +2489,10 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
                         stat: e.stat,
                         intent_to_add: e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD),
                         unmerged: stage != 0,
+                        cached_entry: e.flags.intersects(
+                            gix::index::entry::Flags::ASSUME_VALID
+                                | gix::index::entry::Flags::SKIP_WORKTREE,
+                        ),
                     },
                 );
             }
@@ -2514,7 +2550,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
             continue;
         }
 
-        if info.unmerged && opts.cached {
+        if info.unmerged && (opts.cached || info.cached_entry) {
             // git's `diff_unmerge`: one record with the tree side and an empty
             // destination, whatever the stages hold.
             let (mode, id) = src.unwrap_or((0, null));
@@ -2534,7 +2570,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
         // git's `get_stat_data`.
         let mut dst_mode = info.mode;
         let mut dst_id = info.id;
-        if !opts.cached {
+        if !opts.cached && !info.cached_entry {
             let workdir = workdir.as_deref().expect("checked above");
             let full = worktree_path(workdir, path);
             match std::fs::symlink_metadata(&full) {

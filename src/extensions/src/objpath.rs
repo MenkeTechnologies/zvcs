@@ -378,6 +378,18 @@ pub fn verify_filename_diagnosis(repo: &gix::Repository, arg: &str) -> Option<St
     if b.first() == Some(&b':') && !b.get(1).is_some_and(u8::is_ascii_alphanumeric) {
         return None;
     }
+    // `maybe_die_on_misspelt_object_name()` is a whole second
+    // `get_oid_with_context_1()` over the same operand, not a lookup of the path
+    // half alone — so a plain refname that named nothing is dwim'd a *second* time
+    // here even though there is no better message waiting at the end of it. That is
+    // observable: `expand_ref()` speaks once per call, so
+    // `git rev-parse refs/heads/<dangling symref>` prints
+    // `warning: ignoring dangling symref …` twice where `--verify` — which dies at
+    // `die_no_single_rev()` and never reaches this function — prints it once.
+    if matches!(split(arg), Split::Rev) {
+        let _ = crate::porcelain::rev_parse::dwim_ref_matches(repo, arg);
+        return None;
+    }
     misspelt_object_name(repo, arg)
 }
 

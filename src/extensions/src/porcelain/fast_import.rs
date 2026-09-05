@@ -1503,20 +1503,62 @@ impl Importer {
             .ok_or_else(|| anyhow!("mark :{mark} not declared"))
     }
 
-    /// Validate and copy an identity line, keeping git's exact bytes.
+    /// git's `parse_ident` (builtin/fast-import.c:2001-2046): validate and copy an
+    /// identity line, keeping git's exact bytes.
     ///
     /// git stores the `<name> SP LT <email> GT SP <when>` text verbatim once the
     /// date validates, so the committer line in the object is the stream's own
     /// bytes; only the date is checked.
+    ///
+    /// The scan is deliberately the C one rather than "find the last `>`": git
+    /// takes the first byte that is either `<` or `>` and insists it is `<`, then
+    /// the next such byte and insists it is `>`. A name containing an angle
+    /// bracket is therefore rejected with a named diagnostic instead of quietly
+    /// producing an ident whose email is whatever came last.
     fn ident(&self, raw: &[u8]) -> Result<Vec<u8>> {
-        let gt = raw
+        // `if (*buf == '<') --buf;` guarantees the space delimiter even when the
+        // name is empty; the port cannot step behind the slice, so it treats an
+        // ident that opens with `<` as having its (absent) name end right there.
+        let leading_lt = raw.first() == Some(&b'<');
+        let lt = match leading_lt {
+            true => 0,
+            false => raw
+                .iter()
+                .position(|&b| b == b'<' || b == b'>')
+                .filter(|&i| raw[i] == b'<')
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing < in ident string: {}",
+                        String::from_utf8_lossy(raw)
+                    )
+                })?,
+        };
+        if !leading_lt && lt != 0 && raw[lt - 1] != b' ' {
+            bail!(
+                "missing space before < in ident string: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        let gt = raw[lt + 1..]
             .iter()
-            .rposition(|&b| b == b'>')
-            .ok_or_else(|| anyhow!("Missing > in ident string: {}", String::from_utf8_lossy(raw)))?;
+            .position(|&b| b == b'<' || b == b'>')
+            .map(|i| lt + 1 + i)
+            .filter(|&i| raw[i] == b'>')
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing > in ident string: {}",
+                    String::from_utf8_lossy(raw)
+                )
+            })?;
         let date = raw
             .get(gt + 1..)
             .and_then(|d| d.strip_prefix(b" "))
-            .ok_or_else(|| anyhow!("Missing space after > in ident string: {}", String::from_utf8_lossy(raw)))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing space after > in ident string: {}",
+                    String::from_utf8_lossy(raw)
+                )
+            })?;
         let strict = match self.opts.date_format {
             DateFormat::Raw => true,
             DateFormat::RawPermissive => false,
@@ -1630,10 +1672,23 @@ impl Importer {
 
         if !self.opts.force {
             if let Some(old) = old {
-                if old != new && !self.is_ancestor(old, new) {
-                    eprintln!("warning: not updating {name} (new tip {new} does not contain {old})");
-                    self.failed = true;
-                    return Ok(());
+                match self.is_ancestor(old, new) {
+                    // `return error(_("branch %s is missing commits."), b->name)`
+                    // (builtin/fast-import.c:1674) — one of the two ids does not
+                    // name a commit at all, so there is no ancestry to test.
+                    None => {
+                        eprintln!("error: branch {name} is missing commits.");
+                        self.failed = true;
+                        return Ok(());
+                    }
+                    Some(false) => {
+                        eprintln!(
+                            "warning: not updating {name} (new tip {new} does not contain {old})"
+                        );
+                        self.failed = true;
+                        return Ok(());
+                    }
+                    Some(true) => {}
                 }
             }
         }
@@ -1647,12 +1702,23 @@ impl Importer {
     /// *partial* name and searches the usual prefixes — which finds neither the
     /// `main` that `commit main` writes nor the `foo/bar` that `commit foo/bar`
     /// does, and would answer for `refs/heads/v1` when the stream said `v1`.
+    ///
+    /// It also stops at the first object rather than peeling to a commit.
+    /// `refs_read_ref()` resolves symrefs (`RESOLVE_REF_READING`) and hands back
+    /// whatever id the file holds, and that id is what `update_branch()` passes as
+    /// `old_oid` to `ref_transaction_update()` (builtin/fast-import.c:1663,
+    /// `:1690`) — so a `reset refs/tags/v0.2.0` over an *annotated* tag has to
+    /// expect the tag object, not the commit under it. Peeling here made every
+    /// such update fail its own expected-value check with `should have content
+    /// <commit>, actual content was <tag>` and abort the import. The peel git does
+    /// do is `lookup_commit_reference_gently()` inside the fast-forward guard
+    /// alone (`:1669-1672`), which is where [`Self::is_ancestor`] does it.
     fn current(&self, name: &str) -> Result<Option<ObjectId>> {
         if !name.starts_with("refs/") {
             return self.read_onelevel_ref(name);
         }
         Ok(match self.repo.try_find_reference(name)? {
-            Some(r) => Some(r.into_fully_peeled_id()?.detach()),
+            Some(mut r) => Some(r.follow_to_object()?.detach()),
             None => None,
         })
     }
@@ -1701,17 +1767,40 @@ impl Importer {
     }
 
     /// Whether `old` is reachable from `new`, i.e. the update loses no commits.
-    fn is_ancestor(&self, old: ObjectId, new: ObjectId) -> bool {
-        matches!(self.repo.merge_base(old, new), Ok(base) if base.detach() == old)
+    ///
+    /// Both sides go through `lookup_commit_reference_gently()` first
+    /// (builtin/fast-import.c:1669-1672), so an annotated tag on either end is
+    /// compared as the commit it names; `None` is git's `!old_cmit || !new_cmit`,
+    /// which is the `branch %s is missing commits.` error rather than a refusal.
+    fn is_ancestor(&self, old: ObjectId, new: ObjectId) -> Option<bool> {
+        let peel = |id: ObjectId| -> Option<ObjectId> {
+            Some(self.repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
+        };
+        let (old, new) = (peel(old)?, peel(new)?);
+        Some(matches!(self.repo.merge_base(old, new), Ok(base) if base.detach() == old))
     }
 
     /// Point `name` at `new`, with git's `fast-import` reflog message.
     ///
-    /// A ref that already holds `new` is left completely alone, so a `checkpoint`
-    /// followed by the end-of-stream flush does not append a second reflog entry
-    /// for an update that did not happen.
+    /// A ref that already holds `new` still goes through the transaction, because
+    /// git's does. `update_branch()` runs `ref_transaction_update()` unconditionally
+    /// (builtin/fast-import.c:1687-1697) and the backend decides what that means: a
+    /// no-op update writes no ref file and no reflog line of its own
+    /// (`oideq(&lock->old_oid, &update->new_oid)` leaves `REF_NEEDS_COMMIT` unset,
+    /// refs/files-backend.c:2807-2812), while the `REF_LOG_ONLY` mirror
+    /// `split_head_update()` added for `HEAD` is written regardless. So re-importing
+    /// a stream a repository already holds appends exactly one line to
+    /// `.git/logs/HEAD` — `<oid> <oid> <ident>\tfast-import` — and nothing to the
+    /// branch's own log. Measured on stock 2.55.0 with `reset refs/heads/main` to
+    /// the value main already had.
+    ///
+    /// An earlier short-circuit here returned before the transaction and so wrote
+    /// neither, which is why every "import a stream back into its own repository"
+    /// case diverged by that one line.
     fn write_ref(&self, name: &str, new: ObjectId, old: Option<ObjectId>) -> Result<()> {
-        if old == Some(new) {
+        if old == Some(new) && FullName::try_from(name).is_err() {
+            // A one-level ref has no reflog to write (see `write_onelevel_ref`),
+            // so a no-op update on one really is nothing at all.
             return Ok(());
         }
         if FullName::try_from(name).is_err() {
@@ -2213,14 +2302,34 @@ fn parse_mark(spec: &[u8]) -> Result<u64> {
         .ok_or_else(|| anyhow!("invalid mark: {text}"))
 }
 
-/// git's `validate_raw_date`: `<seconds> SP [+-]<digits>`, with the offset
-/// capped at 1400 and, under the strict (non-permissive) format, its minutes
-/// part below 60.
+/// git's `validate_raw_date` (builtin/fast-import.c:1966-1999): `<seconds> SP
+/// [+-]<digits>`, with the whole of the sanity checking — the `1400 < num` cap on
+/// the timezone — behind the `strict` flag.
+///
+/// `--date-format=raw-permissive` exists for importers whose source repository
+/// records offsets git would never write, so under it *any* parsable offset is
+/// accepted: git's own `-1800` test case is the point. The two `NEEDSWORK`
+/// comments in that function name checks git considered and did not make —
+/// `(num % 100) >= 60` and `((num % 100) % 15) != 0` — so neither is applied here
+/// either, in strict mode included. An earlier version of this function enforced
+/// the minutes one under `strict` and applied the 1400 cap unconditionally, which
+/// rejected both `--date-format=raw +0090` and the permissive format's whole
+/// reason for existing.
+///
+/// The `errno` check around each `strtoul` is what rejects an offset too large to
+/// represent, which is the parse failure below.
 fn valid_raw_date(date: &[u8], strict: bool) -> bool {
     let Some((secs, tz)) = split_space(date) else {
         return false;
     };
     if secs.is_empty() || !secs.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    if std::str::from_utf8(secs)
+        .unwrap_or("x")
+        .parse::<u64>()
+        .is_err()
+    {
         return false;
     }
     let Some((&sign, digits)) = tz.split_first() else {
@@ -2232,13 +2341,10 @@ fn valid_raw_date(date: &[u8], strict: bool) -> bool {
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return false;
     }
-    let Ok(offset) = std::str::from_utf8(digits).unwrap_or("x").parse::<u32>() else {
+    let Ok(offset) = std::str::from_utf8(digits).unwrap_or("x").parse::<u64>() else {
         return false;
     };
-    if offset > 1400 {
-        return false;
-    }
-    !(strict && offset % 100 > 59)
+    !(strict && offset > 1400)
 }
 
 /// Decode a stream field that git requires to be text (a ref name, a spec).

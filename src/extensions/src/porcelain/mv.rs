@@ -268,6 +268,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             force,
             ignore_sparse,
             ignore_case,
+            dry_run,
         ) {
             Ok(Planned::SparseSkip(src)) => only_match_skip_worktree.push(src),
             Ok(Planned::Move(plan)) => {
@@ -312,9 +313,6 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     // the index that describes them has been written.
     let mut materialize: Vec<String> = Vec::new();
     for plan in &plans {
-        if dry_run {
-            println!("Checking rename of '{}' to '{}'", plan.src_rel, plan.dst_rel);
-        }
         if verbose || dry_run {
             // ```c
             // if (show_only || verbose)
@@ -440,6 +438,7 @@ fn plan_source(
     force: bool,
     ignore_sparse: bool,
     ignore_case: bool,
+    show_only: bool,
 ) -> Result<Planned> {
     let src_rel = normalize_rel(workdir, prefix, src_arg)?;
     let src_abs = workdir.join(&src_rel);
@@ -452,6 +451,25 @@ fn plan_source(
         dest_rel.to_owned()
     };
     let dst_abs = workdir.join(&dst_rel);
+
+    // ```c
+    // /* Checking */
+    // for (i = 0; i < argc; i++) {
+    //         const char *src = sources.v[i], *dst = destinations.v[i];
+    //         …
+    //         if (show_only)
+    //                 printf(_("Checking rename of '%s' to '%s'\n"), src, dst);
+    // ```
+    //
+    // (builtin/mv.c:295-303.) The dry run announces the pair it is about to check
+    // *before* checking it, so every `bad` this loop can reach — `bad source`
+    // (`:322`), `can not move directory into itself` (`:348`), `destination
+    // exists` (`:365`) — has the line above it on stdout. Printing it from the
+    // apply phase instead, as this port did, meant a `git mv -n` that dies in the
+    // checking loop printed nothing at all.
+    if show_only {
+        println!("Checking rename of '{src_rel}' to '{dst_rel}'");
+    }
 
     // git reports a same-path move (and a move into a subpath of itself) with
     // this exact phrasing regardless of the item being a file.
@@ -617,6 +635,16 @@ fn plan_source(
     }
 
     let is_dir = meta.is_dir();
+    // `MOVE_VIA_PARENT_DIR` (builtin/mv.c:394-409) appends every index entry under
+    // a directory source to `sources`/`destinations` and grows `argc`, so the
+    // checking loop reaches each of them on a later iteration and prints its own
+    // `Checking rename of …` line — after the directory's. These remaps are that
+    // list, in index order, which is the order git appends them in.
+    if show_only && is_dir {
+        for (old, new) in &remaps {
+            println!("Checking rename of '{old}' to '{new}'");
+        }
+    }
     Ok(Planned::Move(Plan {
         src_abs,
         dst_abs,

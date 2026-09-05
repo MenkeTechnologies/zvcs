@@ -267,46 +267,101 @@ impl delegate::Navigate for Delegate<'_> {
                 handle_errors_and_replacements(&mut self.delayed_errors, objs, errors, &mut replacements)
             }
             None => {
+                // `:/<text>` with no anchor is `get_oid_oneline()` over the list
+                // `handle_one_ref()` built (`object-name.c:1308-1381`):
+                //
+                // ```c
+                // for_each_ref(handle_one_ref, &cb);      /* commit_list_insert(), i.e. prepend */
+                // …
+                // while (list) {
+                //         commit = pop_most_recent_commit(&list, ONELINE_SEEN);
+                //         …
+                //         if (matches) { oidcpy(oid, &commit->object.oid); found = 1; break; }
+                // }
+                // ```
+                //
+                // Two things about that walk are load-bearing and a generic
+                // commit-time traversal reproduces neither. `for_each_ref()` visits
+                // refs in name order while `commit_list_insert()` *prepends*, so the
+                // seeds are consumed in **reverse** name order — the last branch
+                // alphabetically is searched first. And `pop_most_recent_commit()`
+                // takes the list head and puts each parent back with
+                // `commit_list_insert_by_date()`, which walks past every entry whose
+                // date is `>=` the new one — so equal timestamps keep insertion
+                // order rather than heap order. On a fixture where every commit
+                // carries the same timestamp and two branches hold the same subject
+                // (an original and its cherry-pick), those two rules are the whole
+                // answer: stock names the pick on the later branch, and a
+                // `ByCommitTime` walk named the original.
                 let references = self.repo.references().or_erased()?;
                 let references = references.all().or_erased()?;
-                let iter = self
-                    .repo
-                    .rev_walk(
-                        references
-                            .peeled()
-                            .or_raise_erased(|| message("Couldn't configure iterator for peeling"))?
-                            .filter_map(Result::ok)
-                            .filter(|r| r.id().header().ok().is_some_and(|obj| obj.kind().is_commit()))
-                            .filter_map(|r| r.detach().peeled),
-                    )
-                    .sorting(crate::revision::walk::Sorting::ByCommitTime(Default::default()))
-                    .all()
-                    .or_erased()?;
+                let mut list: Vec<(ObjectId, gix_date::SecondsSinceUnixEpoch)> = Vec::new();
+                for r in references
+                    .peeled()
+                    .or_raise_erased(|| message("Couldn't configure iterator for peeling"))?
+                    .filter_map(Result::ok)
+                    .filter(|r| r.id().header().ok().is_some_and(|obj| obj.kind().is_commit()))
+                    .filter_map(|r| r.detach().peeled)
+                {
+                    if list.iter().any(|(id, _)| *id == r) {
+                        continue;
+                    }
+                    let time = self
+                        .repo
+                        .find_object(r)
+                        .ok()
+                        .and_then(|o| o.try_into_commit().ok())
+                        .and_then(|c| c.committer().ok().map(|s| s.seconds()))
+                        .unwrap_or_default();
+                    // `commit_list_insert()`: prepend.
+                    list.insert(0, (r, time));
+                }
+                let mut seen: std::collections::HashSet<ObjectId> =
+                    list.iter().map(|(id, _)| *id).collect();
                 let mut matched = false;
                 let mut count = 0;
-                let commits = iter.map(|res| {
-                    res.map_err(|err| err.raise_erased()).and_then(|commit| {
-                        commit
-                            .id()
-                            .object()
-                            .map_err(|err| err.raise_erased())
-                            .map(Object::into_commit)
-                    })
-                });
-                for commit in commits {
+                while !list.is_empty() {
+                    let (oid, _) = list.remove(0);
                     count += 1;
-                    match commit {
-                        Ok(commit) => {
-                            if matches(commit.message_raw_sloppy()) {
-                                let objs = self.objs[self.idx].get_or_insert_with(Vec::new);
-                                if !objs.contains(&commit.id) {
-                                    objs.push(commit.id);
-                                }
-                                matched = true;
-                                break;
-                            }
+                    let commit = match self
+                        .repo
+                        .find_object(oid)
+                        .map_err(|err| err.raise_erased())
+                        .map(Object::into_commit)
+                    {
+                        Ok(commit) => commit,
+                        Err(err) => {
+                            self.delayed_errors.push(err);
+                            continue;
                         }
-                        Err(err) => self.delayed_errors.push(err),
+                    };
+                    // `pop_most_recent_commit()` queues the parents before the caller
+                    // looks at the commit, so a match still leaves them queued — but
+                    // the loop breaks, so only the ordering up to the match matters.
+                    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+                    if matches(commit.message_raw_sloppy()) {
+                        let objs = self.objs[self.idx].get_or_insert_with(Vec::new);
+                        if !objs.contains(&commit.id) {
+                            objs.push(commit.id);
+                        }
+                        matched = true;
+                        break;
+                    }
+                    for parent in parents {
+                        if !seen.insert(parent) {
+                            continue;
+                        }
+                        let time = self
+                            .repo
+                            .find_object(parent)
+                            .ok()
+                            .and_then(|o| o.try_into_commit().ok())
+                            .and_then(|c| c.committer().ok().map(|s| s.seconds()))
+                            .unwrap_or_default();
+                        // `commit_list_insert_by_date()`: after every entry whose
+                        // date is not strictly smaller.
+                        let at = list.iter().position(|(_, d)| *d < time).unwrap_or(list.len());
+                        list.insert(at, (parent, time));
                     }
                 }
                 if matched {

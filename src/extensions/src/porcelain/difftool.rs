@@ -61,7 +61,14 @@
 //!   * `git difftool --no-index <a> <b>`: an inaccessible path → `error: Could
 //!     not access '<path>'`, exit 1; an identical pair → exit 0; a differing
 //!     regular-file pair under `-x<cmd>`/`--extcmd=` launches the command on the
-//!     two files directly (git's `--no-index` external-diff path).
+//!     two files directly (git's `--no-index` external-diff path) and then exits
+//!     1, because `run_file_diff()` returns the child `git diff --no-index`'s own
+//!     status and `diff_no_index()` sets `exit_with_status`.
+//!   * **The environment `cmd_difftool` exports and the helper reads back.**
+//!     `--tool`/`--extcmd`/`--gui` are `setenv`'d for the helper, and the helper
+//!     resolves them out of the environment — so `GIT_DIFF_TOOL`,
+//!     `GIT_DIFFTOOL_EXTCMD`, `GIT_DIFFTOOL_NO_PROMPT` and `GIT_DIFFTOOL_PROMPT`
+//!     set by the *caller* work exactly as the matching option does.
 //!
 //! What bails, honestly, because the substrate is not in the vendored crates:
 //! a *catalogue* tool's `diff_cmd`. `vimdiff`, `meld` and friends keep theirs in
@@ -339,6 +346,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
         if let Some(code) = empty_value_fatal(&opts) {
             return Ok(code);
         }
+        export_tool_env(&mut opts);
         return no_index(&opts);
     }
 
@@ -380,15 +388,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
     // pair — neither gets the command line. Without them the dir-diff run
     // resolved `diff.tool` from scratch and launched whatever the user's config
     // named instead of the tool that was asked for.
-    if let Some(gui) = opts.gui {
-        std::env::set_var("GIT_MERGETOOL_GUI", if gui { "true" } else { "false" });
-    }
-    if let Some(tool) = opts.tool.as_deref() {
-        std::env::set_var("GIT_DIFF_TOOL", tool);
-    }
-    if let Some(extcmd) = opts.extcmd.as_deref() {
-        std::env::set_var("GIT_DIFFTOOL_EXTCMD", extcmd);
-    }
+    export_tool_env(&mut opts);
 
     // Phase 4 — the launch.
     if opts.dir_diff {
@@ -427,6 +427,49 @@ impl Tool {
             Tool::Unset => "",
         }
     }
+}
+
+/// The three `setenv` calls `cmd_difftool` makes for the helper, followed by the
+/// helper's own reads of them.
+///
+/// ```c
+/// if (use_gui_tool)
+///         setenv("GIT_MERGETOOL_GUI", "true", 1);
+/// else if (difftool_cmd) { … setenv("GIT_DIFF_TOOL", difftool_cmd, 1); … }
+/// if (extcmd) { … setenv("GIT_DIFFTOOL_EXTCMD", extcmd, 1); … }
+/// ```
+///
+/// (`builtin/difftool.c:740-756`.) `--tool`, `--extcmd` and `--gui` reach the
+/// helper through the environment, because in file-diff mode the helper is one
+/// process per changed path and in dir-diff mode it is one process for the pair
+/// — neither gets the command line.
+///
+/// The helper resolves them back out of the environment rather than from an
+/// argv: `use_ext_cmd () { test -n "$GIT_DIFFTOOL_EXTCMD"; }` and
+/// `if test -n "$GIT_DIFF_TOOL"; then merge_tool="$GIT_DIFF_TOOL"`
+/// (`git-difftool--helper.sh:24-26,72-79`). So a run that named neither option
+/// still picks up whatever the caller exported, which is what makes
+/// `GIT_DIFF_TOOL=p git difftool -y` and `GIT_DIFFTOOL_EXTCMD=… git difftool -y`
+/// work. Reading the exported values back into `opts` is this port's stand-in
+/// for that second process reading its environment.
+fn export_tool_env(opts: &mut Opts) {
+    if let Some(gui) = opts.gui {
+        std::env::set_var("GIT_MERGETOOL_GUI", if gui { "true" } else { "false" });
+    }
+    if let Some(tool) = opts.tool.as_deref() {
+        std::env::set_var("GIT_DIFF_TOOL", tool);
+    }
+    if let Some(extcmd) = opts.extcmd.as_deref() {
+        std::env::set_var("GIT_DIFFTOOL_EXTCMD", extcmd);
+    }
+    opts.tool = std::env::var("GIT_DIFF_TOOL").ok();
+    opts.extcmd = std::env::var("GIT_DIFFTOOL_EXTCMD").ok();
+}
+
+/// Whether an environment variable would satisfy one of the helper's `test -n`
+/// guards: present and not the empty string.
+fn env_is_set(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|v| !v.is_empty())
 }
 
 /// `git-difftool--helper`'s prologue: `use_ext_cmd` wins, else `GIT_DIFF_TOOL`,
@@ -1374,26 +1417,31 @@ fn no_index(opts: &Opts) -> Result<ExitCode> {
         let (ma, mb) = (std::fs::symlink_metadata(a)?, std::fs::symlink_metadata(b)?);
         if ma.is_file() && mb.is_file() {
             if let Some(x) = opts.extcmd.as_deref().filter(|v| !v.is_empty()) {
+                // `run_diff` passes `name = p->one->path` and the helper's
+                // `MERGED="$1"` is that name, so both the prompt and the die
+                // below name the *left* path — `README.md` for
+                // `difftool --no-index README.md top.txt`, not `top.txt`.
                 let prompt = should_prompt(opts.prompt, None);
                 if prompt {
-                    print!("\nViewing (1/1): '{b}'\nLaunch '{x}' [Y/n]? ");
+                    print!("\nViewing (1/1): '{a}'\nLaunch '{x}' [Y/n]? ");
                     std::io::stdout().flush()?;
                     match read_reply()? {
-                        None => {
-                            eprintln!("fatal: external diff died, stopping at {b}");
-                            return Ok(ExitCode::from(128));
-                        }
-                        Some(ans) if ans == "n" => return Ok(ExitCode::SUCCESS),
+                        // `read ans || return` returns 1 from `launch_merge_tool`,
+                        // which is under 126 and untrusted, so the helper moves on
+                        // and leaves 0 — the run still ends at `git diff`'s own
+                        // exit code below.
+                        None => return Ok(differing_exit()),
+                        Some(ans) if ans == "n" => return Ok(differing_exit()),
                         Some(_) => {}
                     }
                 }
-                let status = run_cmd(x, Path::new(a), Path::new(b), b, true, "")?;
+                let status = run_cmd(x, Path::new(a), Path::new(b), a, true, "")?;
                 let trust = opts.trust.unwrap_or(false);
                 if status >= 126 || (status != 0 && trust) {
-                    eprintln!("fatal: external diff died, stopping at {b}");
+                    eprintln!("fatal: external diff died, stopping at {a}");
                     return Ok(ExitCode::from(128));
                 }
-                return Ok(ExitCode::SUCCESS);
+                return Ok(differing_exit());
             }
         }
         crate::git_fatal!(
@@ -1408,6 +1456,14 @@ fn no_index(opts: &Opts) -> Result<ExitCode> {
          parser rather than difftool's",
         paths.len()
     )
+}
+
+/// What `difftool --no-index` leaves behind once the pair has been shown:
+/// `run_file_diff` returns `run_command(child)`, the child being `git diff
+/// --no-index`, and `diff_no_index()` sets `revs->diffopt.flags.exit_with_status`
+/// — so a pair that differs is exit 1 no matter what the tool did with it.
+fn differing_exit() -> ExitCode {
+    ExitCode::from(1)
 }
 
 /// Whether two filesystem paths are diff-identical to `git diff --no-index`:
@@ -1431,11 +1487,46 @@ fn paths_identical(a: &str, b: &str) -> Result<bool> {
 /// prompt). Reads the repository's merged configuration when there is one, else
 /// the global files (`--no-index`, and the helper, also run outside a repository).
 pub(super) fn should_prompt(flag: Option<bool>, config: Option<&gix::config::File>) -> bool {
-    match flag {
-        Some(v) => v,
-        None => config_bool("difftool.prompt", config)
-            .or_else(|| config_bool("mergetool.prompt", config))
-            .unwrap_or(true),
+    // ```sh
+    // should_prompt () {
+    //         prompt_merge=$(git config --bool mergetool.prompt || echo true)
+    //         prompt=$(git config --bool difftool.prompt || echo $prompt_merge)
+    //         if test "$prompt" = true
+    //         then
+    //                 test -z "$GIT_DIFFTOOL_NO_PROMPT"
+    //         else
+    //                 test -n "$GIT_DIFFTOOL_PROMPT"
+    //         fi
+    // }
+    // ```
+    //
+    // (`git-difftool--helper.sh:13-22`.) The flag does not answer this directly:
+    // `run_file_diff` exports one variable and lets the config decide which of
+    // the two branches reads it —
+    //
+    // ```c
+    // if (prompt > 0)
+    //         env[2] = "GIT_DIFFTOOL_PROMPT=true";
+    // else if (!prompt)
+    //         env[2] = "GIT_DIFFTOOL_NO_PROMPT=true";
+    // ```
+    //
+    // (`builtin/difftool.c:675-678`.) Exporting one leaves the other as the
+    // caller had it, so a run with neither flag is entirely environment-driven —
+    // which is what makes `GIT_DIFFTOOL_NO_PROMPT=true git difftool --tool=p`
+    // launch without asking.
+    let (no_prompt, prompt_env) = match flag {
+        Some(true) => (env_is_set("GIT_DIFFTOOL_NO_PROMPT"), true),
+        Some(false) => (true, env_is_set("GIT_DIFFTOOL_PROMPT")),
+        None => (env_is_set("GIT_DIFFTOOL_NO_PROMPT"), env_is_set("GIT_DIFFTOOL_PROMPT")),
+    };
+    let configured = config_bool("difftool.prompt", config)
+        .or_else(|| config_bool("mergetool.prompt", config))
+        .unwrap_or(true);
+    if configured {
+        !no_prompt
+    } else {
+        prompt_env
     }
 }
 

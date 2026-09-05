@@ -13,6 +13,14 @@
 //! resolution order, which is git's. The `encoding` header is emitted when
 //! `i18n.commitEncoding` names something other than UTF-8, as git does.
 //!
+//! When no `encoding` header is written — i.e. the commit encoding *is* UTF-8 —
+//! the finished object is passed through `verify_utf8()`, which transcribes every
+//! byte that starts an ill-formed UTF-8 sequence as if it were Latin-1 and prints
+//! `Warning: commit message did not conform to UTF-8.` once. The check covers the
+//! whole buffer, headers included, so an author name carrying a raw `0xe9` is
+//! rewritten by it too — which is what `git am` on an `ISO-8859-1` mail depends
+//! on, since `mailinfo` leaves that header's bytes alone.
+//!
 //! Not covered: `-S`/`--gpg-sign` (commit signing needs a gpg driver that the
 //! vendored crates do not provide), and git's gecos-derived identity fallback
 //! when nothing is configured — both fail with a precise message rather than
@@ -40,7 +48,7 @@ use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
-use gix::objs::Kind;
+use gix::objs::{Kind, Write as _};
 
 /// git's own usage block, printed on stderr next to `error: unknown …`.
 /// `cmd_commit_tree()`'s `struct option options[]` (builtin/commit-tree.c), in
@@ -282,13 +290,119 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         parents: parents.into_iter().collect(),
         author,
         committer,
-        encoding,
+        encoding: encoding.clone(),
         message: BString::from(message),
         extra_headers: Vec::new(),
     };
-    let id = repo.write_object(&commit)?;
-    println!("{}", id.detach());
+
+    // ```c
+    // /* And check the encoding */
+    // if (encoding_is_utf8 && !verify_utf8(&buffer))
+    //         fprintf(stderr, _(commit_utf8_warn));
+    // ```
+    //
+    // (`commit.c:1571-1573`.) The check runs over the finished buffer, headers
+    // and all, so an author name carrying a raw Latin-1 byte is rewritten by it
+    // just as the message is — which is how `git am` on an `ISO-8859-1` mail
+    // ends up with a UTF-8 `author` line even though `mailinfo` left that
+    // header's bytes alone. `encoding_is_utf8` is exactly "no `encoding` header
+    // was written", so `i18n.commitEncoding=ISO-8859-1` keeps the bytes.
+    let mut buffer = Vec::new();
+    gix::objs::WriteTo::write_to(&commit, &mut buffer)?;
+    if encoding.is_none() && !verify_utf8(&mut buffer) {
+        eprintln!(
+            "Warning: commit message did not conform to UTF-8.\n\
+             You may want to amend it after fixing the message, or set the config\n\
+             variable i18n.commitEncoding to the encoding your project uses."
+        );
+    }
+    let id = repo
+        .objects
+        .write_buf(Kind::Commit, &buffer)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("{id}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// `find_invalid_utf8()` (`commit.c:1417`): the offset of the first byte that
+/// starts an ill-formed UTF-8 sequence, or `None` when the whole slice is valid.
+///
+/// It is stricter than a bare decoder: an overlong encoding, a surrogate, a
+/// `U+xxFFFE`/`U+xxFFFF` non-character and anything in `U+FDD0..U+FDEF` are all
+/// rejected, each of them at the offset the sequence *started*.
+fn find_invalid_utf8(buf: &[u8]) -> Option<usize> {
+    const MAX_CODEPOINT: [u32; 4] = [0x7f, 0x7ff, 0xffff, 0x10_ffff];
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        let c = buf[offset];
+        let bad_offset = offset;
+        offset += 1;
+        // "Simple US-ASCII? No worries."
+        if c < 0x80 {
+            continue;
+        }
+        // "Count how many more high bits set: that's how many more bytes this
+        // sequence should have."
+        let mut shifted = c;
+        let mut bytes = 0usize;
+        while shifted & 0x40 != 0 {
+            shifted <<= 1;
+            bytes += 1;
+        }
+        // "Must be between 1 and 3 more bytes." Longer sequences would land
+        // beyond U+10FFFF.
+        if !(1..=3).contains(&bytes) || buf.len() - offset < bytes {
+            return Some(bad_offset);
+        }
+        let mut codepoint = u32::from(shifted & 0x7f) >> bytes;
+        let (min_val, max_val) = (MAX_CODEPOINT[bytes - 1] + 1, MAX_CODEPOINT[bytes]);
+        // "And verify that they are good continuation bytes".
+        for _ in 0..bytes {
+            let b = buf[offset];
+            offset += 1;
+            codepoint = (codepoint << 6) | u32::from(b & 0x3f);
+            if b & 0xc0 != 0x80 {
+                return Some(bad_offset);
+            }
+        }
+        if codepoint < min_val
+            || codepoint > max_val
+            || codepoint & 0x1f_f800 == 0xd800
+            || codepoint & 0xfffe == 0xfffe
+            || (0xfdd0..=0xfdef).contains(&codepoint)
+        {
+            return Some(bad_offset);
+        }
+    }
+    None
+}
+
+/// `verify_utf8()` (`commit.c:1504`).
+///
+/// > This verifies that the buffer is in proper utf8 format.
+/// >
+/// > If it isn't, it assumes any non-utf8 characters are Latin1, and does the
+/// > conversion.
+///
+/// Returns whether the buffer was already valid; a `false` answer means bytes
+/// were rewritten and the caller prints the warning.
+fn verify_utf8(buf: &mut Vec<u8>) -> bool {
+    let mut ok = true;
+    let mut pos = 0usize;
+    loop {
+        let Some(bad) = find_invalid_utf8(&buf[pos..]) else {
+            return ok;
+        };
+        pos += bad;
+        ok = false;
+        // "We know 'c' must be in the range 128-255": the one offending byte is
+        // replaced by its two-byte Latin-1 transcription, and the scan resumes
+        // after it.
+        let c = buf[pos];
+        buf[pos] = 0xc0 + (c >> 6);
+        buf.insert(pos + 1, 0x80 + (c & 0x3f));
+        pos += 2;
+    }
 }
 
 /// Insert git's paragraph separator before appending the next message chunk.

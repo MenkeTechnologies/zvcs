@@ -133,6 +133,17 @@
 //!     `--ita-visible-in-index` and `--max-depth=<n>`: there is no tree walk, no
 //!     submodule and no index here — the two filespecs are the `is_stdin`
 //!     buffers `get_filespec()` builds (range-diff.c:477-489).
+//! * The output formats `diff_flush()` writes for the one filepair
+//!   `patch_diff()` queues, rendered by [`flush_pair`] in `diff_flush()`'s own
+//!   order: `--raw`, `--name-only`, `--name-status` and `--check` first, then
+//!   `--stat` / `--numstat` / `--shortstat`, then the patch — with the
+//!   `separator` between the groups that `DIFF_FORMAT_PATCH` turns into one
+//!   four-space line. `--patch-with-raw` and `--patch-with-stat` are the two
+//!   spellings that set a group *and* the patch, so they are the two that show
+//!   it. The filepair is fixed at paths `a`/`b`, mode `0100644`, both valid with
+//!   the null id (range-diff.c:477-489), which is what makes `--raw`'s two id
+//!   columns a run of zeroes, `--name-only` print `b` and `--name-status` print
+//!   `M	a`.
 //! * Rename and copy detection inside the patches. The inner `git log` runs with
 //!   no `-M` of its own (range-diff.c:44-59), so it detects with whatever
 //!   `diff.renames` says — on, at the default 50% similarity, unless the config
@@ -189,8 +200,10 @@
 //!   empty body, and the one that is easy to miss: `patch_diff()` does run, but
 //!   the filepair it queues has nothing to report, so `diff_flush()` writes
 //!   nothing under `-p`, `--stat`, `--numstat`, `--shortstat`,
-//!   `--compact-summary`, `--dirstat`, `--summary` or `--check`, and the
-//!   deferred option that asked for one of them is again unobservable. The
+//!   `--compact-summary`, `--dirstat`, `--summary` or `--check` — the last three
+//!   groups all open with `diff_unmodified_pair()`, which is what
+//!   [`flush_pair`]'s `unmodified` arm reproduces — and the deferred option that
+//!   asked for one of them is again unobservable. The
 //!   exceptions are `--raw`, `--name-only` and `--name-status`, whose loop is
 //!   gated on `check_pair_status()` alone and lists the pair whatever its
 //!   content — `diff_unmodified_pair()` compares the two filespec *paths*, which
@@ -225,10 +238,12 @@
 //!
 //! ### Not covered — these stop rather than emit output that would diverge
 //!
-//! * The output formats that replace the patch body — `--stat` and its width
-//!   options, `--compact-summary`, `--numstat`, `--shortstat`, `--dirstat`,
-//!   `--summary`, `--raw`, `--name-only`, `--name-status`, `--check` — none of
-//!   which this port renders.
+//! * `--stat=<width>` and the `--stat-*-width` / `--stat-count` spellings, and
+//!   `--compact-summary`: they carry a geometry (and, for the last, a per-row
+//!   annotation) this port does not thread into [`diffstat::show_stats`]. Plain
+//!   `--stat` is rendered, at the flat 80 columns `repo_diff_setup()`'s zeroed
+//!   widths give it — `builtin/range-diff.c` never calls
+//!   `init_diffstat_widths()`.
 //! * The pickaxe *filters* `-S`, `-G` and `--find-object`: `diffcore_pickaxe()`
 //!   can drop the diff-of-diffs' single filepair, which empties the body. Their
 //!   modifiers `--pickaxe-all` and `--pickaxe-regex` are accepted instead, since
@@ -307,7 +322,7 @@ use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::prelude::ObjectIdExt;
 
-use super::{diff_color, Arg, LongOpt};
+use super::{diff_color, diff_files, diffstat, Arg, LongOpt};
 use crate::objname;
 
 /// `RANGE_DIFF_CREATION_FACTOR_DEFAULT`.
@@ -866,9 +881,14 @@ struct Opts {
     /// its `git log` uses a built-in pretty format and so takes
     /// `cmd_log_init_finish()`'s default-notes branch.
     notes: super::notes::DisplayOpt,
-    /// `-s` / `--no-patch`: emit only the pair headers, no diff-of-diffs body,
-    /// exactly as `DIFF_FORMAT_NO_OUTPUT` suppresses the inner patch.
-    no_patch: bool,
+    /// `diffopt.output_format` as `diff_setup_done()` leaves it — the `FMT_*`
+    /// bits [`flush_pair`] dispatches on, `DIFF_FORMAT_NO_OUTPUT` (`-s` /
+    /// `--no-patch` / `--quiet`) included.
+    output_format: u32,
+    /// `o->flags.dirstat_by_line`: `--dirstat=lines` writes nothing for this
+    /// filepair but still rides inside the stat group's block, so it bumps the
+    /// separator `DIFF_FORMAT_PATCH` turns into one four-space line.
+    dirstat_by_line: bool,
     /// `--max-memory=<size>`: the cost matrix's byte budget, checked in
     /// [`get_correspondences`] (range-diff.c:335-344). The default is the 4 GiB
     /// `RANGE_DIFF_MAX_MEMORY_DEFAULT` the `-h` text spells "default 4G".
@@ -939,7 +959,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         // the default notes tree when no `--notes`/`--no-notes` reached it, so
         // the fallback is applied after the whole command line has been read.
         notes: super::notes::DisplayOpt::default(),
-        no_patch: false,
+        output_format: FMT_PATCH,
+        dirstat_by_line: false,
         max_memory: MAX_MEMORY_DEFAULT,
         algorithm: Algorithm::Myers,
         indent_heuristic: true,
@@ -1379,12 +1400,6 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            // The four mutually-exclusive `diff_setup_done()` output formats.
-            // Each still changes the diff-of-diffs body this port cannot render,
-            // so they stay deferred; but their bits are tracked here so the
-            // `cannot be used together` fatal can fire before any revision is
-            // resolved. `-s`/`--no-patch` assigns `NO_OUTPUT`, clearing the rest.
-            "--name-only" | "--name-status" | "--check" => opts.defer(unsupported_flag(a)),
             // `-s`/`--no-patch` assigns `DIFF_FORMAT_NO_OUTPUT`, clearing the
             // other format bits, and suppresses the diff-of-diffs body entirely
             // — leaving the pair headers, which this port renders. So it is
@@ -1519,7 +1534,25 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     format_bits(name, inline),
                     Some((FMT_SUMMARY, _)) | Some((FMT_DIRSTAT, false))
                 );
-                if !writes_nothing {
+                // The formats [`flush_pair`] renders itself. Their bytes are
+                // fixed by the filepair's shape (`--raw`, `--name-only`,
+                // `--name-status`) or derived from the same outer diff the patch
+                // body is (`--check` and the stat group), so nothing is left for
+                // a later flag to change. `--stat=<width>` and the
+                // `--stat-*-width` spellings are excluded: they carry a geometry
+                // this port does not thread into `show_stats()`.
+                let rendered = matches!(
+                    name,
+                    "--raw"
+                        | "--name-only"
+                        | "--name-status"
+                        | "--check"
+                        | "--patch-with-raw"
+                        | "--patch-with-stat"
+                        | "--numstat"
+                        | "--shortstat"
+                ) || (name == "--stat" && inline.is_none());
+                if !writes_nothing && !rendered {
                     opts.defer(unsupported_flag(a));
                 }
                 if inline.is_none()
@@ -1585,8 +1618,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     if output_format == 0 {
         output_format = FMT_PATCH;
     }
-    // Everything below asks only whether the diff-of-diffs body is written.
-    opts.no_patch = output_format & FMT_PATCH == 0;
+    // `diff_setup_done()` is finished with `output_format`; from here on it is
+    // [`flush_pair`]'s dispatch table.
+    opts.output_format = output_format;
+    opts.dirstat_by_line = dirstat_by_line;
     // The three pickaxe refusals, in `diff_setup_done()`'s own order
     // (diff.c:5263-5273), each a `HAS_MULTI_BITS` test on `pickaxe_opts`.
     for (mask, message) in [
@@ -1827,7 +1862,10 @@ pub(super) fn show_range_diff(
         left_only: false,
         right_only: false,
         notes: notes_opt,
-        no_patch: false,
+        // `log-tree.c`'s `show_diff_of_diff()` leaves `diffopt.output_format` at
+        // zero, which `output()` turns into `DIFF_FORMAT_PATCH`.
+        output_format: FMT_PATCH,
+        dirstat_by_line: false,
         // `show_range_diff()` is reached from `log-tree.c`, which leaves
         // `range_diff_opts` at its defaults.
         max_memory: MAX_MEMORY_DEFAULT,
@@ -3802,8 +3840,11 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
         if j < b.len() {
             let ai = b[j].matching as usize;
             pair_header(out, patch_no_width, &mut dashes, Some(&a[ai]), Some(&b[j]), &opts.colors)?;
-            if !opts.no_patch {
-                patch_diff(out, &a[ai].text, &b[j].text, opts)?;
+            if opts.output_format & FMT_NO_OUTPUT == 0 {
+                // `dashes` is `find_unique_abbrev()`'s width, which is also the
+                // width `--raw`'s null-id columns print to.
+                let abbrev_len = dashes.as_deref().map_or(0, str::len);
+                flush_pair(out, &a[ai].text, &b[j].text, abbrev_len, opts)?;
             }
             a[ai].shown = true;
             j += 1;
@@ -3906,6 +3947,228 @@ fn decimal_width(mut number: u64) -> usize {
 /// `--diff-algorithm`, `--no-indent-heuristic`, `-U<n>`, the three
 /// `--output-indicator-*` markers and the whole colour palette all land here and
 /// nowhere else.
+/// Write `body` with [`INDENT`] — the four-space `output_prefix`
+/// `output_prefix_cb()` (range-diff.c:493-496) hands the outer diff — ahead of
+/// each of its lines, the way `diff_line_prefix()` does for every emitter. The
+/// pair headers are the one exception: `output_pair_header()` `fwrite`s its line
+/// straight to `diffopt->file`.
+fn indented(out: &mut Vec<u8>, body: &[u8]) {
+    for line in body.split_inclusive(|b| *b == b'\n') {
+        out.extend_from_slice(INDENT);
+        out.extend_from_slice(line);
+    }
+}
+
+/// `pprint_rename("a", "b")` (`diff.c`) for range-diff's filepair: the two
+/// filespecs share no directory and no basename, so the general
+/// `pfx{old => new}sfx` form collapses to the whole of both names.
+const RENAME_NAME: &[u8] = b"a => b";
+
+/// `diff_flush()` (diff.c:6519) for the one filepair `patch_diff()` queues:
+/// raw/name/name-status/checkdiff first, then the stat group, then the patch —
+/// with `separator` carried between them exactly as upstream carries it.
+///
+/// Three of those groups are gated on `diff_unmodified_pair()`
+/// (`diff_flush_stat`, `diff_flush_checkdiff` and `diff_flush_patch` each open
+/// with it) while the raw/name group is gated on `check_pair_status()` alone.
+/// For this filepair the two answers differ only by content — the filespecs are
+/// fixed at `a`/`b`, mode `0100644`, both valid — so the `=` pair whose two
+/// patch texts are byte-identical lists in `--raw` and prints nothing anywhere
+/// else, while still bumping the separator the stat group bumps unconditionally.
+///
+/// `abbrev_len` is `diff_aligned_abbrev(&p->one->oid, opt->abbrev)`'s width for
+/// `--raw`'s two id columns. Both filespecs carry the null id
+/// (`fill_filespec(spec, null_oid(), 0, 0100644)`, range-diff.c:481), which no
+/// object matches, so `find_unique_abbrev()` leaves it at the requested length
+/// and both columns are the same run of zeroes — the same length the pair
+/// headers' `dashes` run to.
+fn flush_pair(
+    out: &mut Vec<u8>,
+    a: &[u8],
+    b: &[u8],
+    abbrev_len: usize,
+    opts: &Opts,
+) -> Result<()> {
+    let fmt = opts.output_format;
+    let unmodified = a == b;
+    let mut separator = false;
+
+    if fmt & (FMT_RAW | FMT_NAME | FMT_NAME_STATUS | FMT_CHECKDIFF) != 0 {
+        // `flush_one_pair()` (diff.c:6079): checkdiff wins, then raw/name-status
+        // share `diff_flush_raw()`, then name.
+        if fmt & FMT_CHECKDIFF != 0 {
+            if !unmodified {
+                check_pair(out, a, b, opts);
+            }
+        } else if fmt & (FMT_RAW | FMT_NAME_STATUS) != 0 {
+            out.extend_from_slice(INDENT);
+            // `diff_flush_raw()`: the mode/id columns are skipped under
+            // `--name-status`, and a plain `M` prints only `p->one->path`.
+            if fmt & FMT_NAME_STATUS == 0 {
+                let zeroes = "0".repeat(abbrev_len);
+                out.extend_from_slice(
+                    format!(":100644 100644 {zeroes} {zeroes} ").as_bytes(),
+                );
+            }
+            out.extend_from_slice(b"M\ta\n");
+        } else {
+            // `DIFF_FORMAT_NAME` writes `p->two->path`, the only place the `b`
+            // side's name is ever printed.
+            out.extend_from_slice(INDENT);
+            out.extend_from_slice(b"b\n");
+        }
+        separator = true;
+    }
+
+    // `--dirstat=lines` reports directories and both paths sit at the root, so
+    // it writes nothing — but it rides inside this block and so bumps the
+    // separator (diff.c:6549-6566).
+    let dirstat_by_line = fmt & FMT_DIRSTAT != 0 && opts.dirstat_by_line;
+    if fmt & FMT_STAT_GROUP != 0 || dirstat_by_line {
+        if !unmodified {
+            let (added, deleted) = outer_diff_counts(a, b, opts);
+            let files = [diffstat::StatFile::text(RENAME_NAME.to_vec(), added, deleted)];
+            if fmt & FMT_NUMSTAT != 0 {
+                // `show_numstat()` (diff.c:2892): a renamed row prints
+                // `print_name` rather than the quoted `name`.
+                indented(out, format!("{added}\t{deleted}\ta => b\n").as_bytes());
+            }
+            if fmt & FMT_DIFFSTAT != 0 {
+                let mut rendered = Vec::new();
+                // `builtin/range-diff.c` never calls `init_diffstat_widths()`, so
+                // the geometry reaches `show_stats()` as the zeroes
+                // `repo_diff_setup()` left: a flat 80 columns, no `$COLUMNS` and
+                // no `diff.stat*Width`.
+                diffstat::show_stats(
+                    &mut rendered,
+                    &files,
+                    &diffstat::StatWidths::plumbing(),
+                    &opts.colors,
+                );
+                indented(out, &rendered);
+            }
+            if fmt & FMT_SHORTSTAT != 0 {
+                let mut rendered = Vec::new();
+                diffstat::show_shortstats(&mut rendered, &files);
+                indented(out, &rendered);
+            }
+        }
+        separator = true;
+    }
+
+    // `--summary` never writes and never bumps the separator: `is_summary_empty()`
+    // is true for a pair with no creation, deletion, rename, copy or mode change,
+    // and this pair can have none of them.
+
+    if fmt & FMT_PATCH != 0 {
+        if separator {
+            // `DIFF_SYMBOL_SEPARATOR`: the line prefix and nothing else.
+            out.extend_from_slice(INDENT);
+            out.push(b'\n');
+        }
+        if !unmodified {
+            patch_diff(out, a, b, opts)?;
+        }
+    }
+    Ok(())
+}
+
+/// The added/deleted counts `diffstat_consume()` accumulates for the outer diff:
+/// every `+` and `-` record xdiff emits, which is every line inside a change
+/// region. The context width does not enter into it, so the same diff
+/// [`patch_diff`] renders answers both.
+fn outer_diff_counts(a: &[u8], b: &[u8], opts: &Opts) -> (u64, u64) {
+    let input = InternedInput::new(a, b);
+    let diff = match opts.indent_heuristic {
+        true => diff_with_slider_heuristics(opts.algorithm, &input),
+        false => {
+            let mut d = Diff::compute(opts.algorithm, &input);
+            d.postprocess_no_heuristic(&input);
+            d
+        }
+    };
+    let mut added = 0u64;
+    let mut deleted = 0u64;
+    for h in diff.hunks() {
+        deleted += h.before.len() as u64;
+        added += h.after.len() as u64;
+    }
+    (added, deleted)
+}
+
+/// `builtin_checkdiff()` (diff.c:3808) driving `checkdiff_consume()`
+/// (diff.c:3196) over the outer diff.
+///
+/// Only the new side is examined, and the diff it walks is its own: `xecfg.ctxlen
+/// = 1` with `xpp.flags = 0`, so neither `--diff-algorithm` nor the indent
+/// heuristic nor any `-w`-family flag reaches it. `data.filename` is
+/// `name_b ? name_b : name_a`, and `name_b` is set whenever the two paths differ
+/// — always, here — so every report names `b`.
+fn check_pair(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) {
+    let set = opts.colors.get(diff_color::DiffSlot::New);
+    let ws_color = opts.colors.get(diff_color::DiffSlot::Whitespace);
+    let reset = opts.colors.reset();
+    // `ll_merge_marker_size()` with no `conflict-marker-size` attribute:
+    // `DEFAULT_CONFLICT_MARKER_SIZE`.
+    const MARKER_SIZE: usize = 7;
+
+    let after: Vec<&[u8]> = b.split_inclusive(|c| *c == b'\n').collect();
+    let input = InternedInput::new(a, b);
+    let mut diff = Diff::compute(Algorithm::Myers, &input);
+    diff.postprocess_no_heuristic(&input);
+
+    for h in diff.hunks() {
+        let start = h.after.start as usize;
+        for (k, line) in after[start..start + h.after.len()].iter().enumerate() {
+            // `checkdiff_consume_hunk()` resets `lineno` to the hunk's `nb - 1`
+            // and every `+`/` ` record steps it, which makes it the line's
+            // one-based position in the postimage.
+            let lineno = start + k + 1;
+            // xdiff hands whole lines to the consumer: a final line without a
+            // terminator arrives with the newline `xdl_emit_diff()` writes ahead
+            // of the `\ No newline at end of file` marker.
+            let mut body: Vec<u8> = (*line).to_vec();
+            if body.last() != Some(&b'\n') {
+                body.push(b'\n');
+            }
+            if diff_files::is_conflict_marker_sized(&body, MARKER_SIZE) {
+                indented(out, format!("b:{lineno}: leftover conflict marker\n").as_bytes());
+            }
+            let bad = diff_color::ws_check(&body, opts.ws_rule);
+            if bad == 0 {
+                continue;
+            }
+            indented(
+                out,
+                format!("b:{lineno}: {}.\n", diff_color::whitespace_error_string(bad)).as_bytes(),
+            );
+            // `emit_line(o, set, reset, line, 1)` prints the `+` marker xdiff
+            // prepended, then `ws_check_emit()` repaints the body — which is
+            // itself a patch line, so a `+` line of the new series shows as `++`.
+            out.extend_from_slice(INDENT);
+            out.extend_from_slice(set.as_bytes());
+            out.push(b'+');
+            out.extend_from_slice(reset.as_bytes());
+            diff_color::ws_check_emit(out, &body, opts.ws_rule, set, reset, ws_color);
+        }
+    }
+
+    // The `WS_BLANK_AT_EOF` tail (diff.c:3853-3869), whose `fprintf` is the one
+    // report in this function that does *not* carry the line prefix.
+    if opts.ws_rule & diff_color::WS_BLANK_AT_EOF != 0 {
+        let (_, post) = diff_color::check_blank_at_eof(a, b);
+        if post != 0 {
+            out.extend_from_slice(
+                format!(
+                    "b:{post}: {}.\n",
+                    diff_color::whitespace_error_string(diff_color::WS_BLANK_AT_EOF)
+                )
+                .as_bytes(),
+            );
+        }
+    }
+}
+
 fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> {
     let input = InternedInput::new(a, b);
     let diff = match opts.indent_heuristic {

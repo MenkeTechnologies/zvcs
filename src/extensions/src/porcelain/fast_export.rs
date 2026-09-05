@@ -106,7 +106,10 @@
 //! * `--signed-commits=(strip|warn-strip|abort)`, `--reencode=(no|abort)`; the
 //!   two `abort` modes reproduce git's `die()` message and exit 128, and all
 //!   modes are accepted at parse time since most commits trigger none of them
-//! * `--anonymize`
+//! * `--anonymize`, and `--anonymize-map=<from>[:<to>]` seeding it: the seed
+//!   table is consulted by every `anonymize_str()` caller — path and ref
+//!   components, idents, object ids and tag messages — ahead of that caller.s own
+//!   table, and a hit never advances the generated `<prefix><n>` counter
 //! * rev-list limiting: `--max-count=<n>`, `--skip=<n>`, `--no-merges`,
 //!   `--merges`, `--first-parent`, `--topo-order`, `--date-order`, `--reverse`
 //! * `--ancestry-path` (without a pathspec) — git's `limit_to_ancestry` over the
@@ -142,9 +145,6 @@
 //!
 //! ### Honest limitations (bailed on with a precise message, never silently ignored)
 //!
-//! * `--anonymize-map=<from>[:<to>]` — git's seed interacts with a single shared
-//!   token table (refs, paths and idents draw from the same map) whose exact
-//!   structure this port's per-category tables do not reproduce.
 //! * `--signed-commits=(verbatim|warn-verbatim)` on a signed commit — emitting
 //!   `gpgsig` stanzas requires the experimental signed-commit stream extension.
 //! * `--reencode=yes` on a commit carrying an `encoding` header — needs iconv;
@@ -732,28 +732,77 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     if let Some((path, if_exists)) = &import_marks {
         match std::fs::read(path) {
             Ok(bytes) => {
-                for line in bytes.split(|b| *b == b'\n') {
-                    if line.is_empty() {
+                // ```c
+                // line_end = strchr(line, '\n');
+                // if (line[0] != ':' || !line_end)
+                //         die("corrupt mark line: %s", line);
+                // *line_end = '\0';
+                //
+                // mark = strtoumax(line + 1, &mark_end, 10);
+                // if (!mark || mark_end == line + 1
+                //         || *mark_end != ' ' || get_oid_hex(mark_end + 1, &oid))
+                //         die("corrupt mark line: %s", line);
+                // ```
+                //
+                // (`builtin/fast-export.c:1078-1086`.) A line that is not a mark
+                // is fatal, not skipped — pointing `--import-marks` at an
+                // ordinary file stops the export at its first line. The first
+                // check fires before `*line_end = '\0'`, so its message still
+                // carries the line's own newline and `die()`'s follows it.
+                let mut rest = bytes.as_slice();
+                while !rest.is_empty() {
+                    // `fgets()` keeps the terminator and returns NULL at end of
+                    // input, so the only line that can arrive without one is a
+                    // final unterminated line — which fails the `!line_end` half.
+                    let (line, tail) = match rest.iter().position(|b| *b == b'\n') {
+                        Some(nl) => rest.split_at(nl + 1),
+                        None => (rest, &rest[rest.len()..]),
+                    };
+                    rest = tail;
+                    let corrupt = |body: &[u8]| {
+                        fatal(&format!("corrupt mark line: {}", String::from_utf8_lossy(body)))
+                    };
+                    if line.first() != Some(&b':') || line.last() != Some(&b'\n') {
+                        return Ok(corrupt(line));
+                    }
+                    let body = &line[..line.len() - 1];
+                    // `strtoumax(line + 1, &mark_end, 10)`: the digits stop at the
+                    // first byte that is not one, and `mark_end == line + 1`
+                    // catches a run with no digits at all.
+                    let digits = body[1..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    let mark: u32 = std::str::from_utf8(&body[1..1 + digits])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    let mark_end = &body[1 + digits..];
+                    if mark == 0 || digits == 0 || mark_end.first() != Some(&b' ') {
+                        return Ok(corrupt(body));
+                    }
+                    // `get_oid_hex()` reads exactly `hexsz` hex digits and ignores
+                    // whatever follows them.
+                    let hexsz = repo.object_hash().len_in_hex();
+                    let Some(hex) = mark_end.get(1..1 + hexsz) else {
+                        return Ok(corrupt(body));
+                    };
+                    let Ok(id) = ObjectId::from_hex(hex) else {
+                        return Ok(corrupt(body));
+                    };
+                    // `last_idnum` is raised before the object is looked at, so a
+                    // mark naming an object this repository does not have has
+                    // already moved the counter when the run dies.
+                    imported_max = imported_max.max(mark);
+                    // `oid_object_info()` then `if (type != OBJ_COMMIT) continue;`
+                    // — only commits are pre-marked, and a missing object is
+                    // fatal.
+                    let Ok(header) = repo.find_header(id) else {
+                        return Ok(fatal(&format!("object not found: {id}")));
+                    };
+                    if header.kind() != gix::object::Kind::Commit {
                         continue;
                     }
-                    // `:<decimal-mark> <hex-oid>`
-                    let Some(rest) = line.strip_prefix(b":") else {
-                        continue;
-                    };
-                    let Some(sp) = rest.iter().position(|b| *b == b' ') else {
-                        continue;
-                    };
-                    let (mark_bytes, oid_bytes) = (&rest[..sp], &rest[sp + 1..]);
-                    let Ok(mark) = std::str::from_utf8(mark_bytes)
-                        .unwrap_or("")
-                        .parse::<u32>()
-                    else {
-                        continue;
-                    };
-                    let Ok(id) = ObjectId::from_hex(oid_bytes) else {
-                        continue;
-                    };
-                    imported_max = imported_max.max(mark);
                     imported_marks.push((mark, id));
                 }
             }
@@ -780,8 +829,32 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     if ancestry_path && !pathspecs.is_empty() {
         bail!("--ancestry-path with a pathspec is not supported");
     }
-    if !anonymize_map.is_empty() {
-        bail!("--anonymize-map is not supported");
+    // ---- `--anonymize-map=<from>[:<to>]`: seed the anonymizer's tables. ----
+    // ```c
+    // delim = strchr(arg, ':');
+    // if (delim) { keylen = delim - arg; value = delim + 1; }
+    // else       { keylen = strlen(arg); value = arg; }
+    // if (!keylen || !*value)
+    //         return error(_("--anonymize-map token cannot be empty"));
+    // anonymize_str(map, anonymize_seed, arg, keylen, (void *)value);
+    // ```
+    //
+    // (`builtin/fast-export.c:1142-1154`.) With no `:<to>` the token maps to
+    // itself, which is how `--anonymize-map=README.md` keeps that one path
+    // readable in an otherwise anonymised stream. The seed goes through
+    // `anonymize_str` on the seed table itself, so a token named twice keeps its
+    // first mapping.
+    let mut seeds: HashMap<BString, BString> = HashMap::new();
+    for spec in &anonymize_map {
+        let (key, value) = match spec.split_once(':') {
+            Some((k, v)) => (k, v),
+            None => (spec.as_str(), spec.as_str()),
+        };
+        if key.is_empty() || value.is_empty() {
+            eprintln!("error: --anonymize-map token cannot be empty");
+            return Ok(usage_exit());
+        }
+        seeds.entry(BString::from(key)).or_insert_with(|| BString::from(value));
     }
 
     // ---- `--refspec`: rename exported refs through push-style refspecs. ----
@@ -812,6 +885,14 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         let mut names: Vec<BString> = Vec::new();
         for reference in repo.references()?.all()? {
             let reference = reference.map_err(|e| anyhow!("{e}"))?;
+            // `handle_one_ref()`'s `if (flag & REF_ISSYMREF) return 0;`: a
+            // symbolic ref never becomes a `revs->cmdline` entry, so
+            // `refs/remotes/origin/HEAD` — the one every clone has — contributes
+            // neither a source name nor a trailing `reset`. Only the ref it
+            // points at does.
+            if matches!(reference.target(), gix::refs::TargetRef::Symbolic(_)) {
+                continue;
+            }
             let name = reference.name().as_bstr().to_owned();
             if prefix.is_none_or(|p| name.starts_with(p)) {
                 names.push(name);
@@ -1029,7 +1110,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             Order::Date => tips.clone(),
         };
         let topo = gix::traverse::commit::topo::Builder::from_iters(
-            &repo.objects,
+            GraftedCommits { repo: &repo, grafts: repo.commit_grafts().clone() },
             seed,
             Some(hidden.clone()),
         )
@@ -1153,7 +1234,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         last_mark: 0,
         counter: 0,
         labels: std::collections::HashSet::new(),
-        anon: Anon::default(),
+        anon: Anon { seeds, ..Anon::default() },
     };
 
     // Seed the mark table from `--import-marks`: pre-marked objects are skipped by
@@ -1641,6 +1722,74 @@ fn dedup_first_wins(ids: &mut Vec<ObjectId>) {
 /// `compare_commits_by_commit_date` instead (commit.c:930-940), making it a
 /// newest-first heap with insertion order breaking ties (prio-queue.c:4-11), and
 /// is left un-reversed.
+/// The commit-graft table applied where `parse_commit_buffer()` applies it.
+///
+/// git registers `.git/shallow` through `register_shallow()` and `info/grafts`
+/// through `read_graft_line()`, and `parse_commit_buffer()` (commit.c:554-590)
+/// then hands *every* walker the substituted parent list — which is why a
+/// shallow clone's boundary commit simply has no parents and nothing ever goes
+/// looking for the commit the clone did not fetch.
+///
+/// gix keeps that table in `gix_revwalk::Graph`, which the simple walk reaches
+/// through `Simple::grafts()`; the topological walk takes a bare
+/// `gix_object::Find` and has no table of its own. Rewriting the parent headers
+/// on the way out of the object database gives that walk the same view, without
+/// a skip predicate — which could only ever *drop* a parent, and so cannot
+/// express a graft line that names different ones.
+struct GraftedCommits<'a> {
+    repo: &'a gix::Repository,
+    grafts: std::sync::Arc<gix::revwalk::graft::Table>,
+}
+
+impl gix::objs::Find for GraftedCommits<'_> {
+    fn try_find<'a>(
+        &self,
+        id: &gix::hash::oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> std::result::Result<Option<gix::objs::Data<'a>>, gix::objs::find::Error> {
+        let Some(parents) = self.grafts.parents_of(id).map(<[_]>::to_vec) else {
+            return gix::objs::Find::try_find(self.repo, id, buffer);
+        };
+        let mut original = Vec::new();
+        let Some(found) = gix::objs::Find::try_find(self.repo, id, &mut original)? else {
+            return Ok(None);
+        };
+        let (kind, hash_kind) = (found.kind, found.object_hash);
+        buffer.clear();
+        if kind != gix::object::Kind::Commit {
+            buffer.extend_from_slice(found.data);
+            return Ok(Some(gix::objs::Data::new(buffer, kind, hash_kind)));
+        }
+        // A commit header opens with its `tree` line and every `parent` line,
+        // and the graft replaces exactly that run — `author` onward is copied
+        // through untouched.
+        let data = found.data;
+        let mut pos = 0usize;
+        while pos < data.len() {
+            let end = data[pos..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(data.len(), |n| pos + n + 1);
+            let line = &data[pos..end];
+            if line.starts_with(b"parent ") {
+                pos = end;
+            } else if line.starts_with(b"tree ") {
+                buffer.extend_from_slice(line);
+                pos = end;
+            } else {
+                break;
+            }
+        }
+        for p in &parents {
+            buffer.extend_from_slice(b"parent ");
+            buffer.extend_from_slice(p.to_hex().to_string().as_bytes());
+            buffer.push(b'\n');
+        }
+        buffer.extend_from_slice(&data[pos..]);
+        Ok(Some(gix::objs::Data::new(buffer, gix::object::Kind::Commit, hash_kind)))
+    }
+}
+
 pub(super) fn sort_in_topological_order(
     list: Vec<gix::traverse::commit::Info>,
     order: Order,
@@ -2156,6 +2305,20 @@ fn collect_reflog_tips(repo: &gix::Repository, tips: &mut Vec<ObjectId>) -> Resu
 /// in the order the stream first mentions it.
 #[derive(Default)]
 struct Anon {
+    /// `anonymized_seeds`, the table `--anonymize-map=<from>[:<to>]` fills.
+    ///
+    /// ```c
+    /// /* First check if it's a token the user configured manually... */
+    /// if (anonymized_seeds.cmpfn)
+    ///         ret = hashmap_get_entry(&anonymized_seeds, &key, hash, &key);
+    /// ```
+    ///
+    /// (`builtin/fast-export.c:161-164`.) It is consulted by every
+    /// `anonymize_str()` caller — path and ref components, idents, object ids and
+    /// tag messages — ahead of that caller's own table, and a hit is *not* copied
+    /// into it, so a seeded token never advances the `<prefix><n>` counter that
+    /// numbers the generated ones.
+    seeds: HashMap<BString, BString>,
     refs: HashMap<BString, BString>,
     paths: HashMap<BString, BString>,
     idents: HashMap<BString, BString>,
@@ -2185,7 +2348,7 @@ impl Anon {
                 break;
             }
         }
-        Self::map_components(&mut self.refs, rest, "ref", &mut out);
+        Self::map_components(&self.seeds, &mut self.refs, rest, "ref", &mut out);
         out
     }
 
@@ -2193,7 +2356,7 @@ impl Anon {
     /// so shared directories keep sharing a generated name.
     fn path(&mut self, path: &BStr) -> BString {
         let mut out = BString::default();
-        Self::map_components(&mut self.paths, path, "path", &mut out);
+        Self::map_components(&self.seeds, &mut self.paths, path, "path", &mut out);
         out
     }
 
@@ -2220,6 +2383,7 @@ impl Anon {
     /// refname, and anonymizing it has to leave it empty rather than invent a
     /// `ref0` that the stream then carries.
     fn map_components(
+        seeds: &HashMap<BString, BString>,
         table: &mut HashMap<BString, BString>,
         mut path: &[u8],
         prefix: &str,
@@ -2228,11 +2392,16 @@ impl Anon {
         while !path.is_empty() {
             let end = path.iter().position(|b| *b == b'/').unwrap_or(path.len());
             let key = BString::from(path[..end].to_vec());
-            if !table.contains_key(&key) {
-                let value = BString::from(format!("{prefix}{}", table.len()));
-                table.insert(key.clone(), value);
+            match seeds.get(&key) {
+                Some(seeded) => out.extend_from_slice(seeded),
+                None => {
+                    if !table.contains_key(&key) {
+                        let value = BString::from(format!("{prefix}{}", table.len()));
+                        table.insert(key.clone(), value);
+                    }
+                    out.extend_from_slice(&table[&key]);
+                }
             }
-            out.extend_from_slice(&table[&key]);
             path = &path[end..];
             if let Some((separator, rest)) = path.split_first() {
                 out.push(*separator);
@@ -2245,6 +2414,9 @@ impl Anon {
     /// is left alone, as git does.
     fn ident(&mut self, ident: &[u8]) -> BString {
         let key = BString::from(ident.to_vec());
+        if let Some(seeded) = self.seeds.get(&key) {
+            return seeded.clone();
+        }
         let next = self.idents.len();
         self.idents
             .entry(key)
@@ -2257,6 +2429,11 @@ impl Anon {
     /// first-mention order. Used for `--no-data` blob refs and gitlink entries,
     /// where the stream names an object by hash rather than by mark.
     fn oid(&mut self, id: ObjectId) -> BString {
+        // `anonymize_oid()` seeds its lookup with the *hex* of the id, so that is
+        // the token `--anonymize-map` has to match.
+        if let Some(seeded) = self.seeds.get(id.to_hex().to_string().as_bytes().as_bstr()) {
+            return seeded.clone();
+        }
         let width = id.kind().len_in_hex();
         let next = self.oids.len() + 1;
         self.oids
@@ -2284,6 +2461,9 @@ impl Anon {
     /// named it — get the *same* generated string.
     fn tag_message(&mut self, original: &[u8]) -> Vec<u8> {
         let key = BString::from(original.to_vec());
+        if let Some(seeded) = self.seeds.get(&key) {
+            return seeded.clone().into();
+        }
         let next = self.tag_messages.len();
         self.tag_messages
             .entry(key)

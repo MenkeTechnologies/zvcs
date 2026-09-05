@@ -16,7 +16,7 @@
 //!   4. **Patch application** (`am_run`'s loop, `parse_mail`, `do_commit`) and
 //!      the resume verbs (`am_resolve`/`am_skip`/`am_abort`). git implements this
 //!      stage by shelling out to `git mailinfo`/`git apply`/`git write-tree`/
-//!      `git commit-tree`/`git update-ref`/`git stripspace`/`git reset`; because
+//!      `git commit-tree`/`git stripspace`/`git reset`; because
 //!      those subcommands are themselves ported, this module drives them by
 //!      re-executing the git binary (`hosted::git_exe`) as a child — the same
 //!      pattern `for_each_repo`/`quiltimport` use.
@@ -51,8 +51,9 @@
 //!     through `git mailinfo` (authorship + subject + body + diff), the diff is
 //!     staged with `git apply --index`, and the commit is written with
 //!     `git write-tree` + `git commit-tree` preserving the mail's author (name,
-//!     email, and `GIT_AUTHOR_DATE`), then `HEAD` is moved with `git update-ref`
-//!     carrying the `am: <subject>` reflog line. `git am <mbox>` applies and
+//!     email, and `GIT_AUTHOR_DATE`), then `HEAD` is moved by a ref transaction
+//!     carrying the `am: <subject>` reflog line — as bytes, since a Latin-1
+//!     `Subject:` cannot cross a subcommand argv. `git am <mbox>` applies and
 //!     commits, and `--continue`/`--skip`/`--abort` drive the state machine.
 //!
 //!   * Every argument-validation path: unknown/duplicated resume verbs and bad
@@ -1869,9 +1870,16 @@ fn load_state(state_dir: &Path) -> Loaded {
 /// from `author-script`/`final-commit` when resuming).
 struct CommitInfo {
     msg: Vec<u8>,
-    author_name: String,
-    author_email: String,
-    author_date: String,
+    /// Raw bytes, not text: `mailinfo` re-codes the message body into
+    /// `metainfo_charset` but leaves the `Author:`/`Subject:` headers exactly as
+    /// the mail spelled them, so a `charset=ISO-8859-1` mail hands `am` an author
+    /// name with a bare `0xe9` in it. git carries that through to `fmt_ident()`
+    /// untouched and lets `commit_tree_extended()`'s `verify_utf8()` transcribe
+    /// it; decoding it here would replace the byte with U+FFFD and change the
+    /// commit.
+    author_name: BString,
+    author_email: BString,
+    author_date: BString,
 }
 
 /// `am_run`: apply every queued mail. `resume` marks the first iteration as a
@@ -2014,7 +2022,11 @@ fn run_am_loop(
             if !ld.quiet {
                 say_subject("Applying: ", first);
             }
-            if !run_apply(&ctx, &ld, None)? {
+            let applied = run_apply(&ctx, &ld, None)?;
+            if matches!(applied, Applied::Usage) {
+                return Ok(ExitCode::from(129));
+            }
+            if matches!(applied, Applied::Failed) {
                 // `--3way` (and therefore every `--rebasing` session, which
                 // `am_setup` forces threeway on) reconstructs a base tree from
                 // the patch's own index lines and merges instead of giving up.
@@ -2265,18 +2277,18 @@ fn parse_mail(ctx: &Ctx, state_dir: &Path, ld: &Loaded, mail: &Path) -> Result<P
     // Extract Subject/Author/Email/Date from the info block.
     let info = std::fs::read(&info_file).unwrap_or_default();
     let mut subjects: Vec<Vec<u8>> = Vec::new();
-    let mut author_name = String::new();
-    let mut author_email = String::new();
-    let mut author_date = String::new();
+    let mut author_name = BString::default();
+    let mut author_email = BString::default();
+    let mut author_date = BString::default();
     for line in info.split(|&b| b == b'\n') {
         if let Some(v) = line.strip_prefix(b"Subject: ") {
             subjects.push(v.to_vec());
         } else if let Some(v) = line.strip_prefix(b"Author: ") {
-            author_name = String::from_utf8_lossy(v).into_owned();
+            author_name = v.into();
         } else if let Some(v) = line.strip_prefix(b"Email: ") {
-            author_email = String::from_utf8_lossy(v).into_owned();
+            author_email = v.into();
         } else if let Some(v) = line.strip_prefix(b"Date: ") {
-            author_date = String::from_utf8_lossy(v).into_owned();
+            author_date = v.into();
         }
     }
 
@@ -2343,7 +2355,26 @@ fn stripspace(ctx: &Ctx, input: &[u8]) -> Result<Vec<u8>> {
 ///
 /// Returns whether the patch applied cleanly; the child's own diagnostics reach
 /// stderr.
-fn run_apply(ctx: &Ctx, ld: &Loaded, index_file: Option<&Path>) -> Result<bool> {
+/// What one `run_apply()` attempt did.
+///
+/// git links `apply` in: `run_apply()` builds an argv, hands it to
+/// `apply_parse_options()` and runs `apply_all_patches()` inside the `am`
+/// process (builtin/am.c:1500-1540). So an option `apply`'s own parse-options
+/// rejects — `-C` with a non-numeric value, say — reaches
+/// `usage_with_options()`, which `exit(129)`s the *whole* `git am`. It never
+/// returns to `am_run`, so `Patch failed at 0001 …`, the `--show-current-patch`
+/// hints and `die_user_resolve()`'s 128 are all skipped. This port spawns
+/// `apply` as a child, so that early exit has to be recognised from its status.
+enum Applied {
+    Ok,
+    /// `apply` refused the patch: `am_run` goes on to `--3way` or gives up.
+    Failed,
+    /// `apply`'s parse-options refused an option and would have taken the whole
+    /// process down with it.
+    Usage,
+}
+
+fn run_apply(ctx: &Ctx, ld: &Loaded, index_file: Option<&Path>) -> Result<Applied> {
     let mut c = ctx.cmd("apply");
     match index_file {
         Some(path) => {
@@ -2360,10 +2391,14 @@ fn run_apply(ctx: &Ctx, ld: &Loaded, index_file: Option<&Path>) -> Result<bool> 
     if ld.threeway && index_file.is_none() {
         c.stderr(Stdio::null());
     }
-    Ok(c
+    let status = c
         .status()
-        .map_err(|e| anyhow::anyhow!("failed to run apply: {e}"))?
-        .success())
+        .map_err(|e| anyhow::anyhow!("failed to run apply: {e}"))?;
+    Ok(match status.code() {
+        Some(0) => Applied::Ok,
+        Some(129) => Applied::Usage,
+        _ => Applied::Failed,
+    })
 }
 
 /// `fall_back_threeway` (builtin/am.c:1560): what `am -3` does when the patch
@@ -2434,7 +2469,7 @@ fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]
             .status();
     }
 
-    if !run_apply(ctx, ld, Some(&index_path))? {
+    if !matches!(run_apply(ctx, ld, Some(&index_path))?, Applied::Ok) {
         eprintln!(
             "error: Did you hand edit your patch?\nIt does not apply to blobs recorded in its \
              index."
@@ -2552,9 +2587,9 @@ fn get_commit_info(repo: &gix::Repository, oid: ObjectId) -> Result<CommitInfo> 
     Ok(CommitInfo {
         // `msg = strstr(buffer, "\n\n") + 2`: everything past the header block.
         msg: commit.message_raw()?.to_vec(),
-        author_name: author.name.to_str_lossy().into_owned(),
-        author_email: author.email.to_str_lossy().into_owned(),
-        author_date: time.format_or_unix(gix::date::time::format::DEFAULT),
+        author_name: author.name.into(),
+        author_email: author.email.into(),
+        author_date: time.format_or_unix(gix::date::time::format::DEFAULT).into(),
     })
 }
 
@@ -2707,7 +2742,7 @@ fn do_commit(
     if info.author_name.trim().is_empty() {
         eprintln!(
             "fatal: empty ident name (for <{}>) not allowed",
-            info.author_email
+            info.author_email.to_str_lossy()
         );
         return Ok(Some(ExitCode::from(128)));
     }
@@ -2730,8 +2765,12 @@ fn do_commit(
     if let Some(p) = &parent {
         ct.arg("-p").arg(p.to_hex().to_string());
     }
-    ct.env("GIT_AUTHOR_NAME", &info.author_name)
-        .env("GIT_AUTHOR_EMAIL", &info.author_email);
+    // The two identity halves go into the environment as bytes: git hands
+    // `fmt_ident()` the `mailinfo` header verbatim, and an environment variable
+    // is a byte string on the platforms this runs on, so a Latin-1 author name
+    // survives the hop to `commit-tree`.
+    ct.env("GIT_AUTHOR_NAME", os_bytes(&info.author_name))
+        .env("GIT_AUTHOR_EMAIL", os_bytes(&info.author_email));
     // ```c
     // author = fmt_ident(state->author_name, state->author_email, WANT_AUTHOR_IDENT,
     //                    state->ignore_date ? NULL : state->author_date, IDENT_STRICT);
@@ -2748,9 +2787,9 @@ fn do_commit(
     // the date, and a mail with no `Date:` header never had one, and in either
     // case the caller's ambient `GIT_AUTHOR_DATE` must not stand in for it.
     if !info.author_date.is_empty() && !ignore_date {
-        ct.env("GIT_AUTHOR_DATE", &info.author_date);
+        ct.env("GIT_AUTHOR_DATE", os_bytes(&info.author_date));
         if committer_date_is_author_date {
-            ct.env("GIT_COMMITTER_DATE", &info.author_date);
+            ct.env("GIT_COMMITTER_DATE", os_bytes(&info.author_date));
         }
     } else {
         ct.env_remove("GIT_AUTHOR_DATE");
@@ -2779,19 +2818,41 @@ fn do_commit(
     let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
     let reflog = std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "am".to_string());
-    let mut ur = ctx.cmd("update-ref");
-    ur.arg("-m")
-        .arg(format!("{reflog}: {}", String::from_utf8_lossy(first_line(&info.msg))))
-        .arg("HEAD")
-        .arg(&commit);
-    if let Some(p) = &parent {
-        ur.arg(p.to_hex().to_string());
-    }
-    let updated = ur
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run update-ref: {e}"))?
-        .success();
-    if !updated {
+    // `ref_transaction_update(..., reflog_msg, ...)` takes the subject as the
+    // bytes `mailinfo` produced — a Latin-1 `Subject:` lands raw in the reflog,
+    // so the message is assembled as bytes rather than through a lossy decode.
+    let mut reflog_msg: Vec<u8> = format!("{reflog}: ").into_bytes();
+    reflog_msg.extend_from_slice(first_line(&info.msg));
+    // `ref_transaction_update(..., HEAD, new, old, reflog_msg)`: git updates the
+    // ref in-process, and the wording it stores is the mail's subject as
+    // `mailinfo` produced it. This port cannot route those bytes through an
+    // `update-ref` child — a subcommand's argv is `String`, so a Latin-1 subject
+    // would have to be decoded lossily first — so the edit is made here, the way
+    // `commit` makes its own.
+    let updated = repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: BString::from(reflog_msg),
+            },
+            // `update-ref HEAD <new> <old>`: the parent is passed as the expected
+            // old value whenever there is one, and an `am` onto an unborn branch
+            // passes none.
+            expected: match &parent {
+                Some(p) => PreviousValue::MustExistAndMatch(Target::Object(*p)),
+                None => PreviousValue::MustNotExist,
+            },
+            new: Target::Object(
+                ObjectId::from_hex(commit.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("commit-tree wrote an unreadable id: {e}"))?,
+            ),
+        },
+        name: full_name("HEAD")?,
+        deref: true,
+    });
+    if let Err(e) = updated {
+        eprintln!("error: {e}");
         return Ok(Some(ExitCode::from(128)));
     }
 
@@ -3093,16 +3154,19 @@ fn load_current(repo: &gix::Repository, state_dir: &Path) -> Result<Option<Commi
         }
     };
 
-    let (mut name, mut email, mut date): (Option<String>, Option<String>, Option<String>) =
+    let (mut name, mut email, mut date): (Option<BString>, Option<BString>, Option<BString>) =
         (None, None, None);
-    if let Ok(script) = std::fs::read_to_string(state_dir.join("author-script")) {
-        for line in script.lines() {
-            if let Some(v) = line.strip_prefix("GIT_AUTHOR_NAME=") {
-                name = Some(sq_dequote(v).join(""));
-            } else if let Some(v) = line.strip_prefix("GIT_AUTHOR_EMAIL=") {
-                email = Some(sq_dequote(v).join(""));
-            } else if let Some(v) = line.strip_prefix("GIT_AUTHOR_DATE=") {
-                date = Some(sq_dequote(v).join(""));
+    // Read as bytes: an `author-script` written for a Latin-1 mail is not valid
+    // UTF-8, and `read_to_string` would refuse the whole file and turn a
+    // resumable session into `cannot resume`.
+    if let Ok(script) = std::fs::read(state_dir.join("author-script")) {
+        for line in script.split(|&b| b == b'\n') {
+            if let Some(v) = line.strip_prefix(b"GIT_AUTHOR_NAME=") {
+                name = Some(sq_dequote_bytes(v).into());
+            } else if let Some(v) = line.strip_prefix(b"GIT_AUTHOR_EMAIL=") {
+                email = Some(sq_dequote_bytes(v).into());
+            } else if let Some(v) = line.strip_prefix(b"GIT_AUTHOR_DATE=") {
+                date = Some(sq_dequote_bytes(v).into());
             }
         }
     }
@@ -3125,19 +3189,80 @@ fn load_current(repo: &gix::Repository, state_dir: &Path) -> Result<Option<Commi
 
 /// `write_author_script`: the sq-quoted `GIT_AUTHOR_*` lines a resume reads back.
 fn write_author_script(state_dir: &Path, info: &CommitInfo) -> Result<()> {
-    let body = format!(
-        "GIT_AUTHOR_NAME={}\nGIT_AUTHOR_EMAIL={}\nGIT_AUTHOR_DATE={}\n",
-        sq_quote_one(&info.author_name),
-        sq_quote_one(&info.author_email),
-        sq_quote_one(&info.author_date),
-    );
+    let mut body: Vec<u8> = Vec::new();
+    for (key, value) in [
+        (&b"GIT_AUTHOR_NAME="[..], &info.author_name),
+        (&b"GIT_AUTHOR_EMAIL="[..], &info.author_email),
+        (&b"GIT_AUTHOR_DATE="[..], &info.author_date),
+    ] {
+        body.extend_from_slice(key);
+        body.extend_from_slice(&sq_quote_one(value));
+        body.push(b'\n');
+    }
     std::fs::write(state_dir.join("author-script"), body)?;
     Ok(())
 }
 
 /// `sq_quote_buf`: wrap in single quotes, escaping embedded quotes as `'\''`.
-fn sq_quote_one(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
+fn sq_quote_one(s: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'\''];
+    for &b in s {
+        if b == b'\'' {
+            out.extend_from_slice(br"'\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+    out
+}
+
+/// [`sq_dequote`] over raw bytes, joined the way its one `am` caller joins the
+/// tokens it returns. The `author-script` an `am` session writes can carry a
+/// Latin-1 author name, which never round-trips through a `str`.
+fn sq_dequote_bytes(s: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        while i < s.len() && s[i] == b' ' {
+            i += 1;
+        }
+        while i < s.len() && s[i] != b' ' {
+            match s[i] {
+                b'\'' => {
+                    i += 1;
+                    while i < s.len() && s[i] != b'\'' {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                    if i < s.len() {
+                        i += 1; // closing quote
+                    }
+                }
+                b'\\' => {
+                    // `'\''` emits a backslash-escaped quote between two quoted runs.
+                    i += 1;
+                    if i < s.len() {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A byte string as an `OsStr`, for the `GIT_AUTHOR_*` variables `do_commit`
+/// hands `commit-tree`: the values are mail headers, not text, and must reach
+/// the child exactly as they arrived.
+fn os_bytes(s: &BString) -> &std::ffi::OsStr {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::OsStr::from_bytes(s)
 }
 
 /// `sq_dequote`: inverse of `sq_quote` over one or more space-separated tokens.

@@ -178,7 +178,14 @@ pub mod create_or_update {
                     .and_then(|_| committer.trim().write_to(&mut file))
                     .and_then(|_| {
                         if !message.is_empty() {
-                            writeln!(file, "\t{message}")
+                            // Written as bytes, not through `Display`: `log_ref_write_fd()`
+                            // `fwrite`s the message, and a reflog line for a mail whose
+                            // `Subject:` was Latin-1 (`git am` on a `charset=ISO-8859-1`
+                            // patch) carries bytes that are not UTF-8. `BString`'s `Display`
+                            // is lossy and would store U+FFFD in their place.
+                            file.write_all(b"\t")
+                                .and_then(|_| file.write_all(message.as_slice()))
+                                .and_then(|_| file.write_all(b"\n"))
                         } else {
                             writeln!(file)
                         }

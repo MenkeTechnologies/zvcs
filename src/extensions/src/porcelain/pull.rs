@@ -90,10 +90,10 @@
 //! `--gpg-sign`/`-S` and `--[no-]verify-signatures` are likewise forwarded — the
 //! merge port implements both over `crate::gitsig`.
 //!
-//! What is refused rather than faked, because the underlying substrate is
-//! absent: `--rebase=interactive` (interactive todo editing needs a TTY editor
-//! loop). `--set-upstream` is forwarded to the fetch, which is where
-//! `run_fetch()` pushes it and where the ported fetch implements it.
+//! `--rebase=interactive` reaches `git rebase` as `--interactive`, exactly as
+//! `run_rebase()` pushes it (builtin/pull.c:888-889): the todo list belongs to
+//! the rebase, not to pull. `--set-upstream` is forwarded to the fetch, which is
+//! where `run_fetch()` pushes it and where the ported fetch implements it.
 //!
 //! Option *errors* are `parse-options`': an unknown option prints
 //! `error: unknown option \`<name>'` and the whole usage block on stderr and
@@ -113,7 +113,7 @@
 //! `--summary` or `--compact-summary`, so those combined with `--rebase` fail in
 //! the rebase step exactly as they do for git.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::process::ExitCode;
 
 use gix::remote::Direction;
@@ -448,12 +448,27 @@ fn parse_config_rebase(key: &str, v: &str, fatal: bool) -> Result<RebaseMode> {
 /// It runs early in `cmd_pull()` — before the "no tracking information" refusal
 /// and before `config_get_rebase()`, so a bad `pull.ff` beats a bad
 /// `pull.rebase` in either config order. Both were measured against git 2.55.0.
-fn config_get_ff(repo: &gix::Repository) -> Result<()> {
-    let Some(value) = repo.config_snapshot().string("pull.ff").map(|v| v.to_string()) else {
-        return Ok(());
+fn config_get_ff(repo: &gix::Repository) -> Result<Option<&'static str>> {
+    let Some(value) = repo
+        .config_snapshot()
+        .string("pull.ff")
+        .map(|v| v.to_string())
+    else {
+        return Ok(None);
     };
-    if crate::optint::maybe_bool(&value).is_some() || value == "only" {
-        return Ok(());
+    // ```c
+    // if (!strcmp(value, "only")) return "--ff-only";
+    // if (git_parse_maybe_bool(value) == 0) return "--no-ff";
+    // if (git_parse_maybe_bool(value) == 1) return "--ff";
+    // die(_("invalid value for '%s': '%s'"), "pull.ff", value);
+    // ```
+    if value == "only" {
+        return Ok(Some("--ff-only"));
+    }
+    match crate::optint::maybe_bool(&value) {
+        Some(true) => return Ok(Some("--ff")),
+        Some(false) => return Ok(Some("--no-ff")),
+        None => {}
     }
     crate::git_fatal!("invalid value for 'pull.ff': '{value}'");
 }
@@ -862,7 +877,56 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // `config_get_ff()` (builtin/pull.c:171-190) runs before the integration
     // policy is resolved and before the "no tracking information" refusal, so a
     // bad `pull.ff` is what a pull reports even when `pull.rebase` is bad too.
-    config_get_ff(&repo)?;
+    // ```c
+    // if (cleanup_arg)
+    //         /*
+    //          * this only checks the validity of cleanup_arg; we don't need
+    //          * a valid value for use_editor
+    //          */
+    //         get_cleanup_mode(cleanup_arg, 0);
+    // ```
+    //
+    // (builtin/pull.c:1030-1035.) It sits above `parse_repo_refspecs()` and so
+    // above `run_fetch()`: an invalid mode ends the pull before anything is
+    // fetched, which is why stock leaves no `FETCH_HEAD` behind on this refusal
+    // while forwarding the value to the merge and letting *that* reject it would.
+    // The mode names are `sequencer.c:684-701`'s.
+    if let Some(mode) = merge_passthru
+        .iter()
+        .rev()
+        .find_map(|o| o.strip_prefix("--cleanup="))
+    {
+        if !matches!(
+            mode,
+            "default" | "verbatim" | "whitespace" | "strip" | "scissors"
+        ) {
+            crate::git_fatal!("Invalid cleanup mode {mode}");
+        }
+    }
+
+    // ```c
+    // if (!opt_ff) {
+    //         opt_ff = xstrdup_or_null(config_get_ff());
+    //         if (opt_rebase >= 0 && opt_ff && !strcmp(opt_ff, "--ff-only")) {
+    //                 free(opt_ff);
+    //                 opt_ff = xstrdup("--ff");
+    //         }
+    // }
+    // ```
+    //
+    // (builtin/pull.c:1039-1056, comment included: the downgrade relies on
+    // running *before* `config_get_rebase()`, so `opt_rebase >= 0` still means
+    // "the command line said so" and not "config did".) `pull.ff=only` answers
+    // "how should a divergence be reconciled"; an explicit `--rebase` or
+    // `--no-rebase` has already answered it, so the key is demoted to a plain
+    // `--ff` and stops refusing the merge the command line asked for.
+    let mut opt_ff: Option<&'static str> = ff_cli;
+    if opt_ff.is_none() {
+        opt_ff = config_get_ff(&repo)?;
+        if rebase_cli.is_some() && opt_ff == Some("--ff-only") {
+            opt_ff = Some("--ff");
+        }
+    }
 
     // Resolve the integration policy git's `config_get_rebase()` computes: a CLI
     // flag wins, else branch.<name>.rebase / pull.rebase.
@@ -870,7 +934,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         Some(m) => (m, false),
         None => config_rebase(&repo, branch_short.as_deref())?,
     };
-    let rebasing = rebase_mode != RebaseMode::Disabled;
+    let mut rebasing = rebase_mode != RebaseMode::Disabled;
 
     // `repo_read_index_unmerged()` / `file_exists(MERGE_HEAD)` in `cmd_pull()`:
     // both sit above `run_fetch()`, so an unfinished merge stops the pull before
@@ -1131,54 +1195,101 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         repo.merge_base(id, head_id).map(|base| base.detach() == id).unwrap_or(false)
     });
 
-    // `builtin/pull.c`'s `can_ff`: `get_can_ff()` asks whether the *first* fetched
-    // head is a descendant of `HEAD`. When it is, a rebase would replay nothing, so
-    // git forces `opt_ff = "--ff-only"` and runs the *merge* (`ran_ff`), never
-    // starting the rebase.
-    let can_ff = repo
-        .merge_base(commit_of(merge_heads[0].0), head_id)
-        .map(|base| base.detach() == head_id)
-        .unwrap_or(false);
-
-    // `cmd_pull()`'s divergence gate. With neither an `--ff…` flag nor `pull.ff`,
-    // and with the rebase policy left unspecified by both the command line and
-    // config, git refuses to pick an integration strategy for a diverged branch —
-    // it does not quietly merge.
-    // `divergent = !can_ff && !already_up_to_date`: a branch that is merely
-    // *ahead* of the fetched head has not diverged, and needs no policy.
-    let divergent = !can_ff && !already_up_to_date;
-    let ff_configured = ff_cli.is_some() || repo.config_snapshot().string("pull.ff").is_some();
-    if !ff_configured && rebase_unspecified && divergent {
-        show_advice_pull_non_ff(&repo);
-        eprintln!("fatal: Need to specify how to reconcile divergent branches.");
-        return Ok(ExitCode::from(128));
-    }
-
     // Several merge heads have no meaning for a rebase, and cannot all be
-    // fast-forwarded to.
+    // fast-forwarded to. Both refusals sit *above* `get_can_ff()`
+    // (builtin/pull.c:1132-1138), so they are what a two-head `--rebase` or
+    // `--ff-only` reports rather than the divergence the head count then forces.
     if merge_heads.len() > 1 {
         if rebasing {
             eprintln!("fatal: Cannot rebase onto multiple branches.");
             return Ok(ExitCode::from(128));
         }
-        if ff_cli == Some("--ff-only") {
+        if opt_ff == Some("--ff-only") {
             eprintln!("fatal: Cannot fast-forward to multiple branches.");
             return Ok(ExitCode::from(128));
         }
     }
 
-    if rebasing && !can_ff {
-        if rebase_mode == RebaseMode::Interactive {
-            bail!(
-                "--rebase=interactive is not supported (interactive todo editing needs a TTY editor loop)"
-            );
-        }
+    // ```c
+    // static int get_can_ff(struct object_id *orig_head, struct oid_array *merge_heads)
+    // {
+    //         if (merge_heads->nr > 1)
+    //                 return 0;
+    //         …
+    // ```
+    //
+    // (builtin/pull.c:976-996.) More than one merge head is *never* a
+    // fast-forward, however the heads are related: there is one `HEAD` to move
+    // and several places to move it to. So `pull <remote> <a> <b>` is divergent
+    // by construction, and reaches the refusal below even when both heads are
+    // descendants of the branch — which is the only route to that refusal that
+    // needs no diverged branch at all. Otherwise: is the one fetched head a
+    // descendant of `HEAD`? When it is, a rebase would replay nothing, so git
+    // forces `opt_ff = "--ff-only"` and runs the *merge* (`ran_ff`), never
+    // starting the rebase.
+    let can_ff = merge_heads.len() == 1
+        && repo
+            .merge_base(commit_of(merge_heads[0].0), head_id)
+            .map(|base| base.detach() == head_id)
+            .unwrap_or(false);
 
+    // `divergent = !can_ff && !already_up_to_date`: a branch that is merely
+    // *ahead* of the fetched head has not diverged, and needs no policy.
+    let divergent = !can_ff && !already_up_to_date;
+
+    // ```c
+    // /* ff-only takes precedence over rebase */
+    // if (opt_ff && !strcmp(opt_ff, "--ff-only")) {
+    //         if (divergent)
+    //                 die_ff_impossible();
+    //         opt_rebase = REBASE_FALSE;
+    // }
+    // ```
+    //
+    // (builtin/pull.c:1141-1146.) The refusal belongs to `pull`, not to the
+    // `merge` it would otherwise delegate to: dying here is what leaves
+    // `ORIG_HEAD` pointing where it did before, because nothing that writes it
+    // has run yet.
+    if opt_ff == Some("--ff-only") {
+        if divergent {
+            crate::advice::ff_impossible(&repo);
+            eprintln!("fatal: Not possible to fast-forward, aborting.");
+            return Ok(ExitCode::from(128));
+        }
+        rebasing = false;
+    }
+
+    // `cmd_pull()`'s divergence gate. With neither an `--ff…` flag nor `pull.ff`,
+    // and with the rebase policy left unspecified by both the command line and
+    // config, git refuses to pick an integration strategy for a diverged branch —
+    // it does not quietly merge.
+    if opt_ff.is_none() && rebase_unspecified && divergent {
+        show_advice_pull_non_ff();
+        eprintln!("fatal: Need to specify how to reconcile divergent branches.");
+        return Ok(ExitCode::from(128));
+    }
+
+    if rebasing && !can_ff {
         // Rebase the current branch onto the fetched upstream, forwarding the
         // knobs the ported rebase accepts.
+        //
+        // ```c
+        // if (opt_rebase == REBASE_MERGES)
+        //         strvec_push(&cmd.args, "--rebase-merges");
+        // else if (opt_rebase == REBASE_INTERACTIVE)
+        //         strvec_push(&cmd.args, "--interactive");
+        // ```
+        //
+        // (builtin/pull.c:886-889.) The two rebase flavours are mutually
+        // exclusive and neither is a mode `pull` implements itself: both are one
+        // argument handed to `git rebase`, which owns the todo list either way.
+        // `--interactive` with the sequence editor accepting the generated todo
+        // unchanged replays exactly what a plain rebase would.
         let mut rebase_args: Vec<String> = Vec::new();
         if rebase_mode == RebaseMode::Merges {
             rebase_args.push("--rebase-merges".into());
+        } else if rebase_mode == RebaseMode::Interactive {
+            rebase_args.push("--interactive".into());
         }
         if let Some(s) = &strategy {
             rebase_args.push("--strategy".into());
@@ -1239,22 +1350,15 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // Resolve the fast-forward policy git's `config_get_ff()` computes for pull:
     // a CLI flag wins; else pull.ff (which overrides merge.ff) is forwarded to
     // `merge`; else nothing is forwarded and `merge` reads merge.ff itself.
-    let ff_flag: Option<&str> = match ff_cli {
-        // The `can_ff` short-circuit above overrides everything, as git's assignment to
-        // `opt_ff` right before `run_merge()` does.
+    let ff_flag: Option<&str> = match opt_ff {
+        // ```c
+        // if (can_ff) { free(opt_ff); opt_ff = xstrdup("--ff-only"); ret = run_merge(); }
+        // ```
+        //
+        // (builtin/pull.c:1164-1169.) A rebase that reaches here can fast-forward,
+        // so git runs the merge with `--ff-only` and never starts the rebase.
         _ if rebasing => Some("--ff-only"),
-        Some(f) => Some(f),
-        None => match repo
-            .config_snapshot()
-            .string("pull.ff")
-            .map(|v| v.to_string().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("only") => Some("--ff-only"),
-            Some("false" | "no" | "off" | "0") => Some("--no-ff"),
-            Some(_) => Some("--ff"), // true/yes/on/1/valueless → allow
-            None => None,
-        },
+        other => other,
     };
 
     // Delegate the fast-forward, --no-ff/diverged merge, dirty check,
@@ -1365,10 +1469,13 @@ fn refuse_unfinished_merge(repo: &gix::Repository) -> Result<Option<ExitCode>> {
 
 /// `show_advice_pull_non_ff()` (builtin/pull.c): what to do about a diverged
 /// branch, printed before the refusal unless `advice.diverging` is off.
-fn show_advice_pull_non_ff(repo: &gix::Repository) {
-    if repo.config_snapshot().boolean("advice.diverging") == Some(false) {
-        return;
-    }
+fn show_advice_pull_non_ff() {
+    // `advise()`, not `advise_if_enabled()` (builtin/pull.c:840-853, advice.c:124).
+    // This block is deliberately ungated: it is the whole answer to the refusal
+    // it precedes, so neither `advice.diverging`, `--no-advice` nor `GIT_ADVICE=0`
+    // suppresses it. `die_ff_impossible()`'s hint, three lines further down the
+    // same file, *is* `advise_if_enabled(ADVICE_DIVERGING, …)` — the two are a
+    // matched pair, and only one of them can be turned off.
     for line in [
         "You have divergent branches and need to specify how to reconcile them.",
         "You can do so by running one of the following commands sometime before",
@@ -1459,12 +1566,33 @@ fn no_merge_candidates(repo: &gix::Repository, branch: Option<&str>, rebasing: b
             eprintln!();
         }
         Some(branch) => {
-            let remotes = repo.remote_names();
-            let remote = match remotes.len() {
-                1 => remotes.iter().next().map(ToString::to_string),
-                _ => None,
+            // ```c
+            // if (for_each_remote(get_only_remote, &remote_name) || !remote_name)
+            //         remote_name = _("<remote>");
+            // ```
+            //
+            // (builtin/pull.c:344-346.) The remote *list* is not quite the
+            // configured one on the rebase path: `get_rebase_fork_point()` runs
+            // first (builtin/pull.c:1083) and reaches `remote_get(NULL)` through
+            // `get_upstream_branch()` (:586), which materialises the default
+            // remote — the literal name `origin` — in that list whether or not
+            // the repository configures it. So `pull --rebase` in a repository
+            // with no remotes at all suggests `origin/<branch>` and a plain
+            // `pull` in the same repository suggests `<remote>/<branch>`.
+            // Verified against stock 2.55.0 both ways in a fresh repository with
+            // one commit and no remote.
+            let mut names: Vec<String> = repo
+                .remote_names()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            if rebasing && !names.iter().any(|n| n == "origin") {
+                names.push("origin".to_string());
+            }
+            let remote = match names.len() {
+                1 => names.remove(0),
+                _ => "<remote>".to_string(),
             };
-            let remote = remote.unwrap_or_else(|| "<remote>".to_string());
             eprintln!("There is no tracking information for the current branch.");
             eprintln!("{integration}");
             eprintln!("See git-pull(1) for details.");

@@ -115,10 +115,77 @@ pub struct Request {
 pub enum DeleteScope {
     /// `--mirror`: every advertised ref the local repository no longer has.
     All,
-    /// `--prune`: only advertised refs under these destination prefixes (the
-    /// namespaces this push writes to), so an unrelated remote ref is never
-    /// touched.
-    Prefixes(Vec<String>),
+    /// `--prune`: the push refspecs, so each advertised ref can be mapped BACK
+    /// through them to the local ref it would have come from.
+    ///
+    /// ```c
+    /// src_name = get_ref_match(rs, ref, send_mirror, FROM_DST, NULL);
+    /// if (src_name) {
+    ///         if (!src_ref_index.nr)
+    ///                 prepare_ref_index(&src_ref_index, src);
+    ///         if (!string_list_has_string(&src_ref_index, src_name))
+    ///                 ref->peer_ref = alloc_delete_ref();
+    ///         free(src_name);
+    /// }
+    /// ```
+    ///
+    /// (`match_push_refs()`, remote.c:1669-1677.) The name tested against the
+    /// local refs is the *source* the refspec implies, not the advertised name:
+    /// under `+refs/tags/*:refs/heads/*` the remote's `refs/heads/main` is kept
+    /// only if a local `refs/tags/main` exists. Comparing the advertised name to
+    /// the local refs instead answered "the branch is still here" and pruned
+    /// nothing at all.
+    Prune(Vec<PruneSpec>),
+}
+
+/// One refspec, reduced to what the prune scan reads off it.
+pub enum PruneSpec {
+    /// The matching refspec `:` (`--all`, or a configured default). `FROM_DST`
+    /// answers with the advertised name itself — restricted to `refs/heads/`
+    /// unless mirroring (remote.c:1404-1406).
+    Matching,
+    /// A pattern refspec: both sides carry exactly one `*`.
+    Pattern {
+        /// Left-hand side, the local names.
+        src: String,
+        /// Right-hand side, the remote names — `dst_side` in `get_ref_match()`,
+        /// which falls back to the source when the refspec has no destination.
+        dst: String,
+    },
+}
+
+impl PruneSpec {
+    /// `get_ref_match(..., FROM_DST, ...)` for one refspec: the local ref name
+    /// `remote_ref` would have been pushed from, if this refspec covers it.
+    fn source_of(&self, remote_ref: &str) -> Option<String> {
+        match self {
+            PruneSpec::Matching => remote_ref
+                .starts_with("refs/heads/")
+                .then(|| remote_ref.to_owned()),
+            PruneSpec::Pattern { src, dst } => match_name_with_pattern(dst, remote_ref, src),
+        }
+    }
+}
+
+/// `match_name_with_pattern()` (remote.c:815-841): does `name` match the
+/// single-`*` pattern `key`, and if so what does substituting the matched middle
+/// into `value` produce?
+///
+/// ```c
+/// klen = kstar - key;
+/// ksuffixlen = strlen(kstar + 1);
+/// namelen = strlen(name);
+/// ret = !strncmp(name, key, klen) && namelen >= klen + ksuffixlen &&
+///         !memcmp(name + namelen - ksuffixlen, kstar + 1, ksuffixlen);
+/// ```
+fn match_name_with_pattern(key: &str, name: &str, value: &str) -> Option<String> {
+    let (kprefix, ksuffix) = key.split_once('*')?;
+    let (vprefix, vsuffix) = value.split_once('*')?;
+    let middle = name
+        .strip_prefix(kprefix)?
+        .strip_suffix(ksuffix)
+        .filter(|_| name.len() >= kprefix.len() + ksuffix.len())?;
+    Some(format!("{vprefix}{middle}{vsuffix}"))
 }
 
 /// Wire-level options that change the request itself rather than the ref list.
@@ -145,6 +212,10 @@ pub struct SendOptions {
     /// The *matching* refspec, if one is in play. `None` for every push that named
     /// its refs.
     pub matching: Option<Matching>,
+    /// `--progress`: `transport->progress`, which `send_pack()` forwards to its
+    /// `pack-objects` child as `--progress` and which is what makes that child
+    /// print its `Total …` summary.
+    pub progress: bool,
 }
 
 /// `TRANSPORT_PUSH_MATCHING`: push every local branch the remote already carries.
@@ -641,11 +712,46 @@ pub fn send_pack(
         if req.only_if_absent && advertised.contains_key(&req.name) {
             continue;
         }
-        // The remote's current value of the ref; `--force-with-lease` overrides
-        // the old-oid we send with the leased value so the server compare-and-swaps.
+        // ```c
+        // switch (count_refspec_match(dst_value, dst, &matched_dst)) {
+        // case 1:
+        //         break;
+        // case 0:
+        //         if (starts_with(dst_value, "refs/")) {
+        //                 matched_dst = make_linked_ref(dst_value, dst_tail);
+        //         } else if (is_null_oid(&matched_src->new_oid)) {
+        //                 error(_("unable to delete '%s': remote ref does not exist"),
+        //                       dst_value);
+        // ```
+        //
+        // (remote.c:1315-1322.) An unqualified destination is resolved against
+        // the *advertisement* by `refname_match()`, not guessed to be a branch.
+        // `git push origin --delete outermost` therefore finds
+        // `refs/tags/outermost`, which is the only way deleting a remote tag by
+        // its short name has ever worked; guessing `refs/heads/outermost` made
+        // every such delete report `remote ref does not exist`.
+        let req = &Request {
+            name: dwim_delete_target(req, &advertised_order),
+            src: req.src.clone(),
+            new: req.new,
+            force: req.force,
+            expected: req.expected,
+            only_if_absent: req.only_if_absent,
+            check_reachable: req.check_reachable.clone(),
+            explicit_delete: req.explicit_delete,
+        };
+
+        // The remote's current value of the ref. `--force-with-lease` never
+        // changes it: git keeps the lease in `ref->old_oid_expect` and sends
+        // `ref->old_oid` — the advertised value — in the update command, so the
+        // lease is decided here and the server is asked for an ordinary forced
+        // update. Sending the leased value as the old-oid instead turned a
+        // client-side `! [rejected] … (stale info)` into a server-side
+        // `cannot lock ref … but expected <lease>` reported as
+        // `[remote rejected] … (incorrect old value provided)`.
         let remote_current = advertised.get(&req.name).copied().unwrap_or(null);
-        let old = req.expected.unwrap_or(remote_current);
-        let force = req.force || req.expected.is_some();
+        let old = remote_current;
+        let mut force = req.force;
         let deletion = req.new == null;
 
         let reject = |reason: &str| RefStatus {
@@ -704,25 +810,36 @@ pub fn send_pack(
             continue;
         }
 
-        // `--force-if-includes` (remote.c:1698-1711), checked before the
-        // fast-forward rules and after the lease itself. A lease that no longer
-        // matches what the remote advertises is left to the server's
-        // compare-and-swap, which is where this port does the staleness check;
-        // when it *does* match, the advertised tip must additionally be reachable
-        // from the local ref's reflog, or this checkout never saw the update.
-        // `--force` defeats the rejection, as it defeats every other one
-        // (remote.c:1750-1753).
+        // ```c
+        // if (ref->expect_old_sha1) {
+        //         if (!oideq(&ref->old_oid, &ref->old_oid_expect))
+        //                 reject_reason = REF_STATUS_REJECT_STALE;
+        //         else if (ref->check_reachable && ref->unreachable)
+        //                 reject_reason = REF_STATUS_REJECT_REMOTE_UPDATED;
+        //         else
+        //                 force_ref_update = 1;
+        // }
+        // ```
+        //
+        // (remote.c:1712-1726.) The lease is a three-way decision made entirely
+        // on this side, before the fast-forward ladder and before anything is
+        // sent: a lease the advertisement contradicts is stale, a lease it
+        // satisfies over a tip this checkout never saw is a remote update, and
+        // one that survives both *becomes* the force. The stale arm is what
+        // `--force-with-lease=<ref>:<oid>` against a moved ref reports, and it is
+        // reported without a wire round trip at all.
         let mut forced = false;
-        if let (Some(expected), Some(tracking)) = (req.expected, req.check_reachable.as_deref()) {
-            if remote_current == expected
-                && remote_current != null
-                && !is_reachable_in_reflog(repo, &req.name, tracking, remote_current)
-            {
-                if !req.force {
-                    statuses.push(reject("remote ref updated since checkout"));
-                    continue;
-                }
-                forced = true;
+        let mut lease_reject = None;
+        if let Some(expected) = req.expected {
+            if remote_current != expected {
+                lease_reject = Some("stale info");
+            } else if req.check_reachable.as_deref().is_some_and(|tracking| {
+                remote_current != null
+                    && !is_reachable_in_reflog(repo, &req.name, tracking, remote_current)
+            }) {
+                lease_reject = Some("remote ref updated since checkout");
+            } else {
+                force = true;
             }
         }
 
@@ -730,8 +847,11 @@ pub fn send_pack(
         // (remote.c:1734-1745), in git's order — the first rung that fires is the
         // rejection, and each maps to the summary `print_ref_status()` prints for
         // that `REF_STATUS_REJECT_*` (transport.c:752-772). Creating a ref and
-        // deleting one are never rejected here.
-        let reject_reason = if deletion || remote_current == null {
+        // deleting one are never rejected here. `if (!reject_reason && …)` guards
+        // the whole ladder, so a lease that already rejected keeps its own reason.
+        let reject_reason = if lease_reject.is_some() {
+            lease_reject
+        } else if deletion || remote_current == null {
             None
         } else if req.name.starts_with("refs/tags/") {
             // A tag the remote already has: overwriting it is never a
@@ -805,7 +925,10 @@ pub fn send_pack(
                 Some("remote does not support deleting refs") => 4,
                 Some("fetch first") => 5,
                 Some("needs force") => 6,
-                Some("stale info") | Some("remote ref updated since checkout") => 7,
+                Some("stale info") => 7,
+                // `REF_STATUS_REJECT_SHALLOW` sits at 8 between them
+                // (remote.h:180-193), so the remote-updated rejection is 9.
+                Some("remote ref updated since checkout") => 9,
                 _ => 2,
             };
             eprintln!("error: atomic push failed for ref {}. status: {status}", failing.name);
@@ -867,13 +990,16 @@ pub fn send_pack(
         let requested: HashSet<&str> = wire.iter().map(|w| w.name.as_str()).collect();
         let mut doomed: Vec<(&String, &ObjectId)> = advertised
             .iter()
-            .filter(|(name, _)| !opts.local_refs.contains(name.as_str()))
             .filter(|(name, _)| !requested.contains(name.as_str()))
             .filter(|(name, _)| match scope {
-                DeleteScope::All => true,
-                DeleteScope::Prefixes(prefixes) => {
-                    prefixes.iter().any(|p| name.starts_with(p.as_str()))
-                }
+                // `--mirror` reaches `get_ref_match()` through the matching
+                // refspec with `send_mirror` set, which answers with the
+                // advertised name for every ref, `refs/heads/` or not.
+                DeleteScope::All => !opts.local_refs.contains(name.as_str()),
+                DeleteScope::Prune(specs) => specs
+                    .iter()
+                    .find_map(|spec| spec.source_of(name))
+                    .is_some_and(|src| !opts.local_refs.contains(src.as_str())),
             })
             .collect();
         // Deterministic order so the status block reads the same run to run.
@@ -980,7 +1106,36 @@ pub fn send_pack(
         let mut haves: Vec<ObjectId> = advertised.values().copied().collect();
         haves.extend(wire.iter().map(|w| w.old).filter(|o| *o != null));
         let objects = objects_to_send(repo, &wants, &haves);
-        super::pack_objects::pack_bytes_for(repo, &objects)?
+        let bytes = super::pack_objects::pack_bytes_for(repo, &objects)?;
+        // ```c
+        // if (progress)
+        //         fprintf_ln(stderr,
+        //                    _("Total %"PRIu32" (delta %"PRIu32"),"
+        //                      " reused %"PRIu32" (delta %"PRIu32"),"
+        //                      " pack-reused %"PRIu32" (from %"PRIuMAX")"),
+        //                    written, written_delta, reused, reused_delta,
+        //                    reuse_packfile_objects, reuse_packfiles_used_nr);
+        // ```
+        //
+        // (`cmd_pack_objects()`, builtin/pack-objects.c:4507-4513; the trailing
+        // `(from %ju)` is git 2.55's spelling of the field — `git 2.55.0 --progress`
+        // prints `pack-reused 0 (from 0)`.) `send_pack()` runs `pack-objects` with
+        // `--progress` whenever the transport is progressing, so the line belongs
+        // to the push, not to the pack writer's own logging.
+        //
+        // Four of the six counters are structurally zero here: this pack is
+        // written complete and undeltified from the object list above (see the
+        // module header), so nothing is delta-encoded (`written_delta`), nothing
+        // is copied out of an existing pack (`reused`, `reused_delta`), and no
+        // whole packfile range is reused (`reuse_packfile_objects`). `written` is
+        // the object list's length.
+        if opts.progress {
+            eprintln!(
+                "Total {} (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)",
+                objects.len()
+            );
+        }
+        bytes
     } else {
         Vec::new()
     };
@@ -1580,6 +1735,99 @@ fn ansi_color_sequence_len(src: &[u8]) -> Option<usize> {
 /// git batches that last test eight commits at a time purely to bound
 /// `repo_in_merge_bases_many`'s working set; `merge_bases_many` here takes the
 /// whole array, so the batching has nothing to do.
+/// `refname_match()` (refs.c:623-634): does `full_name` match the abbreviated
+/// `pattern` under one of `ref_rev_parse_rules`?
+///
+/// ```c
+/// static const char *ref_rev_parse_rules[] = {
+///         "%.*s",
+///         "refs/%.*s",
+///         "refs/tags/%.*s",
+///         "refs/heads/%.*s",
+///         "refs/remotes/%.*s",
+///         "refs/remotes/%.*s/HEAD",
+///         NULL
+/// };
+/// ```
+///
+/// (refs.c:604-611.) A name already spelled in full matches through the first
+/// rule, so this is not a "short names only" test.
+fn refname_match(pattern: &str, full_name: &str) -> bool {
+    [
+        String::from(pattern),
+        format!("refs/{pattern}"),
+        format!("refs/tags/{pattern}"),
+        format!("refs/heads/{pattern}"),
+        format!("refs/remotes/{pattern}"),
+        format!("refs/remotes/{pattern}/HEAD"),
+    ]
+    .iter()
+    .any(|candidate| candidate == full_name)
+}
+
+/// `count_refspec_match()` (remote.c:1084-1136) reduced to what a deletion needs:
+/// the single advertised ref an unqualified destination names, if there is
+/// exactly one strong match.
+///
+/// ```c
+/// if (namelen != patlen &&
+///     patlen != namelen - 5 &&
+///     !starts_with(name, "refs/heads/") &&
+///     !starts_with(name, "refs/tags/")) {
+///         matched_weak = refs;
+///         weak_match++;
+/// }
+/// else {
+///         matched = refs;
+///         match++;
+/// }
+/// ```
+///
+/// A match outside `refs/heads/` and `refs/tags/` that was not spelled in full
+/// (`namelen == patlen`) or from the top level (`patlen == namelen - 5`, i.e.
+/// without the leading `refs/`) is only *weak*: it loses to any strong match, so
+/// `push $URL main` is not ambiguous between `refs/heads/main` and
+/// `refs/remotes/origin/main`. Several strong matches, or only several weak
+/// ones, are ambiguous and match nothing here.
+fn count_refspec_match<'a>(pattern: &str, advertised: &'a [String]) -> Option<&'a str> {
+    let (mut strong, mut weak): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    for name in advertised {
+        if !refname_match(pattern, name) {
+            continue;
+        }
+        let (namelen, patlen) = (name.len(), pattern.len());
+        if namelen != patlen
+            && patlen + 5 != namelen
+            && !name.starts_with("refs/heads/")
+            && !name.starts_with("refs/tags/")
+        {
+            weak.push(name);
+        } else {
+            strong.push(name);
+        }
+    }
+    let chosen = if strong.is_empty() { &weak } else { &strong };
+    match chosen.as_slice() {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// The remote ref an explicit deletion targets. Only an unqualified name is
+/// resolved against the advertisement; a `refs/`-qualified one is `make_linked_ref`
+/// territory and is left exactly as written, and every non-deletion keeps the
+/// destination the refspec already computed.
+fn dwim_delete_target(req: &Request, advertised: &[String]) -> String {
+    if !req.explicit_delete {
+        return req.name.clone();
+    }
+    // The porcelain has already applied its `refs/heads/` fallback, so the name
+    // the user wrote is what is left after stripping it back off — `explicit_delete`
+    // is set only for a destination that was not `refs/`-qualified.
+    let pattern = req.name.strip_prefix("refs/heads/").unwrap_or(&req.name);
+    count_refspec_match(pattern, advertised).map_or_else(|| req.name.clone(), str::to_owned)
+}
+
 fn is_reachable_in_reflog(
     repo: &gix::Repository,
     local: &str,

@@ -144,8 +144,29 @@ impl<'a> RefSpecRef<'a> {
 
         let sans_refs_prefix = source.strip_prefix(b"refs/")?;
         if let Some(star_pos) = sans_refs_prefix.find_byte(b'*') {
-            if star_pos == 0
-                || sans_refs_prefix[star_pos + 1..].contains(&b'*')
+            // ```c
+            // if (item->pattern) {
+            //         const char *glob = strchr(prefix, '*');
+            //         strvec_pushf(ref_prefixes, "%.*s",
+            //                      (int)(glob - prefix),
+            //                      prefix);
+            // }
+            // ```
+            //
+            // (refspec.c:281-286.) git takes everything before the `*`, wherever
+            // it sits: `refs/*` prefixes with `refs/`, and so does `refs/*/main`.
+            // A `*` immediately after `refs/` is therefore not a disqualifier —
+            // treating it as one sent the unusable `ref-prefix refs/*` instead,
+            // and a server filtering on it advertised no branch at all, so
+            // `fetch <remote> 'refs/*:refs/copies/*'` copied only the tags that
+            // the tag-following refspec's own `refs/tags/` prefix brought back.
+            //
+            // The remaining two guards stay because git never reaches this code
+            // with such a spec: a second `*` fails `check_refname_format()`'s
+            // `REFNAME_REFSPEC_PATTERN` (one wildcard only), and `? [ ] \` are
+            // invalid in a refname at all, so `git fetch . 'refs/heads/[a-z.]/…'`
+            // dies with `invalid refspec` before any prefix is computed.
+            if sans_refs_prefix[star_pos + 1..].contains(&b'*')
                 || sans_refs_prefix.find_byteset(b"?[]\\").is_some()
             {
                 return None;

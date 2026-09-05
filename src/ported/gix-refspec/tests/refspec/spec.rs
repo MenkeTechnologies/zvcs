@@ -55,7 +55,12 @@ mod prefix {
 
     #[test]
     fn strange_glob_patterns_have_no_prefix() {
-        assert_eq!(parse("refs/*/main:refs/*/main").to_ref().prefix(), None);
+        assert_eq!(
+            parse("refs/*/main:refs/*/main").to_ref().prefix().unwrap(),
+            "refs/",
+            "git takes everything before the `*` wherever it sits (refspec.c:281-286): \
+             `GIT_TRACE_PACKET=1 git fetch . 'refs/*/main:refs/*/main'` sends `ref-prefix refs/`"
+        );
         assert_eq!(
             parse("refs/*/foo/*").to_ref().prefix(),
             None,
@@ -147,7 +152,7 @@ mod expand_prefixes {
 
     #[test]
     fn strange_glob_patterns_expand_to_nothing() {
-        assert_eq!(parse("refs/*/main:refs/*/main").len(), 0);
+        assert_eq!(parse("refs/*/main:refs/*/main"), ["refs/"]);
         assert_eq!(parse("refs/*/foo/*").len(), 0);
         assert_eq!(parse("refs/heads/[a-z.]/release/*").len(), 0);
     }

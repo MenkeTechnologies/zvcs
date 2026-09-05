@@ -864,6 +864,14 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     if !refmap.is_empty() {
         let has_refspecs = !positional_specs.is_empty() || (!all && !multiple && !stdin_specs.is_empty());
         if !has_refspecs {
+            // The refusal lives in `get_ref_map()` (builtin/fetch.c:544-545), and
+            // `do_fetch()` has already run `truncate_fetch_head()` by then
+            // (:1912-1917). So stock leaves an *empty* `FETCH_HEAD` behind rather
+            // than the previous fetch's rows — the file is emptied on the way in,
+            // not written on the way out.
+            if opts.write_fetch_head && !opts.dry_run && !opts.append {
+                let _ = std::fs::File::create(repo.git_dir().join("FETCH_HEAD"));
+            }
             eprintln!("fatal: --refmap option is only meaningful with command-line refspec(s)");
             return Ok(ExitCode::from(128));
         }
@@ -1427,6 +1435,14 @@ struct Line {
     /// Full local ref name for `--porcelain`'s fourth column (`FETCH_HEAD` for
     /// the rows that have no tracking ref).
     full: String,
+    /// Whether this row's `<from>` name counts towards the `<from>` column's
+    /// width. `refcol_width()` (builtin/fetch.c:667-706) walks the *ref map* and
+    /// skips every entry with `!ref->peer_ref` — a mapping with no local
+    /// destination, which is exactly a `-> FETCH_HEAD` row — and pruned refs are
+    /// not in the ref map at all, `display_state_init()` having run before
+    /// `prune_refs()` (:1979, :2000). So neither kind widens the column, and both
+    /// are still padded to whatever width the rest of the report chose.
+    widens: bool,
 }
 
 /// The `.git/FETCH_HEAD` sink for one `git fetch` invocation.
@@ -2665,6 +2681,33 @@ fn fetch_one(
             if crate::transport_err::remote_error_fatal(&err).is_some() {
                 return Ok(Verdict::Fatal);
             }
+            // ```c
+            // /* And complain if we didn't get enough bytes to satisfy the read. */
+            // if (bytes_read != size) {
+            //         …
+            //         die(_("the remote end hung up unexpectedly"));
+            // }
+            // ```
+            //
+            // (`get_packet_data()`, pkt-line.c:364-372.) A server that died
+            // mid-conversation — `upload-pack` refusing a shallow request, say,
+            // after it has already written its own `fatal:` — leaves the client
+            // reading a packet that never arrives. git has one sentence for
+            // that, and it is a `die()`, so the exit is 128. The vendored
+            // transport surfaces the same condition as an `UnexpectedEof`
+            // somewhere in the error chain, wrapped in whichever layer noticed
+            // ("Could not decode server reply: Failed to read from line reader:
+            // failed to fill whole buffer"); none of that wording is git's, and
+            // printing it would put a Rust `io::Error` on the terminal in place
+            // of a diagnostic.
+            if err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+            }) {
+                eprintln!("fatal: the remote end hung up unexpectedly");
+                return Ok(Verdict::Fatal);
+            }
             return Err(err);
         }
     };
@@ -2862,6 +2905,7 @@ fn fetch_one(
                         new: id,
                         full: "FETCH_HEAD".to_string(),
                         status,
+                        widens: false,
                     });
                 }
                 continue;
@@ -3042,6 +3086,7 @@ fn fetch_one(
             new: porcelain_new,
             full: local_full.as_bstr().to_string(),
             status,
+            widens: true,
         });
     }
 
@@ -3133,6 +3178,7 @@ fn fetch_one(
                 old: id,
                 new: null,
                 full: name.as_bstr().to_string(),
+                widens: false,
                 // Prune rows are not ref-map entries at all: `prune_refs()` reports them
                 // before the walk, and they are prepended to the summary below.
                 status: 0,
@@ -3274,13 +3320,45 @@ fn fetch_one(
                 })
                 .collect();
             // git's columns are fixed, not fitted: the summary is padded to
-            // `TRANSPORT_SUMMARY_WIDTH` (`2 * <abbrev> + 3`, wide enough for an
+            // `transport_summary_width()` (`2 * <abbrev> + 3`, wide enough for an
             // `<old>...<new>` range) and the `<from>` column starts at
             // `REFCOL_WIDTH` and only grows past it for a longer name.
-            let sw = 2 * abbrev + 3;
-            let fw = rendered
+            //
+            // ```c
+            // int summary_width = 0;
+            // …
+            // if (retcode)
+            //         goto cleanup;
+            // if (verbosity >= 0)
+            //         summary_width = transport_summary_width(ref_map);
+            // …
+            // cleanup:
+            //         for (size_t i = 0; i < display_array.nr; i++)
+            //                 ref_update_display_info_display(info, &display_state, summary_width);
+            // ```
+            //
+            // (builtin/fetch.c:1903, :2059-2062, :2145-2152.) The rows are now
+            // collected during the fetch and rendered from `cleanup:`, and the
+            // width is assigned on the way past — so a fetch that bails early,
+            // which a rejected ref update does, renders the whole report with a
+            // summary width of **zero**: every row loses the column and the
+            // summary is followed by a single space. Verified on stock 2.55.0
+            // against a peer with one rejected and one new branch in the same
+            // invocation, where both rows come out unpadded:
+            //
+            // ```text
+            //  ! [rejected] main       -> div  (non-fast-forward)
+            //  * [new branch] other      -> newone
+            // ```
+            //
+            // git 2.50.1 padded both, which is why this is the one row shape the
+            // two releases disagree about.
+            let sw = if rejected { 0 } else { 2 * abbrev + 3 };
+            let fw = lines
                 .iter()
-                .map(|(f, _)| f.chars().count())
+                .zip(&rendered)
+                .filter(|(l, _)| l.widens)
+                .map(|(_, (f, _))| f.chars().count())
                 .max()
                 .unwrap_or(0)
                 .max(REFCOL_WIDTH);

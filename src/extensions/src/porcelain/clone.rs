@@ -1746,12 +1746,59 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         });
     remove_initial_branch_reflogs(&git_dir, checked_out_branch.as_deref());
 
+    // ```c
+    // if (our && skip_prefix(our->name, "refs/heads/", &head)) {
+    //         /* Local default branch link */
+    //         if (create_symref("HEAD", our->name, NULL) < 0)
+    //                 die(_("unable to update HEAD"));
+    //         if (!option_bare) {
+    //                 update_ref(msg, "HEAD", &our->old_oid, NULL, 0,
+    //                            UPDATE_REFS_DIE_ON_ERR);
+    //                 install_branch_config(0, head, remote_name, our->name);
+    //         }
+    // }
+    // ```
+    //
+    // (`update_head()`, builtin/clone.c:619-627.) A bare clone whose `HEAD` names
+    // a branch never reaches the `update_ref(msg, …)` line: the only write is the
+    // symref creation, and it is passed a NULL reflog message. So with
+    // `core.logAllRefUpdates` on, `logs/HEAD` gets the entry without the
+    // `clone: from <url>` text. The detached arms below (`--branch <tag>`, a
+    // remote `HEAD` on a non-branch) do call `update_ref(msg, …)` and keep it,
+    // which is why this is scoped to a bare clone still on a branch.
+    if bare {
+        strip_head_reflog_message(&git_dir);
+    }
+
     // The tags of a `--single-branch` clone are written by `write_followtags()`,
     // which runs *after* `write_remote_refs()` and outside its transaction, so
     // they land as loose files while the mapped refs are packed. See
     // [`unpack_followed_tags`] for why gitoxide cannot make that split itself.
     if included_tags {
-        unpack_followed_tags(&git_dir)?;
+        // ```c
+        // else {
+        //         local_refs = NULL;
+        //         tail = &local_refs;
+        //         remote_head = copy_ref(find_remote_branch(refs, option_branch));
+        // }
+        // …
+        // /* if --branch=tag, pull the requested tag explicitly */
+        // get_fetch_map(remote_head, tag_refspec, &tail, 0);
+        // ```
+        //
+        // (`wanted_peer_refs()`, builtin/clone.c:483-500.) `--branch` may name a
+        // tag, and when it does the tag *is* the mapped ref: it goes through
+        // `write_remote_refs()` into `packed-refs` like any branch would, and
+        // `write_followtags()` then finds it already at that value and writes
+        // nothing loose for it. Only the tags the clone picked up on the side
+        // become loose files, so the `-b` target is held back here.
+        let mapped_tag = single_outcome
+            .lock()
+            .expect("clone is single-threaded here")
+            .as_ref()
+            .and_then(|(fetched, _)| fetched.clone())
+            .filter(|name| name.starts_with("refs/tags/"));
+        unpack_followed_tags(&git_dir, mapped_tag.as_deref())?;
     }
 
     // `init_db()` creates `refs/heads` and `refs/tags` for every repository it
@@ -2255,7 +2302,7 @@ struct ConfigFixups<'a> {
 /// A tag that already has a loose file keeps it; only the `packed-refs` entry
 /// (and its `^peeled` line) is dropped, since the loose ref is the one git
 /// resolves anyway.
-fn unpack_followed_tags(git_dir: &Path) -> Result<()> {
+fn unpack_followed_tags(git_dir: &Path, mapped_tag: Option<&str>) -> Result<()> {
     let packed_path = git_dir.join("packed-refs");
     let Ok(body) = std::fs::read_to_string(&packed_path) else {
         return Ok(());
@@ -2280,7 +2327,9 @@ fn unpack_followed_tags(git_dir: &Path) -> Result<()> {
         }
         dropping_peel = false;
         match line.split_once(' ') {
-            Some((oid, name)) if name.starts_with("refs/tags/") => {
+            // `mapped_tag` is `write_remote_refs()`'s own ref, not a followed
+            // one, so it keeps the packed entry the initial transaction gave it.
+            Some((oid, name)) if name.starts_with("refs/tags/") && Some(name) != mapped_tag => {
                 unpacked.push((name.to_string(), oid.to_string()));
                 dropping_peel = true;
             }
@@ -3231,6 +3280,31 @@ fn remove_initial_branch_reflogs(git_dir: &Path, keep: Option<&str>) {
     }
     walk(&root, keep_path.as_deref());
     let _ = std::fs::remove_dir(&root);
+}
+
+/// Drop the reflog message from `logs/HEAD` when `HEAD` is a symbolic ref to a
+/// branch — the state `create_symref("HEAD", our->name, NULL)` leaves in a bare
+/// clone, where no `update_ref()` with a message follows it.
+fn strip_head_reflog_message(git_dir: &Path) {
+    let head = git_dir.join("HEAD");
+    let points_at_branch = std::fs::read_to_string(&head)
+        .is_ok_and(|text| text.trim_end().starts_with("ref: refs/heads/"));
+    if !points_at_branch {
+        return;
+    }
+    let log = git_dir.join("logs").join("HEAD");
+    let Ok(body) = std::fs::read_to_string(&log) else {
+        return;
+    };
+    // The message is everything after the TAB that closes the committer field;
+    // git writes the line without one at all.
+    let stripped: String = body
+        .lines()
+        .map(|line| format!("{}\n", line.split_once('\t').map_or(line, |(head, _)| head)))
+        .collect();
+    if stripped != body {
+        let _ = std::fs::write(&log, stripped);
+    }
 }
 
 fn remove_initial_remote_reflogs(git_dir: &Path, remote: &str) {

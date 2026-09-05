@@ -181,10 +181,22 @@ impl Opts {
 /// }
 /// ```
 ///
-/// `add_patterns()` opens the path and requires a regular file (`!S_ISREG(st) →
-/// goto err`), so a missing path and a directory both land here.
+/// `add_patterns()` (dir.c:1054-1099) tests nothing about the file's *type*: it
+/// `open()`s the path, `fstat()`s it, returns 0 outright for a zero-sized file
+/// (:1083-1091) and otherwise has to `read_in_full()` it (:1093-1097). So a
+/// missing path fails at the open and a directory fails at the read, while
+/// `/dev/null` — zero-sized — is a perfectly good exclude file that contributes
+/// no patterns.
 fn reject_exclude_file(path: &str) -> Option<ExitCode> {
-    if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+    let readable = std::fs::File::open(path).and_then(|mut f| {
+        use std::io::Read as _;
+        if f.metadata()?.len() == 0 {
+            return Ok(());
+        }
+        let mut sink = Vec::new();
+        f.read_to_end(&mut sink).map(|_| ())
+    });
+    if readable.is_ok() {
         return None;
     }
     eprintln!("fatal: cannot use {path} as an exclude file");
@@ -873,10 +885,14 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             // that `--directory` prints is presentation only. The candidate set is
             // untracked ∪ ignored so our own exclude stack — not gix's `.gitignore`
             // classification — decides which to keep.
-            let mut candidates: Vec<(BString, bool)> = state
+            let walked: Vec<(BString, bool)> = state
                 .others
                 .iter()
                 .filter(|(path, is_dir)| ps.is_included(path.as_bstr(), Some(*is_dir)))
+                .cloned()
+                .collect();
+            let mut candidates: Vec<(BString, bool)> = walked
+                .iter()
                 .map(|(path, is_dir)| {
                     if opts.directory {
                         collapse_other_directory(&index, path.as_bstr(), *is_dir)
@@ -887,13 +903,59 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                 .collect();
             candidates.sort();
             candidates.dedup();
+
+            // `DIR_HIDE_EMPTY_DIRECTORIES` (`--no-empty-directory`). A collapsed
+            // directory is only reported if `read_directory_recursive()` found
+            // something under it to report; otherwise `treat_directory()` leaves
+            // the state at `path_none` and nothing is emitted:
+            //
+            // ```c
+            // if (state == path_none && !(dir->flags & DIR_HIDE_EMPTY_DIRECTORIES))
+            //         state = excluded ? path_excluded : path_untracked;
+            // ```
+            // (dir.c:2091-2092)
+            //
+            // "Something to report" is a path below it that survives the same
+            // exclude verdict this listing keeps, so a directory holding nothing
+            // but ignored files is as empty as one holding no files at all. A
+            // directory the walk emitted in its own right — a nested repository,
+            // or an empty directory under the default `--empty-directory` — is
+            // never subject to this, exactly as `treat_directory()` returns those
+            // before it ever recurses.
+            let mut nonempty: HashSet<BString> = HashSet::new();
+            if opts.directory && opts.hide_empty_dir {
+                for (path, is_dir) in &walked {
+                    if *is_dir {
+                        nonempty.insert(path.clone());
+                        continue;
+                    }
+                    if matcher.is_excluded(path.as_bstr(), false) != opts.ignored {
+                        continue;
+                    }
+                    for (at, _) in path.iter().enumerate().filter(|(_, b)| **b == b'/') {
+                        nonempty.insert(BString::from(&path[..at]));
+                    }
+                }
+            }
             // `-i` keeps only excluded paths; the default keeps only the rest.
             // This is the whole of git's `dir->entries`, so `-o` and `-k` share it.
             // A directory entry carries git's trailing `/` in its very name, which
             // both the killed test and the printed line depend on.
+            //
+            // Not covered: `-i --directory`'s roll-up of a directory whose whole
+            // subtree is ignored. `treat_directory()` turns that into a
+            // `path_excluded` for the directory itself and then pops the ignored
+            // paths it collected below — all but the first, because the loop starts
+            // at `old_ignored_nr + 1` (dir.c:2070-2074) — so stock reports the
+            // directory *and* one nested level. This listing reports the individual
+            // files instead. Reproducing it needs git's recursive state machine,
+            // not a post-filter over a flat walk.
             let entries: Vec<BString> = candidates
                 .into_iter()
                 .filter(|(path, is_dir)| matcher.is_excluded(path.as_bstr(), *is_dir) == opts.ignored)
+                .filter(|(path, is_dir)| {
+                    !(*is_dir && opts.directory && opts.hide_empty_dir) || nonempty.contains(path)
+                })
                 .map(|(mut name, is_dir)| {
                     if is_dir {
                         name.push(b'/');
@@ -1151,10 +1213,17 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The first `%(<atom>)` in `fmt` that `expand_show_index()` does not recognise,
-/// rendered the way its `die()` renders it — `%(<atom>)`, the whole element
-/// including the parentheses, which is what `die(_("bad ls-files format: %%%.*s"))`
-/// produces.
+/// The first thing in `fmt` that `expand_show_index()` (builtin/ls-files.c:244-287)
+/// refuses, rendered as the text its `die()` puts after `bad ls-files format: `.
+///
+/// It has three refusals, and `strbuf_expand()` reaches them in this order for
+/// every `%` that `strbuf_expand_literal_cb()` did not consume itself (`%n` and a
+/// well-formed `%xNN`; `%%` is `strbuf_expand()`'s own, strbuf.c:428-431):
+///
+/// * not followed by `(` — `element '<rest of the format>' does not start with '('`,
+///   which a trailing bare `%` reaches with an empty element;
+/// * `(` with no `)` after it — `element '<rest>' does not end in ')'`;
+/// * a well-formed element naming an atom it does not know — `%(<atom>)`.
 ///
 /// The atom list is [`expand_format`]'s; the two must stay in step, since an atom
 /// this accepts and that one ignores would print empty instead of dying.
@@ -1179,12 +1248,16 @@ fn unknown_format_atom(fmt: &str) -> Option<String> {
             continue;
         }
         match chars.get(i + 1) {
-            None => break,
             Some('%') => {
                 i += 2;
                 continue;
             }
-            // `strbuf_expand_literal` consumes `%xNN` before the `(` check.
+            // `strbuf_expand_literal_cb` consumes `%n` and `%xNN` before the
+            // `(` check ever runs (strbuf.c:405-421).
+            Some('n') => {
+                i += 2;
+                continue;
+            }
             Some('x') if i + 3 < chars.len() => {
                 let hex: String = chars[i + 2..i + 4].iter().collect();
                 if u8::from_str_radix(&hex, 16).is_ok() {
@@ -1192,19 +1265,23 @@ fn unknown_format_atom(fmt: &str) -> Option<String> {
                     continue;
                 }
             }
-            Some(_) => {}
+            None | Some(_) => {}
         }
-        if chars.get(i + 1) == Some(&'(') {
-            if let Some(close) = chars[i + 2..].iter().position(|&c| c == ')') {
-                let atom: String = chars[i + 2..i + 2 + close].iter().collect();
-                if !ATOMS.contains(&atom.as_str()) {
-                    return Some(format!("%({atom})"));
-                }
-                i += 2 + close + 1;
-                continue;
-            }
+        // Everything from here is `expand_show_index()`'s `start`, i.e. the rest
+        // of the format after the `%`. A missing `(` and a missing `)` both name
+        // that whole remainder.
+        let rest: String = chars[i + 1..].iter().collect();
+        if chars.get(i + 1) != Some(&'(') {
+            return Some(format!("element '{rest}' does not start with '('"));
         }
-        i += 1;
+        let Some(close) = chars[i + 2..].iter().position(|&c| c == ')') else {
+            return Some(format!("element '{rest}' does not end in ')'"));
+        };
+        let atom: String = chars[i + 2..i + 2 + close].iter().collect();
+        if !ATOMS.contains(&atom.as_str()) {
+            return Some(format!("%({atom})"));
+        }
+        i += 2 + close + 1;
     }
     None
 }
@@ -1337,7 +1414,11 @@ fn expand_sparse_index(repo: &gix::Repository, index: &mut gix::index::File) -> 
 enum Excludes<'repo> {
     None,
     Overrides {
-        search: gix::ignore::Search,
+        /// git's `EXC_CMDL`: the `-x` patterns, consulted first.
+        cmdl: gix::ignore::Search,
+        /// git's `EXC_FILE`: the `-X`/`--exclude-from` files, consulted last, in
+        /// the reverse of the order they were named (dir.c:1514-1523).
+        files: gix::ignore::Search,
         case: gix::glob::pattern::Case,
     },
     Stack {
@@ -1370,10 +1451,20 @@ impl<'repo> Excludes<'repo> {
         // file and would trim it, so the trailing run is escaped here, which is
         // the spelling that parser preserves.
         let cmdline = opts.exclude.iter().map(|p| keep_trailing_spaces(p));
-        let mut search = gix::ignore::Search::from_overrides(cmdline, parse);
+        let search = gix::ignore::Search::from_overrides(cmdline, parse);
+        // The `-X` files, read once here and handed to whichever shape is built
+        // below — the *globals* group of a stack, or the low-priority half of
+        // [`Excludes::Overrides`]. Never the override group: that is `-x` alone.
+        let mut exclude_from: Vec<(Vec<u8>, String)> = Vec::new();
         for file in &opts.exclude_from {
+            // `add_patterns()` returns before it reads a zero-sized file
+            // (dir.c:1083-1091), so a character device like `/dev/null` is never
+            // read at all — only stat'd.
+            if std::fs::metadata(file).is_ok_and(|m| m.len() == 0) {
+                continue;
+            }
             if let Ok(bytes) = std::fs::read(file) {
-                search.add_patterns_buffer(&bytes, file.clone(), None, parse);
+                exclude_from.push((bytes, file.clone()));
             }
         }
 
@@ -1394,19 +1485,33 @@ impl<'repo> Excludes<'repo> {
         // command-line patterns can match.
         if !opts.exclude_standard {
             let Some(name) = per_directory else {
-                return Ok(Excludes::Overrides { search, case });
+                let mut files = gix::ignore::Search::default();
+                for (bytes, name) in &exclude_from {
+                    files.add_patterns_buffer(bytes, std::path::PathBuf::from(name), None, parse);
+                }
+                return Ok(Excludes::Overrides {
+                    cmdl: search,
+                    files,
+                    case,
+                });
             };
             // `--exclude-per-directory` on its own reads neither `info/exclude` nor
             // `core.excludesFile`, so the stack is assembled with empty globals instead of
             // going through `Repository::excludes()`, which would load both.
             let state = gix::worktree::stack::State::IgnoreStack(
-                gix::worktree::stack::state::Ignore::new(
-                    search,
-                    Default::default(),
-                    Some(name.into()),
-                    source,
-                    parse,
-                ),
+                {
+                    let mut ignore = gix::worktree::stack::state::Ignore::new(
+                        search,
+                        Default::default(),
+                        Some(name.into()),
+                        source,
+                        parse,
+                    );
+                    for (bytes, name) in &exclude_from {
+                        ignore.add_global_patterns_buffer(bytes, std::path::PathBuf::from(name), None);
+                    }
+                    ignore
+                },
             );
             let id_mappings = state.id_mappings_from_index(index, index.path_backing(), case);
             let stack = gix::worktree::Stack::new(
@@ -1422,6 +1527,18 @@ impl<'repo> Excludes<'repo> {
         }
 
         let mut stack = repo.excludes(index, Some(search), source)?;
+        // `-X` belongs to `EXC_FILE`, beside `info/exclude` and
+        // `core.excludesFile` and *below* the per-directory `.gitignore` files —
+        // see [`gix::worktree::stack::state::Ignore::add_global_patterns_buffer`].
+        // Appending puts it first within that group, which is where git puts a
+        // `-X` that followed `--exclude-standard` on the command line.
+        if !exclude_from.is_empty() {
+            if let gix::worktree::stack::State::IgnoreStack(ignore) = stack.state_mut() {
+                for (bytes, name) in &exclude_from {
+                    ignore.add_global_patterns_buffer(bytes, std::path::PathBuf::from(name), None);
+                }
+            }
+        }
         // `--exclude-standard` assembled the stack around `.gitignore`; a later
         // `--exclude-per-directory` renames the file it looks for, and a later
         // `--no-exclude-per-directory` (an empty name) stops it looking for one.
@@ -1439,9 +1556,22 @@ impl<'repo> Excludes<'repo> {
     fn is_excluded(&mut self, path: &BStr, is_dir: bool) -> bool {
         match self {
             Excludes::None => false,
-            Excludes::Overrides { search, case } => search
-                .pattern_matching_relative_path(path, Some(is_dir), *case)
-                .is_some_and(|m| !m.pattern.is_negative()),
+            // With no on-disk ignore file in play there is no directory stack to
+            // carry a directory's verdict down, so it is applied here: git's walk
+            // stops at an excluded directory (`treat_directory()` returns
+            // `path_excluded` and `read_directory_recursive()` does not descend
+            // for the listing modes that hide it), which makes every path below
+            // one excluded too. The leading components are therefore tested as
+            // directories, longest last, before the path itself.
+            Excludes::Overrides { cmdl, files, case } => {
+                let bytes = path.as_bytes();
+                for (at, _) in bytes.iter().enumerate().filter(|(_, b)| **b == b'/') {
+                    if Self::overrides_verdict(cmdl, files, bytes[..at].as_bstr(), true, *case) {
+                        return true;
+                    }
+                }
+                Self::overrides_verdict(cmdl, files, path, is_dir, *case)
+            }
             Excludes::Stack { stack } => {
                 let mode = is_dir.then_some(gix::index::entry::Mode::DIR);
                 stack
@@ -1450,6 +1580,23 @@ impl<'repo> Excludes<'repo> {
                     .unwrap_or(false)
             }
         }
+    }
+
+    /// `last_exclude_matching_from_lists()` (dir.c:1514-1527) reduced to the two
+    /// groups this shape holds: the first group with a match decides, and a
+    /// negated pattern decides "not excluded" rather than falling through to the
+    /// next group.
+    fn overrides_verdict(
+        cmdl: &gix::ignore::Search,
+        files: &gix::ignore::Search,
+        path: &BStr,
+        is_dir: bool,
+        case: gix::glob::pattern::Case,
+    ) -> bool {
+        [cmdl, files]
+            .into_iter()
+            .find_map(|group| group.pattern_matching_relative_path(path, Some(is_dir), case))
+            .is_some_and(|m| !m.pattern.is_negative())
     }
 }
 
@@ -2209,6 +2356,21 @@ fn render(
             eol.as_deref_mut(),
         );
         line.push(terminator);
+        // ```c
+        // if (format) {
+        //         show_ce_fmt(repo, ce, format, fullname);
+        //         print_debug(ce);
+        //         return;
+        // }
+        // ```
+        // (builtin/ls-files.c:318-322) — `--debug` survives `--format`, and the
+        // block lands after the template's own terminator just as it lands after
+        // the name in the default layout.
+        if opts.debug {
+            if let Some(entry) = entry {
+                append_debug(&mut line, entry);
+            }
+        }
         return line;
     }
 
@@ -2336,6 +2498,12 @@ fn expand_format(
         };
         if next == '%' {
             out.push(b'%');
+            i += 2;
+            continue;
+        }
+        // `strbuf_expand_literal_cb`'s `case 'n'` (strbuf.c:410-412).
+        if next == 'n' {
+            out.push(b'\n');
             i += 2;
             continue;
         }

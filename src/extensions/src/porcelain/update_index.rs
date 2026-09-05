@@ -102,8 +102,15 @@
 //!   * `--untracked-cache`, `--fsmonitor`: the `UNTR` and `FSMN` extensions are
 //!     not writable through the vendored crates.
 //!
-//! Also note that content filters (`.gitattributes` clean/smudge, `autocrlf`)
-//! are not applied when hashing worktree files, matching this port's `git add`.
+//! Content filters run where git runs them. `index_mem()` (read-cache.c:2295)
+//! hands every blob it is about to hash to `convert_to_git()`, so a worktree file
+//! staged by `--add` is stored in its normalised form — `.gitattributes` `clean`,
+//! `working-tree-encoding`, `ident` and the `text`/`core.autocrlf` EOL rules — and
+//! `--refresh`'s content fallback (`ce_compare_data()`, read-cache.c:216) compares
+//! against that same form. The `core.safecrlf` round-trip diagnostic follows
+//! `get_conv_flags()`: only a run that would really write the object carries
+//! `global_conv_flags_eol`, so `--info-only` and `--refresh` stay silent.
+//! Symlinks are stored verbatim; `index_path()`'s `S_IFLNK` arm never converts.
 
 use anyhow::{bail, Result};
 use std::io::Read;
@@ -281,6 +288,18 @@ struct Ctx {
     /// `core.ignoreStat`; when true every written entry gets the `CE_VALID` bit.
     ignore_stat: bool,
     stat_opts: gix::index::entry::stat::Options,
+
+    /// `convert_to_git()` with `get_conv_flags(HASH_WRITE_OBJECT)`
+    /// (read-cache.c:81-88): the `.gitattributes` clean filters plus the EOL
+    /// normalisation, *with* `global_conv_flags_eol` so `core.safecrlf` can warn
+    /// or refuse. Built on first use — a run that never hashes a worktree file
+    /// must not pay for the attribute stack.
+    filters: Option<super::convert_to_git::WorktreeFilter>,
+    /// The same pipeline with `get_conv_flags(0)`: the conversion still happens,
+    /// the round-trip check does not. That is what `--info-only`
+    /// (builtin/update-index.c:280) and `ce_compare_data()` (read-cache.c:216)
+    /// pass, so neither can produce a `safecrlf` diagnostic.
+    filters_quiet: Option<super::convert_to_git::WorktreeFilter>,
 }
 
 /// Signals that git would have called `die()`: the message is already on stderr
@@ -303,6 +322,39 @@ impl Ctx {
     /// large tree leave a cache-tree the next `write-tree` can still mostly reuse.
     fn invalidate(&mut self, path: &BStr) {
         self.index.invalidate_path_in_tree(path);
+    }
+
+    /// `index_mem()`'s conversion step (read-cache.c:2295-2303): every blob that
+    /// carries a path is run through `convert_to_git()` before it is hashed, so
+    /// the id `update-index` records is the id of the *stored* form — the one
+    /// `.gitattributes` `clean`, `working-tree-encoding`, `ident` and the
+    /// `text`/`core.autocrlf` EOL rules produce, not the worktree bytes.
+    ///
+    /// `warn` is `get_conv_flags()`'s distinction: `HASH_WRITE_OBJECT` carries
+    /// `global_conv_flags_eol`, so only a run that would really deposit the blob
+    /// can raise `core.safecrlf`.
+    fn convert_to_git(&mut self, rela: &BStr, bytes: Vec<u8>, warn: bool) -> Result<Vec<u8>> {
+        let Ctx {
+            repo,
+            filters,
+            filters_quiet,
+            ..
+        } = self;
+        let slot = if warn { filters } else { filters_quiet };
+        let filter = match slot {
+            Some(f) => f,
+            none => none.insert(super::convert_to_git::WorktreeFilter::new(repo, warn, false)?),
+        };
+        let path = gix::path::from_bstr(rela).into_owned();
+        // `index_path()` propagates `convert_to_git()`'s failure up to
+        // `add_one_path()`'s `die(_("unable to index file '%s'"), path)` — and
+        // `core.safecrlf=true` is the one that fires in practice, with git's own
+        // `CRLF would be replaced by LF in <path>` wording already in the error.
+        // Either way it is a `fatal:` and exit 128, never this port's own
+        // `zvcs: <verb>:` shape.
+        filter
+            .convert(repo, &path, &bytes)
+            .map_err(|e| crate::fatal::die(e.to_string()))
     }
 }
 
@@ -383,6 +435,8 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         trust_executable_bit,
         ignore_stat,
         stat_opts,
+        filters: None,
+        filters_quiet: None,
     };
 
     match run(&mut ctx, args)? {
@@ -1551,6 +1605,15 @@ fn add_one_path(
         None => crate::git_fatal!("this operation must be run in a work tree"),
     };
     let content = read_worktree_content(&abs, meta)?;
+    // A symlink's target is stored verbatim: `index_path()` (read-cache.c:2372)
+    // takes the `S_IFLNK` arm, which never reaches `index_fd()` and so never
+    // converts. Everything else is a blob and goes through the filters.
+    let content = if meta.is_symlink() {
+        content
+    } else {
+        let warn = !ctx.info_only;
+        ctx.convert_to_git(path.as_bstr(), content, warn)?
+    };
 
     // `--info-only` records the object id without ever creating the object.
     let id = if ctx.info_only {
@@ -1566,8 +1629,9 @@ fn add_one_path(
     Ok(Ok(()))
 }
 
-/// The bytes git would hash for this worktree item: link target for symlinks,
-/// file contents otherwise (no `.gitattributes` filtering — see the module doc).
+/// The raw bytes of this worktree item: link target for symlinks, file contents
+/// otherwise. A regular file still has to pass [`Ctx::convert_to_git`] before it
+/// is hashed; this is only the read.
 fn read_worktree_content(abs: &Path, meta: &gix::index::fs::Metadata) -> Result<Vec<u8>> {
     if meta.is_symlink() {
         let target = std::fs::read_link(abs)?;
@@ -1889,7 +1953,7 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
         let up_to_date = if must_report {
             false
         } else {
-            match worktree_blob_id(ctx, &abs, mode, &meta)? {
+            match worktree_blob_id(ctx, path.as_bstr(), &abs, mode, &meta)? {
                 Some(disk) => disk == id,
                 None => false,
             }
@@ -2225,7 +2289,8 @@ fn match_stat_basic(
 /// Hash the worktree item at `abs` the way git would store it, for the content
 /// comparison `--refresh` falls back to.
 fn worktree_blob_id(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
+    rela: &BStr,
     abs: &Path,
     mode: Mode,
     meta: &gix::index::fs::Metadata,
@@ -2234,6 +2299,14 @@ fn worktree_blob_id(
         return Ok(gitlink_head(abs));
     }
     let content = read_worktree_content(abs, meta)?;
+    // `ce_compare_data()` passes flags `0` to `index_fd()`, so the file is
+    // converted — otherwise a normalised repository would report every CRLF
+    // file as needing an update — but never round-trip-checked.
+    let content = if meta.is_symlink() {
+        content
+    } else {
+        ctx.convert_to_git(rela, content, false)?
+    };
     Ok(Some(gix::objs::compute_hash(
         ctx.repo.object_hash(),
         gix::objs::Kind::Blob,

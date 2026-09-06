@@ -63,6 +63,41 @@ fn installs_every_piece_of_the_shadow() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Re-running the install *through the shim it already installed* must not point
+/// the shim at itself.
+///
+/// macOS `current_exe` reports the path a process was exec'd through, symlink and
+/// all, so a shim invocation names the shim as "the zvcs binary". Linking that
+/// wrote `git -> <bin>/git`, and since every `git-<verb>` is a relative link to
+/// `git`, one run turned the whole directory into `ELOOP` — the machine lost its
+/// `git` entirely, and the only thing left to repair it was the Homebrew binary
+/// under its other name. Linux resolves `/proc/self/exe` and never reproduced it,
+/// which is exactly why it needs a test rather than a platform assumption.
+#[test]
+fn reinstalling_through_the_installed_shim_does_not_point_it_at_itself() {
+    let home = scratch("reentrant");
+    let first = zshadow(&home, &[], &[]);
+    assert!(first.status.success(), "first install failed: {}", String::from_utf8_lossy(&first.stderr));
+
+    let shim = home.join("bin").join("git");
+    let out = Command::new(&shim)
+        .arg("zshadow")
+        .env("ZVCS_HOME", &home)
+        .output()
+        .expect("run zshadow through the installed shim");
+    assert!(out.status.success(), "shim re-install failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let target = std::fs::read_link(&shim).expect("shim is still a symlink");
+    assert_ne!(target, shim, "the shim was pointed at itself");
+    // The dashed links are relative to the shim, so a shim that leads nowhere
+    // takes every one of them with it; both have to still reach a binary.
+    assert!(shim.metadata().is_ok_and(|m| m.is_file()), "{} no longer resolves", shim.display());
+    let dashed = home.join("bin").join("git-status");
+    assert!(dashed.metadata().is_ok_and(|m| m.is_file()), "{} no longer resolves", dashed.display());
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn stdout_is_shell_code_and_stderr_carries_the_summary() {
     let home = scratch("stdout");

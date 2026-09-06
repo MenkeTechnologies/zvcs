@@ -59,9 +59,16 @@ fn install(bin: &Path, comp: &Path) -> Result<()> {
 
     // The `git` shim first: with it in place the dashed links are made relative
     // to it, so a rebuild at a new path only needs the shim repointed.
-    let me = crate::hosted::git_exe().context("cannot resolve the zvcs binary path")?;
+    let me = dashed::shim_target(bin)?;
     let mut shim = dashed::LinkStats::default();
     dashed::link_to(&bin.join("git"), &me, &mut shim)?;
+    // The dashed links are about to be pointed at the shim by name, so a shim
+    // that does not lead to a binary takes all ~300 of them with it. Checking
+    // once here turns that into an error instead of a machine without a `git`.
+    let installed = bin.join("git");
+    if !is_executable(&installed) {
+        anyhow::bail!("{} does not resolve to an executable", installed.display());
+    }
     let links = dashed::install_links(bin, &dashed::link_target(bin)?)?;
     let pages = manpage::install_all().unwrap_or(0);
     let html = htmldoc::install_all().unwrap_or(0);
@@ -79,6 +86,16 @@ fn install(bin: &Path, comp: &Path) -> Result<()> {
         comp.display(),
     );
     Ok(())
+}
+
+/// A path that resolves — through however many symlinks — to a file carrying an
+/// execute bit. `metadata` follows, so a self-referential shim answers `false`
+/// rather than being mistaken for an install that worked.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// Write the embedded `_git` into `dir`, skipping the write when the installed

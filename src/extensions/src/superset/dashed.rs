@@ -31,11 +31,60 @@ pub struct LinkStats {
 /// The path the `git-<verb>` links should point at: the sibling `git` when it
 /// already exists (a relative link, so the dashed forms track whatever the shim
 /// points at and survive rebuilds), else this binary by absolute path.
+///
+/// `symlink_metadata` rather than `exists`, which follows: a shim left pointing
+/// at itself is present but unfollowable, and `exists` answering "absent" there
+/// would spray absolute paths over every dashed link instead of leaving them
+/// tracking the shim — where one repointed link fixes them all.
 pub fn link_target(dir: &Path) -> Result<PathBuf> {
-    if dir.join("git").exists() {
+    if dir.join("git").symlink_metadata().is_ok() {
         Ok(PathBuf::from("git"))
     } else {
-        crate::hosted::git_exe().context("cannot resolve the zvcs binary path")
+        shim_target(dir)
+    }
+}
+
+/// The binary the `git` shim in `dir` should point at.
+///
+/// Not plainly [`crate::hosted::git_exe`]: on macOS `current_exe` hands back the
+/// path the process was exec'd *through*, symlink and all, so `git zshadow` run
+/// through an already-installed shim reports the shim itself. Linking that points
+/// the shim at itself, and because every `git-<verb>` beside it is a relative link
+/// to `git`, one such run turns the whole directory into `ELOOP` and leaves the
+/// machine with no `git` at all. (Linux cannot reach this: `current_exe` there
+/// reads `/proc/self/exe`, which the kernel has already resolved.)
+///
+/// One `read_link` hop off the shim names the real binary. Deliberately not
+/// `canonicalize`: resolving the whole chain would follow Homebrew's `bin/zvcs`
+/// down to a versioned `Cellar/zvcs/<version>/bin/zvcs` that the next
+/// `brew upgrade` deletes, so the shim would break on upgrade instead of
+/// following it.
+pub fn shim_target(dir: &Path) -> Result<PathBuf> {
+    let shim = dir.join("git");
+    let me = crate::hosted::git_exe().context("cannot resolve the zvcs binary path")?;
+    if !same_entry(&me, &shim) {
+        return Ok(me);
+    }
+    let hop = std::fs::read_link(&shim)
+        .with_context(|| format!("{} is not a symlink to the zvcs binary", shim.display()))?;
+    // A relative link reads relative to the directory holding it.
+    let hop = if hop.is_absolute() { hop } else { dir.join(hop) };
+    if same_entry(&hop, &shim) {
+        anyhow::bail!(
+            "{} already points at itself; re-run from the real binary, e.g. `zvcs zshadow`",
+            shim.display()
+        );
+    }
+    Ok(hop)
+}
+
+/// Whether two paths name the same directory entry, following neither of them:
+/// `symlink_metadata`, so a self-referential link answers rather than `ELOOP`.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
     }
 }
 

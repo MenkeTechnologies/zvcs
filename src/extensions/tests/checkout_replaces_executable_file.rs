@@ -127,11 +127,24 @@ fn an_executable_entry_replaces_the_file_it_checks_out_over() {
     assert_eq!(mode(&exe) & 0o111, 0o111, "and it must still be executable");
 }
 
-/// Only the executable path pays for the extra unlink - everything else keeps
-/// writing through the existing file, which is both cheaper and unaffected by
-/// the ownership problem, since it never needs a mode change.
+/// The unlink is not the executable path's alone. `checkout_entry_ca()` clears
+/// whatever is at the path before `create_file()` opens `O_WRONLY | O_CREAT |
+/// O_EXCL` (entry.c:565-577, :89), so a plain entry replaces its file too, and
+/// the mode is only the reason the comment there gives for it.
+///
+/// Measured on stock 2.55.0 over this same fixture — a hard link to each file,
+/// then `reset --hard HEAD~1`:
+///
+/// ```text
+/// plain.txt=v1 link=v2 nlink=1
+/// exe.sh=v1    link=v2 nlink=1
+/// ```
+///
+/// so both names part company and neither checked-out file keeps the link. The
+/// earlier expectation here (link `v1`, nlink 2) was taken from the released
+/// zvcs binary rather than from git, which is the one oracle this suite uses.
 #[test]
-fn a_plain_entry_is_still_written_in_place() {
+fn a_plain_entry_replaces_its_file_the_same_way() {
     let f = Fixture::new("ckplain");
     let plain = f.path("plain.txt");
     let link = f.hardlink("plain.txt");
@@ -139,6 +152,6 @@ fn a_plain_entry_is_still_written_in_place() {
     f.git(&["reset", "--hard", "HEAD~1"]);
 
     assert_eq!(read(&plain), "v1\n", "the entry must be checked out");
-    assert_eq!(read(&link), "v1\n", "a non-executable entry needs no replacement");
-    assert_eq!(links(&plain), 2, "so the file it was written into is the same one");
+    assert_eq!(read(&link), "v2\n", "the old file is left behind, as git leaves it");
+    assert_eq!(links(&plain), 1, "the checked out file must be a fresh one");
 }

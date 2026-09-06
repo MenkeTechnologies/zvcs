@@ -41,7 +41,27 @@ impl delegate::Revision for Delegate<'_> {
         let mut candidates = Some(HashSet::default());
         self.prefix[self.idx] = Some(prefix);
 
-        let empty_tree_id = gix_hash::ObjectId::empty_tree(prefix.as_oid().kind());
+        // The empty tree is synthesized rather than looked up, but *which* empty
+        // tree exists is a property of the repository's hash algorithm, never of
+        // the operand. git spells the test `is_empty_tree_oid(oid, algop)`, which
+        // is `oideq(oid, algop->empty_tree)` (`hash.h:469-473`), and the algorithm
+        // table binds sha1 to `empty_tree_oid` (`hash.c:212`) and sha256 to
+        // `empty_tree_oid_sha256` (`hash.c:227`) — so `algop` is the repository's
+        // algorithm and the sha1 empty tree is simply not a valid object name in a
+        // sha256 repository.
+        //
+        // Keying this off `prefix.as_oid().kind()` instead read the algorithm off
+        // the *operand*: `Prefix::from_hex()` infers its kind from the hex length
+        // alone (`gix-hash/src/prefix.rs:171`, `Kind::from_hex_len(value.len())`),
+        // so a 40-hex operand is Sha1-kind even in a sha256 repository. That made
+        // `4b825dc642cb6eb9a060e54bf8d69288fbee4904` bypass `lookup_prefix` and
+        // resolve to a Sha1 `ObjectId` against a Sha256 odb, which trips
+        // `debug_assert_eq!(self.object_hash, id.kind())` in
+        // `gix-odb/src/store_impls/loose/find.rs:34` — a panic where stock git
+        // says `fatal: Not a valid object name`. Mismatched kinds compare unequal
+        // (`oid`'s `PartialEq` is over the byte slices, and 20 != 32 bytes), so
+        // taking the hash from the repository restores that `die()`.
+        let empty_tree_id = gix_hash::ObjectId::empty_tree(self.repo.object_hash());
         let ok = if prefix.as_oid() == empty_tree_id {
             candidates.as_mut().expect("set").insert(empty_tree_id);
             Ok(Some(Err(())))

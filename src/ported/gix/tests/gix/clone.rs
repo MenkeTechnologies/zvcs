@@ -288,6 +288,7 @@ mod blocking_io {
             .prepare_fetch(gix::progress::Discard, Default::default())?
             .with_shallow(Shallow::Since {
                 cutoff: gix::date::Time::new(1112354053, 0),
+                depth: None,
             })
             .receive(gix::progress::Discard, &AtomicBool::default())?;
 
@@ -320,6 +321,7 @@ mod blocking_io {
                     .map(|n| n.try_into().expect("valid"))
                     .collect(),
                 since_cutoff: None,
+                depth: None,
             })
             .fetch_only(gix::progress::Discard, &AtomicBool::default())?;
 

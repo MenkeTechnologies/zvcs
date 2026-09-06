@@ -81,12 +81,13 @@
 //! * The multi-tree merges decide per path over the union of the index's and the
 //!   trees' paths rather than through `traverse_trees()`'s simultaneous walk. The
 //!   merge functions themselves are ported verbatim; what the walk adds on top is
-//!   directory/file-conflict detection — git substitutes `o->df_conflict_entry`
-//!   for a slot whose path is a directory in that tree — and sparse-directory
-//!   handling. A path that is a file in one tree and a directory in another is
-//!   therefore merged as if the directory side were absent. Because no sparse
-//!   directory entry is ever built here, the index this verb writes is never
-//!   sparse, so `prime_cache_tree()`'s sparse-directory branch
+//!   sparse-directory handling. Directory/file-conflict detection *is* reproduced:
+//!   a slot whose path is a directory in that tree, or whose parent directory is a
+//!   file there, is marked the way `unpack_nondirectories()` substitutes
+//!   `o->df_conflict_entry` for it, so `threeway_merge()`'s two rules that ask
+//!   whether an absence was a real deletion (#14/#2ALT and #13/#3ALT) decline it.
+//!   Because no sparse directory entry is ever built here, the index this verb
+//!   writes is never sparse, so `prime_cache_tree()`'s sparse-directory branch
 //!   (cache-tree.c:872-891) cannot be reached through `read-tree`.
 //! * The `-u` untracked-collision check rejects any existing file at a path the read
 //!   adds; git additionally permits it when the file is `.gitignore`d.
@@ -1050,6 +1051,31 @@ fn multi_tree_read(
         paths.extend(tree.keys().cloned());
     }
 
+    // Every directory each tree holds, so a slot's absence can be told apart from
+    // a directory/file collision. `traverse_trees_recursive()` (unpack-trees.c)
+    // passes `mask & ~dirmask` down as `info->df_conflicts`, and
+    // `unpack_nondirectories()` turns `info->df_conflicts | dirmask` into
+    // `o->df_conflict_entry` slots — so a tree conflicts on a path when the path is
+    // a directory there, or when any ancestor of it is a file there.
+    let tree_dirs: Vec<HashSet<BString>> = trees
+        .iter()
+        .map(|tree| {
+            let mut dirs: HashSet<BString> = HashSet::new();
+            for path in tree.keys() {
+                let mut cut = path.len();
+                while let Some(slash) = path[..cut].iter().rposition(|b| *b == b'/') {
+                    let dir = BString::from(&path[..slash]);
+                    let fresh = dirs.insert(dir);
+                    if !fresh {
+                        break;
+                    }
+                    cut = slash;
+                }
+            }
+            dirs
+        })
+        .collect();
+
     let stat_ctx = StatCtx::new(repo, old)?;
     let ctx = MergeCtx {
         repo,
@@ -1070,9 +1096,14 @@ fn multi_tree_read(
 
     for path in &paths {
         let mut stages: Vec<Option<Ce>> = Vec::with_capacity(trees.len() + 1);
+        let mut df_conflict: Vec<bool> = Vec::with_capacity(trees.len() + 1);
         stages.push(index_slots.get(path).copied());
-        for tree in &trees {
-            stages.push(tree.get(path).copied());
+        df_conflict.push(false);
+        for (tree, dirs) in trees.iter().zip(&tree_dirs) {
+            let slot = tree.get(path).copied();
+            df_conflict
+                .push(slot.is_none() && (dirs.contains(path) || ancestor_is_file(tree, path)));
+            stages.push(slot);
         }
 
         let verdict = if trees.len() == 2 {
@@ -1083,7 +1114,7 @@ fn multi_tree_read(
                 initial_checkout,
             )
         } else {
-            threeway_merge(&ctx, &stages, head_idx, path.as_bstr()).map(|(v, nt)| {
+            threeway_merge(&ctx, &stages, head_idx, &df_conflict, path.as_bstr()).map(|(v, nt)| {
                 nontrivial |= nt;
                 v
             })
@@ -1169,6 +1200,22 @@ fn multi_tree_read(
     crate::index_racy::write_with(repo, &mut new_index, write_options(repo, o))?;
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Is some proper ancestor directory of `path` a *file* in this tree?
+///
+/// `traverse_trees_recursive()` cannot descend into a name that is a blob, so every
+/// path under it arrives at the merge as `o->df_conflict_entry` rather than as a
+/// plain absence.
+fn ancestor_is_file(tree: &HashMap<BString, Ce>, path: &BString) -> bool {
+    let mut cut = path.len();
+    while let Some(slash) = path[..cut].iter().rposition(|b| *b == b'/') {
+        if tree.contains_key(path[..slash].as_bstr()) {
+            return true;
+        }
+        cut = slash;
+    }
+    false
 }
 
 /// Map a raw stage number (0..=3) to gitoxide's `Stage`.
@@ -1399,8 +1446,17 @@ fn threeway_merge(
     ctx: &MergeCtx<'_>,
     stages: &[Option<Ce>],
     head_idx: usize,
+    // `stages[i] == o->df_conflict_entry`: the slot is absent from that tree only
+    // because the name collides with the other kind there — a directory where the
+    // path is a file, or a file standing where the path's parent directory is. git
+    // substitutes a sentinel entry for such a slot and then nulls it out, so the
+    // slot reads as absent everywhere except in the two rules that ask whether the
+    // absence was a real deletion (#14/#2ALT and #13/#3ALT).
+    df_conflict: &[bool],
     path: &gix::bstr::BStr,
 ) -> std::result::Result<(Verdict, bool), String> {
+    let df_conflict_head = df_conflict[head_idx];
+    let df_conflict_remote = df_conflict[head_idx + 1];
     let remote = stages[head_idx + 1];
     let index = stages[0];
     let head = stages[head_idx];
@@ -1431,7 +1487,7 @@ fn threeway_merge(
 
     // #14, #14ALT, #2ALT — the index is allowed to match the result, not head.
     if let Some(rem) = remote {
-        if head_match != 0 && remote_match == 0 {
+        if !df_conflict_head && head_match != 0 && remote_match == 0 {
             if index.is_some() && !same(index, remote) && !same(index, head) {
                 return Err(reject_merge(path));
             }
@@ -1448,8 +1504,11 @@ fn threeway_merge(
         if same(head, remote) {
             return Ok((ctx.merged_entry(h, index, path)?, false));
         }
-        // #13, #3ALT.
-        if remote_match != 0 && head_match == 0 {
+        // #13, #3ALT. A head that only *looks* like an unchanged side because the
+        // remote could not be walked (a file where this path's directory lives, or
+        // the reverse) is not the trivially-resolvable case: git keeps the stage
+        // rather than collapsing the path to stage 0.
+        if !df_conflict_remote && remote_match != 0 && head_match == 0 {
             return Ok((ctx.merged_entry(h, index, path)?, false));
         }
     }

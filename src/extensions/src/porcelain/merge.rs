@@ -3398,15 +3398,29 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
         return Ok(Attempt::Done { code: ExitCode::SUCCESS, autostash_applied: true });
     }
 
+    // `finish_automerge()` (builtin/merge.c):
+    //
+    // ```c
+    // parents = remoteheads;
+    // if (!head_subsumed || fast_forward == FF_NO)
+    //         commit_list_insert(head, &parents);
+    // ```
+    //
+    // The strategy script decides the *tree*; `cmd_merge` decides the parents. So
+    // when the first head fast-forwarded the base line past `HEAD`, the script's
+    // `MRC` no longer names `HEAD` — `merge a b` from an ancestor yields `[a, b]` —
+    // but `--no-ff` puts it back at the front regardless, which is the form
+    // `rebase --rebase-merges` replays an octopus in (`do_merge()` runs
+    // `git merge -s octopus … --no-ff …`, sequencer.c).
+    let mut parents = mrc.clone();
+    if opts.ff == Ff::Never && parents.first() != Some(&ctx.local_id) {
+        parents.insert(0, ctx.local_id);
+    }
     Ok(Attempt::Clean {
         tree: mrt,
         // Every merged head becomes a parent (`mrc` minus HEAD).
         heads: mrc.iter().copied().filter(|p| *p != ctx.local_id).collect(),
-        // `git-merge-octopus` commits exactly its MRC: when the first head
-        // fast-forwarded the base line past `HEAD`, `HEAD` was replaced there and
-        // is not a parent — `merge a b` from an ancestor yields `[a, b]`, not
-        // `[HEAD, a, b]`.
-        parents_override: Some(mrc),
+        parents_override: Some(parents),
         spec_label: ctx.refs.join(" "),
     })
 }

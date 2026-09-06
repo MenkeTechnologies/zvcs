@@ -5349,6 +5349,7 @@ fn emit_combined_diff(
             abbrev,
             false,
             true,
+            false,
         )?);
     }
     if opts.output_format & (FMT_RAW | stat_mask) != 0 {

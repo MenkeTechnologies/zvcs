@@ -4090,7 +4090,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // counts the needle in each side's whole blob and keeps the file when
                 // the two counts differ, and `objfind` only compares ids, so the scan
                 // reads blobs (or nothing at all) and never diffs them.
-                (Some(px), None) => pickaxe_by_count(&repo, candidates, &px.kind)?,
+                (Some(px), None) => pickaxe_by_count(&repo, candidates, &px.kind, &pathspecs, &patch_opts)?,
                 _ => {
                     let jobs: Vec<(ObjectId, Option<ObjectId>)> =
                         candidates.iter().map(|n| (n.id, n.parents.first().copied())).collect();
@@ -4985,6 +4985,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                                 .max(MINIMUM_ABBREV),
                             z,
                             true,
+                            false,
                         )?);
                         separator = true;
                     } else if name_only || name_status {
@@ -9732,6 +9733,14 @@ fn pickaxe_by_count(
     repo: &gix::Repository,
     nodes: Vec<Node>,
     kind: &super::diff_pairs::PickaxeKind,
+    // `-- <pathspec>`: `diff_tree_oid()` prunes the tree walk before
+    // `diffcore_std()` runs `diffcore_rename()` and then `diffcore_pickaxe()`, so
+    // the search only ever sees the entries the pathspec kept. Each worker parses
+    // its own matcher, which holds a `RefCell` and is therefore not shareable.
+    pathspecs: &[String],
+    // The rename settings the exact pass detects with, so a pathspec-limited queue
+    // is paired the way `git log`'s own `diffcore_rename()` would pair it.
+    detect: &super::diff::PatchOpts,
 ) -> Result<Vec<Node>> {
     let empty_needle = match kind {
         super::diff_pairs::PickaxeKind::Occurrences(super::diff_pairs::Needle::Literal(n)) => {
@@ -9746,9 +9755,13 @@ fn pickaxe_by_count(
     // there is real work in each unit.
     let workers = crate::threads::count(nodes.len(), 2);
     if workers <= 1 {
+        let mut limit = match pathspecs.is_empty() {
+            true => None,
+            false => Some(PathspecMatcher::new(repo, pathspecs)?),
+        };
         let mut kept = Vec::new();
         for node in nodes {
-            if commit_changes_count(repo, &node, kind)? {
+            if commit_changes_count(repo, &node, kind, limit.as_mut(), detect)? {
                 kept.push(node);
             }
         }
@@ -9766,11 +9779,15 @@ fn pickaxe_by_count(
             let cursor = &cursor;
             handles.push(scope.spawn(move || -> Result<Vec<usize>> {
                 let repo = proto;
+                let mut limit = match pathspecs.is_empty() {
+                    true => None,
+                    false => Some(PathspecMatcher::new(&repo, pathspecs)?),
+                };
                 let mut mine = Vec::new();
                 loop {
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(node) = nodes.get(i) else { break };
-                    if commit_changes_count(&repo, node, kind)? {
+                    if commit_changes_count(&repo, node, kind, limit.as_mut(), detect)? {
                         mine.push(i);
                     }
                 }
@@ -9806,7 +9823,10 @@ fn commit_changes_count(
     repo: &gix::Repository,
     node: &Node,
     kind: &super::diff_pairs::PickaxeKind,
+    limit: Option<&mut PathspecMatcher>,
+    detect: &super::diff::PatchOpts,
 ) -> Result<bool> {
+    let mut limit = limit;
     let new_tree = repo.find_object(node.id)?.try_into_commit()?.tree()?;
     let old_tree = match node.parents.first() {
         Some(pid) => Some(repo.find_object(*pid)?.try_into_commit()?.tree()?),
@@ -9850,10 +9870,52 @@ fn commit_changes_count(
     // over-approximation, and only a commit it flags needs the second, exact
     // pass. Most commits are not flagged, and the history's renames are paid for
     // only where they might matter.
-    if !any_count_changed(repo, old_tree.as_ref(), &new_tree, kind, &mut count_of, false)? {
+    if !any_count_changed(
+        repo,
+        old_tree.as_ref(),
+        &new_tree,
+        kind,
+        &mut count_of,
+        false,
+        limit.as_deref(),
+    )? {
         return Ok(false);
     }
-    any_count_changed(repo, old_tree.as_ref(), &new_tree, kind, &mut count_of, true)
+    // Under a pathspec the exact pass cannot lean on the tree differ's own rename
+    // tracking: gitoxide pairs before anything is filtered, while git prunes the
+    // walk first (`tree-diff.c`) and only then runs `diffcore_rename()`. Pairing a
+    // kept deletion with a pruned addition would cancel a difference git never
+    // cancels, so the queue is built the way every other pathspec-limited format in
+    // this file builds it — limit, then detect — and each surviving pair is asked
+    // the same `has_changes` question.
+    let Some(m) = limit else {
+        return any_count_changed(
+            repo,
+            old_tree.as_ref(),
+            &new_tree,
+            kind,
+            &mut count_of,
+            true,
+            None,
+        );
+    };
+    let commit = repo.find_object(node.id)?.try_into_commit()?;
+    let files = collect_changes(
+        repo,
+        &commit,
+        node.parents.first().copied(),
+        false,
+        super::diff::Whitespace::Keep,
+        Some(detect),
+        Some(m),
+        None,
+    )?;
+    for f in &files {
+        if pickaxe_file_hit(repo, kind, f)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether any changed pair between the two trees holds the needle a different
@@ -9866,6 +9928,9 @@ fn any_count_changed(
     kind: &super::diff_pairs::PickaxeKind,
     count_of: &mut impl FnMut(&gix::Repository, Option<ObjectId>) -> Result<i64>,
     rename_tracking: bool,
+    // `-- <pathspec>`: applied to the raw tree changes, which is where
+    // `diff_tree_oid()` applies it — ahead of every diffcore pass.
+    limit: Option<&PathspecMatcher>,
 ) -> Result<bool> {
     let mut options = gix::diff::Options::default();
     if rename_tracking {
@@ -9873,6 +9938,9 @@ fn any_count_changed(
     }
     let changes = repo.diff_tree_to_tree(old_tree, Some(new_tree), Some(options))?;
     for change in changes {
+        if limit.is_some_and(|m| !m.matches(change_path(&change))) {
+            continue;
+        }
         let (old_id, new_id) = change_blob_ids(&change);
         // `o->objfind`: a pair is kept when either side *is* one of the named objects,
         // which is decided before the unmodified-pair short circuit below.

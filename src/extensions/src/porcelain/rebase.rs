@@ -2444,6 +2444,18 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     flags & VERBOSE != 0,
                     rerere_autoupdate,
                 )?;
+                // `create_autostash(the_repository, state_dir_path("autostash", &options))`
+                // (builtin/rebase.c:1778-1780) writes into whichever directory the *backend*
+                // owns, and for `--apply` that is `.git/rebase-apply` — the same session
+                // directory `git am` uses. Only the merge backend's copy was ever written
+                // here, so a `rebase --apply --autostash` that stopped on a conflict left no
+                // record of the snapshot: `--abort` then restored orig-head and dropped the
+                // state directory with the local changes still only in an unreferenced stash
+                // commit. Measured against 2.55.0, which says `Applied autostash.` and hands
+                // them back.
+                if let Some(oid) = autostash_oid {
+                    write_autostash_in(&rebase_apply_dir(&repo), oid)?;
+                }
                 // `cmd_rebase()` ends in `return !!ret` (builtin/rebase.c:1920),
                 // so every failure the backend reports collapses to exit 1 —
                 // `git am`'s own 128 for `Patch is empty.` or a conflict included.
@@ -3629,8 +3641,24 @@ fn read_stopped_sha(repo: &gix::Repository) -> Option<ObjectId> {
 /// if any. Written by [`Sequencer::stop_for_conflict`] on a conflict-stop, consumed by
 /// `--continue`/`--abort` to re-apply the user's changes once the rebase ends.
 fn read_autostash(repo: &gix::Repository) -> Option<ObjectId> {
-    let raw = std::fs::read_to_string(rebase_merge_dir(repo).join("autostash")).ok()?;
+    read_autostash_in(&rebase_merge_dir(repo))
+}
+
+/// The same file under whichever state directory the running backend owns —
+/// `state_dir_path("autostash", opts)`, which is `.git/rebase-merge` for the merge
+/// backend and `.git/rebase-apply` for the apply one (builtin/rebase.c:1266).
+fn read_autostash_in(dir: &std::path::Path) -> Option<ObjectId> {
+    let raw = std::fs::read_to_string(dir.join("autostash")).ok()?;
     ObjectId::from_hex(raw.trim().as_bytes()).ok()
+}
+
+/// `create_autostash()`'s own write: `write_file(path, "%s", oid_to_hex(&oid))` after
+/// `safe_create_leading_directories_const()` (sequencer.c, `create_autostash_internal`).
+/// `write_file` completes the line, hence the trailing newline stock leaves.
+fn write_autostash_in(dir: &std::path::Path, oid: ObjectId) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("autostash"), format!("{oid}\n"))?;
+    Ok(())
 }
 
 /// `git rebase --abort`: restore the worktree, index and branch to `orig-head`,
@@ -4149,6 +4177,12 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
     let dir = rebase_apply_dir(repo);
     match action {
         ModeOption::Quit => {
+            // `ACTION_QUIT`: `save_autostash(state_dir_path("autostash", &options))`
+            // (builtin/rebase.c:1422) — the snapshot is pushed onto the stash list rather
+            // than re-applied, so the changes survive a `--quit` that keeps the new tree.
+            if let Some(oid) = read_autostash_in(&dir) {
+                super::stash::store_commit(repo, oid, "autostash")?;
+            }
             let _ = std::fs::remove_dir_all(&dir);
             return Ok(ExitCode::SUCCESS);
         }
@@ -4167,7 +4201,16 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
             ] {
                 let _ = std::fs::remove_file(repo.git_dir().join(f));
             }
+            // `finish_rebase()` (builtin/rebase.c) is what `ACTION_ABORT` ends in, and it
+            // runs `apply_autostash(state_dir_path("autostash", opts))` *before*
+            // `remove_dir_recursively(state_dir)` — the snapshot's only reference lives in
+            // that directory, so the order is the difference between handing the local
+            // changes back and dropping them.
+            let autostash = read_autostash_in(&dir);
             let _ = std::fs::remove_dir_all(&dir);
+            if let Some(oid) = autostash {
+                super::stash::apply_autostash(repo, oid, false)?;
+            }
             super::maintenance::run_auto_maintenance(repo, false)?;
             return Ok(ExitCode::SUCCESS);
         }
@@ -4187,6 +4230,9 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
         quiet: st.quiet,
         head_name: st.head_name.clone(),
     };
+    // Carried across the resume so `finish_rebase()` can put it back when the replay
+    // finally lands, and re-written when this attempt stops again.
+    let autostash = read_autostash_in(&dir);
     let skip = action == ModeOption::Skip;
     if skip {
         // `ACTION_SKIP`'s `reset_head(RESET_HEAD_HARD)` before the `am --skip`:
@@ -4199,6 +4245,11 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
             move_to_original_branch(repo, tip, st.head_name.as_deref(), st.onto)?;
             let _ = std::fs::remove_file(repo.git_dir().join("REBASE_HEAD"));
             let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
+            // `finish_rebase()`'s `apply_autostash(state_dir_path("autostash", opts))`: the
+            // replay is done, so the snapshot goes back on top of the rebased tree.
+            if let Some(oid) = autostash {
+                super::stash::apply_autostash(repo, oid, st.quiet)?;
+            }
             super::maintenance::run_auto_maintenance(repo, st.quiet)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -4212,6 +4263,10 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
                 st.verbose,
                 st.rerere_autoupdate,
             )?;
+            // Still stopped: the reference has to survive into the next resume.
+            if let Some(oid) = autostash {
+                write_autostash_in(&dir, oid)?;
+            }
             // `return !!ret` again: a resumed apply-backend rebase that stops
             // reports 1, not `git am`'s 128.
             let _ = code;

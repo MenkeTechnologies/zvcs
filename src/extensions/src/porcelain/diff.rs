@@ -8680,7 +8680,7 @@ fn render_combined_raw(
     r: &Render,
     line_prefix: &[u8],
 ) {
-    render_combined_raw_at(out, cp, fmt, r.raw_abbrev, r.z, line_prefix);
+    render_combined_raw_at(out, cp, fmt, r.raw_abbrev, r.z, line_prefix, false);
 }
 
 /// [`render_combined_raw`] with the two `Render` fields it reads passed directly,
@@ -8693,6 +8693,10 @@ fn render_combined_raw_at(
     raw_abbrev: usize,
     z: bool,
     line_prefix: &[u8],
+    // `rev->combined_all_paths` (combine-diff.c:1268-1274): the path as each parent
+    // knew it, ahead of the result's own. `filename_changed()` is `R` or `C`, and
+    // this walk runs no rename detection, so every parent's path is the result path.
+    combined_all_paths: bool,
 ) {
     if fmt & F_RAW != 0 {
         out.extend_from_slice(line_prefix);
@@ -8719,6 +8723,12 @@ fn render_combined_raw_at(
         // `-z` drops the inter-name terminator along with the record terminator.
         out.push(if z { 0 } else { b'\t' });
     }
+    if combined_all_paths {
+        for _ in &cp.parents {
+            out.extend_from_slice(&name_field(&cp.path, z));
+            out.push(if z { 0 } else { b'\t' });
+        }
+    }
     out.extend_from_slice(&name_field(&cp.path, z));
     out.push(if z { 0 } else { b'\n' });
 }
@@ -8736,6 +8746,7 @@ pub(crate) fn merge_combined_raw(
     abbrev: usize,
     z: bool,
     raw: bool,
+    combined_all_paths: bool,
 ) -> Result<Vec<u8>> {
     let result_tree = repo.find_commit(commit)?.tree()?;
     let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
@@ -8746,7 +8757,7 @@ pub(crate) fn merge_combined_raw(
     let fmt = if raw { F_RAW } else { F_NAME_STATUS };
     let mut out = Vec::new();
     for cp in &set {
-        render_combined_raw_at(&mut out, cp, fmt, abbrev, z, b"");
+        render_combined_raw_at(&mut out, cp, fmt, abbrev, z, b"", combined_all_paths);
     }
     Ok(out)
 }
@@ -8884,6 +8895,7 @@ fn emit_combined(
             &req.b_prefix,
             line_prefix,
             colors,
+            false,
         )?);
     }
     Ok(())
@@ -8953,7 +8965,16 @@ pub(crate) fn merge_combined_patch_painted(
     for p in parents {
         parent_trees.push(repo.find_commit(*p)?.tree()?);
     }
-    combined_trees_patch_painted(repo, &result_tree, &parent_trees, paths, ctx, dense, colors)
+    combined_trees_patch_painted(
+        repo,
+        &result_tree,
+        &parent_trees,
+        paths,
+        ctx,
+        dense,
+        colors,
+        false,
+    )
 }
 
 /// The combined diff of `result_tree` against every parent tree, with the header
@@ -8976,6 +8997,7 @@ pub(crate) fn combined_trees_patch_headed(
         ctx,
         dense,
         &diff_color::DiffColors::disabled(),
+        false,
     )
 }
 
@@ -8990,10 +9012,13 @@ pub(crate) fn combined_trees_patch_painted(
     ctx: u32,
     dense: bool,
     colors: &diff_color::DiffColors,
+    // `rev->combined_all_paths`: one `--- a/<path>` per parent instead of one
+    // (combine-diff.c:988-997).
+    combined_all_paths: bool,
 ) -> Result<Vec<u8>> {
     let set = combined_path_set(repo, result_tree, parent_trees, paths)?;
     let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
-    combined_patch(&set, ctx, dense, abbrev, b"a/", b"b/", b"", colors)
+    combined_patch(&set, ctx, dense, abbrev, b"a/", b"b/", b"", colors, combined_all_paths)
 }
 
 /// `show_patch_diff()` (combine-diff.c:1015) over an already-built path set: one
@@ -9023,6 +9048,7 @@ fn combined_patch(
     b_prefix: &[u8],
     line_prefix: &[u8],
     colors: &diff_color::DiffColors,
+    combined_all_paths: bool,
 ) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     for cp in set {
@@ -9090,7 +9116,24 @@ fn combined_patch(
             out.push(b'\n');
         }
 
-        if added {
+        // `if (rev->combined_all_paths)` (combine-diff.c:988-1005): one `---` line
+        // per parent, each naming the path as that parent knew it — the result path
+        // here, since no rename detection runs in this walk — and `/dev/null` for a
+        // parent that reports the path as added. Without the option it is the single
+        // line git prints, `/dev/null` only when *every* parent added it.
+        if combined_all_paths {
+            for p in &cp.parents {
+                match p.status == b'A' {
+                    true => dump_quoted_path(&mut out, line_prefix, b"--- ", b"/dev/null"),
+                    false => dump_quoted_path(
+                        &mut out,
+                        line_prefix,
+                        b"--- ",
+                        &quote_one(a_prefix, &cp.path),
+                    ),
+                }
+            }
+        } else if added {
             dump_quoted_path(&mut out, line_prefix, b"--- ", b"/dev/null");
         } else {
             dump_quoted_path(&mut out, line_prefix, b"--- ", &quote_one(a_prefix, &cp.path));

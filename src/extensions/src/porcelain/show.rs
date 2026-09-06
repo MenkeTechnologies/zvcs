@@ -118,9 +118,11 @@ const DEFAULT_ABBREV: usize = 7;
 /// `--remerge-diff` / `--diff-merges=remerge` parses, and is refused where
 /// `do_remerge_diff()` would run: this port has no merge engine to re-run, so a
 /// request that reaches no merge behaves exactly as git's does and one that reaches
-/// a merge says so instead of guessing. `--combined-all-paths` is refused for the
-/// same reason — the shared combined engine prints one `--- a/<path>`, not one per
-/// parent.
+/// a merge says so instead of guessing. `--combined-all-paths` is applied:
+/// `show_raw_diff()`'s per-parent path columns and `show_combined_header()`'s
+/// per-parent `--- a/<path>` lines are both emitted. No rename detection runs in the
+/// combined walk, so `filename_changed()` is false for every parent and each column
+/// is the result path — the same simplification `git diff-tree -c` makes here.
 ///
 /// `--check` is `DIFF_FORMAT_CHECKDIFF`, which `diff_setup_done()` lets clear every
 /// other output format: the record becomes its header and the whitespace report,
@@ -364,6 +366,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `--expand-tabs[=<n>]` / `--no-expand-tabs`; `None` keeps the indented
     // formats on git's `expand_tabs_in_log_default` of 8.
     let mut expand_tabs: Option<usize> = None;
+    // `git_log_output_encoding` (environment.c:51), set by `--encoding=<enc>`.
+    let mut log_encoding: Option<String> = None;
 
     for (idx, a) in args.iter().enumerate() {
         let s = a.as_str();
@@ -562,16 +566,15 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             }
             // `log.abbrevCommit`/`log.date`/`log.showRoot` overrides, mirroring
             // `git log`. There is no `--no-root`; `--root` only forces it on.
-            // `--encoding=<enc>`: the encoding commit messages are re-coded into; this
-            // port writes them as stored, which is `utf-8`/`none`.
+            // `--encoding=<enc>`: `git_log_output_encoding`, the charset
+            // `repo_logmsg_reencode()` re-codes each commit into before `show_log()`
+            // reads it. `none` is git's empty string (builtin/log.c:180-185), which
+            // means "print the stored bytes". Same slot `git log` fills, and the same
+            // re-coder below, so the two commands cannot drift.
             s if s.starts_with("--encoding=") => {
                 let v = &s["--encoding=".len()..];
-                if !super::blame::encoding_is_passthrough(v) {
-                    bail!(
-                        "unsupported option {s} (only utf-8 and none are ported; re-coding \
-                         commit messages is not)"
-                    );
-                }
+                log_encoding =
+                    Some(if v == "none" { String::new() } else { v.to_string() });
             }
             "--abbrev-commit" => cli_abbrev = Some(true),
             "--no-abbrev-commit" => cli_abbrev = Some(false),
@@ -1146,7 +1149,6 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         ) {
             return Ok(fatal("--combined-all-paths makes no sense without -c or --cc\n"));
         }
-        bail!("unsupported option --combined-all-paths");
     }
     // `show_setup_revisions_tweak()` (builtin/log.c:651-659), the whole of what
     // makes `git show` differ from `git log` here:
@@ -1869,6 +1871,26 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     }
     let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
     let (cfg_subject_prefix, cfg_encode_email_headers) = super::log::email_config(&repo);
+    // `get_log_output_encoding()` (environment.c:189-198): `--encoding=` wins, then
+    // `i18n.logOutputEncoding`, then `i18n.commitEncoding`, and UTF-8 when none of
+    // them is set. Resolved exactly as `git log` resolves it — same precedence, same
+    // refusal for the encoders `reencode()` does not have.
+    let output_encoding = match log_encoding {
+        Some(v) => v,
+        None => {
+            let cfg = repo.config_snapshot();
+            cfg.string("i18n.logOutputEncoding")
+                .or_else(|| cfg.string("i18n.commitEncoding"))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "UTF-8".to_string())
+        }
+    };
+    if super::mailinfo::is_utf16_or_32_name(&output_encoding) {
+        bail!(
+            "unsupported flag \"--encoding={output_encoding}\" (the UTF-16 and UTF-32 \
+             families are not ported; every other charset is)"
+        );
+    }
     let renderer = super::log::EntryRenderer::with_color(&repo, want_color);
     let rename_warn = std::cell::RefCell::new(RenameWarnState::default());
     let diff_status = std::cell::Cell::new((false, false));
@@ -1905,6 +1927,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             subject_prefix: &cfg_subject_prefix,
             encode_headers: encode_email_headers.unwrap_or(cfg_encode_email_headers),
         },
+        output_encoding: &output_encoding,
+        combined_all_paths,
     };
     if line_level {
         // `check_single_commit`: the ranges are resolved against exactly one pending
@@ -2377,6 +2401,13 @@ struct DisplayOpts<'a> {
     /// formats read. `cmd_show` runs the same `cmd_log_init`, so unlike
     /// `rev-list` it has both.
     email: super::log::EmailStyle<'a>,
+    /// `get_log_output_encoding()`: the charset each commit is re-coded into before
+    /// `show_log()` renders it, and — for a user format — the charset the finished
+    /// record is converted into on the way out (pretty.c:2026-2046).
+    output_encoding: &'a str,
+    /// `revs->combined_all_paths`: `show_raw_diff()` (combine-diff.c:1268-1274)
+    /// prefixes each combined record with the path as every parent knew it.
+    combined_all_paths: bool,
 }
 
 /// A path as a record field: quoted the way `write_name_quoted()` does it, or raw
@@ -2834,6 +2865,25 @@ fn show_commit_record(
     // `show_log()` as `cmd_log`, so the header is rendered by `git log`'s own
     // formatter — every format name and `%` placeholder behaves identically
     // across the two commands because it is literally the same code.
+    // `show_log()` renders from `repo_logmsg_reencode(commit, NULL, encoding)`
+    // (pretty.c:2315-2316), so the whole object -- headers included -- is re-coded
+    // before anything reads it. A *user* format takes the other road: it is re-coded
+    // to UTF-8 whatever `--encoding` said (pretty.c:1734), expanded against those
+    // bytes, and the finished record converted out of UTF-8 afterwards
+    // (pretty.c:2026-2046). Same split `git log` makes, through the same re-coder.
+    let user_format = matches!(pretty, Pretty::User(_) | Pretty::Reference);
+    let mut recoded;
+    let commit = if disp.output_encoding.is_empty() {
+        commit
+    } else {
+        recoded = commit.clone();
+        super::log::logmsg_reencode(
+            &mut recoded.data,
+            if user_format { "UTF-8" } else { disp.output_encoding },
+        );
+        &recoded
+    };
+    let record_start = out.len();
     disp.renderer.render(
         out,
         commit,
@@ -2854,6 +2904,20 @@ fn show_commit_record(
             from,
         },
     )?;
+    // `repo_format_commit_message()`'s tail: the *rendered record* is converted out
+    // of UTF-8 into the requested encoding, and a conversion that cannot be done
+    // leaves the UTF-8 bytes in place (pretty.c:2026-2046). Only a user format takes
+    // this road; the built-in formats were already re-coded above.
+    if user_format
+        && !disp.output_encoding.is_empty()
+        && !super::mailinfo::same_encoding("UTF-8", disp.output_encoding)
+    {
+        let block = out.split_off(record_start);
+        match super::mailinfo::reencode(&block, "UTF-8", disp.output_encoding) {
+            Some(converted) => out.extend_from_slice(&converted),
+            None => out.extend_from_slice(&block),
+        }
+    }
     // The closing half of `show_log()`: a terminator format ends each record with
     // `opt->diffopt.line_termination`, except the genuinely empty user format,
     // which emits nothing at all (log-tree.c:915-919).
@@ -2977,6 +3041,16 @@ fn show_commit_record(
                     out.extend_from_slice(letters.as_bytes());
                     out.push(sep);
                 }
+                // `show_raw_diff()`'s `rev->combined_all_paths` loop sits outside
+                // the format test, so the name formats carry the per-parent columns
+                // too. No rename detection runs here, so `filename_changed()` is
+                // false for every parent and each column is the result path.
+                if disp.combined_all_paths {
+                    for _ in &letters.chars().collect::<Vec<_>>() {
+                        out.extend_from_slice(&name_bytes(&path, disp.z));
+                        out.push(sep);
+                    }
+                }
                 out.extend_from_slice(&name_bytes(&path, disp.z));
                 out.push(end);
             }
@@ -3050,6 +3124,7 @@ fn show_commit_record(
                         combined_raw_abbrev(repo),
                         disp.z,
                         true,
+                        disp.combined_all_paths,
                     )?);
                 }
                 needsep = true;
@@ -3077,6 +3152,7 @@ fn show_commit_record(
                         3,
                         disp.merges == super::log::DiffMerges::DenseCombined,
                         &disp.patch.colors,
+                        disp.combined_all_paths,
                     )?,
                 };
                 // `printf("%s%c", diff_line_prefix(opt), opt->line_termination)`

@@ -69,6 +69,13 @@ impl Clobber {
     /// wording in git's porcelain table, so a merge blocked by both prints the
     /// block twice — reproduced here rather than folded.
     pub fn report(&self, cmd: &str) {
+        // `setup_unpack_trees_porcelain()` picks between two format strings per
+        // bucket: with `advice_enabled(ADVICE_COMMIT_BEFORE_MERGE)` the advice
+        // sentence is glued onto the end, without it the format stops after the
+        // path list — which already ends in a newline, so `error()`'s own trailing
+        // newline leaves the blank line git prints in its place
+        // (unpack-trees.c:119-174).
+        let hint = crate::advice::Advice::CommitBeforeMerge.enabled();
         let block = |paths: &[BString], headline: &str, advice: &str| {
             if paths.is_empty() {
                 return;
@@ -77,7 +84,10 @@ impl Clobber {
             for path in paths {
                 eprintln!("\t{}", quote_path(path));
             }
-            eprintln!("{advice}");
+            match hint {
+                true => eprintln!("{advice}"),
+                false => eprintln!(),
+            }
         };
         // `setup_unpack_trees_porcelain()` names the command twice: once as it is
         // for the headline, and once as the *action* the advice tells you to

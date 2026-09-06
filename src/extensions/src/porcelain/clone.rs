@@ -796,12 +796,18 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         // Ignored for a local path clone — see the warning at the banner.
         Shallow::NoChange
     } else if !shallow_exclude.is_empty() {
+        // `--depth` rides along rather than being dropped: git sets `TRANS_OPT_DEPTH`,
+        // `TRANS_OPT_DEEPEN_SINCE` and `TRANS_OPT_DEEPEN_NOT` from three independent options
+        // (builtin/clone.c:1372-1380) and sends every one that was named, leaving
+        // `upload-pack.c:send_shallow_list()` to refuse `deepen` together with a rev-list
+        // deepening. Folding them into one selector clones where git exits 128.
         Shallow::Exclude {
             remote_refs: shallow_exclude,
             since_cutoff: shallow_since,
+            depth,
         }
     } else if let Some(cutoff) = shallow_since {
-        Shallow::Since { cutoff }
+        Shallow::Since { cutoff, depth }
     } else if let Some(n) = depth {
         Shallow::DepthAtRemote(n)
     } else {
@@ -2635,6 +2641,34 @@ fn short_pack(err: gix::clone::fetch::Error, branch: Option<&str>, remote_name: 
         gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::Fetch(
             gix::protocol::fetch::Error::ConsumePack(_),
         )) => crate::fatal::die("fetch-pack: invalid index-pack output"),
+        // ```c
+        // /* And complain if we didn't get enough bytes to satisfy the read. */
+        // if (bytes_read != size) {
+        //         if (options & PACKET_READ_GENTLE_ON_EOF)
+        //                 return -1;
+        //
+        //         if (options & PACKET_READ_GENTLE_ON_READ_ERROR)
+        //                 return error(_("the remote end hung up unexpectedly"));
+        //         die(_("the remote end hung up unexpectedly"));
+        // }
+        // ```
+        //
+        // (`get_packet_data()`, pkt-line.c:364-372.) A server that `die()`s part-way
+        // through a response closes the pipe where the client is waiting for the rest of
+        // a packet, and every reader git has on that path ends the process at 128 with
+        // that one sentence — the server's own message having already reached the
+        // terminal through the inherited stderr. `upload-pack` refusing `deepen`
+        // together with `deepen-since` is the case the corpus exercises.
+        //
+        // The condition is `UnexpectedEof` on the packet reader specifically, which is
+        // `read_exact`'s verdict on a stream that stopped mid-packet. Any other I/O
+        // failure is a different fault and keeps its own reporting: a broken pipe while
+        // *writing*, a refused connection, a transport that never opened.
+        gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::Fetch(
+            gix::protocol::fetch::Error::FetchResponse(gix::protocol::fetch::response::Error::Io(ref io)),
+        )) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
+            crate::fatal::die("the remote end hung up unexpectedly")
+        }
         gix::clone::fetch::Error::RefNameMissing { ref wanted } => {
             let wanted = branch.map_or_else(|| wanted.as_ref().as_bstr().to_string(), ToOwned::to_owned);
             crate::fatal::die(format!("Remote branch {wanted} not found in upstream {remote_name}"))

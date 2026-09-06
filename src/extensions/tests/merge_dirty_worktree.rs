@@ -18,10 +18,36 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A home of its own for every child in this file, empty and shared.
+///
+/// The wording these tests pin is git's answer with `advice.commitBeforeMerge`
+/// at its DEFAULT, and the port reads that setting the way git does — through
+/// the whole configuration, system file included. So an `advice.*` line
+/// anywhere in the machine's configuration decides the assertion instead of the
+/// code under test: the same commit printed the advice line on the Linux runner
+/// and left it out on the macOS one, in three tests at once. With an empty home
+/// and no system file, only the fixture repo's own config can speak. The
+/// identity a commit needs is set per repo by the fixtures (`user.email` /
+/// `user.name`), so nothing here has to supply it.
+fn scratch_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir()
+            .join(format!("zvcs-mergedirty-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    })
+}
+
 fn run(dir: &Path, args: &[&str]) -> Output {
     Command::new(BIN)
         .args(args)
         .current_dir(dir)
+        .env("HOME", scratch_home())
+        .env("XDG_CONFIG_HOME", scratch_home().join("xdg"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_ADVICE")
         .output()
         .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
 }

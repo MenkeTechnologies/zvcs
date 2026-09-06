@@ -2624,7 +2624,12 @@ mod watch_gate_tests {
             text.push_str(body);
             std::fs::write(&cfg, text).unwrap();
         }
-        let repo = gix::open(&dir).expect("reopen with the written config");
+        // Isolated: the gate under test is the repository's own `[zvcs]` section, so
+        // the machine's global config must not reach it. A developer with
+        // `zvcs.autohook = true` set globally would otherwise see this test fail
+        // on an unconfigured repository, which is the opposite of what it asserts.
+        let repo = gix::open_opts(&dir, gix::open::Options::isolated())
+            .expect("reopen with the written config");
         (dir, repo)
     }
 

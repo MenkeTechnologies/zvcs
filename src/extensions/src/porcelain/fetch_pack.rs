@@ -808,6 +808,19 @@ fn build_shallow(
     let parse_date =
         |s: &str| -> Result<gix::date::Time> { Ok(gix::date::Time::new(crate::date::approxidate(s), 0)) };
 
+    // `--depth` rides along with a rev-list deepening instead of being dropped by it.
+    // `builtin/fetch-pack.c` fills `args.depth`, `args.deepen_since` and `args.deepen_not`
+    // from three independent options and `fetch-pack.c:send_shallow_list()` sends every one
+    // that was set, leaving `upload-pack.c:send_shallow_list()` to refuse the combination.
+    // `--deepen-relative` is excluded because the relative form is a different deepen line
+    // (`deepen <n>` plus `deepen-relative`) that this selector cannot carry alongside a
+    // cutoff; that combination stays unported.
+    let depth_carried = (!deepen_relative)
+        .then(|| depth)
+        .flatten()
+        .and_then(|d| u32::try_from(d).ok())
+        .and_then(NonZeroU32::new);
+
     if !shallow_exclude.is_empty() {
         let remote_refs = shallow_exclude
             .iter()
@@ -820,11 +833,13 @@ fn build_shallow(
         return Ok(Shallow::Exclude {
             remote_refs,
             since_cutoff,
+            depth: depth_carried,
         });
     }
     if let Some(s) = shallow_since {
         return Ok(Shallow::Since {
             cutoff: parse_date(s)?,
+            depth: depth_carried,
         });
     }
     if let Some(d) = depth {

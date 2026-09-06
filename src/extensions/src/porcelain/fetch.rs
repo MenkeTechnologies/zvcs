@@ -702,15 +702,26 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // Resolve the accumulated shallow-boundary selectors. `--shallow-exclude`
     // (repeatable) may be combined with `--shallow-since`, mirroring git's
     // `deepen_not` + `deepen_since`; a lone `--shallow-since` sets only the cutoff.
-    // Either form supersedes an earlier `--depth`/`--deepen`/`--unshallow`, as git
-    // treats the shallow selectors as one group.
+    // A `--depth` already resolved into `opts.shallow` is carried into the rev-list form
+    // rather than replaced by it. `builtin/fetch.c` hands `TRANS_OPT_DEPTH`,
+    // `TRANS_OPT_DEEPEN_SINCE` and `TRANS_OPT_DEEPEN_NOT` to the transport from three
+    // independent variables, so the server is told about every selector that was named and
+    // `upload-pack.c:send_shallow_list()` is what refuses the combination. Measured against
+    // stock 2.55.0: `git fetch --depth=1 --shallow-since=1970-01-01 origin` is
+    // `fatal: git upload-pack: deepen and deepen-since (or deepen-not) cannot be used
+    // together` followed by `fatal: the remote end hung up unexpectedly`.
+    let depth_carried = match opts.shallow {
+        Some(Shallow::DepthAtRemote(n)) => Some(n),
+        _ => None,
+    };
     if !shallow_exclude.is_empty() {
         opts.shallow = Some(Shallow::Exclude {
             remote_refs: shallow_exclude,
             since_cutoff: shallow_since,
+            depth: depth_carried,
         });
     } else if let Some(cutoff) = shallow_since {
-        opts.shallow = Some(Shallow::Since { cutoff });
+        opts.shallow = Some(Shallow::Since { cutoff, depth: depth_carried });
     }
 
     // --- config-supplied defaults -----------------------------------------
@@ -1142,13 +1153,23 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
     // `--write-commit-graph` / `fetch.writeCommitGraph`: rebuild the commit-graph
     // over everything now reachable, which is what git does at the end of a
-    // fetch. git writes it as an incremental split chain
-    // (`objects/info/commit-graphs/`); the commit-graph port has no chain
-    // protocol, so this is the single-file form at `objects/info/commit-graph`.
+    // fetch (`cmd_fetch()`, builtin/fetch.c:2323-2331):
+    //
+    // ```c
+    // int commit_graph_flags = COMMIT_GRAPH_WRITE_SPLIT;
+    // ...
+    // write_commit_graph_reachable(the_repository->objects->odb,
+    //                              commit_graph_flags, NULL);
+    // ```
+    //
+    // `COMMIT_GRAPH_WRITE_SPLIT` is unconditional there, so the result is a
+    // chain under `objects/info/commit-graphs/` and never the single
+    // `objects/info/commit-graph` file — `--split` is what the CLI spells that.
     if opts.write_commit_graph && !opts.dry_run {
         let code = super::commit_graph(&[
             "write".to_string(),
             "--reachable".to_string(),
+            "--split".to_string(),
             "--no-progress".to_string(),
         ])?;
         if code != ExitCode::SUCCESS {

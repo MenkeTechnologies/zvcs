@@ -655,7 +655,14 @@ pub fn send_pack(
         }
         Signed::Always => {
             if nonce.is_none() {
-                crate::git_fatal!("the receiving end does not support --signed push");
+                // `die(_("the receiving end does not support --signed push"))`
+                // (send-pack.c:543). `send_pack()` dies with the connection
+                // still half-open, so the `receive-pack` on the other end reads
+                // EOF where it expected the command list and the transport
+                // reports that as the hang-up — the same two-`fatal:` shape the
+                // push-options refusal above produces, exit 128.
+                eprintln!("fatal: the receiving end does not support --signed push");
+                return Err(crate::fatal::die("the remote end hung up unexpectedly"));
             }
             true
         }
@@ -1987,8 +1994,24 @@ fn reachable_objects(repo: &gix::Repository, tips: &[ObjectId]) -> HashSet<Objec
 /// the commit set is a boundary computation's output rather than everything
 /// reachable from the tips.
 pub(crate) fn expand_roots(repo: &gix::Repository, roots: &[ObjectId]) -> HashSet<ObjectId> {
+    expand_roots_ordered(repo, roots).into_iter().collect()
+}
+
+/// [`expand_roots`] with the counter's own output order kept.
+///
+/// The counter walks `roots` in the order it is handed them and appends each
+/// tree's contents as it reaches them, so its `Vec` is a function of the input
+/// alone. Collapsing that into a `HashSet` throws the order away, and the pack
+/// writer honours the order it is handed — which is why a caller that packs the
+/// result must use this and not [`expand_roots`]. The same defect on the
+/// non-shallow path (see [`objects_to_send`]) made `git bundle create` produce a
+/// different file on five runs out of five where stock produced one.
+///
+/// Membership tests have no such requirement, so the `have` side of a difference
+/// keeps the hashed form.
+pub(crate) fn expand_roots_ordered(repo: &gix::Repository, roots: &[ObjectId]) -> Vec<ObjectId> {
     if roots.is_empty() {
-        return HashSet::new();
+        return Vec::new();
     }
     let mut input = roots
         .iter()
@@ -2001,10 +2024,16 @@ pub(crate) fn expand_roots(repo: &gix::Repository, roots: &[ObjectId]) -> HashSe
         &std::sync::atomic::AtomicBool::new(false),
         pack::data::output::count::objects::ObjectExpansion::TreeContents,
     ) {
-        Ok((counts, _)) => counts.into_iter().map(|c| c.id).collect(),
+        Ok((counts, _)) => {
+            let mut seen = HashSet::with_capacity(counts.len());
+            counts.into_iter().map(|c| c.id).filter(|id| seen.insert(*id)).collect()
+        }
         // A corrupt object aborts the counter; fall back to the walked roots so a
         // pack is still produced rather than failing the push.
-        Err(_) => roots.iter().copied().collect(),
+        Err(_) => {
+            let mut seen = HashSet::with_capacity(roots.len());
+            roots.iter().copied().filter(|id| seen.insert(*id)).collect()
+        }
     }
 }
 

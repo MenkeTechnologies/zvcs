@@ -591,6 +591,9 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     // and no `deepen*` says nothing more than where the client's history stops —
     // git registers those as grafts and writes nothing back, and so does this: the
     // walk below stops at them through `client_side_commits`.
+    if let Some(message) = deepen_conflict(&shallow_req) {
+        crate::git_fatal!("{message}");
+    }
     let deepening = shallow_req.deepen.requested();
     let boundary = deepening.then(|| crate::shallow_serve::compute(repo, &wants, &shallow_req));
     if let Some(message) = empty_shallow_window(&shallow_req, boundary.as_ref()) {
@@ -2300,6 +2303,9 @@ fn send_pack_section(
     // a deepening was asked for, when the client declared a boundary of its own,
     // or when this repository is itself shallow — and it is skipped entirely
     // otherwise, so an ordinary fetch sees no shallow-info at all.
+    if let Some(message) = deepen_conflict(&args.shallow) {
+        die!("{message}");
+    }
     let deepening = args.shallow.deepen.requested();
     let boundary = deepening.then(|| crate::shallow_serve::compute(repo, &args.wants, &args.shallow));
     if let Some(message) = empty_shallow_window(&args.shallow, boundary.as_ref()) {
@@ -2795,4 +2801,26 @@ fn empty_shallow_window(
     let boundary = boundary?;
     (deepen_rev_list && boundary.commits.is_empty())
         .then(|| "no commits selected for shallow requests".to_owned())
+}
+
+/// `send_shallow_list()` (upload-pack.c:889-890): a `deepen <n>` window is
+/// counted in hops and a `deepen-since`/`deepen-not` window is cut by a
+/// predicate, so git refuses to be told both at once and dies before either is
+/// computed:
+///
+/// ```text
+/// if (data->depth > 0 && data->deepen_rev_list)
+///         die("git upload-pack: deepen and deepen-since (or deepen-not) cannot be used together");
+/// ```
+///
+/// `deepen_rev_list` is what `process_deepen_since()` (upload-pack.c:976) and
+/// `process_deepen_not()` (upload-pack.c:992) set, which is exactly "a since or
+/// a not was named". Both protocol paths funnel through `send_shallow_list()`
+/// — v0's `receive_needs()` (upload-pack.c:1159) and v2's `send_shallow_info()`
+/// (upload-pack.c:1688) — so both ask this first.
+fn deepen_conflict(request: &crate::shallow_serve::Request) -> Option<&'static str> {
+    let deepen_rev_list = request.deepen.since.is_some() || !request.deepen.not.is_empty();
+    (request.deepen.depth.is_some() && deepen_rev_list).then_some(
+        "git upload-pack: deepen and deepen-since (or deepen-not) cannot be used together",
+    )
 }

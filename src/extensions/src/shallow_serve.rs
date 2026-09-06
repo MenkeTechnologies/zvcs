@@ -389,12 +389,21 @@ pub fn objects_within(
     // itself, as `reachable_objects` does for the ordinary path.
     let mut roots: Vec<ObjectId> = window.to_vec();
     roots.extend(wants.iter().copied().filter(|id| !window.contains(id)));
-    let want_closure = crate::porcelain::push_proto::expand_roots(repo, &roots);
+    // Ordered, because this list *is* the pack: `pack_bytes_with_summary` writes the
+    // entries in the order it is handed them, so a `HashSet`'s iteration order became
+    // the pack's, and an unspecified order made every shallow clone of the same
+    // repository produce a different pack. Measured before the change:
+    // `clone --bare --no-local --depth=1 . c.git` run four times wrote four pack names
+    // (6ca62d08…, 4e031ab3…, 92619911…, 316c0ba7…) where stock wrote one
+    // (b8c43e57…) twice. `objects_to_send()` had the same defect on the non-shallow
+    // path and already carries the ordered form; this is the shallow half of it.
+    let want_closure = crate::porcelain::push_proto::expand_roots_ordered(repo, &roots);
 
     let client = client_side_commits(repo, haves, client_shallow);
     if client.is_empty() {
-        return want_closure.into_iter().collect();
+        return want_closure;
     }
+    // The `have` side is only ever asked "does it contain this", so it stays hashed.
     let have_closure = crate::porcelain::push_proto::expand_roots(repo, &client);
     want_closure.into_iter().filter(|id| !have_closure.contains(id)).collect()
 }

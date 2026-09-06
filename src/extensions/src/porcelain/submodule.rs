@@ -547,7 +547,7 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     }
 
     let repo = crate::setup::discover()?;
-    Ok(ExitCode::from(init_repo(&repo, &patterns, quiet)?))
+    Ok(ExitCode::from(init_repo(&repo, &patterns, quiet, None)?))
 }
 
 /// The body of `git submodule init` for one already-opened superproject:
@@ -556,7 +556,12 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
 /// Factored out of `init` so `update --init` can run the same registration pass
 /// against the repository it opened, mirroring git's `module_update` calling the
 /// init pass before `update_submodules`.
-fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Result<u8> {
+fn init_repo(
+    repo: &gix::Repository,
+    patterns: &[BString],
+    quiet: bool,
+    super_prefix: Option<&str>,
+) -> Result<u8> {
     let index = repo.index_or_empty()?;
 
     let mut entries = match module_list(repo, &index, patterns)? {
@@ -599,7 +604,16 @@ fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Resul
     let mut messages: Vec<String> = Vec::new();
 
     for entry in &entries {
-        let display = display_path(entry.path.as_bstr(), prefix.as_ref());
+        // `get_submodule_displaypath()` (builtin/submodule--helper.c:116-133): a
+        // super-prefix and a cwd prefix are mutually exclusive there (the third
+        // combination is a `BUG()`), and under `--recursive` it is the
+        // super-prefix that applies — the path is printed with every enclosing
+        // submodule's path in front of it, so a leaf inside `mid` registers as
+        // `mid/leaf` and not as `leaf`.
+        let display = match super_prefix {
+            Some(sp) => format!("{sp}{}", entry.path),
+            None => display_path(entry.path.as_bstr(), prefix.as_ref()),
+        };
         let Some(sub) = find_submodule(&submodules, &entry.path) else {
             eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
             return Ok(128);
@@ -2744,7 +2758,7 @@ fn update_repo(
     // `update_submodules`, then re-open so the freshly-written `active`/`url`
     // config is visible to `is_active`/`update` below.
     let repo = if opts.init {
-        let code = init_repo(&repo, patterns, opts.quiet)?;
+        let code = init_repo(&repo, patterns, opts.quiet, super_prefix)?;
         if code != 0 {
             return Ok(code);
         }

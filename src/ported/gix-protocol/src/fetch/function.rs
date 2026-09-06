@@ -261,13 +261,26 @@ fn add_shallow_args(
             args.deepen(*commits as usize);
             args.deepen_relative();
         }
-        Shallow::Since { cutoff } => {
+        // `--depth` alongside `--shallow-since`/`--shallow-exclude` is not folded away:
+        // `builtin/clone.c:1372-1380` sets `TRANS_OPT_DEPTH`, `TRANS_OPT_DEEPEN_SINCE` and
+        // `TRANS_OPT_DEEPEN_NOT` from three independent options, so the server sees every one
+        // that was named. `upload-pack.c:send_shallow_list()` is where the combination is
+        // judged, and it dies `git upload-pack: deepen and deepen-since (or deepen-not) cannot
+        // be used together`; a client that sent only one of them would clone where git fails.
+        Shallow::Since { cutoff, depth } => {
+            if let Some(depth) = depth {
+                args.deepen(depth.get() as usize);
+            }
             args.deepen_since(cutoff.seconds);
         }
         Shallow::Exclude {
             remote_refs,
             since_cutoff,
+            depth,
         } => {
+            if let Some(depth) = depth {
+                args.deepen(depth.get() as usize);
+            }
             if let Some(cutoff) = since_cutoff {
                 args.deepen_since(cutoff.seconds);
             }

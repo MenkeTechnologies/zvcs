@@ -231,6 +231,15 @@ pub enum Shallow {
     Since {
         /// The date beyond which there will be no history.
         cutoff: gix_date::Time,
+        /// A commit count named on the same command line, sent as `deepen <n>` alongside `deepen-since`.
+        ///
+        /// git treats `--depth`, `--shallow-since` and `--shallow-exclude` as three independent
+        /// transport options and sends whichever were given (`builtin/clone.c:1372-1380`,
+        /// `builtin/fetch.c`), leaving it to the server to decide what the combination means.
+        /// `upload-pack.c:send_shallow_list()` refuses it — `git upload-pack: deepen and
+        /// deepen-since (or deepen-not) cannot be used together` — so a client that drops one of
+        /// the two silently succeeds where git fails.
+        depth: Option<std::num::NonZeroU32>,
     },
     /// Receive all history excluding all commits reachable from `remote_refs`. These can be long or short
     /// ref names or tag names.
@@ -241,6 +250,9 @@ pub enum Shallow {
         /// If some, this field has the same meaning as [`Shallow::Since`] which can be used in combination
         /// with excluded references.
         since_cutoff: Option<gix_date::Time>,
+        /// A commit count named on the same command line, sent as `deepen <n>` alongside
+        /// `deepen-not`. See [`Shallow::Since::depth`] for why it is carried rather than dropped.
+        depth: Option<std::num::NonZeroU32>,
     },
 }
 

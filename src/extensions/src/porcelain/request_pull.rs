@@ -29,15 +29,20 @@
 //!   * exit codes — 0 on success, 1 for `die`/usage/unmatched remote ref, 129
 //!     for `-h` and for an unknown switch.
 //!
+//!   * the `-M` rename/copy pass. The tree diff is taken *without* gitoxide's
+//!     own rewrite tracking and the resulting filepairs are run through the
+//!     `diffcore-delta.c`/`diffcore-rename.c` port in
+//!     [`super::diffcore_rename`], so the `{a => b}` stat name
+//!     ([`super::diff_pairs::pprint_rename`]) and the `(NN%)` in
+//!     `rename a => b (NN%)` are git's own `estimate_similarity()` score
+//!     rather than an approximation.
+//!
 //! Not covered — these `bail!` rather than emit output that would diverge:
-//!   * a change that `-M` resolves to a rename or copy. git scores similarity
-//!     with `estimate_similarity()` on top of `diffcore_count_changes()`
-//!     (the spanhash algorithm in `diffcore-delta.c`); the vendored gitoxide
-//!     tracks rewrites with a line-based similarity instead and exposes no
-//!     score at all, so the `(NN%)` in `rename a => b (NN%)` / `similarity
-//!     index NN%` and the `a => b` stat name cannot be reproduced. Rewrite
-//!     tracking is switched on purely so such a change is detected and refused
-//!     rather than silently rendered as a delete plus an add.
+//!   * `-p` over a range whose diff contains a rename or copy. The stat block
+//!     above renders it, but the patch body comes from
+//!     [`super::diff::commit_patch`], which is not run with `-M`, so it would
+//!     spell the same change as a delete plus an add and disagree with the
+//!     stat directly above it.
 //!   * unmerged entries and the `diff.statNameWidth`/`diff.statGraphWidth`
 //!     configuration. (`core.quotePath` *is* honoured — the names go through
 //!     `quote_c_style()` — and the column arithmetic is the shared
@@ -635,10 +640,12 @@ fn diff_stat_summary(
     let new_tree = repo.find_object(headrev)?.peel_to_tree()?;
     let abbrev = new_tree.id().shorten()?.hex_len();
 
-    // Rewrite tracking is on only so that a rename/copy is *detected*; the
-    // similarity score git prints for one is not derivable here (see the module
-    // header), so such a change is refused rather than mis-rendered.
-    let options = gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
+    // No rewrite tracking here: gitoxide's own is line-based and carries no
+    // score, and the `-M` the script asks for is git's. The raw
+    // addition/deletion/modification filepairs go through the
+    // `diffcore-rename.c` port below instead, which is the code `git diff -M`
+    // itself runs.
+    let options = gix::diff::Options::default();
     let mut changes = repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), options)?;
     // `gix_diff::tree_with_rewrites` recurses into subdirectories but *also*
     // reports the containing tree entries themselves as changes. git's
@@ -656,13 +663,21 @@ fn diff_stat_summary(
         return Ok(());
     }
 
+    let pairs = detect_renames(repo, &changes)?;
+
+    // A rename in the stat block and a delete-plus-add in the patch body under
+    // it would be two different accounts of one change, so `-p` refuses instead.
+    if patch && pairs.iter().any(|p| p.status == b'R' || p.status == b'C') {
+        anyhow::bail!("{REWRITE_UNSUPPORTED}");
+    }
+
     let mut stats: Vec<StatEntry> = Vec::new();
-    for change in &changes {
-        stats.push(stat_of(repo, change, abbrev)?);
+    for p in &pairs {
+        stats.push(stat_of(repo, p, abbrev)?);
     }
 
     emit_stats(out, &stats)?;
-    emit_summary(out, &changes)?;
+    emit_summary(out, &pairs)?;
     if patch {
         // The script's `$patch` is a plain `-p` on the same `git diff` this
         // function is reproducing, so the body is `git diff <base>..<head>` —
@@ -678,6 +693,140 @@ fn diff_stat_summary(
         out.extend_from_slice(&super::diff::commit_patch(repo, &head, Some(merge_base), 3)?);
     }
     Ok(())
+}
+
+/// One filepair as `diff_flush()` sees it after `diffcore_std()` has run: the two
+/// sides plus the status letter and similarity `diff_resolve_rename_copy()`
+/// assigned.
+struct RenderPair {
+    status: u8,
+    /// `p->score`, in [`super::diffcore_rename::MAX_SCORE`] units.
+    score: u32,
+    old_path: BString,
+    new_path: BString,
+    old_mode: u32,
+    new_mode: u32,
+    old_id: ObjectId,
+    new_id: ObjectId,
+}
+
+impl RenderPair {
+    /// The name the stat block prints: a rename or copy is the only pair whose
+    /// two sides differ, and git factors their common prefix and suffix into
+    /// `pfx{old => new}sfx` (`pprint_rename()`, diff.c).
+    fn stat_name(&self) -> String {
+        if self.old_path == self.new_path {
+            quote_path(self.new_path.as_slice())
+        } else {
+            String::from_utf8_lossy(&super::diff_pairs::pprint_rename(
+                &self.old_path,
+                &self.new_path,
+            ))
+            .into_owned()
+        }
+    }
+}
+
+/// Reads a filespec's blob for [`super::diffcore_rename`]. Both sides of a
+/// tree-to-tree pair name an object in the database, so
+/// `diff_populate_filespec()` here is just an odb lookup.
+struct OdbContent<'a> {
+    repo: &'a gix::Repository,
+}
+
+impl super::diffcore_rename::Content for OdbContent<'_> {
+    fn size(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<u64> {
+        // `check_size_only = 1`: the odb header answers without inflating the blob.
+        let header = self.repo.find_header(spec.oid).ok()?;
+        (header.kind() == gix::object::Kind::Blob).then(|| header.size())
+    }
+
+    fn data(&mut self, spec: &super::diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
+    }
+}
+
+/// The `diffcore_std()` rename pass the script's `git diff -M` runs
+/// (`diffcore_rename()` followed by `diff_resolve_rename_copy()`, diff.c).
+///
+/// `-M` is `DIFF_DETECT_RENAME` with no score argument, which
+/// `diffcore_rename()` reads as `DEFAULT_RENAME_SCORE`; no `-C`, so copies are
+/// only ever found where a rename source was reused, and no `-B`, so break
+/// detection is off.
+fn detect_renames(
+    repo: &gix::Repository,
+    changes: &[ChangeDetached],
+) -> Result<Vec<RenderPair>> {
+    use super::diffcore_rename::{self as dcr, FileSpec};
+
+    let hash = repo.object_hash();
+    let null = ObjectId::null(hash);
+    let mut q = dcr::Queue::default();
+    for change in changes {
+        let path = BString::from(change_path(change).to_vec());
+        let (one, two) = match change {
+            ChangeDetached::Addition { entry_mode, id, .. } => (
+                FileSpec::absent(path.clone()),
+                FileSpec::new(path, entry_mode.value() as u32, *id, true),
+            ),
+            ChangeDetached::Deletion { entry_mode, id, .. } => (
+                FileSpec::new(path.clone(), entry_mode.value() as u32, *id, true),
+                FileSpec::absent(path),
+            ),
+            ChangeDetached::Modification {
+                previous_entry_mode,
+                previous_id,
+                entry_mode,
+                id,
+                ..
+            } => (
+                FileSpec::new(
+                    path.clone(),
+                    previous_entry_mode.value() as u32,
+                    *previous_id,
+                    true,
+                ),
+                FileSpec::new(path, entry_mode.value() as u32, *id, true),
+            ),
+            // Rewrite tracking is off (see `diff_stat_summary`), so gitoxide
+            // never produces this variant here.
+            ChangeDetached::Rewrite { .. } => anyhow::bail!("{REWRITE_UNSUPPORTED}"),
+        };
+        let one = q.add_spec(one);
+        let two = q.add_spec(two);
+        q.add_pair(one, two);
+    }
+
+    let opts = dcr::Options {
+        detect_rename: dcr::DETECT_RENAME,
+        hash_kind: hash,
+        ..Default::default()
+    };
+    let mut content = OdbContent { repo };
+    dcr::run(&mut q, &opts, &mut content);
+    dcr::resolve_rename_copy(&mut q);
+
+    Ok(q
+        .pairs
+        .iter()
+        .map(|p| {
+            let one = &q.specs[p.one];
+            let two = &q.specs[p.two];
+            RenderPair {
+                // A pair that reached the flush with no status is git's
+                // `check_pair_status()` fatal case; `-M` always resolves one, so
+                // an unset letter can only be a modification.
+                status: if p.status == 0 { b'M' } else { p.status },
+                score: p.score,
+                old_path: one.path.clone(),
+                new_path: two.path.clone(),
+                old_mode: one.mode,
+                new_mode: two.mode,
+                old_id: if one.valid() { one.oid } else { null },
+                new_id: if two.valid() { two.oid } else { null },
+            }
+        })
+        .collect())
 }
 
 /// The rows [`super::diffstat::show_stats`] renders.
@@ -710,123 +859,103 @@ fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
     Ok(())
 }
 
-/// Port of `diff_summary()` (diff.c): the `create`/`delete`/`mode change` lines
-/// that follow the diffstat.
-fn emit_summary(out: &mut Vec<u8>, changes: &[ChangeDetached]) -> Result<()> {
-    for change in changes {
-        match change {
-            ChangeDetached::Addition {
-                location,
-                entry_mode,
-                ..
-            } => writeln!(
+/// Port of `diff_summary()` (diff.c): the `create`/`delete`/`rename`/`copy`/
+/// `mode change` lines that follow the diffstat.
+fn emit_summary(out: &mut Vec<u8>, pairs: &[RenderPair]) -> Result<()> {
+    for p in pairs {
+        match p.status {
+            // `show_file_mode_name()`.
+            b'A' => writeln!(
                 out,
                 " create mode {:06o} {}",
-                entry_mode.value(),
-                quote_path(location)
+                p.new_mode,
+                quote_path(p.new_path.as_slice())
             )?,
-            ChangeDetached::Deletion {
-                location,
-                entry_mode,
-                ..
-            } => writeln!(
+            b'D' => writeln!(
                 out,
                 " delete mode {:06o} {}",
-                entry_mode.value(),
-                quote_path(location)
+                p.old_mode,
+                quote_path(p.old_path.as_slice())
             )?,
-            ChangeDetached::Modification {
-                location,
-                previous_entry_mode,
-                entry_mode,
-                ..
-            } => {
-                if previous_entry_mode.value() != entry_mode.value() {
-                    writeln!(
-                        out,
-                        " mode change {:06o} => {:06o} {}",
-                        previous_entry_mode.value(),
-                        entry_mode.value(),
-                        quote_path(location)
-                    )?;
-                }
+            // `show_rename_copy()`: the factored name plus
+            // `similarity_index(p)`, then the mode-change line without a name.
+            b'R' | b'C' => {
+                writeln!(
+                    out,
+                    " {} {} ({}%)",
+                    if p.status == b'C' { "copy" } else { "rename" },
+                    p.stat_name(),
+                    super::diffcore_rename::similarity_index(p.score)
+                )?;
+                emit_mode_change(out, p, false)?;
             }
-            ChangeDetached::Rewrite { .. } => anyhow::bail!("{REWRITE_UNSUPPORTED}"),
+            _ => emit_mode_change(out, p, true)?,
         }
     }
     Ok(())
 }
 
-const REWRITE_UNSUPPORTED: &str =
-    "a rename/copy was detected, but git's estimate_similarity() (diffcore-delta.c) \
-     is not in the vendored crates, so the `(NN%)` similarity `-M` prints cannot be reproduced";
+/// `show_mode_change()`: the ` mode change <old> => <new>` line, with the path
+/// appended only for a plain modification (a rename or copy has already named
+/// both sides on the line above).
+fn emit_mode_change(out: &mut Vec<u8>, p: &RenderPair, show_name: bool) -> Result<()> {
+    if p.old_mode != 0 && p.new_mode != 0 && p.old_mode != p.new_mode {
+        write!(out, " mode change {:06o} => {:06o}", p.old_mode, p.new_mode)?;
+        if show_name {
+            write!(out, " {}", quote_path(p.new_path.as_slice()))?;
+        }
+        out.push(b'\n');
+    }
+    Ok(())
+}
 
-/// The diffstat row for one file-level change: git's added/deleted line counts,
-/// or the pre-/post-image byte sizes when either side is binary.
+const REWRITE_UNSUPPORTED: &str =
+    "a rename or copy is in the range, and the `-p` body would spell it as a delete \
+     plus an add: `commit_patch` is not run with `-M`, so it would contradict the \
+     `rename a => b (NN%)` the stat block above it prints";
+
+/// The diffstat row for one filepair: git's added/deleted line counts, or the
+/// pre-/post-image byte sizes when either side is binary.
 ///
 /// Only the counts are computed here. The `-p` body is rendered by
 /// [`super::diff::commit_patch`] over the same tree pair, so the two never
 /// disagree about a path's spelling or a hunk's header.
-fn stat_of(repo: &gix::Repository, change: &ChangeDetached, abbrev: usize) -> Result<StatEntry> {
+fn stat_of(repo: &gix::Repository, p: &RenderPair, abbrev: usize) -> Result<StatEntry> {
     let _ = abbrev;
     let mut added = 0u64;
     let mut deleted = 0u64;
     let mut binary: Option<(u64, u64)> = None;
 
-    match change {
-        ChangeDetached::Addition {
-            entry_mode, id, ..
-        } => {
-            let is_sub = entry_mode.is_commit();
-            let content = content_of(repo, *id, is_sub)?;
-            if is_binary(is_sub, &content) {
-                binary = Some((0, content.len() as u64));
-            } else {
-                let counts = text_counts(&[], &content)?;
-                added = counts.0;
-                deleted = counts.1;
-            }
+    // git's `S_ISGITLINK`: a gitlink renders as its `Subproject commit <oid>`
+    // line rather than as the commit object it names.
+    let old_is_sub = p.old_mode == 0o160000;
+    let new_is_sub = p.new_mode == 0o160000;
+    let old_content = if p.old_mode == 0 {
+        Vec::new()
+    } else {
+        content_of(repo, p.old_id, old_is_sub)?
+    };
+    let new_content = if p.new_mode == 0 {
+        Vec::new()
+    } else {
+        content_of(repo, p.new_id, new_is_sub)?
+    };
+
+    // A pure mode change (identical content) contributes no counts.
+    if p.old_id != p.new_id || p.old_mode == 0 || p.new_mode == 0 {
+        if (p.old_mode != 0 && is_binary(old_is_sub, &old_content))
+            || (p.new_mode != 0 && is_binary(new_is_sub, &new_content))
+        {
+            binary = Some((old_content.len() as u64, new_content.len() as u64));
+        } else {
+            let counts = text_counts(&old_content, &new_content)?;
+            added = counts.0;
+            deleted = counts.1;
         }
-        ChangeDetached::Deletion {
-            entry_mode, id, ..
-        } => {
-            let is_sub = entry_mode.is_commit();
-            let content = content_of(repo, *id, is_sub)?;
-            if is_binary(is_sub, &content) {
-                binary = Some((content.len() as u64, 0));
-            } else {
-                let counts = text_counts(&content, &[])?;
-                added = counts.0;
-                deleted = counts.1;
-            }
-        }
-        ChangeDetached::Modification {
-            previous_entry_mode,
-            previous_id,
-            entry_mode,
-            id,
-            ..
-        } => {
-            // A pure mode change (identical content) contributes no counts.
-            if previous_id != id {
-                let old_is_sub = previous_entry_mode.is_commit();
-                let new_is_sub = entry_mode.is_commit();
-                let old_content = content_of(repo, *previous_id, old_is_sub)?;
-                let new_content = content_of(repo, *id, new_is_sub)?;
-                if is_binary(old_is_sub, &old_content) || is_binary(new_is_sub, &new_content) {
-                    binary = Some((old_content.len() as u64, new_content.len() as u64));
-                } else {
-                    let counts = text_counts(&old_content, &new_content)?;
-                    added = counts.0;
-                    deleted = counts.1;
-                }
-            }
-        }
-        ChangeDetached::Rewrite { .. } => anyhow::bail!("{REWRITE_UNSUPPORTED}"),
     }
 
     Ok(StatEntry {
-        name: quote_path(change_path(change)),
+        name: p.stat_name(),
         added,
         deleted,
         binary,

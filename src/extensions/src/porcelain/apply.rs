@@ -1675,7 +1675,20 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 // `convert_to_working_tree()`, on the regular-file arm only: `try_create_file()`
                 // returns from the gitlink and symlink branches above it (apply.c:4508-4517).
                 let is_special = mode & 0o170000 == 0o120000 || mode & 0o170000 == 0o160000;
-                let wt_data = match (&mut smudge, is_special) {
+                // `--unsafe-paths` waives `check_unsafe_path()`, so a patch may name a
+                // path OUTSIDE the working tree — and `convert_to_working_tree()` still
+                // runs there, looking up attributes that cannot match a name no
+                // `.gitattributes` can address. gix refuses such a name instead:
+                // priming the attribute stack wants a repo-relative path and answers
+                // `Input path "../outside/t.txt" contains relative or absolute
+                // components`, which turned stock's silent exit 0 into `zvcs: apply:`
+                // and exit 1 with the file never written.
+                //
+                // A path that escapes gets the bytes as they are, which is what the
+                // identity conversion produces anyway.
+                let escapes = path.starts_with('/')
+                    || path.split('/').any(|component| component == "..");
+                let wt_data = match (&mut smudge, is_special || escapes) {
                     (Some(pipeline), false) => {
                         let mut converted = pipeline.convert_to_worktree(
                             &data,

@@ -2791,11 +2791,19 @@ fn do_commit(
         if committer_date_is_author_date {
             ct.env("GIT_COMMITTER_DATE", os_bytes(&info.author_date));
         }
+    } else if committer_date_is_author_date {
+        // Both idents fall back to `ident_default_date()`, which datestamps ONCE
+        // per process and hands every ident the same string (ident.c) — so stock's
+        // author and committer lines carry the same second even when the clock is
+        // what named it. `commit-tree` reads the wall clock separately for each,
+        // and the pair straddled a second boundary on the runner: the committer
+        // came out one second after the author it was supposed to copy. One stamp,
+        // into both.
+        let now = gix::date::Time::now_local_or_utc().format_or_unix(gix::date::time::Format::Raw);
+        ct.env("GIT_AUTHOR_DATE", &now);
+        ct.env("GIT_COMMITTER_DATE", &now);
     } else {
         ct.env_remove("GIT_AUTHOR_DATE");
-        if committer_date_is_author_date {
-            ct.env_remove("GIT_COMMITTER_DATE");
-        }
     }
     ct.stdin(Stdio::piped())
         .stdout(Stdio::piped())

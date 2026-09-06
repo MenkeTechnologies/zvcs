@@ -668,15 +668,31 @@ fn run_tasks(
                 delegate(super::pack_refs::pack_refs(&args))
             }
             "reflog-expire" => super::gc::expire_reflogs(repo).is_ok(),
-            "geometric-repack" => delegate(super::repack::repack(&strings(&[
-                "repack",
-                "-d",
-                "-l",
-                "--cruft",
-                "--cruft-expiration=2.weeks.ago",
-                "--quiet",
-                "--write-midx",
-            ]))),
+            // `maintenance_task_geometric_repack()`: `git repack -d -l
+            // --geometric=<splitFactor> --quiet --write-midx`. The task does not
+            // exist in the vendored v2.39 tree, so the argument list is the one
+            // git 2.55.0 spawns, read off `GIT_TRACE=1`: `run_command: git repack
+            // -d -l --geometric=2 --quiet --write-midx`, and `--geometric=3` with
+            // `maintenance.geometric-repack.splitFactor=3`. There is no `--cruft`
+            // in it — a cruft repack is the `gc` task, and asking for one here
+            // both wrote a `.mtimes` git does not and dropped the packs the
+            // geometric split was supposed to leave alone.
+            "geometric-repack" => {
+                let factor = repo
+                    .config_snapshot()
+                    .integer("maintenance.geometric-repack.splitFactor")
+                    .unwrap_or(2)
+                    .max(0);
+                let geometric = format!("--geometric={factor}");
+                delegate(super::repack::repack(&strings(&[
+                    "repack",
+                    "-d",
+                    "-l",
+                    &geometric,
+                    "--quiet",
+                    "--write-midx",
+                ])))
+            }
             "gc" => delegate(super::gc::gc(&strings(&["gc"]))),
             "rerere-gc" => {
                 !repo.git_dir().join("rr-cache").is_dir()

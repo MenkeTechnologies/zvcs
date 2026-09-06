@@ -903,6 +903,34 @@ fn execute(st: &State) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+    // `write_pack_file()` opens its output with `odb_mkstemp(&tmpname,
+    // "pack/tmp_pack_XXXXXX")` *before* it writes the pack header, and hands that
+    // temporary to `finish_tmp_packfile()` only at the very end — so a `die()`
+    // inside the object loop (`write_no_reuse_object()`'s `unable to read
+    // <oid>`) leaves the temporary sitting in `objects/pack`. Observed on git
+    // 2.55.0: `pack-objects --quiet .git/objects/pack/loose` fed one unreadable
+    // id exits 128 and leaves `objects/pack/tmp_pack_ieF7ve` behind.
+    //
+    // This port builds the whole pack in memory before it stages any file, so
+    // until the temporary is created here the failure left nothing at all — the
+    // one difference between the two sides on `maintenance run
+    // --task=loose-objects` over a corrupt loose object.
+    //
+    // The three states that never reach `write_pack_file()` have no temporary,
+    // and none of them reaches this line either: an option error (rejected by
+    // `preflight`), `--non-empty` with nothing to pack (returned above), and
+    // `--stdout`, which writes no file. The name is the one
+    // [`temp_artifact_path`] gives the pack below, so the success path renames
+    // this very file into place rather than making a second one, and a failure
+    // simply leaves it — `die()` unlinks only what git's `tempfile` list owns,
+    // and the pack's temporary is registered no earlier than the rename.
+    if !st.stdout {
+        let pack_dir = repo.git_dir().join("objects").join("pack");
+        let _ = std::fs::create_dir_all(&pack_dir);
+        let tmp = temp_artifact_path(&pack_dir, "x.pack", 0);
+        let _ = std::fs::OpenOptions::new().create(true).write(true).open(tmp);
+    }
+
     let packed = write_pack(&repo, &counts, compression(&repo, st), &delta, st.progress)?;
 
     if st.stdout {

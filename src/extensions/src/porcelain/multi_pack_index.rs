@@ -41,16 +41,22 @@
 //! top-level `--` before any sub-command leaves git's `OPT_SUBCOMMAND` parser
 //! with nothing to dispatch, so it reports `need a subcommand`.
 //!
-//! `repack`'s argument handling is ported even though its batched-repack
-//! execution is not (see below): `-h`, the two common options, the
-//! `--batch-size=<n>` `OPT_MAGNITUDE` grammar with git's three distinct value
-//! diagnostics, the `--` terminator and the leftover-operand usage block all
-//! match git byte-for-byte, because git rejects a malformed `repack` invocation
-//! during option parsing before it writes a single pack. A well-formed `repack`
-//! reproduces git's no-op cases exactly: `midx_repack()` exits 0 with no output
-//! and no state change when the object store has no MIDX, and when the MIDX names
-//! fewer than two packs — a batch needs two packs to collapse one into another.
-//! Only a MIDX naming two or more packs reaches the missing writer and bails.
+//! `repack` is ported, argument handling and execution alike. `-h`, the two
+//! common options, the `--batch-size=<n>` `OPT_MAGNITUDE` grammar with git's
+//! three distinct value diagnostics, the `--` terminator and the
+//! leftover-operand usage block all match git byte-for-byte; the body follows
+//! `midx_repack()` (midx.c:2006). It exits 0 with no output and no state change
+//! when the object store has no MIDX, and whenever the fill step picks fewer
+//! than two packs — `fill_included_packs_all()` over every present, non-`.keep`,
+//! non-cruft pack when `--batch-size` is absent, and
+//! `fill_included_packs_batch()` oldest-first under the size budget when it is
+//! given. Otherwise every MIDX entry belonging to a picked pack is written into
+//! one new pack, in MIDX order, and the MIDX is rewritten over the enlarged pack
+//! set. The old packs stay: `midx_repack()` unlinks nothing, which is what
+//! leaves `expire` a job. The new pack carries this port's undeltified pack
+//! bytes, so on a repository whose objects git also stores undeltified the file
+//! is byte-identical, and on any other it is larger and differently named while
+//! covering the same object set.
 //!
 //! `write --stdin-packs` reads a set of `.idx` basenames from stdin (git's
 //! `read_packs_from_stdin` + `write_midx_file_only`) and indexes only the packs
@@ -103,11 +109,6 @@
 //!     `let (_num_base_files, data) = data.split_at(1); // TODO: handle base
 //!     files once it's clear what this does`), so a layer cannot even be read
 //!     back correctly, let alone merged.
-//!   * `repack`'s execution when a MIDX names two or more packs — this creates
-//!     new pack files from batched old ones and then rewrites the MIDX;
-//!     `gix-pack` has no pack-repacking driver. Its argument parsing and every
-//!     no-op state (no MIDX, or a MIDX with fewer than two packs) are fully
-//!     reproduced (above); only this final batching step bails.
 //!
 //! `verify` uses `verify_integrity_fast`, which is the exact scope of git's
 //! `verify_midx_file`: trailing checksum, fan-out monotonicity, OID ordering,
@@ -282,6 +283,9 @@ pub(super) const REPACK_OPTS: &[LongOpt] = &[
 ///     no longer resolves any object to and rewrites the MIDX if it dropped any
 ///   * `git multi-pack-index compact <from> <to>` → endpoint resolution and its
 ///     two `fatal:` exits; the collapsing step itself is unported
+///   * `git multi-pack-index repack [--batch-size=<n>]` → silent, exit 0; folds
+///     the packs the fill step picks into one new pack and rewrites the MIDX,
+///     leaving the old packs for `expire`
 ///   * `--object-dir=<dir>` / `--object-dir <dir>` / `--no-object-dir` on any
 ///   * `--progress` / `--no-progress` (accepted; progress is discarded, git's
 ///     own progress goes to stderr and never to stdout)
@@ -289,10 +293,9 @@ pub(super) const REPACK_OPTS: &[LongOpt] = &[
 ///
 /// `write` also honours `--stdin-packs`, `--preferred-pack=` and
 /// `--refs-snapshot=` (see the module docs), and reproduces git's two cross-flag
-/// usage errors. `write --bitmap` / `--incremental`, a `--preferred-pack` that
-/// would break a cross-pack duplicate tie, and a `repack` whose MIDX names two
-/// or more packs `bail!` — see the module docs for the specific missing
-/// substrate.
+/// usage errors. `write --bitmap` / `--incremental` and a `--preferred-pack`
+/// that would break a cross-pack duplicate tie `bail!` — see the module docs for
+/// the specific missing substrate.
 pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0.
     let args = match args.first().map(String::as_str) {
@@ -1030,18 +1033,34 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
 
 /// `repack`: batch small packs into new ones and rewrite the MIDX.
 ///
-/// The batched-repack execution itself is unported — `gix-pack` has no
-/// pack-repacking driver — but git rejects a malformed invocation during option
-/// parsing, long before any pack is written, so every argument-error path is
-/// reproduced here byte-for-byte: `-h`, the `--object-dir` / `--progress`
-/// commons, the `--batch-size=<n>` `OPT_MAGNITUDE` value grammar (base-0 numeric
-/// parse plus optional k/m/g suffix, with git's three distinct diagnostics for
-/// an empty, malformed or out-of-range value), the `--` operand terminator and
-/// git's leftover-operand usage block. A well-formed invocation reproduces git's
-/// no-op cases (no MIDX, or a MIDX naming fewer than two packs) as a silent exit
-/// 0; only a MIDX naming two or more packs reaches the missing writer and
-/// `bail!`s.
+/// A port of `midx_repack()` (midx.c:2006). Option parsing reproduces git's
+/// error paths byte-for-byte: `-h`, the `--object-dir` / `--progress` commons,
+/// the `--batch-size=<n>` `OPT_MAGNITUDE` value grammar (base-0 numeric parse
+/// plus optional k/m/g suffix, with git's three distinct diagnostics for an
+/// empty, malformed or out-of-range value), the `--` operand terminator and
+/// git's leftover-operand usage block.
+///
+/// The body then follows the C: load the MIDX (no MIDX means exit 0 with nothing
+/// done, `midx.c:2024`), pick the packs to fold together with
+/// [`included_packs_batch`] or [`included_packs_all`], and — when fewer than two
+/// were picked — return without writing anything, which is the `goto cleanup`
+/// both fill functions steer into. Otherwise every MIDX entry belonging to a
+/// picked pack is handed to the pack writer, in MIDX order, and the MIDX is
+/// rewritten over the new pack set (`write_midx_internal`, `midx.c:2085`).
+///
+/// The old packs are deliberately left in place: `midx_repack()` never unlinks
+/// one — that is `expire`'s job, which the `incremental-repack` maintenance task
+/// runs immediately before this.
+///
+/// **The new pack's bytes differ from git's**, as everywhere else this port
+/// writes a pack: `gix-pack` stores every object undeltified, so the pack is
+/// larger than git's and, since a pack is named after its own checksum, carries
+/// a different name. The object set it covers is the same.
 fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+    // `midx_repack()`'s `batch_size` parameter: `builtin/multi-pack-index.c`
+    // leaves it 0 when `--batch-size` is absent, and 0 selects
+    // `fill_included_packs_all()` over `fill_included_packs_batch()`.
+    let mut batch_size: u64 = 0;
     let mut after_dd = false;
     // `repack` collects non-option words without stopping, then rejects them all
     // once parsing succeeds; a bad option encountered first still wins, so this
@@ -1089,11 +1108,12 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                 return Ok(ExitCode::from(129));
             }
             "--batch-size" => match it.next() {
-                Some(v) => {
-                    if let Some(msg) = batch_size_error(v) {
-                        return Ok(usage_error(Some(&msg), REPACK_USAGE));
+                Some(v) => match classify_magnitude(v) {
+                    MagValue::Ok(size) => batch_size = size,
+                    other => {
+                        return Ok(usage_error(Some(&magnitude_error(v, other)), REPACK_USAGE))
                     }
-                }
+                },
                 None => {
                     return Ok(usage_error(
                         Some("option `batch-size' requires a value"),
@@ -1103,8 +1123,11 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
             },
             _ if a.starts_with("--batch-size=") => {
                 let v = &a["--batch-size=".len()..];
-                if let Some(msg) = batch_size_error(v) {
-                    return Ok(usage_error(Some(&msg), REPACK_USAGE));
+                match classify_magnitude(v) {
+                    MagValue::Ok(size) => batch_size = size,
+                    other => {
+                        return Ok(usage_error(Some(&magnitude_error(v, other)), REPACK_USAGE))
+                    }
                 }
             }
             _ if a.starts_with("--") => {
@@ -1126,33 +1149,235 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         return Ok(usage_error(None, REPACK_USAGE));
     }
 
-    // `midx_repack()` (midx.c) is a silent no-op — exit 0, no output, no state
-    // change — whenever there is nothing for it to batch. It loads the MIDX with
-    // `load_multi_pack_index()` and returns 0 straight away when the object store
-    // has none, which is the state of every repository that has never run
-    // `multi-pack-index write`. It likewise does nothing when the MIDX names
-    // fewer than two packs, because a batch needs at least two packs to collapse
-    // one into another. git prints nothing and exits 0 in all of these cases,
-    // regardless of `--batch-size`, so this reproduces them exactly.
-    let (_repo, pack_dir) = object_store(object_dir)?;
+    // `midx_repack()` (midx.c:2024): `lookup_multi_pack_index()` returning NULL
+    // is a silent `return 0` — no output, no state change — which is the state of
+    // every repository that has never run `multi-pack-index write`.
+    let (repo, pack_dir) = object_store(object_dir)?;
     let midx = pack_dir.join("multi-pack-index");
     if !midx.exists() {
         return Ok(ExitCode::SUCCESS);
     }
     let file = multi_index::File::at(&midx, None)?;
+
+    // Both fill functions end in "fewer than two packs picked" -> nonzero ->
+    // `goto cleanup`, so a MIDX naming one pack can never reach the writer.
     if file.num_indices() < 2 {
         return Ok(ExitCode::SUCCESS);
     }
+    let packs = midx_pack_stats(&file, &pack_dir);
+    let include = if batch_size != 0 {
+        included_packs_batch(&repo, &file, &packs, batch_size)
+    } else {
+        included_packs_all(&repo, &packs)
+    };
+    let Some(include) = include else {
+        return Ok(ExitCode::SUCCESS);
+    };
 
-    // A MIDX naming two or more packs is the only state in which `midx_repack()`
-    // actually spawns `pack-objects` to rewrite a batch and then rewrites the
-    // MIDX. That step needs a pack-repacking driver gix-pack does not provide —
-    // its only output mode is `Mode::PackCopyAndBaseObjects` with no delta
-    // compression — so collapsing packs is not yet ported.
-    crate::git_fatal!(
-        "multi-pack-index repack of a MIDX naming {} packs is not yet ported — batched repacking needs a pack writer that gix-pack does not provide",
-        file.num_indices()
-    )
+    // git streams every included object id into `pack-objects` in MIDX entry
+    // order (`midx.c:2067`), which is object-id order.
+    let mut ids: Vec<gix::ObjectId> = Vec::new();
+    for entry in 0..file.num_objects() {
+        let (pack, _offset) = file.pack_id_and_pack_offset_at_index(entry);
+        if include.get(pack as usize).copied().unwrap_or(false) {
+            ids.push(file.oid_at_index(entry).to_owned());
+        }
+    }
+    if ids.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    write_batched_pack(&repo, &pack_dir, &ids)?;
+
+    // `write_midx_internal(object_dir, NULL, NULL, NULL, NULL, flags)`
+    // (midx.c:2085) rescans the pack directory, which now also holds the pack
+    // just written. The old packs stay: `midx_repack()` unlinks nothing.
+    drop(file);
+    write_midx(&pack_dir, repo.object_hash())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What `fill_included_packs_*` need to know about one pack a MIDX names: the
+/// fields `struct packed_git` supplies them.
+struct MidxPack {
+    /// Missing when the pack file the MIDX names is gone — git's
+    /// `prepare_midx_pack()` failing, which both fill functions `continue` past.
+    present: bool,
+    /// `p->pack_size`.
+    pack_size: u64,
+    /// `p->num_objects`, from the pack's own `.idx`.
+    num_objects: u64,
+    /// `p->mtime`, the sort key of `compare_by_mtime()`.
+    mtime: std::time::SystemTime,
+    /// `p->pack_keep`: a `.keep` file sits beside the pack.
+    keep: bool,
+    /// `p->is_cruft`: a `.mtimes` file sits beside the pack.
+    cruft: bool,
+}
+
+/// Read the `struct packed_git` fields of every pack the MIDX names, in MIDX pack
+/// order, which is the order both fill functions index `include_pack` by.
+fn midx_pack_stats(file: &multi_index::File, pack_dir: &Path) -> Vec<MidxPack> {
+    file.index_names()
+        .iter()
+        .map(|index_name| {
+            let stem = index_name
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let pack = pack_dir.join(format!("{stem}.pack"));
+            let meta = fs::metadata(&pack).ok();
+            let num_objects = gix::odb::pack::index::File::at(
+                pack_dir.join(format!("{stem}.idx")),
+                file.object_hash(),
+            )
+            .map(|idx| u64::from(idx.num_objects()))
+            .unwrap_or(0);
+            MidxPack {
+                present: meta.is_some(),
+                pack_size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                num_objects,
+                mtime: meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+                keep: pack_dir.join(format!("{stem}.keep")).exists(),
+                cruft: pack_dir.join(format!("{stem}.mtimes")).exists(),
+            }
+        })
+        .collect()
+}
+
+/// `fill_included_packs_all()` (midx.c:1916): every present, non-`.keep`,
+/// non-cruft pack. `None` when it picked fewer than two, which is the C's
+/// `return count < 2` telling `midx_repack()` to do nothing.
+fn included_packs_all(repo: &gix::Repository, packs: &[MidxPack]) -> Option<Vec<bool>> {
+    let pack_kept_objects = repo
+        .config_snapshot()
+        .boolean("repack.packKeptObjects")
+        .unwrap_or(false);
+    let include: Vec<bool> = packs
+        .iter()
+        .map(|p| p.present && (pack_kept_objects || !p.keep) && !p.cruft)
+        .collect();
+    (include.iter().filter(|on| **on).count() >= 2).then_some(include)
+}
+
+/// `fill_included_packs_batch()` (midx.c:1940): walk the packs oldest first and
+/// take those whose *referenced* share of their own bytes is under `batch_size`,
+/// stopping once the taken bytes reach it. `None` when fewer than two were taken.
+///
+/// "Referenced" is the count of MIDX entries that resolve to the pack, so a pack
+/// the MIDX has mostly superseded is charged only for the part still in use:
+/// `expected_size = pack_size * referenced_objects / num_objects`.
+fn included_packs_batch(
+    repo: &gix::Repository,
+    file: &multi_index::File,
+    packs: &[MidxPack],
+    batch_size: u64,
+) -> Option<Vec<bool>> {
+    let pack_kept_objects = repo
+        .config_snapshot()
+        .boolean("repack.packKeptObjects")
+        .unwrap_or(false);
+
+    let mut referenced = vec![0u64; packs.len()];
+    for entry in 0..file.num_objects() {
+        let (pack, _offset) = file.pack_id_and_pack_offset_at_index(entry);
+        if let Some(count) = referenced.get_mut(pack as usize) {
+            *count += 1;
+        }
+    }
+
+    // `QSORT(pack_info, ..., compare_by_mtime)`. A pack whose file is missing
+    // keeps the zeroed mtime `CALLOC_ARRAY` gave it, so it sorts first — and is
+    // then skipped by the `if (!p) continue` in the loop below.
+    let mut order: Vec<usize> = (0..packs.len()).collect();
+    order.sort_by_key(|&i| {
+        if packs[i].present {
+            packs[i].mtime
+        } else {
+            std::time::UNIX_EPOCH
+        }
+    });
+
+    let mut include = vec![false; packs.len()];
+    let mut total_size: u64 = 0;
+    let mut picked = 0usize;
+    for &i in &order {
+        if total_size >= batch_size {
+            break;
+        }
+        let p = &packs[i];
+        if !p.present || (!pack_kept_objects && p.keep) || p.cruft || p.num_objects == 0 {
+            continue;
+        }
+        let expected_size = p.pack_size.saturating_mul(referenced[i]) / p.num_objects;
+        if expected_size >= batch_size {
+            continue;
+        }
+        picked += 1;
+        total_size += expected_size;
+        include[i] = true;
+    }
+
+    (picked >= 2).then_some(include)
+}
+
+/// The `pack-objects <object_dir>/pack/pack -q --delta-base-offset` step
+/// (midx.c:2038): write one pack, its `.idx` and — unless
+/// `pack.writeReverseIndex` is off — its `.rev`, named after the pack's own
+/// checksum.
+fn write_batched_pack(
+    repo: &gix::Repository,
+    pack_dir: &Path,
+    ids: &[gix::ObjectId],
+) -> Result<()> {
+    // midx.c:2021 and 2035: git reads the same two `repack.*` keys `builtin/
+    // repack.c` does, and defaults them the same way.
+    let allow_ofs_delta = repo
+        .config_snapshot()
+        .boolean("repack.useDeltaBaseOffset")
+        .unwrap_or(true);
+    let use_delta_islands = repo
+        .config_snapshot()
+        .boolean("repack.useDeltaIslands")
+        .unwrap_or(false);
+    let packed = super::pack_objects::packed_for(
+        repo,
+        ids,
+        super::pack_objects::WriteOptions {
+            allow_ofs_delta,
+            use_delta_islands,
+            ..super::pack_objects::WriteOptions::default()
+        },
+    )?;
+    if packed.entries.is_empty() {
+        bail!("pack writer produced no files for {} objects", ids.len());
+    }
+
+    let kind = repo.object_hash();
+    let base = pack_dir.join(format!("pack-{}", packed.id));
+    fs::write(base.with_extension("pack"), &packed.bytes)?;
+    // Both companions index into the pack in object-id order.
+    let mut by_oid = packed.entries.clone();
+    by_oid.sort_unstable_by_key(|entry| entry.id);
+    fs::write(
+        base.with_extension("idx"),
+        super::pack_objects::index_file(kind, 2, &packed.id, &by_oid)?,
+    )?;
+    if repo
+        .config_snapshot()
+        .boolean("pack.writeReverseIndex")
+        .unwrap_or(true)
+    {
+        fs::write(
+            base.with_extension("rev"),
+            super::pack_objects::reverse_index_file(kind, &packed.id, &by_oid)?,
+        )?;
+    }
+    Ok(())
 }
 
 /// Classify a `--batch-size` value the way git's `OPT_MAGNITUDE` does and return
@@ -1166,19 +1391,32 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
 /// distinct message; the range bound prints literally as `[0,-1]` in git 2.55.
 fn batch_size_error(v: &str) -> Option<String> {
     match classify_magnitude(v) {
-        MagValue::Ok => None,
-        MagValue::Empty => Some("option `batch-size' expects a numerical value".to_string()),
-        MagValue::Invalid => Some(
-            "option `batch-size' expects a non-negative integer value with an optional k/m/g suffix"
-                .to_string(),
-        ),
-        MagValue::Range => Some(format!("value {v} for option `batch-size' not in range [0,-1]")),
+        MagValue::Ok(_) => None,
+        other => Some(magnitude_error(v, other)),
     }
 }
 
-/// The three outcomes of a magnitude parse that map to git's three diagnostics.
+/// git's diagnostic for a `--batch-size` value [`classify_magnitude`] rejected.
+///
+/// Never called with [`MagValue::Ok`], which is not an error; that arm reports
+/// the accepted-value message so a future caller cannot pass one silently.
+fn magnitude_error(v: &str, value: MagValue) -> String {
+    match value {
+        MagValue::Ok(_) => format!("value {v} for option `batch-size' was accepted"),
+        MagValue::Empty => "option `batch-size' expects a numerical value".to_string(),
+        MagValue::Invalid => {
+            "option `batch-size' expects a non-negative integer value with an optional k/m/g suffix"
+                .to_string()
+        }
+        MagValue::Range => format!("value {v} for option `batch-size' not in range [0,-1]"),
+    }
+}
+
+/// The four outcomes of a magnitude parse: the accepted value, or one of git's
+/// three diagnostics.
 enum MagValue {
-    Ok,
+    /// The parsed value, suffix applied.
+    Ok(u64),
     /// The value was the empty string.
     Empty,
     /// Non-numeric, negative, or a bad unit suffix.
@@ -1253,7 +1491,7 @@ fn classify_magnitude(arg: &str) -> MagValue {
         _ => return MagValue::Invalid,
     };
     match val.checked_mul(factor) {
-        Some(uval) if uval <= u64::MAX as u128 => MagValue::Ok,
+        Some(uval) if uval <= u64::MAX as u128 => MagValue::Ok(uval as u64),
         _ => MagValue::Range,
     }
 }
@@ -1476,12 +1714,29 @@ mod tests {
     /// the `unsigned long` bound would surface as a message/exit-code diff.
     #[test]
     fn batch_size_matches_opt_magnitude() {
-        let ok = [
-            "0", "1", "010", "0x10", "0X1F", "+1", " 1", "  10", "1k", "1K", "9g", "9G",
-            "18446744073709551615",
+        // The value each spelling parses to, which `repack` now passes on to
+        // `fill_included_packs_batch()` as its size budget: base 0 means a
+        // leading `0` is octal and `0x` is hex, and `k`/`m`/`g` are binary.
+        let ok: [(&str, u64); 13] = [
+            ("0", 0),
+            ("1", 1),
+            ("010", 8),
+            ("0x10", 16),
+            ("0X1F", 31),
+            ("+1", 1),
+            (" 1", 1),
+            ("  10", 10),
+            ("1k", 1024),
+            ("1K", 1024),
+            ("9g", 9 * 1024 * 1024 * 1024),
+            ("9G", 9 * 1024 * 1024 * 1024),
+            ("18446744073709551615", u64::MAX),
         ];
-        for v in ok {
-            assert!(matches!(classify_magnitude(v), MagValue::Ok), "expected Ok for {v:?}");
+        for (v, want) in ok {
+            match classify_magnitude(v) {
+                MagValue::Ok(got) => assert_eq!(got, want, "value for {v:?}"),
+                _ => panic!("expected Ok for {v:?}"),
+            }
             assert_eq!(batch_size_error(v), None, "{v:?} should be accepted");
         }
         assert!(matches!(classify_magnitude(""), MagValue::Empty));

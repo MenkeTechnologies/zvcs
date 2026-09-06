@@ -1589,6 +1589,51 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- write phase: nothing here may fail on a well-formed patch ----------
+    // `try_create_file()` does not write the patch result verbatim:
+    //
+    // ```c
+    // if (convert_to_working_tree(state->repo->index, path, buf, size, &nbuf, NULL)) {
+    //         size = nbuf.len;
+    //         buf  = nbuf.buf;
+    // }
+    // res = write_in_full(fd, buf, size) < 0;
+    // ```
+    //
+    // (apply.c:4524-4529.) The *worktree* copy is smudged — `core.autocrlf`, `text`/`eol`,
+    // `ident`, a smudge driver — while the blob `add_index_file()` records stays the
+    // canonical content the patch produced. Writing raw made `git -c core.autocrlf=true am`
+    // leave an LF file where stock leaves CRLF, which the next `status` calls modified and
+    // this one did not. The two arms `try_create_file()` returns from before the conversion —
+    // a gitlink and a symlink — are excluded below, exactly as they are there.
+    //
+    // The pipeline needs a repository, and `--index`/`-N` is the only reason one has been
+    // opened so far; a plain `git apply` inside a repository is smudged just the same, so it
+    // is discovered here. Outside a repository there is nothing to configure a filter from
+    // and the content is written as it stands.
+    let mut smudge_repo = None;
+    if o.apply && !o.cached && idx_repo.is_none() {
+        smudge_repo = crate::setup::discover().ok();
+    }
+    //
+    // Built without `?`: `convert_to_working_tree()` cannot fail the command in git — it
+    // answers "no conversion" and the raw bytes are written — so neither may a repository
+    // this command did not otherwise need. Without `--index` the index is opened here and
+    // nowhere else, and a `git apply` that worked before must not start failing on it.
+    let mut smudge = idx_repo.as_ref().or(smudge_repo.as_ref()).and_then(|repo| {
+        // `convert_attrs()` runs under the default `GIT_ATTR_CHECKIN` direction — apply never
+        // calls `git_attr_set_direction()` — which is the worktree's `.gitattributes` first
+        // and the index's only where there is no file (attr.c:`read_attr`).
+        repo.workdir()?;
+        let index = crate::index_open::or_empty(repo).ok()?;
+        let cache = repo
+            .attributes_only(
+                &index,
+                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+            )
+            .ok()?;
+        gix::filter::Pipeline::new(repo, cache.detach()).ok()
+    });
+
     // Index mutations are accumulated by path and replayed once at the end (git's
     // `remove_file`/`add_index_file`); `--cached` skips every worktree touch.
     let mut idx_remove: Vec<BString> = Vec::new();
@@ -1627,9 +1672,26 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     for op in ops {
         if let Some((path, mode, data)) = op.create {
             if !o.cached {
+                // `convert_to_working_tree()`, on the regular-file arm only: `try_create_file()`
+                // returns from the gitlink and symlink branches above it (apply.c:4508-4517).
+                let is_special = mode & 0o170000 == 0o120000 || mode & 0o170000 == 0o160000;
+                let wt_data = match (&mut smudge, is_special) {
+                    (Some(pipeline), false) => {
+                        let mut converted = pipeline.convert_to_worktree(
+                            &data,
+                            gix::bstr::BStr::new(path.as_bytes()),
+                            gix::filter::plumbing::driver::apply::Delay::Forbid,
+                        )?;
+                        let mut buf = Vec::new();
+                        std::io::copy(&mut converted, &mut buf)?;
+                        drop(converted);
+                        std::borrow::Cow::Owned(buf)
+                    }
+                    _ => std::borrow::Cow::Borrowed(&data[..]),
+                };
                 // `create_file()`'s `error_errno()` (apply.c) unwinds to `git
                 // apply`'s exit 128, not to the crate's `zvcs: apply: …` exit 1.
-                if let Err(e) = create_one_file(Path::new(&path), mode, &data) {
+                if let Err(e) = create_one_file(Path::new(&path), mode, &wt_data) {
                     err(o.quiet(), &format!("error: {e}"));
                     return Ok(ExitCode::from(128));
                 }

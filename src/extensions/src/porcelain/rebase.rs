@@ -2678,8 +2678,37 @@ fn get_fork_point(
     upstream_spec: &str,
     head: ObjectId,
 ) -> Result<Option<ObjectId>> {
-    let Some(reference) = repo.try_find_reference(upstream_spec)? else {
-        return Ok(None);
+    // `get_fork_point()` opens by DWIMming the operand itself, and both failures are
+    // fatal — it never falls back to the plain merge base:
+    //
+    // ```c
+    // switch (repo_dwim_ref(the_repository, refname, strlen(refname), &oid,
+    //                       &full_refname, 0)) {
+    // case 0:
+    //         die("No such ref: '%s'", refname);
+    // case 1:
+    //         break; /* good */
+    // default:
+    //         die("Ambiguous refname: '%s'", refname);
+    // }
+    // ```
+    //
+    // (commit.c:1103-1111; `builtin/rebase.c:1771-1773` is the caller.) A plain
+    // `try_find_reference()` is neither of those: it is not a DWIM, so
+    // `--fork-point origin/main` had to be spelled in full, and for an operand that is a
+    // revision rather than a refname — `main~3`, `HEAD^` — gitoxide rejects the *name*
+    // and the error escaped as `zvcs: rebase: The ref name or path is not a valid ref
+    // name: Reference name contains invalid byte: "~"` at exit 1, where stock says
+    // `fatal: No such ref: 'main~3'` at 128. `merge-base --fork-point` already ports this;
+    // see [`super::merge_base`].
+    let candidates_for_ref = super::rev_parse::dwim_ref_matches(repo, upstream_spec);
+    let full_refname = match candidates_for_ref.len() {
+        0 => return Err(crate::fatal::die(format!("No such ref: '{upstream_spec}'"))),
+        1 => candidates_for_ref[0].clone(),
+        _ => return Err(crate::fatal::die(format!("Ambiguous refname: '{upstream_spec}'"))),
+    };
+    let Some(reference) = repo.try_find_reference(full_refname.as_str())? else {
+        return Err(crate::fatal::die(format!("No such ref: '{upstream_spec}'")));
     };
 
     let mut revs: Vec<ObjectId> = Vec::new();
@@ -3652,6 +3681,37 @@ fn read_autostash_in(dir: &std::path::Path) -> Option<ObjectId> {
     ObjectId::from_hex(raw.trim().as_bytes()).ok()
 }
 
+/// `save_autostash(path)` — `apply_save_autostash(path, 0)` (sequencer.c): the snapshot is
+/// *not* re-applied, it is pushed onto the stash list, and the file is unlinked.
+///
+/// ```c
+/// store.git_cmd = 1;
+/// strvec_pushl(&store.args, "stash", "store", "-m", stash_msg ? stash_msg : "autostash",
+///              "-q", stash_oid, NULL);
+/// if (run_command(&store)) ret = error(_("cannot store %s"), stash_oid);
+/// else if (attempt_apply) …
+/// else fprintf(stderr, _("Autostash exists; creating a new stash entry.\n"
+///                        "Your changes are safe in the stash.\n"
+///                        "You can run \"git stash pop\" or \"git stash drop\" at any time.\n"));
+/// ```
+///
+/// `ACTION_QUIT` is the caller (builtin/rebase.c:1422), and it keeps the rebased tree — so
+/// applying the snapshot would conflict with it. Neither backend did anything with the file,
+/// which meant `git rebase --autostash … && git rebase --quit` silently discarded the local
+/// changes: the stash commit stayed unreferenced and the state directory that named it was
+/// deleted.
+fn save_autostash_in(repo: &gix::Repository, dir: &std::path::Path) -> Result<()> {
+    let Some(oid) = read_autostash_in(dir) else { return Ok(()) };
+    super::stash::store_commit(repo, oid, "autostash")?;
+    eprintln!(
+        "Autostash exists; creating a new stash entry.\n\
+         Your changes are safe in the stash.\n\
+         You can run \"git stash pop\" or \"git stash drop\" at any time."
+    );
+    let _ = std::fs::remove_file(dir.join("autostash"));
+    Ok(())
+}
+
 /// `create_autostash()`'s own write: `write_file(path, "%s", oid_to_hex(&oid))` after
 /// `safe_create_leading_directories_const()` (sequencer.c, `create_autostash_internal`).
 /// `write_file` completes the line, hence the trailing newline stock leaves.
@@ -3827,7 +3887,9 @@ fn rebase_show_current_patch(repo: &gix::Repository) -> Result<ExitCode> {
 
 /// `git rebase --quit`: drop the state directory and leave `HEAD` where it is.
 fn rebase_quit(repo: &gix::Repository) -> Result<ExitCode> {
-    let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+    let dir = rebase_merge_dir(repo);
+    save_autostash_in(repo, &dir)?;
+    let _ = std::fs::remove_dir_all(dir);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -4180,9 +4242,7 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
             // `ACTION_QUIT`: `save_autostash(state_dir_path("autostash", &options))`
             // (builtin/rebase.c:1422) — the snapshot is pushed onto the stash list rather
             // than re-applied, so the changes survive a `--quit` that keeps the new tree.
-            if let Some(oid) = read_autostash_in(&dir) {
-                super::stash::store_commit(repo, oid, "autostash")?;
-            }
+            save_autostash_in(repo, &dir)?;
             let _ = std::fs::remove_dir_all(&dir);
             return Ok(ExitCode::SUCCESS);
         }

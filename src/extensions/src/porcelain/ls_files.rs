@@ -1303,7 +1303,7 @@ fn keep_trailing_spaces(pattern: &str) -> String {
 
 /// Whether a pathspec element carries `exclude` magic, in either spelling —
 /// the `:!`/`:^` short form or the long `:(exclude)` / `:(…,exclude,…)` one.
-fn is_exclude_pathspec(raw: &str) -> bool {
+pub(super) fn is_exclude_pathspec(raw: &str) -> bool {
     let Some(rest) = raw.strip_prefix(':') else {
         return false;
     };

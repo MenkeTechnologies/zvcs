@@ -2683,12 +2683,10 @@ fn entry_is_dirty(
     if index_timestamp == 0 || i64::from(info.stat.mtime.secs) < index_timestamp {
         return false;
     }
-    match std::fs::read(full) {
-        Ok(data) => gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &data)
-            .map(|id| id != info.id)
-            .unwrap_or(true),
-        Err(_) => true,
-    }
+    // `ie_match_stat()`: `changed |= ce_modified_check_fs(istate, ce, st)`, which switches on the
+    // filesystem type — a symlink is compared against its own target bytes, not against what the
+    // link resolves to. Reading through the link here called every racy-looking symlink modified.
+    crate::index_racy::modified_check_fs(repo.object_hash(), full, md, &info.id)
 }
 
 /// git's `ce_match_stat_basic` type and permission comparison.

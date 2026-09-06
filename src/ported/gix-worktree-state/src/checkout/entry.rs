@@ -273,6 +273,29 @@ pub(crate) fn open_file(
     #[cfg_attr(windows, allow(unused_mut))]
     let mut options = open_options(path, destination_is_initially_empty, overwrite_existing);
     let needs_executable_bit = fs_supports_executable_bit && entry_mode == gix_index::entry::Mode::FILE_EXECUTABLE;
+
+    // git never writes *into* a file that is already there. `open_output_fd()` is
+    // `O_WRONLY | O_CREAT | O_EXCL` (entry.c:89), so `checkout_entry_ca()` has to clear the
+    // path first, and it does — "We unlink the old file, to get the new one with the right
+    // permissions (including umask, which is nasty to emulate by hand …)", `remove_subtree()`
+    // for a directory and `unlink()` for anything else (entry.c:565-577).
+    //
+    // Truncating in place instead is observably different, and not only in the permission bits
+    // that comment is about: the directory entry survives, so its *name* survives. On macOS,
+    // where `core.precomposeUnicode` makes the index spell a combining mark composed while the
+    // filesystem still holds the decomposed bytes `readdir()` handed over, a truncating write to
+    // `é.txt` reopens the existing `e◌́.txt` and leaves the decomposed name in place; git's
+    // unlink-then-create replaces it with the composed one. It also keeps a hard link's other
+    // names pointing at the checked-out content, which git deliberately breaks.
+    //
+    // Only when the open could have hit an existing file at all: a clone
+    // (`destination_is_initially_empty`, no overwrite) opens `O_EXCL` and there is nothing to
+    // unlink.
+    let replaced_existing = (overwrite_existing || !destination_is_initially_empty)
+        && std::fs::symlink_metadata(path)
+            .and_then(|meta| try_unlink_path_recursively(path, &meta))
+            .is_ok();
+
     #[cfg(unix)]
     let set_executable_after_creation = if !needs_executable_bit {
         false
@@ -283,16 +306,14 @@ pub(crate) fn open_file(
         // owner, even where the directory permits replacing the file. A Homebrew prefix shared
         // between two accounts hits exactly that on every `reset --hard`.
         // git does not chmod here either: `checkout_entry` unlinks the old entry and `create_file`
-        // recreates it with the final mode, so the file it writes always belongs to it. Unlink for
-        // the same reason, and keep the chmod only for when that is impossible (a read-only
+        // recreates it with the final mode, so the file it writes always belongs to it. The unlink
+        // above is that one; the chmod stays only for when it was impossible (a read-only
         // directory), where it still succeeds on a file we do own.
-        let replaced_existing = !destination_is_initially_empty
-            && std::fs::symlink_metadata(path)
-                .and_then(|meta| try_unlink_path_recursively(path, &meta))
-                .is_ok();
         options.mode(0o777);
         !destination_is_initially_empty && !replaced_existing
     };
+    #[cfg(windows)]
+    let _ = replaced_existing;
     //  not supported on windows
     #[cfg(windows)]
     let set_executable_after_creation = needs_executable_bit;

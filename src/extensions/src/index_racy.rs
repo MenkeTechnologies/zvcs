@@ -37,6 +37,58 @@
 
 use gix::bstr::ByteSlice;
 
+/// `ce_modified_check_fs()` (read-cache.c:2513-2533) — has the worktree content at `full` moved
+/// away from the blob `id` the index recorded?
+///
+/// ```c
+/// switch (st->st_mode & S_IFMT) {
+/// case S_IFREG: if (ce_compare_data(istate, ce, st)) return DATA_CHANGED; break;
+/// case S_IFLNK: if (ce_compare_link(ce, xsize_t(st->st_size))) return DATA_CHANGED; break;
+/// case S_IFDIR: if (S_ISGITLINK(ce->ce_mode)) return ce_compare_gitlink(ce) ? DATA_CHANGED : 0;
+///         /* else fallthrough */
+/// default: return TYPE_CHANGED;
+/// }
+/// ```
+///
+/// The switch is on the **filesystem** type, not on the mode the index recorded, and the symlink
+/// arm is `ce_compare_link()` — `strbuf_readlink()` compared against the blob. It reads the *link*,
+/// never what the link points at. Hashing `std::fs::read()` for every entry followed each symlink
+/// to its target instead, so a clean `link-to-file -> README.md` hashed `README.md`'s bytes,
+/// matched nothing, and was called modified. Both callers below did that, which is why
+/// `git checkout` onto a branch of symlinks listed up to six paths where stock listed one, and why
+/// *which* six varied run to run: only entries that happened to look racy at that moment were
+/// asked.
+///
+/// `md` must come from `symlink_metadata` — this is `lstat`, and following the link is the bug.
+///
+/// Hashing raw can still disagree with a filtered blob (`core.autocrlf`, a clean filter). Erring
+/// toward "modified" costs a re-read; erring the other way makes a real change invisible, so an
+/// unreadable file counts as modified, exactly as `ce_compare_data()`'s `match = -1` does.
+pub fn modified_check_fs(
+    object_hash: gix::hash::Kind,
+    full: &std::path::Path,
+    md: &std::fs::Metadata,
+    id: &gix::ObjectId,
+) -> bool {
+    let ft = md.file_type();
+    let hashed = if ft.is_symlink() {
+        // `ce_compare_link()`.
+        std::fs::read_link(full).ok().map(|t| gix::path::into_bstr(t).into_owned())
+    } else if ft.is_file() {
+        // `ce_compare_data()`.
+        std::fs::read(full).ok().map(Into::into)
+    } else {
+        // `default: return TYPE_CHANGED`. A gitlink is never asked — `is_racy_timestamp()` says
+        // no for `S_ISGITLINK` — so a directory here means the index recorded a blob.
+        return true;
+    };
+    match hashed {
+        Some(bytes) => gix::objs::compute_hash(object_hash, gix::objs::Kind::Blob, &bytes)
+            .is_ok_and(|hash| hash != *id),
+        None => true,
+    }
+}
+
 /// Smudge every racily-clean entry of `index`, as `do_write_index()` does before serialising.
 ///
 /// A no-op for an index with no timestamp (never read from disk), for a bare repository, and for
@@ -79,19 +131,13 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
             let Ok(current) = gix::index::entry::Stat::from_fs(&fs_meta) else {
                 continue;
             };
-            let _ = meta;
             // `ce_match_stat_basic()`: a stat that already differs will be reported anyway, so
             // there is nothing to smudge.
             if current.size != entry.stat.size || current.mtime.secs != entry.stat.mtime.secs {
                 continue;
             }
-            // `ce_modified_check_fs()`: the stat agrees, so the content has to answer. Hashing the
-            // file raw can disagree with a filtered blob (`core.autocrlf`, a clean filter), and
-            // erring toward "smudge it" only costs the next `status` a re-read of one file, while
-            // erring the other way is the invisible change this exists to prevent.
-            let Ok(bytes) = std::fs::read(&full) else { continue };
-            let disk = gix::objs::compute_hash(object_hash, gix::objs::Kind::Blob, &bytes);
-            if disk.is_ok_and(|id| id == entry.id) {
+            // `ce_modified_check_fs()`: the stat agrees, so the content has to answer.
+            if !modified_check_fs(object_hash, &full, &meta, &entry.id) {
                 continue;
             }
             smudge.push(idx);

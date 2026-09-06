@@ -780,17 +780,30 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // `git restore . :!<path>` exclude something: short-circuiting on the `.` skipped the
     // exclusion entirely and restored the path it names.
     let match_all = pathspecs.is_empty();
-    let mut specs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut specs: Vec<String> = Vec::new();
     for p in &pathspecs {
         // A magic pathspec (`:!x`, `:(exclude)x`, `:/`, …) is not a path to resolve against
-        // the prefix, and an exclusion that matches nothing is not the error a positive
-        // spec's failure to match is — so it is handed to the engine and to nothing else.
+        // the prefix — but it still has to *match* something. `report_path_error()`
+        // (dir.c:640-673) walks every element of the parsed set and names each one whose
+        // `ps_matched` slot is still clear, with no exemption for magic; only an exclusion
+        // escapes, because `do_match_pathspec()` marks an exclude item seen as soon as it
+        // subtracts anything. So `git restore --source=X --staged ':(glob)**/*.txt'` with no
+        // match is `error: pathspec … did not match any file(s) known to git` and exit 1,
+        // exactly as the plain `nomatch*` spelling is, while `:!nosuch` is silent — measured
+        // against git 2.55.0. Skipping every `:`-prefixed element here let the whole
+        // `--pathspec-from-file` corpus case (whose only spec is `:(glob)**/*.txt`) exit 0.
         if p.starts_with(':') {
+            if !super::ls_files::is_exclude_pathspec(p) {
+                specs.push(p.clone());
+            }
             continue;
         }
         match resolve_spec(&prefix_components, &wd_c, p) {
             Ok(None) => {}
-            Ok(Some(rel)) => specs.push((p.clone(), rel.into_bytes())),
+            // The resolved form is only wanted for the two rejections above; the check
+            // below matches each element through the pathspec engine from its raw text,
+            // which is what applies the repository prefix.
+            Ok(Some(_)) => specs.push(p.clone()),
             Err(()) => {
                 eprintln!("fatal: {p}: '{p}' is outside repository at '{}'", wd_c.display());
                 return Ok(ExitCode::from(128));
@@ -896,7 +909,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 .map(|e| e.path_in(backing).to_owned())
                 .collect()
         };
-        for (raw, spec) in &specs {
+        for raw in &specs {
             // Each spec is checked on its own: git names the one that matched nothing.
             let single = super::log::PathspecMatcher::new(&repo, std::slice::from_ref(raw))?;
             let hit = source_map

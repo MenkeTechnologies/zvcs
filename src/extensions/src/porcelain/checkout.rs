@@ -641,6 +641,12 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // ref whenever it names a branch, resolves as a rev, is the `HEAD`/`@`
     // spelling, or DWIMs to a unique remote branch; anything else is a pathspec,
     // as is every positional after a `-b`/`-B`/`--orphan`/`-t` start-point.
+    // `dwim_new_local_branch`: `--[no-]guess` on the command line, else `checkout.guess`
+    // (default on). It gates whether `parse_branchname_arg()` consults
+    // `unique_tracking_name()` at all, which is what decides between "this operand is a
+    // ref" and "this operand is a pathspec" — so it has to be known before that split.
+    let guess = guess_flag
+        .unwrap_or_else(|| repo.config_snapshot().boolean("checkout.guess") != Some(false));
     let path_op = if pathspec_from_file.is_some() {
         true
     } else if has_dashdash {
@@ -660,7 +666,13 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                         .flatten()
                         .is_some()
                     || crate::objname::resolve_quiet(&repo, spec).is_some()
-                    || matches!(unique_remote_branch(&repo, spec), Ok(Dwim::One(_)));
+                    // Only when the DWIM is allowed to run: with `--no-guess` git never
+                    // calls `parse_remote_branch()`, so a name that exists only on a remote
+                    // stays an ordinary pathspec — `git checkout --no-guess <b>` is
+                    // `error: pathspec '<b>' did not match any file(s) known to git`, and
+                    // `git checkout --detach --no-guess <b>` is the `--detach does not take
+                    // a path argument` refusal below.
+                    || (guess && matches!(unique_remote_branch(&repo, spec), Ok(Dwim::One(_))));
                 !is_ref
             }
             _ => true,
@@ -916,6 +928,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             &name,
             reset,
             start,
+            None,
             quiet,
             track,
             !only_merge_on_switching_branches,
@@ -1082,30 +1095,36 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // not a local ref and does not resolve as a rev, but names a branch on
         // exactly one remote, becomes `-b <name> --track <remote>/<name>` — git's
         // `dwim_new_local_branch` path in `builtin/checkout.c`.
-        if !detach {
-            let guess = guess_flag.unwrap_or_else(|| {
-                repo.config_snapshot().boolean("checkout.guess") != Some(false)
-            });
-            if guess {
-                match unique_remote_branch(&repo, spec)? {
-                    Dwim::One(remote_short) => {
-                        let code =
-                            create_and_switch(
-                            &repo, spec, false, &remote_short, quiet, Some(true), true,
-                            merge_opt(merge, &conflict_style, spec),
-                        )?;
-                        maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
-                        return Ok(code);
+        //
+        // `--detach` does not turn it off: `dwim_ok` is `!patch_mode &&
+        // dwim_new_local_branch && track == UNSPECIFIED && !new_branch`, with no mention of
+        // `force_detach`, so the DWIM still fires and still sets `*new_branch = arg`. The
+        // refusal comes afterwards, from `if (opts->force_detach && opts->new_branch)`
+        // (builtin/checkout.c:1690-1692) — which is why `git checkout --detach <b>`, for a
+        // `<b>` that exists only on a remote, complains about `-b/-B/--orphan` options the
+        // command line never carried.
+        if guess {
+            match unique_remote_branch(&repo, spec)? {
+                Dwim::One(remote_short) => {
+                    if detach {
+                        crate::git_fatal!("'--detach' cannot be used with '-b/-B/--orphan'");
                     }
-                    Dwim::Many { count } => {
-                        crate::advice::ambiguous_remote_branch_name(&repo, "checkout");
-                        eprintln!(
-                            "fatal: '{spec}' matched multiple ({count}) remote tracking branches"
-                        );
-                        return Ok(ExitCode::from(128));
-                    }
-                    Dwim::None => {}
+                    let full_remote = format!("refs/remotes/{remote_short}");
+                    let code = create_and_switch(
+                        &repo, spec, false, &remote_short, Some(&full_remote), quiet, Some(true),
+                        true, merge_opt(merge, &conflict_style, spec),
+                    )?;
+                    maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
+                    return Ok(code);
                 }
+                Dwim::Many { count } => {
+                    crate::advice::ambiguous_remote_branch_name(&repo, "checkout");
+                    eprintln!(
+                        "fatal: '{spec}' matched multiple ({count}) remote tracking branches"
+                    );
+                    return Ok(ExitCode::from(128));
+                }
+                Dwim::None => {}
             }
         }
         // Not a ref/rev — treat as a path restore from the index (bare form).
@@ -1648,6 +1667,7 @@ fn create_and_switch(
     name: &str,
     reset: bool,
     start: &str,
+    start_reflog: Option<&str>,
     quiet: bool,
     track: Option<bool>,
     merge_worktree: bool,
@@ -1773,9 +1793,20 @@ fn create_and_switch(
                 force_create_reflog: false,
                 // `create_branch()` (branch.c:615-631): the validation that finds the branch
                 // already there sets `forcing`, and a forced creation logs `Reset to`.
-                message: match existed {
-                    true => format!("branch: Reset to {start}"),
-                    false => format!("branch: Created from {start}"),
+                //
+                // The start-point is logged as `create_branch()` received it, and the DWIM
+                // path does not hand it the `<remote>/<name>` the user typed:
+                // `unique_tracking_name()` (checkout.c:50-74) answers with the *full*
+                // `refs/remotes/<remote>/<name>` and `parse_branchname_arg()` assigns it over
+                // the argument (`arg = remote;`, builtin/checkout.c:1505), so the log reads
+                // `Created from refs/remotes/origin/x`. Only the display in
+                // `install_branch_config()` shortens it again.
+                message: {
+                    let start = start_reflog.unwrap_or(start);
+                    match existed {
+                        true => format!("branch: Reset to {start}"),
+                        false => format!("branch: Created from {start}"),
+                    }
                 }
                 .into(),
             },

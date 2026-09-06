@@ -566,7 +566,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         if create_from_track.is_some() {
             return fatal("'--detach' cannot be used with '-b/-B/--orphan'");
         }
-        return switch_detach(&repo, &p.positionals, discard, p.quiet, merge_style);
+        return switch_detach(&repo, &p.positionals, discard, p.quiet, merge_style, guess);
     }
     if let Some(name) = p.force_create {
         // `-C` resets the branch, and `create_branch()` refuses to move one that
@@ -577,7 +577,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         {
             return Ok(code);
         }
-        return switch_create(&repo, name, true, &p.positionals, p.quiet, discard, p.track,
+        return switch_create(&repo, name, true, &p.positionals, None, p.quiet, discard, p.track,
             p.track_inherit, merge_style);
     }
     if let Some(name) = p.create.map(str::to_string).or(create_from_track) {
@@ -586,6 +586,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
             &name,
             false,
             &p.positionals,
+            None,
             p.quiet,
             discard,
             p.track,
@@ -682,6 +683,20 @@ fn switch_existing(
         }
         if !quiet {
             eprintln!("Already on '{branch}'");
+            // `update_refs_for_switch()` ends with
+            //
+            // ```c
+            // if (!opts->quiet &&
+            //     (new_branch_info->path ||
+            //      (!opts->force_detach && !strcmp(new_branch_info->name, "HEAD"))))
+            //         report_tracking(new_branch_info);
+            // ```
+            //
+            // — outside the block that chose between `Already on` and the two `Switched to`
+            // wordings, so the ahead/behind summary follows all three. Only the `Switched to`
+            // arm below had it, which left `git switch <current-branch>` one line short of
+            // `git checkout <current-branch>`.
+            super::checkout::print_tracking_status(repo);
         }
         return Ok(super::checkout::run_post_checkout(
             repo,
@@ -691,9 +706,14 @@ fn switch_existing(
         ));
     }
 
+    // `refs/heads/<arg>` being an illegal refname is not itself an error: git never
+    // validates the name, it just leaves `new_branch_info->path` NULL and lets
+    // `die_expecting_a_branch()` speak (builtin/checkout.c:1712-1719). So `feature^`
+    // and `HEAD~1` land on `a branch is expected, got commit '<arg>'` with the detach
+    // hint, and only a name that resolves to no object at all is `invalid reference`.
     let full_name = match FullName::try_from(full.as_str()) {
         Ok(n) => n,
-        Err(_) => return fatal(format!("invalid reference: {branch}")),
+        Err(_) => return branch_expected(repo, branch),
     };
 
     // Not a local branch: DWIM to a remote-tracking branch, else classify.
@@ -702,8 +722,10 @@ fn switch_existing(
             match unique_remote_branch(repo, branch)? {
                 Dwim::One(remote_short) => {
                     let sp = [remote_short.as_str()];
+                    let full_remote = format!("refs/remotes/{remote_short}");
                     return switch_create(
-                        repo, branch, false, &sp, quiet, force, None, false, merge_style,
+                        repo, branch, false, &sp, Some(&full_remote), quiet, force, None, false,
+                        merge_style,
                     );
                 }
                 Dwim::Many { count } => {
@@ -790,6 +812,9 @@ fn switch_create(
     branch: &str,
     reset: bool,
     positionals: &[&str],
+    // The start-point spelling the branch reflog records, when it differs from what the
+    // caller typed (the `--guess` path, which git rewrites to the full remote-tracking ref).
+    start_reflog: Option<&str>,
     quiet: bool,
     force: bool,
     track: Option<bool>,
@@ -875,7 +900,7 @@ fn switch_create(
     let Some(start_commit) = start_commit else {
         attach_head(repo, &full_name, &from_desc, branch)?;
         if let Some(up) = &upstream {
-            install_tracking(repo, branch, up)?;
+            install_tracking(repo, branch, up, quiet)?;
         }
         if !quiet {
             eprintln!("Switched to a new branch '{branch}'");
@@ -934,9 +959,18 @@ fn switch_create(
                 // `HEAD` when none was given — not the branch `HEAD` happens to be on. A `-C`
                 // over a branch that is already there is `forcing` (branch.c:615-631), which
                 // logs `Reset to` instead of `Created from`.
-                message: match existed {
-                    true => format!("branch: Reset to {}", start.unwrap_or("HEAD")),
-                    false => format!("branch: Created from {}", start.unwrap_or("HEAD")),
+                //
+                // `--guess` is the one case where "as the caller spelled it" is not the
+                // argument: `unique_tracking_name()` (checkout.c:50-74) answers with the full
+                // `refs/remotes/<remote>/<name>` and `parse_branchname_arg()` overwrites the
+                // argument with it (`arg = remote;`, builtin/checkout.c:1505), so the log
+                // reads `Created from refs/remotes/origin/x` rather than `origin/x`.
+                message: {
+                    let logged = start_reflog.or(start).unwrap_or("HEAD");
+                    match existed {
+                        true => format!("branch: Reset to {logged}"),
+                        false => format!("branch: Created from {logged}"),
+                    }
                 }
                 .into(),
             },
@@ -972,7 +1006,7 @@ fn switch_create(
     // the upstream before the worktree moved put `branch '<b>' set up to track '<u>'.` above the
     // `M <path>` lines on the same stream.
     if let Some(up) = &upstream {
-        install_tracking(repo, branch, up)?;
+        install_tracking(repo, branch, up, quiet)?;
     }
 
     attach_head(repo, &full_name, &from_desc, branch)?;
@@ -1012,6 +1046,8 @@ fn switch_detach(
     force: bool,
     quiet: bool,
     merge_style: Option<&str>,
+    // `--guess`, resolved: `parse_branchname_arg()` still DWIMs under `--detach`.
+    guess: bool,
 ) -> Result<ExitCode> {
     if positionals.len() > 1 {
         return fatal("only one reference expected");
@@ -1025,6 +1061,19 @@ fn switch_detach(
         // git's `unable to read tree`, not `invalid reference`.
         Some(s) => {
             let Some(id) = crate::objname::resolve(repo, s) else {
+                // `--detach` does not turn the `--guess` DWIM off: `dwim_ok` is
+                // `!patch_mode && dwim_new_local_branch && track == UNSPECIFIED &&
+                // !new_branch` (builtin/checkout.c) with no mention of `force_detach`, so
+                // `parse_branchname_arg()` still resolves a bare name to its unique
+                // remote-tracking branch and sets `*new_branch = arg` for it. Only then
+                // does `if (opts->force_detach && opts->new_branch)` fire
+                // (builtin/checkout.c:1690-1692) — which is why `git switch --detach <b>`,
+                // for a `<b>` that exists only on a remote, answers with a message about
+                // `-b/-B/--orphan` the command line never mentioned. `--no-guess` (or
+                // `checkout.guess=false`) skips the DWIM and leaves the plain refusal.
+                if guess && matches!(unique_remote_branch(repo, s)?, Dwim::One(_)) {
+                    return fatal("'--detach' cannot be used with '-b/-B/--orphan'");
+                }
                 return fatal(format!("invalid reference: {s}"));
             };
             // `setup_new_branch_info_and_source_tree()` (`builtin/checkout.c:1311`)
@@ -1333,6 +1382,7 @@ fn install_tracking(
     repo: &gix::Repository,
     branch: &str,
     upstream: &(String, String, String),
+    quiet: bool,
 ) -> Result<()> {
     let (remote, merge_ref, short) = upstream;
     let path = repo.common_dir().join("config");
@@ -1360,8 +1410,14 @@ fn install_tracking(
     std::fs::rename(&tmp, &path)?;
 
     // `install_branch_config_multiple_remotes()` (branch.c:168-171) picks the wording from the
-    // same `rebasing` that wrote `branch.<name>.rebase`.
-    println!("{}", super::branch::tracking_line(branch, short, want_rebase));
+    // same `rebasing` that wrote `branch.<name>.rebase` — and prints at all only under
+    // `BRANCH_CONFIG_VERBOSE` (branch.c:144), which `setup_tracking()` clears for a quiet run:
+    // `int config_flags = quiet ? 0 : BRANCH_CONFIG_VERBOSE;` (branch.c:257). Printing it
+    // unconditionally put the notice on stdout under `git switch -q -c <new> <remote>/<b>`,
+    // where stock says nothing at all.
+    if !quiet {
+        println!("{}", super::branch::tracking_line(branch, short, want_rebase));
+    }
     Ok(())
 }
 

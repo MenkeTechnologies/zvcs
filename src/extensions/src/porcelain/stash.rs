@@ -775,7 +775,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
                 message: stash_msg.clone().into(),
             },
             expected: PreviousValue::Any,
-            new: Target::Object(w_commit),
+            new: Target::Object(w_commit.expect("the empty --patch selection returned above")),
         },
         name: "refs/stash".try_into().map_err(|e| anyhow!("invalid ref name refs/stash: {e}"))?,
         deref: false,
@@ -1321,7 +1321,13 @@ fn collect_untracked(repo: &gix::Repository, opts: &PushOpts) -> Result<Vec<BStr
 /// merge commit plus the data `push`/`create` need afterwards.
 struct StashBuild {
     /// The stash (`W`) merge commit id — the value stored in `refs/stash`.
-    w_commit: ObjectId,
+    ///
+    /// `None` only for `--patch` where the selector chose nothing: `do_create_stash()`
+    /// jumps over its `commit_tree()` for `W` the moment `stash_patch()` answers `ret > 0`
+    /// (builtin/stash.c), so the empty selection writes no such commit at all. Building it
+    /// first and discarding it afterwards left an unreferenced commit in the object database
+    /// on every `git stash push -p` the user quit out of — one object stock never has.
+    w_commit: Option<ObjectId>,
     /// The reflog / commit message (`WIP on …` or `On <branch>: …`).
     stash_msg: String,
     /// HEAD's tree, used by `push` to reset the worktree/index afterwards.
@@ -1574,7 +1580,12 @@ fn build_stash_commit(
         (tree_with_worktree_mods(repo, i_tree_id, &wt_mods)?, None)
     };
 
-    let w_commit = repo.new_commit(stash_msg.as_str(), w_tree_id, parents)?.id().detach();
+    // `} else if (ret > 0) { goto done; }` — `stash_patch()` answers 1 for "the user took
+    // nothing", and `done:` is past the `commit_tree()` that would build `W`.
+    let w_commit = match &patch {
+        Some(p) if p.is_empty() => None,
+        _ => Some(repo.new_commit(stash_msg.as_str(), w_tree_id, parents)?.id().detach()),
+    };
 
     Ok(StashBuild {
         w_commit,
@@ -1924,7 +1935,8 @@ pub(crate) fn create_snapshot(repo: &gix::Repository) -> Result<Option<ObjectId>
         return Ok(None);
     }
     let built = build_stash_commit(repo, repo, None, &PushOpts::with_message(None))?;
-    Ok(Some(built.w_commit))
+    // Not `--patch`, so `do_create_stash()` always reached its `commit_tree()` for `W`.
+    Ok(built.w_commit)
 }
 
 /// `git stash create [<message>…]` — build the stash commit graph and print the
@@ -1968,7 +1980,7 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // a bare `git stash create` does.
     let message = Some(args.join(" ")).filter(|m| !m.is_empty());
     let built = build_stash_commit(repo, repo, message.as_deref(), &PushOpts::with_message(None))?;
-    println!("{}", built.w_commit);
+    println!("{}", built.w_commit.expect("`create` never takes the --patch branch"));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2830,7 +2842,7 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
         &fresh,
         CacheTree::LikeMixedReset { touched: HashSet::new() },
     )?;
-    Ok(w_commit)
+    Ok(w_commit.expect("autostash never takes the --patch branch"))
 }
 
 /// Re-apply an autostash `W` commit onto the *current* `HEAD` with a real

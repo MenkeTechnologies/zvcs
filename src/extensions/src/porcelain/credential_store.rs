@@ -432,7 +432,7 @@ fn read_credential_file(path: &Path) -> Result<Vec<Vec<u8>>> {
         {
             Ok(Vec::new())
         }
-        Err(e) => crate::git_fatal!("unable to open {}: {e}", path.display()),
+        Err(e) => crate::git_fatal!("unable to open {}: {}", path.display(), errno(&e)),
     }
 }
 
@@ -521,11 +521,11 @@ fn rewrite_credential_file(
     drop(file);
     if let Err(e) = write {
         let _ = std::fs::remove_file(&lock);
-        crate::git_fatal!("unable to write credential store: {e}");
+        crate::git_fatal!("unable to write credential store: {}", errno(&e));
     }
     if let Err(e) = std::fs::rename(&lock, path) {
         let _ = std::fs::remove_file(&lock);
-        crate::git_fatal!("unable to write credential store: {e}");
+        crate::git_fatal!("unable to write credential store: {}", errno(&e));
     }
     Ok(())
 }
@@ -555,7 +555,21 @@ fn acquire_lock(lock: &Path) -> Result<std::fs::File> {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 waited += 10;
             }
-            Err(e) => crate::git_fatal!("unable to get credential storage lock in {TIMEOUT_MS} ms: {e}"),
+            Err(e) => crate::git_fatal!(
+                "unable to get credential storage lock in {TIMEOUT_MS} ms: {}",
+                errno(&e)
+            ),
         }
+    }
+}
+
+/// Render an `io::Error` the way `die_errno`'s `strerror(errno)` would — every
+/// refusal in this file is a `die_errno()` upstream, and Rust's `Display` for
+/// `io::Error` appends a ` (os error N)` tail git never prints.
+fn errno(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(at) => text[..at].to_string(),
+        None => text,
     }
 }

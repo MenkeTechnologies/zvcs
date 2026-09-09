@@ -384,9 +384,6 @@ fn parse_with_unit(value: &str) -> Option<i64> {
 
 /// Apply `column.ui` and, when `--command=<name>` led the command line,
 /// `column.<name>` — git's `git_column_config` driven by the config reader.
-///
-/// The error string is git's own three-line report, minus the config file and
-/// line number, which gitoxide's value lookup does not surface here.
 fn apply_config(colopts: &mut u32, command: Option<&str>) -> Result<(), String> {
     let mut keys: Vec<String> = vec![COLUMN_UI.to_string()];
     if let Some(c) = command {
@@ -402,31 +399,97 @@ fn apply_config(colopts: &mut u32, command: Option<&str>) -> Result<(), String> 
 /// `column.ui`, always consulted first (`git_column_config`'s first branch).
 const COLUMN_UI: &str = "column.ui";
 
-/// The shared tail of [`apply_config`]: read each full `column.<name>` variable
-/// in `keys` and fold its token list into `colopts`.
+/// The shared tail of [`apply_config`]: run `git_column_config` over every
+/// configured value whose key is one of `keys`, folding each token list into
+/// `colopts`.
+///
+/// This is a *callback* reader, not a lookup, because that is what git installs:
+/// `repo_config(r, get_colopts, &colopts)` calls the callback once per configured
+/// value in parse order, so every occurrence is validated and the **first** bad
+/// one kills the command even when a later line would have overridden it. It also
+/// interleaves the two keys the way the file spells them — `[column] branch=always
+/// ui=never` applies `branch` and then `ui`, which a per-key lookup cannot see.
+/// [`crate::config::walk_config`] is that walk, and it carries each value's origin
+/// so the refusal can name where the value came from.
+///
+/// # Outside a repository
+///
+/// [`crate::config::walk_config`] needs an open repository, and the origin index
+/// it builds (the line each variable sits on) is private to `crate::config`. With
+/// no repository this reader therefore falls back to a plain global/system lookup,
+/// which sees no `-c` override and cannot name a file — so a bad `column.ui` in
+/// `~/.gitconfig` is reported without git's ` in file '<path>' at line <n>` tail,
+/// and a bad `-c column.ui=…` outside a repository is not seen at all. Closing
+/// that needs a `walk_config` that takes an already-parsed `gix::config::File`.
 fn apply_config_keys(colopts: &mut u32, keys: &[String]) -> Result<(), String> {
     // git reads config whether or not there is a repository; fall back to the
     // global/system files when discovery fails.
-    let values = match crate::setup::discover() {
-        Ok(repo) => read_values(repo.config_snapshot().plumbing(), keys),
-        Err(_) => match gix::config::File::from_globals() {
-            Ok(file) => read_values(&file, keys),
-            Err(_) => Vec::new(),
-        },
+    let Ok(repo) = crate::setup::discover() else {
+        let file = match gix::config::File::from_globals() {
+            Ok(file) => file,
+            Err(_) => return Ok(()),
+        };
+        for (key, value) in read_values(&file, keys) {
+            if let Err(msg) = parse_config(colopts, &value) {
+                return Err(format!(
+                    "error: {msg}\nerror: invalid {key} mode {value}\n\
+                     fatal: bad config variable '{key}'\n"
+                ));
+            }
+        }
+        return Ok(());
     };
 
-    for (key, value) in values {
-        if let Err(msg) = parse_config(colopts, &value) {
-            return Err(format!(
-                "error: {msg}\nerror: invalid {key} mode {value}\n\
-                 fatal: bad config variable '{key}'\n"
-            ));
+    for v in crate::config::walk_config(&repo) {
+        // `skip_prefix(var, "column.", &it)` then `strcmp(it, "ui")` /
+        // `strcmp(it, command)`: the key the parser hands the callback is already
+        // lower-cased, so a `--command=Branch` matches no `column.branch` here
+        // exactly as it matches none there.
+        if !keys.iter().any(|k| k == &v.key) {
+            continue;
         }
+        column_config(colopts, &v)?;
     }
     Ok(())
 }
 
-/// Collect every value of each full `column.<name>` key, in config order.
+/// Port of `column_config()` (column.c:318-326): the one callback body
+/// `git_column_config` dispatches to, for whichever of the two keys matched.
+///
+/// ```c
+/// static int column_config(const char *var, const char *value,
+///                          const char *key, unsigned int *colopts)
+/// {
+///         if (!value)
+///                 return config_error_nonbool(var);
+///         if (parse_config(colopts, value))
+///                 return error(_("invalid column.%s mode %s"), key, value);
+///         return 0;
+/// }
+/// ```
+///
+/// Both arms return negative, which `configset_iter()` turns into
+/// `git_die_config_linenr()` — the `fatal:` line that names the value's origin.
+fn column_config(colopts: &mut u32, v: &crate::config::ConfigValue) -> Result<(), String> {
+    let key = v.key.as_str();
+    let fatal = v.origin.die_linenr(key);
+    // `config_error_nonbool()`, for the `[column]\n\tui\n` spelling that has no
+    // `=` at all. `parse_config` never sees it.
+    let Some(value) = v.value.as_deref() else {
+        return Err(format!("error: missing value for '{key}'\nfatal: {fatal}\n"));
+    };
+    match parse_config(colopts, value) {
+        // `parse_option()` printed its own `error()` line first; the C emits the
+        // two in that order because the inner one runs first.
+        Err(msg) => Err(format!(
+            "error: {msg}\nerror: invalid {key} mode {value}\nfatal: {fatal}\n"
+        )),
+        Ok(()) => Ok(()),
+    }
+}
+
+/// Collect every value of each full `column.<name>` key, in config order. Used
+/// only by the repository-less fallback in [`apply_config_keys`].
 fn read_values(file: &gix::config::File, keys: &[String]) -> Vec<(String, String)> {
     let mut values = Vec::new();
     for key in keys {

@@ -10,9 +10,10 @@
 //! `SomeLowercase` arm), which is precisely the case `--allow-onelevel` exists
 //! to accept, and it has no notion of `--refspec-pattern`'s single-`*` budget.
 //!
-//! The command touches a repository only for `--branch`, where the `@{-N}`
-//! "previous checkout" syntax is expanded from the HEAD reflog via
-//! `gix::Head::log_iter`. Everything else works outside a repository, as it
+//! The command touches a repository only for `--branch`, which runs the name
+//! through `repo_interpret_branch_name()`: the `@{-N}` "previous checkout"
+//! syntax off the HEAD reflog, and the `@{upstream}`/`@{u}`/`@{push}` marks off
+//! the branch configuration. Everything else works outside a repository, as it
 //! does with stock git.
 //!
 //! ### Covered (byte-identical stdout/stderr and exit code against stock git)
@@ -26,6 +27,12 @@
 //! * `--branch <shorthand>` — prints the branch name, exit 0; on rejection
 //!   `fatal: '<arg>' is not a valid branch name` on stderr, exit 128
 //! * `@{-N}` expansion for `--branch` inside a repository
+//! * the `@{u}` / `@{upstream}` / `@{push}` marks for `--branch`: the `die()`
+//!   inside `interpret_branch_mark()` when the mark names no upstream
+//!   (`fatal: no such branch: 'x'` for `--branch x@{u}`, which replaces the
+//!   `not a valid branch name` refusal), and the expansion itself for the one
+//!   value `branch_interpret_allowed()` lets through under
+//!   `INTERPRET_BRANCH_LOCAL` — an upstream that is itself a local branch
 //! * `-h` as the only argument — usage on stdout, exit 129; a missing argument,
 //!   an unknown option, or more than one refname — the same usage on stderr,
 //!   exit 129
@@ -36,6 +43,16 @@
 //!   (`refs.c::reinterpret`), so a pathological `@{-1}@{-1}` expands twice. This
 //!   expands a single leading `@{-N}` and appends the remainder verbatim, which
 //!   covers `@{-1}`, `@{-2}`, and `@{-1}~2`-style input but not the nested form.
+//! * `interpret_branch_name()` keeps scanning the remaining `@` positions when a
+//!   mark resolved to a ref `branch_interpret_allowed()` rejects, so stock
+//!   diagnoses the *second* mark of `main@{u}@{u}` (`no such branch:
+//!   'main@{u}'`). Only the first mark position is interpreted here, so that
+//!   input is rejected as an invalid branch name instead. Sharing the scan would
+//!   need `crate::objname`'s `branch_get_upstream` ladder to be callable for a
+//!   branch name rather than for a whole operand — the same thing that would fix
+//!   `a^{}@{u}`, where the ladder is reached through `ambiguity_base()` and that
+//!   strips the `^{}` peel before the `@` scan, so the mark is never seen. (Stock
+//!   dies with `no such branch: 'a^{}'`; `git rev-parse` here has the same gap.)
 //! * The `N` in `@{-N}` is parsed with Rust's integer parser rather than
 //!   `strtol`, which additionally skips leading whitespace. Whitespace is an
 //!   invalid refname byte regardless, so the only effect is that such input
@@ -158,22 +175,47 @@ fn usage_error() -> ExitCode {
 }
 
 /// `builtin/check-ref-format.c::check_ref_format_branch`, via
-/// `strbuf_check_branch_ref`.
+/// `refs.c::check_branch_ref`.
 ///
-/// The shorthand is expanded (`@{-N}`) when a repository is present, prefixed
-/// with `refs/heads/`, and validated. Rejection is git's `die()`: the message on
-/// stderr and exit 128. Acceptance prints the expanded shorthand.
+/// ```c
+/// int check_branch_ref(struct strbuf *sb, const char *name)
+/// {
+///         if (startup_info->have_repository)
+///                 copy_branchname(sb, name, INTERPRET_BRANCH_LOCAL);
+///         else
+///                 strbuf_addstr(sb, name);
+///         strbuf_splice(sb, 0, 0, "refs/heads/", 11);
+///         if (*name == '-' || !strcmp(sb->buf, "refs/heads/HEAD"))
+///                 return -1;
+///         return check_refname_format(sb->buf, 0);
+/// }
+/// ```
+///
+/// The leading-dash and `refs/heads/HEAD` checks run *after* the expansion, which
+/// is why `--branch -x@{u}` reports the upstream failure rather than the dash:
+/// `copy_branchname` dies inside `interpret_branch_mark` before either check is
+/// reached. Rejection is git's `die()`: the message on stderr and exit 128.
+/// Acceptance prints the expanded shorthand.
 fn check_ref_format_branch(arg: &str) -> Result<ExitCode> {
     let expanded = match crate::setup::discover() {
-        Ok(repo) => branchname(&repo, arg),
+        Ok(repo) => match copy_branchname(&repo, arg) {
+            Ok(name) => name,
+            // `interpret_branch_mark`'s `die("%s", err.buf)`. It fires while the
+            // name is being expanded, so it *replaces* the caller's own refusal
+            // rather than being reported alongside it.
+            Err(message) => {
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
+        },
+        // `startup_info->have_repository` is false: the name is taken verbatim
+        // and no `@{…}` shorthand means anything.
         Err(_) => arg.as_bytes().to_vec(),
     };
 
     let mut full = b"refs/heads/".to_vec();
     full.extend_from_slice(&expanded);
 
-    // `strbuf_check_branch_ref` rejects a leading dash on the *original* name
-    // and the reserved `refs/heads/HEAD` before running the format check.
     let rejected = arg.as_bytes().first() == Some(&b'-')
         || full == b"refs/heads/HEAD"
         || !check_refname_format(&full, 0);
@@ -189,19 +231,146 @@ fn check_ref_format_branch(arg: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `strbuf_branchname` with `INTERPRET_BRANCH_LOCAL`: expand a leading `@{-N}`
-/// into the branch it names, keeping any trailing text. Anything else, and any
-/// `@{-N}` that names more checkouts than the reflog holds, is returned as is.
-fn branchname(repo: &gix::Repository, name: &str) -> Vec<u8> {
+/// `refs.c::copy_branchname` with `INTERPRET_BRANCH_LOCAL`, over
+/// `object-name.c::repo_interpret_branch_name`.
+///
+/// ```c
+/// void copy_branchname(struct strbuf *sb, const char *name,
+///                      enum interpret_branch_kind allowed)
+/// {
+///         int len = strlen(name);
+///         struct interpret_branch_name_options options = { .allowed = allowed };
+///         int used = repo_interpret_branch_name(the_repository, name, len, sb, &options);
+///
+///         if (used < 0)
+///                 used = 0;
+///         strbuf_add(sb, name + used, len - used);
+/// }
+/// ```
+///
+/// `repo_interpret_branch_name` runs `interpret_nth_prior_checkout` (gated on
+/// `INTERPRET_BRANCH_LOCAL`, which is set) and then walks the `@` positions left
+/// to right trying `@{upstream}`/`@{u}` and then `@{push}` at each. Two of the
+/// three arms are *not* reachable from here:
+///
+///   * `interpret_empty_at` — a bare `@` meaning `HEAD` — is gated on
+///     `INTERPRET_BRANCH_HEAD`, which `check_branch_ref` does not pass, so
+///     `git check-ref-format --branch @` prints `@`.
+///   * a mark that resolves is only *applied* when `branch_interpret_allowed`
+///     accepts what it resolved to, and with `INTERPRET_BRANCH_LOCAL` alone that
+///     is only a `refs/heads/` value. An ordinary upstream is a
+///     `refs/remotes/` ref, so `main@{u}` is left unexpanded and then rejected
+///     for the `@{` in it — while a branch tracking another *local* branch
+///     (`branch.<n>.remote = .`) does expand.
+///
+/// `Err` is the `die()` inside `interpret_branch_mark`, which fires before either
+/// of those gates and so is reported even for a mark whose value would have been
+/// thrown away.
+fn copy_branchname(repo: &gix::Repository, name: &str) -> Result<Vec<u8>, String> {
     let bytes = name.as_bytes();
-    let Some((nth, used)) = parse_nth_prior(bytes) else {
-        return bytes.to_vec();
+
+    // `interpret_nth_prior_checkout`. A recognised `@{-N}` ends the walk either
+    // way: expanded when the reflog holds that many switches, and otherwise
+    // through the `return len` for "syntax Ok, not enough switches", which never
+    // reaches the `@` scan below.
+    if let Some((nth, used)) = parse_nth_prior(bytes) {
+        return Ok(match nth_branch_switch(repo, nth) {
+            Some(mut branch) => {
+                branch.extend_from_slice(&bytes[used..]);
+                branch
+            }
+            None => bytes.to_vec(),
+        });
+    }
+
+    // `interpret_branch_mark`'s `die()`, for either mark. `upstream_mark_fatal`
+    // is the shared port of that ladder — `branch_get_upstream`'s four arms and,
+    // for a `@{push}`, the whole of `branch_get_push_1` — and it applies the same
+    // left-to-right `@` scan and the same `memchr(name, ':', at)` guard.
+    if let Some(message) = crate::objname::upstream_mark_fatal(repo, name) {
+        return Err(message);
+    }
+
+    let Some((at, mark_len, mark)) = first_mark(name) else {
+        return Ok(bytes.to_vec());
     };
-    let Some(mut branch) = nth_branch_switch(repo, nth) else {
-        return bytes.to_vec();
+    // `if (memchr(name, ':', at)) return -1;` — and a `:` before the first mark
+    // precedes every later one too, so the scan has nothing left to find.
+    if bytes[..at].contains(&b':') {
+        return Ok(bytes.to_vec());
+    }
+
+    // `branch_get(NULL)` and `branch_get("HEAD")` are the same lookup — the
+    // branch HEAD points at. A detached HEAD has none, which the `die()` above
+    // has already reported.
+    let named = &name[..at];
+    let branch = if named.is_empty() || named == "HEAD" {
+        match repo.head_name() {
+            Ok(Some(full)) => full.shorten().to_string(),
+            _ => return Ok(bytes.to_vec()),
+        }
+    } else {
+        named.to_string()
     };
-    branch.extend_from_slice(&bytes[used..]);
-    branch
+
+    let refname = format!("refs/heads/{branch}");
+    let value = match mark {
+        Mark::Upstream => crate::porcelain::branch::upstream_ref(repo, refname.as_str().into()),
+        Mark::Push => crate::porcelain::branch::push_ref(repo, refname.as_str().into()),
+    };
+    // The `die()` above already covered every value the C reports as missing, so
+    // anything unresolved here is a mark this port simply cannot apply; leaving
+    // the name alone is `interpret_branch_mark`'s own `return -1`.
+    let Some(value) = value else {
+        return Ok(bytes.to_vec());
+    };
+
+    // `branch_interpret_allowed(value, INTERPRET_BRANCH_LOCAL)`.
+    if !value.as_bstr().starts_with(b"refs/heads/") {
+        return Ok(bytes.to_vec());
+    }
+    // `set_shortened_ref`, then `copy_branchname`'s `strbuf_add(sb, name + used,
+    // len - used)` for whatever followed the mark.
+    let mut out = crate::refname::shorten_unambiguous(repo, value.as_bstr(), false);
+    out.extend_from_slice(&bytes[at + mark_len..]);
+    Ok(out)
+}
+
+/// Which of the two marks `interpret_branch_name`'s scan reaches first.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// `@{upstream}` / `@{u}`, read with `branch_get_upstream`.
+    Upstream,
+    /// `@{push}`, read with `branch_get_push`.
+    Push,
+}
+
+/// The first `@` position holding a mark, the mark's length, and which mark it
+/// is — the state `interpret_branch_name`'s loop is in when it first gets a
+/// non-negative answer out of `interpret_branch_mark`.
+///
+/// The loop tries `upstream_mark` before `push_mark` at each `@`, so the earlier
+/// position wins and no position can hold both.
+fn first_mark(name: &str) -> Option<(usize, usize, Mark)> {
+    let upstream = crate::objname::upstream_mark_at(name);
+    let push = crate::objname::push_mark_at(name);
+    let (at, mark) = match (upstream, push) {
+        (Some(u), Some(p)) if p < u => (p, Mark::Push),
+        (Some(u), _) => (u, Mark::Upstream),
+        (None, Some(p)) => (p, Mark::Push),
+        (None, None) => return None,
+    };
+    // `at_mark` compares `@{upstream}` before `@{u}`, and only one of the two can
+    // prefix a given position.
+    const UPSTREAM: &[u8] = b"@{upstream}";
+    let rest = &name.as_bytes()[at..];
+    let len = match mark {
+        Mark::Upstream if rest.len() >= UPSTREAM.len()
+            && rest[..UPSTREAM.len()].eq_ignore_ascii_case(UPSTREAM) => UPSTREAM.len(),
+        Mark::Upstream => "@{u}".len(),
+        Mark::Push => "@{push}".len(),
+    };
+    Some((at, len, mark))
 }
 
 /// The syntax half of `refs.c::interpret_nth_prior_checkout`.

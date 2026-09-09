@@ -2403,6 +2403,29 @@ fn verify_path(path: &BStr) -> bool {
 fn create_ce_mode(mode: u32) -> Mode {
     if (mode & 0o170000) == 0o120000 {
         Mode::SYMLINK
+    } else if mode == 0o040000 {
+        // ```c
+        // #define S_ISSPARSEDIR(m) ((m) == S_IFDIR)
+        // …
+        // if (S_ISSPARSEDIR(mode))
+        //         return S_IFDIR;
+        // if (S_ISDIR(mode) || S_ISGITLINK(mode))
+        //         return S_IFGITLINK;
+        // ```
+        //
+        // (`create_ce_mode()`, cache.h.) The sparse-directory arm tests the mode
+        // for *equality* with `S_IFDIR`, so it is `040000` on the nose and nothing
+        // else: `040755` still carries permission bits and falls through to the
+        // gitlink arm, verified against stock 2.55.0 — `update-index --add
+        // --cacheinfo 040755,<oid>,d755` lists `160000 … d755`.
+        //
+        // A sparse-directory entry names a *tree*, and stock expands it on read:
+        // `--cacheinfo 040000,<empty tree>,subtree` leaves an index whose only
+        // observable effect is a `warning: index entry is a directory, but not
+        // sparse` — the entry itself expands to the empty tree's zero paths and
+        // vanishes. Recording a gitlink instead left `subtree` in the index for
+        // good, which stock then reported as `AD subtree`.
+        Mode::DIR
     } else if is_dir_mode(mode) {
         Mode::COMMIT
     } else if (mode & 0o100) != 0 {

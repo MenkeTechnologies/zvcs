@@ -554,8 +554,8 @@ impl Filters {
 /// `print_ref_list()` simply never calls — so `%(is-base:<x>)` is empty for
 /// every branch even where `git for-each-ref` marks one.
 ///
-/// `--edit-description` is refused: it needs an interactive
-/// editor loop that is not wired in this environment. `--recurse-submodules`
+/// `--edit-description` is served by [`edit_description`], through the same
+/// editor launch every other verb in this port uses. `--recurse-submodules`
 /// reproduces both of git's refusals (`submodule.propagateBranches` unset, and
 /// the non-creation actions) and then says it is not ported, rather than
 /// claiming the flag is unknown.
@@ -831,9 +831,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         return delete_branches(&repo, &o);
     }
     if o.edit_description {
-        // --edit-description opens the configured editor on the branch
-        // description; that interactive editor loop is not wired here.
-        bail!("--edit-description is not supported by this port");
+        return edit_description(&repo, &o);
     }
     if let Some(up) = o.set_upstream_to.clone() {
         return set_upstream(&repo, &o, &up);
@@ -1986,6 +1984,11 @@ fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result
         return fatal(format!("branch '{branch_name}' does not exist"));
     }
 
+    // `create_branch()` resolves the start-point as an *object name* first —
+    // `if (repo_get_oid_mb(r, start_name, &oid))` — and only then DWIMs it as a
+    // ref. The object-name pass is what emits `warning: refname '<x>' is
+    // ambiguous.`, so skipping it left the fatal below unannounced.
+    let _ = crate::objname::resolve(repo, upstream_spec);
     let up = match resolve_upstream(repo, upstream_spec)? {
         Some(u) => u,
         None => {
@@ -2008,6 +2011,28 @@ fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result
             return Ok(code);
         }
     };
+    // `--set-upstream-to` is `create_branch(…, BRANCH_TRACK_OVERRIDE)`, so it runs
+    // the very same `dwim_ref()` switch the start-point above does, in the same
+    // order: `repo_get_oid_mb()` first — a name that resolves to nothing is the
+    // `upstream_missing` die handled just above — and then
+    //
+    // ```c
+    // switch (dwim_ref(start_name, strlen(start_name), &oid, &real_ref, 0)) {
+    // …
+    // default:
+    //         die(_("ambiguous object name: '%s'"), start_name);
+    // }
+    // ```
+    //
+    // (`create_branch()`, branch.c.) A name that six DWIM rules resolve two ways
+    // is refused rather than silently attributed to whichever rule wins: with
+    // both `refs/heads/rem/ambi` and `refs/remotes/rem/ambi` present,
+    // `branch --set-upstream-to=rem/ambi main` is fatal in git and used to write
+    // `branch.main.remote=.` here, recording the *local* branch as the upstream
+    // of a name whose remote-tracking reading is the likelier one.
+    if super::rev_parse::dwim_ref_matches(repo, upstream_spec).len() > 1 {
+        return fatal(format!("ambiguous object name: '{upstream_spec}'"));
+    }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     install_tracking(repo, &branch_name, &up, o.quiet)?;
@@ -2074,6 +2099,135 @@ fn unset_upstream(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         while section.remove("merge").is_some() {}
     }
     write_config(&path, &file)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `--edit-description`: open the configured editor on `branch.<name>.description`
+/// and store whatever comes back.
+///
+/// ```c
+/// } else if (edit_description) {
+///         const char *branch_name;
+///         struct strbuf branch_ref = STRBUF_INIT;
+///
+///         if (!argc) {
+///                 if (filter.detached)
+///                         die(_("cannot give description to detached HEAD"));
+///                 branch_name = head;
+///         } else if (argc == 1)
+///                 branch_name = argv[0];
+///         else
+///                 die(_("cannot edit description of more than one branch"));
+///
+///         strbuf_addf(&branch_ref, "refs/heads/%s", branch_name);
+///         if (!refs_ref_exists(get_main_ref_store(the_repository), branch_ref.buf)) {
+///                 strbuf_release(&branch_ref);
+///                 if (!argc)
+///                         return error(_("no commit on branch '%s' yet"), branch_name);
+///                 else
+///                         return error(_("no branch named '%s'"), branch_name);
+///         }
+///         strbuf_release(&branch_ref);
+///
+///         if (edit_branch_description(branch_name))
+///                 return 1;
+/// }
+/// ```
+///
+/// (builtin/branch.c.) The two "does not exist" arms are `error()`, not `die()`,
+/// so they exit **1** and wear an `error:` prefix — the only place in this verb
+/// where a missing branch is not `fatal:`/128.
+fn edit_description(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
+    let named = o.names.first().cloned();
+    if o.names.len() > 1 {
+        return fatal("cannot edit description of more than one branch");
+    }
+    let branch_name = match &named {
+        Some(n) => n.clone(),
+        None => match repo.head_name()? {
+            Some(h) => h.shorten().to_string(),
+            None => return fatal("cannot give description to detached HEAD"),
+        },
+    };
+
+    let full = format!("refs/heads/{branch_name}");
+    if repo.try_find_reference(full.as_str())?.is_none() {
+        // An unborn branch is named by HEAD but has no ref yet, which is why the
+        // wording depends on whether the name came from argv or from HEAD.
+        match named {
+            Some(_) => eprintln!("error: no branch named '{branch_name}'"),
+            None => eprintln!("error: no commit on branch '{branch_name}' yet"),
+        }
+        return Ok(ExitCode::from(1));
+    }
+
+    let snap = repo.config_snapshot();
+    let comment = super::commit::comment_prefix(&snap);
+    let key = format!("branch.{branch_name}.description");
+    // `exists = !read_branch_desc(&buf, branch_name)` — the *merged* configuration
+    // answers this, so a description inherited from an included file still makes
+    // an emptied buffer an unset rather than a no-op.
+    let existing = snap.string(key.as_str()).map(|v| v.to_string());
+
+    // ```c
+    // if (!buf.len || buf.buf[buf.len-1] != '\n')
+    //         strbuf_addch(&buf, '\n');
+    // strbuf_commented_addf(&buf, comment_line_str,
+    //             _("Please edit the description for the branch\n"
+    //               "  %s\n"
+    //               "Lines starting with '%s' will be stripped.\n"),
+    //             branch_name, comment_line_str);
+    // ```
+    //
+    // The empty buffer gets the newline too, so the seeded file always opens with
+    // one blank line above the instructions.
+    let mut buf: Vec<u8> = existing.clone().unwrap_or_default().into_bytes();
+    if buf.last() != Some(&b'\n') {
+        buf.push(b'\n');
+    }
+    let note = format!(
+        "Please edit the description for the branch\n  {branch_name}\nLines starting with '{comment}' will be stripped.\n"
+    );
+    for line in note.split_inclusive('\n') {
+        buf.extend_from_slice(comment.as_bytes());
+        // `strbuf_add_commented_lines()` adds the separating space unless the line
+        // already begins with a newline or a tab.
+        if !line.starts_with('\n') && !line.starts_with('\t') {
+            buf.push(b' ');
+        }
+        buf.extend_from_slice(line.as_bytes());
+    }
+
+    // `git_path("EDIT_DESCRIPTION")`: per-worktree, and *left behind* — git never
+    // unlinks it, so a repository that has edited a description once carries the
+    // file from then on and the state probe sees it.
+    let path = repo.git_dir().join("EDIT_DESCRIPTION");
+    std::fs::write(&path, &buf)?;
+    if super::commit::launch_editor(&snap, &path).is_err() {
+        // `if (launch_editor(...)) return -1;`, and `cmd_branch` turns that into 1.
+        return Ok(ExitCode::from(1));
+    }
+    let edited = std::fs::read(&path)?;
+    let stripped = super::stripspace::strip_space(&edited, Some(comment.as_bytes()));
+
+    // `if (buf.len || exists) git_config_set(name.buf, buf.len ? buf.buf : NULL);`
+    // — an editor that left nothing behind *unsets* a description that was there
+    // and writes nothing at all when there was none.
+    if stripped.is_empty() && existing.is_none() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let cfg_path = repo.common_dir().join("config");
+    let mut file = ConfigFile::from_path_no_includes(cfg_path.clone(), Source::Local)?;
+    let sub = BStr::new(branch_name.as_bytes());
+    if stripped.is_empty() {
+        if let Ok(mut section) = file.section_mut("branch", Some(sub)) {
+            while section.remove("description").is_some() {}
+        }
+    } else {
+        file.set_raw_value_by("branch", Some(sub), "description", stripped.as_slice())?;
+    }
+    write_config(&cfg_path, &file)?;
     Ok(ExitCode::SUCCESS)
 }
 

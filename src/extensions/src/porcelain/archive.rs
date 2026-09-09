@@ -376,16 +376,45 @@ pub fn archive_remote(args: &[String]) -> Result<ExitCode> {
 fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     // `cmd_archive()` parses `-o`/`--remote`/`--exec` first, with
     // `PARSE_OPT_KEEP_ALL`, and hands the rest of the command line to the far side
-    // when a `--remote` came out of it (builtin/archive.c:97-108). Without one
-    // this pass has nothing to say and the ordinary parse below owns every token.
-    if args.iter().any(|a| a == "--remote" || a.starts_with("--remote=") || a.starts_with("--rem")) {
-        let outer = match parse_outer(args) {
-            Ok(outer) => outer,
-            Err(code) => return Ok(code),
-        };
-        if outer.remote.is_some() {
-            return run_remote_archiver(&outer);
+    // when a `--remote` came out of it (builtin/archive.c:97-108). Even without a
+    // `--remote` the pass has one thing to say: `-o`'s file is opened here, before
+    // anything else the command line asks for is looked at.
+    let outer = match parse_outer(args) {
+        Ok(outer) => outer,
+        Err(code) => return Ok(code),
+    };
+    // ```c
+    // if (output)
+    //         create_output_file(output);
+    // if (remote)
+    //         ret = run_remote_archiver(argc, argv, remote, exec, output);
+    // ```
+    //
+    // (builtin/archive.c:100-108.) The open sits *ahead* of every other decision
+    // the command makes, which is observable three ways and is why it cannot be
+    // deferred to whichever writer eventually wants the file: `git archive -o f
+    // <bad-ref>`, `git archive -o f --format=nope HEAD` and `git archive -o f
+    // --nosuchopt HEAD` all leave `f` behind as an empty file, and a `-o` whose
+    // directory does not exist is `fatal:`/128 rather than the writer's error —
+    // which is what this port used to report, with exit 1.
+    //
+    // Only on the client side: the serving half (`cmd_upload_archive_writer()` →
+    // `write_archive(…, remote = 1)`) never runs `cmd_archive()`, and `-o` is
+    // consumed by the client's outer parse rather than forwarded, so the request
+    // that reaches a server carries none.
+    if let Some(path) = (!is_remote).then_some(outer.output.as_ref()).flatten() {
+        if let Err(err) = std::fs::File::create(path) {
+            // `xopen()`'s `die_errno`, which names the path and the errno and
+            // nothing about the archive itself.
+            eprintln!(
+                "fatal: could not open '{path}' for writing: {}",
+                super::add::strip_os_error(&err.to_string())
+            );
+            return Ok(ExitCode::from(128));
         }
+    }
+    if outer.remote.is_some() {
+        return run_remote_archiver(&outer);
     }
 
     let mut opts = Opts::default();

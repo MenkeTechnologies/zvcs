@@ -959,6 +959,7 @@ fn bind_prefix(
         return Ok(Err(ExitCode::from(128)));
     }
     let backing = from_tree.path_backing().to_owned();
+    let mut bound: Vec<(BString, &gix::index::Entry)> = Vec::with_capacity(from_tree.entries().len());
     for e in from_tree.entries() {
         let mut path = BString::from(prefix.as_bytes());
         path.extend_from_slice(e.path_in(&backing).as_ref());
@@ -967,6 +968,59 @@ fn bind_prefix(
             eprintln!("error: Entry '{shown}' overlaps with '{shown}'.  Cannot bind.");
             return Ok(Err(ExitCode::from(128)));
         }
+        bound.push((path, e));
+    }
+
+    // `merged_entry()` hands every bound entry to `add_index_entry(&o->result, ce,
+    // ADD_CACHE_OK_TO_ADD | ADD_CACHE_OK_TO_REPLACE)`, and that runs
+    // `check_file_directory_conflict()` → `has_dir_name()`:
+    //
+    // ```c
+    // if (!(istate->cache[pos]->ce_flags & CE_REMOVE)) {
+    //         retval = -1;
+    //         if (!ok_to_replace)
+    //                 break;
+    //         remove_index_entry_at(istate, pos);
+    //         continue;
+    // }
+    // ```
+    //
+    // (read-cache.c.) `ok_to_replace` is set here, so an existing entry whose whole
+    // name is a *leading directory* of the entry being added is dropped rather than
+    // diagnosed. In `submodule`'s shape that is the gitlink `sub`: binding the tree
+    // under `sub/` adds `sub/README.md`, whose leading directory `sub` already names
+    // an entry, and git removes it. Keeping both left an index no stock git will
+    // write a tree from — `git write-tree` on it is
+    // `fatal: git write-tree: not a valid object name sub` (exit 128), which is
+    // exactly what the interop probe reported against this verb.
+    //
+    // The removal happens inside `add_index_entry()`, so the victim is never marked
+    // `CE_REMOVE` and `check_updates()`'s `unlink_entry()` loop never sees it: `-u`
+    // does not delete its worktree file, which is why `removed` stays empty for a
+    // `--prefix` read.
+    let victims: HashSet<BString> = {
+        let mut out = HashSet::new();
+        for (path, _) in &bound {
+            for (i, b) in path.iter().enumerate() {
+                if *b == b'/' {
+                    let dir = BString::from(&path[..i]);
+                    if existing.contains(&dir) {
+                        out.insert(dir);
+                    }
+                }
+            }
+        }
+        out
+    };
+    if !victims.is_empty() {
+        // `index_name_stage_pos()` looks the directory name up at the stage of the
+        // entry being added, and a tree-derived entry is always stage 0.
+        index.remove_entries(|_, path, entry| {
+            entry.stage() == gix::index::entry::Stage::Unconflicted
+                && victims.contains(&path.to_owned())
+        });
+    }
+    for (path, e) in bound {
         index.dangerously_push_entry(e.stat, e.id, e.flags, e.mode, path.as_bstr());
     }
     index.sort_entries();

@@ -1249,6 +1249,9 @@ fn status_report(
         let index = repo.index_or_empty()?;
         untracked_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
         ignored_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
+        if ignored_matching {
+            collapse_to_matching_ignore(&repo, &index, &mut ignored_paths)?;
+        }
     }
 
     // git orders each section (and each short-format block) by path.
@@ -1786,6 +1789,85 @@ fn parse_similarity(raw: &str) -> Option<RenameOpts> {
         score,
         ..RenameOpts::renames()
     })
+}
+
+/// `--ignored=matching` (`SHOW_MATCHING_IGNORED`) names the entity an ignore rule
+/// matched, and for anything inside an ignored *directory* that entity is the
+/// directory: stock answers `!! build/` for
+/// `status --porcelain --ignored=matching -- build/output.o` and
+/// `!! sub/deep-ignored/` for a pathspec naming the file inside it. The depth of
+/// the pathspec never changes the answer — the collapse is a property of the
+/// mode, not of what was asked for.
+///
+/// This runs as a pass over the walk's output rather than inside it because the
+/// walk stops collapsing as soon as a pathspec is present: `Status::can_recurse()`
+/// (gix-dir entry.rs) lets an ignored directory be descended when it carries a
+/// `pathspec_match`, which is what `git clean <pathspec>` needs and what made
+/// `status --ignored=matching -- sub` report `sub/deep-ignored/thing.txt` where
+/// stock reports the directory. Deciding it here is the same decision either way:
+/// the shallowest ancestor directory that an ignore rule matches *is* the entity
+/// git names, and an entry with no such ancestor is already it.
+///
+/// A negated pattern (`!important.log`) is a match that does not ignore, so the
+/// ancestor scan skips it exactly as `last_matching_pattern()`'s callers do.
+fn collapse_to_matching_ignore(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    paths: &mut Vec<BString>,
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut stack = repo.excludes(
+        index,
+        None,
+        gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+    )?;
+    let mut out: Vec<BString> = Vec::with_capacity(paths.len());
+    for p in paths.iter() {
+        // A directory the walk emitted already carries the trailing separator
+        // [`walk_path`] adds; the scan below works on the bare name.
+        let core = match p.last() {
+            Some(b'/') => &p[..p.len() - 1],
+            _ => p.as_slice(),
+        };
+        let mut collapsed = None;
+        for (i, b) in core.iter().enumerate() {
+            if *b != b'/' {
+                continue;
+            }
+            let dir = &core[..i];
+            // `treat_directory()` never calls a directory ignored while the index
+            // holds something under it — `directory_exists_in_index()` sends it
+            // down the recursing arm first, which is why a `[Ll]ogs/` rule does not
+            // collapse a `logs/` that also carries a tracked `logs/keep.log`.
+            let mut with_sep = BString::from(dir);
+            with_sep.push(b'/');
+            if index.prefixed_entries(with_sep.as_ref()).is_some() {
+                continue;
+            }
+            let ignored = stack
+                .at_entry(gix::bstr::BStr::new(dir), Some(gix::index::entry::Mode::DIR))
+                .map(|plat| {
+                    plat.matching_exclude_pattern()
+                        .is_some_and(|m| !m.pattern.is_negative())
+                })
+                .unwrap_or(false);
+            if ignored {
+                let mut named = BString::from(dir);
+                named.push(b'/');
+                collapsed = Some(named);
+                break;
+            }
+        }
+        out.push(collapsed.unwrap_or_else(|| p.clone()));
+    }
+    // Several files under one ignored directory collapse onto the same name; git
+    // lists that directory once.
+    out.sort();
+    out.dedup();
+    *paths = out;
+    Ok(())
 }
 
 /// The repo-relative path a dirwalk entry should be displayed as: git suffixes a
@@ -2555,6 +2637,9 @@ fn porcelain_v2_output(
     // name the index already holds is not untracked content.
     untracked_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
     ignored_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
+    if ignored_matching {
+        collapse_to_matching_ignore(repo, &index, &mut ignored_paths)?;
+    }
     for (path, r) in recs.iter_mut() {
         if !r.staged && !r.ita {
             // No staged change: HEAD == index for this path, so pull both from

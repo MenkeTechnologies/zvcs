@@ -1688,17 +1688,38 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         };
         let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;
 
-        // `was_same`: unchanged content and mode, so nothing to report and nothing
-        // to write. This is what keeps `--verbose` quiet for paths git would leave
-        // alone even though it hashed them.
+        // `was_same` (read-cache.c:794-797) is a **reporting** gate and nothing
+        // more:
         //
-        // `--renormalize` is the exception: `add_to_index()` skips its `alias`
-        // lookup under `ADD_CACHE_RENORMALIZE`, so `was_same` never becomes true
-        // and every matched tracked blob is reported.
-        if !o.renormalize && current == Some(&(id, mode)) {
-            continue;
+        // ```c
+        // was_same = (alias && !ce_stage(alias) &&
+        //             oideq(&alias->oid, &ce->oid) && ce->ce_mode == alias->ce_mode);
+        // if (pretend) discard_cache_entry(ce);
+        // else if (add_index_entry(istate, ce, add_option)) …
+        // …
+        // if (verbose && !was_same) printf("add '%s'\n", path);
+        // ```
+        //
+        // The entry is still handed to `add_index_entry()`, which replaces it (so
+        // the refreshed stat lands in the index) and invalidates the cache-tree
+        // along its path from `add_index_entry_with_check()`
+        // (read-cache.c:1273-1274). Only the `add '<path>'` line is suppressed.
+        //
+        // Skipping the path outright here — which this did — is why `git stage .`
+        // over a freshly built worktree left every cached subtree id in place
+        // where stock leaves them all invalidated: each of those paths *is* racily
+        // clean, so `run_diff_files(DIFF_RACY_IS_MODIFIED)` hands it to
+        // `add_to_index()`, the stat-based `alias` check under
+        // `CE_MATCH_RACY_IS_DIRTY` declines the "Nothing changed, really" return,
+        // and the entry reaches `add_index_entry()` with content that happens to
+        // match. `add` never had the early exit and so never had the divergence.
+        //
+        // `--renormalize` is the exception to the *report* half: `add_to_index()`
+        // skips its `alias` lookup under `ADD_CACHE_RENORMALIZE`, so `was_same`
+        // never becomes true and every matched tracked blob is reported.
+        if o.renormalize || current != Some(&(id, mode)) {
+            touched.insert(path.clone(), "add");
         }
-        touched.insert(path.clone(), "add");
         staged.push(Staged { path, id, mode, stat: stat_now, intent: false });
     }
 

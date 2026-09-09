@@ -1440,15 +1440,38 @@ fn cmd_split(ctx: &mut Ctx, args: &[String]) -> Result<String> {
 
     if let Some(onto) = ctx.split_onto.clone() {
         ctx.debug(&format!("Reading history for --onto={onto}..."));
-        let Some(onto) = rev_parse_commit(&ctx.repo, &onto) else {
-            return exit_with(128);
-        };
-        // The `onto` history is already just the subdir, so any commit found
-        // there can be used as a rewritten parent verbatim.
-        for (id, _) in rev_list(&ctx.repo, vec![onto], Vec::new())? {
-            let id = id.to_string();
-            ctx.debug(&format!("cache: {id}"));
-            ctx.cache_set(&id, &id)?;
+        // `git rev-list $arg_split_onto | while read rev … done || exit $?`.
+        // The `|| exit` tests the *pipeline's* status, which in POSIX shell is
+        // the `while` loop's and never rev-list's, so a spec rev-list cannot
+        // use ends the seeding and nothing else: the split then runs exactly as
+        // it would have without `--onto` at all, and exits 0 on the history it
+        // did rewrite. Failing the command here instead turned both of the
+        // shapes below into a 128 that stock never produces.
+        //
+        // The two shapes differ only in what reaches stderr. A spec that names
+        // no object at all — `--onto=nosuch` — makes rev-list die with the
+        // ambiguous-argument message; a spec that resolves to something that is
+        // not a commit, such as a tag peeling to a blob or a tree, is accepted
+        // as a pending object, listed as none of the commits asked for, and
+        // exits 0 without a word.
+        match rev_parse_commit(&ctx.repo, &onto) {
+            Some(head) => {
+                // The `onto` history is already just the subdir, so any commit
+                // found there can be used as a rewritten parent verbatim.
+                for (id, _) in rev_list(&ctx.repo, vec![head], Vec::new())? {
+                    let id = id.to_string();
+                    ctx.debug(&format!("cache: {id}"));
+                    ctx.cache_set(&id, &id)?;
+                }
+            }
+            None if rev_exists(&ctx.repo, &onto) => {}
+            None => {
+                eprintln!(
+                    "fatal: ambiguous argument '{onto}': unknown revision or path not in the working tree."
+                );
+                eprintln!("Use '--' to separate paths from revisions, like this:");
+                eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+            }
         }
     }
 

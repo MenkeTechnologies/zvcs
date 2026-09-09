@@ -367,6 +367,33 @@ fn load_config() -> Option<ConfigFile> {
     }
 }
 
+/// `git_config_bool()` (`config.c`) as a config *callback* reaches it: a value
+/// git cannot spell as a boolean is `die()`, not a fallback to the default.
+///
+/// The distinction is the whole exit code. `imap.sslverify = maybe` is fatal at
+/// 128 while `git_config()` is still walking the files — before `parse_options`
+/// has looked at argv, and long before stdin is read — so the command never
+/// reaches its own `nothing to send` at 1. Swallowing the parse error and
+/// keeping the default turned that fatal into a silent read of a value the user
+/// never wrote.
+///
+/// The loop is over *every* occurrence rather than the winning one because the
+/// callback is invoked once per occurrence, in file order, and dies at the
+/// first bad spelling even when a later line would have overridden it. Only
+/// once all of them parse does the last one win, which is what
+/// [`gix::config::File::boolean`] returns — and it is asked separately because
+/// it alone tells a valueless key (implicitly true) from an empty one (false),
+/// a difference the raw strings have already flattened.
+fn config_bool(cfg: &ConfigFile, key: &str, default: bool) -> bool {
+    for raw in cfg.strings(key).unwrap_or_default() {
+        if gix::config::Boolean::try_from(gix::bstr::BStr::new(&raw)).is_err() {
+            eprintln!("fatal: bad boolean config value '{raw}' for '{key}'");
+            crate::hosted::exit(128);
+        }
+    }
+    cfg.boolean(key).ok().flatten().unwrap_or(default)
+}
+
 /// `git_imap_config()` (`imap-send.c:1521`) — every `imap.*` variable, into the
 /// struct the rest of the command runs on.
 fn git_imap_config(cfg: Option<&ConfigFile>) -> ServerConf {
@@ -374,12 +401,9 @@ fn git_imap_config(cfg: Option<&ConfigFile>) -> ServerConf {
     let mut server = ServerConf { ssl_verify: true, ..ServerConf::default() };
     let Some(cfg) = cfg else { return server };
     let string = |key: &str| cfg.string(key).map(|v| v.to_string());
-    // `git_config_bool`: presence without a value is true, otherwise git's
-    // boolean spelling.
-    let boolean = |key: &str, default: bool| cfg.boolean(key).ok().flatten().unwrap_or(default);
 
-    server.ssl_verify = boolean("imap.sslverify", true);
-    server.use_html = boolean("imap.preformattedhtml", false);
+    server.ssl_verify = config_bool(cfg, "imap.sslverify", true);
+    server.use_html = config_bool(cfg, "imap.preformattedhtml", false);
     server.folder = string("imap.folder");
     server.user = string("imap.user");
     server.pass = string("imap.pass");

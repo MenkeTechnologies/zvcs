@@ -4,6 +4,13 @@ description = "git-shadowing superset VCS: the shadow `git` binary and coordinat
 version = "0.22.5"
 edition = "2021"
 rust-version = "1.85"
+# Everything written here is MIT (top-level `LICENSE`). The one exception is the
+# repository's `templates/` directory — git's own `description`, `info/exclude`
+# and fourteen `hooks/*.sample`, copied verbatim from git v2.55.0 so that
+# `git init` writes the bytes stock writes — which stays GPL-2.0-only under
+# git's licence. `porcelain/init.rs` `include_str!`s them; `templates/NOTICE`
+# and `templates/LICENSE.GPL-2.0` carry the provenance and the full text.
+license = "MIT AND GPL-2.0-only"
 
 # The engine as a library, so integration tests can drive it directly.
 [lib]

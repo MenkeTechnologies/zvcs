@@ -32,7 +32,11 @@ use crate::lock::RepoLock;
 ///   * `git init --template=<dir>` / `--template <dir>`   (seed from a template)
 ///     with git's `copy_templates()` precedence: `--template` > the
 ///     `GIT_TEMPLATE_DIR` env var > the `init.templateDir` config (a pathname,
-///     so a leading `~` expands) > gix's built-in default template.
+///     so a leading `~` expands) > git's own compiled-in default template,
+///     vendored as [`DEFAULT_TEMPLATE`] because a port has no
+///     `share/git-core/templates` directory to copy out of. `--template=`
+///     (explicitly empty) names no template and leaves the repository with no
+///     `description`, no `info/exclude` and no `hooks/` at all, like git.
 ///   * `git init --separate-git-dir=<gitdir>`             (real git dir elsewhere + `.git` link file)
 ///   * `git init --shared[=<permissions>]`                (group/world/octal sharing)
 ///   * `git init --object-format=<hash>` / `--object-format <hash>`
@@ -724,26 +728,46 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // (`builtin/init-db.c`): the `--template` command-line value wins, else the
     // `GIT_TEMPLATE_DIR` environment variable, else the `init.templateDir`
     // config (read as a pathname, so a leading `~` expands, matching git's
-    // `git_config_get_pathname("init.templatedir")`), else gix's already
-    // laid-down built-in default. An explicit (even empty) `--template` or a set
-    // `GIT_TEMPLATE_DIR` short-circuits before the config is consulted, so the
-    // config is a DEFAULT the flag/env override — never the other way around.
+    // `git_config_get_pathname("init.templatedir")`), else the compiled-in
+    // default template, which for this port is [`DEFAULT_TEMPLATE`] rather than
+    // a directory under `$(prefix)/share/git-core`. An explicit (even empty)
+    // `--template` or a set `GIT_TEMPLATE_DIR` short-circuits before the config
+    // is consulted, so the config is a DEFAULT the flag/env override — never the
+    // other way around.
     let template = template
         .or_else(|| std::env::var("GIT_TEMPLATE_DIR").ok())
         .or_else(|| configured_template_dir(repo.as_ref(), &git_dir));
 
-    // Seed the git dir from the resolved template. On a fresh init this replaces
-    // gix's built-in default template so ONLY the requested template's files
-    // remain (matching git, which uses the given template dir instead of the
-    // default, not in addition to it); on a reinit git only fills in what is
-    // missing, so nothing already there is disturbed. Structural files stay in
-    // place either way.
-    if let Some(tpl) = template.as_deref().filter(|t| !t.is_empty()) {
-        if reinit {
-            copy_templates(tpl, &git_dir)?;
-        } else {
-            apply_template(tpl, &git_dir)?;
-        }
+    // Seed the git dir from the resolved template. git runs `copy_templates()`
+    // on every init, reinitialization included, and it fills in only what is
+    // missing — but on a *fresh* init git has nothing to fill in around, because
+    // `create_default_files()` writes no template-provided file itself. gix does:
+    // it lays down its own built-in payload (its `description` wording, its hook
+    // samples, its `info/exclude`) before this port ever gets the handle back. So
+    // that payload is stripped first on a fresh init, and the resolved template —
+    // git's own, or the one the flag names — then fully defines which
+    // template-provided files exist and what is in them. Structural files
+    // (`HEAD`, `config`, `objects/`, `refs/`) are never touched.
+    //
+    // The destination is the *common* directory, not the git directory:
+    // `copy_templates()` ends in `strbuf_addstr(&path, repo_get_common_dir(repo))`
+    // before it descends. So `git init` standing inside a linked worktree — whose
+    // git directory is `<main>/.git/worktrees/<name>` — fills in the payload of
+    // the repository they share, where it already exists and nothing is copied,
+    // rather than giving that worktree a `description` and a `hooks/` of its own
+    // that stock git never writes.
+    let template_dir = common_dir(&git_dir);
+    if !reinit {
+        strip_default_template(&template_dir)?;
+    }
+    match template.as_deref() {
+        // `if (!template_dir || !*template_dir) return;` — `--template=` names no
+        // template at all, and is not the same thing as omitting the flag: git
+        // copies nothing and does not warn, leaving a repository with no
+        // `description`, no `info/exclude` and no `hooks/`.
+        Some("") => {}
+        Some(tpl) => copy_templates(tpl, &template_dir)?,
+        None => copy_default_template(&template_dir)?,
     }
 
     // `init.defaultSubmodulePathConfig=true` asks every new repository to opt into
@@ -998,8 +1022,13 @@ pub(super) fn relocate_git_dir(src: &Path, target: &Path, real: &str) -> Result<
 /// that dir *instead of* the default. So the default-template artifacts are
 /// stripped first, letting the requested template fully define the
 /// template-provided files while structural files (`HEAD`, `config`, `objects/`,
-/// `refs/`) remain. Shared with `git clone --template=<dir>`, which git routes
-/// through the very same `copy_templates()` call during its own init step.
+/// `refs/`) remain.
+///
+/// This pairing is `git clone --template=<dir>`'s, which git routes through the
+/// very same `copy_templates()` call during its own init step. [`init`] spells
+/// the two halves out itself, because it has a third case this one cannot
+/// express — no `--template` at all, where the template that replaces gix's is
+/// git's own [`DEFAULT_TEMPLATE`].
 pub(super) fn apply_template(template: &str, git_dir: &Path) -> Result<()> {
     // The strip happens before the template dir is even opened, because stock
     // git has no default template to fall back on: `copy_templates()` warns and
@@ -1038,8 +1067,9 @@ pub(super) fn copy_templates(template: &str, git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove gix's built-in default-template files so a `--template` dir can fully
-/// replace them. Only the template-provided paths are touched
+/// Remove gix's built-in default-template files so the template that init
+/// resolved — a `--template` directory, or git's own [`DEFAULT_TEMPLATE`] — can
+/// fully replace them. Only the template-provided paths are touched
 /// (`description`, `info/exclude` + the now-empty `info/`, and everything under
 /// `hooks/` + the now-empty `hooks/`); structural files are left in place. Empty
 /// directories are removed only when they end up empty, so a template that omits
@@ -1056,6 +1086,53 @@ fn strip_default_template(git_dir: &Path) -> Result<()> {
         }
     }
     let _ = std::fs::remove_dir(&hooks);
+    Ok(())
+}
+
+/// Seed `git_dir` from git's own compiled-in default template
+/// ([`DEFAULT_TEMPLATE`]), with `copy_templates_1`'s never-overwrite rule: a
+/// path the repository already has is left exactly as it is, which is the whole
+/// of what a reinitialization does to the payload.
+///
+/// This is the branch stock git reaches when no `--template`, no
+/// `GIT_TEMPLATE_DIR` and no `init.templateDir` names a directory:
+/// `template_dir = system_path(DEFAULT_GIT_TEMPLATE_DIR)`, the copy of
+/// git's `templates/` tree that `make install` put under
+/// `$(prefix)/share/git-core/templates`. A port has no such directory to read —
+/// and must not read another git installation's, which would make the payload a
+/// property of what else is on the machine — so the tree is vendored in this
+/// file instead.
+///
+/// The two mode values are what `templates/Makefile` produces: `chmod a+rx` for
+/// a source file that is executable in git's tree (all fourteen hooks) and
+/// `chmod a+r` for one that is not (`description`, `info/exclude`), both under
+/// `umask 022`. They are passed as the *creation* mode rather than applied
+/// afterwards so the caller's umask narrows them exactly as it narrows the
+/// `open()` inside git's own `copy_file()`.
+pub(super) fn copy_default_template(git_dir: &Path) -> Result<()> {
+    use std::io::Write;
+
+    for file in DEFAULT_TEMPLATE {
+        let dst = git_dir.join(file.path);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(if file.exec { 0o755 } else { 0o644 });
+        }
+        let mut out = match opts.open(&dst) {
+            Ok(out) => out,
+            // `copy_templates_1` skips a path that already exists rather than
+            // replacing it: `if (!lstat(path.buf, &st_git)) ... exists = 1`.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        };
+        out.write_all(file.body.replace("@PERL_PATH@", PERL_PATH).as_bytes())?;
+    }
     Ok(())
 }
 
@@ -1539,3 +1616,174 @@ fn configured_template_dir(repo: Option<&gix::Repository>, git_dir: &Path) -> Op
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// git's compiled-in default template, vendored
+// ---------------------------------------------------------------------------
+
+/// One file of git's default template: where it lands under the git directory,
+/// whether git installs it executable, and its bytes.
+struct TemplateFile {
+    /// Path under the git directory, always `/`-separated.
+    path: &'static str,
+    /// Whether the file is executable in git's own `templates/` tree, which is
+    /// what decides between `chmod a+rx` and `chmod a+r` in
+    /// `templates/Makefile`. All fourteen hook samples are; `description` and
+    /// `info/exclude` are not. This is the one mode bit that is a fact about
+    /// behaviour rather than about the umask — a hook that is not executable
+    /// does not run — and gix's built-in payload leaves it clear, so a
+    /// repository this port wrote had fourteen hooks stock git would never have
+    /// run.
+    exec: bool,
+    /// The file's bytes exactly as git's source tree carries them, `@PERL_PATH@`
+    /// placeholder included — see [`PERL_PATH`].
+    body: &'static str,
+}
+
+/// The interpreter git's build substitutes for `@PERL_PATH@` when it installs
+/// the templates.
+///
+/// `templates/Makefile` runs three substitutions over every template on its way
+/// into `blt/`: `1s|#!.*/sh|#!$(SHELL_PATH)|`, `s|@SHELL_PATH@|…|` and
+/// `s|@PERL_PATH@|…|g`. Only the third has anything to do on this payload —
+/// every shell sample already begins `#!/bin/sh`, no file contains
+/// `@SHELL_PATH@`, and `@PERL_PATH@` appears four times across
+/// `hooks/prepare-commit-msg.sample` and `hooks/pre-rebase.sample`. Doing it at
+/// write time rather than baking the answer into [`DEFAULT_TEMPLATE`] keeps the
+/// vendored bodies byte-identical to git's own sources, so refreshing them is a
+/// copy rather than a copy plus an edit.
+///
+/// The value is git's top-level `Makefile` default (`PERL_PATH = /usr/bin/perl`),
+/// which is what an installation has to override to differ.
+const PERL_PATH: &str = "/usr/bin/perl";
+
+/// git's `templates/` tree, verbatim, as of v2.55.0.
+///
+/// # Why the bytes are here and not read off the machine
+///
+/// `create_default_files()` copies this payload out of
+/// `system_path(DEFAULT_GIT_TEMPLATE_DIR)` — the directory `make install` fills
+/// under `$(prefix)/share/git-core/templates`. This port ships one binary and no
+/// share directory, and reading *another* git installation's template dir would
+/// make the payload a property of what else happens to be installed rather than
+/// of the port. So the tree is vendored: sixteen files, the same sixteen
+/// `templates/Makefile` lists, in the same bytes.
+///
+/// Until this existed the payload came from gitoxide's built-in default, which
+/// is a deliberately different one — its own `description` wording ("everything
+/// before the `;` is the name of the repository"), its own rewritten hook
+/// samples, and no executable bit on any of them. Every file of a `git init`
+/// differed from stock's.
+///
+/// # They live on disk, not in this file, because they are not ours
+///
+/// The bodies are `include_str!`d out of the repository's top-level `templates/`
+/// directory rather than written inline here. That directory is the licence
+/// boundary: zvcs is MIT, git is GPL-2.0-only, and these sixteen files stay
+/// under git's licence however they are stored. Keeping them as files under a
+/// directory carrying git's own `COPYING` (as `templates/LICENSE.GPL-2.0`) and a
+/// `templates/NOTICE` states that in the one place a reader — or a licence
+/// scanner — will look, which a raw string buried in a Rust source file cannot.
+/// The distribution declares the pair as `license = "MIT AND GPL-2.0-only"`.
+///
+/// # Refreshing it
+///
+/// Copy `templates/description`, `templates/info/exclude` and
+/// `templates/hooks/*.sample` out of the git tag being targeted into this
+/// repository's `templates/`, leaving `@PERL_PATH@` in place — the substitution
+/// happens at write time, so what is stored stays byte-identical to git's
+/// sources rather than to one machine's install. No Rust change is needed unless
+/// git adds or removes a file, which is the only thing the table below records.
+///
+/// # One file is version-dependent
+///
+/// `hooks/commit-msg.sample` is not the same file in every release —
+/// v2.55.0's checks the message for an embedded diff and honours
+/// `core.comment{char,string}` where 2.50.1's does neither — and
+/// `hooks/fsmonitor-watchman.sample` changed its retry handling between those
+/// two releases as well. The other fourteen files are byte-identical across
+/// them. This port targets the newest git, so the newest bytes are the ones
+/// vendored; a machine whose stock git is older will disagree about those two
+/// files and about nothing else.
+const DEFAULT_TEMPLATE: &[TemplateFile] = &[
+    TemplateFile {
+        path: "description",
+        exec: false,
+        body: include_str!("../../../../templates/description"),
+    },
+    TemplateFile {
+        path: "info/exclude",
+        exec: false,
+        body: include_str!("../../../../templates/info/exclude"),
+    },
+    TemplateFile {
+        path: "hooks/applypatch-msg.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/applypatch-msg.sample"),
+    },
+    TemplateFile {
+        path: "hooks/commit-msg.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/commit-msg.sample"),
+    },
+    TemplateFile {
+        path: "hooks/fsmonitor-watchman.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/fsmonitor-watchman.sample"),
+    },
+    TemplateFile {
+        path: "hooks/post-update.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/post-update.sample"),
+    },
+    TemplateFile {
+        path: "hooks/pre-applypatch.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/pre-applypatch.sample"),
+    },
+    TemplateFile {
+        path: "hooks/pre-commit.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/pre-commit.sample"),
+    },
+    TemplateFile {
+        path: "hooks/pre-merge-commit.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/pre-merge-commit.sample"),
+    },
+    TemplateFile {
+        path: "hooks/pre-push.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/pre-push.sample"),
+    },
+    TemplateFile {
+        path: "hooks/pre-rebase.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/pre-rebase.sample"),
+    },
+    TemplateFile {
+        path: "hooks/pre-receive.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/pre-receive.sample"),
+    },
+    TemplateFile {
+        path: "hooks/prepare-commit-msg.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/prepare-commit-msg.sample"),
+    },
+    TemplateFile {
+        path: "hooks/push-to-checkout.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/push-to-checkout.sample"),
+    },
+    TemplateFile {
+        path: "hooks/sendemail-validate.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/sendemail-validate.sample"),
+    },
+    TemplateFile {
+        path: "hooks/update.sample",
+        exec: true,
+        body: include_str!("../../../../templates/hooks/update.sample"),
+    },
+];

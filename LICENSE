@@ -19,3 +19,13 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Scope: the MIT terms above cover this repository except for the `templates/`
+directory. Those sixteen files — `description`, `info/exclude` and the fourteen
+`hooks/*.sample` — are copied verbatim from the git project at tag v2.55.0 so
+that `git init` writes the bytes stock git writes, and they remain under git's
+own licence, GPL-2.0-only. See `templates/NOTICE` for the provenance and
+`templates/LICENSE.GPL-2.0` for git's `COPYING` in full. The distribution as a
+whole is therefore `MIT AND GPL-2.0-only`.

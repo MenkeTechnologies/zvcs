@@ -1,0 +1,48 @@
+This directory is NOT part of the MIT-licensed zvcs source.
+
+The sixteen files below `templates/` — `description`, `info/exclude`, and the
+fourteen `hooks/*.sample` — are copied verbatim from the git project's own
+`templates/` tree at tag v2.55.0, and they stay under git's licence, GPL-2.0-only.
+The full text as git ships it is in `LICENSE.GPL-2.0`, which is git's `COPYING`
+copied byte for byte.
+
+    upstream : https://github.com/git/git/tree/v2.55.0/templates
+    licence  : GPL-2.0-only (git's COPYING)
+    holders  : the git project's contributors; `hooks/pre-rebase.sample` carries
+               its own notice, "Copyright (c) 2006, 2008 Junio C Hamano"
+
+Everything else in this repository is MIT, per the top-level `LICENSE`. The
+split is declared to tooling as `license = "MIT AND GPL-2.0-only"` in
+`src/extensions/Cargo.toml`, which is the SPDX expression for "this
+distribution contains both, each covering its own files".
+
+
+Why the bytes are copied rather than rewritten
+----------------------------------------------
+
+zvcs is measured against stock git by byte-comparing the repositories the two
+produce (`cargo run -p zvcs-parity`). `git init` copies this tree into every new
+repository, so a `description` or a `pre-commit.sample` that merely *does the
+same thing* is still a parity failure — only git's exact bytes pass. A
+functionally equivalent rewrite would therefore not be an alternative to
+copying; it would be a decision to fail those cases.
+
+Reading the files off the machine at run time was the other option and is worse:
+it would make a zvcs repository's contents a property of whichever git happens to
+be installed beside it, and zvcs is built to keep working once stock git is
+uninstalled.
+
+
+Refreshing them
+---------------
+
+Copy `templates/description`, `templates/info/exclude` and
+`templates/hooks/*.sample` out of the git tag being targeted, leaving the
+`@PERL_PATH@` placeholder in place — `porcelain/init.rs` substitutes it at write
+time, exactly as `templates/Makefile` does at install time, so what is stored
+here stays byte-identical to git's sources rather than to one machine's install.
+
+Two of the files are version-dependent: `hooks/commit-msg.sample` and
+`hooks/fsmonitor-watchman.sample` differ between git 2.50.1 and 2.55.0. The
+other fourteen are byte-identical across those releases. zvcs targets the newest
+git, so v2.55.0's bytes are the ones stored here.

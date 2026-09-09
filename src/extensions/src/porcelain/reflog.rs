@@ -966,15 +966,12 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
 
     // git validates `log.date` in its log-config callback, which runs before the
     // argument scan, so an unknown value is fatal ahead of any option or revision
-    // error (verified against git 2.55.0). An empty value is unknown too, where
-    // `parse_date_mode("")` would otherwise accept it as the default layout.
+    // error (verified against git 2.55.0). An empty value is unknown like any
+    // other name `parse_date_format()` does not list, which is why it needs no
+    // test of its own here.
     if let Some(raw) = repo.config_snapshot().string("log.date") {
         let value = raw.to_str_lossy().into_owned();
-        match if value.is_empty() {
-            DateMode::Unknown
-        } else {
-            parse_date_mode(&value)
-        } {
+        match parse_date_mode(&value) {
             DateMode::Known(f) => opts.log_date = Some(f),
             DateMode::Unimplemented => opts.log_date_unsupported = Some(value),
             DateMode::Unknown => {
@@ -2576,8 +2573,8 @@ fn parse_date_mode(value: &str) -> DateMode {
     let mut iso_strict = false;
     let fmt: TimeFormat = match base {
         // The local rendering of the default layout drops the zone offset.
-        "" | "default" if local => DEFAULT_LOCAL.into(),
-        "" | "default" => tfmt::DEFAULT.into(),
+        "default" if local => DEFAULT_LOCAL.into(),
+        "default" => tfmt::DEFAULT.into(),
         "raw" => tfmt::RAW,
         "unix" => tfmt::UNIX,
         "short" => tfmt::SHORT.into(),
@@ -4423,17 +4420,6 @@ pub(crate) fn log_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
     root.join("logs").join(full_name)
 }
 
-/// The full ref name behind a selector's ref part, as `dwim_log()` resolves it.
-fn resolve_log_ref(repo: &gix::Repository, name: &str) -> String {
-    if name == "HEAD" {
-        return name.to_owned();
-    }
-    match repo.try_find_reference(name).ok().flatten() {
-        Some(r) => r.name().as_bstr().to_str_lossy().into_owned(),
-        None => name.to_owned(),
-    }
-}
-
 /// Read a reflog file as raw lines, oldest first. `None` when there is no log.
 fn read_raw_log(path: &Path) -> Result<Option<Vec<RawLine>>> {
     let data = match std::fs::read(path) {
@@ -4475,6 +4461,7 @@ fn write_raw_log(path: &Path, lines: &[RawLine], rewrite: bool) -> Result<()> {
     let mut previous: Option<ObjectId> = None;
     for line in lines {
         let want = previous.unwrap_or_else(|| ObjectId::null(line.old.kind()));
+        let start = out.len();
         if rewrite && want != line.old {
             let mut fixed = want.to_hex().to_string().into_bytes();
             fixed.extend_from_slice(&line.bytes[want.to_hex().to_string().len()..]);
@@ -4482,12 +4469,31 @@ fn write_raw_log(path: &Path, lines: &[RawLine], rewrite: bool) -> Result<()> {
         } else {
             out.extend_from_slice(&line.bytes);
         }
+        // `fprintf(cb->newlog, "%s %s %s %"PRItime" %+05d\t%s", …)`
+        // (`expire_reflog_ent()`, refs/files-backend.c): git rebuilds the line from
+        // the fields it parsed, and that format string carries the tab whether or
+        // not the input had one. Everything before the tab re-renders to the same
+        // bytes the input held, which is why they are copied rather than rebuilt —
+        // but a line written without a message, as `symbolic-ref` writes one, has
+        // no tab to copy, and expiring its log is where git puts one back.
+        if !out[start..].contains(&b'\t') {
+            out.push(b'\t');
+        }
         out.push(b'\n');
         previous = Some(line.new);
     }
     std::fs::write(path, out)?;
     Ok(())
 }
+
+/// `cmd_reflog_delete`'s `struct option options[]` (builtin/reflog.c), in table order:
+/// the first four of [`EXPIRE_OPTS`] and nothing else, all negatable.
+const DELETE_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "dry-run",   neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "rewrite",   neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "updateref", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "verbose",   neg: true, arg: super::Arg::None },
+];
 
 /// `git reflog delete [--rewrite] [--updateref] [--dry-run] <ref>@{<n>}…` — port of
 /// `cmd_reflog_delete`.
@@ -4505,24 +4511,58 @@ fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut selectors: Vec<&str> = Vec::new();
     let mut literal = false;
     for a in args {
+        let s = a.as_str();
         if literal {
-            selectors.push(a);
+            selectors.push(s);
             continue;
         }
-        match a.as_str() {
-            "--" | "--end-of-options" => literal = true,
-            // `-n` is the only short entry in the table, so it is what
-            // `parse_short_opt()` consumes before the `h` test.
-            s if super::asks_for_help(s, "n") => return Ok(super::show_usage(DELETE_USAGE)),
-            "--rewrite" => rewrite = true,
-            "--updateref" => updateref = true,
-            "-n" | "--dry-run" => dry_run = true,
-            "--verbose" => verbose = true,
-            s if s.starts_with('-') && s != "-" => {
-                return Ok(super::unknown_option(s, DELETE_USAGE))
-            }
-            s => selectors.push(s),
+        if s == "--" || s == "--end-of-options" {
+            literal = true;
+            continue;
         }
+        // `-n` is the only short entry in the table, so it is what
+        // `parse_short_opt()` consumes before the `h` test.
+        if super::asks_for_help(s, "n") {
+            return Ok(super::show_usage(DELETE_USAGE));
+        }
+        if let Some(body) = s.strip_prefix("--") {
+            let (opt, unset) = match super::resolve_long(DELETE_OPTS, body) {
+                super::Resolved::One(opt, unset) => (opt, unset),
+                super::Resolved::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(s, &first, &second, DELETE_USAGE))
+                }
+                super::Resolved::Unknown => return Ok(super::unknown_option(s, DELETE_USAGE)),
+            };
+            // Every entry is a flag, so an attached value is `PARSE_OPT_ERROR` out
+            // of `get_value()`: one line, no usage block.
+            if body.contains('=') {
+                let shown = match unset {
+                    true => format!("no-{}", opt.name),
+                    false => opt.name.to_string(),
+                };
+                eprintln!("error: option `{shown}' takes no value");
+                return Ok(ExitCode::from(129));
+            }
+            match opt.name {
+                "dry-run" => dry_run = !unset,
+                "rewrite" => rewrite = !unset,
+                "updateref" => updateref = !unset,
+                "verbose" => verbose = !unset,
+                _ => unreachable!("resolve_long only returns DELETE_OPTS entries"),
+            }
+            continue;
+        }
+        // A short cluster, `-n` being the table's only entry.
+        if s.len() > 1 && s.starts_with('-') {
+            for c in s[1..].chars() {
+                if c != 'n' {
+                    return Ok(super::unknown_option(&format!("-{c}"), DELETE_USAGE));
+                }
+                dry_run = true;
+            }
+            continue;
+        }
+        selectors.push(s);
     }
     if selectors.is_empty() {
         // `return error(_("no reflog specified to delete"))` — a bare `error()`,
@@ -4730,6 +4770,27 @@ fn ref_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
     root.join(full_name)
 }
 
+/// `cmd_reflog_expire`'s `struct option options[]` (builtin/reflog.c), in table order,
+/// as [`super::resolve_long`] reads it.
+///
+/// The two timestamp entries are `OPT_CALLBACK_F(… PARSE_OPT_NONEG …)`, so they take a
+/// value and have no `--no-` spelling; every other entry is an `OPT_BIT` or an
+/// `OPT_BOOL`, which take none and negate. Driving the parse off the table is what
+/// gives `--rew`, `--sing` and the rest their abbreviations, `--exp=now` its
+/// `ambiguous option:` refusal, and `--all=x` the `takes no value` diagnostic —
+/// none of which a hand-written `match` on whole spellings can produce.
+const EXPIRE_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "dry-run",            neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "rewrite",            neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "updateref",          neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "verbose",            neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "expire",             neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "expire-unreachable", neg: false, arg: super::Arg::Required },
+    super::LongOpt { name: "stale-fix",          neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "all",                neg: true,  arg: super::Arg::None },
+    super::LongOpt { name: "single-worktree",    neg: true,  arg: super::Arg::None },
+];
+
 /// `git reflog expire [--expire=<time>] [--expire-unreachable=<time>] [--all] …` — port
 /// of `cmd_reflog_expire`.
 ///
@@ -4737,6 +4798,20 @@ fn ref_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
 /// for one whose new id is still reachable from the ref, `--expire-unreachable` for one
 /// whose is not. `now` expires everything, `never` nothing; without either option git's
 /// `gc.reflogExpire` (90 days) and `gc.reflogExpireUnreachable` (30 days) defaults apply.
+///
+/// A named ref is looked up with `repo_dwim_log()`, the same function `drop` uses, and a
+/// name that names no reflog is an `error()` that does not stop the loop:
+///
+/// ```c
+/// if (!repo_dwim_log(the_repository, argv[i], strlen(argv[i]), NULL, &ref)) {
+///         status |= error(_("reflog could not be found: '%s'"), argv[i]);
+///         continue;
+/// }
+/// ```
+///
+/// `error()` returns `-1`, so the `status` this ORs into leaves `cmd_reflog_expire` as
+/// `-1` and reaches the process as 255. Reading the log file and skipping it when it is
+/// absent — which is what this did instead — reports that repository as expired.
 fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     const DAY: i64 = 24 * 60 * 60;
     let now = std::time::SystemTime::now()
@@ -4775,55 +4850,114 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         }
     };
     let mut literal = false;
-    for a in args {
-        let s = a.as_str();
+    let mut i = 0;
+    while i < args.len() {
+        let s = args[i].as_str();
+        i += 1;
         if literal {
             refs.push(s.to_owned());
             continue;
         }
-        match s {
-            "--" | "--end-of-options" => literal = true,
-            // `-n` is `expire`'s only short entry, so it is what
-            // `parse_short_opt()` consumes before the `h` test that answers help.
-            _ if super::asks_for_help(s, "n") => return Ok(super::show_usage(EXPIRE_USAGE)),
-            "--all" => all = true,
-            "--single-worktree" => single_worktree = true,
-            "-n" | "--dry-run" => dry_run = true,
-            "--rewrite" => rewrite = true,
-            "--updateref" => updateref = true,
-            "--stale-fix" => {}
-            "--verbose" => verbose = true,
-            "--no-verbose" => verbose = false,
-            _ if s.starts_with("--expire-unreachable=") => {
-                let v = &s["--expire-unreachable=".len()..];
-                match cutoff(v) {
-                    Some(t) => expire_unreachable = Some(t),
-                    // `parse_opt_expiry_date_cb()` reports through
-                    // `error(_("invalid timestamp '%s' given to '--%s'"), arg, opt->long_name)`
-                    // (parse-options-cb.c), which `parse_options()` turns into exit 128
-                    // via the `die` its callers install.
-                    None => crate::git_fatal!(
-                        "invalid timestamp '{v}' given to '--expire-unreachable'"
-                    ),
-                }
-            }
-            _ if s.starts_with("--expire=") => {
-                let v = &s["--expire=".len()..];
-                match cutoff(v) {
-                    Some(t) => expire = Some(t),
-                    None => crate::git_fatal!("invalid timestamp '{v}' given to '--expire'"),
-                }
-            }
-            _ if s.starts_with('-') && s != "-" => {
-                return Ok(super::unknown_option(s, EXPIRE_USAGE))
-            }
-            _ => refs.push(s.to_owned()),
+        if s == "--" || s == "--end-of-options" {
+            literal = true;
+            continue;
         }
+        // `-n` is `expire`'s only short entry, so it is what `parse_short_opt()`
+        // consumes before the `h` test that answers help.
+        if super::asks_for_help(s, "n") {
+            return Ok(super::show_usage(EXPIRE_USAGE));
+        }
+        if let Some(body) = s.strip_prefix("--") {
+            // `parse_long_opt()` resolves the whole body — `=<value>` included —
+            // as one name before any value is split off it.
+            let inline = body.split_once('=').map(|(_, v)| v);
+            let (opt, unset) = match super::resolve_long(EXPIRE_OPTS, body) {
+                super::Resolved::One(opt, unset) => (opt, unset),
+                super::Resolved::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(s, &first, &second, EXPIRE_USAGE))
+                }
+                super::Resolved::Unknown => return Ok(super::unknown_option(s, EXPIRE_USAGE)),
+            };
+            // `optname()`: the table's own spelling, `no-`-prefixed for the unset
+            // sense, however far the typed name was abbreviated.
+            let shown = match unset {
+                true => format!("no-{}", opt.name),
+                false => opt.name.to_string(),
+            };
+            // `get_value()`: a value-taking entry takes the attached one or else
+            // the next argument; a flag refuses an attached one outright. Both
+            // rejections are `PARSE_OPT_ERROR` — their own line, no usage block.
+            let value = if opt.arg == super::Arg::Required && !unset {
+                match inline {
+                    Some(v) => v.to_owned(),
+                    None => match args.get(i) {
+                        Some(v) => {
+                            i += 1;
+                            v.clone()
+                        }
+                        None => {
+                            eprintln!("error: option `{shown}' requires a value");
+                            return Ok(ExitCode::from(129));
+                        }
+                    },
+                }
+            } else {
+                if inline.is_some() {
+                    eprintln!("error: option `{shown}' takes no value");
+                    return Ok(ExitCode::from(129));
+                }
+                String::new()
+            };
+            match opt.name {
+                "dry-run" => dry_run = !unset,
+                "rewrite" => rewrite = !unset,
+                "updateref" => updateref = !unset,
+                "verbose" => verbose = !unset,
+                // `opts.stalefix` only pre-marks reachable objects so that a broken
+                // commit is pruned; the entry is accepted and the walk is not run.
+                "stale-fix" => {}
+                "all" => all = !unset,
+                "single-worktree" => single_worktree = !unset,
+                "expire" | "expire-unreachable" => {
+                    let Some(t) = cutoff(&value) else {
+                        // `parse_opt_expiry_date_cb()` reports through
+                        // `error(_("invalid timestamp '%s' given to '--%s'"), arg,
+                        // opt->long_name)` (parse-options-cb.c), which `parse_options()`
+                        // turns into exit 128 via the `die` its callers install.
+                        crate::git_fatal!(
+                            "invalid timestamp '{value}' given to '--{}'",
+                            opt.name
+                        );
+                    };
+                    if opt.name == "expire" {
+                        expire = Some(t);
+                    } else {
+                        expire_unreachable = Some(t);
+                    }
+                }
+                _ => unreachable!("resolve_long only returns EXPIRE_OPTS entries"),
+            }
+            continue;
+        }
+        // A short cluster. `-n` is the only entry, so anything else in it is the
+        // `unknown switch` the caller names by its first offending character.
+        if s.len() > 1 && s.starts_with('-') {
+            for c in s[1..].chars() {
+                if c != 'n' {
+                    return Ok(super::unknown_option(&format!("-{c}"), EXPIRE_USAGE));
+                }
+                dry_run = true;
+            }
+            continue;
+        }
+        refs.push(s.to_owned());
     }
 
     // `repo_config(the_repository, reflog_expire_config, &opts)` (builtin/reflog.c:216).
     let config = ExpireConfig::read(repo, now - 90 * DAY, now - 30 * DAY);
 
+    // `int status = 0`, which every `error()` below ORs `-1` into.
+    let mut failed = false;
     let targets: Vec<String> = if all {
         // ```c
         // worktrees = get_worktrees();
@@ -4865,7 +4999,20 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         // usage error.
         Vec::new()
     } else {
-        refs.iter().map(|r| resolve_log_ref(repo, r)).collect()
+        // `repo_dwim_log()`, and the `error()` for a name it does not answer. The
+        // loop continues past a miss, so `expire nosuchref refs/heads/main` still
+        // expires the branch and still fails.
+        let mut names = Vec::new();
+        for name in &refs {
+            match dwim_log(repo, name) {
+                Some(full) => names.push(full),
+                None => {
+                    eprintln!("error: reflog could not be found: '{name}'");
+                    failed = true;
+                }
+            }
+        }
+        names
     };
 
     for full in targets {
@@ -4960,7 +5107,11 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    Ok(ExitCode::SUCCESS)
+    // `return status`: `-1` from any `error()` above, which the process truncates to 255.
+    Ok(match failed {
+        true => ExitCode::from(255),
+        false => ExitCode::SUCCESS,
+    })
 }
 
 // ---------------------------------------------------------------------------

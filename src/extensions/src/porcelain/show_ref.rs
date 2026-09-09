@@ -171,8 +171,15 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
                 'q' => opts.quiet = true,
                 's' => {
                     opts.hash_only = true;
+                    // `parse_short_opt()` hands `get_value()` whatever follows the
+                    // letter in the cluster, and `PARSE_OPT_OPTARG` only means the
+                    // *next argv entry* is never taken — an attached remainder is
+                    // always the value. So `-sd` is `--hash=d`, which
+                    // `parse_opt_abbrev_cb()` refuses, rather than `-s -d`; the
+                    // digits test that used to guard this let every non-numeric
+                    // remainder fall through and be read as more short flags.
                     let rest: String = short[i + 1..].iter().collect();
-                    if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                    if !rest.is_empty() {
                         match parse_abbrev(&rest) {
                             Some(a) => opts.abbrev = a,
                             None => return numeric_error("hash"),
@@ -446,17 +453,14 @@ fn run_exists(repo: &gix::Repository, refs: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `cmd_show_ref__exists()` and `cmd_refs_exists()` are the same twenty lines
+    // of C around one `refs_read_raw_ref()`, so they are the same two calls here:
+    // a *raw* read of the one name, and the errno split that decides 2 from 1.
+    // Resolving the name through `try_find_reference` instead — which this used to
+    // do — cannot see the difference, because a loose file that will not parse and
+    // a name with no file at all both come back as "not found".
     let name = refs[0].as_str();
-    let present = matches!(
-        repo.try_find_reference(name),
-        Ok(Some(r)) if r.name().as_bstr() == name
-    );
-    if present {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        eprintln!("error: reference does not exist");
-        Ok(ExitCode::from(2))
-    }
+    Ok(super::refs::exit_for_raw_ref(super::refs::read_raw_ref(repo, name)))
 }
 
 /// `--exclude-existing[=<pattern>]`: read ref lines from stdin and echo back

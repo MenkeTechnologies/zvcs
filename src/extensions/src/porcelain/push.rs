@@ -1237,7 +1237,7 @@ fn build_requests(
         // is asked the same question of the same ref list for every explicit
         // source, and a repository with many refs would otherwise walk them all
         // again for each one.
-        let local_refs = crate::refname::all_ref_names(repo);
+        let local_refs = local_head_names(repo);
         for spec in specs {
             // `parse_refspec()` accepts `^<src>` for a push — it sets
             // `item->negative` and returns — but nothing on the push side reads
@@ -1382,8 +1382,48 @@ fn parse_refspec(
     // match is refused rather than disambiguated — see [`SrcRefspecAmbiguous`].
     // A source that matches exactly one ref, or none at all, falls through to the
     // resolution below (the `case 0` object-name fallback included).
-    if !src.is_empty() && crate::refname::count_refspec_match(src, local_refs).0 > 1 {
-        return Err(anyhow::Error::new(SrcRefspecAmbiguous(src.to_string())));
+    let matched_src = if src.is_empty() {
+        None
+    } else {
+        match crate::refname::count_refspec_match(src, local_refs) {
+            (n, _) if n > 1 => {
+                return Err(anyhow::Error::new(SrcRefspecAmbiguous(src.to_string())))
+            }
+            (1, matched) => matched.cloned(),
+            _ => None,
+        }
+    };
+
+    // ```c
+    // if (match_explicit_lhs(src, rs, &matched_src, &allocated_src) < 0)
+    //         return -1;
+    //
+    // if (!dst_value) {
+    //         int flag;
+    //
+    //         dst_value = refs_resolve_ref_unsafe(..., matched_src->name,
+    //                                             RESOLVE_REF_READING, NULL, &flag);
+    //         if (!dst_value || ...)
+    //                 die(_("%s cannot be resolved to branch"), matched_src->name);
+    // }
+    // ```
+    //
+    // (`match_explicit()`, remote.c.) The destination for a bare `<src>` is
+    // resolved from the *matched ref's own name*, and the `die()` sits above
+    // everything that reads an object — so a ref that matched by name but cannot
+    // be read is a `fatal:` at 128, not the `error()` at 1 that a source naming
+    // no ref at all gets. `match_explicit_lhs()` never resolves anything itself;
+    // it matches names and copies the oid `for_each_ref()` already handed it.
+    //
+    // Only the bare form is checked, because only the bare form takes that
+    // branch: git computes an explicit `<src>:<dst>` destination from the
+    // refspec text and never resolves the source for it.
+    if matches!(dst_spec, None | Some("")) {
+        if let Some(name) = &matched_src {
+            if repo.find_reference(name.as_str()).is_err() {
+                crate::git_fatal!("{name} cannot be resolved to branch");
+            }
+        }
     }
 
     let new = if src.is_empty() {
@@ -1570,6 +1610,67 @@ impl std::fmt::Display for DstRefspecCollision {
 }
 
 impl std::error::Error for DstRefspecCollision {}
+
+/// `get_local_heads()`'s candidate set: the name of every ref under `refs/`
+/// whose name is well formed, in iteration order.
+///
+/// ```c
+/// static int one_local_ref(const char *refname, [...] const struct object_id *oid, [...])
+/// {
+///         /* we already know it starts with refs/ to get here */
+///         if (check_refname_format(refname + 5, 0))
+///                 return 0;
+///         ref = alloc_ref(refname);
+///         oidcpy(&ref->new_oid, oid);
+/// ```
+///
+/// (remote.c.) The filter is on the *name* and nothing else, and
+/// `refs_for_each_ref()` hands the callback a ref it could not decode with
+/// `REF_ISBROKEN` set rather than dropping it — only `ref-filter.c` drops those,
+/// which is why `for-each-ref` prints `warning: ignoring broken ref` where
+/// `push` does not. So a ref file this repository cannot read is still a
+/// *candidate* here, and `count_refspec_match()` matches it by name.
+///
+/// That distinction is the whole reason this does not use
+/// `crate::refname::all_ref_names()`, which drops a ref the store cannot
+/// instantiate: dropping it turned `git push origin main` on a repository whose
+/// `extensions.objectFormat` says `sha256` while its loose refs still hold
+/// 40-hex ids into `error: src refspec main does not match any` at exit 1, where
+/// stock 2.55.0 matches the ref, fails to *resolve* it, and is
+/// `fatal: refs/heads/main cannot be resolved to branch` at exit 128 — see
+/// [`resolve_bare_dst`] for the second half.
+fn local_head_names(repo: &gix::Repository) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(platform) = repo.references() else {
+        return out;
+    };
+    let Ok(iter) = platform.all() else {
+        return out;
+    };
+    for reference in iter {
+        let name = match reference {
+            Ok(reference) => reference.name().as_bstr().to_str_lossy().into_owned(),
+            // The name is the one thing a decode failure still carries, and it is
+            // spelled relative to the git directory — i.e. exactly the full ref
+            // name git's iterator would have reported.
+            Err(e) => match e.downcast_ref::<gix::refs::file::iter::loose_then_packed::Error>() {
+                Some(gix::refs::file::iter::loose_then_packed::Error::ReferenceCreation {
+                    relative_path,
+                    ..
+                }) => relative_path.to_string_lossy().into_owned(),
+                _ => continue,
+            },
+        };
+        let Some(rest) = name.strip_prefix("refs/") else {
+            continue;
+        };
+        if gix::validate::reference::name(rest.into()).is_err() {
+            continue;
+        }
+        out.push(name);
+    }
+    out
+}
 
 /// Every `refs/heads/` ref and the object it points at — `get_ref_match()`'s
 /// candidate set for a matching refspec.

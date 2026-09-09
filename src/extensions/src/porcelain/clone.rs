@@ -1070,16 +1070,37 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         gix::prepare_clone(url.clone(), dst)?
     };
 
-    // `--template=<dir>`: git runs its init step with the template, so the sample
-    // hooks, `description` and `info/exclude` come from there instead of the
-    // built-in default. Same code path `git init --template` uses.
-    // An *empty* `--template=` is still a `--template`: `init_db()` is called with
-    // it, `copy_templates()` returns on `if (!template_dir[0])` without warning,
-    // and the repository is left with whatever `init_db` itself created — no
-    // `hooks/`, no `info/`, no `description`. Filtering the empty string out here
-    // skipped the strip too and produced a fully-templated repository instead.
-    if let Some(tpl) = template.as_deref() {
-        super::init::apply_template(tpl, &git_dir)?;
+    // `git clone` runs `init_db()` with whatever `--template` resolved to
+    // (builtin/clone.c), so every one of the three template-provided payloads —
+    // `description`, `info/exclude` and the fourteen `hooks/*.sample` — comes
+    // from the template and from nothing else. That is true of the *default*
+    // template too, which is the case this block used to leave alone.
+    //
+    // Leaving it alone was not neutral. `prepare_clone*()` above has already laid
+    // the repository down, and gitoxide seeds it with a built-in payload of its
+    // own (`gix/src/create.rs`, which `include_bytes!`es `gix/src/assets/init/`):
+    // a different `description`, a different `info/exclude`, fourteen differently
+    // worded hook samples, and — because it writes them as ordinary files — mode
+    // `0644` where git's `templates/Makefile` installs `0755`. So a plain
+    // `git clone` diverged from stock on eighteen files and their permission
+    // bits, none of which any flag had asked for.
+    //
+    // The strip is spelled `apply_template("")` because that is exactly its
+    // stripping half: `copy_templates()` returns on `if (!template_dir[0])`
+    // without copying or warning, leaving only the removal of gitoxide's payload
+    // behind. An *empty* `--template=` is therefore still a `--template` and ends
+    // right there, with no `hooks/`, no `info/` and no `description` — which is
+    // what stock leaves too, and is not the same thing as omitting the flag.
+    //
+    // The destination is the git directory rather than `repo_get_common_dir()`:
+    // a clone always creates the repository it is filling in, so the two are the
+    // same path here, unlike `git init` inside a linked worktree.
+    match template.as_deref() {
+        Some(tpl) => super::init::apply_template(tpl, &git_dir)?,
+        None => {
+            super::init::apply_template("", &git_dir)?;
+            super::init::copy_default_template(&git_dir)?;
+        }
     }
 
     // `-s`/`--shared` and `--reference`/`--reference-if-able`: record the object
@@ -1995,6 +2016,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         detach_head_from_non_branch(&git_dir, bare || no_checkout, quiet)?;
     }
 
+    // Every ref this clone wrote has now been written, so the two ref stores can
+    // be reconciled — see [`drop_doubly_written_refs`] for which entries stock
+    // git leaves in `packed-refs` and why a ref that is in both files is one
+    // gitoxide wrote twice.
+    drop_doubly_written_refs(&git_dir)?;
+
     // `--sparse`: git initializes a cone-mode sparse-checkout containing only the
     // top-level files. This port's own `sparse-checkout set --cone` writes the
     // identical `info/sparse-checkout` pattern pair and `config.worktree` keys and
@@ -2418,6 +2445,84 @@ fn unpack_followed_tags(git_dir: &Path, mapped_tag: Option<&str>) -> Result<()> 
         }
         std::fs::write(&path, format!("{oid}\n"))
             .with_context(|| format!("could not write {}", path.display()))?;
+    }
+    std::fs::write(&packed_path, kept)
+        .with_context(|| format!("could not write {}", packed_path.display()))?;
+    Ok(())
+}
+
+/// Drop a `packed-refs` entry that also exists as a loose ref file.
+///
+/// A clone writes its refs in two disjoint passes, and which pass a ref went
+/// through decides which of the two ref stores holds it:
+///
+/// ```c
+/// t = ref_store_transaction_begin(get_main_ref_store(the_repository),
+///                                 REF_TRANSACTION_FLAG_INITIAL, &err);
+/// [...]
+/// if (initial_ref_transaction_commit(t, &err))
+///         die("%s", err.buf);
+/// ```
+///
+/// (`write_remote_refs()`, builtin/clone.c.) `REF_TRANSACTION_FLAG_INITIAL` is
+/// the flag that writes straight into `packed-refs` in one shot, and the only
+/// refs it is given are the *mapped* ones — the fetch's local destinations.
+/// Everything the clone writes afterwards goes through an ordinary
+/// `refs_update_ref()`/`refs_update_symref()` and lands loose: the local branch
+/// `update_head()` creates, the `refs/remotes/<origin>/HEAD` symref
+/// `set_remote_head()` writes, and the followed tags [`unpack_followed_tags`]
+/// covers. So in a stock clone the packed set and the loose set never overlap —
+/// measured against 2.55.0, a plain clone packs `refs/remotes/origin/main` alone
+/// and leaves `refs/heads/main` and `refs/remotes/origin/HEAD` loose, while a
+/// `--bare` clone packs `refs/heads/main` and leaves nothing loose.
+///
+/// gitoxide draws the line elsewhere: the same ref can come out of the clone
+/// both packed *and* loose, which left a plain clone's `packed-refs` naming
+/// `refs/heads/main` and `refs/remotes/origin/HEAD` on top of the one entry
+/// stock writes. Nothing resolves differently for it — a loose file wins over
+/// the packed entry — but the file is part of the repository stock git reads
+/// back, so the duplicates are removed here rather than left as a spurious
+/// difference.
+///
+/// Only the `packed-refs` side is touched, and only where a loose file already
+/// holds the same name: the ref itself, its value and its reflog are untouched,
+/// so this can never remove a ref from the repository.
+fn drop_doubly_written_refs(git_dir: &Path) -> Result<()> {
+    let packed_path = git_dir.join("packed-refs");
+    let Ok(body) = std::fs::read_to_string(&packed_path) else {
+        return Ok(());
+    };
+
+    let mut kept = String::with_capacity(body.len());
+    let mut dropped = false;
+    // A `^<oid>` line belongs to the ref line above it and travels with it.
+    let mut dropping_peel = false;
+    for line in body.lines() {
+        if line.starts_with('^') {
+            if dropping_peel {
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+            continue;
+        }
+        dropping_peel = false;
+        match line.split_once(' ') {
+            Some((_, name))
+                if name.starts_with("refs/") && git_dir.join(name).is_file() =>
+            {
+                dropped = true;
+                dropping_peel = true;
+            }
+            _ => {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+    }
+
+    if !dropped {
+        return Ok(());
     }
     std::fs::write(&packed_path, kept)
         .with_context(|| format!("could not write {}", packed_path.display()))?;

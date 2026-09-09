@@ -434,14 +434,45 @@ fn branch_subsections(file: &ConfigFile) -> Vec<BString> {
 
 /// Full names of every reference under `refs/remotes/<name>/`, with the target
 /// each one carries.
+///
+/// **A ref whose file this repository cannot decode is still listed.** git's
+/// every caller here goes through `refs_for_each_ref()`, whose iterator hands
+/// the callback a broken loose ref with `REF_ISBROKEN` set rather than dropping
+/// it — `for-each-ref` only skips those because `ref-filter.c` checks the flag
+/// itself and says so (`warning: ignoring broken ref …`), while
+/// `append_ref_to_tracked_list()` (builtin/remote.c) reads nothing but the
+/// refname and therefore lists it. Measured against stock 2.55.0 on a
+/// repository whose `extensions.objectFormat` says `sha256` while its loose
+/// refs still hold 40-hex ids: `git for-each-ref` prints four
+/// `warning: ignoring broken ref` lines and no rows, and `git remote show -n
+/// origin` prints `div` and `main` under `Remote branches` and exits 0.
+///
+/// gitoxide's iterator reports the same file as a per-item
+/// `ReferenceCreation` error instead, and propagating it aborted the whole
+/// listing — `remote show -n` exited 1 having printed only the two URL lines.
+/// The name is the one thing the error does carry, so it is recovered from
+/// `relative_path` and the entry stands in with a null target, which is what
+/// git's callback sees for a ref it could not parse.
 fn tracking_refs(repo: &gix::Repository, name: &str) -> Result<Vec<(FullName, Target)>> {
     let prefix = format!("refs/remotes/{name}/");
-    let platform = repo.references()?;
 
+    // The low-level store, not `repo.references()`: only its iterator yields the
+    // typed `file::iter::Error` that names the ref it failed on. The high-level
+    // one boxes the error into `dyn Error`, where the path is reachable only by
+    // parsing the rendered message.
     let mut out = Vec::new();
-    for reference in platform.prefixed(prefix.as_bytes())? {
-        let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
-        out.push((reference.name().to_owned(), reference.inner.target.clone()));
+    for reference in repo.refs.iter()?.prefixed(prefix.as_bytes().try_into()?)? {
+        match reference {
+            Ok(reference) => out.push((reference.name, reference.target)),
+            Err(gix::refs::file::iter::loose_then_packed::Error::ReferenceCreation { relative_path, .. }) => {
+                let Ok(broken) = FullName::try_from(gix::path::into_bstr(relative_path).as_ref())
+                else {
+                    continue;
+                };
+                out.push((broken, Target::Object(repo.object_hash().null())));
+            }
+            Err(e) => anyhow::bail!("{e}"),
+        }
     }
     out.sort_by(|a, b| a.0.as_bstr().cmp(b.0.as_bstr()));
     Ok(out)

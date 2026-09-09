@@ -463,10 +463,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 recurse_submodules = Some(match inline_val.as_deref() {
                     None | Some("yes") | Some("true") => Recurse::Yes,
                     Some("no") | Some("false") => Recurse::No,
-                    Some("on-demand") => anyhow::bail!(
-                        "unsupported option \"--recurse-submodules=on-demand\" (it needs the \
-                         superproject's old/new submodule gitlinks to decide what to fetch)"
-                    ),
+                    Some("on-demand") => Recurse::OnDemand,
                     // `parse_fetch_recurse_submodules_arg()` (submodule-config.c)
                     // ends on `die("bad %s argument: %s", opt, arg)`, and the
                     // option name it is given is the long name without dashes.
@@ -761,9 +758,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         opts.compact = snap
             .string("fetch.output")
             .is_some_and(|v| v == "compact");
-        // `fetch.recurseSubmodules` supplies the default; `on-demand` (git's own
-        // default) is not implementable here and is treated as "off" rather than
-        // guessed at, which is what a bare `git fetch` does in this build today.
+        // `fetch.recurseSubmodules` supplies the default. git's *unset* default is
+        // `on-demand` as well; see [`Recurse`] for why this build still answers
+        // an unset key with "off".
         recurse = match recurse_submodules {
             Some(r) => r,
             None => match snap
@@ -772,9 +769,11 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 .as_deref()
             {
                 Some("yes" | "true" | "on" | "1") => Recurse::Yes,
+                Some("on-demand") => Recurse::OnDemand,
                 _ => Recurse::No,
             },
         };
+        opts.recurse = recurse;
         // `fetch.parallel` is git's default for `-j`, and is itself 1 when unset;
         // an explicit `0` on either means "pick a reasonable number", which here
         // is the machine's available parallelism.
@@ -1005,6 +1004,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         enabled: opts.write_fetch_head && !opts.dry_run,
         truncate: !opts.append,
     };
+    // `ref_tips_before_fetch` / `ref_tips_after_fetch` (submodule.c) are file-scope
+    // arrays in git, shared by every remote a single `git fetch` touches; the same
+    // accumulator is threaded through the fan-out here for the same reason.
+    let mut tips = SubmoduleTips::default();
 
     let result = (|| -> Result<()> {
         if all {
@@ -1031,6 +1034,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     upstream.as_ref(),
                     &mut fetch_head,
                     &mut op,
+                    &mut tips,
                 ) {
                     Ok(Verdict::Ok) => {}
                     Ok(Verdict::Rejected) => failure = true,
@@ -1089,6 +1093,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     upstream.as_ref(),
                     &mut fetch_head,
                     &mut op,
+                    &mut tips,
                 ) {
                     Ok(Verdict::Ok) => {}
                     Ok(Verdict::Rejected) => failure = true,
@@ -1131,6 +1136,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 upstream.as_ref(),
                 &mut fetch_head,
                 &mut op,
+                &mut tips,
             )? {
                 Verdict::Ok => {}
                 Verdict::Rejected => failure = true,
@@ -1179,8 +1185,18 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
     // `--recurse-submodules[=yes]` / `fetch.recurseSubmodules=yes`: run the same
     // fetch inside every populated submodule, up to `--jobs` at a time.
-    if recurse == Recurse::Yes && !opts.dry_run && fetch_submodules(&repo, &opts)? {
-        failure = true;
+    // `on-demand` runs the same recursion over the subset the fetch actually
+    // brought new commits for — the set `fetch_task_create()` gates on, and
+    // empty (so: no recursion at all) whenever nothing changed or the
+    // superproject configures no submodule.
+    if recurse != Recurse::No && !opts.dry_run {
+        let selected = match recurse {
+            Recurse::OnDemand => Some(changed_submodule_names(&repo, &tips)?),
+            _ => None,
+        };
+        if fetch_submodules(&repo, &opts, selected.as_ref())? {
+            failure = true;
+        }
     }
 
     // `--auto-maintenance`/`--auto-gc`, the last thing `cmd_fetch()` does. `run_auto_maintenance()`
@@ -1297,12 +1313,43 @@ pub(super) fn credentials_in_url(repo: &gix::Repository, url: Option<&gix::url::
     }
 }
 
-/// `--recurse-submodules`' tri-state, minus git's `on-demand` which needs the
-/// superproject's old/new gitlinks to decide and is refused at parse time.
+/// `--recurse-submodules`' tri-state.
+///
+/// ```c
+/// switch (get_fetch_recurse_config(task->sub, spf))
+/// {
+/// case RECURSE_SUBMODULES_ON_DEMAND:
+///         if (!task->sub ||
+///                 !string_list_lookup(&spf->changed_submodule_names,
+///                                     task->sub->name))
+///                 goto cleanup;
+///         task->default_argv = "on-demand";
+///         break;
+/// case RECURSE_SUBMODULES_ON:
+///         task->default_argv = "yes";
+///         break;
+/// case RECURSE_SUBMODULES_OFF:
+///         goto cleanup;
+/// }
+/// ```
+///
+/// (`fetch_task_create()`, submodule.c.) `on-demand` is `yes` with one extra
+/// gate: the submodule must appear in `changed_submodule_names`, the set
+/// [`changed_submodule_names`] computes from the commits this fetch brought in.
+///
+/// **Deviation, deliberate and narrow.** git's *unset* default is
+/// `RECURSE_SUBMODULES_DEFAULT`, which `get_fetch_recurse_config()` resolves to
+/// `on-demand`, so a bare `git fetch` recurses on demand too. This build still
+/// resolves the unset default to [`Recurse::No`] — only an explicit
+/// `--recurse-submodules=on-demand` or `fetch.recurseSubmodules=on-demand`
+/// selects the mode — because turning it on by default would change what every
+/// fetch in a superproject does, and the gate below has only been measured
+/// where it was asked for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Recurse {
     Yes,
     No,
+    OnDemand,
 }
 
 /// Parsed command-line options shared across every remote a single invocation
@@ -1317,6 +1364,12 @@ struct FetchOpts {
     /// `--submodule-prefix`: what the recursing parent prepends to this fetch's own
     /// submodule announcements. Empty in the top-level superproject.
     submodule_prefix: String,
+    /// The resolved `--recurse-submodules` mode. `fetch_one` reads it for one
+    /// reason only: `check_for_new_submodule_commits()` is gated on
+    /// `recurse_submodules != RECURSE_SUBMODULES_OFF`, so the ref tips
+    /// [`changed_submodule_names`] needs are collected during the fetch and
+    /// only when the mode can use them.
+    recurse: Recurse,
     dry_run: bool,
     verbose: bool,
     quiet: bool,
@@ -1430,6 +1483,7 @@ impl Default for FetchOpts {
             no_filter: false,
             set_upstream: false,
             submodule_prefix: String::new(),
+            recurse: Recurse::No,
             // "This is enabled by default."
             auto_maintenance: true,
             address_family: None,
@@ -2084,6 +2138,7 @@ fn fetch_one(
     upstream: Option<&(String, String)>,
     fetch_head: &mut FetchHead,
     progress: &mut prodash::tree::Item,
+    tips: &mut SubmoduleTips,
 ) -> Result<Verdict> {
     // A local path that is not a repository never reaches the transport in git:
     // `enter_repo()` fails on the other side and `die_initial_contact()` follows.
@@ -2622,6 +2677,29 @@ fn fetch_one(
     let fetch_filter = partial_fetch_filter(repo, remote_name.as_deref(), opts);
     let from_promisor = fetch_filter.is_some();
 
+    // ```c
+    // void check_for_new_submodule_commits(struct object_id *oid)
+    // {
+    //         if (!initialized_fetch_ref_tips) {
+    //                 refs_for_each_ref(get_main_ref_store(the_repository),
+    //                                   append_oid_to_array, &ref_tips_before_fetch);
+    //                 initialized_fetch_ref_tips = 1;
+    //         }
+    //         oid_array_append(&ref_tips_after_fetch, oid);
+    // }
+    // ```
+    //
+    // (submodule.c.) The "before" half is *every* ref in the repository, not just
+    // the ones this fetch touches, and it is snapshotted while the ref
+    // transaction is still uncommitted — so it is the pre-fetch state. gitoxide
+    // applies its ref edits inside `receive()`, so the snapshot has to be taken
+    // here, above it, rather than lazily on the first update the way git can.
+    // Same values either way: a fetch that updates nothing leaves the "after"
+    // half empty and the walk finds nothing regardless of what is in "before".
+    if opts.recurse != Recurse::No {
+        tips.snapshot_before(repo);
+    }
+
     let outcome = prepared
         .with_dry_run(opts.dry_run)
         .with_shallow(opts.shallow.clone().unwrap_or_default())
@@ -2732,6 +2810,49 @@ fn fetch_one(
             return Err(err);
         }
     };
+
+    // ```c
+    // if (rm && check_connected(iterate_ref_map, &rm, &opt)) {
+    //         rc = error(_("%s did not send all necessary objects"), display_state->url);
+    //         goto abort;
+    // }
+    // ```
+    //
+    // (`store_updated_refs()`, builtin/fetch.c.) `check_connected()` runs
+    // `git rev-list --objects --stdin --not --all --quiet`, and the `--all` half
+    // is the part gitoxide's own connectivity check has no equivalent of: it
+    // asks the *local* ref store to name everything already here, so a local ref
+    // this repository cannot resolve kills the child before it has read a single
+    // want. Measured against stock 2.55.0 on a repository holding
+    // `refs/heads/dangling` at an id no object file backs: every `git fetch`
+    // against it — with or without `--prune`, `--dry-run`, or an explicit
+    // refspec — is `fatal: bad object refs/heads/dangling` followed by
+    // `error: . did not send all necessary objects`, exit 1, with no ref stored
+    // and no `FETCH_HEAD` written.
+    //
+    // What is modelled is the ref tips, not the full walk: `rev-list` also dies
+    // on a *reachable* object that is missing, and finding those out means
+    // walking every commit from every ref on every fetch. The tips are what
+    // `rev-list` refuses to start on, they are the case a repository reaches by
+    // having a ref written behind git's back, and checking them costs one object
+    // lookup per ref. A dangling *symref* is not one of these: `for_each_ref()`
+    // never yields it, so `refs/heads/broken-symref` is invisible to `--all` and
+    // must stay invisible here. Returning before the summary loop is what keeps
+    // the refs and `FETCH_HEAD` unwritten, which is `goto abort`'s effect.
+    if let Some(broken) = unresolvable_local_ref(repo) {
+        eprintln!("fatal: bad object {broken}");
+        eprintln!("error: {url} did not send all necessary objects");
+        // `goto abort` skips every ref update because git had not made one yet:
+        // the check sits above the transaction. gitoxide applied its edits inside
+        // `receive()`, so the refs are put back instead — the same reconstruction
+        // [`undo_ref_write`] performs for the non-commit rule, and for the same
+        // reason. The *objects* stay, which is also what git leaves behind: the
+        // pack was received before the check ran.
+        for edit in undone_edits(&outcome) {
+            undo_ref_write(repo, edit.0.as_ref(), edit.1)?;
+        }
+        return Ok(Verdict::Rejected);
+    }
 
     // Refs the remote could only offer by making us adopt one of its shallow roots. git leaves
     // them out of both the summary and FETCH_HEAD and warns about each, naming the local
@@ -3087,6 +3208,75 @@ fn fetch_one(
                 ('!', "[rejected]".to_string(), "  (source object not found)")
             }
         };
+        // ```c
+        // if (config->recurse_submodules != RECURSE_SUBMODULES_OFF &&
+        //     (!rm->peer_ref || !oideq(&ref->old_oid, &ref->new_oid))) {
+        //         check_for_new_submodule_commits(&rm->old_oid);
+        // }
+        // ```
+        //
+        // (`store_updated_refs()`, builtin/fetch.c.) `rm` is the *remote* ref, so
+        // `rm->old_oid` is the id the remote advertised — the new value locally,
+        // which is what the "after" tip list is made of. A mapping with no local
+        // destination contributes unconditionally; one that has a destination
+        // contributes only when the ref actually moved.
+        if opts.recurse != Recurse::No {
+            if let Some(id) = remote_id {
+                if old_id != Some(id) {
+                    tips.after.push(id);
+                }
+            }
+        }
+
+        // ```c
+        // if ((flags & REF_HAVE_NEW) && !new_target && !is_null_oid(new_oid) &&
+        //     !(flags & REF_SKIP_OID_VERIFICATION) && !(flags & REF_LOG_ONLY)) {
+        //         struct object *o = parse_object(transaction->ref_store->repo, new_oid);
+        //         [...]
+        //         if (o->type != OBJ_COMMIT && is_branch(refname)) {
+        //                 strbuf_addf(err, _("trying to write non-commit object %s to branch '%s'"),
+        //                             oid_to_hex(new_oid), refname);
+        //                 return REF_TRANSACTION_ERROR_INVALID_NEW_VALUE;
+        //         }
+        // ```
+        //
+        // (`ref_transaction_update()`, refs.c at v2.55.0.) A branch holds a
+        // commit and nothing else, so `git fetch . ambi-ann:refs/heads/pick` —
+        // an annotated tag aimed at `refs/heads/` — is refused by the ref store
+        // rather than by anything in `fetch`. The type tested is the object's
+        // own, not its peeled one: `parse_object()` returns the tag object, so a
+        // tag that points at a perfectly good commit is still not a commit.
+        // `is_branch()` is `HEAD` or `refs/heads/`.
+        //
+        // Measured against stock 2.55.0: `error: trying to write non-commit
+        // object <id> to branch 'refs/heads/pick'`, a summary row of
+        // `! [new tag] ambi-ann -> pick  (unable to update local ref)`, exit 1,
+        // and no `refs/heads/pick` — not even a reflog for it.
+        //
+        // gitoxide's `update_refs` has no equivalent check and applies its edits
+        // inside `receive()`, so the write has already happened by the time this
+        // loop sees it and is put back instead of prevented. That reconstruction
+        // is exact — see [`undo_ref_write`] for the reflog half, which is the
+        // part a plain second edit would get wrong.
+        let non_commit = remote_id.filter(|_| is_branch(local_full.as_bstr())).filter(|id| {
+            repo.find_object(*id)
+                .is_ok_and(|o| o.kind != gix::object::Kind::Commit)
+        });
+        let (flag, reason) = match non_commit {
+            None => (flag, reason),
+            Some(id) => {
+                eprintln!(
+                    "error: trying to write non-commit object {id} to branch '{}'",
+                    local_full.as_bstr()
+                );
+                if edit.is_some() {
+                    undo_ref_write(repo, local_full.as_ref(), old_id)?;
+                }
+                rejected = true;
+                ('!', "  (unable to update local ref)")
+            }
+        };
+
         // `--porcelain`'s two id columns: a ref that did not exist before shows
         // the null id on the left, and one that stayed put repeats its own id on
         // both sides (git prints `<old-object-id> <new-object-id>` either way).
@@ -3642,6 +3832,345 @@ fn update_checked_out_ref(
     }))
 }
 
+/// ```c
+/// int is_branch(const char *refname)
+/// {
+///         return !strcmp(refname, "HEAD") || starts_with(refname, "refs/heads/");
+/// }
+/// ```
+///
+/// (refs.c.) The predicate `ref_transaction_update()`'s commit-only rule is
+/// gated on, and the reason a ref outside `refs/heads/` may hold any object at
+/// all: `git fetch . ambi-ann:refs/x/pick` writes the tag object and exits 0.
+fn is_branch(refname: &BStr) -> bool {
+    refname == "HEAD" || refname.starts_with(b"refs/heads/")
+}
+
+/// Put a ref back the way it was before this fetch wrote it, reflog included.
+///
+/// The rollback half of the `ref_transaction_update()` check above. Stock git
+/// never performs the write at all, so "put it back" has to be indistinguishable
+/// from "never written": a ref that did not exist must leave no ref file *and no
+/// reflog file*, and one that did must be back at its old id with no new reflog
+/// line.
+///
+/// The reflog is the part a second `edit_reference()` cannot do on its own.
+/// gitoxide has no "update the ref but not its log" mode — `RefLog::AndReference`
+/// appends whenever the ref is logged — so restoring an existing ref by editing
+/// it would leave *two* entries where stock leaves none. Both are therefore
+/// removed from the tail of the log after the edit, and a log left empty is
+/// deleted, which is the state a ref that was never touched is in.
+///
+/// A ref that did not exist is deleted with `RefLog::AndReference`, which takes
+/// its whole log file with it in one step.
+fn undo_ref_write(
+    repo: &gix::Repository,
+    name: &gix::refs::FullNameRef,
+    old_id: Option<gix::ObjectId>,
+) -> Result<()> {
+    let log_path = repo.git_dir().join("logs").join(name.as_bstr().to_str_lossy().as_ref());
+    match old_id {
+        None => {
+            repo.edit_reference(RefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::Any,
+                    log: RefLog::AndReference,
+                    message: Default::default(),
+                },
+                name: name.to_owned(),
+                deref: false,
+            })?;
+        }
+        Some(old) => {
+            repo.edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: Default::default(),
+                    },
+                    expected: PreviousValue::Any,
+                    new: Target::Object(old),
+                },
+                name: name.to_owned(),
+                deref: false,
+            })?;
+            // The fetch's entry and the restoring edit's, in that order at the
+            // end of the file.
+            drop_trailing_reflog_lines(&log_path, 2);
+        }
+    }
+    Ok(())
+}
+
+/// Remove the last `n` lines from a reflog, deleting the file when nothing is
+/// left — an empty `logs/<ref>` is not a state git ever writes, and a later
+/// `git reflog` would read it as a ref with a log rather than one without.
+fn drop_trailing_reflog_lines(path: &std::path::Path, n: usize) {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut lines: Vec<&str> = body.lines().collect();
+    for _ in 0..n {
+        if lines.pop().is_none() {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let mut kept = lines.join("\n");
+    kept.push('\n');
+    let _ = std::fs::write(path, kept);
+}
+
+/// Every ref edit this fetch applied, paired with the value the ref held before
+/// it — the input a rollback needs, in the order the edits were made.
+///
+/// `PreviousValue::MustExistAndMatch` is what gitoxide records for an update to
+/// a ref that already existed; anything else means the ref was created, and the
+/// rollback for that is a deletion.
+fn undone_edits(
+    outcome: &gix::remote::fetch::Outcome,
+) -> Vec<(FullName, Option<gix::ObjectId>)> {
+    let update_refs = match &outcome.status {
+        Status::NoPackReceived { update_refs, .. } => update_refs,
+        Status::Change { update_refs, .. } => update_refs,
+    };
+    update_refs
+        .edits
+        .iter()
+        .map(|edit| {
+            let previous = match &edit.change {
+                Change::Update { expected: PreviousValue::MustExistAndMatch(Target::Object(id)), .. } => {
+                    Some(*id)
+                }
+                _ => None,
+            };
+            (edit.name.clone(), previous)
+        })
+        .collect()
+}
+
+/// The first ref whose object this repository does not have — the thing
+/// `rev-list --not --all` dies on, reported by the name it dies on.
+///
+/// Only direct refs are considered, and only their own targets. A symbolic ref
+/// is followed (`refs/remotes/origin/HEAD` resolves through to a branch) and one
+/// that resolves to nothing is skipped entirely, because `for_each_ref()` never
+/// hands such a ref to `--all` in the first place.
+fn unresolvable_local_ref(repo: &gix::Repository) -> Option<String> {
+    use gix::objs::Exists as _;
+    let platform = repo.references().ok()?;
+    for reference in platform.all().ok()?.filter_map(Result::ok) {
+        let name = reference.name().as_bstr().to_string();
+        let Some(id) = reference.try_id() else { continue };
+        if !repo.objects.exists(&id) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// The two oid arrays `check_for_new_submodule_commits()` fills, and the only
+/// input `--recurse-submodules=on-demand` needs from the fetch itself.
+///
+/// `before` is every ref the repository held before any of them moved; `after`
+/// is the id each fetched ref arrived at. The set of commits this fetch
+/// introduced is `after --not before`, which is exactly the rev-list
+/// `calculate_changed_submodule_paths()` builds:
+///
+/// ```c
+/// strvec_push(&argv, "--"); /* argv[0] program name */
+/// oid_array_for_each_unique(&ref_tips_after_fetch, append_oid_to_argv, &argv);
+/// strvec_push(&argv, "--not");
+/// oid_array_for_each_unique(&ref_tips_before_fetch, append_oid_to_argv, &argv);
+/// ```
+///
+/// (submodule.c.)
+#[derive(Default)]
+struct SubmoduleTips {
+    before: Vec<gix::ObjectId>,
+    after: Vec<gix::ObjectId>,
+    initialized: bool,
+}
+
+impl SubmoduleTips {
+    /// `refs_for_each_ref(..., append_oid_to_array, &ref_tips_before_fetch)`,
+    /// taken once per command however many remotes it fans out over — the flag
+    /// git keeps for the same reason.
+    fn snapshot_before(&mut self, repo: &gix::Repository) {
+        if self.initialized {
+            return;
+        }
+        self.initialized = true;
+        let Ok(platform) = repo.references() else { return };
+        let Ok(iter) = platform.all() else { return };
+        for reference in iter.filter_map(Result::ok) {
+            if let Some(id) = reference.try_id() {
+                self.before.push(id.detach());
+            }
+        }
+    }
+}
+
+/// The submodules this fetch brought new commits for — git's
+/// `changed_submodule_names`, and the whole of what separates `on-demand` from
+/// `yes`.
+///
+/// ```c
+/// static void calculate_changed_submodule_paths(struct repository *r,
+///                 struct string_list *changed_submodule_names)
+/// {
+///         [...]
+///         /* No need to check if there are no submodules configured */
+///         if (!submodule_from_path(r, NULL, NULL))
+///                 return;
+///         [...]
+///         collect_changed_submodules(r, changed_submodule_names, &argv);
+///
+///         for_each_string_list_item(name, changed_submodule_names) {
+///                 struct oid_array *commits = name->util;
+///                 [...]
+///                 if (submodule_has_commits(r, path, null_oid(the_hash_algo), commits)) {
+///                         [...]
+///                 }
+///         }
+/// ```
+///
+/// (submodule.c.) Three steps, in this order, and the first is why a repository
+/// with no `.gitmodules` entry at all never walks anything:
+///
+///   1. **No submodule configured — return.** This is the whole of the answer
+///      for `git pull --recurse-submodules=on-demand` in a repository that has
+///      none: nothing is changed, so nothing recurses, and the pull is an
+///      ordinary one.
+///   2. **Walk `after --not before` and collect the gitlinks each new commit
+///      changed**, keyed by the submodule's *name* (`collect_changed_submodules_cb`
+///      records `submodule->name`, which is what `fetch_task_create()` looks up).
+///      A commit is diffed against its parents, so a gitlink that did not move is
+///      not a change; a root commit is diffed against the empty tree, which is
+///      what `diff_tree_combined_merge()` does with no parent.
+///   3. **Drop the ones the submodule already has** (`submodule_has_commits`).
+///      A superproject commit that names a gitlink the submodule's object store
+///      already holds needs no fetch to resolve it.
+fn changed_submodule_names(
+    repo: &gix::Repository,
+    tips: &SubmoduleTips,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut changed = std::collections::BTreeSet::new();
+    if tips.after.is_empty() {
+        return Ok(changed);
+    }
+    // Step 1: `if (!submodule_from_path(r, NULL, NULL)) return;`
+    let Some(modules) = repo.submodules()? else {
+        return Ok(changed);
+    };
+    // Both directions are needed: the walk finds a *path*, the recursion gate
+    // holds a *name*, and `.gitmodules` is what maps one to the other.
+    let mut name_of_path: std::collections::HashMap<BString, String> = Default::default();
+    for sm in modules {
+        name_of_path.insert(sm.path()?.as_bstr().to_owned(), sm.name().to_string());
+    }
+    if name_of_path.is_empty() {
+        return Ok(changed);
+    }
+
+    // Step 2: the rev-list, and a gitlink diff per commit it yields.
+    let walk = repo
+        .rev_walk(tips.after.iter().copied())
+        .with_hidden(tips.before.iter().copied())
+        .all()?;
+    // Keyed by name, because that is what step 3 and the gate both ask for.
+    let mut candidates: std::collections::BTreeMap<String, Vec<(BString, gix::ObjectId)>> =
+        Default::default();
+    for info in walk {
+        let Ok(info) = info else { continue };
+        let Ok(commit) = repo.find_commit(info.id) else {
+            continue;
+        };
+        let Ok(new_tree) = commit.tree() else { continue };
+        let parents: Vec<gix::ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+        let old_trees = match parents.is_empty() {
+            true => vec![repo.empty_tree()],
+            false => parents
+                .iter()
+                .filter_map(|id| repo.find_commit(*id).ok()?.tree().ok())
+                .collect(),
+        };
+        for old_tree in old_trees {
+            let Ok(mut platform) = old_tree.changes() else {
+                continue;
+            };
+            let _ = platform.for_each_to_obtain_tree(&new_tree, |change| {
+                if let Some((path, id)) = gitlink_change(&change) {
+                    if let Some(name) = name_of_path.get(path.as_bstr()) {
+                        candidates.entry(name.clone()).or_default().push((path, id));
+                    }
+                }
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
+            });
+        }
+    }
+
+    // Step 3: `submodule_has_commits()` — a submodule that already holds every
+    // commit the superproject now names has nothing to fetch.
+    for (name, entries) in candidates {
+        let path = entries[0].0.clone();
+        let has_all = submodule_has_commits(repo, path.as_bstr(), entries.iter().map(|(_, id)| *id));
+        if !has_all {
+            changed.insert(name);
+        }
+    }
+    Ok(changed)
+}
+
+/// The gitlink half of one tree diff: the path and the id it now points at, or
+/// `None` for every other kind of entry.
+///
+/// `collect_changed_submodules_cb()` reads `S_ISGITLINK(p->two->mode)` and takes
+/// `p->two->oid`, so a gitlink that was *removed* contributes nothing — there is
+/// no new commit to go and fetch.
+fn gitlink_change(
+    change: &gix::object::tree::diff::Change<'_, '_, '_>,
+) -> Option<(BString, gix::ObjectId)> {
+    use gix::object::tree::diff::Change as C;
+    let (location, entry_mode, id) = match change {
+        C::Addition { location, entry_mode, id, .. } => (location, entry_mode, id),
+        C::Modification { location, entry_mode, id, .. } => (location, entry_mode, id),
+        C::Rewrite { location, entry_mode, id, .. } => (location, entry_mode, id),
+        C::Deletion { .. } => return None,
+    };
+    entry_mode
+        .is_commit()
+        .then(|| ((*location).to_owned(), id.detach()))
+}
+
+/// `submodule_has_commits()`: true when the submodule at `path` is open-able and
+/// its object store already holds every one of `commits`.
+///
+/// git additionally re-checks reachability with a `rev-list --not --all`, which
+/// only matters for a submodule whose objects exist but are unreferenced; a
+/// present object is the part that decides whether a fetch would find anything
+/// new, and it is the part modelled here. A submodule that cannot be opened at
+/// all — never cloned — has nothing, so the answer is `false` and it counts as
+/// changed, which is what git's `!repo_submodule_init()` arm returns too.
+fn submodule_has_commits(
+    repo: &gix::Repository,
+    path: &BStr,
+    commits: impl IntoIterator<Item = gix::ObjectId>,
+) -> bool {
+    let Some(work_dir) = repo.workdir() else {
+        return false;
+    };
+    let Ok(sub) = gix::open(work_dir.join(gix::path::from_bstr(path).as_ref())) else {
+        return false;
+    };
+    use gix::objs::Exists as _;
+    commits.into_iter().all(|id| sub.objects.exists(&id))
+}
+
 /// `--recurse-submodules[=yes]`: run this binary's own `fetch` inside every
 /// populated submodule, `--jobs` at a time.
 ///
@@ -3649,7 +4178,11 @@ fn update_checked_out_ref(
 /// make sense below the top level are forwarded here (verbosity, prune, tags and
 /// the recursion itself), since the superproject's refspecs and remote names do
 /// not apply to a submodule. Returns `true` if any submodule fetch failed.
-fn fetch_submodules(repo: &gix::Repository, opts: &FetchOpts) -> Result<bool> {
+fn fetch_submodules(
+    repo: &gix::Repository,
+    opts: &FetchOpts,
+    selected: Option<&std::collections::BTreeSet<String>>,
+) -> Result<bool> {
     let Some(modules) = repo.submodules()? else {
         return Ok(false);
     };
@@ -3658,6 +4191,14 @@ fn fetch_submodules(repo: &gix::Repository, opts: &FetchOpts) -> Result<bool> {
     let mut dirs: Vec<(String, std::path::PathBuf)> = Vec::new();
     for sm in modules {
         if !sm.is_active().unwrap_or(false) {
+            continue;
+        }
+        // `on-demand`'s gate: `if (!task->sub || !string_list_lookup(
+        // &spf->changed_submodule_names, task->sub->name)) goto cleanup;`
+        // (`fetch_task_create()`, submodule.c). The lookup is by the submodule's
+        // *name*, not its path — the two differ whenever `.gitmodules` names a
+        // section differently from the directory it points at.
+        if selected.is_some_and(|names| !names.contains(sm.name().to_string().as_str())) {
             continue;
         }
         // An unpopulated submodule has no repository to fetch into; git skips it
@@ -3673,7 +4214,14 @@ fn fetch_submodules(repo: &gix::Repository, opts: &FetchOpts) -> Result<bool> {
     }
 
     let exe = crate::hosted::git_exe()?;
-    let mut forwarded: Vec<String> = vec!["fetch".into(), "--recurse-submodules".into()];
+    // `task->default_argv` is the *string* git hands the child — `"yes"` under
+    // `--recurse-submodules`, `"on-demand"` under `--recurse-submodules=on-demand`
+    // — so the recursion keeps its mode all the way down.
+    let mode = match opts.recurse {
+        Recurse::OnDemand => "--recurse-submodules=on-demand",
+        _ => "--recurse-submodules",
+    };
+    let mut forwarded: Vec<String> = vec!["fetch".into(), mode.into()];
     if opts.quiet {
         forwarded.push("--quiet".into());
     }

@@ -43,6 +43,15 @@
 //!     pack's trailer checksum, which is what both git and `gix-pack` name a
 //!     pack after, so the two agree byte-for-byte as long as the received pack
 //!     bytes do. See [`keep_pack`].
+//!   * `--lock-pack` — the kept pack's `.keep` is *reported* as
+//!     `lock <path>` in place of the `keep <hash>` line, which is what git does
+//!     with it; without `--keep` there is no lock to report and it prints
+//!     nothing, again like git.
+//!   * `--check-self-contained-and-connected` — accepted and changes no output.
+//!     git only ever turns it into a `connectivity-ok` line on the branch that
+//!     parses `index-pack`'s captured stdout, which this flag alone does not
+//!     open; the check it asks for is one gitoxide performs on the pack it
+//!     indexes regardless.
 //!
 //! Not covered — each bails rather than silently diverging:
 //!   * a fetch large enough that git would keep the pack on its own
@@ -68,7 +77,7 @@
 //!   * `--upload-pack=<exec>` / `--exec=<exec>` naming anything but the default
 //!     `git-upload-pack` — the vendored transport `connect`
 //!     takes no per-invocation override for the remote program.
-//!   * `--check-self-contained-and-connected`, `--stateless-rpc`, `--lock-pack`.
+//!   * `--stateless-rpc`.
 //!   * a `<ref>` given as a raw object hash (`uploadpack.allowTipSHA1InWant`
 //!     and friends): the vendored refspec layer maps names, not bare ids.
 //!
@@ -97,7 +106,8 @@ const USAGE: &str = "usage: git fetch-pack [--all] [--stdin] [--quiet | -q] [--k
 
 /// The flags this port implements, quoted in every rejection message.
 const PORTED: &str = "ported: --all, --stdin, -q/--quiet, -v, --no-progress, --thin, \
-                      --depth, --shallow-since, --shallow-exclude, --deepen-relative, --diag-url";
+                      --depth, --shallow-since, --shallow-exclude, --deepen-relative, --diag-url, \
+                      -k/--keep, --lock-pack, --check-self-contained-and-connected";
 
 /// git's built-in `unpack_limit`, overridable via `fetch.unpackLimit` and then
 /// `transfer.unpackLimit`.
@@ -132,6 +142,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     let mut diag_url = false;
     let mut include_tag = false;
     let mut keep = false;
+    let mut lock_pack = false;
     let mut dest: Option<&str> = None;
     let mut sought: Vec<String> = Vec::new();
     // The shallow-clone family. git keeps `depth` (`strtol` of `--depth=`),
@@ -168,10 +179,56 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             // so that spelling falls through to `usage(fetch_pack_usage)`.
             "--thin" => {}
             "-k" | "--keep" => keep = true,
-            // `--lock-pack` additionally makes `index-pack` hold a `.keep` lock
-            // whose path `cmd_fetch_pack()` prints as `lock <path>` and expects
-            // the caller to release; there is no lockfile protocol here to hand
-            // that ownership to.
+
+            // `--lock-pack` asks for the `.keep` the kept pack already carries to
+            // be *reported* rather than silently released:
+            //
+            // ```c
+            // if (pack_lockfiles.nr) {
+            //         int i;
+            //
+            //         printf("lock %s\n", pack_lockfiles.items[0].string);
+            //         fflush(stdout);
+            // ```
+            //
+            // (`cmd_fetch_pack()`, builtin/fetch-pack.c.) The list is filled from
+            // `index_pack_lockfile()`, which reads `index-pack`'s own stdout and
+            // returns a path only when that stdout began `keep\t` — so the option
+            // has an effect exactly when the pack was kept, and none at all
+            // otherwise. It does *not* imply `--keep`: measured against stock
+            // 2.55.0, `git fetch-pack --all --lock-pack <url>` prints only the
+            // ref listing and leaves no `.keep` behind, while
+            // `git fetch-pack --all --keep --lock-pack <url>` prints
+            // `lock .git/objects/pack/pack-<hash>.keep` in place of the
+            // `keep\t<hash>` line the bare `--keep` prints, because the lock path
+            // is parsed *out of* that line rather than printed alongside it.
+            "--lock-pack" => lock_pack = true,
+
+            // `--check-self-contained-and-connected` forwards the flag of the
+            // same name to `index-pack`, and `cmd_fetch_pack()` reports the
+            // result as a `connectivity-ok` line only when the child actually ran
+            // and answered:
+            //
+            // ```c
+            // if (args.check_self_contained_and_connected &&
+            //     args.self_contained_and_connected) {
+            //         printf("connectivity-ok\n");
+            //         fflush(stdout);
+            // }
+            // ```
+            //
+            // (builtin/fetch-pack.c.) `self_contained_and_connected` is only ever
+            // set on the branch that parses `index-pack`'s captured stdout, which
+            // `get_pack()` enters for `pack_lockfiles || fsck_objects` — not for
+            // this flag on its own. Measured against stock 2.55.0 on a fetch that
+            // transferred six objects: `--check-self-contained-and-connected`
+            // alone prints nothing but the ref listing, and with `--keep` added it
+            // prints the ordinary `keep\t<hash>` line and still no
+            // `connectivity-ok`. So the flag is accepted and changes no output,
+            // which is what git does with it here; the connectivity check itself
+            // is gitoxide's, which verifies the pack it just indexed.
+            "--check-self-contained-and-connected" => {}
+
             // ```c
             // if (!strcmp("--stateless-rpc", arg)) { args.stateless_rpc = 1; continue; }
             // …
@@ -183,9 +240,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             // the usage error. Refusing early would answer "unsupported" where git answers
             // `usage:` — `fetch-pack --stateless-rpc --advertise-refs` is 129 because of
             // the second flag, which the loop never reaches if the first one bails.
-            "--lock-pack"
-            | "--refetch"
-            | "--check-self-contained-and-connected"
+            "--refetch"
             | "--stateless-rpc"
             | "--cloning"
             | "--update-shallow"
@@ -359,7 +414,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
 
     // --- phase 2: negotiate and receive the pack --------------------------
     let shallow = build_shallow(depth, deepen_relative, shallow_since.as_deref(), &shallow_exclude)?;
-    if let Err(e) = receive(&repo, dest, &selected, shallow, keep) {
+    if let Err(e) = receive(&repo, dest, &selected, shallow, keep, lock_pack) {
         // A failed fetch surfaces as git's `fatal:` with 128 unless it is one of
         // our own refusals, which must stay loud and unmistakable.
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
@@ -869,6 +924,7 @@ fn receive(
     selected: &[(String, ObjectId)],
     shallow: Shallow,
     keep: bool,
+    lock_pack: bool,
 ) -> Result<()> {
     let remote = repo
         .remote_at(dest)?
@@ -895,7 +951,7 @@ fn receive(
         Status::NoPackReceived { .. } => Ok(()),
         Status::Change {
             write_pack_bundle, ..
-        } if keep => keep_pack(repo, write_pack_bundle),
+        } if keep => keep_pack(repo, write_pack_bundle, lock_pack),
         Status::Change {
             write_pack_bundle, ..
         } => explode(repo, write_pack_bundle),
@@ -920,7 +976,11 @@ fn receive(
 ///
 /// `finalize_object_file()` leaves the pack, its index and its reverse index
 /// read-only, so the three are chmod'd to match.
-fn keep_pack(repo: &gix::Repository, bundle: gix::odb::pack::bundle::write::Outcome) -> Result<()> {
+fn keep_pack(
+    repo: &gix::Repository,
+    bundle: gix::odb::pack::bundle::write::Outcome,
+    lock_pack: bool,
+) -> Result<()> {
     let (Some(index_path), Some(data_path)) = (bundle.index_path.clone(), bundle.data_path.clone())
     else {
         // gitoxide found a pack with these bytes already on disk and reused it,
@@ -949,7 +1009,34 @@ fn keep_pack(repo: &gix::Repository, bundle: gix::odb::pack::bundle::write::Outc
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
     }
 
-    println!("keep\t{}", bundle.index.data_hash.to_hex());
+    // `--lock-pack` consumes that `keep\t<hash>` line rather than adding to it:
+    // `get_pack()` captures `index-pack`'s stdout, `index_pack_lockfile()` turns
+    // the line into `<objdir>/pack/pack-<hash>.keep`, and `cmd_fetch_pack()`
+    // prints that path as `lock <path>`. So the two spellings are alternatives,
+    // never both — measured against stock 2.55.0, `--keep` prints
+    // `keep\t<hash>` and `--keep --lock-pack` prints
+    // `lock .git/objects/pack/pack-<hash>.keep` and nothing else.
+    //
+    // The path is composed the way `index_pack_lockfile()` composes it —
+    // `xstrfmt("%s/pack/pack-%s.keep", repo_get_object_directory(...))` — rather
+    // than echoed from the bundle, because gitoxide spells the same file
+    // `./.git/objects/…` where git spells it `.git/objects/…`; both name one
+    // file, only one of them is the string git prints.
+    match (lock_pack, bundle.keep_path.is_some()) {
+        (true, true) => {
+            // gitoxide records the object directory with the leading `./` its
+            // discovery walked in with; git's `setup_git_directory()` never keeps
+            // one, so it is dropped rather than printed.
+            let objects = repo.objects.store_ref().path();
+            let objects = objects.strip_prefix("./").unwrap_or(objects);
+            println!(
+                "lock {}/pack/pack-{}.keep",
+                objects.display(),
+                bundle.index.data_hash.to_hex()
+            );
+        }
+        _ => println!("keep\t{}", bundle.index.data_hash.to_hex()),
+    }
     Ok(())
 }
 

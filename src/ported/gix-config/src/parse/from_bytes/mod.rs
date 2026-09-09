@@ -403,13 +403,55 @@ fn value(backing: &[u8], i: &mut &[u8], dispatch: &mut dyn FnMut(Event)) -> Pars
     Ok(())
 }
 
-/// Parse one or more spaces or horizontal tabs.
+/// Parse one or more spaces, horizontal tabs, or lone carriage returns.
 ///
-/// At least one space or horizontal tab must be present at the current cursor.
-/// On success, `i` is advanced past the whitespace run and the returned
-/// [`BStr`] refers to the consumed bytes.
+/// At least one such byte must be present at the current cursor. On success,
+/// `i` is advanced past the whitespace run and the returned [`BStr`] refers to
+/// the consumed bytes.
+///
+/// # A lone `\r` is whitespace; `\r\n` is a line ending
+///
+/// git reads config through `get_next_char()` (config.c), which turns `\r\n`
+/// into a single `\n` and hands a `\r` that is *not* followed by `\n` back as an
+/// ordinary byte:
+///
+/// ```c
+/// if (c == '\r') {
+///         /* DOS like systems */
+///         c = cs->do_fgetc(cs);
+///         if (c != '\n') {
+///                 if (c != EOF)
+///                         cs->do_ungetc(c, cs);
+///                 c = '\r';
+///         }
+/// }
+/// ```
+///
+/// So a file written on a system that emits bare `\r` parses, and until this
+/// accepted one, `[section]\r\tk = v` died with `fatal: bad config line 1`
+/// where git reads it fine.
+///
+/// The set is `' '`, `'\t'` and that lone `'\r'` — deliberately *not* every byte
+/// `isspace()` accepts. Measured against git 2.55.0 with `[cr]<ws>\tk = v`:
+/// `\r` and `\r\n` both give `cr.k=v` at exit 0, while `\v` (0x0b) and `\f`
+/// (0x0c) both give `fatal: bad config …` at exit 128. Widening this to
+/// `is_ascii_whitespace()` would accept two files git rejects.
+///
+/// A `\r` that *does* begin a `\r\n` is left alone so that [`take_newlines1`]
+/// consumes the pair as one line ending: the round-trip in `parse::format`
+/// decides between `\r\n` and `\n` by looking for a `\r` inside the `Newline`
+/// event, and splitting the pair across a `Whitespace` and a `Newline` would
+/// rewrite a CRLF file as LF.
 fn take_spaces1<'i>(i: &mut &'i [u8]) -> ParseResult<&'i BStr> {
-    let len = i.iter().take_while(|c| **c == b' ' || **c == b'\t').count();
+    let len = i
+        .iter()
+        .enumerate()
+        .take_while(|(idx, c)| match **c {
+            b' ' | b'\t' => true,
+            b'\r' => i.get(idx + 1) != Some(&b'\n'),
+            _ => false,
+        })
+        .count();
     if len == 0 {
         return Err(());
     }

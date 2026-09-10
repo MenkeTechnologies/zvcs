@@ -171,7 +171,11 @@ where
             other: other.as_ref().map(|n| n.as_bstr()),
         }
     };
-    let prep = blob_merge.prepare_merge(objects, with_extra_markers(options, extra_markers))?;
+    let mut prep = blob_merge.prepare_merge(objects, options.blob_merge)?;
+    add_extra_marker_size(
+        &mut prep,
+        extra_markers.saturating_add(options.marker_size_multiplier.saturating_mul(2)),
+    );
     let (pick, resolution) = prep.merge(buf, labels, &options.blob_merge_command_ctx)?;
 
     let merged_blob_id = prep
@@ -181,13 +185,27 @@ where
     Ok((merged_blob_id, resolution))
 }
 
-fn with_extra_markers(opts: &Options, extra_makers: u8) -> crate::blob::platform::merge::Options {
-    let mut out = opts.blob_merge;
-    if let crate::blob::builtin_driver::text::Conflict::Keep { marker_size, .. } = &mut out.text.conflict {
-        *marker_size =
-            marker_size.saturating_add(extra_makers.saturating_add(opts.marker_size_multiplier.saturating_mul(2)));
+/// `ll_merge()`'s last move before it dispatches to the driver
+/// (merge-ll.c:445-447, git v2.55.0):
+///
+/// ```c
+/// if (opts->extra_marker_size) {
+///     marker_size += opts->extra_marker_size;
+/// }
+/// ```
+///
+/// It lands *after* the `conflict-marker-size` attribute has replaced the
+/// default (merge-ll.c:431-438) rather than before it, and that order is the
+/// whole point: a path that asks for thirteen markers is written with fifteen
+/// of them one recursion level down. Widening the default before
+/// [`Platform::prepare_merge()`](crate::blob::Platform::prepare_merge) instead
+/// let the attribute overwrite the widened value, so a virtual merge base under
+/// `conflict-marker-size=13` came out with thirteen-character markers where
+/// stock git writes fifteen.
+fn add_extra_marker_size(prep: &mut crate::blob::PlatformRef<'_>, extra: u8) {
+    if let crate::blob::builtin_driver::text::Conflict::Keep { marker_size, .. } = &mut prep.options.text.conflict {
+        *marker_size = marker_size.saturating_add(extra);
     }
-    out
 }
 
 /// A way to attach metadata to each change.

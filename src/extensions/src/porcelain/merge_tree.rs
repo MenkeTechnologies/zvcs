@@ -1167,44 +1167,20 @@ impl StrategyOptions {
     }
 }
 
-/// Port of git's `parse_rename_score()`: a decimal number, optionally
-/// fractional and optionally `%`-suffixed, scaled onto [`MAX_SCORE`].
-///
-/// `None` when anything is left over after the number, which is how git
+/// git's `parse_rename_score()` (diff.c:6344-6377, v2.55.0), with the
+/// trailing-garbage check `diff_opt_find_renames()` (diff.c:5741-5755) makes of
+/// how far it got: `if (*arg != 0) return error(…)`, which is how git
 /// distinguishes `-Xfind-renames=50` from `-Xfind-renames=abc`.
+///
+/// The scaling is `parse_merge_opt()`'s too, so the one port in
+/// [`crate::merge_apply::parse_rename_score`] answers for both doors. It matters
+/// that it is the *same* one: git's loop scales by ten on **every** digit, not
+/// only the ones after a `.`, so a bare `40` is the fraction `.40` and a bare
+/// `055` is `.055` — a second, hand-rolled reading of the same syntax had every
+/// unsuffixed value collapse to `MAX_SCORE`.
 fn parse_rename_score(s: &str) -> Option<u32> {
-    let bytes = s.as_bytes();
-    let (mut num, mut scale, mut dot) = (0u64, 1u64, false);
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'.' if !dot => {
-                scale = 1;
-                dot = true;
-            }
-            b'%' => {
-                scale = scale.saturating_mul(100);
-                i += 1;
-                break;
-            }
-            c if c.is_ascii_digit() => {
-                num = num.saturating_mul(10).saturating_add(u64::from(c - b'0'));
-                if dot {
-                    scale = scale.saturating_mul(10);
-                }
-            }
-            _ => break,
-        }
-        i += 1;
-    }
-    if i != bytes.len() {
-        return None;
-    }
-    Some(if num >= scale {
-        MAX_SCORE as u32
-    } else {
-        (MAX_SCORE.saturating_mul(num) / scale) as u32
-    })
+    let (score, consumed) = crate::merge_apply::parse_rename_score(s.as_bytes());
+    (consumed == s.len()).then_some(score)
 }
 
 /// `1` when the merge had unresolved conflicts, `0` otherwise — git's contract.

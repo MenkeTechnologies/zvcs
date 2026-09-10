@@ -677,7 +677,16 @@ mod tests {
         assert_eq!(score("50%"), 30000);
         assert_eq!(score("100"), 6000);
         assert_eq!(score("100%"), 60000);
-        assert_eq!(score("5.5"), 33000);
+        // `5.5` is MAX_SCORE, not 55%. The `.` arm sets `scale = 1`
+        // (diff.c:6353-6356), so the trailing digit leaves `num = 55` against
+        // `scale = 10` and `num >= scale` returns MAX_SCORE (diff.c:6371-6372).
+        // This line previously asserted 33000, which the port's own parser
+        // produced only because it had dropped that `scale = 1`. Re-measured
+        // against stock 2.55.0 on a 92%-similar rename pair, where a 55%
+        // threshold would detect the rename and a 100% one cannot:
+        //     git diff --name-status -M5.5  ->  D a.txt / A b.txt
+        //     git diff --name-status -M55%  ->  R092 a.txt b.txt
+        assert_eq!(score("5.5"), 60000);
         assert_eq!(score("0"), 0);
         // An empty/./% value reads as score 0 — verified against git 2.55.0:
         // `git merge-subtree --find-renames= …` is accepted, not "unknown option".

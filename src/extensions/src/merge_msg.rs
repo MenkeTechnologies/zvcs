@@ -109,7 +109,6 @@ pub fn render<'r, 's>(
     strictness: Strictness,
 ) -> Result<Vec<Message>> {
     let mut operands = Operands::new(label1, label2, operand1);
-    operands.default_driver_is_binary = default_driver_is_binary(repo);
     let mut out: Vec<Message> = Vec::new();
     for conflict in conflicts {
         match render_one(repo, conflict, unresolved, &mut operands)? {
@@ -175,11 +174,26 @@ fn render_one<'r, 's>(
                 // (merge-ort.c:2142-2144) built from an ancestor label this
                 // module is not given, so they emit nothing rather than a line
                 // with the wrong operands in it.
+                let binary_conflict = match operands.driver_for(repo, path.as_ref())? {
+                    // `ll_binary_merge()` returns `LL_MERGE_BINARY_CONFLICT`
+                    // whatever the blobs hold (merge-ll.c:81-84), so a text file
+                    // with `-merge` on it still earns the warning.
+                    Driver::Binary => true,
+                    // `ll_xdl_merge()` hands off to the binary driver when a
+                    // buffer is binary (merge-ll.c:117-127); `ll_union_merge()`
+                    // is the same function with `variant` forced, so it bails
+                    // the same way.
+                    Driver::Text => stages.any_is_binary(repo)?,
+                    // `ll_ext_merge()` reports `LL_MERGE_CONFLICT` or
+                    // `LL_MERGE_ERROR` from the driver's exit status
+                    // (merge-ll.c:265-272) and never the binary verdict.
+                    Driver::External => false,
+                };
                 if conflicted
                     && ours.location() == theirs.location()
                     && !matches!(ours, Change::Rewrite { .. })
                     && !matches!(theirs, Change::Rewrite { .. })
-                    && (operands.default_driver_is_binary || stages.any_is_binary(repo)?)
+                    && binary_conflict
                 {
                     out.push(Message {
                         paths: vec![path.clone()],
@@ -689,22 +703,95 @@ fn is_binary(repo: &gix::Repository, id: &ObjectId) -> Result<bool> {
     Ok(head.contains(&0))
 }
 
-/// `find_ll_merge_driver()` (merge-ll.c:363-393) for the one answer this module
-/// needs: whether the driver a path merges with is the built-in `binary`, which
-/// returns `LL_MERGE_BINARY_CONFLICT` and so earns `merge_3way()`'s
-/// `warning: Cannot merge binary files` line (merge-ort.c:2154-2159) even when the
-/// content is plain text.
+/// Which low-level driver a path merges with, as far as the binary warning is
+/// concerned — `find_ll_merge_driver()`'s three outcomes (merge-ll.c:363-394,
+/// git v2.55.0) collapsed onto what each one returns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Driver {
+    /// `ll_merge_drv[LL_BINARY_MERGE]`.
+    Binary,
+    /// `ll_merge_drv[LL_TEXT_MERGE]` or `[LL_UNION_MERGE]`, which is the same
+    /// function with `variant` forced (merge-ll.c:148-166).
+    Text,
+    /// A `merge.<name>.driver` command, run by `ll_ext_merge()`.
+    External,
+}
+
+/// The `merge` attribute, looked up the way merge-ort looks it up.
 ///
-/// Only `merge.default` is read. The per-path `merge` attribute — `ATTR_FALSE`
-/// (`-merge`) is the other way to reach the binary driver — needs the attribute
-/// index `initialize_attr_index()` builds out of the merge's *own*
-/// `.gitattributes` entries (merge-ort.c), which this module is not given; a
-/// `-merge` path whose content is text therefore still gets no warning here.
-/// Content that really is binary is caught by [`Stages::any_is_binary`] either way.
-fn default_driver_is_binary(repo: &gix::Repository) -> bool {
-    repo.config_snapshot()
-        .string("merge.default")
-        .is_some_and(|v| v.as_slice() == b"binary")
+/// `ll_merge()` calls `git_check_attr(&opt->priv->attr_index, path, check)`
+/// (merge-ll.c:429), and that index is the fake one `initialize_attr_index()`
+/// builds — which returns before adding a single entry unless the merge is
+/// renormalizing (merge-ort.c:2050-2052):
+///
+/// ```c
+/// if (!opt->renormalize)
+///     return;
+/// ```
+///
+/// So an ordinary merge resolves the attribute against an **empty** index: the
+/// built-in macros, `core.attributesFile` and `$GIT_DIR/info/attributes` speak,
+/// and no `.gitattributes` from any tree, index or worktree does. An empty
+/// [`gix::index::State`] read through
+/// [`Source::IdMapping`](gix::worktree::stack::state::attributes::Source::IdMapping)
+/// is the same stack of sources with the same one silent.
+struct MergeAttribute<'r> {
+    stack: gix::AttributeStack<'r>,
+    outcome: gix::attrs::search::Outcome,
+}
+
+impl<'r> MergeAttribute<'r> {
+    fn new(repo: &'r gix::Repository) -> Result<Self> {
+        let empty = gix::index::State::new(repo.object_hash());
+        let mut stack = repo.attributes_only(
+            &empty,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        // The first descent loads the attribute sources so the collection knows
+        // the name before the outcome is sized against it.
+        let _ = stack.at_entry("", Some(gix::index::entry::Mode::FILE))?;
+        let mut outcome = gix::attrs::search::Outcome::default();
+        outcome.initialize_with_selection(stack.attributes_collection(), ["merge"]);
+        Ok(MergeAttribute { stack, outcome })
+    }
+
+    /// The `merge` attribute's state at `path`.
+    fn state_at(&mut self, path: &BStr) -> Result<gix::attrs::State> {
+        self.outcome.reset();
+        self.stack
+            .at_entry(path, Some(gix::index::entry::Mode::FILE))?
+            .matching_attributes(&mut self.outcome);
+        Ok(self
+            .outcome
+            .iter_selected()
+            .next()
+            .map(|m| m.assignment.state.to_owned())
+            .unwrap_or(gix::attrs::State::Unspecified))
+    }
+}
+
+/// `find_ll_merge_driver()` (merge-ll.c:363-394, git v2.55.0), whose branch
+/// order this reproduces: `merge` set is text, `-merge` is binary, an unset
+/// attribute falls back to `merge.default` (and to text when that is unset), and
+/// any name left over is looked for among the `merge.<name>.driver` commands
+/// first and the three built-ins second, defaulting to text.
+fn driver_by_name(repo: &gix::Repository, name: &BStr) -> Driver {
+    // `for (fn = ll_user_merge; fn; fn = fn->next)` — a configured
+    // `merge.<name>.driver` wins over a built-in of the same name.
+    if repo
+        .config_snapshot()
+        .string(&format!("merge.{name}.driver"))
+        .is_some()
+    {
+        return Driver::External;
+    }
+    if name == "binary" {
+        Driver::Binary
+    } else {
+        // "text", "union" and every unknown name alike: `/* default to the
+        // 3-way */ return &ll_merge_drv[LL_TEXT_MERGE];`.
+        Driver::Text
+    }
 }
 
 /// The two command-line operands, and the tree of the first one — peeled at most
@@ -714,9 +801,9 @@ struct Operands<'r, 's> {
     label2: &'s str,
     operand1: Operand1<'s>,
     tree1: Option<gix::Tree<'r>>,
-    /// Whether `merge.default` names the built-in `binary` driver, which makes
-    /// every path without a `merge` attribute merge as if its content were binary.
-    default_driver_is_binary: bool,
+    /// The `merge` attribute lookup, built at most once and only when a content
+    /// conflict actually asks which driver ran.
+    merge_attr: Option<MergeAttribute<'r>>,
 }
 
 impl<'r, 's> Operands<'r, 's> {
@@ -726,8 +813,29 @@ impl<'r, 's> Operands<'r, 's> {
             label2,
             operand1,
             tree1: None,
-            default_driver_is_binary: false,
+            merge_attr: None,
         }
+    }
+
+    /// `find_ll_merge_driver(check->items[0].value)` for `path` — the driver
+    /// `ll_merge()` dispatches to (merge-ll.c:429-439, git v2.55.0).
+    fn driver_for(&mut self, repo: &'r gix::Repository, path: &BStr) -> Result<Driver> {
+        let attr = match &mut self.merge_attr {
+            Some(attr) => attr,
+            none => none.insert(MergeAttribute::new(repo)?),
+        };
+        Ok(match attr.state_at(path)? {
+            // `ATTR_TRUE(merge_attr)`.
+            gix::attrs::State::Set => Driver::Text,
+            // `ATTR_FALSE(merge_attr)`.
+            gix::attrs::State::Unset => Driver::Binary,
+            // `ATTR_UNSET(merge_attr)`: `merge.default`, or text when unset.
+            gix::attrs::State::Unspecified => match repo.config_snapshot().string("merge.default") {
+                Some(name) => driver_by_name(repo, name.as_ref()),
+                None => Driver::Text,
+            },
+            gix::attrs::State::Value(name) => driver_by_name(repo, name.as_ref().as_bstr()),
+        })
     }
 
     /// Whether operand 1's tree holds a **non-tree** entry at `path`.

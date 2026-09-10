@@ -920,16 +920,23 @@ fn parse_algorithm_value(value: &str) -> Option<Algorithm> {
     }
 }
 
-/// `parse_rename_score()` (diff.c): read `<num>[.<frac>][%]` and scale it onto
-/// git's `MAX_SCORE`. Returns the score and how many bytes were consumed, since
-/// the caller rejects trailing garbage.
-fn parse_rename_score(cp: &[u8]) -> (u32, usize) {
+/// `parse_rename_score()` (diff.c:6344-6377, v2.55.0): read `<num>[.<frac>][%]`
+/// and scale it onto git's `MAX_SCORE`. Returns the score and how many bytes
+/// were consumed, since the caller rejects trailing garbage.
+///
+/// The scale is a power of ten counted over **every** digit, which is what makes
+/// an unsuffixed number a fraction with the point in front of it: `40` is `.40`,
+/// `055` is `.055`, `100` is `.100`. A `.` restarts the count — `scale = 1` in
+/// the C's own `if ( !dot && ch == '.' )` arm — so the digits before the point
+/// stop counting and `0.6` is `.6`, not `.06`.
+pub(crate) fn parse_rename_score(cp: &[u8]) -> (u32, usize) {
     let (mut num, mut scale) = (0u64, 1u64);
     let mut dot = false;
     let mut at = 0usize;
     loop {
         match cp.get(at) {
             Some(b'.') if !dot => {
+                scale = 1;
                 at += 1;
                 dot = true;
             }

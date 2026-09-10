@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use bstr::BStr;
+use bstr::{BStr, BString};
 use gix_attributes::StateRef;
 use smallvec::SmallVec;
 
@@ -16,7 +16,12 @@ pub(crate) struct Configuration<'a> {
     pub(crate) _attr_digest: Option<eol::AttributesDigest>,
     /// The final digest that includes configuration values
     pub(crate) digest: eol::AttributesDigest,
-    pub(crate) encoding: Option<&'static encoding_rs::Encoding>,
+    /// The `working-tree-encoding` as spelled in the attribute, which is what git carries in
+    /// `conv_attrs::working_tree_encoding` and hands to `iconv` — a name, not a resolved encoding.
+    /// Resolving it here would lose the distinction between `UTF-16`, `UTF-16LE` and `UTF-16BE`,
+    /// which `encoding_rs` folds onto one value, and would turn a name the platform happens not to
+    /// have into a hard failure where git carries on.
+    pub(crate) encoding: Option<BString>,
     /// Whether or not to apply the `ident` filter
     pub(crate) apply_ident_filter: bool,
 }
@@ -37,24 +42,29 @@ impl<'driver> Configuration<'driver> {
             }
         }
 
+        /// This is `git_path_check_encoding()` in the git codebase — `convert.c:1251-1267`, v2.55.0.
+        ///
+        /// The value is kept as it was spelled and never resolved here: git only refuses the two
+        /// boolean forms and drops a name that already means UTF-8, then hands the rest to
+        /// `iconv_open()` at conversion time. Whether the platform has that encoding is not a
+        /// question the attribute lookup answers.
         fn extract_encoding(
             attr: &gix_attributes::search::Match<'_>,
-        ) -> Result<Option<&'static encoding_rs::Encoding>, configuration::Error> {
+        ) -> Result<Option<BString>, configuration::Error> {
             match attr.assignment.state {
                 StateRef::Set | StateRef::Unset => Err(configuration::Error::InvalidEncoding),
-                StateRef::Value(name) => encoding_rs::Encoding::for_label(name.as_bstr())
-                    .ok_or(configuration::Error::UnknownEncoding {
-                        name: name.as_bstr().to_owned(),
-                    })
-                    .map(|encoding| {
-                        // The working-tree-encoding is the encoding we have to expect in the working tree.
-                        // If the specified one is the default encoding, there is nothing to do.
-                        if encoding == encoding_rs::UTF_8 {
+                StateRef::Value(name) => {
+                    let name = name.as_bstr();
+                    // The working-tree-encoding is the encoding we have to expect in the working tree.
+                    // If the specified one is the default encoding, there is nothing to do.
+                    Ok(
+                        if name.is_empty() || crate::worktree::utf::same_encoding(name, "UTF-8") {
                             None
                         } else {
-                            Some(encoding)
-                        }
-                    }),
+                            Some(name.to_owned())
+                        },
+                    )
+                }
                 StateRef::Unspecified => Ok(None),
             }
         }

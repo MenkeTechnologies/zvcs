@@ -16,11 +16,11 @@ pub mod for_label {
 
 /// Try to produce a new `Encoding` for `label` or report an error if it is not known.
 ///
-/// ### Deviation
-///
-/// * There is no special handling of UTF-16LE/BE with checks if data contains a BOM or not, like `git` as we don't expect to have
-///   data available here.
-/// * Special `-BOM` suffixed versions of `UTF-16` encodings are not supported.
+/// This is the `encoding_rs` half of `working-tree-encoding` and answers for the legacy encodings
+/// only. The UTF-16 and UTF-32 family never reaches it: `encoding_rs` folds the byte-order variants
+/// onto one value, knows no `-BOM` suffixed label at all, and encodes the whole family as UTF-8, so
+/// [`worktree::utf`][crate::worktree::utf] carries those and the byte-order-mark rules that go with
+/// them, and both conversion directions consult it first.
 pub fn for_label<'a>(label: impl Into<&'a BStr>) -> Result<&'static Encoding, for_label::Error> {
     let mut label = label.into();
     if label == "latin-1" {

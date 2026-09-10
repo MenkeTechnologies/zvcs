@@ -1,6 +1,6 @@
 use std::{io::Read, path::Path};
 
-use bstr::BStr;
+use bstr::{BStr, ByteSlice};
 
 use crate::{Pipeline, driver, eol, ident, pipeline::util::Configuration, worktree};
 
@@ -130,18 +130,25 @@ impl Pipeline {
             in_src_buffer = true;
         }
 
-        if let Some(encoding) = encoding {
-            worktree::encode_to_git(
-                &self.bufs.src,
-                encoding,
-                &mut self.bufs.dest,
-                if self.options.encodings_with_roundtrip_check.contains(&encoding) {
+        if let Some(encoding) = &encoding {
+            // git's `check_roundtrip()` (convert.c:347-383) looks the name up in
+            // `core.checkRoundtripEncoding`; the list arrives here already resolved, so the name is
+            // resolved to meet it. A name `encoding_rs` cannot resolve is not in the list either.
+            let round_trip = match crate::worktree::encoding::for_label(encoding.as_bstr()) {
+                Ok(resolved) if self.options.encodings_with_roundtrip_check.contains(&resolved) => {
                     worktree::encode_to_git::RoundTripCheck::Fail
-                } else {
-                    worktree::encode_to_git::RoundTripCheck::Skip
-                },
-            )?;
-            self.bufs.swap();
+                }
+                _ => worktree::encode_to_git::RoundTripCheck::Skip,
+            };
+            if worktree::encode_to_git_by_name(
+                bstr_rela_path.as_ref(),
+                &self.bufs.src,
+                encoding.as_ref(),
+                &mut self.bufs.dest,
+                round_trip,
+            )? {
+                self.bufs.swap();
+            }
         }
 
         if eol::convert_to_git(
@@ -206,10 +213,11 @@ impl Pipeline {
             bufs.swap();
         }
 
-        if let Some(encoding) = encoding {
+        if let Some(encoding) = &encoding {
             let (src, dest) = bufs.src_and_dest();
-            worktree::encode_to_worktree(src, encoding, dest)?;
-            bufs.swap();
+            if worktree::encode_to_worktree_by_name(rela_path, src, encoding.as_ref(), dest) {
+                bufs.swap();
+            }
         }
 
         if let Some(driver) = driver {

@@ -67,25 +67,42 @@
 //!   * `--rewrite-submodules-from/-to=<name>:<file>` — the marks file is read
 //!     where git reads it, so a missing or corrupt one fails identically, but a
 //!     stream that actually carries a gitlink to rewrite is refused.
-//!   * `--export-pack-edges=<file>` — the file is created where git creates it
-//!     and a stream that would write objects is refused, because this port has
-//!     no packs and so no pack edges to record.
 //!   * `N` once a notes ref would exceed 255 notes, where git re-fans-out the
 //!     whole notes tree.
 //!
-//! Two deliberate substrate differences, neither of which changes the objects or
-//! refs a caller can observe: objects are written as loose objects rather than
-//! into a new packfile (git itself explodes small packs into loose objects below
-//! `fastimport.unpackLimit`, which defaults to 100, so the temporary packfile is
-//! opened and discarded exactly as git opens and discards it), and the
-//! `--stats` block —
-//! stderr only, and full of allocator and pack-window counters that have no
-//! equivalent here — is never printed. No crash report is dumped on a fatal
-//! error either; the `fast_import_crash_<pid>` file could never match anyway,
-//! and it lives inside `.git` where nothing observes it.
+//! Storage follows git's own rule rather than a fixed choice. `end_packfile()`
+//! keeps the pack it wrote and explodes it with `git unpack-objects` only when
+//! `object_count <= fastimport.unpackLimit` (100 by default, falling back to
+//! `transfer.unpackLimit`), so an import at or below the threshold ends as loose
+//! objects and one above it ends as `pack-<hash>.{pack,idx}` — and
+//! `--export-pack-edges=<file>` records one boundary line per pack *kept*, which
+//! is why a small import leaves the file it created empty. [`PackLog`] is that
+//! bookkeeping: which objects `store_object()` counted, and what
+//! [`PackLog::flush`] then does with them. Objects are written loose as the
+//! stream produces them either way, because the stream can read any of them back
+//! (`cat-blob`, `ls`, `from`) before a pack would exist; a run that keeps its
+//! pack unlinks the loose files it created once the pack is in place.
+//!
+//! What the pack does *not* reproduce is its own bytes. git deltifies each
+//! object against the immediately preceding one and cycles to a new pack when
+//! `--max-pack-size`/`pack.packSizeLimit` would be crossed
+//! (`store_object()` at `fast-import.c:1024-1030`); this port hands the object
+//! set to the same writer `pack-objects` uses, in one pack, with its own delta
+//! window. `--depth`, `--big-file-threshold`, `--active-branches` and
+//! `--max-pack-size` are therefore still validated the way git validates them
+//! and then left to steer nothing. The object set, the index and the refs are a
+//! function of the stream and are identical; the compression and the grouping
+//! are not.
+//!
+//! Two deliberate differences remain, neither of which changes the objects or
+//! refs a caller can observe: the `--stats` block — stderr only, and full of
+//! allocator and pack-window counters that have no equivalent here — is never
+//! printed, and no crash report is dumped on a fatal error, because the
+//! `fast_import_crash_<pid>` file could never match anyway and lives inside
+//! `.git` where nothing observes it.
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Read, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::ExitCode;
@@ -142,11 +159,14 @@ fn usage() -> anyhow::Error {
 ///     `dump_marks()` (`fast-import.c:441`). A run that stored nothing takes
 ///     `end_packfile`'s `discard_pack` branch — close, then
 ///     `unlink_or_warn(pack_data->pack_name)` (935-936).
-///   * A clean run reaches `end_packfile()` at 4025. This port writes loose
-///     objects instead of a pack, which is the state git itself ends in for any
-///     import at or below `fastimport.unpackLimit` (100 by default): there
-///     `end_packfile` explodes the pack with `unpack-objects` and jumps to that
-///     same `discard_pack`. So the temporary goes here too.
+///   * A clean run reaches `end_packfile()` at 4025, and the temporary is gone
+///     either way it goes: `discard_pack` unlinks it for a run that stored
+///     nothing or whose pack `loosen_small_pack()` exploded, and `keep_pack`
+///     renames it onto `pack-<hash>.pack` for a run above
+///     `fastimport.unpackLimit`. This port writes the kept pack under its own
+///     temporary in the same directory and renames that, so the one this struct
+///     tracks is unlinked on every route rather than renamed on one of them —
+///     the same absence, reached differently. See [`PackLog::flush`].
 ///
 /// It is left empty on the surviving route because the twelve bytes
 /// `write_pack_header` produces sit in the `hashfd` buffer until
@@ -183,6 +203,327 @@ impl TempPack {
         // `unlink_or_warn`: git does not treat a failure here as fatal.
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// git's packfile bookkeeping for one run: what `store_object()` has counted
+/// into the pack now being built, and which loose files this port created on the
+/// way there.
+///
+/// `store_object()` (`builtin/fast-import.c:955-1094`) hashes the object, looks
+/// it up in a run-wide table, and stores it only when that table holds no offset
+/// for it *and* no packfile already in the object store has it:
+///
+/// ```c
+/// e = insert_object(&oid);
+/// if (mark) insert_mark(&marks, mark, e);
+/// if (e->idx.offset) { duplicate_count_by_type[type]++; return 1; }
+///
+/// for (source = the_repository->objects->sources; source; source = source->next) {
+///         struct odb_source_files *files = odb_source_files_downcast(source);
+///         if (!packfile_list_find_oid(packfile_store_get_packs(files->packed), &oid))
+///                 continue;
+///         e->type = type;
+///         e->pack_id = MAX_PACK_ID;
+///         e->idx.offset = 1; /* just not zero! */
+///         duplicate_count_by_type[type]++;
+///         return 1;
+/// }
+/// ```
+///
+/// A *loose* copy is deliberately not consulted, so an object the repository
+/// already holds loose is stored into the pack a second time and counted.
+/// `object_count` is therefore not the number of objects the import added to the
+/// store, which is exactly the distinction `fastimport.unpackLimit` is compared
+/// against.
+///
+/// This port writes every object loose as it goes, because the stream can read
+/// any of them back before the pack would exist — `cat-blob`, `ls`, `from`, and
+/// the tree a later commit starts from all go through the object database.
+/// [`PackLog::flush`] is then `end_packfile()`: it decides which of the two
+/// shapes git would have left behind and makes the store match it.
+struct PackLog {
+    /// git's `insert_object()` table, reduced to the one bit `store_object()`
+    /// reads out of it — whether `e->idx.offset` is already set.
+    seen: HashSet<ObjectId>,
+    /// The objects of the pack now being built, in the order they were stored.
+    /// `object_count` is its length.
+    ids: Vec<ObjectId>,
+    /// Objects this run wrote as loose files that were not there before it ran.
+    /// git put them in a packfile instead, so a run that keeps its pack unlinks
+    /// them again.
+    created: Vec<ObjectId>,
+    /// The pack indices the object store held when the run opened, standing in
+    /// for `packfile_list_find_oid` above. Loaded once: a pack this run writes
+    /// can only hold objects already in [`PackLog::seen`], which short-circuits
+    /// ahead of this check exactly as git's table does.
+    packed: Vec<gix::odb::pack::index::File>,
+    /// The primary object directory, which is where the loose files are.
+    objdir: std::path::PathBuf,
+    /// `fastimport.unpackLimit`, else `transfer.unpackLimit`, else git's 100.
+    /// Signed and uncorrected, because `object_count <= unpack_limit` with a
+    /// negative limit keeps every pack.
+    unpack_limit: i64,
+    /// `pack.indexVersion`, which `git_pack_config()` reads into
+    /// `pack_idx_opts.version` for `write_idx_file()`.
+    index_version: u64,
+    /// `--export-pack-edges=<file>`, already open in append mode. One line is
+    /// written per pack *kept*, which is why a run whose objects all fit under
+    /// `unpack_limit` leaves the file empty.
+    edges: Option<std::path::PathBuf>,
+}
+
+impl PackLog {
+    /// Take the object store as `start_packfile()` finds it.
+    fn new(repo: &gix::Repository) -> PackLog {
+        use gix::odb::store::structure::Record;
+        let hash = repo.object_hash();
+        let mut packed = Vec::new();
+        if let Ok(records) = repo.objects.store_ref().structure() {
+            for record in records {
+                let Record::Index { path, .. } = record else { continue };
+                if let Ok(idx) = gix::odb::pack::index::File::at(&path, hash) {
+                    packed.push(idx);
+                }
+            }
+        }
+        PackLog {
+            seen: HashSet::new(),
+            ids: Vec::new(),
+            created: Vec::new(),
+            packed,
+            objdir: repo.objects.store_ref().path().to_path_buf(),
+            unpack_limit: 100,
+            index_version: 2,
+            edges: None,
+        }
+    }
+
+    /// `git_pack_config()` (`builtin/fast-import.c:3869-3893`): the two config
+    /// keys that reach a pack this port can actually produce.
+    ///
+    /// ```c
+    /// if (!repo_config_get_int(the_repository, "pack.indexversion", &indexversion_value)) {
+    ///         pack_idx_opts.version = indexversion_value;
+    ///         …
+    /// }
+    /// if (!repo_config_get_int(the_repository, "fastimport.unpacklimit", &limit))
+    ///         unpack_limit = limit;
+    /// else if (!repo_config_get_int(the_repository, "transfer.unpacklimit", &limit))
+    ///         unpack_limit = limit;
+    /// ```
+    ///
+    /// `pack.depth` and `pack.packSizeLimit` are read there too and steer the
+    /// delta window and the pack-cycling threshold; see the module header for
+    /// why neither is reproduced.
+    fn configure(&mut self, repo: &gix::Repository) {
+        let config = repo.config_snapshot();
+        self.unpack_limit = config
+            .integer("fastimport.unpackLimit")
+            .or_else(|| config.integer("transfer.unpackLimit"))
+            .unwrap_or(100);
+        // git rejects a version above 2 through `git_die_config`; 1 and 2 are the
+        // two `write_idx_file()` can write and the two [`index_file`] emits.
+        self.index_version = match config.integer("pack.indexVersion") {
+            Some(1) => 1,
+            _ => 2,
+        };
+    }
+
+    /// The loose path `<objdir>/ab/cdef…` an object would be written to.
+    fn loose_path(&self, id: &ObjectId) -> std::path::PathBuf {
+        let hex = id.to_string();
+        self.objdir.join(&hex[..2]).join(&hex[2..])
+    }
+
+    /// `store_object()`: hash the object, decide whether git would have counted
+    /// it into the pack, and write it.
+    ///
+    /// The write happens either way — a duplicate is already in the store, so
+    /// `write_buf` is a no-op for it — and only the bookkeeping differs.
+    ///
+    /// The second half of the return is git's `!store_object()`: whether this
+    /// object was *newly stored into the current pack*, which is what
+    /// `parse_new_commit` and `parse_new_tag` set `b->pack_id` / `t->pack_id`
+    /// from (3101, 3272-3274) and therefore what `--export-pack-edges` names.
+    fn store(&mut self, repo: &gix::Repository, kind: Kind, data: &[u8]) -> Result<(ObjectId, bool)> {
+        let id = gix::objs::compute_hash(repo.object_hash(), kind, data)?;
+        let fresh = self.seen.insert(id);
+        // Probed before the write, because that is the only moment the answer is
+        // still "was it there before this run put it there".
+        let loose = self.loose_path(&id);
+        let existed = loose.exists();
+
+        let written = repo.write_buf(kind, data).map_err(to_anyhow)?;
+        debug_assert_eq!(written, id);
+
+        if !existed && loose.exists() {
+            self.created.push(id);
+        }
+        let stored = fresh && !self.packed.iter().any(|idx| idx.lookup(id).is_some());
+        if stored {
+            self.ids.push(id);
+        }
+        Ok((id, stored))
+    }
+
+    /// `end_packfile()` (`builtin/fast-import.c:870-945`) for the pack the log
+    /// has accumulated.
+    ///
+    /// ```c
+    /// if (object_count) {
+    ///         …
+    ///         if (object_count <= unpack_limit) {
+    ///                 if (!loosen_small_pack(pack_data)) {
+    ///                         invalidate_pack_id(pack_id);
+    ///                         goto discard_pack;
+    ///                 }
+    ///         }
+    ///         close(pack_data->pack_fd);
+    ///         idx_name = keep_pack(create_index());
+    ///         …
+    ///         pack_id++;
+    /// } else {
+    /// discard_pack:
+    ///         close(pack_data->pack_fd);
+    ///         unlink_or_warn(pack_data->pack_name);
+    /// }
+    /// ```
+    ///
+    /// Three outcomes, and this port reaches all three:
+    ///
+    ///   * **Nothing stored.** The temporary is unlinked and the object store is
+    ///     untouched. There is nothing to undo here either.
+    ///   * **At or below `unpack_limit`.** `loosen_small_pack()` pipes the pack
+    ///     through `git unpack-objects` and then discards it, which leaves
+    ///     precisely the loose objects this port has already written.
+    ///   * **Above it.** The pack is kept and git wrote no loose copy of
+    ///     anything in it, so the loose files *this run* created are unlinked
+    ///     once the pack is in place. Loose objects that were already there stay
+    ///     — git never touched them, and the packed copy sits beside them.
+    ///
+    /// `keep_pack()` also writes a `pack-<hash>.keep` beside the pack, and
+    /// `cmd_fast_import` removes every one of them with `unkeep_all_packs()`
+    /// before it returns (`builtin/fast-import.c:4028`). The file exists only for
+    /// the width of the run, so it is not reproduced.
+    /// Returns the `.pack` just installed, for the caller's `--export-pack-edges`
+    /// line, or `None` when the pack was discarded.
+    fn flush(&mut self, repo: &gix::Repository) -> Result<Option<std::path::PathBuf>> {
+        let ids = std::mem::take(&mut self.ids);
+        let created = std::mem::take(&mut self.created);
+        if ids.is_empty() || ids.len() as i64 <= self.unpack_limit {
+            return Ok(None);
+        }
+
+        // fast-import's own deltas are `OBJ_OFS_DELTA` (`store_object()` at
+        // 1092), so the pack written here names its bases the same way. The
+        // *choice* of base is this port's delta search rather than git's
+        // last-object window; the pack's object set and its index are what a
+        // reader sees, and both are a function of the stream.
+        let packed = super::pack_objects::packed_for(
+            repo,
+            &ids,
+            super::pack_objects::WriteOptions {
+                allow_ofs_delta: true,
+                ..super::pack_objects::WriteOptions::default()
+            },
+        )?;
+
+        let dir = self.objdir.join("pack");
+        std::fs::create_dir_all(&dir)?;
+        let base = dir.join(format!("pack-{}", packed.id));
+        // Both companions index into the pack in object-id order, which is the
+        // order `write_idx_file()` sorts `create_index()`'s table into.
+        let mut by_oid = packed.entries.clone();
+        by_oid.sort_unstable_by_key(|entry| entry.id);
+        let index = super::pack_objects::index_file(
+            repo.object_hash(),
+            self.index_version,
+            &packed.id,
+            &by_oid,
+        )?;
+        let pack = base.with_extension("pack");
+        install_pack_file(&dir, &pack, &packed.bytes)?;
+        install_pack_file(&dir, &base.with_extension("idx"), &index)?;
+
+        for id in &created {
+            let loose = self.loose_path(id);
+            let _ = std::fs::remove_file(&loose);
+            // The fan-out directory this run created along with it. `remove_dir`
+            // declines while anything else lives there, which is the guard.
+            if let Some(parent) = loose.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+
+        // The pack a later `store()` must not store into again. git gets this
+        // from `packfile_store_load_pack()` registering the kept pack, though its
+        // object table short-circuits ahead of the lookup either way.
+        if let Ok(idx) =
+            gix::odb::pack::index::File::at(base.with_extension("idx"), repo.object_hash())
+        {
+            self.packed.push(idx);
+        }
+        Ok(Some(pack))
+    }
+
+    /// The `--export-pack-edges` line for a pack just kept.
+    ///
+    /// ```c
+    /// if (pack_edges) {
+    ///         fprintf(pack_edges, "%s:", new_p->pack_name);
+    ///         for (i = 0; i < branch_table_sz; i++)
+    ///                 for (b = branch_table[i]; b; b = b->table_next_branch)
+    ///                         if (b->pack_id == pack_id)
+    ///                                 fprintf(pack_edges, " %s", oid_to_hex(&b->oid));
+    ///         for (t = first_tag; t; t = t->next_tag)
+    ///                 if (t->pack_id == pack_id)
+    ///                         fprintf(pack_edges, " %s", oid_to_hex(&t->oid));
+    ///         fputc('\n', pack_edges);
+    ///         fflush(pack_edges);
+    /// }
+    /// ```
+    ///
+    /// (`builtin/fast-import.c:913-928`.) A branch or tag carries the current
+    /// `pack_id` only when its own commit or tag object was *newly stored*
+    /// (3101, 3272-3274), so a tip the pack did not write is not named. The
+    /// branches come out of git's hash table in bucket order, which is a function
+    /// of the ref names rather than of the stream; here they are in the order the
+    /// stream named them.
+    fn write_edges(&self, pack: &std::path::Path, tips: &[ObjectId]) -> Result<()> {
+        let Some(path) = &self.edges else { return Ok(()) };
+        // `odb_pack_name()` builds the name onto the object directory as
+        // `setup.c` recorded it, which is `.git/objects` for a discovery that
+        // started in the worktree root. gitoxide records the same directory with
+        // a leading `./`, and that one component is the whole difference between
+        // the two lines.
+        let shown = pack.strip_prefix("./").unwrap_or(pack);
+        let mut line = shown.display().to_string();
+        line.push(':');
+        for id in tips {
+            line.push(' ');
+            line.push_str(&id.to_string());
+        }
+        line.push('\n');
+        let mut file = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
+        file.write_all(line.as_bytes())?;
+        Ok(())
+    }
+}
+
+/// git's `finalize_object_file()`: put one pack artifact in place read-only, by
+/// rename, so a name that already exists is replaced rather than written into.
+///
+/// The mode is why the rename matters — a pack whose object set has not changed
+/// hashes to the name it already carries, and writing straight at that path
+/// would land on the 0444 file the last run left.
+fn install_pack_file(dir: &std::path::Path, to: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let tmp = dir.join(format!("tmp_pack_{}", crate::porcelain::index_pack::mkstemp_suffix()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444))?;
+    std::fs::rename(&tmp, to).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
 }
 
 /// Which `--date-format` the stream uses.
@@ -263,9 +604,6 @@ struct Opts {
     cat_blob_fd: Option<i32>,
     signed_commits: SignedMode,
     signed_tags: SignedMode,
-    /// `--export-pack-edges=<file>`, kept only so a run that would actually have
-    /// pack edges to report can refuse instead of leaving the file empty.
-    export_pack_edges: Option<String>,
     /// True once an `--import-marks` file has been named and not yet read. git's
     /// `dump_marks` refuses to write while this is outstanding, so a fatal
     /// before the read leaves the export file untouched.
@@ -285,7 +623,6 @@ impl Opts {
             cat_blob_fd: None,
             signed_commits: SignedMode::Verbatim,
             signed_tags: SignedMode::Verbatim,
-            export_pack_edges: None,
             import_marks_pending: false,
         }
     }
@@ -303,6 +640,11 @@ struct Branch {
     delete: bool,
     /// Notes counted in `tree`, used to pick the notes fanout.
     notes: u64,
+    /// git's `b->pack_id == pack_id`: whether the commit object this branch now
+    /// points at was newly stored into the pack currently being built. Only such
+    /// a tip is named on a `--export-pack-edges` line, and it is never cleared by
+    /// a later duplicate commit — git only ever assigns it (3101).
+    packed: bool,
 }
 
 /// One entry in an in-memory tree: a blob/symlink/gitlink, or a sub-directory.
@@ -363,7 +705,15 @@ fn run(args: &[String]) -> Result<ExitCode> {
     // writing porcelain does, so concurrent zvcs writers queue instead of racing.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    // `reset_pack_idx_option(&pack_idx_opts); git_pack_config();` open
+    // `cmd_fast_import` (`builtin/fast-import.c:3942-3943`), before argv and
+    // before the stream, so `fastimport.unpackLimit` is settled by the time the
+    // first object is stored.
+    let mut pack = PackLog::new(&repo);
+    pack.configure(&repo);
+
     let mut imp = Importer {
+        pack,
         repo,
         opts: Opts::new(),
         marks: HashMap::new(),
@@ -394,6 +744,14 @@ fn run(args: &[String]) -> Result<ExitCode> {
         }
         Err(e) => {
             pack.end();
+            // `die_nicely`: `end_packfile(); unkeep_all_packs(); dump_marks();`
+            // (builtin/fast-import.c:441-443), in that order — so a run that
+            // stored more than `fastimport.unpackLimit` objects and *then* died
+            // still leaves them packed rather than loose. A failure to write the
+            // pack here is dropped: git is already on its way out with the
+            // caller's error, and `unlink_or_warn`/`die_errno` inside
+            // `end_packfile` cannot replace it.
+            let _ = imp.end_packfile();
             imp.dump_marks_on_fatal();
             Err(e)
         }
@@ -583,8 +941,13 @@ struct Importer {
     /// Branches in the order the stream first named them.
     branches: Vec<Branch>,
     by_name: HashMap<String, usize>,
-    /// `(<tag name>, <object id>)`, in stream order; written under `refs/tags/`.
-    tags: Vec<(String, ObjectId)>,
+    /// `(<tag name>, <object id>, <newly stored into the current pack>)`, in
+    /// stream order; written under `refs/tags/`. The third field is git's
+    /// `t->pack_id == pack_id` and only decides `--export-pack-edges`.
+    tags: Vec<(String, ObjectId, bool)>,
+    /// git's pack: what `store_object()` counted, and what `end_packfile()` then
+    /// does with it.
+    pack: PackLog,
     /// Set when a ref update was declined; makes the process exit 1.
     failed: bool,
     /// Whether a command other than `feature`/`option` has been seen, which is
@@ -699,11 +1062,18 @@ impl Importer {
                 }
                 _ if starts(a, "--export-pack-edges=") => {
                     let path = &a["--export-pack-edges=".len()..];
-                    // git opens the file the moment it parses the option, which
-                    // is why it exists even when the run dies further along.
-                    std::fs::File::create(path)
+                    // `option_export_pack_edges`: `pack_edges = xfopen(fn, "a")`
+                    // (builtin/fast-import.c:3724). Opened the moment the option
+                    // is parsed — which is why it exists even when the run dies
+                    // further along — and in *append* mode, so a second run adds
+                    // its boundaries below the first's rather than replacing
+                    // them.
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(path)
                         .with_context(|| format!("Cannot open '{path}'"))?;
-                    self.opts.export_pack_edges = Some(path.to_string());
+                    self.pack.edges = Some(std::path::PathBuf::from(path));
                 }
                 _ => bail!("unknown option {a}"),
             }
@@ -734,20 +1104,30 @@ impl Importer {
         let _ = self.export_marks();
     }
 
-    /// Refuse a stream that writes objects while `--export-pack-edges` is set.
+    /// `end_packfile()`: close the pack the log has accumulated, and record its
+    /// boundary when `--export-pack-edges` asked for one.
     ///
-    /// git names one pack boundary per pack it produced; this port writes loose
-    /// objects, so it would leave the file git created empty. An empty edges file
-    /// reads as "the import produced no packs", which is a wrong answer that
-    /// looks like a right one, so the run stops instead.
-    fn check_pack_edges(&self) -> Result<()> {
-        match &self.opts.export_pack_edges {
-            None => Ok(()),
-            Some(path) => bail!(
-                "unsupported flag \"--export-pack-edges={path}\" for a stream that writes \
-                 objects (this port writes loose objects, so there are no pack edges to report)"
-            ),
+    /// The tips are collected here rather than in [`PackLog`] because they are
+    /// branch and tag state: git reads `b->pack_id`/`t->pack_id` out of the
+    /// branch table and the tag list at exactly this point (`913-927`).
+    fn end_packfile(&mut self) -> Result<()> {
+        let Some(pack) = self.pack.flush(&self.repo)? else {
+            // Nothing kept — `discard_pack`, or a pack `loosen_small_pack()`
+            // exploded. Either way there is no boundary to name.
+            return Ok(());
+        };
+        let mut tips: Vec<ObjectId> = Vec::new();
+        for branch in &mut self.branches {
+            if std::mem::take(&mut branch.packed) {
+                tips.extend(branch.head);
+            }
         }
+        for (_, id, packed) in &mut self.tags {
+            if std::mem::take(packed) {
+                tips.push(*id);
+            }
+        }
+        self.pack.write_edges(&pack, &tips)
     }
 
     /// Read commands until `done` or EOF. Returns whether `done` ended the stream.
@@ -756,16 +1136,13 @@ impl Importer {
             let cmd = line.as_slice();
             if cmd == b"blob" {
                 self.seen_data_command = true;
-                self.check_pack_edges()?;
                 self.parse_blob(input)?;
             } else if let Some(v) = after(cmd, b"commit ") {
                 self.seen_data_command = true;
-                self.check_pack_edges()?;
                 let name = utf8(v, "ref name")?;
                 self.parse_commit(input, &name)?;
             } else if let Some(v) = after(cmd, b"tag ") {
                 self.seen_data_command = true;
-                self.check_pack_edges()?;
                 let name = utf8(v, "tag name")?;
                 self.parse_tag(input, &name)?;
             } else if let Some(v) = after(cmd, b"reset ") {
@@ -826,7 +1203,7 @@ impl Importer {
             crate::git_fatal!("expected 'data n' command");
         };
         let payload = input.data(&spec)?;
-        let id = self.repo.write_blob(&payload)?.detach();
+        let id = self.pack.store(&self.repo, Kind::Blob, &payload)?.0;
         if let Some(m) = mark {
             self.marks.insert(m, id);
         }
@@ -956,7 +1333,7 @@ impl Importer {
             line = input.command()?;
         }
 
-        let tree = write_dir(&self.repo, &self.branches[idx].tree)?;
+        let tree = write_dir(&self.repo, &mut self.pack, &self.branches[idx].tree)?;
         let mut buf = Vec::new();
         buf.extend_from_slice(format!("tree {tree}\n").as_bytes());
         for p in &parents {
@@ -992,9 +1369,14 @@ impl Importer {
         buf.push(b'\n');
         buf.extend_from_slice(&message);
 
-        let id = self.repo.write_buf(Kind::Commit, &buf).map_err(to_anyhow)?;
+        // `if (!store_object(OBJ_COMMIT, &new_data, NULL, &b->oid, next_mark))
+        //          b->pack_id = pack_id;` (builtin/fast-import.c:3100-3101).
+        let (id, stored) = self.pack.store(&self.repo, Kind::Commit, &buf)?;
         self.branches[idx].head = Some(id);
         self.branches[idx].delete = false;
+        if stored {
+            self.branches[idx].packed = true;
+        }
         if let Some(m) = mark {
             self.marks.insert(m, id);
         }
@@ -1063,8 +1445,10 @@ impl Importer {
         buf.push(b'\n');
         buf.extend_from_slice(&message);
 
-        let id = self.repo.write_buf(Kind::Tag, &buf).map_err(to_anyhow)?;
-        self.tags.push((name.to_string(), id));
+        // `if (store_object(OBJ_TAG, …)) t->pack_id = MAX_PACK_ID; else
+        //  t->pack_id = pack_id;` (builtin/fast-import.c:3272-3275).
+        let (id, stored) = self.pack.store(&self.repo, Kind::Tag, &buf)?;
+        self.tags.push((name.to_string(), id, stored));
         if let Some(m) = mark {
             self.marks.insert(m, id);
         }
@@ -1186,7 +1570,7 @@ impl Importer {
             if mode == 0o160000 {
                 crate::git_fatal!("Git links cannot be specified 'inline'");
             }
-            (self.repo.write_blob(&payload)?.detach(), path)
+            (self.pack.store(&self.repo, Kind::Blob, &payload)?.0, path)
         } else {
             let (dataref, rest) = split_space(rest)
                 .ok_or_else(|| anyhow!("Missing space after SHA1: M {}", String::from_utf8_lossy(rest)))?;
@@ -1271,7 +1655,7 @@ impl Importer {
                 crate::git_fatal!("expected 'data n' command");
             };
             let payload = input.data(&spec)?;
-            (self.repo.write_blob(&payload)?.detach(), target)
+            (self.pack.store(&self.repo, Kind::Blob, &payload)?.0, target)
         } else {
             let (dataref, target) =
                 split_space(rest).ok_or_else(|| anyhow!("Missing space after SHA1"))?;
@@ -1338,7 +1722,7 @@ impl Importer {
         };
 
         let line = if path.is_empty() {
-            let oid = write_dir(&self.repo, &root)?;
+            let oid = write_dir(&self.repo, &mut self.pack, &root)?;
             let mut l = format!("040000 tree {oid}\t").into_bytes();
             l.push(b'\n');
             l
@@ -1358,7 +1742,7 @@ impl Importer {
                     l
                 }
                 Some(Node::Dir(d)) => {
-                    let oid = write_dir(&self.repo, d)?;
+                    let oid = write_dir(&self.repo, &mut self.pack, d)?;
                     let mut l = format!("040000 tree {oid}\t").into_bytes();
                     l.extend_from_slice(&path);
                     l.push(b'\n');
@@ -1407,6 +1791,7 @@ impl Importer {
             tree: Dir::default(),
             delete: false,
             notes: 0,
+            packed: false,
         });
         self.by_name.insert(name.to_string(), idx);
         Ok(idx)
@@ -1624,13 +2009,29 @@ impl Importer {
         std::fs::write(&full, out).with_context(|| format!("cannot write {}", full.display()))
     }
 
-    /// Flush every pending ref update and the marks file — `checkpoint`, and the
-    /// end of the stream.
+    /// Flush the packfile, every pending ref update and the marks file —
+    /// `checkpoint`, and the end of the stream.
+    ///
+    /// ```c
+    /// static void checkpoint(void) {
+    ///         checkpoint_requested = 0;
+    ///         if (object_count) cycle_packfile();
+    ///         dump_branches();
+    ///         dump_tags();
+    ///         dump_marks();
+    /// }
+    /// ```
+    ///
+    /// (`builtin/fast-import.c:3598-3606`; the end of `cmd_fast_import` is the
+    /// same sequence with a bare `end_packfile()` in place of the cycle, 4025.)
+    /// The pack goes first, so `--export-pack-edges` names the tips of the pack
+    /// that just closed rather than of the one the next command opens.
     fn checkpoint(&mut self) -> Result<()> {
+        self.end_packfile()?;
         for i in 0..self.branches.len() {
             self.update_branch(i)?;
         }
-        for (name, id) in std::mem::take(&mut self.tags) {
+        for (name, id, _) in std::mem::take(&mut self.tags) {
             let full = format!("refs/tags/{name}");
             let old = self.current(&full)?;
             self.write_ref(&full, id, old)?;
@@ -2009,13 +2410,13 @@ fn load_dir(repo: &gix::Repository, oid: ObjectId) -> Result<Dir> {
 /// Serialize the model back into tree objects, skipping directories that ended
 /// up empty — git never records an empty tree as an entry, which is what makes a
 /// delete cascade up through its now-empty parents.
-fn write_dir(repo: &gix::Repository, dir: &Dir) -> Result<ObjectId> {
+fn write_dir(repo: &gix::Repository, pack: &mut PackLog, dir: &Dir) -> Result<ObjectId> {
     let mut items: Vec<(&[u8], u32, ObjectId)> = Vec::new();
     for (name, node) in &dir.entries {
         match node {
             Node::Leaf { mode, oid } => items.push((name.as_slice(), *mode, *oid)),
             Node::Dir(sub) => {
-                let oid = write_dir(repo, sub)?;
+                let oid = write_dir(repo, pack, sub)?;
                 if oid == ObjectId::empty_tree(repo.object_hash()) {
                     continue;
                 }
@@ -2032,7 +2433,9 @@ fn write_dir(repo: &gix::Repository, dir: &Dir) -> Result<ObjectId> {
         buf.push(0);
         buf.extend_from_slice(oid.as_slice());
     }
-    repo.write_buf(Kind::Tree, &buf).map_err(to_anyhow)
+    // `store_tree()` ends in `store_object(OBJ_TREE, …)` like every other object
+    // the stream produces, so a tree counts toward `object_count` too.
+    Ok(pack.store(repo, Kind::Tree, &buf)?.0)
 }
 
 /// Find the node at `path`, or `None` when nothing lives there.

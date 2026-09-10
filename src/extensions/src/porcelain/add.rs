@@ -765,6 +765,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         walked.push(item?.entry);
     }
     walked.sort_by_key(|e| staging_order(existing.contains(&e.rela_path), &e.rela_path));
+    // The names the walk actually reached, whatever it went on to decide about
+    // them. An index entry missing from this set was never offered to the loop
+    // below at all, which is the gap the index-driven pass after it closes.
+    let walk_seen: HashSet<BString> = walked.iter().map(|e| e.rela_path.clone()).collect();
 
     for entry in walked {
         let path = entry.rela_path;
@@ -984,6 +988,134 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         pathspec.is_included(p, Some(false))
     }) {
         staged.push(Staged { path, id, mode: Mode::COMMIT, stat, was_tracked: true });
+    }
+    let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
+
+    // --- the index-driven half of `add_files_to_cache()` --------------------
+    // git takes tracked MODIFICATIONS from `add_files_to_cache()`
+    // (builtin/add.c:590), which is a `run_diff_files()` over the *index*
+    // (read-cache.c:4046 → diff-lib.c:127-293), and takes only the brand-new
+    // paths from the directory walk that `add_files()` consumes
+    // (builtin/add.c:599). The walk above stands in for both halves, and that
+    // holds for exactly as long as the name on disk and the name in the index
+    // are the same bytes.
+    //
+    // When they are not, the entry is never visited and its modification is
+    // never staged. On macOS an index written with `core.precomposeunicode=true`
+    // records the NFC spelling of a path the filesystem holds in NFD, so
+    // `-c core.precomposeunicode=false add -A` walks up the NFD name alone and
+    // leaves the NFC entry sitting at its old blob where git restages it. APFS
+    // resolves either spelling to the same file, so the entry's own name still
+    // `lstat`s — which is all `run_diff_files()` ever asks of it.
+    //
+    // So: every matched stage-0 entry the walk did not emit, in index order,
+    // through the gates `run_diff_files()` applies.
+    //
+    // `--refresh` (`goto finish`, builtin/add.c:516-519) and `--renormalize`
+    // (`renormalize_tracked_files()` runs *instead of* it, builtin/add.c:587-588)
+    // never reach `add_files_to_cache()` at all, so neither reaches this pass.
+    if !refresh && !renormalize {
+        let backing = index.path_backing();
+        for e in index.entries() {
+            // A gitlink is the pass just above; a conflicted path has no stage-0
+            // stat to compare and is `diff_unmerge()`'s, which the walk covers.
+            if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {
+                continue;
+            }
+            let path = e.path_in(backing).to_owned();
+            if walk_seen.contains(&path) || staged_set.contains(&path) {
+                continue;
+            }
+            // `ce_uptodate(ce) || ce_skip_worktree(ce)` (diff-lib.c:229) and the
+            // `CE_VALID` short-circuit (diff-lib.c:246-248) both leave the entry
+            // alone without stat'ing anything.
+            if e.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID) {
+                continue;
+            }
+            // `ce_path_match()` (diff-lib.c:147).
+            if !pathspec.is_included(path.as_bstr(), Some(false)) {
+                continue;
+            }
+            // `update_callback()`'s sparse guard (read-cache.c:3979-3981): a path
+            // the definition leaves out is skipped without a word, unlike the
+            // untracked ones `add_files()` collects and names.
+            if outside_sparse(&path) {
+                continue;
+            }
+            let Some(abs) = repo.workdir_path(&path) else { continue };
+            // `check_removed()` (diff-lib.c:50-54): a file that is gone is the
+            // DELETED arm, which the deletions pass below owns. A blob whose path
+            // is now a directory is deleted too (diff-lib.c:58-76), never a
+            // modification.
+            let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&abs) else {
+                continue;
+            };
+            if !(md.is_file() || md.is_symlink()) {
+                continue;
+            }
+            let stat_now = Stat::from_fs(&md)?;
+            // `ie_match_stat()` under `CE_MATCH_RACY_IS_DIRTY` (diff-lib.c:271):
+            // the same stat gate the walk applies to its own tracked paths.
+            if !racily_clean.contains(&path) && e.stat.matches(&stat_now, stat_match) {
+                continue;
+            }
+
+            // `add_to_index()`'s `intent_only` arm reads nothing and hashes
+            // nothing; see the walk's copy of this above.
+            if intent_to_add {
+                indexed_any = true;
+                staged.push(Staged {
+                    path,
+                    id: repo.object_hash().empty_blob(),
+                    mode: super::stage::mode_from_metadata(&md),
+                    stat: stat_now,
+                    was_tracked: true,
+                });
+                continue;
+            }
+
+            // The walk's own read, verbatim: a symlink's target is stored as it
+            // stands, a regular file goes through the `convert_to_git()` pipeline
+            // (and so can raise `core.safecrlf`'s refusal).
+            let (bytes, mode) = if md.is_symlink() {
+                let target = match std::fs::read_link(&abs) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        read_errors.push((path, os_err_message(&e), true));
+                        continue;
+                    }
+                };
+                #[cfg(unix)]
+                let bytes = {
+                    use std::os::unix::ffi::OsStrExt;
+                    target.as_os_str().as_bytes().to_vec()
+                };
+                #[cfg(not(unix))]
+                let bytes = target.to_string_lossy().into_owned().into_bytes();
+                (bytes, Mode::SYMLINK)
+            } else {
+                let bytes = match std::fs::read(&abs) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        read_errors.push((path, os_err_message(&e), true));
+                        continue;
+                    }
+                };
+                let mode = if md.is_executable() { Mode::FILE_EXECUTABLE } else { Mode::FILE };
+                let rela = gix::path::from_bstr(path.as_bstr()).into_owned();
+                let bytes = match filters.convert(&repo, &rela, &bytes) {
+                    Ok(converted) => converted,
+                    Err(err) => {
+                        eprintln!("fatal: {err}");
+                        return Ok(ExitCode::from(128));
+                    }
+                };
+                (bytes, mode)
+            };
+            indexed_any = true;
+            let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;
+            staged.push(Staged { path, id, mode, stat: stat_now, was_tracked: true });
+        }
     }
     let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
 

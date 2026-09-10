@@ -1254,6 +1254,14 @@ fn status_report(
         }
     }
 
+    // `repo_update_index_if_able(the_repository, &index_lock)` (builtin/commit.c:1658),
+    // between `wt_status_collect()` and the first line of the report. Only
+    // `cmd_status` runs it — `cmd_commit`'s `run_status()` calls do not, and neither
+    // does the block that goes into `COMMIT_EDITMSG`.
+    if reference == Reference::Status && template.is_none() {
+        update_index_if_able(&repo)?;
+    }
+
     // git orders each section (and each short-format block) by path.
     staged.sort_by(|a, b| a.1.cmp(&b.1));
     unstaged.sort_by(|a, b| a.1.cmp(&b.1));
@@ -1397,6 +1405,129 @@ fn status_report(
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `repo_update_index_if_able()` (read-cache.c:2748-2757), the write `cmd_status`
+/// makes on its way out:
+///
+/// ```c
+/// void repo_update_index_if_able(struct repository *repo,
+///                                struct lock_file *lockfile)
+/// {
+///         if ((repo->index->cache_changed ||
+///              has_racy_timestamp(repo->index)) &&
+///             repo_verify_index(repo))
+///                 write_locked_index(repo->index, lockfile, COMMIT_LOCK);
+///         else
+///                 rollback_lock_file(lockfile);
+/// }
+/// ```
+///
+/// `git status` is a read-only report only in what it prints. It takes the index
+/// lock before collecting (builtin/commit.c:1634-1637) and, unless
+/// `GIT_OPTIONAL_LOCKS` turned that off, hands the index back through
+/// `write_locked_index()` — no `SKIP_IF_UNCHANGED` — whenever either half of the
+/// condition holds. That write is what settles two things a report cannot express:
+///
+///   * the racy-clean entries. `has_racy_timestamp()` is true whenever any entry's
+///     recorded mtime is not strictly older than the index's own, which is the
+///     ordinary state of a repository whose files and index were written in the
+///     same second. `do_write_index()` then smudges each one
+///     ([`crate::index_racy::smudge_racily_clean`]), so the next command does not
+///     have to re-read its content to know it is clean.
+///   * the shape of the index. `tweak_split_index()` (read-cache.c:1932-1946) runs
+///     on every index git *reads*: under `core.splitIndex=false` it calls
+///     `remove_split_index()`, which sets `cache_changed` (split-index.c), so the
+///     very next write drops the `link` extension and lands one whole index. Until
+///     something writes, the shared half survives — and `status` is exactly the
+///     command that writes it, without staging a thing.
+///
+/// The write goes through [`crate::index_racy::write`], the one writer this port
+/// has, so it makes the same `tweak_split_index()` decision and performs the same
+/// smudge git's `do_write_index()` does.
+///
+/// ### What is deliberately not here
+///
+/// `refresh_index()` (builtin/commit.c:1630) runs before this and updates the stat
+/// data of every entry whose worktree file moved but whose content did not, setting
+/// `cache_changed` as it goes. This port's `status` has no refresh pass, so the
+/// entries it writes back carry the stat data they were read with. The condition
+/// above is unaffected — `has_racy_timestamp()` and the split-index half of
+/// `cache_changed` are both computed from the index as read — but an index this
+/// leaves behind can still hold stat data git would have refreshed.
+fn update_index_if_able(repo: &gix::Repository) -> Result<()> {
+    // `use_optional_locks()` (environment.c): `git_env_bool("GIT_OPTIONAL_LOCKS", 1)`.
+    // Off means `fd = -1` (builtin/commit.c:1637) and the whole call is skipped.
+    if !crate::setup::git_env_bool("GIT_OPTIONAL_LOCKS", true) {
+        return Ok(());
+    }
+    if !repo.index_path().exists() {
+        return Ok(());
+    }
+    // Serialize the read-modify-write, the way every other writer in this port
+    // does. git holds `index_lock` from before `wt_status_collect()`; re-reading
+    // under the lock reaches the same place without holding it across the report.
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let mut index = repo.open_index()?;
+
+    // `remove_split_index()`'s contribution to `cache_changed`. The rest of it
+    // comes from `refresh_index()`, which this port's `status` does not run.
+    let cache_changed = index.had_link() && crate::config::split_index(repo) == Some(false);
+    if !(cache_changed || has_racy_timestamp(&index)) {
+        return Ok(());
+    }
+    // `repo_verify_index()` → `verify_index_from()` (read-cache.c:2695-2733): the
+    // index on disk must still be the one that was read, compared by the trailing
+    // hash. Anything else means another process rewrote it while the report ran,
+    // and git rolls its lock back rather than clobbering that.
+    if !verify_index(repo, &index) {
+        return Ok(());
+    }
+    super::write_tree::prepare_offset_table(repo, &mut index);
+    crate::index_racy::write(repo, &mut index)?;
+    Ok(())
+}
+
+/// `has_racy_timestamp()` (read-cache.c:2735-2746) over `is_racy_timestamp()`
+/// (`:370-375`) and `is_racy_stat()` (`:355-368`).
+///
+/// The nanosecond refinement in `is_racy_stat()` sits behind `USE_NSEC`, which the
+/// git this port targets is not built with — the `Makefile` documents it as opt-in
+/// (v2.55.0 `Makefile:200-211`) and no `config.mak.uname` arm turns it on — so the
+/// comparison is `istate->timestamp.sec <= sd->sd_mtime.sec`, on whole seconds.
+/// [`crate::index_racy::smudge_racily_clean`] reads it the same way.
+fn has_racy_timestamp(index: &gix::index::File) -> bool {
+    let timestamp = index.timestamp().unix_seconds();
+    if timestamp == 0 {
+        return false;
+    }
+    let timestamp = timestamp as u32;
+    index
+        .entries()
+        .iter()
+        // `!S_ISGITLINK(ce->ce_mode)`: a gitlink's worktree is another repository.
+        .filter(|e| e.mode != gix::index::entry::Mode::COMMIT)
+        .any(|e| timestamp <= e.stat.mtime.secs)
+}
+
+/// `verify_index_from()` (read-cache.c:2695-2728): the trailing hash of the file on
+/// disk against the one the in-memory index was read with. A file too short to hold
+/// a header and a hash, or one that cannot be opened, fails the check — git treats
+/// every one of those as "do not write".
+fn verify_index(repo: &gix::Repository, index: &gix::index::File) -> bool {
+    let Some(read_with) = index.checksum() else {
+        return false;
+    };
+    let len = read_with.as_bytes().len();
+    let Ok(bytes) = std::fs::read(repo.index_path()) else {
+        return false;
+    };
+    // `st.st_size < sizeof(struct cache_header) + the_hash_algo->rawsz`: the
+    // 12-byte header (signature, version, entry count) plus the trailer.
+    if bytes.len() < 12 + len {
+        return false;
+    }
+    bytes[bytes.len() - len..] == *read_with.as_bytes()
 }
 
 /// `wt_status_get_detached_from()` (wt-status.c:1709-1743): what the long format

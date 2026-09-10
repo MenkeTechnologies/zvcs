@@ -329,6 +329,19 @@ pub fn make_refmapping_ignore_predicate(fetch_tags: Tags, ref_map: &RefMap) -> i
     }
 }
 
+/// Where the remote ref of `mapping` sat in the server's advertisement, or [`usize::MAX`] if it was never
+/// advertised.
+///
+/// The latter are the refspecs that named an object id the server did not offer: git's `filter_refs()` moves
+/// them past every advertised ref rather than dropping them, so they are wanted last.
+fn advertised_position(ref_map: &RefMap, mapping: &refmap::Mapping) -> usize {
+    mapping
+        .remote
+        .as_name()
+        .and_then(|name| ref_map.remote_refs.iter().position(|r| r.unpack().0 == name))
+        .unwrap_or(usize::MAX)
+}
+
 /// Add all 'wants' to `arguments` once it's known negotiation is necessary.
 ///
 /// This is a call to be made when [`mark_complete_and_common_ref()`] returned [`Action::MustNegotiate`].
@@ -355,12 +368,20 @@ pub fn add_wants(
     // we have as want instead to get exactly the same graph, but possibly deepened.
     let is_shallow = !matches!(shallow, Shallow::NoChange);
     let mut has_want = false;
-    let wants = ref_map
+    let mut wants: Vec<&refmap::Mapping> = ref_map
         .mappings
         .iter()
         .zip(remote_ref_target_known)
         .filter_map(|(m, known)| (is_shallow || !*known).then_some(m))
-        .filter(|m| !mapping_is_ignored(m));
+        .filter(|m| !mapping_is_ignored(m))
+        .collect();
+    // git's want list is not refspec-major but advertisement-major: `filter_refs()` (`fetch-pack.c`) walks the
+    // ref list exactly as the server advertised it, keeps the entries a sought refspec matched, and only then
+    // appends the sought entries that were never advertised. Our mappings come out of `gix_refspec::MatchGroup`
+    // spec-major instead, so a later refspec's ref would otherwise be wanted before an earlier-advertised one —
+    // `HEAD` is appended as the last refspec of a clone yet advertised first. The server keeps `want` order
+    // verbatim and feeds it to `pack-objects`, so the difference is visible in the pack it writes back.
+    wants.sort_by_key(|m| advertised_position(ref_map, m));
     // The same remote ref can be reached by more than one mapping — an explicit refspec and the opportunistic
     // one that derives its tracking ref both point at it — and asking for it twice would have the server emit
     // a duplicate `wanted-refs` entry.

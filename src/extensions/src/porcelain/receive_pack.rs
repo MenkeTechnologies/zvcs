@@ -1781,6 +1781,17 @@ fn ingest_pack(
     if read_exact(input, &mut header).is_err() {
         return Err("eof before pack header was fully read".into());
     }
+    // `read_pack_header()` (`object-file.c`) vets the signature and the version before the count is looked at,
+    // and `parse_pack_header()` turns each verdict into the `unpack <status>` line below. Neither ever reaches a
+    // child, which is what makes them the answer when a client sends something that is not a pack at all — a
+    // `push-options` section against a server that never advertised the capability lands here.
+    if &header[..4] != b"PACK" {
+        return Err("protocol error (pack signature mismatch detected)".into());
+    }
+    let version = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    if version != 2 && version != 3 {
+        return Err("protocol error (pack version unsupported)".into());
+    }
     let nr_objects = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
     let to_loose = (nr_objects as u64) < config.unpack_limit;
     let child = format!(

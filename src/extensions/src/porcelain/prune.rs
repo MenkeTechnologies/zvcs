@@ -489,7 +489,7 @@ fn reachability<'a>(
     if cache.is_none() {
         let mut roots: Vec<ObjectId> = heads.to_vec();
         collect_roots(repo, &mut roots)?;
-        collect_recent_roots(objdir, repo.object_hash(), expire, &mut roots);
+        collect_recent_roots(objdir, repo.object_hash(), expire, &mut roots)?;
         // The only failure `collect_hook_roots` reports is git's
         // `unable to enumerate additional recent objects` at 128, which it has
         // already printed.
@@ -606,18 +606,50 @@ use crate::date::parse_expiry_date;
 /// `add_unseen_recent_objects_to_traversal()`: with a non-zero cutoff, every
 /// *local* object written after it becomes a traversal root, so the closure also
 /// keeps whatever it points at. Loose objects are dated by their own mtime,
-/// packed ones by their `.pack`'s, exactly as `add_recent_loose()` and
-/// `add_recent_packed()` do.
+/// packed ones by their `.pack`'s.
+///
+/// The gate is `if (mark_recent)` (reachable.c:344) — a plain truthiness test on
+/// `expire`, so every expiry but `never`/`false` enters the scan, `TIME_MAX`
+/// (the `--expire=all`/`--expire=now` default) included.
+///
+/// **The loose half reads each object's header before it filters on mtime**, and
+/// that ordering is the whole of this function's failure mode. git 2.54 replaced
+/// `add_recent_loose()`/`add_recent_packed()` — which only `stat()`ed, and asked
+/// for the type from inside the callback, *after* `obj_is_recent()` had already
+/// returned for a non-recent object — with one `odb_for_each_object()` request
+/// carrying `.typep`/`.mtimep`
+/// (`7a8582c82ce896d89bbcc1d91d8b5bdc31902416`, "reachable: convert to use
+/// `odb_for_each_object()`"):
+///
+/// ```c
+/// r = odb_for_each_object(revs->repo->objects, &oi, add_recent_object, &data, flags);
+/// ```
+///
+/// (reachable.c:246-281.) The iterator resolves the header itself —
+/// `for_each_object_wrapper_cb()` calls `read_object_info_from_path()` and
+/// `return -1`s when it fails (odb/source-loose.c:412-428) — and the request
+/// names `.typep`, so the `!oi->typep && !oi->sizep && !oi->contentp`
+/// short-circuit (odb/source-loose.c:87-93) does not apply. A nonzero return
+/// aborts the walk and reaches
+/// `die("unable to mark recent objects")` (reachable.c:344-352).
+///
+/// So one corrupt loose object ends `git prune` at exit 128 in 2.54 and newer,
+/// where 2.50 filtered it out on age first and went on to report it as
+/// `<oid> unknown` at exit 0. This port targets the newer git. `--expire=never`
+/// still reaches none of it, because `mark_recent` is then 0.
+///
+/// Only the loose source is read here. The packed source is the iterator's
+/// second pass (odb/source-files.c:85-89) and answers from the pack index rather
+/// than by inflating anything, so it has no equivalent failure to reproduce.
 fn collect_recent_roots(
     objdir: &Path,
     hash: gix::hash::Kind,
     expire: i64,
     roots: &mut Vec<ObjectId>,
-) {
-    // `mark_recent == 0` is git's "no grace period at all"; `TIME_MAX` is the
-    // other end, where no mtime can compare greater.
-    if expire == 0 || expire == i64::MAX {
-        return;
+) -> Result<()> {
+    // `if (mark_recent)`: no grace period at all, so the scan never runs.
+    if expire == 0 {
+        return Ok(());
     }
 
     let name_len = hash.len_in_hex() - 2;
@@ -632,18 +664,22 @@ fn collect_recent_roots(
             if !is_object_name(&name, name_len) {
                 continue;
             }
-            if !matches!(mtime_of(&sub.join(&name)), Some(mtime) if mtime > expire) {
+            let Ok(oid) = ObjectId::from_hex(format!("{prefix}{name}").as_bytes()) else {
+                continue;
+            };
+            let path = sub.join(&name);
+            // The iterator's read, ahead of the recency filter below.
+            read_recent_object_header(&path, oid)?;
+            if !matches!(mtime_of(&path), Some(mtime) if mtime > expire) {
                 continue;
             }
-            if let Ok(oid) = ObjectId::from_hex(format!("{prefix}{name}").as_bytes()) {
-                roots.push(oid);
-            }
+            roots.push(oid);
         }
     }
 
     let pack_dir = objdir.join("pack");
     let Some(names) = read_dir_raw(&pack_dir) else {
-        return;
+        return Ok(());
     };
     for name in names {
         let name = name.to_string_lossy().into_owned();
@@ -656,6 +692,39 @@ fn collect_recent_roots(
         }
         if let Ok(index) = pack::index::File::at(pack_dir.join(&name), hash) {
             roots.extend(index.iter().map(|entry| entry.oid));
+        }
+    }
+    Ok(())
+}
+
+/// `read_object_info_from_path()` for one loose object, as the recent-object
+/// iterator asks for it (odb/source-loose.c:412-428).
+///
+/// The header is inflated and thrown away: the caller wants the *outcome*, since
+/// a failure is what aborts the walk. `unpack_loose_header()`'s own diagnostics
+/// go to stderr first — zlib's line from `git_inflate()` (git-zlib.c:165-166)
+/// and then `error: unable to unpack %s header` (odb/source-loose.c:170-173) —
+/// and the abort reaches `die("unable to mark recent objects")` untranslated, as
+/// reachable.c:352 spells it.
+///
+/// A file that cannot be opened at all is not this failure: the iterator's own
+/// directory walk skips a name it cannot `stat`, and `prune_object()` reports
+/// that case itself.
+fn read_recent_object_header(path: &Path, oid: ObjectId) -> Result<()> {
+    let Ok(map) = fs::read(path) else {
+        return Ok(());
+    };
+    let mut z = gix::zlib::Decompress::new();
+    let mut hdr = [0u8; super::fsck::MAX_HEADER_LEN];
+    let mut diag: Vec<String> = Vec::new();
+    match super::fsck::unpack_loose_header(&mut z, &map, &mut hdr, &mut diag) {
+        super::fsck::LooseHeader::Ok => Ok(()),
+        super::fsck::LooseHeader::Bad | super::fsck::LooseHeader::TooLong => {
+            for line in &diag {
+                eprintln!("{line}");
+            }
+            eprintln!("error: unable to unpack {oid} header");
+            Err(crate::fatal::die("unable to mark recent objects"))
         }
     }
 }

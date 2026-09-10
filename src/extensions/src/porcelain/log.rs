@@ -4226,6 +4226,32 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let dirstat_on = dirstat_on && !check;
     let want_names =
         name_only || name_status || raw || summary || stat || numstat || shortstat || dirstat_on;
+    // `diffcore_std()`'s gate on the promisor prefetch (diff.c:6982-6995):
+    //
+    // ```c
+    // int output_formats_to_prefetch = DIFF_FORMAT_DIFFSTAT |
+    //         DIFF_FORMAT_NUMSTAT |
+    //         DIFF_FORMAT_PATCH |
+    //         DIFF_FORMAT_SHORTSTAT |
+    //         DIFF_FORMAT_DIRSTAT;
+    // if (options->repo == the_repository && repo_has_promisor_remote(the_repository) &&
+    //     (options->output_format & output_formats_to_prefetch ||
+    //      options->pickaxe_opts & DIFF_PICKAXE_KINDS_MASK))
+    //         diff_queued_diff_prefetch(options->repo);
+    // ```
+    //
+    // Only the formats that have to read blob content are listed, so `--raw`,
+    // `--name-only` and `--name-status` never reach it — which is why
+    // `git --no-lazy-fetch log --oneline` in a partial clone is silent while
+    // `log -p` is fatal. The remote lookup is asked once per command rather than
+    // once per commit; see [`prefetch_diff_pairs`] for what the batch does.
+    let prefetch_pairs = (emit_patch
+        || stat
+        || numstat
+        || shortstat
+        || dirstat_on
+        || has_pickaxe)
+        && super::rev_list::has_promisor_remote(&repo);
     // `whatchanged` under `DIFF_FORMAT_NO_OUTPUT`: nothing is rendered, but the
     // pair queue still decides whether the commit is shown at all, so it is built
     // and thrown away.
@@ -4790,6 +4816,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 all_need_diff && (show_root || !node.parents.is_empty())
             }
         {
+            // `log_tree_diff_flush()` runs `diffcore_std()` before `show_log()`
+            // (log-tree.c), so a commit whose diff cannot be completed prints no
+            // header at all — the whole record is replaced by the `fatal`.
+            if prefetch_pairs {
+                prefetch_diff_pairs(&repo, node.id, diff_parent, path_limit.as_mut())?;
+            }
             let mut diff: Vec<u8> = Vec::new();
             // `diff_flush()`'s `separator` counter: raised by the raw/name loop, by
             // the count-format block and by a non-empty `--summary`, and read once by
@@ -11387,6 +11419,106 @@ fn record_rename_warnings(
 ) {
     slot.needed_rename_limit = slot.needed_rename_limit.max(reported.needed_rename_limit);
     slot.degraded_cc_to_c |= reported.degraded_cc_to_c;
+}
+
+/// `diff_queued_diff_prefetch()` (diff.c:6963-6980), the batch `diffcore_std()`
+/// makes on behalf of a partial clone before any format reads a blob:
+///
+/// ```c
+/// for (i = 0; i < q->nr; i++) {
+///         add_if_missing(repo, &to_fetch, q->queue[i]->one);
+///         add_if_missing(repo, &to_fetch, q->queue[i]->two);
+/// }
+/// /* NEEDSWORK: Consider deduplicating the OIDs sent. */
+/// promisor_remote_get_direct(repo, to_fetch.oid, to_fetch.nr);
+/// ```
+///
+/// `add_if_missing()` (diff.c:6952-6961) skips a side with no valid id — the
+/// absent half of a creation or a deletion — and skips a gitlink, whose id names
+/// a commit in another repository that this one was never going to hold. The
+/// survey itself must not fetch: `OBJECT_INFO_FOR_PREFETCH` is
+/// `OBJECT_INFO_SKIP_FETCH_OBJECT | OBJECT_INFO_QUICK` (odb.h:339), because one
+/// round trip per object is exactly what the batch exists to avoid. The order is
+/// the queue's, pre-image before post-image, and git does not deduplicate — the
+/// `NEEDSWORK` above is still there — so neither does this.
+///
+/// `promisor_remote_get_direct()` reads no `fetch_if_missing` flag of its own: a
+/// caller that named these objects gets a request even where an incidental read
+/// would not, which is why `fetch_objects()` gets as far as printing
+/// `warning: lazy fetching disabled; some objects may not be available` under
+/// `git --no-lazy-fetch` before refusing. What the request did not produce ends
+/// the command:
+///
+/// ```c
+/// for (i = 0; i < remaining_nr; i++) {
+///         if (is_promisor_object(repo, &remaining_oids[i]))
+///                 die(_("could not fetch %s from promisor remote"),
+///                     oid_to_hex(&remaining_oids[i]));
+/// }
+/// ```
+///
+/// (promisor-remote.c:320-324.) The first *promised* id in queue order is the one
+/// named; an object that was merely absent and never promised is left to the
+/// reader that wanted it, which reports it itself. `remove_fetched_oids()`
+/// (:279-303) preserves the order while it drops what did arrive, so the id git
+/// names is the first of the batch that is still missing.
+///
+/// The same shape as [`super::pack_objects`]'s `prefetch_to_pack()`, which is the
+/// other explicit `promisor_remote_get_direct()` caller in the port.
+fn prefetch_diff_pairs(
+    repo: &gix::Repository,
+    id: ObjectId,
+    parent: Option<ObjectId>,
+    // `-- <pathspec>`: git limits the *tree diff*, so the queue this walks is
+    // already narrowed to the paths the command asked about.
+    limit: Option<&mut PathspecMatcher>,
+) -> Result<()> {
+    let commit = repo.find_object(id)?.try_into_commit()?;
+    // The raw pair list, before any diffcore pass — `diffcore_std()` prefetches
+    // first and only then breaks, renames and pickaxes. No blob counts: reading
+    // them is the very thing the missing objects would fail at.
+    let files = collect_changes(
+        repo,
+        &commit,
+        parent,
+        false,
+        super::diff::Whitespace::Keep,
+        None,
+        limit,
+        None,
+    )?;
+    let restore = gix::odb::store::fetch_if_missing();
+    gix::odb::store::set_fetch_if_missing(false);
+    let mut to_fetch: Vec<ObjectId> = Vec::new();
+    for f in &files {
+        for side in [f.old_side, f.new_side] {
+            let Some((mode, oid)) = side else { continue };
+            if mode & 0o170000 == 0o160000 {
+                continue;
+            }
+            if !repo.has_object(oid) {
+                to_fetch.push(oid);
+            }
+        }
+    }
+    if to_fetch.is_empty() {
+        gix::odb::store::set_fetch_if_missing(restore);
+        return Ok(());
+    }
+    gix::odb::store::set_fetch_if_missing(true);
+    repo.objects.store_ref().fetch_from_promisor(&to_fetch);
+    gix::odb::store::set_fetch_if_missing(false);
+    for oid in &to_fetch {
+        if repo.has_object(oid) {
+            continue;
+        }
+        if super::rev_list::promisor_objects(repo).contains(oid) {
+            gix::odb::store::set_fetch_if_missing(restore);
+            crate::git_fatal!("could not fetch {oid} from promisor remote");
+        }
+    }
+    gix::odb::store::set_fetch_if_missing(restore);
+    Ok(())
 }
 
 fn collect_changes(

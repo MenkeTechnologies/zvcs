@@ -2000,10 +2000,10 @@ fn loose_label_of(repo: &gix::Repository, full: &Path) -> String {
 
 /// `object-file.h`'s `MAX_HEADER_LEN` — the `<type> <size>\0` buffer
 /// `unpack_loose_header()` inflates into.
-const MAX_HEADER_LEN: usize = 32;
+pub(super) const MAX_HEADER_LEN: usize = 32;
 
 /// `object-file.c`'s `enum unpack_loose_header_result`.
-enum LooseHeader {
+pub(super) enum LooseHeader {
     /// The whole `<type> <size>\0` header landed in the buffer.
     Ok,
     /// zlib refused the stream.
@@ -2035,7 +2035,7 @@ fn inflate_error_line(z: &gix::zlib::Decompress, e: &gix::zlib::DecompressError)
 /// `object-file.c::unpack_loose_header`: one `git_inflate()` of the mapped file
 /// into a [`MAX_HEADER_LEN`] buffer, which either contains the terminating NUL
 /// or does not. Appends `git_inflate()`'s own line to `diag` when zlib errors.
-fn unpack_loose_header(
+pub(super) fn unpack_loose_header(
     z: &mut gix::zlib::Decompress,
     map: &[u8],
     hdr: &mut [u8; MAX_HEADER_LEN],
@@ -2738,10 +2738,46 @@ fn loose_scan_order(repo: &gix::Repository, check_full: bool) -> Option<Vec<Obje
 /// only then calls `fsck_obj_buffer()` per entry. So the order is the pack's own
 /// layout, not its index's.
 ///
-/// `None` unless there is exactly one pack across every odb source:
-/// `repo_for_each_pack()` walks `packed_git`, which `rearrange_packed_git()`
-/// orders by locality and then by mtime — a filesystem property this port does
-/// not read back.
+/// `None` unless there is exactly one pack across every odb source, because
+/// with two the order the packs are *visited* in is not a property of the
+/// repository at all. `builtin/fsck.c:1092` walks `repo_for_each_pack`, which
+/// returns `store->packs.head` without re-sorting (packfile.c:1093-1104), and
+/// that list is built by `packfile_store_prepare()`:
+///
+/// ```c
+/// prepare_packed_git_one(store->source);
+/// sort_packs(&store->packs.head, sort_pack);
+/// ```
+///
+/// (packfile.c:1071-1085.) Each of its three layers loses a different piece of
+/// determinism, and the combination is what this refuses to guess:
+///
+/// * `prepare_packed_git_one()` enumerates `<objdir>/pack` with a bare
+///   `readdir()` — no `string_list`, no sort (packfile.c:944-977, the loop at
+///   :968) — and appends each pack to the tail (`packfile_list_append()`,
+///   packfile.c:106-123). So the pre-sort list is raw directory order.
+/// * `sort_pack()` compares `pack_local` and then `mtime`, "and returns 0 on a
+///   full tie" (packfile.c:1044-1069). `p->mtime` is `st_mtime` of the **.pack**
+///   file (packfile.c:840-851) — whole seconds — so two packs written in the
+///   same second, which is exactly what a partial clone's own pack and the
+///   checkout's lazy-fetch pack are, tie.
+/// * `sort_packs` is `DEFINE_LIST_SORT` (packfile.c:1042), a **stable**
+///   linked-list mergesort whose merge takes from the first list on equality
+///   ("Combine two sorted lists. Take from `list` on equality.", mergesort.h:4,
+///   :10). A tie therefore preserves the readdir order above rather than
+///   breaking it by name.
+///
+/// And even readdir order is not the last word: a packed-object lookup moves its
+/// pack to the head of the list (`packfile_list_prepend`, packfile.c:2159-2166),
+/// and `builtin/fsck.c:1066`'s `odb_reprepare()` re-sorts *that* list — so the
+/// order also depends on which packs earlier work in the same process happened
+/// to read from.
+///
+/// The consequence is not cosmetic: this order is the object-creation sequence
+/// [`replay_obj_hash`] needs, so without it [`SlotOrder`] falls back to the
+/// home-slot argument and refuses any report whose lines share a collision
+/// cluster. One pack has no order to get wrong, which is why that is the case
+/// this answers.
 fn pack_scan_order(repo: &gix::Repository) -> Option<Vec<ObjectId>> {
     let hash = repo.object_hash();
     let mut found: Option<Vec<(u64, ObjectId)>> = None;

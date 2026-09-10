@@ -950,6 +950,22 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         None
     };
 
+    // `--textconv`, resolved once for the one path a blame is given. `None` when
+    // the option was not asked for, when the path names no diff driver, or when
+    // that driver configures no `textconv` — all three of which are
+    // `textconv_object()` returning 0 and git reading the blob as it stands.
+    let textconv = match opts.textconv {
+        false => None,
+        true => textconv_driver(&repo, rel_path.as_str().into())?,
+    };
+    // `fake_working_tree_commit()` converts the working-tree image too
+    // (`builtin/blame.c:174-176`), which is what makes the *printed* text the
+    // driver's output rather than the file's.
+    let worktree_content = match (&textconv, worktree_content) {
+        (Some(conv), Some(bytes)) => Some(conv.convert(&bytes)?),
+        (_, other) => other,
+    };
+
     // git's merge parents: `fake_working_tree_commit` gives the synthetic commit
     // holding the final image `HEAD` *and* every id in `MERGE_HEAD` as parents
     // (`blame.c:212-213`), so mid-merge a working-tree line that came from the
@@ -969,12 +985,22 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // `setup_scoreboard()` (`builtin/blame.c:1197-1223`), so the line numbers a
     // regex or `:funcname` spec resolves to are the ones the output will print,
     // and an out-of-range start is fatal (128) rather than an empty answer.
+    // `setup_scoreboard()` runs the driver over the final image before `-L` is
+    // resolved against it (`blame.c:2870-2880`), so a `:<funcname>` or regex
+    // range searches the *converted* text and the line numbers it yields are the
+    // ones the output prints.
     let final_image: Vec<u8> = match &worktree_content {
         Some(content) => content.clone(),
-        None => blob_at(&repo, &suspect, &rel_path)
-            .and_then(|id| repo.find_object(id).ok())
-            .map(|o| o.detach().data)
-            .unwrap_or_default(),
+        None => {
+            let raw = blob_at(&repo, &suspect, &rel_path)
+                .and_then(|id| repo.find_object(id).ok())
+                .map(|o| o.detach().data)
+                .unwrap_or_default();
+            match &textconv {
+                Some(conv) => conv.convert(&raw)?,
+                None => raw,
+            }
+        }
     };
     // `parse_range_funcname()` (line-range.c:118) resolves the path's diff driver
     // and installs its funcname pattern before searching, so `-L :<re>` looks at the
@@ -1007,11 +1033,31 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // blob's own line numbers. Mid-merge the extra scapegoats are blamed by
     // separate walks whose line numbers are their own, so the narrowing does not
     // carry and the full file is walked instead.
+    // The scapegoat's image, which under `--textconv` is the driver's output for
+    // it — `fill_origin_blob()` converts every blob the dig compares, so the
+    // comparison that decides `passes_whole_blame` is between two converted
+    // images just as git's is.
+    let scapegoat_image = |id: &ObjectId| -> Result<Option<Vec<u8>>> {
+        let Some(raw) = blob_at(&repo, id, &rel_path)
+            .and_then(|blob| repo.find_object(blob).ok())
+            .map(|o| o.detach().data)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match &textconv {
+            Some(conv) => conv.convert(&raw)?,
+            None => raw,
+        }))
+    };
+    // Only the overlay path asks about it, and under `--textconv` asking costs a
+    // run of the driver, so it is not computed where `fake_working_tree_commit()`
+    // never existed.
+    let suspect_image = match worktree_content.is_some() {
+        true => scapegoat_image(&suspect)?,
+        false => None,
+    };
     let overlay_is_verbatim = worktree_content.as_ref().is_some_and(|content| {
-        merge_parents.is_empty()
-            && blob_at(&repo, &suspect, &rel_path)
-                .and_then(|id| repo.find_object(id).ok())
-                .is_some_and(|blob| blob.detach().data == *content)
+        merge_parents.is_empty() && suspect_image.as_ref() == Some(content)
     });
     // git narrows the scoreboard to `-L` before the walk starts, so
     // `blame_entry_score()` — and with it the `-M`/`-C` thresholds — measures only
@@ -1050,19 +1096,9 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // scapegoat can claim. Under an in-progress merge the remaining scapegoats are `MERGE_HEAD`s,
     // whose blames are separate walks below and so keep their own origin caches; the counters
     // then add up rather than sharing one, as they would in git's single scoreboard.
-    let fake_commit = match &worktree_content {
-        Some(content) => {
-            let scapegoat_blobs: Vec<Vec<u8>> = std::iter::once(suspect)
-                .filter_map(|id| blob_at(&repo, &id, &rel_path))
-                .filter_map(|blob| repo.find_object(blob).ok())
-                .map(|o| o.detach().data)
-                .collect();
-            Some(gix::blame::FakeCommit {
-                passes_whole_blame: scapegoat_blobs.first().is_some_and(|blob| blob == content),
-            })
-        }
-        None => None,
-    };
+    let fake_commit = worktree_content.as_ref().map(|content| gix::blame::FakeCommit {
+        passes_whole_blame: suspect_image.as_ref() == Some(content),
+    });
 
     let blame_options = gix::repository::blame_file::Options {
         diff_algorithm: opts.diff_algorithm,
@@ -1143,6 +1179,11 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         && !opts.line_porcelain
         && opts.max_age.is_none()
         && opts.revs_file.is_none()
+        // A `--textconv` blame is a different attribution over different text,
+        // and the driver is configuration the key does not name — two runs with
+        // two `diff.<driver>.textconv` programs would share one entry. Kept out
+        // for the same reason `--ignore-rev` is.
+        && textconv.is_none()
         && opts.bottom.is_empty())
         .then(|| (suspect.to_string(), rel_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
@@ -1184,9 +1225,13 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         }
         Some((lines, bytes)) => (lines, bytes),
         None => {
-            let outcome = repo
-                .blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options.clone())
-                .map_err(|e| anyhow!("{e}"))?;
+            let outcome = run_blame(
+                &repo,
+                textconv.as_ref(),
+                rel_path.as_bytes().as_bstr(),
+                suspect,
+                blame_options.clone(),
+            )?;
             let lines = materialize_lines(&outcome);
             stats = outcome.statistics;
             collect_previous_origins(&mut previous_origins, &outcome);
@@ -1222,10 +1267,18 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             let Ok(object) = repo.find_object(blob) else {
                 continue;
             };
-            let bytes = object.detach().data;
-            let outcome = repo
-                .blame_file(rel_path.as_bytes().as_bstr(), *parent, blame_options.clone())
-                .map_err(|e| anyhow!("{e}"))?;
+            let raw = object.detach().data;
+            let bytes = match &textconv {
+                Some(conv) => conv.convert(&raw)?,
+                None => raw,
+            };
+            let outcome = run_blame(
+                &repo,
+                textconv.as_ref(),
+                rel_path.as_bytes().as_bstr(),
+                *parent,
+                blame_options.clone(),
+            )?;
             add_statistics(&mut stats, &outcome.statistics);
             collect_previous_origins(&mut previous_origins, &outcome);
             sources.push((materialize_lines(&outcome), bytes));
@@ -4631,6 +4684,11 @@ struct Options {
     mark_unblamable_lines: bool,
     /// `blame.markIgnoredLines`.
     mark_ignored_lines: bool,
+    /// `--textconv` / `--no-textconv`: `revs.diffopt.flags.allow_textconv`, which
+    /// `fill_origin_blob()` reads before every blob the dig needs
+    /// (`builtin/blame.c:130-137`). Off by default — `git blame` is the porcelain
+    /// that does *not* turn it on, unlike `git diff`.
+    textconv: bool,
     /// Raw `--date` value before repo-side validation; `None` if not given.
     date_arg: Option<String>,
     /// Resolved date mode for the human-format timestamp column, after applying
@@ -4898,6 +4956,10 @@ impl Options {
         let mut show_progress: Option<bool> = None;
         let mut incremental = false;
         let mut ignore_whitespace = false;
+        // `revs.diffopt.flags.allow_textconv`, which `cmd_blame()` leaves off:
+        // `init_revisions()` never sets it and blame installs no tweak, so only
+        // `--textconv` on the command line turns it on.
+        let mut textconv = false;
         // `diff.c:57`: `static int diff_indent_heuristic = 1`.
         let mut indent_heuristic = true;
         // `revs->max_age`, from `--since`/`--after`/`--max-age`. `-1` in git means
@@ -5057,14 +5119,13 @@ impl Options {
                 // positive form asks for.
                 "--indent-heuristic" => indent_heuristic = true,
                 "--no-indent-heuristic" => indent_heuristic = false,
-                // The same shape: `--no-textconv` asks for the state this port is
-                // already in, since the blame here never runs a textconv filter.
-                // `-L :<funcname>` *does* read the path's driver — see
-                // [`line_range_funcname`] — but converting each revision's blob
-                // before blaming it is a separate change to the scoreboard.
-                // (`--textconv` itself stays refused: with a `diff.<driver>.textconv`
-                // configured it changes what is blamed.)
-                "--no-textconv" => {}
+                // `revs.diffopt.flags.allow_textconv`, read by `fill_origin_blob()`
+                // before every blob the dig reads and by `setup_scoreboard()` for
+                // the final image — see [`textconv_odb`] for what the port does
+                // with it. Off by default, so `--no-textconv` asks for the state
+                // the command is already in.
+                "--textconv" => textconv = true,
+                "--no-textconv" => textconv = false,
                 // `optname()` names a short option by its character, so this is
                 // ``switch `L'`` and not ``option `-L'``; the refusal is
                 // parse-options' own `error:` line at 129, never a `zvcs:` gap
@@ -5404,6 +5465,7 @@ impl Options {
             ignore_revs_file,
             mark_unblamable_lines,
             mark_ignored_lines,
+            textconv,
             date_arg,
             // Overwritten in `blame` once blame.date / `--date` are resolved.
             date_mode: DateMode::iso8601(),
@@ -5826,6 +5888,194 @@ pub(crate) fn line_range_funcname(
     use gix::bstr::ByteSlice;
     let mut lookup = crate::userdiff::Lookup::new(repo).map_err(|e| e.to_string())?;
     lookup.for_path(path.as_bytes().as_bstr())
+}
+
+// ---------------------------------------------------------------------------
+// --textconv
+// ---------------------------------------------------------------------------
+
+/// `textconv_object()` for one path, held for the whole blame.
+///
+/// git resolves the driver per `blame_origin` and per call; the driver is a
+/// function of the path alone, and a blame is given exactly one path, so it is
+/// resolved once here. The program's output is memoised by object id because it
+/// is a pure function of the blob: a dig over a long history reads the same
+/// parent blob once per step it survives, and git would spawn the program again
+/// each time (`diff.<driver>.cachetextconv` is the knob that makes *git* keep
+/// the answer, in a notes ref; this cache is per process and changes nothing an
+/// observer can see).
+struct TextconvDriver<'repo> {
+    program: String,
+    path: gix::bstr::BString,
+    conv: std::cell::RefCell<crate::porcelain::cat_file::Textconv<'repo>>,
+    cache: std::cell::RefCell<HashMap<ObjectId, std::sync::Arc<Vec<u8>>>>,
+}
+
+impl TextconvDriver<'_> {
+    /// `run_textconv()` over `blob`. git's NULL return — the program could not
+    /// be started, or exited non-zero — is `fill_textconv()`'s
+    /// `die(_("unable to read files to diff"))`.
+    fn convert(&self, blob: &[u8]) -> Result<Vec<u8>> {
+        let mut conv = self.conv.borrow_mut();
+        match conv.run(&self.program, self.path.as_ref(), blob)? {
+            Some(text) => Ok(text),
+            None => Err(crate::fatal::die("unable to read files to diff")),
+        }
+    }
+
+    /// The same, keyed by the blob's id so a re-read costs nothing.
+    fn convert_cached(&self, id: &gix::hash::oid, blob: &[u8]) -> Result<std::sync::Arc<Vec<u8>>> {
+        if let Some(hit) = self.cache.borrow().get(id) {
+            return Ok(hit.clone());
+        }
+        let text = std::sync::Arc::new(self.convert(blob)?);
+        self.cache.borrow_mut().insert(id.to_owned(), text.clone());
+        Ok(text)
+    }
+}
+
+/// `userdiff_find_by_path()` + `userdiff_get_textconv()` for the blamed path.
+///
+/// `None` where `textconv_object()` returns 0 without running anything: no
+/// `diff` attribute, an attribute naming no configured driver, or a driver with
+/// no `diff.<name>.textconv`. git then reads the blob as it stands, which is the
+/// unconverted blame.
+fn textconv_driver<'repo>(
+    repo: &'repo gix::Repository,
+    path: &str,
+) -> Result<Option<TextconvDriver<'repo>>> {
+    let mut conv = crate::porcelain::cat_file::Textconv::new(repo)?;
+    let path_bstr = gix::bstr::BString::from(path.as_bytes().to_vec());
+    let Some(name) = conv.driver_name(path_bstr.as_ref())? else {
+        return Ok(None);
+    };
+    let Some(program) = crate::porcelain::cat_file::diff_driver_config(repo, &name, "textconv")
+    else {
+        return Ok(None);
+    };
+    Ok(Some(TextconvDriver {
+        program,
+        path: path_bstr,
+        conv: std::cell::RefCell::new(conv),
+        cache: std::cell::RefCell::new(HashMap::new()),
+    }))
+}
+
+/// The object database the dig reads through under `--textconv`.
+///
+/// `fill_origin_blob()` (builtin/blame.c:130-145) is the one place a blame reads
+/// a blob, and it converts before handing it to the diff:
+///
+/// ```c
+/// if (opt->flags.allow_textconv &&
+///     textconv_object(opt->repo, o->path, o->mode,
+///                     &o->blob_oid, 1, &file->ptr, &file_size))
+///         ;
+/// else
+///         file->ptr = repo_read_object_file(the_repository,
+///                                           &o->blob_oid, &type,
+///                                           &file_size);
+/// ```
+///
+/// The blob's *id* is untouched — `o->blob_oid` still names the recorded blob —
+/// so the whole effect is that every image the scoreboard diffs is the driver's
+/// output. Wrapping the object database reproduces exactly that: only a blob is
+/// converted, and every commit and tree the walk parses is passed through
+/// unchanged.
+///
+/// One deliberate difference from git, and it is the only one: git converts
+/// against `o->path`, the path that origin had in *its* revision, while this
+/// converts against the path the blame was given. The two differ only under
+/// `-C`, where an origin may be found in another file, and a driver selected by
+/// a different `.gitattributes` rule would then be the one git ran.
+struct TextconvOdb<'a, 'repo> {
+    inner: &'a gix::OdbHandle,
+    conv: &'a TextconvDriver<'repo>,
+}
+
+impl gix::objs::Find for TextconvOdb<'_, '_> {
+    fn try_find<'a>(
+        &self,
+        id: &gix::hash::oid,
+        buffer: &'a mut Vec<u8>,
+    ) -> std::result::Result<Option<gix::objs::Data<'a>>, gix::objs::find::Error> {
+        // Read into a scratch buffer first: the converted bytes are what
+        // `buffer` has to end up holding, and the borrow of `buffer` taken by
+        // the inner find would otherwise still be alive.
+        let mut raw = Vec::new();
+        let Some(found) = self.inner.try_find(id, &mut raw)? else {
+            return Ok(None);
+        };
+        let kind = found.kind;
+        let found_hash = found.object_hash;
+        buffer.clear();
+        if kind == gix::object::Kind::Blob {
+            let text = self
+                .conv
+                .convert_cached(id, found.data)
+                .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as gix::objs::find::Error)?;
+            buffer.extend_from_slice(&text);
+        } else {
+            buffer.extend_from_slice(found.data);
+        }
+        let object_hash = found_hash;
+        Ok(Some(gix::objs::Data { kind, data: buffer, object_hash }))
+    }
+}
+
+impl gix::objs::FindHeader for TextconvOdb<'_, '_> {
+    fn try_header(
+        &self,
+        id: &gix::hash::oid,
+    ) -> std::result::Result<Option<gix::objs::Header>, gix::objs::find::Error> {
+        self.inner.try_header(id)
+    }
+}
+
+/// `assign_blame()` over one suspect, through the object database the run's
+/// `--textconv` state selects.
+///
+/// Without a driver this is `Repository::blame_file` unchanged. With one the
+/// same call is made by hand, because the wrapped database has to be the one the
+/// walk reads through and `blame_file` passes the repository's own — the option
+/// translation below is `blame.rs:18-73` of the `gix` crate, kept in step with
+/// it.
+fn run_blame(
+    repo: &gix::Repository,
+    conv: Option<&TextconvDriver<'_>>,
+    path: &gix::bstr::BStr,
+    suspect: ObjectId,
+    options: gix::repository::blame_file::Options,
+) -> Result<gix::blame::Outcome> {
+    let Some(conv) = conv else {
+        return repo.blame_file(path, suspect, options).map_err(|e| anyhow!("{e}"));
+    };
+    let cache = repo.commit_graph_if_enabled()?;
+    let mut resource_cache = repo.diff_resource_cache_for_tree_diff()?;
+    let diff_algorithm = match options.diff_algorithm {
+        Some(algorithm) => algorithm,
+        None => repo.diff_algorithm()?,
+    };
+    let opts = gix::blame::Options {
+        diff_algorithm,
+        ranges: options.ranges,
+        since: options.since,
+        bottom: options.bottom,
+        rewrites: options.rewrites,
+        debug_track_path: false,
+        ignore_whitespace: options.ignore_whitespace,
+        indent_heuristic: options.indent_heuristic,
+        detect_moved: options.detect_moved,
+        ignore_revs: options.ignore_revs,
+        detect_copied: options.detect_copied,
+        first_parent: options.first_parent,
+        children: options.children,
+        fake_commit: options.fake_commit,
+        grafts: Some(repo.commit_grafts().clone()),
+    };
+    let odb = TextconvOdb { inner: &repo.objects, conv };
+    gix::blame::file(&odb, suspect, cache, &mut resource_cache, path, opts)
+        .map_err(|e| anyhow!("{e}"))
 }
 
 /// git's `Q_("file %s has only %lu line", "file %s has only %lu lines", lines)`.

@@ -328,13 +328,23 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     // that `anyhow` would collapse a walk-time parse error to. Parse here with
     // the same defaults the walk uses so acceptance never diverges from it.
     let pathspec_defaults = repo.pathspec_defaults_inherit_ignore_case(true)?;
+    // Whether every element is a bare `:(attr:…)` — attribute requirements and
+    // no path pattern at all. See [`attr_pathspec_matches`] for what that buys.
+    let mut attr_only_pathspec = !pathspecs.is_empty();
     for spec in &pathspecs {
-        if let Err(err) = gix::pathspec::parse(spec.as_bytes(), pathspec_defaults) {
-            eprintln!(
-                "fatal: {}",
-                crate::pathspec::parse_error_message(spec.as_str().into(), &err)
-            );
-            return Ok(ExitCode::from(128));
+        match gix::pathspec::parse(spec.as_bytes(), pathspec_defaults) {
+            Ok(pattern) => {
+                attr_only_pathspec &= !pattern.attributes.is_empty()
+                    && pattern.path().is_empty()
+                    && !pattern.is_excluded();
+            }
+            Err(err) => {
+                eprintln!(
+                    "fatal: {}",
+                    crate::pathspec::parse_error_message(spec.as_str().into(), &err)
+                );
+                return Ok(ExitCode::from(128));
+            }
         }
         if pathspec_leaves_worktree(spec, prefix_parts.len(), &workdir_real) {
             eprintln!(
@@ -415,7 +425,25 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         remove_directories
             .then_some(gix::dir::walk::ForDeletionMode::IgnoredDirectoriesCanHideNestedRepositories),
     );
-    let entries = walk(&repo, index, &pathspecs, &excludes, cmdl_excludes_only, options)?;
+    // See [`attr_pathspec_matches`]: the walk decides directory candidates for itself,
+    // so an attribute-only pathspec is applied to what it emitted instead of
+    // inside it.
+    let attr_only = attr_only_pathspec && ignored_too && !ignored_only && excludes.is_empty();
+    let mut attr_match = match attr_only {
+        false => None,
+        true => Some(
+            repo.pathspec(
+                true,
+                pathspecs.iter().map(|s| s.as_bytes()),
+                true,
+                &repo.index_or_load_from_head_or_empty()?.into_owned(),
+                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+            )?
+            .detach()?,
+        ),
+    };
+    let walk_pathspecs: &[String] = if attr_only { &[] } else { &pathspecs };
+    let entries = walk(&repo, index, walk_pathspecs, &excludes, cmdl_excludes_only, options)?;
 
     // (sort key = repo-relative path with a trailing '/' for directories, repo-relative path, is_dir)
     let mut targets: Vec<(BString, BString, bool)> = Vec::new();
@@ -463,6 +491,13 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         // A nested repository is only removed with a second -f, as in git.
         if is_repo && force < 2 {
             continue;
+        }
+        // The attribute-only pathspec, asked about this candidate rather than
+        // about what is under it. See [`attr_pathspec_matches`].
+        if let Some(ps) = attr_match.as_mut() {
+            if !attr_pathspec_matches(ps, entry.rela_path.as_bstr(), is_dir) {
+                continue;
+            }
         }
 
         let mut key = entry.rela_path.clone();
@@ -522,6 +557,101 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Why a bare `:(attr:…)` pathspec is kept out of the walk and applied to what
+/// the walk emitted.
+///
+/// git decides a **directory** candidate's fate before it descends into it, in
+/// `treat_directory()` (dir.c:1966-2006):
+///
+/// ```c
+/// /* The "len-1" is to strip the final '/' */
+/// enum exist_status status = directory_exists_in_index(istate, dirname, len-1);
+///
+/// if (status == index_directory)
+///         return path_recurse;
+/// ...
+/// if (pathspec && !excluded) {
+///         matches_how = match_pathspec_with_flags(istate, pathspec,
+///                                                 dirname, len,
+///                                                 0 /* prefix */,
+///                                                 NULL /* seen */,
+///                                                 DO_MATCH_LEADING_PATHSPEC);
+///         if (!matches_how)
+///                 return path_none;
+/// }
+/// ```
+///
+/// and `match_pathspec_item()` evaluates the attribute half against that
+/// directory's own path, unconditionally and with no directory special case
+/// (dir.c:428-433, `match_pathspec_attrs()` at pathspec.c:767-803). `attr.c`
+/// trims the trailing `/` before matching (attr.c:1052-1065), so a directory has
+/// whatever attributes a `.gitattributes` rule gives its name — and nothing from
+/// the files inside it. So `git clean -ndx -- ':(attr:text)'` lists
+/// `sub/deep-ignored/` only if *that name* carries `text`, whatever
+/// `sub/deep-ignored/thing.txt` carries.
+///
+/// The walk here answers the opposite question. `gix_dir` matches the pathspec
+/// against files and collapses a directory whose contents all matched, so it
+/// reported `sub/deep-ignored/` on the strength of the `.txt` inside it and
+/// dropped a directory whose own name carries the attribute. Neither answer can
+/// be corrected from the emitted set alone while the pathspec is also what
+/// pruned the walk, so for the one shape where git's rule reduces to a test on
+/// the candidate's own path the walk is run **unfiltered** and the pathspec is
+/// applied afterwards, once per emitted entry, with the entry's own
+/// directory-ness.
+///
+/// That reduction needs three conditions, and each is checked:
+///
+/// * **every element is a bare `:(attr:…)`** — with `item->match` empty,
+///   `match_pathspec_item()` returns `MATCHED_RECURSIVELY` the moment the
+///   attribute test passes (dir.c:436-437), so the pathspec *is* the attribute
+///   predicate and `DO_MATCH_LEADING_PATHSPEC` has no prefix to recurse for;
+/// * **`-x`, and no `-e`** — `cmd_clean()` skips `setup_standard_excludes()`
+///   under `-x` (builtin/clean.c:968-969), so `dir->exclude_per_dir` stays NULL
+///   and no pattern list exists: `excluded` is 0 for every candidate and the
+///   `!excluded` guard above is always taken. Under `-X`, or by default, an
+///   ignored directory skips the pathspec test entirely and is reported
+///   unconditionally, which this does not reproduce;
+/// * **a pathspec is present**, which implies `-d` (see `remove_directories`
+///   above), so every untracked directory is emitted collapsed and an emitted
+///   entry's ancestors are all directories the index has entries under — the
+///   `index_directory` short-circuit at dir.c:1984-1985, which recurses without
+///   consulting the pathspec at all.
+///
+/// Outside those conditions nothing changes and the walk keeps the pathspec, so
+/// the `-X` and default-mode divergences above are left standing rather than
+/// half-corrected.
+fn attr_pathspec_matches(
+    ps: &mut gix::PathspecDetached,
+    rela_path: &BStr,
+    is_dir: bool,
+) -> bool {
+    let stack = &mut ps.stack;
+    let odb = &ps.odb;
+    // `match_pathspec_attrs()` (pathspec.c:767-803) asks the attribute stack
+    // about the candidate; `attr.c:1052-1065` trims a trailing `/` and matches
+    // the name, so a directory is asked about as a directory.
+    let mut attrs = |relative_path: &BStr,
+                     case: gix::pathspec::attributes::glob::pattern::Case,
+                     is_dir: bool,
+                     out: &mut gix::pathspec::attributes::search::Outcome|
+     -> bool {
+        let stack = stack.as_mut().expect("a pathspec that carries attributes");
+        let mode = if is_dir {
+            gix::index::entry::Mode::DIR
+        } else {
+            gix::index::entry::Mode::FILE
+        };
+        stack
+            .set_case(case)
+            .at_entry(relative_path, Some(mode), odb)
+            .is_ok_and(|platform| platform.matching_attributes(out))
+    };
+    ps.search
+        .pattern_matching_relative_path(rela_path, Some(is_dir), &mut attrs)
+        .is_some_and(|m| !m.is_excluded())
 }
 
 /// Run the directory walk and collect every emitted entry.

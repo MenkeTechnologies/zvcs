@@ -2732,11 +2732,38 @@ fn show_commit<'a>(
             return r;
         }
         if disp.merges == super::log::DiffMerges::Separate {
+            // `log_tree_diff()`'s `showed_log` (log-tree.c:1155-1173): the `for (;;)`
+            // loop reports whether *any* of the per-parent flushes printed, and a
+            // flush whose queue came out empty prints nothing (log-tree.c:931-937).
+            // Written bytes are the signal, because that is what `show_log()` having
+            // run leaves behind.
+            let mut shown_any = false;
             for p in &parents {
+                let before = out.len();
                 show_commit_record(
                     repo, out, commit, pretty, selection, pathspecs, disp, pickaxe, source,
                     shown_one, line_log_pairs, Some(*p), None,
                 )?;
+                shown_any |= out.len() != before;
+            }
+            // ```c
+            // shown = log_tree_diff(opt, commit, &log);
+            // if (!shown && opt->loginfo && opt->always_show_header) {
+            //         log.parent = NULL;
+            //         show_log(opt);
+            //         shown = 1;
+            // }
+            // ```
+            //
+            // (log-tree.c:1190-1195.) Every parent came out empty, so the merge gets
+            // one header with no ` (from <oid>)` insert. `cmd_log_init_finish()`
+            // clears `always_show_header` when a pickaxe or a `--diff-filter` is in
+            // play (builtin/log.c:333-335), and then nothing is printed at all.
+            if !shown_any && !pickaxe.active() && disp.patch.diff_filter.is_none() {
+                return show_commit_record(
+                    repo, out, commit, pretty, selection, pathspecs, disp, pickaxe, source,
+                    shown_one, line_log_pairs, None, None,
+                );
             }
             return Ok(());
         }
@@ -3131,7 +3158,16 @@ fn show_commit_record(
     // `--follow` alike ("Pickaxe, diff-filter and rename following need diffs"), so
     // the queue is built under `-s` too — which is what lets `-S<needle>` suppress a
     // commit that matched nothing even when nothing would have been printed.
-    let diff_shown = (selection != Selection::Disabled || disp.exit_code || pickaxe.active())
+    // A per-parent `separate` record builds its queue whatever the output format
+    // says: `cmd_show()` sets `rev.diff = 1` outright (builtin/log.c:686, git
+    // 2.55.0), so `log_tree_diff()` is past its `all_need_diff` gate for every
+    // commit, and `log_tree_diff_flush()` then tests the queue it built — which is
+    // what decides whether the record prints at all (see the suppression below).
+    // So `git show -s --diff-merges=separate` still walks each parent's diff.
+    let diff_shown = (selection != Selection::Disabled
+        || disp.exit_code
+        || pickaxe.active()
+        || from.is_some())
         && !(parents.is_empty() && !disp.show_root)
         && !merge_off;
     // `diffcore_pickaxe()` runs inside `diffcore_std()`, which
@@ -3233,6 +3269,31 @@ fn show_commit_record(
     // `--diff-filter` is in play, so a commit whose queue the filter emptied prints
     // nothing at all — not even its header.
     if disp.patch.diff_filter.is_some() && diff_shown && files.is_empty() {
+        return Ok(());
+    }
+    // ```c
+    // if (diff_queue_is_empty(&opt->diffopt)) {
+    //         int saved_fmt = opt->diffopt.output_format;
+    //         opt->diffopt.output_format = DIFF_FORMAT_NO_OUTPUT;
+    //         diff_flush(&opt->diffopt);
+    //         opt->diffopt.output_format = saved_fmt;
+    //         return 0;
+    // }
+    //
+    // if (opt->loginfo && !opt->no_commit_id) {
+    //         show_log(opt);
+    // ```
+    //
+    // (log-tree.c:931-940, git 2.55.0.) The ` (from <oid>)` header belongs to the
+    // flush, which tests the queue before it writes anything — so a per-parent
+    // record whose queue came out empty prints nothing at all. That is why
+    // `git show --diff-merges=separate` on a merge that took one side whole names
+    // only the parent it really differs against. If *every* parent came out empty,
+    // `log_tree_diff()` reported `shown == 0` and `log_tree_commit()`'s
+    // `always_show_header` fallback (log-tree.c:1191-1195) prints one header with
+    // `log.parent = NULL` — the caller's job, since it is the one that knows
+    // whether any of this merge's records printed.
+    if from.is_some() && !queue_nonempty {
         return Ok(());
     }
 
@@ -3590,6 +3651,12 @@ fn show_commit_record(
     if !header_empty {
         match (pretty, selection) {
             (Pretty::Oneline, _) => {}
+            // `if ((opt->diffopt.output_format & ~DIFF_FORMAT_NO_OUTPUT) && …)`
+            // (log-tree.c:941, git 2.55.0): with nothing but `NO_OUTPUT` set there is
+            // no diff to separate the message from. Only a per-parent `separate`
+            // record reaches here under `-s` — every other one turned back at the
+            // empty-queue test above, because `-s` never built a queue.
+            (_, Selection::Disabled) => {}
             (
                 _,
                 Selection::Blocks {

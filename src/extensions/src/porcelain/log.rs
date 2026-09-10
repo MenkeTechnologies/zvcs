@@ -4260,11 +4260,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // unconditionally (`rev.diff = 1`, builtin/log.c:543), and `merges_imply_patch`
     // sets it too (diff-merges.c:186-187).
     //
-    // `--diff-filter` sets it too: revision.c:3149-3152 raises `revs->diff` for the
-    // pickaxe, `--diff-filter` and `--follow` alike, under the comment "Pickaxe,
-    // diff-filter and rename following need diffs" — which is why `git log -s
-    // --diff-filter=M` still builds the queue, and still prints the header of every
-    // commit the filter left something in.
+    // `--diff-filter` sets it too, and so do `-S`/`-G`/`--find-object` and
+    // `--follow`. All three come from one block:
+    //
+    // ```c
+    // /* Pickaxe, diff-filter and rename following need diffs */
+    // if ((revs->diffopt.pickaxe_opts & DIFF_PICKAXE_KINDS_MASK) ||
+    //     revs->diffopt.filter || revs->diffopt.filter_not ||
+    //     revs->diffopt.flags.follow_renames)
+    //         revs->diff = 1;
+    // ```
+    //
+    // (revision.c:3148-3152, git 2.55.0.) It is why `git log -s --diff-filter=M`
+    // still builds the queue — and why `git log --diff-merges=separate -Sfoo`
+    // prints a patch for the *non*-merge commits the pickaxe kept: the long
+    // `--diff-merges` spellings raise `merges_need_diff` alone, so the patch format
+    // `diff_merges_setup_revs()` installs (diff-merges.c:188-191) would otherwise
+    // reach nothing but merges. The pickaxe is what makes every commit diffable.
     let all_need_diff = flavor == Flavor::WhatChanged
         || merges_imply_patch
         || rendering_format
@@ -4272,7 +4284,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // (log-tree.c:1103): `--exit-code` builds the queue by itself, which is why
         // `git log --exit-code -s` still reports 1.
         || exit_code
-        || patch_opts.diff_filter.is_some();
+        || patch_opts.diff_filter.is_some()
+        || has_pickaxe
+        || follow;
     // `--name-only`/`--name-status` are git's reported format; they suppress both
     // the count formats and the `-p` patch. The patch is emitted after the count
     // formats otherwise.
@@ -4925,8 +4939,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // An octopus under `--remerge-diff` never reaches `do_remerge_diff()`: it
         // prints the header, then the warning, then `return 1` (log-tree.c:1135-1141),
         // so no queue is built and no format runs.
+        // A per-parent `separate` record is the other shape that needs the queue
+        // under `-s`/`-q`: the ` (from <oid>)` header is written by
+        // `log_tree_diff_flush()` *after* its `diff_queue_is_empty()` test
+        // (log-tree.c:931-940), so the queue is what decides whether the record
+        // exists — and `git log -s --diff-merges=separate` names only the parents
+        // the merge really differs against.
         else if !octopus_here
-            && (want_names || emit_patch || probe_queue || check || exit_code)
+            && (want_names || emit_patch || probe_queue || check || exit_code || from.is_some())
             && if node.parents.len() > 1 {
                 (all_need_diff || merges_need_diff) && diff_merges != DiffMerges::Off
             } else {
@@ -4954,7 +4974,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // The paths `diffcore_pickaxe()` left in the queue, which the patch is
             // rendered from. Empty and unused when no pickaxe ran.
             let mut pickaxe_paths: Vec<String> = Vec::new();
-            if want_names || probe_queue || check || exit_code || has_pickaxe {
+            if want_names || probe_queue || check || exit_code || has_pickaxe || from.is_some() {
                 // `--name-only`/`--name-status` are the reported format when
                 // present; git suppresses the count formats in that case, so the
                 // blob reads they need are skipped too.

@@ -234,6 +234,12 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
                 && matches!(new, Val::Oid(_))
                 && one_level_update_ok(name) =>
         {
+            // A one-level name is well formed to git, so stock got as far as the
+            // backend and failed there; this build must not fall through to the
+            // direct write and lay a loose ref down beside the reftable store.
+            if let Some(code) = reftable_cmdline_refusal(&repo, name, opts.delete) {
+                return Ok(code);
+            }
             return write_one_level_ref(&repo, name, &new, &old);
         }
         Err(_) => {
@@ -243,6 +249,13 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+
+    // `refs_delete_ref()`/`refs_update_ref()` reach the backend only once the name
+    // and the values have been accepted, which is why a bad name still outranks
+    // this. See [`reftable_transaction_refused`] for the failure itself.
+    if let Some(code) = reftable_cmdline_refusal(&repo, name, opts.delete) {
+        return Ok(code);
+    }
 
     match repo.edit_reference(edit) {
         Ok(_) => Ok(ExitCode::SUCCESS),
@@ -988,6 +1001,65 @@ fn c_string(s: &str) -> &str {
     s.split('\0').next().unwrap_or(s)
 }
 
+/// The failure every reference transaction meets in a repository that declares
+/// the `reftable` backend this build has none for.
+///
+/// `reftable_be_transaction_prepare()` opens the stack before it looks at a
+/// single update, and a declared store that was never created fails to open with
+/// `REFTABLE_IO_ERROR` (`reftable/reftable-error.h:20`, v2.55.0) — which
+/// `reftable_error_str()` spells `I/O error`. Nothing in the transaction is
+/// examined first, so this outranks every precondition the batch carries: a
+/// `create` over a ref that already exists reports the I/O error, not
+/// "reference already exists". What it does *not* outrank is the staging-time
+/// validation `ref_transaction_update()` does as each command is read — a
+/// malformed refname and a new value naming an object that is not in the
+/// repository are both refused before any backend is asked.
+///
+/// Measured against stock 2.55.0 in a files repository declaring
+/// `extensions.refStorage = reftable`: `update-ref -d refs/heads/main` prints
+/// `error: reftable: transaction prepare: I/O error` and exits 1, the update form
+/// dies with `fatal: update_ref failed for ref '<name>': …` and 128, and
+/// `--stdin` dies with `fatal: reftable: transaction prepare: I/O error` and 128
+/// — while a transaction that accumulated no updates at all (empty `--stdin`, a
+/// bare `prepare`/`commit` pair) succeeds silently, because
+/// `ref_transaction_prepare()` returns early on an empty transaction and never
+/// reaches the backend.
+///
+/// Refusing here is also what keeps the repository intact: the port roots its ref
+/// store at `<gitdir>/reftable`, so a files-backend write would create that
+/// directory and drop loose refs inside it — files stock would never write and
+/// cannot read.
+fn reftable_transaction_refused(repo: &gix::Repository) -> Result<()> {
+    if crate::setup::declares_reftable(repo) {
+        crate::git_fatal!("reftable: transaction prepare: I/O error");
+    }
+    Ok(())
+}
+
+/// The command-line form's two shapes of that same failure, or `None` when the
+/// repository has a store this build can write.
+///
+/// `cmd_update_ref()` hands a deletion to `refs_delete_ref()`, which reports
+/// through `error("%s", err.buf)` and returns 1 (`refs.c`), and an update to
+/// `refs_update_ref(…, UPDATE_REFS_DIE_ON_ERR)`, which dies with
+/// `update_ref failed for ref '%s': %s` (builtin/update-ref.c:895-904, v2.55.0).
+fn reftable_cmdline_refusal(
+    repo: &gix::Repository,
+    name: &str,
+    delete: bool,
+) -> Option<ExitCode> {
+    if !crate::setup::declares_reftable(repo) {
+        return None;
+    }
+    let msg = "reftable: transaction prepare: I/O error";
+    if delete {
+        eprintln!("error: {msg}");
+        return Some(ExitCode::from(1));
+    }
+    eprintln!("fatal: update_ref failed for ref '{name}': {msg}");
+    Some(ExitCode::from(128))
+}
+
 /// git's `prepare`: acquire the locks the staged batch needs and validate its
 /// preconditions, then roll everything back. gitoxide's prepared transaction is
 /// perfectly rolled back when dropped, so this catches a doomed batch at
@@ -995,6 +1067,12 @@ fn c_string(s: &str) -> &str {
 fn validate_prepare(repo: &gix::Repository, batch: &Batch) -> Result<()> {
     for name in &batch.absent {
         refname(name)?;
+    }
+    if batch.edits.is_empty() && batch.absent.is_empty() {
+        return Ok(());
+    }
+    reftable_transaction_refused(repo)?;
+    for name in &batch.absent {
         if repo.try_find_reference(name.as_str())?.is_some() {
             crate::git_fatal!("cannot lock ref '{name}': reference already exists");
         }
@@ -1224,12 +1302,15 @@ fn run_stdin(
 fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()> {
     for name in &batch.absent {
         refname(name)?; // reject malformed names the same way an edit would
-        if repo.try_find_reference(name.as_str())?.is_some() {
-            crate::git_fatal!("cannot lock ref '{name}': reference already exists");
-        }
     }
     if batch.is_empty() {
         return Ok(());
+    }
+    reftable_transaction_refused(repo)?;
+    for name in &batch.absent {
+        if repo.try_find_reference(name.as_str())?.is_some() {
+            crate::git_fatal!("cannot lock ref '{name}': reference already exists");
+        }
     }
     if !batch_updates {
         if let Err(e) = repo.edit_references(batch.edits) {

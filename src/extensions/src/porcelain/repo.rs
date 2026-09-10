@@ -268,26 +268,16 @@ fn value_of(repo: &gix::Repository, key: &str) -> Option<String> {
         "layout.shallow" => Some(repo.is_shallow().to_string()),
         // `gix_hash::Kind`'s Display is already git's own `sha1`/`sha256` spelling.
         "object.format" => Some(repo.object_hash().to_string()),
-        "references.format" => Some(reference_format(repo)),
+        // git's `ref_storage_format_to_name()`: the `extensions.refStorage` value,
+        // read only once `core.repositoryFormatVersion` is at least 1 and otherwise
+        // `files`. `crate::setup::ref_storage_format` is the one reader of that key
+        // — `rev-parse --show-ref-format` and `declares_reftable` answer from it too,
+        // so all three agree by construction. It echoes the recorded spelling rather
+        // than folding case, which is what git does: `ref_storage_format_by_name()`
+        // (refs.c:51-57, v2.55.0) compares with `strcmp`, so a value that is not the
+        // exact name of a backend never reaches a report at all.
+        "references.format" => Some(crate::setup::ref_storage_format(repo)),
         _ => None,
-    }
-}
-
-/// git's `ref_storage_format_to_name()`: the `extensions.refStorage` value, which
-/// is only consulted once `core.repositoryFormatVersion` is at least 1, and
-/// otherwise defaults to `files`.
-fn reference_format(repo: &gix::Repository) -> String {
-    let config = repo.config_snapshot();
-    if config
-        .integer("core.repositoryFormatVersion")
-        .unwrap_or(0)
-        < 1
-    {
-        return "files".to_string();
-    }
-    match config.string("extensions.refStorage") {
-        Some(v) => String::from_utf8_lossy(&v).to_lowercase(),
-        None => "files".to_string(),
     }
 }
 

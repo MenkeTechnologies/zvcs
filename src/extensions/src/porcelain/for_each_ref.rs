@@ -1336,7 +1336,15 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     // `--include-root-refs` also lists HEAD and the pseudorefs in the git dir
     // that git's `is_root_ref` accepts. They live directly under `$GIT_DIR`, so
     // the loose scan there finds them; `sort_refs` re-orders everything by name.
-    if include_root_refs {
+    // `add_root_refs()` is the *files* backend's (refs/files-backend.c:421-451,
+    // v2.55.0): it walks the git directory while the loose-ref cache is built, so
+    // it exists only where loose refs do. A repository declaring `reftable` takes
+    // its root refs out of the reftable stack instead, and a declared store this
+    // build never created holds none — stock lists nothing there. Scanning the git
+    // directory anyway would report `HEAD` (the file every repository has, whatever
+    // its backend) as a ref, and then fail to resolve it against a store rooted at
+    // `<gitdir>/reftable`.
+    if include_root_refs && !crate::setup::declares_reftable(&repo) {
         for entry in std::fs::read_dir(repo.git_dir())? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {

@@ -13,9 +13,9 @@
 //! rename, mode-only, file-becomes-directory and symlink-versus-file were
 //! therefore not "untested" — they were unbuildable.
 //!
-//! [`Shape::MergeMatrix`] builds six independent branch pairs, one per class,
-//! deliberately separate so a case can ask about rename/rename without also
-//! answering modify/delete. `main` sits at the base commit of all six.
+//! [`Shape::MergeMatrix`] builds fourteen tips off one base, paired so that a
+//! case can ask about rename/rename without also answering modify/delete.
+//! `main` sits at the base commit of every pair.
 //!
 //! # How this divides territory with the merge modules already here
 //!
@@ -27,7 +27,8 @@
 //!   conflict. Its header records the five defects it could not express; four
 //!   of them are pinned here — the three `merge.directoryRenames` rows in
 //!   [`directory_rename_configuration`], and the file/directory and
-//!   symlink/file omissions in [`merge_tree_over_every_class`].
+//!   symlink/file classes in [`merge_tree_over_every_class`], which the port
+//!   has since learnt to report and which these cases now hold in place.
 //! * [`super::merge_strategies`] owns *which backend* the trees go to on
 //!   [`Shape::CrissCross`]; here the same `-s`/`-X` grammar is asked over inputs
 //!   that make the backends *disagree with each other* — `-s resolve` does no
@@ -40,41 +41,65 @@
 //!   [`Shape::Renamed`]/[`Shape::CrissCross`]/[`Shape::Branched`], including a
 //!   `merge.conflictStyle` sweep *without* `--merge-base` and a `--merge-base`
 //!   sweep *without* `merge.conflictStyle`. The crossing of the two is neither
-//!   module's and is where the label defect below lives.
+//!   module's, and is where the `|||||||` label defect
+//!   [`forced_base_and_conflict_style`] records was found.
 //! * [`super::merge_dirty`] owns the dirty-worktree gates;
 //!   [`super::rebase_engine`] owns `rebase`'s own option table;
 //!   [`super::rerere_engine`] owns `rerere.*` over a merge;
 //!   [`super::sequences`] owns everything needing a second invocation.
 //!
-//! # Which of the eight classes this shape reaches, and which it still does not
+//! # Which classes this shape reaches, and the one it still does not
 //!
 //! | class | reachable | how |
 //! |---|---|---|
 //! | modify/delete | yes | `mm-mod` / `mm-del` on `mm/md.txt` |
-//! | rename/rename | yes | `mm-ren-a` / `mm-ren-b` on `mm/rr.txt` |
+//! | rename/rename, exact | yes | `mm-ren-a` / `mm-ren-b` on `mm/rr.txt` |
+//! | rename/rename, **inexact** | yes | `mm-ren-a` / `mm-ren-edit`, scored `R055` |
 //! | directory rename | yes | `mm-dir` / `mm-add` on `mm/old/` |
 //! | mode-only | yes | `mm-mode` — the corpus's first `100755` blob |
 //! | file becomes directory | yes | `mm-fd` / `mm-file` on `mm/fd` |
 //! | symlink vs file | yes | `mm-reg` / `mm-link` on `mm/slink` |
-//! | **rename/delete** | **no** | see below |
-//! | **rename/add** | **no** | see below |
+//! | **rename/delete** | yes | `mm-ren-a` / `mm-ren-del` on `mm/rr.txt` |
+//! | **add at a rename's destination** | yes | `mm-ren-a` / `mm-ren-add` on `mm/rr-a.txt` |
+//! | **mode/mode** | **no** | see below |
 //!
-//! **rename/delete** needs one side to rename `P` while the other deletes `P`.
-//! The shape renames exactly two paths — `mm/rr.txt` (by `mm-ren-a`/`mm-ren-b`)
-//! and `mm/old/{a,b}.txt` (by `mm-dir`) — and deletes exactly one, `mm/md.txt`
-//! (by `mm-del`); the two sets are disjoint and no re-pointing of the base with
-//! `merge-tree --merge-base=` closes the gap, because every candidate turns the
-//! second side's edit into a *rename* too and lands back on rename/rename.
-//! **rename/add** needs one side to rename `P` to `Q` while the other adds `Q`
-//! independently; nothing in the shape adds `mm/rr-a.txt`, `mm/rr-b.txt` or
-//! `mm/new/*`. Both need another branch in `fixture.rs`, which a corpus module
-//! cannot add — recorded here rather than substituted for with something
-//! easier. A **mode/mode** conflict (two sides setting two different modes on
-//! one path) is unreachable for the same reason: only `mm-mode` touches a mode.
+//! Six of those rows were reachable when this module was written. The other
+//! three — the inexact rename, rename/delete, and the add at a rename's
+//! destination — were not: the shape renamed two paths and deleted a third,
+//! all disjoint,
+//! and nothing added at any rename's destination. `fixture.rs` closed all three
+//! with tips that act on `mm/rr.txt`, the path `mm-ren-a` and `mm-ren-b` already
+//! rename — `mm-ren-del` deletes it, `mm-ren-add` adds an unrelated file at
+//! `mm/rr-a.txt` (the *destination* of `mm-ren-a`'s rename), and `mm-ren-edit`
+//! renames it to `mm/rr-e.txt` while rewriting four of its ten lines. Two of the
+//! three change what this module can claim rather than only adding a row:
+//!
+//! * **The collision at a rename's destination is `add/add`, not `rename/add`.**
+//!   Measured, not inferred from the shape of the inputs: `merge-ort.c` applies
+//!   the rename first and then finds two independent additions at one path, so
+//!   the report is `CONFLICT (add/add): Merge conflict in mm/rr-a.txt` with
+//!   stages 2 and 3 and no stage 1. It is also the only conflicting pair here
+//!   that `-X ours`/`-X theirs` can resolve, which is what turns the claim in
+//!   [`strategy_options_over_every_class`] from one about the *flags* into one
+//!   about the *classes*. See [`add_at_a_rename_destination`].
+//! * **The inexact rename is what makes the similarity options live.** An exact
+//!   rename is paired by object id before any score is computed, so
+//!   `-X find-renames=` and `-X rename-threshold=` could previously only be
+//!   inert controls here. `mm-ren-edit` scores `R055`: a rename at the default
+//!   and at 55%, not one at 56%. The threshold now flips the answer in both
+//!   directions, and the port's largest defect on this shape is in reading it —
+//!   [`similarity_threshold_over_the_inexact_rename`].
+//!
+//! A **mode/mode** conflict — two sides setting two *different* modes on one
+//! path — stays unreachable, and not for want of another branch. A regular file
+//! has exactly two modes, `100644` and `100755`, so "two sides disagree about
+//! the mode" is `mm-mode` against a tip that leaves the bit alone, which is a
+//! mode change on one side only and merges clean. The third spelling of a mode
+//! change is a typechange, and `mm-reg`/`mm-link` already covers that.
 //!
 //! # What `git merge` itself can and cannot do here, and why the verbs differ
 //!
-//! `main` is the *base* of all six pairs, so it is an ancestor of every tip and
+//! `main` is the *base* of every pair, so it is an ancestor of every tip and
 //! a one-argument `git merge` can only fast-forward. A genuine two-head ort
 //! merge from a single invocation is therefore not available on this shape, and
 //! that is a real limit, not an oversight. What *is* available:
@@ -102,62 +127,71 @@
 //!
 //! # What the module finds
 //!
-//! 146 cases, **59 matching (40.4%)**, measured with
+//! 231 cases, **183 matching (79.2%)**, measured with
 //! `--only merge,merge-tree,cherry-pick,revert,rebase --verbose` against
 //! `target/debug/git` with `/usr/bin/git` (2.50.1) as the second oracle:
 //!
 //! | verb | cases | match | parity |
 //! |---|---|---|---|
-//! | `merge-tree` | 67 | 32 | 47.8% |
-//! | `cherry-pick` | 25 | 11 | 44.0% |
-//! | `rebase` | 22 | 0 | 0.0% |
-//! | `merge` | 21 | 5 | 23.8% |
-//! | `revert` | 11 | 11 | 100% |
+//! | `merge-tree` | 120 | 113 | 94.2% |
+//! | `cherry-pick` | 38 | 17 | 44.7% |
+//! | `rebase` | 35 | 17 | 48.6% |
+//! | `merge` | 24 | 22 | 91.7% |
+//! | `revert` | 14 | 14 | 100% |
 //!
-//! **76 of the 87 failures are corroborated by the second oracle** — 2.50.1
-//! gave stock 2.55.0's answer byte for byte, so they are the port's difference
-//! and not a version difference. `version-skew` and `gits-disagree` are **0**
-//! on this shape (the 15 `gits-disagree` cases in that run are all on other
-//! shapes). The remaining 11 are the `[UNSUPPORTED]` verdicts below, which the
-//! harness does not put to a second git because the port has already said it
-//! does not implement the path. `zvcs-flaky` is 0 across the whole run.
+//! **All 48 failures are corroborated by the second oracle** — 2.50.1 gave
+//! stock 2.55.0's answer byte for byte, so every one of them is the port's
+//! difference and not a version difference. `unsupported`, `version-skew`,
+//! `gits-disagree`, `interop-diff` and `zvcs-flaky` are **0** on this shape.
 //!
-//! They are **nine** distinct defects, not 87. The rows below count the cases
-//! each defect is *visible in*, and they overlap — a `rebase mm-reg mm-link`
-//! carries both the symlink defect and the reflog one, so the column sums to
-//! more than 87 on purpose:
+//! The 85 cases the three new tips add account for 20 of the 48; the other 28
+//! are exactly the failing set this module had before those tips existed.
+//! Growing `mm/rr.txt` from three lines to ten to make a similarity score
+//! land between thresholds moved every object id in the shape and changed **no
+//! verdict**: this module, unmodified, was run against the previous
+//! `fixture.rs` and the same `target/debug/git`, and produced the same 28
+//! failing ids.
+//!
+//! They are **six** distinct defects, not 48. The rows below count the cases
+//! each is *visible in* and they overlap on purpose — a
+//! `rebase -c merge.directoryRenames=conflict` carries two of them — so the
+//! column sums to more than 48:
 //!
 //! | defect | cases | verdict |
 //! |---|---|---|
-//! | `merge.directoryRenames` never read: `false` moves the file anyway, `conflict` does not conflict, `true` drops the `Path updated:` line | 19 | 3 `merge-tree`, 6 `cherry-pick`, 6 `rebase`, 4 `merge` |
-//! | `merge-tree --messages` refuses the directory-rename class outright (`conflict at mm/new is a class whose git message text is not ported`) | 11 | `[UNSUPPORTED]` |
-//! | `rebase` writes an extra `rebase: checkout <branch>` HEAD reflog entry before `rebase (start):`, which stock does not write — present on **all 22** `rebase` cases, sole cause on 12 | 12 | `[STATE-DIFF]` |
-//! | `CONFLICT (file/directory): directory in the way of …` omitted | 14 | 8 `merge-tree`, 3 `cherry-pick`, 3 `rebase` |
-//! | symlink-vs-file: stages stacked at the original path instead of `<path>~<side>`, and `merge-tree`'s merged tree is the **base** tree | 14 | 8 `merge-tree`, 3 `cherry-pick`, 3 `rebase` |
-//! | `git merge` over two heads runs ort where stock runs `git-merge-one-file` | 8 | `merge` |
-//! | `cherry-pick` reports rename/rename and file/directory as `CONFLICT (content)` — its `rebase` twin gets both right | 5 | `cherry-pick` |
-//! | `merge --stat`/`--summary` diffstat does not detect the rename | 3 | `merge` |
-//! | one each: `merge.renameLimit=nonsense` not validated (exit 1 against stock's 128), `merge.conflictStyle=diff3`/`zdiff3` drops the `--merge-base=` label from the `\|\|\|\|\|\|\|` line, an emptied `mm/old/` left in the worktree after a directory-rename merge | 4 | 3 `merge-tree`, 1 `merge` |
+//! | `cherry-pick` collapses every class to `CONFLICT (content): Merge conflict in <path>` — rename/rename, rename/delete, file/directory and distinct-types alike; its `rebase` twin names all four correctly | 17 | `cherry-pick` |
+//! | the `# Conflicts:` list in `MERGE_MSG` (and `rebase-merge/message`) names only *one* of the unmerged paths where stock names all of them, on an index whose stages agree entry for entry | 15 | `rebase`, `[STATE-DIFF]` |
+//! | `-X find-renames=<n>`/`-X rename-threshold=<n>` loses an un-suffixed integer under `merge-tree` and `cherry-pick`, and reads it correctly under `rebase` | 7 | 6 `merge-tree`, 1 `cherry-pick` |
+//! | `merge.directoryRenames` *is* read now — `false` is honoured everywhere — but the sequencer and rebase paths render the wrong report: `conflict`/`bogus` print `CONFLICT (add/add): Merge conflict in mm/new` for stock's `CONFLICT (file location): …`, and `true` drops the `Path updated:` line | 9 | 3 `cherry-pick`, 5 `rebase`, 1 `merge-tree` (`--quiet`, exit 1 against stock's 0) |
+//! | `rebase -s resolve` runs ort anyway: stock's `resolve` backend has no rename detection, so it finishes two rebases the port stops with a conflict, and reports the third differently | 3 | `rebase` |
+//! | `git merge` over two heads leaves no `REUC` (resolve-undo) extension in the index where stock records one | 2 | `merge`, `[STATE-DIFF]` |
 //!
-//! Three change what is *written* rather than what is printed, and each is
-//! called out where its cases are defined: `merge.directoryRenames` (the port
-//! commits a tree neither git would write), the symlink-vs-file tree (the port
-//! returns the pre-merge tree), and the emptied directory. A fourth, the
-//! `rebase` reflog entry, is invisible to stdout entirely and was found only by
-//! the runner's state probe — no hand comparison of stdout, index, refs and
-//! objects had caught it.
+//! Two of the six are invisible to stdout entirely and exist only because the
+//! runner probes the post-state: the `# Conflicts:` list and the missing `REUC`
+//! extension. Both survived hand comparison of stdout, exit code, unmerged
+//! stages and refs, because they are in none of those.
+//!
+//! Six defects this module used to record are **gone**, and their cases are
+//! kept as the pins that say so: the extra `rebase: checkout <branch>` HEAD
+//! reflog entry, the omitted `CONFLICT (file/directory)` line, the symlink
+//! stages stacked at one path with the base tree returned, the `[UNSUPPORTED]`
+//! refusal of the directory-rename class under `--messages`, the dropped
+//! `--merge-base=` label on the `\|\|\|\|\|\|\|` line, and
+//! `merge.renameLimit=nonsense` exiting 1 instead of 128.
 //!
 //! # Determinism
 //!
 //! Many of these commit, so their object ids are part of what is compared.
-//! **All 104 distinct argvs this module uses were each run twice against stock
-//! 2.55.0**, in two `cp -Rp` copies of the shape under
-//! [`crate::env::harden`], and the two runs compared on exit code, stdout,
-//! stderr, `ls-files --stage`, `for-each-ref`, `cat-file --batch-check
-//! --batch-all-objects`, `log --all --format='%H %T %P %s'` and the set of
-//! files under `.git`. All 104 agreed; none was nondeterministic. (The count is
-//! of argvs, not cases: the configuration variants reuse an argv already in the
-//! set and cannot introduce a clock the bare argv does not have.)
+//! **Every one of the 231 cases was run stock-against-stock** —
+//! `--bin /opt/homebrew/bin/git --only merge,merge-tree,cherry-pick,rebase,revert`,
+//! which puts git 2.55.0 on both sides of the comparison in two independent
+//! `cp -Rp` copies of the shape under [`crate::env::harden`] and judges them on
+//! everything the differential run judges: stdout, exit code, the full state
+//! probe and the interop probe. That run is `1072/1072 matched (100%)` with a
+//! single exclusion, `branched::rebase::rebase --ignore-date HEAD~1`, which is
+//! another module's case on another shape and is excluded because it reads a
+//! clock. Nothing on [`Shape::MergeMatrix`] is nondeterministic, and nothing on
+//! it is excluded.
 //!
 //! `cp -Rp` is deliberate, for the reason [`super::merge_ort`] gives:
 //! [`crate::fixture::copy_tree`] carries mtimes across and the shapes set
@@ -181,6 +215,10 @@ pub fn cases(out: &mut Vec<Case>) {
     merge_over_more_than_two_heads(out);
     strategy_options_over_every_class(out);
     forced_base_and_conflict_style(out);
+    rename_delete_over_every_verb(out);
+    add_at_a_rename_destination(out);
+    inexact_rename_over_every_verb(out);
+    similarity_threshold_over_the_inexact_rename(out);
 }
 
 /// Push one case per argv against [`Shape::MergeMatrix`].
@@ -202,34 +240,26 @@ fn each(cmd: &'static str, argvs: &[&[&str]], out: &mut Vec<Case>) {
 /// verb's, which is why the same pairs are then asked again through
 /// `cherry-pick` and `rebase` below.
 ///
-/// Three of the six diverge, and all three were reproduced by hand:
-///
-/// * `mm-dir mm-add` — stock exits **1** with `CONFLICT (file location)` and a
-///   stage-3 entry at `mm/new/c.txt`; the port exits **0** with a clean tree.
-///   See [`directory_rename_configuration`].
-/// * `mm-fd mm-file` — the port omits stock's
-///   `CONFLICT (file/directory): directory in the way of mm/fd from mm-file;
-///   moving it to mm/fd~mm-file instead.`
-/// * `mm-reg mm-link` — stock records the file side at `mm/slink~mm-reg` and
-///   writes tree `3fc920d6…`, whose `mm/slink` is `mm-link`'s symlink
-///   (`561da849…`). The port stacks all three stages at `mm/slink`, prints the
-///   same `renamed one of them so each can be recorded somewhere` message
-///   without renaming anything, and writes `6036719e…` — the **base** tree,
-///   whose `mm/slink` is `09d56094…`, the pre-merge target that neither side
-///   kept. The message is right and the tree is neither side's answer.
+/// All six agreed when last measured, which is a change: three of them —
+/// `mm-dir mm-add`, `mm-fd mm-file` and `mm-reg mm-link` — were the module's
+/// three worst `merge-tree` divergences, and the cases are kept as the pins
+/// that say the engine now answers them. `mm-fd mm-file` records the file side
+/// at `mm/fd~mm-file` with both conflict lines, and `mm-reg mm-link` renames one
+/// of the two types rather than stacking three stages at one path and returning
+/// the base tree.
 ///
 /// `--messages` is not redundant with the default. Stock prints the report
-/// either way, but the port takes a different path under the explicit flag: on
-/// `mm-dir mm-add` it stops with
-/// `zvcs: merge-tree: conflict at mm/new is a class whose git message text is
-/// not ported`, so the flag turns a silent wrong answer into a stated refusal.
-/// Both are worth having — one measures the answer, the other the admission.
+/// either way; the port used to take a different path under the explicit flag
+/// and refuse the directory-rename class outright, so the two spellings measure
+/// different things even when they now agree.
 ///
 /// `--name-only`, `--no-messages`, `-z` and `--quiet` each drop a different part
 /// of the record, which is what separates "the report is wrong" from "the tree
-/// is wrong". `--quiet` on `mm-dir mm-add` is the odd one: stock exits **0**
-/// there while the same merge without it exits 1, and the port agrees — a stock
-/// behaviour the corpus had no case for.
+/// is wrong". **`--quiet` on `mm-dir mm-add` is the one that still diverges**,
+/// and only in the exit code: stock exits **0** there while the same merge
+/// without the flag exits 1 — a directory-rename conflict is reported but does
+/// not make `--quiet` fail — and the port exits **1**. Nothing else about the
+/// two runs differs, which is why the flag needs a case of its own.
 ///
 /// The last three argvs are the near misses named in the module header:
 /// `mm-ren-a mm-del` renames and deletes *different* paths, and `mm-dir mm-del`
@@ -270,9 +300,11 @@ fn merge_tree_over_every_class(out: &mut Vec<Case>) {
 
     // `--stdin` is one process answering two merges, and the leading status
     // column is the part only this mode has: stock prints `0` for the
-    // directory-rename record (it reports the conflict in the message field and
-    // still calls the merge complete) and the port prints `1`, on top of losing
-    // the record's whole conflicted-file block.
+    // directory-rename record — it reports the conflict in the message field
+    // and still calls the merge complete — where the same merge as an ordinary
+    // invocation exits 1. The port used to print `1` there and lose the
+    // record's conflicted-file block; both agree now, and the case is what says
+    // so.
     out.push(Case::with_stdin(
         "merge-tree",
         &["merge-tree", "--stdin"],
@@ -288,7 +320,7 @@ fn merge_tree_over_every_class(out: &mut Vec<Case>) {
 }
 
 // ---------------------------------------------------------------------------
-// `merge.directoryRenames`: a key the port never reads
+// `merge.directoryRenames`: read now, reported wrong by two of the three verbs
 // ---------------------------------------------------------------------------
 
 /// The three settings of `merge.directoryRenames`, through every verb that
@@ -296,31 +328,29 @@ fn merge_tree_over_every_class(out: &mut Vec<Case>) {
 ///
 /// **The defect this group exists to pin.** `mm-dir` renames `mm/old/` to
 /// `mm/new/`; `mm-add` adds `mm/old/c.txt` into the old name. Stock's answer is
-/// a function of the key. The port's is not — it behaves as `true` in all
-/// three settings, which is wrong two different ways and silently right the
-/// third. Measured by hand on the shape, stock 2.55.0 and git 2.50.1 agreeing:
+/// a function of the key, and the port's is too **under `merge-tree`** — all
+/// four values agree there, including the tree, which is a change from when
+/// this group was written and the port behaved as `true` whatever the key said.
+/// What is left is a reporting defect confined to the two verbs that carry an
+/// index. Measured by hand on the shape, stock 2.55.0 and git 2.50.1 agreeing:
 ///
-/// | setting | stock | port |
+/// | setting | stock | port under `cherry-pick`/`rebase` |
 /// |---|---|---|
-/// | `false` | tree `65c46d8e…`, `mm/old/c.txt` kept, exit 0 | tree `82dbce05…`, file **moved** to `mm/new/c.txt`, exit 0 |
-/// | `conflict` (default) | tree `82dbce05…`, stage 3 at `mm/new/c.txt`, `CONFLICT (file location)`, exit **1** | tree `82dbce05…`, no conflict, exit **0** |
-/// | `true` | tree `82dbce05…`, exit 0, `Path updated: …` on the pick paths | same tree and status, `Path updated:` line **missing** |
+/// | `false` | `mm/old/c.txt` kept, exit 0 | same, byte for byte |
+/// | `conflict` (default) | `CONFLICT (file location): mm/old/c.txt added in b606dbf … suggesting it should perhaps be moved to mm/new/c.txt.`, exit 1 | `CONFLICT (add/add): Merge conflict in mm/new`, exit 1 |
+/// | `true` | `Path updated: … moving it to mm/new/c.txt.`, exit 0 | the line **missing**, same commit otherwise |
+/// | `bogus` | rejected the same way `conflict` is reported | as `conflict` above |
 ///
-/// The `false` row is the one that loses work: through `cherry-pick` the port
-/// commits `04c99f0d…` where stock commits `4dcef09a…`, a tree neither git
-/// would write for that configuration.
+/// The `false` row is what makes the finding specific rather than "the key is
+/// ignored": it is honoured, and the same merge under the same key prints a
+/// class that is not the class git found. The port names `mm/new`, a
+/// *directory*, as the conflicted path; stock names `mm/new/c.txt`.
 ///
-/// **The controls are the point of the group, not decoration.** If the three
-/// failures stood alone a reader could conclude the port ignores every merge
-/// configuration key, and the fix would be aimed at the wrong place. It does
-/// not. `-X no-renames`, `merge.renames=false` and `diff.renames=false` each
-/// turn the same detection off, and on `merge-tree` and `cherry-pick` the port
-/// then agrees with stock byte for byte — measured, not assumed: those four
-/// cases match. That localises the defect to `merge.directoryRenames` alone.
-/// (`rebase -X no-renames mm-dir mm-add` is the fifth control and it does
-/// *not* match, for an unrelated reason: every `rebase` case in this module
-/// carries the extra HEAD reflog entry described in
-/// [`rebase_over_every_class`]. Its stdout, index and refs agree.)
+/// **The controls are the point of the group, not decoration.** `-X
+/// no-renames`, `merge.renames=false` and `diff.renames=false` each turn the
+/// same detection off, and the port then agrees with stock byte for byte under
+/// all three verbs — measured, not assumed. That localises what is left to the
+/// report and not to the detection.
 ///
 /// `merge.renames=true` is the affirmative spelling rather than a control; it
 /// leaves detection on, so the merge is the default one and the case lands on
@@ -413,15 +443,17 @@ fn directory_rename_configuration(out: &mut Vec<Case>) {
 
 /// Every class again, picked onto `main` two commits at a time.
 ///
-/// `main` is the base of all six pairs, so `cherry-pick <a> <b>` applies `a`
+/// `main` is the base of every pair, so `cherry-pick <a> <b>` applies `a`
 /// cleanly — the commit it writes has `a`'s tree — and then merges `b`'s change
 /// against it. That is the same three trees `merge-tree <a> <b>` sees, reached
 /// through `sequencer.c` with an index and a worktree behind it, and the answers
-/// are **not** the same. On rename/rename, `merge-tree` agrees with stock while
-/// `cherry-pick` reports `CONFLICT (content): Merge conflict in mm/rr-a.txt`
-/// where stock reports
-/// `CONFLICT (rename/rename): mm/rr.txt renamed to mm/rr-a.txt in HEAD and to
-/// mm/rr-b.txt in d4a2413`. Both spellings of each pair are here because the
+/// are **not** the same. `merge-tree` agrees with stock on every class the shape
+/// builds; `cherry-pick` collapses all of them to
+/// `CONFLICT (content): Merge conflict in <path>` — rename/rename,
+/// rename/delete, file/directory and distinct types alike — where stock names
+/// the class, and it does so on a path that is sometimes in neither side's
+/// tree (`mm/rr.txt` for a rename/delete stock reports at `mm/rr-a.txt`).
+/// Both spellings of each pair are here because the
 /// conflicted path is named after the side it came from, so reversing the order
 /// changes the bytes under test (`mm/slink~HEAD` versus
 /// `mm/slink~e0e7093 (merge-matrix: slink becomes a file)`) rather than
@@ -489,22 +521,32 @@ fn cherry_pick_over_every_class(out: &mut Vec<Case>) {
 /// `--merge` names the backend the default already uses, which is what makes a
 /// port that treats it as an unknown option visible.
 ///
-/// **A defect no stdout comparison finds, and every case here carries it.** The
-/// runner's state probe reads the `HEAD` reflog, and the port writes one entry
-/// stock does not. On `rebase mm-mode mm-reg`, stock's trail is
+/// **A defect no stdout comparison finds, and every conflicting case here
+/// carries it.** The runner's state probe reads the files a stopped rebase
+/// leaves behind, and the port's `# Conflicts:` list is short. On
+/// `rebase mm-ren-a mm-ren-b` the two indexes hold the same three unmerged
+/// entries, entry for entry, and stock's `.git/MERGE_MSG` (and its copy at
+/// `.git/rebase-merge/message`) is
 ///
 /// ```text
-/// 0421e7a9 5ca8368f  rebase (start): checkout mm-mode
-/// 5ca8368f 0c4f6522  rebase (pick): merge-matrix: slink becomes a file
-/// 0c4f6522 0c4f6522  rebase (finish): returning to refs/heads/mm-reg
+/// merge-matrix: rename rr.txt to rr-b.txt
+///
+/// # Conflicts:
+/// #	mm/rr-a.txt
+/// #	mm/rr-b.txt
+/// #	mm/rr.txt
 /// ```
 ///
-/// and the port's is the same three preceded by
-/// `0421e7a9 e0e7093f  rebase: checkout mm-reg` — the checkout of the branch
-/// being rebased, recorded as if it were a user action. It is the sole cause of
-/// 12 of the 22 failures in this group and rides along on the other 10, and it
-/// survived every hand comparison of stdout, index, refs and objects because it
-/// is in none of them.
+/// where the port lists `mm/rr-a.txt` alone. It is the sole cause of most of
+/// the failures in this group, and it survives every comparison of stdout,
+/// exit code, unmerged stages and refs because it is in none of them. It is
+/// visible on `cherry-pick` too, where it is masked by the class-name defect in
+/// [`cherry_pick_over_every_class`]; `rebase` is where it is the *only* thing
+/// wrong, and that is what makes it a finding rather than a symptom.
+///
+/// An earlier defect this group carried — an extra `rebase: checkout <branch>`
+/// HEAD reflog entry the port wrote before `rebase (start):` — is gone; the two
+/// reflogs now agree entry for entry.
 fn rebase_over_every_class(out: &mut Vec<Case>) {
     each(
         "rebase",
@@ -579,22 +621,22 @@ fn revert_over_every_class(out: &mut Vec<Case>) {
 /// the corpus barely touches. Stock fast-forwards to `<a>` and then hands the
 /// second head to `git merge-index git-merge-one-file`, which has **no rename
 /// detection, no directory-rename detection and no typechange handling**. The
-/// port answers all six pairs with merge-ort instead, so the two disagree on
-/// nearly everything, and in two of the six the disagreement changes what is
-/// committed rather than what is printed:
+/// port used to answer every pair with merge-ort instead and disagree on nearly
+/// all of them; it now reproduces the octopus backend, down to
+/// `Simple merge did not work, trying automatic merge.`, `git-merge-one-file`'s
+/// own `ERROR: … Not handling case …` on stderr and stock's exit code. The
+/// pairs are kept because that agreement is the thing worth pinning: a port
+/// that quietly upgraded the two-head path to ort would commit a *different
+/// tree* here — on `mm-ren-a mm-ren-b` stock commits both `mm/rr-a.txt` and
+/// `mm/rr-b.txt` at exit 0, where ort raises rename/rename and stops.
 ///
-/// * `merge mm-ren-a mm-ren-b` — stock **succeeds**, commits
-///   `Merge branches 'mm-ren-a' and 'mm-ren-b'` with both `mm/rr-a.txt` and
-///   `mm/rr-b.txt` present, and exits 0. The port raises
-///   `CONFLICT (rename/rename)`, leaves three unmerged stages and exits 1.
-/// * `merge mm-dir mm-add` — both commit; stock's tree keeps `mm/old/c.txt`
-///   (`65c46d8e…`) and the port's moves it to `mm/new/c.txt` (`82dbce05…`).
-///
-/// The other four differ in the report only: stock prints
-/// `Simple merge did not work, trying automatic merge.` followed by
-/// `git-merge-one-file`'s own `ERROR: … Not handling case …` /
-/// `ERROR: … Not merging symbolic link changes.` and `fatal: merge program
-/// failed`, and the port prints an ort-style `CONFLICT (…)` line.
+/// **What is left is in the index rather than in the report.** `merge mm-fd
+/// mm-file` and its `-s octopus` twin agree on stdout, exit code, refs and
+/// worktree, and the port's index carries no `REUC` extension where stock's
+/// records `mm/fd/inside.txt=0|100644:d9930cba…|0` — 920 index bytes against
+/// 864. It is a record the port never writes rather than one it writes
+/// differently, and no stdout comparison can see it; it was found by the
+/// runner's index probe.
 ///
 /// The three `-s` cases are the refusals, and they are `strict` because the
 /// refusal *is* the whole behaviour: `ort`, `resolve` and `recursive` each
@@ -603,20 +645,15 @@ fn revert_over_every_class(out: &mut Vec<Case>) {
 /// three agree byte for byte today, which is what makes them worth pinning —
 /// they are the boundary the octopus cases sit just outside of.
 ///
-/// `--no-stat --no-ff -m merged mm-dir` looks like the boring control and is
-/// not: stdout, index and refs all agree, and the *worktree* does not. After
-/// the directory rename stock has removed `mm/old/`, and the port leaves the
-/// emptied directory behind — visible only because the state probe walks the
-/// worktree (`mm/old -: <dir>` on the port's side of the diff and nowhere on
-/// stock's).
-///
-/// `--stat`/`--summary` after `--no-ff mm-dir` is a separate defect from
-/// everything above and is why those three argvs are here: the merge itself
-/// agrees, and the **diffstat** does not. Stock renders
-/// `mm/{old => new}/a.txt | 0` plus `rename mm/{old => new}/a.txt (100%)`; the
-/// port renders four independent create/delete lines and a
-/// `2 insertions(+), 2 deletions(-)` total. `--no-stat` agrees, which places the
-/// defect in the rename detection of the summary rather than in the merge.
+/// The `--no-ff -m merged mm-dir` group is three spellings of one merge whose
+/// *summary* is the thing under test: `--stat` renders
+/// `mm/{old => new}/a.txt | 0` with `rename mm/{old => new}/a.txt (100%)`,
+/// `--summary` renders the rename lines alone, and `--no-stat` renders neither.
+/// The port used to emit four independent create/delete lines instead of two
+/// renames, and to leave the emptied `mm/old/` behind in the worktree after the
+/// directory rename; both are gone, and these are the cases that would catch
+/// either coming back — the second only because the state probe walks the
+/// worktree, where an empty directory is invisible to git itself.
 fn merge_over_more_than_two_heads(out: &mut Vec<Case>) {
     each(
         "merge",
@@ -657,28 +694,33 @@ fn merge_over_more_than_two_heads(out: &mut Vec<Case>) {
 /// Two findings are recorded here rather than guessed at, because they bound
 /// what this shape can measure:
 ///
-/// * **`-X ours`/`-X theirs` change nothing on any of the five conflicting pairs.** Both are
-///   content-level resolutions in `merge-ort.c`; a modify/delete, a
-///   rename/rename, a distinct-types or a file/directory conflict is not a
-///   content conflict, so the flag is parsed and then has nothing to apply to.
-///   Every `-X ours`/`-X theirs` case below therefore diverges *exactly as its
-///   unadorned twin does* — which is the finding: a port that let `-X theirs`
-///   swallow a modify/delete would show up here and does not.
+/// * **`-X ours`/`-X theirs` change nothing on any of the five conflicting
+///   pairs below.** Both are content-level resolutions in `merge-ort.c`; a
+///   modify/delete, a rename/rename, a distinct-types or a file/directory
+///   conflict is not a content conflict, so the flag is parsed and then has
+///   nothing to apply to. Every `-X ours`/`-X theirs` case below therefore
+///   answers *exactly as its unadorned twin does* — which is the finding: a
+///   port that let `-X theirs` swallow a modify/delete would show up here and
+///   does not. The claim is about the classes, not about the flags, and
+///   [`add_at_a_rename_destination`] is the control that proves it: on an
+///   add/add the same two flags resolve the merge at exit 0 and write two
+///   different trees.
 /// * **`-X find-renames=`/`-X rename-threshold=`/`merge.renameLimit` cannot
-///   flip a rename on this shape.** Every rename it builds is exact — `git mv`
+///   flip a rename on *these* pairs.** Every rename in them is exact — `git mv`
 ///   with no edit, so a `100%` similarity match — and exact renames are found
 ///   by the pairing pass before any similarity score or limit is consulted.
 ///   The four cases that set them agree with their unadorned twins on both
-///   sides. They are kept as the negative control for the *next* claim: it is
-///   `-X no-renames` and `merge.renames=false` that turn detection off, and
-///   both do, which is what makes the `merge.directoryRenames` failures above
-///   specific.
+///   sides. That is what makes them the control for
+///   [`similarity_threshold_over_the_inexact_rename`], where the same options
+///   are asked of a rename that has to be *scored* and the port loses one
+///   spelling of the value: a fix that only made these four pass would have
+///   fixed nothing.
 ///
 /// `merge.renameLimit=nonsense` is the one value that is not inert:
 /// `fatal: bad numeric config value 'nonsense' for 'merge.renamelimit': invalid
-/// unit` at exit **128** in stock, exit 1 in the port. `merge_ort` records the
-/// same validation gap under `merge`; this is the `merge-tree` half, which is a
-/// different entry point into `git_config` and was unmeasured.
+/// unit` at exit **128**, which the port now reproduces — it used to exit 1.
+/// `merge_ort` records the same validation gap under `merge`; this is the
+/// `merge-tree` half, a different entry point into `git_config`.
 fn strategy_options_over_every_class(out: &mut Vec<Case>) {
     for option in ["ours", "theirs"] {
         for pair in [
@@ -736,36 +778,37 @@ fn strategy_options_over_every_class(out: &mut Vec<Case>) {
 // A forced base, and the only content conflict this shape can produce
 // ---------------------------------------------------------------------------
 
-/// `merge-tree --merge-base=` pointed at one of the six tips, which is the only
-/// way to get a **content** conflict out of [`Shape::MergeMatrix`] — and the
+/// `merge-tree --merge-base=` pointed at one of the tips, which was the only
+/// way to get a **content** conflict out of the six original pairs — and so the
 /// only way to make `merge.conflictStyle` mean anything here.
 ///
-/// None of the six pairs disagrees about the *bytes* of a file: `mm/rr.txt` is
+/// None of those six disagrees about the *bytes* of a file: `mm/rr.txt` is
 /// moved and never edited, `mm/md.txt` is edited on one side and removed on the
 /// other, and the rest are type or mode changes. Re-pointing the base changes
 /// that. With `--merge-base=mm-fd`, where `mm/fd` is a directory and so has no
 /// blob at all, `mm-file` and `main` both *add* `mm/fd` with different content
 /// and stock answers `CONFLICT (add/add): Merge conflict in mm/fd` over a real
-/// conflicted blob.
+/// conflicted blob. (`mm-ren-add` has since given the shape a second content
+/// conflict that needs no forced base at all — see
+/// [`add_at_a_rename_destination`] — which is what makes the two spellings
+/// separable rather than one dimension measured twice.)
 ///
-/// **The defect that reaches.** With `merge.conflictStyle=diff3` (and
+/// **The defect that used to reach.** With `merge.conflictStyle=diff3` (and
 /// identically `zdiff3`) stock labels the base section with the name it was
-/// given on the command line and the port leaves the label empty:
+/// given on the command line, and the port left the label empty:
 ///
 /// ```text
 /// stock: <<<<<<< mm-file\nstill a file, edited\n||||||| mm-fd\n=======\n…
 /// port:  <<<<<<< mm-file\nstill a file, edited\n|||||||\n=======\n…
 /// ```
 ///
-/// so the merged trees differ (`2e406707…` against `aed4424f…`) while the
-/// `merge` style agrees byte for byte. It is not a property of the conflict
-/// class: reproduced in a two-line scratch repository, the port gets
-/// `||||||| 5e67bc4048` right for a computed base and for an add/add over a
-/// computed base, and drops the label only when `--merge-base=` names the base
-/// explicitly. [`super::patch_equivalence`] sweeps `merge.conflictStyle`
-/// without `--merge-base` and sweeps `--merge-base` without
-/// `merge.conflictStyle`; the crossing is neither module's, which is why the
-/// defect survived both.
+/// so the merged trees differed while the `merge` style agreed byte for byte.
+/// It was specific to a base named on the command line: the port got
+/// `||||||| 03c866d` right for a computed base then and does now, and the two
+/// spellings agree today. [`super::patch_equivalence`] sweeps
+/// `merge.conflictStyle` without `--merge-base` and sweeps `--merge-base`
+/// without `merge.conflictStyle`; the crossing is neither module's, which is
+/// why the defect survived both and why these cases stay.
 ///
 /// The `--merge-base=mm-reg` pair is the same trick over a **symlink**: the
 /// base is a regular file, both sides are symlinks with different targets, and
@@ -796,5 +839,441 @@ fn forced_base_and_conflict_style(out: &mut Vec<Case>) {
                     .with_config(&[("merge.conflictStyle", style)]),
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rename/delete: one side renames `P`, the other deletes it
+// ---------------------------------------------------------------------------
+
+/// `mm-ren-del` deletes `mm/rr.txt`, which `mm-ren-a` and `mm-ren-b` rename.
+///
+/// The class the module header used to record as unreachable. The old shape
+/// renamed two paths and deleted a third, all disjoint, so the pairing could
+/// only ever produce rename/rename or an unrelated deletion; the tip added to
+/// [`Shape::MergeMatrix`] deletes a path that is *already* renamed by two other
+/// tips, which is the whole of what the class needs. Stock's answer, measured:
+///
+/// ```text
+/// f964a3a9e78e9c2cde983fc571e818f32e31ce32
+/// 100644 f9a9686a62283ad7aecdf804cae37ec4f0d3a02a 1	mm/rr-a.txt
+/// 100644 f9a9686a62283ad7aecdf804cae37ec4f0d3a02a 2	mm/rr-a.txt
+///
+/// CONFLICT (rename/delete): mm/rr.txt renamed to mm/rr-a.txt in mm-ren-a, but deleted in mm-ren-del.
+/// ```
+///
+/// Stages 1 and 2 both at the *destination* and no stage 3 is the shape of the
+/// class: the deletion has no side to record, and the base entry is carried
+/// forward under the new name. The port reproduces it byte for byte through
+/// `merge-tree`, `merge` and default `rebase` — including the `# Conflicts:`
+/// list, which has only one path to get right here — and does not through
+/// `cherry-pick`, which is the same split the module already records for
+/// rename/rename and file/directory, now measured on a third class.
+///
+/// `-X ours` and `-X theirs` are here for the reason the header gives: a
+/// rename/delete is not a content disagreement, so both flags parse and then
+/// have nothing to apply to, and stock still reports the conflict under each.
+/// `-X no-renames` is the control that turns the class off entirely — with no
+/// rename detected the merge is "one side deleted a file the other did not
+/// touch", which resolves clean at exit 0.
+///
+/// `rebase -s resolve mm-ren-a mm-ren-del` is the one divergence this group
+/// contributes that no other case in the module has: `resolve` does no rename
+/// detection, so stock sees `mm-ren-del`'s patch as already applied —
+/// `dropping bb51a921… merge-matrix: delete rr.txt -- patch contents already
+/// upstream` — and finishes the rebase at exit 0. The port runs ort anyway,
+/// raises rename/delete and stops. It is the twin of the `-s resolve`
+/// rename/rename failure in [`rebase_over_every_class`], on a class that did
+/// not exist when that one was written.
+fn rename_delete_over_every_verb(out: &mut Vec<Case>) {
+    each(
+        "merge-tree",
+        &[
+            &["merge-tree", "--write-tree", "mm-ren-a", "mm-ren-del"],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-a", "mm-ren-del"],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-del", "mm-ren-a"],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-b", "mm-ren-del"],
+            &["merge-tree", "--write-tree", "--name-only", "mm-ren-a", "mm-ren-del"],
+            &["merge-tree", "--write-tree", "--quiet", "mm-ren-a", "mm-ren-del"],
+            &["merge-tree", "--write-tree", "--messages", "-X", "ours", "mm-ren-a", "mm-ren-del"],
+            &["merge-tree", "--write-tree", "--messages", "-X", "theirs", "mm-ren-a", "mm-ren-del"],
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--messages",
+                "-X",
+                "no-renames",
+                "mm-ren-a",
+                "mm-ren-del",
+            ],
+            &["merge-tree", "--trivial-merge", "main", "mm-ren-a", "mm-ren-del"],
+        ],
+        out,
+    );
+    each(
+        "cherry-pick",
+        &[
+            &["cherry-pick", "mm-ren-a", "mm-ren-del"],
+            &["cherry-pick", "mm-ren-del", "mm-ren-a"],
+            &["cherry-pick", "-n", "mm-ren-a", "mm-ren-del"],
+        ],
+        out,
+    );
+    each(
+        "rebase",
+        &[
+            &["rebase", "mm-ren-a", "mm-ren-del"],
+            &["rebase", "mm-ren-del", "mm-ren-a"],
+            &["rebase", "--merge", "mm-ren-a", "mm-ren-del"],
+            &["rebase", "-s", "resolve", "mm-ren-a", "mm-ren-del"],
+        ],
+        out,
+    );
+    // The octopus backend has no rename detection, so `git-merge-one-file` sees
+    // a file deleted on one side and untouched on the other and commits the
+    // deletion: stock prints `Merge made by the 'octopus' strategy.` with
+    // `rename mm/{rr.txt => rr-a.txt} (100%)` in the diffstat and exits 0 where
+    // ort would have conflicted. The port agrees, which is the finding — the
+    // two-head path does *not* silently upgrade itself to ort here.
+    each("merge", &[&["merge", "mm-ren-a", "mm-ren-del"]], out);
+    each("revert", &[&["revert", "--no-edit", "-n", "mm-ren-del"]], out);
+}
+
+// ---------------------------------------------------------------------------
+// A collision at a rename's destination — which stock calls add/add
+// ---------------------------------------------------------------------------
+
+/// `mm-ren-add` adds an unrelated file at `mm/rr-a.txt`, the path `mm-ren-a`
+/// renames `mm/rr.txt` to.
+///
+/// **This is add/add, not rename/add, and the distinction is measured rather
+/// than assumed.** `merge-ort.c` resolves the rename first and then finds two
+/// independent additions at one path, so the report is
+/// `CONFLICT (add/add): Merge conflict in mm/rr-a.txt` over a real conflicted
+/// blob with stages 2 and 3 — no stage 1, because the destination has no base
+/// version. A reader expecting `rename/add` from the shape of the inputs would
+/// be reading a class git does not print here.
+///
+/// **It is also the first pair on this shape where `-X ours` and `-X theirs`
+/// do something.** Every other conflicting pair the module builds is a class,
+/// not a hunk, so both flags are inert (see
+/// [`strategy_options_over_every_class`]). An add/add *is* a content
+/// disagreement: stock resolves it at exit 0 and writes two different trees —
+/// `f964a3a9…` for `-X ours` (the renamed content wins) and `6505f80f…` for
+/// `-X theirs` (the independent add wins). The port writes the same two. That
+/// turns the header's "both flags are inert here" from a claim about the flags
+/// into a claim about the *classes*, which is what it always should have been.
+///
+/// The `merge.conflictStyle` rows are the other thing this pair unlocks. The
+/// module header used to say the only content conflict on this shape needed
+/// `--merge-base=` to build; an add/add over a *computed* base is a second one,
+/// and it renders a marker block:
+///
+/// ```text
+/// <<<<<<< mm-ren-a
+/// rr line 1
+/// …
+/// rr line 10
+/// ||||||| 03c866d
+/// =======
+/// an unrelated file at the rename's destination
+/// >>>>>>> mm-ren-add
+/// ```
+///
+/// with the base label present and abbreviated, and the port writes the same
+/// tree (`036fb029…`) under both `diff3` and `zdiff3`. That is the positive
+/// control for the label defect [`forced_base_and_conflict_style`] documents:
+/// the port's `|||||||` line is right for a computed base and was wrong only
+/// for an explicitly named one.
+///
+/// `mm-ren-b mm-ren-add` is the negative control — a rename to `mm/rr-b.txt`
+/// and an add at `mm/rr-a.txt` do not collide, and both sides exit 0 — which is
+/// what makes "the destination is what collides" checkable rather than
+/// asserted.
+///
+/// `--merge-base=mm-ren-add` is the same tip used as a *base* instead: with
+/// `mm/rr-a.txt` already present in stage 1, `main` deletes it and `mm-ren-a`
+/// keeps it, so the class turns into modify/delete on a path no other case in
+/// the module reaches that way.
+fn add_at_a_rename_destination(out: &mut Vec<Case>) {
+    each(
+        "merge-tree",
+        &[
+            &["merge-tree", "--write-tree", "mm-ren-a", "mm-ren-add"],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-a", "mm-ren-add"],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-add", "mm-ren-a"],
+            &["merge-tree", "--write-tree", "-z", "mm-ren-a", "mm-ren-add"],
+            &["merge-tree", "--write-tree", "--quiet", "mm-ren-a", "mm-ren-add"],
+            &["merge-tree", "--write-tree", "--messages", "-X", "ours", "mm-ren-a", "mm-ren-add"],
+            &["merge-tree", "--write-tree", "--messages", "-X", "theirs", "mm-ren-a", "mm-ren-add"],
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--messages",
+                "-X",
+                "no-renames",
+                "mm-ren-a",
+                "mm-ren-add",
+            ],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-b", "mm-ren-add"],
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--messages",
+                "--merge-base=mm-ren-add",
+                "mm-ren-a",
+                "main",
+            ],
+        ],
+        out,
+    );
+    for style in ["merge", "diff3", "zdiff3"] {
+        out.push(
+            Case::new(
+                "merge-tree",
+                &["merge-tree", "--write-tree", "--messages", "mm-ren-a", "mm-ren-add"],
+                Shape::MergeMatrix,
+            )
+            .with_config(&[("merge.conflictStyle", style)]),
+        );
+    }
+    each(
+        "cherry-pick",
+        &[
+            &["cherry-pick", "mm-ren-a", "mm-ren-add"],
+            &["cherry-pick", "mm-ren-add", "mm-ren-a"],
+            &["cherry-pick", "-X", "ours", "mm-ren-a", "mm-ren-add"],
+        ],
+        out,
+    );
+    each(
+        "rebase",
+        &[
+            &["rebase", "mm-ren-a", "mm-ren-add"],
+            &["rebase", "-X", "theirs", "mm-ren-a", "mm-ren-add"],
+            &["rebase", "mm-ren-b", "mm-ren-add"],
+        ],
+        out,
+    );
+    each("merge", &[&["merge", "mm-ren-a", "mm-ren-add"]], out);
+    each("revert", &[&["revert", "--no-edit", "-n", "mm-ren-add"]], out);
+}
+
+// ---------------------------------------------------------------------------
+// The inexact rename, and the option family it makes live
+// ---------------------------------------------------------------------------
+
+/// `mm-ren-edit` renames `mm/rr.txt` to `mm/rr-e.txt` *and* rewrites four of
+/// its ten lines, which stock scores `R055`.
+///
+/// Every other rename on this shape is a bare `git mv`, and an exact rename is
+/// paired by oid before any similarity score is computed — which is why
+/// [`strategy_options_over_every_class`] could only keep `-X find-renames=` and
+/// `-X rename-threshold=` as inert negative controls. A rename that has to be
+/// *scored* to be found is what makes them live, and
+/// [`similarity_threshold_over_the_inexact_rename`] does the sweep.
+///
+/// The pairs here are the class report at the default threshold:
+///
+/// * `mm-ren-a mm-ren-edit` — rename/rename, the same class the exact pair
+///   produces, reached through the scoring path instead of the pairing path.
+/// * `mm-ren-edit mm-ren-del` — the only pair on this shape that reports **two**
+///   conflicts from one merge: `CONFLICT (rename/delete)` for `mm/rr.txt`
+///   renamed to `mm/rr-e.txt` and then `CONFLICT (modify/delete)` for
+///   `mm/rr-e.txt` itself, because the renamed content is also edited. A single
+///   conflict per merge had been true of every case in this module.
+/// * `mm-ren-edit mm-ren-add` and `cherry-pick mm-ren-add mm-ren-edit` — clean,
+///   at exit 0: the edit lands at `mm/rr-e.txt` and the add at `mm/rr-a.txt`,
+///   two paths that do not collide.
+///
+/// `cherry-pick` mislabels all of them as `CONFLICT (content)` exactly as it
+/// does the exact rename/rename, and `rebase` names every class correctly and
+/// records the same stages as stock — the verb-level split, re-measured on
+/// inexact input. The two conflicting `rebase` cases still fail on the short
+/// `# Conflicts:` list [`rebase_over_every_class`] documents, which is a
+/// different defect and is why they are worth having: it says the class report
+/// and the message body are written from different sources.
+fn inexact_rename_over_every_verb(out: &mut Vec<Case>) {
+    each(
+        "merge-tree",
+        &[
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-a", "mm-ren-edit"],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-edit", "mm-ren-b"],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-edit", "mm-ren-del"],
+            &["merge-tree", "--write-tree", "--messages", "mm-ren-edit", "mm-ren-add"],
+            &["merge-tree", "--write-tree", "--name-only", "mm-ren-a", "mm-ren-edit"],
+        ],
+        out,
+    );
+    each(
+        "cherry-pick",
+        &[
+            &["cherry-pick", "mm-ren-a", "mm-ren-edit"],
+            &["cherry-pick", "mm-ren-edit", "mm-ren-a"],
+            &["cherry-pick", "mm-ren-edit", "mm-ren-del"],
+            &["cherry-pick", "mm-ren-add", "mm-ren-edit"],
+        ],
+        out,
+    );
+    each(
+        "rebase",
+        &[
+            &["rebase", "mm-ren-a", "mm-ren-edit"],
+            &["rebase", "mm-ren-edit", "mm-ren-a"],
+            &["rebase", "mm-ren-edit", "mm-ren-del"],
+        ],
+        out,
+    );
+    each("merge", &[&["merge", "mm-ren-a", "mm-ren-edit"]], out);
+    each("revert", &[&["revert", "--no-edit", "-n", "mm-ren-edit"]], out);
+}
+
+/// The similarity threshold swept across `R055` in both directions.
+///
+/// **The defect this group exists to pin.** git reads the value of
+/// `-X find-renames=`/`-X rename-threshold=` with `parse_rename_score`, which
+/// divides the digits by ten to their own count: `40` is 40%, `5` is **50%**,
+/// `055` is 5.5%, and a trailing `%` or an embedded `.` overrides the scaling.
+/// Measured against stock on `mm-ren-a mm-ren-edit`, whose one rename scores 55:
+///
+/// | value | stock reads it as | stock | port under `merge-tree`/`cherry-pick` |
+/// |---|---|---|---|
+/// | *(none)* | 50% | rename/rename | rename/rename |
+/// | `40`, `50`, `55` | 40/50/55% | rename/rename | **rename/delete** |
+/// | `5` | 50% | rename/rename | **rename/delete** |
+/// | `055` | 5.5% | rename/rename | **rename/delete** |
+/// | `6`, `56`, `60`, `80` | 60/56/60/80% | rename/delete | rename/delete |
+/// | `40%`, `55%` | 40/55% | rename/rename | rename/rename |
+/// | `56%`, `80%` | 56/80% | rename/delete | rename/delete |
+/// | `0.4` / `0.6` | 40% / 60% | rename/rename / rename/delete | same |
+///
+/// So the port **does** track the threshold, and its boundary is stock's — the
+/// answer flips between `55%` and `56%` on both sides, in both directions. What
+/// it does not do is apply git's digit scaling: every un-suffixed integer in
+/// the table behaves as a threshold no similarity can reach, so the inexact
+/// rename is lost under it whether the number is 5 or 55. It is a parse defect
+/// in one spelling of one option, not a missing feature, and the `%` and
+/// decimal rows are what make that distinction rather than reporting "renames
+/// are not detected".
+///
+/// **It is also verb-dependent, which no single-verb sweep would have found.**
+/// `rebase -X find-renames=40` and `rebase -X find-renames=60` both reproduce
+/// stock's report and stock's unmerged stages — rename/rename and rename/delete
+/// respectively — so `rebase` reads the bare integer correctly while
+/// `merge-tree` and `cherry-pick` do not: the same option, the same value,
+/// three code paths, two of them wrong. (The two `rebase` cases that stop with
+/// a conflict still *fail*, on the short `# Conflicts:` list that every
+/// conflicting `rebase` here carries — see [`rebase_over_every_class`]. Their
+/// stdout, exit code and stages agree, which is what the threshold claim rests
+/// on, and `rebase -X find-renames=60` matches outright because that answer has
+/// only one unmerged path to list.) The
+/// `cherry-pick` rows are read off the *stages* rather than the message,
+/// because that verb mislabels the class anyway: at `40` the port records
+/// stages 1 and 2 at `mm/rr-a.txt` (the rename/delete layout) and at `40%` it
+/// records stages 1/2/3 at `mm/rr.txt`, `mm/rr-a.txt` and `mm/rr-e.txt` (the
+/// rename/rename layout).
+///
+/// `-X find-renames=80 mm-ren-a mm-ren-b` is the control that keeps the defect
+/// specific: the *exact* rename is still found under the broken spelling,
+/// because pairing by oid happens before any score is consulted. A fix that
+/// only made this case pass would have fixed nothing.
+///
+/// The `merge.*`/`diff.*` rows agree throughout and bound the finding on the
+/// other side: `merge.renames=false` and `diff.renames=false` each drop the
+/// inexact rename to a clean exit 0 on both sides, `merge.renames=true` leaves
+/// the default, `merge.renameLimit=1` does not disable detection for a single
+/// pair, and `merge.renameLimit=nonsense` is `fatal: bad numeric config value`
+/// at exit 128 on both — the validation gap the module header used to record
+/// here is closed.
+fn similarity_threshold_over_the_inexact_rename(out: &mut Vec<Case>) {
+    for value in [
+        "40", "50", "55", "56", "60", "80", "5", "6", "055", "40%", "55%", "56%", "80%", "0.4",
+        "0.6",
+    ] {
+        out.push(Case::new(
+            "merge-tree",
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--messages",
+                "-X",
+                &format!("find-renames={value}"),
+                "mm-ren-a",
+                "mm-ren-edit",
+            ],
+            Shape::MergeMatrix,
+        ));
+    }
+    for value in ["40", "60", "55%"] {
+        out.push(Case::new(
+            "merge-tree",
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--messages",
+                "-X",
+                &format!("rename-threshold={value}"),
+                "mm-ren-a",
+                "mm-ren-edit",
+            ],
+            Shape::MergeMatrix,
+        ));
+    }
+    each(
+        "merge-tree",
+        &[
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--messages",
+                "-X",
+                "no-renames",
+                "mm-ren-a",
+                "mm-ren-edit",
+            ],
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--messages",
+                "-X",
+                "find-renames=80",
+                "mm-ren-a",
+                "mm-ren-b",
+            ],
+        ],
+        out,
+    );
+    for (key, value) in [
+        ("merge.renames", "false"),
+        ("merge.renames", "true"),
+        ("diff.renames", "false"),
+        ("merge.renameLimit", "1"),
+        ("merge.renameLimit", "nonsense"),
+    ] {
+        out.push(
+            Case::new(
+                "merge-tree",
+                &["merge-tree", "--write-tree", "--messages", "mm-ren-a", "mm-ren-edit"],
+                Shape::MergeMatrix,
+            )
+            .with_config(&[(key, value)]),
+        );
+    }
+    // The same option through the two verbs that carry an index: `cherry-pick`
+    // loses the bare integer exactly as `merge-tree` does, and `rebase` does
+    // not.
+    for value in ["40", "40%", "60%"] {
+        out.push(Case::new(
+            "cherry-pick",
+            &["cherry-pick", "-X", &format!("find-renames={value}"), "mm-ren-a", "mm-ren-edit"],
+            Shape::MergeMatrix,
+        ));
+    }
+    for value in ["40", "60", "40%"] {
+        out.push(Case::new(
+            "rebase",
+            &["rebase", "-X", &format!("find-renames={value}"), "mm-ren-a", "mm-ren-edit"],
+            Shape::MergeMatrix,
+        ));
     }
 }

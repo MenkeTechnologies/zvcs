@@ -15,6 +15,7 @@ use crate::runner::{Case, Sequence};
 
 mod add_rm_mv_clean;
 mod archive_export;
+mod attributes_engine;
 mod attributes_filters;
 mod branch_remote;
 mod commit_family;
@@ -511,6 +512,7 @@ pub fn cases() -> Vec<Case> {
     // ---- per-subsystem corpora, one module each ----
     add_rm_mv_clean::cases(&mut c);
     archive_export::cases(&mut c);
+    attributes_engine::cases(&mut c);
     attributes_filters::cases(&mut c);
     branch_remote::cases(&mut c);
     commit_family::cases(&mut c);

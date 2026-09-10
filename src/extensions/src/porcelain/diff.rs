@@ -789,7 +789,7 @@ impl SubmoduleIgnore {
 ///
 /// `git_diff_ui_config()` owns the two configuration keys, so only the porcelains
 /// (`diff`, `log`, `show`) read them; the plumbing verbs see the environment alone.
-fn external_diff_program(
+pub(crate) fn external_diff_program(
     repo: &gix::Repository,
 ) -> Result<Option<super::diff_pairs::ExternalDiff>> {
     if let Some(env) = super::diff_pairs::external_diff_env().map_err(crate::fatal::die)? {
@@ -866,7 +866,7 @@ fn ext_pair(
 /// temporary files even when the worktree already holds the post-image byte for
 /// byte. A side that has no object at all still reaches the driver as its worktree
 /// path, through `prepare_temp_file()`'s `!oid_valid` branch.
-fn ext_context<'a, 'repo>(
+pub(crate) fn ext_context<'a, 'repo>(
     drivers: super::diff_pairs::Drivers<'a, 'repo>,
     env: Option<super::diff_pairs::ExternalDiff>,
 ) -> super::diff_pairs::ExtCtx<'a, 'repo> {
@@ -3438,6 +3438,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `diff.color` / `color.ui` and the terminal test.
     let colors = diff_color::DiffColors::resolve(&repo, diff_color::resolve_color(&repo, color_when));
     let ws_rule = diff_color::whitespace_rule_cfg(&repo);
+    // `run_checkdiff()` resolves the `whitespace` attribute through `attr_path`
+    // (diff.c:5122-5133 at v2.55.0), which is the pair's post-image name *before*
+    // `strip_prefix()` shortens the printed one — so the lookup has to happen ahead
+    // of the `--relative` rewrite below, whose whole job is to shorten `d.path`.
+    let check_rules: Option<Vec<u32>> = (check && !quiet && !combined).then(|| {
+        let mut rules = WsRules::new(&repo);
+        deltas.iter().map(|d| rules.for_path(d.path.as_bstr())).collect()
+    });
     let extra = match move_word.resolve(&repo) {
         Ok(e) => e,
         Err(msg) => {
@@ -3488,7 +3496,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         let mut found_changes = false;
         let mut scratch: Vec<u8> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
-        for (delta, analysis) in deltas.iter().zip(analyses.iter()) {
+        let rules = check_rules.as_deref().unwrap_or_default();
+        for (i, (delta, analysis)) in deltas.iter().zip(analyses.iter()).enumerate() {
             if from_contents {
                 if !pair_reports_change(
                     &mut scratch,
@@ -3503,7 +3512,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
                 found_changes = true;
             }
-            found |= report_whitespace_to(&mut buf, delta, analysis, ws_rule, &colors);
+            let rule = rules.get(i).copied().unwrap_or(ws_rule);
+            found |= report_whitespace_to(&mut buf, delta, analysis, rule, &colors);
         }
         // `checkdiff_consume()` writes through `emit_line()` like every other
         // format, so `--line-prefix` reaches these lines too.
@@ -9756,6 +9766,126 @@ impl ConsumeHunk for PatchSink<'_> {
     }
 }
 
+/// `whitespace_rule()` (ws.c:82-110 at v2.55.0): the rule set that applies to one
+/// path, which is the `whitespace` gitattribute when the path has one and
+/// `core.whitespace` when it does not.
+///
+/// git holds one `static struct attr_check *attr_whitespace_rule` for the whole
+/// process and asks it per path; this is the same amortisation scoped to one
+/// command. `--check` resolves it through `attr_path` — the post-image name of the
+/// pair, or the pre-image name when the two agree (`run_checkdiff()`,
+/// diff.c:5112-5133 at v2.55.0) — and hands it to `builtin_checkdiff()`
+/// (diff.c:4297).
+///
+/// The four attribute states are the four arms of `whitespace_rule()`:
+///
+/// | attribute | v2.55.0 ws.c | rule |
+/// |---|---|---|
+/// | `whitespace` (Set) | ws.c:92-100 | every rule that neither loosens an error nor is excluded from the default, plus the configured tab width |
+/// | `-whitespace` (Unset) | ws.c:101-103 | the configured tab width alone — no checks at all |
+/// | `!whitespace`, or no rule matched (Unspecified) | ws.c:104-106 | `core.whitespace` unchanged |
+/// | `whitespace=<list>` (Value) | ws.c:107-109 | `parse_whitespace_rule(<list>)`, which starts from `WS_DEFAULT_RULE` and not from `core.whitespace` |
+///
+/// The last row is why `-c core.whitespace=-tab-in-indent` cannot switch off a
+/// `whitespace=tab-in-indent,...` attribute: the attribute's list is parsed against
+/// the *default* rule, so the configured value never enters the answer at all.
+pub(crate) struct WsRules<'repo> {
+    /// `whitespace_rule_cfg` (ws.c:14): the global, which every arm but the Value
+    /// one is expressed in terms of.
+    cfg: u32,
+    /// Built lazily, and left `None` when there is nothing to read: a bare
+    /// repository has no worktree stack, and every failure to build one means the
+    /// same thing the Unspecified arm does.
+    stack: Option<gix::AttributeStack<'repo>>,
+    outcome: gix::attrs::search::Outcome,
+}
+
+/// The four states `git_check_attr()` can report, owned so the lookup does not keep
+/// the outcome borrowed while the rule is being computed.
+enum WsAttr {
+    /// `whitespace=<list>`.
+    Value(String),
+    /// `whitespace`.
+    Set,
+    /// `-whitespace`.
+    Unset,
+    /// `!whitespace`, or no rule matched the path.
+    Unspecified,
+}
+
+/// The `all_rule` of `whitespace_rule()`'s Set arm (ws.c:92-100): every entry of
+/// `whitespace_rule_names` whose `loosens_error` and `exclude_default` bits are both
+/// clear. `cr-at-eol` loosens an error and `tab-in-indent` is excluded from the
+/// default, so those two are the ones left out (ws.c:22-31).
+const WS_ATTR_ALL: u32 = diff_color::WS_TRAILING_SPACE
+    | diff_color::WS_SPACE_BEFORE_TAB
+    | diff_color::WS_INDENT_WITH_NON_TAB
+    | diff_color::WS_BLANK_AT_EOL
+    | diff_color::WS_BLANK_AT_EOF
+    | diff_color::WS_INCOMPLETE_LINE;
+
+impl<'repo> WsRules<'repo> {
+    /// The stack reads gitattributes in git's check-in direction — the worktree
+    /// files first, the index as the fallback — which is what `git_check_attr()`
+    /// answers from for a diff.
+    pub(crate) fn new(repo: &'repo gix::Repository) -> Self {
+        let stack = repo.index_or_empty().ok().and_then(|index| {
+            repo.attributes_only(
+                &index,
+                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+            )
+            .ok()
+        });
+        Self {
+            cfg: diff_color::whitespace_rule_cfg(repo),
+            stack,
+            outcome: gix::attrs::search::Outcome::default(),
+        }
+    }
+
+    /// `whitespace_rule(istate, pathname)`.
+    pub(crate) fn for_path(&mut self, path: &gix::bstr::BStr) -> u32 {
+        match self.attribute(path) {
+            WsAttr::Value(v) => diff_color::parse_whitespace_rule(&v),
+            WsAttr::Set => diff_color::ws_tab_width(self.cfg) as u32 | WS_ATTR_ALL,
+            WsAttr::Unset => diff_color::ws_tab_width(self.cfg) as u32,
+            WsAttr::Unspecified => self.cfg,
+        }
+    }
+
+    /// `git_check_attr()` for the single `whitespace` attribute. Every way the
+    /// lookup can decline to answer — no stack, a path the stack cannot descend to,
+    /// or the empty path a root tree carries — is Unspecified, which is git's NULL
+    /// value and therefore the `core.whitespace` arm.
+    fn attribute(&mut self, path: &gix::bstr::BStr) -> WsAttr {
+        if path.is_empty() {
+            return WsAttr::Unspecified;
+        }
+        let Some(stack) = self.stack.as_mut() else {
+            return WsAttr::Unspecified;
+        };
+        let mode = Some(gix::index::entry::Mode::FILE);
+        // The stack only knows an attribute's name once a file declaring it has been
+        // parsed, so descend first, then size the outcome, then match.
+        if stack.at_entry(path, mode).is_err() {
+            return WsAttr::Unspecified;
+        }
+        self.outcome.initialize_with_selection(stack.attributes_collection(), ["whitespace"]);
+        match stack.at_entry(path, mode) {
+            Ok(platform) => platform.matching_attributes(&mut self.outcome),
+            Err(_) => return WsAttr::Unspecified,
+        };
+        match self.outcome.iter_selected().next().map(|m| m.assignment.state) {
+            Some(gix::attrs::StateRef::Value(v)) => {
+                WsAttr::Value(v.as_bstr().to_str_lossy().into_owned())
+            }
+            Some(gix::attrs::StateRef::Set) => WsAttr::Set,
+            Some(gix::attrs::StateRef::Unset) => WsAttr::Unset,
+            _ => WsAttr::Unspecified,
+        }
+    }
+}
+
 /// `checkdiff_consume()` (diff.c): report every added line of `delta` that
 /// breaks a whitespace rule into `out`, and say whether any did.
 ///
@@ -9869,7 +9999,10 @@ pub(crate) fn commit_check(
         true,
     )?;
     let hash_kind = repo.object_hash();
-    let ws_rule = diff_color::whitespace_rule_cfg(repo);
+    // `builtin_checkdiff()` asks `whitespace_rule()` per pair (diff.c:4297), so the
+    // `whitespace` gitattribute reaches a history verb's `--check` the same way it
+    // reaches `git diff --check`.
+    let mut ws_rules = WsRules::new(repo);
     let mut found = false;
     for queued in &deltas {
         // `run_checkdiff()` sits downstream of `run_diff()`'s type-change split, as
@@ -9903,7 +10036,8 @@ pub(crate) fn commit_check(
                     irreversible_delete: opts.irreversible_delete,
                 },
             )?;
-            found |= report_whitespace_to(out, delta, &an, ws_rule, colors);
+            let rule = ws_rules.for_path(delta.path.as_bstr());
+            found |= report_whitespace_to(out, delta, &an, rule, colors);
         }
     }
     Ok(found)

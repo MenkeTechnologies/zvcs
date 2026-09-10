@@ -230,7 +230,15 @@
 //!     to reach xdiff's patience pass, and `gix-imara-diff`'s `patience.rs` omits
 //!     every anchor branch (its header records that `is_anchor()` is constantly
 //!     false), so accepting the flag would silently drop them.
-//!   * `--textconv`/`--ext-diff`, which need a `gitattributes` diff driver to run.
+//!   * `--textconv`, which needs `fill_textconv()` to run a `diff.<name>.textconv`
+//!     program over each side before the differ sees it. `--ext-diff` *is* ported:
+//!     it replaces a pair's whole section with the driver's stdout, which needs no
+//!     converter. One departure there, shared with `git log -p --ext-diff`: git
+//!     hands the driver its own output descriptor, so a driver that *dies* leaves
+//!     the mail header and diffstat already flushed ahead of
+//!     `fatal: external diff died, stopping at <path>`, while this renders a whole
+//!     patch before writing any of it and so prints the fatal alone. Both exit 128
+//!     with the same stderr.
 //!     `--ignore-if-in-upstream` reproduces
 //!     everything `cmd_format_patch` decides before the comparison — the
 //!     single-endpoint promotion that turns a lone rev into `<rev>..HEAD`, the
@@ -794,6 +802,17 @@ struct Opts {
     /// `--full-index`: `index` lines carry the whole object name rather than the
     /// abbreviation `diff_unique_abbrev()` would pick.
     full_index: bool,
+    /// `flags.allow_external` (`--ext-diff` / `--no-ext-diff`). Unlike `cmd_diff()`,
+    /// which raises it before parsing, the history verbs leave it down — so
+    /// `diff.external` and a path's `diff.<name>.command` are both inert until
+    /// `--ext-diff` appears, and a later `--no-ext-diff` puts them back to sleep.
+    allow_external: bool,
+    /// `o->diff_path_counter`, the `GIT_DIFF_PATH_COUNTER` an external driver reads.
+    /// `diff_setup_done()` zeroes it once and nothing resets it, and format-patch
+    /// runs every commit through one `rev.diffopt` — so it counts invocations across
+    /// the whole series, not within a commit. It lives here because that is the
+    /// structure git keeps it in; a per-commit counter restarted each patch at 1.
+    ext_path_counter: std::cell::Cell<u32>,
     /// `-D`/`--irreversible-delete`: a deletion stops after its header, so the
     /// patch cannot be used to restore the file.
     irreversible_delete: bool,
@@ -1470,7 +1489,6 @@ const NO_OP: &[&str] = &[
     // diff is empty, the output is identical with and without it.
     "--always",
     "--no-textconv",
-    "--no-ext-diff",
     "--progress",
     "--no-progress",
     // format-patch compares two *trees*; there is no index in the comparison, so
@@ -1494,11 +1512,10 @@ const NO_OP: &[&str] = &[
 /// `--flag=<value>`; see the module header for what each of them would change.
 const DEFERRED: &[&str] = &[
     "--ignore-if-in-upstream",
-    // `--textconv`/`--ext-diff` need the `gitattributes` diff-driver plumbing that
-    // `git diff` reaches through the vendored filter stack; nothing in this module
-    // can run a driver yet.
+    // `--textconv` needs `fill_textconv()` to run a `diff.<name>.textconv` program
+    // over each side before the differ sees it; `--ext-diff`, which replaces the
+    // whole section with a program's stdout instead, is ported.
     "--textconv",
-    "--ext-diff",
     // `--anchored` is xdiff's `xpp->anchors`, carried into the patience pass
     // (`xdiff/xpatience.c:74-76`). The vendored `gix-imara-diff` has the patience
     // algorithm but omits every anchor branch — its `patience.rs:21-22` records that
@@ -1934,6 +1951,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         indent_heuristic: true,
         ws: super::diff_pairs::Whitespace::Keep,
         full_index: false,
+        allow_external: false,
+        ext_path_counter: std::cell::Cell::new(0),
         irreversible_delete: false,
         skip_or_rotate: None,
         detect_rename: None,
@@ -2615,6 +2634,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             // `diff_setup_done()` lets it win over any `--abbrev` that was given.
             "--full-index" => o.full_index = true,
             "--no-full-index" => o.full_index = false,
+            // `OPT_BIT_F(0, "ext-diff", &options->flags.allow_external, ...)`: the
+            // last spelling on the command line wins, which is why `--no-ext-diff`
+            // cannot be a no-op once `--ext-diff` is ported. Measured against stock
+            // 2.55.0, `--ext-diff --no-ext-diff` prints the built-in patch and
+            // `--no-ext-diff --ext-diff` prints the driver's stdout.
+            "--ext-diff" => o.allow_external = true,
+            "--no-ext-diff" => o.allow_external = false,
             "-D" | "--irreversible-delete" => o.irreversible_delete = true,
             "--indent-heuristic" => o.indent_heuristic = true,
             "--no-indent-heuristic" => o.indent_heuristic = false,
@@ -6628,10 +6654,76 @@ fn render_changes(
     // `git diff` performs at diff.rs:2568.
     let mut plain: Vec<u8> = Vec::new();
     let mut files: Vec<FilePaint> = Vec::with_capacity(changes.len());
+    // `external_diff()` (diff.c:5026) plus the per-path `diff.<name>.command`
+    // override `run_diff_cmd()` prefers to it (diff.c:4953-4957), both inert until
+    // `--ext-diff` raises `flags.allow_external` — `run_diff()` nulls the program
+    // outright when it is down (diff.c:5040-5041).
+    let ext_env = match opts.allow_external {
+        true => super::diff::external_diff_program(repo)?,
+        false => None,
+    };
+    // One gitattributes stack for the whole commit, shared by the driver lookup and
+    // by `prepare_temp_file()`'s worktree-form materialisation, as git's single
+    // `userdiff_find_by_path()` static is.
+    let ext_drivers = match opts.allow_external {
+        true => Some(std::cell::RefCell::new(super::cat_file::Textconv::new(repo)?)),
+        false => None,
+    };
+    let ext = ext_drivers.as_ref().map(|d| super::diff::ext_context(d, ext_env.clone()));
+    // Carry `o->diff_path_counter` in from the commits already rendered, and hand it
+    // back below, so one `format-patch` run numbers its driver invocations the way
+    // one `diff_options` does.
+    if let Some(ctx) = &ext {
+        ctx.counter.set(opts.ext_path_counter.get());
+    }
+    let mut ext_cache: HashMap<String, Option<super::diff_pairs::ExternalDiff>> = HashMap::new();
+    let naming = super::diff_pairs::IndexNaming {
+        base_abbrev: crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex()),
+        full_index: opts.full_index,
+        abbrev_explicit: opts.abbrev,
+    };
     for change in changes {
         let mut one: Vec<u8> = Vec::new();
         let (stat, paint) = emit_change(repo, &mut one, change, abbrev, opts, dissimilarity)?;
         if from_contents && stat.added == 0 && stat.deleted == 0 && is_plain_edit(change) {
+            continue;
+        }
+        // `run_diff_cmd()` (diff.c:4969-4972) hands the pair to the driver and
+        // returns, upstream of every `builtin_diff()` branch below — so this is
+        // tested before the submodule one. The driver's stdout *is* the section,
+        // header included: git gives the child its own output descriptor, so those
+        // bytes are never re-coloured. The diffstat row is untouched, because
+        // `diff_flush_stat()` runs `builtin_diffstat()` on its own pass and never
+        // consults an external program.
+        let pgm = match &ext {
+            Some(ctx) => {
+                external_for_change(repo, ctx.drivers, &mut ext_cache, change, ext_env.as_ref())?
+            }
+            None => None,
+        };
+        if let (Some(ctx), Some(pgm)) = (ext.as_ref(), pgm) {
+            patch.extend_from_slice(&paint_patch(&plain, &files, opts));
+            plain.clear();
+            files.clear();
+            let run = super::diff_pairs::run_external_diff(
+                &pgm,
+                repo,
+                ctx,
+                &ext_pair(change, dissimilarity),
+                &naming,
+                changes.len(),
+                true,
+            )
+            .map_err(crate::fatal::die)?;
+            patch.extend_from_slice(&run.stdout);
+            if let Some(msg) = run.died {
+                // Everything the child printed before failing has already gone out
+                // in git; this buffer is the caller's, so it travels with the error
+                // rather than being dropped.
+                return Err(crate::fatal::die(msg));
+            }
+            stats.push(stat);
+            kept.push(change.clone());
             continue;
         }
         // `builtin_diff()`'s submodule branch (diff.c:3870) replaces the whole
@@ -6653,7 +6745,129 @@ fn render_changes(
         kept.push(change.clone());
     }
     patch.extend_from_slice(&paint_patch(&plain, &files, opts));
+    if let Some(ctx) = &ext {
+        opts.ext_path_counter.set(ctx.counter.get());
+    }
     Ok(Rendered { kept, stats })
+}
+
+/// `run_diff_cmd()`'s program for one pair (diff.c:4953-4957):
+///
+/// ```c
+/// if (o->flags.allow_external || !o->ignore_driver_algorithm)
+///         drv = userdiff_find_by_path(o->repo->index, attr_path);
+/// if (o->flags.allow_external && drv && drv->external.cmd)
+///         pgm = &drv->external;
+/// ```
+///
+/// `attr_path` is `run_diff()`'s, which is the **pre-image** name of the pair
+/// (diff.c:5034-5036) — a rename resolves its driver through where the content came
+/// from, not through where it went. A driver naming `diff.<name>.command` beats
+/// `external_diff()`'s program; anything else falls back to it.
+///
+/// `cache` holds one answer per driver name, which is the amortisation git gets from
+/// its process-wide `userdiff_driver` list.
+fn external_for_change(
+    repo: &gix::Repository,
+    drivers: super::diff_pairs::Drivers<'_, '_>,
+    cache: &mut HashMap<String, Option<super::diff_pairs::ExternalDiff>>,
+    change: &ChangeDetached,
+    env: Option<&super::diff_pairs::ExternalDiff>,
+) -> Result<Option<super::diff_pairs::ExternalDiff>> {
+    let attr_path = gix::bstr::BString::from(ext_attr_path(change).to_vec());
+    let Some(name) = drivers.borrow_mut().driver_name(attr_path.as_ref())? else {
+        return Ok(env.cloned());
+    };
+    if !cache.contains_key(&name) {
+        let settings = crate::userdiff::Settings::for_driver(repo, &name);
+        let found = settings.external.map(|cmd| super::diff_pairs::ExternalDiff {
+            cmd,
+            trust_exit_code: settings.trust_exit_code,
+        });
+        cache.insert(name.clone(), found);
+    }
+    Ok(match &cache[&name] {
+        Some(drv) => Some(drv.clone()),
+        None => env.cloned(),
+    })
+}
+
+/// `attr_path` (diff.c:5036): `p->one->path`, the pre-image name.
+fn ext_attr_path(change: &ChangeDetached) -> &[u8] {
+    match change {
+        ChangeDetached::Rewrite { source_location, .. } => source_location,
+        _ => change_path(change),
+    }
+}
+
+/// This pair as the shared [`super::diff_pairs::run_external_diff`] engine sees it.
+///
+/// A tree-to-tree pair has no worktree side, so both `oid_valid` flags are set and
+/// the ids are the queue's own — `diff_fill_oid_info()` has nothing to fill in.
+/// `score` is what `fill_metainfo()` prints as `similarity index %d%%` for a
+/// rename or copy and as `dissimilarity index %d%%` for a `-B`-broken modification.
+fn ext_pair(
+    change: &ChangeDetached,
+    dissimilarity: &HashMap<Vec<u8>, u32>,
+) -> super::diff_pairs::ExtPair {
+    let mode = |m: &gix::objs::tree::EntryMode| u32::from(m.value());
+    let (old, new, kind, score, old_path, new_path) = match change {
+        ChangeDetached::Addition { location, entry_mode, id, .. } => {
+            (None, Some((*id, mode(entry_mode))), b'A', 0, location, location)
+        }
+        ChangeDetached::Deletion { location, entry_mode, id, .. } => {
+            (Some((*id, mode(entry_mode))), None, b'D', 0, location, location)
+        }
+        ChangeDetached::Modification {
+            location,
+            previous_entry_mode,
+            previous_id,
+            entry_mode,
+            id,
+        } => {
+            // `DIFF_PAIR_TYPE_CHANGED()`: the file-type bits differ.
+            let changed_type = (mode(previous_entry_mode) ^ mode(entry_mode)) & 0o170000 != 0;
+            (
+                Some((*previous_id, mode(previous_entry_mode))),
+                Some((*id, mode(entry_mode))),
+                if changed_type { b'T' } else { b'M' },
+                dissimilarity.get(location.as_slice()).copied().unwrap_or(0),
+                location,
+                location,
+            )
+        }
+        ChangeDetached::Rewrite {
+            source_location,
+            source_entry_mode,
+            source_id,
+            location,
+            entry_mode,
+            id,
+            diff,
+            copy,
+            ..
+        } => (
+            Some((*source_id, mode(source_entry_mode))),
+            Some((*id, mode(entry_mode))),
+            if *copy { b'C' } else { b'R' },
+            similarity_percent(diff.as_ref()),
+            source_location,
+            location,
+        ),
+    };
+    let null = gix::hash::ObjectId::null(gix::hash::Kind::Sha1);
+    super::diff_pairs::ExtPair {
+        old_path: gix::bstr::BString::from(old_path.to_vec()),
+        new_path: gix::bstr::BString::from(new_path.to_vec()),
+        old_id: old.map_or(null, |(id, _)| id),
+        new_id: new.map_or(null, |(id, _)| id),
+        old_mode: old.map_or(0, |(_, m)| m),
+        new_mode: new.map_or(0, |(_, m)| m),
+        old_oid_valid: true,
+        new_oid_valid: true,
+        kind,
+        score,
+    }
 }
 
 /// What one commit's file-pair queue rendered into: the pairs that survived

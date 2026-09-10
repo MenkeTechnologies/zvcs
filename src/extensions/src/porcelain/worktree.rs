@@ -288,7 +288,11 @@ enum HeadInfo {
     /// `HEAD` holds an object id directly.
     Detached(ObjectId),
     /// `HEAD` could not be resolved; git renders this as `(error)`.
-    Unknown,
+    ///
+    /// The id is whatever `add_head_info()` left in `wt->head_oid` when
+    /// `refs_resolve_ref_unsafe()` returned NULL — see [`broken_referent`]. It is
+    /// the null id for every failure that never reached a hex parse.
+    Unknown(ObjectId),
 }
 
 struct Wt {
@@ -331,7 +335,7 @@ impl Wt {
         match &self.head {
             HeadInfo::Branch { oid, .. } => *oid,
             HeadInfo::Detached(oid) => *oid,
-            HeadInfo::Unknown => ObjectId::null(gix::hash::Kind::Sha1),
+            HeadInfo::Unknown(oid) => *oid,
         }
     }
 }
@@ -362,12 +366,94 @@ fn head_info(repo: &gix::Repository) -> HeadInfo {
         return HeadInfo::Detached(head.id().map_or(null, |id| id.detach()));
     }
     match head.referent_name() {
-        Some(name) => HeadInfo::Branch {
-            oid: head.id().map_or(null, |id| id.detach()),
-            name: name.to_owned(),
-        },
-        None => HeadInfo::Unknown,
+        Some(name) => {
+            let oid = head.id().map_or(null, |id| id.detach());
+            // gitoxide reports a referent it could not read as *unborn*, which is
+            // also what a branch that simply does not exist yet looks like. git
+            // tells the two apart by `failure_errno`: a missing ref is forgiven and
+            // resolves to the null id under the branch name, while a ref file whose
+            // contents are not an object name of this repository's hash is `EINVAL`
+            // and makes the whole resolve return NULL (refs.c:2149-2160).
+            match oid.is_null() {
+                true => match broken_referent(repo, name) {
+                    Some(partial) => HeadInfo::Unknown(partial),
+                    None => HeadInfo::Branch { oid, name: name.to_owned() },
+                },
+                false => HeadInfo::Branch { oid, name: name.to_owned() },
+            }
+        }
+        None => HeadInfo::Unknown(null),
     }
+}
+
+/// `parse_loose_ref_contents()` (refs/files-backend.c:616-641 at v2.55.0) for the
+/// one case gitoxide cannot report: a loose ref file that exists and holds
+/// something that is not an object name of this repository's hash algorithm.
+///
+/// ```c
+///         if (parse_oid_hex_algop(buf, oid, &p, algop) ||
+///             (*p != '\0' && !isspace(*p))) {
+///                 *type |= REF_ISBROKEN;
+///                 *failure_errno = EINVAL;
+///                 return -1;
+///         }
+/// ```
+///
+/// `Some(oid)` means broken, and carries the id git is left holding. That id is not
+/// null, because `get_hash_hex_algop()` (hex.c:8-19) decodes into the caller's
+/// buffer one byte at a time and returns `-1` only when it reaches a pair that is
+/// not hex — so a 40-hex sha1 file read by a repository declaring
+/// `extensions.objectFormat = sha256` leaves the twenty sha1 bytes in place and the
+/// remaining twelve at the zero `xcalloc()` gave `struct worktree` (worktree.c:71).
+/// That is why `git worktree list` on such a repository prints an abbreviated sha1
+/// beside `(error)` rather than a row of zeroes.
+///
+/// `None` means "not broken": no such loose file (the ref is packed, or genuinely
+/// unborn — both of which git forgives), a symref, or contents that parse.
+fn broken_referent(repo: &gix::Repository, name: &gix::refs::FullNameRef) -> Option<ObjectId> {
+    // `refs/heads/<name>` is not a per-worktree ref, so the files backend reads it
+    // from the common directory (`files_ref_path()`); a linked worktree and the main
+    // one see the same file.
+    let path = repo.common_dir().join(gix::path::from_byte_slice(name.as_bstr()));
+    let raw = std::fs::read(path).ok()?;
+    let buf = rtrim(&raw);
+    if buf.starts_with(b"ref:") {
+        return None;
+    }
+    let rawsz = repo.object_hash().len_in_bytes();
+    let mut hash = vec![0u8; rawsz];
+    let mut decoded = 0usize;
+    for (i, slot) in hash.iter_mut().enumerate() {
+        let Some(pair) = buf.get(i * 2..i * 2 + 2) else {
+            break;
+        };
+        let Some(byte) = hex_pair(pair) else {
+            break;
+        };
+        *slot = byte;
+        decoded = i + 1;
+    }
+    if decoded == rawsz {
+        // The whole name parsed; git then rejects only a trailing byte that is
+        // neither NUL nor whitespace, and `strbuf_rtrim()` has already removed the
+        // whitespace, so anything left over is trailing junk.
+        return match buf.len() > rawsz * 2 {
+            true => ObjectId::try_from(hash.as_slice()).ok(),
+            false => None,
+        };
+    }
+    ObjectId::try_from(hash.as_slice()).ok()
+}
+
+/// `hex2chr()`: one byte from two hex digits, or `None` for anything else.
+fn hex_pair(pair: &[u8]) -> Option<u8> {
+    let val = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    Some(val(pair[0])? << 4 | val(pair[1])?)
 }
 
 /// `add_head_info()` for a worktree whose ref store would not open at all —
@@ -407,7 +493,7 @@ fn head_info_of_git_dir(repo: &gix::Repository, git_dir: &Path) -> HeadInfo {
             // NULL return, i.e. `(error)`.
             let forgiven = e.kind() == std::io::ErrorKind::NotFound
                 || matches!(e.raw_os_error(), Some(libc::EISDIR) | Some(libc::ENOTDIR));
-            return if forgiven { HeadInfo::Detached(null) } else { HeadInfo::Unknown };
+            return if forgiven { HeadInfo::Detached(null) } else { HeadInfo::Unknown(null) };
         }
     };
     let text = String::from_utf8_lossy(rtrim(&raw)).into_owned();
@@ -422,11 +508,25 @@ fn head_info_of_git_dir(repo: &gix::Repository, git_dir: &Path) -> HeadInfo {
                     .ok()
                     .and_then(|r| r.target().try_id().map(ObjectId::from))
                     .unwrap_or(null);
-                HeadInfo::Branch { oid, name }
+                // A referent gitoxide declined to read is either missing — which
+                // git forgives — or broken, which makes the whole resolve return
+                // NULL. [`broken_referent`] is the test that separates them.
+                match oid.is_null() {
+                    true => match broken_referent(repo, name.as_ref()) {
+                        Some(partial) => HeadInfo::Unknown(partial),
+                        None => HeadInfo::Branch { oid, name },
+                    },
+                    false => HeadInfo::Branch { oid, name },
+                }
             }
-            Err(_) => HeadInfo::Unknown,
+            Err(_) => HeadInfo::Unknown(null),
         },
-        None => ObjectId::from_hex(text.as_bytes()).map_or(HeadInfo::Unknown, HeadInfo::Detached),
+        // The partial-decode artefact [`broken_referent`] reproduces applies here
+        // too — git's `hex_to_bytes()` fills what it can before failing — but no
+        // measured case reaches this arm with a partly-hex `HEAD`, so it keeps the
+        // null id rather than a behaviour nothing has been compared against.
+        None => ObjectId::from_hex(text.as_bytes())
+            .map_or(HeadInfo::Unknown(null), HeadInfo::Detached),
     }
 }
 
@@ -452,7 +552,7 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
     // `HEAD` instead reports the main worktree as sitting on the branch of whichever linked
     // worktree the command was run from.
     let main_head = if is_bare {
-        HeadInfo::Unknown
+        HeadInfo::Unknown(ObjectId::null(repo.object_hash()))
     } else {
         match gix::open(&common) {
             Ok(main) => head_info(&main),
@@ -659,7 +759,7 @@ fn render_porcelain(worktrees: &[Wt], nul: bool) -> String {
                 HeadInfo::Branch { name, .. } => {
                     out.push_str(&format!("branch {}{t}", name.as_bstr().to_str_lossy()));
                 }
-                HeadInfo::Unknown => {}
+                HeadInfo::Unknown(_) => {}
             }
         }
         if wt.is_linked() {
@@ -708,7 +808,7 @@ fn render_plain(repo: &gix::Repository, worktrees: &[Wt], verbose: bool) -> Stri
                 HeadInfo::Branch { name, .. } => {
                     out.push_str(&format!("[{}]", name.as_ref().shorten().to_str_lossy()));
                 }
-                HeadInfo::Unknown => out.push_str("(error)"),
+                HeadInfo::Unknown(_) => out.push_str("(error)"),
             }
         }
 
@@ -753,11 +853,25 @@ fn parse_expiry(text: &str) -> Option<u64> {
 /// git's `find_unique_abbrev()`: the shortest unambiguous prefix at least
 /// `core.abbrev` long. A null id has no object to disambiguate against, so git
 /// simply emits that many zeroes.
+///
+/// An id that names *no* object is truncated to that same length rather than
+/// printed in full. `repo_find_unique_abbrev_r()` (object-name.c:586-599 at
+/// v2.55.0) hands `odb_find_abbrev_len()` a starting length and lets it grow only
+/// while something else shares the prefix (odb.c:918-971); nothing shares the
+/// prefix of an id the object database has never seen, so the starting length is
+/// the answer. gitoxide's `shorten()` instead fails when the object is missing,
+/// which is why the fall-back is a truncation and not `shorten_or_id()`'s whole
+/// name — that is what made `git worktree list` on a repository whose
+/// `extensions.objectFormat` disagrees with its refs print all 64 hex characters
+/// where git prints ten.
 fn abbrev_hex(repo: &gix::Repository, oid: ObjectId) -> String {
+    let len = hex_len(repo);
     if oid.is_null() {
-        "0".repeat(hex_len(repo))
-    } else {
-        oid.attach(repo).shorten_or_id().to_string()
+        return "0".repeat(len);
+    }
+    match oid.attach(repo).shorten() {
+        Ok(prefix) => prefix.to_string(),
+        Err(_) => oid.to_hex_with_len(len).to_string(),
     }
 }
 

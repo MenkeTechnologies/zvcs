@@ -37,6 +37,19 @@
 //!   depends on the platform, the working directory and the configuration read,
 //!   and that the two binaries have no reason to agree on. The tail is present
 //!   and correctly formed; it is not guaranteed to be the same word stock prints.
+//!
+//!   The mechanism was measured rather than guessed. Under the harness environment
+//!   (`GIT_CONFIG_GLOBAL=/dev/null`) stock 2.55.0 prints `Inappropriate ioctl for
+//!   device` and this port prints `No such file or directory`; point
+//!   `GIT_CONFIG_GLOBAL` at an *empty regular file* instead and stock prints
+//!   `Undefined error: 0`. The difference is macOS libc, not git: `fopen()` +
+//!   `fread()` on a character device leaves `errno == ENOTTY (25)` because stdio
+//!   probes the descriptor with `ioctl(TIOCGETA)` to pick its buffering mode, and
+//!   git reads its config files through stdio. This port reads them through
+//!   `read(2)`, which never issues that ioctl, so its residual `errno` is the
+//!   `ENOENT` of an earlier missing-file lookup. Matching stock would mean either
+//!   reimplementing a platform stdio detail inside the config reader or planting a
+//!   literal errno here; neither is git's behaviour, so the tail stays honest.
 //! * C's `strtol` runs off the end of the 512-byte content record when that
 //!   record contains no NUL byte, and C's final `write` can read past the
 //!   1024-byte buffer when a pathological digit run pushes the payload beyond

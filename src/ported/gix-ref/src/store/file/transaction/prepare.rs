@@ -112,6 +112,10 @@ impl Transaction<'_, '_> {
         // Set when the reference being updated is itself symbolic: see [`Self::resolve_symref_chain`].
         // Applied after the borrow of `change.update.change` below ends.
         let mut symref_previous_oid = None;
+        // git's `REF_ISSYMREF` (`lock_raw_ref()`, refs/files-backend.c:628, v2.55.0), read from the
+        // same existing value as `symref_previous_oid` above and kept for the unchanged-value
+        // shortcut in `commit()` — see [`Edit::previous_is_symbolic`].
+        let mut previous_is_symbolic = false;
 
         let lock = match &mut change.update.change {
             Change::Delete { expected, .. } => {
@@ -183,6 +187,7 @@ impl Transaction<'_, '_> {
                     ..
                 }) = &existing_ref
                 {
+                    previous_is_symbolic = true;
                     symref_previous_oid = Self::resolve_symref_chain(store, referent, packed);
                 }
 
@@ -264,6 +269,7 @@ impl Transaction<'_, '_> {
         if let Some(oid) = symref_previous_oid {
             change.leaf_referent_previous_oid = Some(oid);
         }
+        change.previous_is_symbolic = previous_is_symbolic;
         change.lock = lock;
         Ok(())
     }
@@ -303,6 +309,7 @@ impl Transaction<'_, '_> {
                 parent_index: None,
                 leaf_referent_previous_oid: None,
                 log_only_split: false,
+                previous_is_symbolic: false,
             })
             .collect();
         updates
@@ -320,6 +327,7 @@ impl Transaction<'_, '_> {
                     parent_index: Some(idx),
                     leaf_referent_previous_oid: None,
                     log_only_split: false,
+                    previous_is_symbolic: false,
                 },
             )
             .map_err(Error::PreprocessingFailed)?;
@@ -432,6 +440,7 @@ impl Transaction<'_, '_> {
                                     lock: None,
                                     parent_index: None,
                                     leaf_referent_previous_oid: None,
+                                    previous_is_symbolic: false,
                                     // `REF_LOG_ONLY` on a deletion: append to the log and keep it,
                                     // rather than gix's "delete the log, keep the reference".
                                     log_only_split,

@@ -92,7 +92,16 @@ impl Transaction<'_, '_> {
                             // head-split edit — is logged regardless. That is why `git reset`
                             // with no argument still appends `reset: moving to HEAD` to
                             // `.git/logs/HEAD` while leaving the branch log untouched.
-                            let do_update = log.mode == RefLog::Only || previous.as_ref() != Some(new_oid);
+                            //
+                            // The unchanged-value half of that is `!(update->type & REF_ISSYMREF)
+                            // && oideq(&lock->old_oid, &update->new_oid)`
+                            // (refs/files-backend.c:2807-2808, v2.55.0): a reference that *was*
+                            // symbolic is never dropped for being "unchanged", because replacing
+                            // `ref: refs/heads/main` with the id it resolves to detaches it. Hence
+                            // the third disjunct — see [`Edit::previous_is_symbolic`].
+                            let do_update = log.mode == RefLog::Only
+                                || previous.as_ref() != Some(new_oid)
+                                || change.previous_is_symbolic;
                             if do_update {
                                 self.store.reflog_create_or_append(
                                     change.update.name.as_ref(),

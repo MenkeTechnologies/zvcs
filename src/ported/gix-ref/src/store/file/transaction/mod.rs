@@ -50,6 +50,34 @@ pub(in crate::store_impl::file) struct Edit {
     ///
     /// Only ever set on a deletion; updates carry git's flag faithfully in `RefLog::Only` already.
     log_only_split: bool,
+    /// git's `REF_ISSYMREF`: the reference *being updated* held `ref: <name>` before this edit.
+    ///
+    /// `lock_raw_ref()` sets it from the value found on disk (refs/files-backend.c:530 and :628,
+    /// v2.55.0), and the shortcut that drops an update writing the value a reference already holds
+    /// is guarded by it:
+    ///
+    /// ```c
+    /// if (!(update->type & REF_ISSYMREF) &&
+    ///     oideq(&lock->old_oid, &update->new_oid)) {
+    ///         /*
+    ///          * The reference already has the desired
+    ///          * value, so we don't need to write it.
+    ///          */
+    /// } else {
+    ///         ret = write_ref_to_lockfile(refs, lock, &update->new_oid, err);
+    ///         ...
+    ///         update->flags |= REF_NEEDS_COMMIT;
+    /// }
+    /// ```
+    ///
+    /// (`lock_ref_for_update()`, refs/files-backend.c:2806-2833, v2.55.0.) `old_oid` for a symref
+    /// under `REF_NO_DEREF` is the id the *referent* resolves to, so the two can compare equal
+    /// while the update is still a real change: the reference stops being symbolic. git therefore
+    /// takes the write-and-flag branch, and `files_transaction_finish()` writes the reflog from
+    /// that same `REF_NEEDS_COMMIT` (refs/files-backend.c:3301-3307). Which is why
+    /// `git update-ref --no-deref HEAD $(git rev-parse HEAD)` appends `<id> <id> <ident> <ts>`
+    /// to `.git/logs/HEAD` and leaves `HEAD` detached.
+    previous_is_symbolic: bool,
 }
 
 impl Edit {

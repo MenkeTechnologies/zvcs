@@ -315,9 +315,6 @@ pub(super) fn restore_submodule_worktree(
     // overrides reach that child through the environment.
     crate::index_racy::write(sm_repo, &mut target_index)?;
 
-    // The id `HEAD` resolves to before the move, which is the *old* side of the
-    // reflog line git writes below.
-    let previous = sm_repo.head_id().ok().map(|id| id.detach());
     // Detach the submodule HEAD at the restored commit (git detaches here).
     //
     // `submodule_move_head()` (submodule.c:1990) ends in
@@ -325,8 +322,11 @@ pub(super) fn restore_submodule_worktree(
     // the reflog message is `NULL`, so the entry git appends carries an *empty*
     // message, and it is appended even when the submodule was already at that
     // commit — the old id it records is the one `HEAD` resolved to, not the
-    // symref it replaced. `force_create_reflog` is what makes gix write the
-    // line for a move it would otherwise consider uninteresting.
+    // symref it replaced. That entry comes out of the transaction itself: a
+    // `HEAD` holding `ref: refs/heads/<name>` is git's `REF_ISSYMREF`, which the
+    // unchanged-value shortcut in `lock_ref_for_update()` excludes
+    // (refs/files-backend.c:2807-2808, v2.55.0) and gix-ref now excludes with it,
+    // so no line is appended here by hand — doing so would write it twice.
     sm_repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -340,10 +340,6 @@ pub(super) fn restore_submodule_worktree(
         name: "HEAD".try_into().map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
         deref: false,
     })?;
-    // gix writes no reflog line for a symbolic `HEAD` replaced by an object, and
-    // git writes one for every `submodule_move_head()` — with an empty message
-    // and the *resolved* old id, even when the submodule was already there.
-    super::checkout::append_head_log(sm_repo, previous, Some(commit), "");
     Ok(())
 }
 

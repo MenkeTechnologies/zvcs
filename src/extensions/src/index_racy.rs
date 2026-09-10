@@ -187,6 +187,10 @@ pub fn write_split(
     options: gix::index::write::Options,
     request: gix::index::file::split::Request,
 ) -> Result<(), gix::index::file::write::Error> {
+    // Before the smudge, because that is where `do_write_locked_index()` puts it:
+    // `convert_to_sparse()` runs at read-cache.c:3129 and `do_write_index()` — which
+    // holds the smudge loop at :2903 — only at :3138.
+    convert_to_sparse(repo, index);
     smudge_racily_clean(repo, index);
     // `alternate_index_output` (read-cache.c:3332): `read-tree --index-output=<file>` and
     // friends write somewhere that is not the repository's index, and git writes a whole
@@ -194,12 +198,24 @@ pub fn write_split(
     if index.path() != repo.index_path() {
         return index.write(options);
     }
-    write_locked(repo, index, options, request)
+    write_locked_inner(repo, index, options, request)
 }
 
 /// git's `write_locked_index()` proper, without the smudge its `do_write_index()` does —
 /// for the one caller, `update-index`, that already resolved every entry it touched.
 pub fn write_locked(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    options: gix::index::write::Options,
+    request: gix::index::file::split::Request,
+) -> Result<(), gix::index::file::write::Error> {
+    convert_to_sparse(repo, index);
+    write_locked_inner(repo, index, options, request)
+}
+
+/// The serialisation half of [`write_locked`], so the two entry points above can each run
+/// `do_write_locked_index()`'s sparse conversion exactly once.
+fn write_locked_inner(
     repo: &gix::Repository,
     index: &mut gix::index::File,
     options: gix::index::write::Options,
@@ -213,6 +229,103 @@ pub fn write_locked(
         Err(gix::index::file::split::Error::Write(err)) => Err(err),
         Err(err) => Err(gix::index::file::write::Error::Io(std::io::Error::other(err).into())),
     }
+}
+
+/// `convert_to_sparse()` (sparse-index.c:201-259), as far as an index this port also has to
+/// be able to *read* can go: the cache-tree half.
+///
+/// `do_write_locked_index()` calls it before every index write (read-cache.c:3129), so in a
+/// cone-mode sparse repository with `index.sparse=true` the cache-tree is freed and rebuilt
+/// on the way out of every command that writes the index:
+///
+/// ```c
+/// if (!cache_tree_fully_valid(istate->cache_tree)) {
+///         cache_tree_free(&istate->cache_tree);
+///         if (cache_tree_update(istate, WRITE_TREE_MISSING_OK))
+///                 return 0;
+/// }
+/// ```
+///
+/// (sparse-index.c:224-237.) That rebuild is what leaves a fully valid `TREE` behind a
+/// `-c index.sparse=true add` of a path that was already staged unchanged, and what mints
+/// the two tree objects a `-c index.sparse=true rm --cached` implies — neither of which any
+/// of the verbs themselves ask for.
+///
+/// ### What is deliberately not here
+///
+/// `convert_to_sparse_rec()` (sparse-index.c:60-130) — collapsing a wholly-excluded
+/// directory into one sparse directory entry — is left out, and with it the `sdir`
+/// extension and `istate->sparse_index = INDEX_COLLAPSED`. A collapsed index is only
+/// legible to a reader that expands it again (`ensure_full_index()`, sparse-index.c:462),
+/// which this port does not do, so writing one would leave every other command in this
+/// binary reading an index it misunderstands. The index written here therefore stays full
+/// where git's would be collapsed; stock git expands its own the next time a command reads
+/// it, and both sides arrive at the same full index carrying the same cache-tree.
+///
+/// The second rebuild (`cache_tree_free()` + `cache_tree_update(istate, 0)`,
+/// sparse-index.c:246-248) belongs to that collapse — it exists to recompute the extension
+/// over the *collapsed* entries — so it is left out with it. With nothing collapsed it
+/// would rebuild the tree that was just built.
+fn convert_to_sparse(repo: &gix::Repository, index: &mut gix::index::File) {
+    use gix::index::extension::tree::update as cache_tree;
+
+    // `!istate->cache_nr` (sparse-index.c:207). `istate->sparse_index == INDEX_COLLAPSED`
+    // cannot arise: nothing in this port ever collapses one.
+    if index.entries().is_empty() || !is_sparse_index_allowed(repo, index) {
+        return;
+    }
+    // `index_has_unmerged_entries()` (sparse-index.c:218-222): "If we have unmerged entries,
+    // then stay full. Unmerged entries prevent the cache-tree extension from working."
+    if index.entries().iter().any(|e| e.stage() != gix::index::entry::Stage::Unconflicted) {
+        return;
+    }
+
+    let odb = crate::porcelain::write_tree::RepoOdb { repo };
+    if index.cache_tree_fully_valid(&odb) {
+        return;
+    }
+    // `cache_tree_free()` then `cache_tree_update(istate, WRITE_TREE_MISSING_OK)`: the whole
+    // extension is discarded first, so what comes back is derived from the entries alone.
+    // `MISSING_OK` because the rebuild may need trees the repository does not hold yet, and
+    // a failure is "silently return" (sparse-index.c:228-236) — git leaves the index alone
+    // rather than refuse to write it.
+    index.remove_tree();
+    let _ = index.cache_tree_update(
+        &odb,
+        cache_tree::Options {
+            missing_ok: true,
+            repair: false,
+        },
+    );
+}
+
+/// `is_sparse_index_allowed()` (sparse-index.c:153-199) for a caller that is writing the
+/// index, which is git's `flags == 0` — never `SPARSE_INDEX_MEMORY_ONLY`.
+///
+/// The pattern set the function also loads (`init_sparse_checkout_patterns()`, dir.c:1552,
+/// called from sparse-index.c:184) is not read here, because its only reader is
+/// `convert_to_sparse_rec()`'s `path_in_sparse_checkout()` — the collapse
+/// [`convert_to_sparse`] does not do. What sparse-index.c:195 then tests,
+/// `pl->use_cone_patterns`, is `core_sparse_checkout_cone` (dir.c:3513) unless parsing the
+/// pattern file found a non-cone pattern and cleared it (dir.c:927-930). A hand-written
+/// non-cone `.git/info/sparse-checkout` under `core.sparseCheckoutCone=true` is therefore
+/// the one premise where this gate is wider than git's.
+fn is_sparse_index_allowed(repo: &gix::Repository, index: &gix::index::File) -> bool {
+    let snapshot = repo.config_snapshot();
+    // `core_apply_sparse_checkout` and `core_sparse_checkout_cone` (environment.c), both
+    // plain booleans that default to off.
+    if !snapshot.boolean("core.sparseCheckout").unwrap_or(false)
+        || !snapshot.boolean("core.sparseCheckoutCone").unwrap_or(false)
+    {
+        return false;
+    }
+    // "The sparse index is not (yet) integrated with a split index" (sparse-index.c:163-167).
+    if index.split_index().is_some() || index.had_link() {
+        return false;
+    }
+    // `r->settings.sparse_index`, which is `repo_cfg_bool(r, "index.sparse", …, 0)`
+    // (repo-settings.c:63) — off unless the repository or the command line says otherwise.
+    snapshot.boolean("index.sparse").unwrap_or(false)
 }
 
 /// `tweak_split_index()` (read-cache.c:1932-1946), which git runs on every index it reads:

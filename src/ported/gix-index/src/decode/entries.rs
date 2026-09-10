@@ -125,6 +125,87 @@ pub fn chunk<'a>(
     Ok((Outcome { is_sparse }, data))
 }
 
+/// How many zero bytes `mmap` leaves readable past the last byte of an index file
+/// that is `file_len` bytes long.
+///
+/// `mmap` rounds a mapping up to a whole page and zero-fills the part of the last
+/// page the file does not cover, so a reader is free to run that far past the end
+/// of the file and sees zeroes there. One byte further is a fault.
+fn mmap_tail_zero_fill(file_len: usize) -> usize {
+    #[cfg(unix)]
+    let page_size = {
+        // SAFETY: `sysconf` is thread-safe and only reads a value the kernel fixed
+        // at boot; it reports failure as -1, which the fallback below covers.
+        #[expect(unsafe_code)]
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(raw).unwrap_or(4096)
+    };
+    #[cfg(not(unix))]
+    let page_size = 4096;
+
+    let page_size = if page_size == 0 { 4096 } else { page_size };
+    file_len.next_multiple_of(page_size) - file_len
+}
+
+/// Decode entries the way git does when an entry's declared path length runs past
+/// the end of the index file, returning how many bytes of `post_header_data` were
+/// consumed rather than what remains of it.
+///
+/// git decodes entries straight out of the `mmap` of the whole index
+/// (read-cache.c:2233) and never bounds-checks the name it copies out of one:
+/// `memcpy(ce->name, name, len + 1)` (read-cache.c:1877) trusts the `len` it took
+/// from the on-disk flags at :1805, and `ondisk_ce_size()` (:1693) then advances by that
+/// same `len`. A `len` that reaches past the last byte of the file reads the zero
+/// fill in the tail of the final page instead of failing, which is how git parses
+/// a SHA-1 index as a SHA-256 one, keeps whatever garbage entries fall out of it,
+/// and still exits 0 — `git ls-files -s` prints them and `git submodule status`
+/// finds no gitlink among them.
+///
+/// The zero fill is the whole of that tolerance: one byte past the final page git
+/// faults, so `file_len` bounds how far this will read and a decode that wants
+/// more is refused rather than invented.
+pub fn chunk_over_mmap_tail(
+    post_header_data: &[u8],
+    file_len: usize,
+    entries: &mut Vec<Entry>,
+    path_backing: &mut Vec<u8>,
+    num_entries: u32,
+    object_hash: gix_hash::Kind,
+    version: Version,
+) -> Result<(Outcome, usize), decode::Error> {
+    let padded_len = post_header_data
+        .len()
+        .checked_add(mmap_tail_zero_fill(file_len))
+        .ok_or(decode::Error::OutOfMemory)?;
+    let mut padded = Vec::new();
+    padded.try_reserve(padded_len)?;
+    padded.extend_from_slice(post_header_data);
+    padded.resize(padded_len, 0);
+
+    let (outcome, remaining) = chunk(
+        &padded,
+        entries,
+        path_backing,
+        num_entries,
+        object_hash,
+        version,
+    )?;
+
+    // `ce->name` is a NUL-terminated buffer: `create_from_disk()` copies `len + 1` bytes into
+    // it (read-cache.c:1877) but every reader of a path — the ones that print it, compare it
+    // or open it — stops at the first NUL. Reading over the zero fill is the one case where
+    // the two differ, so shorten each path to the string git would have, *after* the entries
+    // are decoded so the advance and the V4 delta base still use the full declared length,
+    // exactly as `ondisk_ce_size()` and `previous_ce->ce_namelen` do.
+    for entry in entries.iter_mut() {
+        let path = &path_backing[entry.path.clone()];
+        if let Some(nul) = path.iter().position(|b| *b == 0) {
+            entry.path.end = entry.path.start + nul;
+        }
+    }
+    Ok((outcome, padded.len() - remaining.len()))
+}
+
 /// Note that `prev_path` is only useful if the version is V4
 fn load_one<'a>(
     data: &'a [u8],

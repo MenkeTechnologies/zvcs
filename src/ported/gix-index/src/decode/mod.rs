@@ -80,6 +80,9 @@ impl State {
     ) -> Result<(Self, Option<gix_hash::ObjectId>), Error> {
         let _span = gix_features::trace::detail!("gix_index::State::from_bytes()", options = ?_options);
         let (version, num_entries, post_header_data) = header::decode(data, object_hash)?;
+        // Kept because `data` is rebound to the trailer as the decode proceeds, and the
+        // whole file's length is what says how far past the entries `mmap` still reads.
+        let data_len = data.len();
         let start_of_extensions = extension::end_of_index_entry::decode(data, object_hash)?;
         if num_entries as usize > entries::max_entries_possible(data.len(), start_of_extensions, object_hash, version) {
             return Err(header::Error::Corrupt("Declared entry count exceeds possible entries for file size").into());
@@ -217,19 +220,59 @@ impl State {
                     (entries_res, ext_res)
                 });
                 let (ext, data) = ext_res?;
-                (entries_res?.0, ext, data)
-            }
-            None | Some(_) => {
-                let (entries, data) = entries(
-                    post_header_data,
-                    path_backing_buffer_size,
-                    num_entries,
-                    object_hash,
-                    version,
-                )?;
-                let (ext, data) = extension::decode::all(data, object_hash, alloc_limit_bytes)?;
+                // The same tolerance the single-threaded branch below explains. It has to
+                // be here too: whether an index decodes must not depend on how many
+                // threads read it, and this branch is taken only for the shape — an `EOIE`
+                // extension and more than one thread — that says where the extensions
+                // start, which is exactly what makes a re-read of the entries alone safe.
+                let entries = match entries_res {
+                    Ok((entries, _)) => entries,
+                    Err(strict @ Error::Entry { .. }) => {
+                        entries_over_mmap_tail(post_header_data, data_len, num_entries, object_hash, version)
+                            .ok_or(strict)?
+                            .0
+                    }
+                    Err(err) => return Err(err),
+                };
                 (entries, ext, data)
             }
+            None | Some(_) => match entries(
+                post_header_data,
+                path_backing_buffer_size,
+                num_entries,
+                object_hash,
+                version,
+            ) {
+                Ok((entries, data)) => {
+                    let (ext, data) = extension::decode::all(data, object_hash, alloc_limit_bytes)?;
+                    (entries, ext, data)
+                }
+                // git has no bounds check to fail here: it reads the entries out of
+                // the `mmap` of the index and follows whatever path length the entry
+                // declares, off the end of the file and into the zero fill of the
+                // final page (read-cache.c:1877). Only try that once the strict pass
+                // has already said the entries do not fit, so a well-formed index
+                // never pays for the copy, and keep the strict error when the second
+                // pass fails for a reason the zero fill cannot explain — an unknown
+                // extended flag, say, which git dies on too (read-cache.c:1812).
+                Err(strict @ Error::Entry { .. }) => {
+                    let Some((outcome, consumed)) =
+                        entries_over_mmap_tail(post_header_data, data_len, num_entries, object_hash, version)
+                    else {
+                        return Err(strict);
+                    };
+                    // git picks the extensions up wherever the entries left off and
+                    // simply finds none when that offset already ran past the file,
+                    // because its loop is bounded by the mapped size
+                    // (read-cache.c:2004 and :2308).
+                    let start_of_extensions =
+                        (header::SIZE + consumed).min(data_len - object_hash.len_in_bytes());
+                    let (ext, data) =
+                        extension::decode::all(&data[start_of_extensions..], object_hash, alloc_limit_bytes)?;
+                    (outcome, ext, data)
+                }
+                Err(err) => return Err(err),
+            },
         };
 
         if data.len() != object_hash.len_in_bytes() {
@@ -296,6 +339,43 @@ fn vec_with_capacity<T>(capacity: usize) -> Result<Vec<T>, Error> {
     let mut vec = Vec::new();
     vec.try_reserve(capacity).map_err(|_| Error::OutOfMemory)?;
     Ok(vec)
+}
+
+/// Decode the entries again, this time reading over the zero fill `mmap` leaves past the end
+/// of a `file_len`-byte index — see [`entries::chunk_over_mmap_tail()`] for why git can and
+/// this normally does not. Also returns how many bytes of `post_header_data` were consumed,
+/// which is where git would look for the extensions.
+///
+/// `None` when the second pass fails as well, which means the failure was never about
+/// running out of file: an unknown extended flag, say, which git dies on too
+/// (read-cache.c:1812). The caller reports the error the strict pass produced.
+fn entries_over_mmap_tail(
+    post_header_data: &[u8],
+    file_len: usize,
+    num_entries: u32,
+    object_hash: gix_hash::Kind,
+    version: Version,
+) -> Option<(EntriesOutcome, usize)> {
+    let mut entries = Vec::new();
+    let mut path_backing = Vec::new();
+    let (entries::Outcome { is_sparse }, consumed) = entries::chunk_over_mmap_tail(
+        post_header_data,
+        file_len,
+        &mut entries,
+        &mut path_backing,
+        num_entries,
+        object_hash,
+        version,
+    )
+    .ok()?;
+    Some((
+        EntriesOutcome {
+            entries,
+            path_backing,
+            is_sparse,
+        },
+        consumed,
+    ))
 }
 
 fn entries(

@@ -197,9 +197,9 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
 /// `gix-index` deliberately has no repository handle, so it names these as a trait
 /// and lets its caller supply them; this is that supply for every verb in this
 /// binary.
-pub(super) struct RepoOdb<'repo> {
+pub(crate) struct RepoOdb<'repo> {
     /// The repository whose odb answers the presence checks and takes the trees.
-    pub(super) repo: &'repo gix::Repository,
+    pub(crate) repo: &'repo gix::Repository,
 }
 
 impl cache_tree::Odb for RepoOdb<'_> {

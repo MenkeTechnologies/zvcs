@@ -73,41 +73,40 @@
 //!     does. `Refusing to create empty bundle.` and `unsupported bundle
 //!     version <n>` are reproduced.
 //!
-//!     **The pack bytes are not git's.** The header — magic line, prerequisite
-//!     and tip lines, terminating blank line — is byte-identical; the pack that
-//!     follows is not, for three independent reasons, each measured against
-//!     stock git 2.55.0 on the `branched` fixture:
+//!     **The whole file is byte-identical to git's**, header and pack alike, on
+//!     every shape the harness measures. It was not always, and the three
+//!     reasons it was not are worth keeping because each names the piece that
+//!     had to be built:
 //!
 //!       1. *Object order.* git's `compute_write_order()` groups the pack by
 //!          type (tagged tips, then remaining commits and tags, then trees, then
-//!          the rest) and keeps delta families contiguous. This port writes in
-//!          the order `objects_to_send()` produces, which is
-//!          `HashSet<ObjectId>` iteration order — so the order is not git's *and
-//!          is not stable between two runs of this binary*. Fixing it means
-//!          returning an ordered collection from
-//!          `push_proto::objects_to_send()` and porting `compute_write_order()`,
-//!          neither of which lives in this module.
-//!       2. *Deflate output.* zvcs compresses through `zlib-rs`, which targets
-//!          zlib-ng-compatible output rather than bit-identity with the zlib
-//!          stock git links. On the `branched` fixture 6 of 13 objects compress
-//!          to a different length at the same level (a 235-byte commit becomes
-//!          149 bytes here and 152 in stock). No level setting closes this; only
-//!          swapping the compressor would.
+//!          the rest) and keeps delta families contiguous. This module once
+//!          wrote in `HashSet<ObjectId>` iteration order, so the order was
+//!          neither git's nor stable between two runs. Closed by
+//!          `push_proto::objects_to_send()` returning the traversal's own order
+//!          and by `pack_objects::compute_write_order()`.
+//!       2. *Deflate output.* zvcs compresses through `zlib-rs` where stock git
+//!          links zlib, so nothing pins the two together by construction. They
+//!          have agreed on every corpus measured; see the `pack_objects` module
+//!          header for what was checked and what a divergence would look like.
 //!       3. *Thinness.* git passes `--thin`, so its deltas may name bases the
-//!          receiver already has; `gix-pack`'s writer has exactly one mode,
-//!          documented as "Copy base objects and deltas from packs, while
-//!          non-packed objects will be treated as base objects"
-//!          (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). With
-//!          `--all` there are no prerequisites, so this one is inert there.
+//!          receiver already has. Closed: the prerequisites — which are the
+//!          walk's edge commits, collected by
+//!          `compute_and_write_prerequisites()` from `rev-list --boundary` —
+//!          now go to the pack writer as its boundary, and
+//!          `pack_objects::interleave_preferred_bases()` turns their trees into
+//!          the delta bases git's `add_preferred_base()` makes of them. With
+//!          `--all` there are no prerequisites, so this was always inert there;
+//!          over a range it is what makes `bundle create - main..div` the same
+//!          429 bytes as stock rather than 560.
 //!
-//!     What is written is a self-contained superset of git's pack: every object
-//!     it references is present, so `git bundle unbundle`, `git clone` and
-//!     `index-pack --fix-thin` all accept it and produce the same objects and
-//!     refs. Delta *base selection* is not currently a cause — on `branched`
-//!     gitoxide picks the same base and emits a byte-identical delta payload —
-//!     and the deltas are `OBJ_OFS_DELTA`, because `write_pack_data()` spawns
-//!     `pack-objects --stdout --thin --delta-base-offset` unconditionally
-//!     (`bundle.c:333-336`).
+//!     Delta *base selection* is not a cause — on `branched` gitoxide picks the
+//!     same base and emits a byte-identical delta payload — and the deltas are
+//!     `OBJ_OFS_DELTA` wherever the base is in the pack, because
+//!     `write_pack_data()` spawns `pack-objects --stdout --thin
+//!     --delta-base-offset` unconditionally (`bundle.c:333-336`); a base the
+//!     thinness left outside is named by id, which is git's own
+//!     `DELTA(entry)->idx.offset` test.
 //!
 //!     `create`'s options are `PARSE_OPT_STOP_AT_NON_OPTION`, so the `<file>`
 //!     operand ends option parsing: `git bundle create <file> -q` reports
@@ -921,11 +920,12 @@ fn create(args: &[String]) -> Result<ExitCode> {
     }
 
     // `write_pack_data()`: the objects reachable from the tips and not from the
-    // prerequisites. git's pack is thin (its deltas may name bases the receiver
-    // already has); this one is not, so it carries every object it references.
-    // A non-thin pack is a strictly self-contained superset — `unbundle` and
-    // `index-pack --fix-thin` accept it unchanged — so the bundle is correct,
-    // but its bytes are not git's. See the module header.
+    // prerequisites. The pack is thin: `pack-objects --thin` turns the walk's
+    // edge commits into preferred bases, so a delta may name a base the pack
+    // does not carry because the receiver already reached it. The prerequisites
+    // *are* those edge commits — `compute_and_write_prerequisites()` collects
+    // them from `rev-list --boundary` and hands them to `pack-objects` as
+    // `^<oid>` (bundle.c) — so they go to the pack writer as the boundary.
     //
     // The wants are the pending entries as typed, so a tag tip is packed as a
     // tag; the haves are the peeled ones, because `pack-objects` peels a `^<tag>`
@@ -940,12 +940,13 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // reached through them.
     super::pack_objects::apply_filter(&repo, filter.as_deref(), &want_objects, &mut objects);
     // `write_pack_data()` spawns `pack-objects --stdout --thin --delta-base-offset`
-    // (bundle.c:333-336) — the flag is unconditional there, so a bundle's deltas
-    // are always `OBJ_OFS_DELTA`. Passing `false` here wrote `OBJ_REF_DELTA`
-    // instead, which is 18 bytes larger per delta and is not what any git bundle
-    // contains.
-    out.extend_from_slice(&crate::porcelain::pack_objects::pack_bytes_with(
-        &repo, &objects, true,
+    // (bundle.c:333-336) — both flags are unconditional there, so a bundle's
+    // deltas are always `OBJ_OFS_DELTA` where the base is in the pack and
+    // `OBJ_REF_DELTA` where `--thin` put it outside. Passing `false` for the
+    // first wrote `OBJ_REF_DELTA` throughout, which is 18 bytes larger per delta
+    // and is not what any git bundle contains.
+    out.extend_from_slice(&crate::porcelain::pack_objects::pack_bytes_thin(
+        &repo, &objects, true, &prereqs,
     )?);
 
     if file == "-" {

@@ -281,21 +281,23 @@ mod expand {
                         push_obj_count_unique(&mut out, seen_objs, &id, obj.1.clone(), objects, stats, false);
                         match obj.0.kind {
                             Tree => {
-                                traverse_delegate.clear();
-                                {
-                                    let objects = ExpandedCountingObjects::new(db, out, objects);
-                                    gix_traverse::tree::breadthfirst(
-                                        gix_object::TreeRefIter::from_bytes(obj.0.data, obj.0.object_hash),
-                                        &mut tree_traversal_state,
-                                        &objects,
-                                        &mut traverse_delegate,
-                                    )
-                                    .map_err(Error::TreeTraverse)?;
-                                    out = objects.dissolve(stats);
-                                }
-                                for id in &traverse_delegate.non_trees {
-                                    out.push(id_to_count(db, buf1, id, objects, stats, allow_pack_lookups));
-                                }
+                                // The tree is walked in git's own order rather than
+                                // breadth-first, because this list *is* the pack for
+                                // the callers that hand it straight to the writer, and
+                                // the pack's entry order is part of what a byte
+                                // comparison against git sees. See
+                                // [`expand_tree_contents`].
+                                let tree = obj.0.data.to_owned();
+                                expand_tree_contents(
+                                    db,
+                                    &tree,
+                                    obj.0.object_hash,
+                                    seen_objs,
+                                    &mut out,
+                                    objects,
+                                    stats,
+                                    allow_pack_lookups,
+                                )?;
                                 break;
                             }
                             Commit => {
@@ -323,6 +325,85 @@ mod expand {
         }
         outcome.total_objects = out.len();
         Ok((out, outcome))
+    }
+
+    /// ```c
+    /// static void process_tree_contents(struct traversal_context *ctx,
+    ///                                   struct tree *tree,
+    ///                                   struct strbuf *base)
+    /// {
+    ///         struct tree_desc desc;
+    ///         struct name_entry entry;
+    ///         ...
+    ///         while (tree_entry(&desc, &entry)) {
+    ///                 ...
+    ///                 if (S_ISDIR(entry.mode)) {
+    ///                         struct tree *t = lookup_tree(ctx->revs->repo, &entry.oid);
+    ///                         ...
+    ///                         process_tree(ctx, t, base, entry.path);
+    ///                 }
+    ///                 else if (S_ISGITLINK(entry.mode))
+    ///                         process_gitlink(ctx, entry.oid.hash, base, entry.path);
+    ///                 else {
+    ///                         struct blob *b = lookup_blob(ctx->revs->repo, &entry.oid);
+    ///                         ...
+    ///                         process_blob(ctx, b, base, entry.path);
+    ///                 }
+    ///         }
+    /// }
+    /// ```
+    ///
+    /// (list-objects.c.) Entry order, descending into a subtree the moment it is
+    /// met — so a directory listed after four blobs is shown after those four
+    /// blobs and before whatever follows it, and its own contents come with it.
+    /// A breadth-first walk instead shows every subtree of a level before any of
+    /// the blobs beside them, which is a different pack for the callers that feed
+    /// this list to the writer unchanged.
+    ///
+    /// The tree itself is shown by the caller; this is only its contents. A
+    /// gitlink names a commit in another repository and is not followed, and an
+    /// object already seen is neither shown again nor descended into, which is
+    /// `process_tree()`'s `obj->flags & SEEN` gate.
+    #[expect(clippy::too_many_arguments)]
+    fn expand_tree_contents(
+        db: &dyn crate::Find,
+        tree: &[u8],
+        hash: gix_hash::Kind,
+        seen: &impl util::InsertImmutable,
+        out: &mut Vec<output::Count>,
+        objects: &gix_features::progress::AtomicStep,
+        stats: &mut Outcome,
+        allow_pack_lookups: bool,
+    ) -> Result<(), Error> {
+        let mut buf = Vec::new();
+        for entry in gix_object::TreeRefIter::from_bytes(tree, hash) {
+            let Ok(entry) = entry else { break };
+            if entry.mode.is_commit() {
+                continue;
+            }
+            let id = entry.oid.to_owned();
+            if !seen.insert(id) {
+                continue;
+            }
+            if !entry.mode.is_tree() {
+                // `process_blob()` never reads the object: the blob is listed on
+                // the strength of the tree entry naming it, which is what
+                // `id_to_count` does and what puts a filtered-out blob in front
+                // of the pack writer rather than dropping it here.
+                out.push(id_to_count(db, &mut buf, &id, objects, stats, allow_pack_lookups));
+                continue;
+            }
+            // Each level owns the bytes it descends into, because the borrow of
+            // the shared buffer would otherwise end at the recursive call.
+            let (child, location) = db.find(&id, &mut buf)?;
+            let child = child.data.to_owned();
+            objects.fetch_add(1, Ordering::Relaxed);
+            stats.decoded_objects += 1;
+            stats.expanded_objects += 1;
+            out.push(output::Count::from_data(id, location));
+            expand_tree_contents(db, &child, hash, seen, out, objects, stats, allow_pack_lookups)?;
+        }
+        Ok(())
     }
 
     #[inline]

@@ -53,13 +53,33 @@
 //! islands off `oe_layer()` is 0 throughout and there is exactly one layer,
 //! which is what [`compute_write_order`] reproduces.
 //!
+//! A **thin** pack is written where the caller supplies the revision walk's edge
+//! commits — see [`write_pack`]'s `boundary`, [`PreferredBases`] and
+//! [`interleave_preferred_bases`]. Their trees join the delta window as git's
+//! preferred bases, so an entry may be an `OBJ_REF_DELTA` on an object the pack
+//! does not carry because the receiver reached it already. `bundle create` is
+//! the caller that does this, because `write_pack_data()` spawns
+//! `pack-objects --thin` unconditionally. This command's own `--thin` is still
+//! accepted without effect: `--thin` is what makes git ask for edges at all
+//! (`cmd_pack_objects()` pushes `--objects-edge` under it and plain `--objects`
+//! otherwise), and [`collect_counts`] drops a `^rev` rather than walking to a
+//! boundary, so there is no edge here to hand over.
+//!
+//! The pack's **entry order is the caller's**: [`write_pack`] writes `counts`
+//! in the order it arrives in, and git's own order is its revision walk's. Given
+//! the same revisions in the same order this module reproduces git's pack byte
+//! for byte, so an order a caller chooses for itself is the one thing that still
+//! separates two otherwise identical packs. Two callers currently choose one:
+//! `repack` sorts its ids by object id for reproducibility rather than handing
+//! over the traversal, and `upload-pack` presents its `want`s in the order the
+//! client listed them rather than the order git's walk would. Neither is a
+//! defect in this module and neither can be repaired here.
+//!
 //! The knobs with nothing to steer are the ones tied to substrate that is still
 //! missing: `--delta-islands`, `--name-hash-version`, `--path-walk`, `--sparse`
-//! and `--shallow`. `--thin`
-//! is likewise accepted without effect, a thin pack needing bases outside the
-//! pack. `--write-bitmap-index` *does* write a `.bitmap` — see [`bitmap_file`] —
-//! unless the pack is missing part of the closure a bitmap must cover, in which
-//! case it warns as git does and writes none.
+//! and `--shallow`. `--write-bitmap-index` *does* write a `.bitmap` — see
+//! [`bitmap_file`] — unless the pack is missing part of the closure a bitmap
+//! must cover, in which case it warns as git does and writes none.
 //!
 //! # What is reproduced exactly
 //!
@@ -931,7 +951,10 @@ fn execute(st: &State) -> Result<ExitCode> {
         let _ = std::fs::OpenOptions::new().create(true).write(true).open(tmp);
     }
 
-    let packed = write_pack(&repo, &counts, compression(&repo, st), &delta, st.progress)?;
+    // No boundary: `collect_counts()` drops a `^rev` rather than walking to it,
+    // so this command has no edge commits to hand over and `--thin` still steers
+    // nothing here. See the module header.
+    let packed = write_pack(&repo, &counts, compression(&repo, st), &delta, st.progress, &[])?;
 
     if st.stdout {
         let mut out = std::io::stdout().lock();
@@ -1165,6 +1188,33 @@ pub(crate) fn pack_bytes_with(
     Ok(pack_bytes_with_summary(repo, ids, allow_ofs_delta)?.0)
 }
 
+/// [`pack_bytes_with`] as `pack-objects --thin` writes it: `boundary` names the
+/// commits at the edge of the walk that produced `ids` — the prerequisites a
+/// bundle lists, or the `have`s a fetch peer reported — and the trees under them
+/// become delta bases the pack itself does not carry.
+///
+/// `bundle.c`'s `write_pack_data()` spawns `pack-objects --stdout --thin
+/// --delta-base-offset` unconditionally, so every git bundle over a range is
+/// thin; a bundle written without this is a valid superset that simply is not
+/// the file git writes.
+pub(crate) fn pack_bytes_thin(
+    repo: &gix::Repository,
+    ids: &[ObjectId],
+    allow_ofs_delta: bool,
+    boundary: &[ObjectId],
+) -> Result<Vec<u8>> {
+    Ok(packed_for_thin(
+        repo,
+        ids,
+        WriteOptions {
+            allow_ofs_delta,
+            ..WriteOptions::default()
+        },
+        boundary,
+    )?
+    .bytes)
+}
+
 /// [`pack_bytes_with`], keeping the closing counts.
 ///
 /// `upload-pack` needs them because it does not print the summary itself: the
@@ -1227,6 +1277,18 @@ pub(crate) fn packed_for(
     ids: &[ObjectId],
     options: WriteOptions,
 ) -> Result<Packed> {
+    packed_for_thin(repo, ids, options, &[])
+}
+
+/// [`packed_for`] with the revision walk's edge commits, which is what
+/// `pack-objects --thin` is: their trees become preferred bases, so an entry may
+/// be a delta on an object the pack itself does not carry. See [`write_pack`].
+pub(crate) fn packed_for_thin(
+    repo: &gix::Repository,
+    ids: &[ObjectId],
+    options: WriteOptions,
+    boundary: &[ObjectId],
+) -> Result<Packed> {
     prefetch_to_pack(repo, ids)?;
     let counts: Vec<pack::data::output::Count> = ids
         .iter()
@@ -1257,6 +1319,7 @@ pub(crate) fn packed_for(
         compression(repo, &State::default()),
         &delta,
         options.progress,
+        boundary,
     )
 }
 
@@ -1470,12 +1533,20 @@ impl DeltaConfig {
 /// order `counts` arrives in, except that a delta's base is always emitted
 /// first — which is what makes an `OBJ_OFS_DELTA`'s backwards distance
 /// representable and what git's `write_one()` recursion guarantees too.
+///
+/// `boundary` is `show_edge()`'s commits — the edge of the revision walk that
+/// produced `counts`, i.e. what the receiver already has. Passing them makes the
+/// result a *thin* pack: their trees join the delta window as preferred bases
+/// and are dropped before the write, so an entry may name a base the pack does
+/// not carry. An empty slice is `pack-objects` without `--thin`, which asks for
+/// no edges at all and so has no preferred base to find.
 fn write_pack(
     repo: &gix::Repository,
     counts: &[pack::data::output::Count],
     level: gix::zlib::Compression,
     delta: &DeltaConfig,
     progress: bool,
+    boundary: &[ObjectId],
 ) -> Result<Packed> {
     use crate::progress::Meter;
     use pack::data::output::delta;
@@ -1542,9 +1613,11 @@ fn write_pack(
             kind,
             size,
             name_hash: 0,
+            preferred_base: false,
         });
     }
     counting.done();
+    interleave_preferred_bases(repo, boundary, delta.search.window, &mut objects);
     assign_name_hashes(repo, &mut objects);
 
     // Phase 2: the delta search, steered by `pack.island` when asked. git
@@ -1596,8 +1669,13 @@ fn write_pack(
         .zip(&reused)
         .map(|(object, reused)| reused.is_some() || object.size > threshold)
         .collect();
+    // A preferred base is never written, so it is in neither of git's two
+    // remaining totals: `Compressing objects` counts `nr_deltas` and `Writing
+    // objects` counts `nr_result`, and `create_object_entry()` bumps neither for
+    // an excluded entry.
+    let to_write = objects.iter().filter(|object| !object.preferred_base).count();
     let mut compressing =
-        Meter::counted("Compressing objects", objects.len(), compressing_progress);
+        Meter::counted("Compressing objects", to_write, compressing_progress);
     let mut deltas = delta::find_deltas(
         &objects,
         &islands,
@@ -1622,7 +1700,7 @@ fn write_pack(
             data: None,
         });
     }
-    compressing.advance(objects.len());
+    compressing.advance(to_write);
     compressing.done();
 
     // Phase 3: serialise, base before delta. `write_entry` recurses into an
@@ -1630,7 +1708,7 @@ fn write_pack(
     // entries appended — the same total, and monotone, which is what the display
     // needs.
     let write_order = compute_write_order(&objects, &deltas, &tag_tips(repo));
-    let mut writing = Meter::counted("Writing objects", objects.len(), progress);
+    let mut writing = Meter::counted("Writing objects", to_write, progress);
     let mut body: Vec<u8> = Vec::new();
     let mut entries: Vec<PackedEntry> = Vec::with_capacity(objects.len());
     let mut offsets: Vec<Option<u64>> = vec![None; objects.len()];
@@ -1643,6 +1721,9 @@ fn write_pack(
         from_reuse: &from_reuse,
     };
     for at in write_order {
+        if objects[at].preferred_base {
+            continue;
+        }
         writing.tick();
         write_entry(
             repo,
@@ -2116,7 +2197,17 @@ fn write_entry(
     entries: &mut Vec<PackedEntry>,
     written_deltas: &mut usize,
 ) -> Result<()> {
-    if offsets[at].is_some() {
+    // ```c
+    // } else if (e->idx.offset || e->preferred_base) {
+    //         /* offset is non zero if object is written already. */
+    //         return WRITE_ONE_SKIP;
+    // }
+    // ```
+    //
+    // (`write_one()`, builtin/pack-objects.c.) A preferred base is in the list
+    // only to be deltified against; it is never written, and the recursion below
+    // reaching one is exactly how a thin pack's base ends up absent.
+    if offsets[at].is_some() || objects[at].preferred_base {
         return Ok(());
     }
     if let Some(delta) = &deltas[at] {
@@ -2137,6 +2228,15 @@ fn write_entry(
 
     // A delta whose base was itself dropped cannot be written as a delta.
     let base_offset = deltas[at].as_ref().and_then(|delta| offsets[delta.base]);
+    // A delta on a *preferred* base has no offset and never will: the base is
+    // not in this pack. git names it by id, because `DELTA(entry)->idx.offset`
+    // stays zero and `write_no_reuse_object()` reads
+    // `type = (allow_ofs_delta && DELTA(entry)->idx.offset) ? OBJ_OFS_DELTA :
+    // OBJ_REF_DELTA` — so `--delta-base-offset` does not reach a thin base.
+    let base_is_thin = deltas[at]
+        .as_ref()
+        .is_some_and(|delta| objects[delta.base].preferred_base);
+    let has_base = base_offset.is_some() || base_is_thin;
 
     // ```c
     // if (!reuse_object)
@@ -2161,7 +2261,7 @@ fn write_entry(
     // search deltified afresh, has to be written the long way.
     let stored = reuse.enabled.then(|| reuse.in_pack[at]).flatten();
     let to_reuse = stored.filter(|stored| match reuse.from_reuse[at] {
-        true => base_offset.is_some(),
+        true => has_base,
         false => !stored.stored_delta && deltas[at].is_none(),
     });
     if let Some(stored) = to_reuse {
@@ -2173,6 +2273,7 @@ fn write_entry(
             reuse,
             &stored,
             base_offset,
+            has_base,
             body,
             offsets,
             entries,
@@ -2193,23 +2294,22 @@ fn write_entry(
         Err(_) => return Ok(()),
     };
 
-    let payload = match (&deltas[at], base_offset) {
-        (Some(delta), Some(_)) => delta_bytes(repo, &objects[delta.base].id, delta, &object)?,
+    let payload = match (&deltas[at], has_base) {
+        (Some(delta), true) => delta_bytes(repo, &objects[delta.base].id, delta, &object)?,
         _ => None,
     };
 
     let start = body.len();
     let offset = PACK_HEADER_LEN + start as u64;
-    let (header, decompressed_size, raw) = match (payload, base_offset) {
-        (Some(delta), Some(base_offset)) => {
-            let header = if allow_ofs_delta {
-                pack::data::entry::Header::OfsDelta {
+    let (header, decompressed_size, raw) = match (payload, has_base) {
+        (Some(delta), true) => {
+            let header = match base_offset.filter(|_| allow_ofs_delta) {
+                Some(base_offset) => pack::data::entry::Header::OfsDelta {
                     base_distance: offset - base_offset,
-                }
-            } else {
-                pack::data::entry::Header::RefDelta {
+                },
+                None => pack::data::entry::Header::RefDelta {
                     base_id: objects[deltas[at].as_ref().expect("delta present").base].id,
-                }
+                },
             };
             let size = delta.len() as u64;
             *written_deltas += 1;
@@ -2272,6 +2372,7 @@ fn write_reuse_entry(
     reuse: &Reuse<'_>,
     stored: &InPack,
     base_offset: Option<u64>,
+    has_base: bool,
     body: &mut Vec<u8>,
     offsets: &mut [Option<u64>],
     entries: &mut Vec<PackedEntry>,
@@ -2290,14 +2391,16 @@ fn write_reuse_entry(
     let offset = PACK_HEADER_LEN + start as u64;
     // `if (DELTA(entry)) type = (allow_ofs_delta && DELTA(entry)->idx.offset) ?
     // OBJ_OFS_DELTA : OBJ_REF_DELTA;`
-    let header = match (&deltas[at], base_offset) {
-        (Some(delta), Some(base_offset)) => {
+    let header = match (&deltas[at], has_base) {
+        (Some(delta), true) => {
             *written_deltas += 1;
-            match allow_ofs_delta {
-                true => pack::data::entry::Header::OfsDelta {
+            // A preferred base has no offset to count back to, so it can only be
+            // named by id — the same `DELTA(entry)->idx.offset` arm as above.
+            match base_offset.filter(|_| allow_ofs_delta) {
+                Some(base_offset) => pack::data::entry::Header::OfsDelta {
                     base_distance: offset - base_offset,
                 },
-                false => pack::data::entry::Header::RefDelta {
+                None => pack::data::entry::Header::RefDelta {
                     base_id: objects[delta.base].id,
                 },
             }
@@ -2357,6 +2460,361 @@ fn deflate_into(data: &[u8], level: gix::zlib::Compression, out: &mut Vec<u8>) -
     Ok(())
 }
 
+/// Splice the preferred bases the boundary trees yield into `objects`, in the
+/// places `get_object_list()` would have added them.
+///
+/// ```c
+/// static void show_object(struct object *obj, const char *name, void *data)
+/// {
+///         add_preferred_base_object(name);
+///         add_object_entry(&obj->oid, obj->type, name, 0);
+/// }
+/// ```
+///
+/// (builtin/pack-objects.c.) The pbase entries for a path therefore land
+/// immediately *before* the first object shown at that path, which is what puts
+/// the boundary root tree just ahead of the first root tree in the set and so
+/// what `compute_write_order()` sees. `show_commit()` carries no name and calls
+/// none of this, which is why a commit never brings a preferred base with it.
+///
+/// A pbase id already in the list is not appended twice; it marks the entry that
+/// is there:
+///
+/// ```c
+/// if (exclude) {
+///         if (!entry->preferred_base)
+///                 nr_result--;
+///         entry->preferred_base = 1;
+/// }
+/// ```
+///
+/// (`have_duplicate_entry()`.) That is how an object the receiver demonstrably
+/// holds — it hangs off a boundary tree at the same path — drops out of the pack
+/// rather than being sent again.
+///
+/// # Departure
+///
+/// git names a tag object with the ref it was pending under and calls
+/// `add_preferred_base_object()` with that, where the walk recovering paths here
+/// gives a tag no path at all. A ref name matching a top-level entry of a
+/// boundary tree is the only case that would differ, and it differs only in
+/// which paths the `done_pbase_paths` memo has already consumed.
+fn interleave_preferred_bases(
+    repo: &gix::Repository,
+    boundary: &[ObjectId],
+    window: usize,
+    objects: &mut Vec<pack::data::output::delta::Object>,
+) {
+    if boundary.is_empty() {
+        return;
+    }
+    let mut bases = PreferredBases::new(repo, boundary, window);
+    if bases.trees.is_empty() {
+        return;
+    }
+
+    let ids: Vec<(ObjectId, gix::object::Kind)> = objects.iter().map(|o| (o.id, o.kind)).collect();
+    let paths = traversal_paths(repo, &ids);
+    let mut position: std::collections::HashMap<ObjectId, usize> = std::collections::HashMap::new();
+    let mut out: Vec<pack::data::output::delta::Object> = Vec::with_capacity(objects.len());
+    let push = |out: &mut Vec<pack::data::output::delta::Object>,
+                    position: &mut std::collections::HashMap<ObjectId, usize>,
+                    object: pack::data::output::delta::Object| {
+        match position.get(&object.id) {
+            // `have_duplicate_entry()`: an id already in the list is never a
+            // second entry. An exclusion still takes hold of the one that is
+            // there; an inclusion of something already excluded is dropped.
+            Some(&at) => out[at].preferred_base |= object.preferred_base,
+            None => {
+                position.insert(object.id, out.len());
+                out.push(object);
+            }
+        }
+    };
+
+    for (object, path) in std::mem::take(objects).into_iter().zip(paths) {
+        if let Some(path) = &path {
+            for base in bases.for_name(repo, path) {
+                let Ok(header) = gix::odb::HeaderExt::header(&repo.objects, base.id) else {
+                    // `check_object()` records `OBJ_BAD` for a preferred base it
+                    // cannot read and `prepare_pack()` skips it; nothing else
+                    // ever looks at it, so it simply does not join the list.
+                    continue;
+                };
+                push(
+                    &mut out,
+                    &mut position,
+                    pack::data::output::delta::Object {
+                        id: base.id,
+                        kind: base.kind,
+                        size: header.size(),
+                        name_hash: base.name_hash,
+                        preferred_base: true,
+                    },
+                );
+            }
+        }
+        push(&mut out, &mut position, object);
+    }
+    *objects = out;
+}
+
+/// git's `pbase_tree` list: the boundary trees a thin pack is allowed to deltify
+/// against, and the memo that keeps each path from being looked up twice.
+///
+/// ```c
+/// static void add_preferred_base(struct object_id *oid)
+/// {
+///         struct pbase_tree *it;
+///         void *data;
+///         unsigned long size;
+///         struct object_id tree_oid;
+///
+///         if (window <= num_preferred_base++)
+///                 return;
+///
+///         data = read_object_with_reference(the_repository, oid,
+///                                           OBJ_TREE, &size, &tree_oid);
+///         if (!data)
+///                 return;
+///
+///         for (it = pbase_tree; it; it = it->next) {
+///                 if (oideq(&it->pcache.oid, &tree_oid)) {
+///                         free(data);
+///                         return;
+///                 }
+///         }
+///
+///         CALLOC_ARRAY(it, 1);
+///         it->next = pbase_tree;
+///         pbase_tree = it;
+///
+///         oidcpy(&it->pcache.oid, &tree_oid);
+///         it->pcache.tree_data = data;
+///         it->pcache.tree_size = size;
+/// }
+/// ```
+///
+/// (builtin/pack-objects.c.) `show_edge()` calls this for every commit at the
+/// edge of the walk, so what a thin pack may lean on is the *tree of each
+/// boundary commit* — the receiver reached those commits already, so it holds
+/// everything under them. `pack-objects` only asks for edges under `--thin`
+/// (`cmd_pack_objects()` pushes `--objects-edge` there and plain `--objects`
+/// otherwise), which is why a repack or a `pack-objects` run without the flag
+/// has no preferred bases at all and is unaffected by any of this.
+struct PreferredBases {
+    /// The distinct boundary trees, most recently added first: `add_preferred_base()`
+    /// pushes onto the head of `pbase_tree` and `add_preferred_base_object()`
+    /// walks it from there.
+    trees: Vec<(ObjectId, Vec<u8>)>,
+    /// `num_preferred_base`, which counts calls rather than trees — it is
+    /// incremented before the read, so a boundary commit that cannot be read
+    /// still consumes one of the `window` slots.
+    considered: usize,
+    /// `done_pbase_paths`: the name hashes already answered for.
+    done: HashSet<u32>,
+}
+
+/// One entry `add_preferred_base_object()` produced: an object the receiver is
+/// known to hold, to be carried in the pack list as a delta base and dropped
+/// before the write.
+struct PreferredBase {
+    id: ObjectId,
+    kind: gix::object::Kind,
+    /// `pack_name_hash(fullname)`, or zero for a boundary root tree, which
+    /// `add_object_entry(&it->pcache.oid, OBJ_TREE, NULL, 1)` names with a NULL.
+    name_hash: u32,
+}
+
+/// `strcspn(name, "\n/")`, git's `name_cmp_len()`: how much of `name` is its
+/// first path component.
+fn name_cmp_len(name: &[u8]) -> usize {
+    name.iter().position(|&c| c == b'\n' || c == b'/').unwrap_or(name.len())
+}
+
+impl PreferredBases {
+    /// `add_preferred_base()` for each boundary commit, in the order
+    /// `mark_edges_uninteresting()` reported them.
+    fn new(repo: &gix::Repository, boundary: &[ObjectId], window: usize) -> Self {
+        let mut out = PreferredBases {
+            trees: Vec::new(),
+            considered: 0,
+            done: HashSet::new(),
+        };
+        for id in boundary {
+            if window <= out.considered {
+                out.considered += 1;
+                continue;
+            }
+            out.considered += 1;
+            // `read_object_with_reference(oid, OBJ_TREE, …)`: peel a commit or a
+            // tag until a tree comes out.
+            let Some(tree) = repo
+                .find_object(*id)
+                .ok()
+                .and_then(|object| object.peel_to_tree().ok())
+            else {
+                continue;
+            };
+            let tree_id = tree.id;
+            if out.trees.iter().any(|(id, _)| *id == tree_id) {
+                continue;
+            }
+            out.trees.insert(0, (tree_id, tree.data.clone()));
+        }
+        out
+    }
+
+    /// ```c
+    /// static void add_preferred_base_object(const char *name)
+    /// {
+    ///         struct pbase_tree *it;
+    ///         size_t cmplen;
+    ///         unsigned hash = pack_name_hash(name);
+    ///
+    ///         if (!num_preferred_base || check_pbase_path(hash))
+    ///                 return;
+    ///
+    ///         cmplen = name_cmp_len(name);
+    ///         for (it = pbase_tree; it; it = it->next) {
+    ///                 if (cmplen == 0) {
+    ///                         add_object_entry(&it->pcache.oid, OBJ_TREE, NULL, 1);
+    ///                 }
+    ///                 else {
+    ///                         struct tree_desc tree;
+    ///                         init_tree_desc(&tree, &it->pcache.oid,
+    ///                                        it->pcache.tree_data, it->pcache.tree_size);
+    ///                         add_pbase_object(&tree, name, cmplen, name);
+    ///                 }
+    ///         }
+    /// }
+    /// ```
+    ///
+    /// The empty name is the root tree's, and it is the arm that puts the
+    /// boundary root trees themselves into the pack list — which is what lets
+    /// the first tree of a `main..div` bundle come out as a delta against the
+    /// tree the receiver already has.
+    fn for_name(&mut self, repo: &gix::Repository, name: &[u8]) -> Vec<PreferredBase> {
+        use pack::data::output::delta::name_hash;
+
+        let mut out = Vec::new();
+        if self.considered == 0 || !self.done.insert(name_hash(name)) {
+            return out;
+        }
+        let cmplen = name_cmp_len(name);
+        for (id, data) in &self.trees {
+            if cmplen == 0 {
+                out.push(PreferredBase {
+                    id: *id,
+                    kind: gix::object::Kind::Tree,
+                    name_hash: 0,
+                });
+            } else {
+                add_pbase_object(repo, data, name, cmplen, name, &mut out);
+            }
+        }
+        out
+    }
+}
+
+/// ```c
+/// static void add_pbase_object(struct tree_desc *tree,
+///                              const char *name,
+///                              size_t cmplen,
+///                              const char *fullname)
+/// {
+///         struct name_entry entry;
+///         int cmp;
+///
+///         while (tree_entry(tree,&entry)) {
+///                 if (S_ISGITLINK(entry.mode))
+///                         continue;
+///                 cmp = tree_entry_len(&entry) != cmplen ? 1 :
+///                       memcmp(name, entry.path, cmplen);
+///                 if (cmp > 0)
+///                         continue;
+///                 if (cmp < 0)
+///                         return;
+///                 if (name[cmplen] != '/') {
+///                         add_object_entry(&entry.oid,
+///                                          object_type(entry.mode),
+///                                          fullname, 1);
+///                         return;
+///                 }
+///                 if (S_ISDIR(entry.mode)) {
+///                         struct tree_desc sub;
+///                         struct pbase_tree_cache *tree;
+///                         const char *down = name+cmplen+1;
+///                         size_t downlen = name_cmp_len(down);
+///
+///                         tree = pbase_tree_get(&entry.oid);
+///                         if (!tree)
+///                                 return;
+///                         init_tree_desc(&sub, &tree->oid, tree->tree_data, tree->tree_size);
+///
+///                         add_pbase_object(&sub, down, downlen, fullname);
+///                         pbase_tree_put(tree);
+///                 }
+///         }
+/// }
+/// ```
+///
+/// The comparison is not a plain path compare: a length mismatch is reported as
+/// "the entry sorts before the name" whichever way round the names actually go,
+/// so the scan only ever stops early on a same-length entry that sorts past it.
+/// Ported as written, because which objects come out is a function of exactly
+/// that.
+fn add_pbase_object(
+    repo: &gix::Repository,
+    tree: &[u8],
+    name: &[u8],
+    cmplen: usize,
+    fullname: &[u8],
+    out: &mut Vec<PreferredBase>,
+) {
+    use pack::data::output::delta::name_hash;
+
+    let Ok(tree) = gix::objs::TreeRef::from_bytes(tree, repo.object_hash()) else {
+        return;
+    };
+    for entry in &tree.entries {
+        if entry.mode.is_commit() {
+            continue;
+        }
+        let cmp = if entry.filename.len() != cmplen {
+            std::cmp::Ordering::Greater
+        } else {
+            name[..cmplen].cmp(entry.filename)
+        };
+        match cmp {
+            std::cmp::Ordering::Greater => continue,
+            std::cmp::Ordering::Less => return,
+            std::cmp::Ordering::Equal => {}
+        }
+        if name.get(cmplen) != Some(&b'/') {
+            out.push(PreferredBase {
+                id: entry.oid.to_owned(),
+                kind: match entry.mode.is_tree() {
+                    true => gix::object::Kind::Tree,
+                    false => gix::object::Kind::Blob,
+                },
+                name_hash: name_hash(fullname),
+            });
+            return;
+        }
+        if entry.mode.is_tree() {
+            let down = &name[cmplen + 1..];
+            let downlen = name_cmp_len(down);
+            let mut buf = Vec::new();
+            let Ok((object, _)) = repo.objects.find(&entry.oid.to_owned(), &mut buf) else {
+                return;
+            };
+            let sub = object.data.to_owned();
+            add_pbase_object(repo, &sub, down, downlen, fullname, out);
+        }
+    }
+}
+
 /// Attach git's `pack_name_hash()` to every object that a tree in this set names.
 ///
 /// The hash is what makes the delta search's sort put successive revisions of
@@ -2370,25 +2828,60 @@ fn deflate_into(data: &[u8], level: gix::zlib::Compression, out: &mut Vec<u8>) -
 /// which is what git gives them too.
 fn assign_name_hashes(repo: &gix::Repository, objects: &mut [pack::data::output::delta::Object]) {
     use pack::data::output::delta::name_hash;
+
+    let ids: Vec<(ObjectId, gix::object::Kind)> = objects.iter().map(|o| (o.id, o.kind)).collect();
+    for (object, path) in objects.iter_mut().zip(traversal_paths(repo, &ids)) {
+        // A preferred base already carries the hash `add_preferred_base_object()`
+        // gave it, and git never revises it: an id already in the list makes
+        // `have_duplicate_entry()` return before `add_object_entry()` reaches the
+        // hash, so a boundary root tree keeps the zero `pack_name_hash(NULL)`
+        // returned for it even when the walk goes on to meet the same tree under
+        // a name.
+        //
+        // A root tree of this set has the empty path, whose hash is zero too, so
+        // the `== 0` guard leaves it alone either way.
+        if object.name_hash == 0 && !object.preferred_base {
+            if let Some(path) = path {
+                object.name_hash = name_hash(&path);
+            }
+        }
+    }
+}
+
+/// The path each object was reached at, indexed like `objects` — git's `name`
+/// argument to `show_object()`, which is both what `pack_name_hash()` hashes and
+/// what `add_preferred_base_object()` looks up in the boundary trees.
+///
+/// A root tree is reached at the empty path, which is the name
+/// `add_pending_tree()` gives it and the one case `add_preferred_base_object()`
+/// answers with the boundary root trees themselves. Commits, tags and anything
+/// no tree in the set names have no path at all.
+fn traversal_paths(
+    repo: &gix::Repository,
+    objects: &[(ObjectId, gix::object::Kind)],
+) -> Vec<Option<Vec<u8>>> {
     use std::collections::VecDeque;
 
+    let mut out: Vec<Option<Vec<u8>>> = vec![None; objects.len()];
     let mut position: std::collections::HashMap<ObjectId, usize> = std::collections::HashMap::new();
-    for (at, object) in objects.iter().enumerate() {
-        position.insert(object.id, at);
+    for (at, (id, _)) in objects.iter().enumerate() {
+        position.insert(*id, at);
     }
 
     // Seed with the root tree of every commit in the set; those are the only
     // trees whose path is known without a parent.
     let mut queue: VecDeque<(ObjectId, Vec<u8>)> = VecDeque::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
-    for object in objects.iter() {
-        if object.kind != gix::object::Kind::Commit {
+    let mut roots: Vec<ObjectId> = Vec::new();
+    for (id, kind) in objects.iter() {
+        if *kind != gix::object::Kind::Commit {
             continue;
         }
-        let Ok(commit) = repo.find_commit(object.id) else {
+        let Ok(commit) = repo.find_commit(*id) else {
             continue;
         };
         if let Ok(tree) = commit.tree_id() {
+            roots.push(tree.detach());
             if seen.insert(tree.detach()) {
                 queue.push_back((tree.detach(), Vec::new()));
             }
@@ -2414,8 +2907,8 @@ fn assign_name_hashes(repo: &gix::Repository, objects: &mut [pack::data::output:
             path.extend_from_slice(entry.filename);
             let child = entry.oid.to_owned();
             if let Some(&at) = position.get(&child) {
-                if objects[at].name_hash == 0 {
-                    objects[at].name_hash = name_hash(&path);
+                if out[at].is_none() {
+                    out[at] = Some(path.clone());
                 }
             }
             if entry.mode.is_tree() && seen.insert(child) {
@@ -2423,6 +2916,16 @@ fn assign_name_hashes(repo: &gix::Repository, objects: &mut [pack::data::output:
             }
         }
     }
+    // A root tree no other tree in the set names is reached at the empty path.
+    // Doing this after the walk rather than as its seed keeps a tree that is
+    // *also* an entry somewhere under the path it was found at, which is where
+    // git's own single `show_object()` per object leaves it.
+    for root in roots {
+        if let Some(&at) = position.get(&root) {
+            out[at].get_or_insert_with(Vec::new);
+        }
+    }
+    out
 }
 
 /// The `.idx` for a pack, in version 1 or 2.

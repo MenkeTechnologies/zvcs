@@ -19,10 +19,12 @@
 //!   re-derive a delta it could copy verbatim. Nothing here copies pack entries,
 //!   so every pair is searched afresh. The output is a valid pack either way;
 //!   the cost is time, not correctness.
-//! * **No preferred bases.** They exist to steer the search using knowledge
-//!   from outside the object set — what a fetch peer already has — which nothing
-//!   here models, so no entry is a preferred base. Delta *islands* are modelled;
-//!   see [`Islands`].
+//! * **Preferred bases are supplied, not discovered.** git learns them from the
+//!   revision walk's edges (`show_edge()` -> `add_preferred_base()`), which is
+//!   outside this crate; a caller that knows what the receiver already has marks
+//!   those entries [`Object::preferred_base`] and the search treats them exactly
+//!   as git does — a window slot that may serve as a base and is never itself
+//!   deltified. Delta *islands* are modelled too; see [`Islands`].
 //! * **`max_depth` is always `depth`.** git lowers it via `check_delta_limit()`
 //!   when the object already has delta *children* from a reused pack delta. With
 //!   no reuse, the child network is empty during the search, so the lowering
@@ -111,6 +113,13 @@ pub struct Object {
     /// is what makes same-named files across revisions adjacent in the sort.
     /// Zero when no path is known, which degrades the sort to type-and-size.
     pub name_hash: u32,
+    /// git's `object_entry::preferred_base`: an object the receiver is known to
+    /// hold already, carried through the search only so that others may deltify
+    /// against it. It occupies a window slot and is never deltified itself —
+    /// `find_deltas()`'s "we do not compute delta to *create* objects we are not
+    /// going to pack" — and the caller drops it before the pack is written,
+    /// which is what makes the result a thin pack.
+    pub preferred_base: bool,
 }
 
 /// The delta the search settled on for one object.
@@ -266,7 +275,11 @@ where
         .filter(|&i| objects[i].size >= MIN_SIZE_FOR_DELTA)
         .filter(|&i| !already_deltified.get(i).copied().unwrap_or(false))
         .collect();
-    if list.len() < 2 {
+    // `prepare_pack()` guards the search with `if (nr_deltas && n > 1)`, where
+    // `nr_deltas` counts only the entries that will actually be written: a list
+    // of nothing but preferred bases has no object to deltify and is skipped.
+    let candidates = list.iter().filter(|&&i| !objects[i].preferred_base).count();
+    if list.len() < 2 || candidates == 0 {
         return out;
     }
     list.sort_by(|&a, &b| type_size_sort(&objects[a], a, &objects[b], b, islands));
@@ -328,14 +341,20 @@ where
     out
 }
 
-/// git's `type_size_sort()`: descending type, descending name hash, descending
-/// size, and finally ascending original position so that the newest object of a
-/// tie is tried first as a base.
+/// git's `type_size_sort()`: descending type, descending name hash, preferred
+/// bases first, descending size, and finally ascending original position so that
+/// the newest object of a tie is tried first as a base.
+///
+/// The preferred-base rung sits between the name hash and the island comparison,
+/// where `a->preferred_base > b->preferred_base` puts a base the receiver
+/// already holds ahead of the objects that would like to deltify against it —
+/// so it is already in the window by the time they arrive.
 fn type_size_sort(a: &Object, a_at: usize, b: &Object, b_at: usize, islands: &Islands) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     type_rank(b.kind)
         .cmp(&type_rank(a.kind))
         .then_with(|| b.name_hash.cmp(&a.name_hash))
+        .then_with(|| b.preferred_base.cmp(&a.preferred_base))
         .then_with(|| islands.delta_cmp(a_at, b_at))
         .then_with(|| b.size.cmp(&a.size))
         .then_with(|| match a_at.cmp(&b_at) {
@@ -456,6 +475,28 @@ where
             let tail = (idx + window - count) % window;
             mem_usage = mem_usage.saturating_sub(array[tail].release(objects));
             count -= 1;
+        }
+
+        // ```c
+        // /* We do not compute delta to *create* objects we are not
+        //  * going to pack.
+        //  */
+        // if (entry->preferred_base)
+        //         goto next;
+        // ```
+        //
+        // The slot is filled and the window advances, so the base stays
+        // available to the entries that follow it; only the search for a delta
+        // *of* it is skipped.
+        if objects[entry].preferred_base {
+            idx += 1;
+            if count + 1 < window {
+                count += 1;
+            }
+            if idx >= window {
+                idx = 0;
+            }
+            continue;
         }
 
         let max_depth = options.depth;
@@ -699,6 +740,7 @@ mod tests {
                 kind: gix_object::Kind::Blob,
                 size: bodies[n].len() as u64,
                 name_hash: name_hash(b"src/file.c"),
+                preferred_base: false,
             })
             .collect();
         (objects, bodies)
@@ -895,6 +937,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_preferred_base_is_a_base_only_and_is_never_deltified() {
+        // The last revision stands in for what the receiver already holds: it is
+        // marked preferred, and the object that would otherwise have been the
+        // base for everything (revision 19, the newest of equal size) is left as
+        // an ordinary entry so both are in the window together.
+        let (mut objects, bodies) = corpus();
+        let preferred = objects.len() - 2;
+        objects[preferred].preferred_base = true;
+
+        let deltas = search(
+            &objects,
+            &bodies,
+            &Options {
+                threads: 1,
+                ..Options::default()
+            },
+        );
+
+        assert!(
+            deltas[preferred].is_none(),
+            "a preferred base is in the search to be deltified against, never to be deltified"
+        );
+        assert!(
+            deltas.iter().enumerate().any(|(at, d)| at != preferred
+                && d.as_ref().is_some_and(|d| d.base == preferred)),
+            "and it is offered as a base: the sort puts it ahead of the objects that want it"
+        );
+    }
+
+    #[test]
+    fn nothing_but_preferred_bases_finds_nothing() {
+        // `prepare_pack()`'s `if (nr_deltas && n > 1)`: with no entry that will
+        // actually be written there is nothing to compress, however many bases
+        // the receiver was said to hold.
+        let (mut objects, bodies) = corpus();
+        for object in &mut objects {
+            object.preferred_base = true;
+        }
+        let deltas = search(&objects, &bodies, &Options::default());
+        assert!(deltas.iter().all(Option::is_none), "no delta is attempted");
     }
 
     #[test]

@@ -193,6 +193,23 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
     if opts.delete {
         delete_symref(&repo, positional[0])
     } else if positional.len() == 2 {
+        // `refs_update_symref()` against a reftable store this build has no
+        // backend for cannot open the stack, so the transaction never gets past
+        // prepare. `cmd_symbolic_ref()` turns that into its exit status with
+        // `ret = !!refs_update_symref(...)` (`builtin/symbolic-ref.c:114-116`,
+        // v2.55.0), which is 1 for any failure. Measured against stock 2.55.0 in
+        // a files repository declaring `extensions.refStorage = reftable`:
+        // `symbolic-ref HEAD refs/heads/feature` prints
+        // `error: reftable: transaction prepare: I/O error` and exits 1.
+        //
+        // Refusing here is what keeps the repository intact: the port's ref store
+        // is rooted at `<gitdir>/reftable`, so a files-backend write would create
+        // that directory and drop a loose `HEAD` inside it — a file stock would
+        // never write and cannot read.
+        if crate::setup::declares_reftable(&repo) {
+            eprintln!("error: reftable: transaction prepare: I/O error");
+            return Ok(ExitCode::from(1));
+        }
         set_symref(&repo, positional[0], positional[1], opts.message.as_deref(), prefer_symlink)
     } else {
         read_symref(&repo, positional[0], &opts)

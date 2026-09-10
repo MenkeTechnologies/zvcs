@@ -179,6 +179,21 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = crate::setup::discover()?;
+
+    // `pack_refs_core()` (`pack-refs.c:50-55`, v2.55.0) returns whatever
+    // `refs_optimize()` hands back, unexamined and unreported. For the reftable
+    // backend that is `refs->err` — the error recorded when the stack failed to
+    // open, returned before any work in `reftable_be_optimize()`
+    // (`refs/reftable-backend.c:1664-1665`, v2.55.0). A declared store that was
+    // never created fails to open with `REFTABLE_IO_ERROR`
+    // (`reftable/reftable-error.h:20`, v2.55.0), which is -2, and `main()` passes
+    // that straight to `exit()`. Measured against stock 2.55.0 in a files
+    // repository declaring `extensions.refStorage = reftable`: `pack-refs --all`
+    // and bare `pack-refs` both exit 254 with nothing on stdout or stderr.
+    if crate::setup::declares_reftable(&repo) {
+        return Ok(ExitCode::from(254));
+    }
+
     let store = &repo.refs;
 
     // Only loose refs need an edit: refs that already live in `packed-refs` and

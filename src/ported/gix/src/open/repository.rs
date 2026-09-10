@@ -257,6 +257,7 @@ impl ThreadSafeRepository {
             current_dir_ref.as_path()
         };
 
+        let reftable = repo_config.reftable;
         let mut refs = {
             let reflog = repo_config.reflog.unwrap_or(gix_ref::store::WriteReflog::Disable);
             let object_hash = repo_config.object_hash;
@@ -266,11 +267,29 @@ impl ThreadSafeRepository {
                 precompose_unicode: repo_config.precompose_unicode,
                 prohibit_windows_device_names: repo_config.protect_windows,
             };
-            match &common_dir {
-                Some(common_dir) => {
-                    crate::RefStore::for_linked_worktree(git_dir.to_owned(), common_dir.into(), ref_store_init_opts)
+            // A declared `reftable` store does not live at the git directory: it is
+            // a stack of its own under `<common dir>/reftable`
+            // (`reftable_be_init()`, `refs/reftable-backend.c:418-429`, v2.55.0).
+            // No reftable format is read here — the point of rooting the store
+            // there is that a repository which only *declares* the format has no
+            // `reftable/` directory at all, so every lookup answers "no such ref",
+            // which is what stock answers in the same repository. The git
+            // directory is carried separately below so the index, hooks and
+            // common directory keep addressing the git directory itself.
+            let root = |dir: &Path| -> PathBuf {
+                if reftable {
+                    dir.join("reftable")
+                } else {
+                    dir.to_owned()
                 }
-                None => crate::RefStore::at(git_dir.to_owned(), ref_store_init_opts),
+            };
+            match &common_dir {
+                Some(common_dir) => crate::RefStore::for_linked_worktree(
+                    root(&git_dir),
+                    root(common_dir).into(),
+                    ref_store_init_opts,
+                ),
+                None => crate::RefStore::at(root(&git_dir), ref_store_init_opts),
             }
         };
         let head = refs.find("HEAD").ok();
@@ -383,7 +402,7 @@ impl ThreadSafeRepository {
 
         {
             let looks_like_standard_git_dir =
-                || refs.git_dir().file_name() == Some(OsStr::new(gix_discover::DOT_GIT_DIR));
+                || git_dir.file_name() == Some(OsStr::new(gix_discover::DOT_GIT_DIR));
             // git's `setup_explicit_git_dir()` reaches `set_git_work_tree(repo, ".")` no matter what
             // the git directory is called, while `setup_discovered_git_dir()` only ever pairs a
             // `.git` directory with its parent.
@@ -407,7 +426,7 @@ impl ThreadSafeRepository {
                 Some(_)
                     if !work_tree_is_explicit
                         && !worktree_dir_override_from_configuration
-                        && refs.git_dir().ancestors().nth(1).and_then(|p| p.file_name())
+                        && git_dir.ancestors().nth(1).and_then(|p| p.file_name())
                             != Some("worktrees".as_ref())
                         && config.is_bare.unwrap_or_default() =>
                 {
@@ -560,6 +579,9 @@ impl ThreadSafeRepository {
                 },
             )?),
             common_dir,
+            // Set only when the ref store was rooted somewhere other than the git
+            // directory, so `git_dir()` keeps answering with the git directory.
+            git_dir: reftable.then(|| git_dir.clone()),
             refs,
             work_tree: worktree_dir,
             config,

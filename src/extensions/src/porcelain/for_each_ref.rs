@@ -4544,19 +4544,25 @@ fn skip_broken_ref<'r>(
     }
 }
 
-/// A single-reference lookup whose target will not parse, reported as absent.
+/// A single-reference lookup that does not resolve, reported as absent.
 ///
 /// `resolve_ref_unsafe()` returns NULL for a ref it cannot read, and the callers
 /// that do not `die()` on NULL treat it exactly as they treat a ref that is not
-/// there. `Repository::head_name()` follows `HEAD`'s symbolic target and fails
-/// on that read instead, so the two endings have to be flattened back together
-/// here.
+/// there. `Repository::head_name()` splits that one NULL into two errors — the
+/// referent will not parse, or `HEAD` is not in the store at all — so both
+/// endings have to be flattened back together here.
+///
+/// The second is not only the broken-repository case: a ref store whose backend
+/// this port cannot read holds no `HEAD` either, and stock lists such a
+/// repository as empty rather than refusing it.
 fn broken_ref_is_absent<T>(
     found: Result<T, gix::reference::find::existing::Error>,
 ) -> Result<Option<T>> {
     use gix::refs::file::loose::reference::decode::Error as DecodeError;
+    use gix::reference::find::existing::Error as FindError;
     match found {
         Ok(v) => Ok(Some(v)),
+        Err(FindError::NotFound { .. }) => Ok(None),
         Err(e) => {
             let broken = std::error::Error::source(&e)
                 .and_then(|s| s.downcast_ref::<DecodeError>())

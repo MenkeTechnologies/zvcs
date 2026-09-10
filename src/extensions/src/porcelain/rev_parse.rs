@@ -255,7 +255,10 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // Plain discovery ignores the variable and silently answers about whatever
     // repository the current directory happens to sit in — a wrong object id
     // rather than an error.
-    let repo = match gix::discover_with_environment_overrides(".") {
+    // `setup::discover` also applies the `-c <key>=<value>` overrides, which a
+    // direct `gix` call drops — without it `rev-parse` answers about a differently
+    // configured repository than every verb that discovers the normal way.
+    let repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
@@ -1466,23 +1469,10 @@ fn query(
     Ok(None)
 }
 
-/// `the_repository->ref_storage_format` as `--show-ref-format` names it.
-///
-/// `extensions.refStorage` is a v1 extension, so it is only read once
-/// `core.repositoryFormatVersion` is at least 1 (`setup.c`'s
-/// `check_repo_format()`); at version 0 git ignores the key outright. The port
-/// stores refs the `files` way whatever the answer here is — reporting the
-/// recorded format is a question about the repository, not about this binary.
-fn ref_storage_format(repo: &gix::Repository) -> String {
-    let config = repo.config_snapshot();
-    if config.integer("core.repositoryFormatVersion").unwrap_or(0) < 1 {
-        return "files".into();
-    }
-    match config.string("extensions.refStorage") {
-        Some(v) if !v.is_empty() => v.to_string(),
-        _ => "files".into(),
-    }
-}
+// `the_repository->ref_storage_format` as `--show-ref-format` names it. One
+// reader for the whole port, so what is reported here and the store the
+// repository was opened with cannot disagree about which format was declared.
+use crate::setup::ref_storage_format;
 
 /// `get_superproject_working_tree()` (`submodule.c:2392-2470`).
 ///

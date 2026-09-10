@@ -8,7 +8,7 @@ impl crate::Repository {
     ///
     /// Synonymous to [`path()`][crate::Repository::path()].
     pub fn git_dir(&self) -> &std::path::Path {
-        self.refs.git_dir()
+        self.git_dir.as_deref().unwrap_or_else(|| self.refs.git_dir())
     }
 
     /// The trust we place in the git-dir, with lower amounts of trust causing access to configuration to be limited.

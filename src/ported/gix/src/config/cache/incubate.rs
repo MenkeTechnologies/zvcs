@@ -18,6 +18,17 @@ pub(crate) struct StageOne {
     pub reflog: Option<gix_ref::store::WriteReflog>,
     pub precompose_unicode: bool,
     pub protect_windows: bool,
+    /// Whether the repository declares `extensions.refStorage = reftable`.
+    ///
+    /// `extensions.refStorage` is a repository format version 1 extension, so
+    /// `check_repo_format()` only reaches `handle_extension()` for it once the
+    /// version says 1; at version 0 the key is ignored outright, exactly as
+    /// `extensions.objectFormat` is above. `handle_extension()`
+    /// (`setup.c:692-709`, v2.55.0) resolves the value through
+    /// `ref_storage_format_by_name()` (`refs.c:51-57`, v2.55.0), which compares
+    /// with `strcmp`, so the value is case-*sensitive* even though the key is
+    /// not. A value no backend answers to is refused before any store is built.
+    pub reftable: bool,
 }
 
 /// Initialization
@@ -50,6 +61,13 @@ impl StageOne {
             (0 | 1, None) => legacy_object_hash()?,
             (version, _) => return Err(Error::UnsupportedRepositoryFormatVersion { version }),
         };
+        // Read next to `objectFormat` and from the same file, before the
+        // worktree configuration is appended: `extensions.refStorage` describes
+        // the whole repository, and git never looks for it in `config.worktree`.
+        let reftable = repo_format_version == 1
+            && config
+                .string("extensions.refStorage")
+                .is_some_and(|format| format == "reftable");
 
         let extension_worktree = util::config_bool(
             &config,
@@ -91,6 +109,7 @@ impl StageOne {
             reflog,
             precompose_unicode,
             protect_windows,
+            reftable,
         })
     }
 }

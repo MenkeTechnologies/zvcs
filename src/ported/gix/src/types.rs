@@ -165,6 +165,18 @@ pub struct Repository {
     pub(crate) work_tree: Option<PathBuf>,
     /// The path to the resolved common directory if this is a linked worktree repository or it is otherwise set.
     pub(crate) common_dir: Option<PathBuf>,
+    /// The git directory, when the ref store is *not* rooted at it.
+    ///
+    /// The ref store normally holds the only copy of the git directory and
+    /// [`git_dir()`](crate::Repository::git_dir()) reads it back from there. A
+    /// repository declaring a ref storage format whose store lives in a
+    /// subdirectory of the git directory breaks that identity — `reftable_be_init()`
+    /// (`refs/reftable-backend.c:418-429`, v2.55.0) roots its stack at
+    /// `<common dir>/reftable` — and everything else the git directory addresses
+    /// (the index, hooks, the common directory) must keep pointing at the git
+    /// directory itself. So the git directory is kept here whenever it and the ref
+    /// store root are two different paths, and `None` means they are the same one.
+    pub(crate) git_dir: Option<PathBuf>,
     /// A free-list of reusable object backing buffers
     pub(crate) bufs: Option<RefCell<Vec<Vec<u8>>>>,
     /// A pre-assembled selection of often-accessed configuration values for quick access.
@@ -210,6 +222,9 @@ pub struct ThreadSafeRepository {
     pub work_tree: Option<PathBuf>,
     /// The path to the common directory if this is a linked worktree repository or it is otherwise set.
     pub common_dir: Option<PathBuf>,
+    /// The git directory, when the ref store is *not* rooted at it — see
+    /// [`Repository::git_dir`](crate::Repository).
+    pub(crate) git_dir: Option<PathBuf>,
     pub(crate) config: crate::config::Cache,
     /// options obtained when instantiating this repository for use when following linked worktrees.
     pub(crate) linked_worktree_options: crate::open::Options,

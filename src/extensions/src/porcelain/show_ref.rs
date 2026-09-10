@@ -221,8 +221,11 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
 
     // `$GIT_DIR` (which `git --git-dir=<path>` sets) names the repository outright
     // and wins over upwards discovery; without honouring it, `git --git-dir=<other>
-    // show-ref` lists the refs of the repository the shell happens to be in.
-    let repo = gix::discover_with_environment_overrides(".")?;
+    // show-ref` lists the refs of the repository the shell happens to be in. Going
+    // through `setup::discover` rather than calling `gix` directly is what also
+    // applies the `-c <key>=<value>` overrides, so `show-ref` and `for-each-ref`
+    // cannot end up reading two different configurations of one repository.
+    let repo = crate::setup::discover()?;
 
     if exclude_existing {
         return run_exclude_existing(&repo, exclude_pattern.as_deref());

@@ -186,6 +186,41 @@ pub fn discover() -> Result<gix::Repository, gix::discover::Error> {
     .map(Into::into)
 }
 
+/// `the_repository->ref_storage_format` by the name the repository recorded for
+/// it, which is what `rev-parse --show-ref-format` and `repo info
+/// references.format` print.
+///
+/// `extensions.refStorage` is a repository format version 1 extension, so it is
+/// only read once `core.repositoryFormatVersion` is at least 1
+/// (`check_repo_format()`, setup.c); at version 0 git ignores the key outright.
+/// The value is echoed as it was written: `ref_storage_format_by_name()`
+/// (`refs.c:51-57`, v2.55.0) compares it with `strcmp`, so a value that is not
+/// the exact name of a backend never reaches a report — it refuses the
+/// repository while the configuration is being read.
+pub fn ref_storage_format(repo: &gix::Repository) -> String {
+    let config = repo.config_snapshot();
+    if config.integer("core.repositoryFormatVersion").unwrap_or(0) < 1 {
+        return "files".into();
+    }
+    match config.string("extensions.refStorage") {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => "files".into(),
+    }
+}
+
+/// Whether the repository declares the `reftable` ref storage format.
+///
+/// The store such a repository names is a reftable stack under
+/// `<common dir>/reftable` (`reftable_be_init()`,
+/// `refs/reftable-backend.c:418-429`, v2.55.0), which this build has no backend
+/// for. Reads there answer "no such ref" because the port roots its ref store at
+/// that same path and nothing is in it; writes are the half that has to be
+/// refused explicitly, because a files-backend write would lay down loose refs
+/// inside a directory that is supposed to hold reftable data.
+pub fn declares_reftable(repo: &gix::Repository) -> bool {
+    ref_storage_format(repo) == "reftable"
+}
+
 pub fn prefix(repo: &gix::Repository) -> Option<PathBuf> {
     let top = work_tree(repo)?;
     let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok())?;

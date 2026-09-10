@@ -19,7 +19,7 @@ mod location {
         ///
         /// Synonymous to [`path()`][crate::ThreadSafeRepository::path()].
         pub fn git_dir(&self) -> &std::path::Path {
-            self.refs.git_dir()
+            self.git_dir.as_deref().unwrap_or_else(|| self.refs.git_dir())
         }
 
         /// Return the path to the working directory if this is not a bare repository.

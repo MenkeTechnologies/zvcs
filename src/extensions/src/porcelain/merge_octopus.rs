@@ -10,30 +10,28 @@
 //! of the eventual commit `git merge` writes.
 //!
 //! The index/worktree mutation the script drives through `read-tree -u -m` and
-//! `merge-index -o git-merge-one-file -a` runs here through the shared octopus
-//! engine [`crate::merge_apply::three_way_merge`] — the same tree-merge, worktree
-//! checkout, and stage-1/2/3 index application that backs the porcelain
-//! `git merge <a> <b>` octopus in `merge.rs`. A fast-forward is expressed as the
-//! degenerate three-way whose base equals ours, which yields the target tree
-//! conflict-free; a real head is a three-way against its merge base.
+//! `merge-index -o git-merge-one-file -a` runs here through those same two ports,
+//! called in process with the same arguments — the arrangement
+//! [`super::merge_resolve`] already uses for `git-merge-resolve.sh`, which chains
+//! the same commands. Nothing about a merge is re-derived: the index stages, the
+//! worktree bytes, the `Auto-merging <path>` / `Added <path> in both, but
+//! differently.` lines, `git-merge-one-file`'s `ERROR: content conflict in <path>` /
+//! `fatal: merge program failed` pair and its `.merge_file_XXXXXX` conflict-marker
+//! labels all come from those ports, which is the only way to match a chain whose
+//! output includes `mkstemp` names.
 //!
-//! ### Known divergences from the shell script
+//! Two things follow from running the real chain rather than a tree merge:
 //!
-//! * **Conflict rendering.** When a head conflicts, `three_way_merge` emits git's
-//!   merge-ort porcelain lines (`Auto-merging <path>`, `CONFLICT (<kind>): Merge
-//!   conflict in <path>`) rather than `git-merge-one-file`'s `Auto-merging` +
-//!   stderr `ERROR: content conflict in <path>`. This matches the porcelain
-//!   octopus already shipped, and only differs on the octopus-failure path (a
-//!   clean octopus — the common case — merges non-overlapping heads and prints
-//!   no conflict lines at all).
-//! * **Multiple merge bases.** `three_way_merge` merges against a single base
-//!   (`common[0]`), as the porcelain octopus driver does, rather than passing all
-//!   `merge-base --all` results to `read-tree`. Criss-cross histories therefore
-//!   use the first best base instead of a recursive virtual base.
-//! * **`Simple merge did not work`** is triggered by intersecting each side's
-//!   changed-path set against the base (`side_changes`), reproducing when
-//!   `read-tree --aggressive` would have left a path unmerged. Identical edits on
-//!   both sides are excluded (they compare equal), matching the script.
+//! * **Every merge base reaches `read-tree`.** `$common` is interpolated unquoted,
+//!   so a criss-cross history makes the "simple merge" a **four**-tree `read-tree`,
+//!   and `threeway_merge()` records the stage-1 ancestor only
+//!   `if (!head_match || !remote_match)` (unpack-trees.c). A path where the head
+//!   matches one base and the remote matches the other lands with stages 2 and 3 and
+//!   no stage 1, which is what sends `git-merge-one-file` down its `.$2$3` arm.
+//!   There is no recursive virtual base anywhere in the octopus.
+//! * **`Simple merge did not work` is `write-tree`'s verdict**, not a guess: the
+//!   script prints it when `git write-tree` refuses the index `read-tree
+//!   --aggressive` just wrote, i.e. exactly when a stage was left behind.
 //!
 //! ### Covered (verified against git 2.55.0: stdout, stderr, exit code)
 //!
@@ -77,7 +75,10 @@
 //! * The three-way branch: `Trying simple merge with <name>`, the conditional
 //!   `Simple merge did not work, trying automatic merge.`, the merge itself, and
 //!   the `Automated merge did not work.` / `Should not be doing an octopus.`
-//!   refusal (exit 2) when a non-final head leaves an unresolved conflict.
+//!   refusal (exit 2) when a non-final head leaves an unresolved conflict — over a
+//!   criss-cross, where the four-tree `read-tree` leaves an add/add with no stage 1,
+//!   that whole sequence including `git-merge-one-file`'s own diagnostics, the one
+//!   object it writes and the `AA` entry it leaves in the index.
 //! * The final exit status is `$OCTOPUS_FAILURE`: 0 for a fully clean run, 1 when
 //!   the last head merged with an unresolved conflict left in the worktree/index.
 //!
@@ -90,13 +91,11 @@
 //! any merging begins.
 
 use anyhow::{bail, Result};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 
-use gix::bstr::{BStr, BString};
+use gix::bstr::BString;
 use gix::hash::ObjectId;
-use gix::prelude::ObjectIdExt;
 use gix::Repository;
 
 /// `git-sh-setup`'s `$LONG_USAGE` for a script that sets neither `USAGE` nor
@@ -187,23 +186,18 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
     // twice where stock's `$common` (always full ids) can never equal a branch
     // name, so stock three-way merges the second head instead.
     let mut mrc_text: Vec<String> = head_commit.map(|c| vec![c.to_string()]).unwrap_or_default();
-    // `MRT=$(git write-tree)` — the "merge result tree". The `diff-index --cached
-    // HEAD` pre-flight above forced the index to equal `HEAD`'s tree, which is
-    // `$head`'s whenever `git merge` is the caller. Unused when `$head` is
-    // unresolvable (the first head dies).
-    let head_arg_tree: ObjectId = match head_commit {
-        Some(c) => repo.find_object(c)?.peel_to_tree()?.id,
-        None => repo.empty_tree().id,
-    };
-    // `$MRT` starts there and then tracks each folded-in head, while `$head`
-    // stays put — the fast-forward's `read-tree` reads the latter, so both are
-    // needed.
-    let mut mrt: ObjectId = head_arg_tree;
+    // `MRT=$(git write-tree)` — the "merge result tree", read out of the *index*, which
+    // the `diff-index --cached HEAD` pre-flight above has just proved equal to `HEAD`'s
+    // tree. It then tracks each folded-in head, while `$head` stays put — the
+    // fast-forward's `read-tree` reads the latter, so both are needed.
+    //
+    // It is a shell *string*, and `write-tree` leaves it empty when the index is
+    // unmerged; hence the `Option`, whose `None` is interpolated into the next
+    // `read-tree` command line as nothing at all.
+    let mut mrt: Option<String> = write_tree(&repo)?.map(|id| id.to_string());
     // `NON_FF_MERGE` is exactly `mrc.len() > 1` (only a three-way merge extends
     // the set), so it needs no separate flag; `OCTOPUS_FAILURE` does.
     let mut octopus_failure = false;
-    let mut cur_index = repo.index_or_load_from_head()?.into_owned();
-    let should_interrupt = AtomicBool::new(false);
     // `pretty_name` is a plain shell variable that outlives one iteration of the
     // loop below, and a head whose spelling is not a shell name leaves it at the
     // previous iteration's value — see [`pretty_name`]. It starts out unset.
@@ -240,7 +234,6 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
         }
         // `common` is non-empty, so `$SHA1` resolved to a commit.
         let sha1_commit = sha1_commit.expect("a non-empty merge base implies a resolved head");
-        let head_tree = repo.find_object(sha1_commit)?.peel_to_tree()?.id;
 
         // `if test "$common,$NON_FF_MERGE" = "$MRC,0"` — while `$MRC` is still a
         // single commit that IS the sole merge base, git fast-forwards to this
@@ -260,120 +253,73 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
             // The old tree is `$head` — the original argument — **not** the
             // running `$MRT`. The two coincide only until the first head is
             // folded in, so a *second* consecutive fast-forward hands read-tree
-            // an index that no longer matches `$head` and it dies. Passing `mrt`
-            // instead made every such octopus succeed at exit 0 with a tree stock
-            // refuses to write, and let an untracked file in the way of the very
-            // first head be silently overwritten.
-            let clobber =
-                crate::merge_guard::verify_two_way(&repo, head_arg_tree, head_tree, &cur_index)?;
-            if !clobber.is_empty() {
-                clobber.report_plumbing();
-                return Ok(ExitCode::from(128));
+            // an index that no longer matches `$head` and it dies.
+            let read_tree_argv = argv(&["-u", "-m", head_spec, sha1]);
+            let code = status(super::read_tree::read_tree(&read_tree_argv)?);
+            if code != 0 {
+                return Ok(ExitCode::from(code));
             }
-            // Past the guard the two-tree merge writes `$SHA1`'s tree wholesale.
-            // Expressed as the degenerate three-way whose base equals ours, the
-            // shared engine yields exactly that, conflict-free, and updates the
-            // worktree — the two-tree merge's observable result. A two-tree
-            // read-tree never conflicts, so this label is never rendered; it is
-            // merge-ort's single-base name for the sole base.
-            let ancestor = common[0].attach(&repo).shorten_or_id().to_string();
-            let labels = gix::merge::blob::builtin_driver::text::Labels {
-                ancestor: Some(BStr::new(ancestor.as_bytes())),
-                current: Some(BStr::new(b"HEAD")),
-                other: Some(BStr::new(pretty.as_bytes())),
-            };
-            let applied = crate::merge_apply::three_way_merge(
-                &repo,
-                mrt,
-                mrt,
-                head_tree,
-                &cur_index,
-                labels,
-                &should_interrupt,
-            )?;
-            cur_index = applied.index;
-            crate::index_racy::write(&repo, &mut cur_index)?;
             // `MRC=$SHA1 MRT=$(git write-tree)`
             mrc = vec![sha1_commit];
             mrc_text = vec![sha1.clone()];
-            mrt = applied.tree_id;
+            mrt = write_tree(&repo)?.map(|id| id.to_string());
             continue;
         }
 
         // `NON_FF_MERGE=1`; `eval_gettextln "Trying simple merge with $pretty_name"`
         println!("Trying simple merge with {pretty}");
 
-        // The script's `read-tree -u -m --aggressive $common $MRT $SHA1` resolves
-        // trivially, and only when `write-tree` then fails — i.e. some path
-        // changed on both sides to a different result — does it print "Simple
-        // merge did not work" and fall to `merge-index`. The shared engine folds
-        // both phases into one pass, so that trigger is recovered by intersecting
-        // each side's changed-path set against the merge base.
-        let base_tree = repo.find_object(common[0])?.peel_to_tree()?;
-        // `git read-tree -u -m --aggressive $common $MRT $SHA1 || exit 2`: the
-        // three-tree merge refuses the same way its two-tree sibling above does,
-        // but the script spells this one's failure `exit 2` rather than letting
-        // read-tree's status through. Refusing here rather than over the merged
-        // tree is also what keeps a failed octopus from leaving that tree in the
-        // object database.
-        let clobber =
-            crate::merge_guard::verify_three_way(&repo, base_tree.id, mrt, head_tree, &cur_index)?;
-        if !clobber.is_empty() {
-            clobber.report_plumbing();
+        // ```sh
+        // git read-tree -u -m --aggressive  $common $MRT $SHA1 || exit 2
+        // next=$(git write-tree 2>/dev/null)
+        // if test $? -ne 0
+        // then
+        //         gettextln "Simple merge did not work, trying automatic merge."
+        //         git merge-index -o git-merge-one-file -a ||
+        //         OCTOPUS_FAILURE=1
+        //         next=$(git write-tree 2>/dev/null)
+        // fi
+        // ```
+        //
+        // (git-merge-octopus.sh:96-106.) `$common` is unquoted, so a criss-cross
+        // history — where `merge-base --all` answers with more than one — makes this a
+        // **four**-tree `read-tree`, and `threeway_merge()` keeps the stage-1 ancestor
+        // only `if (!head_match || !remote_match)` (unpack-trees.c). A path where the
+        // head matches one base and the remote matches the other therefore lands with
+        // stages 2 and 3 and no stage 1, and `git-merge-one-file` takes its `.$2$3`
+        // arm — `Added <path> in both, but differently.` — rather than merging it.
+        // Deriving the answer from the bases one at a time cannot produce that, which
+        // is why this runs the same two plumbing commands the script runs, in process,
+        // the way [`super::merge_resolve`] runs the same chain for `-s resolve`.
+        let mut read_tree_argv = argv(&["-u", "-m", "--aggressive"]);
+        read_tree_argv.extend(common.iter().map(ObjectId::to_string));
+        read_tree_argv.extend(mrt.clone());
+        read_tree_argv.push(sha1.clone());
+        if status(super::read_tree::read_tree(&read_tree_argv)?) != 0 {
+            // `|| exit 2`: the script spells this refusal 2 rather than letting
+            // read-tree's own status through.
             return Ok(ExitCode::from(2));
         }
-        let ours_changes = side_changes(&repo, base_tree.id, mrt)?;
-        let theirs_changes = side_changes(&repo, base_tree.id, head_tree)?;
-        let needs_auto_merge = ours_changes.iter().any(|(path, ours_state)| {
-            theirs_changes
-                .get(path)
-                .is_some_and(|theirs_state| theirs_state != ours_state)
-        });
-        if needs_auto_merge {
+        let mut next = write_tree(&repo)?;
+        if next.is_none() {
             println!("Simple merge did not work, trying automatic merge.");
-        }
-
-        // `read-tree -u -m --aggressive $common $MRT $SHA1` followed, on unmerged
-        // entries, by `merge-index -o git-merge-one-file -a`: both via the shared
-        // octopus engine, which also emits git's `Auto-merging`/`CONFLICT` lines.
-        // `merge_ort_internal()`'s ancestor name: `merged common ancestors` only
-        // when several bases were folded together, otherwise the sole base's
-        // abbreviated id. The shell script shows neither — `git merge-one-file`
-        // runs `git merge-file` with no `-L`, so its `diff3` markers carry the
-        // run's `.merge_file_XXXXXX` temporary names — and this driver renders
-        // merge-ort conflicts, per the divergence noted at the top of the file.
-        let ancestor = if common.len() > 1 {
-            "merged common ancestors".to_string()
-        } else {
-            common[0].attach(&repo).shorten_or_id().to_string()
-        };
-        let labels = gix::merge::blob::builtin_driver::text::Labels {
-            ancestor: Some(BStr::new(ancestor.as_bytes())),
-            current: Some(BStr::new(b"HEAD")),
-            other: Some(BStr::new(pretty.as_bytes())),
-        };
-        let applied = crate::merge_apply::three_way_merge(
-            &repo,
-            base_tree.id,
-            mrt,
-            head_tree,
-            &cur_index,
-            labels,
-            &should_interrupt,
-        )?;
-        cur_index = applied.index;
-        crate::index_racy::write(&repo, &mut cur_index)?;
-        if !applied.conflicts.is_empty() {
-            // `git-merge-one-file` left conflict markers → `OCTOPUS_FAILURE=1`.
-            // The last head may fail (loop ends, exit 1); an earlier one makes the
-            // next iteration print the octopus failure and exit 2.
-            octopus_failure = true;
+            // `git merge-index -o git-merge-one-file -a`, which emits
+            // `git-merge-one-file`'s own lines — `Auto-merging <path>`,
+            // `Added <path> in both, but differently.`, the `ERROR: content conflict
+            // in <path>` / `fatal: merge program failed` pair — and whose
+            // `.merge_file_XXXXXX` conflict labels no re-derivation could match.
+            if status(super::merge_index::merge_index(&argv(&["-o", "git-merge-one-file", "-a"]))?) != 0 {
+                // The last head may fail (the loop ends and `exit "$OCTOPUS_FAILURE"`
+                // is 1); an earlier one makes the next iteration refuse the octopus.
+                octopus_failure = true;
+            }
+            next = write_tree(&repo)?;
         }
 
         // `MRC="$MRC $SHA1"; MRT=$next`
         mrc.push(sha1_commit);
         mrc_text.push(sha1.clone());
-        mrt = applied.tree_id;
+        mrt = next.map(|id| id.to_string());
     }
 
     // `exit "$OCTOPUS_FAILURE"`
@@ -382,6 +328,32 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// One plumbing command line, spelled the way the script spells it.
+fn argv(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// The numeric status an [`ExitCode`] carries; `ExitCode` exposes no accessor on
+/// stable Rust, so probe the 256 values it can hold. The script branches on the
+/// status of the programs it runs, so the ports of those programs have to hand one
+/// back — the same probe [`super::merge_resolve`] needs for the same reason.
+fn status(code: ExitCode) -> u8 {
+    (0u8..=255).find(|&n| code == ExitCode::from(n)).unwrap_or(1)
+}
+
+/// `$(git write-tree 2>/dev/null)`: the index's root tree, or `None` for the empty
+/// string the script gets when `write-tree` refuses an unmerged index.
+///
+/// The refusal is diagnosed on the stderr the script discards, so nothing is printed
+/// here either; the caller only ever tests whether there was an answer.
+/// [`super::write_tree::refresh_cache_tree`] is `write_index_as_tree()`
+/// (cache-tree.c:797-831), which also writes the refreshed cache-tree back into the
+/// index — the side effect the next `read-tree` in the loop reads.
+fn write_tree(repo: &Repository) -> Result<Option<ObjectId>> {
+    let mut index = repo.open_index()?;
+    Ok(super::write_tree::refresh_cache_tree(repo, &mut index, false)?.ok())
 }
 
 /// `eval pretty_name=\${GITHEAD_$SHA1:-$SHA1}`, then the uppercased retry.
@@ -484,40 +456,6 @@ fn merge_base_all(repo: &Repository, sha1: ObjectId, mrc: &[ObjectId]) -> Result
         .into_iter()
         .map(|id| id.detach())
         .collect())
-}
-
-/// The per-path resulting state of `side`'s tree relative to `base`: `Some(id)`
-/// for a path added or modified to that blob, `None` for one deleted. This is the
-/// input to the "changed on both sides" test that decides whether the script's
-/// trivial `read-tree --aggressive` would have left a path unmerged (rename
-/// tracking is off, matching `--aggressive`, so `Rewrite` never appears).
-fn side_changes(
-    repo: &Repository,
-    base: ObjectId,
-    side: ObjectId,
-) -> Result<HashMap<BString, Option<ObjectId>>> {
-    use gix::object::tree::diff::ChangeDetached;
-
-    let base_tree = repo.find_object(base)?.peel_to_tree()?;
-    let side_tree = repo.find_object(side)?.peel_to_tree()?;
-    let changes =
-        repo.diff_tree_to_tree(Some(&base_tree), Some(&side_tree), gix::diff::Options::default())?;
-
-    let mut map = HashMap::new();
-    for change in &changes {
-        match change {
-            ChangeDetached::Addition { location, id, .. }
-            | ChangeDetached::Modification { location, id, .. } => {
-                map.insert(location.clone(), Some(*id));
-            }
-            ChangeDetached::Deletion { location, .. } => {
-                map.insert(location.clone(), None);
-            }
-            // Rename tracking is disabled by default, so this never fires.
-            ChangeDetached::Rewrite { .. } => {}
-        }
-    }
-    Ok(map)
 }
 
 /// Resolve `spec` and peel it to the commit it names, or `None`.

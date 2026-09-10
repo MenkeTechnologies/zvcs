@@ -215,8 +215,11 @@
 //! `diff.algorithm=patience` reaches the blob merge as histogram, since
 //! gitoxide's configuration cache reports patience as unimplemented and falls
 //! back leniently (`-Xpatience` is unaffected — it bypasses the cache);
-//! `merge.verbosity >= 5` does not emit merge-ort's `  From inner merge:` echo of
-//! the recursive base merge; `--verbose`'s extra stderr diagnostics are not
+//! `merge.verbosity >= 5` echoes merge-ort's `  From inner merge:` lines for the
+//! *first* level of merge-base recursion only — a merge base whose own bases
+//! disagree merges through `gix_merge::commit()`, which cannot pass its conflicts
+//! back out, so git's `call_depth >= 2` lines have no counterpart (see
+//! [`virtual_base_tree_reporting`]); `--verbose`'s extra stderr diagnostics are not
 //! emitted; a `pre-merge-commit` hook that edits the index is not reflected
 //! in the committed tree (the pre-computed merge tree is committed);
 //! `default_edit_option`
@@ -2514,6 +2517,10 @@ fn ort_attempt(
     // which git folds into one virtual commit — `merged common ancestors`; and
     // with exactly one base the base's own abbreviated id
     // (`strbuf_add_unique_abbrev(…, DEFAULT_ABBREV)`).
+    //
+    // `path_msg()` drops the recursion's own messages below `merge.verbosity >= 5`
+    // (merge-ort.c:815), so the base merge is only asked to report at all from there up.
+    let mut inner_messages = Vec::new();
     let (base_tree, ancestor) = if ctx.bases.is_empty() {
         (gix::ObjectId::empty_tree(repo.object_hash()), "empty tree".to_string())
     } else if ctx.bases.len() == 1 {
@@ -2534,14 +2541,17 @@ fn ort_attempt(
         // against the *virtual* tree that comes out. Picking a single base instead resolves
         // a criss-cross merge cleanly where git reports a conflict — the wrong answer, not
         // just a different message.
-        (virtual_base_tree(repo, ctx.bases)?, "merged common ancestors".to_string())
+        let (tree, messages) =
+            virtual_base_tree_reporting(repo, ctx.bases, None, merge_verbosity(repo) >= 5)?;
+        inner_messages = messages;
+        (tree, "merged common ancestors".to_string())
     };
     let labels = gix::merge::blob::builtin_driver::text::Labels {
         ancestor: Some(BStr::new(ancestor.as_bytes())),
         current: Some(BStr::new(b"HEAD")),
         other: Some(BStr::new(ctx.spec.as_bytes())),
     };
-    let merged = crate::merge_apply::three_way_merge_guarded(
+    let merged = crate::merge_apply::three_way_merge_guarded_recursive(
         repo,
         base_tree,
         ctx.head_tree,
@@ -2552,6 +2562,7 @@ fn ort_attempt(
         merge_verbosity(repo) != 0,
         xopts,
         ctx.head_tree,
+        &inner_messages,
     )?;
     let applied = match merged {
         crate::merge_apply::Merged::Applied(applied) => applied,
@@ -2611,6 +2622,41 @@ pub(super) fn virtual_base_tree_with(
     bases: &[ObjectId],
     options: Option<gix::merge::tree::Options>,
 ) -> Result<ObjectId> {
+    virtual_base_tree_reporting(repo, bases, options, false).map(|(tree, _msgs)| tree)
+}
+
+/// [`virtual_base_tree_with`], also rendering what the recursion had to say — git's
+/// `merge.verbosity >= 5` output.
+///
+/// ```c
+/// if (opt->priv->call_depth && opt->verbosity < 5)
+///         return; /* Ignore messages from inner merges */
+/// [...]
+/// if (opt->priv->call_depth) {
+///         strbuf_addchars(dest, ' ', 2);
+///         strbuf_addstr(dest, "From inner merge:");
+///         strbuf_addchars(dest, ' ', opt->priv->call_depth * 2);
+/// }
+/// ```
+///
+/// (`path_msg()`, merge-ort.c:815-848.) Below that threshold the recursion's messages are
+/// dropped where they are made; at or above it they go into the *same* `opt->priv->conflicts`
+/// map the outer merge appends to — `clear_or_reinit_internal_opts()` skips that map when it
+/// resets between bases (merge-ort.c:766-772) — so `merge_display_update_messages()` prints
+/// both merges' lines per path, inner first. `report` is the caller's
+/// `opt->verbosity >= 5`; when it is `false` nothing is rendered and this is
+/// [`virtual_base_tree_with`] exactly.
+///
+/// Only the recursion's *top* level is reported. git nests one `call_depth` per level of
+/// merge-base recursion, so a base whose own bases disagree prints at depth 2 and wider; here
+/// that level runs inside `gix_merge::commit()`, which has no way to pass its conflicts back
+/// out, so those lines have no counterpart.
+fn virtual_base_tree_reporting(
+    repo: &gix::Repository,
+    bases: &[ObjectId],
+    options: Option<gix::merge::tree::Options>,
+    report: bool,
+) -> Result<(ObjectId, Vec<crate::merge_msg::Message>)> {
     // The inner merge builds merge options too, and `merge.conflictStyle` is read
     // when they are built — so an unusable value kills the recursion before the
     // virtual base exists, not after. Validating only in the outer merge left the
@@ -2623,8 +2669,38 @@ pub(super) fn virtual_base_tree_with(
         Some(options) => options,
         None => mem.tree_merge_options()?.into(),
     };
-    let out = mem.virtual_merge_base(bases.iter().copied(), options)?;
-    let tree = out.tree_id.detach();
+    // `Repository::virtual_merge_base` would do below what this spells out, but it returns an
+    // outcome that carries only the ids — the inner merges' conflicts are dropped inside it, and
+    // its own `Outcome` is destructured field-by-field in `gix` itself, so it cannot grow a place
+    // to keep them. The plumbing entry point hands both back.
+    let mut bases: Vec<ObjectId> = bases.to_vec();
+    let first = bases.pop().expect("a virtual base needs at least one merge base");
+    let Some(second) = bases.pop() else {
+        // One base is already the base; nothing is merged and nothing is written.
+        return Ok((mem.find_commit(first)?.tree_id()?.detach(), Vec::new()));
+    };
+    let commit_graph = mem.commit_graph_if_enabled()?;
+    let mut graph = mem.revision_graph(commit_graph.as_ref());
+    let mut diff_cache = mem.diff_resource_cache_for_tree_diff()?;
+    let mut blob_merge = mem.merge_resource_cache(Default::default())?;
+    let (out, inner) = gix::merge::plumbing::commit::virtual_merge_base_with_inner_merges(
+        first,
+        second,
+        bases,
+        &mut graph,
+        &mut diff_cache,
+        &mut blob_merge,
+        &mem,
+        &mut |id| id.to_owned().attach(&mem).shorten_or_id().to_string(),
+        options.into(),
+    )?;
+    drop((graph, diff_cache, blob_merge));
+    let tree = out.tree_id;
+    let messages = if report {
+        inner_merge_messages(&mem, &inner)?
+    } else {
+        Vec::new()
+    };
     let written = mem
         .objects
         .take_object_memory()
@@ -2636,7 +2712,41 @@ pub(super) fn virtual_base_tree_with(
         gix::objs::Write::write_buf(repo, *kind, data)
             .map_err(|e| anyhow::anyhow!("failed to write merge-base object: {e}"))?;
     }
-    Ok(tree)
+    Ok((tree, messages))
+}
+
+/// Render one level of merge-base recursion the way `path_msg()` records it at
+/// `call_depth == 1`: every message the inner merge made, each behind
+/// `"  From inner merge:"` and `call_depth * 2` spaces (merge-ort.c:841-845).
+///
+/// The operands are `opt->branch1`/`opt->branch2` as `merge_ort_internal()` renames them for the
+/// recursion — `"Temporary merge branch 1"` and `"…2"` (merge-ort.c:5359-5360) — which is what a
+/// class whose text names a side prints there. [`crate::merge_msg::Strictness::Approximate`]
+/// because this runs after the base merge has already happened and been written: the outer merge
+/// is not refusable at this point, so an unported class degrades to the plain notice, exactly as
+/// it does for the outer merge in [`crate::merge_apply`].
+fn inner_merge_messages(
+    repo: &gix::Repository,
+    inner: &[gix::merge::plumbing::commit::virtual_merge_base::InnerMerge],
+) -> Result<Vec<crate::merge_msg::Message>> {
+    const CALL_DEPTH: usize = 1;
+    let prefix = format!("  From inner merge:{:width$}", "", width = CALL_DEPTH * 2);
+    let mut out = Vec::new();
+    for merge in inner {
+        for mut msg in crate::merge_msg::render(
+            repo,
+            &merge.conflicts,
+            "Temporary merge branch 1",
+            "Temporary merge branch 2",
+            crate::merge_msg::Operand1::Tree(merge.our_tree_id),
+            gix::merge::tree::TreatAsUnresolved::git(),
+            crate::merge_msg::Strictness::Approximate,
+        )? {
+            msg.text.insert_str(0, &prefix);
+            out.push(msg);
+        }
+    }
+    Ok(out)
 }
 
 /// `git-merge-ours`, run through `try_merge_command()` like any other

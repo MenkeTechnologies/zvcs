@@ -58,6 +58,7 @@ use gix::merge::tree::{Conflict, Resolution, ResolutionFailure, TreatAsUnresolve
 /// modes)` there while its message reads `CONFLICT (distinct types)`. `text` is
 /// the free-form line, carrying its own trailing newline exactly as git emits
 /// it via `puts()`.
+#[derive(Clone)]
 pub struct Message {
     pub paths: Vec<BString>,
     pub ctype: &'static str,

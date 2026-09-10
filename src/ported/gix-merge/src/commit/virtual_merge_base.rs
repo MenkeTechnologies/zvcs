@@ -11,6 +11,25 @@ pub struct Outcome {
     pub tree_id: gix_hash::ObjectId,
 }
 
+/// One of the base-merges performed while folding several merge-bases into one, kept so a caller
+/// can report what happened inside it.
+///
+/// Git keeps these too. `merge_ort_internal()` recurses with the *same* `opt->priv`, and
+/// `clear_or_reinit_internal_opts(opti, 1)` — the call that resets it between bases — deliberately
+/// leaves `opti->conflicts` alone (merge-ort.c:748-773, the clearing loop is guarded by
+/// `if (!reinitialize)`). So the inner merges' `path_msg()` entries are still in the map the outer
+/// merge appends to, and `merge_display_update_messages()` prints them interleaved per path. They
+/// are only *invisible* by default because `path_msg()` returns early on
+/// `opt->priv->call_depth && opt->verbosity < 5` (merge-ort.c:815).
+#[derive(Clone)]
+pub struct InnerMerge {
+    /// The tree of `opt->branch1` — "Temporary merge branch 1" — for this merge, i.e. the side the
+    /// conflicts below are reported against.
+    pub our_tree_id: gix_hash::ObjectId,
+    /// The conflicts this base-merge produced, in the order it produced them.
+    pub conflicts: Vec<crate::tree::Conflict>,
+}
+
 /// The error returned by [`commit::merge_base()`](crate::commit::virtual_merge_base()).
 #[derive(Debug, thiserror::Error)]
 #[expect(missing_docs)]
@@ -46,6 +65,40 @@ pub(super) mod function {
     pub fn virtual_merge_base<'objects>(
         first_commit: gix_hash::ObjectId,
         second_commit: gix_hash::ObjectId,
+        others: Vec<gix_hash::ObjectId>,
+        graph: &mut gix_revwalk::Graph<'_, '_, gix_revwalk::graph::Commit<gix_revision::merge_base::Flags>>,
+        diff_resource_cache: &mut gix_diff::blob::Platform,
+        blob_merge: &mut crate::blob::Platform,
+        objects: &'objects (impl gix_object::FindObjectOrHeader + gix_object::Write),
+        abbreviate_hash: &mut dyn FnMut(&gix_hash::oid) -> String,
+        options: crate::tree::Options,
+    ) -> Result<super::Outcome, crate::commit::Error> {
+        virtual_merge_base_with_inner_merges(
+            first_commit,
+            second_commit,
+            others,
+            graph,
+            diff_resource_cache,
+            blob_merge,
+            objects,
+            abbreviate_hash,
+            options,
+        )
+        .map(|(outcome, _inner)| outcome)
+    }
+
+    /// [`virtual_merge_base()`] which also hands back each base-merge it performed, as
+    /// [`InnerMerge`](super::InnerMerge) describes.
+    ///
+    /// This is what a caller needs to reproduce `merge.verbosity >= 5`, where merge-ort stops
+    /// discarding the recursion's `path_msg()` output and prints it alongside the outer merge's.
+    /// The recursion beyond this loop is not reported: an inner merge whose own two merge-bases
+    /// disagree recurses through [`commit()`](crate::commit()), which has no way to pass its
+    /// conflicts back out, so git's `call_depth >= 2` messages have no counterpart here.
+    #[expect(clippy::too_many_arguments)]
+    pub fn virtual_merge_base_with_inner_merges<'objects>(
+        first_commit: gix_hash::ObjectId,
+        second_commit: gix_hash::ObjectId,
         mut others: Vec<gix_hash::ObjectId>,
         graph: &mut gix_revwalk::Graph<'_, '_, gix_revwalk::graph::Commit<gix_revision::merge_base::Flags>>,
         diff_resource_cache: &mut gix_diff::blob::Platform,
@@ -53,7 +106,7 @@ pub(super) mod function {
         objects: &'objects (impl gix_object::FindObjectOrHeader + gix_object::Write),
         abbreviate_hash: &mut dyn FnMut(&gix_hash::oid) -> String,
         mut options: crate::tree::Options,
-    ) -> Result<super::Outcome, crate::commit::Error> {
+    ) -> Result<(super::Outcome, Vec<super::InnerMerge>), crate::commit::Error> {
         let mut merged_commit_id = first_commit;
         others.push(second_commit);
 
@@ -103,8 +156,12 @@ pub(super) mod function {
         // characters wide where stock writes 84 bytes with nine.
         options.marker_size_multiplier = options.marker_size_multiplier.saturating_add(1);
         let mut virtual_merge_bases = Vec::new();
+        let mut inner_merges = Vec::new();
         let mut tree_id = None;
         while let Some(next_commit_id) = others.pop() {
+            // Recorded before the merge: this is `opt->branch1`'s tree for the iteration, which is
+            // what attributes a reported path to "Temporary merge branch 1" or "…2".
+            let our_tree_id = objects.find_commit(&merged_commit_id, &mut Vec::new())?.tree();
             let mut out = crate::commit(
                 merged_commit_id,
                 next_commit_id,
@@ -128,6 +185,10 @@ pub(super) mod function {
             if out.tree_merge.conflicts.iter().any(|c| c.resolution.is_err()) {
                 return Err(Error::VirtualMergeBaseConflict.into());
             }
+            inner_merges.push(super::InnerMerge {
+                our_tree_id,
+                conflicts: out.tree_merge.conflicts.clone(),
+            });
             let merged_tree_id = out
                 .tree_merge
                 .tree
@@ -141,18 +202,21 @@ pub(super) mod function {
             virtual_merge_bases.push(merged_commit_id);
         }
 
-        Ok(super::Outcome {
-            virtual_merge_bases: nonempty::NonEmpty::from_vec(virtual_merge_bases)
-                .expect("the virtual merge-base process always creates at least one commit"),
-            commit_id: merged_commit_id,
-            tree_id: tree_id.map_or_else(
-                || {
-                    let mut buf = Vec::new();
-                    objects.find_commit(&merged_commit_id, &mut buf).map(|c| c.tree())
-                },
-                Ok,
-            )?,
-        })
+        Ok((
+            super::Outcome {
+                virtual_merge_bases: nonempty::NonEmpty::from_vec(virtual_merge_bases)
+                    .expect("the virtual merge-base process always creates at least one commit"),
+                commit_id: merged_commit_id,
+                tree_id: tree_id.map_or_else(
+                    || {
+                        let mut buf = Vec::new();
+                        objects.find_commit(&merged_commit_id, &mut buf).map(|c| c.tree())
+                    },
+                    Ok,
+                )?,
+            },
+            inner_merges,
+        ))
     }
 
     fn create_virtual_commit(

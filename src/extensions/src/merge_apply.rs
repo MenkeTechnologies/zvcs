@@ -285,6 +285,7 @@ pub fn three_way_merge_with_options(
         xopts,
         None,
         None,
+        &[],
     )?;
     let Merged::Applied(applied) = merged else {
         unreachable!("no worktree tree was handed over, so no checkout guard ran")
@@ -325,6 +326,48 @@ pub fn three_way_merge_guarded(
         xopts,
         Some(worktree_tree),
         None,
+        &[],
+    )
+}
+
+/// [`three_way_merge_guarded`] carrying what the merge-base recursion already had to say.
+///
+/// `inner` are the messages a recursive merge base produced, already prefixed with git's
+/// `"  From inner merge:"` — see [`crate::porcelain::merge::virtual_base_tree_reporting`]. They
+/// belong in the same list as this merge's own, because merge-ort keeps both in one
+/// `opt->priv->conflicts` map keyed by path: the recursion writes into it first and
+/// `clear_or_reinit_internal_opts()` leaves it alone between bases (merge-ort.c:766-772), so
+/// `merge_display_update_messages()` sorts the paths once and prints each path's messages in the
+/// order they were made — the inner merge's before the outer merge's. Passing them here rather
+/// than printing them at the call site is what puts them in that order instead of ahead of
+/// everything; it also keeps them unprinted when the checkout guard refuses, as git's are.
+#[allow(clippy::too_many_arguments)]
+pub fn three_way_merge_guarded_recursive(
+    repo: &gix::Repository,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    old_index: &gix::index::File,
+    labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
+    should_interrupt: &AtomicBool,
+    show_msgs: bool,
+    xopts: &StrategyOptions,
+    worktree_tree: ObjectId,
+    inner: &[crate::merge_msg::Message],
+) -> Result<Merged> {
+    merge_and_apply(
+        repo,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        old_index,
+        labels,
+        should_interrupt,
+        show_msgs,
+        xopts,
+        Some(worktree_tree),
+        None,
+        inner,
     )
 }
 
@@ -366,6 +409,7 @@ pub fn three_way_merge_styled(
         &StrategyOptions::default(),
         None,
         style,
+        &[],
     )?;
     let Merged::Applied(applied) = merged else {
         unreachable!("no worktree tree was handed over, so no checkout guard ran")
@@ -456,6 +500,9 @@ fn merge_and_apply(
     // `--conflict=<style>`: the per-invocation override of
     // `merge.conflictStyle`, or `None` to leave the configured style alone.
     style: Option<ConflictStyle>,
+    // Messages a recursive merge base already made, to be printed alongside this merge's own;
+    // empty for every merge that had a single base or was not asked to report the recursion.
+    inner: &[crate::merge_msg::Message],
 ) -> Result<Merged> {
     // `merge_ort_nonrecursive_internal()` (merge-ort.c) shifts *their* tree and
     // the merge base to match the shape of *our* tree, before any merge info is
@@ -509,7 +556,7 @@ fn merge_and_apply(
     // Operand 1 is *our* tree as merged, not as spelled: `-Xsubtree` shifts the
     // other two onto its shape, so this is the tree the conflicts are reported
     // against.
-    let messages: Vec<String> = crate::merge_msg::render(
+    let mut rendered = crate::merge_msg::render(
         repo,
         &merge.conflicts,
         &label1,
@@ -517,11 +564,23 @@ fn merge_and_apply(
         crate::merge_msg::Operand1::Tree(ours_tree),
         unresolved,
         crate::merge_msg::Strictness::Approximate,
-    )?
-    .into_iter()
-    // These are printed with `println!`, so drop the newline git's `puts()` adds.
-    .map(|m| m.text.trim_end_matches('\n').to_owned())
-    .collect();
+    )?;
+    if !inner.is_empty() {
+        // `merge_display_update_messages()` sorts the *paths* once and then prints each path's
+        // list in the order `path_msg()` appended to it (merge-ort.c:4830-4875). The recursion
+        // appended first, into the same map, so a stable sort of `inner ++ outer` by primary
+        // path is that order exactly: one interleaved run per path, inner lines ahead of the
+        // outer lines for the same path.
+        let mut combined = inner.to_vec();
+        combined.append(&mut rendered);
+        combined.sort_by(|a, b| a.paths[0].cmp(&b.paths[0]));
+        rendered = combined;
+    }
+    let messages: Vec<String> = rendered
+        .into_iter()
+        // These are printed with `println!`, so drop the newline git's `puts()` adds.
+        .map(|m| m.text.trim_end_matches('\n').to_owned())
+        .collect();
 
     // `merge_switch_to_result()` ends in `checkout()`, an `unpack_trees()` from
     // the worktree's current tree to the merged one — which refuses rather than

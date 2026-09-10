@@ -5,7 +5,7 @@
 //! prunes the loose objects it just packed (`-d`) and refreshes
 //! `objects/info/packs` (unless `-n` or `repack.updateServerInfo` is false).
 //!
-//! # Pack bytes differ from git's, but the compression does not
+//! # Pack bytes
 //!
 //! The pack is built by `pack-objects`' writer, so it is delta-compressed by
 //! git's own machinery ported into [`gix_pack::data::output::delta`], honouring
@@ -14,14 +14,16 @@
 //! `repack.useDeltaBaseOffset` (default true, as in git) decides whether a delta
 //! names its base by pack offset or by object id.
 //!
-//! The bytes still differ from git's, because objects are enumerated in this
-//! module's own order rather than git's `compute_write_order()`; since a pack's
-//! filename embeds its checksum, the name differs too. What the pack *is* is
-//! valid, complete and comparable in size, with a correct `.idx` and `.rev`
-//! beside it. `-f` *is* honoured — it becomes `pack-objects --no-reuse-delta`,
-//! which the writer acts on, because deltas are otherwise kept from the pack
-//! they are already in. `-F` controls reuse of a stored entry's *bytes*, which
-//! this writer never does, so it is accepted as a no-op.
+//! The objects go in in the order `pack-objects` would have put them in — the
+//! `--all --reflog --indexed-objects` traversal `cmd_repack()` asks it for, via
+//! [`pack_objects_pending`] — because that order is what the delta search and
+//! `compute_write_order()` work from, and so what the pack's checksum, and
+//! therefore its filename, is a function of. Enumerating in this module's own
+//! order instead left every pack under a name stock git never produced. `-f`
+//! *is* honoured — it becomes `pack-objects --no-reuse-delta`, which the writer
+//! acts on, because deltas are otherwise kept from the pack they are already in.
+//! `-F` controls reuse of a stored entry's *bytes*, which this writer never
+//! does, so it is accepted as a no-op.
 //!
 //! # Argument surface
 //!
@@ -805,8 +807,51 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
             }
         }
     }
-    // The pack's entry order is ours to choose; sorting makes a run reproducible.
-    to_pack.sort();
+    // The pack's entry order is *not* ours to choose: it is what the delta search
+    // and `compute_write_order()` work from, so it decides the pack's bytes and
+    // therefore its name.
+    //
+    // ```c
+    // strvec_push(&cmd.args, "--all");
+    // strvec_push(&cmd.args, "--reflog");
+    // strvec_push(&cmd.args, "--indexed-objects");
+    // ```
+    //
+    // (`cmd_repack()`, builtin/repack.c:350-352, git 2.55.0.) `cmd_pack_objects()`
+    // turns those three back into a rev-list argv of its own, in a fixed order
+    // whatever order they arrived in (builtin/pack-objects.c:5241-5252), and
+    // `get_object_list()` hands that to `setup_revisions()`; `traverse_commit_list()`
+    // then appends every object it shows to `to_pack.objects`. So the pack's entry
+    // order is the traversal's order, and [`pack_objects_pending`] is the pending
+    // list it starts from. Sorting the ids instead gave a different delta window
+    // and a different write order, which is why the pack `clone --dissociate`'s
+    // `repack -a -d` leaves behind never matched stock's.
+    //
+    // What the traversal does not reach is what `--keep-unreachable` and
+    // `--pack-loose-unreachable` add *after* `get_object_list()`'s
+    // `traverse_commit_list()` returns, so it keeps the tail. Its order is
+    // git's raw `readdir()` over each `objects/??` fanout
+    // (`for_each_file_in_obj_subdir()`, object-file.c:1457-1490, which sorts
+    // nothing), which is not reproducible from outside that directory read; the
+    // id sort is this port's stand-in for it.
+    //
+    // A geometric run gets none of this: the three pseudo-options are pushed
+    // only `if (!geometry.split_factor)` (builtin/repack.c:339-353), and what
+    // git asks for instead is `--stdin-packs` + `--unpacked`, whose enumeration
+    // is `for_each_object_in_pack(..., ODB_FOR_EACH_OBJECT_PACK_ORDER)` over the
+    // included packs by ascending mtime (`stdin_packs_add_pack_entries()`,
+    // builtin/pack-objects.c:3936-3979) and then the loose fanout. So there the
+    // id order stands.
+    let mut rank: HashMap<ObjectId, usize> = HashMap::new();
+    if geometry.is_none() {
+        let pending = pack_objects_pending(&repo, &promisor_held);
+        for (position, id) in
+            super::pack_objects::traverse_commit_list(&repo, pending).into_iter().enumerate()
+        {
+            rank.entry(id).or_insert(position);
+        }
+    }
+    to_pack.sort_by_key(|id| (rank.get(id).copied().unwrap_or(usize::MAX), *id));
     to_pack.dedup();
 
     // `write_filtered_pack()` (`repack-filtered.c`) drives the second pack with
@@ -1291,6 +1336,125 @@ fn write_bitmaps(st: &State, repo: &gix::Repository) -> bool {
         return configured;
     }
     st.all_into_one && repo.is_bare()
+}
+
+/// `revs->pending` as the `pack-objects` this command drives fills it, which is
+/// the list `traverse_commit_list()` starts from and so what the pack's entry
+/// order is a function of.
+///
+/// `cmd_repack()` passes `--all --reflog --indexed-objects`
+/// (builtin/repack.c:350-352), `cmd_pack_objects()` re-emits them in that fixed
+/// order (builtin/pack-objects.c:5241-5252), and `setup_revisions()` adds each
+/// one's objects as it reaches it:
+///
+/// ```c
+/// if (!strcmp(arg, "--all")) {
+///         handle_refs(refs, revs, *flags, refs_for_each_ref);
+///         handle_refs(refs, revs, *flags, refs_head_ref);
+/// [...]
+/// } else if (!strcmp(arg, "--reflog")) {
+///         add_reflogs_to_pending(revs, *flags);
+/// } else if (!strcmp(arg, "--indexed-objects")) {
+///         add_index_objects_to_pending(revs, *flags);
+/// ```
+///
+/// (`handle_revision_pseudo_opt()`, revision.c:2808-2810 and :2900-2903, git
+/// 2.55.0.) So: every ref, then `HEAD`, then every reflog entry's two ids, then
+/// the index. Tips stay unpeeled — an annotated tag's own object belongs in the
+/// pack, and `handle_commit()` is what peels it.
+///
+/// Assembled the same way [`super::pack_objects`]'s own `rev_list_objects()`
+/// assembles it, because the whole point is that a `repack` and the
+/// `pack-objects --revs --all --reflog --indexed-objects` it stands for enumerate
+/// the objects in one order rather than two.
+///
+/// `excluded` is `--exclude-promisor-objects`' UNINTERESTING set
+/// (revision.c's `odb_for_each_object(..., ODB_FOR_EACH_OBJECT_PROMISOR_ONLY)`):
+/// git marks those before the traversal starts, so they neither reach the pack
+/// nor are walked through.
+fn pack_objects_pending(repo: &gix::Repository, excluded: &HashSet<ObjectId>) -> Vec<ObjectId> {
+    let mut pending: Vec<ObjectId> = Vec::new();
+
+    // `--all`: `refs_for_each_ref` then `refs_head_ref`. A symbolic HEAD repeats a
+    // ref already collected; a detached one is only reachable here.
+    if let Ok(platform) = repo.references() {
+        if let Ok(all) = platform.all() {
+            for mut reference in all.flatten() {
+                if let Ok(id) = reference.follow_to_object() {
+                    pending.push(id.detach());
+                }
+            }
+        }
+    }
+    if let Ok(head) = repo.head() {
+        if let Some(id) = head.id() {
+            pending.push(id.detach());
+        }
+    }
+
+    // `--reflog`: `add_one_reflog_ent()` pends the old and the new id of every
+    // entry. A null id is a ref's creation or deletion line and names no object.
+    let null = ObjectId::null(repo.object_hash());
+    let mut logs = vec![repo.common_dir().join("logs")];
+    let per_worktree = repo.git_dir().join("logs");
+    if per_worktree != logs[0] {
+        logs.push(per_worktree);
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in &logs {
+        collect_log_files(dir, &mut files);
+    }
+    for file in files {
+        let Ok(buf) = fs::read(&file) else { continue };
+        for line in gix::refs::file::log::iter::forward(&buf).flatten() {
+            for id in [line.previous_oid(), line.new_oid()] {
+                if id != null {
+                    pending.push(id);
+                }
+            }
+        }
+    }
+
+    // `--indexed-objects`: `do_add_index_objects_to_pending()` skips gitlinks,
+    // whose ids name commits in another repository, then adds the cache tree.
+    if let Ok(index) = repo.index_or_empty() {
+        for entry in index.entries() {
+            if entry.mode != gix::index::entry::Mode::COMMIT {
+                pending.push(entry.id);
+            }
+        }
+        if let Some(tree) = index.tree() {
+            push_cache_tree(tree, &mut pending);
+        }
+    }
+
+    pending.retain(|id| !excluded.contains(id));
+    pending
+}
+
+/// Every regular file below `dir`, recursively — the reflogs under `logs/`.
+fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => collect_log_files(&path, out),
+            Ok(t) if t.is_file() => out.push(path),
+            _ => {}
+        }
+    }
+}
+
+/// Every valid cache-tree id, recursively. A section with no entry count is
+/// invalid and its id meaningless, which `add_cache_tree()` skips via
+/// `entry_count >= 0`.
+fn push_cache_tree(tree: &gix::index::extension::Tree, out: &mut Vec<ObjectId>) {
+    if tree.num_entries.is_some() {
+        out.push(tree.id);
+    }
+    for child in &tree.children {
+        push_cache_tree(child, out);
+    }
 }
 
 /// Encode `ids` as a pack under the pack *prefix* `base_prefix`, which

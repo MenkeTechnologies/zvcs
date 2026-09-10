@@ -314,6 +314,27 @@ impl<'a> IterInfo<'a> {
     }
 
     fn from_prefix(base: &'a Path, prefix: &'a RelativePath, precompose_unicode: bool) -> std::io::Result<Self> {
+        if prefix.as_ref().is_empty() {
+            // An empty prefix selects every reference rather than a subset of them, which is
+            // what `refs_for_each_ref_ext()` does with one: `prefix = opts->prefix ? opts->prefix
+            // : ""` (refs.c:1944, v2.55.0) hands the empty string to `iterator_begin()` and the
+            // trim is left at zero, so each ref arrives under its full name. It is reachable:
+            // `GIT_REPLACE_REF_BASE=` makes `refs_for_each_replace_ref()` ask for exactly that
+            // (refs.c:1965-1973, v2.55.0, where `.prefix` is the environment value and
+            // `.trim_prefix` its `strlen`), and stock then reads every ref as a replacement and
+            // says `warning: bad replace ref name: refs/heads/main` for the ones whose last
+            // component is not a hash.
+            //
+            // Without this arm the empty prefix walked the *parent* of the git directory: an
+            // empty relative path does not end in `/`, so the branch below took `base.join("")`
+            // — still the git directory, only with a trailing separator — and asked for its
+            // `parent()`, which is the worktree. Every path found there then failed to strip
+            // `base` and the iterator panicked (`loose/iter.rs:59`).
+            return Ok(IterInfo::Base {
+                base,
+                precompose_unicode,
+            });
+        }
         let prefix_path = gix_path::from_bstr(prefix.as_ref().as_bstr());
         let iter_root = base.join(&prefix_path);
         if prefix.as_ref().ends_with(b"/") {

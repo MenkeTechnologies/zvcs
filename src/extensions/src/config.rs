@@ -659,18 +659,16 @@ pub fn index_format_default(repo: &gix::Repository) -> gix::index::Version {
             }
         },
         Err(_) => {
-            // The `feature.manyFiles` cascade, then the key that overrides it.
-            // A `feature.*` value git would have died on has already stopped the
-            // command in the dispatcher's settings gate, so an unreadable one
-            // here can only mean the key is absent.
-            let cascaded = crate::repo_settings::RepoSettings::load(repo)
-                .map(|s| s.many_files)
-                .unwrap_or(false)
-                .then_some(4);
-            let configured = config_int_named(repo, "index.version", "index.version")
+            // `r->settings.index_version`, which is where git has already
+            // resolved the `feature.manyFiles` cascade against an explicit
+            // `index.version` — see [`crate::repo_settings::RepoSettings`],
+            // which quotes the C that resolves the two. A value git would have
+            // died on has stopped the command in the dispatcher's settings gate,
+            // so an unreadable settings block here can only mean the key is
+            // absent.
+            let configured = crate::repo_settings::RepoSettings::load(repo)
                 .ok()
-                .flatten()
-                .or(cascaded);
+                .and_then(|s| s.index_version);
             match configured {
                 None => INDEX_FORMAT_DEFAULT,
                 Some(n) if (INDEX_FORMAT_LB..=INDEX_FORMAT_UB).contains(&n) => n,
@@ -1765,6 +1763,7 @@ fn validated_extension(name: &str) -> Option<(&'static str, &'static [&'static s
         _ => return None,
     })
 }
+
 
 /// The line of the first valueless key that is not the last thing on its line,
 /// which git's `get_value()` refuses and gitoxide's parser accepts.

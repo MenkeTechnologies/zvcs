@@ -104,6 +104,16 @@ pub struct RepoSettings {
     /// *before* an explicit `index.skipHash`, which `repo-settings.c:79` layers
     /// on top with this as its default.
     pub index_skip_hash: bool,
+    /// `r->settings.index_version` after the `feature.manyFiles` cascade
+    /// (`repo-settings.c:59`, which sets 4) and after an explicit `index.version`
+    /// in the non-boolean block below it has had its say.
+    ///
+    /// `None` is git's `-1`, the "nobody chose one" that
+    /// [`crate::config::index_format_default`] answers with
+    /// `INDEX_FORMAT_DEFAULT`. A value outside git's supported range is kept as
+    /// read: the range check lives in `get_index_format_default()`, not here, and
+    /// it warns rather than dies.
+    pub index_version: Option<i64>,
     /// `r->settings.fetch_negotiation_algorithm` after the
     /// `feature.experimental` cascade and before `fetch.negotiationAlgorithm`.
     pub negotiation_algorithm: NegotiationAlgorithm,
@@ -198,6 +208,45 @@ impl RepoSettings {
             index_skip_hash = v;
         }
 
+        // `index.version` opens `prepare_repo_settings()`'s non-boolean block,
+        // and it is *not* the `repo_cfg_*` "cascaded value is the default" shape
+        // the line above uses — it overwrites only when the key is present, so
+        // the 4 `feature.manyFiles` left at line 49 survives an absent key:
+        //
+        // ```c
+        // /* Defaults */
+        // r->settings.index_version = -1;
+        // …
+        // if (manyfiles) {
+        //         r->settings.index_version = 4;
+        // …
+        // /*
+        //  * Non-boolean config
+        //  */
+        // if (!repo_config_get_int(r, "index.version", &value))
+        //         r->settings.index_version = value;
+        // ```
+        //
+        // (repo-settings.c:35, :48-49, :75-79 as of v2.39.0-rc2, the checkout
+        // this was read from; the two lines below reproduce that shape rather
+        // than the cascaded-default one.) `repo_config_get_int` ends in
+        // `git_config_int()`, which dies on a value it cannot read — the reason
+        // this key belongs in the gate and not only in the writer that consumes
+        // it. Measured against git 2.55.0 with the value in `.git/config`:
+        //
+        // ```text
+        // fatal: bad numeric config value 'bogus' for 'index.version' in file .git/config: invalid unit
+        // ```
+        //
+        // and read in this position, not another: `-c index.version=bogus
+        // -c index.skiphash=bogus` reports `index.skiphash`, while
+        // `-c index.version=bogus -c core.packedgitlimit=bogus` reports
+        // `index.version`.
+        let mut index_version = many_files.then_some(4);
+        if let Some(v) = crate::config::config_int(repo, "index.version")? {
+            index_version = Some(v);
+        }
+
         // repo-settings.c:82-85. `pack.readReverseIndex` takes a literal default
         // of 1; `pack.useBitmapBoundaryTraversal` takes the cascaded value, so
         // `feature.experimental` survives here where it did not at line 78.
@@ -227,6 +276,7 @@ impl RepoSettings {
             many_files,
             experimental,
             index_skip_hash,
+            index_version,
             negotiation_algorithm,
             packed_git_window_size,
             packed_git_limit,

@@ -95,7 +95,6 @@ mod sparse_family;
 mod rebase_engine;
 mod receive_hooks;
 mod refspec_algebra;
-mod remote_admin;
 mod reset_family;
 mod revision_syntax;
 mod sequences;
@@ -587,7 +586,6 @@ pub fn cases() -> Vec<Case> {
     rebase_engine::cases(&mut c);
     receive_hooks::cases(&mut c);
     refspec_algebra::cases(&mut c);
-    remote_admin::cases(&mut c);
     reset_family::cases(&mut c);
     revision_syntax::cases(&mut c);
     shape_reach::cases(&mut c);

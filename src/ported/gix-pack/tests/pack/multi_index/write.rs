@@ -121,7 +121,10 @@ fn write_multi_index_from_pack_dir(pack_dir: &Path, object_hash: gix_hash::Kind)
         &mut out,
         &mut progress::Discard,
         &AtomicBool::new(false),
-        gix_pack::multi_index::write::Options { object_hash },
+        gix_pack::multi_index::write::Options {
+            object_hash,
+            bitmap_order: None,
+        },
     )?;
     let file = gix_pack::multi_index::File::at(output_path, None)?;
 

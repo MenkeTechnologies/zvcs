@@ -750,6 +750,23 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     //
     // A source that is shallow itself takes `is_local` away again further down.
     let mut is_local = !no_local && !url_str.contains("://") && Path::new(url_str).is_dir();
+    // The other half of the same probe. `get_repo_path_1()` walks four repository
+    // spellings — `<path>/.git`, `<path>`, `<path>.git/.git`, `<path>.git` — and
+    // only then tries `<path>.bundle` and `<path>` as a *regular file*
+    // (builtin/clone.c:97-141, v2.55.0), setting `*is_bundle` on the second pass.
+    // So a bundle is never a local clone: `is_local` above already excludes it by
+    // requiring a directory, and everything a local clone would have ignored —
+    // the shallow selectors, `--filter` — a bundle ignores too, because
+    // `transport_get()` gives a bundle `ret->smart_options = NULL` and a vtable
+    // of three entries (transport.c:1162-1166, 1212), none of which is
+    // `set_option`.
+    let bundle_source: Option<PathBuf> = match (!url_str.contains("://"))
+        .then(|| classify_local_source(url_str))
+    {
+        Some(LocalSource::Bundle(path)) => Some(path),
+        _ => None,
+    };
+    let is_bundle = bundle_source.is_some();
     let mut reject_shallow_source = false;
     if is_local && gix::open(url_str).map(|r| r.is_shallow()).unwrap_or(false) {
         // ```c
@@ -792,8 +809,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
         is_local = false;
     }
-    let shallow = if is_local {
-        // Ignored for a local path clone — see the warning at the banner.
+    let shallow = if is_local || is_bundle {
+        // Ignored for a local path clone — see the warning at the banner — and for
+        // a bundle, whose transport has no `set_option` to receive the depth with.
+        // Measured on stock 2.55.0: `git clone --depth 1 ./all.bundle v3` leaves no
+        // `.git/shallow` and the full history of the branch it checked out.
         Shallow::NoChange
     } else if !shallow_exclude.is_empty() {
         // `--depth` rides along rather than being dropped: git sets `TRANS_OPT_DEPTH`,
@@ -1038,13 +1058,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // candidate. git then prints three things: the bundle check that rejected it, the `die()` of
     // the `upload-pack` child it fell back to (a file that is not a gitfile is
     // `invalid gitfile format`), and the block `git_connect()` ends with. Exit 128.
-    if !url_str.contains("://") {
-        if let LocalSource::Bundle(path) = classify_local_source(url_str) {
+    let bundle_transport = match bundle_source {
+        None => None,
+        Some(path) => {
             let shown = absolute_pathdup(&path);
-            if created_destination {
-                let _ = std::fs::remove_dir_all(dst);
-            }
             if !looks_like_bundle(&path) {
+                if created_destination {
+                    let _ = std::fs::remove_dir_all(dst);
+                }
                 eprintln!("error: '{shown}' does not look like a v2 or v3 bundle file");
                 eprintln!("fatal: invalid gitfile format: {shown}");
                 eprintln!("fatal: Could not read from remote repository.");
@@ -1053,12 +1074,52 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 eprintln!("and the repository exists.");
                 return Ok(ExitCode::from(128));
             }
-            anyhow::bail!(
-                "cloning from a bundle is not ported: the vendored transport has no bundle \
-                 reader, so '{shown}' cannot be unbundled into a new repository"
-            );
+            // ```c
+            // if (is_bundle) {
+            //         struct bundle_header header = BUNDLE_HEADER_INIT;
+            //         int fd = read_bundle_header(path, &header);
+            //         int has_filter = header.filter.choice != LOFC_DISABLED;
+            //         [...]
+            //         if (has_filter)
+            //                 die(_("cannot clone from filtered bundle"));
+            // }
+            // ```
+            //
+            // (builtin/clone.c:1350-1360, v2.55.0.) A filtered bundle's pack is
+            // missing the objects its filter dropped; a clone has no promisor
+            // remote to fetch them back from, so git refuses before the transport
+            // runs at all.
+            let header = match super::bundle::open_bundle(&path.to_string_lossy()) {
+                Ok((header, _)) => header,
+                Err(e) => return super::bundle::report(&shown, e),
+            };
+            if header.filter.is_some() {
+                if created_destination {
+                    let _ = std::fs::remove_dir_all(dst);
+                }
+                return Ok(fatal("cannot clone from filtered bundle"));
+            }
+            Some(BundleTransport::new(path, shown, &git_dir)?)
         }
-    }
+    };
+
+    // `transport_get()` hands a bundle a vtable whose `get_refs_list` is the
+    // bundle's own header and whose `fetch_refs` is `unbundle()` — the pack is
+    // *installed*, not negotiated (transport.c:151-216, v2.55.0). gitoxide has no
+    // such transport, so the bundle is materialized into a scratch repository
+    // inside the new git dir and the clone runs against that: the header's refs
+    // become the advertisement, and `unbundle()`'s `index-pack --fix-thin --stdin`
+    // writes the very pack the bundle carries, which the local-object adoption
+    // below then moves across byte for byte — which is what stock leaves behind
+    // (`pack-<hash>.pack` in the clone is `sha1`-identical to the bundle's pack).
+    //
+    // Everything downstream — the refspec mapping, `guess_remote_head()`, the
+    // `branch.<name>` section, the checkout — is the ordinary clone path, exactly
+    // as it is in git, where only the three vtable entries differ.
+    let (url, url_str) = match &bundle_transport {
+        Some(bt) => (bt.url.clone(), bt.dir_str.as_str()),
+        None => (url, url_str),
+    };
 
     // Build the clone platform. This already lays the repository down on disk, so
     // the template and alternates below land in the very git dir the fetch will
@@ -1175,7 +1236,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `-s`/`--shared` is `clone_local()`'s other arm and copies nothing: the alternates
     // line written just above already makes the source's objects readable from here, so
     // that spelling skips the pack for the same reason.
-    let adopted_pack_files = (is_local && !shared)
+    // `fetch_refs_from_bundle()` → `unbundle()`: verify the prerequisites against
+    // the repository being filled in, then run `index-pack --fix-thin --stdin`
+    // over the pack the header is followed by (bundle.c:606-640, v2.55.0). git
+    // does this from inside `transport_fetch_refs()`; here it happens just before
+    // the object store is adopted, which is the same window — nothing has been
+    // written to the new repository yet either way.
+    if let Some(bt) = &bundle_transport {
+        if let Some(code) = bt.unbundle(&git_dir)? {
+            return Ok(code);
+        }
+    }
+
+    let adopted_pack_files = ((is_local || is_bundle) && !shared)
         .then(|| {
             adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)
                 .map(|()| pack_dir_entries(&git_dir))
@@ -1207,7 +1280,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // advertise `filter` and earns a second warning,
     // `warning: filtering not recognized by server, ignoring`, that stock never
     // prints. The warning above already told the user the filter was dropped.
-    if !is_local {
+    if !is_local && !is_bundle {
         prepare = prepare.with_filter(filter.clone());
     }
 
@@ -1538,7 +1611,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // understood the filter says nothing about it. The `--filter is ignored in local
             // clones` warning at the banner has already covered that case, and the filter was
             // never put on the wire here either (see `with_filter` above).
-            if filter.is_some() && !filter_supported && !is_local {
+            if filter.is_some() && !filter_supported && !is_local && !is_bundle {
                 eprintln!("warning: filtering not recognized by server, ignoring");
             }
         };
@@ -1632,6 +1705,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
     result?;
+
+    // `close_bundle()` (transport.c:219-227): the bundle transport is torn down
+    // once the refs are in. The scratch repository it stood on goes with it — the
+    // objects have been adopted into the clone by now, so nothing reads it again,
+    // and leaving it behind would put a second repository inside `.git`.
+    if let Some(bt) = &bundle_transport {
+        let _ = std::fs::remove_dir_all(&bt.dir);
+    }
 
     // `--separate-git-dir`: move the git dir to the requested path and leave a
     // `gitdir: <abs>` link file behind, the same relocation `git init` performs.
@@ -1872,9 +1953,20 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             }),
             fetch_bundle_uri: persist_bundle_uri.clone(),
             fetch_bundle_creation_token: persist_creation_token.clone(),
+            // The remote a bundle clone records is the bundle, not the scratch
+            // repository the objects came out of: git never had a second
+            // repository, so `remote.<name>.url` is `absolute_pathdup(path)` —
+            // the same `path` `get_repo_path()` returned.
+            remote_url: bundle_transport.as_ref().map(|bt| bt.shown.clone()),
             config_pairs: &config_pairs,
         },
     )?;
+
+    // ... and so is the `clone: from <url>` the reflogs carry, which gitoxide
+    // wrote from the url it fetched through (`gix/src/clone/fetch/mod.rs`).
+    if let Some(bt) = &bundle_transport {
+        rewrite_clone_reflog_source(&git_dir, &bt.reflog_from, &bt.shown)?;
+    }
 
     // Drop gitoxide's implicit `refs/remotes/<name>/HEAD` wherever git would not
     // have written it: a bare or mirrored clone has no remote-tracking hierarchy at
@@ -2358,6 +2450,10 @@ struct ConfigFixups<'a> {
     /// `fetch.bundleCreationToken`, the largest `bundle.<id>.creationToken` the
     /// bundle-URI client applied, so the next fetch downloads nothing older.
     fetch_bundle_creation_token: Option<String>,
+    /// `remote.<name>.url`, rewritten when the clone fetched through something
+    /// other than the source the caller named — which is only ever a bundle,
+    /// whose objects arrive from a scratch repository this clone stood up.
+    remote_url: Option<String>,
     /// `-c <key>=<value>` pairs, in command-line order.
     config_pairs: &'a [(String, String)],
 }
@@ -2550,6 +2646,7 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
         && fixups.promisor_filter.is_none()
         && fixups.fetch_bundle_uri.is_none()
         && fixups.fetch_bundle_creation_token.is_none()
+        && fixups.remote_url.is_none()
         && fixups.config_pairs.is_empty()
     {
         return Ok(());
@@ -2579,6 +2676,9 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
             if let Some(spec) = &fixups.promisor_filter {
                 section.push("promisor", Some("true".into()))?;
                 section.push("partialclonefilter", Some(spec.as_str().into()))?;
+            }
+            if let Some(url) = &fixups.remote_url {
+                section.set("url", url.as_str())?;
             }
         }
     }
@@ -2969,6 +3069,191 @@ fn looks_like_bundle(path: &Path) -> bool {
         return false;
     };
     bytes.starts_with(b"# v2 git bundle\n") || bytes.starts_with(b"# v3 git bundle\n")
+}
+
+/// The bundle transport, as far as a clone can see it.
+///
+/// git gives a bundle source a three-entry vtable — `get_refs_list` reads the
+/// header, `fetch_refs` runs `unbundle()`, `disconnect` closes the descriptor
+/// (`bundle_vtable`, transport.c:1162-1166, v2.55.0) — and changes nothing else
+/// about `cmd_clone`. gitoxide's fetch machinery has no such transport, so the
+/// bundle is turned into the one thing that machinery does understand: a
+/// repository holding the bundle's pack and advertising the bundle's refs.
+///
+/// It is scratch, it lives inside the new repository's git dir (so adopting its
+/// objects is a same-filesystem hard link rather than a copy), and it is removed
+/// as soon as the fetch that read it returns — the two paths the caller named,
+/// `remote.<name>.url` and the `clone: from <url>` reflog message, are corrected
+/// back to the bundle afterwards.
+struct BundleTransport {
+    /// The bundle file, for `read_bundle_header()`/`unbundle()`.
+    path: PathBuf,
+    /// `absolute_pathdup(path)`: the spelling git records for the source.
+    shown: String,
+    /// The scratch repository.
+    dir: PathBuf,
+    /// `dir` as the clone's `url_str`.
+    dir_str: String,
+    /// `dir` as the clone's url.
+    url: gix::Url,
+    /// The `clone: from <url>` message gitoxide writes for `url`, which names the
+    /// scratch repository and has to be rewritten to name the bundle.
+    reflog_from: String,
+}
+
+impl BundleTransport {
+    fn new(path: PathBuf, shown: String, git_dir: &Path) -> Result<Self> {
+        let dir = git_dir.join("zvcs-bundle-transport");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let url = gix::url::parse(dir_str.as_str().into())?;
+        // `PrepareFetch::new_inner` absolutizes the url before it becomes the
+        // reflog message (`gix/src/clone/mod.rs`), so absolutize the same way here
+        // rather than guessing at the rendering.
+        let mut absolute = url.clone();
+        absolute.absolutize(Path::new(""));
+        let reflog_from = format!("clone: from {}", absolute.to_bstring());
+        Ok(BundleTransport {
+            path,
+            shown,
+            dir,
+            dir_str,
+            url,
+            reflog_from,
+        })
+    }
+
+    /// `fetch_refs_from_bundle()` → `unbundle()` (transport.c:188-217,
+    /// bundle.c:606-640): verify the prerequisites against the repository being
+    /// filled in, then `index-pack --fix-thin --stdin` the pack that follows the
+    /// header. The refs the header carries become the scratch repository's, which
+    /// is what `get_refs_from_bundle()` turns into the advertisement.
+    ///
+    /// `Some(code)` is a failure git reports and exits with; the half-built clone
+    /// is taken down by the junk directory on the way out, as `remove_junk()` does.
+    fn unbundle(&self, git_dir: &Path) -> Result<Option<ExitCode>> {
+        let scratch = gix::init_bare(&self.dir)?;
+        let name = self.path.to_string_lossy().into_owned();
+        let (header, source) = match super::bundle::open_bundle(&name) {
+            Ok(pair) => pair,
+            Err(e) => return super::bundle::report(&self.shown, e).map(Some),
+        };
+
+        // `unbundle()` verifies against `the_repository` — the repository the
+        // clone is creating, which is still empty here, exactly as it is when git
+        // reaches this from `transport_fetch_refs()`.
+        let dest = gix::open(git_dir)?;
+        if !super::bundle::verify_bundle(&dest, &header, false) {
+            // `die(_("remote transport reported error"))` (builtin/clone.c), the
+            // caller of the `transport_fetch_refs()` that just failed.
+            eprintln!("fatal: remote transport reported error");
+            return Ok(Some(ExitCode::from(128)));
+        }
+        if !super::bundle::index_pack(source, &scratch, &[])? {
+            eprintln!("error: index-pack died");
+            eprintln!("fatal: remote transport reported error");
+            return Ok(Some(ExitCode::from(128)));
+        }
+
+        // The advertisement `get_refs_from_bundle()` builds is the header's list
+        // *reversed*: it prepends (`ref->next = result; result = ref;`,
+        // transport.c:163-172), and that order is what `guess_remote_head()` walks.
+        let advertised: Vec<&(gix::ObjectId, Vec<u8>)> = header.refs.iter().rev().collect();
+        for (oid, name) in &advertised {
+            let Ok(name) = std::str::from_utf8(name) else {
+                continue;
+            };
+            if name == "HEAD" {
+                continue;
+            }
+            let Ok(full) = gix::refs::FullName::try_from(name) else {
+                continue;
+            };
+            let file = self.dir.join(gix::path::from_bstr(full.as_bstr()).as_ref());
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&file, format!("{oid}\n"))?;
+        }
+
+        // `guess_remote_head()` is what turns the advertised `HEAD` into the
+        // branch a clone checks out, and a bundle advertises `HEAD` as a plain
+        // object id with no symref attached. The scratch repository has to answer
+        // with the branch that algorithm picks, because the file transport *does*
+        // carry a symref and gitoxide would otherwise believe it over the guess.
+        let head = guess_remote_head(&advertised, &default_branch_name(&dest));
+        let target = head.unwrap_or_else(|| format!("refs/heads/{}", default_branch_name(&dest)));
+        std::fs::write(self.dir.join("HEAD"), format!("ref: {target}\n"))?;
+        Ok(None)
+    }
+}
+
+/// `repo_default_branch_name()`: `init.defaultBranch`, or `master`.
+fn default_branch_name(repo: &gix::Repository) -> String {
+    repo.config_snapshot()
+        .string("init.defaultBranch")
+        .map(|v| v.to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "master".to_string())
+}
+
+/// `guess_remote_head(head, refs, 0)` (remote.c:2492-2545, v2.55.0) over an
+/// advertisement that carries no symref: the default branch first if it points
+/// where `HEAD` does, then `refs/heads/master`, then the first other branch that
+/// points there. `None` where git returns NULL, which is a clone whose `HEAD`
+/// names no branch it was told about.
+fn guess_remote_head(
+    advertised: &[&(gix::ObjectId, Vec<u8>)],
+    default_branch: &str,
+) -> Option<String> {
+    let head = advertised.iter().find(|(_, name)| name == b"HEAD")?;
+    let at = |want: &str| {
+        advertised
+            .iter()
+            .find(|(_, name)| name.as_slice() == want.as_bytes())
+            .filter(|(oid, _)| *oid == head.0)
+            .map(|_| want.to_string())
+    };
+    at(&format!("refs/heads/{default_branch}"))
+        .or_else(|| at("refs/heads/master"))
+        .or_else(|| {
+            advertised
+                .iter()
+                .filter(|r| !std::ptr::eq(**r, *head))
+                .find(|(oid, name)| *oid == head.0 && name.starts_with(b"refs/heads/"))
+                .and_then(|(_, name)| String::from_utf8(name.clone()).ok())
+        })
+}
+
+/// Rewrite the `clone: from <url>` message every reflog this clone wrote carries,
+/// from the url the fetch really ran against to the one the caller named. Only
+/// a bundle clone needs it: it is the one source whose objects arrive from
+/// somewhere other than the recorded remote.
+fn rewrite_clone_reflog_source(git_dir: &Path, from: &str, to: &str) -> Result<()> {
+    let mut stack = vec![git_dir.join("logs")];
+    let replacement = format!("clone: from {to}");
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let path = entry.path();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push(path);
+                continue;
+            }
+            // Reflog lines are bytes, not text: a ref name or a committer name
+            // need not be UTF-8, and decoding one lossily would rewrite it.
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if !bytes.contains_str(from) {
+                continue;
+            }
+            let rewritten = bytes.replace(from.as_bytes(), replacement.as_bytes());
+            std::fs::write(&path, rewritten)?;
+        }
+    }
+    Ok(())
 }
 
 /// The local filesystem path a clone URL names, if any. `-s`/`--shared` only
@@ -3520,5 +3805,91 @@ fn remove_initial_remote_reflogs(git_dir: &Path, remote: &str) {
             Ok(true) => std::fs::remove_dir_all(&path),
             _ => std::fs::remove_file(&path),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(byte: u8) -> gix::ObjectId {
+        gix::ObjectId::from_bytes_or_panic(&[byte; 20])
+    }
+
+    fn advertisement(pairs: &[(u8, &str)]) -> Vec<(gix::ObjectId, Vec<u8>)> {
+        pairs
+            .iter()
+            .map(|(id, name)| (oid(*id), name.as_bytes().to_vec()))
+            .collect()
+    }
+
+    /// `guess_remote_head()` prefers the default branch and then `master`,
+    /// *only* when either points where `HEAD` does — the oid check is the half
+    /// that is easy to drop, and dropping it makes a clone check out a branch
+    /// the remote's `HEAD` does not name.
+    #[test]
+    fn a_default_branch_wins_only_when_it_points_where_head_does() {
+        let refs =
+            advertisement(&[(1, "HEAD"), (2, "refs/heads/master"), (1, "refs/heads/main")]);
+        let refs: Vec<&(gix::ObjectId, Vec<u8>)> = refs.iter().collect();
+
+        // `main` is the default and matches, so it is taken over `master`.
+        assert_eq!(guess_remote_head(&refs, "main").as_deref(), Some("refs/heads/main"));
+        // `master` is the default but points elsewhere, so the fallback
+        // `refs/heads/master` check fails too and the scan finds `main`.
+        assert_eq!(guess_remote_head(&refs, "master").as_deref(), Some("refs/heads/main"));
+    }
+
+    /// With no branch at `HEAD`'s object, git returns NULL and the clone warns
+    /// rather than checking something out.
+    #[test]
+    fn a_head_no_branch_points_at_guesses_nothing() {
+        let refs = advertisement(&[(9, "HEAD"), (2, "refs/heads/main"), (9, "refs/tags/v1")]);
+        let refs: Vec<&(gix::ObjectId, Vec<u8>)> = refs.iter().collect();
+        // The tag points where HEAD does, but `starts_with("refs/heads/")`
+        // excludes it — a scan that forgot the prefix would answer `refs/tags/v1`.
+        assert_eq!(guess_remote_head(&refs, "main"), None);
+    }
+
+    /// A bundle carrying no `HEAD` line advertises none, which is git's
+    /// `guess_remote_head(NULL, ...)`.
+    #[test]
+    fn an_advertisement_without_head_guesses_nothing() {
+        let refs = advertisement(&[(2, "refs/heads/main")]);
+        let refs: Vec<&(gix::ObjectId, Vec<u8>)> = refs.iter().collect();
+        assert_eq!(guess_remote_head(&refs, "main"), None);
+    }
+
+    /// The scan takes the *first* matching branch in advertisement order, which
+    /// for a bundle is the reverse of the header's order.
+    #[test]
+    fn the_scan_takes_the_first_matching_branch_in_advertisement_order() {
+        let refs = advertisement(&[(7, "HEAD"), (7, "refs/heads/b"), (7, "refs/heads/a")]);
+        let refs: Vec<&(gix::ObjectId, Vec<u8>)> = refs.iter().collect();
+        assert_eq!(guess_remote_head(&refs, "main").as_deref(), Some("refs/heads/b"));
+    }
+
+    /// Only the `clone: from <url>` run is rewritten, and every reflog under
+    /// `logs/` is visited — `logs/HEAD`, the branch's, and the remote-tracking
+    /// `HEAD`'s all carry it, and a rewrite that missed one would leave a
+    /// repository naming two different sources for the same clone.
+    #[test]
+    fn the_clone_reflog_source_is_rewritten_everywhere_and_nowhere_else() {
+        let dir = std::env::temp_dir().join(format!("zvcs-clone-reflog-{}", std::process::id()));
+        let logs = dir.join("logs").join("refs").join("heads");
+        std::fs::create_dir_all(&logs).expect("scratch");
+        let line = |what: &str| format!("0{}0 name <n@e> 1 +0000\t{what}\n", "0".repeat(38));
+        std::fs::write(dir.join("logs").join("HEAD"), line("clone: from /tmp/scratch")).unwrap();
+        std::fs::write(logs.join("main"), line("clone: from /tmp/scratch")).unwrap();
+        // A message that merely contains the path is not the clone line.
+        std::fs::write(logs.join("other"), line("commit: /tmp/scratch")).unwrap();
+
+        rewrite_clone_reflog_source(&dir, "clone: from /tmp/scratch", "/repo/x.bundle").unwrap();
+
+        let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap();
+        assert!(read(dir.join("logs").join("HEAD")).ends_with("clone: from /repo/x.bundle\n"));
+        assert!(read(logs.join("main")).ends_with("clone: from /repo/x.bundle\n"));
+        assert!(read(logs.join("other")).ends_with("commit: /tmp/scratch\n"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

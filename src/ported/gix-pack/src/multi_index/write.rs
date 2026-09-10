@@ -30,12 +30,116 @@ pub(crate) struct Entry {
 pub struct Options {
     /// The kind of hash to use for objects and to expect in the input files.
     pub object_hash: gix_hash::Kind,
+    /// When set, plan the `RIDX` and `BTMP` chunks that a multi-pack `.bitmap`
+    /// is read alongside, and compute the pseudo-pack order they encode.
+    ///
+    /// git adds both chunks together, for `MIDX_WRITE_REV_INDEX` or
+    /// `MIDX_WRITE_BITMAP` (midx-write.c:1674-1682, v2.55.0), and `--bitmap`
+    /// sets both bits at once.
+    pub bitmap_order: Option<BitmapOrder>,
+}
+
+/// Which pack `midx_pack_order()` sorts ahead of the others.
+///
+/// git picks one whenever it writes the reverse-index chunks: the pack named by
+/// `--preferred-pack`, else the oldest by mtime, "to ensure that the pack from
+/// which the first object is selected in pseudo pack-order has all of its
+/// objects selected from that pack (and not another pack containing a
+/// duplicate)" (midx-write.c:1458-1497, v2.55.0). `None` is git's
+/// `NO_PREFERRED_PACK`, which leaves every entry demoted equally.
+pub struct BitmapOrder {
+    /// The `.idx` file name of the preferred pack, matched against the sorted
+    /// index names this writer builds the `PNAM` chunk from.
+    pub preferred_index_name: Option<std::ffi::OsString>,
+}
+
+/// One object as the multi-index records it, in the lexicographic order the
+/// `OIDL` chunk stores.
+///
+/// Handed back so a caller that goes on to write a multi-pack `.bitmap` can
+/// address the same objects the file does without re-reading it.
+#[derive(Debug, Clone)]
+pub struct EntryInfo {
+    /// The object's id.
+    pub id: gix_hash::ObjectId,
+    /// Which pack holds it, as an index into the sorted `PNAM` list.
+    pub pack_index: u32,
+    /// Its offset in that pack.
+    pub pack_offset: crate::data::Offset,
 }
 
 /// The result of [`multi_index::write_from_index_paths()`].
 pub struct Outcome {
     /// The calculated multi-index checksum of the file at `multi_index_path`.
     pub multi_index_checksum: gix_hash::ObjectId,
+    /// Every object the multi-index holds, in `OIDL` order.
+    pub entries: Vec<EntryInfo>,
+    /// `midx_pack_order()`: for each position in pseudo-pack order, the
+    /// position the object has in [`Outcome::entries`]. Empty unless
+    /// [`Options::bitmap_order`] asked for it.
+    pub pack_order: Vec<u32>,
+}
+
+/// `midx_pack_order()` (midx-write.c:659-703, v2.55.0).
+///
+/// `placement` is `(pack index, offset in that pack)` per object, in the
+/// multi-index's lexicographic order. Sorts those by
+/// `(preferred-demoted pack, offset)` and answers with the resulting
+/// permutation — the `RIDX` chunk — plus, per pack, where its first object
+/// landed and how many it contributed, which is the `BTMP` chunk.
+pub fn pack_order(
+    placement: &[(u32, crate::data::Offset)],
+    preferred_pack: Option<u32>,
+    num_packs: usize,
+) -> (Vec<u32>, Vec<(u32, u32)>) {
+    // ```c
+    // data[i].pack = midx_pack_perm(ctx, e->pack_int_id);
+    // if (!e->preferred || ctx->compact)
+    //         data[i].pack |= (1U << 31);
+    // ```
+    //
+    // The high bit is the whole mechanism: an entry from the preferred pack
+    // keeps its small key and therefore sorts ahead of every entry that does
+    // not, whichever pack those came from.
+    const DEMOTED: u32 = 1 << 31;
+    let mut data: Vec<(u32, crate::data::Offset, u32)> = placement
+        .iter()
+        .enumerate()
+        .map(|(at, (pack_index, pack_offset))| {
+            let key = if Some(*pack_index) == preferred_pack {
+                *pack_index
+            } else {
+                *pack_index | DEMOTED
+            };
+            (key, *pack_offset, at as u32)
+        })
+        .collect();
+    // `midx_pack_order_cmp()` compares pack then offset and nothing else. Two
+    // entries can only tie on both when they are the same object in the same
+    // pack, which the deduplication above has already ruled out, so the order
+    // is total and git's unstable `QSORT` cannot disagree with this one.
+    data.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut order = Vec::with_capacity(data.len());
+    let mut positions: Vec<Option<u32>> = vec![None; num_packs];
+    let mut counts: Vec<u32> = vec![0; num_packs];
+    for (at, (key, _, entry)) in data.iter().enumerate() {
+        let pack = (key & !DEMOTED) as usize;
+        if positions[pack].is_none() {
+            positions[pack] = Some(at as u32);
+        }
+        counts[pack] += 1;
+        order.push(*entry);
+    }
+    // "if (pack->bitmap_pos == BITMAP_POS_UNKNOWN) pack->bitmap_pos = 0;" — a
+    // pack that contributed nothing still gets a row, and it names position
+    // zero rather than the sentinel.
+    let per_pack = positions
+        .into_iter()
+        .zip(counts)
+        .map(|(position, count)| (position.unwrap_or(0), count))
+        .collect();
+    (order, per_pack)
 }
 
 /// The progress ids used in [`crate::multi_index::write_from_index_paths()`].
@@ -89,7 +193,10 @@ pub(super) mod function {
         out: &mut dyn std::io::Write,
         progress: &mut dyn DynNestedProgress,
         should_interrupt: &AtomicBool,
-        Options { object_hash }: Options,
+        Options {
+            object_hash,
+            bitmap_order,
+        }: Options,
     ) -> Result<Outcome, Error> {
         let out = gix_hash::io::Write::new(out, object_hash);
         let (index_paths_sorted, index_filenames_sorted) = {
@@ -172,6 +279,33 @@ pub(super) mod function {
             );
         }
 
+        // git plans `RIDX` and `BTMP` last, after the optional `LOFF`, and both
+        // together (midx-write.c:1674-1682, v2.55.0).
+        let (order, bitmapped_packs) = match &bitmap_order {
+            None => (Vec::new(), Vec::new()),
+            Some(super::BitmapOrder { preferred_index_name }) => {
+                let preferred = preferred_index_name.as_ref().and_then(|name| {
+                    index_filenames_sorted
+                        .iter()
+                        .position(|candidate| candidate.as_os_str() == name.as_os_str())
+                        .map(|at| at as u32)
+                });
+                let placement: Vec<(u32, crate::data::Offset)> =
+                    entries.iter().map(|e| (e.pack_index, e.pack_offset)).collect();
+                super::pack_order(&placement, preferred, index_filenames_sorted.len())
+            }
+        };
+        if bitmap_order.is_some() {
+            cf.plan_chunk(
+                multi_index::chunk::revindex::ID,
+                multi_index::chunk::revindex::storage_size(entries.len()),
+            );
+            cf.plan_chunk(
+                multi_index::chunk::bitmapped_packs::ID,
+                multi_index::chunk::bitmapped_packs::storage_size(index_filenames_sorted.len()),
+            );
+        }
+
         let mut write_progress =
             progress.add_child_with_id("Writing multi-index".into(), ProgressId::BytesWritten.into());
         let write_start = Instant::now();
@@ -214,6 +348,12 @@ pub(super) mod function {
                         num_large_offsets.expect("available if planned"),
                         &mut chunk_write,
                     ),
+                    multi_index::chunk::revindex::ID => {
+                        multi_index::chunk::revindex::write(&order, &mut chunk_write)
+                    }
+                    multi_index::chunk::bitmapped_packs::ID => {
+                        multi_index::chunk::bitmapped_packs::write(&bitmapped_packs, &mut chunk_write)
+                    }
                     unknown => unreachable!("BUG: forgot to implement chunk {:?}", std::str::from_utf8(&unknown)),
                 }
                 .map_err(gix_hash::io::Error::from)?;
@@ -232,7 +372,18 @@ pub(super) mod function {
             .map_err(gix_hash::io::Error::from)?;
         out.progress.show_throughput(write_start);
 
-        Ok(Outcome { multi_index_checksum })
+        Ok(Outcome {
+            multi_index_checksum,
+            entries: entries
+                .into_iter()
+                .map(|entry| super::EntryInfo {
+                    id: entry.id,
+                    pack_index: entry.pack_index,
+                    pack_offset: entry.pack_offset,
+                })
+                .collect(),
+            pack_order: order,
+        })
     }
 }
 
@@ -253,3 +404,4 @@ impl multi_index::File<crate::MMap> {
         Ok(Self::HEADER_LEN)
     }
 }
+

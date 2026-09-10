@@ -233,7 +233,7 @@ pub(crate) struct Header {
     /// The `@filter` capability's value, when the bundle carries one. `verify`
     /// reports it as `The bundle uses this filter: <spec>`, and `create` writes it
     /// back from the `--filter` the revision walk carried.
-    filter: Option<String>,
+    pub(crate) filter: Option<String>,
 }
 
 /// The failures git reports itself, with its own wording and exit code 1.
@@ -254,7 +254,7 @@ pub(crate) enum HeaderError {
 
 /// Report a [`HeaderError`] the way git does and yield its exit code, except
 /// for [`HeaderError::Malformed`] which becomes an ordinary error.
-fn report(path: &str, err: HeaderError) -> Result<ExitCode> {
+pub(crate) fn report(path: &str, err: HeaderError) -> Result<ExitCode> {
     match err {
         HeaderError::Open => eprintln!("error: could not open '{path}'"),
         HeaderError::NotBundle => {

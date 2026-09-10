@@ -310,3 +310,76 @@ pub mod large_offsets {
         8 * large_offsets as u64
     }
 }
+
+/// Information about the reverse index table, `midx-write.c`'s
+/// `MIDX_CHUNKID_REVINDEX`.
+///
+/// One `u32` per object, in *pseudo-pack order* — the order
+/// `midx_pack_order_cmp()` (git 2.55.0 midx-write.c:644-657) defines: by the
+/// pack the object lives in, and within a pack by its offset, with the
+/// preferred pack sorted ahead of every other. Each value is the object's
+/// position in the MIDX's lexicographic (`OIDL`) order, so the chunk is the map
+/// from a pack-order position back to a MIDX position — which is exactly what a
+/// multi-pack `.bitmap` needs, since its bits address pack order and its entry
+/// headers address lexicographic order.
+pub mod revindex {
+    use std::ops::Range;
+
+    /// The id uniquely identifying the reverse index.
+    pub const ID: gix_chunk::Id = *b"RIDX";
+
+    /// Return the number of bytes needed to store `entries` positions.
+    pub fn storage_size(entries: usize) -> u64 {
+        (entries * 4) as u64
+    }
+
+    pub(crate) fn write(pack_order: &[u32], out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        // `hashwrite_be32(f, ctx->pack_order[i] + nr_base)`, with `nr_base` zero
+        // for a non-incremental MIDX — the only kind written here.
+        for position in pack_order {
+            out.write_all(&position.to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Return true if the `offset` range holds one `u32` per object.
+    pub fn is_valid(offset: &Range<usize>, num_objects: u32) -> bool {
+        (offset.end - offset.start) == (num_objects as usize).saturating_mul(4)
+    }
+}
+
+/// Information about the bitmapped-packs table, `midx-write.c`'s
+/// `MIDX_CHUNKID_BITMAPPEDPACKS`.
+///
+/// Two `u32` per pack — the position its first object takes in pack order, and
+/// how many objects it contributes — so a reader holding a multi-pack bitmap
+/// can tell which slice of the bit space belongs to which pack without
+/// decoding the reverse index (`write_midx_bitmapped_packs()`,
+/// git 2.55.0 midx-write.c:487-513).
+pub mod bitmapped_packs {
+    use std::ops::Range;
+
+    /// The id uniquely identifying the bitmapped-packs table.
+    pub const ID: gix_chunk::Id = *b"BTMP";
+
+    /// Return the number of bytes needed to describe `packs` packs.
+    pub fn storage_size(packs: usize) -> u64 {
+        (packs * (4 /*bitmap position*/ + 4/*bitmapped object count*/)) as u64
+    }
+
+    pub(crate) fn write(
+        positions_and_counts: &[(u32, u32)],
+        out: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        for (position, count) in positions_and_counts {
+            out.write_all(&position.to_be_bytes())?;
+            out.write_all(&count.to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Return true if the `offset` range holds two `u32` per pack.
+    pub fn is_valid(offset: &Range<usize>, num_packs: u32) -> bool {
+        (offset.end - offset.start) == (num_packs as usize).saturating_mul(8)
+    }
+}

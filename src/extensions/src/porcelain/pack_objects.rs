@@ -3629,8 +3629,6 @@ pub(crate) fn bitmap_file(
     packed: &Packed,
     options: &BitmapOptions,
 ) -> Option<Vec<u8>> {
-    use pack::data::output::bitmap;
-
     if packed.entries.is_empty() {
         return None;
     }
@@ -3638,12 +3636,7 @@ pub(crate) fn bitmap_file(
     // The two coordinate systems a `.bitmap` uses: bits address pack positions
     // (offset order, which is how `packed.entries` was built), entry headers and
     // the hash cache address index positions (object id order).
-    let pack_position: std::collections::HashMap<ObjectId, u32> = packed
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(at, entry)| (entry.id, at as u32))
-        .collect();
+    let pack_order: Vec<ObjectId> = packed.entries.iter().map(|entry| entry.id).collect();
     let mut by_oid: Vec<&PackedEntry> = packed.entries.iter().collect();
     by_oid.sort_unstable_by_key(|entry| entry.id);
     let index_position: std::collections::HashMap<ObjectId, u32> = by_oid
@@ -3669,12 +3662,58 @@ pub(crate) fn bitmap_file(
         let merge = commit.parent_ids().count() > 1;
         commits.push((entry.id, date, merge, preferred.contains(&entry.id)));
     }
-    if commits.is_empty() {
-        return None;
-    }
     commits.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let selected_ids = select_commits(&commits);
+    build_bitmap(
+        repo,
+        &packed.id,
+        &pack_order,
+        &kinds,
+        &name_hashes,
+        &index_position,
+        &commits,
+        options,
+    )
+}
+
+/// The half of a `.bitmap` that is the same for a pack and for a multi-pack
+/// index, given both coordinate systems spelled out.
+///
+/// A single-pack bitmap addresses its bits by *pack position* (offset order)
+/// and its entry headers by *index position* (object id order). A multi-pack
+/// bitmap addresses its bits by the MIDX's pseudo-pack order —
+/// `midx_pack_order_cmp()`, which is `(preferred-demoted pack, offset)` — and
+/// its entry headers by the MIDX's lexicographic order. The two callers differ
+/// in nothing else, which is why git runs one `bitmap_writer_*` sequence for
+/// both (`write_midx_bitmap()`, midx-write.c:881-952, v2.55.0, and
+/// `write_pack_file()`).
+///
+/// `pack_order` is the object ids in bit order, `kinds` is indexed the same way,
+/// `name_hashes` and `index_position` address the entry-header order, and
+/// `commits` is the candidate list newest-first.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn build_bitmap(
+    repo: &gix::Repository,
+    checksum: &gix::hash::oid,
+    pack_order: &[ObjectId],
+    kinds: &[gix::object::Kind],
+    name_hashes: &[u32],
+    index_position: &std::collections::HashMap<ObjectId, u32>,
+    commits: &[(ObjectId, i64, bool, bool)],
+    options: &BitmapOptions,
+) -> Option<Vec<u8>> {
+    use pack::data::output::bitmap;
+
+    if pack_order.is_empty() || commits.is_empty() {
+        return None;
+    }
+    let pack_position: std::collections::HashMap<ObjectId, u32> = pack_order
+        .iter()
+        .enumerate()
+        .map(|(at, id)| (*id, at as u32))
+        .collect();
+
+    let selected_ids = select_commits(commits);
 
     // Ascending date, so that walking a commit is most likely to run into an
     // ancestor whose bitmap has already been computed.
@@ -3683,7 +3722,7 @@ pub(crate) fn bitmap_file(
         commits.iter().map(|(id, date, _, _)| (*id, *date)).collect();
     order.sort_by_key(|id| dates.get(id).copied().unwrap_or(0));
 
-    let words = packed.entries.len().div_ceil(64);
+    let words = pack_order.len().div_ceil(64);
     let mut computed: std::collections::HashMap<ObjectId, Vec<u64>> = std::collections::HashMap::new();
     for id in &order {
         let Some(reachable) = reachable_bitmap(repo, *id, words, &pack_position, &computed) else {
@@ -3736,9 +3775,9 @@ pub(crate) fn bitmap_file(
 
     bitmap::write(
         repo.object_hash(),
-        &packed.id,
-        &kinds,
-        &name_hashes,
+        checksum,
+        kinds,
+        name_hashes,
         selected,
         &pseudo_merges,
         bitmap::Options {
@@ -3963,7 +4002,7 @@ fn gitexp(mut base: f64, mut exp: i32) -> f64 {
 /// A prefix without a trailing slash grows one, so `refs/heads` matches
 /// `refs/heads/main` but not `refs/headsfoo`. Tags are peeled, since it is the
 /// commit that can carry a bitmap, not the tag object.
-fn preferred_tip_commits(repo: &gix::Repository, prefixes: &[String]) -> HashSet<ObjectId> {
+pub(crate) fn preferred_tip_commits(repo: &gix::Repository, prefixes: &[String]) -> HashSet<ObjectId> {
     let mut out = HashSet::new();
     for prefix in prefixes {
         let prefix = if prefix.ends_with('/') {

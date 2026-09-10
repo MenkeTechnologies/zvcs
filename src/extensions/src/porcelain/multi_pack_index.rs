@@ -1,7 +1,7 @@
 //! `git multi-pack-index` — write, verify, expire and compact a multi-pack-index (MIDX).
 //!
 //! Covered: the `write`, `verify` and `expire` sub-commands in their default
-//! (v1, non-incremental, non-bitmap) form, `compact`'s argument handling and
+//! (v1, non-incremental) form and `write --bitmap`, `compact`'s argument handling and
 //! chain lookup, the global `--object-dir=<dir>` / `--object-dir <dir>` /
 //! `--no-object-dir` and `--progress` / `--no-progress` options, and the `-h`
 //! usage blocks for the top level and for `write`, `verify`, `expire`,
@@ -12,8 +12,8 @@
 //! `gix_pack::multi_index::write_from_index_paths` emits the same header
 //! (`MIDX`, version 1, hash id, chunk count, zero base files, pack count), the
 //! same four chunks in the same order (`PNAM`, `OIDF`, `OIDL`, `OOFF`, plus
-//! `LOFF` when a pack exceeds 2 GiB), the same 4-byte `PNAM` padding, the same
-//! pack ordering (index basenames sorted), and the same duplicate resolution
+//! `LOFF` when a pack exceeds 2 GiB, and `RIDX` + `BTMP` for `--bitmap`), the
+//! same 4-byte `PNAM` padding, the same pack ordering (index basenames sorted), and the same duplicate resolution
 //! (highest `.idx` mtime wins, ties broken by ascending pack index) that
 //! `midx-write.c`'s `midx_oid_compare()` uses when no preferred pack is given.
 //!
@@ -68,11 +68,14 @@
 //! `write --refs-snapshot=<path>` (and its separate-argument form) is accepted
 //! and discarded: git only consults the snapshot when generating a multi-pack
 //! bitmap, so without `--bitmap` it never influences a single output byte — git
-//! does not even open the file.
+//! does not even open the file. With `--bitmap` the snapshot would replace the
+//! ref walk that chooses which commits get an entry, which is not ported: the
+//! commit set is always the one `refs_for_each_ref()` produces.
 //!
-//! `write --preferred-pack=<name>` is honoured wherever it is observable without
-//! a bitmap, which is duplicate-object resolution. When the named pack is not
-//! among those being indexed, git warns `unknown preferred pack: '<name>'` and
+//! `write --preferred-pack=<name>` is honoured where it is observable:
+//! duplicate-object resolution, and — with `--bitmap` — the pseudo-pack order
+//! the `RIDX` chunk and the bitmap's bits are laid out in. When the named pack
+//! is not among those being indexed, git warns `unknown preferred pack: '<name>'` and
 //! falls back to its default resolution (newest `.idx` mtime, then lowest pack
 //! index) — exactly what `write_from_index_paths` already does — so that path is
 //! reproduced warning-for-warning and byte-for-byte. A *known* preferred pack
@@ -89,17 +92,12 @@
 //!
 //! Not covered — these `bail!` rather than producing a diverging artifact:
 //!
-//!   * `write --bitmap` — the vendored `gix-pack` has no multi-pack bitmap
-//!     writer at all (`src/ported/gix-pack/src/multi_index/` has `write.rs` and
-//!     `verify.rs` but no bitmap module), so the emitted `.bitmap`/`.rev` could
-//!     not match git's. The refusal comes only once there is something to index:
-//!     `write_midx_internal()` fails on an empty pack set before it reaches any
-//!     bitmap work, so `write --bitmap` in a repository with no packs answers
-//!     `error: no pack files to index.` / exit 255 exactly as git does.
 //!   * `write --preferred-pack=<name>` when the named pack is present *and* the
-//!     indexed packs share an object id — the only case the value changes the
-//!     MIDX bytes. `write_from_index_paths` takes only a path list and resolves
-//!     duplicates by mtime/index, with no hook for the preferred-pack tie-break.
+//!     indexed packs share an object id — the only case the value changes which
+//!     copy of the object the MIDX names. `write_from_index_paths` resolves
+//!     duplicates by mtime/index, with no hook for the preferred-pack
+//!     tie-break. `--bitmap` picks a preferred pack of its own (the oldest by
+//!     mtime), so it bails on the same condition.
 //!   * `write --incremental` (with or without `--base=` /
 //!     `--no-write-chain-file`), and the actual collapsing step of `compact`
 //!     once both endpoints resolve — these read and write MIDX chain layers
@@ -539,21 +537,16 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         eprintln!("error: no pack files to index.");
         return Ok(ExitCode::from(255));
     }
-    // Only now — with packs to index — does the missing bitmap writer matter.
-    if bitmap {
-        crate::git_fatal!(
-            "multi-pack-index write --bitmap is not portable here — gix-pack has no multi-pack bitmap writer, so the emitted .bitmap/.rev would not match git's"
-        );
-    }
-
-    // `--preferred-pack` only steers duplicate-object resolution and bitmap
-    // reuse. git warns and falls back to its default resolution when the named
-    // pack is not among those being indexed; that default is exactly the
+    // `--preferred-pack` steers duplicate-object resolution and, when the
+    // reverse-index chunks are written, the pseudo-pack order they encode. git
+    // warns and falls back to its default resolution when the named pack is not
+    // among those being indexed; that default is exactly the
     // `write_from_index_paths` tie-break (newest `.idx` mtime, then lowest pack
     // index), so an unknown preferred pack stays byte-identical. A *known*
     // preferred pack changes the winner only when the same object id appears in
     // more than one of the indexed packs — the one case gix-pack's writer cannot
     // reproduce, so it bails there and nowhere else.
+    let mut preferred_index_name: Option<std::ffi::OsString> = None;
     if let Some(name) = &preferred {
         if preferred_pack_present(name, &index_paths) {
             if has_cross_pack_duplicates(&index_paths, repo.object_hash())? {
@@ -561,18 +554,386 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                     "multi-pack-index write --preferred-pack={name} cannot be reproduced here — the indexed packs share at least one object id and gix_pack::multi_index::write_from_index_paths does not expose the preferred-pack tie-break git uses to resolve the duplicate"
                 );
             }
+            preferred_index_name = index_name_of(name, &index_paths);
         } else {
             eprintln!("warning: unknown preferred pack: '{name}'");
         }
+    } else if bitmap {
+        // ```c
+        // } else if (ctx.nr &&
+        //            (opts->flags & (MIDX_WRITE_REV_INDEX | MIDX_WRITE_BITMAP))) {
+        //         struct packed_git *oldest = ctx.info[0].p;
+        //         ctx.preferred_pack_idx = 0;
+        // ```
+        //
+        // (midx-write.c:1458-1497, v2.55.0.) `--bitmap` always picks a preferred
+        // pack, so that "the pack from which the first object is selected in
+        // pseudo pack-order has all of its objects selected from that pack".
+        preferred_index_name = default_preferred_pack(&pack_dir, &index_paths);
+        if preferred_index_name.is_some() && has_cross_pack_duplicates(&index_paths, repo.object_hash())? {
+            anyhow::bail!(
+                "multi-pack-index write --bitmap cannot be reproduced here — the indexed packs share at least one object id, and the preferred pack git picks for a bitmap write resolves that duplicate by a rule gix_pack::multi_index::write_from_index_paths does not expose"
+            );
+        }
     }
 
-    if !write_midx_from(&pack_dir, repo.object_hash(), index_paths)? {
+    // `--bitmap` is `OPT_BIT(0, "bitmap", &opts.flags, ..., MIDX_WRITE_BITMAP |
+    // MIDX_WRITE_REV_INDEX)` (builtin/multi-pack-index.c:155-156), and the two
+    // reverse-index chunks are planned for either bit
+    // (midx-write.c:1674-1682) — so a bitmap write is also the only write whose
+    // MIDX carries `RIDX` and `BTMP`. The separate `multi-pack-index-<hash>.rev`
+    // file is *not* written: that is gated on `GIT_TEST_MIDX_WRITE_REV`
+    // (midx-write.c:1691-1693).
+    let bitmap_order = bitmap.then(|| multi_index::write::BitmapOrder {
+        preferred_index_name,
+    });
+
+    // ```c
+    // if (midx && !midx_needs_update(midx, &ctx)) {
+    //         [...]
+    //         if (bitmap_exists || !want_bitmap) {
+    //                 if (!want_bitmap)
+    //                         clear_midx_files_ext(ctx.source, "bitmap", NULL);
+    //                 result = 0;
+    //                 goto cleanup;
+    //         }
+    // }
+    // ```
+    //
+    // (midx-write.c:1405-1435, v2.55.0.) A MIDX that already covers exactly this
+    // pack set is left alone, bytes and mtime both — so a plain `write` after a
+    // `write --bitmap` does *not* strip the `RIDX` and `BTMP` chunks the bitmap
+    // write added; it only drops the bitmap itself. Rewriting instead would
+    // leave a MIDX stock never produces from this sequence.
+    if !midx_needs_update(&pack_dir, &index_paths) {
+        if bitmap {
+            if midx_bitmap_present(&pack_dir) {
+                return Ok(ExitCode::SUCCESS);
+            }
+        } else {
+            clear_midx_bitmaps(&pack_dir, None);
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    let Some(staged) = write_midx_from(&pack_dir, repo.object_hash(), index_paths, bitmap_order)?
+    else {
         // `midx-write.c`: `error(_("no pack files to index."))`, and cmd_* hands
         // the -1 straight back to git, which exits 255.
         eprintln!("error: no pack files to index.");
         return Ok(ExitCode::from(255));
+    };
+
+    // git holds the MIDX in a lock file for the whole of `write_midx_internal()`
+    // and only calls `commit_lock_file()` once the bitmap is on disk
+    // (midx-write.c:1700-1725, 1820-1825). A bitmap that cannot be built
+    // therefore leaves *no* MIDX behind, not a MIDX without one — measured on
+    // stock 2.55.0, whose `--stdin-packs` write of one pack of a two-pack
+    // repository reports `Packfile doesn't have full closure` and leaves the
+    // pack directory exactly as it found it.
+    if bitmap && !write_midx_bitmap(&repo, &pack_dir, &staged.checksum, &staged.written)? {
+        staged.roll_back();
+        // `error(_("could not write multi-pack bitmap"))` and the `goto cleanup`
+        // that leaves `result` at its initial `-1` (midx-write.c:1270, 1717-1722).
+        eprintln!("error: could not write multi-pack bitmap");
+        return Ok(ExitCode::from(255));
     }
+    staged.commit(&pack_dir)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `midx_needs_update()` (midx-write.c:1147-1229, v2.55.0), for the flat,
+/// non-compacting write this port performs.
+///
+/// An existing MIDX may be left alone when its checksum verifies, its version is
+/// the one about to be written, and it covers *exactly* the pack set being
+/// indexed — compared by basename with the extension stripped, since the MIDX
+/// tracks `.idx` names and the pack list tracks `.pack` files.
+///
+/// Anything unreadable answers "yes, update": that is `midx_checksum_valid()`
+/// failing, which is the case git treats as no usable MIDX at all.
+fn midx_needs_update(pack_dir: &Path, index_paths: &[PathBuf]) -> bool {
+    let Ok(midx) = multi_index::File::at(pack_dir.join("multi-pack-index"), None) else {
+        return true;
+    };
+    if midx.version() != multi_index::Version::V1 {
+        return true;
+    }
+    if midx.verify_checksum(&mut gix::progress::Discard, &AtomicBool::new(false)).is_err() {
+        return true;
+    }
+    if midx.num_indices() as usize != index_paths.len() {
+        return true;
+    }
+    let stem = |name: &std::ffi::OsStr| {
+        Path::new(name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let have: std::collections::HashSet<String> = index_paths
+        .iter()
+        .filter_map(|p| p.file_name())
+        .map(stem)
+        .collect();
+    midx.index_names().iter().any(|name| !have.contains(&stem(name.as_os_str())))
+}
+
+/// Whether a multi-pack `.bitmap` sits beside the MIDX; git's
+/// `prepare_midx_bitmap_git()` plus `bitmap_is_midx()`.
+fn midx_bitmap_present(pack_dir: &Path) -> bool {
+    dir_names(pack_dir)
+        .iter()
+        .any(|name| name.starts_with("multi-pack-index-") && name.ends_with(".bitmap"))
+}
+
+/// `clear_midx_files_ext(source, "bitmap"/"rev", keep)`: drop every multi-pack
+/// bitmap and reverse index except the one `keep` names.
+fn clear_midx_bitmaps(pack_dir: &Path, keep: Option<&str>) {
+    for name in dir_names(pack_dir) {
+        if !name.starts_with("multi-pack-index-") {
+            continue;
+        }
+        if !(name.ends_with(".bitmap") || name.ends_with(".rev")) {
+            continue;
+        }
+        if keep.is_some_and(|prefix| name.starts_with(prefix)) {
+            continue;
+        }
+        fs::remove_file(pack_dir.join(name)).ok();
+    }
+}
+
+/// The `.idx` file name of the pack a `--preferred-pack` value names.
+///
+/// git's `cmp_idx_or_pack_name()` accepts either spelling; [`preferred_pack_present`]
+/// has already decided that one of the indexed packs answers to it.
+fn index_name_of(name: &str, index_paths: &[PathBuf]) -> Option<std::ffi::OsString> {
+    let base = name.strip_suffix(".idx").or_else(|| name.strip_suffix(".pack"))?;
+    let idx = format!("{base}.idx");
+    index_paths
+        .iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(idx.as_str()))
+        .and_then(|p| p.file_name().map(ToOwned::to_owned))
+}
+
+/// The preferred pack a `--bitmap` write picks for itself: the **oldest** of the
+/// indexed packs by `.pack` mtime.
+///
+/// ```c
+/// struct packed_git *oldest = ctx.info[0].p;
+/// ctx.preferred_pack_idx = 0;
+/// [...]
+/// for (size_t i = 1; i < ctx.nr; i++) {
+///         struct packed_git *p = ctx.info[i].p;
+///         if (!oldest->num_objects || p->mtime < oldest->mtime) {
+///                 oldest = p;
+///                 open_pack_index(oldest);
+///                 ctx.preferred_pack_idx = i;
+///         }
+/// }
+/// if (!oldest->num_objects)
+///         ctx.preferred_pack_idx = NO_PREFERRED_PACK;
+/// ```
+///
+/// (midx-write.c:1458-1497, v2.55.0.) Three details are load-bearing and each is
+/// reproduced here rather than tidied:
+///
+///  * **The order is `readdir`'s, not sorted.** `ctx.info` is filled by
+///    `for_each_file_in_pack_dir()`, which is a bare `readdir` loop
+///    (packfile.c:944-977), and is only sorted by name later
+///    (midx-write.c:1533) — after this choice is made. So the pack that seeds
+///    `oldest`, and therefore wins every mtime tie, is whichever `.idx` the
+///    directory happens to hand out first.
+///  * **The comparison is `<`, so ties keep the incumbent** — which is what
+///    makes the seed matter at all. Two packs written in the same second tie.
+///  * **`mtime` is `st_mtime`**, whole seconds, so a sub-second difference is
+///    not one.
+///
+/// `None` is git's `NO_PREFERRED_PACK`, reached when the pack that won holds no
+/// objects at all.
+fn default_preferred_pack(pack_dir: &Path, index_paths: &[PathBuf]) -> Option<std::ffi::OsString> {
+    let wanted: std::collections::HashSet<&std::ffi::OsStr> =
+        index_paths.iter().filter_map(|p| p.file_name()).collect();
+    let mut candidates: Vec<std::ffi::OsString> = Vec::new();
+    for entry in fs::read_dir(pack_dir).ok()?.filter_map(std::result::Result::ok) {
+        let name = entry.file_name();
+        if wanted.contains(name.as_os_str()) {
+            candidates.push(name);
+        }
+    }
+
+    /// `(st_mtime of the pack, objects in the index)`, git's `packed_git` pair.
+    fn probe(pack_dir: &Path, idx: &std::ffi::OsStr) -> (u64, u32) {
+        let idx_path = pack_dir.join(idx);
+        let mtime = idx_path
+            .with_extension("pack")
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let objects = gix::odb::pack::index::File::at(&idx_path, gix::hash::Kind::Sha1)
+            .map(|f| f.num_objects())
+            .unwrap_or(0);
+        (mtime, objects)
+    }
+
+    let mut chosen = candidates.first()?.clone();
+    let (mut mtime, mut objects) = probe(pack_dir, &chosen);
+    for candidate in candidates.iter().skip(1) {
+        let (candidate_mtime, candidate_objects) = probe(pack_dir, candidate);
+        if objects == 0 || candidate_mtime < mtime {
+            chosen = candidate.clone();
+            mtime = candidate_mtime;
+            objects = candidate_objects;
+        }
+    }
+    (objects != 0).then_some(chosen)
+}
+
+/// `write_midx_bitmap()` (midx-write.c:881-952, v2.55.0): the multi-pack
+/// `.bitmap`, written beside the MIDX it belongs to and named after the MIDX's
+/// own checksum.
+///
+/// # The two coordinate systems, which are the whole difference from a pack
+///
+/// A single-pack `.bitmap` addresses its bits by pack position and its entry
+/// headers by index position. A multi-pack one addresses its bits by the MIDX's
+/// *pseudo-pack* order — `midx_pack_order_cmp()`, which the `RIDX` chunk records
+/// — and its entry headers by the MIDX's lexicographic order, which is how the
+/// `OIDL` chunk stores the objects. git spells this out by building one `index`
+/// array in pack order for `bitmap_writer_build_type_index()` and then
+/// permuting it into lexicographic order for `bitmap_writer_finish()`
+/// (midx-write.c:908-938); the two arrays are handed separately to
+/// [`super::pack_objects::build_bitmap`] here.
+///
+/// The checksum stored in the header is the MIDX hash rather than a pack hash
+/// (`bitmap_writer_set_checksum(&writer, midx_hash)`), and the name hashes are
+/// all zero: `prepare_midx_packing_data()` allocates each object with
+/// `packlist_alloc()` and never sets `->hash`, so the hash cache a MIDX bitmap
+/// carries is a table of zeroes — confirmed on stock 2.55.0, whose 586-byte
+/// bitmap over 31 objects ends in 124 zero bytes before its trailer.
+///
+/// Answers whether the bitmap was written; `false` is git's
+/// `bitmap_writer_build()` failure, which fails the whole command.
+fn write_midx_bitmap(
+    repo: &gix::Repository,
+    pack_dir: &Path,
+    checksum: &gix::hash::oid,
+    written: &multi_index::write::Outcome,
+) -> Result<bool> {
+    // `pdata->objects`, which `prepare_midx_packing_data()` fills by walking
+    // `ctx->pack_order` — so position `i` in it is MIDX pack order.
+    let pack_order: Vec<gix::ObjectId> = written
+        .pack_order
+        .iter()
+        .map(|at| written.entries[*at as usize].id)
+        .collect();
+    let index_position: std::collections::HashMap<gix::ObjectId, u32> = written
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(at, entry)| (entry.id, at as u32))
+        .collect();
+
+    // `bitmap_writer_build_type_index()` reads each object's type out of the
+    // `object_entry`, which for a MIDX carries none — `packlist_alloc()` leaves
+    // it `OBJ_NONE`, so git falls through to `odb_read_object_info()` for every
+    // one of them. The same lookup, once per object, in the same order.
+    let mut kinds: Vec<gix::object::Kind> = Vec::with_capacity(pack_order.len());
+    for id in &pack_order {
+        let Ok(header) = repo.find_header(*id) else {
+            return Ok(false);
+        };
+        kinds.push(header.kind());
+    }
+    let name_hashes = vec![0u32; written.entries.len()];
+
+    // `find_commits_for_midx_bitmap()`: every commit reachable from a ref that
+    // the MIDX also holds, which is `traverse_commit_list()` over the pending
+    // set `add_ref_to_pending()` built, filtered by `oid_pos()` against the MIDX
+    // entries (midx-write.c:790-800, 838-878).
+    let mut options = super::pack_objects::BitmapOptions::from_repo(repo);
+    options.write = true;
+    let preferred_tips = super::pack_objects::preferred_tip_commits(repo, &options.preferred_tips);
+    let mut tips: Vec<gix::ObjectId> = Vec::new();
+    if let Ok(platform) = repo.references() {
+        if let Ok(all) = platform.all() {
+            for reference in all.flatten() {
+                let mut reference = reference;
+                // `reference_get_peeled_oid()` then `object->type != OBJ_COMMIT`:
+                // a tag is followed to the commit, and anything that is not one
+                // is dropped.
+                let Ok(id) = reference.peel_to_id_in_place() else {
+                    continue;
+                };
+                let id = id.detach();
+                if repo.find_commit(id).is_ok() {
+                    tips.push(id);
+                }
+            }
+        }
+    }
+    tips.sort_unstable();
+    tips.dedup();
+    let mut commits: Vec<(gix::ObjectId, i64, bool, bool)> = Vec::new();
+    if let Ok(walk) = repo.rev_walk(tips).all() {
+        for info in walk.flatten() {
+            let id = info.id;
+            if !index_position.contains_key(&id) {
+                continue;
+            }
+            let Ok(commit) = repo.find_commit(id) else {
+                continue;
+            };
+            let date = commit.time().map(|time| time.seconds).unwrap_or(0);
+            let merge = commit.parent_ids().count() > 1;
+            commits.push((id, date, merge, preferred_tips.contains(&id)));
+        }
+    }
+    // `prepare_revision_walk()` hands the traversal a date-ordered queue, so the
+    // list `bitmap_writer_select_commits()` walks is newest first.
+    commits.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let Some(bytes) = super::pack_objects::build_bitmap(
+        repo,
+        checksum,
+        &pack_order,
+        &kinds,
+        &name_hashes,
+        &index_position,
+        &commits,
+        &options,
+    ) else {
+        return Ok(false);
+    };
+
+    // `get_midx_filename_ext(source, &bitmap_name, midx_hash, MIDX_EXT_BITMAP)`:
+    // `multi-pack-index-<midx checksum>.bitmap`, beside the MIDX.
+    //
+    // Written through a temporary and renamed, as `bitmap_writer_finish()` does
+    // (`hashfd` on a `mks_tempfile` then `finalize_object_file()`): the file it
+    // replaces is mode `0444`, so writing in place fails with `EACCES` the
+    // second time the same bitmap is produced.
+    let path = pack_dir.join(format!("multi-pack-index-{checksum}.bitmap"));
+    let tmp = pack_dir.join(format!("multi-pack-index-{checksum}.bitmap.tmp"));
+    fs::write(&tmp, &bytes)?;
+    // `finalize_object_file()` leaves every pack sidecar read-only.
+    let mut perms = fs::metadata(&tmp)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o444);
+    }
+    #[cfg(not(unix))]
+    perms.set_readonly(true);
+    fs::set_permissions(&tmp, perms)?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        fs::remove_file(&tmp).ok();
+        return Err(e.into());
+    }
+    Ok(true)
 }
 
 /// Read the `--stdin-packs` name set from stdin: one `.idx` basename per line,
@@ -636,7 +997,13 @@ fn has_cross_pack_duplicates(index_paths: &[PathBuf], object_hash: gix::hash::Ki
 /// git writes through `multi-pack-index.lock` and renames on success, so a
 /// failed write never replaces a good index; this does the same.
 pub(crate) fn write_midx(pack_dir: &Path, object_hash: gix::hash::Kind) -> Result<bool> {
-    write_midx_from(pack_dir, object_hash, pack_indices(pack_dir))
+    match write_midx_from(pack_dir, object_hash, pack_indices(pack_dir), None)? {
+        Some(staged) => {
+            staged.commit(pack_dir)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// [`write_midx`] over the non-cruft packs only — the set `repack-midx.c:199-235`
@@ -651,7 +1018,13 @@ pub(crate) fn write_midx_without_cruft(
     pack_dir: &Path,
     object_hash: gix::hash::Kind,
 ) -> Result<bool> {
-    write_midx_from(pack_dir, object_hash, non_cruft_pack_indices(pack_dir))
+    match write_midx_from(pack_dir, object_hash, non_cruft_pack_indices(pack_dir), None)? {
+        Some(staged) => {
+            staged.commit(pack_dir)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// [`pack_indices`] minus every pack with a `.mtimes` beside it.
@@ -681,9 +1054,10 @@ fn write_midx_from(
     pack_dir: &Path,
     object_hash: gix::hash::Kind,
     index_paths: Vec<PathBuf>,
-) -> Result<bool> {
+    bitmap_order: Option<multi_index::write::BitmapOrder>,
+) -> Result<Option<StagedMidx>> {
     if index_paths.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
     let lock = pack_dir.join("multi-pack-index.lock");
@@ -699,31 +1073,61 @@ fn write_midx_from(
         &mut out,
         &mut gix::progress::Discard,
         &AtomicBool::new(false),
-        multi_index::write::Options { object_hash },
+        multi_index::write::Options {
+            object_hash,
+            bitmap_order,
+        },
     );
 
     let flushed = out.flush();
     drop(out);
-    if let Err(e) = result {
-        fs::remove_file(&lock).ok();
-        return Err(e.into());
-    }
+    let written = match result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            fs::remove_file(&lock).ok();
+            return Err(e.into());
+        }
+    };
     if let Err(e) = flushed {
         fs::remove_file(&lock).ok();
         return Err(e.into());
     }
-    fs::rename(&lock, pack_dir.join("multi-pack-index"))?;
+    Ok(Some(StagedMidx {
+        lock,
+        checksum: written.multi_index_checksum,
+        written,
+    }))
+}
 
-    // `clear_midx_files_ext()`: a MIDX written without a bitmap invalidates any
-    // bitmap and reverse index left over from an earlier `write --bitmap`.
-    for name in dir_names(pack_dir) {
-        if name.starts_with("multi-pack-index-")
-            && (name.ends_with(".bitmap") || name.ends_with(".rev"))
-        {
-            fs::remove_file(pack_dir.join(name)).ok();
-        }
+/// A MIDX written into `multi-pack-index.lock` and not yet in place.
+///
+/// git's `struct lock_file`: `write_midx_internal()` holds the lock across the
+/// bitmap build and only calls `commit_lock_file()` at the very end
+/// (midx-write.c:1653, 1820-1825), so a failure between the two leaves the
+/// object directory as it was rather than half-updated.
+struct StagedMidx {
+    lock: PathBuf,
+    checksum: gix::ObjectId,
+    written: multi_index::write::Outcome,
+}
+
+impl StagedMidx {
+    /// `commit_lock_file()` followed by `clear_midx_files()`
+    /// (midx-write.c:1821-1824): the MIDX takes its place, and every
+    /// `multi-pack-index-<hash>.{bitmap,rev}` whose hash is not the one just
+    /// written goes with the MIDX it belonged to. A bitmap written for *this*
+    /// hash is kept, which is what `keep_hashes` is for.
+    fn commit(self, pack_dir: &Path) -> Result<()> {
+        fs::rename(&self.lock, pack_dir.join("multi-pack-index"))?;
+        clear_midx_bitmaps(pack_dir, Some(&format!("multi-pack-index-{}", self.checksum)));
+        Ok(())
     }
-    Ok(true)
+
+    /// The `goto cleanup` that never reaches `commit_lock_file()`: the lock is
+    /// rolled back and the MIDX that was in place — if any — stays.
+    fn roll_back(self) {
+        fs::remove_file(&self.lock).ok();
+    }
 }
 
 /// `verify`: check the MIDX against the pack indices it references.
@@ -1770,5 +2174,43 @@ mod tests {
         fs::create_dir_all(&dir).expect("scratch dir");
         assert!(midx_chain_layers(&dir).is_empty());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `midx_pack_order()` without a preferred pack: every entry carries the
+    /// demotion bit, so the order is `(pack, offset)` and nothing else — and
+    /// each pack's `BTMP` row names where its first object landed and how many
+    /// it contributed.
+    #[test]
+    fn midx_pack_order_sorts_by_pack_then_offset() {
+        // Deliberately out of order, and with a *lower* offset in the later
+        // pack, so an implementation that sorted on offset alone would differ.
+        let placement = [(1u32, 5u64), (0, 90), (1, 1), (0, 20)];
+        let (order, per_pack) = multi_index::write::pack_order(&placement, None, 2);
+        assert_eq!(order, vec![3, 1, 2, 0]);
+        assert_eq!(per_pack, vec![(0, 2), (2, 2)]);
+    }
+
+    /// The preferred pack keeps its small key and therefore sorts ahead of every
+    /// other pack, whatever its own index is. This is the half that decides both
+    /// the `RIDX` chunk and which object a multi-pack `.bitmap` bit means, and
+    /// getting it wrong produces a file that decodes without complaint and
+    /// answers every question about the wrong objects.
+    #[test]
+    fn midx_pack_order_puts_the_preferred_pack_first() {
+        let placement = [(0u32, 10u64), (1, 10), (0, 20), (1, 20)];
+        let (order, per_pack) = multi_index::write::pack_order(&placement, Some(1), 2);
+        assert_eq!(order, vec![1, 3, 0, 2]);
+        assert_eq!(per_pack, vec![(2, 2), (0, 2)]);
+    }
+
+    /// "if (pack->bitmap_pos == BITMAP_POS_UNKNOWN) pack->bitmap_pos = 0;" — a
+    /// pack that contributed nothing still gets a `BTMP` row, and it names
+    /// position zero rather than the sentinel.
+    #[test]
+    fn midx_pack_order_gives_an_empty_pack_a_row_of_its_own() {
+        let placement = [(0u32, 10u64)];
+        let (order, per_pack) = multi_index::write::pack_order(&placement, None, 3);
+        assert_eq!(order, vec![0]);
+        assert_eq!(per_pack, vec![(0, 1), (0, 0), (0, 0)]);
     }
 }

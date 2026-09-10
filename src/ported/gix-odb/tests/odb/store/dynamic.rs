@@ -67,6 +67,7 @@ fn db_with_all_object_sources() -> crate::Result<(gix_odb::Handle, gix_testtools
         &std::sync::atomic::AtomicBool::default(),
         gix_odb::pack::multi_index::write::Options {
             object_hash: gix_hash::Kind::Sha1,
+            bitmap_order: None,
         },
     )?;
     Ok((gix_odb::at(objects_dir.path())?, objects_dir))

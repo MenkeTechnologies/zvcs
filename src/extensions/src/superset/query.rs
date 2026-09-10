@@ -556,21 +556,28 @@ fn tracked_count(repo: &gix::Repository) -> usize {
 pub fn zpristine(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
     let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
-    let ok = parallel_map(&repos, |gd, _| probe(gd, is_pristine, |_| false));
+    // `probe(.., |_| false)` would call a repository that could not be opened
+    // "not pristine", which is the right answer for the wrong reason and hides
+    // that it was never read. The count says how many were skipped instead.
+    let ok = parallel_map(&repos, |gd, _| probe_opt(gd, is_pristine));
     if json {
-        emit_json(repos.iter().zip(&ok).filter(|(_, p)| **p).map(|((_, wd), _)| {
+        emit_json(repos.iter().zip(&ok).filter(|(_, p)| **p == Some(true)).map(|((_, wd), _)| {
             serde_json::json!({"repo": wd.to_string_lossy()})
         }));
         return Ok(ExitCode::SUCCESS);
     }
     let mut shown = 0usize;
     for ((_, wd), p) in repos.iter().zip(&ok) {
-        if *p {
+        if *p == Some(true) {
             println!("{}", wd.display());
             shown += 1;
         }
     }
-    eprintln!("zpristine: {shown} of {} indexed are clean and in sync", repos.len());
+    eprintln!(
+        "zpristine: {shown} of {} indexed are clean and in sync{}",
+        repos.len(),
+        unreadable_note(unreadable(&ok))
+    );
     Ok(ExitCode::SUCCESS)
 }
 

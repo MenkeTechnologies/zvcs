@@ -16,6 +16,12 @@
 //!
 //! Two ways of being unopenable are covered, because they fail at different
 //! layers: a git dir that has been removed, and one whose permissions deny it.
+//!
+//! `zpristine` and `zorphans` are here for the same reason as `zdirty`: each
+//! asserts a property of a repository — clean and in sync, has no remote — and
+//! `probe(.., |_| false)` gave the answer "no" to a repository that was never
+//! read. "No" happens to keep it off the list, which is why the omission was
+//! invisible.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -155,10 +161,33 @@ fn a_fleet_that_reads_completely_says_nothing_about_unreadable_repositories() {
     ok(&home, &r, &["commit", "-q", "--allow-empty", "-m", "c0"]);
     ok(&home, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
 
-    for verb in ["zdirty", "zcommits", "ztags"] {
+    for verb in ["zdirty", "zcommits", "ztags", "zpristine", "zorphans"] {
         let out = both(&home, &root, &[verb]);
         assert!(!out.contains("unreadable"), "`git {verb}` reported an unreadable repository in a healthy fleet:\n{out}");
     }
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_property_is_not_asserted_about_a_repository_that_was_not_read() {
+    let Some((root, home)) = fixture("claims") else {
+        eprintln!("skipping: this process can read a 0o000 directory (running as root?)");
+        return;
+    };
+
+    // The readable repository here is dirty, so it is not pristine; what matters
+    // is that the two unopenable ones are reported as skipped rather than
+    // silently absent from a list that reads as complete.
+    let pristine = both(&home, &root, &["zpristine"]);
+    assert!(pristine.contains("2 unreadable"), "zpristine must disclose what it could not read:\n{pristine}");
+    assert!(pristine.contains("of 3 indexed"), "the selection size must still be reported:\n{pristine}");
+
+    // `zorphans` lists repositories with no remote. None of these has one, so
+    // the readable repository is listed and the other two are disclosed.
+    let orphans = both(&home, &root, &["zorphans"]);
+    assert!(orphans.contains("/good"), "the readable repository has no remote and must be listed:\n{orphans}");
+    assert!(orphans.contains("2 unreadable"), "zorphans must disclose what it could not read:\n{orphans}");
+
+    restore(&root);
 }

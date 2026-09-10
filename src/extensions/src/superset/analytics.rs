@@ -392,21 +392,29 @@ pub fn zdivergent(args: &[String]) -> Result<ExitCode> {
 pub fn zorphans(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
     let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
-    let no_remote = parallel_map(&repos, |gd, _| probe(gd, |r| r.remote_names().is_empty(), |_| false));
+    // An unreadable repository has no answer about its remotes; saying "it has
+    // one" excludes it from the list without a word.
+    let no_remote = parallel_map(&repos, |gd, _| {
+        crate::superset::query::probe_opt(gd, |r| r.remote_names().is_empty())
+    });
     if json {
-        emit_json(repos.iter().zip(&no_remote).filter(|(_, o)| **o).map(|((_, wd), _)| {
+        emit_json(repos.iter().zip(&no_remote).filter(|(_, o)| **o == Some(true)).map(|((_, wd), _)| {
             serde_json::json!({"repo": wd.to_string_lossy()})
         }));
         return Ok(ExitCode::SUCCESS);
     }
     let mut shown = 0usize;
     for ((_, wd), orphan) in repos.iter().zip(&no_remote) {
-        if *orphan {
+        if *orphan == Some(true) {
             println!("{}", wd.display());
             shown += 1;
         }
     }
-    eprintln!("zorphans: {shown} of {} indexed have no remote", repos.len());
+    eprintln!(
+        "zorphans: {shown} of {} indexed have no remote{}",
+        repos.len(),
+        crate::superset::query::unreadable_note(crate::superset::query::unreadable(&no_remote))
+    );
     Ok(ExitCode::SUCCESS)
 }
 

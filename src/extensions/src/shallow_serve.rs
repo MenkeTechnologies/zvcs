@@ -22,6 +22,15 @@
 //!     passes is kept, and a kept commit becomes a boundary only when it has a
 //!     parent that did not pass.
 //!
+//! `deepen-relative` is not a third rule. `get_shallow_commits()`
+//! (shallow.c:243-256) turns it into the first one before any boundary is
+//! computed: it measures how far below the wants the client's own cutoff sits and
+//! adds that to the requested count, so the walk that follows is an ordinary
+//! `deepen <n>` from the same tips. A request with no cutoff to measure from —
+//! a client that is not shallow at all, or whose cutoffs this fetch's wants
+//! cannot reach — returns NULL without walking, which is silence on the wire and
+//! an uncut pack rather than a boundary at the wants.
+//!
 //! A repository that is itself shallow contributes its own grafts to both rules:
 //! its cutoff commits are parentless as far as this walk is concerned, and they
 //! are boundaries in their own right, because a client cannot be told to expect
@@ -123,6 +132,16 @@ pub struct Boundary {
     pub unshallow: Vec<ObjectId>,
     /// Every commit inside the window, boundary included — the pack's commit set.
     pub commits: Vec<ObjectId>,
+    /// Whether a window was computed at all, and so whether the pack is cut to
+    /// [`Self::commits`].
+    ///
+    /// `get_shallow_commits()` (shallow.c:243-256) answers a `deepen-relative`
+    /// request with NULL *before walking* when there is no cutoff of the client's
+    /// below the wants to measure from. Nothing is flagged, so `send_shallow()`
+    /// and `send_unshallow()` both write nothing and the pack `upload-pack` goes
+    /// on to build is an ordinary one — bounded by the client's grafts, not by a
+    /// window this walk never produced.
+    pub windowed: bool,
 }
 
 /// A repository's own grafts, as a set. A commit in here is walked as if it had
@@ -154,17 +173,26 @@ fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
     object.peel_to_kind(gix::objs::Kind::Commit).ok().map(|c| c.id)
 }
 
-/// `get_shallow_commits()` (shallow.c:59-108): breadth-first from `tips`, cutting
-/// at `depth` hops. The tips are depth 1, so `depth == 1` makes every tip a
-/// boundary and fetches nothing behind them.
-///
-/// Returns the visited commits and, separately, the ones that are boundaries.
+/// One depth walk's answer.
+struct DepthWalk {
+    /// Every commit the walk reached, boundary included, in visit order.
+    visited: Vec<ObjectId>,
+    /// The ones the walk stopped at.
+    boundary: HashSet<ObjectId>,
+    /// The shallowest depth each visited commit was reached at, which is the
+    /// `commit_depth` slab `get_shallows_or_depth()` carries alongside its walk.
+    depth_of: HashMap<ObjectId, u32>,
+}
+
+/// `get_shallows_or_depth()` (shallow.c:139-232) in its boundary mode: breadth-first
+/// from `tips`, cutting at `depth` hops. The tips are depth 1, so `depth == 1`
+/// makes every tip a boundary and fetches nothing behind them.
 fn walk_by_depth(
     repo: &gix::Repository,
     tips: &[ObjectId],
     depth: u32,
     grafts: &HashSet<ObjectId>,
-) -> (Vec<ObjectId>, HashSet<ObjectId>) {
+) -> DepthWalk {
     let mut visited: Vec<ObjectId> = Vec::new();
     let mut boundary: HashSet<ObjectId> = HashSet::new();
     // The shallowest depth each commit was reached at; a later, deeper arrival
@@ -192,7 +220,30 @@ fn walk_by_depth(
             queue.push_back((parent, cur_depth.saturating_add(1)));
         }
     }
-    (visited, boundary)
+    DepthWalk { visited, boundary, depth_of: seen }
+}
+
+/// `get_shallows_depth()` (shallow.c:234-241): how far below the wants the
+/// client's own cutoff sits, which is what a `deepen-relative` request counts
+/// from.
+///
+/// `get_shallows_or_depth()`'s `shallows` mode runs the same walk with no depth
+/// limit — it stops only where this server's own grafts do — and keeps
+/// `cur_depth_shallow`, the *shallowest* depth any of the client's `shallow`
+/// commits was reached at. The tips are depth 1, so a client cutoff sitting at a
+/// want answers 1. Zero is the "not reachable at all" answer, and it is the one
+/// [`compute`] refuses on.
+fn shallows_depth(
+    repo: &gix::Repository,
+    tips: &[ObjectId],
+    grafts: &HashSet<ObjectId>,
+    client_shallow: &[ObjectId],
+) -> u32 {
+    if client_shallow.is_empty() {
+        return 0;
+    }
+    let depths = walk_by_depth(repo, tips, u32::MAX, grafts).depth_of;
+    client_shallow.iter().filter_map(|id| depths.get(id).copied()).min().unwrap_or(0)
 }
 
 /// `get_shallow_commits_by_rev_list()` (shallow.c:180-227): keep every commit the
@@ -253,30 +304,27 @@ pub fn compute(repo: &gix::Repository, wants: &[ObjectId], request: &Request) ->
     }
 
     let (visited, boundary) = if let Some(depth) = request.deepen.depth {
-        if request.deepen.relative {
-            // `deepen_relative`: the depth is measured from the client's own
-            // boundary, so the walk starts there — one hop deeper, because the
-            // client's boundary commit is a commit it already has.
-            let reachable = reachable_client_shallows(repo, &tips, &grafts, &request.client_shallow);
-            if reachable.is_empty() {
-                walk_by_depth(repo, &tips, depth, &grafts)
-            } else {
-                let (mut visited, boundary) =
-                    walk_by_depth(repo, &reachable, depth.saturating_add(1), &grafts);
-                // Everything between the wants and the client's boundary is
-                // already the client's, but it still belongs to the window — and
-                // the walk for it stops *at* that boundary, since anything behind
-                // it is what the relative walk above is deciding about.
-                let mut stop = grafts.clone();
-                stop.extend(request.client_shallow.iter().copied());
-                let (near, _) = walk_by_depth(repo, &tips, u32::MAX, &stop);
-                let inside: HashSet<ObjectId> = visited.iter().copied().collect();
-                visited.extend(near.into_iter().filter(|id| !inside.contains(id)));
-                (visited, boundary)
+        // `get_shallow_commits()` (shallow.c:243-256): `deepen-relative` is folded
+        // into the absolute depth before the boundary walk begins. The client's own
+        // cutoff is located below the wants and its depth is *added* to the
+        // requested count, so what runs is the same hop count from the same tips as
+        // a plain `deepen <n>` — not a second walk starting at the cutoff. The
+        // difference shows whenever the client has more than one cutoff at more than
+        // one depth: git measures the shallowest of them once and applies a single
+        // absolute cutoff, so a deeper cutoff is simply passed and unshallowed.
+        let depth = if request.deepen.relative {
+            match shallows_depth(repo, &tips, &grafts, &request.client_shallow) {
+                // "else return NULL": no cutoff below the wants to count from —
+                // a client that is not shallow at all sends no `shallow` line and
+                // lands here — so there is nothing to say and nothing to cut.
+                0 => return Boundary::default(),
+                cur_shallow_depth => depth.saturating_add(cur_shallow_depth),
             }
         } else {
-            walk_by_depth(repo, &tips, depth, &grafts)
-        }
+            depth
+        };
+        let walk = walk_by_depth(repo, &tips, depth, &grafts);
+        (walk.visited, walk.boundary)
     } else {
         let since = request.deepen.since;
         let excluded = ancestors_of_refs(repo, &request.deepen.not, &grafts);
@@ -313,24 +361,7 @@ pub fn compute(repo: &gix::Repository, wants: &[ObjectId], request: &Request) ->
         .filter(|id| inside.contains(id) && !boundary.contains(id))
         .collect();
 
-    Boundary { shallow, unshallow, commits: visited }
-}
-
-/// `get_reachable_list()` (upload-pack.c:620-664): the client's shallow commits
-/// that this fetch's wants can actually reach, which is where a relative deepen
-/// measures from.
-fn reachable_client_shallows(
-    repo: &gix::Repository,
-    tips: &[ObjectId],
-    grafts: &HashSet<ObjectId>,
-    client_shallow: &[ObjectId],
-) -> Vec<ObjectId> {
-    if client_shallow.is_empty() {
-        return Vec::new();
-    }
-    let (visited, _) = walk_by_depth(repo, tips, u32::MAX, grafts);
-    let reachable: HashSet<ObjectId> = visited.into_iter().collect();
-    client_shallow.iter().copied().filter(|id| reachable.contains(id)).collect()
+    Boundary { shallow, unshallow, commits: visited, windowed: true }
 }
 
 /// The `^<ref>` half of a `deepen-not` request: every commit reachable from the
@@ -356,7 +387,7 @@ fn ancestors_of_refs(
     if tips.is_empty() {
         return HashSet::new();
     }
-    walk_by_depth(repo, &tips, u32::MAX, grafts).0.into_iter().collect()
+    walk_by_depth(repo, &tips, u32::MAX, grafts).visited.into_iter().collect()
 }
 
 /// The commits the client can be assumed to hold, given what it said it `have`s
@@ -373,7 +404,7 @@ pub fn client_side_commits(
     if tips.is_empty() {
         return Vec::new();
     }
-    walk_by_depth(repo, &tips, u32::MAX, &grafts).0
+    walk_by_depth(repo, &tips, u32::MAX, &grafts).visited
 }
 
 /// The pack for a shallow request: everything the window's commits name, minus

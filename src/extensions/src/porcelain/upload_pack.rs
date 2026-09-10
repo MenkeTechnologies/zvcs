@@ -723,7 +723,10 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     // sending anything behind the boundary would contradict the `shallow` lines
     // just written.
     let mut objects = match &boundary {
-        Some(boundary) => crate::shallow_serve::objects_within(
+        // `windowed` is false when `get_shallow_commits()` answered a
+        // `deepen-relative` request with NULL: no window was computed, so the pack
+        // is the ordinary one the arms below build.
+        Some(boundary) if boundary.windowed => crate::shallow_serve::objects_within(
             repo,
             &wants,
             &boundary.commits,
@@ -733,7 +736,7 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
         // `register_shallow()` for each `shallow` line (upload-pack.c:1117-1119):
         // the client's cutoff becomes a graft for this walk too, so a plain fetch
         // into a shallow clone packs the new tips without reaching behind it.
-        None if !shallow_req.client_shallow.is_empty() => {
+        _ if !shallow_req.client_shallow.is_empty() => {
             let window =
                 crate::shallow_serve::client_side_commits(repo, &wants, &shallow_req.client_shallow);
             crate::shallow_serve::objects_within(
@@ -744,7 +747,7 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
                 &shallow_req.client_shallow,
             )
         }
-        None => crate::porcelain::push_proto::objects_to_send(repo, &wants, &common),
+        _ => crate::porcelain::push_proto::objects_to_send(repo, &wants, &common),
     };
     // `--filter=<spec>` on the `pack-objects` git spawns (upload-pack.c:340-344).
     // The `want`s go in as the exemption: they reach `pack-objects` as pending
@@ -2343,7 +2346,9 @@ fn send_pack_section(
     writer.write("packfile\n")?;
 
     let mut objects = match &boundary {
-        Some(boundary) => crate::shallow_serve::objects_within(
+        // As on v0: a `deepen-relative` request with no cutoff of the client's to
+        // count from computes no window, and the pack is not cut to one.
+        Some(boundary) if boundary.windowed => crate::shallow_serve::objects_within(
             repo,
             &args.wants,
             &boundary.commits,
@@ -2352,7 +2357,7 @@ fn send_pack_section(
         ),
         // `register_shallow()` for the client's own cutoff: its grafts bound this
         // walk too, so a plain fetch into a shallow clone stays inside it.
-        None if !args.shallow.client_shallow.is_empty() => {
+        _ if !args.shallow.client_shallow.is_empty() => {
             let window = crate::shallow_serve::client_side_commits(
                 repo,
                 &args.wants,
@@ -2366,7 +2371,7 @@ fn send_pack_section(
                 &args.shallow.client_shallow,
             )
         }
-        None => crate::porcelain::push_proto::objects_to_send(repo, &args.wants, &args.haves),
+        _ => crate::porcelain::push_proto::objects_to_send(repo, &args.wants, &args.haves),
     };
     // The `want`s are exempt from the filter; see the v0 half above.
     crate::porcelain::pack_objects::apply_filter(repo, args.filter.as_deref(), &args.wants, &mut objects);

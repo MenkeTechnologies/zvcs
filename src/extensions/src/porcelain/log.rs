@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
@@ -4037,6 +4037,46 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--graph` with `-S`/`-G`: the commits the pickaxe kept. `None` when no
     // pickaxe ran, which means every commit prints.
     let mut pickaxe_shown: Option<HashSet<ObjectId>> = None;
+    // `do_remerge_diff()` (log-tree.c:1029-1090) re-runs each merge into a temporary
+    // object directory and diffs its tree against the recorded one.
+    //
+    // ```c
+    //     if (opt->remerge_diff && !opt->remerge_objdir) {
+    //             opt->remerge_objdir = tmp_objdir_create(the_repository, "remerge-diff");
+    //             if (!opt->remerge_objdir)
+    //                     return error(_("unable to create temporary object directory"));
+    //             tmp_objdir_replace_primary_odb(opt->remerge_objdir, 1);
+    //     }
+    // ```
+    //
+    // (log-tree.c:1044-1049.) git's laziness is "the first merge the walk reaches";
+    // here it is "the walk carries a merge at all", which is the same directory for
+    // the same runs bar a `-n` that stops short of one — and the difference is a
+    // directory nothing reads, created and removed inside `.git/objects`.
+    //
+    // `tmp_objdir_replace_primary_odb()` makes the scratch store the process's
+    // primary object database for the rest of the command, which is what the
+    // shadowing below does: everything after it reads and writes through the scratch
+    // store, with the real one behind it as an alternate. `remerge_odb` is bound
+    // first so that it — and the directory it removes on drop — outlives every
+    // reader.
+    // `DEFAULT_ABBREV` as `do_remerge_diff()` reads it for its conflict-marker
+    // labels (log-tree.c:1057): the configured `core.abbrev`, which `--abbrev=<n>`
+    // does not move — and which is read here, before that flag is folded into it, so
+    // the pre-pass below and the record loop re-merge to the same trees.
+    let remerge_abbrev =
+        crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex());
+    let remerge_odb = match remerge && nodes.iter().any(|n| n.parents.len() > 1) {
+        true => Some(
+            crate::tmp_objdir::TmpObjdir::create(&repo, "remerge-diff")
+                .context("unable to create temporary object directory")?,
+        ),
+        false => None,
+    };
+    let mut repo = match &remerge_odb {
+        Some(odb) => odb.repo().clone(),
+        None => repo,
+    };
     if !commit_filter.is_empty()
         || since.is_some()
         || since_as_filter.is_some()
@@ -4078,12 +4118,52 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // tests a diff — so git never reports a merge for `-S`/`-G` no matter
             // what its parents contain. Dropping them here also keeps the scan
             // from reading blobs for the largest commits in the history.
-            let candidates: Vec<Node> = match graph {
-                true => kept.iter().filter(|n| n.parents.len() < 2).cloned().collect(),
-                false => {
-                    kept.retain(|n| n.parents.len() < 2);
+            //
+            // `--remerge-diff` is the exception: `do_remerge_diff()` builds a queue
+            // for a two-parent merge and `diffcore_std()` — hence
+            // `diffcore_pickaxe()` — runs over it (log-tree.c:1075-1077), so such a
+            // merge *can* be reported. It is tested against the re-merged tree, the
+            // same left-hand side the record itself will diff against. An octopus
+            // still has no queue (log-tree.c:1135-1141) and stays excluded.
+            // An octopus under `--remerge-diff` is printed with no queue at all
+            // (log-tree.c:1135-1141), so `diffcore_pickaxe()` never gets the chance
+            // to reject it: it is shown whatever the needle is.
+            let always: HashSet<ObjectId> = match remerge {
+                false => HashSet::new(),
+                true => kept.iter().filter(|n| n.parents.len() > 2).map(|n| n.id).collect(),
+            };
+            let is_candidate = |n: &Node| {
+                (n.parents.len() < 2 || (remerge && n.parents.len() == 2))
+                    && !always.contains(&n.id)
+            };
+            // Under `--remerge-diff` the merge's re-merged tree stands in for its
+            // first parent while the pickaxe reads it, so `candidates` is a doctored
+            // copy and `kept` — whose nodes the record loop renders, `Merge:` header
+            // and all — is narrowed by id rather than replaced.
+            let candidates: Vec<Node> = match (graph, remerge) {
+                (false, false) => {
+                    kept.retain(|n| is_candidate(n));
                     std::mem::take(&mut kept)
                 }
+                _ => kept
+                    .iter()
+                    .filter(|n| is_candidate(n))
+                    .map(|n| -> Result<Node> {
+                        if !remerge || n.parents.len() != 2 {
+                            return Ok(n.clone());
+                        }
+                        let side = super::show::remerge_side(
+                            &repo,
+                            n.parents[0],
+                            n.parents[1],
+                            remerge_abbrev,
+                        )?;
+                        let super::show::Remerge::Diff { tree, .. } = side else {
+                            return Ok(n.clone());
+                        };
+                        Ok(Node { parents: vec![tree], ..n.clone() })
+                    })
+                    .collect::<Result<_>>()?,
             };
             let hits = match (&pickaxe, &pickaxe_g_re) {
                 // `-S` and `--find-object` never need patch text. git's `has_changes`
@@ -4105,9 +4185,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         .collect()
                 }
             };
-            match graph {
-                true => pickaxe_shown = Some(hits.iter().map(|n| n.id).collect()),
-                false => kept = hits,
+            // The scratch objects the scan wrote have done their job; the record loop
+            // re-merges each commit for itself, one at a time, as git does.
+            if let Some(odb) = &remerge_odb {
+                odb.discard_objects()?;
+            }
+            let mut shown: HashSet<ObjectId> = hits.iter().map(|n| n.id).collect();
+            shown.extend(always.iter().copied());
+            match (graph, remerge) {
+                (true, _) => pickaxe_shown = Some(shown),
+                (false, false) => kept = hits,
+                (false, true) => kept.retain(|n| shown.contains(&n.id)),
             }
         }
         if graph {
@@ -4577,16 +4665,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         },
         output_encoding: &output_encoding,
     });
-    // `do_remerge_diff()` (log-tree.c:1029-1090) re-runs the merge into a temporary
-    // object directory and diffs its tree against the recorded one. This port has
-    // no merge engine to re-run, so `--remerge-diff` is refused exactly when the
-    // walk carries a merge that would reach it — a walk without one is rendered
-    // normally, because `set_remerge_diff()` changes nothing else that this command
-    // reads. Checked before any record is written, since the records stream.
-    if remerge && nodes.iter().any(|n| n.parents.len() > 1) {
-        eprintln!("fatal: --diff-merges=remerge is not supported by this build");
-        return Ok(ExitCode::from(128));
-    }
     // The pathspec set the name/stat formats are limited to, parsed once rather
     // than per commit. `--follow` replaces it per commit (see below).
     let mut path_limit = if pathspecs.is_empty() {
@@ -4611,8 +4689,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // The repetition is the `for (;;)` loop in `log_tree_diff()`, so it happens
     // whenever that function gets past its early returns — `--diff-merges=separate -s`
     // repeats the header twice with no diff under either copy.
+    // `log_tree_diff()` tests `opt->remerge_diff` *before* `opt->separate_merges`
+    // (log-tree.c:1134 vs 1146), so a merge under `--remerge-diff` gets the one
+    // remerge record rather than the per-parent repetition `set_remerge_diff()`'s
+    // own `set_separate()` would otherwise ask for.
     let separate_merges =
-        diff_merges == DiffMerges::Separate && (all_need_diff || merges_need_diff);
+        !remerge && diff_merges == DiffMerges::Separate && (all_need_diff || merges_need_diff);
     if separate_merges && graph && nodes.iter().any(|n| n.parents.len() > 1) {
         bail!("`-m` with `--graph` is not ported: git lays out one graph row per
                per-parent record");
@@ -4639,6 +4721,37 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         if print_limit.is_some_and(|n| printed >= n) {
             break;
         }
+        // `do_remerge_diff()` (log-tree.c:1134-1142): a two-parent merge is re-merged
+        // and its result tree takes the place of the parent this record diffs
+        // against; an octopus is skipped with a warning instead.
+        let remerge_here = match remerge && node.parents.len() > 1 {
+            false => None,
+            true if node.parents.len() > 2 => Some(super::show::Remerge::Octopus),
+            true => Some(super::show::remerge_side(&repo, node.parents[0], node.parents[1], remerge_abbrev)?),
+        };
+        let octopus_here = matches!(remerge_here, Some(super::show::Remerge::Octopus));
+        // `diff_tree_oid(&res.tree->object.oid, oid, "", &opt->diffopt)`
+        // (log-tree.c:1076) — the left side is the re-merged tree, not a commit.
+        // `setup_additional_headers()` keeps only the notices whose path the
+        // pathspec matches, and drops the map when none do (log-tree.c:1000-1007).
+        let (diff_parent, remerge_headers): (Option<ObjectId>, Vec<(Vec<u8>, Vec<String>)>) =
+            match &remerge_here {
+                Some(super::show::Remerge::Diff { tree, headers }) => {
+                    let kept = match pathspecs.is_empty() {
+                        true => headers.clone(),
+                        false => {
+                            let specs = PathspecMatcher::new(&repo, &pathspecs)?;
+                            headers.iter().filter(|(p, _)| specs.matches(p)).cloned().collect()
+                        }
+                    };
+                    (Some(*tree), kept)
+                }
+                _ => (diff_parent, Vec::new()),
+            };
+        // `include_conflict_headers` (diff.c:6610-6615): the pickaxe and a
+        // `--diff-filter` take the conflict notices — and the empty queue they would
+        // have rescued — back out.
+        let show_conflict_headers = !has_pickaxe && patch_opts.diff_filter.is_none();
         // `--graph` with `-S`/`-G`: git walked this commit and ran `graph_update()`
         // on it, then `log_tree_commit()` found nothing to print. The row is
         // dropped but the columns still move — the gap is what the `...` skip row
@@ -4809,7 +4922,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // builds and tests the pair queue — and its answer is what decides whether
         // `whatchanged` prints the commit at all. So the queue is still walked
         // under `-s`/`-q`; only the rendering is skipped.
-        else if (want_names || emit_patch || probe_queue || check || exit_code)
+        // An octopus under `--remerge-diff` never reaches `do_remerge_diff()`: it
+        // prints the header, then the warning, then `return 1` (log-tree.c:1135-1141),
+        // so no queue is built and no format runs.
+        else if !octopus_here
+            && (want_names || emit_patch || probe_queue || check || exit_code)
             && if node.parents.len() > 1 {
                 (all_need_diff || merges_need_diff) && diff_merges != DiffMerges::Off
             } else {
@@ -4916,6 +5033,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // commit whose only change is whitespace still separates its message
                 // from the (empty) diff.
                 queue_nonempty = !files.is_empty();
+                // `diff_queue_is_empty()` (diff.c:6607-6620): conflict headers make a
+                // queue non-empty on their own, so a remerge whose only finding is a
+                // notice still separates its message from the diff.
+                if show_conflict_headers && !remerge_headers.is_empty() {
+                    queue_nonempty = true;
+                }
                 if patch_opts.ws != super::diff::Whitespace::Keep {
                     files.retain(reports_change);
                 }
@@ -5174,11 +5297,43 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     .pop()
                     .unwrap_or_default(),
                 };
+                // A remerge record diffs the re-merged tree against the recorded one,
+                // which the batched first-parent window cannot serve.
+                let remerge_patch: Vec<u8> = match remerge_here.is_some() && !octopus_here {
+                    false => Vec::new(),
+                    true => super::diff::commit_patches(
+                        &repo,
+                        &[(node.id, diff_parent)],
+                        &patch_opts,
+                        &pathspecs,
+                        false,
+                    )?
+                    .pop()
+                    .unwrap_or_default(),
+                };
                 let p: &[u8] = match (&node.follow_path, from) {
+                    _ if remerge_here.is_some() => &remerge_patch,
                     (Some(_), _) => &follow_patch,
                     (None, Some(_)) => &separate_patch,
                     (None, None) if has_pickaxe => &pickaxe_patch,
                     (None, None) => patches.get(&repo, &nodes, ni, 3, &pathspecs)?,
+                };
+                // `additional_path_headers` (diff.c:3772-3777, 7050-7096): the
+                // conflict notices the re-merge recorded, spliced into the sections
+                // they belong to plus a header-only section for each path that has
+                // no section of its own.
+                let spliced;
+                let p: &[u8] = match remerge_headers.is_empty() {
+                    true => p,
+                    false => {
+                        spliced = super::show::splice_remerge_headers(
+                            p.to_vec(),
+                            &remerge_headers,
+                            show_conflict_headers,
+                            &patch_opts.colors,
+                        );
+                        &spliced
+                    }
                 };
                 if !p.is_empty() {
                     // `if (separator) emit_diff_symbol(DIFF_SYMBOL_SEPARATOR)`
@@ -5271,6 +5426,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             record_has_diff = !diff.is_empty() || queue_nonempty || combined_here;
             record_queue_empty = !record_has_diff;
+        }
+        // The octopus arm's own output: `show_log(opt)` has already written the
+        // header, and the warning goes to the diff's own stream, so it is part of
+        // the record rather than a diagnostic (log-tree.c:1136-1140). The `return 1`
+        // that follows is what `record_has_diff` says here.
+        if octopus_here {
+            block.extend_from_slice(b"diff: warning: Skipping remerge-diff for octopus merges.\n");
+            record_has_diff = true;
+            record_queue_empty = false;
+        }
+        // `tmp_objdir_discard_objects(opt->remerge_objdir)` (log-tree.c:1087): the
+        // next commit's re-merge must not see this one's objects.
+        if remerge_here.is_some() {
+            if let Some(odb) = &remerge_odb {
+                odb.discard_objects()?;
+            }
         }
         // ```c
         // if (diff_queue_is_empty(&opt->diffopt)) {
@@ -9861,7 +10032,10 @@ fn commit_changes_count(
     let mut limit = limit;
     let new_tree = repo.find_object(node.id)?.try_into_commit()?.tree()?;
     let old_tree = match node.parents.first() {
-        Some(pid) => Some(repo.find_object(*pid)?.try_into_commit()?.tree()?),
+        // `--diff-merges=remerge` substitutes the re-merged tree for the merge's
+        // first parent while the pickaxe reads it, so this side is a tree or a
+        // commit; peeling is the same step for both.
+        Some(pid) => Some(repo.find_object(*pid)?.peel_to_tree()?),
         None => None,
     };
     // Counting a blob means reading it, so the count is memoized per blob id
@@ -10305,7 +10479,7 @@ fn write_parents(
 }
 
 /// git's subject: the first paragraph of the message, folded onto one line.
-fn subject(msg: &[u8]) -> Vec<u8> {
+pub(super) fn subject(msg: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     for line in msg.split(|&b| b == b'\n') {
         let line = trim_end_ws(line);
@@ -11547,7 +11721,11 @@ fn collect_changes(
     let mut warn = warn;
     let new_tree = commit.tree()?;
     let old_tree = match parent {
-        Some(pid) => Some(repo.find_object(pid)?.try_into_commit()?.tree()?),
+        // A commit id in every caller but one: `--diff-merges=remerge` hands the
+        // re-merged *tree* here, which is what `diff_tree_oid()` is given in
+        // `do_remerge_diff()` (log-tree.c:1076). Peeling accepts both and is the same
+        // step for a commit.
+        Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
         None => None,
     };
 

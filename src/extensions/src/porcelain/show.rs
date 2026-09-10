@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
@@ -115,10 +115,13 @@ const DEFAULT_ABBREV: usize = 7;
 /// `dense-combined` print one `diff --combined` / `diff --cc` section set, with the
 /// count formats measured against the first parent and printed ahead of the
 /// combined raw block (`diff_tree_combined()`, combine-diff.c:1600-1610).
-/// `--remerge-diff` / `--diff-merges=remerge` parses, and is refused where
-/// `do_remerge_diff()` would run: this port has no merge engine to re-run, so a
-/// request that reaches no merge behaves exactly as git's does and one that reaches
-/// a merge says so instead of guessing. `--combined-all-paths` is applied:
+/// `--remerge-diff` / `--diff-merges=remerge` re-runs the merge with merge-ort and
+/// diffs its result tree against the tree the merge really recorded
+/// (`do_remerge_diff()`, log-tree.c:1027-1090), so the patch is what the committer
+/// changed on top of a mechanical merge. The re-run writes objects, and they go to
+/// a scratch object directory that is discarded afterwards — see
+/// [`crate::tmp_objdir`] and [`remerge_side`]. An octopus merge is skipped with
+/// git's own warning (log-tree.c:1135-1141). `--combined-all-paths` is applied:
 /// `show_raw_diff()`'s per-parent path columns and `show_combined_header()`'s
 /// per-parent `--- a/<path>` lines are both emitted. No rename detection runs in the
 /// combined walk, so `filename_changed()` is false for every parent and each column
@@ -249,10 +252,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // the last one wins.
     let mut diff_merges: Option<super::log::DiffMerges> = None;
     // `set_remerge_diff()`. The mode is recorded separately from
-    // [`super::log::DiffMerges`] because this port has no remerge engine: the
-    // flag parses, and a merge that would need one is refused where
-    // `do_remerge_diff()` would run (log-tree.c:1134-1143) rather than at parse
-    // time, so a request that reaches no merge behaves exactly as git's does.
+    // [`super::log::DiffMerges`] because `revs->remerge_diff` is a separate field
+    // in git too: `set_remerge_diff()` raises it *and* leaves the separate-merges
+    // mode set (diff-merges.c:65), and `log_tree_diff()` tests it ahead of both
+    // `combine_merges` and `separate_merges` (log-tree.c:1134).
     let mut remerge = false;
     // `--combined-all-paths` (`revs->combined_all_paths`). Only the arity rule
     // `diff_merges_setup_revs()` enforces (diff-merges.c:184-185) is reproduced;
@@ -1292,6 +1295,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         patch_opts.index_abbrev = Some(crate::abbrev::configured_abbrev(&repo, hex_len));
         abbrev_len = Some(hex_len);
     }
+    // `DEFAULT_ABBREV` — the global `core.abbrev` answer, which `--abbrev` does not
+    // move. `do_remerge_diff()` abbreviates its conflict-marker labels with it
+    // (log-tree.c:1057), so it has to be read before the override lands.
+    let remerge_abbrev = crate::abbrev::configured_abbrev(&repo, hex_len);
     if let Some(n) = abbrev_len {
         let mut config = repo.config_snapshot_mut();
         config.append_config(
@@ -1894,7 +1901,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let renderer = super::log::EntryRenderer::with_color(&repo, want_color);
     let rename_warn = std::cell::RefCell::new(RenameWarnState::default());
     let diff_status = std::cell::Cell::new((false, false));
-    let remerge_hit = std::cell::Cell::new(false);
+    let remerge_odb: std::cell::OnceCell<crate::tmp_objdir::TmpObjdir> = std::cell::OnceCell::new();
     let no_prefix: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
     let disp = DisplayOpts {
         show_signature,
@@ -1905,7 +1912,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         show_root,
         merges,
         remerge,
-        remerge_hit: &remerge_hit,
+        remerge_odb: &remerge_odb,
+        remerge_abbrev,
         no_prefix: &no_prefix,
         exit_code,
         status: &diff_status,
@@ -2052,12 +2060,6 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // rename (`<counts>\0<from>\0<to>\0`) carries one prefix where splitting on
     // NUL would write three. That combination is refused rather than approximated.
     let out = apply_line_prefix_except(out, &line_prefix, &no_prefix.borrow());
-    // A merge reached under `--remerge-diff`: nothing this run printed is what git
-    // would have printed, so the buffered records are dropped for the fatal.
-    if remerge_hit.get() {
-        eprintln!("fatal: --diff-merges=remerge is not supported by this build");
-        return Ok(ExitCode::from(128));
-    }
     // `diff_result_code()` (diff.c): `01` when `--exit-code` saw changes, `02` when
     // `--check` found a whitespace error. The two are or-ed, but they never both
     // fire: `DIFF_FORMAT_CHECKDIFF` is the only format under `--check`, and it
@@ -2321,12 +2323,21 @@ struct DisplayOpts<'a> {
     /// The `--diff-merges` mode a merge commit is rendered under, already resolved
     /// against `--first-parent` by `show_setup_revisions_tweak()`.
     merges: super::log::DiffMerges,
-    /// `--remerge-diff` / `--diff-merges=remerge` (`revs->remerge_diff`), which
-    /// this port refuses when it reaches a merge — see [`show_commit`].
+    /// `--remerge-diff` / `--diff-merges=remerge` (`revs->remerge_diff`) — see
+    /// [`show_commit`], which re-runs each two-parent merge and diffs its result
+    /// against the tree the merge actually recorded.
     remerge: bool,
-    /// Set the moment a merge is reached under `remerge`, so the run can print
-    /// `git log`'s fatal and leave at 128 instead of writing a partial record.
-    remerge_hit: &'a std::cell::Cell<bool>,
+    /// `revs->remerge_objdir`: the scratch object store the re-run merge writes
+    /// into, so a conflicted remerge cannot leave blobs and trees in the
+    /// repository. `do_remerge_diff()` creates it on the first merge the walk
+    /// reaches and reuses it for the rest (log-tree.c:1044-1049), which is what
+    /// this [`std::cell::OnceCell`] holds; it stays empty when no merge is reached,
+    /// or when `--diff-merges=remerge` was never asked for.
+    remerge_odb: &'a std::cell::OnceCell<crate::tmp_objdir::TmpObjdir>,
+    /// `DEFAULT_ABBREV` as `do_remerge_diff()` reads it for its conflict-marker
+    /// labels (log-tree.c:1057) — the configured `core.abbrev`, captured before
+    /// `--abbrev=<n>` was folded into it.
+    remerge_abbrev: usize,
     /// Byte ranges of the output that `--line-prefix` must not reach.
     ///
     /// `show_raw_diff()` prints `diff_line_prefix(opt)` only on its `--raw` branch
@@ -2651,14 +2662,14 @@ fn show_tag(
 /// `-L` short-circuits ahead of all of this (log-tree.c:1108-1112), so a
 /// line-level request keeps its single record whatever the mode says.
 #[allow(clippy::too_many_arguments)]
-fn show_commit(
+fn show_commit<'a>(
     repo: &gix::Repository,
     out: &mut Vec<u8>,
     commit: &gix::Commit<'_>,
     pretty: &Pretty,
     selection: Selection,
     pathspecs: &[Vec<u8>],
-    disp: &DisplayOpts<'_>,
+    disp: &DisplayOpts<'a>,
     pickaxe: &Pickaxe,
     source: Option<&str>,
     shown_one: &mut bool,
@@ -2666,20 +2677,65 @@ fn show_commit(
 ) -> Result<()> {
     let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
     if parents.len() > 1 && line_log_pairs.is_none() {
-        // `do_remerge_diff()` (log-tree.c:1134-1142) is where git re-runs the merge
-        // and diffs its result against the recorded tree. This port has no merge
-        // engine to re-run, so the request is refused at exactly the point the
-        // bytes would be wrong — a run that reaches no merge is unaffected, which
-        // is what git's own placement gives.
+        // `do_remerge_diff()` (log-tree.c:1134-1142), which is tested ahead of both
+        // `combine_merges` and `separate_merges` and so wins over whatever mode
+        // `set_remerge_diff()` left behind.
         if disp.remerge {
-            disp.remerge_hit.set(true);
-            return Ok(());
+            // ```c
+            //     if (octopus) {
+            //             show_log(opt);
+            //             fprintf(opt->diffopt.file,
+            //                     "diff: warning: Skipping remerge-diff "
+            //                     "for octopus merges.\n");
+            //             return 1;
+            //     }
+            // ```
+            // (log-tree.c:1135-1141): the header, then the warning on the diff's own
+            // output stream — so it is part of stdout, and part of the record.
+            if parents.len() > 2 {
+                show_commit_record(
+                    repo, out, commit, pretty, selection, pathspecs, disp, pickaxe, source,
+                    shown_one, line_log_pairs, None, Some(&Remerge::Octopus),
+                )?;
+                out.extend_from_slice(
+                    b"diff: warning: Skipping remerge-diff for octopus merges.\n",
+                );
+                return Ok(());
+            }
+            // The scratch object store, created on the first merge the walk reaches
+            // and kept for the rest of it (log-tree.c:1044-1049).
+            let odb = match disp.remerge_odb.get() {
+                Some(odb) => odb,
+                None => {
+                    let created = crate::tmp_objdir::TmpObjdir::create(repo, "remerge-diff")
+                        .context("unable to create temporary object directory")?;
+                    let _ = disp.remerge_odb.set(created);
+                    disp.remerge_odb.get().expect("just set")
+                }
+            };
+            let scratch = odb.repo();
+            let side = remerge_side(scratch, parents[0], parents[1], disp.remerge_abbrev)?;
+            // Everything from here on reads through the scratch store, because the
+            // merge result lives only there. git gets this by replacing the
+            // process's primary ODB outright; the port scopes it to the clone the
+            // scratch directory owns.
+            let scratch_commit = scratch.find_commit(commit.id())?;
+            let r = show_commit_record(
+                scratch, out, &scratch_commit, pretty, selection, pathspecs, disp, pickaxe,
+                source, shown_one, line_log_pairs, None, Some(&side),
+            );
+            // `tmp_objdir_discard_objects(opt->remerge_objdir)` (log-tree.c:1087):
+            // one commit's re-merge must not be visible to the next one. It runs
+            // after the record is rendered, because rendering reads those objects,
+            // and it runs even when rendering failed.
+            odb.discard_objects()?;
+            return r;
         }
         if disp.merges == super::log::DiffMerges::Separate {
             for p in &parents {
                 show_commit_record(
                     repo, out, commit, pretty, selection, pathspecs, disp, pickaxe, source,
-                    shown_one, line_log_pairs, Some(*p),
+                    shown_one, line_log_pairs, Some(*p), None,
                 )?;
             }
             return Ok(());
@@ -2687,8 +2743,321 @@ fn show_commit(
     }
     show_commit_record(
         repo, out, commit, pretty, selection, pathspecs, disp, pickaxe, source, shown_one,
-        line_log_pairs, None,
+        line_log_pairs, None, None,
     )
+}
+
+/// Put a remerge's conflict notices into a rendered patch, which is the two things
+/// `additional_path_headers` does to `diff_flush()`:
+///
+/// * **A path that has a section already.** `fill_metainfo()` appends the headers
+///   after the mode and rename lines and before the `index` line, and raises
+///   `must_show_header` so they cannot be dropped (diff.c:4908-4911):
+///
+///   ```c
+///     if ((more_headers = additional_headers(o, name))) {
+///             add_formatted_headers(msg, more_headers,
+///                                   line_prefix, set, reset);
+///             *must_show_header = 1;
+///     }
+///   ```
+///
+///   `add_formatted_header()` writes one output line per line of the message, each
+///   in the `meta` color (diff.c:3781-3795) — which is why the anchor below is the
+///   end of the metainfo block, not the `diff --git` line itself.
+/// * **A path that has none.** `create_filepairs_for_header_only_notifications()`
+///   (diff.c:7050-7096) invents a pair for it so the notice is not lost, and
+///   `builtin_diff()` renders that pair as its `diff --git` line and the headers
+///   alone — no `index`, no hunks, because both of its filespecs are the null oid
+///   with mode 0 (diff.c:3903-3912, and the `oideq` test at diff.c:4913).
+///
+/// The rendered patch is the anchor rather than the change queue because this
+/// port's patch body comes from the shared `git diff` pipeline, which has no
+/// per-path header channel of its own. The insertion point is defined by the same
+/// grammar `fill_metainfo()` writes: the metainfo lines it may emit, in the order
+/// it emits them, ending at the `index` line.
+pub(super) fn splice_remerge_headers(
+    body: Vec<u8>,
+    headers: &[(Vec<u8>, Vec<String>)],
+    // `include_conflict_headers` (diff.c:6610-6615, 6537-6540): the pickaxe and a
+    // `--diff-filter` that does not ask for unmerged entries both switch the
+    // header-only sections off, and with them the whole reason an otherwise-empty
+    // queue prints anything.
+    inject_missing: bool,
+    colors: &super::diff_color::DiffColors,
+) -> Vec<u8> {
+    if headers.is_empty() {
+        return body;
+    }
+    let meta = colors.get(super::diff_color::DiffSlot::Meta);
+    let reset = colors.reset();
+    let render = |out: &mut Vec<u8>, lines: &[String]| {
+        for line in lines {
+            for part in line.split('\n') {
+                out.extend_from_slice(meta.as_bytes());
+                out.extend_from_slice(part.as_bytes());
+                out.extend_from_slice(reset.as_bytes());
+                out.push(b'\n');
+            }
+        }
+    };
+    // The `diff --git a/<old> b/<new>` line's paths, unquoted. A path git had to
+    // C-quote is left alone: the header map is keyed by the raw bytes, and a quoted
+    // header line would not match it — the notice is then simply not spliced rather
+    // than attached to the wrong section.
+    let section_path = |line: &[u8]| -> Option<Vec<u8>> {
+        let plain = strip_sgr(line);
+        let rest = plain.strip_prefix(b"diff --git a/".as_slice())?.to_vec();
+        // A path that carries a notice is recognized by matching the key itself, so
+        // a name containing ` b/` cannot be split in the wrong place.
+        if let Some((p, _)) = headers
+            .iter()
+            .find(|(p, _)| rest.starts_with(p.as_slice()) && rest[p.len()..].starts_with(b" b/"))
+        {
+            return Some(p.clone());
+        }
+        let sep = find_sub(&rest, b" b/")?;
+        Some(rest[..sep].to_vec())
+    };
+    // `fill_metainfo()`'s own repertoire (diff.c:4860-4906): everything it can write
+    // between the `diff --git` line and the headers. `index` closes the block.
+    const METAINFO: [&[u8]; 9] = [
+        b"old mode ",
+        b"new mode ",
+        b"new file mode ",
+        b"deleted file mode ",
+        b"similarity index ",
+        b"dissimilarity index ",
+        b"rename from ",
+        b"rename to ",
+        b"copy from ",
+    ];
+
+    // The paths that already have a section. git tests the *queue* here
+    // (diff.c:7064-7070) rather than the rendered patch; the two differ only for a
+    // pair whose section came out empty, which a remerge's own queue cannot
+    // produce — its two sides differ by construction.
+    let mut pending: Vec<&(Vec<u8>, Vec<String>)> = match inject_missing {
+        false => Vec::new(),
+        true => {
+            let present: Vec<Vec<u8>> = body
+                .split_inclusive(|&b| b == b'\n')
+                .filter_map(&section_path)
+                .collect();
+            headers.iter().filter(|(p, _)| !present.contains(p)).collect()
+        }
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut lines = body.split_inclusive(|&b| b == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        if let Some(path) = section_path(line) {
+            // `diffcore_fix_diff_index()` re-sorts the queue after the synthetic
+            // pairs go in (diff.c:7093), so a header-only section lands in path order
+            // among the real ones.
+            while let Some(pos) = pending.iter().position(|(p, _)| *p < path) {
+                let (p, lines) = pending.remove(pos);
+                emit_git_header_painted(&mut out, p, p, meta, reset);
+                render(&mut out, lines);
+            }
+            out.extend_from_slice(line);
+            // Copy the metainfo block through, then insert.
+            while let Some(next) = lines.peek() {
+                let plain = strip_sgr(next);
+                let is_meta = METAINFO.iter().any(|p| plain.starts_with(p))
+                    || plain.starts_with(b"copy to ");
+                if !is_meta {
+                    break;
+                }
+                out.extend_from_slice(lines.next().expect("peeked"));
+            }
+            if let Some((_, lines)) = headers.iter().find(|(p, _)| *p == path) {
+                render(&mut out, lines);
+            }
+            continue;
+        }
+        out.extend_from_slice(line);
+    }
+    for (p, lines) in pending {
+        emit_git_header_painted(&mut out, p, p, meta, reset);
+        render(&mut out, lines);
+    }
+    out
+}
+
+/// The `diff --git` line of a header-only section, in the `meta` color the rest of
+/// the metainfo block carries (diff.c:3912).
+fn emit_git_header_painted(out: &mut Vec<u8>, old: &[u8], new: &[u8], meta: &str, reset: &str) {
+    out.extend_from_slice(meta.as_bytes());
+    out.extend_from_slice(b"diff --git a/");
+    out.extend_from_slice(old);
+    out.extend_from_slice(b" b/");
+    out.extend_from_slice(new);
+    out.extend_from_slice(reset.as_bytes());
+    out.push(b'\n');
+}
+
+/// A line with its SGR sequences removed and its newline trimmed, so a colored
+/// patch can be read by the same grammar an uncolored one is.
+fn strip_sgr(line: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(esc) = rest.iter().position(|&b| b == 0x1b) {
+        out.extend_from_slice(&rest[..esc]);
+        match rest[esc..].iter().position(|&b| b == b'm') {
+            Some(end) => rest = &rest[esc + end + 1..],
+            None => {
+                rest = &rest[esc..];
+                break;
+            }
+        }
+    }
+    out.extend_from_slice(rest);
+    while out.last() == Some(&b'\n') || out.last() == Some(&b'\r') {
+        out.pop();
+    }
+    out
+}
+
+/// The first offset of `needle` in `haystack`.
+fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+/// What `--diff-merges=remerge` turned one merge commit into.
+pub(super) enum Remerge {
+    /// A merge with more than two parents, which `do_remerge_diff()` never reaches:
+    /// `log_tree_diff()` prints the header plus a warning and shows no diff at all
+    /// (log-tree.c:1135-1141).
+    Octopus,
+    /// The re-merged tree to diff the recorded tree against, plus the conflict
+    /// notices merge-ort recorded per path.
+    Diff {
+        /// `res.tree->object.oid`, the left side of
+        /// `diff_tree_oid(&res.tree->object.oid, oid, "", &opt->diffopt)`
+        /// (log-tree.c:1076). It lives in the scratch object directory.
+        tree: ObjectId,
+        /// `res.path_messages` as `setup_additional_headers()` hands them to the
+        /// diff machinery (log-tree.c:1075): one path, one or more already-prefixed
+        /// header lines.
+        headers: Vec<(Vec<u8>, Vec<String>)>,
+    },
+}
+
+/// `do_remerge_diff()`'s merge half (log-tree.c:1051-1084): re-run the recorded
+/// merge of `parent1` and `parent2` and report the tree it produces together with
+/// the conflict notices it recorded.
+///
+/// `repo` must be the scratch store's repository: the merge writes every blob it
+/// has to resolve and the whole result tree, and those writes are the reason the
+/// scratch store exists.
+///
+/// The setup is git's, line for line:
+///
+/// * `o.msg_header_prefix = "remerge"` and `o.record_conflict_msgs_as_headers = 1`
+///   (log-tree.c:1054-1055): notices become per-path headers rather than stdout
+///   lines, and `path_msg()` drops the merely-informational ones on the way
+///   (`if (opt->record_conflict_msgs_as_headers && omittable_hint) return;`,
+///   merge-ort.c:813-814) — which is why `Auto-merging <path>` never appears in a
+///   remerge diff while `CONFLICT (…)` does.
+/// * `repo_format_commit_message(parent, "%h (%s)", …)` for `o.branch1`/`o.branch2`
+///   (log-tree.c:1057-1063): the labels the conflict markers carry, so a remerge's
+///   `<<<<<<<` names `<abbrev> (<subject>)` rather than a branch name.
+/// * `repo_get_merge_bases()` then `merge_incore_recursive()` (log-tree.c:1068-1072),
+///   whose multiple-base case merges the bases into a virtual one — the same
+///   recursion [`super::merge::virtual_base_tree`] performs for `git merge`.
+pub(super) fn remerge_side(
+    repo: &gix::Repository,
+    parent1: ObjectId,
+    parent2: ObjectId,
+    // `ctx.abbrev = DEFAULT_ABBREV` (log-tree.c:1057): the label the conflict markers
+    // carry is abbreviated to the *configured* default. `--abbrev=<n>` does not move
+    // it — that sets `revs->abbrev`, a different field — so the caller passes the
+    // configured value it read before folding `--abbrev` into `core.abbrev`.
+    // Getting this wrong changes the marker text, and so the re-merged blob, and so
+    // the `index` line of the diff.
+    default_abbrev: usize,
+) -> Result<Remerge> {
+    let label = |id: ObjectId| -> Result<String> {
+        let commit = repo.find_commit(id)?;
+        let subject = super::log::subject(commit.message_raw()?);
+        Ok(format!(
+            "{} ({})",
+            crate::abbrev::unique_abbrev(repo, &id, default_abbrev),
+            String::from_utf8_lossy(&subject)
+        ))
+    };
+    let branch1 = label(parent1)?;
+    let branch2 = label(parent2)?;
+
+    let bases = repo.merge_bases_many(parent1, &[parent2])?;
+    // `merge_incore_recursive()`'s base handling, which is `merge_ort_internal()`'s
+    // (merge-ort.c:5340-5395): no base at all merges against the empty tree, one is
+    // used as is, and several are merged into a virtual base first.
+    let ancestor_name: String;
+    let base = match bases.len() {
+        0 => {
+            ancestor_name = "empty tree".into();
+            ObjectId::empty_tree(repo.object_hash())
+        }
+        1 => {
+            ancestor_name = crate::abbrev::unique_abbrev(repo, &bases[0].detach(), default_abbrev);
+            repo.find_commit(bases[0])?.tree_id()?.detach()
+        }
+        _ => {
+            ancestor_name = "merged common ancestors".into();
+            let bases: Vec<ObjectId> = bases.iter().map(|id| id.detach()).collect();
+            super::merge::virtual_base_tree(repo, &bases)?
+        }
+    };
+    let labels = gix::merge::blob::builtin_driver::text::Labels {
+        ancestor: Some(gix::bstr::BStr::new(ancestor_name.as_bytes())),
+        current: Some(gix::bstr::BStr::new(branch1.as_bytes())),
+        other: Some(gix::bstr::BStr::new(branch2.as_bytes())),
+    };
+    let ours = repo.find_commit(parent1)?.tree_id()?.detach();
+    let theirs = repo.find_commit(parent2)?.tree_id()?.detach();
+    let mut outcome = repo.merge_trees(base, ours, theirs, labels, repo.tree_merge_options()?)?;
+    // `res.tree`, written into the scratch store — the object `diff_tree_oid()` is
+    // then handed.
+    let tree = outcome.tree.write()?.detach();
+
+    // `res.path_messages`. `merge_display_update_messages()` never runs under
+    // `record_conflict_msgs_as_headers`, so nothing is refused here: a class this
+    // port cannot spell out degrades to the plain content notice rather than
+    // aborting a diff git would have printed.
+    let messages = crate::merge_msg::render(
+        repo,
+        &outcome.conflicts,
+        &branch1,
+        &branch2,
+        crate::merge_msg::Operand1::Tree(ours),
+        gix::merge::tree::TreatAsUnresolved::git(),
+        crate::merge_msg::Strictness::Approximate,
+    )?;
+    let mut headers: Vec<(Vec<u8>, Vec<String>)> = Vec::new();
+    for m in messages {
+        // `path_msg()`'s `omittable_hint` gate (merge-ort.c:809-814): a notice whose
+        // `type_short_descriptions[]` entry does not begin `CONFLICT` or `ERROR` is
+        // a hint, and hints are not recorded as headers.
+        if !(m.ctype.starts_with("CONFLICT") || m.ctype.starts_with("ERROR")) {
+            continue;
+        }
+        // The header text: the prefix, then the message with a space inserted after
+        // every embedded newline (merge-ort.c:854-873). The message's own trailing
+        // newline is not part of the header — `add_formatted_header()` supplies one
+        // per line (diff.c:3781-3795).
+        let text = m.text.strip_suffix('\n').unwrap_or(&m.text);
+        let line = format!("remerge {}", text.replace('\n', "\n "));
+        let path = m.paths[0].to_vec();
+        match headers.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, lines)) => lines.push(line),
+            None => headers.push((path, vec![line])),
+        }
+    }
+    headers.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Remerge::Diff { tree, headers })
 }
 
 /// One record of a commit: the header in the selected pretty format, the
@@ -2713,13 +3082,26 @@ fn show_commit_record(
     shown_one: &mut bool,
     line_log_pairs: Option<&[(line_log::Pair, Vec<line_log::Range>)]>,
     from: Option<ObjectId>,
+    // `--diff-merges=remerge` on a merge: the re-merged tree this record diffs
+    // against instead of a parent, or the octopus case that shows no diff at all.
+    remerge: Option<&Remerge>,
 ) -> Result<()> {
     let parents: Vec<_> = commit.parent_ids().collect();
     let is_merge = parents.len() > 1;
-    // The tree this record diffs against: the named parent for a `separate`
-    // record, otherwise the first parent (`None` for a root commit, whose diff is
-    // against the empty tree).
-    let against: Option<ObjectId> = from.or_else(|| parents.first().map(|p| p.detach()));
+    // The tree this record diffs against: the re-merged tree under
+    // `--diff-merges=remerge` (`diff_tree_oid(&res.tree->object.oid, oid, …)`,
+    // log-tree.c:1076), the named parent for a `separate` record, otherwise the
+    // first parent (`None` for a root commit, whose diff is against the empty
+    // tree). The diff pipeline peels whichever of the two kinds it is handed.
+    let against: Option<ObjectId> = match remerge {
+        Some(Remerge::Diff { tree, .. }) => Some(*tree),
+        _ => from.or_else(|| parents.first().map(|p| p.detach())),
+    };
+    // `res.path_messages` for this record, empty for every non-remerge one.
+    let remerge_headers: &[(Vec<u8>, Vec<String>)] = match remerge {
+        Some(Remerge::Diff { headers, .. }) => headers,
+        _ => &[],
+    };
     // `if (opt->combine_merges) return do_diff_combined(opt, commit);`
     // (log-tree.c:1144-1145) — the whole merge in one section set, headed
     // `diff --cc` or `diff --combined` as `dense_combined_merges` picks.
@@ -2732,7 +3114,11 @@ fn show_commit_record(
     // `separate_merges` produces no diff at all, and `log_tree_commit()`'s
     // `always_show_header` then prints the header alone (log-tree.c:1151-1152,
     // 1191-1195). `--stat`, `--raw` and the rest are suppressed with it.
-    let merge_off = is_merge && disp.merges == super::log::DiffMerges::Off;
+    // An octopus merge under `--diff-merges=remerge` is the same shape: the header
+    // and nothing else, with `log_tree_diff()` returning 1 before it queues
+    // anything (log-tree.c:1135-1141).
+    let merge_off = (is_merge && disp.merges == super::log::DiffMerges::Off)
+        || matches!(remerge, Some(Remerge::Octopus));
     // An empty user format (`--format=`) prints no header at all, and git then
     // omits the blank line that would separate the header from the diff.
     let header_empty = matches!(pretty, Pretty::User(f) if f.is_empty());
@@ -3168,6 +3554,29 @@ fn show_commit_record(
         return Ok(());
     }
 
+    // `setup_additional_headers()` keeps only the paths the pathspec matches
+    // (log-tree.c:1000-1007), and drops the map entirely when none do.
+    let remerge_headers: Vec<(Vec<u8>, Vec<String>)> = match pathspecs.is_empty() {
+        true => remerge_headers.to_vec(),
+        false => {
+            let specs = super::log::PathspecMatcher::new(repo, pathspecs)?;
+            remerge_headers
+                .iter()
+                .filter(|(p, _)| specs.matches(p))
+                .cloned()
+                .collect()
+        }
+    };
+    // `diff_queue_is_empty()` (diff.c:6607-6620): a queue with nothing in it is
+    // still not empty when there are conflict headers to show, so a merge whose
+    // re-run differs from the recorded tree in nothing but its conflict notices
+    // still separates its message from a diff. The pickaxe and `--diff-filter`
+    // switch that off, exactly as `include_conflict_headers` says.
+    let show_conflict_headers = !pickaxe.active() && disp.patch.diff_filter.is_none();
+    if show_conflict_headers && !remerge_headers.is_empty() {
+        queue_nonempty = true;
+    }
+
     // A pathspec that matched nothing leaves the message with no diff and, like git,
     // no trailing separator.
     if !queue_nonempty {
@@ -3324,17 +3733,25 @@ fn show_commit_record(
                         .map(|p| String::from_utf8_lossy(p).into_owned())
                         .collect(),
                 };
-                out.extend_from_slice(
-                    &super::diff::commit_patches(
-                        repo,
-                        &[(commit.id, against)],
-                        &disp.patch,
-                        &specs,
-                        false,
-                    )?
-                    .pop()
-                    .unwrap_or_default(),
-                );
+                let body = super::diff::commit_patches(
+                    repo,
+                    &[(commit.id, against)],
+                    &disp.patch,
+                    &specs,
+                    false,
+                )?
+                .pop()
+                .unwrap_or_default();
+                // `additional_headers()` (diff.c:3772-3777) and the synthetic pairs
+                // `create_filepairs_for_header_only_notifications()` injects
+                // (diff.c:7050-7096) — the two halves of how a remerge's conflict
+                // notices reach the patch.
+                out.extend_from_slice(&splice_remerge_headers(
+                    body,
+                    &remerge_headers,
+                    show_conflict_headers,
+                    &disp.patch.colors,
+                ));
             }
         }
     }
@@ -3429,7 +3846,11 @@ fn collect_changes(
     let ws = opts.ws;
     let new_tree = commit.tree()?;
     let old_tree = match parent {
-        Some(pid) => Some(repo.find_object(pid)?.try_into_commit()?.tree()?),
+        // A commit id in every caller but one: `--diff-merges=remerge` hands the
+        // re-merged *tree* here, which is what `diff_tree_oid()` is given in
+        // `do_remerge_diff()` (log-tree.c:1076). Peeling accepts both and is the same
+        // step for a commit.
+        Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
         None => None,
     };
 

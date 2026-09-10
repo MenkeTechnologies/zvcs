@@ -5706,7 +5706,11 @@ fn commit_deltas(
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
     let new_tree = commit.tree()?;
     let old_tree = match parent {
-        Some(pid) => Some(repo.find_object(pid)?.try_into_commit()?.tree()?),
+        // A commit id in every caller but one: `--diff-merges=remerge` hands the
+        // re-merged *tree* here, which is what `diff_tree_oid()` is given in
+        // `do_remerge_diff()` (log-tree.c:1076). Peeling accepts both and is the same
+        // step for a commit.
+        Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
         None => None,
     };
 

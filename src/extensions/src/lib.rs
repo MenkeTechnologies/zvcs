@@ -64,6 +64,7 @@ pub mod showdate;
 pub mod sigpipe;
 pub mod superset;
 pub mod threads;
+pub mod tmp_objdir;
 pub mod userdiff;
 pub mod transport_err;
 pub mod trace2;

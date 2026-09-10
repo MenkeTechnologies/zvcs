@@ -2998,16 +2998,72 @@ exit 1
 /// `--no-verify` cannot bypass: `--no-verify` skips the hooks on the pushing
 /// side and has no say over the other end. It refuses one ref by name so a
 /// single push can be accepted and rejected at once.
-const PEER_HOOKS: &[(&str, &str)] = &[(
-    "update",
-    r##"#!/bin/sh
+const PEER_HOOKS: &[(&str, &str)] = &[
+    (
+        "update",
+        r##"#!/bin/sh
 if [ "$1" = "refs/heads/veto" ]; then
 	printf 'update refuses %s\n' "$1" >&2
 	exit 1
 fi
 exit 0
 "##,
-)];
+    ),
+    // `update` refuses one ref; `pre-receive` refuses the whole push. That
+    // difference is the sharpest thing this territory has to measure, and
+    // `receive_hooks.rs` could only ever see half of it: a `Case` is one argv
+    // against a pristine copy and cannot write a hook, so the half no fixture
+    // shipped was unmeasurable.
+    //
+    // It also records `$GIT_PUSH_OPTION_COUNT` and the option values, which
+    // nothing could observe before — the `update` hook above branches on `$1`
+    // and says nothing about its environment.
+    (
+        "pre-receive",
+        r##"#!/bin/sh
+{
+	printf 'push-options %s\n' "${GIT_PUSH_OPTION_COUNT:-unset}"
+	i=0
+	while [ "$i" -lt "${GIT_PUSH_OPTION_COUNT:-0}" ]; do
+		eval "printf 'push-option %s\n' \"\$GIT_PUSH_OPTION_$i\""
+		i=$((i + 1))
+	done
+} > pre-receive.log
+veto=0
+while read -r old new ref; do
+	printf 'pre-receive %s %s %s\n' "$old" "$new" "$ref" >> pre-receive.log
+	if [ "$ref" = "refs/heads/veto-all" ]; then
+		veto=1
+	fi
+done
+if [ "$veto" = 1 ]; then
+	printf 'pre-receive refuses the whole push\n' >&2
+	exit 1
+fi
+exit 0
+"##,
+    ),
+    // git ignores what these two return. A port that propagates either turns a
+    // push that already succeeded into a failing one, and every ref has
+    // already moved by the time they run — the receive-side twin of the
+    // `post-commit` trap `FAILING_HOOKS` sets on the client.
+    (
+        "post-receive",
+        r##"#!/bin/sh
+cat > post-receive.log
+printf 'post-receive ran\n' >&2
+exit 1
+"##,
+    ),
+    (
+        "post-update",
+        r##"#!/bin/sh
+printf '%s\n' "$@" > post-update.log
+printf 'post-update ran\n' >&2
+exit 1
+"##,
+    ),
+];
 
 /// The id `refs/heads/dangling` points at in [`Shape::Damaged`]: well-formed,
 /// and belonging to no object. A literal rather than a hash of anything, so it

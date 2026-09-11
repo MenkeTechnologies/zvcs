@@ -967,11 +967,24 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // a kept pack — which by then includes the packs this run just wrote — also
     // holds.
     //
-    // The stamp is the `.pack`'s mtime, which is what `add_recent_packed()` uses
-    // for an object in an ordinary pack. An object that came out of an *existing
-    // cruft* pack should carry the mtime that pack's `.mtimes` recorded for it
-    // rather than the file's; that sidecar has no reader here, so it is dated by
-    // its pack like any other.
+    // ```c
+    // if (pack->is_cruft) {
+    //         if (load_pack_mtimes(pack) < 0)
+    //                 die(_("could not load cruft pack .mtimes"));
+    //         mtime = nth_packed_mtime(pack, pos);
+    // } else {
+    //         mtime = pack->mtime;
+    // }
+    // ```
+    //
+    // (`add_object_in_unpacked_pack()`, builtin/pack-objects.c:3762-3786, git
+    // 2.39.0-rc2.) An ordinary pack dates its objects by the `.pack` file, but a
+    // *cruft* pack dates each one by the `.mtimes` entry beside it — which is
+    // what keeps an object's age its own rather than the age of the last cruft
+    // pack that carried it. `pos` is the index position
+    // (`for_each_object_in_pack()`, packfile.c:2167-2176, which hands the
+    // callback `index_pos` under either ordering), so the sidecar is read in the
+    // same order [`write_mtimes`] writes it.
     let (cruft_candidates, cruft_kept): (Vec<(ObjectId, u32)>, HashSet<ObjectId>) = match st.cruft {
         false => (Vec::new(), HashSet::new()),
         true => {
@@ -990,7 +1003,19 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
                 let stamp = super::prune::mtime_of(&file.path().with_extension("pack"))
                     .unwrap_or(0)
                     .clamp(0, i64::from(u32::MAX)) as u32;
-                candidates.extend(file.iter().map(|e| (e.oid, stamp)));
+                // `load_pack_mtimes()` is only reached for `p->is_cruft`, which
+                // is exactly "a `.mtimes` sits beside the pack"; an unreadable or
+                // corrupt one leaves the pack's own mtime standing, where git
+                // dies. Dying would be the faithful reading, but this is the path
+                // that decides what survives a `gc`, and refusing to expire is
+                // the safe half of the divergence.
+                let mtimes = file.path().with_extension("mtimes");
+                let per_object = read_mtimes(&mtimes, file.num_objects());
+                for (pos, entry) in file.iter().enumerate() {
+                    let stamp =
+                        per_object.as_ref().and_then(|m| m.get(pos).copied()).unwrap_or(stamp);
+                    candidates.push((entry.oid, stamp));
+                }
             }
             (candidates, kept)
         }
@@ -1121,7 +1146,27 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
             let slot = stamps.entry(id).or_insert(stamp);
             *slot = (*slot).max(stamp);
         }
-        for id in super::prune::all_object_ids(&repo, &objdir) {
+        // ```c
+        // static void add_unreachable_loose_objects(void)
+        // {
+        //         for_each_loose_file_in_objdir(get_object_directory(),
+        //                                       add_loose_object,
+        //                                       NULL, NULL, NULL);
+        // }
+        // ```
+        //
+        // (builtin/pack-objects.c:3829-3834, git 2.39.0-rc2.) *Loose* files and
+        // nothing else — the packed half of the enumeration is
+        // `add_objects_in_unpacked_packs()`, which is `cruft_candidates` above.
+        // Walking every object here instead, loose or packed, gave a packed-only
+        // object the `st_mtime` of a loose file that does not exist — zero — and
+        // this `insert` overwrote the stamp its pack had just supplied. Under
+        // `--cruft-expiration` (which is how `gc` always calls this) a zero stamp
+        // is older than any date, so the object was no longer a traversal tip,
+        // fell out of the closure, and the cruft pack came back empty while `-d`
+        // deleted the one that had held it: a second `gc` over an unchanged
+        // object set destroyed the unreachable objects the first one preserved.
+        for id in super::prune::loose_object_ids(&repo, &objdir) {
             if in_new_pack.contains(&id) || cruft_kept.contains(&id) {
                 continue;
             }
@@ -1739,6 +1784,37 @@ fn write_mtimes(
     let ordered: Vec<u32> =
         index.iter().map(|e| stamps.get(&e.oid).copied().unwrap_or(0)).collect();
     install(to, &super::gc::mtimes_bytes(hash, &ordered, index.pack_checksum().as_slice())?)
+}
+
+/// `load_pack_mtimes_file()` (pack-mtimes.c:22-95, git 2.39.0-rc2): one 32-bit
+/// timestamp per object of `path`'s pack, in index order.
+///
+/// The header is `MTME`, version 1 and the hash identifier — twelve bytes — and
+/// the file closes with the pack checksum and its own, so the size git accepts
+/// is fixed by the object count. `None` for every case git reports through
+/// `error()`: a missing, short, mis-signed, wrong-version, unknown-hash or
+/// wrong-length file. Only hash ids 1 (SHA-1) and 2 (SHA-256) are known, and
+/// their raw sizes are what the expected length is built from.
+fn read_mtimes(path: &Path, num_objects: u32) -> Option<Vec<u32>> {
+    const HEADER: usize = 12;
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < HEADER || &bytes[..4] != b"MTME" {
+        return None;
+    }
+    let be32 = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+    if be32(4) != 1 {
+        return None;
+    }
+    let raw_hash_size = match be32(8) {
+        1 => 20,
+        2 => 32,
+        _ => return None,
+    };
+    let count = num_objects as usize;
+    if bytes.len() != HEADER + 4 * count + 2 * raw_hash_size {
+        return None;
+    }
+    Some((0..count).map(|i| be32(HEADER + 4 * i)).collect())
 }
 
 /// Put one pack artifact in place, `0444` and by rename, as git installs them.

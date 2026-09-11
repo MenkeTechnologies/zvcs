@@ -160,7 +160,6 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--no-revs",
     "--flags",
     "--no-flags",
-    "--output-object-format",
     "--bisect",
     "--end-of-options",
     "--all-objects",
@@ -2160,6 +2159,34 @@ fn positional_option(
     // (`builtin/rev-parse.c:758-763`.)
     if arg == "--local-env-vars" {
         print_local_env_vars(out)?;
+        return Ok(Positional::Consumed);
+    }
+    // `--output-object-format[=<algo>]` names the hash the ids are *printed* in.
+    // The bare spelling is a `die()` of its own — it does not reach for
+    // `argv[++i]`, so `rev-parse --output-object-format sha1 HEAD` is the same
+    // failure as `rev-parse --output-object-format`.
+    if arg == "--output-object-format" {
+        out.flush()?;
+        eprintln!("fatal: no object format specified");
+        return Ok(Positional::Fatal);
+    }
+    // `storage` is whatever the repository already stores, and is always
+    // accepted. Any other spelling has to name an algorithm the repository can
+    // actually render, which — with no `extensions.compatObjectFormat` to convert
+    // through — means its own: measured against stock 2.55.0, a sha1 repository
+    // takes `sha1` and `storage` and answers `fatal: unsupported object format:
+    // sha256` for the other algorithm, while a sha256 repository is the mirror
+    // image of that. The comparison is case-sensitive there too (`SHA1` is
+    // rejected), which falls out of comparing against the algorithm's own name.
+    //
+    // Accepting it is the whole of the work: the ids this port prints are the
+    // ones it stores, so an output format equal to the storage format is a no-op.
+    if let Some(format) = arg.strip_prefix("--output-object-format=") {
+        if format != "storage" && format != repo.object_hash().to_string() {
+            out.flush()?;
+            eprintln!("fatal: unsupported object format: {format}");
+            return Ok(Positional::Fatal);
+        }
         return Ok(Positional::Consumed);
     }
     // ```c

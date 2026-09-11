@@ -1622,6 +1622,25 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             source_file = Some(path);
             scoped = match read_config_bytes(path) {
                 Ok(bytes) => {
+                    // `git_config_from_file()` reads the named file through the
+                    // same `git_parse_source()` every other scope goes through,
+                    // and `do_config_from_file()` sets
+                    // `default_error_action = CONFIG_ERROR_DIE`. So a `--file`
+                    // that will not parse is `fatal: bad config line <n> in file
+                    // <path>` at 128 — the same diagnostic the repository and
+                    // global scopes already raise before the command starts,
+                    // naming the path exactly as the command line spelled it.
+                    //
+                    // This is the *read* half only. `git config -f <malformed>
+                    // <key> <value>` does not come through here: the writer has
+                    // its own parser (`config.c`'s `store` pass) and answers
+                    // `error: invalid config file <path>` at exit 3.
+                    if let Some(line) = crate::config::first_bad_config_line(&bytes) {
+                        return Err(crate::fatal::die(format!(
+                            "bad config line {line} in file {}",
+                            path.display()
+                        )));
+                    }
                     let mut f = parse_config(&bytes, path, Source::Cli)?;
                     if includes {
                         // Follow `include.path` / `includeIf` from the named file,

@@ -508,8 +508,23 @@ fn describe_commit_to_string(
     // without any search, and everything below it is the candidate walk. The gate
     // is exactly "is this commit in the name map", because the map only ever holds
     // the priorities the selector admits.
-    let exact_match =
-        opts.debug && build_names(repo, opts.select, filter)?.contains_key(&commit_oid);
+    let exact_match = (opts.debug || exact_only)
+        && build_names(repo, opts.select, filter)?.contains_key(&commit_oid);
+    // ```c
+    // if (!max_candidates)
+    //         die(_("no tag exactly matches '%s'"), oid_to_hex(&cmit->object.oid));
+    // if (debug)
+    //         fprintf(stderr, _("No exact match on refs or tags, searching to describe\n"));
+    // ```
+    //
+    // (`builtin/describe.c:596-600`.) `--exact-match` is `max_candidates = 0`, and
+    // its refusal sits *between* the two halves: after the early return for a name
+    // sitting on the commit, and before the line that announces the search. So
+    // `describe --exact-match --debug` on an unnamed commit prints the `fatal:` and
+    // nothing else — the search it would have described never starts.
+    if exact_only && !exact_match {
+        return Ok(Err(fatal(format!("no tag exactly matches '{commit_oid}'"))?));
+    }
     if opts.debug && !exact_match {
         eprintln!("No exact match on refs or tags, searching to describe");
     }

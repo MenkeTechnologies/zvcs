@@ -250,6 +250,15 @@ fn set_symref(
     if name == "HEAD" && !target.starts_with("refs/") {
         return fatal("Refusing to point HEAD outside of refs/");
     }
+    // `check_refname_format(argv[1], REFNAME_ALLOW_ONELEVEL)` on the *target* is
+    // `cmd_symbolic_ref()`'s own check and runs before the ref store is asked to
+    // do anything, so it outranks both refusals below: stock 2.55.0 answers
+    // `symbolic-ref FETCH_HEAD 'bad~target'` with `fatal: Refusing to set
+    // 'FETCH_HEAD' to invalid ref 'bad~target'` (exit 128), not with the
+    // pseudoref error.
+    if gix::validate::reference::name_partial(BStr::new(target)).is_err() {
+        return fatal(&format!("Refusing to set '{name}' to invalid ref '{target}'"));
+    }
     // git refuses to make a *pseudoref* (MERGE_HEAD, FETCH_HEAD, ORIG_HEAD, …)
     // symbolic; HEAD is the one all-caps name it permits. `is_pseudoref_syntax`
     // in refs.c: a slash-free name whose every byte is upper-case / `_` / `-`.
@@ -257,8 +266,13 @@ fn set_symref(
         eprintln!("error: refusing to update pseudoref '{name}'");
         return Ok(ExitCode::from(1));
     }
-    if gix::validate::reference::name_partial(BStr::new(target)).is_err() {
-        return fatal(&format!("Refusing to set '{name}' to invalid ref '{target}'"));
+    // `ref_transaction_update()` gates the *name* before the backend sees it. A
+    // symbolic update carries no new object id, so the branch it takes is
+    // `!refname_is_safe(refname)` rather than `check_refname_format()`, and the
+    // rejection is an `error:` at exit 1 — not a `fatal:`.
+    if !refname_is_safe(name) {
+        eprintln!("error: refusing to update ref with bad name '{name}'");
+        return Ok(ExitCode::from(1));
     }
 
     let name_full = full_name(name)?;
@@ -440,6 +454,13 @@ fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
     if name == "HEAD" {
         return fatal("deleting 'HEAD' is not allowed");
     }
+    // `refs_read_symbolic_ref()` reaches the ref store through
+    // `refs_resolve_ref_unsafe()`, which refuses a name `check_refname_format()`
+    // will not spell at all — so `-d refs/heads/x.lock` is `No such ref`, where
+    // the well-formed but absent `-d refs/heads/nonexistent` is `Cannot delete`.
+    if !valid_refname(name) {
+        return fatal(&format!("No such ref: {name}"));
+    }
     let Some(target) = symbolic_target(repo, BStr::new(name))? else {
         return fatal(&format!("Cannot delete {name}, not a symbolic ref"));
     };
@@ -546,6 +567,64 @@ fn terminal(saw_symref: bool, name: BString) -> Resolution {
     } else {
         Resolution::NotSymbolic
     }
+}
+
+/// Port of `refname_is_safe()` (refs.c), the check `ref_transaction_update()`
+/// applies to a ref whose update carries no new object id — which is every
+/// symbolic update:
+///
+/// ```c
+/// int refname_is_safe(const char *refname)
+/// {
+///         const char *rest;
+///
+///         if (skip_prefix(refname, "refs/", &rest)) {
+///                 char *buf;
+///                 int result;
+///                 size_t restlen = strlen(rest);
+///
+///                 /* rest must not be empty, or start or end with "/" */
+///                 if (!restlen || *rest == '/' || rest[restlen - 1] == '/')
+///                         return 0;
+///
+///                 /*
+///                  * Does the refname try to escape refs/?
+///                  * For example: refs/foo/../bar is safe but refs/foo/../../bar
+///                  * is not.
+///                  */
+///                 buf = xmallocz(restlen);
+///                 result = !normalize_path_copy(buf, rest) && !strcmp(buf, rest);
+///                 free(buf);
+///                 return result;
+///         }
+///
+///         do {
+///                 if (!isupper(*refname) && *refname != '_')
+///                         return 0;
+///                 refname++;
+///         } while (*refname);
+///         return 1;
+/// }
+/// ```
+///
+/// This is a *looser* test than [`valid_refname`] under `refs/` — `.lock` and a
+/// leading dot are both safe there — and a much *stricter* one outside it, where
+/// only upper-case and `_` are allowed at all. That asymmetry is why stock 2.55.0
+/// writes `refs/heads/x.lock` but refuses `a/b`, `foo` and `MY-REF`.
+///
+/// `normalize_path_copy()` leaves `rest` unchanged exactly when no component is
+/// empty, `.` or `..`; the empty-component case also covers the leading and
+/// trailing slash the C tests separately, and is kept here for the same reason.
+fn refname_is_safe(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("refs/") {
+        if rest.is_empty() || rest.starts_with('/') || rest.ends_with('/') {
+            return false;
+        }
+        return rest.split('/').all(|c| !c.is_empty() && c != "." && c != "..");
+    }
+    // The C loop reads the terminating NUL on an empty name, which is neither
+    // upper-case nor `_`, so `""` is unsafe.
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
 }
 
 /// Port of `check_refname_component`. `*` is always rejected because

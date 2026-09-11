@@ -212,7 +212,50 @@ fn option_table(text: &str) -> Option<Vec<TableOpt>> {
 /// so a table spelled `&[…]`, `&{ … &[…] }` or `[…]` all yield their whole body.
 /// String contents are skipped, so a `;` or a bracket inside a literal cannot
 /// end the scan early.
+/// Drop `//` comments, keeping everything else byte-for-byte.
+///
+/// The recognizers below read every string literal in a block and reject the
+/// whole table if one does not look like an option name — which is the right
+/// rule for entries and the wrong one for prose. A `//` line that happens to
+/// quote a flag, as `GIT_LOG_LONG_OPTS`' does when it explains that git parses
+/// `"--graph-lane-limit="` only in its `=` form, silently demoted `log` to the
+/// regex fallback and cost it 200-odd completions. Nothing announced it; the
+/// table simply stopped being recognised. A string literal inside a comment is
+/// not a table entry, so it is removed before parsing rather than left to be
+/// mistaken for one.
+///
+/// Quotes are tracked so a `//` inside a string literal — a URL, a doc example —
+/// does not start a comment.
+fn strip_line_comments(text: &str) -> String {
+    let b = text.as_bytes();
+    let (mut out, mut i, mut in_str) = (String::with_capacity(text.len()), 0usize, false);
+    while i < b.len() {
+        if in_str {
+            if b[i] == b'\\' && i + 1 < b.len() {
+                out.push(b[i] as char);
+                out.push(b[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b[i] == b'"' {
+                in_str = false;
+            }
+        } else if b[i] == b'"' {
+            in_str = true;
+        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn const_block(text: &str, name_re: &str) -> Option<(String, String)> {
+    let text = &strip_line_comments(text);
     let re = regex::Regex::new(&format!(r"const\s+{name_re}\s*:\s*([^=]*?)=")).unwrap();
     let m = re.captures(text)?;
     let ty = m[1].trim().to_string();

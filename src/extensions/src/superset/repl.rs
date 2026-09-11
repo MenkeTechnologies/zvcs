@@ -121,9 +121,13 @@ fn completion_word_start(line: &str, pos: usize) -> (usize, &str) {
     (start, line.get(start..pos).unwrap_or(""))
 }
 
-// The porcelain completion table (`PORCELAIN_SPEC`: sorted `(verb, opts, subs)`),
-// harvested from each porcelain module's own arg parser at build time so it can
-// never drift from what the verb actually accepts. See build.rs.
+// The porcelain completion table (`PORCELAIN_SPEC`: sorted
+// `(verb, opts, subs, approximate)`), generated at build time from each porcelain
+// module's own arg parser. A verb that declares an option table renders its
+// options from that table the way `show_gitcomp()` prints
+// `--git-completion-helper`, so its list cannot drift from what the verb accepts;
+// a verb that declares none falls back to a whole-file scan for flag literals and
+// carries `approximate: true` to say so. See build.rs.
 include!(concat!(env!("OUT_DIR"), "/porcelain_spec.rs"));
 
 /// `(options, subcommands)` for a superset (`z*`) verb. Hand-authored because the
@@ -162,7 +166,7 @@ fn verb_spec(verb: &str) -> (&'static [&'static str], &'static [&'static str]) {
     if let Some(spec) = superset_spec(verb) {
         return spec;
     }
-    match PORCELAIN_SPEC.binary_search_by(|(v, _, _)| (*v).cmp(verb)) {
+    match PORCELAIN_SPEC.binary_search_by(|(v, _, _, _)| (*v).cmp(verb)) {
         Ok(i) => (PORCELAIN_SPEC[i].1, PORCELAIN_SPEC[i].2),
         Err(_) => (&[], &[]),
     }
@@ -440,6 +444,56 @@ mod tests {
         // Options still complete; nothing past the value position.
         assert!(values("zconfig --").contains(&"--help".to_string()));
         assert!(values("zconfig autoreconcile on ").is_empty());
+    }
+
+    /// Whether the generated row for `verb` came from the regex fallback.
+    fn approximate(verb: &str) -> bool {
+        let i = PORCELAIN_SPEC.binary_search_by(|(v, _, _, _)| (*v).cmp(verb)).expect(verb);
+        PORCELAIN_SPEC[i].3
+    }
+
+    #[test]
+    fn a_table_backed_verb_completes_what_its_parser_resolves() {
+        // `branch` drives its parse off `LONG_OPTS`, so its completion is that
+        // table rendered the way stock prints `--git-completion-helper`: a `=`
+        // on the options that demand a value, and the `--no-` half for the
+        // entries without `PARSE_OPT_NONEG`.
+        assert!(!approximate("branch"));
+        let b = values("branch --");
+        for opt in ["--set-upstream-to=", "--sort=", "--contains", "--no-contains", "--no-verbose"] {
+            assert!(b.contains(&opt.to_string()), "branch missing `{opt}`: {b:?}");
+        }
+        // `--no-contains` is its own table entry (`PARSE_OPT_NONEG`), so the
+        // negated pass must not also offer `--no-no-contains`.
+        assert!(!b.contains(&"--no-no-contains".to_string()), "{b:?}");
+        // The old whole-file harvest offered these three and nothing else; they
+        // are not in the table, and stock offers none of them either.
+        for gone in ["--end-of-options", "--help-all", "-u"] {
+            assert!(!b.contains(&gone.to_string()), "branch still offers `{gone}`: {b:?}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_no_longer_invents_options_for_log() {
+        // `log` resolves names against its own `GIT_LOG_LONG_OPTS`; the whole-file
+        // harvest used to add flag literals from elsewhere in the module that
+        // `git log` answers `unrecognized argument` to. Stock 2.55.0:
+        //   $ git log --renames  → fatal: unrecognized argument: --renames
+        assert!(!approximate("log"));
+        for gone in ["--renames", "--timestamp", "--object-names", "--no-boundary"] {
+            assert!(values(&format!("log {gone}")).is_empty(), "log still offers `{gone}`");
+        }
+        assert!(values("log --deco").contains(&"--decorate-refs".to_string()));
+    }
+
+    #[test]
+    fn a_verb_with_no_readable_table_is_marked_approximate() {
+        // `config` parses its own argv without a `LONG_OPTS` table, so its row is
+        // the regex harvest and says so. Nothing reads the flag at completion
+        // time — it is there so the generated file distinguishes a parsed list
+        // from a guessed one.
+        assert!(approximate("config"));
+        assert!(values("config --get-r").contains(&"--get-regexp".to_string()));
     }
 
     #[test]

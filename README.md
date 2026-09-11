@@ -506,7 +506,11 @@ the `z*` superset verbs and every git-compat porcelain command alike (the latter
 operating on the current repo) — doubling as a live daemon/ledger console. On a
 tty it opens with a stats banner and edits with Tab-completion of every verb plus
 persistent history; piped stdin falls back to a raw reader so scripts stay
-usable. `git zbanner [--color|--no-color]` prints that banner again on demand —
+usable. A `-`-prefixed word completes the verb's long options, generated at build
+time from that verb's own `parse_long_opt()` table and rendered exactly as stock
+prints `--git-completion-helper` (so `--sort=`, `--no-verbose` and the rest match
+git's own completion); a verb that keeps no such table falls back to scanning its
+module for flag literals, which the generated table marks as approximate. `git zbanner [--color|--no-color]` prints that banner again on demand —
 the logo plus os/arch/pid, cores, indexed repos, and the superset/git-compat/total
 verb counts, all read at call time, so a long-lived console can refresh the
 numbers instead of showing what was true when it opened.

@@ -48,7 +48,11 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 /// A scratch directory of our own, since this crate carries no `tempfile`
 /// dev-dependency.
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zvcs-status-compare-branches-{name}"));
+    // Pid-keyed for the same reason every other test file here is: the helper
+    // removes the tree before rebuilding it, so two concurrent runs of this
+    // binary would take turns deleting each other's fixture.
+    let dir =
+        std::env::temp_dir().join(format!("zvcs-status-compare-branches-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir

@@ -40,7 +40,15 @@ use std::process::{Command, Output};
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("zvcs-alternate-refs-it-{name}"));
+    // The pid is what keeps two concurrent runs of this binary apart. Without it
+    // both land on the same `…-{name}` directory, and since each test *removes*
+    // the tree before rebuilding it, one run wipes the other's fixture mid-flight
+    // and the borrower ends up listing a partly-rebuilt alternate — which shows
+    // up as extra object ids rather than missing ones, so it reads like a walk
+    // bug rather than a collision. Measured: one instance passes 7/7, four
+    // concurrent instances fail 5-6 of 7 each. 440 of the 443 test files here
+    // already carry the pid; this was one of the three that did not.
+    let dir = std::env::temp_dir().join(format!("zvcs-alternate-refs-it-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir

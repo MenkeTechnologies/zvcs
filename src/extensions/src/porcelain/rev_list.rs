@@ -69,6 +69,62 @@ fn fatal(message: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// `test_bitmap_walk()` (pack-bitmap.c:2791-2860, git 2.55.0), as far as this
+/// port can carry it.
+///
+/// # What is reproduced
+///
+/// Its first act, which is also the answer for every repository that has no
+/// reachability bitmap — which is every repository until something asks for one:
+///
+/// ```c
+/// if (!(bitmap_git = prepare_bitmap_git(revs->repo)))
+///         die(_("failed to load bitmap indexes"));
+/// ```
+///
+/// (:2800-2801.) `prepare_bitmap_git()` opens the multi-pack-index's `.bitmap`
+/// if the object store has one and otherwise the first pack `.bitmap` it can
+/// read; with none to open it returns NULL and the command dies before it looks
+/// at the revisions at all — so this runs ahead of the "exactly one commit"
+/// check at :2803 and reports the same 128.
+///
+/// # What is not
+///
+/// The verification itself. With a bitmap present git decompresses the EWAH
+/// entry for the named commit, reports its width and checksum and which pack or
+/// MIDX held it, then walks the history for real and compares the two sets:
+///
+/// ```text
+/// Bitmap v1 test (6 entries loaded, 6 total)
+/// Found bitmap for 'fb4152cb686cb19362ccdac8e20f28970374b712'. 64 bits / 9fda7296 checksum
+/// Located via pack '4144d7e85c7b4bb5ad1f4bf68d28d60f87216873'.
+/// OK!
+/// ```
+///
+/// (git 2.55.0 over a five-commit repository repacked with
+/// `--write-bitmap-index`; the `Verifying bitmap entries` meter between the last
+/// two lines is a progress meter and so appears only on a terminal.)
+///
+/// Every line of that needs a `.bitmap` *reader* — the v1 header, the four type
+/// bitmaps, the per-commit entries and the XOR chain `find_bitmap_for_commit()`
+/// resolves — and this tree has only a writer
+/// (`gix_pack::data::output::bitmap`). Answering with anything less would be
+/// claiming a verification that did not happen, so the gap is stated instead.
+fn test_bitmap_walk(repo: &gix::Repository) -> Result<ExitCode> {
+    let pack_dir = repo.objects.store_ref().path().join("pack");
+    let present = std::fs::read_dir(&pack_dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_name().to_string_lossy().ends_with(".bitmap")
+        })
+    });
+    if !present {
+        return Ok(fatal("failed to load bitmap indexes"));
+    }
+    anyhow::bail!(
+        "rev-list --test-bitmap cannot verify a bitmap here — reading a pack or multi-pack `.bitmap` (the v1 header, its four type bitmaps and the XOR-chained per-commit entries) has no implementation in this tree, which carries only gix_pack::data::output::bitmap's writer"
+    )
+}
+
 /// Print a diagnostic that already carries its own prefixes and newline, and
 /// return git's fatal exit code.
 ///
@@ -489,6 +545,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `--bisect-vars`: `bisect_show_vars`, which replaces the listing with the
     // six `bisect_*` shell assignments `git bisect` sources.
     let mut bisect_vars = false;
+    // `--test-bitmap`, read by `cmd_rev_list()`'s leftover loop like the two
+    // above — but terminal rather than a mode: it runs `test_bitmap_walk()` and
+    // jumps to the exit (`builtin/rev-list.c:805-808`), so nothing is listed.
+    let mut test_bitmap = false;
     let mut quiet = false;
     let mut disk_usage = false;
     let mut disk_usage_human = false;
@@ -833,6 +893,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 bisect = true;
                 bisect_vars = true;
             }
+            "--test-bitmap" => test_bitmap = true,
             // `revs->dense` (revision.c:2462-2465). `--dense` restores the
             // `repo_init_revisions()` default, so it is only ever an undo of an
             // earlier `--sparse`. Neither says anything without a pathspec: the
@@ -1458,6 +1519,22 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
         eprintln!("fatal: {msg}");
         return Ok(ExitCode::from(128));
+    }
+
+    // `--test-bitmap` runs in `cmd_rev_list()`'s leftover loop, which is after
+    // `setup_revisions()` — so every revision and the pathspec have already been
+    // parsed and their diagnostics already given — and it ends the command:
+    //
+    // ```c
+    // if (!strcmp(arg, "--test-bitmap")) {
+    //         test_bitmap_walk(&revs);
+    //         goto cleanup;
+    // }
+    // ```
+    //
+    // (`builtin/rev-list.c:805-808`, git 2.55.0.)
+    if test_bitmap {
+        return test_bitmap_walk(&repo);
     }
 
     // `revs->abbrev` is the minimum width every abbreviation in the run is asked

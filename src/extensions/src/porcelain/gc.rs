@@ -83,16 +83,13 @@
 //!     effective expiry is `now`, because that is the one expiry whose semantics
 //!     the delegate implements. See below.
 //!
-//!   * **Repacking**, as [`repack_all`] below: every object the repository holds
-//!     is partitioned into the reachable set and the rest, the reachable set is
-//!     written into one new pack, and the loose copies and superseded packs are
-//!     removed. This is `git repack -ad`'s observable effect.
-//!   * **Cruft packs.** Unreachable objects that survive the prune expiry go into
-//!     a second pack carrying a `.mtimes` sidecar, which is what `--cruft` (the
-//!     default since git 2.37) means. `--no-cruft` leaves them loose instead, and
-//!     an expiry of `now` drops them outright — all three verified against git
-//!     2.55.0 on the `conflicted` fixture, whose two unreachable objects
-//!     (`2ae666ad…` tree, `5eb9640f…` blob) make the distinction visible.
+//!   * **Repacking**, delegated to [`super::repack::repack`] with the argument
+//!     list [`repack_argv`] builds. `gc` writes no pack of its own: it assembles
+//!     one `repack` command line and runs it (`builtin/gc.c:897`, `:919-927`,
+//!     `:948-959`, `:1016-1022`), and every choice about which objects land in
+//!     which pack is the child's. Cruft packs, the `--cruft`/`-a`/`-A` split,
+//!     `--keep-pack=`, `--filter=`/`--filter-to=` and the reachability bitmap
+//!     all come with it rather than being reproduced here.
 //!   * **Commit-graph**, delegated to [`super::commit_graph::commit_graph`] as
 //!     `commit-graph write --reachable`, matching `gc.writeCommitGraph`'s default
 //!     of true.
@@ -100,53 +97,48 @@
 //!     [`super::update_server_info::update_server_info`], which `repack` refreshes
 //!     at the end of a successful run.
 //!
-//! ## Pack bytes differ from git's, but the compression does not
+//! ## The pack is stock's, byte for byte
 //!
-//! The packs come from `pack-objects`' writer, so they are delta-compressed by
-//! git's own machinery ported into [`gix_pack::data::output::delta`], under the
-//! repository's `pack.*` settings and `repack.useDeltaBaseOffset`, with
-//! `--aggressive` widening the search to `gc.aggressiveWindow` /
-//! `gc.aggressiveDepth`.
+//! It was not always. This module used to pack inline, partitioning the object
+//! store by object id, and that enumeration order is not the one
+//! `type_size_sort()` and `compute_write_order()` work from — so the pack, and
+//! the checksum its filename carries, differed from stock's while every other
+//! observable stayed the same. Measured on a five-commit fixture with a tag and
+//! a second branch, git 2.55.0 against the port before the delegation:
 //!
-//! The cruft pack is searched separately, under `repack.cruftWindow`,
-//! `repack.cruftWindowMemory`, `repack.cruftDepth` and `repack.cruftThreads`,
-//! each falling back to what the reachable pack used. git reaches the same
-//! split by running `repack --cruft`, which keeps a second set of
-//! `pack-objects` arguments for the cruft child; see [`cruft_delta_options`].
+//! ```text
+//! $ git  gc -q && ls .git/objects/pack/*.pack
+//! pack-7e6496f9d634596b18115a5246892b08ad4f2b2a.pack
+//! $ zvcs gc -q && ls .git/objects/pack/*.pack
+//! pack-7f2cb2cba512c726b828561efbe48764c73e4661.pack
+//! ```
 //!
-//! The bytes still differ from git's, because objects are enumerated in this
-//! module's own order rather than git's `compute_write_order()` — so the
-//! checksum embedded in a pack's filename differs too. What is reproduced is the *object storage layout* —
-//! which objects end up loose, which end up packed, how many packs and sidecars
-//! exist, and that every one of them is well-formed. `git fsck`,
-//! `git verify-pack` and `git cat-file` all accept the result.
+//! Driving the same fixture through the child's own argument list —
+//! `pack-refs --all --prune`, `reflog expire --all`, then
+//! `repack -d -l --cruft --cruft-expiration=2.weeks.ago` — already produced
+//! `7e6496f9…` under both binaries, which is what made the second packing path
+//! the defect rather than the pack writer.
 //!
 //! # Not performed
 //!
 //! These are skipped, and a `gc` that exits 0 has **not** done them:
 //!
-//!   1. **Reachability bitmaps** (`.bitmap`). git writes one for a large enough
-//!      repack; it is a lookup accelerator, and its absence changes no answer.
-//!   2. **`--keep-largest-pack`, `--max-cruft-size`.** Both select *which*
-//!      objects a pack holds rather than how it is compressed: this port always
-//!      rewrites every pack, and the fixtures' cruft packs are far below any
-//!      size limit. They are accepted, and `--max-cruft-size` (with its
-//!      `gc.maxCruftSize` default) still warns below git's 1 MiB floor.
-//!      `--aggressive` *is* honoured: it widens the delta search to
-//!      `gc.aggressiveWindow` and `gc.aggressiveDepth`, and passes the `-f`
-//!      git's own `--aggressive` pushes, so no delta is kept from an existing
-//!      pack.
+//!   1. **Reusing the deltas an existing pack already holds.** `pack-objects`
+//!      keeps them unless `--no-reuse-delta` says otherwise, and the port's
+//!      writer always searches afresh — so a `gc` over a repository whose
+//!      objects are *already* packed can still write a different pack from
+//!      stock's. Stock's own second `gc` moves to a new checksum and stays
+//!      there; this port's is idempotent from the first:
 //!
-//!   3. **`gc.repackFilter` / `gc.repackFilterTo`.** git forwards these to its
-//!      `repack` child as `--filter=` / `--filter-to=`, which makes it write a
-//!      *second* pack holding the filtered-out objects. [`repack_all`] has no
-//!      counterpart for that split — it partitions the store into reachable and
-//!      unreachable and writes one pack for each — so a valid filter is read and
-//!      then not applied. What *is* reproduced is the pair of refusals the child
-//!      raises for a spec it cannot parse and for `--filter-to` without
-//!      `--filter`; see [`check_repack_filter`], which explains why the split is
-//!      not simply bolted on.
-//!   4. **Writing `gc.log`.** A failure is reported on stderr here rather than
+//!      ```text
+//!      $ git  gc -q; git  gc -q   # 7e6496f9… then 4bbc768e…
+//!      $ zvcs gc -q; zvcs gc -q   # 7e6496f9… both times
+//!      ```
+//!
+//!      Confirmed to be delta reuse and nothing else: stock's second pass under
+//!      `-f`, which is `--no-reuse-delta`, reproduces the port's answer. The gap
+//!      is in the pack writer, not here.
+//!   2. **Writing `gc.log`.** A failure is reported on stderr here rather than
 //!      captured to a file, there being no detached child whose output would
 //!      otherwise be lost, and the file is not removed after a successful run
 //!      either (`builtin/gc.c:99-101`). Reading one *is* done — see
@@ -164,7 +156,7 @@
 //! No `gc.pid` lock is taken, so `--force` has nothing to override.
 
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -172,8 +164,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
 use gix::objs::Kind;
-use gix::objs::Write as _;
-use gix::odb::pack;
 
 // The pack artifacts all end the same way and name the hash the same way, so
 // the two encoders `pack-objects` already had are shared rather than repeated.
@@ -266,27 +256,6 @@ enum Prune {
     Dated,
 }
 
-/// Where the objects that survive the reachability walk as *unreachable* go.
-///
-/// Verified one flag at a time against git 2.55.0 on the `conflicted` fixture,
-/// which holds two unreachable objects left behind by its half-finished merge:
-///
-/// | invocation                | loose | packs | `.mtimes` |
-/// |---------------------------|-------|-------|-----------|
-/// | `gc` (default)            | 0     | 2     | 1         |
-/// | `gc --no-cruft`           | 2     | 1     | 0         |
-/// | `gc --prune=now`          | 0     | 1     | 0         |
-/// | `gc --no-cruft --no-prune`| 2     | 1     | 0         |
-#[derive(PartialEq, Clone, Copy)]
-enum Unreachable {
-    /// `--cruft` (the default): a second pack, with a `.mtimes` sidecar.
-    Cruft,
-    /// An expiry of `now`: deleted outright, packed nowhere.
-    Drop,
-    /// `--no-cruft`: left exactly where they are, which is loose.
-    Leave,
-}
-
 /// `git gc` — housekeeping driver.
 ///
 /// Returns 129 with git's own usage output for `-h` and for every malformed
@@ -313,11 +282,23 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // default only when the command line was silent — matching git, where the
     // command line overrides the config.
     let mut prune: Option<Prune> = None;
+    // `--expire-to=<dir>`, git's `cfg.repack_expire_to`. It is forwarded to the
+    // `repack` child verbatim (builtin/gc.c:642-643) and nowhere else, which is
+    // why the value is kept rather than dropped with the rest of `VALUE_OPTS`.
+    let mut expire_to: Option<String> = None;
     // The raw text of the last `--prune=<value>`, kept so `parse_expiry_date()`
     // can be applied once after parsing, the way `cmd_gc()` applies it to
     // `prune_expire_arg` — last occurrence wins, and an unreadable earlier one is
     // never seen.
     let mut prune_raw: Option<String> = None;
+    // git's `prune_expire_arg`, which starts at a sentinel meaning "the command
+    // line said nothing" (builtin/gc.c:860-861). `None` here is that sentinel;
+    // `Some(None)` is `--no-prune`'s NULL and `Some(Some(v))` is `--prune=<v>`.
+    // Only a non-sentinel value replaces `cfg.prune_expire` (:912-915), so a
+    // bare `--prune` — an `OPTARG` whose `defval` *is* the sentinel — leaves
+    // `gc.pruneExpire` and the built-in `2.weeks.ago` in charge. The text is
+    // kept verbatim because `add_repack_all_option()` forwards it verbatim.
+    let mut prune_expire_arg: Option<Option<String>> = None;
     // Parsed eagerly, at the point the option is seen, because git's
     // `parse_max_cruft_size()` runs as a parse-options callback: a bad value
     // beats a later `-h` or a later unknown option, but a *valid* small value
@@ -366,7 +347,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             "--auto" => auto = true,
             "--no-auto" => auto = false,
             "--prune" => prune = Some(Prune::Dated),
-            "--no-prune" => prune = Some(Prune::Disabled),
+            "--no-prune" => {
+                prune = Some(Prune::Disabled);
+                prune_expire_arg = Some(None);
+            }
             "--cruft" => cruft = Some(true),
             "--no-cruft" => cruft = Some(false),
             "--aggressive" => aggressive = true,
@@ -399,15 +383,18 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             // packs.
             "--keep-largest-pack" => keep_largest_pack = Some(true),
             "--no-keep-largest-pack" => keep_largest_pack = Some(false),
-            "--force" | "--no-force"
+            "--force" | "--no-force" => {}
             // `--no-expire-to` is a valid negation (USAGE spells it `--[no-]expire-to`);
             // `--max-cruft-size` has no `--no-` form, so one is left to error out.
-            | "--no-expire-to" => {}
+            // An `OPT_STRING` unset stores a NULL rather than a value, so the
+            // repack child is handed no `--expire-to` at all.
+            "--no-expire-to" => expire_to = None,
             // `--prune=<date>` is the only optional-value option.
             _ if a.starts_with("--prune=") => {
                 // `--prune` is an `OPT_STRING`: the value is only kept here and
                 // checked once, after parsing, on whichever occurrence came last.
                 prune_raw = Some(a["--prune=".len()..].to_string());
+                prune_expire_arg = Some(Some(a["--prune=".len()..].to_string()));
                 prune = Some(Prune::Dated);
             }
             _ if VALUE_OPTS
@@ -426,6 +413,9 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
                         None => return Ok(bad_cruft_size(value)),
                     }
                 }
+                if name == "expire-to" {
+                    expire_to = Some(value.clone());
+                }
                 i += 1;
             }
             _ if VALUE_OPTS
@@ -437,6 +427,9 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
                         Some(size) => max_cruft_size = Some(size),
                         None => return Ok(bad_cruft_size(v)),
                     }
+                }
+                if let Some(v) = a.strip_prefix("--expire-to=") {
+                    expire_to = Some(v.to_string());
                 }
             }
             _ if a.starts_with("--") => {
@@ -545,9 +538,20 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // anything, so nothing below this point may run either. `need_to_gc()`
     // decides in two steps and the second one was missing here: the counters
     // first, and then the `pre-auto-gc` hook, which gets the last word.
-    if auto && !(gc_needed(&repo) && pre_auto_gc_allows(&repo)) {
-        return Ok(ExitCode::SUCCESS);
-    }
+    //
+    // The decision also *is* the repack's argument list on this path: git calls
+    // `need_to_gc()` with the half-built `repack_args` and lets it append, so
+    // which of the two counters tripped is what separates a full rewrite from
+    // an incremental one. It runs here, ahead of the foreground tasks
+    // (builtin/gc.c:936 versus :1012), so the counts it reads are the ones from
+    // before `pack-refs` and `reflog expire` touched anything.
+    let auto_repack = match auto {
+        false => None,
+        true => match auto_repack_choice(&repo).filter(|_| pre_auto_gc_allows(&repo)) {
+            Some(choice) => Some(choice),
+            None => return Ok(ExitCode::SUCCESS),
+        },
+    };
 
     // `cmd_gc()`: `if (cfg.detach_auto && opts.detach < 0) opts.detach = 1;`
     // inside the `--auto` branch (builtin/gc.c:930-931), so only `--auto` lets
@@ -593,20 +597,26 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     });
 
+    // `cfg.prune_expire` itself, as the text `add_repack_all_option()` forwards.
+    // `GC_CONFIG_INIT` seeds it with `"2.weeks.ago"` (builtin/gc.c:161),
+    // `gc.pruneExpire` replaces it (:201-204), and a non-sentinel
+    // `prune_expire_arg` replaces it again (:912-915) — `--no-prune`'s NULL
+    // included, which is the one case that leaves the repack child with no
+    // expiry argument at all.
+    let prune_expire: Option<String> = match prune_expire_arg {
+        Some(explicit) => explicit,
+        None => Some(
+            repo.config_snapshot()
+                .string("gc.pruneExpire")
+                .and_then(|v| v.to_str().ok().map(str::to_string))
+                .unwrap_or_else(|| "2.weeks.ago".to_string()),
+        ),
+    };
+
     // `--cruft` beats the config, which beats git's built-in default of true.
     let cruft = cruft.unwrap_or_else(|| {
         repo.config_snapshot().boolean("gc.cruftPacks").unwrap_or(true)
     });
-    // An expiry of `now` means nothing unreachable survives, so there is nothing
-    // for a cruft pack to hold — git writes none even under an explicit
-    // `--cruft`, which `gc --cruft --prune=now` on the `conflicted` fixture
-    // confirms (one pack, no `.mtimes`).
-    let unreachable = match (prune, cruft) {
-        (Prune::Now, _) => Unreachable::Drop,
-        (_, true) => Unreachable::Cruft,
-        (_, false) => Unreachable::Leave,
-    };
-
     // git's order: pack-refs, then reflog expire, then repack, then prune, then
     // worktree prune, then rerere gc, then commit-graph write.
     if pack_refs_enabled(&repo) {
@@ -669,9 +679,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // `git_pack_config()`'s `pack.useBitmaps` and `pack.allowPackReuse`, which
     // git reaches through the `pack-objects` grandchild its `repack` child
     // starts. That is why `gc -h` prints usage under a bad value and a real `gc`
-    // dies: the read belongs to the packing, not to the option parsing. This
-    // port packs inline, so it is arranged here, immediately before
-    // [`repack_all`]. See [`super::pack_objects::PackConfig`].
+    // dies: the read belongs to the packing, not to the option parsing. The
+    // delegate reaches it too, but only after its own argument diagnostics, so
+    // the read is arranged here to keep git's order. See
+    // [`super::pack_objects::PackConfig`].
     match crate::repo_settings::RepoSettings::load(&repo)
         .and_then(|settings| super::pack_objects::PackConfig::load(&repo, &settings))
     {
@@ -682,13 +693,75 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    repack_all(
+    // `gc` does not pack anything itself. It builds one `repack` argument list
+    // and runs it as a child (builtin/gc.c:1016-1022), and every choice about
+    // *which* objects land in *which* pack is that child's — so the pack's
+    // bytes, and the checksum its filename carries, are `repack`'s to decide.
+    //
+    // Duplicating the packing here instead is what made `gc` write a pack stock
+    // git never writes. The two paths enumerated objects differently: this
+    // module partitioned the store by object id, while `repack`'s port ranks by
+    // the `pack-objects` traversal that `setup_revisions()` seeds from
+    // `--all --reflog --indexed-objects`, and that order is the final tiebreak
+    // of `type_size_sort()` and the iteration order of `compute_write_order()`.
+    // Measured on a five-commit fixture with a tag and a second branch:
+    //
+    // ```text
+    // $ git gc -q && ls .git/objects/pack/*.pack     # stock 2.55.0
+    // pack-7e6496f9d634596b18115a5246892b08ad4f2b2a.pack
+    // $ zvcs gc -q && ls .git/objects/pack/*.pack    # before this change
+    // pack-7f2cb2cba512c726b828561efbe48764c73e4661.pack
+    // ```
+    //
+    // and the same fixture driven through the child's own argument list —
+    // `pack-refs --all --prune`, `reflog expire --all`, then
+    // `repack -d -l --cruft --cruft-expiration=2.weeks.ago` — already produced
+    // `7e6496f9…` under *both* binaries. So the divergence was never in the
+    // pack writer; it was in `gc` having a second one.
+    let argv = repack_argv(
         &repo,
-        unreachable,
-        delta_options(&repo, aggressive, crate::progress::enabled(quiet)),
-        quiet,
-        keep_largest_pack,
-    )?;
+        &RepackArgs {
+            aggressive,
+            quiet,
+            auto: auto_repack.as_ref(),
+            prune_expire: prune_expire.as_deref(),
+            cruft,
+            max_cruft_size,
+            expire_to: expire_to.as_deref(),
+            keep_largest_pack,
+            repack_filter: repack_filter.as_deref(),
+            repack_filter_to: repack_filter_to.as_deref(),
+        },
+    );
+    // ```c
+    // if (run_command(&repack_cmd))
+    //         die(FAILED_RUN, repack_args.v[0]);
+    // ```
+    //
+    // (`builtin/gc.c:1021-1022`; `FAILED_RUN` is `"failed to run %s"`.) The
+    // child has already said what went wrong, so `gc` adds one line naming the
+    // step that failed and exits 128:
+    //
+    // ```text
+    // $ git gc --quiet          # a ref naming an object the repository lacks
+    // error: refs/heads/dangling does not point to a valid object!
+    // fatal: bad object refs/heads/dangling
+    // fatal: failed to run repack
+    // ```
+    //
+    // The delegate reports through the error it returns rather than through a
+    // child's stderr, so the child's line is rendered here, in its place, before
+    // `gc`'s own. An error that is neither of git's two shapes is this port
+    // speaking for itself and is left to the caller to render as such.
+    if let Err(err) = super::repack::repack(&argv) {
+        match err.downcast_ref::<crate::fatal::Fatal>() {
+            Some(fatal) => eprintln!("fatal: {fatal}"),
+            None if err.downcast_ref::<crate::fatal::Silent>().is_none() => return Err(err),
+            None => {}
+        }
+        eprintln!("fatal: failed to run repack");
+        return Err(anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL)));
+    }
 
     // `repack` has already removed every unreachable object under `Drop`, so the
     // delegate finds nothing left to do; it still runs, because it also sweeps
@@ -744,399 +817,283 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
 }
 
 // --- repacking -------------------------------------------------------------
+//
+// `gc` never writes a pack. It assembles one `repack` command line and runs it
+// (`builtin/gc.c:897` seeds it, :919-927 and :948-959 finish it, :1016-1022 runs
+// it), so everything below is argument construction and the packing itself
+// belongs to [`super::repack`].
 
-/// How the repack's pack writer is steered.
+/// What `need_to_gc()` appended to the repack's arguments, which is also which
+/// of its two counters tripped.
 ///
-/// `repack.useDeltaBaseOffset` decides how a delta names its base, defaulting to
-/// by-offset as it does in git. `--aggressive` then substitutes
-/// `gc.aggressiveWindow` (250) and `gc.aggressiveDepth` (50) for `pack.window`
-/// and `pack.depth`, which is exactly what git's `--aggressive` pushes onto its
-/// `repack` child's argument list — and, like git, a value of zero or less is
-/// dropped rather than forwarded, leaving the `pack.*` value in place.
-fn delta_options(
-    repo: &gix::Repository,
-    aggressive: bool,
-    progress: bool,
-) -> super::pack_objects::WriteOptions {
-    let snapshot = repo.config_snapshot();
-    let mut options = super::pack_objects::WriteOptions {
-        allow_ofs_delta: snapshot.boolean("repack.useDeltaBaseOffset").unwrap_or(true),
-        progress,
-        ..super::pack_objects::WriteOptions::default()
-    };
-    if aggressive {
-        // `strvec_push(&repack_args, "-f")` (builtin/gc.c:920), which reaches
-        // `pack-objects` as `--no-reuse-delta`: the point of `--aggressive` is
-        // to search every pair again rather than keep the deltas already on
-        // disk, and a widened window that reused them would not use it.
-        options.no_reuse_delta = true;
-        let positive = |key: &str, default: i64| {
-            let value = snapshot.integer(key).unwrap_or(default);
-            usize::try_from(value).ok().filter(|n| *n > 0)
-        };
-        options.window = positive("gc.aggressiveWindow", 250);
-        options.depth = positive("gc.aggressiveDepth", 50);
-    }
-    options
+/// ```c
+/// if (too_many_packs(cfg)) {
+///         [...]
+///         add_repack_all_option(cfg, &keep_pack, repack_args);
+/// } else if (too_many_loose_objects(cfg->gc_auto_threshold))
+///         add_repack_incremental_option(repack_args);
+/// else
+///         return 0;
+/// ```
+///
+/// (`builtin/gc.c:679-710`, git 2.55.0.) The two are not interchangeable: too
+/// many *packs* asks for the rewrite that reduces their number, while too many
+/// loose *objects* asks only that the loose ones be gathered, leaving every
+/// existing pack where it is.
+enum AutoRepack {
+    /// `too_many_packs()`: the full rewrite, carrying the `--keep-pack=` names
+    /// `find_base_packs()` chose.
+    AllIntoOne(Vec<String>),
+    /// `too_many_loose_objects()`: `add_repack_incremental_option()`, which is
+    /// `--no-write-bitmap-index` and nothing else (`builtin/gc.c:659-662`).
+    Incremental,
 }
 
-/// How the *cruft* pack's writer is steered, which is not the same as the
-/// reachable pack's.
+/// `need_to_gc()`'s counters, and the arguments the winning one implies.
 ///
-/// git gets here in two hops: `gc` runs `repack --cruft`, and `repack` keeps a
-/// second `struct pack_objects_args` for the cruft child. Each of the four
-/// `repack.cruft*` values goes into that second set, and any it does not set is
-/// copied from the first — so an unset key leaves the cruft pack searching
-/// exactly as the reachable pack does, and a set one overrides `pack.window`,
-/// `pack.depth`, `pack.windowMemory` or `pack.threads` for the cruft pack alone.
+/// `None` is git's `return 0` — no collection is due — which `cmd_gc()` turns
+/// into an exit before anything is touched. The `pre-auto-gc` veto that closes
+/// the same function is [`pre_auto_gc_allows`], applied by the caller.
 ///
-/// Why the split exists: a cruft pack is objects nobody references, rewritten
-/// on every `gc`. Spending the reachable pack's delta budget on it is waste, so
-/// git lets the two be tuned apart.
-fn cruft_delta_options(
-    repo: &gix::Repository,
-    base: super::pack_objects::WriteOptions,
-) -> super::pack_objects::WriteOptions {
-    let snapshot = repo.config_snapshot();
-    let mut options = base;
-    // git stores these as strings and lets the `pack-objects` child parse them,
-    // so a value it cannot read fails there rather than here. A negative window,
-    // depth or thread count is not a number `pack-objects` accepts, so it is
-    // left to the inherited value instead of being forced through.
-    let count = |key: &str| {
-        snapshot
-            .integer(key)
-            .and_then(|value| usize::try_from(value).ok())
-    };
-    if let Some(window) = count("repack.cruftWindow") {
-        options.window = Some(window);
-    }
-    if let Some(depth) = count("repack.cruftDepth") {
-        options.depth = Some(depth);
-    }
-    if let Some(threads) = count("repack.cruftThreads") {
-        options.threads = Some(threads);
-    }
-    if let Some(limit) = snapshot
-        .integer("repack.cruftWindowMemory")
-        .and_then(|value| u64::try_from(value).ok())
-    {
-        options.window_memory = Some(limit);
-    }
-    options
-}
-
-/// `git repack -ad`: rewrite the whole local object store into one pack holding
-/// every reachable object, then dispose of the rest as `unreachable` says.
+/// # The memory estimate, and why the kept pack is dropped here
 ///
-/// The reachable set is [`super::prune`]'s, unchanged — the same roots (index
-/// entries and cache-tree, every ref, `HEAD`, every reflog entry) and the same
-/// closure. `prune` deletes what falls outside it and this packs what falls
-/// inside, so the two agreeing is not a coincidence to be maintained but the
-/// same function called twice.
+/// git's `too_many_packs` branch keeps the largest pack only when repacking it
+/// would not fit in half of physical RAM:
 ///
-/// Packs marked with a `.keep` are left alone entirely, as git leaves them: they
-/// are neither rewritten nor deleted, and the objects they hold are not copied
-/// into the new pack.
-fn repack_all(
-    repo: &gix::Repository,
-    unreachable: Unreachable,
-    delta: super::pack_objects::WriteOptions,
-    quiet: bool,
-    keep_largest_pack: Option<bool>,
-) -> Result<()> {
-    let hash = repo.object_hash();
-    let objdir = repo.objects.store_ref().path().to_path_buf();
-    let pack_dir = objdir.join("pack");
-
-    // Everything the store already holds, and where. A loose object also
-    // remembers its path and mtime: the path so it can be unlinked once packed,
-    // the mtime because a cruft pack has to record it.
-    let loose = loose_objects(&objdir, hash);
-    // `find_base_packs()` (builtin/gc.c:485-505) picks the packs `gc` hands
-    // `repack --keep-pack`: with a threshold, every local non-cruft pack at or
-    // over it; without, the single largest. `--keep-largest-pack` overrides
-    // `gc.bigPackThreshold` either way (:951-956).
-    let base_packs = match keep_largest_pack {
-        Some(true) => find_base_packs(&pack_dir, 0),
-        Some(false) => Vec::new(),
-        None => match big_pack_threshold(repo) {
+/// ```c
+/// struct packed_git *p = find_base_packs(&keep_pack, 0);
+/// mem_have = total_ram();
+/// mem_want = estimate_repack_memory(cfg, p);
+/// if (!mem_have || mem_want < mem_have / 2)
+///         string_list_clear(&keep_pack, 0);
+/// ```
+///
+/// (`builtin/gc.c:690-702`.) `estimate_repack_memory()` (:574-618) is a sum of
+/// C `sizeof`s — `struct object_entry`, `struct blob`, `struct tree`,
+/// `struct object *`, `off_t + uint32_t` — times the approximate object count,
+/// plus the pack's own bytes and the two delta caches. Those sizes are the C
+/// build's, not anything observable from here, so the estimate is not
+/// reproducible byte for byte. What *is* certain is the comparison's outcome
+/// for any repository at which `gc` is a fast operation: the per-object terms
+/// come to a few hundred bytes, so a repository would need on the order of ten
+/// million objects before the estimate reached half the RAM of a machine that
+/// could hold it. This port therefore takes the branch git takes there and
+/// clears the list. `gc.bigPackThreshold` is unaffected — it is the other
+/// branch, and it is reproduced exactly.
+fn auto_repack_choice(repo: &gix::Repository) -> Option<AutoRepack> {
+    // `gc.auto` at zero or below disables automatic gc outright — git returns
+    // before it ever counts packs, so a repository over `gc.autoPackLimit` is
+    // still left alone.
+    let auto_threshold = repo.config_snapshot().integer("gc.auto").unwrap_or(6700);
+    if auto_threshold <= 0 {
+        return None;
+    }
+    if too_many_packs(repo) {
+        let pack_dir = repo.objects.store_ref().path().join("pack");
+        let keep = match big_pack_threshold(repo) {
             0 => Vec::new(),
-            limit => find_base_packs(&pack_dir, limit),
-        },
-    };
-    let rewritable = local_packs(&pack_dir, hash, &base_packs);
-
-    let mut existing: Vec<ObjectId> = loose.keys().copied().collect();
-    // A packed object is dated by its `.pack`'s mtime, which is what git's
-    // `add_recent_packed()` uses and what `prune` already assumes. Without this
-    // an object repacked out of an old pack into a cruft pack would be stamped
-    // with the epoch and expire on the very next dated prune.
-    let mut packed_mtime: HashMap<ObjectId, u32> = HashMap::new();
-    for (base, index) in &rewritable {
-        let stamp = super::prune::mtime_of(&pack_dir.join(format!("{base}.pack")))
-            .unwrap_or(0)
-            .clamp(0, i64::from(u32::MAX)) as u32;
-        for entry in index.iter() {
-            existing.push(entry.oid);
-            packed_mtime.insert(entry.oid, stamp);
-        }
-    }
-    existing.sort_unstable();
-    existing.dedup();
-    // `--keep-pack=<name>` does not merely spare the pack: `pack-objects` treats
-    // everything in it as already delivered, so the new pack holds only what the
-    // kept packs do not. Without this an object that is both loose and inside a
-    // kept pack is written *again*, leaving `gc` with one more pack than it
-    // started with rather than one fewer.
-    if !base_packs.is_empty() {
-        let mut kept_objects: HashSet<ObjectId> = HashSet::new();
-        for base in &base_packs {
-            let idx = pack_dir.join(format!("{base}.idx"));
-            if let Ok(index) = pack::index::File::at(&idx, hash) {
-                kept_objects.extend(index.iter().map(|entry| entry.oid));
+            threshold => {
+                let kept = find_base_packs(&pack_dir, threshold);
+                // ```c
+                // if (keep_pack.nr >= cfg->gc_auto_pack_limit) {
+                //         cfg->big_pack_threshold = 0;
+                //         string_list_clear(&keep_pack, 0);
+                //         find_base_packs(&keep_pack, 0);
+                // }
+                // ```
+                //
+                // (`builtin/gc.c:684-688`.) Keeping as many packs as the limit
+                // allows would leave the collection with nothing to do, so the
+                // threshold is abandoned and only the largest pack is kept.
+                let limit = repo.config_snapshot().integer("gc.autoPackLimit").unwrap_or(50);
+                match i64::try_from(kept.len()).is_ok_and(|n| n >= limit) {
+                    true => find_base_packs(&pack_dir, 0),
+                    false => kept,
+                }
             }
-        }
-        existing.retain(|id| !kept_objects.contains(id));
-    }
-    // `repack` runs `pack-objects --all`, whose ref walk dies on a ref naming an object
-    // the repository does not have — and `gc` adds its own line when the child fails
-    // (`fatal: failed to run repack`, builtin/gc.c). The repack stops here, before a pack
-    // is written from a reachability set that ref could not contribute to.
-    //
-    // It runs *before* the "Nothing new to pack." decision, because that
-    // decision is `repack`'s reading of what `pack-objects` produced
-    // (`if (!names.nr)`, builtin/repack.c) and `pack-objects` has to have run to
-    // produce it. An object store whose every loose name is unreadable leaves
-    // nothing to pack *and* has a bad ref, and git dies rather than reporting
-    // the emptiness.
-    //
-    // `pack-objects` prints only the death: the
-    // `error: <ref> does not point to a valid object!` a `git gc` run also shows comes
-    // from the `pack-refs --all --prune` child that ran before it (confirmed under
-    // `GIT_TRACE=1` on git 2.55.0), and this port runs that same step above.
-    if let Some(name) = super::prune::bad_object_ref(repo) {
-        eprintln!("fatal: bad object {name}");
-        eprintln!("fatal: failed to run repack");
-        return Err(anyhow::Error::new(crate::fatal::Silent(128)));
-    }
-
-    if existing.is_empty() {
-        // `gc` reaches its repacking through a `repack -d -l` child
-        // (`builtin/gc.c:897`, with `-a`/`-A`/`--cruft` appended by
-        // `add_repack_all_option()` and `-q` by `builtin/gc.c:926-927`), so
-        // `repack`'s own `if (!names.nr) printf_ln(_("Nothing new to pack."))`
-        // (`builtin/repack.c:460-462`) lands on `gc`'s stdout. An empty object
-        // store is exactly the case that leaves `pack-objects` with nothing to
-        // write, so `git init --bare b && git -C b gc` says so; this port packs
-        // inline, so the notice is emitted here, on the same terms.
-        if !quiet {
-            println!("Nothing new to pack.");
-        }
-        return Ok(());
-    }
-
-    // `gc` reaches its packing through `repack -d -l -a|-A`, and `cmd_repack()`
-    // adds `--exclude-promisor-objects` in a partial clone — then puts every
-    // object the `.promisor` packs held into a promisor pack of its own
-    // (`repack_promisor_objects()`, gated on `ALL_INTO_ONE`, which `gc`'s
-    // `-a`/`-A` always sets). Without both halves the marker file disappears
-    // with the pack `-d` deletes, and the repository stops excusing the objects
-    // the promisor remote still owes: stock git reads the result as
-    // `broken link from tree … to blob …`.
-    let promisor_held = match super::rev_list::has_promisor_remote(repo) {
-        true => super::rev_list::promisor_pack_objects(repo),
-        false => HashSet::new(),
-    };
-
-    let mut roots = Vec::new();
-    super::prune::collect_roots(repo, &mut roots)?;
-    let reachable = super::prune::close_over_excluding(repo, roots, &promisor_held);
-
-    // `existing` is already sorted and deduplicated, so both halves come out in
-    // the oid order a pack index wants. A promisor-held object belongs to
-    // neither: it is written back out by the promisor pass below, so it must not
-    // reach the main pack (`keep`) nor be treated as unreachable cruft (`rest`).
-    existing.retain(|id| !promisor_held.contains(id));
-    let (keep, rest): (Vec<ObjectId>, Vec<ObjectId>) =
-        existing.into_iter().partition(|id| reachable.contains(id));
-
-    // The traversal above is what git reports as `Enumerating objects`, ahead of
-    // the counting/compressing/writing meters the pack writer drives.
-    {
-        let mut enumerating =
-            crate::progress::Meter::unknown("Enumerating objects", delta.progress);
-        enumerating.advance(keep.len());
-        enumerating.done();
-    }
-
-    // The new pack has to be written before anything is removed: every object in
-    // it is read back out of the very packs and loose files being replaced.
-    //
-    // Every pack the run produces is *built* first and installed together at the
-    // end, because that is what git's `packtmp` prefix plus
-    // `generated_pack_install()` amounts to: a `pack-objects` child that dies
-    // leaves nothing behind, and `gc` reports `fatal: failed to run repack` over
-    // an object store it has not touched. See [`Bundle`].
-    let mut bundles: Vec<(Bundle, bool)> = Vec::new();
-    // `repack_promisor_objects()` runs *before* the main `pack-objects`, and
-    // finishes with `write_promisor_file(promisor_name, NULL, 0)` — an empty
-    // file named for the pack it marks — so what `-d` deletes below is replaced
-    // in kind.
-    if !promisor_held.is_empty() {
-        let mut ids: Vec<ObjectId> = promisor_held.iter().copied().collect();
-        ids.sort_unstable();
-        if let Some(bundle) = build_bundle(repo, &ids, None, delta)? {
-            bundles.push((bundle, true));
-        }
-    }
-    if let Some(bundle) = build_bundle(repo, &keep, None, delta)? {
-        bundles.push((bundle, false));
-    }
-    if unreachable == Unreachable::Cruft {
-        // git reports the cruft pass separately. Its second line, `Traversing
-        // cruft objects`, counts a walk out from the cruft tips that has no
-        // counterpart here: `rest` is already the complete unreachable set,
-        // partitioned out of everything the store holds, so there is nothing left
-        // to traverse and no honest number to print for it.
-        let mut enumerating =
-            crate::progress::Meter::unknown("Enumerating cruft objects", delta.progress);
-        enumerating.advance(rest.len());
-        enumerating.done();
-
-        let mtimes: HashMap<ObjectId, u32> = rest
-            .iter()
-            .map(|id| {
-                let stamp = loose
-                    .get(id)
-                    .map(|l| l.mtime)
-                    .or_else(|| packed_mtime.get(id).copied())
-                    .unwrap_or(0);
-                (*id, stamp)
-            })
-            .collect();
-        if let Some(bundle) =
-            build_bundle(repo, &rest, Some(&mtimes), cruft_delta_options(repo, delta))?
-        {
-            bundles.push((bundle, false));
-        }
-    }
-
-    // `generated_pack_install()`: nothing lands until every pack has been built.
-    let mut written = Vec::new();
-    for (bundle, promisor) in &bundles {
-        let base = install_bundle(&pack_dir, bundle)?;
-        if *promisor {
-            std::fs::write(pack_dir.join(format!("{base}.promisor")), b"")?;
-        }
-        written.push(base);
-    }
-
-    // `--no-cruft` keeps the unreachable objects but packs them nowhere, so any
-    // that were living in a pack about to be deleted have to be written back out
-    // loose first. This is `repack -d`'s unpack-unreachable step, and skipping it
-    // would silently destroy them: `git gc && git gc --no-cruft` on the
-    // `conflicted` fixture leaves its two unreachable objects loose and readable,
-    // not gone.
-    if unreachable == Unreachable::Leave {
-        for id in &rest {
-            if loose.contains_key(id) {
-                continue;
-            }
-            // Detached so the read is finished before the write begins: an
-            // `Object` borrows the repository's reusable buffer and returns it
-            // on drop, and `write_buf` wants that buffer itself.
-            let object = repo
-                .find_object(*id)
-                .with_context(|| format!("read object {id} while unpacking it"))?
-                .detach();
-            repo.write_buf(object.kind, &object.data)
-                .map_err(|err| anyhow::anyhow!("unable to write object {id}: {err}"))?;
-        }
-    }
-
-    // Now the old copies. A loose object goes if it was packed just now; under
-    // `Leave` the unreachable ones are precisely the loose files that stay.
-    let discard_rest = unreachable != Unreachable::Leave;
-    for id in keep.iter().chain(rest.iter().filter(|_| discard_rest)) {
-        if let Some(entry) = loose.get(id) {
-            let _ = std::fs::remove_file(&entry.path);
-        }
-    }
-    // `repack -d` finishes with `prune-packed`, which removes *every* loose
-    // object a pack already holds — including the packs `--keep-pack` spared, and
-    // so including the copies that were never candidates for the new pack. Left
-    // behind, they are the objects `gc` was asked to collect still sitting loose.
-    for base in &base_packs {
-        let Ok(index) = pack::index::File::at(pack_dir.join(format!("{base}.idx")), hash) else {
-            continue;
         };
-        for entry in index.iter() {
-            if let Some(loose) = loose.get(&entry.oid) {
-                let _ = std::fs::remove_file(&loose.path);
-            }
-        }
+        return Some(AutoRepack::AllIntoOne(keep));
     }
-    for (base, _) in &rewritable {
-        // A pack this run just wrote must not be deleted as if it were an old
-        // one — possible when the object set and its order reproduce a checksum.
-        if written.iter().any(|w| w == base) {
-            continue;
-        }
-        for ext in ["pack", "idx", "rev", "mtimes", "bitmap", "promisor"] {
-            let _ = std::fs::remove_file(pack_dir.join(format!("{base}.{ext}")));
-        }
+    match too_many_loose_objects(repo, auto_threshold) {
+        true => Some(AutoRepack::Incremental),
+        false => None,
     }
-    // The packs are gone; a multi-pack-index still naming them would answer every
-    // lookup for their objects with an offset into a file that no longer exists.
-    super::multi_pack_index::drop_stale_midx(&pack_dir);
-    Ok(())
 }
 
-/// A loose object, as the sweep below found it.
-struct Loose {
-    path: PathBuf,
-    /// `st_mtime` in whole seconds, which is what a `.mtimes` sidecar stores.
-    /// Clamped into `u32` because the format's field is 32 bits wide.
-    mtime: u32,
+/// Everything `cmd_gc()` has resolved by the time it finishes the repack's
+/// argument list, gathered so [`repack_argv`] reads as the C does.
+struct RepackArgs<'a> {
+    /// `--aggressive`, which pushes `-f` plus the two `gc.aggressive*` values.
+    aggressive: bool,
+    /// `opts.quiet`, which pushes `-q`.
+    quiet: bool,
+    /// `None` for a manual run — the `else` at `builtin/gc.c:948` — and `Some`
+    /// for an automatic one, carrying what `need_to_gc()` decided.
+    auto: Option<&'a AutoRepack>,
+    /// `cfg.prune_expire`, verbatim. `None` is `--no-prune`'s NULL.
+    prune_expire: Option<&'a str>,
+    /// `cfg.cruft_packs`.
+    cruft: bool,
+    /// `cfg.max_cruft_size`; zero and unset are the same to git's `if`.
+    max_cruft_size: Option<u64>,
+    /// `cfg.repack_expire_to`.
+    expire_to: Option<&'a str>,
+    /// `keep_largest_pack`, git's tri-state `int` at `-1` until asked.
+    keep_largest_pack: Option<bool>,
+    /// `gc.repackFilter`, already filtered to a non-empty value.
+    repack_filter: Option<&'a str>,
+    /// `gc.repackFilterTo`, likewise.
+    repack_filter_to: Option<&'a str>,
 }
 
-/// Every loose object under `objdir`, by id.
+/// The `repack` command line `gc` runs, built in git's order.
 ///
-/// The fan-out scan is [`super::prune::is_object_name`]'s, so a file that is not
-/// named like an object — a stray `tmp_obj_*`, an editor backup — is skipped
-/// here exactly as `prune` skips it.
-fn loose_objects(objdir: &Path, hash: gix::hash::Kind) -> HashMap<ObjectId, Loose> {
-    let name_len = hash.len_in_hex() - 2;
-    let mut out = HashMap::new();
-    let Some(fanouts) = super::prune::read_dir_raw(objdir) else {
-        return out;
-    };
-    for fanout in fanouts {
-        let fanout = fanout.to_string_lossy().into_owned();
-        if fanout.len() != 2 || !fanout.bytes().all(|b| b.is_ascii_hexdigit()) {
-            continue;
+/// ```c
+/// strvec_pushl(&repack_args, "repack", "-d", "-l", NULL);
+/// [...]
+/// if (aggressive) {
+///         strvec_push(&repack_args, "-f");
+///         if (cfg.aggressive_depth > 0)
+///                 strvec_pushf(&repack_args, "--depth=%d", cfg.aggressive_depth);
+///         if (cfg.aggressive_window > 0)
+///                 strvec_pushf(&repack_args, "--window=%d", cfg.aggressive_window);
+/// }
+/// if (opts.quiet)
+///         strvec_push(&repack_args, "-q");
+/// ```
+///
+/// (`builtin/gc.c:897, 919-927`, git 2.55.0.) The order matters only in that it
+/// is the order stock hands the child, and the child is the same port either
+/// way; it is reproduced because a divergence in it would be a divergence in
+/// what was read.
+fn repack_argv(repo: &gix::Repository, args: &RepackArgs<'_>) -> Vec<String> {
+    let mut argv = vec!["repack".to_string(), "-d".to_string(), "-l".to_string()];
+    if args.aggressive {
+        // `-f` reaches `pack-objects` as `--no-reuse-delta`: the point of
+        // `--aggressive` is to search every pair again rather than keep the
+        // deltas already on disk, and a widened window that reused them would
+        // not use it.
+        argv.push("-f".to_string());
+        let snapshot = repo.config_snapshot();
+        let depth = snapshot.integer("gc.aggressiveDepth").unwrap_or(50);
+        if depth > 0 {
+            argv.push(format!("--depth={depth}"));
         }
-        let dir = objdir.join(&fanout);
-        let Some(names) = super::prune::read_dir_raw(&dir) else {
-            continue;
-        };
-        for name in names {
-            let name = name.to_string_lossy().into_owned();
-            if !super::prune::is_object_name(&name, name_len) {
-                continue;
-            }
-            let Ok(id) = ObjectId::from_hex(format!("{fanout}{name}").as_bytes()) else {
-                continue;
-            };
-            let path = dir.join(&name);
-            let mtime = super::prune::mtime_of(&path)
-                .unwrap_or(0)
-                .clamp(0, i64::from(u32::MAX)) as u32;
-            out.insert(id, Loose { path, mtime });
+        let window = snapshot.integer("gc.aggressiveWindow").unwrap_or(250);
+        if window > 0 {
+            argv.push(format!("--window={window}"));
         }
     }
-    out
+    if args.quiet {
+        argv.push("-q".to_string());
+    }
+
+    match args.auto {
+        Some(AutoRepack::Incremental) => argv.push("--no-write-bitmap-index".to_string()),
+        Some(AutoRepack::AllIntoOne(keep)) => add_repack_all_option(&mut argv, args, keep),
+        None => {
+            // ```c
+            // if (keep_largest_pack != -1) {
+            //         if (keep_largest_pack)
+            //                 find_base_packs(&keep_pack, 0);
+            // } else if (cfg.big_pack_threshold) {
+            //         find_base_packs(&keep_pack, cfg.big_pack_threshold);
+            // }
+            // ```
+            //
+            // (`builtin/gc.c:951-956`.) The flag is a tri-state that *overrides*
+            // `gc.bigPackThreshold` — `--no-keep-largest-pack` included, which
+            // keeps nothing at all where the config would have kept the big packs.
+            let pack_dir = repo.objects.store_ref().path().join("pack");
+            let keep = match args.keep_largest_pack {
+                Some(true) => find_base_packs(&pack_dir, 0),
+                Some(false) => Vec::new(),
+                None => match big_pack_threshold(repo) {
+                    0 => Vec::new(),
+                    threshold => find_base_packs(&pack_dir, threshold),
+                },
+            };
+            add_repack_all_option(&mut argv, args, &keep);
+        }
+    }
+    argv
+}
+
+/// `add_repack_all_option()` (`builtin/gc.c:628-657`, git 2.55.0).
+///
+/// ```c
+/// if (cfg->prune_expire && !strcmp(cfg->prune_expire, "now")
+///         && !(cfg->cruft_packs && cfg->repack_expire_to))
+///         strvec_push(args, "-a");
+/// else if (cfg->cruft_packs) {
+///         strvec_push(args, "--cruft");
+///         if (cfg->prune_expire)
+///                 strvec_pushf(args, "--cruft-expiration=%s", cfg->prune_expire);
+///         if (cfg->max_cruft_size)
+///                 strvec_pushf(args, "--max-cruft-size=%lu", cfg->max_cruft_size);
+///         if (cfg->repack_expire_to)
+///                 strvec_pushf(args, "--expire-to=%s", cfg->repack_expire_to);
+/// } else {
+///         strvec_push(args, "-A");
+///         if (cfg->prune_expire)
+///                 strvec_pushf(args, "--unpack-unreachable=%s", cfg->prune_expire);
+/// }
+/// ```
+///
+/// The first test is a literal `strcmp` against `"now"`, not a parsed expiry:
+/// `--prune=all` means the same date to `parse_expiry_date()` and still takes
+/// the cruft branch, where `--cruft-expiration=all` expires the same objects by
+/// a different route. `--expire-to` is the exception that keeps `-a` away even
+/// under `now`, because the objects being expired have somewhere to go.
+///
+/// What the three branches do to an unreachable object, one flag at a time
+/// against git 2.55.0 on the `conflicted` fixture — whose half-finished merge
+/// leaves two behind (`2ae666ad…` tree, `5eb9640f…` blob):
+///
+/// | invocation                 | branch    | loose | packs | `.mtimes` |
+/// |----------------------------|-----------|-------|-------|-----------|
+/// | `gc` (default)             | `--cruft` | 0     | 2     | 1         |
+/// | `gc --no-cruft`            | `-A`      | 2     | 1     | 0         |
+/// | `gc --prune=now`           | `-a`      | 0     | 1     | 0         |
+/// | `gc --no-cruft --no-prune` | `-A`      | 2     | 1     | 0         |
+///
+/// The second row and the fourth agree because `-A`'s
+/// `--unpack-unreachable=<date>` only loosens what is *older* than the date, and
+/// nothing in a fixture is; `--no-prune` drops the argument entirely and reaches
+/// the same place by never expiring at all.
+fn add_repack_all_option(argv: &mut Vec<String>, args: &RepackArgs<'_>, keep_pack: &[String]) {
+    if args.prune_expire == Some("now") && !(args.cruft && args.expire_to.is_some()) {
+        argv.push("-a".to_string());
+    } else if args.cruft {
+        argv.push("--cruft".to_string());
+        if let Some(expire) = args.prune_expire {
+            argv.push(format!("--cruft-expiration={expire}"));
+        }
+        if let Some(size) = args.max_cruft_size.filter(|n| *n != 0) {
+            argv.push(format!("--max-cruft-size={size}"));
+        }
+        if let Some(dir) = args.expire_to {
+            argv.push(format!("--expire-to={dir}"));
+        }
+    } else {
+        argv.push("-A".to_string());
+        if let Some(expire) = args.prune_expire {
+            argv.push(format!("--unpack-unreachable={expire}"));
+        }
+    }
+
+    // `keep_one_pack()` (builtin/gc.c:621-626) pushes the *basename* of each
+    // pack `find_base_packs()` chose, which is the `.pack` file's name.
+    for base in keep_pack {
+        argv.push(format!("--keep-pack={base}.pack"));
+    }
+
+    if let Some(filter) = args.repack_filter {
+        argv.push(format!("--filter={filter}"));
+    }
+    if let Some(filter_to) = args.repack_filter_to {
+        argv.push(format!("--filter-to={filter_to}"));
+    }
 }
 
 /// `gc.bigPackThreshold`, in bytes, or zero when it is unset.
@@ -1204,257 +1161,6 @@ fn find_base_packs(pack_dir: &Path, limit: u64) -> Vec<String> {
     }
     kept.extend(largest.map(|(base, _)| base));
     kept
-}
-
-/// Every local pack that may be rewritten, as `(base name, index)`.
-///
-/// Alternates are deliberately not included: `repack` rewrites the repository's
-/// own object store and must not touch a store it merely borrows from. A pack
-/// beside a `.keep` file is skipped for the reason `git repack` skips it — the
-/// marker is a promise that the pack stays put — and so is one at or above
-/// `big_pack_threshold` bytes, which git keeps for the same reason by a
-/// different route.
-fn local_packs(
-    pack_dir: &Path,
-    hash: gix::hash::Kind,
-    base_packs: &[String],
-) -> Vec<(String, pack::index::File)> {
-    let mut out = Vec::new();
-    let Some(names) = super::prune::read_dir_raw(pack_dir) else {
-        return out;
-    };
-    for name in names {
-        let name = name.to_string_lossy().into_owned();
-        let Some(base) = name.strip_suffix(".idx") else {
-            continue;
-        };
-        if pack_dir.join(format!("{base}.keep")).exists() {
-            continue;
-        }
-        if base_packs.iter().any(|kept| kept == base) {
-            continue;
-        }
-        if !matches!(std::fs::metadata(pack_dir.join(format!("{base}.pack"))), Ok(md) if md.is_file())
-        {
-            continue;
-        }
-        if let Ok(index) = pack::index::File::at(pack_dir.join(&name), hash) {
-            out.push((base.to_string(), index));
-        }
-    }
-    out
-}
-
-/// One finished pack, held in memory until every pack the run produces has been
-/// built.
-///
-/// git's `pack-objects` children all write under one `packtmp` prefix and
-/// `generated_pack_install()` moves them into `objects/pack` only afterwards, so
-/// a later child that dies — a cruft pass that cannot read a damaged loose
-/// object, say — leaves the store exactly as it found it. Installing each pack
-/// as it was written instead left the main pack behind on `git gc` over a
-/// repository stock git refuses outright.
-struct Bundle {
-    /// `pack-<checksum>`, the name every artifact shares.
-    base: String,
-    pack: Vec<u8>,
-    idx: Vec<u8>,
-    rev: Vec<u8>,
-    /// The `.mtimes` sidecar a cruft pack carries, and nothing else does.
-    mtimes: Option<Vec<u8>>,
-}
-
-/// Write one pack and its sidecars for `ids`, returning the `pack-<hash>` base
-/// name, or `None` when there was nothing to write.
-///
-/// The pack comes from `pack-objects`' writer, so it is delta-compressed under
-/// the repository's `pack.*` settings, with `repack.useDeltaBaseOffset` choosing
-/// how a delta names its base and `gc --aggressive` widening the search per
-/// `gc.aggressiveWindow` / `gc.aggressiveDepth`. Its entries are therefore *not*
-/// in `ids` order — a base has to precede the deltas that need it — so the
-/// index's three parallel columns are rebuilt from the writer's own record of
-/// where each object landed.
-///
-/// An object the writer could not read is absent from the pack, and is dropped
-/// from the index and the `.mtimes` alongside it rather than left as a dangling
-/// entry.
-fn build_bundle(
-    repo: &gix::Repository,
-    ids: &[ObjectId],
-    mtimes: Option<&HashMap<ObjectId, u32>>,
-    delta: super::pack_objects::WriteOptions,
-) -> Result<Option<Bundle>> {
-    if ids.is_empty() {
-        return Ok(None);
-    }
-    let hash = repo.object_hash();
-
-    let packed = super::pack_objects::packed_for(repo, ids, delta)
-        .with_context(|| format!("build a pack of {} objects", ids.len()))?;
-    if packed.entries.is_empty() {
-        return Ok(None);
-    }
-
-    // A v2 index stores its three columns in object-id order, whatever order the
-    // pack itself is in.
-    let mut by_oid = packed.entries.clone();
-    by_oid.sort_unstable_by_key(|entry| entry.id);
-    let written: Vec<ObjectId> = by_oid.iter().map(|entry| entry.id).collect();
-    let offsets: Vec<u64> = by_oid.iter().map(|entry| entry.offset).collect();
-    let crcs: Vec<u32> = by_oid.iter().map(|entry| entry.crc32).collect();
-
-    let pack_hash = packed.id;
-    let pack_id = pack_hash.as_slice();
-    Ok(Some(Bundle {
-        base: format!("pack-{pack_hash}"),
-        idx: index_bytes(hash, &written, &offsets, &crcs, pack_id)?,
-        rev: reverse_index_bytes(hash, &offsets, pack_id)?,
-        mtimes: match mtimes {
-            None => None,
-            Some(mtimes) => {
-                let stamps: Vec<u32> = written
-                    .iter()
-                    .map(|id| mtimes.get(id).copied().unwrap_or(0))
-                    .collect();
-                Some(mtimes_bytes(hash, &stamps, pack_id)?)
-            }
-        },
-        pack: packed.bytes,
-    }))
-}
-
-/// `generated_pack_install()` (builtin/repack.c): move one finished pack and its
-/// sidecars into `objects/pack`.
-///
-/// The pack is written under a temporary name because its final name is its own
-/// checksum, which is only known once the last byte is in — this is also how git
-/// writes it. The name carries the pid because concurrent runs against one
-/// object store are the norm here, and a shared name would have them writing
-/// over each other's bytes before either rename.
-fn install_bundle(pack_dir: &Path, bundle: &Bundle) -> Result<String> {
-    std::fs::create_dir_all(pack_dir).with_context(|| format!("create {}", pack_dir.display()))?;
-
-    let tmp = pack_dir.join(format!("tmp_pack_zvcs_gc_{}", std::process::id()));
-    std::fs::write(&tmp, &bundle.pack).with_context(|| format!("create {}", tmp.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // git installs pack artifacts read-only; a failure to set the mode is not
-        // fatal there and is not here either.
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444));
-    }
-
-    let base = &bundle.base;
-    std::fs::rename(&tmp, pack_dir.join(format!("{base}.pack")))
-        .with_context(|| format!("install {base}.pack"))?;
-
-    write_sidecar(pack_dir, base, "idx", &bundle.idx)?;
-    write_sidecar(pack_dir, base, "rev", &bundle.rev)?;
-    if let Some(bytes) = bundle.mtimes.as_deref() {
-        write_sidecar(pack_dir, base, "mtimes", bytes)?;
-    }
-    Ok(base.clone())
-}
-
-/// Install one `.idx`/`.rev`/`.mtimes` beside the pack it belongs to.
-///
-/// Written under a temporary name and renamed into place, as git installs every
-/// pack artifact. The rename is what makes a rerun work: these files are left
-/// `0444` (git's mode, matching [`super::pack_objects`]), and a pack whose object
-/// set has not changed hashes to the name it had last time, so writing straight
-/// to the destination would hit the read-only file a previous run left there and
-/// fail with `EACCES`. A rename replaces its destination whatever its mode is.
-fn write_sidecar(pack_dir: &Path, base: &str, ext: &str, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let path = pack_dir.join(format!("{base}.{ext}"));
-    let tmp = pack_dir.join(format!("tmp_{ext}_zvcs_gc_{}", std::process::id()));
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    // Set the mode while the file is still under its temporary name: a failure
-    // there is not fatal, exactly as git does not check its own chmod.
-    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444));
-    std::fs::rename(&tmp, &path).with_context(|| format!("install {}", path.display()))
-}
-
-/// A v2 pack index: the `\xfftOc` signature, the 256-entry fan-out, then the
-/// ids, their CRC32s and their offsets as three parallel columns, and finally
-/// the pack's checksum and the index's own.
-///
-/// Only the 32-bit offset column is emitted, so an entry beyond 2 GiB into the
-/// pack cannot be indexed; it would need the 64-bit spill table that
-/// [`super::pack_objects::index_file`] writes. Reaching that needs a repository
-/// whose whole reachable set exceeds 2 GiB after delta compression, which is
-/// past what this writer — which assembles the pack in memory — supports
-/// anyway.
-fn index_bytes(
-    hash: gix::hash::Kind,
-    ids: &[ObjectId],
-    offsets: &[u64],
-    crcs: &[u32],
-    pack_id: &[u8],
-) -> Result<Vec<u8>> {
-    const LARGE_OFFSET_THRESHOLD: u64 = 0x7fff_ffff;
-    if let Some(offset) = offsets.iter().find(|o| **o > LARGE_OFFSET_THRESHOLD) {
-        crate::git_fatal!("pack offset {offset} needs a 64-bit index offset table, which is not written");
-    }
-    let mut bytes = Vec::with_capacity(8 + 256 * 4 + ids.len() * 32);
-    bytes.extend_from_slice(&[0xff, b't', b'O', b'c']);
-    bytes.extend_from_slice(&2u32.to_be_bytes());
-
-    // The fan-out's Nth slot counts every id whose first byte is <= N, so a
-    // single pass over the sorted ids fills it.
-    let mut fanout = [0u32; 256];
-    for id in ids {
-        fanout[usize::from(id.as_slice()[0])] += 1;
-    }
-    let mut running = 0u32;
-    for slot in &mut fanout {
-        running += *slot;
-        *slot = running;
-    }
-    for count in fanout {
-        bytes.extend_from_slice(&count.to_be_bytes());
-    }
-
-    for id in ids {
-        bytes.extend_from_slice(id.as_slice());
-    }
-    for crc in crcs {
-        bytes.extend_from_slice(&crc.to_be_bytes());
-    }
-    for offset in offsets {
-        bytes.extend_from_slice(&(*offset as u32).to_be_bytes());
-    }
-    bytes.extend_from_slice(pack_id);
-    append_checksum(&mut bytes, hash)?;
-    Ok(bytes)
-}
-
-/// A `.rev` reverse index: `RIDX`, version 1, the hash identifier, then one
-/// 32-bit index position per pack entry *in ascending pack-offset order*, and
-/// the two trailing checksums.
-///
-/// Confirmed against a git 2.55.0 `.rev` for an 8-object pack, whose body was
-/// `[2, 7, 0, 4, 1, 5, 3, 6]` — exactly the index positions of its entries read
-/// in offset order.
-///
-/// Here the pack was written in object-id order, so pack position and index
-/// position coincide and the permutation is the identity. It is still computed
-/// from the offsets rather than assumed, so the writer stays correct if the pack
-/// order ever stops matching the index order.
-fn reverse_index_bytes(hash: gix::hash::Kind, offsets: &[u64], pack_id: &[u8]) -> Result<Vec<u8>> {
-    let mut order: Vec<u32> = (0..offsets.len() as u32).collect();
-    order.sort_by_key(|i| offsets[*i as usize]);
-
-    let mut bytes = Vec::with_capacity(12 + offsets.len() * 4);
-    bytes.extend_from_slice(b"RIDX");
-    bytes.extend_from_slice(&1u32.to_be_bytes());
-    bytes.extend_from_slice(&hash_id(hash).to_be_bytes());
-    for index_position in order {
-        bytes.extend_from_slice(&index_position.to_be_bytes());
-    }
-    bytes.extend_from_slice(pack_id);
-    append_checksum(&mut bytes, hash)?;
-    Ok(bytes)
 }
 
 /// A `.mtimes` sidecar: `MTME`, version 1, the hash identifier, then one 32-bit
@@ -1597,22 +1303,25 @@ pub(super) fn too_many_packs(repo: &gix::Repository) -> bool {
 /// `gc.repackFilter` and `gc.repackFilterTo`, or `None` when it would have
 /// started.
 ///
-/// # What this does and does not do
+/// # Why the check is here and not left to the child
 ///
-/// The *diagnostics* are ported; the object split they gate is not. git's
-/// `--filter` makes `repack` write a **second** pack holding what the old packs
-/// held and the new one does not, built by a `pack-objects --stdin-packs` pass
-/// that [`repack_all`] has no counterpart for — it partitions the store into
-/// reachable and unreachable and writes one pack for each, with no third set and
-/// no `^`-excluded input. Splitting the reachable half here instead would also
-/// have to decide what happens to a filtered-out object that was only ever
-/// loose, which git leaves alone because `--stdin-packs` never enumerates it,
-/// and getting that wrong deletes objects. So a *valid* filter is read and then
-/// not applied, and this is listed with the other "Not performed" steps in the
-/// module docs.
+/// The split a valid filter asks for *is* performed — [`super::repack`] writes
+/// the second pack, and `gc` reaches it by forwarding `--filter=`/`--filter-to=`
+/// like git does. What this covers is the pair of refusals an *invalid* pairing
+/// draws, and their two extra lines:
 ///
-/// What is reproduced is the pair of refusals, which are reachable from
-/// configuration alone and stop the `gc` in git exactly as they stop it here.
+/// ```text
+/// $ git -c gc.repackFilter=bogusfilter gc
+/// fatal: invalid filter-spec 'bogusfilter'
+/// fatal: failed to run repack
+/// ```
+///
+/// The spec is rejected while the child's parse-options is still running, so it
+/// beats every pre-flight the child would otherwise reach first — which is why
+/// it is answered before the delegate is entered rather than after.
+///
+/// Both values come from configuration alone, so a repository can be left in a
+/// state where every `gc` stops here.
 fn check_repack_filter(filter: Option<&str>, filter_to: Option<&str>) -> Option<ExitCode> {
     let failed = |message: &str| {
         eprintln!("fatal: {message}");

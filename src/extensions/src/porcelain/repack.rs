@@ -215,13 +215,15 @@
 //!   * `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps`, turns
 //!     `-b` on by itself; `--no-write-bitmap-index` overrides either.
 //!   * `repack.useDeltaBaseOffset` *is* read, and picks `OBJ_OFS_DELTA` over
-//!     `OBJ_REF_DELTA`. `repack.packKeptObjects` is not: it tunes a kept-object
-//!     exclusion this writer does not perform. `repack.cruftWindow` /
-//!     `repack.cruftWindowMemory` / `repack.cruftDepth` / `repack.cruftThreads`
-//!     are not read here either: the cruft pack this module writes uses the same
-//!     delta search the main pack does. [`super::gc`] does tune its own cruft
-//!     pack with all four. `repack.updateServerInfo` *is* honoured, since the closing
-//!     `update-server-info` it gates is real; see [`execute`].
+//!     `OBJ_REF_DELTA`. `repack.cruftWindow` / `repack.cruftWindowMemory` /
+//!     `repack.cruftDepth` / `repack.cruftThreads` are read too, and steer the
+//!     cruft pack's delta search alone; see [`cruft_delta_override`].
+//!     `repack.packKeptObjects` and its `--[no-]pack-kept-objects` flag *are*
+//!     read, as the tri-state deciding whether `--honor-pack-keep` reaches the
+//!     child and so whether an on-disk `.keep` pack's objects stay out of the
+//!     new pack; see [`honor_pack_keep`]. `repack.updateServerInfo` *is*
+//!     honoured, since the closing `update-server-info` it gates is real; see
+//!     [`execute`].
 //!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
 //!     of it depends on resolving and parsing the named blob;
 //!   * `combine:` sub-specs are not percent-decoded.
@@ -440,6 +442,10 @@ struct State {
     /// finally falls back to "only when everything goes into one pack in a bare
     /// repository".
     write_bitmap: Option<bool>,
+    /// git's tri-state `po_args.pack_kept_objects`, which decides whether
+    /// `prepare_pack_objects()` pushes `--honor-pack-keep` (repack.c:41-42).
+    /// `None` is its `-1`, resolved in [`honor_pack_keep`].
+    pack_kept_objects: Option<bool>,
     /// `-f`: `po_args.no_reuse_delta`, passed on as `--no-reuse-delta`.
     no_reuse_delta: bool,
     write_midx: bool,
@@ -842,6 +848,54 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // included packs by ascending mtime (`stdin_packs_add_pack_entries()`,
     // builtin/pack-objects.c:3936-3979) and then the loose fanout. So there the
     // id order stands.
+    // `--keep-pack=<name>` does not merely spare a pack from `-d`: the name is
+    // forwarded to `pack-objects` (builtin/repack.c:335-337), where
+    // `add_extra_kept_packs()` matches it against each local pack's basename and
+    // sets `pack_keep_in_core` together with `ignore_packed_keep_in_core`
+    // (builtin/pack-objects.c:4913-4935). `want_object_in_pack()` then returns 0
+    // for any object one of those packs already holds — `if
+    // (ignore_packed_keep_in_core && p->pack_keep_in_core) return 0;`
+    // (:1677-1682) — so the kept pack's contents never reach the new pack. That
+    // is the whole point of the option: leave the expensive pack where it is and
+    // write only what it does not already hold.
+    //
+    // Without the exclusion the objects are written a *second* time, so a run
+    // meant to consolidate instead duplicates a pack's worth of them. Measured
+    // on a repository with a 15-object pack and a 6-object pack, git 2.55.0:
+    //
+    // ```text
+    // $ git  repack -a -d -q --keep-pack=pack-616e38f1….pack
+    // pack-616e38f1….idx: 15   pack-1b7dc8d6….idx: 6
+    // $ zvcs repack -a -d -q --keep-pack=pack-616e38f1….pack   # before this
+    // pack-616e38f1….idx: 15   pack-6f70987b….idx: 21
+    // ```
+    //
+    // It is applied after the `--keep-unreachable` and geometric tails above
+    // because `want_object_in_pack()` sits under every one of them: an object a
+    // kept pack holds is unwanted however the enumeration reached it.
+    //
+    // A pack marked with an on-disk `.keep` is the same test's other half —
+    // `if (ignore_packed_keep_on_disk && p->pack_keep) return 0;` (:1675-1676) —
+    // reached through the `--honor-pack-keep` that [`honor_pack_keep`] decides.
+    // The two are separate switches with one effect, so they share the sweep.
+    let honor_keep_on_disk = honor_pack_keep(st, &repo);
+    if !st.keep_packs.is_empty() || honor_keep_on_disk {
+        let kept_objects: HashSet<ObjectId> = existing
+            .iter()
+            .filter(|file| file.path().parent() == Some(pack_dir.as_path()))
+            .filter(|file| {
+                let named = file
+                    .path()
+                    .with_extension("pack")
+                    .file_name()
+                    .is_some_and(|name| st.keep_packs.iter().any(|k| name == k.as_str()));
+                named || (honor_keep_on_disk && file.path().with_extension("keep").exists())
+            })
+            .flat_map(|file| file.iter().map(|entry| entry.oid))
+            .collect();
+        to_pack.retain(|id| !kept_objects.contains(id));
+    }
+
     let mut rank: HashMap<ObjectId, usize> = HashMap::new();
     if geometry.is_none() {
         let pending = pack_objects_pending(&repo, &promisor_held);
@@ -964,6 +1018,19 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     let packtmp_name = format!(".tmp-{}-pack", std::process::id());
     let packtmp = pack_dir.join(&packtmp_name);
     let packtmp_shown = format!("{packdir}/{packtmp_name}");
+    // Everything written under that prefix is a *tempfile* to git, not merely a
+    // file with a temporary name: `generated_pack_populate()` hands each
+    // extension to `register_tempfile()` (repack.c:340-360), which puts it on
+    // the list `tempfile.c` unlinks from its `atexit()` and signal handlers.
+    // `generated_pack_install()` then `rename_tempfile()`s the ones that survive
+    // (:373-399), taking them off that list as it goes.
+    //
+    // So a run that dies part-way leaves nothing behind. Without the equivalent
+    // here, a main pack written before a later step failed stayed in the object
+    // store under its temporary name: `gc` over a repository holding a corrupt
+    // object died in the cruft pass and left `.tmp-<pid>-pack-<hash>.{pack,idx,rev}`
+    // where stock leaves an untouched `objects/pack`.
+    let _packtmp_cleanup = PackTmpCleanup { dir: pack_dir.clone(), prefix: packtmp_name.clone() };
     // git's `names`: the hash of every pack this run wrote *into the
     // repository's own* `objects/pack`, with the number of objects it holds. It
     // is the set `write_midx_included_packs()` picks the preferred pack out of.
@@ -1112,7 +1179,9 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
         // `--non-empty`: with nothing left over there is no cruft pack, which is
         // the ordinary case for a repository whose objects are all reachable.
         if !cruft.is_empty() {
-            let path = write_pack(&repo, st, &cruft, &packtmp, write_rev, progress, false)?;
+            let path = write_pack_with(
+                &repo, st, &cruft, &packtmp, write_rev, progress, false, true,
+            )?;
             let hash = pack_hash(&pack_base_name(&path));
             write_mtimes(&repo, &path, &suffixed(&packtmp, &format!("-{hash}.mtimes")), &stamps)?;
             new_packs.push((hash, cruft.len()));
@@ -1324,6 +1393,45 @@ fn resolve_midx_cruft(
 /// nobody having said anything git falls back to writing one only when the whole
 /// repository goes into a single pack *and* the repository is bare — the case
 /// where the pack is guaranteed to hold the closure a bitmap needs.
+/// Whether `--honor-pack-keep` reaches the `pack-objects` child, which decides
+/// whether an on-disk `.keep` pack's objects are copied into the new pack.
+///
+/// ```c
+/// if (po_args.pack_kept_objects < 0)
+///         po_args.pack_kept_objects = write_bitmaps > 0 &&
+///                 write_midx == REPACK_WRITE_MIDX_NONE;
+/// [...]
+/// if (!args->pack_kept_objects)
+///         strvec_push(&cmd->args,  "--honor-pack-keep");
+/// ```
+///
+/// (builtin/repack.c:271-273 and repack.c:41-42, git 2.55.0.) The `> 0` is load
+/// bearing: `write_bitmaps` is a tri-state and it is still `-1` at that point
+/// unless a flag or `repack.writeBitmaps` / `pack.writeBitmaps` said so. The
+/// later fallback — bitmaps for an all-into-one repack of a bare repository
+/// (:266-270) — leaves it at `-1`, which is *not* `> 0`, so a bare `repack -a -d`
+/// still honours `.keep` even though it writes a bitmap. That is why this reads
+/// the request rather than [`write_bitmaps`]'s answer.
+///
+/// The point of the flag is that a `.keep` is a promise the pack stays put: the
+/// objects it holds are already delivered, so writing them again would leave the
+/// repository holding two copies rather than one.
+fn honor_pack_keep(st: &State, repo: &gix::Repository) -> bool {
+    let requested = st.write_bitmap.or_else(|| {
+        let snapshot = repo.config_snapshot();
+        snapshot
+            .boolean("repack.writeBitmaps")
+            .or_else(|| snapshot.boolean("pack.writeBitmaps"))
+    });
+    // `repack_config()` reads `repack.packkeptobjects` into the same variable the
+    // flag writes (builtin/repack.c:65-68), and `cmd_repack()` runs the config
+    // before `parse_options()`, so the flag wins where both speak.
+    let asked = st
+        .pack_kept_objects
+        .or_else(|| repo.config_snapshot().boolean("repack.packKeptObjects"));
+    !asked.unwrap_or(requested.unwrap_or(false) && !st.write_midx)
+}
+
 fn write_bitmaps(st: &State, repo: &gix::Repository) -> bool {
     if let Some(explicit) = st.write_bitmap {
         return explicit;
@@ -1469,6 +1577,54 @@ fn write_pack(
     progress: bool,
     write_bitmap: bool,
 ) -> Result<PathBuf> {
+    write_pack_with(repo, st, ids, base_prefix, write_rev, progress, write_bitmap, false)
+}
+
+/// The cruft pack's delta search, which is not the reachable pack's.
+///
+/// `cmd_repack()` keeps a second `struct pack_objects_args` for the cruft child
+/// and fills it from four configuration keys of its own
+/// (`repack_config()`, builtin/repack.c:82-97), then copies anything they left
+/// unset from the first:
+///
+/// ```c
+/// if (!cruft_po_args.window)
+///         cruft_po_args.window = xstrdup_or_null(po_args.window);
+/// if (!cruft_po_args.window_memory)
+///         cruft_po_args.window_memory = xstrdup_or_null(po_args.window_memory);
+/// if (!cruft_po_args.depth)
+///         cruft_po_args.depth = xstrdup_or_null(po_args.depth);
+/// if (!cruft_po_args.threads)
+///         cruft_po_args.threads = xstrdup_or_null(po_args.threads);
+/// ```
+///
+/// (builtin/repack.c:488-495, git 2.55.0.) So an unset key leaves the cruft pack
+/// searching exactly as the reachable pack does, and a set one overrides that
+/// pack's `--window` / `--window-memory` / `--depth` / `--threads` for the cruft
+/// pack alone.
+///
+/// Why the split exists: a cruft pack holds objects nobody references and is
+/// rewritten on every collection. Spending the reachable pack's delta budget on
+/// it is waste, so git lets the two be tuned apart.
+///
+/// git stores all four as strings and lets the `pack-objects` child parse them,
+/// so a value the child would not accept is dropped here rather than forced
+/// through — the same treatment [`forwarded_size`] gives the command-line forms.
+fn cruft_delta_override(repo: &gix::Repository, key: &str) -> Option<String> {
+    repo.config_snapshot().string(key).map(|v| v.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_pack_with(
+    repo: &gix::Repository,
+    st: &State,
+    ids: &[ObjectId],
+    base_prefix: &Path,
+    write_rev: bool,
+    progress: bool,
+    write_bitmap: bool,
+    cruft: bool,
+) -> Result<PathBuf> {
     let allow_ofs_delta = repo
         .config_snapshot()
         .boolean("repack.useDeltaBaseOffset")
@@ -1492,10 +1648,38 @@ fn write_pack(
             // `pack.windowMemory`, `pack.depth` and `pack.threads`. A negative
             // value is dropped rather than forwarded: git lets `OPT_INTEGER`
             // take one and the delta search here has no meaning for it.
-            window: forwarded_size(st.window.as_deref()),
-            window_memory: forwarded_size(st.window_memory.as_deref()).map(|n| n as u64),
-            depth: forwarded_size(st.depth.as_deref()),
-            threads: forwarded_size(st.threads.as_deref()),
+            //
+            // A cruft pack reads `repack.cruft*` first and falls back to these;
+            // see [`cruft_delta_override`].
+            window: forwarded_size(
+                cruft
+                    .then(|| cruft_delta_override(repo, "repack.cruftWindow"))
+                    .flatten()
+                    .as_deref()
+                    .or(st.window.as_deref()),
+            ),
+            window_memory: forwarded_size(
+                cruft
+                    .then(|| cruft_delta_override(repo, "repack.cruftWindowMemory"))
+                    .flatten()
+                    .as_deref()
+                    .or(st.window_memory.as_deref()),
+            )
+            .map(|n| n as u64),
+            depth: forwarded_size(
+                cruft
+                    .then(|| cruft_delta_override(repo, "repack.cruftDepth"))
+                    .flatten()
+                    .as_deref()
+                    .or(st.depth.as_deref()),
+            ),
+            threads: forwarded_size(
+                cruft
+                    .then(|| cruft_delta_override(repo, "repack.cruftThreads"))
+                    .flatten()
+                    .as_deref()
+                    .or(st.threads.as_deref()),
+            ),
             ..super::pack_objects::WriteOptions::default()
         },
     )?;
@@ -1600,6 +1784,34 @@ fn pack_hash(stem: &str) -> String {
 /// before the index that makes it findable appears. An extension this run did
 /// not write is *removed* at the destination rather than left there, which is
 /// what keeps a previous run's `.bitmap` from outliving the pack it described.
+/// git's `tempfile` registration for the packs written under `packtmp`, as the
+/// one thing it is observable for: whatever is still sitting under that prefix
+/// when the run ends is removed.
+///
+/// `generated_pack_install()` renames the files it installs, so by the time a
+/// successful run gets here the prefix names nothing and the sweep is a no-op.
+/// A run that returned early — or died — is the case this exists for.
+///
+/// Only the prefix's own files are touched, and the prefix carries the process
+/// id, so a concurrent `repack` in the same repository cannot be swept by it.
+/// A pack written to a `--filter-to` destination outside `packtmp` is likewise
+/// untouched, which is what git leaves behind too.
+struct PackTmpCleanup {
+    dir: PathBuf,
+    prefix: String,
+}
+
+impl Drop for PackTmpCleanup {
+    fn drop(&mut self) {
+        let Ok(entries) = fs::read_dir(&self.dir) else { return };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&self.prefix) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 fn install_pack(pack_dir: &Path, packtmp: &Path, hash: &str) -> Result<PathBuf> {
     let from = suffixed(packtmp, &format!("-{hash}"));
     let to = pack_dir.join(format!("pack-{hash}"));
@@ -2322,6 +2534,7 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
         "quiet" => st.quiet = on,
         "keep-unreachable" => st.keep_unreachable = on,
         "write-bitmap-index" => st.write_bitmap = Some(on),
+        "pack-kept-objects" => st.pack_kept_objects = Some(on),
         "unpack-unreachable" => st.loosen_unreachable = on,
         "write-midx" => {
             st.write_midx = on;

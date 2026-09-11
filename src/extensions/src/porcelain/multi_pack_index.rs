@@ -518,6 +518,53 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let (repo, pack_dir) = object_store(object_dir)?;
     reject_chain(&pack_dir)?;
 
+    // The existing MIDX is not merely something to compare against at the end:
+    // `write_midx_internal()` *starts* from it, and both ways that can go wrong
+    // are observable.
+    //
+    // ```c
+    // if (!opts->packs_to_include || ctx.incremental) {
+    //         struct multi_pack_index *m = get_multi_pack_index(opts->source);
+    //         if (m && !midx_checksum_valid(m)) {
+    //                 warning(_("ignoring existing multi-pack-index; checksum mismatch"));
+    //                 m = NULL;
+    //         }
+    //         [...]
+    //                 if (!opts->packs_to_include)
+    //                         ctx.m = m;
+    // }
+    // [...]
+    // } else if (ctx.m && !ctx.compact && fill_packs_from_midx(&ctx)) {
+    //         goto cleanup;
+    // }
+    // ```
+    //
+    // (midx-write.c:1311-1330 and :1376-1378, git 2.55.0.) `packs_to_include` is
+    // `--stdin-packs`, which is why neither happens under it: that write starts
+    // from the named packs and never reads what is already there.
+    //
+    // The first is a *warning* and the write carries on from scratch; the second
+    // is fatal. `fill_packs_from_midx()` walks the pack names the MIDX records
+    // and opens each one through `prepare_midx_pack()`, whose failure becomes
+    // `error(_("could not load pack %d"), pack_int_id)` (:957-970). That returns
+    // -1 into the `goto cleanup` that leaves `result` at its `-1` initializer
+    // (:1270), so git exits 255 having written nothing. A MIDX naming a pack
+    // somebody deleted is exactly that case, and answering it by quietly
+    // rewriting the MIDX is the port claiming a repair git does not perform.
+    if !stdin_packs {
+        if let Ok(existing) = multi_index::File::at(pack_dir.join("multi-pack-index"), None) {
+            if existing
+                .verify_checksum(&mut gix::progress::Discard, &AtomicBool::new(false))
+                .is_err()
+            {
+                eprintln!("warning: ignoring existing multi-pack-index; checksum mismatch");
+            } else if let Some(id) = unloadable_midx_pack(&pack_dir, &existing) {
+                eprintln!("error: could not load pack {id}");
+                return Ok(ExitCode::from(255));
+            }
+        }
+    }
+
     // The pack set: every pack in the object store, or — with `--stdin-packs` —
     // only those whose `.idx` basename git read from stdin (existing MIDX
     // ignored, matching `write_midx_file_only`).
@@ -640,6 +687,32 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     }
     staged.commit(&pack_dir)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The `pack_int_id` of the first pack an existing MIDX names that
+/// `prepare_midx_pack()` could not open, or `None` when every one of them loads.
+///
+/// ```c
+/// strbuf_addf(&pack_name, "%s/pack/%s", files->base.path,
+///             m->pack_names[pack_int_id]);
+/// p = packfile_store_load_pack(files->packed, pack_name.buf, files->base.local);
+/// [...]
+/// if (!p) {
+///         m->packs[pack_int_id] = MIDX_PACK_ERROR;
+///         return 1;
+/// }
+/// ```
+///
+/// (`prepare_midx_pack()`, midx.c:456-485, git 2.55.0.) The name a MIDX records
+/// is the `.idx`, and loading it needs the `.pack` beside it, so either file
+/// missing is a pack that cannot be loaded. The id is the position in the MIDX's
+/// own pack list — `pack_int_id` counts from `m->num_packs_in_base`, which is
+/// zero for the single flat layer this port reads and writes.
+fn unloadable_midx_pack(pack_dir: &Path, midx: &multi_index::File) -> Option<usize> {
+    midx.index_names().iter().position(|name| {
+        let index = pack_dir.join(name);
+        !index.is_file() || !index.with_extension("pack").is_file()
+    })
 }
 
 /// `midx_needs_update()` (midx-write.c:1147-1229, v2.55.0), for the flat,

@@ -14,21 +14,12 @@
 //! Each is a place where git has substrate this crate does not, rather than a
 //! simplification of the algorithm itself:
 //!
-//! * **No delta reuse from existing packs.** git's `try_delta()` opens with a
-//!   `reuse_delta && IN_PACK(trg) == IN_PACK(src)` shortcut that declines to
-//!   re-derive a delta it could copy verbatim. Nothing here copies pack entries,
-//!   so every pair is searched afresh. The output is a valid pack either way;
-//!   the cost is time, not correctness.
 //! * **Preferred bases are supplied, not discovered.** git learns them from the
 //!   revision walk's edges (`show_edge()` -> `add_preferred_base()`), which is
 //!   outside this crate; a caller that knows what the receiver already has marks
 //!   those entries [`Object::preferred_base`] and the search treats them exactly
 //!   as git does — a window slot that may serve as a base and is never itself
 //!   deltified. Delta *islands* are modelled too; see [`Islands`].
-//! * **`max_depth` is always `depth`.** git lowers it via `check_delta_limit()`
-//!   when the object already has delta *children* from a reused pack delta. With
-//!   no reuse, the child network is empty during the search, so the lowering
-//!   never fires.
 //! * **Static work partitioning.** git's `ll_find_deltas()` partitions the list
 //!   across threads exactly as this does, then keeps rebalancing: an idle thread
 //!   steals half the backlog of the busiest one. The stealing is a throughput
@@ -120,6 +111,61 @@ pub struct Object {
     /// going to pack" — and the caller drops it before the pack is written,
     /// which is what makes the result a thin pack.
     pub preferred_base: bool,
+}
+
+/// git's `IN_PACK(entry)` and `entry->in_pack_type`: which existing pack the
+/// object database reads this object out of, and whether that pack stores it as
+/// a delta.
+///
+/// `check_object()` records both before any search happens, and `try_delta()`
+/// reads both to decide whether a pair is worth trying at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InPack {
+    /// Identifies the pack. Only compared for equality, which is git's
+    /// `IN_PACK(trg_entry) == IN_PACK(src_entry)` pointer test.
+    pub pack: usize,
+    /// Whether the stored entry's header type is `OBJ_REF_DELTA` or
+    /// `OBJ_OFS_DELTA`. Recorded from the header even when the delta was not
+    /// kept, because `drop_reused_delta()` leaves `in_pack_type` alone.
+    pub stored_delta: bool,
+}
+
+/// What `check_object()` settled before the search runs, which is what the
+/// search has to respect.
+///
+/// Every field is indexed like the `objects` slice given to [`find_deltas()`];
+/// an empty slice means the caller had nothing to reuse from, which is the
+/// `--no-reuse-delta` case and the shape every caller with no existing pack
+/// passes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Reuse<'a> {
+    /// git's `reuse_delta`, the flag `--no-reuse-delta` clears. It gates the
+    /// `try_delta()` shortcut below, exactly as it does in git.
+    pub enabled: bool,
+    /// git's first test in `should_attempt_deltas()`: `if (DELTA(entry))
+    /// return 0`, which holds for an object whose delta was reused from an
+    /// existing pack. Such an object is left out of the sorted list entirely,
+    /// so it neither gets searched nor ever occupies a window slot — the latter
+    /// is what keeps a searched delta from choosing a reused delta as its base
+    /// and closing a cycle.
+    pub already_deltified: &'a [bool],
+    /// How each object is stored in an existing pack, or `None` for one the
+    /// object database reads loose.
+    pub in_pack: &'a [Option<InPack>],
+    /// `check_delta_limit(entry, 0)`: how tall the tree of *reused* deltas
+    /// resting on this object is. `find_deltas()` subtracts it from `--depth`,
+    /// so that an object at the foot of a chain it must keep does not acquire
+    /// a delta of its own that would push its dependants past the limit.
+    /// Zero for an object nothing reused rests on, which is git's
+    /// `if (DELTA_CHILD(entry))` being false.
+    pub child_height: &'a [usize],
+}
+
+impl Reuse<'_> {
+    /// git's `IN_PACK(entry)`, which is `NULL` for an object no pack holds.
+    fn in_pack(&self, at: usize) -> Option<InPack> {
+        self.in_pack.get(at).copied().flatten()
+    }
 }
 
 /// The delta the search settled on for one object.
@@ -238,14 +284,8 @@ fn type_rank(kind: gix_object::Kind) -> u8 {
 /// Search `objects` for deltas and return, for each of them, the delta chosen
 /// or `None` if it stays a base object.
 ///
-/// `already_deltified` is git's first test in `should_attempt_deltas()`:
-/// `if (DELTA(entry)) return 0`, which holds for an object whose delta was
-/// reused from an existing pack by `check_object()`. Such an object is left out
-/// of the sorted list entirely, so it neither gets searched nor ever occupies a
-/// window slot — the latter is what keeps a searched delta from choosing a
-/// reused delta as its base and closing a cycle. An empty slice means nothing
-/// was reused, which is the `--no-reuse-delta` case and the shape every caller
-/// with no pack to reuse from passes.
+/// `reuse` is what `check_object()` already settled: which objects keep a delta
+/// an existing pack holds, and how every object is stored in one. See [`Reuse`].
 ///
 /// `new_state` is called once per thread to build whatever an object read needs
 /// (an object database handle, typically); `read` then fetches one object's
@@ -255,7 +295,7 @@ pub fn find_deltas<S, New, Read>(
     objects: &[Object],
     islands: &Islands,
     options: &Options,
-    already_deltified: &[bool],
+    reuse: &Reuse<'_>,
     mut new_state: New,
     read: Read,
 ) -> Vec<Option<Delta>>
@@ -273,7 +313,7 @@ where
     // into the order the window slides over.
     let mut list: Vec<usize> = (0..objects.len())
         .filter(|&i| objects[i].size >= MIN_SIZE_FOR_DELTA)
-        .filter(|&i| !already_deltified.get(i).copied().unwrap_or(false))
+        .filter(|&i| !reuse.already_deltified.get(i).copied().unwrap_or(false))
         .collect();
     // `prepare_pack()` guards the search with `if (nr_deltas && n > 1)`, where
     // `nr_deltas` counts only the entries that will actually be written: a list
@@ -306,6 +346,7 @@ where
                 segment,
                 islands,
                 options,
+                reuse,
                 window,
                 &state,
                 &read,
@@ -322,7 +363,9 @@ where
                     let read = &read;
                     let cache_size = &cache_size;
                     scope.spawn(move || {
-                        find_deltas_in_segment(objects, segment, islands, options, window, &state, read, cache_size)
+                        find_deltas_in_segment(
+                            objects, segment, islands, options, reuse, window, &state, read, cache_size,
+                        )
                     })
                 })
                 .collect();
@@ -443,11 +486,13 @@ fn two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
 }
 
 /// git's `find_deltas()` over one contiguous slice of the sorted list.
+#[expect(clippy::too_many_arguments)]
 fn find_deltas_in_segment<S, Read>(
     objects: &[Object],
     list: &[usize],
     islands: &Islands,
     options: &Options,
+    reuse: &Reuse<'_>,
     window: usize,
     state: &S,
     read: &Read,
@@ -489,17 +534,34 @@ where
         // available to the entries that follow it; only the search for a delta
         // *of* it is skipped.
         if objects[entry].preferred_base {
-            idx += 1;
-            if count + 1 < window {
-                count += 1;
-            }
-            if idx >= window {
-                idx = 0;
-            }
+            advance(&mut idx, &mut count, window);
             continue;
         }
 
-        let max_depth = options.depth;
+        // ```c
+        // /*
+        //  * If the current object is at pack edge, take the depth the
+        //  * objects that depend on the current object into account
+        //  * otherwise they would become too deep.
+        //  */
+        // max_depth = depth;
+        // if (DELTA_CHILD(entry)) {
+        //         max_depth -= check_delta_limit(entry, 0);
+        //         if (max_depth <= 0)
+        //                 goto next;
+        // }
+        // ```
+        //
+        // The children are the deltas kept from an existing pack: the search
+        // adds none, since it only ever sets an entry's own base. Giving this
+        // object a delta costs every one of them a level, so the budget it may
+        // spend is what is left of `--depth` above the tallest of them.
+        let height = reuse.child_height.get(entry).copied().unwrap_or(0);
+        if height >= options.depth {
+            advance(&mut idx, &mut count, window);
+            continue;
+        }
+        let max_depth = options.depth - height;
         let mut best_base: Option<usize> = None;
         let mut j = window;
         while j > 1 {
@@ -514,6 +576,7 @@ where
             let outcome = try_delta(
                 objects,
                 islands,
+                reuse,
                 &mut array,
                 idx,
                 other,
@@ -553,16 +616,22 @@ where
             array[dst] = swap;
         }
 
-        idx += 1;
-        if count + 1 < window {
-            count += 1;
-        }
-        if idx >= window {
-            idx = 0;
-        }
+        advance(&mut idx, &mut count, window);
     }
 
     found
+}
+
+/// git's `next:` label at the foot of `find_deltas()`'s loop: the window moves
+/// on whether or not the entry that just left it was searched.
+fn advance(idx: &mut usize, count: &mut usize, window: usize) {
+    *idx += 1;
+    if *count + 1 < window {
+        *count += 1;
+    }
+    if *idx >= window {
+        *idx = 0;
+    }
 }
 
 /// git's `delta_cacheable()`: whether a delta earns a place in the in-memory
@@ -585,6 +654,7 @@ fn delta_cacheable(options: &Options, spent: u64, src_size: u64, trg_size: u64, 
 fn try_delta<S, Read>(
     objects: &[Object],
     islands: &Islands,
+    reuse: &Reuse<'_>,
     array: &mut [Unpacked],
     trg_slot: usize,
     src_slot: usize,
@@ -610,6 +680,37 @@ where
     if trg_obj.kind != src_obj.kind {
         return -1;
     }
+
+    // ```c
+    // /*
+    //  * We do not bother to try a delta that we discarded on an
+    //  * earlier try, but only when reusing delta data.  Note that
+    //  * src_entry that is marked as the preferred_base should always
+    //  * be considered, as even if we produce a suboptimal delta against
+    //  * it, we will still save the transfer cost, as we already know
+    //  * the other side has it and we won't send src_entry at all.
+    //  */
+    // if (reuse_delta && IN_PACK(trg_entry) &&
+    //     IN_PACK(trg_entry) == IN_PACK(src_entry) &&
+    //     !src_entry->preferred_base &&
+    //     trg_entry->in_pack_type != OBJ_REF_DELTA &&
+    //     trg_entry->in_pack_type != OBJ_OFS_DELTA)
+    //         return 0;
+    // ```
+    //
+    // Both objects already share a pack and the target is stored whole in it,
+    // so whoever wrote that pack had this very pair in hand and stored the
+    // target as a base anyway. Re-deriving the delta would overrule a decision
+    // that is already on disk — which is exactly what `--no-reuse-delta` asks
+    // for, and why the shortcut is off when it is given.
+    if reuse.enabled && !src_obj.preferred_base {
+        if let (Some(trg_stored), Some(src_stored)) = (reuse.in_pack(trg_at), reuse.in_pack(src_at)) {
+            if trg_stored.pack == src_stored.pack && !trg_stored.stored_delta {
+                return 0;
+            }
+        }
+    }
+
     // Do not bust the allowed depth.
     if src.depth as usize >= max_depth {
         return 0;
@@ -747,17 +848,182 @@ mod tests {
     }
 
     fn search(objects: &[Object], bodies: &[Vec<u8>], options: &Options) -> Vec<Option<super::Delta>> {
+        search_with(objects, bodies, options, &super::Reuse::default())
+    }
+
+    fn search_with(
+        objects: &[Object],
+        bodies: &[Vec<u8>],
+        options: &Options,
+        reuse: &super::Reuse<'_>,
+    ) -> Vec<Option<super::Delta>> {
         find_deltas(
             objects,
             &super::Islands::default(),
             options,
-            &[],
+            reuse,
             || (),
             |(), oid| {
                 let n = u32::from_be_bytes(oid.as_bytes()[..4].try_into().expect("4 bytes")) as usize;
                 bodies.get(n).cloned()
             },
         )
+    }
+
+    fn found(deltas: &[Option<super::Delta>]) -> usize {
+        deltas.iter().filter(|delta| delta.is_some()).count()
+    }
+
+    /// `try_delta()`'s opening shortcut: a pair that one existing pack already
+    /// holds, with the target stored whole, was weighed when that pack was
+    /// written and is not weighed again — unless `--no-reuse-delta` says to.
+    #[test]
+    fn a_pair_one_pack_already_stores_whole_is_not_weighed_again() {
+        use super::{InPack, Reuse};
+        let (objects, bodies) = corpus();
+        let options = Options {
+            window: 10,
+            depth: 50,
+            threads: 1,
+            ..Options::default()
+        };
+        let whole: Vec<Option<InPack>> = objects
+            .iter()
+            .map(|_| {
+                Some(InPack {
+                    pack: 0,
+                    stored_delta: false,
+                })
+            })
+            .collect();
+
+        let skipped = search_with(
+            &objects,
+            &bodies,
+            &options,
+            &Reuse {
+                enabled: true,
+                in_pack: &whole,
+                ..Reuse::default()
+            },
+        );
+        assert_eq!(
+            found(&skipped),
+            0,
+            "one pack holds every one of these whole, so the pack's own writer already declined each pair"
+        );
+
+        let forced = search_with(
+            &objects,
+            &bodies,
+            &options,
+            &Reuse {
+                enabled: false,
+                in_pack: &whole,
+                ..Reuse::default()
+            },
+        );
+        assert!(
+            found(&forced) > 0,
+            "`--no-reuse-delta` clears the flag the shortcut is gated on, so the same pairs are searched"
+        );
+
+        let as_delta: Vec<Option<InPack>> = whole
+            .iter()
+            .map(|stored| {
+                stored.map(|stored| InPack {
+                    stored_delta: true,
+                    ..stored
+                })
+            })
+            .collect();
+        assert!(
+            found(&search_with(
+                &objects,
+                &bodies,
+                &options,
+                &Reuse {
+                    enabled: true,
+                    in_pack: &as_delta,
+                    ..Reuse::default()
+                }
+            )) > 0,
+            "a target the pack stores as a delta is one whose delta was dropped, not one that was declined"
+        );
+
+        let split: Vec<Option<InPack>> = (0..objects.len())
+            .map(|at| {
+                Some(InPack {
+                    pack: at % 2,
+                    stored_delta: false,
+                })
+            })
+            .collect();
+        assert!(
+            found(&search_with(
+                &objects,
+                &bodies,
+                &options,
+                &Reuse {
+                    enabled: true,
+                    in_pack: &split,
+                    ..Reuse::default()
+                }
+            )) > 0,
+            "no single writer ever saw a cross-pack pair, so nothing was decided about it"
+        );
+    }
+
+    /// `find_deltas()`'s `max_depth -= check_delta_limit(entry, 0)`: a delta
+    /// taken here costs every reused delta already resting on this object a
+    /// level, so the object may only spend what is left of `--depth`.
+    #[test]
+    fn a_reused_chain_resting_on_an_object_spends_its_depth_budget() {
+        use super::Reuse;
+        let (objects, bodies) = corpus();
+        let options = Options {
+            window: 10,
+            depth: 5,
+            threads: 1,
+            ..Options::default()
+        };
+        assert!(
+            found(&search(&objects, &bodies, &options)) > 0,
+            "with nothing resting on them these do deltify"
+        );
+
+        let one_left = vec![options.depth - 1; objects.len()];
+        let narrowed = search_with(
+            &objects,
+            &bodies,
+            &options,
+            &Reuse {
+                child_height: &one_left,
+                ..Reuse::default()
+            },
+        );
+        assert!(found(&narrowed) > 0, "one level of budget is still a level");
+        for delta in narrowed.iter().flatten() {
+            assert_eq!(
+                delta.depth, 1,
+                "only the one level left under the reused chains may be spent"
+            );
+        }
+
+        let nothing_left = vec![options.depth; objects.len()];
+        assert_eq!(
+            found(&search_with(
+                &objects,
+                &bodies,
+                &options,
+                &Reuse {
+                    child_height: &nothing_left,
+                    ..Reuse::default()
+                }
+            )),
+            0,
+            "a chain that already fills `--depth` leaves its base nothing to spend"
+        );
     }
 
     #[test]
@@ -882,7 +1148,7 @@ mod tests {
         };
 
         let unrestricted = search(&objects, &bodies, &options);
-        let restricted = find_deltas(&objects, &islands, &options, &[], || (), |(), oid| {
+        let restricted = find_deltas(&objects, &islands, &options, &super::Reuse::default(), || (), |(), oid| {
             let n = u32::from_be_bytes(oid.as_bytes()[..4].try_into().expect("4 bytes")) as usize;
             bodies.get(n).cloned()
         });
@@ -920,7 +1186,7 @@ mod tests {
                 threads: 1,
                 ..Options::default()
             },
-            &[],
+            &super::Reuse::default(),
             || (),
             |(), oid| {
                 let n = u32::from_be_bytes(oid.as_bytes()[..4].try_into().expect("4 bytes")) as usize;

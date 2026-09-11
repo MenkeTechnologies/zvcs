@@ -46,7 +46,14 @@
 //! by [`break_delta_chains`] exactly as `get_object_details()`'s second pass
 //! does. A reused delta's stored bytes are copied across with the entry; only a
 //! delta the pack split made unusable is recomputed, by the same encoder that
-//! produced it.
+//! produced it. Reuse also decides what the search may *not* reconsider: a pair
+//! that one existing pack already holds, with the target stored whole, was
+//! weighed by whoever wrote that pack and is left alone — `try_delta()`'s
+//! opening shortcut — and an object carrying reused deltas may only spend what
+//! is left of `--depth` above them, which is `check_delta_limit()`. Both are
+//! what makes repacking an already-packed repository land on the pack it
+//! already has instead of a differently-deltified one, and both are off under
+//! `--no-reuse-delta`.
 //!
 //! One layout input is still absent, and is not reachable from the default
 //! configuration: delta islands do not split the write order into layers — with
@@ -1676,11 +1683,30 @@ fn write_pack(
     let to_write = objects.iter().filter(|object| !object.preferred_base).count();
     let mut compressing =
         Meter::counted("Compressing objects", to_write, compressing_progress);
+    // The rest of what `check_object()` left the search: `IN_PACK(entry)` and
+    // `entry->in_pack_type` per object, and the height of the reused chain
+    // standing on each of them.
+    let stored: Vec<Option<delta::InPack>> = in_pack
+        .iter()
+        .map(|stored| {
+            stored.map(|stored| delta::InPack {
+                pack: stored.pack,
+                stored_delta: stored.stored_delta,
+            })
+        })
+        .collect();
+    let child_height = reused_child_heights(&reused);
+    let reuse = delta::Reuse {
+        enabled: delta.reuse_delta,
+        already_deltified: &already_deltified,
+        in_pack: &stored,
+        child_height: &child_height,
+    };
     let mut deltas = delta::find_deltas(
         &objects,
         &islands,
         &delta.search,
-        &already_deltified,
+        &reuse,
         || repo.clone(),
         |repo, id| {
             let mut buf = Vec::new();
@@ -1775,7 +1801,24 @@ fn write_pack(
 /// verbatim, and everything `write_reuse_object()` needs to do the copying.
 ///
 /// Only the *first* index that holds an object is consulted, because that is the
-/// one the odb resolves it from and therefore git's `IN_PACK(entry)`.
+/// one the odb resolves it from and therefore git's `IN_PACK(entry)`. A
+/// multi-pack-index is asked before any single pack index, and a pack it covers
+/// is not asked again, which is `find_pack_entry()`'s order:
+///
+/// ```c
+/// for (m = r->objects->multi_pack_index; m; m = m->next) {
+///         if (fill_midx_entry(r, oid, e, m))
+///                 return 1;
+/// }
+/// list_for_each(pos, &r->objects->packed_git_mru) {
+///         struct packed_git *p = list_entry(pos, struct packed_git, mru);
+///         if (!p->multi_pack_index && fill_pack_entry(oid, e, p)) {
+/// ```
+///
+/// (packfile.c, `find_pack_entry()`.) Without it a repository that has had
+/// `multi-pack-index write` run over it — which `git maintenance` does on its
+/// own — reports no object as packed at all, and every delta it already holds
+/// is searched for again from scratch.
 fn in_pack_table(
     repo: &gix::Repository,
     objects: &[pack::data::output::delta::Object],
@@ -1793,56 +1836,110 @@ fn in_pack_table(
     };
     let hash = repo.object_hash();
 
-    for record in records {
+    // The multi-index round first, and the pack index paths it covers, so that
+    // the second round can skip them the way git skips a `p->multi_pack_index`.
+    let mut covered: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    for record in &records {
+        let Record::MultiIndex { path, .. } = record else { continue };
+        let Ok(midx) = pack::multi_index::File::at(path, None) else { continue };
+        let Some(dir) = path.parent() else { continue };
+        // `m->packs[pack_int_id]`: the multi-index names each pack it covers by
+        // its index file, and every object it answers for names one of them.
+        let opened: Vec<Option<OpenedPack>> = midx
+            .index_names()
+            .iter()
+            .map(|name| {
+                let path = dir.join(name);
+                covered.insert(path.clone());
+                open_pack(&path, hash, &mut packs)
+            })
+            .collect();
+        for entry in midx.iter() {
+            let Some(&target) = at.get(&entry.oid) else { continue };
+            if decided[target] {
+                continue;
+            }
+            let Some(Some(opened)) = opened.get(entry.pack_index as usize) else { continue };
+            decided[target] = true;
+            out[target] = stored_as(&packs[opened.pack], opened, entry.pack_offset);
+        }
+    }
+
+    for record in &records {
         let Record::Index { path, .. } = record else { continue };
-        let Ok(idx) = pack::index::File::at(&path, hash) else { continue };
-        let Ok(data) = pack::data::File::at(path.with_extension("pack"), hash) else {
+        if covered.contains(path) {
             continue;
-        };
-
-        // `offset_to_pack_pos()` + `nth_packed_object_id()`, which an
-        // `OBJ_OFS_DELTA`'s backwards distance needs to name a base, and
-        // `pack_pos_to_offset(p, pos + 1)`, which is where the entry's stored
-        // bytes end. The last entry ends at the trailer.
-        let mut by_offset: Vec<(u64, ObjectId)> =
-            idx.iter().map(|e| (e.pack_offset, e.oid)).collect();
-        by_offset.sort_unstable_by_key(|(offset, _)| *offset);
-        let pack_end = data.pack_end() as u64;
-        let pos_of = |offset: u64| by_offset.binary_search_by_key(&offset, |(o, _)| *o).ok();
-
-        let pack = packs.len();
+        }
+        let Ok(idx) = pack::index::File::at(path, hash) else { continue };
+        let Some(opened) = open_pack(path, hash, &mut packs) else { continue };
         for entry in idx.iter() {
             let Some(&target) = at.get(&entry.oid) else { continue };
             if decided[target] {
                 continue;
             }
             decided[target] = true;
-            let Ok(packed) = data.entry(entry.pack_offset) else { continue };
-            let Some(pos) = pos_of(entry.pack_offset) else { continue };
-            let ends_at = match by_offset.get(pos + 1) {
-                Some((offset, _)) => *offset,
-                None => pack_end,
-            };
-            let base_id = match packed.header {
-                pack::data::entry::Header::OfsDelta { base_distance } => entry
-                    .pack_offset
-                    .checked_sub(base_distance)
-                    .and_then(|offset| pos_of(offset).map(|i| by_offset[i].1)),
-                pack::data::entry::Header::RefDelta { base_id } => Some(base_id),
-                _ => None,
-            };
-            out[target] = Some(InPack {
-                pack,
-                data_offset: packed.data_offset,
-                data_len: ends_at.saturating_sub(packed.data_offset),
-                stored_delta: base_id.is_some(),
-                entry_size: packed.decompressed_size,
-                base_id,
-            });
+            out[target] = stored_as(&packs[opened.pack], &opened, entry.pack_offset);
         }
-        packs.push(data);
     }
     (packs, out)
+}
+
+/// One existing pack, opened once for [`in_pack_table`].
+struct OpenedPack {
+    /// Its position in the table [`in_pack_table`] returns.
+    pack: usize,
+    /// Every entry's offset with the object it holds, ascending: git's
+    /// `pack_pos_to_offset()` and `nth_packed_object_id()` tables, which an
+    /// `OBJ_OFS_DELTA`'s backwards distance needs to name a base and which say
+    /// where an entry's stored bytes end.
+    by_offset: Vec<(u64, ObjectId)>,
+    /// Where the last entry ends: the start of the pack trailer.
+    pack_end: u64,
+}
+
+/// Open the pack belonging to `index_path` and build its offset table, adding
+/// the pack to `packs`. `None` for a pack that cannot be read, which leaves its
+/// objects to be searched as though they were loose.
+fn open_pack(index_path: &std::path::Path, hash: gix::hash::Kind, packs: &mut Vec<pack::data::File>) -> Option<OpenedPack> {
+    let idx = pack::index::File::at(index_path, hash).ok()?;
+    let data = pack::data::File::at(index_path.with_extension("pack"), hash).ok()?;
+    let mut by_offset: Vec<(u64, ObjectId)> = idx.iter().map(|e| (e.pack_offset, e.oid)).collect();
+    by_offset.sort_unstable_by_key(|(offset, _)| *offset);
+    let pack_end = data.pack_end() as u64;
+    let pack = packs.len();
+    packs.push(data);
+    Some(OpenedPack {
+        pack,
+        by_offset,
+        pack_end,
+    })
+}
+
+/// `check_object()`'s reading of one entry's header: what it is stored as, where
+/// its deflated bytes are, and which object it deltifies against.
+fn stored_as(data: &pack::data::File, opened: &OpenedPack, offset: u64) -> Option<InPack> {
+    let pos_of = |offset: u64| opened.by_offset.binary_search_by_key(&offset, |(o, _)| *o).ok();
+    let packed = data.entry(offset).ok()?;
+    let pos = pos_of(offset)?;
+    let ends_at = match opened.by_offset.get(pos + 1) {
+        Some((offset, _)) => *offset,
+        None => opened.pack_end,
+    };
+    let base_id = match packed.header {
+        pack::data::entry::Header::OfsDelta { base_distance } => offset
+            .checked_sub(base_distance)
+            .and_then(|offset| pos_of(offset).map(|i| opened.by_offset[i].1)),
+        pack::data::entry::Header::RefDelta { base_id } => Some(base_id),
+        _ => None,
+    };
+    Some(InPack {
+        pack: opened.pack,
+        data_offset: packed.data_offset,
+        data_len: ends_at.saturating_sub(packed.data_offset),
+        stored_delta: base_id.is_some(),
+        entry_size: packed.decompressed_size,
+        base_id,
+    })
 }
 
 /// git's `check_object()` delta reuse: for each position in `objects`, the
@@ -1979,6 +2076,59 @@ fn break_delta_chains(reused: &mut [Option<ReusedDelta>], depth: u32) {
             }
         }
     }
+}
+
+/// git's `check_delta_limit(entry, 0)` (builtin/pack-objects.c:2945) for every
+/// object at once: how tall the tree of reused deltas resting on it is.
+///
+/// ```c
+/// static unsigned int check_delta_limit(struct object_entry *me, unsigned int n)
+/// {
+///         struct object_entry *child = DELTA_CHILD(me);
+///         unsigned int m = n;
+///         while (child) {
+///                 const unsigned int c = check_delta_limit(child, n + 1);
+///                 if (m < c)
+///                         m = c;
+///                 child = DELTA_SIBLING(child);
+///         }
+///         return m;
+/// }
+/// ```
+///
+/// The child links exist only for deltas `check_object()` reused — the ones
+/// `break_delta_chains()` has just finished pruning — because the search sets an
+/// entry's base without ever linking it as a child, and
+/// `compute_write_order()` rebuilds the network from scratch afterwards. So the
+/// whole table is settled here, once, before the search reads it.
+///
+/// Each entry has at most one base, so the links form a forest: measuring every
+/// node's distance to its root orders the nodes so that a child is always seen
+/// before its parent, and one pass upwards then carries the heights.
+fn reused_child_heights(reused: &[Option<ReusedDelta>]) -> Vec<usize> {
+    let mut height = vec![0usize; reused.len()];
+    let mut distance = vec![0usize; reused.len()];
+    for at in 0..reused.len() {
+        // Bounded by the chain length rather than trusted to terminate, for the
+        // same reason [`reused_depth`] is: a corrupt pack must not hang us.
+        let mut cursor = at;
+        let mut steps = 0usize;
+        while let Some(entry) = reused[cursor] {
+            steps += 1;
+            if steps > reused.len() {
+                break;
+            }
+            cursor = entry.base;
+        }
+        distance[at] = steps;
+    }
+    let mut order: Vec<usize> = (0..reused.len()).collect();
+    order.sort_unstable_by(|&a, &b| distance[b].cmp(&distance[a]));
+    for at in order {
+        let Some(entry) = reused[at] else { continue };
+        height[entry.base] = height[entry.base].max(height[at] + 1);
+    }
+    height
 }
 
 /// How long the delta chain ending at `at` is, counting `at` itself.

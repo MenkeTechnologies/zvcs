@@ -292,6 +292,84 @@ impl Builder {
             rlw: self.rlw as u64,
         }
     }
+
+    /// A bitmap that was read back off disk, in the form the builder operates
+    /// on — git keeps one `struct ewah_bitmap` for both directions, and so must
+    /// anything that XORs a stored bitmap against another.
+    pub fn from_decoded(decoded: &EwahVec) -> Self {
+        Builder {
+            buffer: decoded.bits.clone(),
+            bit_size: decoded.num_bits as usize,
+            rlw: decoded.rlw as usize,
+        }
+    }
+
+    /// The compressed words themselves, git's `buffer`.
+    pub fn words(&self) -> &[u64] {
+        &self.buffer
+    }
+
+    /// git's `ewah_checksum()` (`ewah/ewah_bitmap.c`:498-508, v2.55.0), the
+    /// value `rev-list --test-bitmap` prints for the commit it was handed.
+    ///
+    /// git runs it over `buffer`'s bytes *in memory*, which are host order and
+    /// not the big-endian order the same words take on disk, so this reads each
+    /// word back out in native order to agree with it.
+    pub fn checksum(&self) -> u32 {
+        let mut crc = self.bit_size as u32;
+        for word in &self.buffer {
+            for byte in word.to_ne_bytes() {
+                crc = crc.wrapping_shl(5).wrapping_sub(crc).wrapping_add(u32::from(byte));
+            }
+        }
+        crc
+    }
+
+    /// git's `ewah_to_bitmap()` (`ewah/bitmap.c`:102-118, v2.55.0): expand the
+    /// compressed stream into the plain 64-bit words a `struct bitmap` holds.
+    pub fn to_bitmap_words(&self) -> std::vec::Vec<u64> {
+        let mut words = std::vec::Vec::new();
+        let mut iter = Iter::new(&self.buffer);
+        while let Some(word) = iter.next_word() {
+            words.push(word);
+        }
+        words
+    }
+
+    /// git's `ewah_add_dirty_words()`: append `number` words verbatim (or
+    /// inverted) as literals, without the all-zero/all-one folding
+    /// [`add()`](Builder::add) performs.
+    fn add_dirty_words(&mut self, buffer: &[u64], mut number: usize, negate: bool) {
+        let mut at = 0usize;
+        loop {
+            let literals = rlw_get_literal_words(self.buffer[self.rlw]);
+            let can_add = (number as u64).min(RLW_LARGEST_LITERAL_COUNT - literals);
+            rlw_set_literal_words(&mut self.buffer[self.rlw], literals + can_add);
+
+            for offset in 0..can_add as usize {
+                let word = buffer[at + offset];
+                self.buffer.push(if negate { !word } else { word });
+            }
+
+            self.bit_size += can_add as usize * BITS_IN_EWORD;
+
+            if number as u64 - can_add == 0 {
+                break;
+            }
+
+            self.buffer_push_rlw(0);
+            at += can_add as usize;
+            number -= can_add as usize;
+        }
+    }
+}
+
+/// git's `bitmap_equals()` (`ewah/bitmap.c`:237-261, v2.55.0): two plain
+/// bitmaps are equal when they agree on every word the shorter one has and the
+/// longer one is zero past that point.
+pub fn bitmap_words_equal(a: &[u64], b: &[u64]) -> bool {
+    let (small, big) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    small.iter().zip(big).all(|(l, r)| l == r) && big[small.len()..].iter().all(|word| *word == 0)
 }
 
 /// How many bits [`Builder::from_bitmap_words`] ends up covering for `words`,
@@ -446,10 +524,371 @@ mod tests {
         assert_eq!(round_trip(&recovered), round_trip(&Builder::from_bitmap_words(&later)));
     }
 
+    /// The plain 64-bit words a bitmap covers, which is what a reader gets back
+    /// out of git's `ewah_to_bitmap()`.
+    fn words_of(builder: &Builder) -> std::vec::Vec<u64> {
+        builder.to_bitmap_words()
+    }
+
+    /// Two bitmaps of the shape a pack's entries take: a shared body of
+    /// scattered literal words, long runs between them, and a small delta.
+    fn pair() -> (Builder, Builder) {
+        let mut earlier = vec![0u64; 24];
+        for at in (0..12).step_by(2) {
+            earlier[at] = 0x0f0f_0f0f_0f0f_0f0f;
+        }
+        earlier[20] = u64::MAX;
+        let mut later = earlier.clone();
+        later[13] = 0x00ff_00ff_00ff_00ff;
+        later[21] = u64::MAX;
+        (
+            Builder::from_bitmap_words(&earlier),
+            Builder::from_bitmap_words(&later),
+        )
+    }
+
+    #[test]
+    fn xor_over_the_compressed_streams_agrees_with_xor_over_the_words() {
+        let (a, b) = pair();
+        let combined = super::xor(&a, &b);
+        let (left, right) = (words_of(&a), words_of(&b));
+        let expected: std::vec::Vec<u64> = (0..left.len().max(right.len()))
+            .map(|at| left.get(at).copied().unwrap_or(0) ^ right.get(at).copied().unwrap_or(0))
+            .collect();
+        assert!(
+            super::bitmap_words_equal(&words_of(&combined), &expected),
+            "the run/literal walk must produce the same bits as XOR-ing word by word"
+        );
+        assert_eq!(
+            combined.num_bits(),
+            a.num_bits().max(b.num_bits()),
+            "git ends with out->bit_size = max(bit_size)"
+        );
+    }
+
+    #[test]
+    fn xor_undoes_itself_which_is_how_a_chained_entry_is_read_back() {
+        let (a, b) = pair();
+        let stored = super::xor(&a, &b);
+        let recovered = super::xor(&stored, &b);
+        assert!(
+            super::bitmap_words_equal(&words_of(&recovered), &words_of(&a)),
+            "XOR-ing a stored entry back against its base recovers the original"
+        );
+    }
+
+    #[test]
+    fn xor_against_an_empty_bitmap_is_the_bitmap_itself() {
+        let (a, _) = pair();
+        let empty = Builder::from_bitmap_words(&[0u64; 24]);
+        assert!(
+            super::bitmap_words_equal(&words_of(&super::xor(&a, &empty)), &words_of(&a)),
+            "nothing to flip leaves every bit where it was"
+        );
+    }
+
+    #[test]
+    fn xor_of_bitmaps_of_different_lengths_keeps_the_longer_tail() {
+        let short = Builder::from_bitmap_words(&{
+            let mut words = vec![0u64; 3];
+            words[1] = 0x5555_5555_5555_5555;
+            words
+        });
+        let long = Builder::from_bitmap_words(&{
+            let mut words = vec![0u64; 40];
+            words[1] = 0x5555_5555_5555_5555;
+            words[30] = u64::MAX;
+            words[39] = 1;
+            words
+        });
+        let combined = super::xor(&short, &long);
+        let mut expected = vec![0u64; 40];
+        expected[30] = u64::MAX;
+        expected[39] = 1;
+        assert!(
+            super::bitmap_words_equal(&words_of(&combined), &expected),
+            "the tail past the shorter stream survives the discharge"
+        );
+    }
+
+    #[test]
+    fn a_bitmap_read_back_off_disk_can_be_xored_like_a_built_one() {
+        let (a, b) = pair();
+        let mut bytes = std::vec::Vec::new();
+        super::xor(&a, &b).write_to(&mut bytes);
+        let (decoded, rest) = crate::ewah::decode(&bytes).expect("what we write, we can read");
+        assert!(rest.is_empty());
+        let stored = Builder::from_decoded(&decoded);
+        assert_eq!(
+            stored.checksum(),
+            super::xor(&a, &b).checksum(),
+            "the checksum a reader reports is the one the bytes carry"
+        );
+        assert!(super::bitmap_words_equal(
+            &words_of(&super::xor(&stored, &b)),
+            &words_of(&a)
+        ));
+    }
+
     #[test]
     fn an_all_zero_bitmap_is_one_empty_word() {
         let built = Builder::from_bitmap_words(&[0u64; 16]);
         assert_eq!(round_trip(&built), std::vec::Vec::<usize>::new());
         assert_eq!(built.num_bits(), 64, "git emits one empty word for an empty bitmap");
     }
+}
+
+/// git's `struct ewah_iterator`: walks a compressed stream one uncompressed
+/// 64-bit word at a time, expanding runs as it goes (`ewah/ewah_bitmap.c`
+/// :305-372, v2.55.0).
+struct Iter<'a> {
+    buffer: &'a [u64],
+    buffer_size: usize,
+    pointer: usize,
+    /// Literal words in the current run-length word, and how many are spent.
+    lw: u64,
+    literals: u64,
+    /// Running length of the current run-length word, and how much is spent.
+    rl: u64,
+    compressed: u64,
+    /// The value the run repeats.
+    b: bool,
+}
+
+impl<'a> Iter<'a> {
+    /// git's `ewah_iterator_init()`.
+    fn new(buffer: &'a [u64]) -> Self {
+        let mut it = Iter {
+            buffer,
+            buffer_size: buffer.len(),
+            pointer: 0,
+            lw: 0,
+            literals: 0,
+            rl: 0,
+            compressed: 0,
+            b: false,
+        };
+        if it.pointer < it.buffer_size {
+            it.read_new_rlw();
+        }
+        it
+    }
+
+    /// git's `read_new_rlw()`: skip run-length words that describe nothing.
+    fn read_new_rlw(&mut self) {
+        self.literals = 0;
+        self.compressed = 0;
+        loop {
+            let word = self.buffer[self.pointer];
+            self.rl = rlw_get_running_len(word);
+            self.lw = rlw_get_literal_words(word);
+            self.b = rlw_get_run_bit(word);
+
+            if self.rl != 0 || self.lw != 0 {
+                return;
+            }
+            if self.pointer < self.buffer_size - 1 {
+                self.pointer += 1;
+            } else {
+                self.pointer = self.buffer_size;
+                return;
+            }
+        }
+    }
+
+    /// git's `ewah_iterator_next()`.
+    fn next_word(&mut self) -> Option<u64> {
+        if self.pointer >= self.buffer_size {
+            return None;
+        }
+
+        let next = if self.compressed < self.rl {
+            self.compressed += 1;
+            if self.b { u64::MAX } else { 0 }
+        } else {
+            self.literals += 1;
+            self.pointer += 1;
+            self.buffer[self.pointer]
+        };
+
+        if self.compressed == self.rl && self.literals == self.lw {
+            self.pointer += 1;
+            if self.pointer < self.buffer_size {
+                self.read_new_rlw();
+            }
+        }
+
+        Some(next)
+    }
+}
+
+/// git's `struct rlw_iterator` (`ewah/ewok_rlw.h`:84-112, v2.55.0), which walks
+/// the compressed stream in whole run-length words rather than expanding it.
+struct RlwIter<'a> {
+    buffer: &'a [u64],
+    size: usize,
+    pointer: usize,
+    literal_word_start: usize,
+    literal_words: u64,
+    running_len: u64,
+    literal_word_offset: usize,
+    running_bit: bool,
+}
+
+impl<'a> RlwIter<'a> {
+    /// git's `rlwit_init()`.
+    fn new(buffer: &'a [u64]) -> Self {
+        let mut it = RlwIter {
+            buffer,
+            size: buffer.len(),
+            pointer: 0,
+            literal_word_start: 0,
+            literal_words: 0,
+            running_len: 0,
+            literal_word_offset: 0,
+            running_bit: false,
+        };
+        it.next_word();
+        it.literal_word_start = it.literal_words_start() + it.literal_word_offset;
+        it
+    }
+
+    /// git's `rlwit_literal_words()`: where the literal words of the current
+    /// run-length word begin.
+    fn literal_words_start(&self) -> usize {
+        self.pointer - self.literal_words as usize
+    }
+
+    /// git's `rlwit_word_size()`.
+    fn word_size(&self) -> u64 {
+        self.running_len + self.literal_words
+    }
+
+    /// git's `next_word()`; false once the stream is exhausted, leaving the
+    /// current run-length word's fields untouched exactly as the C does.
+    fn next_word(&mut self) -> bool {
+        if self.pointer >= self.size {
+            return false;
+        }
+        let word = self.buffer[self.pointer];
+        self.pointer += rlw_get_literal_words(word) as usize + 1;
+        self.literal_words = rlw_get_literal_words(word);
+        self.running_len = rlw_get_running_len(word);
+        self.running_bit = rlw_get_run_bit(word);
+        self.literal_word_offset = 0;
+        true
+    }
+
+    /// git's `rlwit_discard_first_words()`.
+    fn discard_first_words(&mut self, mut x: u64) {
+        while x > 0 {
+            if self.running_len > x {
+                self.running_len -= x;
+                return;
+            }
+
+            x -= self.running_len;
+            self.running_len = 0;
+
+            let discard = x.min(self.literal_words);
+            self.literal_word_start += discard as usize;
+            self.literal_words -= discard;
+            x -= discard;
+
+            if x > 0 || self.word_size() == 0 {
+                if !self.next_word() {
+                    break;
+                }
+                self.literal_word_start = self.literal_words_start() + self.literal_word_offset;
+            }
+        }
+    }
+
+    /// git's `rlwit_discharge()`: copy at most `max` words into `out`,
+    /// optionally inverted, and report how many were copied.
+    fn discharge(&mut self, out: &mut Builder, max: u64, negate: bool) -> u64 {
+        let mut index = 0u64;
+
+        while index < max && self.word_size() > 0 {
+            let mut pl = self.running_len;
+            if index + pl > max {
+                pl = max - index;
+            }
+
+            out.add_empty_words(self.running_bit ^ negate, pl);
+            index += pl;
+
+            let mut pd = self.literal_words;
+            if pd + index > max {
+                pd = max - index;
+            }
+
+            out.add_dirty_words(&self.buffer[self.literal_word_start..], pd as usize, negate);
+
+            self.discard_first_words(pd + pl);
+            index += pd;
+        }
+
+        index
+    }
+}
+
+/// git's `ewah_xor()` (`ewah/ewah_bitmap.c`:407-469, v2.55.0), computed on the
+/// two compressed streams exactly as git computes it.
+///
+/// The compressed shape of the result — and so its word count, and so the
+/// `ewah_checksum()` that `rev-list --test-bitmap` prints — depends on which
+/// branch of the run/literal interplay produced each word, which is why this
+/// walks the streams rather than XOR-ing the expanded words: a literal word
+/// discharged against a run stays a literal here even when it is all-zero,
+/// where re-compressing would fold it into a run.
+pub fn xor(a: &Builder, b: &Builder) -> Builder {
+    let mut out = Builder::new();
+    let mut rlw_i = RlwIter::new(&a.buffer);
+    let mut rlw_j = RlwIter::new(&b.buffer);
+
+    while rlw_i.word_size() > 0 && rlw_j.word_size() > 0 {
+        while rlw_i.running_len > 0 || rlw_j.running_len > 0 {
+            let i_is_prey = rlw_i.running_len < rlw_j.running_len;
+            let (predator_running_len, negate_words) = if i_is_prey {
+                (rlw_j.running_len, rlw_j.running_bit)
+            } else {
+                (rlw_i.running_len, rlw_i.running_bit)
+            };
+
+            let index = if i_is_prey {
+                rlw_i.discharge(&mut out, predator_running_len, negate_words)
+            } else {
+                rlw_j.discharge(&mut out, predator_running_len, negate_words)
+            };
+
+            out.add_empty_words(negate_words, predator_running_len - index);
+
+            if i_is_prey {
+                rlw_j.discard_first_words(predator_running_len);
+            } else {
+                rlw_i.discard_first_words(predator_running_len);
+            }
+        }
+
+        let literals = rlw_i.literal_words.min(rlw_j.literal_words);
+
+        if literals > 0 {
+            for k in 0..literals as usize {
+                out.add(rlw_i.buffer[rlw_i.literal_word_start + k] ^ rlw_j.buffer[rlw_j.literal_word_start + k]);
+            }
+
+            rlw_i.discard_first_words(literals);
+            rlw_j.discard_first_words(literals);
+        }
+    }
+
+    if rlw_i.word_size() > 0 {
+        rlw_i.discharge(&mut out, u64::MAX, false);
+    } else {
+        rlw_j.discharge(&mut out, u64::MAX, false);
+    }
+
+    out.bit_size = a.bit_size.max(b.bit_size);
+    out
 }

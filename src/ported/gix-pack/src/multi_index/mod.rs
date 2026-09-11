@@ -36,6 +36,8 @@ pub struct File<T = MMap> {
     lookup_ofs: usize,
     offsets_ofs: usize,
     large_offsets_ofs: Option<usize>,
+    /// Where the `RIDX` chunk starts, when the multi-pack index carries one.
+    revindex_ofs: Option<usize>,
 }
 
 ///

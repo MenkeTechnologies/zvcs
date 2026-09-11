@@ -143,6 +143,23 @@ where
             .ok()
             .transpose()?;
 
+        // `RIDX`, the reverse index a multi-pack `.bitmap` needs to turn one of
+        // its bits back into a lexicographic position (midx-write.c writes it
+        // alongside the bitmap, git 2.55.0). Absent on a multi-pack index written
+        // without `--bitmap`, which is why this is optional and unvalidated here
+        // rather than a hard requirement.
+        let revindex = chunks
+            .validated_usize_offset_by_id(chunk::revindex::ID, |offset| {
+                chunk::revindex::is_valid(&offset, num_objects)
+                    .then_some(offset)
+                    .ok_or(Error::InvalidChunkSize {
+                        id: chunk::revindex::ID,
+                        message: "The chunk with the reverse index doesn't have the correct size",
+                    })
+            })
+            .ok()
+            .transpose()?;
+
         let checksum_offset = chunks.highest_offset() as usize;
         let trailer = &data[checksum_offset..];
         if trailer.len() != object_hash.len_in_bytes() {
@@ -163,6 +180,7 @@ where
             lookup_ofs: lookup.start,
             offsets_ofs: offsets.start,
             large_offsets_ofs: large_offsets.map(|r| r.start),
+            revindex_ofs: revindex.map(|r| r.start),
             num_objects,
             num_indices,
         })

@@ -69,60 +69,399 @@ fn fatal(message: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// `test_bitmap_walk()` (pack-bitmap.c:2791-2860, git 2.55.0), as far as this
-/// port can carry it.
-///
-/// # What is reproduced
-///
-/// Its first act, which is also the answer for every repository that has no
-/// reachability bitmap — which is every repository until something asks for one:
+/// `test_bitmap_walk()` (pack-bitmap.c:2791-2860, git 2.55.0).
 ///
 /// ```c
 /// if (!(bitmap_git = prepare_bitmap_git(revs->repo)))
 ///         die(_("failed to load bitmap indexes"));
+///
+/// if (revs->pending.nr != 1)
+///         die(_("you must specify exactly one commit to test"));
+///
+/// fprintf_ln(stderr, "Bitmap v%d test (%d entries%s, %d total)", …);
 /// ```
 ///
-/// (:2800-2801.) `prepare_bitmap_git()` opens the multi-pack-index's `.bitmap`
-/// if the object store has one and otherwise the first pack `.bitmap` it can
-/// read; with none to open it returns NULL and the command dies before it looks
-/// at the revisions at all — so this runs ahead of the "exactly one commit"
-/// check at :2803 and reports the same 128.
-///
-/// # What is not
-///
-/// The verification itself. With a bitmap present git decompresses the EWAH
-/// entry for the named commit, reports its width and checksum and which pack or
-/// MIDX held it, then walks the history for real and compares the two sets:
+/// The verification proper decompresses the named commit's bitmap, reports its
+/// width, its `ewah_checksum()` and which pack or multi-pack index held it, then
+/// walks the history for real and compares the two object sets:
 ///
 /// ```text
-/// Bitmap v1 test (6 entries loaded, 6 total)
-/// Found bitmap for 'fb4152cb686cb19362ccdac8e20f28970374b712'. 64 bits / 9fda7296 checksum
-/// Located via pack '4144d7e85c7b4bb5ad1f4bf68d28d60f87216873'.
+/// Bitmap v1 test (5 entries loaded, 5 total)
+/// Found bitmap for 'b3908a4b5db61d6adaaaaa08d672572d6240e199'. 64 bits / 7844dc46 checksum
+/// Located via pack 'c0c20beec0f8cdfc7b825ef5cfe1edc2ed7667b6'.
 /// OK!
 /// ```
 ///
-/// (git 2.55.0 over a five-commit repository repacked with
-/// `--write-bitmap-index`; the `Verifying bitmap entries` meter between the last
-/// two lines is a progress meter and so appears only on a terminal.)
+/// # The `Verifying bitmap entries` meter is not drawn
 ///
-/// Every line of that needs a `.bitmap` *reader* — the v1 header, the four type
-/// bitmaps, the per-commit entries and the XOR chain `find_bitmap_for_commit()`
-/// resolves — and this tree has only a writer
-/// (`gix_pack::data::output::bitmap`). Answering with anything less would be
-/// claiming a verification that did not happen, so the gap is stated instead.
-fn test_bitmap_walk(repo: &gix::Repository) -> Result<ExitCode> {
-    let pack_dir = repo.objects.store_ref().path().join("pack");
-    let present = std::fs::read_dir(&pack_dir).is_ok_and(|entries| {
-        entries.flatten().any(|entry| {
-            entry.file_name().to_string_lossy().ends_with(".bitmap")
-        })
-    });
-    if !present {
-        return Ok(fatal("failed to load bitmap indexes"));
+/// git's is not gated on a terminal — `is_foreground_fd()` (progress.c:106-110)
+/// answers yes for a pipe or a file, since `tcgetpgrp()` fails on both — so
+/// stock writes it into a redirected stderr as well. It is left out here for
+/// the same reason `index-pack` leaves its meters out: this tree draws no
+/// progress. Everything else on stderr is byte-for-byte what stock writes.
+fn test_bitmap_walk(repo: &gix::Repository, seeds: &[Seed], pending: &[Pending]) -> Result<ExitCode> {
+    let bitmapped = match open_bitmap(repo) {
+        Ok(Some(bitmapped)) => bitmapped,
+        // `error()` has already said what was wrong with the file; git's
+        // `prepare_bitmap_git()` then hands back NULL and the caller dies.
+        Ok(None) => return Ok(fatal("failed to load bitmap indexes")),
+        Err(code) => return Ok(code),
+    };
+
+    // `revs->pending` holds the objects `handle_revision_arg()` queued, each
+    // exactly as it was named and before any peeling. This tree splits that
+    // list in two: an operand that is already a commit lands in `seeds`, a tag,
+    // tree or blob lands in `pending`, and peeling a tag records the tag *and*
+    // yields the commit underneath it, so one tag operand shows up once in each
+    // list. Discounting the tags recovers git's count, and with a single
+    // operand the first unpeeled object is the head of `pending` when there is
+    // one and the seed otherwise.
+    //
+    // A tree or blob operand is recorded twice — once on the way through
+    // `handle_commit()`'s tree arm and once by the `pend_non_commit()` retry —
+    // so the list is read by object id. The cost is that two operands naming
+    // the *same* tree count once here where git counts two, and say "doesn't
+    // have an indexed bitmap" where git says "exactly one commit"; both are
+    // 128, and both ways of writing it are a mistake.
+    let mut named: Vec<&Pending> = Vec::new();
+    for entry in pending {
+        if !named.iter().any(|seen| seen.id == entry.id) {
+            named.push(entry);
+        }
     }
-    anyhow::bail!(
-        "rev-list --test-bitmap cannot verify a bitmap here — reading a pack or multi-pack `.bitmap` (the v1 header, its four type bitmaps and the XOR-chained per-commit entries) has no implementation in this tree, which carries only gix_pack::data::output::bitmap's writer"
-    )
+    let tags_peeled = named
+        .iter()
+        .filter(|entry| entry.kind == gix::object::Kind::Tag)
+        .count();
+    let pending_nr = seeds.len() + named.len() - tags_peeled;
+    if pending_nr != 1 {
+        return Ok(fatal("you must specify exactly one commit to test"));
+    }
+    let (root, uninteresting) = named.first().map_or_else(
+        || {
+            let seed = seeds.first().expect("one pending object, and it is the seed");
+            (seed.id, seed.uninteresting)
+        },
+        |entry| (entry.id, entry.uninteresting),
+    );
+
+    let bitmap = bitmapped.bitmap();
+    eprintln!(
+        "Bitmap v{version} test ({entries} entries{loaded}, {total} total)",
+        version = bitmap.version,
+        entries = bitmap.entry_count,
+        loaded = if bitmap.has_lookup_table() { "" } else { " loaded" },
+        // `bitmap_total_entry_count()` sums the chain of multi-pack index
+        // layers; a bitmap written by this tree is never incremental, so the
+        // sum is the one file's own count.
+        total = bitmap.entry_count,
+    );
+
+    let stored = bitmapped
+        .index_position_of(&root)
+        .and_then(|at| bitmap.bitmap_for(at).ok().flatten());
+    let Some(stored) = stored else {
+        return Ok(fatal(&format!("commit '{root}' doesn't have an indexed bitmap")));
+    };
+
+    eprintln!(
+        "Found bitmap for '{root}'. {bits} bits / {checksum:08x} checksum",
+        bits = stored.num_bits(),
+        checksum = stored.checksum(),
+    );
+    eprintln!("{}", bitmapped.located_via());
+
+    let result = stored.to_bitmap_words();
+    // An operand written `^<rev>` is queued `UNINTERESTING`, and a walk whose
+    // only tip is excluded shows nothing — so the comparison is against an
+    // empty set, which is the mismatch git reports.
+    let walked = if uninteresting {
+        Ok(Vec::new())
+    } else {
+        walk_into_bitmap(repo, root, &bitmapped)
+    };
+    match walked {
+        Err(message) => Ok(fatal(&message)),
+        Ok(walked) => {
+            if gix::odb::pack::bitmap_index::bitmap_words_equal(&result, &walked) {
+                eprintln!("OK!");
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(fatal("mismatch in bitmap results"))
+            }
+        }
+    }
+}
+
+/// The `.bitmap` `prepare_bitmap_git()` opened, with whichever index resolves
+/// its two coordinate systems.
+enum Bitmapped {
+    /// One pack's bitmap, whose bits address pack positions — the pack read in
+    /// offset order — and whose entries name commits by `.idx` position.
+    Pack {
+        bitmap: gix::odb::pack::bitmap_index::File,
+        index: gix::odb::pack::index::File,
+        /// Every object's pack offset, ascending; an object's bit is where its
+        /// own offset sorts here, which is git's `offset_to_pack_pos()`.
+        offsets: Vec<u64>,
+    },
+    /// A multi-pack index's bitmap, whose bits address pseudo-pack order and
+    /// whose entries name commits by `OIDL` position.
+    Midx {
+        bitmap: gix::odb::pack::bitmap_index::File,
+        index: gix::odb::pack::multi_index::File,
+        /// `RIDX` inverted: the bit an object's lexicographic position takes.
+        bit_of_lexicographic: Vec<u32>,
+    },
+}
+
+impl Bitmapped {
+    fn bitmap(&self) -> &gix::odb::pack::bitmap_index::File {
+        match self {
+            Bitmapped::Pack { bitmap, .. } | Bitmapped::Midx { bitmap, .. } => bitmap,
+        }
+    }
+
+    /// Where `id` sorts in object-id order, which is how an entry names its
+    /// commit — git's `nth_bitmap_object_oid()` read backwards.
+    fn index_position_of(&self, id: &gix::hash::oid) -> Option<u32> {
+        match self {
+            Bitmapped::Pack { index, .. } => index.lookup(id),
+            Bitmapped::Midx { index, .. } => index.lookup(id),
+        }
+    }
+
+    /// Which bit stands for `id`, git's `bitmap_position()` (pack-bitmap.c
+    /// :1095-1104) without the extended index, which only a walk that adds
+    /// unpacked objects to the bitmap ever fills.
+    fn bit_position_of(&self, id: &gix::hash::oid) -> Option<u32> {
+        match self {
+            Bitmapped::Pack { index, offsets, .. } => {
+                let offset = index.pack_offset_at_index(index.lookup(id)?);
+                offsets.binary_search(&offset).ok().map(|at| at as u32)
+            }
+            Bitmapped::Midx {
+                index,
+                bit_of_lexicographic,
+                ..
+            } => bit_of_lexicographic.get(index.lookup(id)? as usize).copied(),
+        }
+    }
+
+    /// git's `Located via …` line, which names the pack by its trailing
+    /// checksum and a multi-pack index by its own.
+    fn located_via(&self) -> String {
+        match self {
+            Bitmapped::Pack { index, .. } => format!("Located via pack '{}'.", index.pack_checksum()),
+            Bitmapped::Midx { index, .. } => format!("Located via MIDX '{}'.", index.checksum()),
+        }
+    }
+}
+
+/// `open_bitmap()` (pack-bitmap.c:721-738) followed by `load_bitmap()`: the
+/// multi-pack index's `.bitmap` if the object store has one, else the first
+/// pack `.bitmap` that reads.
+///
+/// `Ok(None)` is git's "there was nothing to open", `Err(())` is a file that was
+/// opened and rejected — which has already printed its own `error:` line, as
+/// `error()` does before returning -1.
+///
+/// Alternate object directories are not searched. git walks `odb->sources`; this
+/// looks in the repository's own `objects/pack` only, so a bitmap that lives
+/// solely in an alternate is not found.
+fn open_bitmap(repo: &gix::Repository) -> Result<Option<Bitmapped>, ExitCode> {
+    let pack_dir = repo.objects.store_ref().path().join("pack");
+    let hash = repo.object_hash();
+
+    let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(&pack_dir) {
+        Ok(entries) => entries.flatten().map(|entry| entry.file_name()).collect(),
+        Err(_) => return Ok(None),
+    };
+    names.sort();
+
+    // A multi-pack bitmap is named after the multi-pack index's checksum, and
+    // wins over every pack bitmap that is also present.
+    if let Some(name) = names
+        .iter()
+        .find(|name| is_midx_bitmap(&name.to_string_lossy()))
+    {
+        let index = match gix::odb::pack::multi_index::File::at(pack_dir.join("multi-pack-index"), None) {
+            Ok(index) => index,
+            Err(_) => return Ok(None),
+        };
+        let bitmap = match gix::odb::pack::bitmap_index::File::at(&pack_dir.join(name), hash, index.num_objects())
+        {
+            Ok(bitmap) => bitmap,
+            Err(err) => return Err(rejected(&err)),
+        };
+        if bitmap.checksum != index.checksum() {
+            eprintln!("error: checksum doesn't match in MIDX and bitmap");
+            return Err(fatal("failed to load bitmap indexes"));
+        }
+        // `load_midx_revindex()` failing is a warning and then a give-up, since
+        // the bits cannot be read back into object ids without it.
+        let Some(pack_order) = index.pack_order() else {
+            eprintln!("warning: multi-pack bitmap is missing required reverse index");
+            return Err(fatal("failed to load bitmap indexes"));
+        };
+        let mut bit_of_lexicographic = vec![0u32; pack_order.len()];
+        for (bit, lexicographic) in pack_order.iter().enumerate() {
+            match bit_of_lexicographic.get_mut(*lexicographic as usize) {
+                Some(slot) => *slot = bit as u32,
+                None => {
+                    eprintln!("warning: multi-pack bitmap is missing required reverse index");
+                    return Err(fatal("failed to load bitmap indexes"));
+                }
+            }
+        }
+        return Ok(Some(Bitmapped::Midx {
+            bitmap,
+            index,
+            bit_of_lexicographic,
+        }));
+    }
+
+    // git stops at the first pack bitmap it can read and traces the rest as
+    // "ignoring extra bitmap file"; its pack order is the object store's, this
+    // one's is the directory's, which only differs when a repository carries
+    // more than one bitmap — a state git itself calls a duplicate.
+    for name in &names {
+        let name = name.to_string_lossy();
+        let Some(stem) = name.strip_suffix(".bitmap") else {
+            continue;
+        };
+        let index = match gix::odb::pack::index::File::at(pack_dir.join(format!("{stem}.idx")), hash) {
+            Ok(index) => index,
+            Err(_) => continue,
+        };
+        let bitmap =
+            match gix::odb::pack::bitmap_index::File::at(&pack_dir.join(name.as_ref()), hash, index.num_objects()) {
+                Ok(bitmap) => bitmap,
+                Err(err) => return Err(rejected(&err)),
+            };
+        let offsets = index.sorted_offsets();
+        return Ok(Some(Bitmapped::Pack {
+            bitmap,
+            index,
+            offsets,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// What git does with a `.bitmap` it opened and could not use: say what was
+/// wrong with it, then give up loading bitmaps at all.
+///
+/// `BUG()` is the exception. It names the C source position, prints no `error:`
+/// prefix and aborts, which a shell reports as 134 rather than git's own 128.
+fn rejected(err: &gix::odb::pack::bitmap_index::decode::Error) -> ExitCode {
+    if err.is_bug() {
+        eprintln!("{err}");
+        return ExitCode::from(134);
+    }
+    for line in err.error_lines() {
+        eprintln!("error: {line}");
+    }
+    fatal("failed to load bitmap indexes")
+}
+
+/// `multi-pack-index-<checksum>.bitmap`, the name `midx_bitmap_filename()`
+/// builds for a non-chained multi-pack index.
+fn is_midx_bitmap(name: &str) -> bool {
+    name.strip_prefix("multi-pack-index-")
+        .and_then(|rest| rest.strip_suffix(".bitmap"))
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The walk `test_bitmap_walk()` compares the stored bitmap against: every
+/// commit reachable from `root` and every tree and blob they reach, each one
+/// looked up in the bitmap's own object order and checked against the four type
+/// bitmaps (`test_show_commit()` and `test_show_object()`, pack-bitmap.c
+/// :2716-2745).
+///
+/// The error string is what git's `die()` would have said, without its prefix.
+fn walk_into_bitmap(repo: &gix::Repository, root: ObjectId, bitmapped: &Bitmapped) -> Result<Vec<u64>, String> {
+    let bitmap = bitmapped.bitmap();
+    let types = [
+        (gix::object::Kind::Commit, bitmap.commits.to_bitmap_words()),
+        (gix::object::Kind::Tree, bitmap.trees.to_bitmap_words()),
+        (gix::object::Kind::Blob, bitmap.blobs.to_bitmap_words()),
+        (gix::object::Kind::Tag, bitmap.tags.to_bitmap_words()),
+    ];
+    let mut base: Vec<u64> = Vec::new();
+
+    let mark = |id: ObjectId, kind: gix::object::Kind, base: &mut Vec<u64>| -> Result<(), String> {
+        let Some(pos) = bitmapped.bit_position_of(&id) else {
+            return Err(format!("object not in bitmap: '{id}'"));
+        };
+        let pos = pos as usize;
+        let found: Vec<gix::object::Kind> = types
+            .iter()
+            .filter(|(_, words)| words.get(pos / 64).is_some_and(|word| word & (1 << (pos % 64)) != 0))
+            .map(|(kind, _)| *kind)
+            .collect();
+        match found.as_slice() {
+            [] => return Err(format!("object '{id}' not found in type bitmaps")),
+            [one] if *one == kind => {}
+            [one] => {
+                return Err(format!(
+                    "object '{id}': real type '{}', expected: '{}'",
+                    kind,
+                    one
+                ))
+            }
+            _ => return Err(format!("object '{id}' does not have a unique type")),
+        }
+        if base.len() <= pos / 64 {
+            base.resize(pos / 64 + 1, 0);
+        }
+        base[pos / 64] |= 1 << (pos % 64);
+        Ok(())
+    };
+
+    let walk = repo
+        .rev_walk(Some(root))
+        .all()
+        .map_err(|_| "revision walk setup failed".to_string())?;
+
+    let mut trees: Vec<ObjectId> = Vec::new();
+    for info in walk {
+        let info = info.map_err(|_| "revision walk setup failed".to_string())?;
+        let id = info.id;
+        mark(id, gix::object::Kind::Commit, &mut base)?;
+        if let Some(tree) = commit_tree(repo, id) {
+            trees.push(tree);
+        }
+    }
+
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    while let Some(tree) = trees.pop() {
+        if !seen.insert(tree) {
+            continue;
+        }
+        mark(tree, gix::object::Kind::Tree, &mut base)?;
+        let Ok(object) = repo.find_object(tree) else {
+            return Err(format!("object not in bitmap: '{tree}'"));
+        };
+        let object = object.into_tree();
+        let Ok(parsed) = object.decode().map(|tree| tree.entries.clone()) else {
+            return Err(format!("object not in bitmap: '{tree}'"));
+        };
+        for entry in parsed {
+            let id = entry.oid.to_owned();
+            if entry.mode.is_tree() {
+                trees.push(id);
+            } else if entry.mode.is_commit() {
+                // A gitlink names a commit in another repository, which is not
+                // part of this pack and which git's walk does not show either.
+            } else if seen.insert(id) {
+                mark(id, gix::object::Kind::Blob, &mut base)?;
+            }
+        }
+    }
+
+    Ok(base)
 }
 
 /// Print a diagnostic that already carries its own prefixes and newline, and
@@ -1534,7 +1873,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     //
     // (`builtin/rev-list.c:805-808`, git 2.55.0.)
     if test_bitmap {
-        return test_bitmap_walk(&repo);
+        return test_bitmap_walk(&repo, &seeds, &pending);
     }
 
     // `revs->abbrev` is the minimum width every abbreviation in the run is asked

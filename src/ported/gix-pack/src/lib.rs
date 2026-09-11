@@ -50,6 +50,8 @@ mod find_traits;
 pub use find_traits::{Find, FindExt};
 
 ///
+pub mod bitmap_index;
+///
 pub mod index;
 ///
 pub mod multi_index;

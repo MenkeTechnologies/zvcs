@@ -136,6 +136,18 @@ where
         (pack_index, pack_offset)
     }
 
+    /// The `RIDX` chunk: one entry per object in pseudo-pack order, each the
+    /// position that object takes in this file's object-id order.
+    ///
+    /// It is the map a multi-pack `.bitmap` needs, whose bits address pack
+    /// order while its entry headers address object-id order. `None` when the
+    /// multi-pack index was written without `--bitmap`, which omits the chunk.
+    pub fn pack_order(&self) -> Option<Vec<EntryIndex>> {
+        let start = self.revindex_ofs?;
+        let data = &self.data[start..][..self.num_objects as usize * 4];
+        Some(data.chunks_exact(4).map(crate::read_u32).collect())
+    }
+
     /// Return an iterator over all entries within this file.
     pub fn iter(&self) -> impl Iterator<Item = Entry> + '_ {
         (0..self.num_objects).map(move |idx| {

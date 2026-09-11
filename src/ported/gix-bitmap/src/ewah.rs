@@ -184,3 +184,21 @@ pub struct Vec {
     /// RLW is an offset into the `bits` buffer, so `1` translates into &bits\[1] essentially.
     rlw: u64,
 }
+
+mod read {
+    use super::Vec;
+
+    impl Vec {
+        /// The compressed words as they sit on disk once byte-swapped, git's
+        /// `struct ewah_bitmap`'s `buffer`.
+        pub fn words(&self) -> &[u64] {
+            &self.bits
+        }
+
+        /// The offset of the last run-length word within [`words()`](Vec::words()),
+        /// git's `self->rlw` expressed as an index rather than a pointer.
+        pub fn run_length_word_offset(&self) -> u64 {
+            self.rlw
+        }
+    }
+}

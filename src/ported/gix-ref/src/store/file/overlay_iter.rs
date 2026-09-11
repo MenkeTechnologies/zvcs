@@ -72,13 +72,9 @@ impl<'p> LooseThenPacked<'p, '_> {
             .map(Into::into)
             .map(|r| self.strip_namespace(r))
             .map_err(|err| match err {
-                packed::iter::Error::Reference {
-                    invalid_line,
-                    line_number,
-                } => Error::PackedReference {
-                    invalid_line,
-                    line_number,
-                },
+                packed::iter::Error::Reference { line, line_number } => {
+                    Error::PackedReference { line, line_number }
+                }
                 packed::iter::Error::Header { .. } => unreachable!("this one only happens on iteration creation"),
             })
     }
@@ -476,9 +472,7 @@ impl file::Store {
 mod error {
     use std::{io, path::PathBuf};
 
-    use gix_object::bstr::BString;
-
-    use crate::store_impl::file;
+    use crate::store_impl::{file, packed as gix_ref_packed};
 
     /// The error returned by the [`LooseThenPacked`][super::LooseThenPacked] iterator.
     #[derive(Debug, thiserror::Error)]
@@ -493,8 +487,15 @@ mod error {
             source: file::loose::reference::decode::Error,
             relative_path: PathBuf,
         },
-        #[error("Invalid reference in line {line_number}: {invalid_line:?}")]
-        PackedReference { invalid_line: BString, line_number: usize },
+        /// A `packed-refs` record that will not parse. git's iterator dies here
+        /// (`next_record()` → `die_invalid_line()`, refs/packed-backend.c:802-805,
+        /// v2.39.0-rc2), and `line` carries what that `die()` would name for a
+        /// caller that wants to reproduce it.
+        #[error("Invalid reference in line {line_number}: {:?}", line.line)]
+        PackedReference {
+            line: gix_ref_packed::InvalidLine,
+            line_number: usize,
+        },
     }
 }
 pub use error::Error;

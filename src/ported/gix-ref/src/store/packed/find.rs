@@ -39,18 +39,23 @@ impl packed::Buffer {
     pub(crate) fn try_find_full_name(&self, name: &FullNameRef) -> Result<Option<packed::Reference<'_>>, Error> {
         match self.binary_search_by(name.as_bstr()) {
             Ok(line_start) => {
-                let mut input = &self.as_ref()[line_start..];
-                Ok(Some(
-                    packed::decode::reference(&mut input, self.object_hash).map_err(|_| Error::Parse)?,
-                ))
+                let buffer = self.as_ref();
+                let mut input = &buffer[line_start..];
+                Ok(Some(packed::decode::reference(&mut input, self.object_hash).map_err(
+                    |_| Error::Parse {
+                        line: packed::InvalidLine::at_offset(self.path.clone(), buffer, line_start),
+                    },
+                )?))
             }
-            Err((parse_failure, _)) => {
-                if parse_failure {
-                    Err(Error::Parse)
-                } else {
-                    Ok(None)
-                }
-            }
+            // git's lookup does not scan the file, so it only ever dies on a record the
+            // search itself had to read: `packed_read_raw_ref()` dies on the record it
+            // landed on (refs/packed-backend.c:747-748, v2.39.0-rc2) and the comparisons
+            // on the way there read records too. `binary_search_by` reports where the
+            // first unreadable one was so the message can name it, as git's does.
+            Err((Some(offset), _)) => Err(Error::Parse {
+                line: packed::InvalidLine::at_offset(self.path.clone(), self.as_ref(), offset),
+            }),
+            Err((None, _)) => Ok(None),
         }
     }
 
@@ -69,9 +74,9 @@ impl packed::Buffer {
 
     /// Perform a binary search where `Ok(pos)` is the beginning of the line that matches `name` perfectly and `Err(pos)`
     /// is the beginning of the line at which `name` could be inserted to still be in sort order.
-    pub(in crate::store_impl::packed) fn binary_search_by(&self, full_name: &BStr) -> Result<usize, (bool, usize)> {
+    pub(in crate::store_impl::packed) fn binary_search_by(&self, full_name: &BStr) -> Result<usize, (Option<usize>, usize)> {
         let a = self.as_ref();
-        let mut encountered_parse_failure = false;
+        let mut encountered_parse_failure = None;
         a.binary_search_by_key(&full_name.as_ref(), |b: &u8| {
             let ofs = std::ptr::from_ref::<u8>(b) as usize - a.as_ptr() as usize;
             let line = packed::decode::record_at_offset(a, ofs);
@@ -82,7 +87,8 @@ impl packed::Buffer {
             match packed::decode::name_at_record_start(line, self.object_hash) {
                 Some(name) => name,
                 None => {
-                    encountered_parse_failure = true;
+                    encountered_parse_failure
+                        .get_or_insert_with(|| packed::decode::record_start_at_offset(a, ofs));
                     &[]
                 }
             }
@@ -106,8 +112,12 @@ mod error {
     pub enum Error {
         #[error("The ref name or path is not a valid ref name")]
         RefnameValidation(#[from] crate::name::Error),
+        /// git dies on this one: every place its `packed-refs` lookup reads a record
+        /// it cannot parse reaches `die_invalid_line()` (refs/packed-backend.c:257-268
+        /// and :747-748, v2.39.0-rc2), so the error carries the record as well as the
+        /// fact — see [`InvalidLine`][crate::packed::InvalidLine].
         #[error("The reference could not be parsed")]
-        Parse,
+        Parse { line: crate::store_impl::packed::InvalidLine },
     }
 
     impl From<Infallible> for Error {

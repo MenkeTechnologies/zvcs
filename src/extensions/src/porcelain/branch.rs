@@ -563,6 +563,10 @@ impl Filters {
 /// The merge check for `-d` uses reachability from HEAD only (not a configured
 /// upstream), which is git's behavior when no upstream is set.
 pub fn branch(args: &[String]) -> Result<ExitCode> {
+    branch_inner(args).map_err(super::show_ref::packed_refs_die)
+}
+
+fn branch_inner(args: &[String]) -> Result<ExitCode> {
     let mut o = Opts {
         mode: ListMode::Local,
         show_current: false,

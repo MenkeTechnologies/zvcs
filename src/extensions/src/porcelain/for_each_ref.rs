@@ -899,6 +899,10 @@ impl Filters {
 ///
 /// A run that matches no refs prints nothing and exits 0, matching stock git.
 pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
+    for_each_ref_inner(args).map_err(super::show_ref::packed_refs_die)
+}
+
+fn for_each_ref_inner(args: &[String]) -> Result<ExitCode> {
     // The dispatcher passes the argument tail, but tolerate the subcommand
     // being present at index 0 so both calling conventions behave the same.
     let args = match args.first() {
@@ -4539,16 +4543,24 @@ fn skip_broken_ref<'r>(
     use gix::refs::file::iter::loose_then_packed::Error as IterError;
     match entry {
         Ok(r) => Ok(Some(r)),
-        Err(e) => match e.downcast_ref::<IterError>() {
-            Some(IterError::ReferenceCreation { relative_path, .. }) => {
-                eprintln!(
-                    "warning: ignoring broken ref {}",
-                    relative_path.to_string_lossy().replace('\\', "/")
-                );
-                Ok(None)
+        // A `packed-refs` record that will not parse is not a broken ref to warn
+        // about and walk past: git's packed iterator `die()`s the moment it reads
+        // one. See `show_ref::packed_refs_die`.
+        Err(e) => {
+            if let Some(line) = gix::refs::packed::InvalidLine::in_error(e.as_ref()) {
+                return Err(crate::fatal::die(line.to_string()));
             }
-            _ => Err(anyhow!("{e}")),
-        },
+            match e.downcast_ref::<IterError>() {
+                Some(IterError::ReferenceCreation { relative_path, .. }) => {
+                    eprintln!(
+                        "warning: ignoring broken ref {}",
+                        relative_path.to_string_lossy().replace('\\', "/")
+                    );
+                    Ok(None)
+                }
+                _ => Err(anyhow!("{e}")),
+            }
+        }
     }
 }
 

@@ -43,7 +43,8 @@ pub mod open {
                 if !sorted {
                     // this implementation is likely slower than what git does, but it's less code, too.
                     let mut entries =
-                        packed::Iter::new(&backing.as_ref()[offset..], object_hash)?.collect::<Result<Vec<_>, _>>()?;
+                        packed::Iter::new_at(&backing.as_ref()[offset..], object_hash, path.clone())?
+                            .collect::<Result<Vec<_>, _>>()?;
                     entries.sort_by_key(|e| e.name.as_bstr());
                     let mut serialized = Vec::<u8>::new();
                     for entry in entries {
@@ -62,6 +63,21 @@ pub mod open {
                     (backing, offset)
                 }
             };
+
+            // `verify_buffer_safe()` (refs/packed-backend.c:450-463, git v2.39.0-rc2).
+            // git will not scan the whole file on every invocation, so this is the one
+            // eager check it does make: the last record must be LF-terminated and long
+            // enough that reading a name out of it cannot run off the end. It `die()`s
+            // when it is not, which is why a `packed-refs` whose *last* line is junk ends
+            // every command in the repository and not only the ones that iterate —
+            // including `git worktree list`, which otherwise never looks at that record.
+            //
+            // `create_snapshot()` calls it twice, at :667 before sorting and again at :677
+            // after, "since reordering the records might have moved a short one to the end
+            // of the buffer". This is the second call. The first has nothing left to catch
+            // here: the branch above reaches a non-`sorted` file only by parsing every
+            // record in it, which rejects strictly more than a length check would.
+            verify_buffer_safe(&path, &backing.as_ref()[offset..], object_hash)?;
             Ok(packed::Buffer {
                 offset,
                 data: backing,
@@ -105,6 +121,23 @@ pub mod open {
         }
     }
 
+    /// git's `verify_buffer_safe()`: the last record of `buffer` (which starts past the
+    /// header) must end in a newline and hold at least a hex hash plus a separator and one
+    /// more byte, or git dies naming it.
+    fn verify_buffer_safe(path: &std::path::Path, buffer: &[u8], object_hash: gix_hash::Kind) -> Result<(), Error> {
+        let Some(last) = buffer.len().checked_sub(1) else {
+            return Ok(());
+        };
+        let last_record = packed::decode::record_start_at_offset(buffer, last);
+        if buffer[last] != b'\n' || buffer.len() - last_record < object_hash.len_in_hex() + 2 {
+            return Err(Error::InvalidLine(packed::InvalidLine::at_record(
+                path.to_owned(),
+                &buffer[last_record..],
+            )));
+        }
+        Ok(())
+    }
+
     mod error {
         use crate::packed;
 
@@ -118,6 +151,10 @@ pub mod open {
             HeaderParsing,
             #[error("The buffer could not be opened or read")]
             Io(#[from] std::io::Error),
+            /// The file's last record fails git's `verify_buffer_safe()`. git dies on this
+            /// before it reads a single reference, so the message is git's.
+            #[error("{0}")]
+            InvalidLine(packed::InvalidLine),
         }
     }
     pub use error::Error;

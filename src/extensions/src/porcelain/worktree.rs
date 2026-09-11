@@ -105,6 +105,10 @@ use gix::refs::FullName;
 /// double-width characters can pad differently. Both are byte-identical for the
 /// ASCII paths that occur in practice.
 pub fn worktree(args: &[String]) -> Result<ExitCode> {
+    worktree_inner(args).map_err(super::show_ref::packed_refs_die)
+}
+
+fn worktree_inner(args: &[String]) -> Result<ExitCode> {
     // Dispatch hands us the tail *after* the verb, so the subcommand is at index
     // 0. Tolerate a leading `worktree` as well, matching the other multi-verb
     // porcelain modules, so either wiring convention works.
@@ -355,17 +359,27 @@ pub(super) fn path_to_string(p: &Path) -> String {
 
 /// Read `HEAD` of `repo` the way git's `add_head_info()` does: resolve it in the
 /// worktree's own ref store, keeping the symref target unpeeled.
-fn head_info(repo: &gix::Repository) -> HeadInfo {
-    let Ok(head) = repo.head() else {
-        // gitoxide refuses a `HEAD` git's zero-flag resolve forgives; see
-        // [`head_info_of_git_dir`] for which failures are which.
-        return head_info_of_git_dir(repo, repo.git_dir());
+fn head_info(repo: &gix::Repository) -> Result<HeadInfo> {
+    let head = match repo.head() {
+        Ok(head) => head,
+        // A `packed-refs` file whose last record will not parse is not a `HEAD`
+        // this port may forgive: git's `verify_buffer_safe()` dies before any
+        // command reads a reference, `git worktree list` included. Everything
+        // else is gitoxide refusing a `HEAD` git's zero-flag resolve forgives;
+        // see [`head_info_of_git_dir`] for which failures are which.
+        Err(e) => {
+            let e = super::show_ref::packed_refs_die(anyhow::Error::new(e));
+            if e.downcast_ref::<crate::fatal::Fatal>().is_some() {
+                return Err(e);
+            }
+            return Ok(head_info_of_git_dir(repo, repo.git_dir()));
+        }
     };
     let null = ObjectId::null(repo.object_hash());
     if head.is_detached() {
-        return HeadInfo::Detached(head.id().map_or(null, |id| id.detach()));
+        return Ok(HeadInfo::Detached(head.id().map_or(null, |id| id.detach())));
     }
-    match head.referent_name() {
+    Ok(match head.referent_name() {
         Some(name) => {
             let oid = head.id().map_or(null, |id| id.detach());
             // gitoxide reports a referent it could not read as *unborn*, which is
@@ -383,7 +397,7 @@ fn head_info(repo: &gix::Repository) -> HeadInfo {
             }
         }
         None => HeadInfo::Unknown(null),
-    }
+    })
 }
 
 /// `parse_loose_ref_contents()` (refs/files-backend.c:616-641 at v2.55.0) for the
@@ -553,10 +567,18 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
     // worktree the command was run from.
     let main_head = if is_bare {
         HeadInfo::Unknown(ObjectId::null(repo.object_hash()))
+    } else if this_git_dir == common {
+        // Already standing in the main worktree: `get_worktree_ref_store()` hands
+        // back `get_main_ref_store(the_repository)`, which is this repository's own
+        // store. Re-opening it by its resolved absolute path would build a second
+        // store that names its files absolutely, and a diagnostic out of it would
+        // not read the way git's — whose `$GIT_DIR` is the plain `.git` it was set
+        // up with — reads.
+        head_info(repo)?
     } else {
         match gix::open(&common) {
-            Ok(main) => head_info(&main),
-            Err(_) => head_info(repo),
+            Ok(main) => head_info(&main)?,
+            Err(_) => head_info(repo)?,
         }
     };
     let mut out = vec![Wt {
@@ -632,7 +654,7 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
 
         let head = match repo.worktree_proxy_by_id(BStr::new(id.as_str())) {
             Some(proxy) => match proxy.into_repo_with_possibly_inaccessible_worktree() {
-                Ok(wt_repo) => head_info(&wt_repo),
+                Ok(wt_repo) => head_info(&wt_repo)?,
                 Err(_) => head_info_of_git_dir(repo, &admin),
             },
             None => head_info_of_git_dir(repo, &admin),

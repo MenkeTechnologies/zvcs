@@ -65,6 +65,10 @@ struct Opts {
 /// 1 when nothing matched (and for `--verify --quiet` on a missing ref), 2 for
 /// `--exists` on a missing ref, 128 for the `fatal:` paths.
 pub fn show_ref(args: &[String]) -> Result<ExitCode> {
+    show_ref_inner(args).map_err(packed_refs_die)
+}
+
+fn show_ref_inner(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the flags only, but tolerate a leading subcommand name.
     let args = match args.first() {
         Some(a) if a == "show-ref" => &args[1..],
@@ -375,8 +379,9 @@ fn run_patterns(repo: &gix::Repository, opts: &Opts, patterns: &[String]) -> Res
         // rather than being skipped, and the id git prints is the null one.
         let mut reference = match broken_as_null(reference) {
             Ok(r) => r,
-            Err(None) => continue,
-            Err(Some(name)) => {
+            Err(Broken::Skipped) => continue,
+            Err(Broken::Packed(e)) => return Err(e),
+            Err(Broken::Loose(name)) => {
                 if (opts.branches || opts.tags) && !prefix_selected(&name, opts) {
                     continue;
                 }
@@ -482,7 +487,12 @@ fn run_exclude_existing(repo: &gix::Repository, pattern: Option<&str>) -> Result
     // name. Broken refs are skipped, as git's ref iteration does.
     let mut existing: HashSet<Vec<u8>> = HashSet::new();
     for reference in repo.references()?.all()? {
-        let Ok(reference) = reference else { continue };
+        let reference = match broken_as_null(reference) {
+            Ok(r) => r,
+            // A `packed-refs` record git dies on is not a broken ref to skip.
+            Err(Broken::Packed(e)) => return Err(e),
+            Err(Broken::Loose(_) | Broken::Skipped) => continue,
+        };
         existing.insert(reference.name().as_bstr().to_vec());
     }
 
@@ -672,17 +682,55 @@ fn broken_as_null<'r>(
         gix::Reference<'r>,
         Box<dyn std::error::Error + Send + Sync + 'static>,
     >,
-) -> std::result::Result<gix::Reference<'r>, Option<String>> {
+) -> std::result::Result<gix::Reference<'r>, Broken> {
     use gix::refs::file::iter::loose_then_packed::Error as IterError;
     match entry {
         Ok(r) => Ok(r),
-        Err(e) => match e.downcast_ref::<IterError>() {
-            Some(IterError::ReferenceCreation { relative_path, .. }) => {
-                Err(Some(relative_path.to_string_lossy().replace('\\', "/")))
+        // A `packed-refs` record that will not parse is not a broken ref at all: git
+        // never gets as far as yielding one, because its packed iterator `die()`s on
+        // the spot. See [`packed_refs_die`].
+        Err(e) => {
+            if let Some(line) = gix::refs::packed::InvalidLine::in_error(e.as_ref()) {
+                return Err(Broken::Packed(crate::fatal::die(line.to_string())));
             }
-            // A traversal or read failure is not a broken ref, and the listing
-            // walked past those before this function existed.
-            _ => Err(None),
-        },
+            match e.downcast_ref::<IterError>() {
+                Some(IterError::ReferenceCreation { relative_path, .. }) => {
+                    Err(Broken::Loose(relative_path.to_string_lossy().replace('\\', "/")))
+                }
+                // A traversal or read failure is not a broken ref, and the listing
+                // walked past those before this function existed.
+                _ => Err(Broken::Skipped),
+            }
+        }
+    }
+}
+
+/// What [`broken_as_null`] found instead of a reference.
+enum Broken {
+    /// A loose ref file that would not parse, named by its path relative to the
+    /// git directory. git yields it with a null object id.
+    Loose(String),
+    /// A `packed-refs` record git would have died on before yielding anything.
+    Packed(anyhow::Error),
+    /// Not a broken ref: the listing walked past this before it could be one.
+    Skipped,
+}
+
+/// Turn an error that carries an unparsable `packed-refs` record into git's own
+/// `die()` for it.
+///
+/// git reaches `die_invalid_line()` from four places in `refs/packed-backend.c`
+/// (v2.39.0-rc2): the eager `verify_buffer_safe()` at :460-463, the
+/// non-`sorted` pass in `sort_snapshot()` at :349-351, the lookup in
+/// `packed_read_raw_ref()` at :747-748, and the iterator in `next_record()` at
+/// :802-805 and :832-836. Which one fires decides only *when* the command stops,
+/// never what it prints, so every command that can meet one converts the same
+/// way: git's sentence on stderr and 128, not this port's voice at 1.
+///
+/// Any other error passes through untouched.
+pub(super) fn packed_refs_die(err: anyhow::Error) -> anyhow::Error {
+    match err.chain().find_map(gix::refs::packed::InvalidLine::in_error) {
+        Some(line) => crate::fatal::die(line.to_string()),
+        None => err,
     }
 }

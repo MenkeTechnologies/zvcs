@@ -896,6 +896,20 @@ fn run_command(argv: &[String]) -> ExitCode {
             eprintln!("fatal: {msg}");
             ExitCode::from(fatal::EXIT_FATAL)
         }
+        // A `packed-refs` record the parser refuses is a `die()` inside the
+        // packed backend (`die_invalid_line()`, refs/packed-backend.c:257-268,
+        // v2.39.0-rc2), below every command — so in git no verb arranges this
+        // and every verb gets it. `run_command` is where this port is below
+        // every command, so it is wired here rather than in the handful of verbs
+        // that happened to be measured. The predicate matches only an error
+        // chain carrying `gix::refs::packed::InvalidLine`, which nothing but the
+        // `packed-refs` parser raises; see [`fatal::packed_refs_fatal`].
+        Err(e) if fatal::packed_refs_fatal(&e).is_some() => {
+            let msg = fatal::packed_refs_fatal(&e).expect("checked");
+            trace2::error(&msg);
+            eprintln!("fatal: {msg}");
+            ExitCode::from(fatal::EXIT_FATAL)
+        }
         // Data git cannot read is a `die()` in git, not a `return 1`: every arm
         // of `do_read_index()` that fails calls `die()`, and a loose ref whose
         // body will not parse ends the verbs that do not tolerate broken refs at

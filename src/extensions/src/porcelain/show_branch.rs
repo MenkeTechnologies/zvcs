@@ -136,7 +136,7 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
             }
         }
         if opts.all_heads || opts.all_remotes {
-            snarf_refs(&repo, opts.all_heads, opts.all_remotes, &mut names);
+            snarf_refs(&repo, opts.all_heads, opts.all_remotes, &mut names)?;
         }
     }
 
@@ -1236,7 +1236,7 @@ fn append_short_ref(
 
 /// `snarf_refs()` — append local heads and/or remote-tracking branches, each
 /// appended range sorted with git's `version_cmp`.
-fn snarf_refs(repo: &gix::Repository, heads: bool, remotes: bool, names: &mut Vec<String>) {
+fn snarf_refs(repo: &gix::Repository, heads: bool, remotes: bool, names: &mut Vec<String>) -> Result<()> {
     for (want, prefix) in [(heads, "refs/heads/"), (remotes, "refs/remotes/")] {
         if !want {
             continue;
@@ -1245,7 +1245,17 @@ fn snarf_refs(repo: &gix::Repository, heads: bool, remotes: bool, names: &mut Ve
         if let Ok(platform) = repo.references() {
             if let Ok(iter) = platform.all() {
                 for reference in iter {
-                    let Ok(mut reference) = reference else { continue };
+                    let mut reference = match reference {
+                        Ok(r) => r,
+                        // `for_each_ref()` hands `append_head_ref` a broken ref
+                        // with a null id and walks on; it never reaches a
+                        // `packed-refs` record the backend refuses, because
+                        // `next_record()` dies before yielding one.
+                        Err(e) => match crate::fatal::packed_refs_in_iteration(e) {
+                            Some(fatal) => return Err(fatal),
+                            None => continue,
+                        },
+                    };
                     let name = reference.name().as_bstr().to_string();
                     if !name.starts_with(prefix) {
                         continue;
@@ -1259,6 +1269,7 @@ fn snarf_refs(repo: &gix::Repository, heads: bool, remotes: bool, names: &mut Ve
         }
         names[start..].sort_by(|a, b| version_cmp(a.as_bytes(), b.as_bytes()).cmp(&0));
     }
+    Ok(())
 }
 
 /// `append_one_rev()` — a literal revision if it resolves, else a glob matched
@@ -1275,7 +1286,7 @@ fn append_one_rev(repo: &gix::Repository, av: &str, names: &mut Vec<String>) -> 
     }
     if av.contains(['*', '?', '[']) {
         let start = names.len();
-        append_matching_refs(repo, av, names);
+        append_matching_refs(repo, av, names)?;
         if names.len() == start && names.len() < MAX_REVS {
             eprintln!("error: no matching refs with {av}");
         }
@@ -1287,15 +1298,23 @@ fn append_one_rev(repo: &gix::Repository, av: &str, names: &mut Vec<String>) -> 
 
 /// `append_matching_ref()` — the pattern is matched against the tail of the ref
 /// name carrying the same number of slashes as the pattern itself.
-fn append_matching_refs(repo: &gix::Repository, pattern: &str, names: &mut Vec<String>) {
+fn append_matching_refs(repo: &gix::Repository, pattern: &str, names: &mut Vec<String>) -> Result<()> {
     let pattern_slashes = pattern.matches('/').count();
     let Ok(platform) = repo.references() else {
-        return;
+        return Ok(());
     };
-    let Ok(iter) = platform.all() else { return };
+    let Ok(iter) = platform.all() else { return Ok(()) };
 
     for reference in iter {
-        let Ok(mut reference) = reference else { continue };
+        let mut reference = match reference {
+            Ok(r) => r,
+            // The same walk, and the same distinction: a broken ref is skipped,
+            // a `packed-refs` record git dies on ends the command.
+            Err(e) => match crate::fatal::packed_refs_in_iteration(e) {
+                Some(fatal) => return Err(fatal),
+                None => continue,
+            },
+        };
         let refname = reference.name().as_bstr().to_string();
 
         // Drop leading path components until the tail has as many slashes as the
@@ -1333,6 +1352,7 @@ fn append_matching_refs(repo: &gix::Repository, pattern: &str, names: &mut Vec<S
             append_ref(repo, &refname, names);
         }
     }
+    Ok(())
 }
 
 /// `rev_is_head()` — does the resolved `HEAD` ref name denote this shown ref?

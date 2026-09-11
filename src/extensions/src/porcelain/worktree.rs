@@ -105,10 +105,6 @@ use gix::refs::FullName;
 /// double-width characters can pad differently. Both are byte-identical for the
 /// ASCII paths that occur in practice.
 pub fn worktree(args: &[String]) -> Result<ExitCode> {
-    worktree_inner(args).map_err(super::show_ref::packed_refs_die)
-}
-
-fn worktree_inner(args: &[String]) -> Result<ExitCode> {
     // Dispatch hands us the tail *after* the verb, so the subcommand is at index
     // 0. Tolerate a leading `worktree` as well, matching the other multi-verb
     // porcelain modules, so either wiring convention works.
@@ -368,7 +364,7 @@ fn head_info(repo: &gix::Repository) -> Result<HeadInfo> {
         // else is gitoxide refusing a `HEAD` git's zero-flag resolve forgives;
         // see [`head_info_of_git_dir`] for which failures are which.
         Err(e) => {
-            let e = super::show_ref::packed_refs_die(anyhow::Error::new(e));
+            let e = crate::fatal::packed_refs_die(anyhow::Error::new(e));
             if e.downcast_ref::<crate::fatal::Fatal>().is_some() {
                 return Err(e);
             }

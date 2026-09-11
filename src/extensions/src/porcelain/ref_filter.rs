@@ -370,7 +370,7 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<Vec<Candidate>>
 
     let mut names: Vec<Vec<u8>> = Vec::new();
     for r in repo.references()?.all()? {
-        let r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let r = r.map_err(crate::fatal::ref_iteration_error)?;
         names.push(r.name().as_bstr().to_vec());
     }
     // `do_filter_refs()` appends the HEAD pseudo entry *after* the `refs/` walk
@@ -497,7 +497,7 @@ fn populate(
     let all_names: HashSet<Vec<u8>> = if needs_short || needs_symref_short {
         let mut set = HashSet::new();
         for r in repo.references()?.all()? {
-            let r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let r = r.map_err(crate::fatal::ref_iteration_error)?;
             set.insert(r.name().as_bstr().to_vec());
         }
         set
@@ -623,7 +623,7 @@ pub(super) fn pretty_print_ref(
     let short = if needs_short {
         let mut all = HashSet::new();
         for r in repo.references()?.all()? {
-            let r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let r = r.map_err(crate::fatal::ref_iteration_error)?;
             all.insert(r.name().as_bstr().to_vec());
         }
         short_name(repo, name, &all)

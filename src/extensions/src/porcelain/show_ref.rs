@@ -65,10 +65,6 @@ struct Opts {
 /// 1 when nothing matched (and for `--verify --quiet` on a missing ref), 2 for
 /// `--exists` on a missing ref, 128 for the `fatal:` paths.
 pub fn show_ref(args: &[String]) -> Result<ExitCode> {
-    show_ref_inner(args).map_err(packed_refs_die)
-}
-
-fn show_ref_inner(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the flags only, but tolerate a leading subcommand name.
     let args = match args.first() {
         Some(a) if a == "show-ref" => &args[1..],
@@ -688,7 +684,7 @@ fn broken_as_null<'r>(
         Ok(r) => Ok(r),
         // A `packed-refs` record that will not parse is not a broken ref at all: git
         // never gets as far as yielding one, because its packed iterator `die()`s on
-        // the spot. See [`packed_refs_die`].
+        // the spot. See [`crate::fatal::packed_refs_fatal`].
         Err(e) => {
             if let Some(line) = gix::refs::packed::InvalidLine::in_error(e.as_ref()) {
                 return Err(Broken::Packed(crate::fatal::die(line.to_string())));
@@ -716,21 +712,3 @@ enum Broken {
     Skipped,
 }
 
-/// Turn an error that carries an unparsable `packed-refs` record into git's own
-/// `die()` for it.
-///
-/// git reaches `die_invalid_line()` from four places in `refs/packed-backend.c`
-/// (v2.39.0-rc2): the eager `verify_buffer_safe()` at :460-463, the
-/// non-`sorted` pass in `sort_snapshot()` at :349-351, the lookup in
-/// `packed_read_raw_ref()` at :747-748, and the iterator in `next_record()` at
-/// :802-805 and :832-836. Which one fires decides only *when* the command stops,
-/// never what it prints, so every command that can meet one converts the same
-/// way: git's sentence on stderr and 128, not this port's voice at 1.
-///
-/// Any other error passes through untouched.
-pub(super) fn packed_refs_die(err: anyhow::Error) -> anyhow::Error {
-    match err.chain().find_map(gix::refs::packed::InvalidLine::in_error) {
-        Some(line) => crate::fatal::die(line.to_string()),
-        None => err,
-    }
-}

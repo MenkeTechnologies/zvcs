@@ -256,3 +256,81 @@ pub fn unreadable_repository_data(err: &anyhow::Error) -> bool {
         false
     })
 }
+
+// ---------------------------------------------------------------------------
+// refs/packed-backend.c: a record that will not parse is a `die()`
+// ---------------------------------------------------------------------------
+
+/// git's `die_invalid_line()` sentence for an unparsable `packed-refs` record,
+/// if `err` carries one — `unexpected line in <path>: <line>`, or
+/// `unterminated line in …` when the record has no line ending, at exit 128.
+///
+/// git reaches `die_invalid_line()` (refs/packed-backend.c:257-268, v2.39.0-rc2)
+/// from four places: `sort_snapshot()` at :349-351, `verify_buffer_safe()` at
+/// :460-463, the lookup in `packed_read_raw_ref()` at :747-748, and the iterator
+/// in `next_record()` at :802-805 and :832-836. None of them is a verb's own
+/// code — they are all inside the packed backend, below every command — so in
+/// git *every* verb that reads a ref dies the same way, and none of them has to
+/// arrange it.
+///
+/// That is why this belongs here and not in a verb: `run_command` is this port's
+/// equivalent of being below every command, so wiring it there gives the whole
+/// surface git's behaviour at once, including the verbs that reach the ref store
+/// through code this module does not own.
+///
+/// [`gix::refs::packed::InvalidLine::in_error`] is what makes it narrow. It
+/// matches four concrete error variants and nothing else — the eager check at
+/// `packed::Buffer::open()`, the packed lookup, the packed iterator, and the
+/// iterator seen through `LooseThenPacked` — every one of which is raised only
+/// by the `packed-refs` parser refusing a record. No other failure in the tree
+/// can produce them, so an error chain that carries one is always a record git
+/// would have died on, and an error that does not carry one is untouched.
+pub fn packed_refs_fatal(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(gix::refs::packed::InvalidLine::in_error).map(|line| line.to_string())
+}
+
+/// Turn an error that carries an unparsable `packed-refs` record into git's own
+/// `die()` for it, leaving anything else untouched.
+///
+/// [`packed_refs_fatal`] is what `run_command` uses, and covers a command that
+/// simply lets the error out. This is for the call sites that have to *decide*
+/// something on the spot — `worktree list` forgives a `HEAD` gitoxide refuses
+/// but not a `packed-refs` file git dies on, and telling the two apart means
+/// converting one of them early.
+pub fn packed_refs_die(err: anyhow::Error) -> anyhow::Error {
+    match packed_refs_fatal(&err) {
+        Some(message) => die(message),
+        None => err,
+    }
+}
+
+/// The ref-iteration error gitoxide hands back as a `Box<dyn Error>`, as an
+/// `anyhow::Error` that still knows what it is.
+///
+/// `gix::Repository::references()` yields
+/// `Result<Reference, Box<dyn Error + Send + Sync>>`, and a boxed error is opaque
+/// to `anyhow`'s downcasting: `Error::from_boxed` keeps the `Display` but not the
+/// type, so a caller that boxes one has thrown away every classification
+/// `run_command` makes downstream — [`packed_refs_fatal`] included. Unboxing the
+/// one concrete type the iterator actually yields is what keeps it.
+pub fn ref_iteration_error(err: Box<dyn std::error::Error + Send + Sync + 'static>) -> anyhow::Error {
+    match err.downcast::<gix::refs::file::iter::loose_then_packed::Error>() {
+        Ok(typed) => anyhow::Error::new(*typed),
+        Err(other) => anyhow::anyhow!("{other}"),
+    }
+}
+
+/// What a ref iteration should do about a ref it could not read: `Some` is a
+/// `packed-refs` record git dies on, `None` a broken ref git's `for_each_ref()`
+/// walks past.
+///
+/// git's iteration never *yields* a record its packed backend refuses —
+/// `next_record()` dies on the spot — but it does yield a loose ref whose file
+/// will not parse, with a null id and `REF_ISBROKEN` set, and leaves what to do
+/// about it to the caller. gitoxide reports both as an iteration error, so a
+/// caller that walks past every error walks past git's `die()` too.
+pub fn packed_refs_in_iteration(
+    err: Box<dyn std::error::Error + Send + Sync + 'static>,
+) -> Option<anyhow::Error> {
+    packed_refs_fatal(&ref_iteration_error(err)).map(die)
+}

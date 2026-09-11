@@ -139,7 +139,25 @@ const LONG_OPTS: &[super::LongOpt] = &[
     super::LongOpt { name: "unmerged", neg: true, arg: super::Arg::None },
     super::LongOpt { name: "refresh", neg: false, arg: super::Arg::None },
     super::LongOpt { name: "really-refresh", neg: false, arg: super::Arg::None },
-    super::LongOpt { name: "cacheinfo", neg: false, arg: super::Arg::Required },
+    // `{OPTION_LOWLEVEL_CALLBACK, 0, "cacheinfo", …, PARSE_OPT_NOARG |
+    // /* disallow --cacheinfo=<mode> form */ PARSE_OPT_NONEG |
+    // PARSE_OPT_LITERAL_ARGHELP, NULL, 0, cacheinfo_callback}`
+    // (builtin/update-index.c:1025-1031, git 2.39.0-rc2; unchanged in 2.55.0, where
+    // `git update-index --cacheinfo=100644,<oid>,p` is still
+    // `error: option `cacheinfo' takes no value`). `NOARG` is the truth about the
+    // *table entry*: parse-options hands the callback no value, and the low-level
+    // callback reads `<mode>,<object>,<path>` out of `ctx->argv` itself. That is why
+    // `show_gitcomp()` prints it bare — `OPTION_LOWLEVEL_CALLBACK` falls to its
+    // `default:` arm, and even `OPTION_CALLBACK` would `break` on `PARSE_OPT_NOARG`
+    // before the `=` (parse-options.c:646-664) — while the `OPT_CALLBACK_F` two lines
+    // below it prints `--chmod=`. Measured against stock 2.55.0:
+    // `git update-index --git-completion-helper` → `--cacheinfo` and `--chmod=`.
+    //
+    // Nothing in this file reads the field: the operand-consuming half is
+    // `option_with_value()`'s own `"cacheinfo" | "chmod"` arm, and the refusal of an
+    // attached value is its own `matches!(name, "chmod" | "index-version")` test.
+    // `resolve_long`/`canonical_long` read `name` and `neg` and nothing else.
+    super::LongOpt { name: "cacheinfo", neg: false, arg: super::Arg::None },
     super::LongOpt { name: "chmod", neg: false, arg: super::Arg::Required },
     super::LongOpt { name: "assume-unchanged", neg: false, arg: super::Arg::None },
     super::LongOpt { name: "no-assume-unchanged", neg: false, arg: super::Arg::None },
@@ -2453,5 +2471,43 @@ fn version_number(v: gix::index::Version) -> u8 {
         gix::index::Version::V2 => 2,
         gix::index::Version::V3 => 3,
         gix::index::Version::V4 => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LONG_OPTS;
+
+    fn arg(name: &str) -> super::super::Arg {
+        LONG_OPTS.iter().find(|o| o.name == name).unwrap_or_else(|| panic!("no `{name}` entry")).arg
+    }
+
+    /// `cacheinfo`'s C entry is `PARSE_OPT_NOARG`: parse-options hands its
+    /// low-level callback no value at all, and the callback reads
+    /// `<mode>,<object>,<path>` out of `ctx->argv` itself — which is why git also
+    /// refuses the attached form outright (`--cacheinfo=<v>` is
+    /// ``error: option `cacheinfo' takes no value``, and the C table says so in a
+    /// comment on the flag). Its neighbour `chmod` is a plain `OPT_CALLBACK_F` and
+    /// does take one.
+    ///
+    /// The distinction is not decoration: this field is the only thing the
+    /// generated completion table reads to decide a trailing `=`, and
+    /// `show_gitcomp()` (parse-options.c) breaks out before the `=` for
+    /// `PARSE_OPT_NOARG` — so getting it wrong offers a spelling git rejects.
+    /// Measured against stock 2.55.0:
+    ///
+    /// ```text
+    /// $ git update-index --git-completion-helper
+    /// … --cacheinfo --chmod= …
+    /// ```
+    #[test]
+    fn cacheinfo_completes_bare_and_chmod_completes_with_a_value() {
+        assert!(arg("cacheinfo") == super::super::Arg::None);
+        assert!(arg("chmod") == super::super::Arg::Required);
+        assert!(arg("index-version") == super::super::Arg::Required);
+        // The `MARK_FLAG`/`UNMARK_FLAG` `OPTION_SET_INT` pairs take nothing either,
+        // so a regression that blanket-flipped the table would be caught here too.
+        assert!(arg("assume-unchanged") == super::super::Arg::None);
+        assert!(arg("no-assume-unchanged") == super::super::Arg::None);
     }
 }

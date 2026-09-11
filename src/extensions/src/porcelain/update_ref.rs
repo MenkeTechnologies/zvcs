@@ -666,6 +666,29 @@ fn check_new_object(repo: &gix::Repository, name: &str, new: &Val) -> Result<()>
     Ok(())
 }
 
+/// `parse_refname()` (builtin/update-ref.c:53-75, git 2.39.0-rc2; the same
+/// function in 2.55.0, measured): every `--stdin` command validates the name the
+/// moment it reads it, before a single `<new-oid>`/`<old-oid>` is parsed.
+///
+/// ```c
+/// if (check_refname_format(ref.buf, REFNAME_ALLOW_ONELEVEL))
+///         die("invalid ref format: %s", ref.buf);
+/// ```
+///
+/// That ordering is visible: `update ../bad notahash` reports the ref name, not
+/// the unparseable oid. A `symref-*` target is read through the same function, so
+/// both halves of a `symref-create` answer to it.
+///
+/// This is git's own check, not gitoxide's stricter `FullName` one — the two
+/// disagree about one-level names, and [`refname`] below still reports what
+/// `FullName` refused for the names git would have taken.
+fn parse_refname(name: &str) -> Result<()> {
+    if !super::check_ref_format::check_refname_format_onelevel(name.as_bytes()) {
+        crate::git_fatal!("invalid ref format: {name}");
+    }
+    Ok(())
+}
+
 /// Validate `name` as a fully-qualified ref name.
 fn refname(name: &str) -> Result<FullName> {
     name.try_into()
@@ -1380,6 +1403,7 @@ fn stage_oid_command(
     let slot = |n: usize| -> Option<&str> { args.get(n).map(String::as_str) };
 
     let name = slot(0).ok_or_else(|| anyhow!("{cmd}: missing <ref>"))?;
+    parse_refname(name)?;
 
     match cmd {
         "update" => {
@@ -1555,10 +1579,12 @@ fn stage_symref_command(
         crate::git_fatal!("{cmd}: cannot operate with deref mode");
     }
     let name = slot(0).ok_or_else(|| anyhow!("{cmd}: missing <ref>"))?;
+    parse_refname(name)?;
 
     match cmd {
         "symref-create" => {
             let target = slot(1).ok_or_else(|| anyhow!("symref-create: missing <new-target>"))?;
+            parse_refname(target)?;
             let (name, target) = (refname(name)?, refname(target)?);
             let plan = plan_symref_log(repo, &name, &target, deref, msg)?;
             batch.symref_logs.push((batch.edits.len(), plan));
@@ -1574,12 +1600,23 @@ fn stage_symref_command(
         }
         "symref-update" => {
             let target = slot(1).ok_or_else(|| anyhow!("symref-update: missing <new-target>"))?;
+            parse_refname(target)?;
             // Optional old value: `ref <old-target>` or `oid <old-oid>`.
             let expected = match slot(2) {
                 None | Some("") => PreviousValue::Any,
                 Some("ref") => {
                     let old = slot(3)
                         .ok_or_else(|| anyhow!("symref-update {name}: missing <old-target>"))?;
+                    // The one old value `parse_cmd_symref_update()` does *not* read
+                    // through `parse_refname()`: it checks the name itself and names
+                    // the command and the ref it was updating. Measured against stock
+                    // 2.55.0 — `symref-update <ref> <target> ref ../bad` is
+                    // `fatal: symref-update <ref>: invalid ref: ../bad`, where the
+                    // same `../bad` as a `symref-delete`/`symref-verify` old value is
+                    // `fatal: invalid ref format: ../bad`.
+                    if !super::check_ref_format::check_refname_format_onelevel(old.as_bytes()) {
+                        crate::git_fatal!("symref-update {name}: invalid ref: {old}");
+                    }
                     PreviousValue::MustExistAndMatch(Target::Symbolic(refname(old)?))
                 }
                 Some("oid") => match parse_slot(repo, slot(3), nul, Slot::Old)? {
@@ -1604,7 +1641,10 @@ fn stage_symref_command(
         "symref-delete" => {
             let expected = match slot(1) {
                 None | Some("") => PreviousValue::Any,
-                Some(old) => PreviousValue::MustExistAndMatch(Target::Symbolic(refname(old)?)),
+                Some(old) => {
+                    parse_refname(old)?;
+                    PreviousValue::MustExistAndMatch(Target::Symbolic(refname(old)?))
+                }
             };
             batch.edits.push(RefEdit {
                 change: Change::Delete {
@@ -1619,6 +1659,7 @@ fn stage_symref_command(
         "symref-verify" => match slot(1) {
             None | Some("") => batch.absent.push(name.to_string()),
             Some(old) => {
+                parse_refname(old)?;
                 let target = Target::Symbolic(refname(old)?);
                 batch.edits.push(RefEdit {
                     change: Change::Update {
@@ -1791,4 +1832,52 @@ fn unquote_c(b: &[u8]) -> Result<(String, usize)> {
     }
     let s = String::from_utf8(out).map_err(|_| anyhow!("quoted string is not valid UTF-8"))?;
     Ok((s, i))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_refname;
+
+    /// Every `--stdin` command reports a malformed ref name in git's own words, not
+    /// gitoxide's. Measured against stock 2.55.0, in a repository with a commit so
+    /// the empty-repository check does not answer first:
+    ///
+    /// ```text
+    /// $ printf 'update ../bad %s\n' "$oid" | git update-ref --stdin
+    /// fatal: invalid ref format: ../bad
+    /// ```
+    ///
+    /// gitoxide's `FullName` refuses the same names with a per-rule sentence
+    /// (`Reference name cannot contain repeated dots`), which is a different
+    /// message for the same defect and is what this port used to print.
+    #[test]
+    fn a_malformed_stdin_ref_name_is_refused_in_gits_words() {
+        for bad in [
+            "../bad",
+            "refs/heads/ok..bad",
+            "refs/heads/bad~x",
+            "refs/heads/",
+            "refs/heads/a.lock",
+            "refs/heads/x@{1}",
+            "@",
+            "refs/heads/.hidden",
+            "refs/heads/a//b",
+            "refs/heads/end.",
+        ] {
+            let err = parse_refname(bad).expect_err(bad);
+            assert_eq!(format!("{err}"), format!("invalid ref format: {bad}"), "{bad}");
+        }
+    }
+
+    /// The flag is `REFNAME_ALLOW_ONELEVEL`, so a single-component name is well
+    /// formed to git even though `FullName` refuses it — `update main <oid>` on
+    /// stdin is accepted by stock 2.55.0 and writes `$GIT_DIR/main`. Checking the
+    /// name here with gitoxide's stricter rule instead would turn that acceptance
+    /// into a refusal, so the two must stay separate checks.
+    #[test]
+    fn a_one_level_name_is_well_formed_to_git_even_where_fullname_refuses_it() {
+        for ok in ["main", "v1.0", "-dashstart", "HEAD", "refs/heads/main", "refs/heads/@"] {
+            assert!(parse_refname(ok).is_ok(), "{ok}");
+        }
+    }
 }

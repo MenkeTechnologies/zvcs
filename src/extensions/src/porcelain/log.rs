@@ -151,14 +151,27 @@ const GIT_LOG_LONG_OPTS: &[&str] = &[
     "git-completion-helper-all",
     "glob",
     "graph",
-    // `graph-lane-limit` was listed here and does not belong: the rule above is
-    // that a token earns a place only by *not* answering `unrecognized
-    // argument`, and stock 2.55.0 answers exactly that —
-    // `git log -0 --graph-lane-limit` → `fatal: unrecognized argument:
-    // --graph-lane-limit`. Listing it made this port call the option known but
-    // unimplemented, which is the population this list exists to keep out of
-    // git's wording. (`--max-count-oldest` and `--exclude-hidden` do stay: they
-    // fail under stock with `requires a value`, not `unrecognized argument`.)
+    // `graph-lane-limit` is absent here, and this list cannot express it
+    // correctly either way. git 2.55.0 parses it only through
+    // `skip_prefix(arg, "--graph-lane-limit=", …)`, so the two spellings answer
+    // differently:
+    //
+    //     git log --graph-lane-limit          fatal: unrecognized argument: …
+    //     git log --graph-lane-limit=5        fatal: the option '--graph-lane-limit' requires '--graph'
+    //     git log --graph --graph-lane-limit=3   works
+    //
+    // Membership is keyed on the name with `=value` cut off, so listing it makes
+    // both spellings say "not implemented" and omitting it makes both say
+    // "unrecognized argument". Omitted is the better half — it matches stock on
+    // the bare form — but the `=` form still diverges, and closing that needs a
+    // value-only entry kind this table does not have.
+    //
+    // It is also new since 2.50.1, which rejects it, and absent from 2.39
+    // entirely; it appears in neither `-h` nor `--help-all`.
+    //
+    // (`--max-count-oldest` and `--exclude-hidden` do stay: they fail under
+    // stock with `requires a value`, which is the known-but-unimplemented
+    // population this list exists for.)
     "grep",
     "grep-reflog",
     "help",
@@ -4044,6 +4057,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--graph` with `-S`/`-G`: the commits the pickaxe kept. `None` when no
     // pickaxe ran, which means every commit prints.
     let mut pickaxe_shown: Option<HashSet<ObjectId>> = None;
+    // `-S`/`-G` under `--diff-merges=separate`: which of a merge's per-parent records
+    // `diffcore_pickaxe()` kept, as `(merge, parent)` pairs. `log_tree_diff()` flushes
+    // the queue once per parent (log-tree.c:1076-1092, git 2.55.0), so the needle is
+    // asked about each parent separately and only the ones it answers for are
+    // rendered. `None` when no pickaxe ran, or when merges are not shown per parent.
+    let mut pickaxe_merge_parents: Option<HashSet<(ObjectId, ObjectId)>> = None;
     // `do_remerge_diff()` (log-tree.c:1029-1090) re-runs each merge into a temporary
     // object directory and diffs its tree against the recorded one.
     //
@@ -4121,34 +4140,93 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // them, then prints nothing, so their columns still move (see
         // [`render_graph`]). `pickaxe_shown` records which ones printed.
         if has_pickaxe {
-            // A merge produces no diff without `-m`/`-c`/`--cc`, and the pickaxe
-            // tests a diff — so git never reports a merge for `-S`/`-G` no matter
-            // what its parents contain. Dropping them here also keeps the scan
-            // from reading blobs for the largest commits in the history.
+            // What `log_tree_diff()` does with a *merge* is settled before
+            // `diffcore_pickaxe()` is ever reached (log-tree.c:1051-1073, git
+            // 2.55.0), and the answers are not the same:
             //
-            // `--remerge-diff` is the exception: `do_remerge_diff()` builds a queue
-            // for a two-parent merge and `diffcore_std()` — hence
-            // `diffcore_pickaxe()` — runs over it (log-tree.c:1075-1077), so such a
-            // merge *can* be reported. It is tested against the re-merged tree, the
-            // same left-hand side the record itself will diff against. An octopus
-            // still has no queue (log-tree.c:1135-1141) and stays excluded.
-            // An octopus under `--remerge-diff` is printed with no queue at all
-            // (log-tree.c:1135-1141), so `diffcore_pickaxe()` never gets the chance
-            // to reject it: it is shown whatever the needle is.
-            let always: HashSet<ObjectId> = match remerge {
-                false => HashSet::new(),
-                true => kept.iter().filter(|n| n.parents.len() > 2).map(|n| n.id).collect(),
+            //   * `opt->combine_merges` — `-c`, `--cc`, `--diff-merges=combined`,
+            //     `dense-combined` — goes to `do_diff_combined()`, and
+            //     `diff_tree_combined()` calls `show_log()` as its first statement
+            //     (combine-diff.c:1512-1515) before it looks at a single path. The
+            //     merge is already printed by the time the needle is applied, so no
+            //     needle can drop it.
+            //   * `opt->separate_merges` — `-m`, `--diff-merges=separate|m|on|1`,
+            //     and `--diff-merges=first-parent` — runs the `for (;;)` loop's
+            //     `diff_tree_oid(parent, commit)` + `log_tree_diff_flush()` once per
+            //     parent (log-tree.c:1076-1092). `diffcore_pickaxe()` therefore
+            //     judges each parent on its own, and the merge prints one record for
+            //     each parent that hits and none for the ones that do not.
+            //     `first_parent_merges` breaks after the first (log-tree.c:1088).
+            //   * neither reaches `else return 0` (log-tree.c:1071-1072): no queue,
+            //     so no hit. That is git's *default* merge mode, and the only shape
+            //     "a merge produces no diff" was ever right about.
+            //
+            // `has_pickaxe` is itself what set `revs->diff = 1` (revision.c:3148-3152),
+            // so `all_need_diff` is true here by construction and none of
+            // `log_tree_diff()`'s earlier returns apply.
+            //
+            // `--remerge-diff` is its own branch, tested first (log-tree.c:1054):
+            // `do_remerge_diff()` builds a queue for a two-parent merge and
+            // `diffcore_std()` — hence `diffcore_pickaxe()` — runs over it
+            // (log-tree.c:1075-1077), so such a merge can be reported, tested against
+            // the re-merged tree that the record itself will diff against. An octopus
+            // under `--remerge-diff` is printed with no queue at all
+            // (log-tree.c:1135-1141), so `diffcore_pickaxe()` never gets the chance to
+            // reject it: it is shown whatever the needle is.
+            let combine_merges =
+                !remerge && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined);
+            // How many parents that `for (;;)` loop reaches, or `None` when a merge
+            // never enters it.
+            let separate_parents: Option<usize> = match diff_merges {
+                _ if remerge || combine_merges => None,
+                DiffMerges::Separate => Some(usize::MAX),
+                DiffMerges::FirstParent => Some(1),
+                _ => None,
             };
+            // The merges the scan cannot speak to: printed by `show_log()` ahead of it
+            // (combined) or handed no queue to reject (octopus under `--remerge-diff`).
+            let always: HashSet<ObjectId> = kept
+                .iter()
+                .filter(|n| {
+                    n.parents.len() > 1 && (combine_merges || (remerge && n.parents.len() > 2))
+                })
+                .map(|n| n.id)
+                .collect();
             let is_candidate = |n: &Node| {
                 (n.parents.len() < 2 || (remerge && n.parents.len() == 2))
                     && !always.contains(&n.id)
             };
+            // One scan job per (merge, parent) pair the `for (;;)` loop would diff,
+            // each shaped as a one-parent `Node` because that is exactly what
+            // `diff_tree_oid(parent, commit)` makes of it — the same question the scan
+            // already answers for an ordinary commit. Empty in git's default merge
+            // mode, so a plain `git log -S<needle>` pays one `matches!` for it.
+            // Built before `candidates`, which may take `kept` apart.
+            let merge_jobs: Vec<Node> = match separate_parents {
+                None => Vec::new(),
+                Some(cap) => kept
+                    .iter()
+                    .filter(|n| n.parents.len() > 1 && !always.contains(&n.id))
+                    .flat_map(|n| {
+                        n.parents
+                            .iter()
+                            .take(cap)
+                            .map(|p| Node { parents: vec![*p], ..n.clone() })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+            };
+            // Whether any merge survives the scan as something other than an ordinary
+            // one-parent candidate. When it does not, `kept` and `candidates` are the
+            // same list in the same order and the fast path below may move one into
+            // the other; when it does, `kept` has to be narrowed by id instead.
+            let merge_mode = combine_merges || separate_parents.is_some();
             // Under `--remerge-diff` the merge's re-merged tree stands in for its
             // first parent while the pickaxe reads it, so `candidates` is a doctored
             // copy and `kept` — whose nodes the record loop renders, `Merge:` header
             // and all — is narrowed by id rather than replaced.
-            let candidates: Vec<Node> = match (graph, remerge) {
-                (false, false) => {
+            let candidates: Vec<Node> = match (graph, remerge, merge_mode) {
+                (false, false, false) => {
                     kept.retain(|n| is_candidate(n));
                     std::mem::take(&mut kept)
                 }
@@ -4172,25 +4250,35 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     })
                     .collect::<Result<_>>()?,
             };
-            let hits = match (&pickaxe, &pickaxe_g_re) {
-                // `-S` and `--find-object` never need patch text. git's `has_changes`
-                // counts the needle in each side's whole blob and keeps the file when
-                // the two counts differ, and `objfind` only compares ids, so the scan
-                // reads blobs (or nothing at all) and never diffs them.
-                (Some(px), None) => pickaxe_by_count(&repo, candidates, &px.kind, &pathspecs, &patch_opts)?,
-                _ => {
-                    let jobs: Vec<(ObjectId, Option<ObjectId>)> =
-                        candidates.iter().map(|n| (n.id, n.parents.first().copied())).collect();
-                    let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, ..patch_opts.clone() }, &pathspecs, false)?;
-                    candidates
-                        .into_iter()
-                        .zip(patches)
-                        .filter(|(_, patch)| {
-                            pickaxe_hit(patch, pickaxe_s.as_deref(), pickaxe_g_re.as_ref())
-                        })
-                        .map(|(node, _)| node)
-                        .collect()
+            let scan = |candidates: Vec<Node>| -> Result<Vec<Node>> {
+                match (&pickaxe, &pickaxe_g_re) {
+                    // `-S` and `--find-object` never need patch text. git's `has_changes`
+                    // counts the needle in each side's whole blob and keeps the file when
+                    // the two counts differ, and `objfind` only compares ids, so the scan
+                    // reads blobs (or nothing at all) and never diffs them.
+                    (Some(px), None) => pickaxe_by_count(&repo, candidates, &px.kind, &pathspecs, &patch_opts),
+                    _ => {
+                        let jobs: Vec<(ObjectId, Option<ObjectId>)> =
+                            candidates.iter().map(|n| (n.id, n.parents.first().copied())).collect();
+                        let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, ..patch_opts.clone() }, &pathspecs, false)?;
+                        Ok(candidates
+                            .into_iter()
+                            .zip(patches)
+                            .filter(|(_, patch)| {
+                                pickaxe_hit(patch, pickaxe_s.as_deref(), pickaxe_g_re.as_ref())
+                            })
+                            .map(|(node, _)| node)
+                            .collect())
+                    }
                 }
+            };
+            let hits = scan(candidates)?;
+            // The pairs that survived, not the commits: a merge can print for one
+            // parent and stay silent for another, and the record loop needs to know
+            // which. A pair is unique because each job carries a distinct parent.
+            let merge_hits: HashSet<(ObjectId, ObjectId)> = match merge_jobs.is_empty() {
+                true => HashSet::new(),
+                false => scan(merge_jobs)?.into_iter().map(|n| (n.id, n.parents[0])).collect(),
             };
             // The scratch objects the scan wrote have done their job; the record loop
             // re-merges each commit for itself, one at a time, as git does.
@@ -4199,10 +4287,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             let mut shown: HashSet<ObjectId> = hits.iter().map(|n| n.id).collect();
             shown.extend(always.iter().copied());
-            match (graph, remerge) {
-                (true, _) => pickaxe_shown = Some(shown),
-                (false, false) => kept = hits,
-                (false, true) => kept.retain(|n| shown.contains(&n.id)),
+            shown.extend(merge_hits.iter().map(|(id, _)| *id));
+            if separate_parents.is_some() {
+                pickaxe_merge_parents = Some(merge_hits);
+            }
+            match (graph, remerge, merge_mode) {
+                (true, _, _) => pickaxe_shown = Some(shown),
+                (false, false, false) => kept = hits,
+                _ => kept.retain(|n| shown.contains(&n.id)),
             }
         }
         if graph {
@@ -4725,7 +4817,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         .enumerate()
         .flat_map(|(ni, n)| {
             if separate_merges && n.parents.len() > 1 {
-                n.parents.iter().map(|p| (ni, Some(*p), Some(*p))).collect::<Vec<_>>()
+                // `-S`/`-G`: each iteration of `log_tree_diff()`'s `for (;;)` loop
+                // flushes its own queue, so `diffcore_pickaxe()` rejected some of
+                // these parents and kept others. The rejected ones produced no
+                // record at all — `always_show_header` is off under a pickaxe
+                // (`cmd_log_init_finish()`), so there is not even a bare header.
+                n.parents
+                    .iter()
+                    .filter(|p| {
+                        pickaxe_merge_parents
+                            .as_ref()
+                            .is_none_or(|hits| hits.contains(&(n.id, **p)))
+                    })
+                    .map(|p| (ni, Some(*p), Some(*p)))
+                    .collect::<Vec<_>>()
             } else {
                 vec![(ni, n.parents.first().copied(), None)]
             }
@@ -4773,6 +4878,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `--diff-filter` take the conflict notices — and the empty queue they would
         // have rescued — back out.
         let show_conflict_headers = !has_pickaxe && patch_opts.diff_filter.is_none();
+        // `opt->combine_merges` on a merge: `log_tree_diff()` hands this record to
+        // `do_diff_combined()` (log-tree.c:1064-1065) instead of the per-parent loop,
+        // so it is `diff_tree_combined()` that renders it.
+        let combined_record = node.parents.len() > 1
+            && !remerge
+            && matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined);
         // `--graph` with `-S`/`-G`: git walked this commit and ran `graph_update()`
         // on it, then `log_tree_commit()` found nothing to print. The row is
         // dropped but the columns still move — the gap is what the `...` skip row
@@ -4981,6 +5092,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // The paths `diffcore_pickaxe()` left in the queue, which the patch is
             // rendered from. Empty and unused when no pickaxe ran.
             let mut pickaxe_paths: Vec<String> = Vec::new();
+            // The paths a *combined* merge's own scan is left with once the pickaxe
+            // has had its say. `None` when nothing narrows the combined path set;
+            // `Some(vec![])` when the narrowing left nothing, which is not the same
+            // thing — an empty pathspec means "no limit".
+            let mut combined_paths: Option<Vec<String>> = None;
             if want_names || probe_queue || check || exit_code || has_pickaxe || from.is_some() {
                 // `--name-only`/`--name-status` are the reported format when
                 // present; git suppresses the count formats in that case, so the
@@ -5051,6 +5167,72 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         })
                         .map(|p| String::from_utf8_lossy(&p).into_owned())
                         .collect();
+                }
+                // A combined merge is not rendered from this queue at all —
+                // `diff_tree_combined()` builds its own path list — so the pickaxe
+                // reaches it a different way, and the way depends on the kind:
+                //
+                //   * `-S`/`-G` raise `need_generic_pathscan` (combine-diff.c:1547-1553),
+                //     which abandons the all-trees-at-once scan for
+                //     `find_paths_generic()` (combine-diff.c:1380-1423): one ordinary
+                //     `diff_tree_oid(parent_i, commit)` + `diffcore_std()` per parent,
+                //     folded together by `intersect_paths()`. The combined section
+                //     therefore covers only the paths *every* parent's filtered queue
+                //     still names — which is why `git log --cc -S<needle>` on a merge
+                //     whose resolution does not move the needle prints the header, the
+                //     blank line, and no diff at all.
+                //   * `--find-object` is masked out of that test
+                //     (`& ~DIFF_PICKAXE_KIND_OBJFIND`, combine-diff.c:1552), so it keeps
+                //     the multitree scan and is filtered afterwards by
+                //     `combined_objfind()` (combine-diff.c:1468-1489), which keeps a
+                //     path whose result-side *or any parent-side* id is a needle
+                //     (`match_objfind`, combine-diff.c:1454-1466). A path's parent-side
+                //     id is what the two-way diff against that parent calls its old
+                //     side, so the union of the per-parent hits is that same set.
+                //
+                // Parent 0's queue is `files`, already built and filtered above.
+                if combined_record && has_pickaxe {
+                    let objfind = matches!(
+                        pickaxe.as_ref().map(|p| &p.kind),
+                        Some(super::diff_pairs::PickaxeKind::ObjFind(_))
+                    );
+                    let mut set: HashSet<Vec<u8>> = files.iter().map(|f| f.path.clone()).collect();
+                    for parent in node.parents.iter().skip(1) {
+                        let mut limit = match pathspecs.is_empty() {
+                            true => None,
+                            false => Some(PathspecMatcher::new(&repo, &pathspecs)?),
+                        };
+                        let mut other = collect_changes(
+                            &repo,
+                            &commit,
+                            Some(*parent),
+                            count_formats || patch_opts.ws != super::diff::Whitespace::Keep,
+                            patch_opts.ws,
+                            Some(&patch_opts),
+                            limit.as_mut(),
+                            Some(&mut rename_warn),
+                        )?;
+                        if let Some(prefix) = &patch_opts.relative {
+                            other.retain(|f| f.path.starts_with(prefix.as_bytes()));
+                        }
+                        if let Some(filter) = &patch_opts.diff_filter {
+                            other.retain(|f| super::diff::diff_filter_selected(filter, f.status));
+                        }
+                        if let Some(px) = &pickaxe {
+                            pickaxe_filter_files(&repo, px, &mut other)?;
+                        }
+                        if let Some(re) = &pickaxe_g_re {
+                            grep_filter_files(&repo, re, pickaxe_all, &mut other)?;
+                        }
+                        let here: HashSet<Vec<u8>> = other.into_iter().map(|f| f.path).collect();
+                        match objfind {
+                            true => set.extend(here),
+                            false => set.retain(|p| here.contains(p)),
+                        }
+                    }
+                    combined_paths = Some(
+                        set.into_iter().map(|p| String::from_utf8_lossy(&p).into_owned()).collect(),
+                    );
                 }
                 // `diff_flush()` (diff.c:7210): under a whitespace rule the queue is
                 // re-rendered quietly first and every pair whose patch came out empty
@@ -5184,12 +5366,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                             separator = true;
                         }
                     }
-                    if raw {
+                    // `find_paths_generic()`/`combined_objfind()` have already had
+                    // their say about which paths survive; every block below reports
+                    // the narrowed list, and nothing at all when it came out empty.
+                    if combined_paths.as_ref().is_some_and(|v| v.is_empty()) {
+                    } else if raw {
                         diff.extend_from_slice(&super::diff::merge_combined_raw(
                             &repo,
                             node.id,
                             &node.parents,
-                            &pathspecs,
+                            combined_paths.as_deref().unwrap_or(&pathspecs),
                             crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex())
                                 .max(MINIMUM_ABBREV),
                             z,
@@ -5202,7 +5388,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                             &repo,
                             node.id,
                             &node.parents,
-                            &pathspecs,
+                            combined_paths.as_deref().unwrap_or(&pathspecs),
                         )? {
                             if name_status {
                                 diff.extend_from_slice(letters.as_bytes());
@@ -5309,7 +5495,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 let follow_patch: Vec<u8> = match &node.follow_path {
                     Some(path) => super::diff::commit_patches(
                         &repo,
-                        &[(node.id, node.parents.first().copied())],
+                        &[(node.id, from.or_else(|| node.parents.first().copied()))],
                         &patch_opts,
                         &[path.to_string()],
                         true,
@@ -5320,7 +5506,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 };
                 // A per-parent `-m` record diffs against *that* parent, which the
                 // batched window (one first-parent patch per commit) cannot serve.
-                let separate_patch: Vec<u8> = match from {
+                // Under a pickaxe the narrowed render below serves it instead: it
+                // diffs against the same parent and knows which pairs survived.
+                let separate_patch: Vec<u8> = match from.filter(|_| !has_pickaxe) {
                     Some(parent) => super::diff::commit_patches(
                         &repo,
                         &[(node.id, Some(parent))],
@@ -5338,7 +5526,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // differs per commit, so a pickaxe run renders this commit on its
                 // own, against the paths that survived (both sides of a rename, since
                 // limiting to the destination alone would hide the deletion).
-                let pickaxe_patch: Vec<u8> = match has_pickaxe && from.is_none() {
+                // `diff_parent` is the parent *this record* diffs against — the same
+                // one `files`, and so `pickaxe_paths`, were built from — so a
+                // per-parent `-m` record is served here too, narrowed to the pairs
+                // its own `log_tree_diff_flush()` left in the queue.
+                let pickaxe_patch: Vec<u8> = match has_pickaxe {
                     false => Vec::new(),
                     true if pickaxe_paths.is_empty() => Vec::new(),
                     true => super::diff::commit_patches(
@@ -5350,6 +5542,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     )?
                     .pop()
                     .unwrap_or_default(),
+                };
+                // A combined merge under a pickaxe is still a combined merge:
+                // `do_diff_combined()` renders it (log-tree.c:1064-1065) and the
+                // needle narrowed its *path set*, not its shape. The batched window
+                // renders the unnarrowed one, so this record is rendered on its own.
+                let combined_pickaxe_patch: Vec<u8> = match combined_record && has_pickaxe {
+                    false => Vec::new(),
+                    true if combined_paths.as_ref().is_some_and(|v| v.is_empty()) => Vec::new(),
+                    true => super::diff::merge_combined_patch_painted(
+                        &repo,
+                        node.id,
+                        &node.parents,
+                        combined_paths.as_deref().unwrap_or(&pathspecs),
+                        3,
+                        diff_merges == DiffMerges::DenseCombined,
+                        &patch_opts.colors,
+                    )?,
                 };
                 // A remerge record diffs the re-merged tree against the recorded one,
                 // which the batched first-parent window cannot serve.
@@ -5368,8 +5577,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 let p: &[u8] = match (&node.follow_path, from) {
                     _ if remerge_here.is_some() => &remerge_patch,
                     (Some(_), _) => &follow_patch,
+                    (None, _) if combined_record && has_pickaxe => &combined_pickaxe_patch,
+                    (None, _) if has_pickaxe => &pickaxe_patch,
                     (None, Some(_)) => &separate_patch,
-                    (None, None) if has_pickaxe => &pickaxe_patch,
                     (None, None) => patches.get(&repo, &nodes, ni, 3, &pathspecs)?,
                 };
                 // `additional_path_headers` (diff.c:3772-3777, 7050-7096): the

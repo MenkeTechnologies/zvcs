@@ -151,7 +151,14 @@ const GIT_LOG_LONG_OPTS: &[&str] = &[
     "git-completion-helper-all",
     "glob",
     "graph",
-    "graph-lane-limit",
+    // `graph-lane-limit` was listed here and does not belong: the rule above is
+    // that a token earns a place only by *not* answering `unrecognized
+    // argument`, and stock 2.55.0 answers exactly that —
+    // `git log -0 --graph-lane-limit` → `fatal: unrecognized argument:
+    // --graph-lane-limit`. Listing it made this port call the option known but
+    // unimplemented, which is the population this list exists to keep out of
+    // git's wording. (`--max-count-oldest` and `--exclude-hidden` do stay: they
+    // fail under stock with `requires a value`, not `unrecognized argument`.)
     "grep",
     "grep-reflog",
     "help",

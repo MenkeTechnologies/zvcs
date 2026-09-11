@@ -132,7 +132,10 @@ pub mod create_or_update {
             options.append(true).read(false);
             let log_path = reflog_base.join(&full_name);
 
-            if force_create_reflog || self.should_autocreate_reflog(&full_name) {
+            // The two halves of `log_ref_setup()` differ in more than whether `O_CREAT` is set:
+            // only the creating half is allowed to clear a directory out of the way, and only the
+            // non-creating half treats `EISDIR` as "nothing to write here".
+            let file_for_appending = if force_create_reflog || self.should_autocreate_reflog(&full_name) {
                 let parent_dir = log_path.parent().expect("always with parent directory");
                 gix_tempfile::create_dir::all(parent_dir, Default::default()).map_err(|err| {
                     Error::CreateLeadingDirectories {
@@ -141,22 +144,54 @@ pub mod create_or_update {
                     }
                 })?;
                 options.create(true);
-            }
-
-            let file_for_appending = match options.open(&log_path) {
-                Ok(f) => Some(f),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                Err(err) => {
-                    // TODO: when Kind::IsADirectory becomes stable, use that.
-                    if log_path.is_dir() {
-                        gix_tempfile::remove_dir::empty_depth_first(log_path.clone())
-                            .and_then(|_| options.open(&log_path))
-                            .map(Some)
-                            .map_err(|_| Error::Append {
-                                source: err,
-                                reflog_path: self.reflog_path(name),
-                            })?
-                    } else {
+                match options.open(&log_path) {
+                    Ok(f) => Some(f),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    // `raceproof_create_file()` (refs/files-backend.c:1149-1158) answers `EISDIR`
+                    // by removing the directory "if it is empty (and recursively any empty
+                    // directories that it contains)" and calling the opener once more — once,
+                    // because a process racing us to create directories is one we let win. A
+                    // directory that still holds a file survives and the retry fails again.
+                    //
+                    // `is_dir()` rather than `ErrorKind::IsADirectory`: Windows reports a
+                    // directory open as `PermissionDenied`, so the errno test would miss it.
+                    Err(err) if log_path.is_dir() => gix_tempfile::remove_dir::empty_depth_first(log_path.clone())
+                        .and_then(|()| options.open(&log_path))
+                        .map(Some)
+                        .map_err(|_| Error::Append {
+                            source: err,
+                            reflog_path: self.reflog_path(name),
+                        })?,
+                    Err(err) => {
+                        return Err(Error::Append {
+                            source: err,
+                            reflog_path: log_path,
+                        });
+                    }
+                }
+            } else {
+                // The other half (refs/files-backend.c:1887-1903) is a bare
+                // `open(logfile, O_APPEND | O_WRONLY)` whose failure is inspected:
+                //
+                // ```c
+                // if (errno == ENOENT || errno == EISDIR) {
+                //         /*
+                //          * The logfile doesn't already exist, but that is not an error;
+                //          * it only means that we won't write log entries to it.
+                //          */
+                //         ;
+                // } else { … goto error; }
+                // ```
+                //
+                // So a directory sitting where the log would go is as quiet as a missing log,
+                // and it is left standing: `core.logAllRefUpdates=false` updating a ref whose
+                // `logs/` path is a directory exits 0, writes the ref, and does not touch the
+                // directory — measured against git 2.55.0.
+                match options.open(&log_path) {
+                    Ok(f) => Some(f),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(_err) if log_path.is_dir() => None,
+                    Err(err) => {
                         return Err(Error::Append {
                             source: err,
                             reflog_path: log_path,

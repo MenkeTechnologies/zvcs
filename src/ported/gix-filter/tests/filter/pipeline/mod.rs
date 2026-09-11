@@ -65,6 +65,9 @@ fn pipeline(
             eol_config,
             encodings_with_roundtrip_check,
             crlf_roundtrip_check,
+            // The check-in default, which is what these fixtures converted under before
+            // `CONV_WRITE_OBJECT` became a field.
+            write_object: gix_filter::pipeline::WriteObject::Yes,
             object_hash: gix_testtools::object_hash(),
         },
     );

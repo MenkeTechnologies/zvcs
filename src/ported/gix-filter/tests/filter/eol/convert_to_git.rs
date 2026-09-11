@@ -121,13 +121,26 @@ fn crlf_in_index_prevents_conversion_to_lf() -> crate::Result {
     Ok(())
 }
 
+/// git does not quote the path here.
+///
+/// `die(_("LF would be replaced by CRLF in %s"), path)` — convert.c:216, v2.55.0.
+/// The quoted spelling one screen up (convert.c:208-210) is the
+/// `CONV_EOL_RNDTRP_WARN` message, a different string for a different branch.
+/// These two expectations carried the quoted form from upstream gitoxide, so the
+/// test was pinning a message git never prints. Measured against stock 2.55.0
+/// with `core.autocrlf=true`, `core.safecrlf=true` and a lone-LF file:
+///
+/// ```text
+/// $ git add hello.txt
+/// fatal: LF would be replaced by CRLF in hello.txt
+/// ```
 #[test]
 fn round_trip_check() -> crate::Result {
     let mut buf = Vec::new();
     for (input, expected) in [
-        (&b"lone-nl\nhi\r\nho"[..], "LF would be replaced by CRLF in 'hello.txt'"),
+        (&b"lone-nl\nhi\r\nho"[..], "LF would be replaced by CRLF in hello.txt"),
         // despite trying, I was unable to get into the other branch
-        (b"lone-cr\nhi\r\nho", "LF would be replaced by CRLF in 'hello.txt'"),
+        (b"lone-cr\nhi\r\nho", "LF would be replaced by CRLF in hello.txt"),
     ] {
         let err = eol::convert_to_git(
             input,

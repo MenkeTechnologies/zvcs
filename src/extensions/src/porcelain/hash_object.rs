@@ -501,8 +501,13 @@ fn convert_for_checkin<'repo>(
             .filter_pipeline(None)
             .map_err(|err| Fatal::new(format!("unable to setup filters: {err}")))?;
         if !write {
-            pipeline.options_mut().crlf_roundtrip_check =
-                gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;
+            let options = pipeline.options_mut();
+            options.crlf_roundtrip_check = gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;
+            // The other half of what `get_conv_flags()` withholds without `INDEX_WRITE_OBJECT`:
+            // `CONV_WRITE_OBJECT` is `encode_to_git()`'s `die_on_error` (`convert.c:392`), so a
+            // file whose `working-tree-encoding` cannot be applied is announced with `error:` and
+            // hashed unconverted instead of refused (`convert.c:426-429`).
+            options.write_object = gix::filter::plumbing::pipeline::WriteObject::No;
         }
         *filters = Some(FilterPipeline { pipeline, index });
     }

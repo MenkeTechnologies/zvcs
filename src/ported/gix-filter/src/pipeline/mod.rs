@@ -16,6 +16,40 @@ pub enum CrlfRoundTripCheck {
     Skip,
 }
 
+/// Whether the content being converted to git is on its way into the object database.
+///
+/// This is git's `CONV_WRITE_OBJECT` (`convert.h:17`, "Content is written to the index"), which
+/// `get_conv_flags()` sets from `INDEX_WRITE_OBJECT` and nothing else:
+///
+/// ```c
+/// static int get_conv_flags(unsigned flags)
+/// {
+///         if (flags & INDEX_RENORMALIZE)
+///                 return CONV_EOL_RENORMALIZE;
+///         else if (flags & INDEX_WRITE_OBJECT)
+///                 return global_conv_flags_eol | CONV_WRITE_OBJECT;
+///         else
+///                 return 0;
+/// }
+/// ```
+///
+/// — `object-file.c:33-41`, git v2.55.0. `encode_to_git()` reads it as `die_on_error`
+/// (`convert.c:392`): a caller that is about to store the blob cannot accept a half-converted
+/// one and dies, while a caller only reporting an id says its piece and hashes what it has.
+#[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum WriteObject {
+    /// The blob is headed for the database, so a failed `working-tree-encoding` conversion is
+    /// fatal.
+    ///
+    /// The default, because every pipeline built from a repository serves check-in
+    /// (`git add`, `git stash`, the merge machinery) unless its caller says otherwise.
+    #[default]
+    Yes,
+    /// The blob is not being stored, so a failed conversion is reported on stderr and the
+    /// content is left as it stands — `error(msg); return 0;`, `convert.c:426-429`.
+    No,
+}
+
 /// Additional configuration for the filter pipeline.
 #[derive(Default, Clone)]
 pub struct Options {
@@ -27,6 +61,9 @@ pub struct Options {
     pub crlf_roundtrip_check: CrlfRoundTripCheck,
     /// All worktree encodings for round-trip checks should be performed.
     pub encodings_with_roundtrip_check: Vec<&'static encoding_rs::Encoding>,
+    /// Whether a conversion to git is storing the result, which decides how a failed
+    /// `working-tree-encoding` conversion is reported.
+    pub write_object: WriteObject,
     /// The object hash to use when applying the `ident` filter.
     pub object_hash: gix_hash::Kind,
 }

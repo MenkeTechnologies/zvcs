@@ -35,14 +35,50 @@ fn reflog_lines(store: &file::Store, name: &str, buf: &mut Vec<u8>) -> Result<Ve
 
 const WRITE_MODES: &[WriteReflog] = &[WriteReflog::Normal, WriteReflog::Disable, WriteReflog::Always];
 
+/// The write mode decides autocreation; it is not orthogonal to it.
+///
+/// `should_autocreate_reflog()` (refs.c:1056-1070) takes the mode as its first
+/// parameter and switches on it — `LOG_REFS_ALWAYS` returns 1 for every name,
+/// `LOG_REFS_NORMAL` returns 1 only for the four well-known prefixes, and
+/// anything else (`LOG_REFS_NONE`, i.e. `core.logAllRefUpdates=false`) falls to
+/// `default: return 0`. This test previously asserted the opposite — that
+/// `WriteReflog::Disable` still autocreates for `refs/heads/*` — which is
+/// upstream gitoxide's decomposition, not git's rule.
+///
+/// Re-measured against stock 2.55.0, one fresh ref per mode so no update is
+/// short-circuited by `previous == new`:
+///
+/// ```text
+/// core.logAllRefUpdates   refs/heads/*   refs/tags/*
+/// unset                   CREATED        none
+/// false                   none           none
+/// true                    CREATED        none
+/// always                  CREATED        CREATED
+/// ```
 #[test]
-fn should_autocreate_is_unaffected_by_writemode() -> Result {
-    let (_keep, store) = empty_store(WriteReflog::Disable)?;
+fn should_autocreate_follows_the_write_mode() -> Result {
+    let (_keep, disabled) = empty_store(WriteReflog::Disable)?;
+    for any_name in &["HEAD", "refs/heads/main", "refs/remotes/any", "refs/notes/any", "refs/tags/0.1.0"] {
+        assert!(
+            !disabled.should_autocreate_reflog(Path::new(any_name)),
+            "`false` autocreates nothing, not even {any_name}"
+        );
+    }
+
+    let (_keep, normal) = empty_store(WriteReflog::Normal)?;
     for should_create_name in &["HEAD", "refs/heads/main", "refs/remotes/any", "refs/notes/any"] {
-        assert!(store.should_autocreate_reflog(Path::new(should_create_name)));
+        assert!(normal.should_autocreate_reflog(Path::new(should_create_name)));
     }
     for should_not_create_name in &["FETCH_HEAD", "SOMETHING", "refs/special/this", "refs/tags/0.1.0"] {
-        assert!(!store.should_autocreate_reflog(Path::new(should_not_create_name)));
+        assert!(!normal.should_autocreate_reflog(Path::new(should_not_create_name)));
+    }
+
+    let (_keep, always) = empty_store(WriteReflog::Always)?;
+    for any_name in &["HEAD", "refs/heads/main", "refs/tags/0.1.0", "refs/special/this", "SOMETHING"] {
+        assert!(
+            always.should_autocreate_reflog(Path::new(any_name)),
+            "`always` autocreates everything, including {any_name}"
+        );
     }
     Ok(())
 }

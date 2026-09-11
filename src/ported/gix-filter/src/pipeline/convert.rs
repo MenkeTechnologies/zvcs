@@ -2,7 +2,11 @@ use std::{io::Read, path::Path};
 
 use bstr::{BStr, ByteSlice};
 
-use crate::{Pipeline, driver, eol, ident, pipeline::util::Configuration, worktree};
+use crate::{
+    Pipeline, driver, eol, ident,
+    pipeline::{WriteObject, util::Configuration},
+    worktree,
+};
 
 ///
 pub mod configuration {
@@ -131,11 +135,19 @@ impl Pipeline {
         }
 
         if let Some(encoding) = &encoding {
-            // git's `check_roundtrip()` (convert.c:347-383) looks the name up in
-            // `core.checkRoundtripEncoding`; the list arrives here already resolved, so the name is
-            // resolved to meet it. A name `encoding_rs` cannot resolve is not in the list either.
+            // `if (die_on_error && check_roundtrip(enc))` — convert.c:452. The check is not only
+            // reported differently when the blob is not being stored, it is not run at all:
+            // "the round trip check is only performed if content is written to Git"
+            // (convert.c:441-443), since content nobody keeps cannot lose anything.
             let round_trip = match crate::worktree::encoding::for_label(encoding.as_bstr()) {
-                Ok(resolved) if self.options.encodings_with_roundtrip_check.contains(&resolved) => {
+                // git's `check_roundtrip()` (convert.c:347-383) looks the name up in
+                // `core.checkRoundtripEncoding`; the list arrives here already resolved, so the
+                // name is resolved to meet it. A name `encoding_rs` cannot resolve is not in the
+                // list either.
+                Ok(resolved)
+                    if self.options.write_object == WriteObject::Yes
+                        && self.options.encodings_with_roundtrip_check.contains(&resolved) =>
+                {
                     worktree::encode_to_git::RoundTripCheck::Fail
                 }
                 _ => worktree::encode_to_git::RoundTripCheck::Skip,
@@ -146,6 +158,7 @@ impl Pipeline {
                 encoding.as_ref(),
                 &mut self.bufs.dest,
                 round_trip,
+                self.options.write_object,
             )? {
                 self.bufs.swap();
             }

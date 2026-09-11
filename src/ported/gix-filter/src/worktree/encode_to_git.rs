@@ -47,6 +47,7 @@ pub(crate) mod function {
     use encoding_rs::DecoderResult;
 
     use super::{Error, RoundTripCheck};
+    use crate::pipeline::WriteObject;
     use crate::worktree::utf;
 
     /// Decode `src` according to `src_encoding` to `UTF-8` for storage in git and place it in `buf`.
@@ -108,12 +109,37 @@ pub(crate) mod function {
     /// `buf`. Return `true` when `buf` holds the converted content and `false` when the content was
     /// left as it stands, which git answers for an empty input (`convert.c:398`).
     ///
-    /// ### Deviation
-    ///
-    /// git decides between `die()` and `error()`-and-carry-on by whether `CONV_WRITE_OBJECT` is set,
-    /// which is a property of the caller and not of the pipeline. Every arm here is an error, which
-    /// is the `CONV_WRITE_OBJECT` behaviour — the one `add` and `hash-object` ask for.
+    /// `write_object` is git's `die_on_error`, taken from `CONV_WRITE_OBJECT` at `convert.c:392`.
+    /// With [`WriteObject::Yes`] a failure is returned as an error for the caller to report and
+    /// abort on; with [`WriteObject::No`] it is printed as `error: <msg>` and the unconverted
+    /// content is kept, which is the `error(msg); return 0;` at `convert.c:426-429`. That is the
+    /// difference between `git hash-object -w` refusing a file whose `working-tree-encoding` is
+    /// wrong and a plain `git hash-object` naming the problem and printing the id anyway.
     pub fn encode_to_git_by_name(
+        rela_path: &BStr,
+        src: &[u8],
+        src_encoding: &BStr,
+        buf: &mut Vec<u8>,
+        round_trip: RoundTripCheck,
+        write_object: WriteObject,
+    ) -> Result<bool, Error> {
+        match encode_to_git_checked(rela_path, src, src_encoding, buf, round_trip) {
+            Ok(converted) => Ok(converted),
+            // git does not turn every failure into a refusal; it turns it into a refusal only
+            // when the blob is on its way to the database. Otherwise it prints the same text
+            // through `error()` and answers 0, leaving the content unmodified — which is why
+            // an id still reaches stdout and the exit code stays 0.
+            Err(err) if write_object == WriteObject::No => {
+                eprintln!("error: {err}");
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The body of [`encode_to_git_by_name()`], which reports every failure as an error so that
+    /// its caller can pick between git's two ways of announcing one.
+    fn encode_to_git_checked(
         rela_path: &BStr,
         src: &[u8],
         src_encoding: &BStr,

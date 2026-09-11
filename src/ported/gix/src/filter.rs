@@ -129,6 +129,12 @@ impl<'repo> Pipeline<'repo> {
             eol_config: gix_filter::eol::Configuration { auto_crlf, eol },
             encodings_with_roundtrip_check: encodings,
             crlf_roundtrip_check: safe_crlf,
+            // `get_conv_flags()` (object-file.c:33-41) sets `CONV_WRITE_OBJECT` for the
+            // `INDEX_WRITE_OBJECT` callers, which is every check-in path that stores what it
+            // converted. A caller that only reports an id — `git hash-object` without `-w` — turns
+            // this off through [`gix_filter::Pipeline::options_mut()`], the same way it turns off
+            // the `core.safecrlf` round-trip check.
+            write_object: gix_filter::pipeline::WriteObject::Yes,
             object_hash: repo.object_hash(),
         })
     }

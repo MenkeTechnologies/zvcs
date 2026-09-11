@@ -19,12 +19,31 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// The binary under test with the ambient user and system config kept out, so
 /// a global `pack.*` cannot change what gets written.
+/// Fixed dates, because one test flips a bit at a computed offset.
+///
+/// `a_bitmap_that_disagrees_with_the_history_is_a_mismatch_and_not_an_ok` walks
+/// past the header and the four type bitmaps to a byte inside the first entry's
+/// compressed words and flips it, then requires the walk to notice. Which bit
+/// that offset lands on depends on the bitmap's contents, which depend on the
+/// object ids, which — with the dates left to the clock — changed on every run.
+/// Most layouts put a meaningful bit there and the test passed; some did not,
+/// and the walk legitimately reported `OK!` because the object set really was
+/// unchanged. It showed up as a 1-in-8 failure under concurrency, where runs
+/// straddle different seconds, and never in isolation.
+///
+/// Pinning the dates makes the oids, the pack and the bitmap identical on every
+/// run, so the flipped bit is the same bit every time. The assertion is
+/// unchanged; only the input stopped moving.
+const FIXED_DATE: &str = "2026-01-01T00:00:00+00:00";
+
 fn cmd(repo: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(BIN);
     c.args(args)
         .current_dir(repo)
         .env("HOME", repo.join(".isolated-home"))
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_DATE", FIXED_DATE)
+        .env("GIT_COMMITTER_DATE", FIXED_DATE);
     c
 }
 

@@ -5067,6 +5067,33 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // under `-c`/`--cc` reports 0; `--check` reports through
                 // `check_failed` instead, which is why `--check --exit-code` is 2
                 // rather than 3.
+                //
+                // It is an *assignment*, not an accumulation. `diffcore_std()` ends
+                //
+                // ```c
+                // if (diff_queued_diff.nr && !options->flags.diff_from_contents)
+                //         options->flags.has_changes = 1;
+                // else
+                //         options->flags.has_changes = 0;
+                // ```
+                //
+                // (diff.c:7528-7531) and runs at the top of every
+                // `log_tree_diff_flush()`, so the flag carries the *last* record's
+                // answer and not the disjunction of all of them.
+                // `diff_result_code()` (diff.c:7550-7552) reads it once, after the
+                // walk. Measured against git 2.55.0:
+                //
+                // ```text
+                // log -p --exit-code -2, oldest of the two an empty commit   0
+                // log -1 -s --diff-merges=separate --exit-code on a merge
+                //     whose second parent's tree it took whole               0
+                // ```
+                //
+                // Records git never flushes — a root commit without
+                // `show_root_diff`, a combined merge, an octopus under
+                // `--remerge-diff` — reach no `diffcore_std()` at all and leave the
+                // flag as the previous record set it, which is why the assignment
+                // sits inside the same gates the flush does.
                 if !check
                     && !(node.parents.len() > 1
                         && matches!(
@@ -5078,7 +5105,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         true => !files.is_empty(),
                         false => queue_nonempty,
                     };
-                    has_changes |= changed;
+                    has_changes = changed;
                 }
                 // A merge under a combined mode runs `diff_tree_combined()`
                 // (combine-diff.c:1600-1610) instead of `diff_flush()`, and the two

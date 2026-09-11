@@ -136,9 +136,12 @@ pub(crate) fn parse_whitespace_rule(spec: &str) -> u32 {
     rule
 }
 
-/// git's `whitespace_rule_cfg`, from `core.whitespace`. Per-path overrides come
-/// from the `whitespace` gitattribute, which this port does not read, so every
-/// file in a diff shares the configured rule.
+/// git's `whitespace_rule_cfg` (ws.c:14), from `core.whitespace`.
+///
+/// This is only the global. `whitespace_rule(istate, pathname)` (ws.c:88-110)
+/// layers the per-path `whitespace` gitattribute over it, and that lookup lives in
+/// [`super::diff::WsRules`], which resolves the attribute for each path and falls
+/// back to this value for the paths that do not set one.
 pub(crate) fn whitespace_rule_cfg(repo: &gix::Repository) -> u32 {
     match repo.config_snapshot().string("core.whitespace") {
         Some(v) => parse_whitespace_rule(&v.to_string()),

@@ -694,6 +694,12 @@ struct SubmoduleIgnore {
     /// `options->flags.override_submodule_config`, which only the command-line flag
     /// sets — and which makes the whole `.gitmodules` lookup below never happen.
     overridden: bool,
+    /// `options->flags.ignore_dirty_submodules`, which only `dirty` raises
+    /// (`handle_ignore_submodules_arg()`, submodule.c:441-442). It changes no pair
+    /// this port queues — the gitlink itself is still diffed — but it does cancel
+    /// the worktree dirtiness probe, which is the one thing about it that is
+    /// observable here. See [`submodule_probe_warnings`].
+    ignore_dirty: bool,
     /// Each `.gitmodules` path whose submodule names an `ignore` value, and whether
     /// that value is `all`. A path absent here is a submodule that names none.
     per_path: std::collections::HashMap<BString, bool>,
@@ -732,8 +738,21 @@ impl SubmoduleIgnore {
                 }
             }
         }
+        self.load_per_path(repo);
+        None
+    }
+
+    /// The per-path half of `set_diffopt_flags_from_submodule_config()`
+    /// (submodule.c:180-200) on its own: `submodule.<name>.ignore` from the
+    /// superproject config, falling back to the `.gitmodules` value.
+    ///
+    /// Split out of [`Self::load`] because the worktree dirtiness probe consults the
+    /// same setting for gitlinks that produced no pair at all, which is a set
+    /// [`Self::load`]'s own gates (it runs only for a queued gitlink, and raises
+    /// `.gitmodules`' parse failure) deliberately does not cover.
+    fn load_per_path(&mut self, repo: &gix::Repository) {
         let Ok(Some(subs)) = repo.submodules() else {
-            return None;
+            return;
         };
         let snap = repo.config_snapshot();
         for sub in subs {
@@ -748,7 +767,6 @@ impl SubmoduleIgnore {
             };
             self.per_path.insert(path.into(), ignore);
         }
-        None
     }
 
     fn ignored(&self, path: &BString) -> bool {
@@ -1517,6 +1535,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // this verb runs.
         if let Some(v) = snap.string("diff.ignoreSubmodules") {
             ignore_submodules.default_all = v.as_bstr() == "all";
+            ignore_submodules.ignore_dirty = v.as_bstr() == "dirty";
         }
         // `diff.dirstat` (diff.c:521-532, inside `git_diff_basic_config()`): the
         // parsed parameters land in `default_diff_options`/`diff_dirstat_permille_
@@ -2113,15 +2132,24 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--ignore-submodules" => {
                 ignore_submodules.overridden = true;
                 ignore_submodules.default_all = true;
+                ignore_submodules.ignore_dirty = false;
             }
             s if s.starts_with("--ignore-submodules=") => {
                 ignore_submodules.overridden = true;
+                // Every call resets all three flags before setting the one the word
+                // names (submodule.c:432-435), so each spelling is an assignment
+                // rather than an accumulation.
+                ignore_submodules.ignore_dirty = false;
                 match &s["--ignore-submodules=".len()..] {
                     "all" => ignore_submodules.default_all = true,
-                    // `untracked` and `dirty` only relax what counts as a
-                    // *modification* of a checked-out submodule; the gitlink pair
-                    // itself stays in the queue, as does `none`'s.
-                    "none" | "untracked" | "dirty" => ignore_submodules.default_all = false,
+                    "dirty" => {
+                        ignore_submodules.default_all = false;
+                        ignore_submodules.ignore_dirty = true;
+                    }
+                    // `untracked` only relaxes what counts as a *modification* of a
+                    // checked-out submodule; the gitlink pair itself stays in the
+                    // queue, as does `none`'s.
+                    "none" | "untracked" => ignore_submodules.default_all = false,
                     v => {
                         eprintln!("fatal: bad --ignore-submodules argument: {v}");
                         return Ok(ExitCode::from(128));
@@ -2986,6 +3014,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 unmerged_stage,
             )?;
         }
+        // The gitlinks this pass hands to `match_stat_with_submodule()`
+        // (diff-lib.c:88-107), each of which is a child `git status` inside the
+        // submodule — and a second reader of `diff.submodule`.
+        submodule_probe_warnings(
+            &repo,
+            &workdir,
+            &paths,
+            &mut ignore_submodules,
+            fmt & F_PATCH != 0,
+        );
         // The side the platform resolves by *reading the path* rather than by id.
         // `-R` swaps the two filespecs, so the worktree side becomes the pre-image
         // and the root has to travel with it.
@@ -4538,6 +4576,143 @@ fn submodule_status() -> gix::status::Submodule {
     gix::status::Submodule::Given {
         ignore: gix::submodule::config::Ignore::Untracked,
         check_dirty: false,
+    }
+}
+
+/// The *second* `diff.submodule` warning, and the child process behind it.
+///
+/// `match_stat_with_submodule()` (diff-lib.c:88-107) is where the index↔worktree
+/// walk decides a gitlink's dirtiness:
+///
+/// ```c
+/// int changed = ie_match_stat(diffopt->repo->index, ce, st, ce_option);
+/// if (S_ISGITLINK(ce->ce_mode)) {
+///         if (!diffopt->flags.override_submodule_config)
+///                 set_diffopt_flags_from_submodule_config(diffopt, ce->name);
+///         if (diffopt->flags.ignore_submodules)
+///                 changed = 0;
+///         else if (!diffopt->flags.ignore_dirty_submodules &&
+///                  (!changed || diffopt->flags.dirty_submodules))
+///                 *dirty_submodule = is_submodule_modified(ce->name,
+///                                          diffopt->flags.ignore_untracked_in_submodules);
+/// }
+/// ```
+///
+/// and `is_submodule_modified()` (submodule.c:1880-1915) does not read the
+/// submodule in-process. It spawns a **child git**:
+///
+/// ```c
+/// strvec_pushl(&cp.args, "status", "--porcelain=2", NULL);
+/// if (ignore_untracked)
+///         strvec_push(&cp.args, "-uno");
+/// prepare_submodule_repo_env(&cp.env);
+/// cp.git_cmd = 1;
+/// cp.dir = path;
+/// ```
+///
+/// `prepare_submodule_repo_env()` (submodule.c:495-498) is
+/// `prepare_other_repo_env()` (run-command.c:2006-2010), whose
+/// `sanitize_repo_env()` (run-command.c:1995-2004) clears every variable of
+/// `local_repo_env` **except** two:
+///
+/// ```c
+/// for (var = local_repo_env; *var; var++)
+///         if (strcmp(*var, CONFIG_DATA_ENVIRONMENT) &&
+///             strcmp(*var, CONFIG_COUNT_ENVIRONMENT))
+///                 strvec_push(env, *var);
+/// ```
+///
+/// `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` survive, so the child is an
+/// ordinary `git status` inside the submodule that still carries the parent's `-c`
+/// overrides — and `git_status_config()` ends in `git_diff_ui_config()`
+/// (diff.c:453-460), which prints the unknown-format warning again. Once per
+/// probed submodule, on the child's inherited stderr.
+///
+/// Every row below was measured against git 2.55.0 in a superproject with two
+/// populated submodules:
+///
+/// ```text
+/// -c diff.submodule=bogus diff HEAD~1 -- sub              2
+/// -c diff.submodule=bogus diff HEAD~1                     3   one child per submodule
+/// -c diff.submodule=bogus diff --cached HEAD~1 -- sub     1   no worktree pass
+/// -c diff.submodule=bogus diff HEAD~1 HEAD -- sub         1   tree to tree
+/// -c diff.submodule=bogus diff HEAD~1 -- x.txt            1   pathspec excludes it
+/// diff.submodule=bogus in .git/config, diff HEAD~1 -- sub 1   not the child's config
+/// diff.submodule=bogus in ~/.gitconfig, diff HEAD~1 -- sub 2  that one is
+/// -c … --stat/--raw/--name-only, submodule HEAD moved     1   no DIFF_FORMAT_PATCH
+/// -c … --ignore-submodules=all, or =dirty                 1   no probe at all
+/// -c … --ignore-submodules=untracked                      2
+/// ```
+///
+/// Which configuration the child can see is the whole of the rule, so rather than
+/// guess at scopes this reopens each probed submodule and asks *its* snapshot: the
+/// system, global and inherited command-line values are in it (this port delivers
+/// `-c` through `GIT_CONFIG_COUNT`/`_KEY_N`/`_VALUE_N` as well, which is the
+/// channel `sanitize_repo_env()` keeps), and the superproject's own `.git/config`
+/// is not.
+///
+/// The gate is the first line: with no `diff.submodule` configured anywhere there
+/// is nothing for a child to reject, and nothing below runs.
+fn submodule_probe_warnings(
+    repo: &gix::Repository,
+    workdir: &std::path::Path,
+    paths: &[String],
+    ignore: &mut SubmoduleIgnore,
+    patch_output: bool,
+) {
+    if repo.config_snapshot().string("diff.submodule").is_none() {
+        return;
+    }
+    // `!diffopt->flags.ignore_dirty_submodules`: no gitlink is probed at all.
+    if ignore.ignore_dirty {
+        return;
+    }
+    let Ok(index) = repo.index_or_empty() else {
+        return;
+    };
+    // An empty pathspec is "no limiting", which is why the matcher is built only
+    // for a non-empty one — the same contract `PathspecMatcher::new` documents.
+    let specs = match paths.is_empty() {
+        true => None,
+        false => match super::log::PathspecMatcher::new(repo, paths) {
+            Ok(m) => Some(m),
+            Err(_) => return,
+        },
+    };
+    ignore.load_per_path(repo);
+    for entry in index.entries() {
+        if entry.stage() != gix::index::entry::Stage::Unconflicted
+            || index_mode_kind(entry.mode) != Some(EntryKind::Commit)
+        {
+            continue;
+        }
+        let path = entry.path(&index).to_owned();
+        if specs.as_ref().is_some_and(|s| !s.matches(&path)) {
+            continue;
+        }
+        // `flags.ignore_submodules` -> `changed = 0` and no probe.
+        if ignore.ignored(&path) {
+            continue;
+        }
+        // submodule.c:1896-1902: a path that is not a git directory is "not checked
+        // out, so it is not modified" and returns before `start_command()`.
+        let Ok(sub) = gix::open(workdir.join(gix::path::from_bstr(path.as_bstr()).as_ref())) else {
+            continue;
+        };
+        // `ie_match_stat()` on a gitlink is `ce_compare_gitlink()`: the entry counts
+        // as changed when the submodule's `HEAD` no longer resolves to the object the
+        // gitlink records. Without `DIFF_FORMAT_PATCH` (`flags.dirty_submodules`,
+        // diff.c:5335-5336) that cancels the probe.
+        let changed = sub.head_id().map(gix::Id::detach).ok() != Some(entry.id);
+        if changed && !patch_output {
+            continue;
+        }
+        if let Some(v) = sub.config_snapshot().string("diff.submodule") {
+            let raw = v.to_str_lossy();
+            if parse_submodule_params(&raw).is_none() {
+                eprintln!("warning: Unknown value for 'diff.submodule' config variable: '{raw}'");
+            }
+        }
     }
 }
 

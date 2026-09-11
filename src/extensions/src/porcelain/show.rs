@@ -3250,14 +3250,30 @@ fn show_commit_record(
     // why `--check --exit-code` is 2 rather than 3. Under a whitespace rule the
     // queue is re-tested after the quiet re-render (`diff_from_contents`), so a
     // change that came out empty does not count.
+    //
+    // It is an *assignment*, not an accumulation:
+    //
+    // ```c
+    // if (diff_queued_diff.nr && !options->flags.diff_from_contents)
+    //         options->flags.has_changes = 1;
+    // else
+    //         options->flags.has_changes = 0;
+    // ```
+    //
+    // closes `diffcore_std()` (diff.c:7528-7531), which runs at the top of every
+    // `log_tree_diff_flush()` — so the flag holds the *last* record's answer, not
+    // the disjunction of all of them, and `diff_result_code()` (diff.c:7550-7552)
+    // reads it once after the walk. `git show --diff-merges=separate --exit-code`
+    // on a merge that took its second parent's tree whole is 0 in git 2.55.0 for
+    // exactly that reason: the final per-parent record diffed empty. Records git
+    // never flushes leave the flag alone, which is why this sits under the same
+    // gates the flush does.
     if !combined && selection != Selection::Check {
         let changed = match disp.patch.ws != super::diff::Whitespace::Keep {
             true => !files.is_empty(),
             false => queue_nonempty,
         };
-        if changed {
-            disp.status.set((true, disp.status.get().1));
-        }
+        disp.status.set((changed, disp.status.get().1));
     }
     // `diff_tree_combined()` calls `show_log()` before it has scanned a single path
     // (combine-diff.c:1506-1516), so a merge whose queue the pickaxe emptied still

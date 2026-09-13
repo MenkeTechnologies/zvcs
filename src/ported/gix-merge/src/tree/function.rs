@@ -237,9 +237,13 @@ where
                 // meets their added tree and is moved aside (merge-ort.c:4123-4181). A path
                 // of theirs beneath the file is no conflict of its own (t6423 5d, `y/d/e`
                 // against the added file `y/d`), and was content-merged into the file.
+                // The same holds for a file *our* side renamed there: the rename's
+                // destination is re-emitted as an addition once the rename is processed, and
+                // that addition meets their directory (t6423 7e with `B A`, A's `y/d/g`
+                // against B's `x/d -> z/d` moved to `y/d`).
                 let is_added_file = |idx: usize| {
                     let change = &our_changes[idx].inner;
-                    matches!(change, Change::Addition { .. }) && !change.entry_mode().is_tree()
+                    matches!(change, Change::Addition { .. } | Change::Rewrite { .. }) && !change.entry_mode().is_tree()
                 };
                 // A directory of *ours* holding nothing but deletions and rename sources
                 // merges to nothing, and a non-directory of theirs takes its place

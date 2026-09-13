@@ -230,6 +230,35 @@ fn a_rename_delete_moved_aside_keeps_the_base_stage() {
     }
 }
 
+/// The same merge with `B` first: A's `y/d/g` lies beneath B's renamed `y/d`, which is a
+/// file/directory conflict at `y/d` and no content merge. The two were merged as an
+/// add/add at `y/d` ("Auto-merging y/d") into a different tree.
+#[test]
+fn a_path_added_beneath_a_rename_destination_is_not_merged_into_it() {
+    let f = Fixture::transitive_rename_delete_with_directories_in_the_way("beneath");
+    for (mode, first_line) in [
+        ("conflict", "CONFLICT (file location): x/d renamed to z/d in B, inside a directory that was renamed in A, suggesting it should perhaps be moved to y/d.\n"),
+        ("true", "Path updated: x/d renamed to z/d in B, inside a directory that was renamed in A; moving it to y/d.\n"),
+    ] {
+        let (code, out, err) = f.run(&["-c", &format!("merge.directoryRenames={mode}"), "merge-tree", "--write-tree", "B", "A"]);
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "79bf2ef24bff2af81ebd7ad7542eda37f1cd8fc3\n\
+                 100644 6f1852975b9306ae5d8dfdf0d4cb1f5cb36ac229 1\ty/d~B\n\
+                 100644 6f1852975b9306ae5d8dfdf0d4cb1f5cb36ac229 2\ty/d~B\n\
+                 \n\
+                 {first_line}\
+                 CONFLICT (rename/delete): x/d renamed to y/d in B, but deleted in A.\n\
+                 CONFLICT (file/directory): directory in the way of y/d from B; moving it to y/d~B instead.\n"
+            ),
+            "merge.directoryRenames={mode}"
+        );
+        assert_eq!(code, 1);
+    }
+}
+
 /// Without directory renames the symlink stays at `dir/subdir`, whose directory
 /// held nothing but the rename's source and so merges to nothing: the symlink
 /// is placed there without a conflict in either operand order. With `rename`

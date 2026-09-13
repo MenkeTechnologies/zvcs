@@ -1698,22 +1698,20 @@ fn preflight(repo: &gix::Repository, state_dir: &Path) -> Result<Option<ExitCode
     // first — and `git_check_attr()` (attr.c:1330) dies on an `--attr-source` /
     // `GIT_ATTR_SOURCE` that names no tree-ish (attr.c:1221-1226), before the
     // dirty-index check below is reached.
+    if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(repo, &index, |_| true)? {
+        for path in &death.unmerged {
+            println!("{path}: needs merge");
+        }
+        return Ok(Some(death.die()?));
+    }
     {
-        let ctx = super::read_tree::StatCtx::new(repo, &index)?;
         let mut out = std::io::stdout().lock();
         let mut reported: BTreeSet<BString> = BTreeSet::new();
         for e in state.entries() {
-            let path = e.path(state);
             if e.stage_raw() == 0 {
-                if ctx.refresh_compares_data(e, path) {
-                    if let Some(message) = super::pack_objects::bad_default_attr_source(repo) {
-                        out.flush()?;
-                        eprintln!("fatal: {message}");
-                        return Ok(Some(ExitCode::from(128)));
-                    }
-                }
                 continue;
             }
+            let path = e.path(state);
             if reported.insert(path.to_owned()) {
                 writeln!(out, "{path}: needs merge")?;
             }

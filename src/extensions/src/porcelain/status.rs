@@ -900,6 +900,37 @@ fn status_report(
         return Ok(ExitCode::from(128));
     }
 
+    // `cmd_status()` refreshes the index before collecting anything
+    // (builtin/commit.c:1629-1632), limited to the pathspec and with
+    // `REFRESH_UNMERGED`, so conflicted paths are not named. Its content compare
+    // of a racily clean entry is the first attribute lookup, and dies on a bad
+    // `--attr-source` / `GIT_ATTR_SOURCE` — see
+    // [`super::read_tree::StatCtx::refresh_dies_on_attr_source`]. `git commit`
+    // reaches this report with its own `prepare_index()` refresh already done.
+    if reference == Reference::Status {
+        let index = repo.index_or_empty()?;
+        let death = if pathspecs.is_empty() {
+            super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |_| true)?
+        } else {
+            // A pathspec the engine refuses is reported by the collection below.
+            match repo.pathspec(
+                false,
+                &pathspecs,
+                false,
+                &index,
+                gix::worktree::stack::state::attributes::Source::IdMapping,
+            ) {
+                Ok(mut ps) => super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |p| {
+                    ps.is_included(p, Some(false))
+                })?,
+                Err(_) => None,
+            }
+        };
+        if let Some(death) = death {
+            return death.die();
+        }
+    }
+
     // The porcelain-v2 machine format is a separate renderer with its own,
     // richer per-path fields (HEAD/index/worktree modes + oids); it shares none
     // of the v1/long collection below, so the two cannot regress each other.

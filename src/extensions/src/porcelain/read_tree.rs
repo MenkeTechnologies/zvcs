@@ -1667,6 +1667,26 @@ pub(super) enum Probe {
 /// mtime/size/inode moved is "not uptodate" even when the bytes are unchanged.
 /// That distinction is load-bearing — `read-tree -m` refuses on it, and
 /// `read-tree --reset -u` / `checkout -f` rewrite the file because of it.
+/// Where [`StatCtx::refresh_dies_on_attr_source`] found the refresh dying.
+pub(super) struct RefreshDeath {
+    /// The conflicted paths the walk reached first, in index order, once each —
+    /// what `refresh_index()` names on stdout unless the caller passed
+    /// `REFRESH_UNMERGED`.
+    pub(super) unmerged: Vec<BString>,
+    /// The `fatal:` body.
+    message: &'static str,
+}
+
+impl RefreshDeath {
+    /// `die()`: whatever the walk printed is flushed ahead of the fatal, exit 128.
+    pub(super) fn die(&self) -> Result<ExitCode> {
+        use std::io::Write as _;
+        std::io::stdout().flush()?;
+        eprintln!("fatal: {}", self.message);
+        Ok(ExitCode::from(128))
+    }
+}
+
 pub(super) struct StatCtx {
     workdir: Option<PathBuf>,
     /// `core.trustCtime` / `core.checkStat`, as `Stat::matches` consumes them.
@@ -1770,6 +1790,46 @@ impl StatCtx {
             return self.is_racy(entry);
         }
         !(data_changed && entry.stat.size != 0)
+    }
+
+    /// `refresh_index()`'s walk (git 2.55.0 read-cache.c:1527-1563) up to the entry
+    /// whose `ce_compare_data()` makes the refresh's first attribute lookup, when that
+    /// lookup dies: `compute_default_attr_source()` (attr.c:1201-1228) refuses an
+    /// `--attr-source` / `GIT_ATTR_SOURCE` that names no tree-ish with
+    /// `die(_("bad --attr-source or GIT_ATTR_SOURCE"))`. `None` when the source is
+    /// fine or no entry reaches the compare, so the refresh runs to completion.
+    ///
+    /// `include` is `ce_path_match()` against the refresh's pathspec: an entry it
+    /// rejects is skipped, an unmerged one without being named (read-cache.c:1548-1563).
+    pub(super) fn refresh_dies_on_attr_source(
+        repo: &gix::Repository,
+        index: &gix::index::File,
+        mut include: impl FnMut(&gix::bstr::BStr) -> bool,
+    ) -> Result<Option<RefreshDeath>> {
+        let Some(message) = super::pack_objects::bad_default_attr_source(repo) else {
+            return Ok(None);
+        };
+        let ctx = Self::new(repo, index)?;
+        let state: &gix::index::State = index;
+        let mut unmerged: Vec<BString> = Vec::new();
+        for e in state.entries() {
+            let path = e.path(state);
+            if !include(path) {
+                continue;
+            }
+            // Every stage of a conflicted path is skipped at once and the path named
+            // once (read-cache.c:1551-1563).
+            if e.stage_raw() != 0 {
+                if unmerged.last().map(|p| p.as_bstr()) != Some(path) {
+                    unmerged.push(path.to_owned());
+                }
+                continue;
+            }
+            if ctx.refresh_compares_data(e, path) {
+                return Ok(Some(RefreshDeath { unmerged, message }));
+            }
+        }
+        Ok(None)
     }
 
     /// git's `is_racy_stat()`: an entry whose mtime is not older than the index's

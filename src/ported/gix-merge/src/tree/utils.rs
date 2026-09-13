@@ -490,6 +490,51 @@ impl TreeNodes {
         .into()
     }
 
+    /// Whether nothing of this side stays beneath the directory at `location` once
+    /// the merge is done, so that it is no longer in the way of a non-directory
+    /// placed at `location` itself.
+    ///
+    /// merge-ort decides a file/directory conflict in `process_entry()` only after
+    /// every path below the directory was processed: when the directory merged to
+    /// nothing, "directory no longer in the way, but we do have a file we need to
+    /// place here" (merge-ort.c:4090-4110). The other side has a non-directory at
+    /// `location`, so every base path below it is gone there, and what this side
+    /// leaves below it is what survives. Deletions leave nothing; neither does the
+    /// source of a rename, which `process_renames()` marks "resolved by removal"
+    /// (merge-ort.c:3222-3226). Additions, modifications (a modify/delete keeps
+    /// the file) and rename destinations stay.
+    pub fn nothing_remains_beneath(&self, location: &BStr, changes: &ChangeListRef) -> bool {
+        let mut cursor_idx = 0;
+        for component in to_components(location) {
+            match self.0[cursor_idx].children.get(component) {
+                Some(&child_idx) => cursor_idx = child_idx,
+                None => return true,
+            }
+        }
+        let mut pending: Vec<usize> = self.0[cursor_idx].children.values().copied().collect();
+        while let Some(node_idx) = pending.pop() {
+            let node = &self.0[node_idx];
+            pending.extend(node.children.values().copied());
+            let Some(change_idx) = node.change_idx else {
+                continue;
+            };
+            let change = &changes[change_idx].inner;
+            if change.entry_mode().is_tree() {
+                continue;
+            }
+            let removed = match node.location {
+                ChangeLocation::RenamedLocation => false,
+                ChangeLocation::CurrentLocation => {
+                    matches!(change, Change::Deletion { .. } | Change::Rewrite { .. })
+                }
+            };
+            if !removed {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Compare both changes and return `true` if they are *not* exactly the same.
     /// One two changes are the same, they will have the same effect.
     /// Since this is called after [`Self::check_conflict`], *our* change will not be applied,

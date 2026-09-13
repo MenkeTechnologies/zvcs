@@ -97,6 +97,38 @@ impl Fixture {
     }
 }
 
+/// Without directory renames the symlink stays at `dir/subdir`, whose directory
+/// held nothing but the rename's source and so merges to nothing: the symlink
+/// is placed there without a conflict in either operand order. With `rename`
+/// first it was moved aside to `dir/subdir~symlink` as if the directory stayed.
+#[test]
+fn a_directory_holding_only_a_rename_source_is_not_in_the_way() {
+    let f = Fixture::symlink_replaces_renamed_directory("gone");
+    let (code, out, err) = f.run(&["-c", "merge.directoryRenames=false", "merge-tree", "--write-tree", "rename", "symlink"]);
+    assert_eq!(err, "");
+    assert_eq!(
+        out,
+        "13ab88ed1ecbc999c1e3c4b567977553ef27e948\n\
+         100644 d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 1\trenamed-dir/subdir/file\n\
+         100644 d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 2\trenamed-dir/subdir/file\n\
+         \n\
+         CONFLICT (rename/delete): dir/subdir/file renamed to renamed-dir/subdir/file in rename, but deleted in symlink.\n"
+    );
+    assert_eq!(code, 1);
+
+    let (code, out, err) = f.run(&["-c", "merge.directoryRenames=false", "merge-tree", "--write-tree", "symlink", "rename"]);
+    assert_eq!(err, "");
+    assert_eq!(
+        out,
+        "13ab88ed1ecbc999c1e3c4b567977553ef27e948\n\
+         100644 d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 1\trenamed-dir/subdir/file\n\
+         100644 d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 3\trenamed-dir/subdir/file\n\
+         \n\
+         CONFLICT (rename/delete): dir/subdir/file renamed to renamed-dir/subdir/file in rename, but deleted in symlink.\n"
+    );
+    assert_eq!(code, 1);
+}
+
 /// The symlink follows the directory rename into `renamed-dir/subdir`, where the
 /// rename's `renamed-dir/subdir/file` keeps a directory, so it is moved aside.
 /// That file/directory notice was refused as an unported message class.

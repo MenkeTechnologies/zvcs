@@ -241,8 +241,20 @@ where
                     let change = &our_changes[idx].inner;
                     matches!(change, Change::Addition { .. }) && !change.entry_mode().is_tree()
                 };
+                // A directory of *ours* holding nothing but deletions and rename sources
+                // merges to nothing, and a non-directory of theirs takes its place
+                // without a conflict (merge-ort.c:4090-4110). merge-ort looks at the
+                // directory after every path below it; asking the lookup tree what will
+                // be left keeps the answer from depending on which side is walked first
+                // (t6423 12m with `merge.directoryRenames=false`, `A B`).
+                let directory_merges_to_nothing = |ours: &PossibleConflict| {
+                    matches!(ours, PossibleConflict::TreeToNonTree { change_idx: None })
+                        && !matches!(theirs, Change::Rewrite { .. })
+                        && our_tree.nothing_remains_beneath(theirs.location().as_bstr(), our_changes)
+                };
                 match our_tree.check_conflict(theirs.source_location()).filter(|ours| {
                     !matches!(ours, PossibleConflict::PassedRewrittenDirectory { .. })
+                        && !directory_merges_to_nothing(ours)
                         && !matches!(
                             ours,
                             PossibleConflict::NonTreeToTree { change_idx: Some(idx) }

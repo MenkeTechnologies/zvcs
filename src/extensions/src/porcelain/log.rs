@@ -2864,7 +2864,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // excluded tip has none to start from — git raises it the moment the argument is
     // pended, so it beats every post-loop conflict check below.
     if walk_reflogs {
-        if let Some(name) = reflog_excluded_tip(&repo, &revs, &rev_negated) {
+        if let Some(name) = reflog_excluded_tip(&repo, &revs, &rev_negated, seen_dashdash) {
             eprintln!("fatal: cannot walk reflogs for {name}");
             return Ok(ExitCode::from(128));
         }
@@ -3155,6 +3155,36 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     tip_sources.push(name.clone());
                 }
                 Err(_) if spec_is_path(&repo, spec) => {
+                    // `setup_revisions()`'s filename fallback checks the whole
+                    // tail before it prunes with any of it:
+                    //
+                    // ```c
+                    // for (j = i; j < argc; j++)
+                    //         verify_filename(revs->prefix, argv[j], j == i);
+                    // strvec_pushv(&prune_data, argv + i);
+                    // ```
+                    //
+                    // (revision.c:2907-2911). The operand that triggered the
+                    // fallback is a path by definition -- that is what got the
+                    // arm -- so only the ones after it can fail, and they fail
+                    // with `no such path in the working tree` rather than
+                    // `ambiguous argument`: `j == i` is what picks the wording,
+                    // and it is false for every one of them. They are named
+                    // ahead of anything the pathspec layer would say about the
+                    // first, which is the difference between `git reflog show ..`
+                    // ending at `'..' is outside repository` and `git reflog show
+                    // .. nosuchfile` ending at `nosuchfile`.
+                    if !in_paths {
+                        for tail in &revs[at + 1..] {
+                            if spec_is_path(&repo, tail) {
+                                continue;
+                            }
+                            if let Some(msg) = crate::setup::verify_filename(tail, false) {
+                                eprintln!("fatal: {msg}");
+                                return Ok(ExitCode::from(128));
+                            }
+                        }
+                    }
                     in_paths = true;
                     prune(&mut pathspecs, spec);
                 }
@@ -7359,13 +7389,38 @@ fn reflog_excluded_tip(
     repo: &gix::Repository,
     revs: &[String],
     negated: &[bool],
+    seen_dashdash: bool,
 ) -> Option<String> {
     for (spec, flip) in revs.iter().zip(negated.iter().copied()) {
+        // `handle_revision_arg_1()` returns before `handle_dotdot()` for a
+        // bare `..`, so it is never pended and `add_reflog_for_walk()` never
+        // sees it -- nor anything after it, because that operand sends
+        // `setup_revisions()` down the filename fallback, which makes prune
+        // data of the rest of argv. Splitting it here instead read `..` as
+        // `HEAD..HEAD` and raised `cannot walk reflogs for HEAD` ahead of the
+        // pathspec layer's own diagnosis.
+        if crate::objname::is_parent_directory_pathspec(spec, seen_dashdash) {
+            return None;
+        }
         if let Some(rest) = spec.strip_prefix('^') {
             if !flip {
                 return Some(rest.to_string());
             }
             continue;
+        }
+        // `<rev>^!` and `<rev>^-<n>` pend the selected parents with
+        // `flags ^ (UNINTERESTING | BOTTOM)`, and `add_parents_only()` pends
+        // each one under `arg_` -- the operand with the mark already cut off.
+        // So the name `add_reflog_for_walk()` dies with is `<rev>`, not the
+        // operand as written. `^@` is the exception the flag records: it keeps
+        // `flags`, pends the parents interesting, and leaves
+        // `git reflog show HEAD^@` walking `HEAD`'s log.
+        if let crate::objname::ParentsOnly::Mark { base, replaces, .. } =
+            crate::objname::parents_only(spec)
+        {
+            if !replaces && !flip {
+                return Some(crate::objname::uninteresting_mark(base).0.to_string());
+            }
         }
         if let Some((lhs, rhs)) = spec.split_once("...") {
             let l = if lhs.is_empty() { "HEAD" } else { lhs };

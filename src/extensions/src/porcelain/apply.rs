@@ -1145,30 +1145,39 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // --include/--exclude and the invocation prefix: keep only the patches whose
-    // (post-strip, post-prefix) name the rule list admits (git's `use_patch`). An
-    // empty result is not an error — the input still held valid patches.
-    if !o.limits.is_empty() || !prefix.is_empty() {
-        patches.retain(|p| use_patch(p, &prefix, &o.limits, o.has_include));
-    }
-
-    // `parse_chunk()` (apply.c:2262-2268) gives every patch `use_patch()` admits its
-    // `ws_rule` from `whitespace_rule()`, whose `git_check_attr()` (ws.c:90 → attr.c:1330)
-    // resolves the default attribute source before anything is checked or written —
-    // so `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish dies here, under
-    // `--check` and `--stat` alike, and outside a repository names that instead
-    // (attr.c:1216-1226). An excluded patch never asks.
-    if !patches.is_empty() {
-        let refusal = match crate::setup::discover() {
-            Ok(repo) => super::pack_objects::bad_default_attr_source(&repo),
-            Err(_) => std::env::var_os("GIT_ATTR_SOURCE")
-                .map(|_| "cannot use --attr-source or GIT_ATTR_SOURCE without repo"),
-        };
-        if let Some(message) = refusal {
-            eprintln!("fatal: {message}");
-            return Ok(ExitCode::from(128));
+    // `apply_patch()`'s parse loop (apply.c:4896-4930), in input order: keep only the
+    // patches whose (post-strip, post-prefix, post-reverse) name `use_patch()` admits,
+    // and say `Skipped patch '<name>'.` for every other one when verbose. An empty
+    // result is not an error — the input still held valid patches.
+    //
+    // `parse_chunk()` (apply.c:2262-2268) gives each admitted patch its `ws_rule` from
+    // `whitespace_rule()`, whose `git_check_attr()` (ws.c:90 → attr.c:1330) resolves
+    // the default attribute source before anything is checked or written — so an
+    // `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish dies at the first admitted
+    // patch, under `--check` and `--stat` alike, and outside a repository names that
+    // instead (attr.c:1216-1226). Skipped patches before it have already been said.
+    let mut admitted: Vec<Patch> = Vec::with_capacity(patches.len());
+    for p in patches {
+        if !use_patch(&p, &prefix, &o.limits, o.has_include) {
+            if verbosity(&o).verbose {
+                eprintln!("Skipped patch '{}'.", say_patch_name(&p));
+            }
+            continue;
         }
+        if admitted.is_empty() {
+            let refusal = match crate::setup::discover() {
+                Ok(repo) => super::pack_objects::bad_default_attr_source(&repo),
+                Err(_) => std::env::var_os("GIT_ATTR_SOURCE")
+                    .map(|_| "cannot use --attr-source or GIT_ATTR_SOURCE without repo"),
+            };
+            if let Some(message) = refusal {
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+        admitted.push(p);
     }
+    let mut patches = admitted;
 
     // `apply_patch()` links each parsed patch onto the list it will walk, and under
     // `-R` it *prepends* instead of appending: `if (!list || !state->apply_in_reverse)
@@ -1353,7 +1362,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         // `check_patch_list()` (apply.c:4172): `apply_verbosity > verbosity_normal`,
         // which `--reject` reaches without `-v`.
         if verbosity(&o).verbose {
-            eprintln!("Checking patch {name}...");
+            eprintln!("Checking patch {}...", say_patch_name(p));
         }
 
         // A view of the index for this iteration; recomputed each time so no
@@ -4347,6 +4356,17 @@ fn rename_line(p: &Patch) -> String {
 // ---------------------------------------------------------------------------
 // --include / --exclude — port of apply.c:use_patch + wildmatch (flags 0)
 // ---------------------------------------------------------------------------
+
+/// `say_patch_name()` (apply.c:370-388): `old => new` when the patch renames, else the
+/// post-image name (the pre-image one for a deletion), each through `quote_c_style()`.
+fn say_patch_name(p: &Patch) -> String {
+    let quote = |n: &str| crate::quote::quoted_name_string(n.as_bytes());
+    match (p.old_name.as_deref(), p.new_name.as_deref()) {
+        (Some(old), Some(new)) if old != new => format!("{} => {}", quote(old), quote(new)),
+        (_, Some(n)) | (Some(n), None) => quote(n),
+        (None, None) => String::new(),
+    }
+}
 
 /// Whether a patch survives the `--include`/`--exclude` rule list: the first rule
 /// whose glob matches the patch's post-image name decides (its include/exclude

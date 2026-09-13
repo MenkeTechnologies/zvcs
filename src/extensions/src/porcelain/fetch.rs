@@ -476,16 +476,18 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
             // Submodule recursion and its parallelism.
             "--recurse-submodules" => {
+                // `option_fetch_parse_recurse_submodules()` → `parse_fetch_recurse()`
+                // (submodule-config.c:419-439, 457-476): `git_parse_maybe_bool()`'s
+                // whole grammar first (`on`, `1`, `TRUE`, ...), then `on-demand`,
+                // then `die("bad %s argument: %s", opt, arg)` with the long name.
                 recurse_submodules = Some(match inline_val.as_deref() {
-                    None | Some("yes") | Some("true") => Recurse::Yes,
-                    Some("no") | Some("false") => Recurse::No,
-                    Some("on-demand") => Recurse::OnDemand,
-                    // `parse_fetch_recurse_submodules_arg()` (submodule-config.c)
-                    // ends on `die("bad %s argument: %s", opt, arg)`, and the
-                    // option name it is given is the long name without dashes.
-                    Some(other) => {
-                        crate::git_fatal!("bad recurse-submodules argument: {other}")
-                    }
+                    None => Recurse::Yes,
+                    Some(v) => match crate::optint::maybe_bool(v) {
+                        Some(true) => Recurse::Yes,
+                        Some(false) => Recurse::No,
+                        None if v == "on-demand" => Recurse::OnDemand,
+                        None => crate::git_fatal!("bad recurse-submodules argument: {v}"),
+                    },
                 });
             }
             "--no-recurse-submodules" => recurse_submodules = Some(Recurse::No),
@@ -656,6 +658,43 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // ```c
+    // if (recurse_submodules_cli != RECURSE_SUBMODULES_DEFAULT)
+    //         config.recurse_submodules = recurse_submodules_cli;
+    // if (negotiate_only) {
+    //         switch (recurse_submodules_cli) {
+    //         case RECURSE_SUBMODULES_OFF:
+    //         case RECURSE_SUBMODULES_DEFAULT:
+    //                 config.recurse_submodules = RECURSE_SUBMODULES_OFF;
+    //                 break;
+    //         default:
+    //                 die(_("options '%s' and '%s' cannot be used together"),
+    //                     "--negotiate-only", "--recurse-submodules");
+    //         }
+    // }
+    // if (config.recurse_submodules != RECURSE_SUBMODULES_OFF) { ... fetch_config_from_gitmodules() }
+    // if (porcelain) { ... the same switch for "--porcelain" ... }
+    // ```
+    //
+    // (builtin/fetch.c:2616-2662.) Both refusals look at the command line alone, directly
+    // after `parse_options()` and ahead of every other check, so `--negotiate-only
+    // --recurse-submodules` is refused before the missing tips are, and a configured
+    // `fetch.recurseSubmodules` or `submodule.recurse` is silently switched off instead.
+    let cli_recurses = matches!(recurse_submodules, Some(Recurse::Yes | Recurse::OnDemand));
+    if opts.negotiate_only && cli_recurses {
+        crate::git_fatal!("options '--negotiate-only' and '--recurse-submodules' cannot be used together");
+    }
+    if opts.porcelain && cli_recurses {
+        crate::git_fatal!("options '--porcelain' and '--recurse-submodules' cannot be used together");
+    }
+    // `config.recurse_submodules` as `cmd_fetch()` leaves it: `None` is
+    // `RECURSE_SUBMODULES_DEFAULT`, which `add_options_to_argv()` does not forward.
+    let resolved_recurse = if opts.negotiate_only || opts.porcelain {
+        Some(Recurse::No)
+    } else {
+        recurse_for_children(&repo, recurse_submodules)
+    };
+
     // `--stdin` refspecs are appended after everything named on the command line,
     // as git's `add_refspec` on the stdin lines does.
     let stdin_specs: Vec<String> = if read_stdin {
@@ -780,21 +819,11 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         opts.compact = snap
             .string("fetch.output")
             .is_some_and(|v| v == "compact");
-        // `fetch.recurseSubmodules` supplies the default. git's *unset* default is
-        // `on-demand` as well; see [`Recurse`] for why this build still answers
-        // an unset key with "off".
-        recurse = match recurse_submodules {
-            Some(r) => r,
-            None => match snap
-                .string("fetch.recurseSubmodules")
-                .map(|v| v.to_string())
-                .as_deref()
-            {
-                Some("yes" | "true" | "on" | "1") => Recurse::Yes,
-                Some("on-demand") => Recurse::OnDemand,
-                _ => Recurse::No,
-            },
-        };
+        // `submodule.recurse`, `fetch.recurseSubmodules` and `.gitmodules` supply the
+        // default, resolved above exactly as `cmd_fetch()` resolves them. git's *unset*
+        // default is `on-demand` as well; see [`Recurse`] for why this build still
+        // answers it with "off".
+        recurse = resolved_recurse.unwrap_or(Recurse::No);
         opts.recurse = recurse;
         // `fetch.parallel` is git's default for `-j`, and is itself 1 when unset;
         // an explicit `0` on either means "pick a reasonable number", which here
@@ -971,7 +1000,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         if opts.keep {
             push("--keep");
         }
-        match recurse_for_children(&repo, recurse_submodules) {
+        match resolved_recurse {
             Some(Recurse::Yes) => push("--recurse-submodules"),
             Some(Recurse::No) => push("--no-recurse-submodules"),
             Some(Recurse::OnDemand) => push("--recurse-submodules=on-demand"),
@@ -1088,10 +1117,6 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         };
         if opts.negotiation_restrict.is_none() && !configured_tips {
             eprintln!("fatal: --negotiate-only needs one or more --negotiation-restrict=*");
-            return Ok(ExitCode::from(128));
-        }
-        if recurse == Recurse::Yes {
-            eprintln!("fatal: options '--negotiate-only' and '--recurse-submodules' cannot be used together");
             return Ok(ExitCode::from(128));
         }
     }

@@ -712,7 +712,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
         if let Some(mode) = stat_config(&snap) {
             opts.stat = mode;
         }
-        merge_log_config = shortlog_config(&snap);
+        merge_log_config = shortlog_config(&repo)?;
         opts.branch_desc = snap.boolean("merge.branchdesc").unwrap_or(false);
         opts.autostash = snap.boolean("merge.autoStash").unwrap_or(false);
         // `commit.gpgsign` sets git's `sign_commit` to the empty key, meaning
@@ -3614,16 +3614,62 @@ fn stat_config(snapshot: &gix::config::Snapshot<'_>) -> Option<StatMode> {
 }
 
 /// `merge.log` / `merge.summary` (the deprecated synonym) folded to a shortlog
-/// length by `git_config_bool_or_int()`: an integer is taken as-is, a true
-/// boolean is `DEFAULT_MERGE_LOG_LEN`, a false one (and an unset key) is 0.
-fn shortlog_config(snapshot: &gix::config::Snapshot<'_>) -> i64 {
-    let plumbing = snapshot.plumbing();
-    let log = plumbing.values::<BString>("merge.log").unwrap_or_default();
-    let summary = plumbing.values::<BString>("merge.summary").unwrap_or_default();
-    log.last()
-        .or(summary.last())
-        .and_then(|v| bool_or_int(v.as_bstr()))
-        .unwrap_or(0)
+/// length by `fmt_merge_msg_config()` (fmt-merge-msg.c:22-28), which
+/// `git_merge_config` reaches once per configured value in parse order — so the
+/// later of the two keys wins, and the first unparseable one is fatal:
+///
+/// ```c
+/// merge_log_config = git_config_bool_or_int(key, value, &is_bool);
+/// if (!is_bool && merge_log_config < 0)
+///         return error("%s: negative length %s", key, value);
+/// if (is_bool && merge_log_config)
+///         merge_log_config = DEFAULT_MERGE_LOG_LEN;
+/// ```
+///
+/// `git_config_bool_or_int()` (config.c:1436-1445) tries only the boolean
+/// *words* (`git_parse_maybe_bool_text`, where a valueless key is true) and then
+/// `git_config_int()`, which dies through `die_bad_number` — so `-c 'merge.log=1 '`
+/// is `bad numeric config value '1 ' for 'merge.log': invalid unit` at 128, not
+/// a length of one. A negative integer is the `return error()` arm, which
+/// `configset_iter()` turns into the origin-named fatal — measured against git
+/// 2.55.0:
+///
+/// ```text
+/// $ git -c merge.log=-3 merge side
+/// error: merge.log: negative length -3
+/// fatal: unable to parse 'merge.log' from command-line config
+/// ```
+fn shortlog_config(repo: &gix::Repository) -> Result<i64> {
+    let mut len = 0;
+    for v in crate::config::walk_config(repo) {
+        if v.key != "merge.log" && v.key != "merge.summary" {
+            continue;
+        }
+        let as_bool = match v.value.as_deref() {
+            None => Some(true),
+            Some(raw) => crate::optint::maybe_bool_text(raw),
+        };
+        len = match (as_bool, v.value.as_deref()) {
+            (Some(true), _) => DEFAULT_MERGE_LOG_LEN,
+            (Some(false), _) => 0,
+            (None, raw) => {
+                let raw = raw.unwrap_or("");
+                match crate::config::parse_config_int(raw) {
+                    Ok(n) if n < 0 => {
+                        eprintln!("error: {}: negative length {raw}", v.key);
+                        crate::git_fatal!("{}", v.origin.die_linenr(&v.key));
+                    }
+                    Ok(n) => n,
+                    Err(reason) => crate::git_fatal!(
+                        "bad numeric config value '{raw}' for '{}'{}: {reason}",
+                        v.key,
+                        v.origin.bad_number_clause()
+                    ),
+                }
+            }
+        };
+    }
+    Ok(len)
 }
 
 /// `git_parse_int()` behind parse-options' `OPT_INTEGER`, through the shared
@@ -3634,18 +3680,6 @@ fn parse_option_int(value: &str) -> Option<i64> {
     crate::optint::integer(&crate::optint::long_opt("log"), value).ok()
 }
 
-/// `git_config_bool_or_int()` as the shortlog length reads it.
-fn bool_or_int(value: &BStr) -> Option<i64> {
-    let text = value.to_str().ok()?;
-    if let Ok(n) = text.trim().parse::<i64>() {
-        return Some(n);
-    }
-    match text.to_ascii_lowercase().as_str() {
-        "" | "true" | "yes" | "on" => Some(DEFAULT_MERGE_LOG_LEN),
-        "false" | "no" | "off" => Some(0),
-        _ => None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The merge message: title, `--log` shortlog, `--edit` comment block

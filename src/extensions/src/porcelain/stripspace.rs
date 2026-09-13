@@ -363,6 +363,10 @@ fn comment_string() -> Result<Result<Vec<u8>, ExitCode>> {
     // Like `setup_git_directory_gently()`: a repository is preferred, but the
     // command is legal outside one, where git reads the global set plus the
     // `GIT_CONFIG_*` overrides.
+    //
+    // `-s` and `-c` are the only modes that run that setup
+    // (builtin/stripspace.c:56-59), after option parsing.
+    crate::config::check_bare_and_worktree();
     let config = match crate::setup::discover() {
         Ok(repo) => repo.config_snapshot().plumbing().clone(),
         Err(_) => {

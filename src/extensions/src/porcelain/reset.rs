@@ -728,7 +728,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
                 }
             }
             ResetMode::Hard | ResetMode::Merge | ResetMode::Keep => {
-                crate::git_fatal!("this operation must be run in a work tree")
+                return Err(crate::fatal::need_work_tree())
             }
         }
     }

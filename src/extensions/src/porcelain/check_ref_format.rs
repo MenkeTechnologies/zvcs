@@ -197,6 +197,9 @@ fn usage_error() -> ExitCode {
 /// reached. Rejection is git's `die()`: the message on stderr and exit 128.
 /// Acceptance prints the expanded shorthand.
 fn check_ref_format_branch(arg: &str) -> Result<ExitCode> {
+    // `setup_git_directory_gently()` (builtin/check-ref-format.c:47) — the only
+    // mode of this command that looks for a repository at all.
+    crate::config::check_bare_and_worktree();
     let expanded = match crate::setup::discover() {
         Ok(repo) => match copy_branchname(&repo, arg) {
             Ok(name) => name,

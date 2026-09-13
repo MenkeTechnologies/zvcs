@@ -1944,8 +1944,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // git resolves the tree-ish before it notices there is no worktree, so a bare repo
     // reaches this `fatal` (exit 128) rather than the earlier usage error.
     if !opts.cached && repo.workdir().is_none() {
-        eprintln!("fatal: this operation must be run in a work tree");
-        return Ok(ExitCode::from(128));
+        return Err(crate::fatal::need_work_tree());
     }
 
     // Magic (`:(…)`) and glob (`* ? [`) pathspecs go through gitoxide's pathspec engine,
@@ -2524,7 +2523,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
 
     let workdir: Option<PathBuf> = repo.workdir().map(Path::to_path_buf);
     if !opts.cached && workdir.is_none() {
-        crate::git_fatal!("this operation must be run in a work tree");
+        return Err(crate::fatal::need_work_tree());
     }
     let index_timestamp = index_state.timestamp().unix_seconds();
     // `core.trustCTime` / `core.checkStat`, which decide how much of the stat data

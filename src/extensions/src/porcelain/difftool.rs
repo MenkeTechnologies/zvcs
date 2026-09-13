@@ -359,8 +359,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
         }
     };
     if repo.workdir().is_none() {
-        eprintln!("fatal: this operation must be run in a work tree");
-        return Ok(ExitCode::from(128));
+        return Err(crate::fatal::need_work_tree());
     }
 
     // Phase 3 — `die_for_incompatible_opt3` (C step 4) then the empty-value

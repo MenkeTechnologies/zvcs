@@ -1739,6 +1739,11 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             // git reads `git_help_config` only once it has a topic, then lets
             // the command line override the configured format, then falls back
             // to `DEFAULT_HELP_FORMAT` ("man").
+            //
+            // `setup_git_directory_gently()` runs here and nowhere earlier in
+            // `cmd_help()` (builtin/help.c:743), so `-a`, `-g`, `--config` and a
+            // bare `help` never meet a repository's setup warnings.
+            crate::config::check_bare_and_worktree();
             let config = match help_config() {
                 Ok(c) => c,
                 Err(code) => return Ok(code),

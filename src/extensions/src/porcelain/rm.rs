@@ -289,7 +289,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
     let workdir = match repo.workdir() {
         Some(w) => w.to_owned(),
-        None => return Ok(fatal("this operation must be run in a work tree")),
+        None => return Err(crate::fatal::need_work_tree()),
     };
 
     // Serialize the whole read-modify-write of the index through the repo

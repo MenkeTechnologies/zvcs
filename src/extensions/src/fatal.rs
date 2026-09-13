@@ -78,7 +78,18 @@ pub fn die(message: impl Into<String>) -> anyhow::Error {
 /// git's `setup_work_tree()`: the commands that need a work tree die with this
 /// when setup did not find one, which is what standing in a `.git` directory or
 /// a bare repository leaves them with.
+///
+/// A repository setup marked bogus answers first (setup.c:500-501), whether or
+/// not a work tree would otherwise have been found:
+///
+/// ```c
+/// if (repo->worktree_config_is_bogus)
+///         die(_("unable to set up work tree using invalid config"));
+/// ```
 pub fn need_work_tree() -> anyhow::Error {
+    if crate::config::worktree_config_is_bogus() {
+        return die("unable to set up work tree using invalid config");
+    }
     die("this operation must be run in a work tree")
 }
 

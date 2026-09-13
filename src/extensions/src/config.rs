@@ -2670,6 +2670,107 @@ pub fn repository_format_refusal() -> Option<String> {
     verify_repository_format(&format)
 }
 
+/// `repo->worktree_config_is_bogus` — set once [`check_bare_and_worktree`] has
+/// warned, and read by every port of `setup_work_tree()` through
+/// [`crate::fatal::need_work_tree`].
+static WORKTREE_CONFIG_IS_BOGUS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether setup found `core.bare = true` next to a `core.worktree` and so left
+/// the repository unable to set up a work tree (setup.c:1147-1148).
+pub fn worktree_config_is_bogus() -> bool {
+    WORKTREE_CONFIG_IS_BOGUS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The `core.bare` / `core.worktree` half of `setup_git_directory_gently()`:
+/// warn when the repository's own config asks for both, and remember it for
+/// `setup_work_tree()`.
+///
+/// `check_repository_format_gently()` (setup.c:753-809) collects the two keys
+/// through `read_worktree_config()` (setup.c:587-602) — from
+/// `$GIT_COMMON_DIR/config` during `read_repository_format()`, then, when
+/// `extensions.worktreeConfig` is on, from `$GIT_DIR/config.worktree` on top —
+/// and installs them only when there is no common directory or the per-worktree
+/// file was read:
+///
+/// ```c
+/// if (candidate->version < 0)
+///         return 0;
+/// …
+/// if (!has_common) {
+///         if (candidate->is_bare != -1)
+///                 is_bare_repository_cfg = candidate->is_bare;
+///         if (candidate->work_tree)
+///                 git_work_tree_cfg = xstrdup(candidate->work_tree);
+/// }
+/// ```
+///
+/// Every discovery path that holds a `git_work_tree_cfg` ends in
+/// `setup_explicit_git_dir()` (setup.c:1217, 1267), whose second arm is the one
+/// reproduced here (setup.c:1142-1155):
+///
+/// ```c
+/// if (work_tree_env)
+///         set_git_work_tree(repo, work_tree_env);
+/// else if (is_bare_repository_cfg > 0) {
+///         if (git_work_tree_cfg) {
+///                 warning("core.bare and core.worktree do not make sense");
+///                 repo->worktree_config_is_bogus = true;
+///         }
+/// ```
+///
+/// Only the files count: `read_repository_format()` uses
+/// `git_config_from_file()`, so neither `-c core.bare=false` nor an `[include]`
+/// changes the answer. A format `verify_repository_format()` refuses returns
+/// before any of this, as does a config that names no version.
+pub fn check_bare_and_worktree() {
+    if std::env::var_os("GIT_WORK_TREE").is_some() {
+        return;
+    }
+    let Some(dirs) = repository_directories() else {
+        return;
+    };
+    let common_config = dirs.common_dir.join("config");
+    let format = read_repository_format(&common_config);
+    if format.version < 0 || verify_repository_format(&format).is_some() {
+        return;
+    }
+    // `get_common_dir()`: `$GIT_COMMON_DIR`, or a `commondir` file in `$GIT_DIR`.
+    let mut has_common = std::env::var_os("GIT_COMMON_DIR").is_some()
+        || dirs.git_dir.join("commondir").is_file();
+    let (mut is_bare, mut work_tree) = read_bare_and_worktree(&common_config);
+    if worktree_config_enabled(&common_config) {
+        let (bare, tree) = read_bare_and_worktree(&dirs.git_dir.join("config.worktree"));
+        is_bare = bare.or(is_bare);
+        work_tree = tree.or(work_tree);
+        has_common = false;
+    }
+    if has_common || is_bare != Some(true) || work_tree.is_none() {
+        return;
+    }
+    eprintln!("warning: core.bare and core.worktree do not make sense");
+    WORKTREE_CONFIG_IS_BOGUS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `read_worktree_config()` over one file: the last `core.bare` and the last
+/// `core.worktree` it names. A valueless `core.worktree` never gets here — the
+/// read refuses it first ([`extension_value_refusal`]).
+fn read_bare_and_worktree(path: &std::path::Path) -> (Option<bool>, Option<String>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (None, None);
+    };
+    let Ok(file) = gix::config::File::from_bytes_no_includes(
+        &bytes,
+        gix::config::file::Metadata::from(gix::config::Source::Local),
+        Default::default(),
+    ) else {
+        return (None, None);
+    };
+    let is_bare = file.boolean("core.bare").ok().flatten();
+    let work_tree = file.string("core.worktree").map(|v| v.to_string());
+    (is_bare, work_tree)
+}
+
 /// The `fatal:` line git would have printed for a repository this port failed to
 /// open, searched for anywhere in an `anyhow` chain.
 ///

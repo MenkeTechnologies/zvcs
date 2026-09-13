@@ -265,6 +265,11 @@ const NEED_WORK_TREE: &[&str] = &[
 /// there is none at all, git's `RUN_SETUP` has already died with "not a git
 /// repository", which each command still reports for itself.
 pub(crate) fn setup_work_tree() -> anyhow::Result<()> {
+    // `if (repo->worktree_config_is_bogus) die(…)` is the first line of
+    // `setup_work_tree()` (setup.c:500-501).
+    if crate::config::worktree_config_is_bogus() {
+        return Err(crate::fatal::need_work_tree());
+    }
     if let Ok(repo) = crate::setup::discover() {
         // A relative `core.worktree` is installed by walking to it —
         // `if (chdir(git_work_tree_cfg)) die_errno(_("cannot chdir to '%s'"), …)`
@@ -286,6 +291,38 @@ pub(crate) fn setup_work_tree() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// The verbs [`run`] does not put through setup's `core.bare` + `core.worktree`
+/// check ([`crate::config::check_bare_and_worktree`]).
+///
+/// Their `commands[]` entries carry neither `RUN_SETUP` nor `RUN_SETUP_GENTLY`
+/// (git.c:545-679), and their builtins never call `setup_git_directory*()` on the
+/// way to an answer. Three more call `setup_git_directory_gently()` themselves in
+/// one mode only and so make the check at that point: `check-ref-format --branch`
+/// (builtin/check-ref-format.c:47), `stripspace -s`/`-c`
+/// (builtin/stripspace.c:57) and `help <topic>` (builtin/help.c:743).
+///
+/// Measured against git 2.55.0 in a repository with `core.bare = true` and
+/// `core.worktree = ..`: each of these, run bare, prints no warning, while every
+/// other builtin prints it before its own output.
+const SETUP_FREE_VERBS: &[&str] = &[
+    "check-ref-format",
+    "clone",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
+    "get-tar-commit-id",
+    "help",
+    "init",
+    "init-db",
+    "mailsplit",
+    "remote-ext",
+    "remote-fd",
+    "stripspace",
+    "url-parse",
+    "verify-pack",
+    "version",
+];
 
 /// The verbs that put this repository through `prepare_repo_settings()` before
 /// they do anything else (`crate::repo_settings`).
@@ -1282,6 +1319,19 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // Only a repository that was found but has no work tree refuses here: when
     // there is none at all, git's `RUN_SETUP` has already died with "not a git
     // repository", which each command still reports for itself.
+    // `setup_git_directory_gently()`'s `core.bare` + `core.worktree` warning
+    // (setup.c:1144-1149). It belongs to setup, so it precedes everything the
+    // builtin says — its usage, its `-h`, the work-tree gate below — and it is
+    // placed after the `--help` rewrite because `cmd_help()` runs its own setup.
+    let rev_parse_before_setup =
+        sub == "rev-parse" && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote");
+    if !SETUP_FREE_VERBS.contains(&sub)
+        && !SUPERSET_VERBS.contains(&sub)
+        && !rev_parse_before_setup
+    {
+        crate::config::check_bare_and_worktree();
+    }
+
     let help_only = args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all");
     if !help_only && NEED_WORK_TREE.contains(&sub) {
         setup_work_tree()?;

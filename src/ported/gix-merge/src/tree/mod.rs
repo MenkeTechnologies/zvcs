@@ -237,7 +237,8 @@ impl Conflict {
             treat_as_unresolved::TreeMerge::EvasiveRenames | treat_as_unresolved::TreeMerge::ForcedResolution => {
                 match &self.resolution {
                     Ok(success) => match success {
-                        Resolution::SourceLocationAffectedByRename { .. } => false,
+                        Resolution::SourceLocationAffectedByRename { .. }
+                        | Resolution::DirectoryRenameSkippedDueToRerename { .. } => false,
                         Resolution::Forced(_) => {
                             how.tree_merge == treat_as_unresolved::TreeMerge::ForcedResolution
                                 || self
@@ -302,13 +303,17 @@ impl Conflict {
                 }
                 | ResolutionFailure::OursAddedTheirsAddedTypeMismatch { .. }
                 | ResolutionFailure::DirectoryRenameSuggested { .. }
+                | ResolutionFailure::DirectoryRenameSplit { .. }
+                | ResolutionFailure::DirectoryRenameFileInWay { .. }
+                | ResolutionFailure::DirectoryRenameCollision { .. }
                 | ResolutionFailure::OursDeletedTheirsRenamed => None,
             }
         }
         match &self.resolution {
             Ok(success) => match success {
                 Resolution::Forced(failure) => failure_merged_blob(failure),
-                Resolution::SourceLocationAffectedByRename { .. } => None,
+                Resolution::SourceLocationAffectedByRename { .. }
+                | Resolution::DirectoryRenameSkippedDueToRerename { .. } => None,
                 Resolution::OursModifiedTheirsRenamedAndChangedThenRename { merged_blob, .. } => *merged_blob,
                 Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { merged_blob } => Some(*merged_blob),
             },
@@ -353,6 +358,17 @@ pub enum Resolution {
     /// This is a resolution failure was forcefully turned into a usable resolution, i.e. [making a choice](ResolveWith)
     /// is turned into a valid resolution.
     Forced(ResolutionFailure),
+    /// A change landed in `old_dir`, which the other side renamed to `new_dir`, but the change's own
+    /// side renamed `new_dir` away too, so the change was left where it was
+    /// (`INFO_DIR_RENAME_SKIPPED_DUE_TO_RERENAME`, merge-ort.c:2676-2684).
+    DirectoryRenameSkippedDueToRerename {
+        /// The directory the other side renamed.
+        old_dir: BString,
+        /// The path of the change that stayed in place.
+        path: BString,
+        /// Where the other side renamed `old_dir` to.
+        new_dir: BString,
+    },
 }
 
 /// Describes of a conflict involving *our* change and *their* failed to be resolved.
@@ -402,6 +418,30 @@ pub enum ResolutionFailure {
         /// The repository-relative path the change ended up in after following the
         /// directory rename.
         final_location: BString,
+    },
+    /// The renames out of `source_dir` went to several directories with no strict majority, so
+    /// no directory rename was derived for it (`CONFLICT_DIR_RENAME_SPLIT`, merge-ort.c:2496-2504).
+    /// `ours` and `theirs` are a tree deletion at `source_dir`.
+    DirectoryRenameSplit {
+        /// The directory whose destination is unclear.
+        source_dir: BString,
+    },
+    /// A directory rename would move `source_files` to `new_path`, where something is already in
+    /// the way, so they were left where they were (`CONFLICT_DIR_RENAME_FILE_IN_WAY`,
+    /// merge-ort.c:2419-2434).
+    DirectoryRenameFileInWay {
+        /// Where the directory rename would have put the paths.
+        new_path: BString,
+        /// The paths the directory rename would have moved there, sorted.
+        source_files: Vec<BString>,
+    },
+    /// Directory renames would move all of `source_files` to the one path `new_path`, so none of
+    /// them was moved (`CONFLICT_DIR_RENAME_COLLISION`, merge-ort.c:2435-2446).
+    DirectoryRenameCollision {
+        /// Where the directory renames would have put the paths.
+        new_path: BString,
+        /// The paths the directory renames would have moved there, sorted.
+        source_files: Vec<BString>,
     },
     /// *ours* and *theirs* are in an untested state so it can't be handled yet, and is considered a conflict
     /// without adding our *or* their side to the resulting tree.
@@ -482,6 +522,7 @@ pub enum ResolveWith {
     Ours,
 }
 
+mod dir_renames;
 pub(super) mod function;
 mod utils;
 ///
@@ -541,7 +582,7 @@ pub mod apply_index_entries {
             for conflict in conflicts.iter().filter(|c| c.is_unresolved(how)) {
                 let (renamed_path, current_path): (Option<&BStr>, &BStr) = match &conflict.resolution {
                     Ok(success) => match success {
-                        Resolution::Forced(_) => continue,
+                        Resolution::Forced(_) | Resolution::DirectoryRenameSkippedDueToRerename { .. } => continue,
                         Resolution::SourceLocationAffectedByRename { final_location } => {
                             (Some(final_location.as_bstr()), final_location.as_bstr())
                         }
@@ -578,6 +619,11 @@ pub mod apply_index_entries {
                         ResolutionFailure::DirectoryRenameSuggested { final_location } => {
                             (Some(final_location.as_bstr()), final_location.as_bstr())
                         }
+                        // Nothing was moved and no stage is recorded; the merge is merely
+                        // not clean.
+                        ResolutionFailure::DirectoryRenameSplit { .. }
+                        | ResolutionFailure::DirectoryRenameFileInWay { .. }
+                        | ResolutionFailure::DirectoryRenameCollision { .. } => continue,
                     },
                 };
                 let source_path = conflict.ours.source_location();

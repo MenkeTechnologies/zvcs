@@ -415,6 +415,50 @@ fn render_one<'r, 's>(
             )?);
         }
 
+        // `handle_path_level_conflicts()` (merge-ort.c:2419-2446): the paths a
+        // directory rename would have moved stay put. git lists them after the
+        // new path, in `string_list_insert()` order.
+        Err(ResolutionFailure::DirectoryRenameFileInWay { new_path, source_files }) => {
+            let joined = join_paths(source_files);
+            out.push(Message {
+                paths: std::iter::once(new_path.clone()).chain(source_files.iter().cloned()).collect(),
+                ctype: "CONFLICT (file in way of directory rename)",
+                text: format!(
+                    "CONFLICT (implicit dir rename): Existing file/dir at {new_path} in the way of implicit directory rename(s) putting the following path(s) there: {joined}.\n"
+                ),
+            });
+        }
+        Err(ResolutionFailure::DirectoryRenameCollision { new_path, source_files }) => {
+            let joined = join_paths(source_files);
+            out.push(Message {
+                paths: std::iter::once(new_path.clone()).chain(source_files.iter().cloned()).collect(),
+                ctype: "CONFLICT(directory rename collision)",
+                text: format!(
+                    "CONFLICT (implicit dir rename): Cannot map more than one path to {new_path}; implicit directory renames tried to put these paths there: {joined}\n"
+                ),
+            });
+        }
+        // `get_provisional_directory_renames()` (merge-ort.c:2496-2504).
+        Err(ResolutionFailure::DirectoryRenameSplit { source_dir }) => {
+            out.push(Message {
+                paths: vec![source_dir.clone()],
+                ctype: "CONFLICT(directory rename unclear split)",
+                text: format!(
+                    "CONFLICT (directory rename split): Unclear where to rename {source_dir} to; it was renamed to multiple other directories, with no destination getting a majority of the files.\n"
+                ),
+            });
+        }
+        // `check_for_directory_rename()` (merge-ort.c:2676-2684).
+        Ok(Resolution::DirectoryRenameSkippedDueToRerename { old_dir, path, new_dir }) => {
+            out.push(Message {
+                paths: vec![old_dir.clone(), path.clone(), new_dir.clone()],
+                ctype: "Directory rename skipped since directory was renamed on both sides",
+                text: format!(
+                    "WARNING: Avoiding applying {old_dir} -> {new_dir} rename to {path}, because {new_dir} itself was renamed.\n"
+                ),
+            });
+        }
+
         _ => return Ok(None),
     }
     Ok(Some(out))
@@ -472,6 +516,15 @@ fn directory_rename_message<'r, 's>(
         },
         text,
     })
+}
+
+/// `strbuf_add_separated_string_list(&buf, ", ", list)`.
+fn join_paths(paths: &[BString]) -> String {
+    paths
+        .iter()
+        .map(|p| p.to_str_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// merge-ort's modify/delete notice (merge-ort.c:4406-4410), shared by the
@@ -545,7 +598,8 @@ pub fn conflict_location(conflict: &Conflict) -> BString {
             final_location: Some(final_location),
             ..
         },
-    ) = &conflict.resolution
+    )
+    | Err(ResolutionFailure::DirectoryRenameSuggested { final_location }) = &conflict.resolution
     {
         return final_location.clone();
     }

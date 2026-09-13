@@ -23,41 +23,6 @@ use crate::{
     },
 };
 
-/// Assuming that `their_location` is the destination of *their* rewrite, check if *it* passes
-/// over a directory rewrite in *our* tree. If so, rewrite it so that we get the path
-/// it would have had if it had been renamed along with *our* directory.
-pub fn possibly_rewritten_location(
-    check_tree: &TreeNodes,
-    their_location: &BStr,
-    our_changes: &ChangeListRef,
-) -> Option<BString> {
-    check_tree.check_conflict(their_location).and_then(|pc| match pc {
-        PossibleConflict::PassedRewrittenDirectory { change_idx } => {
-            let passed_change = &our_changes[change_idx];
-            rewrite_location_with_renamed_directory(their_location, &passed_change.inner)
-        }
-        _ => None,
-    })
-}
-
-pub fn rewrite_location_with_renamed_directory(their_location: &BStr, passed_change: &Change) -> Option<BString> {
-    match passed_change {
-        Change::Rewrite {
-            source_location,
-            location,
-            ..
-        } if passed_change.entry_mode().is_tree() => {
-            // This is safe even without dealing with slashes as we found this rewrite
-            // by walking each component, and we know it's a tree for added safety.
-            let suffix = their_location.strip_prefix(source_location.as_bytes())?;
-            let mut rewritten = location.to_owned();
-            rewritten.push_str(suffix);
-            Some(rewritten)
-        }
-        _ => None,
-    }
-}
-
 /// Produce a unique path within the directory that contains the file at `file_path` like `a/b`, using `editor`
 /// and `tree` to assure unique names, to obtain the tree at `a/` and `side_name` to more clearly signal
 /// where the file is coming from.
@@ -80,7 +45,17 @@ pub fn unique_path_in_tree(
     // We could use a cursor here, but clashes are so unlikely that this wouldn't be meaningful for performance.
     let base_len = buf.len();
     let mut suffix = 0;
-    while editor.get(to_components_bstring_ref(&buf)).is_some() || tree.check_conflict(buf.as_bstr()).is_some() {
+    // `unique_path()` (merge-ort.c:930-935) only skips names that exist *exactly*:
+    // `strmap_contains(existing_paths, newpath.buf)`. A lookup that merely passes a
+    // changed directory on the way is not an occupied name, and counting it as one
+    // never terminates once that directory is the candidate's parent.
+    let occupied = |path: &BStr| {
+        matches!(
+            tree.check_conflict(path),
+            Some(PossibleConflict::Match { .. } | PossibleConflict::TreeToNonTree { .. })
+        )
+    };
+    while editor.get(to_components_bstring_ref(&buf)).is_some() || occupied(buf.as_bstr()) {
         buf.truncate(base_len);
         buf.push_str(format!("_{suffix}"));
         suffix += 1;
@@ -221,11 +196,25 @@ pub struct TrackedChange {
     /// The `ours_idx_to_ignore` assures that the same rewrite won't be used as matching side, which
     /// would lead to strange effects. Only set if it's a rewrite though.
     pub needs_tree_insertion: Option<Option<usize>>,
-    /// A new `(location, change_idx)` pair for the change that can happen if the location is touching a rewrite in a parent
-    /// directory, but otherwise doesn't have a match. This means we shall redo the operation but with
-    /// the changed path.
-    /// The second tuple entry `change_idx` is the change-idx we passed over, which refers to the other side that interfered.
-    pub rewritten_location: Option<(BString, usize)>,
+    /// The location this change had before a directory rename moved it, if one did.
+    /// merge-ort moves the path's `conflict_info` but leaves `pathnames[side]` alone
+    /// (merge-ort.c:2826-2845), so content merges still label this side with it.
+    pub location_before_directory_rename: Option<BString>,
+}
+
+impl TrackedChange {
+    /// The path merge-ort's `pathnames[side]` holds for this change: where its side
+    /// put it, before any directory rename moved it.
+    pub fn label_location(&self) -> &BString {
+        self.location_before_directory_rename
+            .as_ref()
+            .unwrap_or_else(|| match &self.inner {
+                Change::Addition { location, .. }
+                | Change::Deletion { location, .. }
+                | Change::Modification { location, .. }
+                | Change::Rewrite { location, .. } => location,
+            })
+    }
 }
 
 pub type ChangeList = Vec<TrackedChange>;
@@ -260,7 +249,7 @@ pub fn track(change: ChangeRef<'_>, changes: &mut ChangeList) {
         },
         was_written: is_tree,
         needs_tree_insertion: None,
-        rewritten_location: None,
+        location_before_directory_rename: None,
     });
 }
 

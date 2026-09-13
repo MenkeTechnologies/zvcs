@@ -706,6 +706,101 @@ fn reported(v: &ConfigValue, errors: Vec<String>) -> Rejection {
 }
 
 // ---------------------------------------------------------------------------
+// merge
+// ---------------------------------------------------------------------------
+
+/// `repo_config(the_repository, git_merge_config, &merge_log_config)` —
+/// `cmd_merge` (builtin/merge.c:1400), after `show_usage_with_options_if_asked()`
+/// and before `parse_options()`, so it refuses `--abort`, `--quit` and
+/// `--continue` exactly as it refuses a merge.
+///
+/// Measured against git 2.55.0 in a repository with a conflicted merge:
+///
+/// ```text
+/// $ git -c diff.renameLimit=always merge --abort
+/// fatal: bad numeric config value 'always' for 'diff.renamelimit': invalid unit
+/// $ git -c color.ui=bogus -c merge.autostash=bogus merge --quit
+/// fatal: bad boolean config value 'bogus' for 'color.ui'
+/// $ git -c merge.autostash=bogus -c color.ui=bogus merge --quit
+/// fatal: bad boolean config value 'bogus' for 'merge.autostash'
+/// ```
+pub fn validate_merge(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_merge_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
+/// `git_merge_config()` (builtin/merge.c:661-741), keeping only the arms that
+/// can refuse a value.
+///
+/// `branch.<current>.mergeoptions` returns before anything else and is split by
+/// `porcelain::merge` itself. `merge.stat`/`merge.diffstat` and `merge.ff`
+/// accept any value ("A setting from a future?"). `merge.verifysignatures`,
+/// `merge.stat` and `gpg.mintrustlevel` do not return, so they still fall
+/// through to `fmt_merge_msg_config` and `git_diff_ui_config`, which claim none
+/// of them.
+fn git_merge_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    match key {
+        "merge.verifysignatures" => {
+            bool_value(v, key)?;
+        }
+        "pull.twohead" | "pull.octopus" | "commit.cleanup" => {
+            string_value(v)?;
+            return Ok(());
+        }
+        "merge.ff" => return Ok(()),
+        "merge.defaulttoupstream" | "commit.gpgsign" | "merge.autostash" => {
+            bool_value(v, key)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+    fmt_merge_msg_config(v, out)?;
+    crate::diff_config::git_diff_ui_config(v, out)
+}
+
+/// `fmt_merge_msg_config()` (fmt-merge-msg.c:26-52).
+///
+/// ```c
+/// if (!strcmp(key, "merge.log") || !strcmp(key, "merge.summary")) {
+///         int is_bool;
+///         *merge_log_config = git_config_bool_or_int(key, value, ctx->kvi, &is_bool);
+///         if (!is_bool && *merge_log_config < 0)
+///                 return error("%s: negative length %s", key, value);
+///         ...
+/// } else if (!strcmp(key, "merge.branchdesc")) {
+///         use_branch_desc = git_config_bool(key, value);
+/// } else if (!strcmp(key, "merge.suppressdest")) {
+///         if (!value)
+///                 return config_error_nonbool(key);
+///         ...
+/// } else {
+///         return git_default_config(key, value, ctx, cb);
+/// }
+/// ```
+fn fmt_merge_msg_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    match key {
+        "merge.log" | "merge.summary" => {
+            let Some(raw) = v.value.as_deref() else {
+                return Ok(());
+            };
+            // `git_parse_maybe_bool_text` first, so `1` is a length, not a word.
+            if crate::optint::maybe_bool_text(raw).is_none() && int_value(v, key)? < 0 {
+                return Err(reported(v, vec![format!("{key}: negative length {raw}")]));
+            }
+            Ok(())
+        }
+        "merge.branchdesc" => bool_value(v, key).map(|_| ()),
+        "merge.suppressdest" => string_value(v).map(|_| ()),
+        _ => git_default_config(v, out),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // merge-recursive
 // ---------------------------------------------------------------------------
 

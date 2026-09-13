@@ -1219,7 +1219,32 @@ struct Analysis {
 pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `builtin_diff()` splits before anything else: `--no-index` compares two paths
     // on disk and needs no repository, so it cannot wait for discovery below.
-    if args.iter().take_while(|a| *a != "--").any(|a| a == "--no-index") {
+    //
+    // ```c
+    // for (i = 1; i < argc; i++) {
+    //         if (!strcmp(argv[i], "--")) { i++; break; }
+    //         if (!strcmp(argv[i], "--no-index")) no_index = DIFF_NO_INDEX_EXPLICIT;
+    //         if (argv[i][0] != '-') break;
+    // }
+    // ```
+    //
+    // (builtin/diff.c:438-446.) The scan stops at the first non-option, so a
+    // `--no-index` written behind a revision is not the explicit form: `git diff
+    // HEAD --cached --no-index` is an ordinary diff that goes on to set up the
+    // repository (and die on a broken `.git/config`) rather than the no-index
+    // parser's `unknown option `cached'`.
+    let explicit_no_index = args
+        .iter()
+        .take_while(|a| *a != "--")
+        .scan(false, |stop, a| {
+            if *stop {
+                return None;
+            }
+            *stop = !a.starts_with('-');
+            Some(a)
+        })
+        .any(|a| a == "--no-index");
+    if explicit_no_index {
         return super::diff_no_index::run(args);
     }
     let mut cached = false;
@@ -1605,6 +1630,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut revs_uninteresting: Vec<bool> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     let mut in_rev_region = true;
+    // `symdiff_prepare()`'s tallies over `rev->cmdline` (builtin/diff.c:317-360): the
+    // `A..B` / `A...B` operands (each pends one `REV_CMD_LEFT`) and the plain
+    // revisions (`REV_CMD_REV`), which is all it needs to refuse a range that is
+    // not alone on the line.
+    let mut range_operands = 0usize;
+    let mut other_revisions = 0usize;
     // The first argument git would not resolve to an option, held until the whole command
     // line has been read. See [`invalid_option`].
     let mut invalid_arg: Option<String> = None;
@@ -1614,7 +1645,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // included. This holds the flag still waiting for that value.
     let mut pending_value: Option<String> = None;
 
-    for a in args {
+    for (arg_idx, a) in args.iter().enumerate() {
         if let Some(flag) = pending_value.take() {
             // `--` is not a value. `setup_revisions()` cuts the option region at
             // the separator before it parses a single option:
@@ -2376,6 +2407,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with('-') && !is_known_option(s) => {
                 invalid_arg.get_or_insert_with(|| s.to_owned());
             }
+            // `--no-index` is `cmd_diff()`'s own pre-scan word, never an option of
+            // `setup_revisions()`. Reaching this loop means the pre-scan stopped at
+            // an operand before it (see the top of this function), so the word is
+            // left in argv like any unknown option and ends in `usage()`: stock
+            // `git diff HEAD --no-index` exits 129 with the usage block.
+            "--no-index" => {
+                invalid_arg.get_or_insert_with(|| "--no-index".to_owned());
+            }
             // `-h` is `diff_opt_parse()`'s internal help, which `usage()`s the
             // block on **stderr** at 129 with no `error:` line — diff never
             // routes it to stdout, unlike the parse_options porcelain.
@@ -2434,6 +2473,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // directory rather than `HEAD..HEAD` — and the pathspec layer
                 // then rejects it for leaving the repository. See
                 // [`crate::objname::is_parent_directory_pathspec`].
+                let was_rev_region = in_rev_region;
                 if in_rev_region && crate::objname::is_parent_directory_pathspec(s, seen_dashdash) {
                     in_rev_region = false;
                 }
@@ -2502,6 +2542,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         revs_uninteresting.push(true);
                         revs.push(range.b.to_owned());
                         revs_uninteresting.push(false);
+                        range_operands += 1;
                         continue;
                     }
                     // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }`
@@ -2548,6 +2589,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         }
                         revs.push(bare.to_string());
                         revs_uninteresting.push(uninteresting);
+                        other_revisions += 1;
                         continue;
                     }
                     // `if (seen_dashdash || *arg == '^') die(_("bad revision '%s'"), arg);`
@@ -2578,6 +2620,26 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         return Ok(ExitCode::from(128));
                     }
                     in_rev_region = false;
+                }
+                // The pathspec break of `setup_revisions()` (revision.c:2896-2910):
+                //
+                // ```c
+                // for (j = i; j < argc; j++)
+                //         verify_filename(revs->prefix, argv[j], j == i);
+                // ```
+                //
+                // `argc` was already cut at the `--`, and the first element was
+                // checked above with the misspelt-revision wording. Every later one,
+                // options included, must name something in the worktree — so
+                // `git diff README.md main..HEAD` is `main..HEAD: no such path`.
+                if was_rev_region && !in_rev_region {
+                    let end = args.iter().position(|t| t == "--").unwrap_or(args.len());
+                    for t in args.get(arg_idx + 1..end).unwrap_or_default() {
+                        if let Some(msg) = crate::setup::verify_filename(t, false) {
+                            eprintln!("fatal: {msg}");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
                 }
                 paths.push(s.to_string());
             }
@@ -2657,6 +2719,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &paths) {
         eprintln!("fatal: {msg}");
         return Ok(ExitCode::from(128));
+    }
+
+    // `symdiff_prepare()` (builtin/diff.c:337-367): a second `REV_CMD_LEFT` is
+    // `usage(builtin_diff_usage)`, and so is any plain revision beside a range —
+    // "git diff A..B C..D" and "git diff A..B C" are both refused.
+    if range_operands > 1 || (range_operands == 1 && other_revisions > 0) {
+        return Ok(usage_error());
     }
 
     // `cmd_diff()` sorts the pending objects into two arrays before it dispatches

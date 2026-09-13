@@ -110,7 +110,26 @@ pub fn render<'r, 's>(
 ) -> Result<Vec<Message>> {
     let mut operands = Operands::new(label1, label2, operand1);
     let mut out: Vec<Message> = Vec::new();
+    // `ci->path_conflict`, as far as directory renames set it: only under
+    // `merge.directoryRenames=conflict` (merge-ort.c:2867-2872).
+    let path_conflicts: std::collections::HashSet<&BString> = conflicts
+        .iter()
+        .filter_map(|c| match &c.resolution {
+            Err(ResolutionFailure::DirectoryRenameSuggested { final_location }) => Some(final_location),
+            _ => None,
+        })
+        .collect();
     for conflict in conflicts {
+        // A modify/delete whose content equals the base "came from a
+        // rename/delete" and is not announced when the path is a path
+        // conflict (merge-ort.c:4396-4402).
+        if let Err(ResolutionFailure::OursModifiedTheirsDeleted) = &conflict.resolution {
+            if let (Change::Modification { location, previous_id, id, .. }, _) = conflict.changes_in_resolution() {
+                if previous_id == id && path_conflicts.contains(location) {
+                    continue;
+                }
+            }
+        }
         match render_one(repo, conflict, unresolved, &mut operands)? {
             Some(msgs) => out.extend(msgs),
             None => match strictness {
@@ -246,7 +265,15 @@ fn render_one<'r, 's>(
         // exactly the tree that retains `path` as a non-tree entry.
         Err(ResolutionFailure::OursModifiedTheirsDeleted) => {
             let path = ours.location().to_owned();
-            let (modify_branch, delete_branch) = operands.split_at(repo, path.as_bstr())?;
+            // `side = (ci->filemask == 5) ? 2 : 1` (merge-ort.c:4378-4386): the
+            // modifying operand is the stage its version is recorded at. Its
+            // tree need not hold the path, when a directory rename moved the
+            // file there (t6423 12n2).
+            let (modify_branch, delete_branch) = if conflict.entries()[1].is_some() {
+                (operands.label1, operands.label2)
+            } else {
+                (operands.label2, operands.label1)
+            };
             out.push(modify_delete(&path, delete_branch, modify_branch));
         }
 

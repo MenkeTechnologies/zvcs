@@ -867,6 +867,28 @@ fn apply_directory_rename_modifications(
 
     let tracked = &mut changes[pair.change_idx];
     match &mut tracked.inner {
+        // "Directory renames can result in rename-to-self" (merge-ort.c:2931-2942):
+        // `process_renames()` skips a pair whose old and new path are the same
+        // entry, so `process_entry()` finds the base and this side's version
+        // at one path, which is a modification of it and no rename at all.
+        Change::Rewrite {
+            source_location,
+            source_entry_mode,
+            source_id,
+            entry_mode,
+            id,
+            location,
+            ..
+        } if pair.renamed && *source_location == new_path => {
+            tracked.location_before_directory_rename = Some(location.clone());
+            tracked.inner = Change::Modification {
+                location: new_path,
+                previous_entry_mode: *source_entry_mode,
+                previous_id: *source_id,
+                entry_mode: *entry_mode,
+                id: *id,
+            };
+        }
         Change::Addition { location, .. } | Change::Rewrite { location, .. } => {
             tracked.location_before_directory_rename = Some(std::mem::replace(location, new_path));
         }

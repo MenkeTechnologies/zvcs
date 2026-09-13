@@ -192,15 +192,6 @@ impl Meter {
         }
     }
 
-    /// Close the phase with git's `, done.` line. A phase that never ticked
-    /// still prints, which is what the pack-writing callers rely on for an
-    /// empty pack.
-    pub fn done(mut self) {
-        if self.on {
-            self.display(self.current, Some(", done.\n"), true);
-        }
-    }
-
     /// Close a phase whose output went through a throughput-counting hashfile:
     /// `pack-objects --stdout`'s `Writing objects`, which `hashfd_ext()` hands
     /// the progress (`builtin/pack-objects.c:1350-1363`) so every flush reports
@@ -209,18 +200,22 @@ impl Meter {
     /// The redraws before it carry no rate — `display_throughput()` only fills
     /// the display after half a second has passed (`progress.c:214-216`) — so
     /// only the closing line has one.
+    ///
+    /// Like [`Meter::stop`], a phase that never displayed ends silently:
+    /// `stop_progress_msg()` skips `force_last_update()` while `last_value` is
+    /// still `-1` (`progress.c:375-376`), so an empty pack draws no
+    /// `Writing objects` line at all.
     pub fn done_with_throughput(mut self, total_bytes: u64) {
-        if !self.on {
+        let (true, Some(last)) = (self.on, self.last_value) else {
             return;
-        }
+        };
         self.throughput(total_bytes);
-        self.force_last_update("done", self.current);
+        self.force_last_update("done", last);
     }
 
     /// `stop_progress_msg()` (`progress.c:362-385`): close the phase with
     /// `, <msg>.`, carrying the whole-phase throughput average if bytes were
-    /// reported. Unlike [`Meter::done`], a phase that was never displayed ends
-    /// silently, as git's does.
+    /// reported. A phase that was never displayed ends silently, as git's does.
     pub fn stop(mut self, msg: &str) {
         if let (true, Some(last)) = (self.on, self.last_value) {
             self.force_last_update(msg, last);
@@ -323,9 +318,11 @@ impl Meter {
         self.last_value = Some(n);
         let tp = self.throughput.as_ref().map_or_else(String::new, |tp| tp.display.clone());
         let last_count_len = self.counters.len();
-        let show_update = match self.total {
+        // `if (progress->total)` (progress.c:127): a total of 0 draws like an
+        // unknown one, a bare count and only on an update tick.
+        let show_update = match self.total.filter(|&total| total != 0) {
             Some(total) => {
-                let percent = if total == 0 { 100 } else { ((n as u64 * 100) / total as u64) as u32 };
+                let percent = ((n as u64 * 100) / total as u64) as u32;
                 if self.last_percent != Some(percent) || update {
                     self.last_percent = Some(percent);
                     self.counters = format!("{percent:>3}% ({n}/{total}){tp}");

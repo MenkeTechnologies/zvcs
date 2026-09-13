@@ -921,10 +921,16 @@ fn execute(st: &State) -> Result<ExitCode> {
     }
     // git reports the object list it just built as `Enumerating objects`, a
     // count with no total because the traversal is what decides the total.
+    // `add_object_entry()` calls `display_progress(progress_state, ++nr_seen)`
+    // per object (builtin/pack-objects.c:1875) and `stop_progress()` closes it
+    // (:5410); with no object shown `last_value` stays `-1` and the phase ends
+    // without a line (progress.c:375-376).
     {
         let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", st.progress);
-        enumerating.advance(counts.len());
-        enumerating.done();
+        for _ in 0..counts.len() {
+            enumerating.tick();
+        }
+        enumerating.stop("done");
     }
 
     // git skips the pack entirely rather than writing an empty one, and says so
@@ -1237,10 +1243,14 @@ pub(crate) fn pack_for_upload(
     progress: bool,
 ) -> Result<Vec<u8>> {
     // `start_progress(_("Enumerating objects"), 0)` around `get_object_list()`,
-    // whose `add_object_entry()` counts every object shown (:1875).
+    // whose `add_object_entry()` counts every object shown (:1875), closed by
+    // `stop_progress()` (:5410). A fetch that is already up to date shows no
+    // object, so `last_value` stays `-1` and nothing is drawn (progress.c:375-376).
     let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", progress);
-    enumerating.advance(ids.len());
-    enumerating.done();
+    for _ in 0..ids.len() {
+        enumerating.tick();
+    }
+    enumerating.stop("done");
     let options = WriteOptions {
         allow_ofs_delta,
         progress,
@@ -1642,7 +1652,10 @@ fn write_pack(
             preferred_base: false,
         });
     }
-    counting.done();
+    // `get_object_details()` ticks `display_progress(progress_state, i + 1)` per
+    // entry and closes with `stop_progress()` (builtin/pack-objects.c:2627-2629),
+    // which draws nothing for an empty list (progress.c:375-376).
+    counting.stop("done");
     interleave_preferred_bases(repo, boundary, delta.search.window, &mut objects);
     assign_name_hashes(repo, &mut objects);
 
@@ -1768,7 +1781,8 @@ fn write_pack(
     for _ in 0..nr_deltas {
         compressing.tick();
     }
-    compressing.done();
+    // `stop_progress(&progress_state)` (builtin/pack-objects.c:3664).
+    compressing.stop("done");
 
     // Phase 3: serialise, base before delta. `write_entry` recurses into an
     // object's base first, so the meter counts positions reached rather than
@@ -1813,7 +1827,10 @@ fn write_pack(
         let kind = repo.object_hash();
         writing.done_with_throughput(HEADER_LEN + body.len() as u64 + kind.len_in_bytes() as u64);
     } else {
-        writing.done();
+        // `display_progress(progress_state, written)` after each `write_one()`
+        // and `stop_progress()` once the pack is closed (builtin/pack-objects.c:1388,
+        // 1506): an empty pack never displayed, so it has no closing line.
+        writing.stop("done");
     }
     // git's closing summary belongs to the pack write itself, so every caller —
     // `pack-objects` either way it emits, `repack` and `gc` — reports it.

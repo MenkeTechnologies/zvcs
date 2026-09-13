@@ -950,8 +950,10 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // `Enumerating objects` (`add_object_entry()`, builtin/pack-objects.c:1875).
     {
         let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", progress);
-        enumerating.advance(objects.len());
-        enumerating.done();
+        for _ in 0..objects.len() {
+            enumerating.tick();
+        }
+        enumerating.stop("done");
     }
     // `write_pack_data()` spawns `pack-objects --stdout --thin --delta-base-offset`
     // (bundle.c:333-336) — both flags are unconditional there, so a bundle's

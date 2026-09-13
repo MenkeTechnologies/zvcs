@@ -1041,8 +1041,10 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     let progress = crate::progress::enabled(st.quiet);
     {
         let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", progress);
-        enumerating.advance(to_pack.len());
-        enumerating.done();
+        for _ in 0..to_pack.len() {
+            enumerating.tick();
+        }
+        enumerating.stop("done");
     }
     // git writes every pack a run produces under one temporary prefix and only
     // moves them into place afterwards, in a single `generated_pack_install()`

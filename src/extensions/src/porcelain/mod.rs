@@ -864,6 +864,7 @@ pub use show_branch::show_branch;
 pub use show_index::show_index;
 pub use show_ref::show_ref;
 pub use sparse_checkout::sparse_checkout;
+pub use sparse_checkout::top_level_refused as sparse_checkout_top_level_refused;
 pub use stage::stage;
 pub use stash::stash;
 pub use status::status;

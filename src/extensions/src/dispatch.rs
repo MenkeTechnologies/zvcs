@@ -1248,8 +1248,16 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote");
     // Each gate has its own answer to "does `-h` come first?", and the two do not
     // agree — see [`HELP_BEFORE_CONFIG_VERBS`] and [`SETTINGS_BEFORE_HELP_VERBS`].
-    let settings_help_skip = help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub);
-    let config_help_skip = help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub);
+    // `cmd_sparse_checkout()` runs its top-level `parse_options()` before both
+    // `git_config(git_default_config)` and `prepare_repo_settings()`
+    // (builtin/sparse-checkout.c:938-944), so a missing or unknown subcommand, or
+    // any option ahead of it, is a 129 usage error no config value can pre-empt.
+    let parse_before_config =
+        sub == "sparse-checkout" && crate::porcelain::sparse_checkout_top_level_refused(args);
+    let settings_help_skip =
+        (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config;
+    let config_help_skip =
+        (help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub)) || parse_before_config;
     let in_repo_settings =
         !settings_help_skip && !rev_parse_no_setup && REPO_SETTINGS_VERBS.contains(&sub);
     // `git_default_config()`'s own two keys (`crate::default_config`) are checked

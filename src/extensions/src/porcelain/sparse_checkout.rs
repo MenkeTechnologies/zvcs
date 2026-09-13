@@ -56,6 +56,23 @@ use gix::index::entry::{Flags, Mode};
 ///
 /// Paths are matched as lossy UTF-8, so a tracked path with invalid UTF-8 bytes
 /// may be classified differently than git would classify it.
+/// The subcommand names `cmd_sparse_checkout()` declares with `OPT_SUBCOMMAND`.
+const SUBCOMMANDS: &[&str] =
+    &["list", "set", "add", "init", "reapply", "disable", "check-rules", "clean"];
+
+/// Whether the top-level `parse_options()` of `cmd_sparse_checkout()`
+/// (builtin/sparse-checkout.c:938-940) refuses `args` with a usage error: no
+/// subcommand, an option ahead of it, or a name that is not a subcommand. That
+/// parse runs before `git_config(git_default_config)` at :942, so the dispatcher
+/// consults this to keep its config gates from pre-empting the 129.
+pub fn top_level_refused(args: &[String]) -> bool {
+    let args: &[String] = match args.first() {
+        Some(a) if a == "sparse-checkout" => &args[1..],
+        _ => args,
+    };
+    args.first().is_none_or(|sub| !SUBCOMMANDS.contains(&sub.as_str()))
+}
+
 pub fn sparse_checkout(args: &[String]) -> Result<ExitCode> {
     // Dispatch hands us the subcommand at index 0; tolerate the command name
     // being present so the module works either way.

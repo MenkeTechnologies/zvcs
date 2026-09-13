@@ -1330,7 +1330,7 @@ fn reset_index_to_tree(
 ///
 /// `CE_EXTENDED` rides along because it is what makes `ce_write_entry()` choose
 /// index version 3, without which the bit has nowhere to go on disk.
-fn carry_skip_worktree(old: &gix::index::File, new_index: &mut gix::index::File) {
+pub(super) fn carry_skip_worktree(old: &gix::index::File, new_index: &mut gix::index::File) {
     let skipped: HashSet<BString> = {
         let backing = old.path_backing();
         old.entries()

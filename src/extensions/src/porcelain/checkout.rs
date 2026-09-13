@@ -3387,6 +3387,15 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         }
     }
 
+    // `reset_tree()` (builtin/checkout.c:754-790) leaves `skip_sparse_checkout`
+    // clear, so `unpack_trees()` keeps the sparse checkout's `CE_SKIP_WORKTREE`
+    // on the result — the same carry `reset --hard` makes. Carried before the
+    // checkout, because the worktree writer skips a `SKIP_WORKTREE` entry: without
+    // it `checkout -f` materialised every path outside the cone and dropped the
+    // bits from the index.
+    super::reset::carry_skip_worktree(&old, &mut new_index);
+    super::reset::carry_skip_worktree(&old, &mut subset);
+
     // `oneway_merge()` builds `o->result` out of the tree alone, so the index
     // `check_updates()` reads attributes from is the new tree's (unpack-trees.c:399).
     checkout_subset(repo, &mut subset, &new_index, &should_interrupt)?;

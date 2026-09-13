@@ -1115,6 +1115,47 @@ pub(crate) fn remove_branch_state(repo: &gix::Repository, verbose: bool) -> Resu
     for name in ["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
         let _ = std::fs::remove_file(git_dir.join(name));
     }
+    save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
+    Ok(())
+}
+
+/// `save_autostash_ref(r, refname)` (sequencer.c:4851-4855), the last step of
+/// `remove_merge_branch_state()` (branch.c:829-838): a `git merge --autostash`
+/// whose merge is being thrown away does not re-apply its snapshot, it files it
+/// as a real stash entry so the local changes stay reachable.
+///
+/// `apply_save_autostash_ref()` (sequencer.c:4821-4849) with `attempt_apply == 0`
+/// reads the ref (a symref is refused), hands the id to
+/// `apply_save_autostash_oid()`, which runs `git stash store -m autostash -q
+/// <oid>` and reports on stderr (sequencer.c:4757-4777), then deletes the ref
+/// whether or not the store worked. Every caller ignores the return value.
+pub(crate) fn save_autostash_ref(repo: &gix::Repository, refname: &str) -> Result<()> {
+    // `refs_ref_exists()` then `refs_resolve_ref_unsafe(RESOLVE_REF_READING)`.
+    let Ok(reference) = repo.find_reference(refname) else {
+        return Ok(());
+    };
+    let stash_oid = match reference.target() {
+        gix::refs::TargetRef::Object(id) => id.to_owned(),
+        gix::refs::TargetRef::Symbolic(_) => {
+            eprintln!("error: autostash reference is a symref");
+            return Ok(());
+        }
+    };
+    let hex = stash_oid.to_string();
+    let args = ["store", "-m", "autostash", "-q", &hex].map(str::to_string);
+    // The store is a `git stash store` child (`store.git_cmd = 1`), so whatever
+    // this process buffered goes out ahead of it (run-command.c:743).
+    crate::cstdio::before_spawn();
+    match super::stash::stash(&args) {
+        Ok(code) if code == ExitCode::SUCCESS => eprint!(
+            "Autostash exists; creating a new stash entry.\n\
+             Your changes are safe in the stash.\n\
+             You can run \"git stash pop\" or \"git stash drop\" at any time.\n"
+        ),
+        _ => eprintln!("error: cannot store {hex}"),
+    }
+    // `refs_delete_ref(…, refname, &stash_oid, REF_NO_DEREF)`.
+    crate::sequencer::delete_state_ref(repo, refname)?;
     Ok(())
 }
 

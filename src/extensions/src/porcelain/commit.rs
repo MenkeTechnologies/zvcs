@@ -494,10 +494,14 @@ pub(super) fn die_resolve_conflict(index: &gix::index::File) -> ExitCode {
 /// The ref goes away either way: a clean apply reports `Applied autostash.`, and
 /// a conflicting one hands the commit to `git stash store` so it stays reachable
 /// through `refs/stash` (`apply_save_autostash_oid()`).
-fn apply_merge_autostash(repo: &gix::Repository) -> Result<()> {
+pub(crate) fn apply_merge_autostash(repo: &gix::Repository) -> Result<()> {
     let Some(stash) = read_state_oid(repo, "MERGE_AUTOSTASH") else {
         return Ok(());
     };
+    // The apply is a `git stash apply` child (sequencer.c:4735-4751), so
+    // `start_command()`'s `fflush(NULL)` (run-command.c:743) puts the buffered
+    // `[<branch> <oid>] <subject>` summary out ahead of `Applied autostash.`.
+    crate::cstdio::before_spawn();
     let conflicts = super::stash::apply_autostash(repo, stash, true)?;
     if conflicts.is_empty() {
         eprintln!("Applied autostash.");

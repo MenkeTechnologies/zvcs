@@ -1784,6 +1784,9 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
             ] {
                 let _ = std::fs::remove_file(git_dir.join(name));
             }
+            // `remove_merge_branch_state()` ends in `save_autostash_ref(r,
+            // "MERGE_AUTOSTASH")` (branch.c:837).
+            super::reset::save_autostash_ref(&repo, "MERGE_AUTOSTASH")?;
             Ok(ExitCode::SUCCESS)
         }
         Verb::Continue => sequencer_continue(&repo),

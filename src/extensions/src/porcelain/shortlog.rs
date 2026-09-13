@@ -100,10 +100,6 @@
 //!   * `-w` measures a code point as one display column, where git uses
 //!     `wcwidth()`. Wrapping differs only for subjects containing wide (CJK) or
 //!     zero-width characters, or for text that is not valid UTF-8.
-//!   * mailmap lookups go through `gix_mailmap`, which case-normalises a matched
-//!     email even when the matching entry supplies no replacement address; git
-//!     keeps the commit's own casing. Only `-e` output against such a mailmap is
-//!     affected.
 //!   * `--remove-empty` is accepted but does nothing. It only matters for a merge
 //!     whose parent adds every path the pathspec names, where git treats that
 //!     parent as a root and stops walking behind it.

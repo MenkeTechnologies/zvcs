@@ -136,6 +136,9 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };
+    if let Some(code) = require_toplevel(&repo) {
+        return Ok(code);
+    }
 
     // `if ! git diff-index --quiet --cached HEAD --` — the script's first
     // action, ahead of the argument loop, so it fires even for arguments that
@@ -171,8 +174,12 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
     //
     // `git update-index -q --refresh` — without it a file whose stat data drifted
     // but whose content did not would fail read-tree's `verify_uptodate()`.
+    //
+    // The script does not test its status, so a refresh that dies — `this
+    // operation must be run in a work tree` when run from inside `.git` — says
+    // so and the chain carries on to read-tree.
     let refresh: Vec<String> = vec!["-q".to_string(), "--refresh".to_string()];
-    super::update_index::update_index(&refresh)?;
+    child_status(super::update_index::update_index(&refresh))?;
 
     // `git read-tree -u -m --aggressive $bases $head $remotes || exit 2`. The
     // operand lists are interpolated unquoted, so they go through verbatim and
@@ -184,7 +191,7 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
     read_tree_argv.extend(parsed.bases.iter().cloned());
     read_tree_argv.extend(parsed.head.iter().cloned());
     read_tree_argv.extend(parsed.remotes.iter().cloned());
-    if status(super::read_tree::read_tree(&read_tree_argv)?) != 0 {
+    if child_status(super::read_tree::read_tree(&read_tree_argv))? != 0 {
         return Ok(ExitCode::from(2));
     }
 
@@ -215,18 +222,62 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
     // script collapses to 0 or 1.
     let merge_index_argv: Vec<String> =
         ["-o", "git-merge-one-file", "-a"].iter().map(|s| s.to_string()).collect();
-    Ok(match status(super::merge_index::merge_index(&merge_index_argv)?) {
+    Ok(match child_status(super::merge_index::merge_index(&merge_index_argv))? {
         0 => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     })
 }
 
-/// The numeric status an [`ExitCode`] carries; `ExitCode` exposes no accessor on
-/// stable Rust, so probe the 256 values it can hold. The script branches on the
-/// status of the programs it runs, so the ports of those programs have to hand
-/// one back.
-fn status(code: ExitCode) -> u8 {
-    (0u8..=255).find(|&n| code == ExitCode::from(n)).unwrap_or(1)
+/// `git_dir_init`'s `SUBDIRECTORY_OK`-unset half (git-sh-setup.sh:326-335):
+///
+/// ```sh
+/// test -z "$(git rev-parse --show-cdup)" || {
+///         exit=$?
+///         gettextln "You need to run this command from the toplevel of the working tree." >&2
+///         exit $exit
+/// }
+/// ```
+///
+/// `--show-cdup` prints nothing in a bare repository and inside the git
+/// directory, where there is no work tree to be below. `$exit` is the status of
+/// `test -z`, which is 1. `merge-resolve` and `merge-octopus` both source
+/// git-sh-setup without `SUBDIRECTORY_OK`, so both refuse a subdirectory before
+/// their own first line runs.
+pub(super) fn require_toplevel(repo: &Repository) -> Option<ExitCode> {
+    let top = repo.workdir()?;
+    if crate::setup::is_inside_git_dir(repo) {
+        return None;
+    }
+    let here = std::env::current_dir().ok()?.canonicalize().ok()?;
+    if top.canonicalize().ok()? == here {
+        return None;
+    }
+    eprintln!("You need to run this command from the toplevel of the working tree.");
+    Some(ExitCode::from(1))
+}
+
+/// The status a script sees from a plumbing command it runs as a child.
+///
+/// git spawns `update-index`, `read-tree` and `merge-index` as processes, so a
+/// `die()` inside one prints `fatal: …` there and the script only observes 128.
+/// These ports run in process and hand the `die()` back as an error; rendering
+/// it here keeps it from ending the whole strategy at 128 — `|| exit 2` has to
+/// see a status, not an unwound error. `ExitCode` has no accessor on stable
+/// Rust, so a returned code is read back by probing the 256 values it can hold.
+pub(super) fn child_status(result: Result<ExitCode>) -> Result<u8> {
+    match result {
+        Ok(code) => Ok((0u8..=255).find(|&n| code == ExitCode::from(n)).unwrap_or(1)),
+        Err(err) => {
+            if let Some(fatal) = err.downcast_ref::<crate::fatal::Fatal>() {
+                eprintln!("fatal: {fatal}");
+                return Ok(crate::fatal::EXIT_FATAL);
+            }
+            if let Some(silent) = err.downcast_ref::<crate::fatal::Silent>() {
+                return Ok(silent.0);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// The paths `git diff-index --cached --name-only HEAD --` would print, sorted

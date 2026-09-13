@@ -147,6 +147,11 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };
+    // The rest of `git_dir_init`: no `SUBDIRECTORY_OK`, so a subdirectory is
+    // refused ahead of the argument loop and its not-an-octopus exit 2.
+    if let Some(code) = super::merge_resolve::require_toplevel(&repo) {
+        return Ok(code);
+    }
 
     let parsed = parse(args);
 
@@ -255,7 +260,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
             // folded in, so a *second* consecutive fast-forward hands read-tree
             // an index that no longer matches `$head` and it dies.
             let read_tree_argv = argv(&["-u", "-m", head_spec, sha1]);
-            let code = status(super::read_tree::read_tree(&read_tree_argv)?);
+            let code = child_status(super::read_tree::read_tree(&read_tree_argv))?;
             if code != 0 {
                 return Ok(ExitCode::from(code));
             }
@@ -295,7 +300,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
         read_tree_argv.extend(common.iter().map(ObjectId::to_string));
         read_tree_argv.extend(mrt.clone());
         read_tree_argv.push(sha1.clone());
-        if status(super::read_tree::read_tree(&read_tree_argv)?) != 0 {
+        if child_status(super::read_tree::read_tree(&read_tree_argv))? != 0 {
             // `|| exit 2`: the script spells this refusal 2 rather than letting
             // read-tree's own status through.
             return Ok(ExitCode::from(2));
@@ -308,7 +313,7 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
             // `Added <path> in both, but differently.`, the `ERROR: content conflict
             // in <path>` / `fatal: merge program failed` pair — and whose
             // `.merge_file_XXXXXX` conflict labels no re-derivation could match.
-            if status(super::merge_index::merge_index(&argv(&["-o", "git-merge-one-file", "-a"]))?) != 0 {
+            if child_status(super::merge_index::merge_index(&argv(&["-o", "git-merge-one-file", "-a"])))? != 0 {
                 // The last head may fail (the loop ends and `exit "$OCTOPUS_FAILURE"`
                 // is 1); an earlier one makes the next iteration refuse the octopus.
                 octopus_failure = true;
@@ -335,13 +340,9 @@ fn argv(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_string()).collect()
 }
 
-/// The numeric status an [`ExitCode`] carries; `ExitCode` exposes no accessor on
-/// stable Rust, so probe the 256 values it can hold. The script branches on the
-/// status of the programs it runs, so the ports of those programs have to hand one
-/// back — the same probe [`super::merge_resolve`] needs for the same reason.
-fn status(code: ExitCode) -> u8 {
-    (0u8..=255).find(|&n| code == ExitCode::from(n)).unwrap_or(1)
-}
+// The status the script sees from each plumbing child — shared with
+// `merge_resolve`, which runs the same chain.
+use super::merge_resolve::child_status;
 
 /// `$(git write-tree 2>/dev/null)`: the index's root tree, or `None` for the empty
 /// string the script gets when `write-tree` refuses an unmerged index.

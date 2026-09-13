@@ -961,7 +961,15 @@ fn execute(st: &State) -> Result<ExitCode> {
     // No boundary: `collect_counts()` drops a `^rev` rather than walking to it,
     // so this command has no edge commits to hand over and `--thin` still steers
     // nothing here. See the module header.
-    let packed = write_pack(&repo, &counts, compression(&repo, st), &delta, st.progress, &[])?;
+    let packed = write_pack(
+        &repo,
+        &counts,
+        compression(&repo, st),
+        &delta,
+        st.progress,
+        st.stdout,
+        &[],
+    )?;
 
     if st.stdout {
         let mut out = std::io::stdout().lock();
@@ -1110,12 +1118,11 @@ fn resolved_threads(configured: usize) -> usize {
 /// and `-q` (or the absence of both, stderr not being a terminal here)
 /// suppresses.
 ///
-/// The reuse counts are always zero, which is the truth about the pack written
-/// here — nothing is ever copied out of an existing pack — rather than a
-/// stand-in for git's numbers; see the module docs.
-fn report_progress(progress: bool, total: usize, deltas: usize) {
+/// The reuse pair counts the entries [`write_reuse_entry`] copied out of an
+/// existing pack; see [`PackSummary::line`].
+fn report_progress(progress: bool, summary: &PackSummary) {
     if progress {
-        eprintln!("Total {total} (delta {deltas}), reused 0 (delta 0), pack-reused 0 (from 0)");
+        eprintln!("{}", summary.line());
     }
 }
 
@@ -1149,22 +1156,25 @@ pub(crate) struct Packed {
 }
 
 /// `written` and `written_delta` as `builtin/pack-objects.c:5520-5527` reports
-/// them. The three reuse counters git prints beside these are always zero here:
-/// nothing is ever copied out of an existing pack, which is the truth about this
-/// writer rather than a stand-in.
+/// them, alongside the entries copied verbatim out of an existing pack.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PackSummary {
     pub(crate) written: usize,
     pub(crate) written_delta: usize,
+    /// `reused` and `reused_delta`: entries `write_reuse_object()` copied out of
+    /// an existing pack, and the deltas among them (builtin/pack-objects.c:699-720).
+    pub(crate) reused: usize,
+    pub(crate) reused_delta: usize,
 }
 
 impl PackSummary {
     /// The line itself, without a trailing newline — `Total %u (delta %u),
-    /// reused %u (delta %u), pack-reused %u (from %u)`.
+    /// reused %u (delta %u), pack-reused %u (from %u)`. The last pair counts
+    /// bitmap pack-reuse (`reuse_packfile_objects`), which this writer never does.
     pub(crate) fn line(&self) -> String {
         format!(
-            "Total {} (delta {}), reused 0 (delta 0), pack-reused 0 (from 0)",
-            self.written, self.written_delta
+            "Total {} (delta {}), reused {} (delta {}), pack-reused 0 (from 0)",
+            self.written, self.written_delta, self.reused, self.reused_delta
         )
     }
 }
@@ -1193,33 +1203,6 @@ pub(crate) fn pack_bytes_with(
     allow_ofs_delta: bool,
 ) -> Result<Vec<u8>> {
     Ok(pack_bytes_with_summary(repo, ids, allow_ofs_delta)?.0)
-}
-
-/// [`pack_bytes_with`] as `pack-objects --thin` writes it: `boundary` names the
-/// commits at the edge of the walk that produced `ids` — the prerequisites a
-/// bundle lists, or the `have`s a fetch peer reported — and the trees under them
-/// become delta bases the pack itself does not carry.
-///
-/// `bundle.c`'s `write_pack_data()` spawns `pack-objects --stdout --thin
-/// --delta-base-offset` unconditionally, so every git bundle over a range is
-/// thin; a bundle written without this is a valid superset that simply is not
-/// the file git writes.
-pub(crate) fn pack_bytes_thin(
-    repo: &gix::Repository,
-    ids: &[ObjectId],
-    allow_ofs_delta: bool,
-    boundary: &[ObjectId],
-) -> Result<Vec<u8>> {
-    Ok(packed_for_thin(
-        repo,
-        ids,
-        WriteOptions {
-            allow_ofs_delta,
-            ..WriteOptions::default()
-        },
-        boundary,
-    )?
-    .bytes)
 }
 
 /// [`pack_bytes_with`], keeping the closing counts.
@@ -1267,6 +1250,10 @@ pub(crate) struct WriteOptions {
     /// Report the counting, compressing and writing phases on stderr the way
     /// git's progress meter does. See [`crate::progress`].
     pub(crate) progress: bool,
+    /// The pack is going to stdout, which is when `write_pack_file()` builds its
+    /// hashfile with the progress attached (`builtin/pack-objects.c:1350-1363`)
+    /// and `Writing objects` closes with the byte count and rate.
+    pub(crate) to_stdout: bool,
     /// `repack.useDeltaIslands`: pass `--delta-islands` on, so the search
     /// honours `pack.island`.
     pub(crate) use_delta_islands: bool,
@@ -1326,6 +1313,7 @@ pub(crate) fn packed_for_thin(
         compression(repo, &State::default()),
         &delta,
         options.progress,
+        options.to_stdout,
         boundary,
     )
 }
@@ -1553,6 +1541,7 @@ fn write_pack(
     level: gix::zlib::Compression,
     delta: &DeltaConfig,
     progress: bool,
+    to_stdout: bool,
     boundary: &[ObjectId],
 ) -> Result<Packed> {
     use crate::progress::Meter;
@@ -1633,24 +1622,14 @@ fn write_pack(
     // nothing until it returns, so the meter goes from nothing to complete in one
     // step — the line git leaves on screen either way.
     //
-    // Both lines are skipped when no delta can be found at all, which is git's
-    // `if (nr_deltas)` gate: a one-object pack has nothing to deltify against,
-    // and a zero window or depth disables the search. git counts its delta
-    // *candidates* there, which this port does not work out separately, so the
-    // count below is every object handed to the search.
+    // Both lines are skipped when no delta can be attempted at all, which is
+    // `prepare_pack()`'s gate (builtin/pack-objects.c:3633-3667): a zero window
+    // or depth returns early, and the search runs only for `nr_deltas && n > 1`.
     let islands = if delta.use_islands {
         load_delta_islands(repo, &objects)
     } else {
         delta::Islands::default()
     };
-    let searchable = objects.len() > 1 && delta.search.window > 0 && delta.search.depth > 0;
-    let compressing_progress = progress && searchable;
-    if compressing_progress {
-        eprintln!(
-            "Delta compression using up to {} threads",
-            resolved_threads(delta.search.threads)
-        );
-    }
     // `check_object()` runs before the search, because what it settles is also
     // what the search must leave alone: an object that keeps a delta from an
     // existing pack is not a search candidate at all. The same pass records how
@@ -1681,8 +1660,30 @@ fn write_pack(
     // objects` counts `nr_result`, and `create_object_entry()` bumps neither for
     // an excluded entry.
     let to_write = objects.iter().filter(|object| !object.preferred_base).count();
+    // `prepare_pack()` gathers what `should_attempt_deltas()` admits — not
+    // already a delta, not `no_try_delta`, at least 50 bytes (builtin/
+    // pack-objects.c:3376-3404) — as `n`, and counts the ones that will be
+    // written as `nr_deltas`, the total `Compressing objects` reports.
+    let candidates: Vec<&delta::Object> = objects
+        .iter()
+        .zip(&already_deltified)
+        .filter(|(object, deltified)| !**deltified && object.size >= 50)
+        .map(|(object, _)| object)
+        .collect();
+    let nr_deltas = candidates.iter().filter(|object| !object.preferred_base).count();
+    let compressing_progress = progress
+        && delta.search.window > 0
+        && delta.search.depth > 0
+        && nr_deltas > 0
+        && candidates.len() > 1;
+    // `ll_find_deltas()` announces threads only on its threaded path
+    // (builtin/pack-objects.c:3209-3216); one thread searches silently.
+    let threads = resolved_threads(delta.search.threads);
+    if compressing_progress && threads > 1 {
+        eprintln!("Delta compression using up to {threads} threads");
+    }
     let mut compressing =
-        Meter::counted("Compressing objects", to_write, compressing_progress);
+        Meter::counted("Compressing objects", nr_deltas, compressing_progress);
     // The rest of what `check_object()` left the search: `IN_PACK(entry)` and
     // `entry->in_pack_type` per object, and the height of the reused chain
     // standing on each of them.
@@ -1726,7 +1727,12 @@ fn write_pack(
             data: None,
         });
     }
-    compressing.advance(to_write);
+    // `find_deltas()` calls `display_progress(progress_state, *processed)` once
+    // per candidate it finishes; the search here returns them all at once, so
+    // they are counted off afterwards and the meter redraws at the same steps.
+    for _ in 0..nr_deltas {
+        compressing.tick();
+    }
     compressing.done();
 
     // Phase 3: serialise, base before delta. `write_entry` recurses into an
@@ -1738,7 +1744,7 @@ fn write_pack(
     let mut body: Vec<u8> = Vec::new();
     let mut entries: Vec<PackedEntry> = Vec::with_capacity(objects.len());
     let mut offsets: Vec<Option<u64>> = vec![None; objects.len()];
-    let mut written_deltas = 0usize;
+    let mut summary = PackSummary::default();
     let from_reuse: Vec<bool> = reused.iter().map(Option::is_some).collect();
     let reuse = Reuse {
         enabled: delta.reuse_object,
@@ -1762,13 +1768,21 @@ fn write_pack(
             &mut body,
             &mut offsets,
             &mut entries,
-            &mut written_deltas,
+            &mut summary,
         )?;
     }
-    writing.done();
+    if to_stdout {
+        // `stop_progress()` runs after `finalize_hashfile()`, so the total the
+        // hashfile last reported is the whole pack: header, entries and trailer.
+        let kind = repo.object_hash();
+        writing.done_with_throughput(HEADER_LEN + body.len() as u64 + kind.len_in_bytes() as u64);
+    } else {
+        writing.done();
+    }
     // git's closing summary belongs to the pack write itself, so every caller —
     // `pack-objects` either way it emits, `repack` and `gc` — reports it.
-    report_progress(progress, entries.len(), written_deltas);
+    summary.written = entries.len();
+    report_progress(progress, &summary);
 
     let kind = repo.object_hash();
     let mut bytes = Vec::with_capacity(HEADER_LEN as usize + body.len() + kind.len_in_bytes());
@@ -1784,10 +1798,7 @@ fn write_pack(
     Ok(Packed {
         bytes,
         id,
-        summary: PackSummary {
-            written: entries.len(),
-            written_delta: written_deltas,
-        },
+        summary,
         entries,
     })
 }
@@ -2345,7 +2356,7 @@ fn write_entry(
     body: &mut Vec<u8>,
     offsets: &mut [Option<u64>],
     entries: &mut Vec<PackedEntry>,
-    written_deltas: &mut usize,
+    summary: &mut PackSummary,
 ) -> Result<()> {
     // ```c
     // } else if (e->idx.offset || e->preferred_base) {
@@ -2372,7 +2383,7 @@ fn write_entry(
             body,
             offsets,
             entries,
-            written_deltas,
+            summary,
         )?;
     }
 
@@ -2427,7 +2438,7 @@ fn write_entry(
             body,
             offsets,
             entries,
-            written_deltas,
+            summary,
         );
     }
 
@@ -2462,7 +2473,7 @@ fn write_entry(
                 },
             };
             let size = delta.len() as u64;
-            *written_deltas += 1;
+            summary.written_delta += 1;
             (header, size, delta)
         }
         _ => {
@@ -2526,7 +2537,7 @@ fn write_reuse_entry(
     body: &mut Vec<u8>,
     offsets: &mut [Option<u64>],
     entries: &mut Vec<PackedEntry>,
-    written_deltas: &mut usize,
+    summary: &mut PackSummary,
 ) -> Result<()> {
     let range = stored.data_offset..stored.data_offset + stored.data_len;
     let Some(data) = reuse.packs[stored.pack].entry_slice(range) else {
@@ -2543,7 +2554,9 @@ fn write_reuse_entry(
     // OBJ_OFS_DELTA : OBJ_REF_DELTA;`
     let header = match (&deltas[at], has_base) {
         (Some(delta), true) => {
-            *written_deltas += 1;
+            summary.written_delta += 1;
+            // `write_reuse_object()` bumps `reused_delta` in both delta arms.
+            summary.reused_delta += 1;
             // A preferred base has no offset to count back to, so it can only be
             // named by id — the same `DELTA(entry)->idx.offset` arm as above.
             match base_offset.filter(|_| allow_ofs_delta) {
@@ -2564,6 +2577,7 @@ fn write_reuse_entry(
     };
     header.write_to(stored.entry_size, body)?;
     body.extend_from_slice(&data);
+    summary.reused += 1;
     offsets[at] = Some(offset);
     entries.push(PackedEntry {
         id: objects[at].id,

@@ -43,6 +43,11 @@ pub struct Meter {
     last_percent: Option<u32>,
     /// When an unbounded meter last redrew, which is all that paces one.
     last_draw: Option<std::time::Instant>,
+    /// `progress->start_ns`, which the closing throughput average is taken over.
+    started: std::time::Instant,
+    /// The throughput text `display()` appends after the counters (`tp` in
+    /// `progress.c:126`); empty until a closing rate has been computed.
+    suffix: String,
     on: bool,
 }
 
@@ -60,13 +65,24 @@ impl Meter {
             last_percent: None,
             // Set now, so the first redraw waits out the interval as git does.
             last_draw: Some(std::time::Instant::now()),
+            started: std::time::Instant::now(),
+            suffix: String::new(),
             on,
         }
     }
 
     /// A phase of `total` items — git's `Counting`, `Compressing` and `Writing`.
     pub fn counted(title: &'static str, total: usize, on: bool) -> Self {
-        Meter { title, total: Some(total), current: 0, last_percent: None, last_draw: None, on }
+        Meter {
+            title,
+            total: Some(total),
+            current: 0,
+            last_percent: None,
+            last_draw: None,
+            started: std::time::Instant::now(),
+            suffix: String::new(),
+            on,
+        }
     }
 
     /// Count one item and redraw if that changed what the line would say.
@@ -108,6 +124,33 @@ impl Meter {
         }
     }
 
+    /// Close a phase whose output went through a throughput-counting hashfile:
+    /// `pack-objects --stdout`'s `Writing objects`, which `hashfd_ext()` hands
+    /// the progress (`builtin/pack-objects.c:1350-1363`) so every flush reports
+    /// the bytes written.
+    ///
+    /// `force_last_update()` (`progress.c:332-348`) replaces the running figure
+    /// with the whole-phase average: the elapsed time since `start_progress()` in
+    /// 1024ths of a second, floored at one, divided into the total. The redraws
+    /// before it carry no rate — `display_throughput()` only fills the display
+    /// after half a second has passed (`progress.c:214-216`) — so only the
+    /// closing line has one.
+    pub fn done_with_throughput(mut self, total_bytes: u64) {
+        if !self.on {
+            return;
+        }
+        let elapsed_ns = self.started.elapsed().as_nanos() as u64;
+        let misecs = ((elapsed_ns.wrapping_mul(4398)) >> 32) as u32;
+        let rate = (total_bytes / u64::from(misecs.max(1))) as u32;
+        // `throughput_string()` (`progress.c:175-183`).
+        self.suffix = format!(
+            ", {} | {}",
+            humanise(total_bytes, false),
+            humanise(u64::from(rate) * 1024, true)
+        );
+        self.draw(true);
+    }
+
     /// `100 * current / total`, or `None` when the total is unknown. A total of
     /// zero reads as complete, matching git's `display()`.
     fn percent(&self) -> Option<u32> {
@@ -127,11 +170,12 @@ impl Meter {
         let _ = match self.total {
             Some(total) => write!(
                 err,
-                "{}: {:>3}% ({}/{}){tail}",
+                "{}: {:>3}% ({}/{}){}{tail}",
                 self.title,
                 self.percent().unwrap_or(100),
                 self.current,
-                total
+                total,
+                self.suffix
             ),
             None => write!(err, "{}: {}{tail}", self.title, self.current),
         };
@@ -139,9 +183,40 @@ impl Meter {
     }
 }
 
+/// `humanise_bytes()` (`strbuf.c:875-909`) without `HUMANISE_COMPACT`: git's
+/// truncating fractions, its rounding nudges and its `>` unit boundaries, with
+/// `rate` selecting the `/s` units `strbuf_humanise_rate()` asks for.
+fn humanise(bytes: u64, rate: bool) -> String {
+    let per = if rate { "/s" } else { "" };
+    if bytes > 1 << 30 {
+        let frac = (bytes & ((1 << 30) - 1)) / 10_737_419;
+        format!("{}.{frac:02} GiB{per}", bytes >> 30)
+    } else if bytes > 1 << 20 {
+        let x = bytes + 5243;
+        format!("{}.{:02} MiB{per}", x >> 20, ((x & ((1 << 20) - 1)) * 100) >> 20)
+    } else if bytes > 1 << 10 {
+        let x = bytes + 5;
+        format!("{}.{:02} KiB{per}", x >> 10, ((x & ((1 << 10) - 1)) * 100) >> 10)
+    } else if bytes == 1 {
+        format!("1 byte{per}")
+    } else {
+        format!("{bytes} bytes{per}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stock 2.55.0 closed a 591-byte bundle pack with `591 bytes | 591.00
+    /// KiB/s`: written inside one 1024th of a second, the rate is the total.
+    #[test]
+    fn throughput_renders_as_git_writes_it() {
+        assert_eq!(humanise(591, false), "591 bytes");
+        assert_eq!(humanise(591 * 1024, true), "591.00 KiB/s");
+        assert_eq!(humanise(1, true), "1 byte/s");
+        assert_eq!(humanise(1 << 20, false), "1024.00 KiB");
+    }
 
     /// A disabled meter is inert, which is what lets every call site drive one
     /// without asking whether progress is on.

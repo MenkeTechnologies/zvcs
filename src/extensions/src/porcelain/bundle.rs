@@ -686,11 +686,16 @@ fn create(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    // `builtin_bundle_create_options`: the three progress switches all feed the
-    // same `progress` int, which only decides what `pack-objects` narrates on
-    // stderr. Nothing here narrates, so all four spellings are accepted and
-    // dropped. `--version` is the one option that changes the bytes.
+    // `builtin_bundle_create_options`: the progress switches are
+    // `OPT_PASSTHRU_ARGV` into `pack_opts`, after the `--progress` that
+    // `isatty(STDERR_FILENO)` pushes and before the unconditional
+    // `--all-progress-implied` (builtin/bundle.c:94-96). The `pack-objects` child
+    // reads them in that order, last one wins, and `--all-progress-implied` lifts
+    // an enabled meter to `progress = 2` so `Writing objects` shows despite
+    // `--stdout` (builtin/pack-objects.c:5352-5353). `--version` is the one
+    // option that changes the bytes.
     // `int version = -1`, which `create_bundle()` reads as "pick the minimum".
+    let mut progress = crate::progress::enabled(false);
     let mut version: Option<i64> = None;
     let mut rev_args: Vec<&str> = Vec::new();
     let mut file: Option<&str> = None;
@@ -719,7 +724,9 @@ fn create(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => end_of_opts = true,
-            "-q" | "--quiet" | "--progress" | "--all-progress" | "--all-progress-implied" => {}
+            "-q" | "--quiet" => progress = false,
+            "--progress" | "--all-progress" => progress = true,
+            "--all-progress-implied" => {}
             "--version" => {
                 let Some(v) = args.get(i + 1) else {
                     eprintln!("error: option `version' requires a value");
@@ -939,15 +946,34 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // tips the user named are never filtered out, only the objects the walk
     // reached through them.
     super::pack_objects::apply_filter(&repo, filter.as_deref(), &want_objects, &mut objects);
+    // The child's `get_object_list()` shows each object it adds as
+    // `Enumerating objects` (`add_object_entry()`, builtin/pack-objects.c:1875).
+    {
+        let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", progress);
+        enumerating.advance(objects.len());
+        enumerating.done();
+    }
     // `write_pack_data()` spawns `pack-objects --stdout --thin --delta-base-offset`
     // (bundle.c:333-336) — both flags are unconditional there, so a bundle's
     // deltas are always `OBJ_OFS_DELTA` where the base is in the pack and
     // `OBJ_REF_DELTA` where `--thin` put it outside. Passing `false` for the
     // first wrote `OBJ_REF_DELTA` throughout, which is 18 bytes larger per delta
-    // and is not what any git bundle contains.
-    out.extend_from_slice(&crate::porcelain::pack_objects::pack_bytes_thin(
-        &repo, &objects, true, &prereqs,
-    )?);
+    // and is not what any git bundle contains. `--stdout` is why the writing
+    // phase closes with a byte count and rate.
+    out.extend_from_slice(
+        &crate::porcelain::pack_objects::packed_for_thin(
+            &repo,
+            &objects,
+            crate::porcelain::pack_objects::WriteOptions {
+                allow_ofs_delta: true,
+                progress,
+                to_stdout: true,
+                ..Default::default()
+            },
+            &prereqs,
+        )?
+        .bytes,
+    );
 
     if file == "-" {
         io::stdout().write_all(&out)?;

@@ -1689,7 +1689,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             junk.leave();
             // Check out the branch `HEAD` points to. This is a no-op for an empty
             // remote, leaving an empty repository exactly like git does.
-            checkout.main_worktree(op.add_child("checkout"), &should_interrupt)?;
+            let (repo, _) = checkout.main_worktree(op.add_child("checkout"), &should_interrupt)?;
+            // `checkout()` (builtin/clone.c:677-698) is a `oneway_merge` `unpack_trees()`, which
+            // ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+            // (unpack-trees.c:2086-2090) before `write_locked_index()` — so a fresh clone's
+            // index carries a `TREE` extension. gix's checkout writes the entries only.
+            if let Ok(mut index) = repo.open_index() {
+                super::write_tree::rebuild_cache_tree(&repo, &mut index);
+                crate::index_racy::write(&repo, &mut index)?;
+            }
         }
         Ok(())
     })();

@@ -932,6 +932,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             quiet,
             track,
             !only_merge_on_switching_branches,
+            force,
             merge_opt(merge, &conflict_style, &name),
         );
     }
@@ -1112,7 +1113,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                     let full_remote = format!("refs/remotes/{remote_short}");
                     let code = create_and_switch(
                         &repo, spec, false, &remote_short, Some(&full_remote), quiet, Some(true),
-                        true, merge_opt(merge, &conflict_style, spec),
+                        true, force, merge_opt(merge, &conflict_style, spec),
                     )?;
                     maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
                     return Ok(code);
@@ -1671,6 +1672,7 @@ fn create_and_switch(
     quiet: bool,
     track: Option<bool>,
     merge_worktree: bool,
+    force: bool,
     merge: Option<MergeOpt<'_>>,
 ) -> Result<ExitCode> {
     // `old_branch_info.commit` for the post-checkout hook at the tail.
@@ -1766,7 +1768,13 @@ fn create_and_switch(
     }
 
     let mut autostashed = false;
-    if target_tree != cur_tree || index_unborn(repo)? {
+    if force {
+        // `-f` is `opts->discard_changes`, and `merge_working_tree()` answers it with
+        // `reset_tree(new_tree, opts, 1, writeout_error, new_branch_info)` whatever the
+        // two trees are (builtin/checkout.c:871-876) — a same-tree `checkout -f -B`
+        // still rewrites the index through `unpack_trees()`, cache-tree included.
+        reset_worktree_to_tree(repo, target_tree)?;
+    } else if target_tree != cur_tree || index_unborn(repo)? {
         match move_worktree(repo, cur_tree, target_tree, merge)? {
             Moved::Refused(code) => return Ok(code),
             Moved::Autostashed => autostashed = true,
@@ -1776,8 +1784,9 @@ fn create_and_switch(
     // `merge_working_tree()` ends here, and its last act is the listing of the
     // local changes carried onto the new branch — before `update_refs_for_switch()`
     // announces the switch. `only_merge_on_switching_branches` skips the whole
-    // function, listing included.
-    if merge_worktree && !autostashed {
+    // function, listing included, and `-f` skips the listing
+    // (`if (!opts->discard_changes && !opts->quiet …)`, builtin/checkout.c:930).
+    if merge_worktree && !force && !autostashed {
         show_local_changes(&start_id.to_string(), quiet)?;
     }
 

@@ -415,6 +415,22 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 orphan = Some(super::value_at(args, i + 1, a)?.to_string());
                 i += 1;
             }
+            // `OPT_STRING(0, "orphan", …)` (builtin/checkout.c:1795) also takes
+            // its value attached, `--orphan=<name>`.
+            _ if a.starts_with("--orphan=") => {
+                orphan = Some(a["--orphan=".len()..].to_string());
+            }
+            // `OPT_STRING('b', NULL, …)` / `OPT_STRING('B', NULL, …)`
+            // (builtin/checkout.c:2097-2100): `parse_short_opt()` hands the rest of
+            // the token to `get_arg()` as the value, so `-bname` is `-b name`.
+            _ if a.len() > 2 && (a.starts_with("-b") || a.starts_with("-B")) => {
+                let name = a[2..].to_string();
+                if a.starts_with("-B") {
+                    new_branch_force = Some(name);
+                } else {
+                    new_branch_create = Some(name);
+                }
+            }
             // `-d` is git's short form of `--detach` (OPT_BOOL('d', "detach")).
             "-d" | "--detach" => detach = true,
             "--no-detach" => detach = false,
@@ -711,11 +727,33 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 "git checkout: --ours/--theirs, --force and --merge are incompatible when\nchecking out of the index."
             );
         }
+    } else if patch_mode {
+        // `if (opts->patch_mode || opts->pathspec.nr) ret = checkout_paths(...)`
+        // (builtin/checkout.c:2076): `--patch` alone reaches `checkout_paths()`,
+        // so a `-p` with no pathspec meets *its* refusals, in its order
+        // (builtin/checkout.c:530-551), never `checkout_branch()`'s. `ignore_unmerged`
+        // is only ever set by `--force` here (:1922), which is why `-p --ours` is
+        // not refused. `opts->new_branch` has already absorbed `--orphan` (:1957-1962).
+        if track.is_some() {
+            crate::git_fatal!("'--track' cannot be used with updating paths");
+        }
+        if new_branch_log {
+            crate::git_fatal!("'-l' cannot be used with updating paths");
+        }
+        if force {
+            crate::git_fatal!("'--force' cannot be used with updating paths");
+        }
+        if detach {
+            crate::git_fatal!("'--detach' cannot be used with updating paths");
+        }
+        if merge {
+            crate::git_fatal!("options '--merge' and '--patch' cannot be used together");
+        }
+        if let Some(name) = orphan.as_deref().or(new_branch.as_ref().map(|(n, _)| n.as_str())) {
+            crate::git_fatal!("Cannot update paths and switch to branch '{name}' at the same time.");
+        }
     } else {
         // `checkout_branch()`'s refusals (builtin/checkout.c:1667-1699).
-        if patch_mode {
-            crate::git_fatal!("'--patch' cannot be used with switching branches");
-        }
         if overlay_mode.is_some() {
             crate::git_fatal!("'--[no]-overlay' cannot be used with switching branches");
         }

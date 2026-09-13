@@ -553,10 +553,15 @@ struct State {
     /// (`builtin/pack-objects.c:5334`), which is why the `--path-walk` default
     /// at :5189 sees the flag alone.
     use_bitmap_index: Option<bool>,
-    /// Whether the phase meters and the end-of-run summary go to stderr. Seeded
-    /// from `isatty(2)` in [`parse`], then `-q` and `--progress` (and
-    /// `--all-progress`) override it, last one wins.
-    progress: bool,
+    /// git's `static int progress`: 0 silent, 1 the meters and the end-of-run
+    /// summary, 2 also `Writing objects` and the delta thread count for a pack
+    /// going to stdout (`progress > pack_to_stdout`, builtin/pack-objects.c:1340,
+    /// 3214). Seeded from `isatty(2)` (:5177); `-q`, `--progress` (1) and
+    /// `--all-progress` (2) write it, last one wins (:5046-5052).
+    progress: u8,
+    /// `--all-progress-implied`, which raises a non-zero `progress` to 2 once
+    /// parsing is done (:5352-5353).
+    all_progress_implied: bool,
     /// Non-option arguments; at most one (the base name) is legal.
     positionals: Vec<String>,
 }
@@ -926,7 +931,7 @@ fn execute(st: &State) -> Result<ExitCode> {
     // (:5410); with no object shown `last_value` stays `-1` and the phase ends
     // without a line (progress.c:375-376).
     {
-        let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", st.progress);
+        let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", st.progress != 0);
         for _ in 0..counts.len() {
             enumerating.tick();
         }
@@ -982,11 +987,10 @@ fn execute(st: &State) -> Result<ExitCode> {
         &counts,
         compression(&repo, st),
         &delta,
-        st.progress,
-        // `st.progress` does not keep `--progress` (1) apart from
-        // `--all-progress` (2), so this command still draws every phase it
-        // enables, `--stdout` or not.
-        st.progress,
+        st.progress != 0,
+        // `progress > pack_to_stdout` (builtin/pack-objects.c:1340, 3214): with
+        // `--stdout` only `--all-progress` (2) shows `Writing objects`.
+        st.progress > 1,
         st.stdout,
         &[],
     )?;
@@ -5280,7 +5284,7 @@ fn parse(args: &[String]) -> Parsed {
     // git's `cmd_pack_objects` starts with progress on and clears it when stderr
     // is not a terminal, so a run on a terminal reports without being asked and a
     // piped one stays silent. `-q` and `--progress` then override, last one wins.
-    st.progress = crate::progress::enabled(false);
+    st.progress = u8::from(crate::progress::enabled(false));
     let mut end_of_opts = false;
     let mut i = 0;
 
@@ -5322,6 +5326,10 @@ fn parse(args: &[String]) -> Parsed {
         }
     }
 
+    // `if (progress && all_progress_implied) progress = 2;` (:5352-5353).
+    if st.progress != 0 && st.all_progress_implied {
+        st.progress = 2;
+    }
     Parsed::Ok(st)
 }
 
@@ -5745,8 +5753,14 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "sparse" => st.sparse = Some(on),
         "path-walk" => st.path_walk = Some(on),
         "use-bitmap-index" => st.use_bitmap_index = Some(on),
-        "quiet" => st.progress = !on,
-        "progress" | "all-progress" => st.progress = on,
+        // `option_parse_quiet()` (:4938-4950): `-q` clears the level, `--no-quiet`
+        // sets 1 only when it is 0, so `--all-progress --no-quiet` stays at 2.
+        "quiet" if on => st.progress = 0,
+        "quiet" => st.progress = st.progress.max(1),
+        // `OPT_SET_INT` stores its value, or 0 when negated.
+        "progress" => st.progress = if on { 1 } else { 0 },
+        "all-progress" => st.progress = if on { 2 } else { 0 },
+        "all-progress-implied" => st.all_progress_implied = on,
         "exclude-promisor-objects" => st.exclude_promisor = on,
         "exclude-promisor-objects-best-effort" => st.exclude_promisor_best_effort = on,
         "keep-unreachable" => {
@@ -5845,7 +5859,7 @@ fn short_opts(cluster: &str, i: &mut usize, st: &mut State) -> Option<ExitCode> 
                 return Some(ExitCode::from(129));
             }
             // `-q` and `--progress` write the same flag, so the last one wins.
-            'q' => st.progress = false,
+            'q' => st.progress = 0,
             other => {
                 eprint!("error: unknown switch `{other}'\n{USAGE}");
                 return Some(ExitCode::from(129));

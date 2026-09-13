@@ -93,9 +93,15 @@ impl Search {
             }
 
             if let Some(attrs) = mapping.value.attrs_match.as_mut() {
+                // git's `match_pathspec_attrs()` (pathspec.c:725-761) runs
+                // `git_check_attr()` and then compares *every* requested item,
+                // including the ones no `.gitattributes` line mentions: those read
+                // back as `ATTR_UNSET` and satisfy `:(attr:!name)`
+                // (MATCH_UNSPECIFIED). A lookup that found nothing is therefore not
+                // a mismatch; it leaves every selected attribute unspecified, which
+                // `reset()` makes explicit so no earlier path's result is compared.
                 if !attributes(relative_path, Case::Sensitive, is_dir, attrs) {
-                    // we have attrs, but it didn't match any
-                    return None;
+                    attrs.reset();
                 }
                 for (actual, expected) in attrs.iter_selected().zip(mapping.value.pattern.attributes.iter()) {
                     if actual.assignment != expected.as_ref() {

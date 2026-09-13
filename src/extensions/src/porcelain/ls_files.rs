@@ -822,12 +822,17 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // `:(attr:…)` elements are checked with `git_check_attr()` in attr.c's
+    // default direction, `GIT_ATTR_CHECKIN` (the zero value of `enum
+    // git_attr_direction`, attr.h:202-206; builtin/ls-files.c never changes it):
+    // the work tree's `.gitattributes` first, the index's only where the file is
+    // absent. Reading only the index made an untracked `.gitattributes` invisible.
     let mut ps = repo.pathspec(
         true,
         &patterns,
         false,
         &index,
-        gix::worktree::stack::state::attributes::Source::IdMapping,
+        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
     )?;
 
     // The exclude stack git assembles from `-x`, `-X` and `--exclude-standard`.

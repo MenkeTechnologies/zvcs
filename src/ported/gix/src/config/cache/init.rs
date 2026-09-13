@@ -149,6 +149,8 @@ impl Cache {
         let reflog = util::query_refupdates(&config, lenient_config)?;
         let refs_namespace = util::query_refs_namespace(&config, lenient_config)?;
         let ignore_case = config_bool(&config, &Core::IGNORE_CASE, "core.ignoreCase", false, lenient_config)?;
+        let is_bare_after_config =
+            util::config_bool_opt(&config, &Core::BARE, "core.bare", lenient_config)?.or(is_bare);
         let use_multi_pack_index = config_bool(
             &config,
             &Core::MULTIPACK_INDEX,
@@ -176,6 +178,7 @@ impl Cache {
             reflog,
             refs_namespace,
             is_bare,
+            is_bare_after_config,
             ignore_case,
             hex_len,
             filter_config_section,
@@ -224,6 +227,8 @@ impl Cache {
             false,
             self.lenient_config,
         )?;
+        let is_bare_after_config =
+            util::config_bool_opt(config, &Core::BARE, "core.bare", self.lenient_config)?.or(self.is_bare);
 
         #[cfg(feature = "revision")]
         {
@@ -234,6 +239,7 @@ impl Cache {
         let refs_namespace = util::query_refs_namespace(config, self.lenient_config)?;
 
         self.hex_len = hex_len;
+        self.is_bare_after_config = is_bare_after_config;
         self.ignore_case = ignore_case;
         self.reflog = reflog;
         self.refs_namespace = refs_namespace;

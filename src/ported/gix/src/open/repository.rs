@@ -337,10 +337,11 @@ impl ThreadSafeRepository {
         // core.worktree might be used to overwrite the worktree directory, but only when the work
         // tree is not already spoken for: `setup_explicit_git_dir()` (setup.c:1142-1179) is an
         // if-chain that starts at `GIT_WORK_TREE`, so `core.worktree` is reached only when the
-        // environment named no work tree.
-        let worktree_dir_override_from_configuration = if !work_tree_is_explicit
-            && !config.is_bare_but_assume_bare_if_unconfigured()
-        {
+        // environment named no work tree, and only when `is_bare_repository_cfg > 0` did not return
+        // first: an unset `core.bare` is -1 and reaches the `core.worktree` arm. The value tested is
+        // setup's, from the repository's files and `git --bare` alone; `-c core.bare` and the global
+        // configuration are not read until `git_default_core_config()` runs after setup.
+        let worktree_dir_override_from_configuration = if !work_tree_is_explicit && config.is_bare != Some(true) {
             fn assure_config_is_from_current_repo(
                 section: &gix_config::file::Metadata,
                 git_dir: &Path,
@@ -434,8 +435,11 @@ impl ThreadSafeRepository {
                 ImplicitWorkTree::ParentOfDotGitDir => looks_like_standard_git_dir()
                     .then(|| git_dir.parent().expect("parent is always available").to_owned()),
             };
+            // Both `setup_discovered_git_dir()` (setup.c:1230-1242) and `setup_explicit_git_dir()`
+            // (setup.c:1144-1178) withhold the implied work tree only for `is_bare_repository_cfg > 0`;
+            // an unset `core.bare` gets one.
             match worktree_dir {
-                None if implied.is_some() && !config.is_bare_but_assume_bare_if_unconfigured() => {
+                None if implied.is_some() && config.is_bare != Some(true) => {
                     worktree_dir = implied;
                 }
                 // We may assume that the presence of a worktree-dir means it's not bare, but only if there

@@ -1284,12 +1284,13 @@ pub fn core_worktree_chdir_error(repo: &gix::Repository) -> Option<String> {
     if std::env::var_os("GIT_WORK_TREE").is_some() {
         return None;
     }
-    let config = repo.config_snapshot();
-    // `is_bare_repository_cfg > 0`: `core.bare`, or `git --bare` (git.c:258)
-    // when the config does not say.
-    if config.boolean("core.bare").or(gix::open::bare_repository_cfg().then_some(true)) == Some(true) {
+    // `is_bare_repository_cfg > 0` as setup has it: `git --bare` (git.c:258), then
+    // `core.bare` from the repository's files (setup.c:797-801). `-c core.bare` and
+    // the global configuration are applied later, by `git_default_core_config()`.
+    if repo.bare_config_at_setup() == Some(true) {
         return None;
     }
+    let config = repo.config_snapshot();
     let value = config.string("core.worktree")?;
     let value = value.to_string();
     let path = Path::new(&value);

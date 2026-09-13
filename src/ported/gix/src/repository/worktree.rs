@@ -77,8 +77,18 @@ impl crate::Repository {
     ///
     /// This is not to be confused with the [`worktree()`](crate::Repository::worktree()) method, which may exist if this instance
     /// was opened in a worktree that was created separately.
+    ///
+    /// `is_bare_repository_cfg` here is the value after the configuration was read, so
+    /// `git -c core.bare=false --bare` is not bare even though setup ran with the flag's 1.
     pub fn is_bare(&self) -> bool {
-        self.config.is_bare.unwrap_or(true) && self.workdir().is_none()
+        self.config.is_bare_after_config.unwrap_or(true) && self.workdir().is_none()
+    }
+
+    /// `is_bare_repository_cfg` as setup saw it (setup.c:1144, 1231): `git --bare`, then a
+    /// `core.bare` from the repository's own configuration files. Neither `-c` nor the global
+    /// configuration counts. `None` is git's -1, unset.
+    pub fn bare_config_at_setup(&self) -> Option<bool> {
+        self.config.is_bare
     }
 
     /// If `id` points to a tree, produce a stream that yields one worktree entry after the other. The index of the tree at `id`

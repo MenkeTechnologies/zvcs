@@ -616,8 +616,15 @@ pub(crate) struct Cache {
     pub resolved: crate::Config,
     /// The hex-length to assume when shortening object ids. If `None`, it should be computed based on the approximate object count.
     pub hex_len: Option<usize>,
-    /// `true` if the repository is designated as 'bare', without work tree. If `None`, the value wasn't configured.
+    /// `is_bare_repository_cfg` as setup leaves it: `git --bare` (git.c:258), then a `core.bare`
+    /// from the repository's own files (`check_repository_format_gently()`, setup.c:797-801).
+    /// This is the value discovery decides the work tree with. If `None`, it is -1 (unset).
     pub is_bare: Option<bool>,
+    /// `is_bare_repository_cfg` once `git_default_core_config()` (environment.c:339-342) has
+    /// seen every `core.bare` in the full configuration, `-c` and `GIT_CONFIG_PARAMETERS`
+    /// included: the last one wins, and without any it is still [`is_bare`](Self::is_bare).
+    /// This is what `is_bare_repository()` (environment.c:131-135) reads.
+    pub is_bare_after_config: Option<bool>,
     /// The type of hash to use.
     pub object_hash: gix_hash::Kind,
     /// If true, multi-pack indices, whether present or not, may be used by the object database.

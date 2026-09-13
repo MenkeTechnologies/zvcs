@@ -248,6 +248,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut new_branch_force: Option<String> = None;
     let mut detach = false;
     let mut quiet = false;
+    // `--[no-]progress` → `opts->show_progress`, -1 until given.
+    let mut progress: Option<bool> = None;
     // `-f`/`--force` → git's `opts->discard_changes`.
     let mut force = false;
     // `opts->ignore_skipworktree` (builtin/checkout.c:1821).
@@ -469,9 +471,10 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--no-orphan" => orphan = None,
             "--no-pathspec-from-file" => pathspec_from_file = None,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
-            // Accepted no-ops: progress is discarded and ignored-file overwrite is
-            // the default, so toggling either changes nothing.
-            "--progress" | "--no-progress" => {}
+            "--progress" => progress = Some(true),
+            "--no-progress" => progress = Some(false),
+            // Accepted no-op: ignored-file overwrite is the default, so toggling it
+            // changes nothing.
             "--overwrite-ignore" | "--no-overwrite-ignore" => {}
             "--ignore-other-worktrees" => ignore_other_worktrees = true,
             "--no-ignore-other-worktrees" => ignore_other_worktrees = false,
@@ -844,6 +847,18 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "'--merge', '--ours', or '--theirs' cannot be used when checking out of a tree"
         );
     }
+
+    // ```c
+    // if (opts->show_progress < 0) {
+    //         if (opts->quiet)
+    //                 opts->show_progress = 0;
+    //         else
+    //                 opts->show_progress = isatty(2);
+    // }
+    // ```
+    //
+    // (builtin/checkout.c:1909-1913.)
+    set_show_progress(progress.unwrap_or_else(|| !quiet && std::io::IsTerminal::is_terminal(&std::io::stderr())));
 
     // --- Dispatch -----------------------------------------------------------
     // `--pathspec-from-file`: pathspecs come from the file (or stdin for `-`),
@@ -2142,7 +2157,7 @@ fn restore_conflict_stage(
         let should_interrupt = AtomicBool::new(false);
         // `checkout_paths()` writes through `state.istate = the_repository->index`
         // (builtin/checkout.c:412), so the attributes come from the full index.
-        checkout_subset(repo, &mut subset, &index, &should_interrupt)?;
+        checkout_subset(repo, &mut subset, &index, &should_interrupt, &crate::worktree::UpdatingFiles::off())?;
     }
 
     if had_error {
@@ -2598,7 +2613,7 @@ fn restore_from_index(
     }
     let should_interrupt = AtomicBool::new(false);
     // `state.istate = the_repository->index` (builtin/checkout.c:412).
-    checkout_subset(repo, &mut subset, &index, &should_interrupt)?;
+    checkout_subset(repo, &mut subset, &index, &should_interrupt, &crate::worktree::UpdatingFiles::off())?;
 
     // Refresh stat info in the real index for the restored paths so a later
     // status stays cheap; content ids are unchanged. An unmerged path has no
@@ -2783,7 +2798,7 @@ fn restore_from_tree(
     // *before* it writes anything (builtin/checkout.c:400-412), so the attributes a
     // matched path sees are the tree's and every other path's are the index's — which is
     // exactly "the subset first, the index for what it lacks".
-    checkout_subset(repo, &mut subset, &index, &should_interrupt)?;
+    checkout_subset(repo, &mut subset, &index, &should_interrupt, &crate::worktree::UpdatingFiles::off())?;
 
     // Fold the tree's blobs (with fresh checkout stats) into the real index.
     let fresh = stats_by_path(&subset);
@@ -3231,6 +3246,26 @@ pub(super) fn old_head_label(repo: &gix::Repository) -> Result<Option<String>> {
 /// Move a clean worktree and its index from the current state to `new_tree`,
 /// writing only the files that changed (added/modified checked out, removed
 /// deleted). Mirrors the file-level reconciliation used by `zsync`.
+/// `opts->show_progress` (builtin/checkout.c:1909-1913), which `checkout` and
+/// `switch` hand to `unpack_trees()` as `verbose_update` in `reset_tree()` and
+/// `merge_working_tree()` (builtin/checkout.c:770, 833). Set once by those two
+/// commands after option parsing; every other caller of the two unpack paths
+/// below — `rebase` checking out its branch — leaves it off, as git's
+/// `reset_head()` does.
+static SHOW_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record this `checkout`/`switch` invocation's `show_progress`.
+pub(super) fn set_show_progress(on: bool) {
+    SHOW_PROGRESS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `get_progress()` for the unpack a branch switch runs: `total` entries removed
+/// or written, reported when this command's `show_progress` is on.
+fn unpack_progress(total: usize) -> Result<crate::worktree::UpdatingFiles> {
+    let on = SHOW_PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+    crate::worktree::UpdatingFiles::start(total, on).map_err(|e| crate::fatal::die(e.to_string()))
+}
+
 pub(super) fn update_worktree_to_tree(
     repo: &gix::Repository,
     old_tree: ObjectId,
@@ -3305,7 +3340,9 @@ pub(super) fn update_worktree_to_tree(
     // worktree's `.gitattributes` when the result index has none (attr.c:784-787), so a
     // switch to a branch without one must delete it before it writes anything — else the
     // outgoing branch's attributes would still be smudging files that no longer have any.
+    let updating = unpack_progress(touched.len())?;
     for path in touched.iter().filter(|p| !new_flat.contains_key(*p)) {
+        updating.tick();
         if let Some(full) = repo.workdir_path(path.as_bstr()) {
             let _ = std::fs::remove_file(&full);
             if let Some(workdir) = repo.workdir() {
@@ -3326,7 +3363,8 @@ pub(super) fn update_worktree_to_tree(
     // not stand in for it, which is what removing the touched paths here ensures.
     let mut result_attrs = old.clone();
     result_attrs.remove_entries(|_, path, _| touched.contains(&path.to_owned()));
-    checkout_subset(repo, &mut subset, &result_attrs, &should_interrupt)?;
+    checkout_subset(repo, &mut subset, &result_attrs, &should_interrupt, &updating)?;
+    updating.stop();
 
     // The index moves with the worktree, one path at a time: the touched entries
     // are replaced by the new tree's, the rest stay exactly as they were.
@@ -3435,11 +3473,17 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
             .map(|e| e.path_in(backing).to_owned())
             .collect()
     };
+    let dropped = {
+        let backing = old.path_backing();
+        old.entries().iter().filter(|e| !new_paths.contains(&e.path_in(backing).to_owned())).count()
+    };
+    let updating = unpack_progress(subset.entries().len() + dropped)?;
     {
         let backing = old.path_backing();
         for e in old.entries() {
             let path = e.path_in(backing);
             if !new_paths.contains(&path.to_owned()) {
+                updating.tick();
                 if let Some(full) = repo.workdir_path(path) {
                     let _ = std::fs::remove_file(&full);
                     // `unlink_entry()`'s `schedule_dir_for_removal()`.
@@ -3462,7 +3506,8 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
 
     // `oneway_merge()` builds `o->result` out of the tree alone, so the index
     // `check_updates()` reads attributes from is the new tree's (unpack-trees.c:399).
-    checkout_subset(repo, &mut subset, &new_index, &should_interrupt)?;
+    checkout_subset(repo, &mut subset, &new_index, &should_interrupt, &updating)?;
+    updating.stop();
 
     // "Take the stat information from stage0, take the data from stage1": an entry
     // that was not rewritten keeps the stat cache it already had.
@@ -3522,6 +3567,7 @@ fn checkout_subset(
     index: &mut gix::index::File,
     attr_source: &gix::index::State,
     should_interrupt: &AtomicBool,
+    updating: &crate::worktree::UpdatingFiles,
 ) -> Result<()> {
     let workdir = repo
         .workdir()
@@ -3544,6 +3590,7 @@ fn checkout_subset(
         .checkout_options(gix::worktree::stack::state::attributes::Source::IdMappingThenWorktree)?;
     opts.destination_is_initially_empty = false;
     opts.overwrite_existing = true;
+    opts.on_entry = updating.hook();
     let odb = repo.objects.clone().into_arc()?;
     // `state->istate` is the whole index, never the paths being written, so the
     // attribute files of `attr_source` ride along — see

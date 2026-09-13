@@ -386,6 +386,11 @@ impl UpdatingFiles {
         Ok(UpdatingFiles(Some(std::sync::Arc::new(std::sync::Mutex::new(Some(meter))))))
     }
 
+    /// The `NULL` progress of an unpack that does not report.
+    pub fn off() -> Self {
+        UpdatingFiles(None)
+    }
+
     /// One removal or checkout done.
     pub fn tick(&self) {
         if let Some(meter) = &self.0 {

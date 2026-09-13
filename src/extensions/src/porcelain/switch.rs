@@ -173,6 +173,8 @@ struct Parsed<'a> {
     merge: bool,
     conflict_style: Option<String>,
     quiet: bool,
+    /// `--[no-]progress` → `opts->show_progress`; `None` until given.
+    progress: Option<bool>,
     /// `None` default, `Some(true)` for `--track`, `Some(false)` for `--no-track`.
     track: Option<bool>,
     /// `--track=inherit`: `BRANCH_TRACK_INHERIT`, which copies the start-point branch's own
@@ -206,6 +208,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         merge: false,
         conflict_style: None,
         quiet: false,
+        progress: None,
         track: None,
         track_inherit: false,
         guess: None,
@@ -334,10 +337,10 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                     }
                     p.conflict_style = Some(v.to_string());
                 }
+                "progress" => p.progress = Some(true),
+                "no-progress" => p.progress = Some(false),
                 // Silently-accepted no-ops that do not change deterministic output.
-                "progress"
-                | "no-progress"
-                | "overwrite-ignore"
+                "overwrite-ignore"
                 | "no-overwrite-ignore"
                 | "no-recurse-submodules" => {}
                 // `option_parse_recurse_submodules_worktree_updater()`
@@ -555,6 +558,12 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         }
         None => {}
     }
+
+    // `opts->show_progress`: the flag when given, else `!quiet && isatty(2)`
+    // (builtin/checkout.c:1909-1913), as `checkout` resolves it.
+    super::checkout::set_show_progress(
+        p.progress.unwrap_or_else(|| !p.quiet && std::io::IsTerminal::is_terminal(&std::io::stderr())),
+    );
 
     if let Some(name) = p.orphan {
         if p.track.is_some() {

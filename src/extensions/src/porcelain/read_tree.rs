@@ -149,6 +149,9 @@ pub(super) struct Opts {
     merge: bool,               // -m
     reset: bool,               // --reset
     update: bool,              // -u
+    /// `-v`/`--verbose`: `OPT__VERBOSE(&opts.verbose_update)` (builtin/read-tree.c:129),
+    /// the `Updating files` meter of a `-u` unpack.
+    verbose_update: bool,
     index_only: bool,          // -i
     dry_run: bool,             // -n/--dry-run
     read_empty: bool,          // --empty
@@ -407,8 +410,8 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
                     'u' => o.update = true,
                     'i' => o.index_only = true,
                     'n' => o.dry_run = true,
-                    // Progress and feedback: this port emits neither, so both no-op.
-                    'v' | 'q' => {}
+                    'v' => o.verbose_update = true,
+                    'q' => {}
                     'h' => {
                         print!("{USAGE}");
                         return Ok(Err(ExitCode::from(129)));
@@ -485,8 +488,15 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
                 no_value!();
                 o.read_empty = false;
             }
-            // Feedback-only switches: this port is silent either way.
-            "verbose" | "no-verbose" | "quiet" | "no-quiet" => no_value!(),
+            "verbose" => {
+                no_value!();
+                o.verbose_update = true;
+            }
+            "no-verbose" => {
+                no_value!();
+                o.verbose_update = false;
+            }
+            "quiet" | "no-quiet" => no_value!(),
             // `--trivial`/`--aggressive` only tune the three-tree merge.
             "trivial" => {
                 no_value!();
@@ -843,9 +853,14 @@ fn finish(o: Opts) -> Result<ExitCode> {
                     .cloned(),
             );
         }
-        checkout_subset(&repo, &mut new_index, &wanted)?;
+        // `check_updates()` (unpack-trees.c:429-506): `get_progress()` over every
+        // entry written or removed, then one tick per removal and per write.
+        let updating = crate::worktree::UpdatingFiles::start(wanted.len() + removed.len(), o.verbose_update)
+            .map_err(|e| crate::fatal::die(e.to_string()))?;
+        checkout_subset(&repo, &mut new_index, &wanted, &updating)?;
         move_submodules(&repo, &new_index, &o)?;
         for path in &removed {
+            updating.tick();
             if let Some(full) = repo.workdir_path(path.as_bstr()) {
                 let _ = std::fs::remove_file(&full);
                 // `unlink_entry()` schedules the directory it just emptied, and
@@ -856,6 +871,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
                 }
             }
         }
+        updating.stop();
     }
 
     // ---- Persist. ----
@@ -1229,8 +1245,12 @@ fn multi_tree_read(
     new_index.sort_entries();
 
     if o.update {
-        checkout_subset(repo, &mut new_index, &wanted)?;
+        // `check_updates()`'s meter, as in the one- and two-tree read above.
+        let updating = crate::worktree::UpdatingFiles::start(wanted.len() + removed.len(), o.verbose_update)
+            .map_err(|e| crate::fatal::die(e.to_string()))?;
+        checkout_subset(repo, &mut new_index, &wanted, &updating)?;
         for path in &removed {
+            updating.tick();
             if let Some(full) = repo.workdir_path(path.as_bstr()) {
                 let _ = std::fs::remove_file(&full);
                 // `unlink_entry()` schedules the directory it just emptied, and
@@ -1241,6 +1261,7 @@ fn multi_tree_read(
                 }
             }
         }
+        updating.stop();
     }
 
     if let Some(out) = &o.index_output {
@@ -2039,6 +2060,7 @@ fn checkout_subset(
     repo: &gix::Repository,
     index: &mut gix::index::File,
     wanted: &BTreeSet<BString>,
+    updating: &crate::worktree::UpdatingFiles,
 ) -> Result<()> {
     if wanted.is_empty() {
         return Ok(());
@@ -2058,6 +2080,7 @@ fn checkout_subset(
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
     opts.destination_is_initially_empty = false;
     opts.overwrite_existing = true;
+    opts.on_entry = updating.hook();
     let odb = repo.objects.clone().into_arc()?;
     let should_interrupt = AtomicBool::new(false);
     let discard_files = gix::progress::Discard;

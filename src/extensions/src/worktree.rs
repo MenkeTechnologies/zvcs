@@ -225,16 +225,30 @@ where
     // and leaves the file modified against the very index that named it. git materialises
     // through the replacement too when it materialises at all — the difference is that it
     // does not materialise a file it has no reason to touch.
+    //
+    // `check_updates()` still ticks its meter for every entry `checkout_entry()` returned
+    // early on (unpack-trees.c:490-501), so those are reported to `on_entry` here, where
+    // they are skipped; an entry kept out of the work tree is not one it counts.
+    let mut up_to_date = 0usize;
     let stale: Vec<usize> = {
         let backing = index.path_backing();
         index
             .entries()
             .iter()
             .enumerate()
-            .filter(|(_, entry)| !is_up_to_date(entry, backing, &dir, options.stat_options))
+            .filter(|(_, entry)| {
+                let fresh = is_up_to_date(entry, backing, &dir, options.stat_options);
+                if fresh && !entry.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE) {
+                    up_to_date += 1;
+                }
+                !fresh
+            })
             .map(|(i, _)| i)
             .collect()
     };
+    if let Some(on_entry) = &options.on_entry {
+        (0..up_to_date).for_each(|_| on_entry());
+    }
     if stale.len() == index.entries().len() {
         return gix::worktree::state::checkout(index, dir, objects, files, bytes, should_interrupt, options)
             .map(|_| ());

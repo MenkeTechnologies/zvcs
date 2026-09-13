@@ -255,8 +255,80 @@ where
                         && our_tree.is_not_same_change_in_possible_conflict(theirs, ours, our_changes)
                 }) {
                     None => {
-                        apply_change(&mut editor, theirs, None)?;
-                        their_changes[theirs_idx].was_written = true;
+                        // Two renames of different files to one path are looked up by their
+                        // sources and never meet. `process_renames()` records each side's
+                        // version at the shared destination as a collision
+                        // (merge-ort.c:3160-3185), without the base, and `process_entry()`
+                        // content-merges the two there as an add/add (merge-ort.c:4290-4323).
+                        // Directory renames produce these (t6423 7b, 10d, 11f).
+                        let colliding_rename = match theirs {
+                            Change::Rewrite {
+                                source_location: their_source,
+                                location,
+                                entry_mode,
+                                ..
+                            } if entry_mode.is_blob_or_symlink() => match our_tree.check_conflict(location.as_bstr()) {
+                                Some(PossibleConflict::Match { change_idx }) => {
+                                    let ours = &our_changes[change_idx];
+                                    let collides = !ours.was_written
+                                        && matches!(
+                                            &ours.inner,
+                                            Change::Rewrite { source_location: our_source, location: our_location, entry_mode: our_mode, .. }
+                                                if our_location == location && our_source != their_source && our_mode.is_blob_or_symlink()
+                                        );
+                                    collides.then_some(change_idx)
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        let merged_mode = colliding_rename.and_then(|ours_idx| {
+                            merge_modes(our_changes[ours_idx].inner.entry_mode(), theirs.entry_mode())
+                        });
+                        match (colliding_rename, merged_mode) {
+                            (Some(ours_idx), Some(merged_mode)) => {
+                                use crate::tree::utils::to_components_bstring_ref as toc;
+                                let ours = &our_changes[ours_idx].inner;
+                                let location = theirs.location().to_owned();
+                                let (our_mode, our_id) = ours.entry_mode_and_id();
+                                let (their_mode, their_id) = theirs.entry_mode_and_id();
+                                let (our_id, their_id) = (our_id.to_owned(), their_id.to_owned());
+                                let (merged_blob_id, resolution) = perform_blob_merge(
+                                    labels,
+                                    objects,
+                                    blob_merge,
+                                    &mut diff_state.buf1,
+                                    &mut write_blob_to_odb,
+                                    (our_changes[ours_idx].label_location(), our_id, our_mode),
+                                    (their_changes[theirs_idx].label_location(), their_id, their_mode),
+                                    (&location, their_id.kind().null(), merged_mode),
+                                    (0, outer_side),
+                                    &options,
+                                )?;
+                                editor.remove(toc(&ours.source_location().to_owned()))?;
+                                editor.remove(toc(&theirs.source_location().to_owned()))?;
+                                editor.upsert(toc(&location), merged_mode.kind(), merged_blob_id)?;
+                                let conflict = Conflict::with_resolution(
+                                    Resolution::OursModifiedTheirsModifiedThenBlobContentMerge {
+                                        merged_blob: ContentMerge {
+                                            resolution,
+                                            merged_blob_id,
+                                        },
+                                    },
+                                    (ours, theirs, Original, outer_side),
+                                    [None, index_entry(&our_mode, &our_id), index_entry(&their_mode, &their_id)],
+                                );
+                                our_changes[ours_idx].was_written = true;
+                                their_changes[theirs_idx].was_written = true;
+                                if should_fail_on_conflict(conflict) {
+                                    break 'outer;
+                                }
+                            }
+                            _ => {
+                                apply_change(&mut editor, theirs, None)?;
+                                their_changes[theirs_idx].was_written = true;
+                            }
+                        }
                     }
                     Some(candidate) => {
                         use crate::tree::utils::to_components_bstring_ref as toc;

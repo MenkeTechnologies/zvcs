@@ -566,6 +566,18 @@ pub(super) fn detect_and_apply<Find: gix_object::FindObjectOrHeader>(
             entries[MERGE_BASE] = None;
             entries[other_side] = None;
         }
+        // A rename of another file by the other side that ended at the same
+        // path is a collision, which keeps each side's version there but not
+        // the base (merge-ort.c:3160-3185; t6423 10d).
+        let collides_with_other_rename = pairs[other_side]
+            .iter()
+            .enumerate()
+            .any(|(other_idx, other)| {
+                other.renamed && other.one != pair.one && final_two[other_side][other_idx] == final_two[side][pair_idx]
+            });
+        if collides_with_other_rename {
+            out[conflict_idx].entries[MERGE_BASE] = None;
+        }
     }
     Ok(out)
 }

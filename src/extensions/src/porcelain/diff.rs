@@ -3054,8 +3054,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // No second revision can reach here: `cmd_diff()`'s `--cached` arity check
         // above returns `usage_error()` (129) for `revs.len() >= 2` before any of this
         // runs, so the tree-vs-index collection below always has exactly one endpoint.
-        old_tree_id = Some(tree_id_for(&repo, revs.first())?);
-        collect_tree_index(&repo, revs.first(), &mut deltas, ita_invisible)?;
+        // One resolution for the one pending tree, as `cmd_diff()` has.
+        let tree_id = tree_id_for(&repo, revs.first())?;
+        old_tree_id = Some(tree_id);
+        collect_tree_index(&repo, tree_id, &mut deltas, ita_invisible)?;
         cache = repo.diff_resource_cache_for_tree_diff()?;
     } else if revs.len() == 2 {
         let old_tree = rev_object(&repo, revs[0].as_str())?.peel_to_tree()?;
@@ -4425,11 +4427,10 @@ pub(crate) fn diff_filter_selected(filter: &[u8], status: u8) -> bool {
 /// `U` pair whose old side comes from the tree.
 fn collect_tree_index(
     repo: &gix::Repository,
-    spec: Option<&String>,
+    tree_id: ObjectId,
     deltas: &mut Vec<Delta>,
     ita_invisible: bool,
 ) -> Result<()> {
-    let tree_id = tree_id_for(repo, spec)?;
     // `repo_read_index()` finding no index file is an empty index, not HEAD's
     // tree (read-cache.c:2218 `if (!must_exist && errno == ENOENT)`), so a bare
     // repository, or one whose `.git/index` is gone, shows every path as deleted.
@@ -5185,7 +5186,13 @@ fn rev_object<'r>(repo: &'r gix::Repository, spec: &str) -> Result<gix::Object<'
 fn tree_id_for(repo: &gix::Repository, spec: Option<&String>) -> Result<ObjectId> {
     Ok(match spec {
         Some(s) => rev_object(repo, s.as_str())?.peel_to_tree()?.id,
-        None => repo.head_tree_id_or_empty()?.detach(),
+        // `add_head_to_pending()` (revision.c:335-345) is `repo_get_oid("HEAD")`,
+        // and `cmd_diff()` pends the empty tree when that finds nothing
+        // (builtin/diff.c:558-565).
+        None => match crate::objname::resolve(repo, "HEAD") {
+            Some(id) => repo.find_object(id)?.peel_to_tree()?.id,
+            None => ObjectId::empty_tree(repo.object_hash()),
+        },
     })
 }
 

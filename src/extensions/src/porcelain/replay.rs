@@ -309,6 +309,8 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
     // port cannot hand on. Recorded rather than raised, because `parse_options()`
     // is not where git looks at it; see the arm that fills it in.
     let mut unported: Option<String> = None;
+    // Whether `parse_options()` has consumed its `--`; see that arm.
+    let mut dashdash = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -319,18 +321,22 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
         };
         let inline = inline.as_deref();
         match name {
-            "--contained" => contained = true,
-            "--no-contained" => contained = false,
-            "--onto" => onto_name = Some(value_of(args, &mut i, inline, name)?),
-            "--advance" => advance_name = Some(value_of(args, &mut i, inline, name)?),
-            "--revert" => revert_name = Some(value_of(args, &mut i, inline, name)?),
-            "--ref" => ref_name = Some(value_of(args, &mut i, inline, name)?),
-            "--ref-action" => ref_action = Some(value_of(args, &mut i, inline, name)?),
+            "--contained" if !dashdash => contained = true,
+            "--no-contained" if !dashdash => contained = false,
+            "--onto" if !dashdash => onto_name = Some(value_of(args, &mut i, inline, name)?),
+            "--advance" if !dashdash => {
+                advance_name = Some(value_of(args, &mut i, inline, name)?)
+            }
+            "--revert" if !dashdash => revert_name = Some(value_of(args, &mut i, inline, name)?),
+            "--ref" if !dashdash => ref_name = Some(value_of(args, &mut i, inline, name)?),
+            "--ref-action" if !dashdash => {
+                ref_action = Some(value_of(args, &mut i, inline, name)?)
+            }
             // parse_options_step()'s `internal_help`: the block on stdout at
             // 129, ahead of every unported-flag refusal below.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
-            "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),
+            "-h" | "--help-all" if !dashdash => return Ok(super::show_usage(USAGE)),
             // `cmd_replay` passes `PARSE_OPT_KEEP_UNKNOWN_OPT` and no
             // `PARSE_OPT_KEEP_DASHDASH` (builtin/replay.c:117-118), so neither of
             // these is rejected by `parse_options()` at all: the separator ends
@@ -340,6 +346,13 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
             // here is what puts `error: exactly one of --onto, --advance, or
             // --revert is required` in front of it, which is what stock prints
             // for a bare `git replay --zzbogus`.
+            //
+            // Without `PARSE_OPT_KEEP_DASHDASH`, parse_options_step() drops the
+            // first `--` and stops (parse-options.c:892-897); what follows reaches
+            // `setup_revisions()` verbatim, so `-- div-cold` is a revision
+            // argument there, and replay's own options past it are unknown ones.
+            // Only a second `--` is `setup_revisions()`'s pathspec separator.
+            "--" if !dashdash => dashdash = true,
             "--" => {
                 unported.get_or_insert_with(|| {
                     "unsupported flag \"--\" (pathspec-limited replay is not ported; \

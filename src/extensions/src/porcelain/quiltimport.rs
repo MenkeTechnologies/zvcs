@@ -382,6 +382,18 @@ fn git_dir_init() -> Result<PathBuf, ExitCode> {
             return Err(ExitCode::from(128));
         }
     };
+    // `GIT_DIR=$(git rev-parse --git-dir) || exit` (git-sh-setup.sh:327) is the
+    // script's first repository command, and `cmd_rev_parse()` runs
+    // `git_config(git_default_config)` before answering — so a value that
+    // callback refuses (`core.safecrlf=<junk>`) dies 128 here, ahead of the
+    // script's own `--author` check.
+    if let Err(rejection) = crate::default_config::validate(&repo) {
+        let msg = rejection.into_fatal();
+        if !msg.is_empty() {
+            eprintln!("fatal: {msg}");
+        }
+        return Err(ExitCode::from(128));
+    }
     // `test -z "$(git rev-parse --show-cdup)"`: empty for a bare repository and
     // at the top of a work tree, non-empty anywhere below it.
     if let Some(workdir) = repo.workdir() {

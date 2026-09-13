@@ -1,0 +1,36 @@
+use crate::gitcomp::*;
+
+/// `builtin_merge_options[]` (builtin/merge.c:261-339).
+pub(super) const BUILTIN_MERGE_OPTIONS: &[Opt] = &[
+    OPT_SET_INT(NULL),
+    OPT_BOOL("stat"),
+    OPT_BOOL("summary"),
+    OPT_CALLBACK_F("compact-summary", PARSE_OPT_NOARG),
+    option(Type::Integer, "log", PARSE_OPT_OPTARG),
+    OPT_BOOL("squash"),
+    OPT_BOOL("commit"),
+    OPT_BOOL("edit"),
+    OPT_CLEANUP(),
+    OPT_SET_INT("ff"),
+    OPT_SET_INT_F("ff-only", PARSE_OPT_NONEG),
+    OPT_RERERE_AUTOUPDATE(),
+    OPT_BOOL("verify-signatures"),
+    OPT_CALLBACK("strategy"),
+    OPT_STRVEC("strategy-option"),
+    OPT_CALLBACK("message"),
+    option(Type::LowlevelCallback, "file", PARSE_OPT_NONEG),
+    OPT_STRING("into-name"),
+    // OPT__VERBOSITY (parse-options.h:545-560)
+    OPT_CALLBACK_F("verbose", PARSE_OPT_NOARG),
+    OPT_CALLBACK_F("quiet", PARSE_OPT_NOARG),
+    OPT_BOOL("abort"),
+    OPT_BOOL("quit"),
+    OPT_BOOL("continue"),
+    OPT_BOOL("allow-unrelated-histories"),
+    OPT_SET_INT("progress"),
+    option(Type::String, "gpg-sign", PARSE_OPT_OPTARG),
+    OPT_AUTOSTASH(),
+    OPT_BOOL("overwrite-ignore"),
+    OPT_BOOL("signoff"),
+    OPT_BOOL("no-verify"),
+];

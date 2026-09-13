@@ -1,0 +1,42 @@
+use crate::gitcomp::*;
+
+/// `builtin_apply_options[]` (apply.c:5202-5283), which `apply_parse_options()`
+/// passes to `parse_options()` for `cmd_apply()` (builtin/apply.c:34).
+pub(super) const BUILTIN_APPLY_OPTIONS: &[Opt] = &[
+    OPT_CALLBACK_F("exclude", PARSE_OPT_NONEG),
+    OPT_CALLBACK_F("include", PARSE_OPT_NONEG),
+    OPT_CALLBACK(NULL),
+    OPT_BOOL("no-add"),
+    OPT_BOOL("stat"),
+    OPT_NOOP_NOARG("allow-binary-replacement"),
+    OPT_NOOP_NOARG("binary"),
+    OPT_BOOL("numstat"),
+    OPT_BOOL("summary"),
+    OPT_BOOL("check"),
+    OPT_BOOL("index"),
+    OPT_BOOL("intent-to-add"),
+    OPT_BOOL("cached"),
+    OPT_BOOL_F("unsafe-paths", PARSE_OPT_NOCOMPLETE),
+    OPT_BOOL("apply"),
+    OPT_BOOL("3way"),
+    OPT_SET_INT_F("ours", PARSE_OPT_NONEG),
+    OPT_SET_INT_F("theirs", PARSE_OPT_NONEG),
+    OPT_SET_INT_F("union", PARSE_OPT_NONEG),
+    OPT_FILENAME("build-fake-ancestor"),
+    OPT_SET_INT(NULL),
+    OPT_UNSIGNED(NULL),
+    OPT_CALLBACK("whitespace"),
+    OPT_CALLBACK_F("ignore-space-change", PARSE_OPT_NOARG),
+    OPT_CALLBACK_F("ignore-whitespace", PARSE_OPT_NOARG),
+    OPT_BOOL("reverse"),
+    OPT_BOOL("unidiff-zero"),
+    OPT_BOOL("reject"),
+    OPT_BOOL("allow-overlap"),
+    // OPT__VERBOSITY (parse-options.h:545-560)
+    OPT_CALLBACK_F("verbose", PARSE_OPT_NOARG),
+    OPT_CALLBACK_F("quiet", PARSE_OPT_NOARG),
+    OPT_BIT("inaccurate-eof"),
+    OPT_BIT("recount"),
+    OPT_CALLBACK("directory"),
+    OPT_BOOL("allow-empty"),
+];

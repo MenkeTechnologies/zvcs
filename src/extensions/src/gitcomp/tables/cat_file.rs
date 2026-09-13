@@ -1,0 +1,30 @@
+use crate::gitcomp::*;
+
+/// `options[]` (builtin/cat-file.c:1098-1148).
+pub(super) const CAT_FILE_OPTIONS: &[Opt] = &[
+    OPT_GROUP(),
+    OPT_CMDMODE(NULL),
+    OPT_CMDMODE(NULL),
+    OPT_GROUP(),
+    OPT_CMDMODE(NULL),
+    OPT_CMDMODE(NULL),
+    OPT_HIDDEN_BOOL("allow-unknown-type"),
+    OPT_BOOL("use-mailmap"),
+    OPT_ALIAS("mailmap", "use-mailmap"),
+    OPT_GROUP(),
+    OPT_CALLBACK_F("batch", PARSE_OPT_OPTARG | PARSE_OPT_NONEG),
+    OPT_CALLBACK_F("batch-check", PARSE_OPT_OPTARG | PARSE_OPT_NONEG),
+    OPT_BOOL_F(NULL, PARSE_OPT_HIDDEN),
+    OPT_BOOL(NULL),
+    OPT_CALLBACK_F("batch-command", PARSE_OPT_OPTARG | PARSE_OPT_NONEG),
+    OPT_CMDMODE("batch-all-objects"),
+    OPT_GROUP(),
+    OPT_BOOL("buffer"),
+    OPT_BOOL("follow-symlinks"),
+    OPT_BOOL("unordered"),
+    OPT_GROUP(),
+    OPT_CMDMODE("textconv"),
+    OPT_CMDMODE("filters"),
+    OPT_STRING("path"),
+    OPT_PARSE_LIST_OBJECTS_FILTER(),
+];

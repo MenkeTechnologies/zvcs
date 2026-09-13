@@ -1,0 +1,33 @@
+use crate::gitcomp::*;
+
+/// `options[]` (builtin/blame.c:951-986).
+pub(super) const BLAME_OPTIONS: &[Opt] = &[
+    OPT_BOOL("incremental"),
+    OPT_BOOL(NULL),
+    OPT_BOOL("root"),
+    OPT_BOOL("show-stats"),
+    OPT_BOOL("progress"),
+    OPT_BIT("score-debug"),
+    OPT_BIT("show-name"),
+    OPT_BIT("show-number"),
+    OPT_BIT("porcelain"),
+    OPT_BIT("line-porcelain"),
+    OPT_BIT(NULL),
+    OPT_BIT(NULL),
+    OPT_BIT(NULL),
+    OPT_BIT(NULL),
+    OPT_BIT("show-email"),
+    OPT_BIT(NULL),
+    OPT_CALLBACK_F("diff-algorithm", PARSE_OPT_NONEG),
+    OPT_STRING_LIST("ignore-rev"),
+    OPT_STRING_LIST("ignore-revs-file"),
+    OPT_BIT("color-lines"),
+    OPT_BIT("color-by-age"),
+    OPT_CALLBACK_F("minimal", PARSE_OPT_NOARG | PARSE_OPT_HIDDEN),
+    OPT_STRING(NULL),
+    OPT_STRING("contents"),
+    OPT_CALLBACK_F(NULL, PARSE_OPT_OPTARG),
+    OPT_CALLBACK_F(NULL, PARSE_OPT_OPTARG),
+    OPT_STRING_LIST(NULL),
+    OPT__ABBREV(),
+];

@@ -505,23 +505,23 @@ impl TreeNodes {
 
     fn remove_leaf_inner(&mut self, location: &BStr, must_exist: bool) {
         let mut components = to_components(location).peekable();
-        let mut cursor = &mut self.0[0];
+        let mut cursor_idx = 0;
         while let Some(component) = components.next() {
-            match cursor.children.get(component).copied() {
+            match self.0[cursor_idx].children.get(component).copied() {
                 None => debug_assert!(!must_exist, "didn't find '{location}' for removal"),
                 Some(existing_idx) => {
                     let is_last = components.peek().is_none();
                     if is_last {
-                        cursor.children.remove(component);
-                        cursor = &mut self.0[existing_idx];
-                        debug_assert!(
-                            cursor.is_leaf_node(),
-                            "BUG: we should really only try to remove leaf nodes: {cursor:?}"
-                        );
-                        cursor.change_idx = None;
-                    } else {
-                        cursor = &mut self.0[existing_idx];
+                        // A path can be a leaf change and a directory at once: one side
+                        // deleted the blob `x/d` and added `x/d/f` (t6423 7e). Handling the
+                        // blob's change must not detach the directory below it, whose
+                        // changes are still looked up through this node.
+                        if self.0[existing_idx].is_leaf_node() {
+                            self.0[cursor_idx].children.remove(component);
+                        }
+                        self.0[existing_idx].change_idx = None;
                     }
+                    cursor_idx = existing_idx;
                 }
             }
         }

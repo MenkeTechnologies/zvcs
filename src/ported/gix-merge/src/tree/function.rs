@@ -220,12 +220,12 @@ where
                     their_tree.insert(theirs, theirs_idx);
                 }
 
-                // A directory *our* side added is no file in the way of a path beneath it. Its
-                // node only turns into a leaf when every change inside it was moved elsewhere
-                // by a directory rename.
+                // A directory *our* side added or deleted is no file in the way of a path
+                // beneath it. Its node only turns into a leaf when every change inside it was
+                // moved elsewhere by a directory rename, or was resolved away at its old path.
                 let is_added_directory = |idx: usize| {
                     let change = &our_changes[idx].inner;
-                    matches!(change, Change::Addition { .. }) && change.entry_mode().is_tree()
+                    matches!(change, Change::Addition { .. } | Change::Deletion { .. }) && change.entry_mode().is_tree()
                 };
                 // Passing a directory *our* side renamed wholesale is not a conflict of
                 // its own either: merge-ort only moves a change along a directory rename it
@@ -336,9 +336,9 @@ where
                                 }
                             } else if matches!(candidate, PossibleConflict::NonTreeToTree { .. }) {
                                 // We are writing on top of what was a file, a conflict we probably already saw and dealt with.
-                                let location = theirs.location();
-                                let (mode, id) = theirs.entry_mode_and_id();
-                                editor.upsert(to_components(location), mode.kind(), id.to_owned())?;
+                                // The change is applied as a whole: a rename still leaves its source
+                                // (t6423 3b, where `z/b -> y/b` passed the emptied `z` of the other side).
+                                apply_change(&mut editor, theirs, None)?;
                                 their_changes[theirs_idx].was_written = true;
                             } else {
                                 gix_trace::debug!(
@@ -1165,6 +1165,12 @@ where
                                         editor.remove(toc(source_location))?;
                                         pick_our_tree(side, our_tree, their_tree)
                                             .remove_existing_leaf(source_location.as_bstr());
+                                        // `process_renames()` marks the old path "resolved by
+                                        // removal" (merge-ort.c:3222-3226), so the rename's source
+                                        // no longer stands in the way of what the deleting side put
+                                        // beneath it (x/d deleted, x/d/f added: t6423 7e).
+                                        pick_our_tree(side, their_tree, our_tree)
+                                            .remove_leaf(source_location.as_bstr());
                                     }
                                     Some(ResolveWith::Ancestor) => {}
                                 }

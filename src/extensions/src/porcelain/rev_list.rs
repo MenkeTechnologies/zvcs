@@ -909,6 +909,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut date_mode = super::log::DateMode::Default;
     let mut order = Order::Date;
     let mut filter: Option<Filter> = None;
+    // `--filter-provided-objects` (builtin/rev-list.c:609-612, 736-744): the
+    // objects named on the command line lose their `USER_GIVEN` exemption and go
+    // through the filter like everything the walk reaches.
+    let mut filter_provided_objects = false;
     let mut missing = Missing::Error;
     // `--no-walk` and its `sorted`/`unsorted` argument (git's `unsorted_input`).
     let mut no_walk = false;
@@ -1172,6 +1176,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // `~<oid>` lines after the listing (builtin/rev-list.c:817-818,
             // 989-996).
             "--filter-print-omitted" => print_omitted = true,
+            "--filter-provided-objects" => filter_provided_objects = true,
             "--ancestry-path" => ancestry_path = true,
             // ```c
             // } else if (skip_prefix(arg, "--ancestry-path=", &optarg)) {
@@ -2615,9 +2620,19 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             if !seen.insert(entry.id) {
                 continue;
             }
+            // `list_objects_filter__filter_object()` (list-objects-filter.c:808-821)
+            // consults the filter only for an object carrying `NOT_USER_GIVEN`; a
+            // pending tree or blob has it only under `--filter-provided-objects`.
+            // Otherwise it is shown unconditionally.
             match entry.kind {
                 gix::object::Kind::Tree => {
-                    object_lines.push((entry.id, entry.name.clone()));
+                    // `filter_trees_depth()` hides a tree at depth 0 only for
+                    // `tree:0`; the blob filters always show trees.
+                    let root_hidden = filter_provided_objects
+                        && matches!(walk.filter, Some(Filter::TreeDepth(0)));
+                    if !root_hidden {
+                        object_lines.push((entry.id, entry.name.clone()));
+                    }
                     if let Err(code) = walk_tree(
                         &repo,
                         entry.id,
@@ -2632,8 +2647,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                         return Ok(code);
                     }
                 }
-                gix::object::Kind::Blob => match blob_filtered(&repo, entry.id, &entry.name, &mut absent, &walk)?
-                {
+                gix::object::Kind::Blob => match blob_filtered(
+                    &repo,
+                    entry.id,
+                    &entry.name,
+                    &mut absent,
+                    &ObjectWalk { filter: walk.filter.filter(|_| filter_provided_objects), ..walk },
+                )? {
                     Ok(BlobVerdict::Filtered) => omitted.push(entry.id),
                     Ok(BlobVerdict::Absent) => {}
                     Ok(BlobVerdict::Show) => object_lines.push((entry.id, entry.name.clone())),

@@ -1,7 +1,6 @@
 use anyhow::Result;
-use prodash::Root as _;
 use std::collections::HashSet;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{Read, Write};
 use std::num::NonZeroU32;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -33,16 +32,17 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `-v`/`--verbose`, `-q`/`--quiet`, `--dry-run` (and their `--no-…` negations)
 ///   * `--porcelain`                  → machine-readable `<flag> <old> <new> <ref>` on stdout
 ///   * `--write-fetch-head`/`--no-write-fetch-head`, `-a`/`--append` → `.git/FETCH_HEAD`
-///   * `--progress`/`--no-progress`   → force/suppress the stderr progress meter
+///   * `--progress`/`--no-progress`   → accepted; git's meters are not ported, so nothing is drawn
 ///   * `--show-forced-updates`/`--no-show-forced-updates` → the `(forced update)` note
 ///   * `--prefetch`                   → rewrite every refspec into `refs/prefetch/…`
 ///   * `--stdin`                      → read additional refspecs from standard input
 ///   * `-u`/`--update-head-ok`        → allow updating the ref `HEAD` points at
-///   * `-k`/`--keep`                  → keep the downloaded pack (always the case here)
+///   * `-k`/`--keep`, `--no-keep`     → accepted; a pack below `fetch.unpackLimit` is exploded either way
 ///   * `--write-commit-graph`         → write the commit-graph after fetching
 ///   * `--recurse-submodules[=yes|no]`, `-j`/`--jobs <n>` → fetch in populated submodules
 ///   * `--upload-pack <path>`         → run `<path>` instead of `git-upload-pack` on the other end
-///   * `-o`/`--server-option <opt>`   → protocol-v2 `server-option=<opt>` line (repeatable)
+///   * `-o`/`--server-option <opt>`   → protocol-v2 `server-option=<opt>` line (repeatable;
+///     `--no-server-option` clears the list)
 ///   * `--refmap <refspec>`           → map the command-line refspecs' results with `<refspec>`
 ///     instead of the remote's configured ones (repeatable; `--refmap=''` stores nowhere)
 ///   * `--negotiation-restrict <rev>` (alias `--negotiation-tip`) → seed the `have` walk with only
@@ -442,17 +442,13 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "-u" | "--update-head-ok" => opts.update_head_ok = true,
             "--no-update-head-ok" => opts.update_head_ok = false,
 
-            // `-k`/`--keep` asks for the received pack to be kept rather than
-            // exploded into loose objects. This build never runs the equivalent
-            // of `unpack-objects` — gitoxide always writes the pack and its index
-            // into `objects/pack` — so the flag names the behaviour that is
-            // already in force. `--no-keep` would have to explode the pack, which
-            // has no implementation here, so it is refused instead of ignored.
+            // `OPT_BOOL('k', "keep", &keep, ...)` (builtin/fetch.c:180). The only
+            // reader is `set_option(transport, TRANS_OPT_KEEP, "yes")` when it is
+            // set (builtin/fetch.c:1514, :1862), which asks `fetch_pack()` for a
+            // `.keep` beside the pack. `--no-keep` is the default it started at:
+            // the small-pack explode in `explode_small_pack()` applies as usual.
             "-k" | "--keep" => {}
-            "--no-keep" => anyhow::bail!(
-                "unsupported option \"--no-keep\" (the received pack is always kept; \
-                 there is no unpack-objects path)"
-            ),
+            "--no-keep" => {}
 
             // Post-fetch commit-graph write (git's `--write-commit-graph`).
             "--write-commit-graph" => write_commit_graph = Some(true),
@@ -540,6 +536,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
             // Protocol-v2 server options, repeatable, transmitted as `server-option=<value>` lines.
             "-o" | "--server-option" => opts.server_options.push(take_value!("--server-option").into()),
+            // `OPT_STRING_LIST('o', "server-option", ...)` (builtin/fetch.c:209):
+            // the negation is `string_list_clear()` in `parse_opt_string_list()`.
+            "--no-server-option" => opts.server_options.clear(),
 
             // git's `parse_refmap_arg`: repeatable, no negation, and an empty value is the documented way to
             // say "don't store anywhere" — it appends a refspec that matches nothing rather than clearing the
@@ -971,30 +970,15 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         Some((remote, merge.as_bstr().to_string()))
     });
 
-    // The progress tree is always built; only the renderer is conditional, so
-    // gitoxide's counters go nowhere when progress is suppressed (as under a
-    // non-terminal stderr) and to the line renderer otherwise.
-    let show_progress =
-        opts.progress.unwrap_or_else(|| std::io::stderr().is_terminal()) && !opts.quiet;
+    // gitoxide reports into a progress tree, and nothing draws it. The line
+    // renderer that used to was never git's output: a ` fetch` header, cursor-up
+    // escapes and a `list refs 1 steps [ === ]` bar, written even for a fetch
+    // that moved no objects — where stock 2.55.0 with `--progress` into a pipe
+    // writes nothing but the `From`/ref lines. git's own meters (`remote:`
+    // sideband lines, `Receiving objects`, `Resolving deltas`) are not ported
+    // here, so the honest output is none.
     let root = prodash::tree::Root::new();
     let mut op = root.add_child("fetch");
-    let render = show_progress.then(|| {
-        let mut o = prodash::render::line::Options {
-            throughput: true,
-            ..Default::default()
-        }
-        .auto_configure(prodash::render::line::StreamKind::Stderr);
-        // `--progress` forces the live display even when stderr is not a terminal,
-        // matching git; auto_configure would otherwise disable it in that case.
-        if opts.progress == Some(true) {
-            o.output_is_terminal = true;
-        }
-        o.hide_cursor = false;
-        // git colors progress only on a real terminal, so `--progress` into a
-        // pipe stays plain even though the meter is forced on.
-        o.colored = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        prodash::render::line::render(std::io::stderr(), root.downgrade(), o)
-    });
 
     // --- dispatch by mode -------------------------------------------------
     let mut failure = false;
@@ -1146,9 +1130,6 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         Ok(())
     })();
 
-    if let Some(handle) = render {
-        handle.shutdown_and_wait();
-    }
     result?;
 
     // `transfer.credentialsInUrl=die` is git's `fatal:` exit, taken before any
@@ -2493,11 +2474,24 @@ fn fetch_one(
         Err(verdict) => return Ok(verdict),
     };
 
+    // `git_connect()` on a local path that is not a repository: `enter_repo()`
+    // fails in the spawned `upload-pack` and the fetch dies with git's block at
+    // 128. The vendored transport refuses the same path before spawning, in its
+    // own words, which would otherwise surface as a `zvcs: fetch:` error at 1.
+    let connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
+        Ok(connection) => connection,
+        Err(err) => {
+            if crate::transport_err::file_url_fatal(&err).is_some() {
+                return Ok(Verdict::Fatal);
+            }
+            return Err(err.into());
+        }
+    };
+
     // `--negotiate-only` never lists refs and never asks for a pack: it runs the negotiation on its
     // own and prints the commits the remote acknowledged as common, one per line.
     if opts.negotiate_only {
-        let common = remote
-            .connect_with_options(gix::remote::Direction::Fetch, connect_options)?
+        let common = connection
             .with_server_options(server_options)
             .negotiate_only(&mut *progress, restrictions)?;
         let mut out = String::new();
@@ -2510,8 +2504,7 @@ fn fetch_one(
     }
 
     let should_interrupt = AtomicBool::new(false);
-    let prepared = match remote
-        .connect_with_options(gix::remote::Direction::Fetch, connect_options)?
+    let prepared = match connection
         .with_server_options(server_options)
         .prepare_fetch(&mut *progress, map_options)
     {
@@ -4592,32 +4585,45 @@ fn explode_small_pack(
         return Ok(());
     };
 
+    // `unpack-objects` writes each object through `write_object_file()`, which
+    // returns early for one the repository already has —
+    // `freshen_packed_object() || freshen_loose_object()` (object-file.c). A
+    // `--refetch` receives objects this repository holds in its existing packs,
+    // and git leaves only the new ones loose. "Already has" is a question about
+    // the pre-fetch object set, so the pack is moved out of `objects/pack` before
+    // a fresh handle is opened to answer it; the vendored loose writer itself
+    // persists unconditionally.
+    let scratch = super::fetch_pack::Scratch::new(repo)?;
+    let scratch_index = scratch.path.join("pack.idx");
+    let scratch_data = scratch.path.join("pack.pack");
+    std::fs::rename(data_path, &scratch_data)?;
+    std::fs::rename(index_path, &scratch_index)?;
+    // The `.keep` file guards the pack until its refs point at it; with the objects
+    // loose there is nothing left to guard.
+    for path in [bundle.keep_path.clone(), Some(data_path.with_extension("rev"))]
+        .into_iter()
+        .flatten()
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    let before = gix::open(repo.git_dir())?;
+
     use gix::objs::Write as _;
-    let pack = gix::odb::pack::Bundle::at(index_path, repo.object_hash())?;
+    use gix::odb::pack::Find as _;
+    let pack = gix::odb::pack::Bundle::at(&scratch_index, repo.object_hash())?;
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut inflate = gix::zlib::Inflate::default();
     let mut cache = gix::odb::pack::cache::Never;
     for idx in 0..pack.index.num_objects() {
         let id = pack.index.oid_at_index(idx).to_owned();
+        if before.objects.contains(&id) {
+            continue;
+        }
         let (object, _) = pack.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache)?;
-        repo.objects
+        before
+            .objects
             .write_buf_with_known_id(object.kind, object.data, id)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    drop(pack);
-
-    // The `.keep` file guards the pack until its refs point at it; with the objects
-    // loose there is nothing left to guard.
-    for path in [
-        Some(data_path.clone()),
-        Some(index_path.clone()),
-        bundle.keep_path.clone(),
-        Some(data_path.with_extension("rev")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let _ = std::fs::remove_file(path);
     }
     Ok(())
 }

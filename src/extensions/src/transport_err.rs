@@ -119,6 +119,24 @@ pub fn not_a_repository_fatal(path: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// [`not_a_repository_fatal`] for the vendored transport's own spelling of the
+/// same failure, or `None` when `err` is something else.
+///
+/// Before it spawns anything for a local path, `gix` asks whether the path is a
+/// git directory and fails with `connect::Error::FileUrl` — "Could not verify
+/// that "<url>" url is a valid git directory before attempting to use it" —
+/// where git's `git_connect()` would have spawned `upload-pack`/`receive-pack`
+/// and died in `enter_repo()`. The URL carried in the error is the path as it
+/// was configured or typed, which is the string git's message quotes.
+pub fn file_url_fatal(err: &gix::remote::connect::Error) -> Option<ExitCode> {
+    match err {
+        gix::remote::connect::Error::FileUrl { url, .. } => {
+            Some(not_a_repository_fatal(&url.to_bstring().to_string()))
+        }
+        _ => None,
+    }
+}
+
 /// The one line the stderr supervisor swallowed, or `None` when it swallowed
 /// none and the child's words already reached the terminal on their own.
 ///

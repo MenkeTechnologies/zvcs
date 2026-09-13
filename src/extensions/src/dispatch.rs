@@ -528,9 +528,6 @@ enum ConfigCallback {
     Status,
     /// `git_commit_config` (builtin/commit.c:1669).
     Commit,
-    /// `git_checkout_config` (builtin/checkout.c:1277), installed by
-    /// `checkout_main()` for `checkout`, `switch` and `restore`.
-    Checkout,
     /// `grep_cmd_config` (builtin/grep.c:297).
     Grep,
     /// `git_blame_config` (builtin/blame.c:714).
@@ -551,6 +548,9 @@ enum ConfigCallback {
 /// `stash` is `DiffBasic` even though `git stash show` reaches the UI layer
 /// through the diff it runs: the choice here is per verb, and taking the
 /// narrower layer under-matches on that one subcommand rather than refusing
+    /// `git_checkout_config` (builtin/checkout.c:1277), installed by
+    /// `checkout_main()` for `checkout`, `switch` and `restore`.
+    Checkout,
 /// `stash list` for a key git lets through.
 fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
     match sub {

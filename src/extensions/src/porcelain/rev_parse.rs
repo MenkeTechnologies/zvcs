@@ -3102,16 +3102,10 @@ fn git_path(repo: &gix::Repository, ctx: &PathCtx, name: &str) -> std::path::Pat
 /// rather than the absolute path, because the cwd is then *outside* the work tree
 /// and `set_git_dir()` is called with `make_realpath = 0`.
 fn gitdir_string(repo: &gix::Repository, _ctx: &PathCtx) -> std::path::PathBuf {
-    let cwd = setup_cwd();
     match std::env::var_os("GIT_DIR") {
-        Some(env) => {
-            let env = std::path::PathBuf::from(env);
-            // `read_gitfile()` replaces a `gitdir: <path>` file with the
-            // symlink-resolved directory it names (`setup.c:1176-1180`).
-            let stored = read_gitfile(&env).unwrap_or(env);
-            explicit_gitdir_string(repo, stored, &cwd)
-        }
-        None => discovered_gitdir_string(repo, &cwd, false),
+        // With `$GIT_DIR` set the field and the variable agree (see below).
+        Some(_) => repo_get_git_dir(repo),
+        None => discovered_gitdir_string(repo, &setup_cwd(), false),
     }
 }
 
@@ -3138,10 +3132,24 @@ fn gitdir_string(repo: &gix::Repository, _ctx: &PathCtx) -> std::path::PathBuf {
 /// Everywhere else `set_git_dir()` does run, and it re-exports its result through
 /// `setenv(GIT_DIR_ENVIRONMENT, repo->gitdir, 1)`, so the field and `$GIT_DIR`
 /// agree and [`gitdir_string`]'s rules describe both.
-fn repo_gitdir_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
+fn repo_gitdir_string(repo: &gix::Repository, _ctx: &PathCtx) -> std::path::PathBuf {
+    repo_get_git_dir(repo)
+}
+
+/// `repo_get_git_dir(the_repository)`: the `repo->gitdir` string described
+/// above, shared with the commands outside rev-parse — `.` when the cwd is a
+/// bare repository's own directory.
+pub(crate) fn repo_get_git_dir(repo: &gix::Repository) -> std::path::PathBuf {
+    let cwd = setup_cwd();
     match std::env::var_os("GIT_DIR") {
-        Some(_) => gitdir_string(repo, ctx),
-        None => discovered_gitdir_string(repo, &setup_cwd(), true),
+        Some(env) => {
+            let env = std::path::PathBuf::from(env);
+            // `read_gitfile()` replaces a `gitdir: <path>` file with the
+            // symlink-resolved directory it names (`setup.c:1176-1180`).
+            let stored = read_gitfile(&env).unwrap_or(env);
+            explicit_gitdir_string(repo, stored, &cwd)
+        }
+        None => discovered_gitdir_string(repo, &cwd, true),
     }
 }
 

@@ -270,8 +270,36 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // 2. --pathspec-from-file: mutually exclusive with cmdline pathspecs, read
-    //    before the empty-pathspec check (both fatal, exit 128).
+    // 2. `rm` is `RUN_SETUP` (git.c), so the repository is found before anything
+    //    below can die, and every pathspec is parsed before the work tree is
+    //    required:
+    //
+    // ```c
+    // parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_CWD, prefix, argv);
+    //
+    // if (pathspec_from_file) {
+    //         if (pathspec.nr)
+    //                 die(_("'%s' and pathspec arguments cannot be used together"), "--pathspec-from-file");
+    //         parse_pathspec_file(&pathspec, 0, PATHSPEC_PREFER_CWD, prefix, pathspec_from_file, pathspec_file_nul);
+    // } else if (pathspec_file_nul) {
+    //         die(_("the option '%s' requires '%s'"), "--pathspec-file-nul", "--pathspec-from-file");
+    // }
+    //
+    // if (!pathspec.nr)
+    //         die(_("No pathspec was given. Which files should I remove?"));
+    //
+    // if (!index_only)
+    //         setup_work_tree(the_repository);
+    // ```
+    //
+    // (builtin/rm.c:280-299.) So bad magic or an element outside the repository
+    // outranks the conflicting-options check and, in a bare repository, the
+    // missing work tree. `git rm --cached` edits the index alone, so a bare
+    // repository with an index answers it like any other.
+    let repo = crate::setup::discover()?;
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+        return Ok(fatal(msg));
+    }
     if let Some(file) = &opts.pathspec_from_file {
         if !pathspecs.is_empty() {
             return Ok(fatal(
@@ -279,22 +307,17 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             ));
         }
         pathspecs = super::commit::read_pathspec_file(file, opts.pathspec_file_nul)?;
+        if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+            return Ok(fatal(msg));
+        }
+    } else if opts.pathspec_file_nul {
+        return Ok(fatal("the option '--pathspec-file-nul' requires '--pathspec-from-file'"));
     }
 
     if pathspecs.is_empty() {
         return Ok(fatal("No pathspec was given. Which files should I remove?"));
     }
 
-    // 3. Open the repository; only a removal that touches the work tree needs one.
-    //
-    // ```c
-    // if (!index_only)
-    //         setup_work_tree(the_repository);
-    // ```
-    //
-    // (builtin/rm.c:298-299.) `git rm --cached` edits the index alone, so a bare
-    // repository with an index answers it like any other.
-    let repo = crate::setup::discover()?;
     if !opts.cached {
         crate::dispatch::setup_work_tree()?;
     }
@@ -305,28 +328,14 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     // `index.lock`. Held for the rest of the function; a no-op with no daemon.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    // 4. Validate every pathspec up front: bad magic (`:(bogus)…`) or a spec that
-    //    escapes the worktree is fatal (exit 128), exactly like git — before any
-    //    matching or mutation. Also records which specs are exclusions, since
-    //    git's "did not match" report skips exclude specs.
+    // 4. Record which specs are exclusions, since git's "did not match" report
+    //    skips exclude specs. Every one of them parsed cleanly in step 2.
     let defaults = repo.pathspec_defaults_inherit_ignore_case(false)?;
-    let prefix = repo.prefix()?.map(|p| p.to_path_buf()).unwrap_or_default();
-    let root = gix::path::realpath(repo.workdir().unwrap_or_else(|| repo.git_dir()))?;
     let mut is_exclude: Vec<bool> = Vec::with_capacity(pathspecs.len());
     let mut patterns: Vec<BString> = Vec::with_capacity(pathspecs.len());
     for raw in &pathspecs {
-        let mut parsed = match gix::pathspec::parse(raw.as_bytes(), defaults) {
-            Ok(p) => p,
-            Err(_) => return Ok(fatal(format!("{raw}: bad pathspec magic"))),
-        };
+        let parsed = gix::pathspec::parse(raw.as_bytes(), defaults)?;
         is_exclude.push(parsed.is_excluded());
-        if parsed.normalize(&prefix, &root).is_err() {
-            return Ok(fatal(format!(
-                "{raw}: '{}' is outside repository at '{}'",
-                parsed.path().to_str_lossy(),
-                root.display()
-            )));
-        }
         patterns.push(BString::from(raw.as_str()));
     }
 

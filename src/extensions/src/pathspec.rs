@@ -230,7 +230,9 @@ pub fn first_outside_repository_fatal<S: AsRef<[u8]>>(
     specs: &[S],
     defaults: gix::pathspec::Defaults,
 ) -> Option<String> {
-    let workdir = repo.workdir()?;
+    let Some(workdir) = repo.workdir() else {
+        return bare_outside_repository_fatal(repo, specs, defaults);
+    };
     let root = gix::path::realpath(workdir).unwrap_or_else(|_| workdir.to_owned());
     // `prefix_path_gently()` is handed `revs->prefix`, the CWD as seen from the
     // working tree. Outside one there is nothing to be outside *of*.
@@ -249,6 +251,66 @@ pub fn first_outside_repository_fatal<S: AsRef<[u8]>>(
             )
         })
     })
+}
+
+/// [`first_outside_repository_fatal`] in a repository without a working tree.
+///
+/// `prefix_path_gently()` still runs there (setup.c:120-147) with a `NULL`
+/// prefix: a relative element fails only when `normalize_path_copy_len()` climbs
+/// above the top, and an absolute one always fails, because
+/// `abspath_part_inside_repo()` returns -1 when `repo_get_work_tree()` is `NULL`
+/// (setup.c:56-60). The hint then falls back to `repo_get_git_dir()` and goes
+/// through `absolute_path()` unnormalised, so standing in the bare repository
+/// itself — where the stored git dir is `.` — prints `<cwd>/.`.
+fn bare_outside_repository_fatal<S: AsRef<[u8]>>(
+    repo: &gix::Repository,
+    specs: &[S],
+    defaults: gix::pathspec::Defaults,
+) -> Option<String> {
+    let bad = specs.iter().find_map(|spec| {
+        let mut pattern = gix::pathspec::parse(spec.as_ref(), defaults).ok()?;
+        let copyfrom = pattern.path().to_owned();
+        let outside = gix::path::is_absolute(gix::path::from_bstr(copyfrom.as_bstr()))
+            || pattern.normalize(std::path::Path::new(""), std::path::Path::new("")).is_err();
+        outside.then(|| (spec.as_ref().as_bstr().to_owned(), copyfrom))
+    })?;
+    let hint = absolute_path(&crate::porcelain::rev_parse::repo_get_git_dir(repo));
+    Some(format!(
+        "{}: '{}' is outside repository at '{}'",
+        bad.0.to_str_lossy(),
+        bad.1.to_str_lossy(),
+        hint.display()
+    ))
+}
+
+/// `strbuf_add_absolute_path()` (abspath.c): a relative path is appended to the
+/// current directory — spelled as `$PWD` when that names the same directory as
+/// `getcwd()` — with one `/` between, and nothing is normalised.
+fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path.to_owned();
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return path.to_owned();
+    };
+    let base = match std::env::var_os("PWD").map(std::path::PathBuf::from) {
+        Some(pwd) if pwd != cwd && same_inode(&pwd, &cwd) => pwd,
+        _ => cwd,
+    };
+    let mut out = base.into_os_string();
+    if !out.as_encoded_bytes().ends_with(b"/") {
+        out.push("/");
+    }
+    out.push(path.as_os_str());
+    out.into()
+}
+
+fn same_inode(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
 }
 
 /// Both of `init_pathspec_item()`'s `die()`s, in git's order, for a command that

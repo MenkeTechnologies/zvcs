@@ -1441,6 +1441,15 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `git <builtin> --git-completion-helper[-all]`. In git it is answered inside
+    // the builtin's `parse_options()` (parse-options.c:1052-1059), so everything
+    // `run_builtin()` does first — repository setup, the config read, the
+    // work-tree gate — has already happened above; nothing after this point, the
+    // write lane included, is reached.
+    if let Some(result) = crate::gitcomp::answer(sub, args) {
+        return result;
+    }
+
     // Lock-contention → queue. For an index-mutating verb, try to take the repo's
     // write lane WITHOUT blocking: if it is already held, submit this command as a
     // job (it will run on the daemon's fair FIFO) and return its number instead of

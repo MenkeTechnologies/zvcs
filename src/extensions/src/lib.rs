@@ -24,6 +24,7 @@ pub mod diffopt;
 pub mod dispatch;
 pub mod external;
 pub mod fatal;
+pub mod gitcomp;
 pub mod gitsig;
 pub mod hooks;
 pub mod hosted;

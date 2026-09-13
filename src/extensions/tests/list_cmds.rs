@@ -18,9 +18,11 @@
 //!     message quotes: a bad top-level token is reported with the whole
 //!     remainder of the spec, a bad `list-<category>` with the bare category.
 //!
-//! `--list-cmds=parseopt` is the one deliberate divergence and is asserted as
-//! such, together with the invariant that keeps it honest: whatever it lists
-//! must really answer `--git-completion-helper`.
+//! `--list-cmds=parseopt` lists only the builtins whose option table is ported,
+//! so it is a subset of stock's until every table is, and is asserted with the
+//! invariant that keeps it honest: whatever it lists must answer
+//! `--git-completion-helper` and `--git-completion-helper-all` byte for byte as
+//! stock does.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -409,32 +411,79 @@ fn unknown_tokens_die_the_way_stock_does() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
-/// `parseopt` is the one group that cannot match stock: it names the commands
-/// that answer `--git-completion-helper`, and this port implements that flag
-/// nowhere, so the honest answer is the empty list. The invariant asserted here
-/// is what keeps it honest — every name it *does* print must really answer.
+/// `parseopt` names the commands that answer `--git-completion-helper`, which
+/// this port does from a ported `struct option` table per builtin. Every name
+/// it prints must answer both helper forms exactly as stock does — the option
+/// list `git-completion.bash` pastes into the user's candidates — and every name
+/// must be one stock lists too, in stock's order, space-terminated with no
+/// newline.
 #[test]
 fn parseopt_lists_only_commands_that_answer_the_completion_helper() {
     let repo = fixture("parseopt");
     let out = run(&repo, &["--list-cmds=parseopt"]);
     assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!text.contains('\n') && (text.is_empty() || text.ends_with(' ')), "{text:?}");
 
-    let names: Vec<String> =
-        String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_owned).collect();
+    let names: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    assert!(names.iter().any(|n| n == "add"), "add's table is ported: {names:?}");
     for name in &names {
-        let helper = run(&repo, &[name, "--git-completion-helper"]);
-        assert!(
-            helper.status.success(),
-            "{name} is listed under parseopt but `--git-completion-helper` failed"
-        );
-        let text = String::from_utf8_lossy(&helper.stderr).into_owned();
-        assert!(!text.contains("unsupported flag"), "{name} rejects --git-completion-helper: {text}");
+        for helper in ["--git-completion-helper", "--git-completion-helper-all"] {
+            let ours = run(&repo, &[name, helper]);
+            assert!(ours.status.success(), "{name} {helper} failed: {:?}", ours);
+            let line = String::from_utf8_lossy(&ours.stdout).into_owned();
+            assert!(line.ends_with('\n') && line.lines().count() == 1, "{name} {helper}: {line:?}");
+            if stock_available() {
+                let stock = run_stock(&repo, &[name, helper]);
+                assert_eq!(
+                    String::from_utf8_lossy(&ours.stdout),
+                    String::from_utf8_lossy(&stock.stdout),
+                    "{name} {helper}"
+                );
+                assert_eq!(ours.stderr, stock.stderr, "{name} {helper}");
+            }
+        }
     }
+    if stock_available() {
+        let stock = run_stock(&repo, &["--list-cmds=parseopt"]);
+        let stock_names: Vec<String> = String::from_utf8_lossy(&stock.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let in_stock_order: Vec<&String> =
+            stock_names.iter().filter(|n| names.contains(n)).collect();
+        assert_eq!(names.iter().collect::<Vec<_>>(), in_stock_order);
+    }
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
 
-    // Today that leaves nothing to print — and stock's format is still matched
-    // for the empty case: no trailing newline, exit 0.
-    assert!(names.is_empty(), "the invariant above now covers a non-empty list: {names:?}");
-    assert!(out.stdout.is_empty());
+/// A `RUN_SETUP` builtin never reaches `parse_options()` without a repository
+/// (git.c:472-480), so the helper dies there the way the command would; a
+/// work tree is demanded by `NEED_WORK_TREE` before the builtin runs, so a bare
+/// repository refuses `add` too.
+#[test]
+fn completion_helper_runs_after_repository_setup() {
+    let repo = fixture("helper-setup");
+    let outside = repo.parent().unwrap().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let bare = repo.parent().unwrap().join("bare.git");
+    assert!(run(&repo, &["init", "-q", "--bare", bare.to_str().unwrap()]).status.success());
+
+    for dir in [&outside, &bare] {
+        let mut cmd = command(BIN, dir, &["add", "--git-completion-helper"]);
+        let ours = cmd.env("GIT_CEILING_DIRECTORIES", repo.parent().unwrap()).output().unwrap();
+        assert_eq!(ours.status.code(), Some(128), "{dir:?}: {ours:?}");
+        assert!(ours.stdout.is_empty(), "{dir:?}: {ours:?}");
+        if stock_available() {
+            let mut cmd = command(STOCK, dir, &["add", "--git-completion-helper"]);
+            let stock = cmd.env("GIT_CEILING_DIRECTORIES", repo.parent().unwrap()).output().unwrap();
+            assert_eq!(ours.stderr, stock.stderr, "{dir:?}");
+        }
+    }
+    // Only the lone argument is the helper: with a second one it is an option
+    // like any other, and `add` rejects it.
+    let two = run(&repo, &["add", "--git-completion-helper", "x"]);
+    assert_eq!(two.status.code(), Some(129), "{two:?}");
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 

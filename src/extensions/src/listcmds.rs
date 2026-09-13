@@ -52,7 +52,7 @@
 //! | `config` | `completion.commands` config | `list_cmds_by_config()` |
 //! | `deprecated` | [`DEPRECATED`] ∩ dispatch tables | `list_builtins(&list, DEPRECATED, 0)` |
 //! | `list-<cat>` | `git help -a`/`-g` tables | `list_cmds_by_category()` |
-//! | `parseopt` | [`PARSEOPT_VERBS`] | `list_builtins(&list, 0, NO_PARSEOPT)` |
+//! | `parseopt` | [`crate::gitcomp`] tables | `list_builtins(&list, 0, NO_PARSEOPT)` |
 //!
 //! There is **no negation syntax**. `--list-cmds=no-main` is not "everything but
 //! main": `match_token()` (git.c:71-76) is an exact length-and-bytes compare, so
@@ -79,22 +79,13 @@ const DEPRECATED: &[&str] = &["pack-redundant", "whatchanged"];
 ///
 /// git's answer is "every builtin whose entry lacks `NO_PARSEOPT`", i.e. every
 /// builtin driven by `parse_options()`, because `parse_options()` is what
-/// implements `--git-completion-helper` for free. This port has no such shared
-/// implementation — its option sweeps are per-command — and no verb answers the
-/// flag today:
-///
-/// ```text
-/// $ git log --git-completion-helper
-/// zvcs: log: unsupported flag "--git-completion-helper"
-/// ```
-///
-/// So the honest answer is the empty list, and `git --list-cmds=parseopt`
-/// prints nothing. Naming verbs here that cannot answer would be worse than
-/// printing nothing: the completion script would then run the helper on them
-/// and paste this port's error text into the user's option list. Add a verb to
-/// this table only together with a working `--git-completion-helper` for it;
-/// `listcmds.rs`'s test asserts every name listed here really answers.
-const PARSEOPT_VERBS: &[&str] = &[];
+/// implements `--git-completion-helper` for free. This port answers the helper
+/// from [`crate::gitcomp`], one ported `struct option` array per builtin, so the
+/// list is exactly the builtins that module has a table for — never a name the
+/// completion script would ask and receive this port's error text from.
+fn parseopt_verbs() -> impl Iterator<Item = &'static str> {
+    crate::gitcomp::builtins().iter().map(|b| b.name)
+}
 
 /// The `command-list.txt` attribute groups that have no heading in `git help -a`
 /// and so cannot be read back out of the tables this port prints.
@@ -307,12 +298,11 @@ fn apply_completion_commands(list: &mut Vec<String>) {
 /// `--list-cmds=parseopt`, which git answers inside `handle_options()` rather
 /// than through `list_cmds()` (git.c:327-334) and formats differently: the names
 /// are printed with `printf("%s ", …)`, so they are space-separated with a
-/// trailing space and **no** newline. Reproduced byte for byte, including the
-/// empty output [`PARSEOPT_VERBS`] currently produces.
+/// trailing space and **no** newline. Reproduced byte for byte.
 pub fn parseopt() -> ExitCode {
     crate::trace2::cmd_name("_query_");
     let names: Vec<&str> =
-        PARSEOPT_VERBS.iter().copied().filter(|v| dispatch::is_verb(v)).collect();
+        parseopt_verbs().filter(|v| dispatch::is_verb(v)).collect();
     print!("{}", names.iter().map(|n| format!("{n} ")).collect::<String>());
     ExitCode::SUCCESS
 }
@@ -393,8 +383,8 @@ mod tests {
     /// can run the binary.
     #[test]
     fn parseopt_verbs_are_dispatched() {
-        for verb in PARSEOPT_VERBS {
-            assert!(dispatch::is_verb(verb), "{verb} is listed in PARSEOPT_VERBS but not dispatched");
+        for verb in parseopt_verbs() {
+            assert!(dispatch::is_verb(verb), "{verb} has a gitcomp table but is not dispatched");
         }
     }
 

@@ -1121,27 +1121,6 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Turning the forced-update check off makes the summary silently misreport
-    // rewritten branches as fast-forwards, so git says so once per invocation —
-    // before any fetching, and regardless of `-q` or of whether anything is
-    // fetched at all.
-    // `advice_enabled(ADVICE_FETCH_SHOW_FORCED_UPDATES)` wraps both halves of
-    // this report in `store_updated_refs()` — the "check disabled" note here and
-    // the "it took N seconds" one that is not ported.
-    //
-    // The warning is `store_updated_refs()`' (builtin/fetch.c:1351-1353), so it belongs to
-    // the process that updates refs: under `fetch_multiple()` that is each child.
-    if one.is_some()
-        && !opts.show_forced_updates
-        && crate::advice::Advice::FetchShowForcedUpdates.enabled_in(&repo)
-    {
-        eprintln!(
-            "warning: fetch normally indicates which branches had a forced update,\n\
-             but that check has been disabled; to re-enable, use '--show-forced-updates'\n\
-             flag or run 'git config fetch.showForcedUpdates true'"
-        );
-    }
-
     // Serialize ref mutations through the repo coordinator, as the write
     // commands do; a no-op guard if no daemon is running. Not held around
     // `fetch_multiple()`: its children take the lock for their own ref updates, and
@@ -3933,6 +3912,31 @@ fn fetch_one(
                 status: 0,
             });
         }
+    }
+
+    // ```c
+    // if (advice_enabled(ADVICE_FETCH_SHOW_FORCED_UPDATES)) {
+    //         if (!config->show_forced_updates) {
+    //                 warning(_(warn_show_forced_updates));
+    //         } else if (forced_updates_ms > FORCED_UPDATES_DELAY_WARNING_IN_MS) {
+    //                 warning(_(warn_time_show_forced_updates), forced_updates_ms / 1000.0);
+    //         }
+    // }
+    // ```
+    //
+    // (`store_updated_refs()`, builtin/fetch.c:1351-1358.) The note closes the walk over the
+    // ref map, so it is printed only by a fetch that got that far: not by one whose remote or
+    // refspec was refused, not by `--negotiate-only`, not after the connectivity check's
+    // `goto abort`, and under `fetch_multiple()` by each child rather than the parent. Its
+    // place is ahead of everything `do_fetch()` does after `fetch_and_consume_refs()`: the
+    // `--set-upstream` warnings and the summary rendered at `cleanup:`. The timing half is
+    // not ported; this build does not time the forced-update check.
+    if !opts.show_forced_updates && crate::advice::Advice::FetchShowForcedUpdates.enabled_in(repo) {
+        eprintln!(
+            "warning: fetch normally indicates which branches had a forced update,\n\
+             but that check has been disabled; to re-enable, use '--show-forced-updates'\n\
+             flag or run 'git config fetch.showForcedUpdates true'"
+        );
     }
 
     fetch_head.write(if atomic_abort { &[] } else { &fetch_head_rows })?;

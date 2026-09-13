@@ -82,26 +82,28 @@ pub mod main_worktree {
             self.main_worktree_inner(&mut progress, should_interrupt, None)
         }
 
-        /// Like [`main_worktree()`](Self::main_worktree()), calling `on_entry` once for every entry whose
+        /// Like [`main_worktree()`](Self::main_worktree()), handing the index built from the tree to
+        /// `prepare` before anything is written. `prepare` may mark entries `SKIP_WORKTREE`, which the
+        /// checkout then passes over, and returns the `on_entry` hook called once for every entry whose
         /// checkout concluded (see [`gix_worktree_state::checkout::Options::on_entry`]).
-        pub fn main_worktree_with_entry_hook<P>(
+        pub fn main_worktree_with_index_hook<P>(
             &mut self,
             mut progress: P,
             should_interrupt: &AtomicBool,
-            on_entry: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+            prepare: &mut dyn FnMut(&mut gix_index::File) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         ) -> Result<(Repository, gix_worktree_state::checkout::Outcome), Error>
         where
             P: gix_features::progress::NestedProgress,
             P::SubProgress: gix_features::progress::NestedProgress + 'static,
         {
-            self.main_worktree_inner(&mut progress, should_interrupt, on_entry)
+            self.main_worktree_inner(&mut progress, should_interrupt, Some(prepare))
         }
 
         fn main_worktree_inner(
             &mut self,
             progress: &mut dyn gix_features::progress::DynNestedProgress,
             should_interrupt: &AtomicBool,
-            on_entry: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+            prepare: Option<&mut dyn FnMut(&mut gix_index::File) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
         ) -> Result<(Repository, gix_worktree_state::checkout::Outcome), Error> {
             let _span = gix_trace::coarse!("gix::clone::PrepareCheckout::main_worktree()");
             let repo = self
@@ -140,6 +142,8 @@ pub mod main_worktree {
             // fetch per file.
             #[cfg(feature = "blocking-network-client")]
             crate::promisor::prefetch(repo, index.entries().iter().map(|entry| entry.id));
+
+            let on_entry = prepare.and_then(|prepare| prepare(&mut index));
 
             let mut opts = repo.checkout_options(gix_worktree::stack::state::attributes::Source::IdMapping)?;
             opts.destination_is_initially_empty = true;

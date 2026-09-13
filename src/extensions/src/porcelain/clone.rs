@@ -1607,6 +1607,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         Ok(())
     };
 
+    // Set when `git_sparse_checkout_init()` failed ahead of the checkout.
+    let mut sparse_init_failed = false;
     // Run the clone, capturing the result so a `remote: ` line the stream left
     // unterminated is flushed before any error is propagated.
     let result = (|| -> Result<()> {
@@ -1718,6 +1720,38 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             }
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
+            // `--sparse` is set up before anything is checked out:
+            //
+            // ```c
+            // if (option_sparse_checkout && git_sparse_checkout_init(dir))
+            //         return 1;
+            //
+            // junk_mode = JUNK_LEAVE_REPO;
+            // err = checkout(submodule_progress, ...);
+            // ```
+            //
+            // (builtin/clone.c:1626-1631.) `git_sparse_checkout_init()` runs `sparse-checkout
+            // set` as a child and sets `cfg->apply_sparse_checkout = 1` in this process
+            // (builtin/clone.c:615-635), so `checkout()`'s `unpack_trees()` reads the pattern
+            // file the child wrote and marks everything outside it `SKIP_WORKTREE` before
+            // `check_updates()` counts what to write. The child's own config writes are not
+            // re-read: `core_sparse_checkout_cone` keeps the value it had when the clone
+            // started, so the patterns are matched in that dialect (dir.c:3513). A failure
+            // returns before `junk_mode` moves on, so the whole clone goes.
+            let sparse_patterns = if sparse {
+                let cone = checkout
+                    .repo()
+                    .config_snapshot()
+                    .boolean("core.sparseCheckoutCone")
+                    .unwrap_or(false);
+                if run_self(&dir, &["sparse-checkout", "set", "--cone"], true)? != 0 {
+                    sparse_init_failed = true;
+                    return Ok(());
+                }
+                Some(super::sparse_checkout::UnpackPatterns::load(checkout.repo(), cone)?)
+            } else {
+                None
+            };
             // `junk_mode = JUNK_LEAVE_REPO;` (builtin/clone.c:1629), immediately before
             // `checkout()`: from here on a failure keeps the repository and only warns.
             junk.leave();
@@ -1725,31 +1759,41 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // remote, leaving an empty repository exactly like git does.
             // `checkout()` unpacks `HEAD`'s tree with `opts.verbose_update =
             // (option_verbosity >= 0)` (builtin/clone.c:682), after returning early for an
-            // unborn `HEAD`; every entry of the tree is written.
-            let head_tree = checkout.repo().head_tree_id().ok().map(|id| id.detach());
-            let total = head_tree
-                .and_then(|tree| checkout.repo().index_from_tree(&tree).ok())
-                .map_or(0, |index| index.entries().len());
-            let updating = match crate::worktree::UpdatingFiles::start(total, !quiet && head_tree.is_some()) {
-                Ok(updating) => updating,
-                // `get_progress()` dies before anything is written, and with
-                // `junk_mode == JUNK_LEAVE_REPO` the `remove_junk()` handler keeps the
-                // repository and says so (builtin/clone.c:384-398). The exit is taken
-                // here, as `die()` takes it, so nothing unwinds into the cleanup that
-                // would delete the clone.
-                Err(e) => {
-                    eprintln!("fatal: {e}");
-                    eprintln!(
-                        "warning: Clone succeeded, but checkout failed.\n\
-                         You can inspect what was checked out with 'git status'\n\
-                         and retry with 'git restore --source=HEAD :/'\n"
+            // unborn `HEAD`, so `prepare` only runs for a tree that is checked out.
+            let mut updating = None;
+            let mut prepare = |index: &mut gix::index::File| {
+                if let Some(pl) = &sparse_patterns {
+                    // Sparse checkout loop #1 over `o->src_index`, which a clone has not
+                    // populated, then loop #2 over the result, where every entry is
+                    // `CE_ADDED` (unpack-trees.c:1974-1976, :2035-2042). Each draws its own
+                    // `Updating index flags` meter.
+                    let mut src = gix::index::File::from_state(
+                        gix::index::State::new(index.object_hash()),
+                        index.path().to_owned(),
                     );
-                    std::process::exit(128);
+                    pl.mark_new_skip_worktree(&mut src, &|_| true, !quiet)
+                        .unwrap_or_else(|e| checkout_died(e));
+                    pl.mark_new_skip_worktree(index, &|_| true, !quiet)
+                        .unwrap_or_else(|e| checkout_died(e));
                 }
+                // `get_progress()` counts only the entries still `CE_UPDATE`:
+                // `apply_sparse_checkout()` took that bit off every skipped one
+                // (unpack-trees.c:361-377, :523-560).
+                let total = index
+                    .entries()
+                    .iter()
+                    .filter(|e| !e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+                    .count();
+                let meter = crate::worktree::UpdatingFiles::start(total, !quiet).unwrap_or_else(|e| checkout_died(e));
+                let hook = meter.hook();
+                updating = Some(meter);
+                hook
             };
             let (repo, _) =
-                checkout.main_worktree_with_entry_hook(gix::progress::Discard, &should_interrupt, updating.hook())?;
-            updating.stop();
+                checkout.main_worktree_with_index_hook(gix::progress::Discard, &should_interrupt, &mut prepare)?;
+            if let Some(updating) = updating {
+                updating.stop();
+            }
             // `checkout()` (builtin/clone.c:677-698) is a `oneway_merge` `unpack_trees()`, which
             // ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
             // (unpack-trees.c:2086-2090) before `write_locked_index()` — so a fresh clone's
@@ -1771,6 +1815,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
     result?;
+    // `git_sparse_checkout_init()` failed ahead of `checkout()`: `error()`, then
+    // `return 1` with `junk_mode` still unset, so the clone is removed.
+    if sparse_init_failed {
+        eprintln!("error: failed to initialize sparse-checkout");
+        if created_destination {
+            let _ = std::fs::remove_dir_all(dst);
+        }
+        return Ok(ExitCode::from(1));
+    }
 
     // `close_bundle()` (transport.c:219-227): the bundle transport is torn down
     // once the refs are in. The scratch repository it stood on goes with it — the
@@ -2216,7 +2269,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // still holds the destination and takes it away — a `git clone --bare
     // --sparse` leaves nothing on disk. This port's junk guard was released when
     // the fetch finished, so the removal is re-stated here.
-    if sparse {
+    //
+    // A clone that checks out ran the child before `checkout()`, where it belongs
+    // (see above); only a bare or `--no-checkout` clone, which never unpacks, is
+    // set up here.
+    if sparse && (bare || no_checkout) {
         let code = run_self(&dir, &["sparse-checkout", "set", "--cone"], true)?;
         if code != 0 {
             eprintln!("error: failed to initialize sparse-checkout");
@@ -3501,6 +3558,21 @@ fn write_alternates(git_dir: &Path, alternates: &[PathBuf]) -> Result<()> {
 /// `.gitmodules` rather than off the user's command line, and
 /// [`transport_allowed`] refuses a `user`-scoped transport for it. Passing it
 /// down here is what makes a recursive clone honor `protocol.file.allow`.
+/// A `die()` inside `checkout()`'s `unpack_trees()`, such as `start_delayed_progress()`
+/// refusing `GIT_PROGRESS_DELAY`: with `junk_mode == JUNK_LEAVE_REPO` the
+/// `remove_junk()` handler keeps the repository and says so
+/// (builtin/clone.c:384-398). The exit is taken here, as `die()` takes it, so
+/// nothing unwinds into the cleanup that would delete the clone.
+fn checkout_died(e: crate::progress::DelayError) -> ! {
+    eprintln!("fatal: {e}");
+    eprintln!(
+        "warning: Clone succeeded, but checkout failed.\n\
+         You can inspect what was checked out with 'git status'\n\
+         and retry with 'git restore --source=HEAD :/'\n"
+    );
+    std::process::exit(128);
+}
+
 fn run_self(dir: &str, args: &[&str], from_user: bool) -> Result<u8> {
     let exe = crate::hosted::git_exe()?;
     let mut cmd = std::process::Command::new(&exe);

@@ -330,6 +330,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let mut template: Option<String> = None;
     let mut separate_git_dir: Option<String> = None;
     let mut ref_format: Option<String> = None;
+    // `--revision=<rev>`: parsed like git's `OPT_STRING`, refused once `cmd_clone()`
+    // has run every check that precedes the transport — see the refusal beside the
+    // destination tests.
+    let mut revision_requested: Option<String> = None;
     // `--reference <repo>` / `--reference-if-able <repo>`: the bool records
     // whether a missing repository is a warning (`if-able`) or fatal.
     let mut references: Vec<(String, bool)> = Vec::new();
@@ -505,14 +509,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // never reaches the command. Cloning at a bare revision is not
             // ported, and *that* refusal is this port's own — which is why the
             // value is taken first and the gap reported second.
-            "--revision" => {
-                let _ = take_value!();
-                bail!(
-                    "unsupported option \"--revision\" (cloning at a bare revision needs the \
-                     unborn-HEAD handshake, which is not ported)"
-                );
-            }
-            "--no-revision" => {}
+            "--revision" => revision_requested = Some(take_value!()),
+            "--no-revision" => revision_requested = None,
             // `--filter=<spec>`: ask the remote to withhold the objects `<spec>` selects against.
             // git parses the spec in `cmd_clone`'s option table, so an invalid one never reaches the
             // network; `Filter::from_str` reproduces both the grammar and the messages.
@@ -676,17 +674,31 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         bare = true;
     }
 
-    // git's ref storage formats are exactly `files` and `reftable`. `files` is the
-    // backend gix writes, so it is a no-op that matches stock git; `reftable` has
-    // no vendored backend and is rejected honestly rather than silently producing
-    // a files-backed repository.
+    // `usage_msg_opt()` for the operand count is the first thing `cmd_clone()` does
+    // with what `parse_options()` left, so a bad count is 129 ahead of every option
+    // conflict and every value check below. Measured against stock 2.55.0:
+    //
+    // ```text
+    // $ git clone --ref-format=2m a b c         → fatal: Too many arguments.  (129)
+    // $ git clone --ref-format=2m               → fatal: You must specify a repository to clone.  (129)
+    // $ git clone --bundle-uri=x --depth=1      → fatal: You must specify a repository to clone.  (129)
+    // $ git clone --bare --separate-git-dir=x   → fatal: You must specify a repository to clone.  (129)
+    // ```
+    if positionals.len() > 2 {
+        return Ok(usage_error("Too many arguments."));
+    }
+    let url_str = match positionals.first() {
+        Some(u) => *u,
+        None => return Ok(usage_error("You must specify a repository to clone.")),
+    };
+
+    // git's ref storage formats are exactly `files` and `reftable`, and an unknown
+    // name dies here. `files` is the backend gix writes; `reftable` has no vendored
+    // backend, and its refusal waits for the source and destination checks git runs
+    // before anything is created (see beside the destination tests).
     if let Some(fmt) = ref_format.as_deref() {
         match fmt {
-            "files" => {}
-            "reftable" => bail!(
-                "the reftable ref storage format is not supported: no vendored \
-                 reftable backend"
-            ),
+            "files" | "reftable" => {}
             other => crate::git_fatal!("unknown ref storage format '{other}'"),
         }
     }
@@ -706,13 +718,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("options '--bare' and '--separate-git-dir' cannot be used together");
     }
 
-    if positionals.len() > 2 {
-        return Ok(usage_error("Too many arguments."));
-    }
-    let url_str = match positionals.first() {
-        Some(u) => *u,
-        None => return Ok(usage_error("You must specify a repository to clone.")),
-    };
     // `cmd_clone` resolves a local path before anything is created or announced, so a
     // source that is not there is reported on its own.
     if !url_str.contains("://")
@@ -883,6 +888,20 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     }
     // `junk_work_tree` in `cmd_clone()`: git remembers the directory it made so `remove_junk()`
     // can take it down again on any death below, and leaves a directory it found alone.
+    // This port's own two gaps, refused only once every check git makes before
+    // creating anything has passed: stock 2.55.0 answers `clone --ref-format=reftable
+    // nope` with `repository 'nope' does not exist`, and `clone --revision=HEAD .
+    // .git` with the non-empty destination refusal above, so neither may pre-empt
+    // them.
+    if ref_format.as_deref() == Some("reftable") {
+        bail!("the reftable ref storage format is not supported: no vendored reftable backend");
+    }
+    if revision_requested.is_some() {
+        bail!(
+            "unsupported option \"--revision\" (cloning at a bare revision needs the \
+             unborn-HEAD handshake, which is not ported)"
+        );
+    }
     let created_destination = !dst.exists();
     std::fs::create_dir_all(dst)?;
     // ```c

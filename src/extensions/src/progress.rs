@@ -22,9 +22,57 @@
 //! decision (git's callers pass a NULL `struct progress *` otherwise); a meter
 //! built with `on == false` is inert. [`enabled`] answers the pack-writing
 //! commands' rule once so every caller asks it the same way.
+//!
+//! "stderr" can be a relay rather than fd 2: `upload-pack` runs `pack-objects`
+//! with `pack_objects.err = -1` and ships what the child writes there to the
+//! client on band 2 (`create_pack_file()`, upload-pack.c:360-361/436-452). The
+//! pack writer runs in-process here, so [`with_relay`] stands in for that pipe:
+//! every meter line, and every other line the pack writer reports through
+//! [`write_stderr`], goes to the relay instead.
 
+use std::cell::RefCell;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    /// The pipe `start_command()` gave the `pack-objects` child for its stderr.
+    static RELAY: RefCell<Option<Box<dyn FnMut(&[u8])>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with this thread's progress output handed to `relay` instead of
+/// stderr, as `upload-pack`'s `pack-objects` child writes into a pipe.
+pub fn with_relay<R>(relay: impl FnMut(&[u8]) + 'static, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Box<dyn FnMut(&[u8])>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RELAY.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = RELAY.with(|slot| slot.borrow_mut().replace(Box::new(relay)));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// `fprintf(stderr, …); fflush(stderr)` from the pack writer: to the relay when
+/// one is installed, else to stderr.
+pub fn write_stderr(bytes: &[u8]) {
+    let relayed = RELAY.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(relay) => {
+            relay(bytes);
+            true
+        }
+        None => false,
+    });
+    if !relayed {
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(bytes);
+        let _ = err.flush();
+    }
+}
+
+fn relaying() -> bool {
+    RELAY.with(|slot| slot.borrow().is_some())
+}
 
 /// Whether a pack-writing command should report progress: git's rule is a
 /// terminal on stderr and no `--quiet`.
@@ -276,23 +324,26 @@ impl Meter {
         let title_len = self.title.len();
         let progress_line_len = title_len + self.counters.len() + 2;
         let cols = usize::try_from(crate::pager::term_columns()).unwrap_or(80);
-        let mut err = std::io::stderr().lock();
-        let _ = if self.split {
-            write!(err, "  {}{eol:>clear_len$}", self.counters)
+        let line = if self.split {
+            format!("  {}{eol:>clear_len$}", self.counters)
         } else if done.is_none() && cols < progress_line_len {
             let clear_len = if title_len + 1 < cols { cols - title_len - 1 } else { 0 };
             self.split = true;
-            write!(err, "{}:{:clear_len$}\n  {}{eol}", self.title, "", self.counters)
+            format!("{}:{:clear_len$}\n  {}{eol}", self.title, "", self.counters)
         } else {
-            write!(err, "{}: {}{eol:>clear_len$}", self.title, self.counters)
+            format!("{}: {}{eol:>clear_len$}", self.title, self.counters)
         };
-        let _ = err.flush();
+        write_stderr(line.as_bytes());
     }
 }
 
 /// `is_foreground_fd(fileno(stderr))` (`progress.c:106-110`): a background job
-/// keeps quiet until its closing line.
+/// keeps quiet until its closing line. A relay is a pipe, where `tcgetpgrp()`
+/// fails and the answer is yes.
 fn is_foreground_stderr() -> bool {
+    if relaying() {
+        return true;
+    }
     // SAFETY: plain queries on this process's own descriptor and group.
     unsafe {
         let tpgrp = libc::tcgetpgrp(libc::STDERR_FILENO);

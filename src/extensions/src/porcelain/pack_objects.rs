@@ -977,6 +977,10 @@ fn execute(st: &State) -> Result<ExitCode> {
         compression(&repo, st),
         &delta,
         st.progress,
+        // `st.progress` does not keep `--progress` (1) apart from
+        // `--all-progress` (2), so this command still draws every phase it
+        // enables, `--stdout` or not.
+        st.progress,
         st.stdout,
         &[],
     )?;
@@ -1132,7 +1136,7 @@ fn resolved_threads(configured: usize) -> usize {
 /// existing pack; see [`PackSummary::line`].
 fn report_progress(progress: bool, summary: &PackSummary) {
     if progress {
-        eprintln!("{}", summary.line());
+        crate::progress::write_stderr(format!("{}\n", summary.line()).as_bytes());
     }
 }
 
@@ -1160,9 +1164,6 @@ pub(crate) struct Packed {
     pub(crate) bytes: Vec<u8>,
     pub(crate) id: ObjectId,
     pub(crate) entries: Vec<PackedEntry>,
-    /// The two counts `pack-objects` closes a run with, for callers that have to
-    /// relay them rather than print them (`upload-pack` puts them on band 2).
-    pub(crate) summary: PackSummary,
 }
 
 /// `written` and `written_delta` as `builtin/pack-objects.c:5520-5527` reports
@@ -1212,29 +1213,41 @@ pub(crate) fn pack_bytes_with(
     ids: &[ObjectId],
     allow_ofs_delta: bool,
 ) -> Result<Vec<u8>> {
-    Ok(pack_bytes_with_summary(repo, ids, allow_ofs_delta)?.0)
+    let options = WriteOptions {
+        allow_ofs_delta,
+        ..WriteOptions::default()
+    };
+    Ok(packed_for(repo, ids, options)?.bytes)
 }
 
-/// [`pack_bytes_with`], keeping the closing counts.
+/// The pack `upload-pack` serves: `pack-objects --revs --stdout`, with
+/// `--progress` unless the client sent `no-progress` and `--delta-base-offset`
+/// when it asked for `ofs-delta` (`create_pack_file()`, upload-pack.c:324-335).
 ///
-/// `upload-pack` needs them because it does not print the summary itself: the
-/// `pack-objects` child writes it to its stderr and `create_pack_file()` relays
-/// that onto band 2 of the client's connection (upload-pack.c:337-350), so the
-/// line has to travel rather than be emitted where it is computed.
-pub(crate) fn pack_bytes_with_summary(
+/// `--progress` is `progress = 1`, which `--stdout` (`pack_to_stdout = 1`) does
+/// not exceed, so of the meters only `Enumerating objects` (:5386-5387),
+/// `Counting objects` and `Compressing objects` draw, then the `Total …` line
+/// (:5429-5436); `Delta compression using up to %d threads` (:3214) and
+/// `Writing objects` (:1340) stay silent. All of it goes to
+/// [`crate::progress::write_stderr`], which `upload-pack` points at band 2.
+pub(crate) fn pack_for_upload(
     repo: &gix::Repository,
     ids: &[ObjectId],
     allow_ofs_delta: bool,
-) -> Result<(Vec<u8>, PackSummary)> {
-    let packed = packed_for(
-        repo,
-        ids,
-        WriteOptions {
-            allow_ofs_delta,
-            ..WriteOptions::default()
-        },
-    )?;
-    Ok((packed.bytes, packed.summary))
+    progress: bool,
+) -> Result<Vec<u8>> {
+    // `start_progress(_("Enumerating objects"), 0)` around `get_object_list()`,
+    // whose `add_object_entry()` counts every object shown (:1875).
+    let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", progress);
+    enumerating.advance(ids.len());
+    enumerating.done();
+    let options = WriteOptions {
+        allow_ofs_delta,
+        progress,
+        to_stdout: true,
+        ..WriteOptions::default()
+    };
+    Ok(packed_for(repo, ids, options)?.bytes)
 }
 
 /// What a caller outside this module can steer the pack writer with. Everything
@@ -1260,6 +1273,11 @@ pub(crate) struct WriteOptions {
     /// Report the counting, compressing and writing phases on stderr the way
     /// git's progress meter does. See [`crate::progress`].
     pub(crate) progress: bool,
+    /// `progress = 2`: `--all-progress`, or `--all-progress-implied` with
+    /// progress on. Only this shows `Writing objects` and the delta thread
+    /// count for a pack going to stdout (`progress > pack_to_stdout`,
+    /// builtin/pack-objects.c:1340, 3214, 5352-5353).
+    pub(crate) all_progress: bool,
     /// The pack is going to stdout, which is when `write_pack_file()` builds its
     /// hashfile with the progress attached (`builtin/pack-objects.c:1350-1363`)
     /// and `Writing objects` closes with the byte count and rate.
@@ -1323,6 +1341,7 @@ pub(crate) fn packed_for_thin(
         compression(repo, &State::default()),
         &delta,
         options.progress,
+        options.all_progress,
         options.to_stdout,
         boundary,
     )
@@ -1551,6 +1570,7 @@ fn write_pack(
     level: gix::zlib::Compression,
     delta: &DeltaConfig,
     progress: bool,
+    all_progress: bool,
     to_stdout: bool,
     boundary: &[ObjectId],
 ) -> Result<Packed> {
@@ -1689,8 +1709,13 @@ fn write_pack(
     // `ll_find_deltas()` announces threads only on its threaded path
     // (builtin/pack-objects.c:3209-3216); one thread searches silently.
     let threads = resolved_threads(delta.search.threads);
-    if compressing_progress && threads > 1 {
-        eprintln!("Delta compression using up to {threads} threads");
+    // `progress > pack_to_stdout` (builtin/pack-objects.c:3214): a pack going to
+    // stdout names its threads only under `progress = 2`.
+    let writing_progress = progress && (all_progress || !to_stdout);
+    if compressing_progress && writing_progress && threads > 1 {
+        crate::progress::write_stderr(
+            format!("Delta compression using up to {threads} threads\n").as_bytes(),
+        );
     }
     let mut compressing =
         Meter::counted("Compressing objects", nr_deltas, compressing_progress);
@@ -1750,7 +1775,8 @@ fn write_pack(
     // entries appended — the same total, and monotone, which is what the display
     // needs.
     let write_order = compute_write_order(&objects, &deltas, &tag_tips(repo));
-    let mut writing = Meter::counted("Writing objects", to_write, progress);
+    // `if (progress > pack_to_stdout)` (builtin/pack-objects.c:1340).
+    let mut writing = Meter::counted("Writing objects", to_write, writing_progress);
     let mut body: Vec<u8> = Vec::new();
     let mut entries: Vec<PackedEntry> = Vec::with_capacity(objects.len());
     let mut offsets: Vec<Option<u64>> = vec![None; objects.len()];
@@ -1808,7 +1834,6 @@ fn write_pack(
     Ok(Packed {
         bytes,
         id,
-        summary,
         entries,
     })
 }

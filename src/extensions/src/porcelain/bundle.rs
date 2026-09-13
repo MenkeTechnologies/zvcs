@@ -967,6 +967,8 @@ fn create(args: &[String]) -> Result<ExitCode> {
             crate::porcelain::pack_objects::WriteOptions {
                 allow_ofs_delta: true,
                 progress,
+                // The unconditional `--all-progress-implied` (builtin/bundle.c:94-96).
+                all_progress: true,
                 to_stdout: true,
                 ..Default::default()
             },

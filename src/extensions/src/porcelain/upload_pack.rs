@@ -70,8 +70,9 @@
 //!   1. **The pack is built in one piece, not streamed.**
 //!      `pack_objects::pack_bytes_for` returns a finished `Vec<u8>` before a
 //!      byte goes out, so there is no silent producer to interleave keepalives
-//!      with (`uploadpack.keepAlive`, upload-pack.c:382-498) and no progress on
-//!      band 2. It is also built in-process, so there is no `pack-objects`
+//!      with (`uploadpack.keepAlive`, upload-pack.c:382-498). Its progress
+//!      still reaches band 2 as it is drawn, through
+//!      [`crate::progress::with_relay`]. It is also built in-process, so there is no `pack-objects`
 //!      argument vector to hand to `uploadpack.packObjectsHook` — which would
 //!      additionally need the protected-config scope that keeps a cloned
 //!      repository's own `.git/config` from running commands on the serving
@@ -772,8 +773,6 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     // a two-or-three byte varint where an `OBJ_REF_DELTA` spends a full object
     // id, which is 18 bytes per delta of pure overhead.
     let use_ofs_delta = cap_present(&want_caps, b"ofs-delta");
-    let (pack, summary) =
-        crate::porcelain::pack_objects::pack_bytes_with_summary(repo, &objects, use_ofs_delta)?;
     // `data->use_sideband` (upload-pack.c:1135-1138) is the packet size the
     // selected band carries, not a flag: `LARGE_PACKET_MAX` for `side-band-64k`
     // and `DEFAULT_PACKET_MAX` for plain `side-band`. `send_sideband()` chunks at
@@ -786,34 +785,18 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
     } else {
         None
     };
-    // ```c
-    // if (!pack_data->no_progress)
-    //         opts.progress = ODB_GENERATE_PACK_PROGRESS_STANDARD;
-    // …
-    // sz = xread(generator->err, progress, sizeof(progress));
-    // if (0 < sz)
-    //         send_client_data(2, progress, sz, pack_data->use_sideband);
-    // ```
-    //
-    // (`create_pack_file()`, upload-pack.c:284/337-345.) The closing
-    // `Total …` line `pack-objects` writes to its stderr is relayed to the
-    // client on band 2, or — with no side-band negotiated — onto this process's
-    // own stderr (`send_client_data()`, upload-pack.c:182-198). `no-progress`
-    // asks for none of it. The progress *meter* is not written at all, here or
-    // by git: `pack-objects` renders it only onto a terminal.
-    let no_progress = cap_present(&want_caps, b"no-progress");
-    if !no_progress {
-        let line = format!("{}\n", summary.line());
-        match use_sideband {
-            Some(_) => {
-                let mut framed = Vec::with_capacity(line.len() + 1);
-                framed.push(2);
-                framed.extend_from_slice(line.as_bytes());
-                write_pkt(&mut out, &framed)?;
-            }
-            None => eprint!("{line}"),
-        }
-    }
+    // `if (!pack_data->no_progress) strvec_push(&pack_objects.args,
+    // "--progress");` (upload-pack.c:331-332), and what the child writes to its
+    // stderr is relayed with `send_client_data(2, …)` (:436-452): band 2 under a
+    // side-band, else this process's own stderr (:182-198).
+    let progress = !cap_present(&want_caps, b"no-progress");
+    let pack = if use_sideband.is_some() {
+        crate::progress::with_relay(relay_on_band_2, || {
+            crate::porcelain::pack_objects::pack_for_upload(repo, &objects, use_ofs_delta, progress)
+        })?
+    } else {
+        crate::porcelain::pack_objects::pack_for_upload(repo, &objects, use_ofs_delta, progress)?
+    };
     if let Some(band_max) = use_sideband {
         // Multiplex the pack on band 1, then a flush closes the side-band stream.
         //
@@ -1268,6 +1251,22 @@ fn write_pkt(out: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(payload.len() + 4);
     pkt_line(&mut buf, payload);
     out.write_all(&buf)
+}
+
+/// The `pack-objects` child's stderr, as `create_pack_file()` forwards it:
+/// read in `char progress[128]` pieces and each sent at once with
+/// `send_client_data(2, progress, sz, …)` (upload-pack.c:303, 441-445).
+/// `send_sideband()` writes with `write_or_die()`; a client that has gone away
+/// surfaces on the pack's band-1 write that follows.
+fn relay_on_band_2(bytes: &[u8]) {
+    let mut out = std::io::stdout().lock();
+    for piece in bytes.chunks(128) {
+        let mut framed = Vec::with_capacity(piece.len() + 1);
+        framed.push(2);
+        framed.extend_from_slice(piece);
+        let _ = write_pkt(&mut out, &framed);
+    }
+    let _ = out.flush();
 }
 
 /// Read one pkt-line: `None` on flush (`0000`), else its payload with the header
@@ -2378,15 +2377,14 @@ fn send_pack_section(
     if args.include_tag {
         add_included_tags(repo, &mut objects);
     }
-    let (pack, summary) =
-        crate::porcelain::pack_objects::pack_bytes_with_summary(repo, &objects, args.ofs_delta)
-            .map_err(|e| Die(format!("{e:#}")))?;
-    // The pack is always multiplexed in v2, so the `Total …` line
-    // `create_pack_file()` relays from the pack generator's stderr always goes
-    // to band 2 — unless the client asked for `no-progress`.
-    if !args.no_progress {
-        writer.band(2, format!("{}\n", summary.line()).as_bytes())?;
-    }
+    // The pack is always multiplexed in v2, so the progress `create_pack_file()`
+    // relays from the `pack-objects` child always goes to band 2 — none of it
+    // when the client asked for `no-progress`.
+    writer.out.flush()?;
+    let pack = crate::progress::with_relay(relay_on_band_2, || {
+        crate::porcelain::pack_objects::pack_for_upload(repo, &objects, args.ofs_delta, !args.no_progress)
+    })
+    .map_err(|e| Die(format!("{e:#}")))?;
     // The band byte eats one of the 65516 payload bytes a pkt-line can carry,
     // and `relay_pack_data()` holds the pack's last byte back until EOF, so it
     // always arrives in a packet of its own.

@@ -420,7 +420,7 @@ pub fn objects_within(
     // itself, as `reachable_objects` does for the ordinary path.
     let mut roots: Vec<ObjectId> = window.to_vec();
     roots.extend(wants.iter().copied().filter(|id| !window.contains(id)));
-    // Ordered, because this list *is* the pack: `pack_bytes_with_summary` writes the
+    // Ordered, because this list *is* the pack: `pack_for_upload` writes the
     // entries in the order it is handed them, so a `HashSet`'s iteration order became
     // the pack's, and an unspecified order made every shallow clone of the same
     // repository produce a different pack. Measured before the change:

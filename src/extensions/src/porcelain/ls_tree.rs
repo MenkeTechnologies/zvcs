@@ -629,7 +629,9 @@ fn walk(
                 base.push(b'/');
                 walk(repo, child, &base, opts, out)?;
             }
-        } else if !opts.dirs_only && path_selects(&name, opts) {
+        } else if !(opts.dirs_only && !mode.is_commit()) && path_selects(&name, opts) {
+            // LS_TREE_ONLY (`-d`) drops only OBJ_BLOB entries: object_type()
+            // maps a gitlink to OBJ_COMMIT, so a submodule still prints.
             write_entry(repo, out, mode, &oid, &name, opts)?;
         }
     }

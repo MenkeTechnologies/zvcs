@@ -155,3 +155,48 @@ fn ls_tree_cwd_scope_and_full_variants() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `-d` (LS_TREE_ONLY) filters out only OBJ_BLOB entries: `object_type()` maps
+/// a gitlink (mode 160000) to OBJ_COMMIT, so a submodule entry still prints
+/// under `-d`, with the dedicated printers and with `--format` alike
+/// (builtin/ls-tree.c show_tree_common() / show_tree_fmt()).
+#[test]
+fn ls_tree_dirs_only_keeps_gitlinks() {
+    let Some(stock) = stock_git() else {
+        eprintln!("no stock git found to compare against; skipping");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("zvcs-lstree-gitlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let repo = root.canonicalize().unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("src/f.txt"), b"a").unwrap();
+    std::fs::write(repo.join("top.txt"), b"b").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,7c9f5d7e12e0b209b88dea5b678f0584186b8b28,sub",
+        ],
+    );
+    git(
+        &repo,
+        &["-c", "user.name=t", "-c", "user.email=a@b.c", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "i"],
+    );
+
+    for args in [
+        &["ls-tree", "-d", "HEAD"][..],
+        &["ls-tree", "--format=%(objectmode) %(objecttype)", "-d", "HEAD"],
+        &["ls-tree", "-d", "-r", "HEAD"],
+        &["ls-tree", "-d", "--name-only", "HEAD"],
+        &["ls-tree", "-d", "-l", "HEAD"],
+    ] {
+        assert_parity(&stock, &repo, args);
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}

@@ -566,6 +566,18 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     };
 
+    // `initialize_task_config()` (builtin/gc.c:1464) is the first config read,
+    // after `parse_options()` and the `--auto`/`--schedule` check, and its
+    // `gc_config()` ends in `git_default_config()`. So an option error or a bad
+    // `--task` answers 129 under a config value that callback refuses. The
+    // repository settings block is not read here at all: measured against git
+    // 2.55.0, `-c core.packedGitLimit=bogus maintenance run --task=pack-refs`
+    // dies inside the `pack-refs` child and ends `error: task 'pack-refs'
+    // failed` at exit 1.
+    if let Err(rejection) = crate::cmd_config::validate_gc(&repo) {
+        return Err(rejection.into_error());
+    }
+
     // git validates `maintenance.strategy` only when it is about to consult it,
     // which a `--task` run never does â `run --task=gc` succeeds under a strategy
     // value that makes a bare `run` die. The check lands before `--auto`'s work,
@@ -1141,6 +1153,14 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };
+
+    // The config walk comes after parsing, too, and reaches
+    // `git_default_config()` but not the settings block: measured against git
+    // 2.55.0, `-c core.createObject=bogus maintenance is-needed` dies at 128 while
+    // `-c core.packedGitLimit=bogus` exits 0.
+    if let Err(rejection) = crate::cmd_config::validate_gc(&repo) {
+        return Err(rejection.into_error());
+    }
 
     // Without `--task` the answer is derived from the strategy's task set, so an
     // unusable `maintenance.strategy` is fatal here exactly as it is for `run` â

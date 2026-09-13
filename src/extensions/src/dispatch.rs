@@ -349,7 +349,6 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
     "log",
     "ls-files",
     "ls-tree",
-    "maintenance",
     "merge",
     "merge-base",
     "merge-tree",
@@ -453,7 +452,6 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "init-db",
     "interpret-trailers",
     "mailinfo",
-    "mktag",
     "multi-pack-index",
     "notes",
     "patch-id",
@@ -547,7 +545,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "blame" | "annotate" => ConfigCallback::Blame,
         "fetch" => ConfigCallback::Fetch,
         "repack" => ConfigCallback::Repack,
-        "gc" | "maintenance" => ConfigCallback::Gc,
+        "gc" => ConfigCallback::Gc,
         "add" | "stage" | "branch" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
         _ => ConfigCallback::Default,
     }
@@ -585,7 +583,6 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "init",
     "last-modified",
     "ls-files",
-    "maintenance",
     "merge",
         // `cmd_reflog()` hands `show` — named, or implied by a first token that is
         // no subcommand — to `cmd_log_reflog()` (builtin/reflog.c:154, :491),
@@ -602,7 +599,6 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
                 _ => ConfigCallback::Log,
             }
         }
-    "mktag",
     "mktree",
     "prune",
     "prune-packed",

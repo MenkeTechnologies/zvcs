@@ -121,6 +121,14 @@ pub fn mktag(args: &[String]) -> Result<ExitCode> {
         .read_to_end(&mut buf)
         .map_err(|e| anyhow::anyhow!("could not read from stdin: {e}"))?;
 
+    // `git_config(git_fsck_config, …)` (builtin/mktag.c:94) runs only after
+    // `parse_options()` and the stdin read, and `git_fsck_config` ends in
+    // `git_default_config()` — so `mktag --bogus` is a 129 under a value that
+    // callback refuses, and a tag on stdin is a 128 before it is checked.
+    if let Err(rejection) = crate::default_config::validate(&repo) {
+        return Err(rejection.into_error());
+    }
+
     // `Reporter::new` hands back git's `die()` text for an unusable `fsck.<id>`
     // value; git exits 128 with it, so route it through the same helper as the
     // other fatals rather than letting anyhow reformat it.
@@ -139,6 +147,14 @@ pub fn mktag(args: &[String]) -> Result<ExitCode> {
         // an uninitialised object id, which is not something to imitate.
         crate::git_fatal!("tag on stdin has no usable 'object'/'type' header after fsck demotion");
     };
+
+    // `verify_object_in_tag` (builtin/mktag.c:99) is the first object lookup, and
+    // the lookup is what reads the repository settings block: measured against
+    // git 2.55.0, `-c core.packedGitLimit=bogus mktag` still reports a tag that
+    // fails fsck, and dies on the setting for one that passes.
+    if let Err(msg) = crate::repo_settings::RepoSettings::load(&repo) {
+        return fatal(&msg);
+    }
 
     // `verify_object_in_tag`: the tagged object must exist and have that type.
     let Ok(header) = repo.find_header(tagged_oid) else {

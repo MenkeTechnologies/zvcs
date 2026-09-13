@@ -766,53 +766,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let mut opts = Opts {
-        cached: false,
-        match_missing: false,
-        ita_invisible: false,
-        allow_textconv: false,
-        format: Format::Raw,
-        nul: false,
-        abbrev: None,
-        exit_code: false,
-        reverse: false,
-        line_prefix: Vec::new(),
-        relative: None,
-        filter_include: Vec::new(),
-        filter_exclude: Vec::new(),
-        ws: Ws::default(),
-        ignore_lines: None,
-        ignore_blank_lines: false,
-        pickaxe: None,
-        pickaxe_all: false,
-        rename: diffcore_rename::Options::default(),
-        patch: false,
-        ctx: 3,
-        inter_hunk_ctx: 0,
-        check: false,
-        binary: false,
-        indent_heuristic: true,
-        algorithm: None,
-        numstat: false,
-        diffstat: false,
-        shortstat: false,
-        summary: false,
-        stat: StatWidths::plumbing(),
-        compact_summary: false,
-        full_index: false,
-        src_prefix: "a/".to_owned(),
-        dst_prefix: "b/".to_owned(),
-        irreversible_delete: false,
-        dirstat: None,
-        dirstat_params: Vec::new(),
-        emit_pairs: true,
-        color_when: None,
-        // git's `ws_error_highlight_default`; `diff.wsErrorHighlight` replaces it
-        // once the repository is discovered, unless a flag already set it.
-        ws_error_highlight: diff_color::WSEH_NEW,
-        move_word: diff_color::MoveWordOpts::default(),
-        skip_or_rotate: None,
-    };
+    let mut opts = plumbing_opts();
     // Whether a `--ws-error-highlight` flag was seen, so the config default does
     // not overwrite it (git reads the config first and the flag last).
     let mut wseh_explicit = false;
@@ -2458,6 +2412,75 @@ fn object_is_commit(repo: &gix::Repository, id: &ObjectId) -> bool {
 
 /// Diff `tree_id` against the index, then (unless `--cached`) fold in how the worktree
 /// deviates from that index, exactly as git's `oneway_diff` does.
+/// `cmd_diff_index()`'s option state before a single argument is parsed: the
+/// `repo_init_revisions()` + `git_diff_basic_config()` defaults.
+fn plumbing_opts() -> Opts {
+    Opts {
+        cached: false,
+        match_missing: false,
+        ita_invisible: false,
+        allow_textconv: false,
+        format: Format::Raw,
+        nul: false,
+        abbrev: None,
+        exit_code: false,
+        reverse: false,
+        line_prefix: Vec::new(),
+        relative: None,
+        filter_include: Vec::new(),
+        filter_exclude: Vec::new(),
+        ws: Ws::default(),
+        ignore_lines: None,
+        ignore_blank_lines: false,
+        pickaxe: None,
+        pickaxe_all: false,
+        rename: diffcore_rename::Options::default(),
+        patch: false,
+        ctx: 3,
+        inter_hunk_ctx: 0,
+        check: false,
+        binary: false,
+        indent_heuristic: true,
+        algorithm: None,
+        numstat: false,
+        diffstat: false,
+        shortstat: false,
+        summary: false,
+        stat: StatWidths::plumbing(),
+        compact_summary: false,
+        full_index: false,
+        src_prefix: "a/".to_owned(),
+        dst_prefix: "b/".to_owned(),
+        irreversible_delete: false,
+        dirstat: None,
+        dirstat_params: Vec::new(),
+        emit_pairs: true,
+        color_when: None,
+        // git's `ws_error_highlight_default`; `diff.wsErrorHighlight` replaces it
+        // once the repository is discovered, unless a flag already set it.
+        ws_error_highlight: diff_color::WSEH_NEW,
+        move_word: diff_color::MoveWordOpts::default(),
+        skip_or_rotate: None,
+    }
+}
+
+/// The paths `git diff-index --cached --name-only <tree> --` prints, in the order it
+/// prints them: every pair `run_diff_index()` queues with no pathspec, no rename
+/// detection and no filter, so the name listing is exactly the queue.
+///
+/// This is the pre-flight `git-merge-resolve.sh:11-14` and `git-merge-octopus.sh:44-47`
+/// run, and it goes through the same [`collect`] the command does — which is what
+/// gives it `do_oneway_diff()`'s `diff_unmerge()` record for a conflicted path
+/// (diff-lib.c:467-473) and the `add -N` entry a `--cached` plumbing diff still
+/// sees (diff-lib.c:452-459, `ita_invisible_in_index` off).
+pub(crate) fn cached_name_only(repo: &gix::Repository, tree_id: &ObjectId) -> Result<Vec<BString>> {
+    let opts = Opts {
+        cached: true,
+        ..plumbing_opts()
+    };
+    Ok(collect(repo, tree_id, &opts)?.into_iter().map(|d| d.path).collect())
+}
+
 fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Vec<Delta>> {
     let null = ObjectId::null(repo.object_hash());
     let mut tree: BTreeMap<BString, (u32, ObjectId)> = BTreeMap::new();

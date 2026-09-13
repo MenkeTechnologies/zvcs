@@ -65,16 +65,20 @@
 //!
 //! ### Floors (bail rather than approximate)
 //!
-//! * An unborn `HEAD` and an already-unmerged index, both of which the
-//!   `diff-index` pre-flight would have to diagnose in git's own words.
+//! * An unborn `HEAD`, which the `diff-index` pre-flight would have to diagnose
+//!   in git's own words.
+//!
+//! An already-unmerged index is not a floor: the pre-flight is the ported
+//! `diff-index --cached` queue ([`super::diff_index::cached_name_only`]), whose
+//! `diff_unmerge()` record lists every conflicted path, so the script's refusal
+//! (exit 2) is reproduced.
 
 // `print!`/`println!` here go through git's stdout buffer. `merge` reaches this
 // module in-process and arms that buffer (see `crate::cstdio`), so both halves of
 // its output have to be buffered or they interleave against each other; run as
 // its own command nothing arms it and these are unbuffered writes as before.
 use crate::cstdio::{print, println};
-use anyhow::{bail, Result};
-use std::collections::BTreeSet;
+use anyhow::Result;
 use std::process::ExitCode;
 
 use gix::bstr::BString;
@@ -283,9 +287,6 @@ pub(super) fn child_status(result: Result<ExitCode>) -> Result<u8> {
 /// The paths `git diff-index --cached --name-only HEAD --` would print, sorted
 /// bytewise as the index — and therefore git's diff queue — orders them.
 fn dirty_paths(repo: &Repository) -> Result<Vec<BString>> {
-    use gix::diff::index::ChangeRef;
-    use gix::status::tree_index::TrackRenames;
-
     let head_tree = match repo.head_commit().ok().and_then(|c| c.tree_id().ok()) {
         Some(id) => id.detach(),
         None => anyhow::bail!(
@@ -294,35 +295,7 @@ fn dirty_paths(repo: &Repository) -> Result<Vec<BString>> {
         ),
     };
 
-    let index = repo.index_or_empty()?;
-    let index_state: &gix::index::State = &index;
-    if index_state.entries().iter().any(|e| e.stage_raw() != 0) {
-        bail!(
-            "unsupported: unmerged (conflicted) index entries — diff-index's U records are not ported"
-        );
-    }
-
-    let mut paths: BTreeSet<BString> = BTreeSet::new();
-    repo.tree_index_status(
-        &head_tree,
-        index_state,
-        None,
-        TrackRenames::Disabled,
-        |change, _tree_index, _worktree_index| -> Result<_, std::convert::Infallible> {
-            match change {
-                ChangeRef::Addition { location, .. }
-                | ChangeRef::Deletion { location, .. }
-                | ChangeRef::Modification { location, .. } => {
-                    paths.insert(location.into_owned());
-                }
-                // Rename tracking is disabled above, so this never fires.
-                ChangeRef::Rewrite { .. } => {}
-            }
-            Ok(gix::diff::index::Action::Continue(()))
-        },
-    )?;
-
-    Ok(paths.into_iter().collect())
+    super::diff_index::cached_name_only(repo, &head_tree)
 }
 
 /// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which

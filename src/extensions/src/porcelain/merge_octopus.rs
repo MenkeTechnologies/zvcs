@@ -86,12 +86,12 @@
 //!
 //! An unborn `HEAD` bails: stock git runs `diff-index` against it twice and lets
 //! the resulting `fatal: ambiguous argument 'HEAD'` through, which is not
-//! reproduced. So does an unmerged index, whose `U` records the ported
-//! `diff-index` does not emit either. Both are rejected by `dirty_paths` before
-//! any merging begins.
+//! reproduced; `dirty_paths` rejects it before any merging begins. An unmerged
+//! index is refused the way the script refuses it: the pre-flight is the ported
+//! `diff-index --cached` queue, whose `diff_unmerge()` record lists each
+//! conflicted path.
 
-use anyhow::{bail, Result};
-use std::collections::BTreeSet;
+use anyhow::Result;
 use std::process::ExitCode;
 
 use gix::bstr::BString;
@@ -468,9 +468,6 @@ fn commit_reference(repo: &Repository, spec: &str) -> Option<ObjectId> {
 /// The paths `git diff-index --cached --name-only HEAD --` would print, sorted
 /// bytewise as the index — and therefore git's diff queue — orders them.
 fn dirty_paths(repo: &Repository) -> Result<Vec<BString>> {
-    use gix::diff::index::ChangeRef;
-    use gix::status::tree_index::TrackRenames;
-
     let head_tree = match repo.head_commit().ok().and_then(|c| c.tree_id().ok()) {
         Some(id) => id.detach(),
         None => anyhow::bail!(
@@ -479,37 +476,7 @@ fn dirty_paths(repo: &Repository) -> Result<Vec<BString>> {
         ),
     };
 
-    let index = repo.index_or_empty()?;
-    let index_state: &gix::index::State = &index;
-    if index_state.entries().iter().any(|e| e.stage_raw() != 0) {
-        bail!("unsupported: unmerged (conflicted) index entries — diff-index's U records are not ported");
-    }
-
-    let mut paths: BTreeSet<BString> = BTreeSet::new();
-    repo.tree_index_status(
-        &head_tree,
-        index_state,
-        None,
-        TrackRenames::Disabled,
-        |change, _tree_index, _worktree_index| -> Result<_, std::convert::Infallible> {
-            match change {
-                ChangeRef::Addition { location, .. } => {
-                    paths.insert(location.into_owned());
-                }
-                ChangeRef::Deletion { location, .. } => {
-                    paths.insert(location.into_owned());
-                }
-                ChangeRef::Modification { location, .. } => {
-                    paths.insert(location.into_owned());
-                }
-                // Rename tracking is disabled above, so this never fires.
-                ChangeRef::Rewrite { .. } => {}
-            }
-            Ok(gix::diff::index::Action::Continue(()))
-        },
-    )?;
-
-    Ok(paths.into_iter().collect())
+    super::diff_index::cached_name_only(repo, &head_tree)
 }
 
 /// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which

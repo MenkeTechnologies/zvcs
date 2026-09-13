@@ -2571,14 +2571,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         // moment its pre-scan finds a `--`, revision.c:3036-3037.) A
                         // separator anywhere therefore settles the question before it
                         // is asked: `git diff dual --` diffs the branch, where plain
-                        // `git diff dual` refuses to guess.
-                        if !seen_dashdash && std::fs::symlink_metadata(bare).is_ok() {
-                            eprintln!(
-                                "fatal: ambiguous argument '{bare}': both revision and filename"
-                            );
-                            eprintln!("Use '--' to separate paths from revisions, like this:");
-                            eprintln!("'git <command> [<revision>...] -- [<file>...]'");
-                            return Ok(ExitCode::from(128));
+                        // `git diff dual` refuses to guess. Outside a work tree —
+                        // a bare repository, or a cwd inside the git directory —
+                        // `verify_non_filename()` returns before it stats anything
+                        // (setup.c:301-302), so the bare gitdir's own `HEAD` file
+                        // does not make `git diff --cached HEAD` ambiguous there.
+                        if !seen_dashdash {
+                            if let Some(message) = crate::setup::verify_non_filename(&repo, bare) {
+                                eprintln!("fatal: {message}");
+                                return Ok(ExitCode::from(128));
+                            }
                         }
                         // `get_reference()`'s `die("bad object %s", name)`: the name
                         // resolved, the object is simply not there. The name printed is

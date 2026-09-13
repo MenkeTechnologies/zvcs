@@ -290,6 +290,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // CLI > config > built-in default).
     let mut all_flag: Option<bool> = None;
     let mut multiple = false;
+    // git's `verbosity`, which `add_options_to_argv()` hands to every
+    // `fetch_multiple()` child as that many `-v` or a `-q`.
+    let mut verbosity: i32 = 0;
     let mut positionals: Vec<&str> = Vec::new();
 
     // Shallow-boundary selectors that combine (git's `--shallow-exclude` is a
@@ -363,8 +366,18 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         }
 
         match key {
-            "-v" | "--verbose" => opts.verbose = true,
-            "-q" | "--quiet" => opts.quiet = true,
+            // `OPT__VERBOSITY(&verbosity)`, whose callback is
+            // `parse_opt_verbosity_cb()` (parse-options-cb.c:65-85): `-v` counts up
+            // from zero, `-q` counts down from zero, and either one first resets a
+            // count going the other way.
+            "-v" | "--verbose" => {
+                opts.verbose = true;
+                verbosity = if verbosity >= 0 { verbosity + 1 } else { 1 };
+            }
+            "-q" | "--quiet" => {
+                opts.quiet = true;
+                verbosity = if verbosity <= 0 { verbosity - 1 } else { -1 };
+            }
             "--dry-run" => opts.dry_run = true,
             "--all" => all_flag = Some(true),
             "-m" | "--multiple" => multiple = true,
@@ -382,8 +395,14 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "-f" | "--force" => opts.force = true,
             // Negations git's parse-options accepts for the `--[no-]…` booleans:
             // resetting each flag to its default (git clears the corresponding bit).
-            "--no-verbose" => opts.verbose = false,
-            "--no-quiet" => opts.quiet = false,
+            "--no-verbose" => {
+                opts.verbose = false;
+                verbosity = 0;
+            }
+            "--no-quiet" => {
+                opts.quiet = false;
+                verbosity = 0;
+            }
             "--no-dry-run" => opts.dry_run = false,
             "--no-all" => all_flag = Some(false),
             "--no-multiple" => multiple = false,
@@ -605,7 +624,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             }
             "--set-upstream" => opts.set_upstream = true,
             "--no-set-upstream" => opts.set_upstream = false,
-            "--" => {
+            // `parse_options_step()` ends option parsing at either terminator and drops it
+            // (parse-options.c:1110-1121). `fetch_multiple()`'s parallel children are
+            // started as `... --end-of-options <remote>`.
+            "--" | "--end-of-options" => {
                 positionals.extend(args[i..].iter().map(String::as_str));
                 break;
             }
@@ -837,6 +859,151 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
     let all = all_flag.unwrap_or(false);
 
+    // ```c
+    // if (all) {
+    //         if (argc == 1)
+    //                 die(_("fetch --all does not take a repository argument"));
+    //         else if (argc > 1)
+    //                 die(_("fetch --all does not make sense with refspecs"));
+    //         (void) for_each_remote(get_one_remote_for_fetch, &list);
+    //         /* do not do fetch_multiple() of one */
+    //         if (list.nr == 1)
+    //                 remote = remote_get(list.items[0].string);
+    // } else if (argc == 0) {
+    //         remote = remote_get(NULL);
+    // } else if (multiple) {
+    //         for (i = 0; i < argc; i++)
+    //                 if (!add_remote_or_group(argv[i], &list))
+    //                         die(_("no such remote or remote group: %s"), argv[i]);
+    // } else {
+    //         (void) add_remote_or_group(argv[0], &list);
+    //         if (list.nr > 1) {
+    //                 if (argc > 1)
+    //                         die(_("fetching a group and specifying refspecs does not make sense"));
+    //         } else {
+    //                 remote = remote_get(argv[0]);
+    //                 ...
+    //         }
+    // }
+    // string_list_remove_duplicates(&list, 0);
+    // ```
+    //
+    // (`cmd_fetch()`, builtin/fetch.c:2699-2742.) `one` is git's `remote`: `Some` when this
+    // process fetches a single remote itself (`Some(None)` for the default one), `None`
+    // when `list` goes to `fetch_multiple()` — including the empty list that a
+    // `remote_get(NULL)` with no usable default leaves behind. `--all` skips every remote
+    // `skipFetchAll` marks (`get_one_remote_for_fetch()`, :2179-2185); a named remote or
+    // group is fetched whatever that flag says.
+    let mut list: Vec<String> = Vec::new();
+    let one: Option<Option<String>> = if all {
+        match positionals.len() {
+            0 => {}
+            1 => crate::git_fatal!("fetch --all does not take a repository argument"),
+            _ => crate::git_fatal!("fetch --all does not make sense with refspecs"),
+        }
+        list = remotes_in_config_order(&repo)
+            .into_iter()
+            .filter(|name| !super::remote::skip_fetch_all(&repo, name))
+            .collect();
+        (list.len() == 1).then(|| Some(list[0].clone()))
+    } else if positionals.is_empty() {
+        (!default_fetch_remote_missing(&repo)).then_some(None)
+    } else if multiple {
+        for name in &positionals {
+            if !add_remote_or_group(&repo, name, &mut list) {
+                crate::git_fatal!("no such remote or remote group: {name}");
+            }
+        }
+        None
+    } else {
+        add_remote_or_group(&repo, positionals[0], &mut list);
+        if list.len() > 1 {
+            if positionals.len() > 1 {
+                crate::git_fatal!("fetching a group and specifying refspecs does not make sense");
+            }
+            None
+        } else {
+            Some(Some(positionals[0].to_string()))
+        }
+    };
+    // `string_list_remove_duplicates(&list, 0)` (builtin/fetch.c:2742) drops all but the
+    // first of each run of equal entries — the list is unsorted, so only *adjacent*
+    // repeats collapse, which is what `git fetch --multiple origin origin` relies on.
+    list.dedup();
+
+    // ```c
+    // strvec_pushl(&argv, "-c", "fetch.bundleURI=",
+    //              "fetch", "--append", "--no-auto-gc",
+    //              "--no-write-commit-graph", NULL);
+    // for (i = 0; i < server_options.nr; i++)
+    //         strvec_pushf(&argv, "--server-option=%s", server_options.items[i].string);
+    // add_options_to_argv(&argv, config);
+    // ```
+    //
+    // (`fetch_multiple()`, builtin/fetch.c:2302-2307, and `add_options_to_argv()`,
+    // :2187-2226.) Only what the command line said is passed on: `prune`, `prune_tags` and
+    // `tags` are still unset when config supplied them, and `write_fetch_head` has already
+    // been cleared by `--dry-run` (:2689-2690).
+    let child_argv: Vec<String> = {
+        let mut argv: Vec<String> =
+            ["-c", "fetch.bundleURI=", "fetch", "--append", "--no-auto-gc", "--no-write-commit-graph"]
+                .map(String::from)
+                .to_vec();
+        for option in &opts.server_options {
+            argv.push(format!("--server-option={option}"));
+        }
+        let mut push = |arg: &str| argv.push(arg.to_string());
+        if opts.dry_run {
+            push("--dry-run");
+        }
+        if opts.prune_from_cli {
+            push(if opts.prune == Some(true) { "--prune" } else { "--no-prune" });
+        }
+        if opts.prune_tags_from_cli {
+            push(if opts.prune_tags == Some(true) { "--prune-tags" } else { "--no-prune-tags" });
+        }
+        if opts.update_head_ok {
+            push("--update-head-ok");
+        }
+        if opts.force {
+            push("--force");
+        }
+        if opts.keep {
+            push("--keep");
+        }
+        match recurse_for_children(&repo, recurse_submodules) {
+            Some(Recurse::Yes) => push("--recurse-submodules"),
+            Some(Recurse::No) => push("--no-recurse-submodules"),
+            Some(Recurse::OnDemand) => push("--recurse-submodules=on-demand"),
+            None => {}
+        }
+        match opts.tags {
+            Some(Tags::All) => push("--tags"),
+            Some(Tags::None) => push("--no-tags"),
+            _ => {}
+        }
+        if verbosity >= 2 {
+            push("-v");
+        }
+        if verbosity >= 1 {
+            push("-v");
+        } else if verbosity < 0 {
+            push("-q");
+        }
+        match opts.address_family {
+            Some(gix::protocol::transport::AddressFamily::V4) => push("--ipv4"),
+            Some(gix::protocol::transport::AddressFamily::V6) => push("--ipv6"),
+            _ => {}
+        }
+        if !opts.write_fetch_head || opts.dry_run {
+            push("--no-write-fetch-head");
+        }
+        if opts.porcelain {
+            push("--porcelain");
+        }
+        argv
+    };
+
     // Every refspec git accepts on the command line, from `--stdin` or via `--refmap` goes through
     // `refspec_append()`, which dies on a malformed one before anything is fetched.
     // Under `--all`/`--multiple` every positional is a remote name, so there are no refspecs to expand
@@ -904,16 +1071,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // for the submodules to recurse into.
     if opts.negotiate_only {
         // `cmd_fetch` resolves the remote before it looks at the tips, so a run with
-        // no remote to negotiate with is refused for that reason first. `--all` holds
-        // a remote only when it collected exactly one; otherwise, and with no
-        // positional, the arm that runs is `remote_get(NULL)` — note that `argc == 0`
-        // is tested ahead of `--multiple`, so a bare `--multiple` lands there too.
-        let no_remote = if all {
-            repo.remote_names().len() != 1
-        } else {
-            positionals.is_empty() && default_fetch_remote_missing(&repo)
-        };
-        if no_remote {
+        // no remote to negotiate with is refused for that reason first: `if (!remote)`
+        // (builtin/fetch.c:2750-2751), which is every run that selected `list` instead.
+        if one.is_none() {
             eprintln!("fatal: must supply remote when using --negotiate-only");
             return Ok(ExitCode::from(128));
         }
@@ -943,7 +1103,13 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // `advice_enabled(ADVICE_FETCH_SHOW_FORCED_UPDATES)` wraps both halves of
     // this report in `store_updated_refs()` — the "check disabled" note here and
     // the "it took N seconds" one that is not ported.
-    if !opts.show_forced_updates && crate::advice::Advice::FetchShowForcedUpdates.enabled_in(&repo) {
+    //
+    // The warning is `store_updated_refs()`' (builtin/fetch.c:1351-1353), so it belongs to
+    // the process that updates refs: under `fetch_multiple()` that is each child.
+    if one.is_some()
+        && !opts.show_forced_updates
+        && crate::advice::Advice::FetchShowForcedUpdates.enabled_in(&repo)
+    {
         eprintln!(
             "warning: fetch normally indicates which branches had a forced update,\n\
              but that check has been disabled; to re-enable, use '--show-forced-updates'\n\
@@ -952,8 +1118,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     }
 
     // Serialize ref mutations through the repo coordinator, as the write
-    // commands do; a no-op guard if no daemon is running.
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    // commands do; a no-op guard if no daemon is running. Not held around
+    // `fetch_multiple()`: its children take the lock for their own ref updates, and
+    // a parent holding it would leave each of them waiting on this process.
+    let _lock = one.is_some().then(|| crate::lock::RepoLock::acquire(repo.git_dir()));
 
     // The upstream of the current branch decides which FETCH_HEAD row is the
     // merge candidate (git's `FETCH_HEAD_MERGE`) when the configured refspecs
@@ -991,122 +1159,8 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     let mut tips = SubmoduleTips::default();
 
     let result = (|| -> Result<()> {
-        if all {
-            if !positionals.is_empty() {
-                crate::git_fatal!("fetch --all does not take a repository argument");
-            }
-            // git announces each remote on stdout while fanning out, but only on
-            // the genuinely multi-remote path: `cmd_fetch` short-circuits
-            // `--all` over a single remote into the ordinary one-remote fetch,
-            // which prints nothing. `-q` silences the announcement either way.
-            let names = repo.remote_names();
-            let announce = names.len() > 1 && !opts.quiet;
-            fetch_head.truncate_now()?;
-            for name in names {
-                let n = name.as_bstr();
-                if announce {
-                    println!("Fetching {n}");
-                }
-                match fetch_one(
-                    &repo,
-                    Some(n),
-                    &stdin_specs.iter().map(String::as_str).collect::<Vec<_>>(),
-                    &opts,
-                    upstream.as_ref(),
-                    &mut fetch_head,
-                    &mut op,
-                    &mut tips,
-                ) {
-                    Ok(Verdict::Ok) => {}
-                    Ok(Verdict::Rejected) => failure = true,
-                    Ok(Verdict::Fatal) => {
-                        fatal = true;
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("error: could not fetch {n}: {e}");
-                        failure = true;
-                    }
-                }
-            }
-        } else if multiple && !positionals.is_empty() {
-            // `--multiple` reads every positional as a remote *name* or group
-            // (`add_remote_or_group()`), so a URL or path is refused before anything is
-            // fetched — `git fetch --multiple .` never contacts `.` at all.
-            //
-            // `cmd_fetch` tests `argc == 0` *before* `multiple`, so a bare `git fetch
-            // --multiple` is not an empty fan-out but an ordinary fetch from the default
-            // remote — hence the `!positionals.is_empty()` guard on this arm.
-            for name in &positionals {
-                let known = repo
-                    .remote_names()
-                    .iter()
-                    .any(|n| n.as_bstr() == BStr::new(*name))
-                    || repo
-                        .config_snapshot()
-                        .string(&format!("remotes.{name}"))
-                        .is_some();
-                if !known {
-                    eprintln!("fatal: no such remote or remote group: {name}");
-                    fatal = true;
-                    break;
-                }
-            }
-            if fatal {
-                return Ok(());
-            }
-            // `string_list_remove_duplicates(&list, 0)` (builtin/fetch.c:2742) drops all but
-            // the first of each run of equal entries — the list is unsorted, so only
-            // *adjacent* repeats collapse, which is what `git fetch --multiple origin origin`
-            // relies on to fetch once.
-            let mut positionals = positionals.clone();
-            positionals.dedup();
-            fetch_head.truncate_now()?;
-            for name in &positionals {
-                if !opts.quiet {
-                    println!("Fetching {name}");
-                }
-                match fetch_one(
-                    &repo,
-                    Some(BStr::new(*name)),
-                    &stdin_specs.iter().map(String::as_str).collect::<Vec<_>>(),
-                    &opts,
-                    upstream.as_ref(),
-                    &mut fetch_head,
-                    &mut op,
-                    &mut tips,
-                ) {
-                    Ok(Verdict::Ok) => {}
-                    Ok(Verdict::Rejected) => failure = true,
-                    Ok(Verdict::Fatal) => {
-                        fatal = true;
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("error: could not fetch {name}: {e}");
-                        failure = true;
-                    }
-                }
-            }
-        } else {
-            let name = positionals.first().map(|s| BStr::new(*s));
-            // `cmd_fetch`'s no-argument arm is `remote = remote_get(NULL)`, which
-            // comes back NULL when the name it settles on — `branch.<current>.remote`,
-            // else the sole configured remote, else `origin` — has no URL. git then
-            // reaches neither `fetch_one()` nor an error but the `fetch_multiple()`
-            // arm, over a list nothing was ever added to: the loop runs zero times
-            // and the command succeeds without a word. Three options are refused
-            // there first, because none of them means anything with no remote.
-            if name.is_none() && default_fetch_remote_missing(&repo) {
-                if opts.atomic {
-                    crate::git_fatal!("--atomic can only be used when fetching from one remote");
-                }
-                if read_stdin {
-                    crate::git_fatal!("--stdin can only be used when fetching from one remote");
-                }
-                fetch_head.truncate_now()?;
-                return Ok(());
-            }
+        if let Some(name) = &one {
+            let name = name.as_deref().map(BStr::new);
             let mut refspecs: Vec<&str> = positional_specs.iter().map(String::as_str).collect();
             refspecs.extend(stdin_specs.iter().map(String::as_str));
             match fetch_one(
@@ -1122,6 +1176,41 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 Verdict::Ok => {}
                 Verdict::Rejected => failure = true,
                 Verdict::Fatal => fatal = true,
+            }
+        } else {
+            // ```c
+            // if (filter_options.choice)
+            //         die(_("--filter can only be used with the remote "
+            //               "configured in extensions.partialclone"));
+            // if (atomic_fetch)
+            //         die(_("--atomic can only be used when fetching "
+            //               "from one remote"));
+            // if (stdin_refspecs)
+            //         die(_("--stdin can only be used when fetching "
+            //               "from one remote"));
+            // if (max_children < 0)
+            //         max_children = config.parallel;
+            // result = fetch_multiple(&list, max_children, &config);
+            // ```
+            //
+            // (`cmd_fetch()`, builtin/fetch.c:2786-2807.) With an empty `list` — no
+            // usable default remote — the loop runs zero times and the command succeeds
+            // without a word, after the refusals and the FETCH_HEAD truncation.
+            if opts.filter.is_some() {
+                crate::git_fatal!(
+                    "--filter can only be used with the remote configured in extensions.partialclone"
+                );
+            }
+            if opts.atomic {
+                crate::git_fatal!("--atomic can only be used when fetching from one remote");
+            }
+            if read_stdin {
+                crate::git_fatal!("--stdin can only be used when fetching from one remote");
+            }
+            // `if (!append && write_fetch_head) truncate_fetch_head()` (:2292-2296).
+            fetch_head.truncate_now()?;
+            if fetch_multiple(&list, opts.jobs, &child_argv, verbosity >= 0 && !opts.porcelain) {
+                failure = true;
             }
         }
         Ok(())
@@ -1167,7 +1256,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // brought new commits for — the set `fetch_task_create()` gates on, and
     // empty (so: no recursion at all) whenever nothing changed or the
     // superproject configures no submodule.
-    if recurse != Recurse::No && !opts.dry_run {
+    //
+    // Only after a single-remote fetch: `if (!result && remote && ...)`
+    // (builtin/fetch.c:2819). Each `fetch_multiple()` child already recursed for its own remote.
+    if one.is_some() && recurse != Recurse::No && !opts.dry_run {
         let selected = match recurse {
             Recurse::OnDemand => Some(changed_submodule_names(&repo, &tips)?),
             _ => None,
@@ -1289,6 +1381,408 @@ pub(super) fn credentials_in_url(repo: &gix::Repository, url: Option<&gix::url::
         }
         _ => Verdict::Ok,
     }
+}
+
+/// `for_each_remote()` (remote.c:865-876) over `remote_state->remotes`, which
+/// `make_remote()` fills in the order the configuration first sets a
+/// `remote.<name>.<key>` for each name (`handle_config()`, remote.c:431-505). A section
+/// header with no key under it creates no remote, and neither does a name that begins
+/// with `/`, which `handle_config()` only warns about.
+fn remotes_in_config_order(repo: &gix::Repository) -> Vec<String> {
+    let snapshot = repo.config_snapshot();
+    let mut names: Vec<String> = Vec::new();
+    for section in snapshot.plumbing().sections() {
+        let header = section.header();
+        if !header.name().eq_ignore_ascii_case(b"remote") {
+            continue;
+        }
+        let Some(sub) = header.subsection_name() else { continue };
+        if sub.starts_with(b"/") || section.body().value_names().next().is_none() {
+            continue;
+        }
+        let name = sub.to_str_lossy().into_owned();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// `add_remote_or_group()` (remote.c:2149-2163): the members of `remotes.<name>`
+/// when that group lists any, else `<name>` itself when it is a configured remote.
+///
+/// `get_remote_group()` (remote.c:2128-2147) compares the *normalized* key —
+/// `remotes.` plus the rest, value name lowercased — with `strcmp`, so a group
+/// is found only under the spelling `git config` stores, and every value's
+/// words (split on space, tab and newline) are appended in configuration order.
+fn add_remote_or_group(repo: &gix::Repository, name: &str, list: &mut Vec<String>) -> bool {
+    let prev = list.len();
+    let snapshot = repo.config_snapshot();
+    for section in snapshot.plumbing().sections() {
+        let header = section.header();
+        if !header.name().eq_ignore_ascii_case(b"remotes") {
+            continue;
+        }
+        let body = section.body();
+        let mut seen: Vec<String> = Vec::new();
+        for value_name in body.value_names() {
+            let lower = value_name.to_ascii_lowercase();
+            let key = match header.subsection_name() {
+                Some(sub) => format!("{sub}.{lower}"),
+                None => lower.clone(),
+            };
+            let nth = seen.iter().filter(|s| **s == lower).count();
+            seen.push(lower.clone());
+            if key != name {
+                continue;
+            }
+            let Some(value) = body.values(lower.as_str()).get(nth).cloned() else { continue };
+            for word in value.split(|b| matches!(b, b' ' | b'\t' | b'\n')).filter(|w| !w.is_empty()) {
+                list.push(word.to_str_lossy().into_owned());
+            }
+        }
+    }
+    if list.len() == prev {
+        if !remote_is_configured(repo, name) {
+            return false;
+        }
+        list.push(name.to_string());
+    }
+    true
+}
+
+/// `remote_is_configured(remote_get(name), 0)` (remote.c:856-863): the remote has an
+/// `origin` — configuration, or (`remotes_remote_get_1()`, for a name
+/// `valid_remote_nick()` accepts) a readable `$GIT_DIR/remotes/<name>` or
+/// `$GIT_DIR/branches/<name>` file.
+fn remote_is_configured(repo: &gix::Repository, name: &str) -> bool {
+    if remotes_in_config_order(repo).iter().any(|n| n == name) {
+        return true;
+    }
+    let nick = !name.is_empty() && name != "." && name != ".." && !name.contains('/');
+    nick && ["remotes", "branches"]
+        .iter()
+        .any(|dir| std::fs::File::open(repo.git_dir().join(dir).join(name)).is_ok())
+}
+
+/// `config.recurse_submodules` as `cmd_fetch()` leaves it for `add_options_to_argv()`:
+/// `submodule.recurse` and `fetch.recurseSubmodules` in the order the configuration sets
+/// them (`git_fetch_config()`, builtin/fetch.c:138-153), then the command line
+/// (:2616-2617), then `.gitmodules`' `fetch.recurseSubmodules` while nothing else has
+/// spoken (:2637-2644, `gitmodules_fetch_config()`, submodule-config.c:1000-1018).
+/// `None` is `RECURSE_SUBMODULES_DEFAULT`, for which no option is passed.
+fn recurse_for_children(repo: &gix::Repository, cli: Option<Recurse>) -> Option<Recurse> {
+    /// `git_parse_maybe_bool()`: a valueless key is true.
+    fn maybe_bool(value: Option<&BStr>) -> Option<bool> {
+        let Some(value) = value else { return Some(true) };
+        match value.to_str_lossy().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" => Some(true),
+            "false" | "no" | "off" | "" => Some(false),
+            other => other.parse::<i64>().ok().map(|n| n != 0),
+        }
+    }
+    /// `parse_fetch_recurse_submodules_arg()` (submodule-config.c).
+    fn fetch_arg(value: Option<&BStr>) -> Option<Recurse> {
+        match maybe_bool(value) {
+            Some(true) => Some(Recurse::Yes),
+            Some(false) => Some(Recurse::No),
+            None if value.is_some_and(|v| v == "on-demand") => Some(Recurse::OnDemand),
+            None => None,
+        }
+    }
+    /// Walk `file` in order, feeding every `<section>.<key>` occurrence to `parse`.
+    fn walk(
+        file: &gix::config::File,
+        wanted: &[(&[u8], &str)],
+        mut apply: impl FnMut(usize, Option<&BStr>),
+    ) {
+        for section in file.sections() {
+            let header = section.header();
+            if header.subsection_name().is_some() {
+                continue;
+            }
+            let body = section.body();
+            let mut seen: Vec<String> = Vec::new();
+            for value_name in body.value_names() {
+                let lower = value_name.to_ascii_lowercase();
+                let nth = seen.iter().filter(|s| **s == lower).count();
+                seen.push(lower.clone());
+                for (which, (section_name, key)) in wanted.iter().enumerate() {
+                    if header.name().eq_ignore_ascii_case(section_name) && lower == *key {
+                        let values = body.values(lower.as_str());
+                        apply(which, values.get(nth).map(|v| v.as_bstr()));
+                    }
+                }
+            }
+        }
+    }
+
+    let snapshot = repo.config_snapshot();
+    let mut configured = None;
+    walk(
+        snapshot.plumbing(),
+        &[(b"submodule", "recurse"), (b"fetch", "recursesubmodules")],
+        |which, value| {
+            let parsed = match which {
+                0 => maybe_bool(value).map(|on| if on { Recurse::Yes } else { Recurse::No }),
+                _ => fetch_arg(value),
+            };
+            if parsed.is_some() {
+                configured = parsed;
+            }
+        },
+    );
+    if let Some(resolved) = cli.or(configured) {
+        return Some(resolved);
+    }
+    let modules = repo.modules().ok().flatten()?;
+    let mut from_gitmodules = None;
+    walk(modules.config(), &[(b"fetch", "recursesubmodules")], |_, value| {
+        if let Some(parsed) = fetch_arg(value) {
+            from_gitmodules = Some(parsed);
+        }
+    });
+    from_gitmodules
+}
+
+/// `fetch_multiple()` (builtin/fetch.c:2286-2345) past its FETCH_HEAD truncation, which
+/// the caller has done: a `git fetch` child per remote, one after another when
+/// `max_children == 1` or there is a single remote, otherwise through
+/// `run_processes_parallel()`. `true` when any child failed — git's `!!result`.
+fn fetch_multiple(list: &[String], max_children: usize, argv: &[String], announce: bool) -> bool {
+    if max_children != 1 && list.len() != 1 {
+        let mut argv = argv.to_vec();
+        argv.push("--end-of-options".to_string());
+        return fetch_parallel(list, max_children, &argv, announce);
+    }
+    let mut failed = false;
+    for name in list {
+        let mut cmd = argv.to_vec();
+        cmd.push(name.clone());
+        if announce {
+            println!("Fetching {name}");
+        }
+        if run_git_cmd(&cmd) != 0 {
+            eprintln!("error: could not fetch {name}");
+            failed = true;
+        }
+    }
+    failed
+}
+
+/// `run_command()` on a `child_process` with `git_cmd = 1` (run-command.c): flush,
+/// start this binary as `git <args>` with the inherited stdio, and answer what
+/// `finish_command()` answers — `-1` when it could not be started.
+pub(super) fn run_git_cmd(args: &[String]) -> i32 {
+    crate::cstdio::before_spawn();
+    let status = crate::hosted::git_exe()
+        .and_then(|exe| std::process::Command::new(exe).args(args).status());
+    match status {
+        Ok(status) => wait_status_code(&args[0], status),
+        Err(e) => {
+            eprintln!("error: cannot exec '{}': {}", args[0], crate::external::strerror(&e));
+            -1
+        }
+    }
+}
+
+/// `wait_or_whine()` (run-command.c:558-596): the exit code, or `128 + signal` with an
+/// `error:` line unless the signal is SIGINT, SIGQUIT or SIGPIPE. `argv0` is
+/// `cmd->args.v[0]`, the first word the caller pushed.
+fn wait_status_code(argv0: &str, status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    let sig = std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0);
+    if sig != libc::SIGINT && sig != libc::SIGQUIT && sig != libc::SIGPIPE {
+        eprintln!("error: {argv0} died of signal {sig}");
+    }
+    128 + sig
+}
+
+/// `start_command()` for a `run_processes_parallel()` child: `git_cmd = 1`,
+/// `no_stdin = 1`, and `err = -1` with `stdout_to_stderr = 1` (`pp_start_one()`,
+/// run-command.c) — one pipe the parent reads, carrying both of the child's streams.
+fn spawn_grouped(args: &[String]) -> std::io::Result<(std::process::Child, std::fs::File)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid two-element buffer for `pipe(2)`.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `pipe(2)` succeeded, so both descriptors are open and owned here alone.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // A sibling started later must not inherit this child's write end, or the
+    // reader would never see end-of-file.
+    for fd in fds {
+        // SAFETY: `fd` is one of the descriptors opened just above.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    let exe = crate::hosted::git_exe()?;
+    crate::cstdio::before_spawn();
+    let child = std::process::Command::new(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(write.try_clone()?))
+        .stderr(std::process::Stdio::from(write))
+        .spawn()?;
+    Ok((child, std::fs::File::from(read)))
+}
+
+/// `run_processes_parallel()` (run-command.c) driving `fetch_next_remote()`,
+/// `fetch_failed_to_start()` and `fetch_finished()` (builtin/fetch.c:2237-2284).
+///
+/// Output is grouped: the child that owns the output is copied to stderr as it arrives
+/// (`pp_output()`), every other child's is held, and when the owner finishes its output,
+/// then everything held for children that finished meanwhile, is written and ownership
+/// moves round-robin to the next working slot (`pp_collect_finished()`). Up to four
+/// children start per turn of the loop (`spawn_cap`), and each turn polls for 100ms.
+fn fetch_parallel(list: &[String], processes: usize, argv: &[String], announce: bool) -> bool {
+    use std::os::fd::AsRawFd;
+
+    #[derive(PartialEq, Eq)]
+    enum State {
+        Free,
+        Working,
+        WaitCleanup,
+    }
+    struct Slot {
+        state: State,
+        child: Option<std::process::Child>,
+        err: Option<std::fs::File>,
+        buf: Vec<u8>,
+        remote: usize,
+    }
+    let write_stderr = |bytes: &[u8]| {
+        let _ = std::io::stderr().write_all(bytes);
+    };
+
+    let mut slots: Vec<Slot> = (0..processes)
+        .map(|_| Slot { state: State::Free, child: None, err: None, buf: Vec::new(), remote: 0 })
+        .collect();
+    let (mut next, mut running, mut owner) = (0usize, 0usize, 0usize);
+    let mut buffered: Vec<u8> = Vec::new();
+    let mut failed = false;
+
+    loop {
+        for _ in 0..4 {
+            if running >= processes {
+                break;
+            }
+            // `fetch_next_remote()`: no remote left ends the spawning for this turn.
+            let Some(name) = list.get(next) else { break };
+            let i = slots.iter().position(|s| s.state == State::Free).expect("a free slot while below the cap");
+            next += 1;
+            let mut cmd = argv.to_vec();
+            cmd.push(name.clone());
+            if announce {
+                println!("Fetching {name}");
+            }
+            match spawn_grouped(&cmd) {
+                Ok((child, err)) => {
+                    slots[i] = Slot {
+                        state: State::Working,
+                        child: Some(child),
+                        err: Some(err),
+                        buf: Vec::new(),
+                        remote: next - 1,
+                    };
+                    running += 1;
+                }
+                Err(e) => {
+                    eprintln!("error: cannot exec '{}': {}", cmd[0], crate::external::strerror(&e));
+                    // `fetch_failed_to_start()`: `state->result = error(...)`, and 0 so
+                    // the next remote is tried.
+                    eprintln!("error: could not fetch {name}");
+                    failed = true;
+                }
+            }
+        }
+        if running == 0 {
+            break;
+        }
+
+        // `pp_buffer_io()`
+        let mut pfds: Vec<libc::pollfd> = slots
+            .iter()
+            .map(|s| libc::pollfd {
+                fd: match (&s.state, &s.err) {
+                    (State::Working, Some(f)) => f.as_raw_fd(),
+                    _ => -1,
+                },
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            })
+            .collect();
+        loop {
+            // SAFETY: `pfds` is a live buffer of `pfds.len()` pollfd records.
+            if unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 100) } >= 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                eprintln!("fatal: poll: {}", crate::external::strerror(&e));
+                crate::hosted::exit(128);
+            }
+        }
+        for (slot, pfd) in slots.iter_mut().zip(&pfds) {
+            if slot.state != State::Working || pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+                continue;
+            }
+            let mut chunk = [0u8; 8192];
+            let Some(err) = slot.err.as_mut() else { continue };
+            match err.read(&mut chunk) {
+                Ok(0) => {
+                    slot.err = None;
+                    slot.state = State::WaitCleanup;
+                }
+                Ok(n) => slot.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                Err(e) => {
+                    eprintln!("fatal: read: {}", crate::external::strerror(&e));
+                    crate::hosted::exit(128);
+                }
+            }
+        }
+
+        // `pp_output()`
+        if slots[owner].state == State::Working && !slots[owner].buf.is_empty() {
+            write_stderr(&slots[owner].buf);
+            slots[owner].buf.clear();
+        }
+
+        // `pp_collect_finished()`
+        while running > 0 {
+            let Some(i) = slots.iter().position(|s| s.state == State::WaitCleanup) else { break };
+            let code = match slots[i].child.take().map(|mut child| child.wait()) {
+                Some(Ok(status)) => wait_status_code(&argv[0], status),
+                _ => -1,
+            };
+            if code != 0 {
+                let name = &list[slots[i].remote];
+                slots[i]
+                    .buf
+                    .extend_from_slice(format!("could not fetch '{name}' (exit code: {code})\n").as_bytes());
+                failed = true;
+            }
+            running -= 1;
+            slots[i].state = State::Free;
+            if i != owner {
+                buffered.append(&mut slots[i].buf);
+            } else {
+                write_stderr(&slots[i].buf);
+                slots[i].buf.clear();
+                write_stderr(&buffered);
+                buffered.clear();
+                let n = processes;
+                let step = (0..n).find(|k| slots[(owner + k) % n].state == State::Working).unwrap_or(n);
+                owner = (owner + step) % n;
+            }
+        }
+    }
+    // `pp_cleanup()`
+    write_stderr(&buffered);
+    failed
 }
 
 /// `--recurse-submodules`' tri-state.

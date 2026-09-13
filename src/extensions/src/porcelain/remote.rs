@@ -2544,7 +2544,7 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// git's parse order) and, inside each, value name by value name. A key written
 /// without `=` counts as `true`, as `git_config_bool` treats a `NULL` value, and
 /// an unparseable value leaves the previous verdict alone.
-fn skip_fetch_all(repo: &gix::Repository, name: &str) -> bool {
+pub(super) fn skip_fetch_all(repo: &gix::Repository, name: &str) -> bool {
     /// git's `git_parse_maybe_bool`, which is deliberately narrower than a
     /// number parse: anything else is a config error, which git reports and this
     /// caller ignores in favour of the value already decided.

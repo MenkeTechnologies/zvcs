@@ -40,6 +40,91 @@ pub struct Store {
     packed: packed::modifiable::MutableSharedBuffer,
 }
 
+/// A callback run every time a file store is about to read or write references.
+///
+/// git builds its ref store lazily, the first time a code path asks for it
+/// (`get_main_ref_store()` → `ref_store_init()`, refs.c), and settings it reads
+/// at that point — `core.logAllRefUpdates` among them — are refused there and
+/// nowhere earlier. A store here exists from the moment a repository is opened,
+/// so a host that needs git's timing installs this hook and makes its decision
+/// on the first use instead. It runs on every entry so the host, not this crate,
+/// decides what "first" means; it must be cheap.
+static FIRST_USE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the [`FIRST_USE_HOOK`]. Only the first installation takes effect.
+pub fn set_first_use_hook(hook: fn()) {
+    let _ = FIRST_USE_HOOK.set(hook);
+}
+
+/// Run the installed hook, if any.
+pub(crate) fn first_use() {
+    if HOOKS_SUSPENDED.with(std::cell::Cell::get) {
+        return;
+    }
+    if let Some(hook) = FIRST_USE_HOOK.get() {
+        hook();
+    }
+}
+
+thread_local! {
+    /// Set while [`without_hooks`] runs.
+    static HOOKS_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the store hooks switched off on this thread.
+///
+/// For reads that are not a use of a ref store in git's sense: repository
+/// discovery validates `HEAD` through a throwaway store, where git's
+/// `validate_headref()` (setup.c) reads the file directly and never builds one.
+pub fn without_hooks<T>(f: impl FnOnce() -> T) -> T {
+    let _suspended = HooksSuspended::new();
+    f()
+}
+
+/// The store hooks switched off on this thread until the guard is dropped — the
+/// shape of [`without_hooks`] for a whole function body.
+pub struct HooksSuspended {
+    previous: bool,
+}
+
+impl HooksSuspended {
+    /// Switch the hooks off, remembering whether they already were.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        HooksSuspended {
+            previous: HOOKS_SUSPENDED.with(|s| s.replace(true)),
+        }
+    }
+}
+
+impl Drop for HooksSuspended {
+    fn drop(&mut self) {
+        HOOKS_SUSPENDED.with(|s| s.set(self.previous));
+    }
+}
+
+/// A callback run where git's files backend calls `packed_refs_lock()`: a
+/// transaction that deletes a reference, or one that migrates values into
+/// `packed-refs` (`refs/files-backend.c:2982-3036`, `:1478`).
+///
+/// `packed_refs_lock()` reads `core.packedRefsTimeout` on its first call
+/// (`refs/packed-backend.c:1222-1228`) and dies on a value it cannot parse —
+/// even when there is no `packed-refs` file to lock against, which is a case
+/// this store skips the lock for. The hook gives the host that moment.
+static PACKED_REFS_LOCK_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the [`PACKED_REFS_LOCK_HOOK`]. Only the first installation takes effect.
+pub fn set_packed_refs_lock_hook(hook: fn()) {
+    let _ = PACKED_REFS_LOCK_HOOK.set(hook);
+}
+
+/// Run the installed packed-refs lock hook, if any.
+pub(crate) fn packed_refs_lock() {
+    if let Some(hook) = PACKED_REFS_LOCK_HOOK.get() {
+        hook();
+    }
+}
+
 mod access {
     use std::path::Path;
 

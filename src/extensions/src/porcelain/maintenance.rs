@@ -672,12 +672,19 @@ fn run_tasks(
         let ok = match task {
             // `maintenance_task_pack_refs()` forwards `--auto`, so the packing
             // itself re-applies the same threshold the condition just checked.
+            //
+            // A child, as `maintenance_task_pack_refs()` runs it
+            // (`run_command(&cmd)`, builtin/gc.c): a value `pack-refs` dies on at
+            // ref-store setup or at `packed_refs_lock()` — `core.logAllRefUpdates`,
+            // `core.packedRefsTimeout` — ends that process with 128, which the
+            // task reports as `error: task 'pack-refs' failed` at exit 1. Run in
+            // this process, the same `die()` ended maintenance itself with 128.
             "pack-refs" => {
-                let mut args = strings(&["pack-refs", "--all", "--prune"]);
+                let mut args = vec!["pack-refs", "--all", "--prune"];
                 if auto {
-                    args.push("--auto".to_owned());
+                    args.push("--auto");
                 }
-                delegate(super::pack_refs::pack_refs(&args))
+                spawn_git(repo, &args)
             }
             "reflog-expire" => super::gc::expire_reflogs(repo).is_ok(),
             // `maintenance_task_geometric_repack()`: `git repack -d -l

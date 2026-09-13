@@ -198,6 +198,11 @@ impl ThreadSafeRepository {
         mut options: Options,
     ) -> Result<Self, Error> {
         let _span = gix_trace::detail!("open_from_paths()");
+        // Opening reads references for its own bookkeeping (`HEAD`, the worktree
+        // and namespace probes below), where git's setup reads files and builds no
+        // ref store. None of that is the first use a host hooks onto the store,
+        // so the hooks stay off until the repository is handed out.
+        let _no_ref_hooks = gix_ref::file::HooksSuspended::new();
         options.open_path_as_is = false;
         let Options {
             ref mut git_dir_trust,

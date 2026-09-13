@@ -76,7 +76,9 @@ pub(crate) fn git_with_metadata(
         // With ref-table, the hash is probably stored as part of the ref-db itself, so we can handle it from there.
         // In other words, it's important not to fail on detached heads here because we guessed the hash kind wrongly.
         let refs = gix_ref::file::Store::at(dot_git.as_ref().into(), Default::default());
-        match refs.find_loose("HEAD") {
+        // `validate_headref()` (setup.c) reads the file and builds no ref store, so
+        // nothing a host hooks onto a store's first use belongs to this probe.
+        match gix_ref::file::without_hooks(|| refs.find_loose("HEAD")) {
             Ok(head) => {
                 if head.name.as_bstr() != "HEAD" {
                     return Err(crate::is_git::Error::MisplacedHead {

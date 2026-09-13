@@ -16,6 +16,7 @@ impl file::Store {
         Name: TryInto<&'a FullNameRef, Error = E>,
         crate::name::Error: From<E>,
     {
+        file::first_use();
         Ok(self.reflog_path(name.try_into()?).is_file())
     }
 
@@ -32,6 +33,7 @@ impl file::Store {
         Name: TryInto<&'a FullNameRef, Error = E>,
         crate::name::Error: From<E>,
     {
+        file::first_use();
         let name: &FullNameRef = name.try_into().map_err(|err| Error::RefnameValidation(err.into()))?;
         let path = self.reflog_path(name);
         if path.is_dir() {
@@ -57,6 +59,7 @@ impl file::Store {
         Name: TryInto<&'a FullNameRef, Error = E>,
         crate::name::Error: From<E>,
     {
+        file::first_use();
         let name: &FullNameRef = name.try_into().map_err(|err| Error::RefnameValidation(err.into()))?;
         let path = self.reflog_path(name);
         match std::fs::File::open(&path) {

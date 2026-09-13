@@ -187,6 +187,72 @@ pub fn cli_override(key: &str) -> Option<&'static str> {
 /// `gix_config`'s override order, so the two channels agree when both carry the
 /// same key.
 pub fn discover() -> Result<gix::Repository, gix::discover::Error> {
+    discover_with_overrides().inspect(arm_ref_store_refusal)
+}
+
+/// What `ref_store_init()` (refs.c:2322-2342) would die with when the main ref
+/// store is first created, once a repository has been found.
+static REF_STORE_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Record the refusal for [`ref_store_first_use`] and install that hook.
+///
+/// git reads `core.logAllRefUpdates` while it builds the ref store:
+///
+/// ```c
+/// struct ref_store_init_options opts = {
+///         .access_flags = flags,
+///         .log_all_ref_updates = repo_settings_get_log_all_ref_updates(repo),
+/// };
+/// ```
+///
+/// and `repo_settings_get_log_all_ref_updates()` (repo-settings.c:180-194) takes
+/// the last value, answers `always` case-insensitively, and hands anything else
+/// to `git_config_bool()`, which dies. The store is built lazily by
+/// `get_main_ref_store()`, so stock 2.55.0 with `-c core.logAllRefUpdates=none`
+/// dies in `status`, `branch`, `rev-parse HEAD` and `log`, and not in
+/// `rev-parse --git-dir`, `ls-files`, `config` or `hash-object`. gitoxide opens
+/// its ref store eagerly, so the value is read here and the `die()` waits in
+/// the store's first-use hook.
+fn arm_ref_store_refusal(repo: &gix::Repository) {
+    REF_STORE_REFUSAL.get_or_init(|| {
+        let raw = crate::config::last_value_implicit(repo, "core.logallrefupdates")?;
+        let raw = raw?;
+        if raw.eq_ignore_ascii_case("always") || crate::optint::maybe_bool(&raw).is_some() {
+            return None;
+        }
+        Some(format!("bad boolean config value '{raw}' for 'core.logallrefupdates'"))
+    });
+    gix::refs::file::set_first_use_hook(ref_store_first_use);
+    PACKED_REFS_TIMEOUT_REFUSAL
+        .get_or_init(|| crate::config::config_int(repo, "core.packedrefstimeout").err());
+    gix::refs::file::set_packed_refs_lock_hook(packed_refs_lock_first_use);
+}
+
+/// What `packed_refs_lock()`'s `repo_config_get_int(…, "core.packedrefstimeout",
+/// …)` (refs/packed-backend.c:1222-1228) would die with. See
+/// [`crate::sequencer::packed_refs_lock_timeout`] for the same read made by the
+/// state-ref deletions that never reach a ref transaction here.
+static PACKED_REFS_TIMEOUT_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The ref store's packed-refs lock hook: `die()` with the recorded refusal.
+fn packed_refs_lock_first_use() {
+    if let Some(Some(message)) = PACKED_REFS_TIMEOUT_REFUSAL.get() {
+        crate::trace2::error(message);
+        eprintln!("fatal: {message}");
+        std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
+    }
+}
+
+/// The ref store's first-use hook: `die()` with the recorded refusal, if any.
+fn ref_store_first_use() {
+    if let Some(Some(message)) = REF_STORE_REFUSAL.get() {
+        crate::trace2::error(message);
+        eprintln!("fatal: {message}");
+        std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
+    }
+}
+
+fn discover_with_overrides() -> Result<gix::Repository, gix::discover::Error> {
     let overrides = CLI_OVERRIDES.get();
     if overrides.is_none_or(Vec::is_empty) {
         return gix::discover(".");

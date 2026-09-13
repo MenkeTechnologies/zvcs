@@ -75,6 +75,7 @@ impl file::Store {
         partial_name: &PartialNameRef,
         packed: Option<&packed::Buffer>,
     ) -> Result<Option<Reference>, Error> {
+        file::first_use();
         fn decompose_if(mut r: Reference, input_changed_to_precomposed: bool) -> Reference {
             if input_changed_to_precomposed {
                 use gix_object::bstr::ByteSlice;

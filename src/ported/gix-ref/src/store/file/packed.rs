@@ -103,6 +103,7 @@ pub(crate) mod modifiable {
         pub(crate) fn assure_packed_refs_uptodate(
             &self,
         ) -> Result<Option<super::SharedBufferSnapshot>, packed::buffer::open::Error> {
+            crate::store_impl::file::first_use();
             self.packed.recent_snapshot(
                 || self.packed_refs_path().metadata().and_then(|m| m.modified()).ok(),
                 || self.open_packed_buffer(),

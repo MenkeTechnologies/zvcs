@@ -107,6 +107,7 @@ impl file::Store {
     ///
     /// The transaction inherits the parent namespace.
     pub fn transaction(&self) -> Transaction<'_, '_> {
+        file::first_use();
         Transaction {
             store: self,
             packed_transaction: None,

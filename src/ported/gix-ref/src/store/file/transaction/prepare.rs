@@ -465,6 +465,17 @@ impl Transaction<'_, '_> {
             })
             .collect();
 
+        // `files_transaction_prepare()` locks `packed-refs` for any transaction
+        // holding a deletion that is not log-only (`refs/files-backend.c:2982-3036`),
+        // and a migrating transaction locks it too (`:1478`) — whether or not a
+        // `packed-refs` file exists, which the lock decision below does consider.
+        let takes_packed_refs_lock = !matches!(self.packed_refs, PackedRefs::DeletionsOnly)
+            || updates.iter().any(|edit| {
+                matches!(edit.update.change, Change::Delete { log, .. } if log != RefLog::Only)
+            });
+        if takes_packed_refs_lock {
+            file::packed_refs_lock();
+        }
         let mut maybe_updates_for_packed_refs = match self.packed_refs {
             PackedRefs::DeletionsAndNonSymbolicUpdates(_)
             | PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(_) => Some(0_usize),

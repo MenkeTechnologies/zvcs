@@ -221,6 +221,7 @@ impl file::Store {
     /// Note that since packed-refs are storing refs as precomposed unicode if [`Self::precompose_unicode`] is true, for consistency
     /// we also return loose references as precomposed unicode.
     pub fn iter(&self) -> Result<Platform<'_>, packed::buffer::open::Error> {
+        file::first_use();
         Ok(Platform {
             store: self,
             packed: self.assure_packed_refs_uptodate()?,
@@ -446,6 +447,7 @@ impl file::Store {
         common_dir_info: Option<IterInfo<'_>>,
         packed: Option<&'p packed::Buffer>,
     ) -> std::io::Result<LooseThenPacked<'p, 's>> {
+        file::first_use();
         Ok(LooseThenPacked {
             git_dir: self.git_dir(),
             common_dir: self.common_dir(),

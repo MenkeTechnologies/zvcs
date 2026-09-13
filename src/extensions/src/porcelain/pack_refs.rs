@@ -279,6 +279,10 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
     // written through it.
     let packed_refs = store.packed_refs_path();
     if edits.is_empty() {
+        // `packed_refs_lock()` reads `core.packedRefsTimeout` before it locks
+        // (refs/packed-backend.c:1222-1228); the transaction below reaches the
+        // same read through the ref store's packed-refs lock hook.
+        crate::sequencer::packed_refs_lock_timeout(&repo)?;
         if let Err(e) = gix::lock::File::acquire_to_update_resource(
             &packed_refs,
             gix::lock::acquire::Fail::Immediately,

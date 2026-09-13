@@ -1570,6 +1570,27 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // not exist yet, and `update_head()` makes the clone's HEAD a symref to it
     // (builtin/clone.c:1565-1572, 603-611).
     let mut unborn_head: Option<String> = None;
+    // ```c
+    //         copy_or_link_directory(&src, &dest, src_repo);
+    //         [...]
+    // }
+    //
+    // if (0 <= option_verbosity)
+    //         fprintf(stderr, _("done.\n"));
+    // ```
+    //
+    // (`clone_local()`, builtin/clone.c:365-371.) The line belongs to the local-clone
+    // routine, not to `cmd_clone`: a clone that ran the transport prints whatever the
+    // progress meter printed and nothing more, so `--no-local` ends after the banner.
+    // `cmd_clone` calls it once the refs are mapped and the empty-repository warning
+    // is out, and before `update_head()`, `--sparse` and `checkout()`
+    // (builtin/clone.c:1559-1598, :1609-1631), so it precedes every meter and
+    // warning those draw.
+    let say_done = || {
+        if is_local && !quiet {
+            eprintln!("done.");
+        }
+    };
     let mut warn_empty = |quiet: bool| {
         if !quiet {
             eprintln!("warning: You appear to have cloned an empty repository.");
@@ -1664,6 +1685,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 )) if branch.is_none() => {
                     cloned_empty = true;
                     warn_empty(quiet);
+                    say_done();
                     // An empty clone is a *successful* clone in git — `checkout()` runs and
                     // returns, `junk_mode` moves on, and the repository stays.
                     junk.leave();
@@ -1685,6 +1707,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 unborn_head = unborn_head_target(&outcome.ref_map);
                 warn_empty(quiet);
             }
+            say_done();
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
             // `checkout()` is still called for a bare or `--no-checkout` clone; it returns
@@ -1703,6 +1726,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 )) if branch.is_none() => {
                     cloned_empty = true;
                     warn_empty(quiet);
+                    say_done();
                     // An empty clone is a *successful* clone in git — `checkout()` runs and
                     // returns, `junk_mode` moves on, and the repository stays.
                     junk.leave();
@@ -1718,6 +1742,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 unborn_head = unborn_head_target(&outcome.ref_map);
                 warn_empty(quiet);
             }
+            say_done();
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
             // `--sparse` is set up before anything is checked out:
@@ -2129,22 +2154,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         == Some(true)
     {
         super::init::enable_submodule_path_config(&git_dir)?;
-    }
-
-    // ```c
-    //         copy_or_link_directory(&src, &dest, src_repo);
-    //         [...]
-    // }
-    //
-    // if (0 <= option_verbosity)
-    //         fprintf(stderr, _("done.\n"));
-    // ```
-    //
-    // (`clone_local()`, builtin/clone.c:365-371.) The line belongs to the local-clone
-    // routine, not to `cmd_clone`: a clone that ran the transport prints whatever the
-    // progress meter printed and nothing more, so `--no-local` ends after the banner.
-    if is_local && !quiet {
-        eprintln!("done.");
     }
 
     // `--mirror` together with `--branch` maps every tag twice, and the ref

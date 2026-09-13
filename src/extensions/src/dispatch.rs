@@ -500,7 +500,7 @@ enum ConfigCallback {
 /// through the diff it runs: the choice here is per verb, and taking the
 /// narrower layer under-matches on that one subcommand rather than refusing
 /// `stash list` for a key git lets through.
-fn config_callback(sub: &str) -> ConfigCallback {
+fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
     match sub {
         "status" => ConfigCallback::Status,
         "commit" => ConfigCallback::Commit,
@@ -552,6 +552,21 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "ls-files",
     "maintenance",
     "merge",
+        // `cmd_reflog()` hands `show` — named, or implied by a first token that is
+        // no subcommand — to `cmd_log_reflog()` (builtin/reflog.c:154, :491),
+        // which runs `repo_config(the_repository, git_log_config, &cfg)`
+        // (builtin/log.c:792). `list`, `exists`, `expire`, `delete`, `drop` and
+        // `write` install no diff callback, and stock 2.55.0 runs them under
+        // `-c color.diff=bogus` at exit 0 where `reflog` and `reflog show` die.
+        "reflog" => {
+            let first = args.iter().map(String::as_str).find(|a| *a != "reflog");
+            match first {
+                Some("list" | "exists" | "expire" | "delete" | "drop" | "write") => {
+                    ConfigCallback::Default
+                }
+                _ => ConfigCallback::Log,
+            }
+        }
     "mktag",
     "mktree",
     "prune",
@@ -1246,7 +1261,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                 if sub == "diff" {
                     crate::diff_config::claim_submodule_warning();
                 }
-                let outcome = match config_callback(sub) {
+                let outcome = match config_callback(sub, args) {
                     ConfigCallback::Default => {
                         crate::default_config::validate(&repo).map(|_| ())
                     }

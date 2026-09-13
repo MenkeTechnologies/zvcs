@@ -197,6 +197,29 @@ impl RepoSettings {
         let mut pack_use_bitmap_boundary_traversal = experimental;
         let pack_use_multi_pack_reuse = experimental;
 
+        // The commit-graph block, read between the cascade and `pack.usesparse`
+        // (repo-settings.c:66-74, git 2.55.0):
+        //
+        // ```c
+        // repo_cfg_bool(r, "core.commitgraph", &r->settings.core_commit_graph, 1);
+        // repo_cfg_int(r, "commitgraph.generationversion", …, 2);
+        // repo_cfg_bool(r, "commitgraph.readchangedpaths", &read_changed_paths, 1);
+        // repo_cfg_int(r, "commitgraph.changedpathsversion", …, read_changed_paths ? -1 : 0);
+        // repo_cfg_bool(r, "gc.writecommitgraph", …, 1);
+        // repo_cfg_bool(r, "fetch.writecommitgraph", …, 0);
+        // ```
+        //
+        // Only validated here: nothing in this port consumes the values yet, but
+        // `repo_cfg_bool`/`repo_cfg_int` die on a value they cannot parse, so
+        // `-c core.commitGraph=always rev-parse --git-dir` is
+        // `fatal: bad boolean config value 'always' for 'core.commitgraph'`.
+        config_bool_strict(repo, "core.commitgraph")?;
+        crate::config::config_int(repo, "commitgraph.generationversion")?;
+        config_bool_strict(repo, "commitgraph.readchangedpaths")?;
+        crate::config::config_int(repo, "commitgraph.changedpathsversion")?;
+        config_bool_strict(repo, "gc.writecommitgraph")?;
+        config_bool_strict(repo, "fetch.writecommitgraph")?;
+
         // repo-settings.c:77-78. Both defaults here are literals, which is why
         // `pack.usePathWalk` unset lands on 0 even under `feature.experimental`.
         let pack_use_sparse = config_bool_strict(repo, "pack.usesparse")?.unwrap_or(true);

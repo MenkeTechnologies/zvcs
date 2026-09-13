@@ -3197,7 +3197,9 @@ fn explicit_work_tree(
         return Some(std::fs::canonicalize(&joined).unwrap_or(joined));
     }
     let config = repo.config_snapshot();
-    if config.boolean("core.bare") == Some(true) {
+    // `is_bare_repository_cfg > 0`: `core.bare`, or `git --bare` (git.c:258)
+    // when the config does not say.
+    if config.boolean("core.bare").or(gix::open::bare_repository_cfg().then_some(true)) == Some(true) {
         return None;
     }
     if let Some(value) = config.string("core.worktree") {

@@ -1285,7 +1285,9 @@ pub fn core_worktree_chdir_error(repo: &gix::Repository) -> Option<String> {
         return None;
     }
     let config = repo.config_snapshot();
-    if config.boolean("core.bare") == Some(true) {
+    // `is_bare_repository_cfg > 0`: `core.bare`, or `git --bare` (git.c:258)
+    // when the config does not say.
+    if config.boolean("core.bare").or(gix::open::bare_repository_cfg().then_some(true)) == Some(true) {
         return None;
     }
     let value = config.string("core.worktree")?;

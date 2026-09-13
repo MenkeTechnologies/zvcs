@@ -2780,6 +2780,9 @@ pub fn check_bare_and_worktree() {
         work_tree = tree.or(work_tree);
         has_common = false;
     }
+    // `git --bare` starts `is_bare_repository_cfg` at 1 (git.c:258); a
+    // `core.bare` in the files replaces it.
+    let is_bare = is_bare.or(gix::open::bare_repository_cfg().then_some(true));
     if has_common || is_bare != Some(true) || work_tree.is_none() {
         return;
     }

@@ -168,7 +168,23 @@ impl ThreadSafeRepository {
                 } => git_dir.clone(),
                 _ => path,
             };
-            (git_dir, env_worktree_dir, ImplicitWorkTree::CurrentDir)
+            // The last two arms of that chain (setup.c:1172-1179, v2.55.0):
+            //
+            //     else if (!git_env_bool(GIT_IMPLICIT_WORK_TREE_ENVIRONMENT, 1)) {
+            //             set_git_dir(repo, gitdirenv, 0); … return NULL; }
+            //     else set_git_work_tree(repo, ".");
+            //
+            // `git --bare` and `setup_bare_git_dir()` both set the variable to 0. A value that is
+            // not a boolean is refused by the host before a repository is opened.
+            let implicit = std::env::var_os("GIT_IMPLICIT_WORK_TREE")
+                .and_then(|v| gix_config::Boolean::try_from(v).ok())
+                .is_none_or(|b| b.0);
+            let implicit_work_tree = if implicit {
+                ImplicitWorkTree::CurrentDir
+            } else {
+                ImplicitWorkTree::None
+            };
+            (git_dir, env_worktree_dir, implicit_work_tree)
         } else {
             let (git_dir, worktree_dir) = gix_discover::repository::Path::from_dot_git_dir(path, path_kind, &cwd)
                 .expect("we have sanitized path with is_git()")

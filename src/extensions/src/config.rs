@@ -1200,6 +1200,26 @@ pub fn multi_values(repo: &gix::Repository, key: &str) -> Vec<String> {
         .collect()
 }
 
+/// `repo_settings_get_big_file_threshold()`'s `git_config_ulong()` refusing
+/// `core.bigFileThreshold`, as the message after `fatal: `, or `None` when the
+/// effective value parses (or is not set).
+///
+/// git 2.55.0 reads this key lazily, the first time a blob is hashed from the
+/// work tree, not while `git_default_config()` parses the configuration. Measured:
+/// with `-c core.bigFileThreshold=warn`, `ls-files`, `add -N` and adding only a
+/// symlink exit 0, while `add <file>` dies — before `-v` prints anything — and a
+/// value from a file names it: `… for 'core.bigfilethreshold' in file .git/config:
+/// invalid unit`. The last value wins, as for every single-valued key.
+pub fn big_file_threshold_refusal(repo: &gix::Repository) -> Option<String> {
+    let value = walk_config(repo)
+        .into_iter()
+        .filter(|v| v.key == "core.bigfilethreshold")
+        .last()?;
+    let raw = value.value.clone().unwrap_or_default();
+    let reason = parse_config_ulong(&raw).err()?;
+    Some(bad_number(&raw, &value.key, &value.origin.bad_number_clause(), reason))
+}
+
 pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
     use gix::bstr::ByteSlice as _;
     use std::collections::HashMap;

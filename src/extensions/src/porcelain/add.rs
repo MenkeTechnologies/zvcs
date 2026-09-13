@@ -753,6 +753,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // `check_embedded_repo`'s `adviced_on_embedded_repo`: the warning is printed
     // per repository, the advice at most once per invocation.
     let mut embedded_advised = false;
+    // `core.bigFileThreshold` is read the first time a work-tree file is hashed,
+    // not when the configuration is parsed; see
+    // [`crate::config::big_file_threshold_refusal`].
+    let mut big_file_checked = false;
 
     // The paths git counts toward "did this pathspec match anything":
     // `prune_directory()` (builtin/add.c:99-121) marks `seen` from the walk entries
@@ -916,6 +920,16 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             let bytes = target.to_string_lossy().into_owned().into_bytes();
             (bytes, Mode::SYMLINK)
         } else {
+            // A symlink's target never reaches the blob hasher that consults the
+            // threshold, so only this branch asks — git 2.55.0 adds a lone
+            // symlink under `-c core.bigFileThreshold=warn` and dies on a file.
+            if !big_file_checked {
+                big_file_checked = true;
+                if let Some(message) = crate::config::big_file_threshold_refusal(&repo) {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
             let bytes = match std::fs::read(&abs) {
                 Ok(b) => b,
                 Err(e) => {

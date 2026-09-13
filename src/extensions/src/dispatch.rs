@@ -547,6 +547,9 @@ enum ConfigCallback {
     /// `git_merge_config` (builtin/merge.c:661) — its own keys, then
     /// `fmt_merge_msg_config`, then `git_diff_ui_config`.
     Merge,
+    /// `git_branch_config` (builtin/branch.c:84) — its own keys, then
+    /// `git_color_config`, then the default.
+    Branch,
 }
 
 /// Which callback `sub` installs.
@@ -589,7 +592,8 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
             ConfigCallback::MergeRecursive
         }
         "merge" => ConfigCallback::Merge,
-        "add" | "stage" | "branch" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
+        "branch" => ConfigCallback::Branch,
+        "add" | "stage" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
         _ => ConfigCallback::Default,
     }
 }
@@ -1342,6 +1346,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                         crate::cmd_config::validate_merge_recursive(&repo)
                     }
                     ConfigCallback::Merge => crate::cmd_config::validate_merge(&repo),
+                    ConfigCallback::Branch => crate::cmd_config::validate_branch(&repo),
                 };
                 if let Err(rejection) = outcome {
                     return Err(rejection.into_error());

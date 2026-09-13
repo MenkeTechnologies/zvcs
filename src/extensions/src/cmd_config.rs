@@ -116,6 +116,109 @@ pub fn validate_checkout(repo: &gix::Repository) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// `repo_config(the_repository, git_branch_config, &sorting_options)` —
+/// `git branch` (builtin/branch.c:795), after `-h` and before `parse_options()`,
+/// so a refused value stops a delete or a rename as surely as a listing.
+///
+/// Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c submodule.recurse=abc branch -D nosuch
+/// fatal: bad boolean config value 'abc' for 'submodule.recurse'
+/// $ git -c submodule.recurse=abc -c color.ui=bogus branch
+/// fatal: bad boolean config value 'abc' for 'submodule.recurse'
+/// $ git -c color.ui=bogus -c submodule.recurse=abc branch
+/// fatal: bad boolean config value 'bogus' for 'color.ui'
+/// ```
+pub fn validate_branch(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_branch_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// branch
+// ---------------------------------------------------------------------------
+
+/// `git_branch_config()` (builtin/branch.c:84-123).
+///
+/// ```c
+/// if (!strcmp(var, "branch.sort")) {
+///         if (!value)
+///                 return config_error_nonbool(var);
+///         ...
+/// }
+/// if (starts_with(var, "column."))
+///         return git_column_config(var, value, "branch", &colopts);
+/// if (!strcmp(var, "color.branch")) {
+///         branch_use_color = git_config_colorbool(var, value);
+///         return 0;
+/// }
+/// if (skip_prefix(var, "color.branch.", &slot_name)) {
+///         int slot = LOOKUP_CONFIG(color_branch_slots, slot_name);
+///         if (slot < 0)
+///                 return 0;
+///         if (!value)
+///                 return config_error_nonbool(var);
+///         return color_parse(value, branch_colors[slot]);
+/// }
+/// if (!strcmp(var, "submodule.recurse")) { ... git_config_bool ... }
+/// if (!strcasecmp(var, "submodule.propagateBranches")) { ... git_config_bool ... }
+///
+/// if (git_color_config(var, value, cb) < 0)
+///         return -1;
+///
+/// return git_default_config(var, value, ctx, cb);
+/// ```
+fn git_branch_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    if key == "branch.sort" {
+        string_value(v)?;
+        return Ok(());
+    }
+    // `git_column_config()` (column.c:328-343): `column.ui` and the key named
+    // after the command; every other `column.*` is ignored.
+    if key.starts_with("column.") {
+        if key == "column.ui" || key == "column.branch" {
+            let raw = string_value(v)?;
+            if let Err(message) = crate::porcelain::column::validate_config_value(&raw) {
+                let name = key.trim_start_matches("column.");
+                return Err(reported(
+                    v,
+                    vec![message, format!("invalid column.{name} mode {raw}")],
+                ));
+            }
+        }
+        return Ok(());
+    }
+    if key == "color.branch" {
+        colorbool(v, key)?;
+        return Ok(());
+    }
+    if let Some(slot) = key.strip_prefix("color.branch.") {
+        // `LOOKUP_CONFIG` is `strcasecmp` over `color_branch_slots[]`.
+        if !crate::porcelain::branch::COLOR_SLOTS
+            .iter()
+            .any(|s| slot.eq_ignore_ascii_case(s))
+        {
+            return Ok(());
+        }
+        let raw = string_value(v)?;
+        if crate::porcelain::color::parse_color_spec(&raw).is_none() {
+            return Err(reported(v, vec![format!("invalid color value: {raw}")]));
+        }
+        return Ok(());
+    }
+    if key == "submodule.recurse" || key.eq_ignore_ascii_case("submodule.propagatebranches") {
+        bool_value(v, key)?;
+        return Ok(());
+    }
+    git_color_config(v)?;
+    git_default_config(v, out)
+}
+
 // ---------------------------------------------------------------------------
 // checkout / switch / restore
 // ---------------------------------------------------------------------------

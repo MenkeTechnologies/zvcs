@@ -909,13 +909,16 @@ writes off the caller's critical path:
   than a fixed slice, because one commit that rewrites a large file outweighs a
   hundred that touch a line each. `ZVCS_THREADS=1` forces the sequential path and
   produces byte-identical output.
-- **A cache that remembers.** An abbreviation is fixed once the object and the
-  width `core.abbrev` resolves to are both known — which is why the width is part
-  of the key, not an assumption — and a tree pair's change list and per-file line
-  tallies are a pure function of two immutable trees. None of it can go stale, so
-  it is computed once and read
-  back forever after — which is what `log --stat` and `blame` are reading instead
-  of the object store. The answers live in memory-mapped rkyv images under
+- **A cache that remembers.** A tree pair's change list and per-file line
+  tallies are a pure function of two immutable trees. An abbreviation is not: it
+  is unique relative to every other object in one store, so its key names the
+  width `core.abbrev` resolves to, the object store (its canonical path and
+  alternates) and that store's generation (the pack directories and the one loose
+  fan-out directory the id can collide in). A new or pruned object changes the
+  key rather than serving a stale width, and another clone never reads this
+  one's answer. An entry is computed once and read back until its inputs change,
+  which is what `log --oneline`, `log --stat` and `blame` read instead of the
+  object store. The answers live in memory-mapped rkyv images under
   `~/.zvcs/cache/`, so a hit is a binary search and a slice into the mapping:
   nothing is decoded, allocated or copied, and a short command pays for the
   entries it touches rather than for every one on the machine.

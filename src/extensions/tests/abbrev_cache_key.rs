@@ -1,8 +1,9 @@
 //! `core.abbrev` must not be able to poison the shared abbreviation cache.
 //!
 //! Abbreviations are memoised machine-wide in `~/.zvcs/cache/abbrev` (see
-//! `crate::rcache`), keyed by the object id and the width the abbreviation was
-//! computed at. `core.abbrev` is three different things
+//! `crate::rcache`), keyed by the object id, the width the abbreviation was
+//! computed at, and the generation of the object store it was computed against
+//! (the last group of tests below). `core.abbrev` is three different things
 //! (`git_default_core_config()`, environment.c):
 //!
 //! ```c
@@ -97,9 +98,15 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> (i32, String) {
+        self.run_in(&self.work, args)
+    }
+
+    /// [`run`](Self::run) in another directory, with this fixture's cache home —
+    /// how a second repository comes to share the machine-wide cache.
+    fn run_in(&self, dir: &Path, args: &[&str]) -> (i32, String) {
         let out = Command::new(BIN)
             .args(args)
-            .current_dir(&self.work)
+            .current_dir(dir)
             .env("ZVCS_HOME", &self.home)
             .env("HOME", &self.root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -308,8 +315,13 @@ fn an_already_poisoned_cache_on_disk_recovers() {
 }
 
 /// The planted record is only meaningful if the reader would otherwise have used
-/// it, so this pins that the journal really is consulted: the *current* key
-/// scheme, planted the same way with a deliberately wrong value, does come back.
+/// it, so this pins that the journal really is consulted: the record the current
+/// key scheme wrote, with its value swapped for a deliberately wrong one, does
+/// come back.
+///
+/// The current key ends in a store generation derived from directory state, which
+/// a test cannot predict, so the record is taken from the journal a real run wrote
+/// rather than built by hand. Its layout is still checked byte for byte.
 ///
 /// Without this, [`an_already_poisoned_cache_on_disk_recovers`] would still pass
 /// against a build that had stopped reading the journal at all.
@@ -320,22 +332,32 @@ fn the_journal_is_read_so_the_recovery_test_is_meaningful() {
     let raw: Vec<u8> = (0..head.len() / 2)
         .map(|i| u8::from_str_radix(&head[i * 2..i * 2 + 2], 16).unwrap())
         .collect();
+    let short = f.first_id(&["log", "--oneline", "-1"]);
+    assert_eq!(short.len(), AUTO_WIDTH);
 
-    // The v2 key for the automatic width, carrying a sentinel value no
-    // disambiguation could produce.
+    // A sentinel no disambiguation could produce, as long as the real value so
+    // the record's length prefix stays true.
     const SENTINEL: &str = "zzzzzzz";
-    let mut key = raw;
-    key.push(AUTO_WIDTH as u8);
-    key.push(abbrev_key_version());
-
-    let mut record = Vec::new();
-    record.extend_from_slice(&(key.len() as u32).to_le_bytes());
-    record.extend_from_slice(&(SENTINEL.len() as u32).to_le_bytes());
-    record.extend_from_slice(&key);
-    record.extend_from_slice(SENTINEL.as_bytes());
-
-    std::fs::create_dir_all(f.cache_dir()).unwrap();
-    std::fs::write(f.cache_dir().join("abbrev.log"), &record).unwrap();
+    let journal = f.cache_dir().join("abbrev.log");
+    let mut bytes = std::fs::read(&journal).expect("the run must have written its row");
+    let mut at = 0;
+    let mut swapped = false;
+    while at + 8 <= bytes.len() {
+        let klen = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let vlen = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let (key_at, val_at) = (at + 8, at + 8 + klen);
+        let key = &bytes[key_at..val_at];
+        if key.starts_with(&raw) && bytes[val_at..val_at + vlen] == *short.as_bytes() {
+            assert_eq!(klen, raw.len() + 10, "id, width, key version, 8-byte generation");
+            assert_eq!(key[raw.len()], AUTO_WIDTH as u8);
+            assert_eq!(key[raw.len() + 1], abbrev_key_version());
+            bytes[val_at..val_at + vlen].copy_from_slice(SENTINEL.as_bytes());
+            swapped = true;
+        }
+        at = val_at + vlen;
+    }
+    assert!(swapped, "no journal record for HEAD at the automatic width");
+    std::fs::write(&journal, &bytes).unwrap();
 
     assert_eq!(
         f.first_id(&["log", "--oneline", "-1"]),
@@ -344,11 +366,101 @@ fn the_journal_is_read_so_the_recovery_test_is_meaningful() {
     );
 }
 
-/// The key-schema version this test file plants records for, kept next to the
+/// The key-schema version this test file reads records for, kept next to the
 /// records themselves so a bump fails loudly here rather than quietly turning
 /// [`the_journal_is_read_so_the_recovery_test_is_meaningful`] into a no-op.
 fn abbrev_key_version() -> u8 {
-    2
+    3
+}
+
+// ---------------------------------------------------------------------------
+// the answer belongs to one object store in one state
+// ---------------------------------------------------------------------------
+
+/// Content for a blob whose id shares `prefix`'s first four hex digits, so it
+/// forces an id with that prefix past `core.abbrev=4`.
+fn colliding_blob(prefix: &str) -> String {
+    (0u64..)
+        .map(|n| format!("x{n}\n"))
+        .find(|content| {
+            let id = gix::objs::compute_hash(
+                gix::hash::Kind::Sha1,
+                gix::objs::Kind::Blob,
+                content.as_bytes(),
+            )
+            .unwrap()
+            .to_string();
+            id[..4] == prefix[..4]
+        })
+        .unwrap()
+}
+
+/// Byte copy of a directory tree.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+/// The shortest unique prefix depends on every object in the store, not only on
+/// the id: git recomputes it against `r->objects` on every call
+/// (`repo_find_unique_abbrev_r()`, object-name.c:586-600). Two byte-identical
+/// clones share a cache home; one gains a blob colliding with HEAD at four hex
+/// digits. That clone must print HEAD widened, and the other — which holds no
+/// such blob — must print four characters, as stock git 2.55.0 does there.
+///
+/// Before the key named the store, the clean clone read back the widened answer
+/// the other had cached and printed it.
+#[test]
+fn an_abbreviation_widened_in_one_repository_is_not_served_in_another() {
+    let f = Fixture::new("cross-repo");
+    let clean = f.root.join("clean");
+    copy_tree(&f.work, &clean);
+
+    let head = f.head();
+    let blob = f.root.join("collide.txt");
+    std::fs::write(&blob, colliding_blob(&head)).unwrap();
+    f.ok(&["hash-object", "-w", blob.to_str().unwrap()]);
+
+    let args = ["-c", "core.abbrev=4", "log", "--oneline", "-1"];
+    let widened = f.first_id(&args);
+    assert!(widened.len() > 4, "the colliding clone must widen HEAD: got {widened:?}");
+    assert!(head.starts_with(&widened));
+
+    let (code, stdout) = f.run_in(&clean, &args);
+    assert_eq!(code, 0);
+    let id = stdout.split_whitespace().next().unwrap_or_default();
+    assert_eq!(id, &head[..4], "the clean clone must not print the other clone's width");
+}
+
+/// The same dependency inside one repository over time. A colliding loose object
+/// written after HEAD's prefix was cached must widen the next run, and deleting
+/// it again (what `prune` does to an unreachable blob) must shorten it back —
+/// both are what git prints, because git never remembers the answer.
+#[test]
+fn a_loose_object_added_or_removed_changes_the_cached_width() {
+    let f = Fixture::new("generation");
+    let head = f.head();
+    let args = ["-c", "core.abbrev=4", "log", "--oneline", "-1"];
+    assert_eq!(f.first_id(&args), head[..4], "cold, no collision");
+    assert_eq!(f.first_id(&args), head[..4], "warm, no collision");
+
+    let blob = f.root.join("collide.txt");
+    std::fs::write(&blob, colliding_blob(&head)).unwrap();
+    let blob_id = f.ok(&["hash-object", "-w", blob.to_str().unwrap()]).trim_end().to_string();
+    let widened = f.first_id(&args);
+    assert!(widened.len() > 4, "a new colliding object must widen HEAD: got {widened:?}");
+
+    let loose = f.work.join(".git/objects").join(&blob_id[..2]).join(&blob_id[2..]);
+    std::fs::remove_file(&loose).unwrap();
+    assert_eq!(f.first_id(&args), head[..4], "the collision is gone again");
 }
 
 /// `core.abbrev = 0` — the one value that could still reach the retired key's

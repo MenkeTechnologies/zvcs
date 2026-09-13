@@ -7473,11 +7473,16 @@ struct AbbrevCache {
     /// is the port of the C above and is shared with every other verb that has to
     /// agree on this width.
     hex_len: usize,
+    /// The object store the abbreviations are unique in, and its state — the
+    /// other half of what an answer depends on. `None` when the store's
+    /// alternates cannot be resolved, which bypasses the shared image entirely.
+    stamp: Option<std::sync::Arc<crate::abbrev::StoreStamp>>,
     /// Abbreviations computed by THIS cache. Anything else is one lookup away in
     /// the shared image, so only what the image lacks is held here.
     local: std::collections::HashMap<ObjectId, String>,
-    /// New rows for the cache, keyed by the id's raw bytes as the image keys them.
-    fresh: Vec<(Vec<u8>, String)>,
+    /// New rows for the cache: the id's raw bytes as the image keys them, and the
+    /// store generation the abbreviation was computed under.
+    fresh: Vec<(Vec<u8>, u64, String)>,
 }
 
 impl AbbrevCache {
@@ -7485,14 +7490,20 @@ impl AbbrevCache {
         // See [`AbbrevCache::hex_len`]: the resolved width, never the raw config
         // text, because `no`/`off`/`false` and `auto` are different answers.
         let hex_len = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
-        AbbrevCache { hex_len, local: Default::default(), fresh: Vec::new() }
+        let stamp = crate::abbrev::StoreStamp::new(repo).map(std::sync::Arc::new);
+        AbbrevCache { hex_len, stamp, local: Default::default(), fresh: Vec::new() }
     }
 
-    /// A cache for a worker thread: the shared image needs no handing over, and
-    /// anything the worker computes stays private until
+    /// A cache for a worker thread: the shared image and the store stamp need no
+    /// handing over, and anything the worker computes stays private until
     /// [`absorb`](Self::absorb) takes it.
     fn fork(&self) -> Self {
-        AbbrevCache { hex_len: self.hex_len, local: Default::default(), fresh: Vec::new() }
+        AbbrevCache {
+            hex_len: self.hex_len,
+            stamp: self.stamp.clone(),
+            local: Default::default(),
+            fresh: Vec::new(),
+        }
     }
 
     /// Take what a forked cache computed. Two workers may have shortened the same
@@ -7508,11 +7519,19 @@ impl AbbrevCache {
         if let Some(short) = self.local.get(&oid) {
             return short.clone();
         }
-        if let Some(short) = crate::rcache::abbrev_load(oid.as_slice(), self.hex_len) {
-            return short.to_string();
+        // The generation is read before the answer is computed, never after: see
+        // [`crate::abbrev::StoreStamp`] for why that ordering is what keeps a
+        // concurrently written object from being cached under the wrong state.
+        let generation = self.stamp.as_ref().map(|s| s.generation(oid.as_slice()));
+        if let Some(generation) = generation {
+            if let Some(short) = crate::rcache::abbrev_load(oid.as_slice(), self.hex_len, generation) {
+                return short.to_string();
+            }
         }
         let short = id.shorten_or_id().to_string();
-        self.fresh.push((oid.as_slice().to_vec(), short.clone()));
+        if let Some(generation) = generation {
+            self.fresh.push((oid.as_slice().to_vec(), generation, short.clone()));
+        }
         self.local.insert(oid, short.clone());
         short
     }

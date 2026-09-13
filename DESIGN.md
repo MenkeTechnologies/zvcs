@@ -437,8 +437,18 @@ jobs(
 ## 6a. Derived-answer caches (`~/.zvcs/cache/`, `rcache.rs`)
 
 Tree diffs, blames and object abbreviations are pure functions of the inputs
-their key names: no *event* can invalidate an entry, because the objects behind
-it never change. What the immutability does not buy is protection from a key
+their key names: no *event* can invalidate an entry, because an entry whose
+inputs changed is found under a different key. For tree diffs and blames the
+inputs are immutable objects. An abbreviation's are not: the shortest unique
+prefix depends on every object in the store (`repo_find_unique_abbrev_r()`
+recomputes it against `r->objects` on each call, object-name.c:586-600), so its
+key (`ABBREV_KEY_VERSION` 3) carries an 8-byte `abbrev::StoreStamp` generation
+hashed from the canonical objects directory, every alternate,
+`$GIT_ALTERNATE_OBJECT_DIRECTORIES`, each `pack/` directory's inode and ctime,
+and the inode and ctime of the loose fan-out directory `objects/<xx>` the id's
+first byte names. Version 2 keyed on the id and width alone, so a prefix widened
+in a clone holding a colliding blob was printed by every clone on the machine.
+What the immutability does not buy is protection from a key
 that names too little — an entry answers for every input the key left out, and
 since these images live in `~/.zvcs/cache` keyed by commit id, a key that is
 short by one option is wrong in every repository on the machine rather than in
@@ -485,8 +495,10 @@ live in **rkyv** images instead, read in place out of an mmap.
   race (stale base, truncated journal, torn tail record) degrades to a cache
   miss — a recomputation the command would have done anyway — which is what lets
   the read path stay lock-free.
-- **Migration.** `db.rs` drains the old `treediff`/`blame`/`abbrev` tables into
-  these images and drops them on every read-write ledger open. It is deliberately
+- **Migration.** `db.rs` drains the old `treediff`/`blame` tables into these
+  images and drops them, with `abbrev`, on every read-write ledger open. The
+  `abbrev` rows are not imported: they name no object store, so no generation
+  could be stamped onto them truthfully. It is deliberately
   not version-gated: during an upgrade an older binary still running recreates
   those tables from its own schema, and a once-per-db import would strand
   whatever landed after it ran.

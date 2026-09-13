@@ -15,7 +15,6 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -312,43 +311,13 @@ fn collect_cache_rows(conn: &Connection) -> Vec<crate::rcache::CacheWrite> {
         }
     }
 
-    // The ledger stored ids as hex text; the image keys them by their raw bytes,
-    // so `log` can look one up without formatting a string per commit. A row that
-    // is not parseable hex came from a different hash format and is dropped.
-    if let Ok(mut stmt) = conn.prepare("SELECT hex_len, oid, short FROM abbrev") {
-        if let Ok(rows) = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-        }) {
-            let mut by_len: HashMap<usize, Vec<(Vec<u8>, String)>> = HashMap::new();
-            for (hex_len, oid, short) in rows.filter_map(|r| r.ok()) {
-                let Ok(hex_len) = usize::try_from(hex_len) else { continue };
-                let Some(raw) = unhex(&oid) else { continue };
-                by_len.entry(hex_len).or_default().push((raw, short));
-            }
-            jobs.extend(
-                by_len
-                    .into_iter()
-                    .map(|(hex_len, rows)| crate::rcache::CacheWrite::Abbrev { hex_len, rows }),
-            );
-        }
-    }
+    // The `abbrev` table is deliberately not carried over. Its rows name no object
+    // store, and an abbreviation is only unique relative to one — the image keys
+    // it by the store's generation (`rcache::ABBREV_KEY_VERSION` 3) — so there is
+    // no generation that could be stamped onto them truthfully. The table is still
+    // dropped with the others.
 
     jobs
-}
-
-/// Decode a lowercase-or-uppercase hex string into bytes, or `None` if it is not
-/// an even-length run of hex digits.
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
-        return None;
-    }
-    text.as_bytes()
-        .chunks(2)
-        .map(|pair| {
-            let nibble = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
-            Some((nibble(pair[0])? << 4) | nibble(pair[1])?)
-        })
-        .collect()
 }
 
 /// Whether the repo at `root` has changed since its last scan — by the root
@@ -1884,7 +1853,7 @@ mod snapshot_atomic_tests {
 
 #[cfg(test)]
 mod cache_migration_tests {
-    use super::{collect_cache_rows, export_caches_to_rcache, unhex};
+    use super::{collect_cache_rows, export_caches_to_rcache};
     use crate::rcache::CacheWrite;
     use rusqlite::Connection;
 
@@ -1926,7 +1895,8 @@ mod cache_migration_tests {
             [],
         )
         .unwrap();
-        // Two hex lengths, plus a row whose id is not hex at all.
+        // Abbreviations are the exception: the rows name no object store, so none
+        // of them may come across (see `collect_cache_rows`).
         conn.execute("INSERT INTO abbrev (oid, hex_len, short) VALUES ('aabb', 7, 'aab')", []).unwrap();
         conn.execute("INSERT INTO abbrev (oid, hex_len, short) VALUES ('ccdd', 8, 'ccdd')", []).unwrap();
         conn.execute("INSERT INTO abbrev (oid, hex_len, short) VALUES ('zzzz', 7, 'zzz')", []).unwrap();
@@ -1935,7 +1905,7 @@ mod cache_migration_tests {
 
         let mut treediffs = 0;
         let mut blames = 0;
-        let mut abbrevs: Vec<(usize, usize)> = Vec::new(); // (hex_len, row count)
+        let mut abbrevs = 0;
         for job in &jobs {
             match job {
                 CacheWrite::TreeDiff { old_tree, new_tree, counts, files } => {
@@ -1951,20 +1921,12 @@ mod cache_migration_tests {
                     assert_eq!(runs, "r1\nr2");
                     blames += 1;
                 }
-                CacheWrite::Abbrev { hex_len, rows } => {
-                    // The id must arrive as raw bytes: the image keys it that way
-                    // so `log` never formats a string to look one up.
-                    for (oid, _) in rows {
-                        assert_eq!(oid.len(), 2, "hex must be decoded, not carried as text");
-                    }
-                    abbrevs.push((*hex_len, rows.len()));
-                }
+                CacheWrite::Abbrev { .. } => abbrevs += 1,
             }
         }
         assert_eq!(treediffs, 1);
         assert_eq!(blames, 1);
-        abbrevs.sort_unstable();
-        assert_eq!(abbrevs, vec![(7, 1), (8, 1)], "one row per length, the non-hex row dropped");
+        assert_eq!(abbrevs, 0, "a ledger abbreviation names no object store and must not be imported");
     }
 
     #[test]
@@ -1994,13 +1956,5 @@ mod cache_migration_tests {
         let conn = Connection::open(dir.join("t.sqlite")).unwrap();
         assert!(collect_cache_rows(&conn).is_empty());
         export_caches_to_rcache(&conn);
-    }
-
-    #[test]
-    fn unhex_rejects_what_is_not_an_object_id() {
-        assert_eq!(unhex("00ff"), Some(vec![0x00, 0xff]));
-        assert_eq!(unhex("AABB"), Some(vec![0xaa, 0xbb]));
-        assert_eq!(unhex("abc"), None, "odd length is not a byte string");
-        assert_eq!(unhex("zz"), None, "non-hex digits are not an object id");
     }
 }

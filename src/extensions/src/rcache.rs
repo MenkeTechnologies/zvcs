@@ -1,9 +1,12 @@
 //! Zero-copy caches for derived answers (`~/.zvcs/cache/`).
 //!
-//! Everything cached here is a pure function of immutable git objects: a
-//! tree-to-tree diff, a `(commit, path)` blame, an object id's abbreviation at a
-//! given hex length. Such an answer never expires and is valid in every clone
-//! that holds the objects, so the store needs no invalidation — only fast reads.
+//! A tree-to-tree diff and a `(commit, path)` blame are keyed by the immutable
+//! objects they are computed from. An object id's abbreviation is not: it depends
+//! on every other object in the store it was computed against, so its key also
+//! names that store and its state (see [`ABBREV_KEY_VERSION`] and
+//! [`crate::abbrev::StoreStamp`]). No entry is ever rewritten in place — a key
+//! whose inputs changed is simply a different key — so the store needs no
+//! invalidation, only fast reads.
 //!
 //! # Why not the SQLite ledger
 //!
@@ -80,7 +83,8 @@
 //! versioning the key itself instead, so the old byte string can never be looked
 //! up again — see [`ABBREV_KEY_VERSION`], which exists because one
 //! `git -c core.abbrev=no log` used to poison every later `git log --oneline` on
-//! the machine.
+//! the machine, and was bumped again when an abbreviation computed in one
+//! repository turned out to be served in another.
 
 use memmap2::Mmap;
 use rkyv::{Archive, Serialize};
@@ -148,7 +152,7 @@ pub struct Table {
 /// documented as unstable across releases and cannot be used for that. FNV is
 /// specified by its constants, which is exactly the property needed here, and the
 /// keys it is fed (hex object ids) are already high-entropy.
-fn hash_key(key: &[u8]) -> u64 {
+pub(crate) fn hash_key(key: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in key {
         h ^= u64::from(*b);
@@ -389,23 +393,27 @@ pub fn treediff_load(old_tree: &str, new_tree: &str, counts: bool) -> Option<&'s
 ///   machine. `AbbrevCache::hex_len` in `porcelain::log` carries the C.
 /// * `2` — `hex_len` is the resolved width from
 ///   [`crate::abbrev::configured_abbrev`]: `auto`'s derived number, or the hash's
-///   own hex width for the false-y words.
+///   own hex width for the false-y words. The key still named no repository, so
+///   an id widened in a clone holding a colliding object (`edfab` beside a blob
+///   `edfa3b0d…`) was printed at that width by every clone on the machine, where
+///   git — which recomputes against `r->objects` on every call
+///   (object-name.c:586-600) — prints `edfa`.
+/// * `3` — the key also carries the 8-byte [`crate::abbrev::StoreStamp`]
+///   generation: the object store's identity (primary directory, alternates),
+///   its pack directories' state, and the state of the loose fan-out directory
+///   the id's first byte names.
 ///
-/// The one-shot import out of the old SQLite ledger ([`crate::db`]) stamps the
-/// current version onto rows the ledger stored under the version-1 meaning. That
-/// is safe rather than a second poisoning: a numeric `core.abbrev` meant the same
-/// number under both, and the `0` rows — the poisoned ones — become keys nothing
-/// asks for, because every reader now resolves to at least
-/// [`crate::abbrev::MINIMUM_ABBREV`] and git itself refuses `core.abbrev = 0`
-/// with `abbrev length out of range: 0` before any command runs.
-pub const ABBREV_KEY_VERSION: u8 = 2;
+/// The one-shot import out of the old SQLite ledger ([`crate::db`]) carries no
+/// abbreviations over: the ledger's rows name no store, so no generation can be
+/// stamped onto them truthfully, and an abbreviation is cheap to recompute.
+pub const ABBREV_KEY_VERSION: u8 = 3;
 
 /// Bytes an abbrev key can take: the largest hash gix supports (32) plus the hex
-/// length and [`ABBREV_KEY_VERSION`].
-pub const ABBREV_KEY_MAX: usize = 34;
+/// length, [`ABBREV_KEY_VERSION`] and the 8-byte store generation.
+pub const ABBREV_KEY_MAX: usize = 42;
 
-/// Raw object id bytes, the hex length, then [`ABBREV_KEY_VERSION`], written into
-/// `buf`.
+/// Raw object id bytes, the hex length, [`ABBREV_KEY_VERSION`], then the store
+/// generation, written into `buf`.
 ///
 /// The key is the id's bytes rather than its hex text because `log --oneline`
 /// looks up every commit and every parent: formatting a 40-byte string per lookup
@@ -414,25 +422,31 @@ pub const ABBREV_KEY_MAX: usize = 34;
 /// The hex length is part of the key because the correct abbreviation grows with
 /// the repository — a prefix that was unique when it was computed must not be
 /// served once the repo needs a longer one — and because two different
-/// `core.abbrev` settings must not answer for each other.
+/// `core.abbrev` settings must not answer for each other. The generation is part
+/// of it because the answer is only unique relative to one object store in one
+/// state — see [`crate::abbrev::StoreStamp`].
 pub fn abbrev_key_into(
     buf: &mut [u8; ABBREV_KEY_MAX],
     oid: &[u8],
     hex_len: usize,
+    generation: u64,
 ) -> Option<usize> {
     if oid.len() > 32 || hex_len > u8::MAX as usize {
         return None;
     }
-    buf[..oid.len()].copy_from_slice(oid);
-    buf[oid.len()] = hex_len as u8;
-    buf[oid.len() + 1] = ABBREV_KEY_VERSION;
-    Some(oid.len() + 2)
+    let n = oid.len();
+    buf[..n].copy_from_slice(oid);
+    buf[n] = hex_len as u8;
+    buf[n + 1] = ABBREV_KEY_VERSION;
+    buf[n + 2..n + 10].copy_from_slice(&generation.to_le_bytes());
+    Some(n + 10)
 }
 
-/// The abbreviation cached for an object id at `hex_len`.
-pub fn abbrev_load(oid: &[u8], hex_len: usize) -> Option<&'static str> {
+/// The abbreviation cached for an object id at `hex_len` in the store state
+/// `generation` names.
+pub fn abbrev_load(oid: &[u8], hex_len: usize, generation: u64) -> Option<&'static str> {
     let mut buf = [0u8; ABBREV_KEY_MAX];
-    let n = abbrev_key_into(&mut buf, oid, hex_len)?;
+    let n = abbrev_key_into(&mut buf, oid, hex_len, generation)?;
     let v = abbrev().get(&buf[..n])?;
     std::str::from_utf8(v).ok()
 }
@@ -475,8 +489,9 @@ pub fn blame_load(commit: &str, path: &str, algo: &str) -> Option<(&'static str,
 pub enum CacheWrite {
     /// A tree pair's change list, with or without the per-file line counts.
     TreeDiff { old_tree: String, new_tree: String, counts: bool, files: String },
-    /// Abbreviations computed at one `core.abbrev` length, keyed by raw id bytes.
-    Abbrev { hex_len: usize, rows: Vec<(Vec<u8>, String)> },
+    /// Abbreviations computed at one `core.abbrev` length: raw id bytes, the store
+    /// generation each was computed under, and the abbreviation.
+    Abbrev { hex_len: usize, rows: Vec<(Vec<u8>, u64, String)> },
     /// One `(commit, path)` blame, run-length encoded.
     Blame { commit: String, path: String, algo: String, blob: String, runs: String },
 }
@@ -499,9 +514,9 @@ impl CacheWrite {
             }
             CacheWrite::Abbrev { hex_len, rows } => rows
                 .into_iter()
-                .filter_map(|(oid, short)| {
+                .filter_map(|(oid, generation, short)| {
                     let mut buf = [0u8; ABBREV_KEY_MAX];
-                    let n = abbrev_key_into(&mut buf, &oid, hex_len)?;
+                    let n = abbrev_key_into(&mut buf, &oid, hex_len, generation)?;
                     Some((buf[..n].to_vec(), short.into_bytes()))
                 })
                 .collect(),
@@ -1019,9 +1034,28 @@ mod tests {
         assert_ne!(blame_key("a", "b/c", "x"), blame_key("a/b", "c", "x"));
         let mut one = [0u8; ABBREV_KEY_MAX];
         let mut two = [0u8; ABBREV_KEY_MAX];
-        let n1 = abbrev_key_into(&mut one, &[0xaa; 20], 7).unwrap();
-        let n2 = abbrev_key_into(&mut two, &[0xaa; 20], 8).unwrap();
+        let n1 = abbrev_key_into(&mut one, &[0xaa; 20], 7, 1).unwrap();
+        let n2 = abbrev_key_into(&mut two, &[0xaa; 20], 8, 1).unwrap();
         assert_ne!(one[..n1], two[..n2], "hex length must be part of the key");
+        let n2 = abbrev_key_into(&mut two, &[0xaa; 20], 7, 2).unwrap();
+        assert_ne!(one[..n1], two[..n2], "the store generation must be part of the key");
+    }
+
+    /// A version-2 key named no object store, so every row written under it may be
+    /// another repository's answer. Its bytes are the id, the width and the version
+    /// byte `2`; no version-3 lookup, whatever its generation, may produce them.
+    #[test]
+    fn a_version_two_abbrev_key_can_never_be_found_again() {
+        let oid = [0xcc; 20];
+        let mut v2 = oid.to_vec();
+        v2.extend_from_slice(&[7, 2]);
+        for generation in [0u64, 1, u64::MAX] {
+            let mut buf = [0u8; ABBREV_KEY_MAX];
+            let n = abbrev_key_into(&mut buf, &oid, 7, generation).unwrap();
+            assert_eq!(n, oid.len() + 10, "id, hex length, key version, generation");
+            assert_ne!(&buf[..n], v2.as_slice());
+            assert_ne!(&buf[..v2.len()], v2.as_slice(), "not even as a prefix");
+        }
     }
 
     /// A key carries [`ABBREV_KEY_VERSION`], so a row written under the previous
@@ -1032,9 +1066,8 @@ mod tests {
     fn an_abbrev_key_from_the_retired_scheme_can_never_be_found_again() {
         let oid = [0xbb; 20];
         let mut buf = [0u8; ABBREV_KEY_MAX];
-        let n = abbrev_key_into(&mut buf, &oid, 7).unwrap();
-        assert_eq!(n, oid.len() + 2, "id, hex length, key version");
-        assert_eq!(buf[n - 1], ABBREV_KEY_VERSION);
+        let n = abbrev_key_into(&mut buf, &oid, 7, 0).unwrap();
+        assert_eq!(buf[oid.len() + 1], ABBREV_KEY_VERSION);
 
         // Version 1's key was the id and the length byte, and nothing else.
         let mut retired = oid.to_vec();
@@ -1046,8 +1079,8 @@ mod tests {
         // different widths and therefore to different keys.
         let mut auto = [0u8; ABBREV_KEY_MAX];
         let mut full = [0u8; ABBREV_KEY_MAX];
-        let a = abbrev_key_into(&mut auto, &oid, 7).unwrap();
-        let f = abbrev_key_into(&mut full, &oid, 40).unwrap();
+        let a = abbrev_key_into(&mut auto, &oid, 7, 0).unwrap();
+        let f = abbrev_key_into(&mut full, &oid, 40, 0).unwrap();
         assert_ne!(auto[..a], full[..f]);
     }
 }

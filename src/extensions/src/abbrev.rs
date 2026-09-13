@@ -139,6 +139,121 @@ pub fn unique_abbrev(repo: &gix::Repository, id: &gix::hash::ObjectId, len: usiz
     hex[..widened.min(hexsz)].to_owned()
 }
 
+/// Which object store an abbreviation was computed against, and the state it was
+/// in — the half of an abbreviation's answer that the object id does not carry.
+///
+/// git never remembers an abbreviation: `repo_find_unique_abbrev_r()`
+/// (object-name.c:586-600) asks `odb_find_abbrev_len(r->objects, …)` on every
+/// call, and `odb_find_abbrev_len()` (odb.c:963-968) walks every source of *this*
+/// repository's object database, alternates included:
+///
+/// ```c
+/// odb_prepare_alternates(odb);
+/// for (struct odb_source *source = odb->sources; source; source = source->next) {
+///         ret = odb_source_find_abbrev_len(source, oid, len, &len);
+/// ```
+///
+/// The shortest unique prefix is therefore a function of the id *and* of every
+/// object that shares its leading hex, in the stores this repository reads. The
+/// machine-wide cache in [`crate::rcache`] keyed only on the id, so a prefix
+/// widened in one clone — one holding a colliding blob — was printed by every
+/// other clone on the machine, where git prints the shorter one.
+///
+/// A stamp names both halves:
+///
+/// * **Identity** — the canonical path of the primary objects directory, each
+///   alternate gix resolved out of `objects/info/alternates`, and the raw
+///   `$GIT_ALTERNATE_OBJECT_DIRECTORIES`.
+/// * **Generation** — for every one of those directories, the `pack` directory's
+///   inode and ctime (a pack or `multi-pack-index` appearing, disappearing or
+///   being renamed into place changes it), and, per lookup, the same for the one
+///   loose fan-out directory `objects/<xx>` the id's first byte names.
+///
+/// The fan-out directory is enough for loose objects because nothing outside it
+/// can collide: every abbreviation is at least [`MINIMUM_ABBREV`] hex digits, so
+/// a colliding id shares the first byte, and a loose object with that first byte
+/// can only live in that directory. Creating or unlinking an entry changes a
+/// directory's ctime, and ctime — unlike mtime — cannot be set back by `touch`,
+/// `tar` or `rsync -t`. Removal invalidates too, which it must: `prune` can only
+/// shorten the length git needs, and a cached longer answer would then differ.
+///
+/// The ordering is what makes a concurrent writer safe. The generation is read
+/// *before* the answer is computed, and gix's prefix lookup re-reads the pack
+/// directory whenever it finds nothing ambiguous (`consolidate_with_disk_state`),
+/// so an answer is never older than the generation it is stored under: a store
+/// that changes in between leaves the row under a generation no later run can
+/// observe again.
+pub struct StoreStamp {
+    /// The primary objects directory first, then every alternate.
+    dirs: Vec<std::path::PathBuf>,
+    /// Identity plus every `pack` directory's state.
+    store: u64,
+    /// [`StoreStamp::generation`] per leading byte, read on first use.
+    fanout: [std::sync::OnceLock<u64>; 256],
+}
+
+impl StoreStamp {
+    /// The stamp for `repo`'s object store as it stands now, or `None` when the
+    /// alternates cannot be resolved — an answer whose inputs are unknown must not
+    /// be remembered.
+    pub fn new(repo: &gix::Repository) -> Option<StoreStamp> {
+        let store = repo.objects.store_ref();
+        let mut dirs = vec![store.path().to_path_buf()];
+        dirs.extend(store.alternate_db_paths().ok()?);
+
+        let mut identity = Vec::new();
+        for dir in &dirs {
+            let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            identity.extend_from_slice(canonical.as_os_str().as_encoded_bytes());
+            identity.push(0);
+        }
+        if let Some(env) = std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES") {
+            identity.extend_from_slice(env.as_encoded_bytes());
+        }
+        identity.push(0);
+        for dir in &dirs {
+            push_dir_state(&mut identity, &dir.join("pack"));
+        }
+
+        Some(StoreStamp {
+            dirs,
+            store: crate::rcache::hash_key(&identity),
+            fanout: std::array::from_fn(|_| std::sync::OnceLock::new()),
+        })
+    }
+
+    /// The generation an abbreviation of `oid` is valid under: the store's own
+    /// stamp and the state of the loose fan-out directory `oid` would live in.
+    /// Read once per leading byte, so a walk pays at most 256 `stat`s per store.
+    pub fn generation(&self, oid: &[u8]) -> u64 {
+        let first = oid.first().copied().unwrap_or(0);
+        *self.fanout[usize::from(first)].get_or_init(|| {
+            let mut state = self.store.to_le_bytes().to_vec();
+            let fanout = format!("{first:02x}");
+            for dir in &self.dirs {
+                push_dir_state(&mut state, &dir.join(&fanout));
+            }
+            crate::rcache::hash_key(&state)
+        })
+    }
+}
+
+/// Append what identifies a directory's current entry set: its inode and ctime,
+/// or a lone marker byte when it does not exist (a fan-out directory is created
+/// with its first loose object and removed by `prune` with its last).
+fn push_dir_state(buf: &mut Vec<u8>, dir: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(dir) {
+        Ok(meta) => {
+            buf.push(1);
+            buf.extend_from_slice(&meta.ino().to_le_bytes());
+            buf.extend_from_slice(&meta.ctime().to_le_bytes());
+            buf.extend_from_slice(&meta.ctime_nsec().to_le_bytes());
+        }
+        Err(_) => buf.push(0),
+    }
+}
+
 /// Auto abbreviation length: `ceil(log2(objects) / 2)`, floored at 7 — the same
 /// heuristic `gix` uses for `core.abbrev = auto`.
 pub fn auto_abbrev(repo: &gix::Repository, hexsz: usize) -> usize {

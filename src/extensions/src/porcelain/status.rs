@@ -1611,7 +1611,7 @@ pub(super) fn detached_from(repo: &gix::Repository) -> Option<(String, bool)> {
         _ => abbrev(noid),
     };
     // `state->detached_at = !repo_get_oid(r, "HEAD", &oid) && oideq(&oid, &state->detached_oid)`.
-    let at = repo.head_id().map(|id| id.detach() == noid).unwrap_or(false);
+    let at = crate::objname::resolve(repo, "HEAD").is_some_and(|id| id == noid);
     Some((name, at))
 }
 
@@ -1643,11 +1643,19 @@ enum ReferenceTree {
 fn reference_tree_oid(repo: &gix::Repository, spec: &str) -> Result<ReferenceTree> {
     // `repo_get_oid(s->reference, &oid)` (builtin/commit.c:1639) only turns the
     // name into an oid; it does not read the object, so an unborn `HEAD` is the
-    // only thing that makes it fail here.
-    let Ok(id) = repo.rev_parse_single(spec) else {
+    // only thing that makes it fail here. It is `get_oid_basic()` all the same,
+    // which reads `core.warnAmbiguousRefs` and dies on a value it cannot parse.
+    if crate::objname::resolve(repo, spec).is_none() {
+        return Ok(ReferenceTree::Resolved(None));
+    }
+    // `wt_status_collect_changes_index()` then hands the same name to
+    // `setup_revisions()` as `opt.def` (wt-status.c:673-674), whose
+    // `get_oid_with_context()` (revision.c:3129) resolves it a second time — so a
+    // `HEAD` that is ambiguous with `refs/heads/HEAD` is warned about twice.
+    let Some(id) = crate::objname::resolve(repo, spec) else {
         return Ok(ReferenceTree::Resolved(None));
     };
-    let Some(object) = repo.try_find_object(id.detach())? else {
+    let Some(object) = repo.try_find_object(id)? else {
         return Ok(ReferenceTree::BadObject);
     };
     Ok(match object.peel_to_kind(gix::object::Kind::Tree) {

@@ -710,7 +710,11 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     //   and `--keep` die there with the generic work-tree message.
     // * MIXED (including the default and the pathspec form, both of which have
     //   already defaulted to MIXED above) reaches the explicit
-    //   `is_bare_repository()` check and dies naming the mode.
+    //   `is_bare_repository()` check and dies naming the mode. That is
+    //   `is_bare_repository_cfg && !repo_get_work_tree()` (environment.c:131-135)
+    //   with the cfg starting at -1 (environment.c:49), so only an explicit
+    //   `core.bare = false` spares it: standing inside a work tree's `.git`
+    //   directory leaves no work tree, yet the reset rewrites the index there.
     // * `--soft` needs neither, and is the one mode that works in a bare repo.
     //
     // Both precede the `-N` check below, which is why `git reset -N --hard` in
@@ -719,7 +723,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         match mode {
             ResetMode::Soft => {}
             ResetMode::Mixed => {
-                crate::git_fatal!("{} reset is not allowed in a bare repository", mode.label())
+                if repo.config_snapshot().boolean("core.bare").unwrap_or(true) {
+                    crate::git_fatal!("{} reset is not allowed in a bare repository", mode.label())
+                }
             }
             ResetMode::Hard | ResetMode::Merge | ResetMode::Keep => {
                 crate::git_fatal!("this operation must be run in a work tree")

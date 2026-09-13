@@ -3166,48 +3166,20 @@ fn reflog_entries(
 ///
 /// Returns whether anything was printed.
 pub fn short_oid_ambiguous(repo: &gix::Repository, name: &str, quietly: bool) -> bool {
-    // `get_short_oid()` refuses the name outright outside `[MINIMUM_ABBREV, hexsz]`
-    // (`object-name.c:503-506`), so those never reach the report.
-    if name.len() < crate::abbrev::MINIMUM_ABBREV
-        || name.len() > repo.object_hash().len_in_hex()
-        || !name.bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    let Some(mut listed) = short_oid_candidates(repo, name, disambiguate_filter(repo)) else {
         return false;
-    }
-    let Ok(prefix) = gix::hash::Prefix::from_hex(&name.to_ascii_lowercase()) else {
-        return false;
-    };
-    let mut candidates = std::collections::HashSet::new();
-    if repo.objects.lookup_prefix(prefix, Some(&mut candidates)).is_err() {
-        return false;
-    }
-    if candidates.len() < 2 {
-        return false;
-    }
-    let kind_of = |id: &ObjectId| repo.find_header(*id).ok().map(|h| h.kind());
-    let mut listed: Vec<ObjectId> = match disambiguate_filter(repo) {
-        Some(want) => {
-            let passed: Vec<ObjectId> =
-                candidates.iter().copied().filter(|id| kind_passes(repo, id, want)).collect();
-            match passed.len() {
-                // `finish_object_disambiguation()` answered, so the name resolved.
-                1 => return false,
-                // `ds.fn = NULL`: nothing satisfied the hint, list everything.
-                0 => candidates.into_iter().collect(),
-                _ => passed,
-            }
-        }
-        None => candidates.into_iter().collect(),
     };
     if quietly {
         return true;
     }
+    let kind_of = |id: &ObjectId| repo.find_header(*id).ok().map(|h| h.kind());
     // `sort_ambiguous()` (`object-name.c:453-484`): tags, then commits, then trees
     // and blobs; inside one type, `oidcmp()`.
     listed.sort_by_key(|id| (type_sort_order(kind_of(id)), *id));
 
     let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
-    eprintln!("error: short object ID {name} is ambiguous");
+    // `ds.hex_pfx`, which `parse_oid_prefix()` lowercases (`object-name.c:244-246`).
+    eprintln!("error: short object ID {} is ambiguous", name.to_ascii_lowercase());
     eprintln!("hint: The candidates are:");
     for id in &listed {
         let kind = kind_of(id);
@@ -3228,6 +3200,92 @@ pub fn short_oid_ambiguous(repo: &gix::Repository, name: &str, quietly: bool) ->
         eprintln!("hint:   {hex} {type_name}{}", ambiguous_object_desc(repo, id, kind));
     }
     true
+}
+
+/// Whether `get_short_oid()` answers `SHORT_NAME_AMBIGUOUS` for `name` under the
+/// hint `want`, and if so the candidates `get_short_oid()` lists.
+///
+/// `update_disambiguate_state()` (`object-name.c:52-102`) and
+/// `finish_object_disambiguation()` (`object-name.c:104-136`) between them give:
+/// one candidate is found without consulting the hint; of two or more, exactly
+/// one passing the hint is found, and any other count is ambiguous. `ds.fn =
+/// NULL` for the listing when none passed (`object-name.c:517-518`), so every
+/// candidate is listed then.
+fn short_oid_candidates(
+    repo: &gix::Repository,
+    name: &str,
+    want: Option<&str>,
+) -> Option<Vec<ObjectId>> {
+    // `init_object_disambiguation()` refuses the name outright outside
+    // `[MINIMUM_ABBREV, hexsz]` or when it is not hex (`object-name.c:273-279`).
+    if name.len() < crate::abbrev::MINIMUM_ABBREV
+        || name.len() > repo.object_hash().len_in_hex()
+        || !name.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let prefix = gix::hash::Prefix::from_hex(&name.to_ascii_lowercase()).ok()?;
+    let mut candidates = std::collections::HashSet::new();
+    repo.objects.lookup_prefix(prefix, Some(&mut candidates)).ok()?;
+    if candidates.len() < 2 {
+        return None;
+    }
+    match want {
+        Some(want) => {
+            let passed: Vec<ObjectId> =
+                candidates.iter().copied().filter(|id| kind_passes(repo, id, want)).collect();
+            match passed.len() {
+                1 => None,
+                0 => Some(candidates.into_iter().collect()),
+                _ => Some(passed),
+            }
+        }
+        None => Some(candidates.into_iter().collect()),
+    }
+}
+
+/// Whether `get_oid_with_context()` returns `SHORT_NAME_AMBIGUOUS` for a name
+/// that did not resolve — the result `batch_one_object()` reports as
+/// `<name> ambiguous` rather than `<name> missing` (`builtin/cat-file.c:593-595`).
+///
+/// Only `get_oid_1()`'s own result can carry it out of
+/// `get_oid_with_context_1()` (`object-name.c:1745-1748,1889`): a `:path` name
+/// returns the index lookup's `-1` or `get_oid_oneline()`'s answer, and a
+/// `<rev>:<path>` name whose `<rev>` does not resolve returns the `-1` of the
+/// whole-name `get_oid_1()` (the `:` makes it non-hex). Inside `get_oid_1()`
+/// (`object-name.c:1084-1142`) a trailing `^<n>`/`~<n>` recurses through
+/// `get_parent()`/`get_nth_ancestor()` with `GET_OID_COMMITTISH`, which hand the
+/// inner result straight back (`object-name.c:837-838,870-871`); every other
+/// shape ends at `get_short_oid()` on the whole name, the only step that says
+/// `SHORT_NAME_AMBIGUOUS` (`peel_onion()`, `get_oid_basic()` and
+/// `get_describe_name()` are only tested against zero).
+pub fn get_oid_ambiguous(repo: &gix::Repository, name: &str) -> bool {
+    if name.starts_with(':') {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    let mut len = bytes.len();
+    // `batch_one_object()` passes no disambiguator, so `get_short_oid()` falls
+    // back to `default_disambiguate_hint()` — `core.disambiguate`.
+    let mut want = disambiguate_filter(repo);
+    loop {
+        let digits = bytes[..len].iter().rev().take_while(|b| b.is_ascii_digit()).count();
+        let Some(&suffix) = len.checked_sub(digits + 1).map(|i| &bytes[i]) else { break };
+        if suffix != b'^' && suffix != b'~' {
+            break;
+        }
+        // `unsigned_mult_overflows()`/`unsigned_add_overflows()` and the
+        // `num > INT_MAX` test all return `MISSING_OBJECT` before recursing.
+        if digits > 0 {
+            match name[len - digits..len].parse::<u64>() {
+                Ok(num) if num <= i32::MAX as u64 => {}
+                _ => return false,
+            }
+        }
+        len -= digits + 1;
+        want = Some("committish");
+    }
+    short_oid_candidates(repo, &name[..len], want).is_some()
 }
 
 /// `show_ambiguous_object()`'s `desc` (`object-name.c:412-451`): a commit gets

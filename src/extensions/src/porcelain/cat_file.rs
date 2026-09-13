@@ -1842,8 +1842,12 @@ fn process_request(
     let oid = std::str::from_utf8(name).ok().and_then(|s| crate::objname::resolve(repo, s));
 
     let Some(oid) = oid else {
+        // `get_oid_with_context()`'s `SHORT_NAME_AMBIGUOUS` is reported apart from
+        // `MISSING_OBJECT` (`builtin/cat-file.c:589-595`).
+        let ambiguous = std::str::from_utf8(name)
+            .is_ok_and(|s| crate::objname::get_oid_ambiguous(repo, s));
         out.write_all(name)?;
-        out.write_all(b" missing")?;
+        out.write_all(if ambiguous { b" ambiguous" } else { b" missing" })?;
         out.write_all(&[delim])?;
         return Ok(EmitOutcome::Ok);
     };

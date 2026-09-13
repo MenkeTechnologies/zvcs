@@ -40,14 +40,10 @@ gix = { path = "../ported/gix", features = [
     "merge",
     "sha256",
 ] }
-# Clone progress rendering. gitoxide already depends on prodash 31.0.0 (registry)
-# and drives fetch/checkout through its progress traits; enabling the line
-# renderer here (features unify with gix's copy) lets `git clone` show the remote
-# sideband progress + local receive/resolve/checkout status to stderr, like git.
+# gitoxide already depends on prodash 31.0.0 (registry) and reports fetch and
+# checkout through its progress traits. `porcelain::fetch_progress` implements
+# those traits to draw git's own fetch meters; nothing renders the tree itself.
 prodash = { version = "31.0.0", features = [
-    "render-line",
-    "render-line-crossterm",
-    "render-line-autoconfigure",
     "progress-tree",
     "unit-bytes",
     "unit-human",
@@ -100,7 +96,7 @@ serde_json = "1"
 # Terminal paging: dup2/isatty/close to splice the pager onto fd 1/2, as git does.
 libc = "0.2"
 # Interactive line editor for `git zrepl` (history, cursor motion, ctrl-c/ctrl-d).
-# crossterm 0.29 matches prodash's copy above, so no second crossterm is pulled in.
+# It brings crossterm 0.29 into the tree.
 # Only the interactive (tty) path uses it; piped stdin stays a raw line reader.
 reedline = "0.49"
 # TUI for `git ztop` — the live, churn-sorted fleet monitor (toasts + colorscheme

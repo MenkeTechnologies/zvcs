@@ -1,27 +1,30 @@
-//! git's progress meter, as `pack-objects`, `repack` and `gc` write it.
+//! git's progress meter (`progress.c`), as `pack-objects`, `repack`, `gc` and the
+//! fetch-side `index-pack`/`unpack-objects` meters write it.
 //!
-//! Every phase of a pack write reports through [`Meter`], which reproduces
-//! `progress.c`'s framing byte for byte (checked against git 2.55.0 driven from a
-//! pseudo-terminal):
+//! Every phase reports through [`Meter`], which reproduces `progress.c`'s framing
+//! byte for byte (checked against git 2.55.0 driven from a pseudo-terminal):
 //!
 //! ```text
 //!   Enumerating objects: 9, done.\n          an unbounded count
 //!   Counting objects:  11% (1/9)\r           a bounded one, redrawn in place
 //!   Counting objects: 100% (9/9), done.\n    …and its closing line
+//!   Receiving objects: 100% (6/6), 6.70 KiB | 571.00 KiB/s, done.\n
 //! ```
 //!
 //! Each redraw ends in a carriage return so the next one overwrites it; only the
 //! closing line ends in a newline, which the terminal's own `onlcr` renders as
 //! the `\r\n` a capture of git shows. A bounded meter redraws when its whole-number
-//! percentage changes, which is the cadence git's own output shows, and the
-//! percentage is right-aligned in three columns (`  1%`, ` 50%`, `100%`).
+//! percentage changes or when the once-a-second update tick has fired, and an
+//! unbounded one only on the tick; the percentage is right-aligned in three
+//! columns (`  1%`, ` 50%`, `100%`).
 //!
-//! Everything goes to stderr, and only when stderr is a terminal: git's
-//! `start_progress()` is reached with progress enabled just when `isatty(2)` and
-//! `--quiet` was not given, so a piped `gc` prints nothing at all. [`enabled`]
-//! answers that question once so every caller asks it the same way.
+//! Everything goes to stderr. Whether a command shows progress at all is its own
+//! decision (git's callers pass a NULL `struct progress *` otherwise); a meter
+//! built with `on == false` is inert. [`enabled`] answers the pack-writing
+//! commands' rule once so every caller asks it the same way.
 
 use std::io::{IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 /// Whether a pack-writing command should report progress: git's rule is a
 /// terminal on stderr and no `--quiet`.
@@ -29,7 +32,26 @@ pub fn enabled(quiet: bool) -> bool {
     !quiet && std::io::stderr().is_terminal()
 }
 
-/// One phase of a pack write.
+/// The interval `set_progress_signal()` arms its `SIGALRM` for (`progress.c:88-91`).
+const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `TP_IDX_MAX` (`progress.c:24`): how many samples the running rate averages over.
+const TP_IDX_MAX: usize = 8;
+
+/// `struct throughput` (`progress.c:26-36`).
+struct Throughput {
+    curr_total: u64,
+    prev_total: u64,
+    prev: Instant,
+    avg_bytes: u32,
+    avg_misecs: u32,
+    last_bytes: [u32; TP_IDX_MAX],
+    last_misecs: [u32; TP_IDX_MAX],
+    idx: usize,
+    display: String,
+}
+
+/// One phase — git's `struct progress`.
 ///
 /// A disabled meter writes nothing, so callers can drive it unconditionally.
 pub struct Meter {
@@ -38,49 +60,49 @@ pub struct Meter {
     /// prints a bare running total, as git does while it is still enumerating.
     total: Option<usize>,
     current: usize,
+    /// `last_value`, `-1` in git until the first display.
+    last_value: Option<usize>,
     /// The last percentage drawn, so a bounded meter redraws only when the
     /// whole number changes rather than once per object.
     last_percent: Option<u32>,
-    /// When an unbounded meter last redrew, which is all that paces one.
-    last_draw: Option<std::time::Instant>,
     /// `progress->start_ns`, which the closing throughput average is taken over.
-    started: std::time::Instant,
-    /// The throughput text `display()` appends after the counters (`tp` in
-    /// `progress.c:126`); empty until a closing rate has been computed.
-    suffix: String,
+    started: Instant,
+    /// When the next `SIGALRM` would set `progress_update`.
+    next_update: Instant,
+    throughput: Option<Throughput>,
+    /// `counters_sb`: the text after `<title>: ` as last drawn.
+    counters: String,
+    /// `progress->split`: the counters moved to their own line once the full line
+    /// no longer fit the terminal.
+    split: bool,
     on: bool,
 }
-
-/// How often an unbounded meter redraws, matching the interval git's
-/// `progress.c` arms its `SIGALRM` for.
-const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Meter {
     /// A phase whose size is not known yet — git's `Enumerating objects`.
     pub fn unknown(title: &'static str, on: bool) -> Self {
-        Meter {
-            title,
-            total: None,
-            current: 0,
-            last_percent: None,
-            // Set now, so the first redraw waits out the interval as git does.
-            last_draw: Some(std::time::Instant::now()),
-            started: std::time::Instant::now(),
-            suffix: String::new(),
-            on,
-        }
+        Self::start(title, None, on)
     }
 
     /// A phase of `total` items — git's `Counting`, `Compressing` and `Writing`.
     pub fn counted(title: &'static str, total: usize, on: bool) -> Self {
+        Self::start(title, Some(total), on)
+    }
+
+    /// `start_progress_delay()` (`progress.c:259-279`) with no delay.
+    fn start(title: &'static str, total: Option<usize>, on: bool) -> Self {
+        let now = Instant::now();
         Meter {
             title,
-            total: Some(total),
+            total,
             current: 0,
+            last_value: None,
             last_percent: None,
-            last_draw: None,
-            started: std::time::Instant::now(),
-            suffix: String::new(),
+            started: now,
+            next_update: now + UPDATE_INTERVAL,
+            throughput: None,
+            counters: String::new(),
+            split: false,
             on,
         }
     }
@@ -92,35 +114,23 @@ impl Meter {
 
     /// Count `n` items at once, for a phase that reports in batches.
     pub fn advance(&mut self, n: usize) {
-        self.current += n;
-        if !self.on {
-            return;
-        }
-        match self.percent() {
-            // Bounded: redraw only when the whole-number percentage moves.
-            Some(percent) => {
-                if self.last_percent != Some(percent) {
-                    self.last_percent = Some(percent);
-                    self.draw(false);
-                }
-            }
-            // Unbounded: there is no percentage to move, so redraw on the clock.
-            // git's `progress.c` arms a one-second `SIGALRM` for exactly this,
-            // which is why a short enumeration prints its closing line only.
-            None => {
-                if self.last_draw.is_none_or(|at| at.elapsed() >= REDRAW_INTERVAL) {
-                    self.last_draw = Some(std::time::Instant::now());
-                    self.draw(false);
-                }
-            }
+        self.set(self.current + n);
+    }
+
+    /// `display_progress(progress, n)`: the count is now `n`.
+    pub fn set(&mut self, n: usize) {
+        self.current = n;
+        if self.on {
+            self.display(n, None, false);
         }
     }
 
     /// Close the phase with git's `, done.` line. A phase that never ticked
-    /// still prints, which is what git does for an empty pack.
+    /// still prints, which is what the pack-writing callers rely on for an
+    /// empty pack.
     pub fn done(mut self) {
         if self.on {
-            self.draw(true);
+            self.display(self.current, Some(", done.\n"), true);
         }
     }
 
@@ -129,30 +139,85 @@ impl Meter {
     /// the progress (`builtin/pack-objects.c:1350-1363`) so every flush reports
     /// the bytes written.
     ///
-    /// `force_last_update()` (`progress.c:332-348`) replaces the running figure
-    /// with the whole-phase average: the elapsed time since `start_progress()` in
-    /// 1024ths of a second, floored at one, divided into the total. The redraws
-    /// before it carry no rate — `display_throughput()` only fills the display
-    /// after half a second has passed (`progress.c:214-216`) — so only the
-    /// closing line has one.
+    /// The redraws before it carry no rate — `display_throughput()` only fills
+    /// the display after half a second has passed (`progress.c:214-216`) — so
+    /// only the closing line has one.
     pub fn done_with_throughput(mut self, total_bytes: u64) {
         if !self.on {
             return;
         }
-        let elapsed_ns = self.started.elapsed().as_nanos() as u64;
-        let misecs = ((elapsed_ns.wrapping_mul(4398)) >> 32) as u32;
-        let rate = (total_bytes / u64::from(misecs.max(1))) as u32;
-        // `throughput_string()` (`progress.c:175-183`).
-        self.suffix = format!(
-            ", {} | {}",
-            humanise(total_bytes, false),
-            humanise(u64::from(rate) * 1024, true)
-        );
-        self.draw(true);
+        self.throughput(total_bytes);
+        self.force_last_update("done", self.current);
+    }
+
+    /// `stop_progress_msg()` (`progress.c:362-385`): close the phase with
+    /// `, <msg>.`, carrying the whole-phase throughput average if bytes were
+    /// reported. Unlike [`Meter::done`], a phase that was never displayed ends
+    /// silently, as git's does.
+    pub fn stop(mut self, msg: &str) {
+        if let (true, Some(last)) = (self.on, self.last_value) {
+            self.force_last_update(msg, last);
+        }
+    }
+
+    /// `display_throughput()` (`progress.c:193-251`): `total` bytes have been
+    /// transferred so far. The first report only starts the clock; the rate shown
+    /// is refreshed at most every half second, averaged over the last
+    /// [`TP_IDX_MAX`] refreshes, and drawn with the next update tick.
+    pub fn throughput(&mut self, total: u64) {
+        if !self.on {
+            return;
+        }
+        let now = Instant::now();
+        let Some(tp) = self.throughput.as_mut() else {
+            self.throughput = Some(Throughput {
+                curr_total: total,
+                prev_total: total,
+                prev: now,
+                avg_bytes: 0,
+                avg_misecs: 0,
+                last_bytes: [0; TP_IDX_MAX],
+                last_misecs: [0; TP_IDX_MAX],
+                idx: 0,
+                display: String::new(),
+            });
+            return;
+        };
+        tp.curr_total = total;
+        let elapsed = now.duration_since(tp.prev);
+        if elapsed.as_nanos() <= 500_000_000 {
+            return;
+        }
+        let misecs = misecs(elapsed);
+        let count = total.wrapping_sub(tp.prev_total) as u32;
+        tp.prev_total = total;
+        tp.prev = now;
+        tp.avg_bytes = tp.avg_bytes.wrapping_add(count);
+        tp.avg_misecs = tp.avg_misecs.wrapping_add(misecs);
+        let rate = tp.avg_bytes / tp.avg_misecs.max(1);
+        tp.avg_bytes = tp.avg_bytes.wrapping_sub(tp.last_bytes[tp.idx]);
+        tp.avg_misecs = tp.avg_misecs.wrapping_sub(tp.last_misecs[tp.idx]);
+        tp.last_bytes[tp.idx] = count;
+        tp.last_misecs[tp.idx] = misecs;
+        tp.idx = (tp.idx + 1) % TP_IDX_MAX;
+        tp.display = throughput_string(total, rate);
+        if let (Some(last), true) = (self.last_value, now >= self.next_update) {
+            self.display(last, None, false);
+        }
+    }
+
+    /// `force_last_update()` (`progress.c:332-348`): replace the running rate with
+    /// the average since `start_progress()` and draw the closing line.
+    fn force_last_update(&mut self, msg: &str, value: usize) {
+        if let Some(tp) = self.throughput.as_mut() {
+            let rate = tp.curr_total / u64::from(misecs(self.started.elapsed()).max(1));
+            tp.display = throughput_string(tp.curr_total, rate as u32);
+        }
+        self.display(value, Some(&format!(", {msg}.\n")), true);
     }
 
     /// `100 * current / total`, or `None` when the total is unknown. A total of
-    /// zero reads as complete, matching git's `display()`.
+    /// zero reads as complete.
     fn percent(&self) -> Option<u32> {
         match self.total {
             Some(0) => Some(100),
@@ -161,26 +226,88 @@ impl Meter {
         }
     }
 
-    /// One redraw. A line that will be overwritten ends in a carriage return and
-    /// nothing else; the closing line ends in a newline, which the terminal's
-    /// own `onlcr` turns into the `\r\n` a capture of git shows.
-    fn draw(&mut self, done: bool) {
-        let tail = if done { ", done.\n" } else { "\r" };
+    /// Consume the update tick: whether a `SIGALRM` fired since the last display.
+    /// `display()` clears `progress_update` on every call, drawn or not.
+    fn take_update(&mut self) -> bool {
+        let now = Instant::now();
+        if now < self.next_update {
+            return false;
+        }
+        while self.next_update <= now {
+            self.next_update += UPDATE_INTERVAL;
+        }
+        true
+    }
+
+    /// `display()` (`progress.c:112-173`). `done` is the closing text; `force` is
+    /// `force_last_update()` setting `progress_update` first.
+    fn display(&mut self, n: usize, done: Option<&str>, force: bool) {
+        let update = self.take_update() || force;
+        self.last_value = Some(n);
+        let tp = self.throughput.as_ref().map_or_else(String::new, |tp| tp.display.clone());
+        let last_count_len = self.counters.len();
+        let show_update = match self.total {
+            Some(total) => {
+                let percent = if total == 0 { 100 } else { ((n as u64 * 100) / total as u64) as u32 };
+                if self.last_percent != Some(percent) || update {
+                    self.last_percent = Some(percent);
+                    self.counters = format!("{percent:>3}% ({n}/{total}){tp}");
+                    true
+                } else {
+                    false
+                }
+            }
+            None if update => {
+                self.counters = format!("{n}{tp}");
+                true
+            }
+            None => false,
+        };
+        if !show_update || !(done.is_some() || is_foreground_stderr()) {
+            return;
+        }
+        let eol = done.unwrap_or("\r");
+        let clear_len = if self.counters.len() < last_count_len {
+            last_count_len - self.counters.len() + 1
+        } else {
+            0
+        };
+        // The "+ 2" accounts for the ": ".
+        let title_len = self.title.len();
+        let progress_line_len = title_len + self.counters.len() + 2;
+        let cols = usize::try_from(crate::pager::term_columns()).unwrap_or(80);
         let mut err = std::io::stderr().lock();
-        let _ = match self.total {
-            Some(total) => write!(
-                err,
-                "{}: {:>3}% ({}/{}){}{tail}",
-                self.title,
-                self.percent().unwrap_or(100),
-                self.current,
-                total,
-                self.suffix
-            ),
-            None => write!(err, "{}: {}{tail}", self.title, self.current),
+        let _ = if self.split {
+            write!(err, "  {}{eol:>clear_len$}", self.counters)
+        } else if done.is_none() && cols < progress_line_len {
+            let clear_len = if title_len + 1 < cols { cols - title_len - 1 } else { 0 };
+            self.split = true;
+            write!(err, "{}:{:clear_len$}\n  {}{eol}", self.title, "", self.counters)
+        } else {
+            write!(err, "{}: {}{eol:>clear_len$}", self.title, self.counters)
         };
         let _ = err.flush();
     }
+}
+
+/// `is_foreground_fd(fileno(stderr))` (`progress.c:106-110`): a background job
+/// keeps quiet until its closing line.
+fn is_foreground_stderr() -> bool {
+    // SAFETY: plain queries on this process's own descriptor and group.
+    unsafe {
+        let tpgrp = libc::tcgetpgrp(libc::STDERR_FILENO);
+        tpgrp < 0 || tpgrp == libc::getpgid(0)
+    }
+}
+
+/// An interval in 1024ths of a second, as `progress.c:234` computes it.
+fn misecs(elapsed: Duration) -> u32 {
+    ((elapsed.as_nanos() as u64).wrapping_mul(4398) >> 32) as u32
+}
+
+/// `throughput_string()` (`progress.c:175-183`).
+fn throughput_string(total: u64, rate: u32) -> String {
+    format!(", {} | {}", humanise(total, false), humanise(u64::from(rate) * 1024, true))
 }
 
 /// `humanise_bytes()` (`strbuf.c:875-909`) without `HUMANISE_COMPACT`: git's
@@ -247,5 +374,26 @@ mod tests {
     #[test]
     fn an_empty_phase_reads_as_complete() {
         assert_eq!(Meter::counted("Counting objects", 0, true).percent(), Some(100));
+    }
+
+    /// The first byte count only starts the clock: git's `display_throughput()`
+    /// allocates the structure and returns, so a phase that reported bytes once
+    /// has a rate on its closing line and none on the redraws before it.
+    #[test]
+    fn the_first_throughput_report_starts_the_clock() {
+        let mut m = Meter::counted("Receiving objects", 3, true);
+        m.throughput(403);
+        let tp = m.throughput.as_ref().expect("the first report allocates");
+        assert_eq!((tp.curr_total, tp.display.as_str()), (403, ""));
+    }
+
+    /// `stop_progress_msg()` skips `force_last_update()` for a meter whose
+    /// `last_value` is still `-1`: an empty `Receiving objects` phase prints
+    /// nothing at all.
+    #[test]
+    fn a_never_displayed_meter_stops_silently() {
+        let m = Meter::counted("Receiving objects", 0, true);
+        assert_eq!(m.last_value, None);
+        m.stop("done");
     }
 }

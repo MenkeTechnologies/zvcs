@@ -1,6 +1,4 @@
 use anyhow::{bail, Context, Result};
-use prodash::Root as _;
-use std::io::IsTerminal;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -59,9 +57,10 @@ use gix::remote::fetch::{Shallow, Tags};
 ///
 /// `init.defaultSubmodulePathConfig` is honored here as it is in `git init`.
 ///
-/// Progress (remote sideband + local receive/resolve/checkout) is rendered to
-/// stderr like git: shown when stderr is a terminal, forced on with `--progress`,
-/// and suppressed by `-q`/`--quiet` or `--no-progress`.
+/// Progress is git's: the `remote: ` sideband lines and `index-pack`'s
+/// `Receiving objects`/`Resolving deltas` (see [`super::fetch_progress`]), shown
+/// when stderr is a terminal, forced on with `--progress`, and suppressed by
+/// `-q`/`--quiet` or `--no-progress`. A local clone transfers nothing and shows none.
 /// Any other option is rejected explicitly rather than silently mis-handled.
 ///
 /// # Refspec and `HEAD` setup
@@ -928,8 +927,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
 
     let should_interrupt = AtomicBool::new(false);
 
-    // git prints the "Cloning into ..." banner before any progress; keep it above
-    // the live renderer so the two don't overdraw each other. `0 <= option_verbosity`
+    // git prints the "Cloning into ..." banner before any progress. `0 <= option_verbosity`
     // (clone.c:1134) is what `-q` switches off.
     if !quiet {
         if bare {
@@ -1508,49 +1506,36 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Drive gitoxide's fetch/checkout through a prodash tree and render it to
-    // stderr with the line renderer. The tree relays the remote's sideband
-    // progress (Enumerating/Counting/Compressing objects, Total …) as well as the
-    // local pack receive/resolve and worktree checkout counters — the same
-    // information git surfaces. When progress is suppressed the tree is still used
-    // but no renderer is attached, so nothing is drawn.
-    // A local clone transfers nothing: `clone_local()` copies or links the object store and
-    // the only transport call is the ls-refs that built the ref map, so git has no
-    // progress to report however loudly `--progress` asks for it. This port runs a real
-    // fetch underneath and would otherwise narrate work git never does.
-    let show_progress =
-        force_progress.unwrap_or_else(|| std::io::stderr().is_terminal()) && !quiet && !is_local;
-    let root = prodash::tree::Root::new();
-    // Create the operation node BEFORE launching the renderer. prodash's line
-    // renderer can otherwise race an empty tree at startup and exit before gix
-    // adds any progress, rendering nothing at all (documented on
-    // `keep_running_if_progress_is_empty`). gix's fetch adds a "remote" child here
-    // (the server's Enumerating/Counting/Compressing sideband) plus local
-    // "receiving pack"/"resolving" and checkout counters.
-    let mut op = root.add_child(if bare { "clone (bare)" } else { "clone" });
-    let no_color = std::env::var_os("NO_COLOR").is_some();
-    let render = show_progress.then(|| {
-        let mut opts = prodash::render::line::Options {
-            throughput: true,
-            ..Default::default()
-        }
-        .auto_configure(prodash::render::line::StreamKind::Stderr);
-        // `--progress` forces the live display even when stderr is not a terminal,
-        // matching git; auto_configure would otherwise disable it in that case.
-        if force_progress == Some(true) {
-            opts.output_is_terminal = true;
-        }
-        // auto_configure clobbers both of the following; reassert them after it:
-        //   * git never hides the cursor, but auto_hide_cursor (signal-hook) forces
-        //     hide_cursor on — that can strand the cursor hidden if a render is
-        //     interrupted. Keep it visible.
-        //   * colorize whenever we draw live to a terminal (git colors on a tty),
-        //     honoring only the NO_COLOR standard — not the CLICOLOR/CLICOLOR_FORCE
-        //     env quirks crosstermion::color::allowed keys on.
-        opts.hide_cursor = false;
-        opts.colored = opts.output_is_terminal && !no_color;
-        prodash::render::line::render(std::io::stderr(), root.downgrade(), opts)
+    // The pack is reported as `fetch` reports it (`fetch_progress`): the server's
+    // `remote: ` lines and `index-pack`'s meters, with `transport->progress` from
+    // `transport_set_verbosity(transport, option_verbosity, option_progress)`
+    // (builtin/clone.c:1353). A local clone transfers nothing: `clone_local()`
+    // copies or links the object store and the only transport call is the ls-refs
+    // that built the ref map, so git has no progress to report however loudly
+    // `--progress` asks for it. This port runs a real fetch underneath, which asks
+    // the server for no progress and draws nothing.
+    let transport_progress =
+        !is_local && super::fetch_progress::transport_progress(quiet, force_progress);
+    let meters = super::fetch_progress::Meters::new(super::fetch_progress::Plan {
+        progress: transport_progress,
+        quiet,
+        // `transport_set_option(transport, TRANS_OPT_KEEP, "yes")` (builtin/clone.c:1362):
+        // every pack goes to `index-pack`, so the unpack limit is never consulted.
+        keep_pack: true,
+        unpack_limit: 0,
+        index_pack_required: false,
     });
+    let remote_output = match gix::open(&git_dir) {
+        Ok(repo) => super::fetch_progress::RemoteOutput::new(&repo),
+        Err(_) => super::fetch_progress::RemoteOutput::plain(),
+    };
+    {
+        let sideband = (!is_local).then(|| remote_output.handler());
+        prepare = prepare.configure_connection(move |connection| {
+            connection.set_transfer_progress(!transport_progress, sideband.clone());
+            Ok(())
+        });
+    }
 
     // Whether the remote advertised a `refs/remotes/<name>/HEAD` of its own. gitoxide
     // always fetches `HEAD:refs/remotes/<name>/HEAD`, so for a bare or mirrored clone —
@@ -1598,8 +1583,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         .map(|repo| resolve_remote_name(&repo, origin.as_deref()))
         .unwrap_or_else(|_| origin.clone().unwrap_or_else(|| "origin".to_string()));
 
-    // Run the clone, capturing the result so the renderer is always torn down
-    // (cursor restored, thread joined) before any error is propagated.
+    // Run the clone, capturing the result so a `remote: ` line the stream left
+    // unterminated is flushed before any error is propagated.
     let result = (|| -> Result<()> {
         // git's `transport.c` warns as soon as it has the capability list and then transfers
         // everything, leaving the promisor configuration in place regardless.
@@ -1638,7 +1623,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // A bare clone never checks out a worktree; `--no-checkout` likewise
             // fetches the pack and writes the refs/`HEAD` but leaves the worktree
             // (and index) empty. Fetching is the whole job in both cases.
-            let fetched = prepare.fetch_only(op.add_child("fetch"), &should_interrupt);
+            let fetched = prepare.fetch_only(meters.clone(), &should_interrupt);
             let outcome = match fetched {
                 Ok((_repo, outcome)) => outcome,
                 // gitoxide refuses a fetch whose refspecs matched nothing; git calls that an
@@ -1678,7 +1663,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             junk.leave();
         } else {
             // `git clone 'url'...`
-            let fetched = prepare.fetch_then_checkout(op.add_child("fetch"), &should_interrupt);
+            let fetched = prepare.fetch_then_checkout(meters.clone(), &should_interrupt);
             let (mut checkout, outcome) = match fetched {
                 Ok(pair) => pair,
                 Err(gix::clone::fetch::Error::Fetch(
@@ -1708,7 +1693,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             junk.leave();
             // Check out the branch `HEAD` points to. This is a no-op for an empty
             // remote, leaving an empty repository exactly like git does.
-            let (repo, _) = checkout.main_worktree(op.add_child("checkout"), &should_interrupt)?;
+            let (repo, _) = checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
             // `checkout()` (builtin/clone.c:677-698) is a `oneway_merge` `unpack_trees()`, which
             // ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
             // (unpack-trees.c:2086-2090) before `write_locked_index()` — so a fresh clone's
@@ -1721,9 +1706,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         Ok(())
     })();
 
-    if let Some(handle) = render {
-        handle.shutdown_and_wait();
-    }
+    remote_output.finish();
     // A transport that never connected is git's own `die()`, not a wrapped error:
     // the ssh child's stderr, then the fixed block, exit 128.
     if let Err(e) = &result {

@@ -557,6 +557,7 @@ mod fast_export;
 mod fast_import;
 mod fetch;
 mod fetch_pack;
+mod fetch_progress;
 pub(crate) mod filespec;
 mod filter_branch;
 mod fmt_merge_msg;

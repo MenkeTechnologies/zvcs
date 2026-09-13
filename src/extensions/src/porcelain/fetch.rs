@@ -32,12 +32,13 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `-v`/`--verbose`, `-q`/`--quiet`, `--dry-run` (and their `--no-…` negations)
 ///   * `--porcelain`                  → machine-readable `<flag> <old> <new> <ref>` on stdout
 ///   * `--write-fetch-head`/`--no-write-fetch-head`, `-a`/`--append` → `.git/FETCH_HEAD`
-///   * `--progress`/`--no-progress`   → accepted; git's meters are not ported, so nothing is drawn
+///   * `--progress`/`--no-progress`   → force/suppress the `remote: ` lines and the `Receiving objects`,
+///     `Resolving deltas` or `Unpacking objects` meters (see [`super::fetch_progress`])
 ///   * `--show-forced-updates`/`--no-show-forced-updates` → the `(forced update)` note
 ///   * `--prefetch`                   → rewrite every refspec into `refs/prefetch/…`
 ///   * `--stdin`                      → read additional refspecs from standard input
 ///   * `-u`/`--update-head-ok`        → allow updating the ref `HEAD` points at
-///   * `-k`/`--keep`, `--no-keep`     → accepted; a pack below `fetch.unpackLimit` is exploded either way
+///   * `-k`/`--keep`, `--no-keep`     → keep the received pack even below `fetch.unpackLimit`
 ///   * `--write-commit-graph`         → write the commit-graph after fetching
 ///   * `--recurse-submodules[=yes|no]`, `-j`/`--jobs <n>` → fetch in populated submodules
 ///   * `--upload-pack <path>`         → run `<path>` instead of `git-upload-pack` on the other end
@@ -444,11 +445,11 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
             // `OPT_BOOL('k', "keep", &keep, ...)` (builtin/fetch.c:180). The only
             // reader is `set_option(transport, TRANS_OPT_KEEP, "yes")` when it is
-            // set (builtin/fetch.c:1514, :1862), which asks `fetch_pack()` for a
-            // `.keep` beside the pack. `--no-keep` is the default it started at:
-            // the small-pack explode in `explode_small_pack()` applies as usual.
-            "-k" | "--keep" => {}
-            "--no-keep" => {}
+            // set (builtin/fetch.c:1514, :1862). That is `args->keep_pack`, which
+            // sends every pack to `index-pack --keep` however small it is
+            // (fetch-pack.c:965, 989, 1007). `--no-keep` is the default.
+            "-k" | "--keep" => opts.keep = true,
+            "--no-keep" => opts.keep = false,
 
             // Post-fetch commit-graph write (git's `--write-commit-graph`).
             "--write-commit-graph" => write_commit_graph = Some(true),
@@ -970,13 +971,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         Some((remote, merge.as_bstr().to_string()))
     });
 
-    // gitoxide reports into a progress tree, and nothing draws it. The line
-    // renderer that used to was never git's output: a ` fetch` header, cursor-up
-    // escapes and a `list refs 1 steps [ === ]` bar, written even for a fetch
-    // that moved no objects — where stock 2.55.0 with `--progress` into a pipe
-    // writes nothing but the `From`/ref lines. git's own meters (`remote:`
-    // sideband lines, `Receiving objects`, `Resolving deltas`) are not ported
-    // here, so the honest output is none.
+    // Listing refs and negotiating report into a progress tree nothing draws: git
+    // prints nothing for them. The pack itself is reported through
+    // `fetch_progress::Meters` in `fetch_one()`.
     let root = prodash::tree::Root::new();
     let mut op = root.add_child("fetch");
 
@@ -1381,6 +1378,8 @@ struct FetchOpts {
     append: bool,
     /// `--progress` forced on / `--no-progress` forced off / unset = auto.
     progress: Option<bool>,
+    /// `-k`/`--keep`.
+    keep: bool,
     /// Resolved `--show-forced-updates` / `fetch.showForcedUpdates`.
     show_forced_updates: bool,
     /// `--prefetch`: every destination moves under `refs/prefetch/`.
@@ -1446,6 +1445,7 @@ impl Default for FetchOpts {
             write_fetch_head: true,
             append: false,
             progress: None,
+            keep: false,
             show_forced_updates: true,
             prefetch: false,
             update_head_ok: false,
@@ -2478,7 +2478,7 @@ fn fetch_one(
     // fails in the spawned `upload-pack` and the fetch dies with git's block at
     // 128. The vendored transport refuses the same path before spawning, in its
     // own words, which would otherwise surface as a `zvcs: fetch:` error at 1.
-    let connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
+    let mut connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
         Ok(connection) => connection,
         Err(err) => {
             if crate::transport_err::file_url_fatal(&err).is_some() {
@@ -2487,6 +2487,11 @@ fn fetch_one(
             return Err(err.into());
         }
     };
+    // `transport_set_verbosity()` (transport.c:1301-1312) makes `transport->progress`,
+    // which `fetch_refs_via_pack()` hands on as `args.no_progress` (transport.c:452).
+    let transport_progress = super::fetch_progress::transport_progress(opts.quiet, opts.progress);
+    let remote_output = super::fetch_progress::RemoteOutput::new(repo);
+    connection.set_transfer_progress(!transport_progress, Some(remote_output.handler()));
 
     // `--negotiate-only` never lists refs and never asks for a pack: it runs the negotiation on its
     // own and prints the commits the remote acknowledged as common, one per line.
@@ -2622,13 +2627,7 @@ fn fetch_one(
     };
     // `fetch_pack_fsck_objects()` (`fetch-pack.c:2158`): `fetch.fsckObjects`
     // first, `transfer.fsckObjects` as the fallback, off when neither is set.
-    let fsck_objects = {
-        let snapshot = repo.config_snapshot();
-        snapshot
-            .boolean("fetch.fsckObjects")
-            .or_else(|| snapshot.boolean("transfer.fsckObjects"))
-            .unwrap_or(false)
-    };
+    let fsck_objects = fetch_pack_fsck_objects(repo);
 
     // ```c
     // static inline void fetch_one_setup_partial(struct remote *remote)
@@ -2709,7 +2708,17 @@ fn fetch_one(
         .with_reflog_message(RefLogMessage::Prefixed {
             action: opts.reflog_action.clone().into(),
         })
-        .receive(&mut *progress, &should_interrupt);
+        .receive(
+            super::fetch_progress::Meters::new(super::fetch_progress::Plan {
+                progress: transport_progress,
+                quiet: opts.quiet,
+                keep_pack: opts.keep,
+                unpack_limit: super::fetch_progress::unpack_limit(repo),
+                index_pack_required: fsck_objects || from_promisor,
+            }),
+            &should_interrupt,
+        );
+    remote_output.finish();
     let outcome = match outcome {
         Ok(outcome) => outcome,
         // The post-fetch connectivity check (`connected.c`) said the pack was short of what the
@@ -2894,8 +2903,10 @@ fn fetch_one(
     // depends on: exploding the pack deleted the very file its `.promisor` marker names, so a
     // `git fetch --refetch` on a partial clone left an orphaned marker, the history loose, and
     // `fsck` reporting broken links into the blobs the filter had skipped.
+    //
+    // `args->keep_pack` is the first condition of the same test: `--keep` never unpacks.
     if let Status::Change { write_pack_bundle, .. } = &outcome.status {
-        if !fsck_objects && !from_promisor {
+        if !fsck_objects && !from_promisor && !opts.keep {
             explode_small_pack(repo, write_pack_bundle)?;
         }
     }
@@ -4556,6 +4567,16 @@ fn fsck_fetched(
     Ok(())
 }
 
+/// `fetch_pack_fsck_objects()` (`fetch-pack.c:2158`): `fetch.fsckObjects` first,
+/// `transfer.fsckObjects` as the fallback, off when neither is set.
+pub(super) fn fetch_pack_fsck_objects(repo: &gix::Repository) -> bool {
+    let snapshot = repo.config_snapshot();
+    snapshot
+        .boolean("fetch.fsckObjects")
+        .or_else(|| snapshot.boolean("transfer.fsckObjects"))
+        .unwrap_or(false)
+}
+
 /// `fetch_pack()`'s `unpack-objects` path: a pack carrying fewer objects than
 /// `fetch.unpackLimit` (falling back to `transfer.unpackLimit`, then git's 100) is
 /// exploded into loose objects and dropped, because indexing a tiny pack costs more
@@ -4567,18 +4588,9 @@ fn explode_small_pack(
     repo: &gix::Repository,
     bundle: &gix::odb::pack::bundle::write::Outcome,
 ) -> Result<()> {
-    let limit = {
-        let snap = repo.config_snapshot();
-        snap.integer("fetch.unpackLimit")
-            .or_else(|| snap.integer("transfer.unpackLimit"))
-            .unwrap_or(100)
-    };
-    // `0` disables the shortcut, and a negative value is git's "always unpack".
-    if limit == 0 {
-        return Ok(());
-    }
-    let count = bundle.index.num_objects;
-    if limit > 0 && u64::from(count) >= limit as u64 {
+    // `0` disables the shortcut: no header is read, and `index-pack` takes every pack.
+    let limit = super::fetch_progress::unpack_limit(repo);
+    if limit == 0 || u64::from(bundle.index.num_objects) >= limit {
         return Ok(());
     }
     let (Some(index_path), Some(data_path)) = (&bundle.index_path, &bundle.data_path) else {

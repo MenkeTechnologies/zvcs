@@ -12,8 +12,9 @@
 //!   * `--all` — every advertised ref, `HEAD` included.
 //!   * `--stdin` — additional ref names, one per line, appended after the ones
 //!     given on the command line (the plain form; see below for `--stateless-rpc`).
-//!   * `-q`/`--quiet`, `-v`, `--no-progress` — accepted; this port never paints
-//!     progress, so they only ever affected stderr.
+//!   * `-q`/`--quiet`, `-v`, `--no-progress` — stderr only: `-q` silences the
+//!     `Receiving objects`/`Resolving deltas` meters, `--no-progress` also asks
+//!     the server for no `remote: ` progress (see [`super::fetch_progress`]).
 //!   * `--thin` — accepted, see the note on thin packs below. There is no
 //!     `--no-thin`: git's option loop knows only `--thin`, so the negated spelling
 //!     is a usage error there and here.
@@ -156,6 +157,8 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     // Flags git's loop accepts that this port cannot act on; refused once the
     // whole command line has been read, so a later usage error still wins.
     let mut unported: Vec<String> = Vec::new();
+    let mut quiet = false;
+    let mut no_progress = false;
 
     for a in args {
         let a = a.as_str();
@@ -170,9 +173,11 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         match a {
             "--all" => all = true,
             "--stdin" => from_stdin = true,
-            // Progress and verbosity only ever reached stderr, which this port
-            // leaves empty on the success path.
-            "-q" | "--quiet" | "-v" | "--no-progress" => {}
+            // `args.quiet` and `args.no_progress` (builtin/fetch-pack.c:91-92,
+            // 140-141). Unlike `fetch`, nothing here consults `isatty(2)`.
+            "-q" | "--quiet" => quiet = true,
+            "--no-progress" => no_progress = true,
+            "-v" => {}
             // gitoxide always requests a thin pack; the end state is identical
             // either way (see the module docs). git's loop knows `--thin` and
             // nothing else — there is no `--no-thin` entry (builtin/fetch-pack.c:100),
@@ -414,7 +419,14 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
 
     // --- phase 2: negotiate and receive the pack --------------------------
     let shallow = build_shallow(depth, deepen_relative, shallow_since.as_deref(), &shallow_exclude)?;
-    if let Err(e) = receive(&repo, dest, &selected, shallow, keep, lock_pack) {
+    let plan = super::fetch_progress::Plan {
+        progress: !no_progress,
+        quiet,
+        keep_pack: keep,
+        unpack_limit: super::fetch_progress::unpack_limit(&repo),
+        index_pack_required: super::fetch::fetch_pack_fsck_objects(&repo),
+    };
+    if let Err(e) = receive(&repo, dest, &selected, shallow, lock_pack, plan) {
         // A failed fetch surfaces as git's `fatal:` with 128 unless it is one of
         // our own refusals, which must stay loud and unmistakable.
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
@@ -946,9 +958,10 @@ fn receive(
     dest: &str,
     selected: &[(String, ObjectId)],
     shallow: Shallow,
-    keep: bool,
     lock_pack: bool,
+    plan: super::fetch_progress::Plan,
 ) -> Result<()> {
+    let keep = plan.keep_pack;
     let remote = repo
         .remote_at(dest)?
         .with_fetch_tags(Tags::None)
@@ -958,8 +971,11 @@ fn receive(
         )?;
 
     let should_interrupt = AtomicBool::new(false);
-    let outcome = remote
-        .connect_with_options(gix::remote::Direction::Fetch, own_upload_pack(&remote))?
+    let mut connection =
+        remote.connect_with_options(gix::remote::Direction::Fetch, own_upload_pack(&remote))?;
+    let remote_output = super::fetch_progress::RemoteOutput::new(repo);
+    connection.set_transfer_progress(!plan.progress, Some(remote_output.handler()));
+    let outcome = connection
         .prepare_fetch(
             gix::progress::Discard,
             gix::remote::ref_map::Options::default(),
@@ -967,7 +983,9 @@ fn receive(
         // Deepen exactly as `--depth`/`--shallow-*` asked; `Shallow::NoChange`
         // (the common case) leaves negotiation untouched.
         .with_shallow(shallow)
-        .receive(gix::progress::Discard, &should_interrupt)?;
+        .receive(super::fetch_progress::Meters::new(plan), &should_interrupt);
+    remote_output.finish();
+    let outcome = outcome?;
 
     match outcome.status {
         // Nothing new on the wire — every wanted object is already local.

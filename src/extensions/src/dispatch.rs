@@ -573,6 +573,7 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "diff-files",
     "diff-index",
     "diff-tree",
+        "checkout" | "switch" | "restore" => ConfigCallback::Checkout,
     "fsck",
     "gc",
     "hash-object",
@@ -1331,6 +1332,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // Interactive hunk selection (`add -p`, `reset -p`, `checkout -p`,
     // `restore -p`, `commit -p`/`-i`) writes nothing itself: it renders hunks,
     // waits on the user, and hands each accepted selection to a `git apply`
+                    ConfigCallback::Checkout => crate::cmd_config::validate_checkout(&repo),
     // CHILD, which takes the lane for the microseconds it needs. Holding the
     // lane in the parent would (a) block every other zvcs writer for as long as
     // the user reads, and (b) deadlock the child, which would find the lane busy

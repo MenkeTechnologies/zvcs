@@ -105,6 +105,84 @@ pub fn validate_repack(repo: &gix::Repository) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// `repo_config(the_repository, git_checkout_config, opts)` — `checkout`,
+/// `switch` and `restore`, all three through `checkout_main()`
+/// (builtin/checkout.c:1879).
+pub fn validate_checkout(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_checkout_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// checkout / switch / restore
+// ---------------------------------------------------------------------------
+
+/// `git_checkout_config()` (builtin/checkout.c:1277-1297).
+///
+/// ```c
+/// if (!strcmp(var, "diff.ignoresubmodules")) {
+///         if (!value)
+///                 return config_error_nonbool(var);
+///         handle_ignore_submodules_arg(&opts->diff_options, value);
+///         return 0;
+/// }
+/// if (!strcmp(var, "checkout.guess")) {
+///         opts->dwim_new_local_branch = git_config_bool(var, value);
+///         return 0;
+/// }
+/// if (starts_with(var, "submodule."))
+///         return git_default_submodule_config(var, value, NULL);
+/// return git_xmerge_config(var, value, ctx, NULL);
+/// ```
+///
+/// Note the `submodule.` arm returns without reaching `git_default_config`, and
+/// that `git_default_submodule_config()` (submodule.c:216-225) reads only
+/// `submodule.recurse`, as a boolean: `submodule.recurse=abc` stops all three
+/// verbs before they parse their options.
+fn git_checkout_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    if key == "diff.ignoresubmodules" {
+        let raw = string_value(v)?;
+        // `handle_ignore_submodules_arg()` (submodule.c:429-445): `strcmp`
+        // against four words, and `die()` for anything else.
+        if !["all", "untracked", "dirty", "none"].contains(&raw.as_str()) {
+            return Err(Rejection::Die(format!("bad --ignore-submodules argument: {raw}")));
+        }
+        return Ok(());
+    }
+    if key == "checkout.guess" {
+        bool_value(v, key)?;
+        return Ok(());
+    }
+    if key.starts_with("submodule.") {
+        if key == "submodule.recurse" {
+            bool_value(v, key)?;
+        }
+        return Ok(());
+    }
+    git_xmerge_config(v, out)
+}
+
+/// `git_xmerge_config()` (xdiff-interface.c:342-355), with the
+/// `parse_conflict_style_name()` table (xdiff-interface.c:312-326) inline: three
+/// exact, case-sensitive names.
+fn git_xmerge_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    if v.key == "merge.conflictstyle" {
+        let raw = string_value(v)?;
+        if !["diff3", "zdiff3", "merge"].contains(&raw.as_str()) {
+            return Err(reported(
+                v,
+                vec![format!("unknown style '{raw}' given for '{}'", v.key)],
+            ));
+        }
+        return Ok(());
+    }
+    git_default_config(v, out)
+}
+
 // ---------------------------------------------------------------------------
 // grep
 // ---------------------------------------------------------------------------
@@ -625,4 +703,53 @@ fn reported(v: &ConfigValue, errors: Vec<String>) -> Rejection {
         errors,
         fatal: v.origin.die_linenr(&v.key),
     }
+}
+
+// ---------------------------------------------------------------------------
+// merge-recursive
+// ---------------------------------------------------------------------------
+
+/// `init_merge_options()` → `merge_recursive_config()` (merge-recursive.c:3847-3877)
+/// — what `git merge-recursive`, its `-ours`/`-theirs` aliases and
+/// `git merge-subtree` run as `cmd_merge_recursive`'s first statement, ahead of
+/// `-h` and the `argc < 4` usage line.
+///
+/// Targeted lookups come first, each dying on a value it cannot read; then
+/// `git_config(git_xmerge_config)` walks every value. Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c merge.conflictStyle=bogus -c merge.verbosity=bogus merge-recursive
+/// fatal: bad numeric config value 'bogus' for 'merge.verbosity': invalid unit
+/// $ git -c core.createObject=bogus -c merge.conflictStyle=bogus merge-subtree
+/// fatal: invalid mode for object creation: bogus
+/// $ git -c merge.conflictStyle=bogus -c core.createObject=bogus merge-subtree
+/// error: unknown style 'bogus' given for 'merge.conflictstyle'
+/// fatal: unable to parse 'merge.conflictstyle' from command-line config
+/// ```
+///
+/// `merge.directoryRenames` is read too but never refuses (the C ignores values
+/// it does not know, "from future versions of git").
+pub fn validate_merge_recursive(repo: &gix::Repository) -> Result<(), Rejection> {
+    // `git_config_get_int()`: `die_bad_number`, with its ` in file` clause.
+    for key in ["merge.verbosity", "diff.renamelimit", "merge.renamelimit"] {
+        crate::config::config_int(repo, key).map_err(Rejection::Die)?;
+    }
+    // `git_config_get_bool("merge.renormalize")`, and `git_config_rename()`
+    // (diff.c:191-198) for the two rename keys: `copies`/`copy` first, then
+    // `git_config_bool`, whose refusal carries no origin.
+    for key in ["merge.renormalize", "diff.renames", "merge.renames"] {
+        let Some((raw, _)) = crate::config::last_value_with_origin(repo, key) else {
+            continue;
+        };
+        let copies = key != "merge.renormalize"
+            && (raw.eq_ignore_ascii_case("copies") || raw.eq_ignore_ascii_case("copy"));
+        if !copies && crate::optint::maybe_bool(&raw).is_none() {
+            return Err(Rejection::Die(format!("bad boolean config value '{raw}' for '{key}'")));
+        }
+    }
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_xmerge_config(&v, &mut out)?;
+    }
+    Ok(())
 }

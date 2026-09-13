@@ -9,6 +9,7 @@ use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
 use super::log::{approxidate, get_commit_format, rev_list_pretty_body, wildmatch, Pretty};
+use super::list_objects_filter::{self, Situation, LOFR_DO_SHOW, LOFR_MARK_SEEN, LOFR_SKIP_TREE};
 use crate::revfilter::{compile_patterns, CommitFilter, Dialect};
 
 /// The usage block stock git prints on a usage error, verbatim. git exits 129
@@ -650,19 +651,6 @@ struct Pending {
     uninteresting: bool,
 }
 
-/// `--filter=<spec>`: which objects the `--objects` walk leaves out.
-#[derive(Clone, Copy)]
-enum Filter {
-    /// `blob:none` — omit every blob.
-    BlobNone,
-    /// `blob:limit=<n>` — omit blobs of `n` bytes or more.
-    BlobLimit(u64),
-    /// `tree:<depth>` — omit every object whose depth from the root tree is at
-    /// least `depth`. The root tree itself is depth 0, so `tree:0` omits
-    /// everything and `tree:1` keeps only the root trees.
-    TreeDepth(u64),
-}
-
 /// `--missing=<action>`: what an object the repository does not have costs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Missing {
@@ -682,18 +670,27 @@ enum Missing {
     AllowPromisor,
 }
 
-/// What the `--objects` walk lists, and what it does about objects the
-/// repository does not have.
-#[derive(Clone, Copy)]
-struct ObjectWalk<'a> {
-    filter: Option<Filter>,
+/// git's `struct traversal_context` (list-objects.c:21-28) together with the
+/// object flags the `--objects` walk reads and writes: what it lists, what it
+/// does about objects the repository does not have, and the `--filter` that
+/// decides each object's fate.
+struct Traversal<'r> {
+    repo: &'r gix::Repository,
+    /// `ctx->filter`: `None` when no `--filter` was given.
+    filter: Option<list_objects_filter::Filter>,
+    /// `FILTER_SHOWN_BUT_REVISIT` on the objects that carry it.
+    revisit: list_objects_filter::ShownButRevisit,
+    /// `SEEN | UNINTERESTING`: an object here is never offered again.
+    seen: HashSet<ObjectId>,
     missing: Missing,
-    /// `--filter-print-omitted`: whether an omit set is being collected, which
-    /// is what makes the walk descend into a tree the filter excluded.
-    collect_omits: bool,
     /// The `--` pathspecs, which restrict the listed trees and blobs the same
     /// way they restrict the commits. `None` means every object is listed.
-    pathspecs: Option<&'a super::log::PathspecMatcher>,
+    pathspecs: Option<&'r super::log::PathspecMatcher>,
+    /// Each listed object and the path it was reached through, which
+    /// `--no-object-names` drops at render time.
+    lines: Vec<(ObjectId, Vec<u8>)>,
+    /// The objects `--missing=print` reports once the walk is over.
+    absent: Vec<MissingObject>,
 }
 
 /// `git rev-list` — list commit ids reachable from the given revisions.
@@ -908,7 +905,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // the default stands until `--date=<mode>` moves it.
     let mut date_mode = super::log::DateMode::Default;
     let mut order = Order::Date;
-    let mut filter: Option<Filter> = None;
+    let mut filter: Option<list_objects_filter::FilterOptions> = None;
     // `--filter-provided-objects` (builtin/rev-list.c:609-612, 736-744): the
     // objects named on the command line lose their `USER_GIVEN` exemption and go
     // through the filter like everything the walk reaches.
@@ -1690,15 +1687,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 // git leaves an unrecognised value on the default action.
                 _ => missing = Missing::Error,
             },
-            s if s.starts_with("--filter=") => match parse_filter(&s["--filter=".len()..]) {
-                Some(f) => filter = Some(f),
-                None => {
-                    return Ok(fatal(&format!(
-                        "invalid filter-spec '{}'",
-                        &s["--filter=".len()..]
-                    )))
+            // `parse_list_objects_filter(&revs->filter, arg)` (revision.c:2926-2927):
+            // a repeated `--filter` extends the first into a `combine:`, and a bad
+            // spec dies where it is read.
+            s if s.starts_with("--filter=") => {
+                let spec = &s.as_bytes()["--filter=".len()..];
+                if let Err(message) = list_objects_filter::parse_list_objects_filter(&mut filter, spec, false) {
+                    return Ok(fatal(&message));
                 }
-            },
+            }
             // `--skip=<n>` / `--skip <n>`: `revs->skip_count`. A negative count is
             // git's "no skip" (its `>= 0` guard), and a non-numeral is
             // `setup_revisions()`'s `die("'%s': not an integer")` rather than the
@@ -2569,16 +2566,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     } else {
         Some(super::log::PathspecMatcher::new(&repo, &pathspecs)?)
     };
-    let walk = ObjectWalk {
-        filter,
-        missing,
-        collect_omits: print_omitted,
-        pathspecs: object_specs.as_ref(),
+    // `traverse_commit_list_filtered()` (list-objects.c:426) builds the filter
+    // before the first commit is shown, so a `sparse:oid=` that does not resolve
+    // dies with nothing printed. `--filter-print-omitted` hands it the
+    // `omitted_objects` set to fill.
+    let filter = match filter.as_ref().map(|f| list_objects_filter::Filter::init(&repo, f, print_omitted)) {
+        Some(Err(message)) => return Ok(fatal(&message)),
+        Some(Ok(f)) => Some(f),
+        None => None,
     };
-    let mut absent: Vec<MissingObject> = Vec::new();
-    // `--filter-print-omitted`'s `omitted_objects` set, filled by the filter and
-    // printed once the walk is over.
-    let mut omitted: Vec<ObjectId> = Vec::new();
     // The same UNINTERESTING marking reaches the object walk: a tree or blob a
     // promisor pack holds is already "seen" and is never listed.
     let mut seen: HashSet<ObjectId> = match exclude_promisor {
@@ -2595,10 +2591,18 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if objects && !hidden.is_empty() && !commits.is_empty() {
         mark_hidden_objects(&repo, &hidden, first_parent, &mut seen)?;
     }
-    // Each entry is the object and the path it was reached through, which
-    // `--no-object-names` drops at render time. The tag objects seeded from refs
-    // come ahead of any tree, named by the tag's own name field.
-    let mut object_lines: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    let mut trav = Traversal {
+        repo: &repo,
+        filter,
+        revisit: HashSet::new(),
+        seen,
+        missing,
+        pathspecs: object_specs.as_ref(),
+        lines: Vec::new(),
+        absent: Vec::new(),
+    };
+    // The tag objects seeded from refs come ahead of any tree, named by the
+    // tag's own name field.
     if objects {
         // `traverse_non_commits()` (`list-objects.c:344-375`), in pending order:
         // a tag prints its own line and stops there, a blob prints one line, and
@@ -2610,59 +2614,43 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // its contents from an interesting tree named *before* it, not only after.
         for entry in pending.iter().filter(|e| e.uninteresting) {
             match entry.kind {
-                gix::object::Kind::Tree => mark_tree_seen(&repo, entry.id, &mut seen),
+                gix::object::Kind::Tree => mark_tree_seen(&repo, entry.id, &mut trav.seen),
                 _ => {
-                    seen.insert(entry.id);
+                    trav.seen.insert(entry.id);
                 }
             }
         }
         for entry in pending.iter().filter(|e| !e.uninteresting) {
-            if !seen.insert(entry.id) {
+            if trav.seen.contains(&entry.id) {
                 continue;
             }
-            // `list_objects_filter__filter_object()` (list-objects-filter.c:808-821)
+            // `list_objects_filter__filter_object()` (list-objects-filter.c:799)
             // consults the filter only for an object carrying `NOT_USER_GIVEN`; a
-            // pending tree or blob has it only under `--filter-provided-objects`.
-            // Otherwise it is shown unconditionally.
-            match entry.kind {
+            // pending object has it only under `--filter-provided-objects`
+            // (builtin/rev-list.c:958-966).
+            let walked = match entry.kind {
+                gix::object::Kind::Tag => process_tag(&mut trav, entry.id, &entry.name, filter_provided_objects),
                 gix::object::Kind::Tree => {
-                    // `filter_trees_depth()` hides a tree at depth 0 only for
-                    // `tree:0`; the blob filters always show trees.
-                    let root_hidden = filter_provided_objects
-                        && matches!(walk.filter, Some(Filter::TreeDepth(0)));
-                    if !root_hidden {
-                        object_lines.push((entry.id, entry.name.clone()));
-                    }
-                    if let Err(code) = walk_tree(
-                        &repo,
-                        entry.id,
-                        &entry.name,
-                        0,
-                        &mut seen,
-                        &mut object_lines,
-                        &mut absent,
-                        &mut omitted,
-                        &walk,
-                    )? {
-                        return Ok(code);
-                    }
+                    process_tree(&mut trav, entry.id, &mut Vec::new(), &entry.name, filter_provided_objects)
                 }
-                gix::object::Kind::Blob => match blob_filtered(
-                    &repo,
-                    entry.id,
-                    &entry.name,
-                    &mut absent,
-                    &ObjectWalk { filter: walk.filter.filter(|_| filter_provided_objects), ..walk },
-                )? {
-                    Ok(BlobVerdict::Filtered) => omitted.push(entry.id),
-                    Ok(BlobVerdict::Absent) => {}
-                    Ok(BlobVerdict::Show) => object_lines.push((entry.id, entry.name.clone())),
-                    Err(code) => return Ok(code),
-                },
-                _ => object_lines.push((entry.id, entry.name.clone())),
+                gix::object::Kind::Blob => {
+                    process_blob(&mut trav, entry.id, &mut Vec::new(), &entry.name, filter_provided_objects)
+                }
+                gix::object::Kind::Commit => {
+                    trav.seen.insert(entry.id);
+                    trav.lines.push((entry.id, entry.name.clone()));
+                    Ok(())
+                }
+            };
+            if let Err(code) = walked {
+                return Ok(code);
             }
         }
     }
+    // The commits `setup_revisions()` read from the command line: every other
+    // commit the walk returns was reached through a parent and carries
+    // `NOT_USER_GIVEN` (revision.c:1160, 1207).
+    let user_given_commits: HashSet<ObjectId> = seeds.iter().map(|s| s.id).collect();
     let object_line = |id: &ObjectId, name: &[u8], out: &mut Vec<u8>| {
         out.extend_from_slice(id.to_string().as_bytes());
         if object_names {
@@ -2696,13 +2684,27 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     for (id, is_boundary) in &emitted {
         let record_start = out.len();
-        if disk_usage {
+        // `do_traverse()` (list-objects.c:377) offers every commit to the
+        // filter as `LOFS_COMMIT` and calls `show_commit()` — which does the
+        // counting, the disk usage and the printing — only on `LOFR_DO_SHOW`.
+        let commit_shown = list_objects_filter::filter_object(
+            &repo,
+            trav.filter.as_mut(),
+            filter_provided_objects || !user_given_commits.contains(id),
+            Situation::Commit,
+            *id,
+            b"",
+            b"",
+            &mut trav.revisit,
+        ) & LOFR_DO_SHOW
+            != 0;
+        if commit_shown && disk_usage {
             match object_disk_size(&repo, *id) {
                 Some(n) => disk_total += n,
                 None => return Ok(fatal(&format!("unable to get disk usage of {id}"))),
             }
         }
-        if count_only && !quiet {
+        if commit_shown && count_only && !quiet {
             // `--count` with `--cherry-mark` reports the equivalent commits in a column of their
             // own rather than among the two sides (`print_commit_counts()`), which is how
             // `3\t2` distinguishes "three commits, two of them already upstream".
@@ -2717,7 +2719,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // `show_commit` returns before rendering under `--quiet` and `--count`,
         // but `traverse_commit_list` still visits the objects behind each commit,
         // so the interleaved `--in-commit-order` listing below is not skipped.
-        if !quiet && !count_only {
+        if commit_shown && !quiet && !count_only {
             out.extend_from_slice(header_prefix);
             // `--timestamp`: `show_commit()` prints the commit date in front of the
             // object name, which is how a caller sorts a list without re-reading each
@@ -2811,18 +2813,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             graph_blocks.push((!text.is_empty()).then(|| super::log::GraphBlock::message_only(text)));
         }
         if objects && in_commit_order && !is_boundary {
-            if let Err(code) = collect_commit_objects(
-                &repo,
-                *id,
-                &mut seen,
-                &mut object_lines,
-                &mut absent,
-                &mut omitted,
-                &walk,
-            )? {
+            if let Err(code) = collect_commit_objects(&mut trav, *id) {
                 return Ok(code);
             }
-            for (oid, name) in object_lines.drain(..) {
+            for (oid, name) in trav.lines.drain(..) {
                 if disk_usage {
                     match object_disk_size(&repo, oid) {
                         Some(n) => disk_total += n,
@@ -2894,19 +2888,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // commit's objects inside the loop, alongside the commit, and those stand.
     if objects && !in_commit_order && abort.is_none() {
         for id in &commits {
-            if let Err(code) = collect_commit_objects(
-                &repo,
-                *id,
-                &mut seen,
-                &mut object_lines,
-                &mut absent,
-                &mut omitted,
-                &walk,
-            )? {
+            if let Err(code) = collect_commit_objects(&mut trav, *id) {
                 return Ok(code);
             }
         }
-        for (id, name) in &object_lines {
+        for (id, name) in &trav.lines {
             if disk_usage {
                 match object_disk_size(&repo, *id) {
                     Some(n) => disk_total += n,
@@ -2987,12 +2973,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // different tables, so the same ids order differently in the two blocks. See
     // [`crate::oidhash`].
     if print_omitted {
+        // `list_objects_filter__free()` merges a combine's per-sub-filter sets
+        // into `omitted_objects` before this runs.
+        let omitted = trav.filter.take().map(|f| f.finish().into_ids()).unwrap_or_default();
         for id in crate::oidhash::khash_order(&omitted) {
             writeln!(sink, "~{id}")?;
         }
     }
     // The map is keyed by id, so the order comes from the ids alone; the entry
     // each one names supplies the two fields `print-info` appends.
+    let absent = std::mem::take(&mut trav.absent);
     let absent_ids: Vec<ObjectId> = absent.iter().map(|entry| entry.id).collect();
     for id in crate::oidhash::hashmap_order(&absent_ids) {
         let Some(entry) = absent.iter().find(|entry| entry.id == id) else {
@@ -3954,34 +3944,6 @@ fn count_distance(
     nr
 }
 
-/// The `--filter=<spec>` forms this port applies. Anything else — `sparse:`,
-/// `object:type=`, `combine:` — is reported as an invalid spec rather than
-/// silently letting every object through.
-fn parse_filter(spec: &str) -> Option<Filter> {
-    if spec == "blob:none" {
-        return Some(Filter::BlobNone);
-    }
-    if let Some(v) = spec.strip_prefix("blob:limit=") {
-        return parse_size(v).map(Filter::BlobLimit);
-    }
-    if let Some(v) = spec.strip_prefix("tree:") {
-        return v.parse::<u64>().ok().map(Filter::TreeDepth);
-    }
-    None
-}
-
-/// git's `git_parse_ulong` for a filter size: digits with an optional `k`/`m`/`g`
-/// multiplier, either case.
-fn parse_size(value: &str) -> Option<u64> {
-    let (digits, scale) = match value.as_bytes().last() {
-        Some(b'k') | Some(b'K') => (&value[..value.len() - 1], 1024),
-        Some(b'm') | Some(b'M') => (&value[..value.len() - 1], 1024 * 1024),
-        Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
-        _ => (value, 1),
-    };
-    digits.parse::<u64>().ok()?.checked_mul(scale)
-}
-
 /// The commit's committer timestamp, or 0 when the object cannot be read — the
 /// value git's `parse_commit_gently` failure path leaves behind.
 pub(crate) fn commit_date(repo: &gix::Repository, id: ObjectId) -> i64 {
@@ -4453,35 +4415,208 @@ fn mark_hidden_objects(
     Ok(())
 }
 
-/// Append the `--objects` lines for one commit: its tree walked depth-first,
-/// globally de-duplicated through `seen`.
-///
-/// An object the repository does not have is fatal unless `--missing` asked for
-/// it to be skipped, which is git's `finish_object__ma`; `absent` collects the
-/// ones `--missing=print` then reports.
-fn collect_commit_objects(
-    repo: &gix::Repository,
-    commit: ObjectId,
-    seen: &mut HashSet<ObjectId>,
-    lines: &mut Vec<(ObjectId, Vec<u8>)>,
-    absent: &mut Vec<MissingObject>,
-    omitted: &mut Vec<ObjectId>,
-    walk: &ObjectWalk<'_>,
-) -> Result<Result<(), ExitCode>> {
-    let Some(tree) = commit_tree(repo, commit) else {
-        return Ok(Ok(()));
+/// The root tree of one commit, walked the way `do_traverse()` pends it
+/// (list-objects.c:397-404): with `NOT_USER_GIVEN` set and an empty path.
+fn collect_commit_objects(trav: &mut Traversal<'_>, commit: ObjectId) -> Result<(), ExitCode> {
+    let Some(tree) = commit_tree(trav.repo, commit) else {
+        return Ok(());
     };
-    if !seen.insert(tree) {
-        return Ok(Ok(()));
+    process_tree(trav, tree, &mut Vec::new(), b"", true)
+}
+
+/// git's `show_object()` callback (builtin/rev-list.c:366, 379) as far as the
+/// listing goes: `finish_object()` first asks whether the object exists, and a
+/// missing one goes to `finish_object__ma()` instead of being listed.
+fn show_object(
+    trav: &mut Traversal<'_>,
+    id: ObjectId,
+    name: &[u8],
+    kind: gix::object::Kind,
+    exists: bool,
+) -> Result<(), ExitCode> {
+    if !exists {
+        return match note_missing(trav.repo, id, name, kind, &mut trav.absent, trav.missing) {
+            Some(code) => Err(code),
+            None => Ok(()),
+        };
     }
-    // `tree:0` omits even the root tree; every other filter keeps it. A root tree
-    // is reached through no path, so its name is empty.
-    if matches!(walk.filter, Some(Filter::TreeDepth(0))) {
-        omitted.push(tree);
-    } else {
-        lines.push((tree, Vec::new()));
+    trav.lines.push((id, name.to_vec()));
+    Ok(())
+}
+
+/// `process_tag()` (list-objects.c:221).
+fn process_tag(trav: &mut Traversal<'_>, id: ObjectId, name: &[u8], not_user_given: bool) -> Result<(), ExitCode> {
+    let r = list_objects_filter::filter_object(
+        trav.repo,
+        trav.filter.as_mut(),
+        not_user_given,
+        Situation::Tag,
+        id,
+        b"",
+        b"",
+        &mut trav.revisit,
+    );
+    if r & LOFR_MARK_SEEN != 0 {
+        trav.seen.insert(id);
     }
-    walk_tree(repo, tree, &[], 1, seen, lines, absent, omitted, walk)
+    if r & LOFR_DO_SHOW != 0 {
+        show_object(trav, id, name, gix::object::Kind::Tag, true)?;
+    }
+    Ok(())
+}
+
+/// `process_blob()` (list-objects.c:51). The filter runs *before* the show
+/// callback, and only the callback looks the object up — so a `blob:none` walk
+/// never touches a blob at all, which is what lets it list a partial clone whose
+/// blobs are not there.
+fn process_blob(
+    trav: &mut Traversal<'_>,
+    id: ObjectId,
+    path: &mut Vec<u8>,
+    name: &[u8],
+    not_user_given: bool,
+) -> Result<(), ExitCode> {
+    if trav.seen.contains(&id) {
+        return Ok(());
+    }
+    let pathlen = path.len();
+    path.extend_from_slice(name);
+    let r = list_objects_filter::filter_object(
+        trav.repo,
+        trav.filter.as_mut(),
+        not_user_given,
+        Situation::Blob,
+        id,
+        path,
+        &path[pathlen..],
+        &mut trav.revisit,
+    );
+    if r & LOFR_MARK_SEEN != 0 {
+        trav.seen.insert(id);
+    }
+    let shown = match r & LOFR_DO_SHOW != 0 {
+        true => {
+            let exists = trav.repo.find_header(id).is_ok();
+            show_object(trav, id, path, gix::object::Kind::Blob, exists)
+        }
+        false => Ok(()),
+    };
+    path.truncate(pathlen);
+    shown
+}
+
+/// `process_tree()` (list-objects.c:149): offer the tree to the filter as
+/// `LOFS_BEGIN_TREE`, walk its entries unless the filter said `LOFR_SKIP_TREE`,
+/// then offer it again as `LOFS_END_TREE`. `base` is the path of the tree being
+/// walked into, `/`-terminated when non-empty, and is restored on return.
+///
+/// A tree the repository lacks is `die("bad tree object")` territory unless
+/// `--missing` asked otherwise; under the default action this port keeps the
+/// `missing object` fatal [`note_missing`] raises. Otherwise the filter still
+/// decides whether the tree is shown, and showing it reports it missing.
+fn process_tree(
+    trav: &mut Traversal<'_>,
+    id: ObjectId,
+    base: &mut Vec<u8>,
+    name: &[u8],
+    not_user_given: bool,
+) -> Result<(), ExitCode> {
+    if trav.seen.contains(&id) {
+        return Ok(());
+    }
+    // The entries are collected first so the tree borrow ends before recursing.
+    let entries: Option<Vec<(ObjectId, Vec<u8>, gix::object::tree::EntryMode)>> =
+        tree_object(trav.repo, id).map(|tree| {
+            tree.iter()
+                .filter_map(|e| e.ok())
+                .map(|e| (e.object_id(), e.filename().to_vec(), e.mode()))
+                .collect()
+        });
+    let failed_parse = entries.is_none();
+    let baselen = base.len();
+    base.extend_from_slice(name);
+    if failed_parse && trav.missing == Missing::Error {
+        // `base` is this tree's own path — empty for the root tree.
+        if let Some(code) = note_missing(trav.repo, id, base, gix::object::Kind::Tree, &mut trav.absent, trav.missing) {
+            return Err(code);
+        }
+    }
+
+    let r = list_objects_filter::filter_object(
+        trav.repo,
+        trav.filter.as_mut(),
+        not_user_given,
+        Situation::BeginTree,
+        id,
+        base,
+        &base[baselen..],
+        &mut trav.revisit,
+    );
+    if r & LOFR_MARK_SEEN != 0 {
+        trav.seen.insert(id);
+    }
+    if r & LOFR_DO_SHOW != 0 {
+        show_object(trav, id, base, gix::object::Kind::Tree, !failed_parse)?;
+    }
+    if !base.is_empty() {
+        base.push(b'/');
+    }
+
+    if r & LOFR_SKIP_TREE == 0 {
+        if let Some(entries) = entries {
+            process_tree_contents(trav, &entries, base)?;
+        }
+    }
+
+    let r = list_objects_filter::filter_object(
+        trav.repo,
+        trav.filter.as_mut(),
+        not_user_given,
+        Situation::EndTree,
+        id,
+        base,
+        &base[baselen..],
+        &mut trav.revisit,
+    );
+    if r & LOFR_MARK_SEEN != 0 {
+        trav.seen.insert(id);
+    }
+    if r & LOFR_DO_SHOW != 0 {
+        show_object(trav, id, base, gix::object::Kind::Tree, !failed_parse)?;
+    }
+    base.truncate(baselen);
+    Ok(())
+}
+
+/// `process_tree_contents()` (list-objects.c:100): every entry the pathspecs
+/// admit, subtrees recursed into where they stand, gitlinks skipped because
+/// their commit lives in another repository. Everything reached here carries
+/// `NOT_USER_GIVEN`.
+fn process_tree_contents(
+    trav: &mut Traversal<'_>,
+    entries: &[(ObjectId, Vec<u8>, gix::object::tree::EntryMode)],
+    base: &mut Vec<u8>,
+) -> Result<(), ExitCode> {
+    for (id, filename, mode) in entries {
+        let is_tree = mode.is_tree();
+        if trav.pathspecs.is_some() {
+            let baselen = base.len();
+            base.extend_from_slice(filename);
+            let interesting = entry_interesting(base, is_tree, trav.pathspecs);
+            base.truncate(baselen);
+            if !interesting {
+                continue;
+            }
+        }
+        if is_tree {
+            process_tree(trav, *id, base, filename, true)?;
+        } else if mode.is_commit() {
+            // ignore gitlink
+        } else {
+            process_blob(trav, *id, base, filename, true)?;
+        }
+    }
+    Ok(())
 }
 
 /// The tree a commit points at, or `None` if the object is missing or is not a
@@ -4698,114 +4833,6 @@ fn mark_tree_seen(repo: &gix::Repository, tree: ObjectId, seen: &mut HashSet<Obj
             seen.insert(id);
         }
     }
-}
-
-/// Depth-first walk recording `(<oid>, <path>)` per entry, descending into a subtree
-/// immediately after listing it — the order git's `process_tree` produces.
-///
-/// `depth` is the depth of the entries listed here, counting the root tree as 0
-/// and its entries as 1, which is what `--filter=tree:<n>` measures. Gitlink
-/// entries are skipped: their commit lives in another repository.
-#[allow(clippy::too_many_arguments)]
-fn walk_tree(
-    repo: &gix::Repository,
-    tree: ObjectId,
-    base: &[u8],
-    depth: u64,
-    seen: &mut HashSet<ObjectId>,
-    lines: &mut Vec<(ObjectId, Vec<u8>)>,
-    absent: &mut Vec<MissingObject>,
-    omitted: &mut Vec<ObjectId>,
-    walk: &ObjectWalk<'_>,
-) -> Result<Result<(), ExitCode>> {
-    // Nothing at this depth, or under it, survives the tree filter.
-    //
-    // ```c
-    // if (include_it)
-    //         filter_res = LOFR_DO_SHOW;
-    // else if (omits && !been_omitted)
-    //         /*
-    //          * Must update omit information of children
-    //          * recursively; they have not been omitted yet.
-    //          */
-    //         filter_res = LOFR_ZERO;
-    // else
-    //         filter_res = LOFR_SKIP_TREE;
-    // ```
-    //
-    // (`filter_trees_depth()`, list-objects-filter.c:226-235.) An excluded tree
-    // is `LOFR_SKIP_TREE` — the subtree is never visited — *unless* an omit set
-    // is being collected, in which case the walk descends anyway with nothing
-    // shown, so every child is recorded as omitted too.
-    let excluded = matches!(walk.filter, Some(Filter::TreeDepth(max)) if depth >= max);
-    if excluded && !walk.collect_omits {
-        return Ok(Ok(()));
-    }
-    let Some(object) = tree_object(repo, tree) else {
-        // `base` is this tree's own path — the `path->buf` `process_tree()` hands
-        // `show_object()` — and is empty for the root tree.
-        if let Some(code) = note_missing(
-            repo,
-            tree,
-            base,
-            gix::object::Kind::Tree,
-            absent,
-            walk.missing,
-        ) {
-            return Ok(Err(code));
-        }
-        return Ok(Ok(()));
-    };
-    // The entries are collected first so the tree borrow ends before recursing.
-    let entries: Vec<(ObjectId, Vec<u8>, gix::object::tree::EntryMode)> = object
-        .iter()
-        .filter_map(|e| e.ok())
-        .map(|e| (e.object_id(), e.filename().to_vec(), e.mode()))
-        .collect();
-    for (id, filename, mode) in entries {
-        if mode.is_commit() {
-            continue;
-        }
-        let mut path = Vec::with_capacity(base.len() + 1 + filename.len());
-        if !base.is_empty() {
-            path.extend_from_slice(base);
-            path.push(b'/');
-        }
-        path.extend_from_slice(&filename);
-        if !entry_interesting(&path, mode.is_tree(), walk.pathspecs) {
-            continue;
-        }
-        if !seen.insert(id) {
-            continue;
-        }
-        if mode.is_tree() {
-            match excluded {
-                true => omitted.push(id),
-                false => lines.push((id, path.clone())),
-            }
-            if let Err(code) =
-                walk_tree(repo, id, &path, depth + 1, seen, lines, absent, omitted, walk)?
-            {
-                return Ok(Err(code));
-            }
-            continue;
-        }
-        if excluded {
-            omitted.push(id);
-            continue;
-        }
-        match blob_filtered(repo, id, &path, absent, walk)? {
-            Ok(BlobVerdict::Filtered) => {
-                omitted.push(id);
-                continue;
-            }
-            Ok(BlobVerdict::Absent) => continue,
-            Ok(BlobVerdict::Show) => {}
-            Err(code) => return Ok(Err(code)),
-        }
-        lines.push((id, path));
-    }
-    Ok(Ok(()))
 }
 
 /// git's `missing_objects_map_entry`: one object the walk could not read, with
@@ -5069,66 +5096,6 @@ fn entry_interesting(
     } else {
         specs.matches(path)
     }
-}
-
-/// Whether `--filter=` omits this blob. Reading its header is also the missing
-/// object check: `finish_object()` asks the object database for every object it
-/// is about to show, and dies unless `--missing` said not to.
-fn blob_filtered(
-    repo: &gix::Repository,
-    id: ObjectId,
-    path: &[u8],
-    absent: &mut Vec<MissingObject>,
-    walk: &ObjectWalk<'_>,
-) -> Result<Result<BlobVerdict, ExitCode>> {
-    // ```c
-    // if (ctx->filter_fn) {
-    //         r = ctx->filter_fn(ctx->revs->repo, LOFS_BLOB, obj, …);
-    //         if (r & LOFR_MARK_SEEN) obj->flags |= SEEN;
-    //         if (r & LOFR_DO_SHOW) ctx->show_object(obj, path->buf, ctx->show_data);
-    //         return;
-    // }
-    // ```
-    //
-    // (`process_blob()`, list-objects.c.) The filter runs *before* the show
-    // callback, and only the callback looks the object up — so a `blob:none`
-    // walk never touches a blob at all. That is what lets it list a partial
-    // clone whose blobs are not there; asking about them first turned the
-    // listing into `missing object '<oid>'`.
-    if matches!(walk.filter, Some(Filter::BlobNone)) {
-        return Ok(Ok(BlobVerdict::Filtered));
-    }
-    let header = repo.find_header(id).ok();
-    let Some(header) = header else {
-        if let Some(code) = note_missing(
-            repo,
-            id,
-            path,
-            gix::object::Kind::Blob,
-            absent,
-            walk.missing,
-        ) {
-            return Ok(Err(code));
-        }
-        // A missing object is skipped rather than listed — and it is *not* one
-        // the filter omitted, so it belongs to the missing report, not the
-        // omitted one.
-        return Ok(Ok(BlobVerdict::Absent));
-    };
-    Ok(Ok(match walk.filter {
-        Some(Filter::BlobLimit(limit)) if header.size() >= limit => BlobVerdict::Filtered,
-        _ => BlobVerdict::Show,
-    }))
-}
-
-/// What [`blob_filtered`] decided about one blob.
-enum BlobVerdict {
-    /// The filter omitted it: `--filter-print-omitted` names this one.
-    Filtered,
-    /// The repository does not have it; `--missing` has already been consulted.
-    Absent,
-    /// List it.
-    Show,
 }
 
 /// git's `get_object_disk_usage`: the bytes the object occupies in the object

@@ -590,6 +590,7 @@ mod interpret_trailers;
 mod jump;
 mod last_modified;
 pub(crate) mod line_log;
+mod list_objects_filter;
 pub(crate) mod log;
 mod ls_files;
 mod ls_remote;

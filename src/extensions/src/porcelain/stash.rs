@@ -2659,6 +2659,15 @@ fn restore_stash_commit(
         }
     }
 
+    // `init_ui_merge_options(&o, the_repository)` (builtin/stash.c:696), after the
+    // `--index` arm and before the merge: its `merge_recursive_config()` reads
+    // `merge.verbosity`, `diff.renamelimit` and `merge.renamelimit` with
+    // `git_config_get_int()`, which dies on a value it cannot read — so the
+    // refusal comes out alone, with no `The stash entry is kept` after it.
+    if super::merge::merge_recursive_config_check(repo).is_some() {
+        return Err(crate::parseopt::silent(crate::fatal::EXIT_FATAL));
+    }
+
     // `merge_trees()` (merge-recursive.c): a merge whose base already equals the
     // other side has nothing to bring in and says so on stdout, `-q` included — which
     // is what an entry holding only untracked files looks like from here.

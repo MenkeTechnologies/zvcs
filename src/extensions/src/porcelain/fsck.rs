@@ -407,6 +407,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // makes `snapshot_refs()` return before it touches the ref store, which is
     // why this is the `else` of step 2.
     let mut default_refs_snapshot = 0usize;
+    let mut snapshot_missed = false;
     if !explicit_heads {
         default_refs_snapshot = collect_default_heads(
             &repo,
@@ -415,6 +416,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             &mut pre_parsed,
             &promisor,
             &mut errors,
+            &mut snapshot_missed,
         )?;
     }
 
@@ -437,7 +439,14 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // is what decides where two colliding ids land in `obj_hash`. Take only
     // membership from the iterator and re-lay `all` in git's order whenever that
     // order is reconstructible — see [`loose_scan_order`].
-    let scan_ordered = match loose_scan_order(&repo, opt.check_full) {
+    // `snapshot_refs()` read every head it parsed, and each read a pack answered
+    // moved that pack to the front of its source's list (see [`PackLists`]).
+    // Those reads are the snapshot's heads, in order, only when the snapshot
+    // is all this port replays: an `<object>` argument's `repo_get_oid()` may
+    // read on its own account, and a read that misses re-prepares the odb.
+    let snapshot_reads = (!explicit_heads && !snapshot_missed).then_some(heads.as_slice());
+    let pack_lists = PackLists::load(&repo, snapshot_reads);
+    let scan_ordered = match loose_scan_order(&repo, opt.check_full, pack_lists.as_ref()) {
         Some(order) if order.len() == all.len() && order.iter().all(|id| in_odb.contains(id)) => {
             all = order;
             true
@@ -455,9 +464,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // creation this port does not model), and when there is no linked worktree —
     // whose HEAD git snapshots with the main one but which this port handles in
     // one later block together with that worktree's index and reflogs.
-    let creation_modeled = scan_ordered
+    let mut creation_modeled = scan_ordered
         && !opt.connectivity_only
         && repo.worktrees().map(|w| w.is_empty()).unwrap_or(true);
+    let has_promisor_remote = super::rev_list::has_promisor_remote(&repo);
 
     // Children of every object, for `used` and `missing`. git checks every
     // object in the odb, not just the reachable ones, and marks each child it
@@ -775,8 +785,50 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     //
     // Every snapshotted head goes through it, whichever of the two ways it was
     // snapshotted — an explicit `<object>` in step 2 or a reference in step 2b.
+    //
+    // `fsck_handle_ref()` then hands the head to `mark_object()`, whose
+    // `is_promisor_object()` (builtin/fsck.c:155) builds the promisor set on its
+    // first call in a repository with a promisor remote (packfile.c:2781-2798):
+    // `add_promisor_object()` runs over every promisor pack in pack order and
+    // opens each object with `lookup_object()` (packfile.c:2733) — a lookup of
+    // an object the scan already created, which moves it back to its home slot.
+    let mut promisor_pass_done = !has_promisor_remote;
+    if has_promisor_remote && (snapshot_missed || heads.is_empty()) {
+        // `snapshot_ref()` asks `is_promisor_object()` about a head it cannot
+        // parse (builtin/fsck.c:554-555), which runs the pass before the scan
+        // has created anything; with no snapshot head at all the pass runs at
+        // a reflog's or an index entry's `mark_object()` instead. Neither
+        // position is replayed.
+        creation_modeled = false;
+        promisor_pass_done = true;
+    }
     for id in heads.clone() {
         state.note(id);
+        if promisor_pass_done {
+            continue;
+        }
+        promisor_pass_done = true;
+        // Between `odb_reprepare()` and here only two things read packed
+        // objects through `find_pack_entry()`: `fsck_finish()`'s blob lint and
+        // this head's own `parse_object()` — which reads only a tree, since
+        // `fsck_obj()` freed every tree's buffer (builtin/fsck.c:444-445,
+        // tree.c:208-213) while commits, tags and blobs stay parsed. The pass
+        // itself sets `skip_mru_updates` (packfile.c:2573), so it leaves the
+        // list alone.
+        let first_is_tree = matches!(repo.find_header(id).map(|h| h.kind()), Ok(Kind::Tree));
+        let finish_read = !gitmodules_found.is_empty() || !gitattributes_found.is_empty();
+        match &pack_lists {
+            Some(lists)
+                if !corrupt.contains(&id)
+                    && !unparseable.contains_key(&id)
+                    && (!finish_read || lists.pack_count() < 2) =>
+            {
+                for promised in lists.promisor_pass(first_is_tree.then_some(id)) {
+                    state.note(promised);
+                }
+            }
+            _ => creation_modeled = false,
+        }
     }
 
     // ---- 4. the rest of the head set ----------------------------------------
@@ -1610,6 +1662,7 @@ fn collect_default_heads(
     pre_parsed: &mut HashSet<ObjectId>,
     promisor: &HashSet<ObjectId>,
     errors: &mut u8,
+    missed: &mut bool,
 ) -> Result<usize> {
     let mut count = 0usize;
     // One `snapshot_ref()` call: `parse_object()` first, which creates the object
@@ -1627,6 +1680,7 @@ fn collect_default_heads(
                             id: ObjectId|
      -> usize {
         if !repo.has_object(id) {
+            *missed = true;
             if promisor.contains(&id) {
                 return 1;
             }
@@ -2714,117 +2768,192 @@ fn probe_insert(table: &mut [Option<ObjectId>], id: ObjectId) {
 /// order, which `std::fs::read_dir` is the same system call for.
 ///
 /// After every source's loose walk, `check_full` re-runs `fsck_obj()` over the
-/// packed objects through `verify_pack()`; [`pack_scan_order`] is that tail.
+/// packed objects through `verify_pack()`: `verify_packfile()` (pack-check.c)
+/// sorts each pack's index entries by **pack offset** before calling
+/// `fsck_obj_buffer()`, and `repo_for_each_pack` visits the packs source by
+/// source in [`PackLists`] order.
 ///
 /// `None` when the tail is not reconstructible — `--no-full` (which skips the
 /// packs entirely, leaving the odb listing this port takes `all` from wider than
-/// what git created) or packs whose visiting order [`pack_scan_order`] cannot
-/// determine.
-fn loose_scan_order(repo: &gix::Repository, check_full: bool) -> Option<Vec<ObjectId>> {
+/// what git created) or pack lists [`PackLists::load`] cannot replay.
+fn loose_scan_order(
+    repo: &gix::Repository,
+    check_full: bool,
+    pack_lists: Option<&PackLists>,
+) -> Option<Vec<ObjectId>> {
     let mut out = loose_only_scan_order(repo);
     if has_packs(repo) {
         if !check_full {
             return None;
         }
-        out.extend(pack_scan_order(repo)?);
+        for pack in pack_lists?.packs() {
+            out.extend(pack.ids_by_offset());
+        }
     }
     Some(out)
 }
 
-/// The order `verify_pack()` re-checks packed objects in.
+/// One `struct packed_git` in a source's `packfile_store` list.
+struct ListedPack {
+    /// `st_mtime` of the **.pack** file (packfile.c:840-851), whole seconds.
+    mtime: i64,
+    index: pack::index::File,
+    /// `p->pack_promisor`: a `.promisor` file sits beside the pack.
+    promisor: bool,
+}
+
+impl ListedPack {
+    /// The pack's ids in pack-offset order, which is both `verify_packfile()`'s
+    /// order and `for_each_object_in_pack()`'s under
+    /// `ODB_FOR_EACH_OBJECT_PACK_ORDER` (packfile.c:2310-2350).
+    fn ids_by_offset(&self) -> Vec<ObjectId> {
+        let mut by_offset: Vec<(u64, ObjectId)> =
+            self.index.iter().map(|entry| (entry.pack_offset, entry.oid)).collect();
+        by_offset.sort();
+        by_offset.into_iter().map(|(_, id)| id).collect()
+    }
+}
+
+/// Every odb source's pack list as it stands after `cmd_fsck`'s
+/// `odb_reprepare()` (builtin/fsck.c:1066).
 ///
-/// `verify_packfile()` (pack-check.c) reads every index entry, sorts the array
-/// by **pack offset** — "since unpacking them is more efficient that way" — and
-/// only then calls `fsck_obj_buffer()` per entry. So the order is the pack's own
-/// layout, not its index's.
+/// `packfile_store_prepare()` builds a source's list by enumerating
+/// `<objdir>/pack` with a bare `readdir()` and appending each `.idx` to the tail
+/// (`prepare_pack()`, `packfile_list_append()`, packfile.c:106-123, :991-1005),
+/// then sorts it (packfile.c:1071-1085). `sort_pack()` compares `pack_local`,
+/// which every pack of one source shares, and then `mtime`, younger first,
+/// returning 0 on a tie (packfile.c:1044-1069); `sort_packs` is
+/// `DEFINE_LIST_SORT`, a stable mergesort (mergesort.h), so a tie keeps list
+/// order.
 ///
-/// Packs are visited source by source (`repo_for_each_pack`, packfile.h:185-236),
-/// and within one source in the order of that source's own list, which
-/// `packfile_store_prepare()` builds and sorts:
+/// Every read a pack answers moves that pack to the head of its list
+/// (`find_pack_entry()`, packfile.c:2149-2168). A source is asked packed-first,
+/// then loose (odb/source-files.c:51-63), and sources are asked in order. So
+/// the reads `snapshot_refs()` made move packs about before `odb_reprepare()`
+/// re-sorts — which re-appends nothing, since `packfile_store_load_pack()`
+/// returns the `packs_by_path` entry it already has (packfile.c:872-894) — and
+/// a tie is left in that moved order.
 ///
-/// ```c
-/// prepare_packed_git_one(store->source);
-/// sort_packs(&store->packs.head, sort_pack);
-/// ```
-///
-/// (packfile.c:1071-1085.) `sort_pack()` compares `pack_local` and then
-/// `mtime`, younger first, "and returns 0 on a full tie" (packfile.c:1044-1069).
-/// Every pack of one source shares that source's `local` flag
-/// (`prepare_pack()` passes `data->source->local`, packfile.c:991-1004), so
-/// within a source only `mtime` decides — `st_mtime` of the **.pack** file
-/// (packfile.c:840-851), whole seconds. When those seconds are pairwise
-/// distinct the order is fully determined, and that is the case answered here.
-///
-/// A tie is refused (`None`), because a tie leaves the order to state that is
-/// not a property of the repository:
-///
-/// * `prepare_packed_git_one()` enumerates `<objdir>/pack` with a bare
-///   `readdir()` and appends each pack to the tail (`packfile_list_append()`,
-///   packfile.c:106-123), and `sort_packs` is `DEFINE_LIST_SORT`
-///   (packfile.c:1042), a stable mergesort that keeps that order on equality
-///   (mergesort.h:4, :10).
-/// * A packed-object lookup moves its pack to the head of the list
-///   (`packfile_list_prepend`, packfile.c:2149-2168), and `cmd_fsck`'s
-///   `odb_reprepare()` (builtin/fsck.c:1066) re-sorts that list without
-///   re-appending the packs it already holds (`packfile_store_load_pack()`
-///   returns the `packs_by_path` entry, packfile.c:872-894) — so a tie also
-///   depends on which packs `snapshot_refs()` happened to read from.
-///
-/// A source with a `multi-pack-index` and more than one pack is refused too:
+/// A source with a `multi-pack-index` and more than one pack is refused:
 /// `prepare_pack()` skips the packs the midx covers (packfile.c:998-1000) and
 /// `packfile_store_get_packs()` loads them afterwards through
 /// `prepare_midx_pack()` (packfile.c:1093-1104), an ordering this does not
 /// replay.
-///
-/// The consequence is not cosmetic: this order is the object-creation sequence
-/// [`replay_obj_hash`] needs, so without it [`SlotOrder`] falls back to the
-/// home-slot argument and refuses any report whose lines share a collision
-/// cluster.
-fn pack_scan_order(repo: &gix::Repository) -> Option<Vec<ObjectId>> {
-    use std::os::unix::fs::MetadataExt;
+struct PackLists {
+    /// Each source's object directory and its packs, in list order.
+    sources: Vec<(PathBuf, Vec<ListedPack>)>,
+}
 
-    let hash = repo.object_hash();
-    let mut out: Vec<ObjectId> = Vec::new();
-    for objdir in odb_sources(repo) {
-        let dir = objdir.join("pack");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        // (.pack mtime in whole seconds, the pack's ids in pack-offset order)
-        let mut packs: Vec<(i64, Vec<ObjectId>)> = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(base) = name.strip_suffix(".idx") else {
-                continue;
-            };
-            // `add_packed_git()` drops a pack whose `.pack` is not a regular file.
-            let Ok(meta) = std::fs::metadata(dir.join(format!("{base}.pack"))) else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
+impl PackLists {
+    /// `reads` is the snapshot's read sequence when it is known. Without it a
+    /// tie cannot be placed, and `None` is returned.
+    fn load(repo: &gix::Repository, reads: Option<&[ObjectId]>) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let hash = repo.object_hash();
+        let mut sources = Vec::new();
+        let mut tie = false;
+        for objdir in odb_sources(repo) {
+            let dir = objdir.join("pack");
+            let mut packs: Vec<ListedPack> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let Some(base) = name.strip_suffix(".idx") else {
+                        continue;
+                    };
+                    // `add_packed_git()` drops a pack whose `.pack` is not a
+                    // regular file.
+                    let Ok(meta) = std::fs::metadata(dir.join(format!("{base}.pack"))) else {
+                        continue;
+                    };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    packs.push(ListedPack {
+                        mtime: meta.mtime(),
+                        index: pack::index::File::at(dir.join(&name), hash).ok()?,
+                        promisor: dir.join(format!("{base}.promisor")).exists(),
+                    });
+                }
             }
-            let index = pack::index::File::at(dir.join(&name), hash).ok()?;
-            let mut byte_offsets: Vec<(u64, ObjectId)> = index
-                .iter()
-                .map(|entry| (entry.pack_offset, entry.oid))
-                .collect();
-            byte_offsets.sort();
-            packs.push((meta.mtime(), byte_offsets.into_iter().map(|(_, id)| id).collect()));
+            if packs.len() > 1 && dir.join("multi-pack-index").exists() {
+                return None;
+            }
+            sort_packs(&mut packs);
+            tie |= packs.windows(2).any(|pair| pair[0].mtime == pair[1].mtime);
+            sources.push((objdir, packs));
         }
-        if packs.len() > 1 && dir.join("multi-pack-index").exists() {
-            return None;
+        let mut lists = Self { sources };
+        // With pairwise distinct mtimes the re-sort alone decides the order, so
+        // the reads only matter for a tie.
+        if tie {
+            // `parse_object()` returns early for an object already parsed, so
+            // only a head's first appearance reads.
+            let mut parsed: HashSet<ObjectId> = HashSet::new();
+            for &id in reads? {
+                if parsed.insert(id) {
+                    move_to_front(&mut lists.sources, id);
+                }
+            }
+            for (_, packs) in &mut lists.sources {
+                sort_packs(packs);
+            }
         }
-        // Younger first; any tie is unorderable (see above).
-        packs.sort_by(|a, b| b.0.cmp(&a.0));
-        if packs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return None;
+        Some(lists)
+    }
+
+    fn packs(&self) -> impl Iterator<Item = &ListedPack> {
+        self.sources.iter().flat_map(|(_, packs)| packs.iter())
+    }
+
+    fn pack_count(&self) -> usize {
+        self.packs().count()
+    }
+
+    /// The ids `add_promisor_object()` is called with, in call order:
+    /// `odb_for_each_object(… PROMISOR_ONLY | PACK_ORDER)` skips loose objects
+    /// (odb/source-files.c:85) and non-promisor packs (packfile.c:2580-2582) and
+    /// walks the rest in list order, each in pack order. `read` is one packed
+    /// read made since `odb_reprepare()`, which moves its pack first.
+    fn promisor_pass(&self, read: Option<ObjectId>) -> Vec<ObjectId> {
+        let mut sources: Vec<(PathBuf, Vec<&ListedPack>)> = self
+            .sources
+            .iter()
+            .map(|(objdir, packs)| (objdir.clone(), packs.iter().collect()))
+            .collect();
+        if let Some(id) = read {
+            move_to_front(&mut sources, id);
         }
-        for (_, ids) in packs {
-            out.extend(ids);
+        sources
+            .iter()
+            .flat_map(|(_, packs)| packs.iter())
+            .filter(|pack| pack.promisor)
+            .flat_map(|pack| pack.ids_by_offset())
+            .collect()
+    }
+}
+
+/// `sort_packs(…, sort_pack)` within one source: younger first, stable on a tie.
+fn sort_packs(packs: &mut [ListedPack]) {
+    packs.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+}
+
+/// One read of `id` through the odb: the first source whose pack list holds it
+/// moves that pack to the front (`find_pack_entry()`); a source holding it
+/// loose answers without touching any list.
+fn move_to_front<P: std::borrow::Borrow<ListedPack>>(sources: &mut [(PathBuf, Vec<P>)], id: ObjectId) {
+    let hex = id.to_hex().to_string();
+    for (objdir, packs) in sources.iter_mut() {
+        if let Some(at) = packs.iter().position(|p| p.borrow().index.lookup(id).is_some()) {
+            let pack = packs.remove(at);
+            packs.insert(0, pack);
+            return;
+        }
+        if objdir.join(&hex[..2]).join(&hex[2..]).is_file() {
+            return;
         }
     }
-    Some(out)
 }
 
 /// The loose half of [`loose_scan_order`].

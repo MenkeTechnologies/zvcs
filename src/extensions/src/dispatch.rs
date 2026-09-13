@@ -351,6 +351,17 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
     "ls-tree",
     "merge",
     "merge-base",
+    // The script verbs below are here because of their first git call rather
+    // than their own code: sourcing `git-sh-setup` without `NONGIT_OK` runs
+    // `git_dir_init`, whose `GIT_DIR=$(git rev-parse --git-dir) || exit`
+    // (git-sh-setup.sh:327) reaches both gates, so the script ends at
+    // rev-parse's 128. Measured under git 2.55.0 with
+    // `-c core.packedGitLimit=bogus` and `-c core.createObject=bogus`: all three
+    // exit 128. `mergetool` sets `NONGIT_OK` and calls `git_dir_init` itself,
+    // after its option loop, so it runs the same gates from its own driver.
+    "merge-octopus",
+    "merge-one-file",
+    "merge-resolve",
     "merge-tree",
     "mktree",
     "mv",
@@ -452,6 +463,12 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "init-db",
     "interpret-trailers",
     "mailinfo",
+    // `cmd_merge_recursive`'s `init_merge_options()`; see
+    // `crate::cmd_config::validate_merge_recursive`.
+    "merge-recursive",
+    "merge-recursive-ours",
+    "merge-recursive-theirs",
+    "merge-subtree",
     "multi-pack-index",
     "notes",
     "patch-id",
@@ -521,6 +538,9 @@ enum ConfigCallback {
     Repack,
     /// `gc_config` (builtin/gc.c:176) — targeted lookups, then the default walk.
     Gc,
+    /// `merge_recursive_config` (merge-recursive.c:3847) — targeted lookups,
+    /// then `git_xmerge_config`.
+    MergeRecursive,
 }
 
 /// Which callback `sub` installs.
@@ -546,6 +566,9 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "fetch" => ConfigCallback::Fetch,
         "repack" => ConfigCallback::Repack,
         "gc" => ConfigCallback::Gc,
+        "merge-recursive" | "merge-recursive-ours" | "merge-recursive-theirs" | "merge-subtree" => {
+            ConfigCallback::MergeRecursive
+        }
         "add" | "stage" | "branch" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
         _ => ConfigCallback::Default,
     }
@@ -584,6 +607,11 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "last-modified",
     "ls-files",
     "merge",
+    // `git-sh-setup` answers a first-position `-h` before `git_dir_init` runs
+    // the `rev-parse` that reads the configuration.
+    "merge-octopus",
+    "merge-one-file",
+    "merge-resolve",
         // `cmd_reflog()` hands `show` — named, or implied by a first token that is
         // no subcommand — to `cmd_log_reflog()` (builtin/reflog.c:154, :491),
         // which runs `repo_config(the_repository, git_log_config, &cfg)`
@@ -1305,6 +1333,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::Fetch => crate::cmd_config::validate_fetch(&repo),
                     ConfigCallback::Repack => crate::cmd_config::validate_repack(&repo),
                     ConfigCallback::Gc => crate::cmd_config::validate_gc(&repo),
+                    ConfigCallback::MergeRecursive => {
+                        crate::cmd_config::validate_merge_recursive(&repo)
+                    }
                 };
                 if let Err(rejection) = outcome {
                     return Err(rejection.into_error());

@@ -232,11 +232,21 @@ where
                 // derived from file renames (merge-ort.c:3481-3541), and
                 // `dir_renames::detect_and_apply()` has already moved every change it
                 // follows. A change still under the old name stays there.
+                // A file *our* side added where *their* side put a directory is a
+                // file/directory conflict at the file's path, found from there: the file
+                // meets their added tree and is moved aside (merge-ort.c:4123-4181). A path
+                // of theirs beneath the file is no conflict of its own (t6423 5d, `y/d/e`
+                // against the added file `y/d`), and was content-merged into the file.
+                let is_added_file = |idx: usize| {
+                    let change = &our_changes[idx].inner;
+                    matches!(change, Change::Addition { .. }) && !change.entry_mode().is_tree()
+                };
                 match our_tree.check_conflict(theirs.source_location()).filter(|ours| {
                     !matches!(ours, PossibleConflict::PassedRewrittenDirectory { .. })
                         && !matches!(
                             ours,
-                            PossibleConflict::NonTreeToTree { change_idx: Some(idx) } if is_added_directory(*idx)
+                            PossibleConflict::NonTreeToTree { change_idx: Some(idx) }
+                                if is_added_directory(*idx) || is_added_file(*idx)
                         )
                         && ours
                             .change_idx()

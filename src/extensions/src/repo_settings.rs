@@ -279,6 +279,14 @@ impl RepoSettings {
             pack_use_bitmap_boundary_traversal = v;
         }
 
+        // repo-settings.c:142-143 (2.55.0) — `repo_config_get_ulong(r,
+        // "core.deltabasecachelimit", &ulongval)`, read ahead of the window size.
+        // It sizes `packfile.c`'s delta-base cache, which gix-pack does not share,
+        // so only the refusal is observable: `core.deltaBaseCacheLimit=false`
+        // stops every command that prepares the settings with `bad numeric config
+        // value 'false' for 'core.deltabasecachelimit': invalid unit`.
+        config_ulong(repo, "core.deltabasecachelimit")?;
+
         // repo-settings.c:143-152. The rounding is git's, comment included: the
         // window must be a multiple of `pagesize * 2`, and a value smaller than
         // one such multiple is raised to it rather than rejected.

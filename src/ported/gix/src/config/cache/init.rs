@@ -30,6 +30,7 @@ impl Cache {
             precompose_unicode: _,
             protect_windows: _,
             reftable: _,
+            worktree_config: _,
         }: StageOne,
         git_dir: &std::path::Path,
         branch_name: Option<&gix_ref::FullNameRef>,

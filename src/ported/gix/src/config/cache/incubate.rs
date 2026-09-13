@@ -29,6 +29,11 @@ pub(crate) struct StageOne {
     /// with `strcmp`, so the value is case-*sensitive* even though the key is
     /// not. A value no backend answers to is refused before any store is built.
     pub reftable: bool,
+    /// Whether `extensions.worktreeConfig` is on, so `$GIT_DIR/config.worktree`
+    /// was read and `check_repository_format_gently()` cleared `has_common`
+    /// (`setup.c:787-796`, v2.55.0): a linked worktree then takes `core.bare`
+    /// like the main one instead of ignoring it.
+    pub worktree_config: bool,
 }
 
 /// Initialization
@@ -50,7 +55,7 @@ impl StageOne {
             lenient,
         )?;
 
-        let is_bare = util::config_bool_opt(&config, &Core::BARE, "core.bare", lenient)?;
+        let mut is_bare = util::config_bool_opt(&config, &Core::BARE, "core.bare", lenient)?;
         let repo_format_version = Core::REPOSITORY_FORMAT_VERSION
             .try_into_usize(config.integer("core.repositoryFormatVersion"))?
             .unwrap_or_default();
@@ -85,6 +90,13 @@ impl StageOne {
                 lossy,
                 lenient,
             )?;
+            // `check_repository_format_gently()` (`setup.c:787-801`, v2.55.0)
+            // re-reads the per-worktree file through `read_worktree_config()`, so
+            // a `core.bare` there replaces the one from the common `config`
+            // before discovery decides whether there is a work tree.
+            if let Some(bare) = util::config_bool_opt(&worktree_config, &Core::BARE, "core.bare", lenient)? {
+                is_bare = Some(bare);
+            }
             config.append(worktree_config)?;
         }
         let precompose_unicode = Core::PRECOMPOSE_UNICODE
@@ -110,6 +122,7 @@ impl StageOne {
             precompose_unicode,
             protect_windows,
             reftable,
+            worktree_config: extension_worktree,
         })
     }
 }

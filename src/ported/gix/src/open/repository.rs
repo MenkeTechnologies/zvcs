@@ -258,6 +258,7 @@ impl ThreadSafeRepository {
         };
 
         let reftable = repo_config.reftable;
+        let worktree_config = repo_config.worktree_config;
         let mut refs = {
             let reflog = repo_config.reflog.unwrap_or(gix_ref::store::WriteReflog::Disable);
             let object_hash = repo_config.object_hash;
@@ -423,11 +424,14 @@ impl ThreadSafeRepository {
                 // A work tree named by `GIT_WORK_TREE` is not an inference and survives: git sets it
                 // in `setup_explicit_git_dir()` before it ever looks at `core.bare`, which is why
                 // `GIT_WORK_TREE=<dir> git ls-files -o` works from inside a bare repository.
+                // A linked worktree ignores `core.bare` only while `has_common` holds;
+                // `extensions.worktreeConfig` clears it (`setup.c:795-801`, v2.55.0).
                 Some(_)
                     if !work_tree_is_explicit
                         && !worktree_dir_override_from_configuration
-                        && git_dir.ancestors().nth(1).and_then(|p| p.file_name())
-                            != Some("worktrees".as_ref())
+                        && (worktree_config
+                            || git_dir.ancestors().nth(1).and_then(|p| p.file_name())
+                                != Some("worktrees".as_ref()))
                         && config.is_bare.unwrap_or_default() =>
                 {
                     worktree_dir = None;

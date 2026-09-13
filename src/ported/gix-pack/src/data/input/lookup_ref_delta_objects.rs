@@ -17,6 +17,8 @@ pub struct LookupRefDeltaObjectsIter<I, Find> {
     /// The sum of all entries added so far, as a cache to avoid recomputation
     inserted_entries_length_in_bytes: i64,
     buf: Vec<u8>,
+    /// Where the id of every base object taken from `lookup` is recorded, if anyone asked.
+    base_sink: Option<std::sync::Arc<parking_lot::Mutex<Vec<ObjectId>>>>,
 }
 
 impl<I, Find> LookupRefDeltaObjectsIter<I, Find>
@@ -35,7 +37,14 @@ where
             inserted_entries_length_in_bytes: 0,
             next_delta: None,
             buf: Vec::new(),
+            base_sink: None,
         }
+    }
+
+    /// Record in `sink` the id of every base object this iterator inserts from its lookup, in insertion order.
+    pub fn with_base_sink(mut self, sink: std::sync::Arc<parking_lot::Mutex<Vec<ObjectId>>>) -> Self {
+        self.base_sink = Some(sink);
+        self
     }
 
     fn shifted_pack_offset(&self, pack_offset: u64) -> u64 {
@@ -104,6 +113,9 @@ where
                                         entry.bytes_in_pack() as i64,
                                         Some(base_id),
                                     );
+                                    if let Some(sink) = &self.base_sink {
+                                        sink.lock().push(base_id);
+                                    }
                                     entry
                                 }
                                 None => {

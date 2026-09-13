@@ -30,6 +30,141 @@ pub(crate) fn transport_progress(quiet: bool, force_progress: Option<bool>) -> b
     force_progress.unwrap_or_else(|| !quiet && std::io::stderr().is_terminal())
 }
 
+/// `check_objects()` (builtin/index-pack.c:278-294): the `Checking objects` meter
+/// a `--strict` `index-pack -v` draws after the pack is resolved.
+///
+/// ```c
+/// max = get_max_object_index(the_repository);
+/// if (verbose)
+///         progress = start_delayed_progress(the_repository,
+///                                           _("Checking objects"), max);
+/// for (i = 0; i < max; i++) {
+///         foreign_nr += check_object(get_indexed_object(the_repository, i));
+///         display_progress(progress, i + 1);
+/// }
+/// stop_progress(&progress);
+/// ```
+///
+/// `max` is not an object count but the size of the child's object hash table
+/// (`get_max_object_index()`, object.c:18-21), so the meter counts its slots. The
+/// check itself — every linked object present — is the vendored fetch's
+/// connectivity check; only the meter is drawn here.
+///
+/// `grafts` is the shallow file the child reads: the commits
+/// `is_repository_shallow()` registers the first time a commit is parsed.
+pub(crate) fn check_objects(
+    repo: &gix::Repository,
+    bundle: &gix::odb::pack::bundle::write::Outcome,
+    grafts: &[gix::ObjectId],
+    verbose: bool,
+) -> Result<(), crate::progress::DelayError> {
+    if !verbose {
+        return Ok(());
+    }
+    let max = obj_hash_size(parsed_objects(repo, bundle, grafts));
+    let mut meter = Meter::delayed("Checking objects", max, true)?;
+    for i in 0..max {
+        meter.set(i + 1);
+    }
+    meter.stop("done");
+    Ok(())
+}
+
+/// The commits `is_repository_shallow()` reads from the repository's shallow
+/// file (shallow.c:63-95), for [`check_objects`].
+pub(crate) fn shallow_grafts(repo: &gix::Repository) -> Vec<gix::ObjectId> {
+    repo.shallow_commits()
+        .ok()
+        .flatten()
+        .map(|commits| commits.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+/// `obj_hash_size` once `n` objects have gone through `create_object()`
+/// (object.c:147-163): the table starts empty, becomes 32 slots on the first
+/// insert, and doubles whenever `obj_hash_size - 1 <= nr_objs * 2`.
+fn obj_hash_size(n: usize) -> usize {
+    let mut size = 0usize;
+    for nr in 0..n {
+        if size == 0 || size - 1 <= nr * 2 {
+            size = if size < 32 { 32 } else { size * 2 };
+        }
+    }
+    size
+}
+
+/// How many distinct objects a `--strict` `index-pack` has created by the time
+/// `check_objects()` runs: every object `sha1_object()` parsed
+/// (builtin/index-pack.c:928-966) plus everything that parse and `fsck_walk()`
+/// looked up.
+///
+///   * a blob is `lookup_blob()`ed;
+///   * a commit's `parse_commit_buffer()` looks up its tree, then — after
+///     `lookup_commit_graft()` has registered every shallow commit
+///     (commit.c:554, shallow.c:63-95) — its parents, which a shallow commit does
+///     not have (commit.c:566-569);
+///   * a tag's `parse_tag_buffer()` looks up its target (tag.c:168-175);
+///   * a tree's `fsck_walk_tree()` looks up each entry but a gitlink
+///     (fsck.c:368-398).
+///
+/// The bases a thin pack was completed with are not among them:
+/// `fix_unresolved_deltas()` appends them without `sha1_object()`.
+fn parsed_objects(
+    repo: &gix::Repository,
+    bundle: &gix::odb::pack::bundle::write::Outcome,
+    grafts: &[gix::ObjectId],
+) -> usize {
+    use gix::objs::{CommitRefIter, TagRef, TreeRefIter};
+
+    let Some(index_path) = &bundle.index_path else {
+        return 0;
+    };
+    let hash = repo.object_hash();
+    let Ok(index) = gix::odb::pack::index::File::at(index_path, hash) else {
+        return 0;
+    };
+    let bases: std::collections::HashSet<_> = bundle.thin_pack_bases.iter().collect();
+    let mut created = std::collections::HashSet::new();
+    let mut grafts_registered = false;
+    for entry in index.iter().filter(|e| !bases.contains(&e.oid)) {
+        created.insert(entry.oid);
+        let Ok(object) = repo.find_object(entry.oid) else { continue };
+        match object.kind {
+            gix::object::Kind::Blob => {}
+            gix::object::Kind::Commit => {
+                let mut commit = CommitRefIter::from_bytes(&object.data, hash);
+                let Ok(tree) = commit.tree_id() else { continue };
+                created.insert(tree);
+                if !grafts_registered {
+                    grafts_registered = true;
+                    created.extend(grafts.iter().copied());
+                }
+                if !grafts.contains(&entry.oid) {
+                    created.extend(commit.parent_ids());
+                }
+            }
+            gix::object::Kind::Tag => {
+                if let Ok(tag) = TagRef::from_bytes(&object.data, hash) {
+                    created.insert(tag.target());
+                }
+            }
+            gix::object::Kind::Tree => {
+                for tree_entry in TreeRefIter::from_bytes(&object.data, hash) {
+                    let Ok(tree_entry) = tree_entry else { break };
+                    if tree_entry.mode.is_commit() {
+                        continue;
+                    }
+                    if !(tree_entry.mode.is_tree() || tree_entry.mode.is_blob_or_symlink()) {
+                        break;
+                    }
+                    created.insert(tree_entry.oid.to_owned());
+                }
+            }
+        }
+    }
+    created.len()
+}
+
 /// `unpack_limit` after `fetch_pack_setup()` (fetch-pack.c:2015-2026): 100, unless
 /// `fetch.unpackLimit` or else `transfer.unpackLimit` is set to a non-negative
 /// value.
@@ -71,7 +206,7 @@ impl Plan {
     }
 
     /// `index-pack -v` (fetch-pack.c:1013-1014).
-    fn index_pack_verbose(&self) -> bool {
+    pub(crate) fn index_pack_verbose(&self) -> bool {
         !self.quiet && self.progress
     }
 
@@ -345,5 +480,23 @@ impl RemoteOutput {
     /// (sideband.c:424-432).
     pub(crate) fn finish(&self) {
         self.lock().finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::obj_hash_size;
+
+    /// The `Checking objects` totals stock 2.55.0 draws for clones whose
+    /// `index-pack` created 16, 17, 32 and 33 objects: the table doubles one
+    /// insert after it is half full, not when it is full.
+    #[test]
+    fn the_object_hash_grows_as_create_object_grows_it() {
+        assert_eq!(obj_hash_size(0), 0, "nothing created, nothing allocated");
+        assert_eq!(obj_hash_size(1), 32);
+        assert_eq!(obj_hash_size(16), 32);
+        assert_eq!(obj_hash_size(17), 64);
+        assert_eq!(obj_hash_size(32), 64);
+        assert_eq!(obj_hash_size(33), 128);
     }
 }

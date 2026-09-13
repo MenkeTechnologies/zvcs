@@ -123,6 +123,8 @@ pub struct Meter {
     /// `progress->split`: the counters moved to their own line once the full line
     /// no longer fit the terminal.
     split: bool,
+    /// `progress->delay`: update ticks still to pass before the first draw.
+    delay: u32,
     on: bool,
 }
 
@@ -135,6 +137,22 @@ impl Meter {
     /// A phase of `total` items — git's `Counting`, `Compressing` and `Writing`.
     pub fn counted(title: &'static str, total: usize, on: bool) -> Self {
         Self::start(title, Some(total), on)
+    }
+
+    /// `start_delayed_progress()` (`progress.c:291-295`): a phase of `total` items
+    /// that stays silent until it has outlived `GIT_PROGRESS_DELAY` update ticks.
+    /// A phase that finishes sooner never draws, and its [`Meter::stop`] prints
+    /// nothing.
+    ///
+    /// `GIT_PROGRESS_DELAY` is read only for a meter that is on, as git only
+    /// calls `start_delayed_progress()` when it will report; an unparsable value
+    /// is `die()` at that point, which the caller reports as its own process would.
+    pub fn delayed(title: &'static str, total: usize, on: bool) -> Result<Self, DelayError> {
+        let mut meter = Self::start(title, Some(total), on);
+        if on {
+            meter.delay = default_delay()?;
+        }
+        Ok(meter)
     }
 
     /// `start_progress_delay()` (`progress.c:259-279`) with no delay.
@@ -151,6 +169,7 @@ impl Meter {
             throughput: None,
             counters: String::new(),
             split: false,
+            delay: 0,
             on,
         }
     }
@@ -291,6 +310,16 @@ impl Meter {
     /// `force_last_update()` setting `progress_update` first.
     fn display(&mut self, n: usize, done: Option<&str>, force: bool) {
         let update = self.take_update() || force;
+        // `if (progress->delay && (!update || --progress->delay)) return;`
+        if self.delay != 0 {
+            if !update {
+                return;
+            }
+            self.delay -= 1;
+            if self.delay != 0 {
+                return;
+            }
+        }
         self.last_value = Some(n);
         let tp = self.throughput.as_ref().map_or_else(String::new, |tp| tp.display.clone());
         let last_count_len = self.counters.len();
@@ -350,6 +379,30 @@ fn is_foreground_stderr() -> bool {
         tpgrp < 0 || tpgrp == libc::getpgid(0)
     }
 }
+
+/// `get_default_delay()` (`progress.c:281-289`): `GIT_PROGRESS_DELAY` read once
+/// through `git_env_ulong()` (`parse.c:214-220`), one tick when unset. The value
+/// lands in an `int` and then the `unsigned` delay, which keeps its low 32 bits.
+fn default_delay() -> Result<u32, DelayError> {
+    static DELAY: std::sync::OnceLock<Result<u32, DelayError>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| match std::env::var("GIT_PROGRESS_DELAY") {
+        Err(std::env::VarError::NotPresent) => Ok(1),
+        Ok(v) => crate::config::parse_config_ulong(&v).map(|n| n as u32).map_err(|_| DelayError),
+        Err(std::env::VarError::NotUnicode(_)) => Err(DelayError),
+    })
+}
+
+/// `git_env_ulong()`'s `die(_("failed to parse %s"), "GIT_PROGRESS_DELAY")`.
+#[derive(Clone, Copy, Debug)]
+pub struct DelayError;
+
+impl std::fmt::Display for DelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to parse GIT_PROGRESS_DELAY")
+    }
+}
+
+impl std::error::Error for DelayError {}
 
 /// An interval in 1024ths of a second, as `progress.c:234` computes it.
 fn misecs(elapsed: Duration) -> u32 {
@@ -419,6 +472,23 @@ mod tests {
             m.tick();
         }
         assert_eq!(m.last_percent, Some(1), "crossing one percent redraws exactly once");
+    }
+
+    /// `if (progress->delay && (!update || --progress->delay)) return;`: a delayed
+    /// meter records nothing until as many update ticks as its delay have fired,
+    /// which is what keeps a fast phase — and its closing line — silent.
+    #[test]
+    fn a_delayed_meter_waits_out_its_ticks() {
+        let mut m = Meter::start("Checking objects", Some(4), true);
+        m.delay = 2;
+        m.set(1);
+        assert_eq!((m.last_value, m.delay), (None, 2), "no tick has fired");
+        m.next_update = Instant::now();
+        m.set(2);
+        assert_eq!((m.last_value, m.delay), (None, 1), "the first tick only counts down");
+        m.next_update = Instant::now();
+        m.set(3);
+        assert_eq!((m.last_value, m.delay), (Some(3), 0), "the second tick draws");
     }
 
     /// An empty phase is complete, not a division by zero.

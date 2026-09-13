@@ -63,6 +63,9 @@ pub struct Outcome {
     /// The file is created right before moving the pack data and index data into place (i.e. `data_path` and `index_path`)
     /// and is expected to be removed by the caller when ready.
     pub keep_path: Option<PathBuf>,
+    /// The ids of the base objects a thin pack was completed with from the object database, in the order they were
+    /// inserted. They are part of the written pack, but were never sent.
+    pub thin_pack_bases: Vec<gix_hash::ObjectId>,
 }
 
 impl Outcome {

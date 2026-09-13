@@ -2879,7 +2879,21 @@ fn fetch_one(
     // `%s failed` that follows the child's own diagnostic.
     if let Status::Change { write_pack_bundle, .. } = &outcome.status {
         if fsck_objects {
-            if let Err(message) = fsck_fetched(repo, write_pack_bundle, &fsck_msgs) {
+            // `--strict` unless the fetch is a promisor's, which gets
+            // `--fsck-objects` and no `check_objects()` (fetch-pack.c:1053-1063).
+            let check_objects = || {
+                if from_promisor {
+                    return Ok(());
+                }
+                super::fetch_progress::check_objects(
+                    repo,
+                    write_pack_bundle,
+                    &super::fetch_progress::shallow_grafts(repo),
+                    !opts.quiet && transport_progress,
+                )
+                .map_err(|e| e.to_string())
+            };
+            if let Err(message) = fsck_fetched(repo, write_pack_bundle, &fsck_msgs, check_objects) {
                 eprintln!("fatal: {message}");
                 eprintln!("fatal: index-pack failed");
                 return Ok(Verdict::Fatal);
@@ -4393,10 +4407,15 @@ mod tests {
 /// `fsck error in pack objects`, and git dies at the first of the two it reaches.
 /// See [`super::receive_pack`] for the same shape on the push side, including why
 /// a `.gitmodules` blob's position in the pack decides which pass lints it.
+///
+/// `check_objects` runs where `index-pack` calls `check_objects()`
+/// (builtin/index-pack.c:2089-2090): after the per-object pass, which dies
+/// before reaching it, and ahead of `fsck_finish()` (builtin/index-pack.c:2115).
 fn fsck_fetched(
     repo: &gix::Repository,
     bundle: &gix::odb::pack::bundle::write::Outcome,
     msgs: &super::fsck::MsgConfig,
+    check_objects: impl FnOnce() -> std::result::Result<(), String>,
 ) -> std::result::Result<(), String> {
     use super::fsck::{big_file_threshold, check_blob, check_object, Severity};
 
@@ -4499,6 +4518,13 @@ fn fsck_fetched(
     // `fsck_finish()`: every blob the trees named that the per-object pass did
     // not already lint, whether or not the pack carried it.
     let failed_before_finish = failed;
+    if !failed {
+        // The child dies inside `check_objects()`, so nothing of the pack survives.
+        if let Err(message) = check_objects() {
+            discard();
+            return Err(message);
+        }
+    }
     let mut queue: Vec<gix::ObjectId> = entries
         .iter()
         .map(|(_, id)| *id)

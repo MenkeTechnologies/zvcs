@@ -76,6 +76,7 @@ impl crate::Bundle {
         };
 
         let object_hash = options.object_hash;
+        let thin_pack_bases = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let data_file = Arc::new(parking_lot::Mutex::new(io::BufWriter::with_capacity(
             64 * 1024,
             match directory.as_ref() {
@@ -102,7 +103,8 @@ impl crate::Bundle {
                     )?,
                     thin_pack_lookup,
                     options.compression,
-                );
+                )
+                .with_base_sink(Arc::clone(&thin_pack_bases));
                 let pack_version = pack_entries_iter.inner.version();
                 let pack_entries_iter = data::input::EntriesToBytesIter::new(
                     pack_entries_iter,
@@ -159,6 +161,7 @@ impl crate::Bundle {
             data_path,
             index_path,
             keep_path,
+            thin_pack_bases: std::mem::take(&mut *thin_pack_bases.lock()),
         })
     }
 
@@ -191,6 +194,7 @@ impl crate::Bundle {
             None => gix_tempfile::new(std::env::temp_dir(), ContainingDirectory::Exists, AutoRemove::Tempfile)?,
         })));
         let object_hash = options.object_hash;
+        let thin_pack_bases = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let eight_pages = 4096 * 8;
         let (pack_entries_iter, pack_version): (
             Box<dyn Iterator<Item = Result<data::input::Entry, data::input::Error>> + Send + 'static>,
@@ -211,7 +215,8 @@ impl crate::Bundle {
                     )?,
                     thin_pack_lookup,
                     options.compression,
-                );
+                )
+                .with_base_sink(Arc::clone(&thin_pack_bases));
                 let pack_kind = pack_entries_iter.inner.version();
                 (Box::new(pack_entries_iter), pack_kind)
             }
@@ -260,6 +265,7 @@ impl crate::Bundle {
             data_path,
             index_path,
             keep_path,
+            thin_pack_bases: std::mem::take(&mut *thin_pack_bases.lock()),
         })
     }
 

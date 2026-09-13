@@ -108,6 +108,7 @@ mod write_to_directory {
             data_path: None,
             keep_path: None,
             object_hash: gix_hash::Kind::Sha1,
+            thin_pack_bases: Vec::new(),
         })
     }
 

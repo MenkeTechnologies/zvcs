@@ -1583,6 +1583,30 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         .map(|repo| resolve_remote_name(&repo, origin.as_deref()))
         .unwrap_or_else(|_| origin.clone().unwrap_or_else(|| "origin".to_string()));
 
+    // `index-pack`'s `Checking objects` meter. The child is `--strict` when
+    // `check_self_contained_and_connected` is set — a clone that neither deepens
+    // nor filters (builtin/clone.c:1402-1403, builtin/index-pack.c:1939-1941) —
+    // or when `transfer.fsckObjects` asks for `--strict` on a non-promisor pack
+    // (fetch-pack.c:1053-1063); a filtered clone is a promisor's.
+    let deepen = shallow_depth_given || shallow_since_given || shallow_exclude_given;
+    // A child that dies there leaves `fetch-pack` without the `keep` line it
+    // reads back (`index_pack_lockfile()`, fetch-pack.c:1085-1090).
+    let check_pack = |repo: &gix::Repository, outcome: &gix::remote::fetch::Outcome| -> Result<()> {
+        let gix::remote::fetch::Status::Change { write_pack_bundle, .. } = &outcome.status else {
+            return Ok(());
+        };
+        let strict = filter.is_none() && (!deepen || super::fetch::fetch_pack_fsck_objects(repo));
+        if strict {
+            let grafts = super::fetch_progress::shallow_grafts(repo);
+            let verbose = !quiet && transport_progress;
+            if let Err(e) = super::fetch_progress::check_objects(repo, write_pack_bundle, &grafts, verbose) {
+                eprintln!("fatal: {e}");
+                return Err(crate::fatal::die("fetch-pack: invalid index-pack output"));
+            }
+        }
+        Ok(())
+    };
+
     // Run the clone, capturing the result so a `remote: ` line the stream left
     // unterminated is flushed before any error is propagated.
     let result = (|| -> Result<()> {
@@ -1625,7 +1649,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // (and index) empty. Fetching is the whole job in both cases.
             let fetched = prepare.fetch_only(meters.clone(), &should_interrupt);
             let outcome = match fetched {
-                Ok((_repo, outcome)) => outcome,
+                Ok((repo, outcome)) => {
+                    check_pack(&repo, &outcome)?;
+                    outcome
+                }
                 // gitoxide refuses a fetch whose refspecs matched nothing; git calls that an
                 // empty clone and carries on, so the refusal is turned back into one. The
                 // repository has to be kept explicitly: `PrepareFetch` deletes the
@@ -1665,7 +1692,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // `git clone 'url'...`
             let fetched = prepare.fetch_then_checkout(meters.clone(), &should_interrupt);
             let (mut checkout, outcome) = match fetched {
-                Ok(pair) => pair,
+                Ok((checkout, outcome)) => {
+                    check_pack(checkout.repo(), &outcome)?;
+                    (checkout, outcome)
+                }
                 Err(gix::clone::fetch::Error::Fetch(
                     gix::remote::fetch::Error::NoMapping { .. },
                 )) if branch.is_none() => {

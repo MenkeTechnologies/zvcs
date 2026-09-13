@@ -504,9 +504,17 @@ pub(super) fn detect_and_apply<Find: gix_object::FindObjectOrHeader>(
         compute_collisions(&dir_renames[MERGE_SIDE2], &pairs[MERGE_SIDE1]),
         compute_collisions(&dir_renames[MERGE_SIDE1], &pairs[MERGE_SIDE2]),
     ];
+    // `pair->two->path` after `apply_directory_rename_modifications()`, and the
+    // renames whose stages were recorded with the conflict they produced.
+    let mut final_two: [Vec<BString>; 3] = [
+        Vec::new(),
+        pairs[MERGE_SIDE1].iter().map(|p| p.two.clone()).collect(),
+        pairs[MERGE_SIDE2].iter().map(|p| p.two.clone()).collect(),
+    ];
+    let mut moved_renames = Vec::new();
     for side in MERGE_SIDE1..=MERGE_SIDE2 {
         let other_side = 3 - side;
-        for pair in &pairs[side] {
+        for (pair_idx, pair) in pairs[side].iter().enumerate() {
             if directory_renames == DirectoryRenames::Disabled && pair.renamed {
                 continue;
             }
@@ -522,6 +530,7 @@ pub(super) fn detect_and_apply<Find: gix_object::FindObjectOrHeader>(
             ) else {
                 continue;
             };
+            final_two[side][pair_idx] = new_path.clone();
             apply_directory_rename_modifications(
                 &mut info.paths,
                 pair,
@@ -531,6 +540,31 @@ pub(super) fn detect_and_apply<Find: gix_object::FindObjectOrHeader>(
                 directory_renames,
                 &mut out,
             );
+            if pair.renamed {
+                moved_renames.push((out.len() - 1, side, pair_idx));
+            }
+        }
+    }
+
+    // `process_renames()` runs once every pair is where directory renames put
+    // it. Two renames of one source to different paths are a
+    // rename/rename(1to2) (merge-ort.c:2961-3068), which leaves the base at
+    // the old path and carries neither it nor the other side's version to a
+    // new one. Renames that ended at the same path are a rename/rename(1to1),
+    // which does carry the base (merge-ort.c:2983-2995).
+    for (conflict_idx, side, pair_idx) in moved_renames {
+        let other_side = 3 - side;
+        let pair = &pairs[side][pair_idx];
+        let renamed_to_elsewhere = pairs[other_side]
+            .iter()
+            .enumerate()
+            .any(|(other_idx, other)| {
+                other.renamed && other.one == pair.one && final_two[other_side][other_idx] != final_two[side][pair_idx]
+            });
+        if renamed_to_elsewhere {
+            let entries = &mut out[conflict_idx].entries;
+            entries[MERGE_BASE] = None;
+            entries[other_side] = None;
         }
     }
     Ok(out)
@@ -833,6 +867,7 @@ fn apply_directory_rename_modifications(
         // A rename carries the base and the other side's version of its source
         // along to the destination (`process_renames()`, merge-ort.c:3192-3211),
         // and with `path_conflict` set they stay there as stages.
+        // `detect_and_apply()` takes them back for a rename/rename(1to2).
         if let Some(source) = paths.get(pair.one.as_bstr()) {
             for stage in [MERGE_BASE, 3 - side] {
                 entries[stage] = source.stages[stage]

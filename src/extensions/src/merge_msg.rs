@@ -434,6 +434,31 @@ fn render_one<'r, 's>(
             out.push(modify_delete(&path, delete_branch, modify_branch));
         }
 
+        // A non-directory placed where the other side still has a directory, which
+        // merge-ort moves aside under a unique name once the directory is known to
+        // survive the merge (`process_entry()`, merge-ort.c:4111-4174). `gix-merge`
+        // carries the moved change on both sides of this class and records only its
+        // stage, so the stage says which operand it came from: `df_file_index` is the
+        // side without the directory (merge-ort.c:4165-4166).
+        Err(ResolutionFailure::OursDirectoryTheirsNonDirectoryTheirsRenamed {
+            renamed_unique_path_of_theirs,
+        }) => {
+            let old_path = ours.location().to_owned();
+            let new_path = renamed_unique_path_of_theirs.clone();
+            let file_branch = if conflict.entries()[1].is_some() {
+                operands.label1
+            } else {
+                operands.label2
+            };
+            out.push(Message {
+                paths: vec![new_path.clone(), old_path.clone()],
+                ctype: "CONFLICT (file/directory)",
+                text: format!(
+                    "CONFLICT (file/directory): directory in the way of {old_path} from {file_branch}; moving it to {new_path} instead.\n"
+                ),
+            });
+        }
+
         // One side renamed a directory and the other put a change inside the old
         // name, so merge-ort moved the change along (`apply_directory_rename_and_ort`,
         // merge-ort.c:2797-2839). Under `merge.directoryRenames=conflict` — git's

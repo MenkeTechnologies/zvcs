@@ -1146,12 +1146,48 @@ fn collapsed_ignored_names(
 // --refresh
 // ---------------------------------------------------------------------------
 
+/// The conflicted paths `refresh()`'s `refresh_index()` names (read-cache.c:1518,
+/// 1559-1560): `<path>: needs merge` under `REFRESH_QUIET`, and under `-v`'s
+/// `REFRESH_IN_PORCELAIN` `U\t<path>`, the first one preceded by the header
+/// `show_file()` prints once (read-cache.c:1450-1456, builtin/add.c:133-134).
+pub(super) fn print_refresh_unmerged(paths: &[BString], verbose: bool) {
+    for (n, path) in paths.iter().enumerate() {
+        if !verbose {
+            println!("{path}: needs merge");
+            continue;
+        }
+        if n == 0 {
+            println!("Unstaged changes after refreshing the index:");
+        }
+        println!("U\t{path}");
+    }
+}
+
 /// `--refresh` re-stats the matched *index* entries and stages nothing. With
 /// `--verbose` git switches `refresh_index()` into porcelain mode, which prints
 /// a header plus one `M`/`D` line per still-unstaged path on stdout.
 fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let index = open_index(repo)?;
     let patterns = pathspec_patterns(repo, o)?;
+    // `refresh_index()` dies at the first racily clean entry it has to hash under
+    // a bad `--attr-source`, before the unmatched-pathspec loop below — see
+    // [`super::read_tree::StatCtx::refresh_dies_on_attr_source`].
+    {
+        let mut ps = repo.pathspec(
+            true,
+            &patterns,
+            false,
+            &index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        let death = super::read_tree::StatCtx::refresh_dies_on_attr_source(repo, &index, |p| {
+            ps.is_included(p, Some(false))
+        })?;
+        if let Some(death) = death {
+            print_refresh_unmerged(&death.unmerged, o.verbose);
+            return death.die();
+        }
+    }
     // `--refresh` compares the worktree against the index, and the index holds
     // *converted* content — so the comparison has to convert too, or every file
     // the filters touch looks modified. It writes no object, which is git's

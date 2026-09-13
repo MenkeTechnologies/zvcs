@@ -570,6 +570,29 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         .iter()
         .map(|s| BString::from(s.clone().into_bytes()))
         .collect();
+
+    // `--refresh` is `refresh()` (builtin/add.c:123-133): `refresh_index()` over the
+    // pathspec, which dies at the first racily clean entry it has to hash under a
+    // bad `--attr-source` — see
+    // [`super::read_tree::StatCtx::refresh_dies_on_attr_source`] — before its own
+    // unmatched-pathspec loop. `-v` is `REFRESH_IN_PORCELAIN`, which names a
+    // conflicted path `U\t<path>` under the header instead of `<path>: needs merge`.
+    if refresh {
+        let mut ps = repo.pathspec(
+            true,
+            &patterns,
+            false,
+            &index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        let death = super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |p| {
+            ps.is_included(p, Some(false))
+        })?;
+        if let Some(death) = death {
+            super::stage::print_refresh_unmerged(&death.unmerged, verbose);
+            return death.die();
+        }
+    }
     // ```c
     // /* Set up the default git porcelain excludes */
     // if (!ignored_too) {

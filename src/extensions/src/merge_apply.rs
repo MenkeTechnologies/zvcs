@@ -156,6 +156,49 @@ pub fn unmerged_paths(index: &gix::index::File) -> Vec<BString> {
     paths
 }
 
+/// `append_conflicts_hint()` (sequencer.c): append the `Conflicts:` block for
+/// `paths` (see [`unmerged_paths`]) to a stopped pick's `MERGE_MSG`.
+///
+/// ```c
+/// if (cleanup_mode == COMMIT_MSG_CLEANUP_SCISSORS) {
+///         strbuf_addch(msgbuf, '\n');
+///         wt_status_append_cut_line(msgbuf);
+///         strbuf_addstr(msgbuf, comment_line_str);
+/// }
+/// strbuf_addch(msgbuf, '\n');
+/// strbuf_commented_addf(msgbuf, comment_line_str, "Conflicts:\n");
+/// ```
+///
+/// Under `--cleanup=scissors` the hint goes below a cut line
+/// (`wt_status_append_cut_line()`, wt-status.c), because everything after that
+/// line is what the final commit strips. The bare comment string after the cut
+/// line is what turns the following `'\n'` into a lone `#` line.
+pub fn append_conflicts_hint(msg: &mut Vec<u8>, paths: &[BString], comment: &str, scissors: bool) {
+    if scissors {
+        msg.push(b'\n');
+        for line in [
+            "------------------------ >8 ------------------------",
+            "Do not modify or remove the line above.",
+            "Everything below it will be ignored.",
+        ] {
+            msg.extend_from_slice(comment.as_bytes());
+            msg.push(b' ');
+            msg.extend_from_slice(line.as_bytes());
+            msg.push(b'\n');
+        }
+        msg.extend_from_slice(comment.as_bytes());
+    }
+    msg.push(b'\n');
+    msg.extend_from_slice(comment.as_bytes());
+    msg.extend_from_slice(b" Conflicts:\n");
+    for path in paths {
+        msg.extend_from_slice(comment.as_bytes());
+        msg.push(b'\t');
+        msg.extend_from_slice(path);
+        msg.push(b'\n');
+    }
+}
+
 /// Remove the worktree file `path` names, then `rmdir` every directory the
 /// removal may have emptied, deepest first.
 ///

@@ -1292,19 +1292,20 @@ fn revert_one(
         // hardcoded `#` survives into the committed message under any other
         // setting.
         let comment = super::rebase_todo::comment_prefix(repo);
-        let mut merge_msg = message.clone();
-        if !merge_msg.ends_with('\n') {
-            merge_msg.push('\n');
+        //
+        // The mode is `opts->default_msg_cleanup` (sequencer.c's
+        // `do_recursive_merge()`), so `--cleanup=scissors` moves the block below
+        // a cut line.
+        let mut merge_msg = message.clone().into_bytes();
+        if !merge_msg.ends_with(b"\n") {
+            merge_msg.push(b'\n');
         }
-        merge_msg.push('\n');
-        merge_msg.push_str(&comment);
-        merge_msg.push_str(" Conflicts:\n");
-        for path in &conflicted_paths {
-            merge_msg.push_str(&comment);
-            merge_msg.push('\t');
-            merge_msg.push_str(&path.to_str_lossy());
-            merge_msg.push('\n');
-        }
+        crate::merge_apply::append_conflicts_hint(
+            &mut merge_msg,
+            &conflicted_paths,
+            &comment,
+            cleanup == Some(Cleanup::Scissors),
+        );
         std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
 
         // git's `do_pick_commit` names the reverted commit and *its* subject here,

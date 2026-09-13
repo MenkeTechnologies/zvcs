@@ -1480,16 +1480,17 @@ fn pick_one(
         // that strips this block strips `core.commentChar`, so under any other
         // setting the whole block survived into the commit object.
         let comment = super::rebase_todo::comment_prefix(&repo);
-        let mut merge_msg = message.clone();
-        merge_msg.push(b'\n');
-        merge_msg.extend_from_slice(comment.as_bytes());
-        merge_msg.extend_from_slice(b" Conflicts:\n");
-        for path in crate::merge_apply::unmerged_paths(&new_index) {
-            merge_msg.extend_from_slice(comment.as_bytes());
-            merge_msg.push(b'\t');
-            merge_msg.extend_from_slice(&path[..]);
-            merge_msg.push(b'\n');
-        }
+        //
+        // The mode is `opts->default_msg_cleanup` (sequencer.c's
+        // `do_recursive_merge()`), so `--cleanup=scissors` moves the block below
+        // a cut line.
+        let mut merge_msg: Vec<u8> = message.clone().into();
+        crate::merge_apply::append_conflicts_hint(
+            &mut merge_msg,
+            &crate::merge_apply::unmerged_paths(&new_index),
+            &comment,
+            cleanup == Some(Cleanup::Scissors),
+        );
         std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg[..])?;
 
         eprintln!("error: could not apply {pick_short}... {pick_subject}");

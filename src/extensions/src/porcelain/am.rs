@@ -2033,15 +2033,18 @@ fn run_am_loop(
                 say_subject("Applying: ", first);
             }
             let applied = run_apply(&ctx, &ld, None)?;
-            if matches!(applied, Applied::Usage) {
-                return Ok(ExitCode::from(129));
+            if let Some(code) = applied.process_exit() {
+                return Ok(code);
             }
             if matches!(applied, Applied::Failed) {
                 // `--3way` (and therefore every `--rebasing` session, which
                 // `am_setup` forces threeway on) reconstructs a base tree from
                 // the patch's own index lines and merges instead of giving up.
                 let recovered = if ld.threeway {
-                    let merged = fall_back_threeway(&ctx, repo, &ld, &info.msg)?;
+                    let merged = match fall_back_threeway(&ctx, repo, &ld, &info.msg)? {
+                        Ok(merged) => merged,
+                        Err(code) => return Ok(code),
+                    };
                     // "Applying the patch to an earlier tree and merging the
                     // result may have produced the same tree as ours."
                     if merged && index_has_no_changes(repo)? {
@@ -2382,10 +2385,28 @@ enum Applied {
     /// `apply`'s parse-options refused an option and would have taken the whole
     /// process down with it.
     Usage,
+    /// `apply` hit a `die()` — a bad `--attr-source` (attr.c:1226), a bad `-p`
+    /// (apply.c:5043) — which in git ends `am` at 128 right there, with no
+    /// `Patch failed at` and no advice. An error `apply_all_patches()` merely
+    /// returns (apply.c:5194) is [`Applied::Failed`] even though `git apply`
+    /// exits 128 for both, so the child reports the die on a status of its own.
+    Died,
+}
+
+impl Applied {
+    /// The exit status of an attempt that took the whole `am` process down.
+    fn process_exit(&self) -> Option<ExitCode> {
+        match self {
+            Applied::Usage => Some(ExitCode::from(129)),
+            Applied::Died => Some(ExitCode::from(128)),
+            Applied::Ok | Applied::Failed => None,
+        }
+    }
 }
 
 fn run_apply(ctx: &Ctx, ld: &Loaded, index_file: Option<&Path>) -> Result<Applied> {
     let mut c = ctx.cmd("apply");
+    c.env(super::apply::LINKED_ENV, "1");
     match index_file {
         Some(path) => {
             c.arg("--cached").env("GIT_INDEX_FILE", path);
@@ -2397,16 +2418,21 @@ fn run_apply(ctx: &Ctx, ld: &Loaded, index_file: Option<&Path>) -> Result<Applie
     for opt in &ld.apply_opts {
         c.arg(opt);
     }
-    c.arg(ctx.spath("patch"));
+    // `apply_state.apply_verbosity = verbosity_silent` (builtin/am.c:1531-1532) is
+    // set after `apply_parse_options()`, and `check_apply_state()` then mutes the
+    // error and warning routines only (apply.c:183-188): a `die()` still prints.
+    // A trailing `-q` is that verbosity, applied after the patch's own options.
     if ld.threeway && index_file.is_none() {
-        c.stderr(Stdio::null());
+        c.arg("-q");
     }
+    c.arg(ctx.spath("patch"));
     let status = c
         .status()
         .map_err(|e| anyhow::anyhow!("failed to run apply: {e}"))?;
     Ok(match status.code() {
         Some(0) => Applied::Ok,
         Some(129) => Applied::Usage,
+        Some(code) if code == i32::from(super::apply::LINKED_DIE_STATUS) => Applied::Died,
         _ => Applied::Failed,
     })
 }
@@ -2427,8 +2453,14 @@ fn run_apply(ctx: &Ctx, ld: &Loaded, index_file: Option<&Path>) -> Result<Applie
 /// worktree, and only the final merge is checked out.
 ///
 /// Returns `Ok(true)` when the merge produced a clean result, `Ok(false)` when
-/// it stopped — either arm having already printed what git prints.
-fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]) -> Result<bool> {
+/// it stopped — either arm having already printed what git prints — and
+/// `Err(code)` when the linked-in apply ended the whole `am` process with `code`.
+fn fall_back_threeway(
+    ctx: &Ctx,
+    repo: &gix::Repository,
+    ld: &Loaded,
+    msg: &[u8],
+) -> Result<std::result::Result<bool, ExitCode>> {
     let index_path = ctx.sdir_abs.join("patch-merge-index");
     let _ = std::fs::remove_file(&index_path);
 
@@ -2453,14 +2485,14 @@ fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]
         .success()
     {
         eprintln!("error: could not build fake ancestor");
-        return Ok(false);
+        return Ok(Ok(false));
     }
 
     let base_tree = match capture(write_tree_in(ctx, &index_path))? {
         Some(t) => t,
         None => {
             eprintln!("error: Repository lacks necessary blobs to fall back on 3-way merge.");
-            return Ok(false);
+            return Ok(Ok(false));
         }
     };
 
@@ -2479,19 +2511,23 @@ fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]
             .status();
     }
 
-    if !matches!(run_apply(ctx, ld, Some(&index_path))?, Applied::Ok) {
+    let applied = run_apply(ctx, ld, Some(&index_path))?;
+    if let Some(code) = applied.process_exit() {
+        return Ok(Err(code));
+    }
+    if matches!(applied, Applied::Failed) {
         eprintln!(
             "error: Did you hand edit your patch?\nIt does not apply to blobs recorded in its \
              index."
         );
-        return Ok(false);
+        return Ok(Ok(false));
     }
 
     let their_tree = match capture(write_tree_in(ctx, &index_path))? {
         Some(t) => t,
         None => {
             eprintln!("error: could not write tree");
-            return Ok(false);
+            return Ok(Ok(false));
         }
     };
 
@@ -2539,9 +2575,9 @@ fn fall_back_threeway(ctx: &Ctx, repo: &gix::Repository, ld: &Loaded, msg: &[u8]
         // merge in the changes.` was missing along with the `rr-cache` entry.
         super::rerere::repo_rerere(repo, ld.rerere_autoupdate)?;
         eprintln!("error: Failed to merge in the changes.");
-        return Ok(false);
+        return Ok(Ok(false));
     }
-    Ok(true)
+    Ok(Ok(true))
 }
 
 /// `write_index_as_tree(..., index_path, ...)`: `git write-tree` reading the

@@ -626,6 +626,30 @@ fn err(quiet: bool, msg: &str) {
     }
 }
 
+/// Set by `git am` on the `apply` child it runs in place of git's linked-in
+/// `apply_all_patches()` (builtin/am.c:1539).
+pub(crate) const LINKED_ENV: &str = "ZVCS_APPLY_LINKED";
+
+/// The exit status a [`die`] reports under [`LINKED_ENV`].
+///
+/// git's `apply` fails two ways that both leave `git apply` at 128: a `die()`
+/// (attr.c:1226, apply.c:5043, apply.c:5288) ends the process it runs in, while an
+/// error `apply_all_patches()` unwinds to `-128` is returned (apply.c:5194). Inside
+/// `git am` the first takes `am` down with it and the second is just a patch that
+/// did not apply (builtin/am.c:1909), so the child has to say which one happened.
+pub(crate) const LINKED_DIE_STATUS: u8 = 3;
+
+/// git's `die()`: `fatal: <msg>` and exit 128, or [`LINKED_DIE_STATUS`] when the
+/// caller is `git am`, which then dies itself.
+fn die(msg: &str) -> ExitCode {
+    eprintln!("fatal: {msg}");
+    if std::env::var_os(LINKED_ENV).is_some() {
+        ExitCode::from(LINKED_DIE_STATUS)
+    } else {
+        ExitCode::from(128)
+    }
+}
+
 /// Fetch the value of a long option, from `--name=value` or the following argv
 /// entry.
 fn long_value(
@@ -878,10 +902,9 @@ fn parse_opts(
                                 o.strip_explicit = true;
                             }
                             Err(_) => {
-                                eprintln!(
-                                    "fatal: option -p expects a non-negative integer, got '{v}'"
-                                );
-                                return Err(ExitCode::from(128));
+                                return Err(die(&format!(
+                                    "option -p expects a non-negative integer, got '{v}'"
+                                )));
                             }
                         }
                     } else {
@@ -918,8 +941,7 @@ fn parse_opts(
 
     // git's one post-parse usage check, run before it opens any patch file.
     if conflict_given && !o.three_way {
-        eprintln!("fatal: --ours, --theirs, and --union require --3way");
-        return Err(ExitCode::from(128));
+        return Err(die("--ours, --theirs, and --union require --3way"));
     }
 
     // `check_apply_state()` (apply.c:169): `state->apply` starts at 1 and any
@@ -1171,8 +1193,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                     .map(|_| "cannot use --attr-source or GIT_ATTR_SOURCE without repo"),
             };
             if let Some(message) = refusal {
-                eprintln!("fatal: {message}");
-                return Ok(ExitCode::from(128));
+                return Ok(die(message));
             }
         }
         admitted.push(p);

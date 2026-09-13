@@ -293,6 +293,7 @@ fn set_symref(
     // exit 0, and simply writes no reflog entry for it.
     let previous = leaf_object_id(repo, BStr::new(name))?;
     let new = leaf_object_id(repo, BStr::new(target)).unwrap_or(None);
+    let via_head = head_refers_to(repo, name_full.as_ref())?;
 
     repo.edit_reference(RefEdit {
         change: Change::Update {
@@ -323,7 +324,61 @@ fn set_symref(
             message.unwrap_or_default(),
         )?;
     }
+    if via_head {
+        log_head_split(repo, previous, message)?;
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether `HEAD` is a symbolic ref naming `name` directly — the `head_ref`
+/// `files_transaction_prepare()` computes before it locks anything:
+///
+/// ```c
+/// head_ref = refs_resolve_refdup(ref_store, "HEAD",
+///                                RESOLVE_REF_NO_RECURSE,
+///                                NULL, &head_type);
+/// if (head_ref && !(head_type & REF_ISSYMREF)) {
+///         FREE_AND_NULL(head_ref);
+/// }
+/// ```
+///
+/// (refs/files-backend.c:2951-2957, git 2.55.0). An update of `HEAD` itself is
+/// never split, so it answers false there.
+fn head_refers_to(repo: &gix::Repository, name: &FullNameRef) -> Result<bool> {
+    if name.as_bstr() == BStr::new("HEAD") {
+        return Ok(false);
+    }
+    Ok(symbolic_target(repo, BStr::new("HEAD"))?.is_some_and(|t| t.as_ref() == name))
+}
+
+/// The `REF_LOG_ONLY` update of `HEAD` that `split_head_update()` adds when the
+/// ref being made symbolic is the one `HEAD` points at
+/// (refs/files-backend.c:2446-2493, git 2.55.0):
+///
+/// ```c
+/// new_update = ref_transaction_add_update(
+///                 transaction, "HEAD",
+///                 update->flags | REF_LOG_ONLY | REF_NO_DEREF | REF_LOG_VIA_SPLIT,
+///                 &update->new_oid, &update->old_oid, &update->peeled,
+///                 NULL, NULL, update->committer_info, update->msg);
+/// ```
+///
+/// `refs_update_symref()` hands the transaction a `new_target` and no new id, so
+/// the copied `new_oid` is the null id, and the split update carries no target
+/// of its own. `parse_and_write_reflog()` therefore skips the dangling-target
+/// check for it and logs `<old> 0000…` for `HEAD` — whether or not the symref's
+/// own target resolves, which is why stock 2.55.0 answers
+/// `symbolic-ref refs/heads/main does-not-exist` on a checked-out `main` with a
+/// new `HEAD` line and nothing in `main`'s log. The old id is `HEAD`'s lock
+/// value, i.e. what `HEAD` resolved to before the write.
+fn log_head_split(
+    repo: &gix::Repository,
+    previous: Option<ObjectId>,
+    message: Option<&str>,
+) -> Result<()> {
+    let head = full_name("HEAD")?;
+    let null = repo.object_hash().null();
+    append_reflog(repo, head.as_ref(), previous, &null, message.unwrap_or_default())
 }
 
 /// `create_symref_locked()` for a target the reference transaction cannot carry.
@@ -348,6 +403,7 @@ fn set_symref_raw(
     prefer_symlink: bool,
 ) -> Result<ExitCode> {
     let previous = leaf_object_id(repo, name.as_bstr())?;
+    let via_head = head_refers_to(repo, name)?;
 
     // `files_ref_path()`: `HEAD` and the other per-worktree names live in the
     // worktree's git dir, `refs/…` in the common one.
@@ -375,6 +431,9 @@ fn set_symref_raw(
 
     if let Some(new) = leaf_object_id(repo, BStr::new(target)).unwrap_or(None) {
         append_reflog(repo, name, previous, &new, message.unwrap_or_default())?;
+    }
+    if via_head {
+        log_head_split(repo, previous, message)?;
     }
     Ok(ExitCode::SUCCESS)
 }

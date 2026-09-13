@@ -86,6 +86,23 @@ enum AttrTree {
 }
 
 pub fn check_attr(args: &[String]) -> Result<ExitCode> {
+    // `if (!is_bare_repository()) setup_work_tree();` is the first statement of
+    // `cmd_check_attr()` (builtin/check-attr.c:110-111), ahead of
+    // `parse_options()` and every argument check. `is_bare_repository()` is
+    // `is_bare_repository_cfg && !get_git_work_tree()` (environment.c:196-200),
+    // and `is_bare_repository_cfg` starts at -1 (environment.c:32), so only a
+    // repository without a work tree whose `core.bare` is explicitly false —
+    // what standing inside its `.git` directory leaves — dies here.
+    if let Ok(repo) = crate::setup::discover() {
+        let bare_cfg = repo
+            .config_snapshot()
+            .boolean("core.bare")
+            .unwrap_or(true);
+        if !bare_cfg && repo.workdir().is_none() {
+            return Err(crate::fatal::need_work_tree());
+        }
+    }
+
     let mut all = false;
     let mut cached = false;
     let mut stdin_paths = false;

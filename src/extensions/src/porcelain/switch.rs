@@ -683,6 +683,10 @@ fn switch_existing(
         }
         if !quiet {
             eprintln!("Already on '{branch}'");
+        }
+        // `remove_branch_state(the_repository, !opts->quiet)` (builtin/checkout.c:1044).
+        super::reset::remove_branch_state(repo, !quiet)?;
+        if !quiet {
             // `update_refs_for_switch()` ends with
             //
             // ```c
@@ -790,6 +794,9 @@ fn switch_existing(
             eprintln!("Previous HEAD position was {abbrev} {summary}");
         }
         eprintln!("Switched to branch '{branch}'");
+    }
+    super::reset::remove_branch_state(repo, !quiet)?;
+    if !quiet {
         // `report_tracking()`, which `cmd_switch` reaches through the same
         // `update_refs_for_switch()` `checkout` does.
         super::checkout::print_tracking_status(repo);
@@ -905,6 +912,7 @@ fn switch_create(
         if !quiet {
             eprintln!("Switched to a new branch '{branch}'");
         }
+        super::reset::remove_branch_state(repo, !quiet)?;
         return Ok(super::checkout::run_post_checkout(
             repo,
             old_head,
@@ -1028,6 +1036,7 @@ fn switch_create(
             }
         }
     }
+    super::reset::remove_branch_state(repo, !quiet)?;
     if autostashed {
         show_autostash_listing(&start_commit.to_string(), quiet)?;
     }
@@ -1174,6 +1183,7 @@ fn switch_detach(
         let (abbrev, summary) = describe(repo, target_id)?;
         eprintln!("HEAD is now at {abbrev} {summary}");
     }
+    super::reset::remove_branch_state(repo, !quiet)?;
     if autostashed {
         show_autostash_listing(&target_id.to_string(), quiet)?;
     }
@@ -1244,6 +1254,7 @@ fn switch_orphan(
     if !quiet {
         eprintln!("Switched to a new branch '{branch}'");
     }
+    super::reset::remove_branch_state(repo, !quiet)?;
     Ok(ExitCode::SUCCESS)
 }
 

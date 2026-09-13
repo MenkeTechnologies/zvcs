@@ -945,7 +945,7 @@ fn continue_single_pick(
     })?;
 
     let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-    crate::sequencer::post_commit_cleanup(repo)?;
+    crate::sequencer::post_commit_cleanup(repo, false)?;
 
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
     print_summary(

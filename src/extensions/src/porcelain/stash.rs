@@ -959,7 +959,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         // `die()` there is the child's: its `fatal:` line is all that is printed,
         // and `run_command()` failing makes `do_push_stash()` return -1, exit 1
         // (builtin/stash.c:1822-1825), with the stash already stored.
-        if let Err(err) = super::reset::remove_branch_state(repo) {
+        if let Err(err) = super::reset::remove_branch_state(repo, false) {
             eprintln!("fatal: {err}");
             return Ok(ExitCode::FAILURE);
         }

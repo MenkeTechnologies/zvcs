@@ -932,7 +932,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             }
             move_head(&repo, commit.id, reflog_spec)?;
         }
-        remove_branch_state(&repo)?;
+        remove_branch_state(&repo, false)?;
         super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
         // No `HEAD is now at` here: `cmd_reset()` gates `print_new_head_line()`
         // on `reset_type == HARD`, so `--merge` and `--keep` move the branch in
@@ -982,7 +982,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // (builtin/reset.c:542-543), after the index is written (:530) and the
     // "Unstaged changes after reset:" listing and `HEAD is now at` line are
     // printed — so a `die()` inside it leaves both behind.
-    remove_branch_state(&repo)?;
+    remove_branch_state(&repo, false)?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -1100,12 +1100,18 @@ pub(crate) fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> 
 /// Shared with [`crate::porcelain::stash`], whose push runs `git reset --hard`
 /// as a child (builtin/stash.c:1816-1825) and so inherits this step too.
 ///
+/// Also the tail of every branch switch: `update_refs_for_switch()`
+/// (builtin/checkout.c:1044) runs `remove_branch_state(the_repository,
+/// !opts->quiet)`, which is where `checkout` and `switch` announce the
+/// cherry-pick or revert they cancel. `verbose` is that flag; reset
+/// (builtin/reset.c:543) and stash pass `0`.
+///
 /// A config value the `AUTO_MERGE` deletion cannot read is fatal
 /// ([`crate::sequencer::delete_state_ref`]), and it is reached before the merge
 /// state files are unlinked, as branch.c:842-844 orders them.
-pub(crate) fn remove_branch_state(repo: &gix::Repository) -> Result<()> {
+pub(crate) fn remove_branch_state(repo: &gix::Repository, verbose: bool) -> Result<()> {
     let git_dir = repo.git_dir();
-    crate::sequencer::post_commit_cleanup(repo)?;
+    crate::sequencer::post_commit_cleanup(repo, verbose)?;
     for name in ["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
         let _ = std::fs::remove_file(git_dir.join(name));
     }

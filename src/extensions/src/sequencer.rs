@@ -1363,10 +1363,28 @@ fn unquote_config_value(raw: &str) -> String {
 /// actually in progress *and* it was the last one, which is what lets
 /// `git reset --merge` sit in the middle of `--skip` without destroying the
 /// remaining todo.
-pub fn post_commit_cleanup(repo: &gix::Repository) -> Result<()> {
+///
+/// `verbose` is the caller's flag (`!opts->quiet` from `update_refs_for_switch()`,
+/// `0` from commit, reset, am and the pick commands): a pseudo-ref that was there
+/// and got deleted is announced (sequencer.c:2970-2986):
+///
+/// ```c
+/// if (!refs_delete_ref(get_main_ref_store(r), "",
+///                      "CHERRY_PICK_HEAD", NULL, REF_NO_DEREF) &&
+///     verbose)
+///         warning(_("cancelling a cherry picking in progress"));
+/// ```
+pub fn post_commit_cleanup(repo: &gix::Repository, verbose: bool) -> Result<()> {
     let git_dir = repo.git_dir();
-    let mut need_cleanup = delete_state_ref(repo, "CHERRY_PICK_HEAD")?;
-    need_cleanup |= delete_state_ref(repo, "REVERT_HEAD")?;
+    let picking = delete_state_ref(repo, "CHERRY_PICK_HEAD")?;
+    if picking && verbose {
+        eprintln!("warning: cancelling a cherry picking in progress");
+    }
+    let reverting = delete_state_ref(repo, "REVERT_HEAD")?;
+    if reverting && verbose {
+        eprintln!("warning: cancelling a revert in progress");
+    }
+    let need_cleanup = picking || reverting;
     delete_state_ref(repo, "AUTO_MERGE")?;
     if !need_cleanup || !have_finished_the_last_pick(git_dir) {
         return Ok(());

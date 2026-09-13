@@ -2578,7 +2578,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `core.packedRefsTimeout` read. It runs *before* `commit_index_files()`
     // (:1957): a `die()` there leaves `HEAD` on the new commit and the index
     // locks rolled back, which is what the guards below do when dropped unkept.
-    crate::sequencer::post_commit_cleanup(&repo)?;
+    crate::sequencer::post_commit_cleanup(&repo, false)?;
     for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
         let path = repo.git_dir().join(name);
         if path.exists() {

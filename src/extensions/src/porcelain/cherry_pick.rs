@@ -2117,7 +2117,7 @@ fn continue_single_pick(
     // runs on its way out: the pseudo-refs always go, the sequencer directory
     // only once the todo is down to the instruction just finished.
     let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-    crate::sequencer::post_commit_cleanup(repo)?;
+    crate::sequencer::post_commit_cleanup(repo, false)?;
 
     // `print_commit_summary()`. `git commit` reaches it with
     // `author_date_is_interesting()` true here, because `prepare_to_commit()`

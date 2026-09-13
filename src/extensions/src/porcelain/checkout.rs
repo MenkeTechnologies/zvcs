@@ -949,6 +949,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             if !quiet {
                 eprintln!("Switched to a new branch '{name}'");
             }
+            super::reset::remove_branch_state(&repo, !quiet)?;
             let head = head_commit_id(&repo);
             return Ok(run_post_checkout(&repo, head, head, true));
         }
@@ -1087,7 +1088,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 return Ok(code);
             }
             let code =
-                switch_to_branch_opts(&repo, spec, quiet, force, None, merge_opt(merge, &conflict_style, spec))?;
+                switch_to_branch_opts(&repo, spec, quiet, force, None, merge_opt(merge, &conflict_style, spec), true)?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
@@ -1325,6 +1326,9 @@ fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> R
     } else {
         show_local_changes("HEAD", quiet)?;
     }
+    // `update_refs_for_switch()`'s "Nothing to do" arm still ends in
+    // `remove_branch_state(the_repository, !opts->quiet)` (builtin/checkout.c:1044).
+    super::reset::remove_branch_state(repo, !quiet)?;
     Ok(run_post_checkout(repo, head, head_commit_id(repo), true))
 }
 
@@ -1347,7 +1351,10 @@ pub(crate) fn switch_to_branch(
     // `options.switch_to` checkout records.
     reflog_message: Option<&str>,
 ) -> Result<ExitCode> {
-    switch_to_branch_opts(repo, spec, quiet, force, reflog_message, None)
+    // Rebase's switch is `checkout_up_to_date()` → `reset_head()`
+    // (builtin/rebase.c:855-865), which never reaches `update_refs_for_switch()`
+    // and so leaves any in-progress state alone.
+    switch_to_branch_opts(repo, spec, quiet, force, reflog_message, None, false)
 }
 
 /// [`switch_to_branch`] with `opts->merge` made explicit — the spelling
@@ -1479,6 +1486,10 @@ pub(crate) fn switch_to_branch_opts(
     force: bool,
     reflog_message: Option<&str>,
     merge: Option<MergeOpt<'_>>,
+    // Whether this is `switch_branches()`'s `update_refs_for_switch()`, which
+    // ends in `remove_branch_state(the_repository, !opts->quiet)`
+    // (builtin/checkout.c:1044).
+    update_refs_for_switch: bool,
 ) -> Result<ExitCode> {
     // `merge_working_tree()` runs for every switch, the no-op one included, and its first act is
     // to refuse an unmerged index.
@@ -1519,6 +1530,11 @@ pub(crate) fn switch_to_branch_opts(
             )?;
             if !quiet {
                 eprintln!("Already on '{spec}'");
+            }
+            if update_refs_for_switch {
+                super::reset::remove_branch_state(repo, !quiet)?;
+            }
+            if !quiet {
                 // `report_tracking()` runs after the message on BOTH arms of
                 // `update_refs_for_switch()` (builtin/checkout.c) — the
                 // already-on arm is not an early return in git, it just skips
@@ -1596,6 +1612,11 @@ pub(crate) fn switch_to_branch_opts(
             }
         }
         eprintln!("Switched to branch '{spec}'");
+    }
+    if update_refs_for_switch {
+        super::reset::remove_branch_state(repo, !quiet)?;
+    }
+    if !quiet {
         // `report_tracking()`: the ahead/behind summary for a branch with an upstream,
         // the same block `status` prints under its header.
         print_tracking_status(repo);
@@ -1674,6 +1695,7 @@ fn detached_checkout(
         let (abbrev, summary) = describe(repo, target_id)?;
         eprintln!("HEAD is now at {abbrev} {summary}");
     }
+    super::reset::remove_branch_state(repo, !quiet)?;
     Ok(run_post_checkout(repo, old_commit, Some(target_id), true))
 }
 
@@ -1917,6 +1939,9 @@ fn create_and_switch(
                 )
             );
         }
+    }
+    super::reset::remove_branch_state(repo, !quiet)?;
+    if !quiet {
         // `report_tracking()` follows for a branch that already existed; a brand-new
         // one has nothing to report beyond the upstream just configured.
         if existed {
@@ -2011,6 +2036,7 @@ fn orphan_checkout(
     if !quiet {
         eprintln!("Switched to a new branch '{name}'");
     }
+    super::reset::remove_branch_state(repo, !quiet)?;
     // The new branch is unborn, so `new_branch_info->commit` is still the commit
     // the orphan was started from — git reports the same id on both sides.
     Ok(run_post_checkout(repo, old_head, old_head, true))
@@ -3460,33 +3486,10 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;
-    // `remove_branch_state()`: a forced switch abandons any in-progress merge,
-    // cherry-pick or revert, exactly as git's `switch_branches` does after the
-    // worktree is reconciled.
-    remove_branch_state(repo);
+    // The in-progress merge, cherry-pick or revert this abandons is dropped by
+    // `update_refs_for_switch()`, after the transition message — not here, where
+    // it ran silently and ahead of that message for forced switches only.
     Ok(())
-}
-
-/// git's `remove_branch_state()` (branch.c): the merge/sequencer state files a
-/// switch invalidates, plus the `CHERRY_PICK_HEAD` / `REVERT_HEAD` that
-/// `sequencer_post_commit_cleanup()` drops on its way through.
-///
-/// `AUTO_MERGE` is on the list because `git merge` writes it for the conflicted
-/// tree and nothing else removes it: a forced checkout out of a conflicted state
-/// that leaves it behind makes the next `git diff` compare against a stale tree.
-/// `MERGE_AUTOSTASH` is saved rather than deleted by git and is left alone here.
-fn remove_branch_state(repo: &gix::Repository) {
-    for name in [
-        "MERGE_HEAD",
-        "MERGE_RR",
-        "MERGE_MSG",
-        "MERGE_MODE",
-        "AUTO_MERGE",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-    ] {
-        let _ = std::fs::remove_file(repo.git_dir().join(name));
-    }
 }
 
 /// git's `show_local_changes()`: the `diff-index --name-status` listing a

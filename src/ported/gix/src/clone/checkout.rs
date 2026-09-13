@@ -79,13 +79,29 @@ pub mod main_worktree {
             P: gix_features::progress::NestedProgress,
             P::SubProgress: gix_features::progress::NestedProgress + 'static,
         {
-            self.main_worktree_inner(&mut progress, should_interrupt)
+            self.main_worktree_inner(&mut progress, should_interrupt, None)
+        }
+
+        /// Like [`main_worktree()`](Self::main_worktree()), calling `on_entry` once for every entry whose
+        /// checkout concluded (see [`gix_worktree_state::checkout::Options::on_entry`]).
+        pub fn main_worktree_with_entry_hook<P>(
+            &mut self,
+            mut progress: P,
+            should_interrupt: &AtomicBool,
+            on_entry: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        ) -> Result<(Repository, gix_worktree_state::checkout::Outcome), Error>
+        where
+            P: gix_features::progress::NestedProgress,
+            P::SubProgress: gix_features::progress::NestedProgress + 'static,
+        {
+            self.main_worktree_inner(&mut progress, should_interrupt, on_entry)
         }
 
         fn main_worktree_inner(
             &mut self,
             progress: &mut dyn gix_features::progress::DynNestedProgress,
             should_interrupt: &AtomicBool,
+            on_entry: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         ) -> Result<(Repository, gix_worktree_state::checkout::Outcome), Error> {
             let _span = gix_trace::coarse!("gix::clone::PrepareCheckout::main_worktree()");
             let repo = self
@@ -127,6 +143,7 @@ pub mod main_worktree {
 
             let mut opts = repo.checkout_options(gix_worktree::stack::state::attributes::Source::IdMapping)?;
             opts.destination_is_initially_empty = true;
+            opts.on_entry = on_entry;
 
             let mut files = progress.add_child_with_id("checkout".to_string(), ProgressId::CheckoutFiles.into());
             let mut bytes = progress.add_child_with_id("writing".to_string(), ProgressId::BytesWritten.into());

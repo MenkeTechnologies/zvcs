@@ -1723,7 +1723,33 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             junk.leave();
             // Check out the branch `HEAD` points to. This is a no-op for an empty
             // remote, leaving an empty repository exactly like git does.
-            let (repo, _) = checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
+            // `checkout()` unpacks `HEAD`'s tree with `opts.verbose_update =
+            // (option_verbosity >= 0)` (builtin/clone.c:682), after returning early for an
+            // unborn `HEAD`; every entry of the tree is written.
+            let head_tree = checkout.repo().head_tree_id().ok().map(|id| id.detach());
+            let total = head_tree
+                .and_then(|tree| checkout.repo().index_from_tree(&tree).ok())
+                .map_or(0, |index| index.entries().len());
+            let updating = match crate::worktree::UpdatingFiles::start(total, !quiet && head_tree.is_some()) {
+                Ok(updating) => updating,
+                // `get_progress()` dies before anything is written, and with
+                // `junk_mode == JUNK_LEAVE_REPO` the `remove_junk()` handler keeps the
+                // repository and says so (builtin/clone.c:384-398). The exit is taken
+                // here, as `die()` takes it, so nothing unwinds into the cleanup that
+                // would delete the clone.
+                Err(e) => {
+                    eprintln!("fatal: {e}");
+                    eprintln!(
+                        "warning: Clone succeeded, but checkout failed.\n\
+                         You can inspect what was checked out with 'git status'\n\
+                         and retry with 'git restore --source=HEAD :/'\n"
+                    );
+                    std::process::exit(128);
+                }
+            };
+            let (repo, _) =
+                checkout.main_worktree_with_entry_hook(gix::progress::Discard, &should_interrupt, updating.hook())?;
+            updating.stop();
             // `checkout()` (builtin/clone.c:677-698) is a `oneway_merge` `unpack_trees()`, which
             // ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
             // (unpack-trees.c:2086-2090) before `write_locked_index()` — so a fresh clone's

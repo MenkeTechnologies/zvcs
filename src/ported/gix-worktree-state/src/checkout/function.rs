@@ -59,6 +59,7 @@ where
 
     let mut ctx = chunk::Context {
         buf: Vec::new(),
+        on_entry: options.on_entry.clone(),
         options: (&options).into(),
         path_cache: Stack::from_state_and_ignore_case(
             dir,

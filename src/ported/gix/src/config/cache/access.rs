@@ -364,6 +364,7 @@ impl Cache {
             destination_is_initially_empty: false,
             overwrite_existing: false,
             keep_going: false,
+            on_entry: None,
             stat_options: self.stat_options().map_err(|err| match err {
                 config::stat_options::Error::ConfigCheckStat(err) => {
                     config::checkout_options::Error::ConfigCheckStat(err)

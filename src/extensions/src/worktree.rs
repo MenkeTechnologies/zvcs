@@ -352,6 +352,51 @@ fn is_up_to_date(
 /// (`unlink_entry()`, unpack-trees.c.) Deleting the last file in a directory takes the
 /// directory with it — `remove_scheduled_dirs()` walks back up as far as the emptiness
 /// goes — so a checkout that drops `nested/deep/path.txt` leaves no `nested/` behind.
+/// `check_updates()`'s `Updating files` meter (unpack-trees.c:361-377, 429-506).
+///
+/// `get_progress()` starts it only for an unpack that updates the work tree
+/// and was asked to report (`o->update && o->verbose_update`), over every entry
+/// marked `CE_UPDATE` or `CE_WT_REMOVE`; `display_progress(progress, ++cnt)`
+/// follows each removal and each checked-out entry, and `stop_progress()` comes
+/// once the writes are done. It is a delayed meter, so a prompt checkout draws
+/// nothing at all.
+pub struct UpdatingFiles(Option<std::sync::Arc<std::sync::Mutex<Option<crate::progress::Meter>>>>);
+
+impl UpdatingFiles {
+    /// `get_progress()`: `total` entries to remove or write, reported only when `on`.
+    pub fn start(total: usize, on: bool) -> Result<Self, crate::progress::DelayError> {
+        if !on {
+            return Ok(UpdatingFiles(None));
+        }
+        let meter = crate::progress::Meter::delayed("Updating files", total, true)?;
+        Ok(UpdatingFiles(Some(std::sync::Arc::new(std::sync::Mutex::new(Some(meter))))))
+    }
+
+    /// One removal or checkout done.
+    pub fn tick(&self) {
+        if let Some(meter) = &self.0 {
+            if let Some(meter) = meter.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                meter.tick();
+            }
+        }
+    }
+
+    /// [`UpdatingFiles::tick`] as the per-entry hook the work-tree writer calls.
+    pub fn hook(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+        let meter = self.0.clone()?;
+        Some(std::sync::Arc::new(move || UpdatingFiles(Some(meter.clone())).tick()))
+    }
+
+    /// `stop_progress(&progress)`.
+    pub fn stop(self) {
+        if let Some(meter) = self.0 {
+            if let Some(meter) = meter.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                meter.stop("done");
+            }
+        }
+    }
+}
+
 pub fn prune_empty_dirs(workdir: &std::path::Path, full: &std::path::Path) {
     let original: Option<&std::path::Path> = original_cwd();
     let mut cur = full.parent();

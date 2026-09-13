@@ -72,6 +72,9 @@ pub struct Options {
     pub filters: gix_filter::Pipeline,
     /// Control how long-running processes may use the 'delay' capability.
     pub filter_process_delay: gix_filter::driver::apply::Delay,
+    /// Called once for every entry whose checkout has concluded, written or failed, so a caller can report
+    /// progress per entry as it happens. Entries marked `SKIP_WORKTREE` are passed over without a call.
+    pub on_entry: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// The error returned by the [checkout()][crate::checkout()] function.

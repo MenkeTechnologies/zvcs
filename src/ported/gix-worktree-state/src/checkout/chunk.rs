@@ -76,6 +76,14 @@ pub struct Context<Find: Clone> {
     pub filters: gix_filter::Pipeline,
     pub buf: Vec<u8>,
     pub options: Options,
+    pub on_entry: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Tell the caller one more entry has concluded, see [`checkout::Options::on_entry`].
+fn entry_done(on_entry: &Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    if let Some(on_entry) = on_entry {
+        on_entry();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -216,6 +224,7 @@ where
                         if !is_collision(&err, delayed.entry_path, &mut out.collisions, files) {
                             handle_error(err, delayed.entry_path, files, &mut out.errors, ctx.options.keep_going)?;
                         }
+                        entry_done(&ctx.on_entry);
                         std::io::copy(&mut read, &mut std::io::sink())?;
                         continue;
                     }
@@ -234,6 +243,7 @@ where
                 )?;
                 delayed_files += 1;
                 files.fetch_add(1, Ordering::Relaxed);
+                entry_done(&ctx.on_entry);
             }
         }
     }
@@ -290,6 +300,7 @@ pub fn checkout_entry_handle_result<'entry, Find>(
         filters,
         buf,
         options,
+        on_entry,
     }: &mut Context<Find>,
 ) -> Result<entry::Outcome<'entry>, checkout::Error>
 where
@@ -311,10 +322,12 @@ where
             if let Some(num) = out.as_bytes() {
                 bytes.fetch_add(num, Ordering::Relaxed);
                 files.fetch_add(1, Ordering::Relaxed);
+                entry_done(on_entry);
             }
             Ok(out)
         }
         Err(checkout::Error::Io(err)) if is_collision(&err, entry_path, collisions, files) => {
+            entry_done(on_entry);
             Ok(entry::Outcome::Written { bytes: 0 })
         }
         Err(err) => {
@@ -327,8 +340,10 @@ where
                 },
                 other => other,
             };
-            handle_error(err, entry_path, files, errors, options.keep_going)
-                .map(|()| entry::Outcome::Written { bytes: 0 })
+            handle_error(err, entry_path, files, errors, options.keep_going).map(|()| {
+                entry_done(on_entry);
+                entry::Outcome::Written { bytes: 0 }
+            })
         }
     }
 }

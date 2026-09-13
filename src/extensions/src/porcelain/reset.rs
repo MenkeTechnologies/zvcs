@@ -945,7 +945,6 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         }
         move_head(&repo, commit.id, reflog_spec)?;
     }
-    remove_branch_state(&repo)?;
 
     match mode {
         ResetMode::Soft => {}
@@ -972,6 +971,12 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         // Handled above, before the ref move.
         ResetMode::Merge | ResetMode::Keep => unreachable!(),
     }
+
+    // `remove_branch_state()` is the last step of `cmd_reset()`
+    // (builtin/reset.c:542-543), after the index is written (:530) and the
+    // "Unstaged changes after reset:" listing and `HEAD is now at` line are
+    // printed — so a `die()` inside it leaves both behind.
+    remove_branch_state(&repo)?;
 
     Ok(ExitCode::SUCCESS)
 }

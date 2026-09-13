@@ -454,57 +454,6 @@ fn read_state_oid(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
         .map(|id| id.detach())
 }
 
-/// Delete one of those pseudo-refs, reporting whether it had existed — git's
-/// `refs_delete_ref(..., REF_NO_DEREF)`.
-fn delete_state_ref(repo: &gix::Repository, name: &str) -> bool {
-    let mut removed = std::fs::remove_file(repo.git_dir().join(name)).is_ok();
-    if let Ok(reference) = repo.find_reference(name) {
-        let current = reference.target().into_owned();
-        removed |= repo
-            .edit_reference(gix::refs::transaction::RefEdit {
-                change: gix::refs::transaction::Change::Delete {
-                    expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(current),
-                    log: gix::refs::transaction::RefLog::AndReference,
-                    message: Default::default(),
-                },
-                name: reference.name().to_owned(),
-                deref: false,
-            })
-            .is_ok();
-    }
-    removed
-}
-
-/// git's `sequencer_post_commit_cleanup()` (sequencer.c): drop the pseudo-refs a
-/// cherry-pick/revert left behind and, once the todo list is down to its final
-/// entry, the sequencer directory with it.
-fn sequencer_post_commit_cleanup(repo: &gix::Repository) -> Result<()> {
-    let mut need_cleanup = delete_state_ref(repo, "CHERRY_PICK_HEAD");
-    need_cleanup |= delete_state_ref(repo, "REVERT_HEAD");
-    delete_state_ref(repo, "AUTO_MERGE");
-    if !need_cleanup || !have_finished_the_last_pick(repo) {
-        return Ok(());
-    }
-    // `sequencer_remove_state()`: the whole `.git/sequencer` directory goes.
-    let dir = repo.git_dir().join("sequencer");
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-    }
-    Ok(())
-}
-
-/// git's `have_finished_the_last_pick()`: true when `.git/sequencer/todo` holds
-/// at most one line (the pick just concluded), false when it is missing entirely.
-fn have_finished_the_last_pick(repo: &gix::Repository) -> bool {
-    let Ok(buf) = std::fs::read(repo.git_dir().join("sequencer").join("todo")) else {
-        return false;
-    };
-    match buf.iter().position(|&b| b == b'\n') {
-        None => true,
-        Some(eol) => eol + 1 >= buf.len(),
-    }
-}
-
 /// git's `refresh_cache_or_die()` → `die_resolve_conflict("commit")`: the exact
 /// output `git commit` produces while unmerged entries remain in the index.
 ///
@@ -568,7 +517,7 @@ fn apply_merge_autostash(repo: &gix::Repository) -> Result<()> {
             );
         }
     }
-    delete_state_ref(repo, "MERGE_AUTOSTASH");
+    crate::sequencer::delete_state_ref(repo, "MERGE_AUTOSTASH")?;
     Ok(())
 }
 
@@ -2619,9 +2568,26 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         repo.commit("HEAD", &message, tree_id, parents)?
     };
 
-    // The commit is in the object store and `HEAD` points at it, which is git's
-    // `commit_index_files()` moment: the prepared index becomes the real one and
-    // an interactive selection is no longer rolled back.
+    // The operation this commit concluded is over: drop the sequencer pseudo-refs
+    // (and its todo directory once the last pick is in), then the merge state
+    // files. Leaving `MERGE_HEAD` behind is what makes the next `git merge` die
+    // with "You have not concluded your merge".
+    //
+    // `sequencer_post_commit_cleanup()` (builtin/commit.c:1951) is shared with
+    // reset and the pick commands, so its `AUTO_MERGE` deletion makes the same
+    // `core.packedRefsTimeout` read. It runs *before* `commit_index_files()`
+    // (:1957): a `die()` there leaves `HEAD` on the new commit and the index
+    // locks rolled back, which is what the guards below do when dropped unkept.
+    crate::sequencer::post_commit_cleanup(&repo)?;
+    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
+        let path = repo.git_dir().join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+    }
+
+    // `commit_index_files()` (builtin/commit.c:1957): the prepared index becomes
+    // the real one and an interactive selection is no longer rolled back.
     if let Some(stage) = &mut interactive_stage {
         stage.keep();
     }
@@ -2637,18 +2603,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // guard therefore stops rolling it back here.
     if let Some(stage) = &mut staged_index {
         stage.keep();
-    }
-
-    // The operation this commit concluded is over: drop the sequencer pseudo-refs
-    // (and its todo directory once the last pick is in), then the merge state
-    // files. Leaving `MERGE_HEAD` behind is what makes the next `git merge` die
-    // with "You have not concluded your merge".
-    sequencer_post_commit_cleanup(&repo)?;
-    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
-        let path = repo.git_dir().join(name);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
     }
 
     // `repo_rerere()` — the resolutions the user just staged become postimages, so

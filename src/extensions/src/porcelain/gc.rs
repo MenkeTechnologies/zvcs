@@ -1294,10 +1294,12 @@ pub(super) fn too_many_packs(repo: &gix::Repository) -> bool {
 // "this commit is not in the full ancestor closure of the tip set". That
 // equivalence is what [`reachable_commits`] computes directly.
 //
-// Divergences, both edge-of-edge: per-pattern `gc.<pattern>.reflog*` matching
-// uses a `*`/`?` glob (git's `wildmatch` bracket classes are not honoured), and
-// only the main ref store's `logs/` are processed (git's `--all` also visits
-// each linked worktree's ref store, which `prune` already declines to support).
+// The common `logs/` and every linked worktree's admin `logs/` are processed, as
+// `--all` visits each worktree's ref store; a shared ref's log is skipped when no
+// worktree is current (see `any_worktree_is_current`).
+//
+// Divergence, edge-of-edge: per-pattern `gc.<pattern>.reflog*` matching uses a
+// `*`/`?` glob (git's `wildmatch` bracket classes are not honoured).
 
 /// The `repack` child's diagnostics for the two arguments `gc` forwards from
 /// `gc.repackFilter` and `gc.repackFilterTo`, or `None` when it would have

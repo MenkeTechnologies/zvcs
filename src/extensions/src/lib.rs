@@ -1310,9 +1310,31 @@ pub(crate) fn exec_path() -> String {
             return p;
         }
     }
+    format!("{}/bin", system_prefix())
+}
+
+/// `system_prefix()` for a build without `RUNTIME_PREFIX` (exec-cmd.c:275-278),
+/// which is every Unix build: config.mak.uname sets `RUNTIME_PREFIX` only in its
+/// Windows toolchain blocks (:512, :719). git answers with its compiled-in
+/// `prefix`; this port is installed per user under `$HOME/.zvcs`, so that is the
+/// prefix it answers with, and the directory [`exec_path`] names sits beneath it.
+pub(crate) fn system_prefix() -> String {
     match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => format!("{h}/.zvcs/bin"),
-        _ => ".zvcs/bin".to_string(),
+        Ok(h) if !h.is_empty() => format!("{h}/.zvcs"),
+        _ => ".zvcs".to_string(),
+    }
+}
+
+/// `system_path()` (exec-cmd.c:290-299): an absolute `path` is returned as it
+/// stands, anything else is `"%s/%s"` of [`system_prefix`] and `path`. It never
+/// fails, which is why `interpolate_path()` can hand it `%(prefix)/` unguarded
+/// (path.c:706-707). The join is textual, so an empty `path` keeps the trailing
+/// slash: stock's `config --type=path` prints `%(prefix)/` as `<prefix>/`.
+pub(crate) fn system_path(path: &str) -> String {
+    if std::path::Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        format!("{}/{path}", system_prefix())
     }
 }
 

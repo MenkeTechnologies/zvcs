@@ -340,6 +340,12 @@ struct Display {
     blob: Option<String>,
     /// The merged read, the only one that walks the command line — see [`for_each_entry`].
     command_line: bool,
+    /// The directory `git config` is standing in once setup has run, which is
+    /// where `is_missing_file()` resolves a relative `:(optional)` path: the top
+    /// of the work tree for a command started below it, the process directory
+    /// otherwise (a bare repository, the git directory itself, or no repository).
+    /// See [`crate::setup::setup_cwd`].
+    path_base: Option<std::path::PathBuf>,
 }
 
 /// `--type=<t>` and its legacy spellings (`--bool`, `--int`, `--bool-or-int`,
@@ -381,6 +387,13 @@ enum TypeError {
     /// a `~user` no passwd entry names and for a bare `~` with no `$HOME`; both
     /// are one bare `die()` naming the *unexpanded* value.
     ExpandUser,
+    /// Not a failure: an `:(optional)` path naming no file. `git_config_pathname()`
+    /// leaves the destination NULL (config.c:1321-1325) and `format_config_path()`
+    /// returns 1 for it (builtin/config.c:353-356), which every caller takes as
+    /// "pretend this entry did not exist": `collect_config()` drops the value,
+    /// `get_value()`'s `--default` arm drops the default, and `show_all_config()`
+    /// prints nothing for it.
+    MissingOptional,
 }
 
 impl ValueType {
@@ -405,11 +418,14 @@ impl ValueType {
     /// the first value that does not. Only the message differs; what parses and
     /// what does not is the same either way, so the error is always described and
     /// the caller decides whether to print it.
+    /// `base` is where a relative `:(optional)` path is looked for under
+    /// `--type=path` ([`Display::path_base`]); the other types ignore it.
     fn canonicalize(
         self,
         key: &str,
         value: &[u8],
         implicit: bool,
+        base: Option<&std::path::Path>,
     ) -> std::result::Result<Vec<u8>, TypeError> {
         // Verbatim: git hands the stored bytes to each type's reader untouched,
         // and the number grammar itself skips *leading* blanks only — so a
@@ -449,7 +465,7 @@ impl ValueType {
                 Some(b) => b.to_string().into_bytes(),
                 None => value.to_vec(),
             }),
-            ValueType::Path => expand_config_path(&text).map(String::into_bytes),
+            ValueType::Path => expand_config_path(&text, base).map(String::into_bytes),
             // `git_config_expiry_date()` (config.c) — `parse_expiry_date()` with an
             // `error()` in front of the failure, and the epoch seconds printed raw.
             ValueType::ExpiryDate => match crate::date::parse_expiry_date(&text) {
@@ -498,14 +514,46 @@ fn canonical_int(text: &str, width: Width) -> std::result::Result<Vec<u8>, TypeE
     }
 }
 
-/// `--type=path`: `interpolate_path(value, 0)` (`path.c`). A leading `~/`
-/// expands to `$HOME`, a leading `~user` to that user's passwd home directory,
-/// and everything else is returned as it stands. A `~user` no passwd entry
-/// names — and a bare `~` with no `$HOME` — is git's NULL return, which
+/// `--type=path`: `interpolate_path(value, 0)` (`path.c`). A leading
+/// `%(prefix)/` resolves through [`crate::system_path`] (path.c:706-707), a
+/// leading `~/` expands to `$HOME`, a leading `~user` to that user's passwd home
+/// directory, and everything else is returned as it stands. A `~user` no passwd
+/// entry names — and a bare `~` with no `$HOME` — is git's NULL return, which
 /// `git_config_pathname()` turns into a `die()`; answering with the unexpanded
 /// text instead made `git config --type=path --get pa.k` print
-/// `~nosuchuser000/x` and exit 0 where stock is fatal at 128.
-fn expand_config_path(text: &str) -> std::result::Result<String, TypeError> {
+/// `~nosuchuser000/x` and exit 0 where stock is fatal at 128. `%(prefix)/x` used
+/// to be printed unexpanded as well.
+///
+/// `git_config_pathname()` strips one leading `:(optional)` before interpolating
+/// and, when the expanded path is a missing file, answers with no value at all
+/// (config.c:1316-1325) — [`TypeError::MissingOptional`]. `is_missing_file()`
+/// (wrapper.c) is `stat()` failing with `ENOENT`; any other failure keeps the
+/// path. The marker used to be printed as part of the value.
+fn expand_config_path(
+    text: &str,
+    base: Option<&std::path::Path>,
+) -> std::result::Result<String, TypeError> {
+    let Some(rest) = text.strip_prefix(":(optional)") else {
+        return interpolate_config_path(text);
+    };
+    let path = interpolate_config_path(rest)?;
+    // A relative name is looked for where setup left git standing, not where the
+    // process started ([`Display::path_base`]); an absolute one replaces the base.
+    let probe = match base {
+        Some(base) => base.join(&path),
+        None => std::path::PathBuf::from(&path),
+    };
+    match std::fs::metadata(&probe) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(TypeError::MissingOptional),
+        _ => Ok(path),
+    }
+}
+
+/// `interpolate_path(value, 0)` itself, once any `:(optional)` is gone.
+fn interpolate_config_path(text: &str) -> std::result::Result<String, TypeError> {
+    if let Some(rest) = text.strip_prefix("%(prefix)/") {
+        return Ok(crate::system_path(rest));
+    }
     if let Some(rest) = text.strip_prefix("~/") {
         return match std::env::var_os("HOME") {
             Some(home) => Ok(format!(
@@ -1411,6 +1459,10 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
     };
     d.prefix = repo.as_ref().and_then(crate::setup::prefix).map(|p| format!("{}/", p.display()));
+    d.path_base = match &repo {
+        Some(repo) => crate::setup::setup_cwd(repo),
+        None => std::env::current_dir().ok(),
+    };
     d.blob = match &scope {
         Scope::Blob(spec) => Some(spec.clone()),
         _ => None,
@@ -1975,21 +2027,25 @@ fn get(
         }
         Ok(())
     })?;
-    // Only a `--get` that found *nothing* reaches the `--default` arm; a key that
-    // exists but was filtered out by a value-pattern still exits 1.
-    if selected.is_empty() {
-        return emit_default(&mut out, d, name);
-    }
-
     // git canonicalizes in file order and dies on the first value that does not
     // parse as the requested type — even when `--get` would have returned a
-    // later one, so the error names the same value stock git names.
+    // later one, so the error names the same value stock git names. A missing
+    // `:(optional)` path is dropped instead, as if it had never been set.
     let mut canonical: Vec<(String, Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
     for (k, v, implicit, meta) in &selected {
         match typed(d, k, v, *implicit, meta) {
-            Ok(v) => canonical.push((k.clone(), v, *implicit, meta.clone())),
+            Ok(Some(v)) => canonical.push((k.clone(), v, *implicit, meta.clone())),
+            Ok(None) => {}
             Err(code) => return Ok(code),
         }
+    }
+
+    // `get_value()` consults `--default` when no value survived the walk
+    // (`if (!values.nr && ...)`, builtin/config.c:608): nothing matched the key,
+    // a value-pattern filtered every match out before `collect_config()` listed
+    // it, or every listed match was a missing optional path.
+    if canonical.is_empty() {
+        return emit_default(&mut out, d, name);
     }
 
     let emit: &[_] = if all { &canonical } else { &canonical[canonical.len() - 1..] };
@@ -2039,7 +2095,7 @@ fn emit_default(out: &mut impl std::io::Write, d: &Display, name: &str) -> Resul
     };
     let formatted = match d.ty {
         None => Ok(default.as_bytes().to_vec()),
-        Some(t) => t.canonicalize(name, default.as_bytes(), false),
+        Some(t) => t.canonicalize(name, default.as_bytes(), false, d.path_base.as_deref()),
     };
     match formatted {
         Ok(value) => {
@@ -2054,6 +2110,9 @@ fn emit_default(out: &mut impl std::io::Write, d: &Display, name: &str) -> Resul
             eprintln!("fatal: failed to format default config value: {default}");
             Ok(ExitCode::from(128))
         }
+        // "default was a missing optional value": the item is dropped, so
+        // `ret = !values.nr` is 1 and nothing is printed.
+        Err(TypeError::MissingOptional) => Ok(ExitCode::from(1)),
         Err(err) => Ok(report_type_error(err, name, default.as_bytes(), None)),
     }
 }
@@ -2228,10 +2287,14 @@ fn typed(
     value: &[u8],
     implicit: bool,
     meta: &gix::config::file::Metadata,
-) -> std::result::Result<Vec<u8>, ExitCode> {
-    let Some(t) = d.ty else { return Ok(value.to_vec()) };
-    t.canonicalize(key, value, implicit)
-        .map_err(|err| report_type_error(err, key, value, meta.path.as_deref()))
+) -> std::result::Result<Option<Vec<u8>>, ExitCode> {
+    let Some(t) = d.ty else { return Ok(Some(value.to_vec())) };
+    match t.canonicalize(key, value, implicit, d.path_base.as_deref()) {
+        Ok(v) => Ok(Some(v)),
+        // `collect_config()` releases the item and moves on (builtin/config.c:529-533).
+        Err(TypeError::MissingOptional) => Ok(None),
+        Err(err) => Err(report_type_error(err, key, value, meta.path.as_deref())),
+    }
 }
 
 /// Put one of git's three type-failure shapes on stderr and hand back its exit
@@ -2259,6 +2322,9 @@ fn report_type_error(
         }
         TypeError::BadBool => eprintln!("fatal: bad boolean config value '{shown}' for '{key}'"),
         TypeError::ExpandUser => eprintln!("fatal: failed to expand user dir in: '{shown}'"),
+        // Not an error: `typed` and `emit_default` drop the entry before reporting.
+        // Should a caller hand one here anyway, the entry counts as unset.
+        TypeError::MissingOptional => return ExitCode::from(1),
         // The callback's own `error()`, then the line the config machinery adds
         // when a callback aborts the parse (config.c's `git_parse_source` /
         // `git_config_from_parameters`).
@@ -2310,7 +2376,7 @@ fn normalize_value(ty: Option<ValueType>, key: &str, value: &str) -> Option<Stri
     if matches!(ty, ValueType::Path | ValueType::ExpiryDate) {
         return Some(value.to_string());
     }
-    match ty.canonicalize(key, value.as_bytes(), false) {
+    match ty.canonicalize(key, value.as_bytes(), false, None) {
         // The parsed escape sequence is a "sanity-check" only; git returns the
         // value it was given (builtin/config.c:693-700).
         Ok(_) if ty == ValueType::Color => Some(value.to_string()),
@@ -2326,6 +2392,9 @@ fn normalize_value(ty: Option<ValueType>, key: &str, value: &str) -> Option<Stri
                     eprintln!("{message}");
                     eprintln!("fatal: cannot parse color '{value}'");
                 }
+                // `--type=path` returns above without canonicalizing, so a write
+                // never meets an `:(optional)` path here.
+                TypeError::MissingOptional => {}
             }
             None
         }
@@ -2413,7 +2482,7 @@ fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
             None => value.to_vec(),
             // A valueless key is git's `NULL`, and the boolean readers answer *true*
             // for it — the same distinction `--get` already makes.
-            Some(t) => match t.canonicalize(key, value, implicit) {
+            Some(t) => match t.canonicalize(key, value, implicit, d.path_base.as_deref()) {
                 Ok(v) => v,
                 Err(_) => return Ok(()),
             },
@@ -2491,7 +2560,8 @@ fn get_regexp(
             return Ok(());
         }
         match typed(d, key, value, implicit, meta) {
-            Ok(v) => collected.push((key.to_owned(), v, implicit, meta.clone())),
+            Ok(Some(v)) => collected.push((key.to_owned(), v, implicit, meta.clone())),
+            Ok(None) => {}
             Err(code) => failed = Some(code),
         }
         Ok(())

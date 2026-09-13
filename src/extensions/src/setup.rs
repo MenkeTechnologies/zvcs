@@ -726,24 +726,20 @@ fn realpath_lenient(path: &Path) -> Option<PathBuf> {
     Some(realpath_lenient(parent)?.join(name))
 }
 
-/// `interpolate_path(value, 0)` as `git_config_pathname()` calls it, for the two
-/// forms a `safe.directory` entry can use: a leading `~`/`~user` and the
-/// `%(prefix)/` installation-relative form. Anything else is returned unchanged.
+/// `interpolate_path(value, 0)` (path.c:698-737) as `git_config_pathname()` calls
+/// it: a leading `~`/`~user` expands to a home directory, the `%(prefix)/`
+/// installation-relative form goes through [`crate::system_path`], and anything
+/// else is returned unchanged.
 ///
-/// `None` is git's `NULL`, which `git_config_pathname()` turns into a failure —
-/// and [`safe_directory_allows`] then skips the entry, because a `~nosuchuser`
+/// `None` is git's `NULL`, which only the `~` forms can produce: `%(prefix)/` is
+/// handed to `system_path()`, which always answers (path.c:706-707). A `None` is
+/// what `git_config_pathname()` turns into `failed to expand user dir`, and
+/// [`safe_directory_allows`] skips such an entry, because a `~nosuchuser`
 /// exemption cannot match a real repository anyway. `diff.orderFile` goes through
 /// the same `git_config_pathname()`, which is why `status` reads it from here.
 pub(crate) fn interpolate_path(value: &str) -> Option<PathBuf> {
     if let Some(rest) = value.strip_prefix("%(prefix)/") {
-        // git resolves this against its own install prefix. gitoxide's
-        // `gix_path::env` knows the same location, and a `safe.directory` written
-        // this way is aimed at repositories git itself installed.
-        let prefix = gix::path::env::exe_invocation()
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)?;
-        return Some(prefix.join(rest));
+        return Some(PathBuf::from(crate::system_path(rest)));
     }
     let Some(after_tilde) = value.strip_prefix('~') else {
         return Some(PathBuf::from(value));

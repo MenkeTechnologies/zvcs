@@ -780,6 +780,7 @@ fn status_report(
     // `rev.diffopt.detect_rename` for both halves of the report, settled: the
     // command line, else `status.renames`, else `diff.renames`.
     let renames = renames.unwrap_or_else(RenameOpts::renames);
+    let orderfile = configured_orderfile(&repo)?;
 
     // git's `s->prefix`. Two renderers drop it regardless of the config:
     // `wt_porcelain_print` resets `relative_paths`/`prefix` before printing (v1
@@ -950,6 +951,8 @@ fn status_report(
             ignore_all,
             null_term,
             path_prefix,
+            unborn,
+            orderfile.as_deref(),
         );
     }
 
@@ -1284,6 +1287,13 @@ fn status_report(
             collapse_to_matching_ignore(&repo, &index, &mut ignored_paths)?;
         }
     }
+
+    // `wt_status_collect()` (wt-status.c:863-876) runs `run_diff_files()`, then —
+    // unless `s->is_initial`, whose collector reads the index and runs no diff —
+    // `run_diff_index()`, each ending in `diffcore_std()` and its order step. An
+    // unmerged path is queued by both (`diff_unmerge()`, diff-lib.c:222, :469).
+    diffcore_order_read(&repo, orderfile.as_deref(), !work_pairs.is_empty() || !unmerged.is_empty())?;
+    diffcore_order_read(&repo, orderfile.as_deref(), !unborn && !staged_pairs.is_empty())?;
 
     // `repo_update_index_if_able(the_repository, &index_lock)` (builtin/commit.c:1658),
     // between `wt_status_collect()` and the first line of the report. Only
@@ -1763,6 +1773,71 @@ fn configured_rename_limit(snap: &gix::config::Snapshot) -> i64 {
     snap.integer("status.renameLimit")
         .or_else(|| snap.integer("diff.renameLimit"))
         .unwrap_or(diffcore_rename::DEFAULT_RENAME_LIMIT)
+}
+
+/// `diff.orderFile` as every `diff_options` wt-status builds carries it:
+/// `git_diff_ui_config()` reads it through `git_config_pathname()`, freeing the
+/// previous value first so the last one wins (diff.c:442-445), and
+/// `repo_diff_setup()` copies it in (diff.c:5167). `git_config_pathname()`
+/// interpolates `~` and `%(prefix)/`, and an `:(optional)` path naming no file is
+/// `NULL`, i.e. unset (config.c:1316-1325). A `~user` it cannot expand has
+/// already died while the configuration was read, in [`crate::diff_config`].
+pub(crate) fn configured_orderfile(repo: &gix::Repository) -> Result<Option<String>> {
+    use gix::bstr::ByteSlice;
+    let Some(raw) = repo.config_snapshot().string("diff.orderFile") else {
+        return Ok(None);
+    };
+    let raw = raw.to_str_lossy().into_owned();
+    let (optional, value) = match raw.strip_prefix(":(optional)") {
+        Some(rest) => (true, rest),
+        None => (false, raw.as_str()),
+    };
+    let Some(path) = crate::setup::interpolate_path(value) else {
+        return Ok(None);
+    };
+    let path = path.to_string_lossy().into_owned();
+    if optional {
+        // `is_missing_file()` (wrapper.c:724-735): only `ENOENT` is missing; any
+        // other `stat()` failure dies.
+        match std::fs::metadata(orderfile_open_path(repo, &path)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                let text = e.to_string();
+                let reason = text.find(" (os error ").map_or(text.as_str(), |i| &text[..i]);
+                return Err(crate::fatal::die(format!("could not stat {path}: {reason}")));
+            }
+        }
+    }
+    Ok(Some(path))
+}
+
+/// The file `prepare_order()` opens for `path`. `status` and `commit` are
+/// `RUN_SETUP` commands, so git is standing at the top of the work tree and a
+/// relative name is taken from there. An empty name stays empty, so the open
+/// fails as `strbuf_read_file("")` does rather than on the directory.
+fn orderfile_open_path(repo: &gix::Repository, path: &str) -> std::path::PathBuf {
+    match repo.workdir() {
+        Some(top) if !path.is_empty() => top.join(path),
+        _ => std::path::PathBuf::from(path),
+    }
+}
+
+/// `diffcore_order()` (diffcore-order.c:112-127), the step `diffcore_std()` runs
+/// when `diff.orderFile` is set (diff.c:7519-7520). An empty queue returns before
+/// anything is read; otherwise `prepare_order()` reads the file and dies when it
+/// cannot (diffcore-order.c:24-26). The order it computes is not observable from
+/// the status collectors, whose callbacks file every pair into a sorted
+/// `string_list`, so the read and its failure are all that is ported.
+pub(crate) fn diffcore_order_read(
+    repo: &gix::Repository,
+    orderfile: Option<&str>,
+    queued: bool,
+) -> Result<()> {
+    if let (Some(path), true) = (orderfile, queued) {
+        super::diff_files::read_order_file_at(path, &orderfile_open_path(repo, path))?;
+    }
+    Ok(())
 }
 
 /// Resolve `status.showUntrackedFiles`, which stands in for an absent
@@ -2417,6 +2492,10 @@ fn porcelain_v2_output(
     ignore_all: bool,
     null_term: bool,
     prefix: Option<&[u8]>,
+    // git's `s->is_initial`, which skips `run_diff_index()` altogether.
+    is_initial: bool,
+    // [`configured_orderfile`], for the order step of both diffs.
+    orderfile: Option<&str>,
 ) -> Result<ExitCode> {
     use gix::bstr::ByteSlice;
     use std::collections::BTreeMap;
@@ -2753,6 +2832,11 @@ fn porcelain_v2_output(
             }
         }
     }
+
+    // `wt_status_collect()`'s two diffs and their order step, as in the long and
+    // short formats (wt-status.c:863-876).
+    diffcore_order_read(repo, orderfile, !work_pairs.is_empty() || !unmerged.is_empty())?;
+    diffcore_order_read(repo, orderfile, !is_initial && !staged_pairs.is_empty())?;
 
     // ------------------------------------------------------ diffcore_rename()
     // `wt_status_collect_updated_cb()`'s `DIFF_STATUS_RENAMED` arm

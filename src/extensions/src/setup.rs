@@ -720,8 +720,9 @@ fn realpath_lenient(path: &Path) -> Option<PathBuf> {
 ///
 /// `None` is git's `NULL`, which `git_config_pathname()` turns into a failure —
 /// and [`safe_directory_allows`] then skips the entry, because a `~nosuchuser`
-/// exemption cannot match a real repository anyway.
-fn interpolate_path(value: &str) -> Option<PathBuf> {
+/// exemption cannot match a real repository anyway. `diff.orderFile` goes through
+/// the same `git_config_pathname()`, which is why `status` reads it from here.
+pub(crate) fn interpolate_path(value: &str) -> Option<PathBuf> {
     if let Some(rest) = value.strip_prefix("%(prefix)/") {
         // git resolves this against its own install prefix. gitoxide's
         // `gix_path::env` knows the same location, and a `safe.directory` written

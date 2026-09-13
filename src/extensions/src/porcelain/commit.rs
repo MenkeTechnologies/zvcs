@@ -2207,14 +2207,37 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             whence,
             &author,
             author_message || date_override.is_some(),
-            untracked_arg.as_deref(),
-            match amend {
-                true => super::status::Reference::AmendParent,
-                false => super::status::Reference::Commit,
-            },
         )?);
+        // `run_status(s->fp, index_file, prefix, 1, s)` (builtin/commit.c:1025): the
+        // whole `wt_status_print()` body, commented, uncolored and hintless. Its own
+        // closing section trailer is the block's last line. It prints into the
+        // stream opened on `COMMIT_EDITMSG` at :911, so a `die()` while it collects
+        // (an unreadable `diff.orderFile`) leaves everything written before it on
+        // disk when `exit()` flushes that stream.
+        let reference = match amend {
+            true => super::status::Reference::AmendParent,
+            false => super::status::Reference::Commit,
+        };
+        match super::status::commit_template_block(reference, untracked_arg.as_deref(), &comment) {
+            Ok(block) => buf.push_str(&block),
+            Err(e) => {
+                std::fs::write(&msg_path, &buf)?;
+                return Err(e);
+            }
+        }
     }
     std::fs::write(&msg_path, &buf)?;
+    if !(use_editor && include_status) {
+        // The other arm of that `if`: `index_differs_from(the_repository, parent,
+        // &flags, 1)` (builtin/commit.c:1062), reached only when `parent` resolves
+        // (:1037). Its `run_diff_index()` ends in `diffcore_std()`, whose order step
+        // reads `diff.orderFile` as soon as the queue holds a pair
+        // (diffcore-order.c:119-126) — which it does exactly when the index records
+        // something the parent's tree does not.
+        let differs = parent_tree_id.is_some() && !unchanged;
+        let orderfile = super::status::configured_orderfile(&repo)?;
+        super::status::diffcore_order_read(&repo, orderfile.as_deref(), differs)?;
+    }
     if use_editor && include_status && verbose {
         append_verbose_diff(&repo, &msg_path, cleanup)?;
     }
@@ -3580,10 +3603,6 @@ fn editor_status_block(
     // `author_date_is_interesting()` (builtin/commit.c:694): the author date is
     // shown when it was inherited or forced rather than taken from the clock.
     date_is_interesting: bool,
-    // `-u<mode>`, which reached `wt_status` before `prepare_to_commit()` ran.
-    untracked: Option<&str>,
-    // `s->reference` / `s->amend`, as `run_status()` sets them.
-    reference: super::status::Reference,
 ) -> Result<String> {
     let mut buf = String::new();
     // `prepare_to_commit()` warns above everything else when an operation is being
@@ -3677,12 +3696,6 @@ fn editor_status_block(
     // `status_printf_ln(s, GIT_COLOR_NORMAL, "%s", "")` — "Add new line for
     // clarity" (builtin/commit.c:1021).
     buf.push_str(&format!("{comment}\n"));
-    // `run_status(s->fp, index_file, prefix, 1, s)` (builtin/commit.c:1025): the
-    // whole `wt_status_print()` body, commented, uncolored and hintless. Its own
-    // closing section trailer is the block's last line.
-    buf.push_str(&super::status::commit_template_block(
-        reference, untracked, comment,
-    )?);
     Ok(buf)
 }
 

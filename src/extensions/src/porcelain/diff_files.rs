@@ -2651,10 +2651,19 @@ fn pickaxe_hit(px: &Pickaxe, d: &Delta, an: &Analysis) -> bool {
 /// and lines beginning with `#` are skipped; a leading `\#` is an escaped literal `#`.
 /// git silently proceeds with no patterns when the file cannot be read.
 pub(crate) fn read_order_file(path: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+    read_order_file_at(path, std::path::Path::new(path))
+}
+
+/// [`read_order_file`] for a caller whose working directory is not the one git
+/// would be standing in: `path` is the name git prints, `open` the file it opens.
+pub(crate) fn read_order_file_at(
+    path: &str,
+    open: &std::path::Path,
+) -> anyhow::Result<Vec<Vec<u8>>> {
     // `prepare_order()`'s `die_errno(_("failed to read orderfile '%s'"), orderfile)`:
     // an order file that cannot be opened ends the run at 128 rather than leaving
     // the queue in its original order.
-    let data = std::fs::read(path).map_err(|e| {
+    let data = std::fs::read(open).map_err(|e| {
         // `die_errno`'s `: <strerror>` tail. `std::io::Error`'s Display appends
         // ` (os error N)`, which git does not print.
         let text = e.to_string();

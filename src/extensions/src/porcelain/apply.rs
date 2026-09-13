@@ -1776,7 +1776,19 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                         Flags::EXTENDED | Flags::INTENT_TO_ADD,
                     )
                 } else {
-                    let id = repo.write_blob(&data)?.detach();
+                    // `add_index_file()` (apply.c:4479-4484): the odb's own `error()`
+                    // line, then this one, and the run ends with 128.
+                    let id = match crate::odb_write::write_object(repo, gix::object::Kind::Blob, &data) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            err(o.quiet(), &format!("error: {e}"));
+                            err(
+                                o.quiet(),
+                                &format!("error: unable to create backing store for newly created file {path}"),
+                            );
+                            return Ok(ExitCode::from(128));
+                        }
+                    };
                     // For `--index` the entry's stat comes from the file just written
                     // (git's `fill_stat_cache_info`); `--cached` writes no file, so the
                     // stat is zeroed, exactly as `make_empty_cache_entry` leaves it.
@@ -2098,25 +2110,41 @@ fn try_threeway(
         return Ok(ThreeWayOutcome::Fallback(None));
     }
     let post_bytes: Vec<u8> = post.concat();
-    let post_id = repo.write_blob(&post_bytes)?.detach();
-    let our_id = repo.write_blob(ours)?.detach();
+    // `odb_write_object()` for theirs and ours (apply.c:3749-3751, :3764-3765):
+    // the return value is ignored, so a failed write prints its `error()` and the
+    // computed id is used regardless — and read back below, where it dies.
+    let write_keep_id = |data: &[u8]| {
+        crate::odb_write::write_object(repo, gix::object::Kind::Blob, data).unwrap_or_else(|e| {
+            err(o.quiet(), &format!("error: {e}"));
+            e.id
+        })
+    };
+    let post_id = write_keep_id(&post_bytes);
+    let our_id = write_keep_id(ours);
 
     // `three_way_merge()`'s trivial resolutions, which never reach the merge
-    // driver: one side did not move, so the other side is the answer.
+    // driver: one side did not move, so `resolve_to()` (apply.c:3612-3626) reads
+    // the other side back out of the object database.
     if pre_id == our_id {
         return Ok(ThreeWayOutcome::Merged(ThreeWay {
             path,
-            content: post_bytes,
+            content: read_blob_or_die(repo, post_id)?,
             stages: None,
         }));
     }
     if pre_id == post_id || our_id == post_id {
         return Ok(ThreeWayOutcome::Merged(ThreeWay {
             path,
-            content: ours.to_vec(),
+            content: read_blob_or_die(repo, our_id)?,
             stages: None,
         }));
     }
+
+    // `read_mmblob()` for base, ours and theirs, in that order (apply.c:3645-3647):
+    // the merge reads its inputs from the object database, not from memory.
+    let base_bytes = read_blob_or_die(repo, pre_id)?;
+    let our_bytes = read_blob_or_die(repo, our_id)?;
+    let their_bytes = read_blob_or_die(repo, post_id)?;
 
     // `ll_merge()` with `LL_MERGE_OPTIONS_INIT`: `XDL_MERGE_ZEALOUS`, the
     // configured conflict style, and git's fixed base/ours/theirs labels.
@@ -2139,9 +2167,9 @@ fn try_threeway(
     let mut input = gix::diff::blob::InternedInput::default();
     let merge = MergeText::new(
         &mut input,
-        ours,
-        &pre_bytes,
-        &post_bytes,
+        &our_bytes,
+        &base_bytes,
+        &their_bytes,
         gix::diff::blob::Algorithm::Myers,
     );
     let (_resolution, conflicts) = merge.run_with(
@@ -2164,6 +2192,15 @@ fn try_threeway(
         content,
         stages: (conflicts > 0).then_some([Some(pre_id), Some(our_id), Some(post_id)]),
     }))
+}
+
+/// `resolve_to()` / `read_mmblob()` (apply.c:3620-3622, xdiff-interface.c:191-193):
+/// `odb_read_object()` must yield a blob, or the process dies.
+fn read_blob_or_die(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
+    match repo.find_object(id).ok().filter(|obj| obj.kind == gix::object::Kind::Blob) {
+        Some(obj) => Ok(obj.detach().data),
+        None => Err(crate::fatal::Fatal(format!("unable to read blob object {id}")).into()),
+    }
 }
 
 /// Whether a creation/rename target is already taken, and where. git's

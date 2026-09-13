@@ -1691,17 +1691,30 @@ fn preflight(repo: &gix::Repository, state_dir: &Path) -> Result<Option<ExitCode
     let index = repo.index_or_empty()?;
     let state: &gix::index::State = &index;
 
-    // `refresh_index` under `REFRESH_QUIET` still reports unmerged entries, once
-    // per path, on stdout.
+    // `repo_refresh_and_write_index()` (am.c:1819) walks the index in order
+    // (read-cache.c:1526-1600). Under `REFRESH_QUIET` it still reports unmerged
+    // entries, once per path, on stdout; a stage-0 entry whose stat cannot vouch
+    // for it is hashed by `ce_compare_data()`, whose `index_fd()` asks attributes
+    // first — and `git_check_attr()` (attr.c:1330) dies on an `--attr-source` /
+    // `GIT_ATTR_SOURCE` that names no tree-ish (attr.c:1221-1226), before the
+    // dirty-index check below is reached.
     {
+        let ctx = super::read_tree::StatCtx::new(repo, &index)?;
         let mut out = std::io::stdout().lock();
         let mut reported: BTreeSet<BString> = BTreeSet::new();
         for e in state.entries() {
+            let path = e.path(state);
             if e.stage_raw() == 0 {
+                if ctx.refresh_compares_data(e, path) {
+                    if let Some(message) = super::pack_objects::bad_default_attr_source(repo) {
+                        out.flush()?;
+                        eprintln!("fatal: {message}");
+                        return Ok(Some(ExitCode::from(128)));
+                    }
+                }
                 continue;
             }
-            let path = e.path(state).to_owned();
-            if reported.insert(path.clone()) {
+            if reported.insert(path.to_owned()) {
                 writeln!(out, "{path}: needs merge")?;
             }
         }

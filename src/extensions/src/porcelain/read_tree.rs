@@ -1728,6 +1728,50 @@ impl StatCtx {
         Probe::Uptodate
     }
 
+    /// Whether `refresh_cache_ent()` (git 2.55.0 read-cache.c:1339-1437) would reach
+    /// `ce_compare_data()` for this stage-0 entry — the one step of an index refresh
+    /// that hashes a regular file through `index_fd()`, and so the one that consults
+    /// attributes (object-file.c:1368 `would_convert_to_git_filter_fd()`).
+    ///
+    /// Two ways in: `ie_match_stat()` finding no stat change on a racily-clean entry
+    /// (read-cache.c:431-436), or `ie_modified()` finding a change that is neither a
+    /// mode/type change nor a size change git can trust (read-cache.c:459-491 — a
+    /// recorded size of zero cannot be trusted). Symlinks answer through
+    /// `ce_compare_link()` and gitlinks through the nested repository, so neither
+    /// counts.
+    pub(super) fn refresh_compares_data(&self, entry: &gix::index::Entry, path: &gix::bstr::BStr) -> bool {
+        // `ce_skip_worktree()` / `CE_VALID` mark the entry up to date before any
+        // `lstat()` (read-cache.c:1365-1372); an intent-to-add entry is
+        // MODE|TYPE_CHANGED (read-cache.c:410-411), which `ie_modified()` returns as-is.
+        if entry.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID | Flags::INTENT_TO_ADD)
+            || !matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE)
+        {
+            return false;
+        }
+        let Some(workdir) = &self.workdir else {
+            return false;
+        };
+        let full = workdir.join(gix::path::from_bstr(path).as_ref());
+        let Ok(meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
+            return false;
+        };
+        if !meta.is_file()
+            || (self.trust_executable_bit && meta.is_executable() != (entry.mode == Mode::FILE_EXECUTABLE))
+        {
+            return false;
+        }
+        let Ok(now) = Stat::from_fs(&meta) else {
+            return false;
+        };
+        // `match_stat_data()`'s DATA_CHANGED, plus the racily-smudged zero size.
+        let data_changed = entry.stat.size != now.size || (entry.stat.size == 0 && !entry.id.is_empty_blob());
+        let other_changed = self.stat_data_changed(&entry.stat, &Stat { size: entry.stat.size, ..now });
+        if !data_changed && !other_changed {
+            return self.is_racy(entry);
+        }
+        !(data_changed && entry.stat.size != 0)
+    }
+
     /// git's `is_racy_stat()`: an entry whose mtime is not older than the index's
     /// own timestamp cannot be proven clean from `stat` data alone. A zero index
     /// timestamp (an index never written to disk) disables the check entirely.

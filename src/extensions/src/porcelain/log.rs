@@ -4175,6 +4175,27 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         Some(odb) => odb.repo().clone(),
         None => repo,
     };
+
+    // `cmd_log_init_finish()` (builtin/log.c:325-331), which runs — and loads the
+    // display notes — before the walk, so `commit_match()` can grep them:
+    //
+    // ```c
+    // memset(&w, 0, sizeof(w));
+    // userformat_find_requirements(NULL, &w);
+    // if (!rev->show_notes_given && (!rev->pretty_given || w.notes))
+    //         rev->show_notes = 1;
+    // if (rev->show_notes)
+    //         load_display_notes(&rev->notes_opt);
+    // ```
+    //
+    // With no `--notes`/`--no-notes` of its own, a run shows notes when the caller
+    // picked no format, or when the last saved user format expands `%N` — even if
+    // a built-in chosen after it is what renders.
+    if !notes_opt.given && (!pretty_given || user_format_wants_notes) {
+        notes_opt.show_only();
+    }
+    let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
+
     if !commit_filter.is_empty()
         || since.is_some()
         || since_as_filter.is_some()
@@ -4202,7 +4223,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // `get_reflog_message()` strips the entry's trailing newline, which is
             // the form [`ReflogEntry::message`] already holds.
             let reflog_message = node.reflog.as_ref().map(|rl| rl.message.as_slice());
-            if !commit_filter.matches_with(&commit, reflog_message, None)? {
+            // `if (opt->show_notes) format_display_notes(&commit->object.oid, &buf,
+            // encoding, 1);` — the raw note text, no `Notes:` header, no indent.
+            let notes = || super::notes::format_display(&repo, &notes_trees, node.id, true);
+            let notes: Option<&dyn Fn() -> Result<Vec<u8>>> = notes_opt.show.then_some(&notes);
+            if !commit_filter.matches_with(&commit, reflog_message, notes)? {
                 continue;
             }
             kept.push(node);
@@ -4728,23 +4753,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
 
     // Relative dates (`%cr`/`%ar`, `--date=relative`) are measured against now.
     let now = now_secs();
-
-    // `cmd_log_init_finish()` (builtin/log.c:325-329):
-    //
-    // ```c
-    // memset(&w, 0, sizeof(w));
-    // userformat_find_requirements(NULL, &w);
-    // if (!rev->show_notes_given && (!rev->pretty_given || w.notes))
-    //         rev->show_notes = 1;
-    // ```
-    //
-    // With no `--notes`/`--no-notes` of its own, a run shows notes when the caller
-    // picked no format, or when the last saved user format expands `%N` — even if
-    // a built-in chosen after it is what renders.
-    if !notes_opt.given && (!pretty_given || user_format_wants_notes) {
-        notes_opt.show_only();
-    }
-    let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
 
     // git emits one terminated record per commit for any non-empty format, even
     // when a given commit expands to nothing (e.g. `%d` on an undecorated commit).

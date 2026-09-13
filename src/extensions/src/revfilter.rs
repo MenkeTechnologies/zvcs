@@ -724,6 +724,20 @@ mod tests {
     }
 
     #[test]
+    fn shown_notes_are_grepped_as_raw_body_lines() {
+        let data = b"tree t\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\none\n";
+        let notes: &[u8] = b"notetext\n";
+        assert!(filter(&[], &["^notetext$"]).matches_buffer(data, None, Some(notes)));
+        // `format_display_notes(..., raw = 1)` writes no `Notes:` header.
+        assert!(!filter(&[], &["^Notes"]).matches_buffer(data, None, Some(notes)));
+        assert!(!filter(&[], &["notetext"]).matches_buffer(data, None, None));
+        let mut f = filter(&[], &["notetext"]);
+        f.invert_grep = true;
+        assert!(!f.matches_buffer(data, None, Some(notes)));
+        assert!(f.matches_buffer(data, None, None));
+    }
+
+    #[test]
     fn reflog_patterns_match_the_prepended_reflog_line() {
         let data = b"tree t\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nm\n";
         let f = CommitFilter {

@@ -164,6 +164,7 @@ mod update {
                 &[],
                 fetch::Tags::None,
                 reflog_message.map_or(fetch::DryRun::No, |_| fetch::DryRun::Yes),
+                true,
                 fetch::WritePackedRefs::Never,
                 NON_ATOMIC,
             )
@@ -212,6 +213,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::No,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )
@@ -256,6 +258,7 @@ mod update {
                 &[],
                 fetch::Tags::None,
                 fetch::DryRun::Yes,
+                true,
                 fetch::WritePackedRefs::Never,
                 NON_ATOMIC,
             )?;
@@ -289,6 +292,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )?;
@@ -317,6 +321,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )?;
@@ -358,6 +363,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )?;
@@ -410,6 +416,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )?;
@@ -459,6 +466,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )?;
@@ -490,6 +498,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )?;
@@ -632,6 +641,7 @@ mod update {
                 &[],
                 fetch::Tags::None,
                 fetch::DryRun::Yes,
+                true,
                 fetch::WritePackedRefs::Never,
                 NON_ATOMIC,
             )
@@ -669,6 +679,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )
@@ -719,6 +730,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )
@@ -752,6 +764,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )
@@ -804,6 +817,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )
@@ -858,6 +872,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::Yes,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )
@@ -894,6 +909,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::No,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )
@@ -918,6 +934,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::No,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )
@@ -953,6 +970,7 @@ mod update {
             &[],
             fetch::Tags::None,
             fetch::DryRun::No,
+            true,
             fetch::WritePackedRefs::Never,
             NON_ATOMIC,
         )

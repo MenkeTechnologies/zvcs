@@ -186,6 +186,7 @@ where
             negotiation: Default::default(),
             refetch: false,
             atomic: false,
+            show_forced_updates: true,
             filter: None,
             shallow_update: shallow::Mode::Reject,
         })
@@ -242,6 +243,7 @@ where
     negotiation: gix_protocol::fetch::negotiate::Restrictions,
     refetch: bool,
     atomic: bool,
+    show_forced_updates: bool,
     filter: Option<gix_protocol::fetch::filter::Filter>,
     shallow_update: shallow::Mode,
 }
@@ -321,6 +323,17 @@ where
     /// [`refs::update::Outcome::rejected_atomically`] says so.
     pub fn with_atomic(mut self, enabled: bool) -> Self {
         self.inner.atomic = enabled;
+        self
+    }
+
+    /// Whether to check each updated ref for a forced update (the default).
+    ///
+    /// This is git's `--[no-]show-forced-updates` / `fetch.showForcedUpdates`. Disabled, the
+    /// ancestry walk is skipped and every update counts as a fast-forward (`fast_forward = 1`,
+    /// `builtin/fetch.c:1047-1056`): it is neither rejected for being non-fast-forward nor logged
+    /// as `forced-update`.
+    pub fn with_show_forced_updates(mut self, enabled: bool) -> Self {
+        self.inner.show_forced_updates = enabled;
         self
     }
 

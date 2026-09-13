@@ -2712,6 +2712,7 @@ fn fetch_one(
         .with_refetch(opts.refetch)
         .with_filter(fetch_filter.clone())
         .with_atomic(opts.atomic)
+        .with_show_forced_updates(opts.show_forced_updates)
         .with_reflog_message(RefLogMessage::Prefixed {
             action: opts.reflog_action.clone().into(),
         })

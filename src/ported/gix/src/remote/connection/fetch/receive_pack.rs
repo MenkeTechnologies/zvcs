@@ -328,6 +328,7 @@ where
                 &self.ref_map.extra_refspecs,
                 con.remote.fetch_tags,
                 fetch::DryRun::Yes,
+                self.show_forced_updates,
                 self.write_packed_refs,
                 self.atomic,
             )?;
@@ -398,6 +399,7 @@ where
             &self.ref_map.extra_refspecs,
             con.remote.fetch_tags,
             self.dry_run,
+            self.show_forced_updates,
             self.write_packed_refs,
             self.atomic,
         )?;

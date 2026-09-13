@@ -73,6 +73,7 @@ pub(crate) fn update(
     extra_refspecs: &[gix_refspec::RefSpec],
     fetch_tags: fetch::Tags,
     dry_run: fetch::DryRun,
+    show_forced_updates: bool,
     write_packed_refs: fetch::WritePackedRefs,
     atomic: bool,
 ) -> Result<update::Outcome, update::Error> {
@@ -188,7 +189,11 @@ pub(crate) fn update(
                                     }
                                 } else {
                                     let mut force = spec.allow_non_fast_forward();
+                                    // `fetch.showForcedUpdates=false` skips the ancestry walk and takes
+                                    // every update as a fast-forward (builtin/fetch.c:1047-1056), which
+                                    // governs the rejection and the reflog message, not just the summary.
                                     let is_fast_forward = match dry_run {
+                                        fetch::DryRun::No if !show_forced_updates => true,
                                         fetch::DryRun::No => {
                                             let ancestors = repo
                                                 .find_object(local_id)?

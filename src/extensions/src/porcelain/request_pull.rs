@@ -216,10 +216,9 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
         Vec::new()
     };
     // headrev=$(git rev-parse --verify --quiet "$head"^0)
-    let Ok(head_commit) = head_object.peel_to_kind(gix::object::Kind::Commit) else {
+    let Some(headrev) = commit_reference(&repo, local_sha1) else {
         return Ok(die(&format!("fatal: Ambiguous revision: {local}")));
     };
-    let headrev = head_commit.id;
 
     // Was it a branch with a description?
     let branch_name = head.strip_prefix("refs/heads/").unwrap_or(head.as_str());
@@ -329,8 +328,24 @@ fn die(message: &str) -> ExitCode {
 
 /// `git rev-parse --verify --quiet <spec>^0`.
 fn peel_to_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let object = repo.rev_parse_single(spec).ok()?.object().ok()?;
-    Some(object.peel_to_commit().ok()?.id)
+    commit_reference(repo, repo.rev_parse_single(spec).ok()?.detach())
+}
+
+/// The `^0` of `git rev-parse --verify --quiet "<rev>"^0`: `get_parent()`
+/// (`object-name.c`) hands the resolved id to `lookup_commit_reference()`, which
+/// is not quiet — `--quiet` only silences `rev-parse`'s own `fatal:` — so a
+/// tree or blob, bare or behind a tag, prints `error: object <id> is a <type>,
+/// not a commit` naming the unpeeled id (`commit.c:61-64`) before the script's
+/// `die`.
+fn commit_reference(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    let found = crate::objname::lookup_commit_reference(repo, id);
+    if let Some(message) = found.type_error() {
+        eprintln!("error: {message}");
+    }
+    match found {
+        crate::objname::CommitRef::Commit(commit) => Some(commit),
+        _ => None,
+    }
 }
 
 /// `git symbolic-ref -q <name>`: the target of `<name>` when it is a symbolic

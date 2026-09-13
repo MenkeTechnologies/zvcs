@@ -335,6 +335,16 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
 }
 
 fn cmd_init(args: &[String]) -> Result<ExitCode> {
+    // git 2.55.0 refuses `init` without a work tree ahead of its own
+    // `parse_options()` — measured from inside `.git/refs`, `init --bogus` and
+    // `init -h` both answer `fatal: this operation must be run in a work tree`
+    // at 128 — and so ahead of `update_modes()`, which is where
+    // `extensions.worktreeConfig` is written. Checking later left that key
+    // behind in a repository git leaves untouched.
+    let repo = crate::setup::discover()?;
+    if repo.workdir().is_none() {
+        return Err(crate::fatal::need_work_tree());
+    }
     let mut cone: Option<bool> = None;
     let mut sparse_index: Option<bool> = None;
     for a in args {

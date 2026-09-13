@@ -160,6 +160,18 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     let pathspecs = &rest[i..];
 
     let repo = crate::setup::discover()?;
+    // `git_dir_init` (git-mergetool.sh `main`, after the option loop — the script
+    // sets `NONGIT_OK`, so sourcing git-sh-setup skipped it): its
+    // `GIT_DIR=$(git rev-parse --git-dir) || exit` runs `rev-parse` under the same
+    // two config gates dispatch applies to `rev-parse` itself, the settings block
+    // and then `git_default_config`, and ends the script at rev-parse's 128.
+    // Measured against git 2.55.0: `-c core.packedGitLimit=bogus mergetool` and
+    // `-c feature.experimental=' ' mergetool` exit 128, while the same values
+    // with `--tool-help` exit 0 because that arm exits inside the loop above.
+    if let Err(msg) = crate::repo_settings::RepoSettings::load(&repo) {
+        return Err(crate::fatal::die(msg));
+    }
+    crate::default_config::validate(&repo).map_err(|r| r.into_error())?;
     // `require_work_tree`. git's wording embeds the script's own absolute path,
     // which cannot be reproduced, so this states the condition instead.
     if repo.workdir().is_none() {

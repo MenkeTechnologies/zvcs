@@ -1365,9 +1365,9 @@ fn unquote_config_value(raw: &str) -> String {
 /// remaining todo.
 pub fn post_commit_cleanup(repo: &gix::Repository) -> Result<()> {
     let git_dir = repo.git_dir();
-    let mut need_cleanup = delete_state_ref(repo, "CHERRY_PICK_HEAD");
-    need_cleanup |= delete_state_ref(repo, "REVERT_HEAD");
-    delete_state_ref(repo, "AUTO_MERGE");
+    let mut need_cleanup = delete_state_ref(repo, "CHERRY_PICK_HEAD")?;
+    need_cleanup |= delete_state_ref(repo, "REVERT_HEAD")?;
+    delete_state_ref(repo, "AUTO_MERGE")?;
     if !need_cleanup || !have_finished_the_last_pick(git_dir) {
         return Ok(());
     }
@@ -1440,14 +1440,14 @@ pub fn post_commit_cleanup(repo: &gix::Repository) -> Result<()> {
 ///
 /// `show_hint` is the caller's `res == 1` (`sequencer.c:2520`): a merge that
 /// reported conflicts, not a strategy that refused outright.
-pub fn print_advice(repo: &gix::Repository, action: Action, no_commit: bool) {
+pub fn print_advice(repo: &gix::Repository, action: Action, no_commit: bool) -> Result<()> {
     // `is_rebase_i(opts)` cannot be true here: this port's rebase engine prints
     // `rebase_resolvemsg` itself and never routes through the sequencer's
     // cherry-pick path, so the first branch reduces to the environment override.
     if let Some(msg) = std::env::var_os("GIT_CHERRY_PICK_HELP") {
         crate::advice::Advice::MergeConflict.advise_in(repo, &msg.to_string_lossy());
-        delete_state_ref(repo, "CHERRY_PICK_HEAD");
-        return;
+        delete_state_ref(repo, "CHERRY_PICK_HEAD")?;
+        return Ok(());
     }
     let name = action.name();
     let body = if no_commit {
@@ -1465,6 +1465,7 @@ pub fn print_advice(repo: &gix::Repository, action: Action, no_commit: bool) {
         )
     };
     crate::advice::Advice::MergeConflict.advise_in(repo, &body);
+    Ok(())
 }
 
 /// `refs_delete_ref(…, REF_NO_DEREF)` for a root-level pseudo-ref, reporting
@@ -1473,7 +1474,15 @@ pub fn print_advice(repo: &gix::Repository, action: Action, no_commit: bool) {
 /// These are normally a loose file holding a raw object id — that is what the
 /// files ref backend produces for a name outside `refs/`, and what this port
 /// writes — so the file is removed first and the ref store consulted only after.
-pub fn delete_state_ref(repo: &gix::Repository, name: &str) -> bool {
+///
+/// The deletion is a ref transaction in git whether or not the ref exists, and
+/// `files_transaction_prepare()` gives every non-log-only deletion a packed
+/// transaction and locks `packed-refs` for it (refs/files-backend.c:2982-3036).
+/// That lock is where `core.packedRefsTimeout` is first read, so a value
+/// `git_config_int()` cannot parse is fatal at this point
+/// ([`packed_refs_lock_timeout`]).
+pub fn delete_state_ref(repo: &gix::Repository, name: &str) -> Result<bool> {
+    packed_refs_lock_timeout(repo)?;
     let mut removed = std::fs::remove_file(repo.git_dir().join(name)).is_ok();
     if let Ok(reference) = repo.find_reference(name) {
         let current = reference.target().into_owned();
@@ -1489,7 +1498,29 @@ pub fn delete_state_ref(repo: &gix::Repository, name: &str) -> bool {
             })
             .is_ok();
     }
-    removed
+    Ok(removed)
+}
+
+/// The `core.packedRefsTimeout` read `packed_refs_lock()` makes before it takes
+/// `packed-refs.lock` (refs/packed-backend.c:1222-1228):
+///
+/// ```c
+/// static int timeout_configured = 0;
+/// static int timeout_value = 1000;
+///
+/// if (!timeout_configured) {
+///         repo_config_get_int(the_repository, "core.packedrefstimeout", &timeout_value);
+///         timeout_configured = 1;
+/// }
+/// ```
+///
+/// `repo_config_get_int()` goes through `git_config_int()`, whose
+/// `die_bad_number()` names the key as that literal spells it. Returns the
+/// timeout in milliseconds.
+pub fn packed_refs_lock_timeout(repo: &gix::Repository) -> Result<i64> {
+    let value = crate::config::config_int(repo, "core.packedrefstimeout")
+        .map_err(crate::fatal::die)?;
+    Ok(value.unwrap_or(1000))
 }
 
 #[cfg(test)]

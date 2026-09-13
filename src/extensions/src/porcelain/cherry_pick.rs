@@ -1383,7 +1383,7 @@ fn pick_one(
                                 format!("{pick_id}\n"),
                             )?;
                         }
-                        crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit);
+                        crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit)?;
                     }
                     // `repo_rerere(r, opts->allow_rerere_auto)` runs on the
                     // `if (res)` path whatever produced the conflict — the
@@ -1497,7 +1497,7 @@ fn pick_one(
         // `print_advice(r, res == 1, opts)`: the in-tree merge reporting
         // conflicts *is* `res == 1`, so the hint always shows here. Which of the
         // two variants it is comes from `opts->no_commit`, not from the action.
-        crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit);
+        crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit)?;
         // `repo_rerere(r, opts->allow_rerere_auto)` (sequencer.c's
         // `do_pick_commit()`), immediately after `print_advice()`: a conflict a
         // previous run resolved is replayed into the worktree, a new one has its

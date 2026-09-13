@@ -926,7 +926,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             }
             move_head(&repo, commit.id, reflog_spec)?;
         }
-        remove_branch_state(&repo);
+        remove_branch_state(&repo)?;
         super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
         // No `HEAD is now at` here: `cmd_reset()` gates `print_new_head_line()`
         // on `reset_type == HARD`, so `--merge` and `--keep` move the branch in
@@ -945,7 +945,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         }
         move_head(&repo, commit.id, reflog_spec)?;
     }
-    remove_branch_state(&repo);
+    remove_branch_state(&repo)?;
 
     match mode {
         ResetMode::Soft => {}
@@ -1085,12 +1085,20 @@ pub(crate) fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> 
 /// Removing it unconditionally would break `git cherry-pick --skip`, which is
 /// `git reset --merge HEAD` followed by resuming the very todo list this would
 /// have deleted.
-fn remove_branch_state(repo: &gix::Repository) {
+///
+/// Shared with [`crate::porcelain::stash`], whose push runs `git reset --hard`
+/// as a child (builtin/stash.c:1816-1825) and so inherits this step too.
+///
+/// A config value the `AUTO_MERGE` deletion cannot read is fatal
+/// ([`crate::sequencer::delete_state_ref`]), and it is reached before the merge
+/// state files are unlinked, as branch.c:842-844 orders them.
+pub(crate) fn remove_branch_state(repo: &gix::Repository) -> Result<()> {
     let git_dir = repo.git_dir();
-    let _ = crate::sequencer::post_commit_cleanup(repo);
+    crate::sequencer::post_commit_cleanup(repo)?;
     for name in ["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
         let _ = std::fs::remove_file(git_dir.join(name));
     }
+    Ok(())
 }
 
 /// `REFRESH_INDEX_DELAY_WARNING_IN_MS` (builtin/reset.c): two seconds.

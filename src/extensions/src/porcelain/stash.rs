@@ -942,6 +942,14 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
             // (`git apply -R`) or `-S` skips the reset, and neither writes it.
             super::reset::set_orig_head(repo, id)?;
         }
+        // …and ends in `remove_branch_state()` (builtin/reset.c:542-543). A
+        // `die()` there is the child's: its `fatal:` line is all that is printed,
+        // and `run_command()` failing makes `do_push_stash()` return -1, exit 1
+        // (builtin/stash.c:1822-1825), with the stash already stored.
+        if let Err(err) = super::reset::remove_branch_state(repo) {
+            eprintln!("fatal: {err}");
+            return Ok(ExitCode::FAILURE);
+        }
     }
 
     // `--keep-index` stages the stashed index back with

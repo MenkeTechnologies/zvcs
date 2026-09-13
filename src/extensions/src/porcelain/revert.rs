@@ -1319,7 +1319,7 @@ fn revert_one(
         // `print_advice(r, res == 1, opts)`: `--no-commit` picks the two-line
         // variant regardless of the action, since with no commit pending there
         // is no `--continue` to point at.
-        crate::sequencer::print_advice(repo, crate::sequencer::Action::Revert, o.no_commit);
+        crate::sequencer::print_advice(repo, crate::sequencer::Action::Revert, o.no_commit)?;
         // `repo_rerere(r, opts->allow_rerere_auto)` (sequencer.c's
         // `do_pick_commit()`), immediately after `print_advice()`: the conflict is
         // recorded in `.git/rr-cache` and `MERGE_RR`, or a recorded resolution is

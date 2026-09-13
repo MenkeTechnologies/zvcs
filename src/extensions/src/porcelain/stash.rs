@@ -467,7 +467,7 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = usage_requested(&args[1..], PUSH_USAGE) {
                 return Ok(code);
             }
-            let opts = match parse_push_options(&args[1..], PUSH_USAGE)? {
+            let opts = match parse_push_options(&args[1..], PUSH_USAGE, false)? {
                 Ok(o) => o,
                 Err(code) => return Ok(code),
             };
@@ -608,7 +608,7 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             // `cmd_stash` re-enters `push_stash()` with `push_assumed` set, which
             // renders `git_stash_usage` against push's option table — the same
             // option surface as `git stash push`, a different usage block.
-            let opts = match parse_push_options(args, STASH_PUSH_USAGE)? {
+            let opts = match parse_push_options(args, STASH_PUSH_USAGE, true)? {
                 Ok(o) => o,
                 Err(code) => return Ok(code),
             };
@@ -3815,20 +3815,61 @@ impl PushOpts {
 /// negations git generates for every boolean. Note that `--only-untracked` is
 /// *not* among them — git rejects it as an unknown option, so it is not
 /// accepted here either.
+///
+/// `push_assumed` is `push_stash()`'s argument of the same name: set for the
+/// bare `git stash <option>...` form, where `cmd_stash()` re-enters with no
+/// explicit sub-command. It changes how an operand is read (builtin/stash.c:1940-1960):
+///
+/// ```c
+/// if (argc) {
+///         int flags = PARSE_OPT_KEEP_DASHDASH;
+///         if (push_assumed)
+///                 flags |= PARSE_OPT_STOP_AT_NON_OPTION;
+///         argc = parse_options(argc, argv, prefix, options, ..., flags);
+///         force_assume |= patch_mode;
+/// }
+/// if (argc) {
+///         if (!strcmp(argv[0], "--")) {
+///                 argc--;
+///                 argv++;
+///         } else if (push_assumed && !force_assume) {
+///                 die("subcommand wasn't specified; 'push' can't be assumed due to unexpected token '%s'",
+///                     argv[0]);
+///         }
+/// }
+/// ```
+///
+/// Parsing stops at the first operand, so nothing after it is an option; the
+/// operand is fatal unless `--patch` survived the parse, in which case it and
+/// everything after it are the pathspec. Without the stop, `git stash -S pop`
+/// read `pop` as a path and reported it as unmatched.
 fn parse_push_options(
     args: &[String],
     usage: &'static str,
+    push_assumed: bool,
 ) -> Result<std::result::Result<PushOpts, ExitCode>> {
     let mut o = PushOpts::with_message(None);
     let mut from_file: Option<String> = None;
     let mut nul = false;
     let mut rest_are_paths = false;
+    // Index of the operand `PARSE_OPT_STOP_AT_NON_OPTION` stopped at.
+    let mut stopped_at: Option<usize> = None;
     // `OPT_DIFF_UNIFIED`/`OPT_DIFF_INTERHUNK_CONTEXT`/`--[no-]auto-advance`, the
     // hunk selector's knobs, parsed by the same helper `reset -p` uses.
     let mut patch_opts = super::reset::PatchDiffOpts::default();
     let mut i = 0;
     while i < args.len() {
         let orig = args[i].as_str();
+        // `PARSE_OPT_STOP_AT_NON_OPTION`: `parse_options_step()` returns at the
+        // first `*arg != '-' || !arg[1]` token, so a lone `-` is an operand too.
+        if push_assumed
+            && !rest_are_paths
+            && !patch_opts.awaiting_value()
+            && (!orig.starts_with('-') || orig == "-")
+        {
+            stopped_at = Some(i);
+            break;
+        }
         // Respell the token the way `parse_long_opt()` reads it. Two positions
         // are exempt because parse-options never looks them up: an argument owed
         // to `-U`/`--unified`/`--inter-hunk-context`, and everything past `--`.
@@ -3910,6 +3951,18 @@ fn parse_push_options(
 
     if let Err(code) = patch_opts.finish() {
         return Ok(Err(code));
+    }
+
+    // `force_assume |= patch_mode` — the *final* `--patch`, so `-p --no-patch`
+    // still dies and `--no-patch -p` does not.
+    if let Some(at) = stopped_at {
+        if !o.patch {
+            crate::git_fatal!(
+                "subcommand wasn't specified; 'push' can't be assumed due to unexpected token '{}'",
+                args[at]
+            );
+        }
+        o.pathspecs.extend(args[at..].iter().cloned());
     }
 
     if let Some(f) = from_file {

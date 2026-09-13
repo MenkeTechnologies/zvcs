@@ -972,7 +972,14 @@ impl MoveWordOpts {
         // are resolved by the renderer into [`FilePaint::word_regex`]; what is
         // compiled here is the pair of ends, with [`ExtraPaint::word_regex_explicit`]
         // recording which one it is.
-        let regex_src = self.word_regex.clone().or_else(|| word_regex_cfg(cfg));
+        //
+        // `builtin_diff()` calls `init_diff_words_data()` only `if (o->word_diff)`
+        // (diff.c:4074-4075), so without a word diff an uncompilable
+        // `diff.wordRegex` is never handed to `regcomp()` and never dies.
+        let regex_src = match self.word_diff {
+            WordDiff::None => None,
+            _ => self.word_regex.clone().or_else(|| word_regex_cfg(cfg)),
+        };
         let word_regex = match regex_src {
             Some(pat) => Some(
                 compile_word_regex(&pat)

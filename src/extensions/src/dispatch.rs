@@ -973,6 +973,15 @@ fn help_reads_config(args: &[String]) -> bool {
     !(args.is_empty() || args == ["-g"] || args == ["--guides"])
 }
 
+/// Whether the dispatcher's `read_early_config()` reads the repository's config
+/// for this invocation — outside [`CONFIG_GATE_EXEMPT_VERBS`], and for `help`
+/// only in the forms [`help_reads_config`] names. Both refusals raised during
+/// that read, a line the parser rejects and an `extensions.<key>` value
+/// `check_repo_format()` rejects, answer to it.
+fn reads_repository_config(sub: &str, args: &[String]) -> bool {
+    !CONFIG_GATE_EXEMPT_VERBS.contains(&sub) && (sub != "help" || help_reads_config(args))
+}
+
 /// The verbs that answer without ever opening the repository through the path
 /// that would surface a repository-format refusal, and therefore need
 /// `read_and_verify_repository_format()` reproduced for them explicitly.
@@ -1100,7 +1109,7 @@ fn repository_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
     if sub == "rev-parse" && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote") {
         return None;
     }
-    let msg = format_refusal(sub)?;
+    let msg = format_refusal(sub, args)?;
     crate::trace2::error(&msg);
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
@@ -1108,11 +1117,22 @@ fn repository_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
 
 /// The `err.buf` half of [`repository_format_gate`], split out so the two
 /// readings read as the two questions they are.
-fn format_refusal(sub: &str) -> Option<String> {
+fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
     // `check_repo_format()` refusing an `extensions.<key>` value happens inside
     // the config *reader*, so it precedes every reading below — and it prints its
     // own `error:` line ahead of the reader's `fatal:`.
-    if !FORMAT_GENTLE_VERBS.contains(&sub) {
+    //
+    // Being part of that read, it refuses exactly the verbs whose repository
+    // config is read at all — [`config_file_gate`]'s set — and not only the ones
+    // setup dies for. Measured against git 2.55.0 with `extensions.objectFormat =
+    // bogus` at version 1: the `RUN_SETUP_GENTLY` verbs `column`, `config`,
+    // `diff`, `grep`, `bundle`, `hash-object`, `var`, `merge-file`,
+    // `interpret-trailers`, `patch-id`, `mailinfo`, `help -a` and the rest all
+    // print `error: invalid value for 'extensions.objectformat': 'bogus'` and
+    // `fatal: bad config line …` at 128, while `version`, `stripspace`,
+    // `url-parse`, `mailsplit`, `check-ref-format`, `credential-store get` and a
+    // bare `help` run.
+    if reads_repository_config(sub, args) {
         // Named the way [`config_file_gate`] names it: `cmd_init_db()` reads the
         // config through `set_git_dir(real_path(…))`, so `init` spells the file
         // absolutely where a `RUN_SETUP` verb keeps the relative `.git/config`.
@@ -1146,10 +1166,7 @@ fn format_refusal(sub: &str) -> Option<String> {
 /// than returned as an error because it is not the command's — `run_builtin()`
 /// dies with it before the command exists.
 fn config_file_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
-    if CONFIG_GATE_EXEMPT_VERBS.contains(&sub) {
-        return None;
-    }
-    if sub == "help" && !help_reads_config(args) {
+    if !reads_repository_config(sub, args) {
         return None;
     }
     // `cmd_init_db()` resolves the directory for itself and calls

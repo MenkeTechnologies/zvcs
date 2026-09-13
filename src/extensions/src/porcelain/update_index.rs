@@ -1956,7 +1956,17 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
         }
 
         let new_stat = Stat::from_fs(&meta)?;
-        let changed = match_stat_basic(ctx, mode, id, stat, &new_stat, &meta);
+        let mut changed = match_stat_basic(ctx, mode, id, stat, &new_stat, &meta);
+        // `ie_match_stat()` does not take a stat match on a racily clean entry at its
+        // word (read-cache.c:431-436): `ce_modified_check_fs()` compares the content,
+        // and a difference is DATA_CHANGED, which `ie_modified()` then trusts because
+        // the recorded size is not zero (read-cache.c:476-489).
+        if changed == 0 && is_racy_entry(&ctx.index, &stat) {
+            die_on_bad_attr_source(ctx, &meta)?;
+            if worktree_blob_id(ctx, path.as_bstr(), &abs, mode, &meta)? != Some(id) {
+                changed = DATA_CHANGED;
+            }
+        }
         if changed == 0 {
             i += 1;
             continue;
@@ -1971,6 +1981,7 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
         let up_to_date = if must_report {
             false
         } else {
+            die_on_bad_attr_source(ctx, &meta)?;
             match worktree_blob_id(ctx, path.as_bstr(), &abs, mode, &meta)? {
                 Some(disk) => disk == id,
                 None => false,
@@ -2302,6 +2313,26 @@ fn match_stat_basic(
         changed |= DATA_CHANGED;
     }
     changed
+}
+
+/// `is_racy_timestamp()` (read-cache.c:370-375) for one entry, on whole seconds like
+/// [`has_racy_timestamp`].
+fn is_racy_entry(index: &gix::index::File, stat: &Stat) -> bool {
+    let seconds = index.timestamp().unix_seconds();
+    seconds != 0 && seconds <= i64::from(stat.mtime.secs)
+}
+
+/// `ce_compare_data()` hashes a regular file through `index_fd()`, which consults
+/// attributes first (object-file.c:1368), and the first lookup dies on an
+/// `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish (attr.c:1221-1226).
+/// `ce_compare_link()` reads a symlink without asking.
+fn die_on_bad_attr_source(ctx: &Ctx, meta: &gix::index::fs::Metadata) -> Result<()> {
+    if meta.is_file() {
+        if let Some(message) = super::pack_objects::bad_default_attr_source(&ctx.repo) {
+            crate::git_fatal!("{message}");
+        }
+    }
+    Ok(())
 }
 
 /// Hash the worktree item at `abs` the way git would store it, for the content

@@ -1174,7 +1174,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
         }
         Op::Abort => abort(),
         Op::Quit => quit(),
-        Op::Continue => continue_merge(&opts),
+        Op::Continue => continue_merge(),
         Op::Merge => {
             // git's `builtin/merge.c` incompatibility checks, keyed off the literal
             // flags. `--squash` cannot fast-forward, so it clashes with `--no-ff`,
@@ -4751,98 +4751,41 @@ fn reflog_action(spec: &str) -> String {
     std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| format!("merge {spec}"))
 }
 
-/// `git merge --continue`: finish a merge whose conflicts have been resolved and
-/// staged, writing the merge commit from the current index and clearing the
-/// in-progress state, exactly as `git commit` does when `MERGE_HEAD` is present.
-fn continue_merge(opts: &Opts) -> Result<ExitCode> {
+/// `git merge --continue`: `cmd_commit()` itself, with a one-word argv.
+///
+/// ```c
+/// if (continue_current_merge) {
+///         int nargc = 1;
+///         const char *nargv[] = {"commit", NULL};
+///         ...
+///         if (!file_exists(git_path_merge_head(the_repository)))
+///                 die(_("There is no merge in progress (MERGE_HEAD missing)."));
+///
+///         /* Invoke 'git commit' */
+///         ret = cmd_commit(nargc, nargv, prefix, the_repository);
+///         goto done;
+/// }
+/// ```
+///
+/// (builtin/merge.c:1456-1470.) The `orig_argc != 2` refusal has already run
+/// by the time this is reached, so no merge option can reach the commit.
+///
+/// This used to be a private copy of the merge-concluding half of commit, and
+/// every piece of `cmd_commit()` it skipped was visible: no editor over
+/// `MERGE_MSG` (builtin/commit.c `use_editor` defaults on without `-m`), no
+/// `pre-commit`/`prepare-commit-msg`/`post-commit` hooks but a `post-merge` one
+/// commit never runs, no `repo_rerere()` (builtin/commit.c:1964) — so neither the
+/// `Recorded resolution for '<path>'.` line nor the postimage — and `MERGE_RR`
+/// unlinked with the branch state, where `sequencer_post_commit_cleanup()` leaves
+/// it for rerere to read.
+fn continue_merge() -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
-    let git_dir = repo.git_dir().to_owned();
-    if !git_dir.join("MERGE_HEAD").exists() {
+    if !repo.git_dir().join("MERGE_HEAD").exists() {
         eprintln!("fatal: There is no merge in progress (MERGE_HEAD missing).");
         return Ok(ExitCode::from(128));
     }
-
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-
-    // Refuse while the index still carries conflicted (stage 1/2/3) entries.
-    //
-    // `--continue` is `cmd_commit()` (builtin/merge.c invokes it with a one-word
-    // argv), so the refusal is *commit's*, not a copy of its wording:
-    // `refresh_index()` runs under `REFRESH_IN_PORCELAIN` first and reports each
-    // conflicted path as `U<TAB><path>` on **stdout** before the diagnosis goes
-    // to stderr. Reproducing only the stderr half left stock's three stdout lines
-    // unanswered on a merge stopped over three paths.
-    let index = repo.open_index()?;
-    if index.entries().iter().any(|e| e.stage() != Stage::Unconflicted) {
-        return Ok(super::commit::die_resolve_conflict(&index));
-    }
-
-    let head = repo.head()?;
-    if head.is_unborn() {
-        crate::git_fatal!("cannot conclude a merge on an unborn branch");
-    }
-    let local_id = head
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("HEAD does not point to a commit"))?
-        .detach();
-
-    // Parents: HEAD first, then every id listed in MERGE_HEAD.
-    let mut parents: Vec<ObjectId> = vec![local_id];
-    let merge_head = std::fs::read_to_string(git_dir.join("MERGE_HEAD"))?;
-    for line in merge_head.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        parents.push(
-            ObjectId::from_hex(line.as_bytes())
-                .map_err(|e| anyhow::anyhow!("invalid id in MERGE_HEAD: {e}"))?,
-        );
-    }
-
-    // Message from MERGE_MSG, comment lines (the `# Conflicts:` block) stripped as
-    // git's finalize cleanup does.
-    let raw = std::fs::read_to_string(git_dir.join("MERGE_MSG")).unwrap_or_default();
-    let comment = comment_char(&repo);
-    let mut msg = cleanup_message(&raw, Cleanup::Strip, &comment);
-    if opts.signoff {
-        append_signoff(&repo, &mut msg)?;
-    }
-    if !opts.no_verify {
-        let msg_path = git_dir.join("COMMIT_EDITMSG");
-        std::fs::write(&msg_path, &msg)?;
-        let arg = msg_path.to_string_lossy().into_owned();
-        if !crate::hooks::run(&repo, "commit-msg", &[&arg], None)? {
-            return Ok(ExitCode::from(1));
-        }
-        msg = std::fs::read_to_string(&msg_path)?;
-    }
-    let subject = msg.lines().next().unwrap_or("").to_string();
-
-    let tree_id = index_tree(&repo, &index)?;
-    let commit_id = repo.commit("HEAD", &msg, tree_id, parents)?;
-    // `update_main_cache_tree()` again — see [`settle_index_for_commit`]. The
-    // resolve-undo stays: measured against stock 2.55.0, the index after
-    // `git merge --continue` over a hand-resolved conflict carries both the
-    // filled-in `TREE` and the `REUC` the conflict recorded, where the index
-    // after a strategy's own commit carries `TREE` alone.
-    settle_index_for_commit(&repo, tree_id, false)?;
-
-    remove_merge_state(&git_dir, true);
-    let _ = crate::hooks::run(&repo, "post-merge", &["0"], None);
-
-    if !opts.quiet {
-        let short = commit_id.shorten_or_id();
-        let branch_label = match repo.head_name()? {
-            Some(name) => name.shorten().to_string(),
-            None => "detached HEAD".to_string(),
-        };
-        println!("[{branch_label} {short}] {subject}");
-    }
-    // `git merge --continue` is `cmd_commit()` (builtin/merge.c:1467-1468), whose
-    // last act is `apply_autostash_ref(the_repository, "MERGE_AUTOSTASH", …)`.
-    super::commit::apply_merge_autostash(&repo)?;
-    Ok(ExitCode::SUCCESS)
+    drop(repo);
+    super::commit::commit(&[])
 }
 
 /// `strerror(errno)`: the bare message, without Rust's ` (os error <n>)` tail.

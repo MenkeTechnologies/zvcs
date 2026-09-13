@@ -631,7 +631,33 @@ fn finish(o: Opts) -> Result<ExitCode> {
 
     let repo = crate::setup::discover()?;
 
-    // Resolve every tree-ish before any other check, exactly like git's read loop.
+    // The index is locked and read before any tree-ish is looked at:
+    //
+    // ```c
+    // repo_hold_locked_index(the_repository, &lock_file, LOCK_DIE_ON_ERROR);
+    // …
+    // if (opts.reset || opts.merge || opts.prefix) {
+    //         if (repo_read_index_unmerged(the_repository) && (opts.prefix || opts.merge))
+    //                 die(_("You need to resolve your current index first"));
+    //         stage = opts.merge = 1;
+    // }
+    // ```
+    //
+    // (builtin/read-tree.c:191-206, the tree-ish loop at :208-216.) So an
+    // unmerged index outranks a bad tree-ish, `-u -i`, the missing work tree and
+    // "at least one tree"; only `--reset` reads past the conflict.
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    // Bound first: `index_or_empty` yields an Arc<FileSnapshot<File>>, and the
+    // deref chain to &File only resolves once it is a named binding.
+    let index = repo.index_or_empty()?;
+    let old = gix::index::File::clone(&index);
+
+    if o.merge_like() && !o.reset && old.entries().iter().any(|e| e.stage_raw() != 0) {
+        return fatal("You need to resolve your current index first");
+    }
+
+    // Resolve every tree-ish, in git's read loop order.
     let mut tree_ids: Vec<ObjectId> = Vec::with_capacity(o.trees.len());
     for spec in &o.trees {
         // `repo_get_oid()` only has to *name* an object: a full-length hex
@@ -687,17 +713,6 @@ fn finish(o: Opts) -> Result<ExitCode> {
     }
     if o.merge_like() && tree_ids.is_empty() {
         return fatal("you must specify at least one tree to merge");
-    }
-
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-
-    // Bound first: `index_or_empty` yields an Arc<FileSnapshot<File>>, and the
-    // deref chain to &File only resolves once it is a named binding.
-    let index = repo.index_or_empty()?;
-    let old = gix::index::File::clone(&index);
-
-    if o.merge_like() && !o.reset && old.entries().iter().any(|e| e.stage_raw() != 0) {
-        return fatal("You need to resolve your current index first");
     }
 
     // `core.maxTreeDepth` bounds the tree recursion every form below performs, so

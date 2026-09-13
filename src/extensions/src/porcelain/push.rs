@@ -194,6 +194,14 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             // `--quiet` drives `transport->verbose` negative, which is what
             // `set_upstreams()` tests before printing its notice (transport.c:120).
             "-q" | "--quiet" => f.quiet = true,
+            // `OPT__VERBOSITY()` points `-v` and `-q` at the one `verbosity` int,
+            // and both negations are `*(int *)opt->value = 0`
+            // (parse-options-cb.c `parse_opt_verbosity_cb`), so either one
+            // clears whatever the other had set.
+            "--no-verbose" | "--no-quiet" => {
+                f.verbose = false;
+                f.quiet = false;
+            }
             // `transport_set_verbosity(transport, verbosity, progress)`: the flag
             // forces the meter on, `--no-progress` off, and with neither it
             // follows `isatty(2)` (transport.c). `send_pack()` passes it to
@@ -334,16 +342,22 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
 
     let repo = crate::setup::discover()?;
 
-    let remote_name: String = match f.repo.clone().or_else(|| positionals.first().cloned()) {
+    // ```c
+    // if (argc > 0) {
+    //         repo = argv[0];
+    //         set_refspecs(argv + 1, argc - 1, repo);
+    // }
+    // ```
+    //
+    // (`cmd_push()`, builtin/push.c:652-655.) `--repo` only seeds `repo`; a
+    // positional repository overwrites it, and the refspecs always start at the
+    // second positional. So `push --repo=origin origin veto` pushes `veto` to
+    // `origin`, never a refspec named `origin`.
+    let remote_name: String = match positionals.first().cloned().or_else(|| f.repo.clone()) {
         Some(r) => r,
         None => default_push_remote(&repo),
     };
-    // With `--repo`, all positionals are refspecs; otherwise the first is the remote.
-    let specs: Vec<String> = if f.repo.is_some() {
-        positionals
-    } else {
-        positionals.into_iter().skip(1).collect()
-    };
+    let specs: Vec<String> = positionals.into_iter().skip(1).collect();
 
     // `parse_refspec()` (refspec.c) rejects a push refspec whose destination is
     // present but empty:
@@ -359,13 +373,20 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // `die("invalid refspec '%s'", refspec)`. The one spelling that survives is
     // `:` (or `+:`) on its own, which the function special-cases above that block
     // as the *matching* refspec.
+    //
+    // The rest of the push branch of `parse_refspec()` applies too: a refspec
+    // with no destination must have a source that is itself a valid ref name,
+    // so `git push origin ./.remote.git` dies here rather than failing to match.
+    // `--delete <ref>` reaches the same parser as `:<ref>` (`set_refspecs()`,
+    // builtin/push.c:118-121), after its own plain-name refusal.
     for spec in &specs {
-        let body = spec.strip_prefix('+').unwrap_or(spec);
-        if body == ":" {
-            continue;
-        }
-        if body.rsplit_once(':').is_some_and(|(_, dst)| dst.is_empty()) {
-            crate::git_fatal!("invalid refspec '{spec}'");
+        let as_parsed = match f.delete {
+            true if spec.contains(':') || spec.is_empty() => continue,
+            true => format!(":{spec}"),
+            false => spec.clone(),
+        };
+        if !push_refspec_is_valid(&as_parsed, repo.object_hash().len_in_hex()) {
+            crate::git_fatal!("invalid refspec '{as_parsed}'");
         }
     }
 
@@ -501,30 +522,20 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("push options must not have new line characters");
     }
 
+    // Not a configured remote, so the name is a URL or a path. Whether that path
+    // is a repository is not decided here: git only finds out inside
+    // `git_connect()`, which `transport_push()` reaches after `check_push_refs()`
+    // — see the refusal ahead of `build_requests()` below.
     let remote = match repo.find_remote(remote_name.as_str()) {
         Ok(r) => r,
-        Err(_) => {
-            // Not a configured remote, so the name is a URL or a path. When it
-            // is neither — no such directory — `git_connect()` runs
-            // `git-receive-pack '<dest>'`, which dies with `enter_repo`'s
-            // message, and the parent follows with `die_initial_contact`. The
-            // vendored transport reports one Rust-level metadata error instead,
-            // so both lines and the 128 are reproduced here, as `send-pack`
-            // already does for the same case.
-            if let Some(bad) =
-                super::send_pack::local_dest_that_is_not_a_repository(remote_name.as_str())
-            {
-                eprintln!("fatal: '{bad}' does not appear to be a git repository");
-                eprintln!(
-                    "fatal: Could not read from remote repository.\n\n\
-                     Please make sure you have the correct access rights\n\
-                     and the repository exists."
-                );
-                return Ok(ExitCode::from(128));
-            }
-            repo.remote_at(remote_name.as_str())?
-        }
+        Err(_) => repo.remote_at(remote_name.as_str())?,
     };
+    // `transport->url`, which every `failed to push some refs to '%s'` names.
+    let transport_url = remote
+        .url(Direction::Push)
+        .or_else(|| remote.url(Direction::Fetch))
+        .map(|u| u.to_bstring().to_string())
+        .unwrap_or_else(|| remote_name.to_string());
 
     // `transport_check_allowed()` for the push direction. git reaches it from the
     // same `git_connect()`, so `protocol.<name>.allow` gates a push exactly as it
@@ -599,6 +610,44 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // (`match_explicit()`, remote.c.) It is an `error()`, not a `die()`: the refspec is
     // dropped, `match_push_refs()` returns non-zero, and `push_with_options()` closes with
     // its own `failed to push some refs` line at exit 1.
+    //
+    // ```c
+    // local_refs = get_local_heads();
+    //
+    // if (check_push_refs(local_refs, rs) < 0)
+    //         goto done;
+    //
+    // refspec_ref_prefixes(rs, &transport_options.ref_prefixes);
+    //
+    // remote_refs = transport->vtable->get_refs_list(transport, 1,
+    //                                                &transport_options);
+    // ```
+    //
+    // (`transport_push()`, transport.c:1300-1311.) Every explicit source is
+    // matched against the local refs *before* the transport is opened, and
+    // `check_push_refs()` ORs the results rather than stopping at the first
+    // (remote.c:1572-1587), so each refspec that names nothing gets its own
+    // `error:` line — and a destination that is not even a repository is never
+    // looked at.
+    // `--delete <ref>` is `:<ref>` in git's refspec list — an empty source,
+    // which `match_explicit_lhs()` accepts — so there is nothing to check.
+    if !f.delete && !check_push_refs(&repo, &specs) {
+        eprintln!("error: failed to push some refs to '{transport_url}'");
+        return Ok(ExitCode::from(1));
+    }
+
+    // `get_refs_list()` → `git_connect()`: a local destination that is not a
+    // repository dies in `enter_repo()`, and `die_initial_contact()` follows.
+    // The vendored transport reports one Rust-level metadata error instead, so
+    // git's block and its 128 are reproduced here — ahead of the `pre-push`
+    // hook, which `transport_push()` runs only once the advertisement is in
+    // hand (transport.c:1335-1339). The configured URL is tested as well as a
+    // bare path: `remote.origin.url = ./peer` read from a directory where
+    // `./peer` does not exist is the same refusal.
+    if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(&transport_url) {
+        return Ok(crate::transport_err::not_a_repository_fatal(bad));
+    }
+
     let (mut requests, upstreams) = match build_requests(&repo, &f, &specs) {
         Ok(pair) => pair,
         Err(e) => {
@@ -1639,6 +1688,99 @@ impl std::error::Error for DstRefspecCollision {}
 /// stock 2.55.0 matches the ref, fails to *resolve* it, and is
 /// `fatal: refs/heads/main cannot be resolved to branch` at exit 128 — see
 /// [`resolve_bare_dst`] for the second half.
+/// `parse_refspec(item, refspec, 0)` (refspec.c:21-160), the push direction,
+/// reduced to its verdict: `false` is the `return 0` that
+/// `refspec_item_init_or_die()` turns into `invalid refspec '<spec>'`.
+///
+/// `hex_len` is `the_hash_algo->hexsz`, which only a negative refspec reads: an
+/// exact object name cannot be excluded.
+fn push_refspec_is_valid(spec: &str, hex_len: usize) -> bool {
+    use super::check_ref_format::{check_refname_format, ALLOW_ONELEVEL, REFSPEC_PATTERN};
+
+    let (lhs, negative) = match spec.as_bytes().first() {
+        Some(b'+') => (&spec[1..], false),
+        Some(b'^') => (&spec[1..], true),
+        _ => (spec, false),
+    };
+    let colon = lhs.rfind(':');
+    // Negative refspecs only have one side.
+    if negative && colon.is_some() {
+        return false;
+    }
+    // `:` (or `+:`) on its own is the matching refspec.
+    if colon == Some(0) && lhs.len() == 1 {
+        return true;
+    }
+    let dst = colon.map(|at| &lhs[at + 1..]);
+    let mut is_glob = dst.is_some_and(|d| d.contains('*'));
+    let src = &lhs[..colon.unwrap_or(lhs.len())];
+    if src.contains('*') {
+        if colon.is_some() && !is_glob {
+            return false;
+        }
+        is_glob = true;
+    } else if colon.is_some() && is_glob {
+        return false;
+    }
+    let src = if src == "@" { "HEAD" } else { src };
+    let flags = ALLOW_ONELEVEL | if is_glob { REFSPEC_PATTERN } else { 0 };
+    let valid = |name: &str| check_refname_format(name.as_bytes(), flags);
+
+    if negative {
+        let exact_oid = src.len() == hex_len && src.bytes().all(|b| b.is_ascii_hexdigit());
+        return !src.is_empty() && !exact_oid && valid(src);
+    }
+    // LHS: empty deletes, a wildcard must look like a ref, anything else is an
+    // object name nobody validates yet.
+    if !src.is_empty() && is_glob && !valid(src) {
+        return false;
+    }
+    // RHS: missing means the source must look like a ref, empty is refused.
+    match dst {
+        None => valid(src),
+        Some("") => false,
+        Some(dst) => valid(dst),
+    }
+}
+
+/// `check_push_refs()` (remote.c:1572-1587): `match_explicit_lhs()` for every
+/// refspec that is neither a pattern, the matching refspec nor a negative one,
+/// reporting each failure as its own `error()` and answering whether all of
+/// them matched.
+///
+/// `match_explicit_lhs()` (remote.c:1204-1227) accepts exactly one matching
+/// local ref, falls back to `try_explicit_object_name()` for none — where an
+/// empty source is a deletion and anything `get_oid()` resolves is an object —
+/// and refuses more than one.
+fn check_push_refs(repo: &gix::Repository, specs: &[String]) -> bool {
+    let local_refs = local_head_names(repo);
+    let mut all_matched = true;
+    for spec in specs {
+        let body = spec.strip_prefix('+').unwrap_or(spec);
+        if spec.starts_with('^') || body == ":" || body.contains('*') {
+            continue;
+        }
+        let src = body.rfind(':').map_or(body, |at| &body[..at]);
+        let src = if src == "@" { "HEAD" } else { src };
+        if src.is_empty() {
+            continue;
+        }
+        match crate::refname::count_refspec_match(src, &local_refs) {
+            (1, _) => {}
+            (0, _) if repo.rev_parse_single(src).is_ok() => {}
+            (0, _) => {
+                eprintln!("error: {}", SrcRefspecMissing(src.to_string()));
+                all_matched = false;
+            }
+            _ => {
+                eprintln!("error: {}", SrcRefspecAmbiguous(src.to_string()));
+                all_matched = false;
+            }
+        }
+    }
+    all_matched
+}
+
 fn local_head_names(repo: &gix::Repository) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(platform) = repo.references() else {

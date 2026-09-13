@@ -71,9 +71,9 @@ const USAGE: &str = "usage: git check-ref-format [--normalize] [<options>] <refn
                      or: git check-ref-format --branch <branchname-shorthand>\n";
 
 /// `REFNAME_ALLOW_ONELEVEL` — waive the "at least two components" rule.
-const ALLOW_ONELEVEL: u32 = 1;
+pub(crate) const ALLOW_ONELEVEL: u32 = 1;
 /// `REFNAME_REFSPEC_PATTERN` — permit exactly one `*` in the whole refname.
-const REFSPEC_PATTERN: u32 = 2;
+pub(crate) const REFSPEC_PATTERN: u32 = 2;
 
 /// `refs.c::refname_disposition`, transcribed verbatim.
 ///

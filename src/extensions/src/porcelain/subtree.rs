@@ -1690,6 +1690,12 @@ fn run(args: &[String]) -> Result<ExitCode> {
     let (opts, positionals) = parseopt(&argv)?;
 
     let repo = crate::setup::discover()?;
+    // `git-sh-setup` finds the repository with `git rev-parse --git-dir`, whose
+    // `git_config(git_default_config, NULL)` dies on a value it refuses
+    // (`core.checkStat=bogus`) — before `require_work_tree` is reached.
+    if let Err(rejection) = crate::default_config::validate(&repo) {
+        return Err(rejection.into_error());
+    }
     // `. git-sh-setup` with `SUBDIRECTORY_OK` unset: refuse a bare repository,
     // then run from the top of the work tree, since `<prefix>` and every
     // index/worktree child command are relative to it.

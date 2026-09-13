@@ -311,7 +311,12 @@ fn write_cursor<'repo>(cursor: &mut Cursor<'_, 'repo>) -> Result<Id<'repo>, writ
                     id: entry.oid,
                     source: err,
                 })?;
-                if !entry.mode.is_commit() && !cursor.repo.has_object(entry.oid) {
+                // A gitlink names an object of another repository, and a mode-0 entry
+                // with the null id names none at all: it is what merge-ort writes for a
+                // path whose stage it cleared (merge-ort.c:2792-2797, 3857-3860), and
+                // what `gix_object::tree::Editor::upsert_mode()` keeps for it.
+                let names_no_object_here = entry.mode.is_commit() || (entry.mode.value() == 0 && entry.oid.is_null());
+                if !names_no_object_here && !cursor.repo.has_object(entry.oid) {
                     return Err(write::Error::MissingObject {
                         filename: entry.filename.clone(),
                         kind: entry.mode.into(),

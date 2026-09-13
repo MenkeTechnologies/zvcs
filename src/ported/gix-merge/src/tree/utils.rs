@@ -260,6 +260,17 @@ pub fn track(change: ChangeRef<'_>, changes: &mut ChangeList) {
     });
 }
 
+/// The mode merge-ort holds for a path's stage and writes into the merged tree.
+///
+/// Every mode it reads from a tree has gone through `canon_mode()` (object.h:145-154,
+/// applied by `decode_tree_entry()`, tree-walk.c:42), which a kind already is. The one
+/// mode that never passed through it is the `0` a cleared side-1 stage holds
+/// (`apply_directory_rename_modifications()`, merge-ort.c:2792-2797): it is recorded as
+/// it is, and `write_tree()` writes it as `"%o"`, i.e. `0` (merge-ort.c:3857-3860).
+pub fn canon_mode(mode: EntryMode) -> EntryMode {
+    if mode.value() == 0 { mode } else { mode.kind().into() }
+}
+
 /// Unconditionally apply `change` to `editor`.
 pub fn apply_change(
     editor: &mut tree::Editor<'_>,
@@ -303,9 +314,9 @@ pub fn apply_change(
         }
     };
 
-    editor.upsert(
+    editor.upsert_mode(
         to_components(alternative_location.unwrap_or(location)),
-        mode.kind(),
+        canon_mode(*mode),
         *id,
     )?;
     Ok(())

@@ -835,6 +835,16 @@ fn apply_directory_rename_modifications(
         );
     }
 
+    // A directory still at the old path keeps its entry there, and the file moves
+    // on in a copy whose side-1 stage is cleared, whichever side the file is on:
+    // `new_ci->stages[1].mode = 0; oidcpy(&new_ci->stages[1].oid, null_oid())`
+    // (merge-ort.c:2792-2797). A file side 1 added where the base had a directory
+    // therefore arrives with mode 0 and the null id; that is its stage, and
+    // `write_tree()` writes `"%o"` of it, a `0` entry (merge-ort.c:3857-3860).
+    // A side-1 rename meeting the same state trips process_entry()'s
+    // `is_null == (filemask == match_mask)` assertion (merge-ort.c:4213-4214) and
+    // stock aborts with nothing to follow, so only additions are cleared.
+    let clears_side1_stage = ci.dirmask != 0 && side == MERGE_SIDE1;
     if ci.dirmask == 0 {
         paths.remove(old_path);
     } else {
@@ -842,6 +852,13 @@ fn apply_directory_rename_modifications(
         dir_ci.filemask = 0;
         dir_ci.clean = true;
         ci.dirmask = 0;
+        ci.stages[MERGE_SIDE1] = None;
+    }
+    if clears_side1_stage {
+        if let Change::Addition { entry_mode, id, .. } = &mut changes[pair.change_idx].inner {
+            *entry_mode = EntryMode::from_bytes(b"0 ").expect("a single octal digit is a mode");
+            *id = id.kind().null();
+        }
     }
     match paths.get_mut(&new_path) {
         None => {

@@ -32,6 +32,31 @@ impl Fixture {
         Fixture { root, work }
     }
 
+    /// base `p/d/x` and `p/q`; `A` deletes `p/d/x` and adds a file at `p/d`; `B` deletes
+    /// `p/d/x` and moves `p/q` to `r/q`, so `p/` went to `r/` and nothing of `B` is at `r/d`.
+    fn file_replaces_directory_side1(tag: &str) -> Self {
+        let f = Fixture::new(tag);
+        let seq = |n: u32| (1..=n).map(|i| format!("{i}\n")).collect::<String>();
+        f.git(&["init", "-q", "-b", "main", "."]);
+        f.write("p/d/x", &seq(20));
+        f.write("p/q", &seq(30));
+        f.git(&["add", "."]);
+        f.git(&["commit", "-qm", "O"]);
+        f.git(&["branch", "A"]);
+        f.git(&["branch", "B"]);
+        f.git(&["checkout", "-q", "A"]);
+        f.git(&["rm", "-q", "p/d/x"]);
+        f.write("p/d", "new\n");
+        f.git(&["add", "p/d"]);
+        f.git(&["commit", "-qm", "A"]);
+        f.git(&["checkout", "-q", "B"]);
+        f.git(&["rm", "-q", "p/d/x"]);
+        std::fs::create_dir_all(f.work.join("r")).unwrap();
+        f.git(&["mv", "p/q", "r/q"]);
+        f.git(&["commit", "-qm", "B"]);
+        f
+    }
+
     /// t6423 12m.
     fn symlink_replaces_renamed_directory(tag: &str) -> Self {
         let f = Fixture::new(tag);
@@ -95,6 +120,60 @@ impl Fixture {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
     }
+}
+
+/// With `symlink` as the first operand the symlink is side 1's, and the copy that
+/// follows the directory rename has its side-1 stage cleared (merge-ort.c:2792-2797):
+/// the moved-aside entry is recorded as mode 0 with the null id and written into the
+/// tree as a `0` entry. It was recorded and written as the symlink.
+#[test]
+fn a_side1_file_leaving_a_base_directory_loses_its_stage() {
+    let f = Fixture::symlink_replaces_renamed_directory("zero");
+    for (mode, first_line) in [
+        ("conflict", "CONFLICT (file location): dir/subdir added in symlink inside a directory that was renamed in rename, suggesting it should perhaps be moved to renamed-dir/subdir.\n"),
+        ("true", "Path updated: dir/subdir added in symlink inside a directory that was renamed in rename; moving it to renamed-dir/subdir.\n"),
+    ] {
+        let (code, out, err) = f.run(&["-c", &format!("merge.directoryRenames={mode}"), "merge-tree", "--write-tree", "symlink", "rename"]);
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "a004c0a5a4a5ff7f27b048d990d242a4908577b9\n\
+                 100644 d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 1\trenamed-dir/subdir/file\n\
+                 100644 d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 3\trenamed-dir/subdir/file\n\
+                 000000 0000000000000000000000000000000000000000 2\trenamed-dir/subdir~symlink\n\
+                 \n\
+                 {first_line}\
+                 CONFLICT (rename/delete): dir/subdir/file renamed to renamed-dir/subdir/file in rename, but deleted in symlink.\n\
+                 CONFLICT (file/directory): directory in the way of renamed-dir/subdir from symlink; moving it to renamed-dir/subdir~symlink instead.\n"
+            ),
+            "merge.directoryRenames={mode}"
+        );
+        assert_eq!(code, 1);
+    }
+}
+
+/// The cleared stage without a file/directory conflict: `A`'s `p/d` follows `p/ -> r/`
+/// and lands as a `0` entry with the null id. As the second operand it keeps its blob.
+#[test]
+fn a_cleared_side1_stage_is_written_without_a_conflict_too() {
+    let f = Fixture::file_replaces_directory_side1("zero-clean");
+    let (code, out, err) = f.run(&["-c", "merge.directoryRenames=conflict", "merge-tree", "--write-tree", "A", "B"]);
+    assert_eq!(err, "");
+    assert_eq!(
+        out,
+        "8e683f82d485e319440a4c96356c60d68f697da9\n\
+         000000 0000000000000000000000000000000000000000 2\tr/d\n\
+         \n\
+         CONFLICT (file location): p/d added in A inside a directory that was renamed in B, suggesting it should perhaps be moved to r/d.\n"
+    );
+    assert_eq!(code, 1);
+
+    let (code, out, err) = f.run(&["-c", "merge.directoryRenames=true", "merge-tree", "--write-tree", "A", "B"]);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "8e683f82d485e319440a4c96356c60d68f697da9\n", ""));
+
+    let (code, out, err) = f.run(&["-c", "merge.directoryRenames=true", "merge-tree", "--write-tree", "B", "A"]);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "ec21e7e59289f085e95dbd651305a6eb44b4bcb4\n", ""));
 }
 
 /// Without directory renames the symlink stays at `dir/subdir`, whose directory

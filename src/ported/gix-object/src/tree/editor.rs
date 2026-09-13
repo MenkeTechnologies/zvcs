@@ -9,7 +9,7 @@ use gix_hash::ObjectId;
 
 use crate::{
     Tree, tree,
-    tree::{Editor, EntryKind},
+    tree::{Editor, EntryKind, EntryMode},
 };
 
 /// A way to constrain all [tree-edits](Editor) to a given subtree.
@@ -145,7 +145,24 @@ impl Editor<'_> {
         C: AsRef<BStr>,
     {
         self.path_buf.borrow_mut().clear();
-        self.upsert_or_remove_at_pathbuf(rela_path, EditMode::Upsert(kind, id, UpsertMode::Normal))
+        self.upsert_or_remove_at_pathbuf(rela_path, EditMode::Upsert(kind.into(), id, UpsertMode::Normal))
+    }
+
+    /// Like [`upsert()`](Self::upsert()), but with the `mode` exactly as it is to be written into the tree
+    /// rather than a [kind](EntryKind).
+    ///
+    /// The one mode no kind stands for is `0`, and an entry of mode `0` with a null `id` is written like any
+    /// other instead of being dropped as a placeholder. git's merge-ort writes `"%o %s%c"` of whatever mode a
+    /// merged path ended with (`write_tree()`, merge-ort.c:3857-3860, git v2.55.0), and a path whose side-1
+    /// stage `apply_directory_rename_modifications()` cleared ends with mode `0` and the null id
+    /// (merge-ort.c:2792-2797).
+    pub fn upsert_mode<I, C>(&mut self, rela_path: I, mode: EntryMode, id: ObjectId) -> Result<&mut Self, Error>
+    where
+        I: IntoIterator<Item = C>,
+        C: AsRef<BStr>,
+    {
+        self.path_buf.borrow_mut().clear();
+        self.upsert_or_remove_at_pathbuf(rela_path, EditMode::Upsert(mode, id, UpsertMode::Normal))
     }
 
     fn get_inner<I, C>(&self, rela_path: I) -> Option<&tree::Entry>
@@ -210,7 +227,8 @@ impl Editor<'_> {
                 }
             }
             if all_entries_unchanged_or_written {
-                tree.entries.retain(|e| !e.oid.is_null());
+                // A null id is a placeholder, except with mode 0: see `upsert_mode()`.
+                tree.entries.retain(|e| !e.oid.is_null() || e.mode.value() == 0);
                 if let Some((_, _, parent_to_adjust)) =
                     parent_idx.map(|idx| parents.get_mut(idx).expect("always present, pointing towards zero"))
                 {
@@ -274,7 +292,7 @@ impl Editor<'_> {
         let mut path_buf = self.path_buf.borrow_mut();
         let mut cursor = self.trees.get_mut(path_buf.as_bstr()).expect("root is always present");
         let mut rela_path = rela_path.into_iter().peekable();
-        let new_kind_is_tree = matches!(edit, EditMode::Upsert(EntryKind::Tree, _, _));
+        let new_kind_is_tree = matches!(edit, EditMode::Upsert(mode, _, _) if mode.is_tree());
         while let Some(name) = rela_path.next() {
             let name = name.as_ref();
             if name.is_empty() {
@@ -319,13 +337,13 @@ impl Editor<'_> {
                                 }
                             }
                         }
-                        EditMode::Upsert(kind, id, _mode) => {
+                        EditMode::Upsert(mode, id, _upsert_mode) => {
                             let entry = &mut cursor.entries[idx];
                             if is_last {
                                 // unconditionally overwrite what's there.
                                 entry.oid = id;
                                 needs_sorting = check_type_change(entry);
-                                entry.mode = kind.into();
+                                entry.mode = mode;
                                 None
                             } else if entry.mode.is_tree() {
                                 // Possibly lookup the existing tree on our way down the path.
@@ -342,12 +360,12 @@ impl Editor<'_> {
                 }
                 Err(insertion_idx) => match edit {
                     EditMode::Remove(_) => break,
-                    EditMode::Upsert(kind, id, _mode) => {
+                    EditMode::Upsert(mode, id, _upsert_mode) => {
                         cursor.entries.insert(
                             insertion_idx,
                             tree::Entry {
                                 filename: name.into(),
-                                mode: if is_last { kind.into() } else { EntryKind::Tree.into() },
+                                mode: if is_last { mode } else { EntryKind::Tree.into() },
                                 oid: if is_last { id } else { id.kind().null() },
                             },
                         );
@@ -428,7 +446,7 @@ mod cursor {
             self.path_buf.borrow_mut().clear();
             self.upsert_or_remove_at_pathbuf(
                 rela_path,
-                EditMode::Upsert(EntryKind::Tree, self.object_hash.null(), UpsertMode::AssureTreeOnly),
+                EditMode::Upsert(EntryKind::Tree.into(), self.object_hash.null(), UpsertMode::AssureTreeOnly),
             )?;
             let prefix = self.path_buf.borrow_mut().clone();
             Ok(Cursor {
@@ -461,7 +479,7 @@ mod cursor {
         {
             self.parent.path_buf.borrow_mut().clone_from(&self.prefix);
             self.parent
-                .upsert_or_remove_at_pathbuf(rela_path, EditMode::Upsert(kind, id, UpsertMode::Normal))?;
+                .upsert_or_remove_at_pathbuf(rela_path, EditMode::Upsert(kind.into(), id, UpsertMode::Normal))?;
             Ok(self)
         }
 
@@ -516,7 +534,7 @@ enum RemoveMode {
 enum EditMode {
     Remove(RemoveMode),
     /// Insert or replace an entry of `kind` and `id` according to the given mode.
-    Upsert(EntryKind, ObjectId, UpsertMode),
+    Upsert(EntryMode, ObjectId, UpsertMode),
 }
 
 enum WriteMode {

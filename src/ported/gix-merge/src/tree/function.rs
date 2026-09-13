@@ -13,8 +13,8 @@ use crate::tree::{
     ConflictMapping::{Original, Swapped},
     ContentMerge, Error, Options, Outcome, Resolution, ResolutionFailure, ResolveWith,
     utils::{
-        ChangeList, PossibleConflict, TrackedChange, TreeNodes, apply_change, perform_blob_merge, to_components,
-        track, unique_path_in_tree,
+        ChangeList, PossibleConflict, TrackedChange, TreeNodes, apply_change, canon_mode, perform_blob_merge,
+        to_components, track, unique_path_in_tree,
     },
 };
 
@@ -397,11 +397,11 @@ where
                                 )?;
                                 match tree_conflicts {
                                     None => {
-                                        editor.upsert(toc(&renamed_location), mode.kind(), id.to_owned())?;
+                                        editor.upsert_mode(toc(&renamed_location), canon_mode(mode), id.to_owned())?;
                                     }
                                     Some(ResolveWith::Ours) => {
                                         if outer_side.is_swapped() {
-                                            editor.upsert(to_components(location), mode.kind(), id.to_owned())?;
+                                            editor.upsert_mode(to_components(location), canon_mode(mode), id.to_owned())?;
                                         }
                                     }
                                     Some(ResolveWith::Ancestor) => {
@@ -418,7 +418,7 @@ where
                                         None,
                                         None,
                                         index_entry_at_path(
-                                            &mode.kind().into(),
+                                            &canon_mode(mode),
                                             &id.to_owned(),
                                             ConflictIndexEntryPathHint::RenamedOrTheirs,
                                         ),

@@ -219,11 +219,10 @@ impl cache_tree::Odb for RepoOdb<'_> {
         &self,
         tree: &[u8],
     ) -> std::result::Result<gix::ObjectId, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        use gix::objs::Write;
-        self.repo
-            .objects
-            .write_buf(gix::object::Kind::Tree, tree)
-            .map_err(Into::into)
+        // `odb_write_object_ext()` returns early for a tree some source already
+        // holds (odb/source-loose.c:614-619), so re-serialising an existing tree
+        // never needs a writable object directory.
+        crate::odb_write::write_object(self.repo, gix::object::Kind::Tree, tree).map_err(Into::into)
     }
 }
 

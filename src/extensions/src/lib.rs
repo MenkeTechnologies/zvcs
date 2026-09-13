@@ -40,6 +40,7 @@ pub mod merge_msg;
 pub mod merge_ws;
 pub mod namespace;
 pub mod objname;
+pub mod odb_write;
 pub mod oidhash;
 pub mod objpath;
 pub mod optint;

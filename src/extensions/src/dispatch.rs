@@ -366,7 +366,6 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
     "mktree",
     "mv",
     "name-rev",
-    "pack-refs",
     "prune",
     "prune-packed",
     "pull",
@@ -471,6 +470,12 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "merge-subtree",
     "multi-pack-index",
     "notes",
+    // `pack_refs_core()` runs `repo_config(repo, git_default_config, NULL)`
+    // (pack-refs.c:37) and never prepares the settings block: measured against
+    // git 2.55.0, `-c core.abbrev=bogus pack-refs` dies while
+    // `-c index.version=bogus`, `-c core.packedGitLimit=bogus` and
+    // `-c feature.experimental=bogus pack-refs` exit 0.
+    "pack-refs",
     "patch-id",
     "push",
     "replace",

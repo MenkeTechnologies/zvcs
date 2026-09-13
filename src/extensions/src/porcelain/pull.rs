@@ -1065,7 +1065,16 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // Network / bad-remote failures surface as `Err`; a ref-rejection returns a
     // non-success code with the summary already printed. The tracking-ref check
     // below then reports the missing upstream, as git's pull does.
-    let fetch_code = match super::fetch(&fetch_args) {
+    // `run_fetch()` starts a `git fetch` child, and the first thing that child does is
+    // `repo_config(the_repository, git_fetch_config, &config)` (builtin/fetch.c:2607), whose
+    // `die()`s for a bad `fetch.prune`, `fetch.recurseSubmodules`, `fetch.output`, ... end it at
+    // once. The dispatcher runs that pass for a `git fetch` it is handed; the in-process call
+    // below bypasses the dispatcher, so the pass is run here, and its refusal travels the same
+    // road as any other `die()` inside the fetch.
+    let fetch_result = crate::cmd_config::validate_fetch(&repo)
+        .map_err(|rejection| rejection.into_error())
+        .and_then(|()| super::fetch(&fetch_args));
+    let fetch_code = match fetch_result {
         Ok(code) => code,
         // git spawns the fetch as a child, so a `die()` inside it prints there and
         // `run_fetch()` sees nothing but a non-zero status — which `cmd_pull`

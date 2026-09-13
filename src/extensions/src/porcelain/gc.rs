@@ -1740,6 +1740,21 @@ pub(super) fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
     for dir in &dirs {
         collect_reflog_files(dir, dir, &mut files);
     }
+    // ```c
+    // if (!worktree->is_current &&
+    //     parse_worktree_ref(ref, NULL, NULL, NULL) == REF_WORKTREE_SHARED)
+    //         return 0;
+    // ```
+    //
+    // (`collect_reflog()`, builtin/reflog.c:91-109.) A shared ref's reflog is
+    // collected only through the current worktree's store, so when no worktree
+    // is current — see [`any_worktree_is_current`] — only the per-worktree logs
+    // (`HEAD` and the rest under the common `logs/` that are not shared, plus
+    // each admin directory's own) are expired.
+    if !any_worktree_is_current(repo) {
+        let common_logs = repo.common_dir().join("logs");
+        files.retain(|(name, path)| !path.starts_with(&common_logs) || !is_shared_ref(name));
+    }
     files.sort();
     files.dedup();
 
@@ -1750,6 +1765,76 @@ pub(super) fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
         expire_one_reflog(repo, refname, path, &cfg, &mut head_reachable)?;
     }
     Ok(())
+}
+
+/// `parse_worktree_ref() == REF_WORKTREE_SHARED` (refs.c) for a name read from a
+/// `logs/` directory: a name outside `refs/` (`HEAD`, a pseudoref) belongs to
+/// the worktree, and so do `refs/bisect/`, `refs/worktree/` and
+/// `refs/rewritten/` (`is_per_worktree_ref()`); everything else is shared.
+fn is_shared_ref(name: &str) -> bool {
+    name.starts_with("refs/")
+        && !["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// Whether any entry of `get_worktrees()` has `is_current` set, as
+/// `is_current_worktree()` (git 2.55.0 worktree.c:59-67) decides it:
+///
+/// ```c
+/// char *git_dir = absolute_pathdup(repo_get_git_dir(wt->repo));
+/// char *wt_git_dir = get_worktree_git_dir(wt);
+/// int is_current = !fspathcmp(git_dir, absolute_path(wt_git_dir));
+/// ```
+///
+/// This is a string comparison, so the *spelling* of `$GIT_DIR` decides it:
+///
+/// * In the main repository `get_worktree_git_dir()` answers the common dir,
+///   which without a `commondir` file is the git dir as spelled — equal to
+///   itself however it is spelled.
+/// * In a linked worktree it answers `<commondir>/worktrees/<id>`, and
+///   `get_common_dir_noenv()` (setup.c:323-350) runs the `commondir` file
+///   through `strbuf_add_real_path()`, so that side is a resolved path. The git
+///   dir matches it only when it is spelled that way too. Discovery standing *in*
+///   the admin directory sets it to `"."` (`setup_bare_git_dir()`,
+///   setup.c:1283-1284), which `strbuf_add_absolute_path()` (abspath.c:293-316)
+///   turns into `<cwd>/.` — never equal. Discovery from below it, or through a
+///   checkout's gitfile, spells it resolved and matches; `$GIT_DIR` is taken as
+///   given.
+///
+/// Measured on git 2.55.0 with a linked worktree `wt`: `reflog expire --all` run
+/// in `.git/worktrees/wt` (or with `GIT_DIR=.` there) keeps the reflogs of
+/// `refs/heads/*`, while `GIT_DIR=$PWD`, `.git/worktrees/wt/logs` and `.git`
+/// all expire them.
+fn any_worktree_is_current(repo: &gix::Repository) -> bool {
+    let real = |p: &Path| gix::path::realpath(p).unwrap_or_else(|_| p.to_path_buf());
+    let common = real(repo.common_dir());
+    let git_dir = real(repo.git_dir());
+    if git_dir == common {
+        return true;
+    }
+    let Some(id) = git_dir.file_name() else { return true };
+    let wt_git_dir = common.join("worktrees").join(id);
+    let Ok(cwd) = std::env::current_dir() else { return true };
+    let spelled = match std::env::var_os("GIT_DIR") {
+        Some(value) => PathBuf::from(value),
+        None if real(&cwd) == git_dir => PathBuf::from("."),
+        None => return true,
+    };
+    let absolute = if spelled.is_absolute() {
+        spelled.into_os_string()
+    } else {
+        // `strbuf_add_absolute_path()` prefixes `$PWD` when it names the same
+        // directory as `getcwd()`, and joins with one `/` without normalizing.
+        let pwd = std::env::var_os("PWD").map(PathBuf::from).filter(|pwd| real(pwd) == real(&cwd));
+        let mut base = pwd.unwrap_or(cwd).into_os_string();
+        if !base.to_string_lossy().ends_with('/') {
+            base.push("/");
+        }
+        base.push(spelled.as_os_str());
+        base
+    };
+    absolute == wt_git_dir.into_os_string()
 }
 
 /// Every reflog file below `dir`, keyed by ref name (`logs/refs/heads/main` ->

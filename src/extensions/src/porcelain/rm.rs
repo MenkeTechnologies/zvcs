@@ -524,7 +524,13 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     //    staged content matches neither HEAD nor the worktree (staged AND local).
     if !opts.force {
         let hash_kind = repo.object_hash();
-        let head_tree = repo.head_tree().ok();
+        // `if (repo_get_oid(the_repository, "HEAD", &oid)) oidclr(&oid, …)`
+        // (builtin/rm.c:382-384): the name goes through `get_oid_basic()`, so its
+        // `core.warnAmbiguousRefs` read and ambiguity warning happen here, and only
+        // when the command is not forced.
+        let head_tree = crate::objname::resolve(&repo, "HEAD")
+            .and_then(|id| repo.find_object(id).ok())
+            .and_then(|object| object.peel_to_tree().ok());
 
         let mut both: Vec<String> = Vec::new();
         let mut staged_only: Vec<String> = Vec::new();

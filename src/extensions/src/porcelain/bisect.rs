@@ -41,8 +41,9 @@
 //! `halfway()` short-circuit that decides which of two equally-good midpoints is
 //! taken, so the chosen commit, the `Bisecting: N revisions left to test after
 //! this (roughly M steps)` line and the `[<oid>] <subject>` line are byte-identical.
-//! The terminal report reproduces `git diff-tree --pretty --stat --summary`,
-//! including git's diffstat column scaling and truncation.
+//! The terminal report is `show_commit()`'s child, `git --no-pager show --stat
+//! --summary --no-abbrev-commit --diff-merges=first-parent <oid>` (bisect.c:974-998),
+//! so the user's `show` configuration shapes it and a refusal ends the bisection.
 //!
 //! A range containing merges is bisected the way git does it: `find_bisection()`
 //! weights every candidate by how many candidates it reaches, then returns the
@@ -54,10 +55,7 @@
 //! `--first-parent` is honoured on every later step, not just recorded:
 //! `BISECT_FIRST_PARENT` sets `revs.first_parent_only` for the candidate walk and
 //! stops the weight propagation after the first parent, which is git's
-//! `FIND_BISECTION_FIRST_PARENT_ONLY`. A first bad commit that is a merge is
-//! reported the way `show_diff_tree()` does it — a `Merge:` header of abbreviated
-//! parents, then `--stat`/`--summary` against the first parent alone, which is
-//! what `--cc` falls back to for those formats.
+//! `FIND_BISECTION_FIRST_PARENT_ONLY`.
 //!
 //! Custom terms name their own references: `bisect_write` stores the bad side at
 //! `refs/bisect/<term-bad>` and each good side at `refs/bisect/<term-good>-<oid>`,
@@ -100,10 +98,7 @@ use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
 
-use super::diffstat::{self, StatWidths};
-use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput};
 use gix::hash::ObjectId;
-use gix::object::tree::diff::ChangeDetached;
 
 /// The usage block git prints on a usage error, verbatim.
 const USAGE: &str = "\
@@ -2930,333 +2925,89 @@ fn estimate_bisect_steps(all: usize) -> usize {
 }
 
 /// The bisection is over: name the culprit and show it, as git does.
+///
+/// ```c
+/// printf("%s is the first '%s' commit\n", oid_to_hex(bisect_rev), term_bad);
+/// show_commit(revs.commits->item);
+/// ```
+///
+/// (`bisect_next_all()`, bisect.c:1116-1119.) The `# first '<term>' commit:` log
+/// line is `bisect_successful()` (builtin/bisect.c:655-676), which `bisect_next()`
+/// runs only once `bisect_next_all()` has returned — so a `show` that dies
+/// (`log.diffMerges` without a value, say) ends the command at 128 with the line
+/// printed and nothing appended to `BISECT_LOG`.
 fn report_first_bad(ctx: &Ctx, bad: ObjectId, terms: &Terms) -> Result<u8> {
     let hex = bad.to_hex().to_string();
-    let subj = subject(&ctx.repo, bad)?;
-    // Rendered before anything is printed, so an unsupported diff bails cleanly.
-    let report = diff_tree_report(&ctx.repo, bad)?;
-
-    ctx.append_log(&format!("# first '{}' commit: [{hex}] {subj}\n", terms.bad))?;
     println!("{hex} is the first '{}' commit", terms.bad);
-    std::io::stdout().write_all(&report)?;
+    show_commit(ctx, &hex)?;
+
+    let subj = subject(&ctx.repo, bad)?;
+    ctx.append_log(&format!("# first '{}' commit: [{hex}] {subj}\n", terms.bad))?;
     // `BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND`; see [`STEP_COMPLETED`].
     STEP_COMPLETED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND)
 }
 
-// --- `git diff-tree --pretty --stat --summary` --------------------------------
-
-/// One row of the diffstat.
-struct StatEntry {
-    /// Display path, C-quoted when it needs it (so always ASCII).
-    name: String,
-    added: u32,
-    deleted: u32,
-    /// `(old size, new size)` for a binary file, which shows no `+`/`-` graph.
-    binary: Option<(u64, u64)>,
-    /// The `--summary` line this change contributes, if any.
-    summary: Option<String>,
-}
-
-/// Render the commit exactly as `git diff-tree --pretty --stat --summary` does.
-/// Like diff-tree, a root commit or an empty diff renders nothing at all.
-fn diff_tree_report(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
-    let commit = repo.find_object(id)?.try_into_commit()?;
-    let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
-    let Some(parent) = parents.first().copied() else {
-        return Ok(Vec::new());
-    };
-
-    // For a merge, `--cc` still renders `--stat`/`--summary` against the first
-    // parent alone (combine-diff.c:1567 "show stat against the first parent even
-    // when doing combined diff"), so the same single-parent diff serves both.
-    let new_tree = commit.tree()?;
-    let old_tree = repo.find_object(parent)?.try_into_commit()?.tree()?;
-    let mut changes = repo.diff_tree_to_tree(
-        Some(&old_tree),
-        Some(&new_tree),
-        gix::diff::Options::default(),
-    )?;
-    // `gix_diff::tree_with_rewrites` recurses into subdirectories but *also*
-    // reports the containing tree entries themselves (`gix-diff/src/tree/function.rs`
-    // visits `Change::Addition`/`Change::Modification` for an entry whose mode is a
-    // tree and *then* queues it for descent). `show_diff_tree()` sets up an ordinary
-    // `rev_info` and `diff_setup_done()` turns recursion on for a stat format with
-    // no `DIFF_OPT_TREE_IN_RECURSIVE` beside it, so git's `--stat`/`--summary` only
-    // ever see blob-, symlink- and gitlink-level filepairs.
-    //
-    // Without this the first-bad-commit report listed the directories as binary
-    // blobs — `copies | Bin 0 -> 37 bytes` and `orig | Bin 74 -> 74 bytes`, those
-    // being the raw *tree object* sizes — beside the files inside them, and counted
-    // them: ` 4 files changed` where stock prints ` 2 files changed`, plus a bogus
-    // ` create mode 040000 copies` summary line. `log`'s `prepare_change` and
-    // `request-pull`'s stat builder apply the identical filter for the identical
-    // reason.
-    changes.retain(|c| !change_is_tree_entry(c));
-    if changes.is_empty() {
-        return Ok(Vec::new());
-    }
-    changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
-
-    let mut files = Vec::with_capacity(changes.len());
-    for change in &changes {
-        files.push(stat_entry(repo, change)?);
-    }
-
-    let mut out: Vec<u8> = Vec::new();
-    writeln!(out, "commit {}", commit.id())?;
-    // `--pretty` adds a `Merge:` header for a multi-parent commit. bisect's
-    // `show_diff_tree()` leaves `rev.abbrev` at git's default (unlike
-    // `diff-tree`, which pins it to full oids), so the parents are abbreviated.
-    if parents.len() > 1 {
-        use gix::prelude::ObjectIdExt;
-        let shorts: Vec<String> = parents
-            .iter()
-            .map(|p| p.attach(repo).shorten_or_id().to_string())
-            .collect();
-        writeln!(out, "Merge: {}", shorts.join(" "))?;
-    }
-    let author = commit.author()?;
-    out.extend_from_slice(b"Author: ");
-    out.extend_from_slice(author.name);
-    out.extend_from_slice(b" <");
-    out.extend_from_slice(author.email);
-    out.extend_from_slice(b">\n");
-    let date = author.time()?.format(gix::date::time::format::DEFAULT)?;
-    writeln!(out, "Date:   {date}")?;
-    out.push(b'\n');
-    for line in trim_trailing_newlines(commit.message_raw()?).split(|&b| b == b'\n') {
-        out.extend_from_slice(b"    ");
-        out.extend_from_slice(line);
-        out.push(b'\n');
-    }
-    out.push(b'\n');
-    out.extend_from_slice(render_stat(&files).as_bytes());
-    Ok(out)
-}
-
-/// Is this change a *directory* entry that git's recursive walk would never
-/// surface as a filepair?
+/// `show_commit()` (bisect.c:974-998): a real `git show` child, so the user's own
+/// `show` configuration applies and its refusals stop the bisection.
 ///
-/// An addition or deletion of a tree is the directory itself appearing or going
-/// away; the files inside it arrive separately from the descent, and git reports
-/// only those. A modification is a directory entry only when *both* sides are
-/// trees — a path that turned from a directory into a file (or the reverse) is a
-/// real filepair git does report, so the two-sided test is what keeps it.
-fn change_is_tree_entry(change: &ChangeDetached) -> bool {
-    match change {
-        ChangeDetached::Addition { entry_mode, .. }
-        | ChangeDetached::Deletion { entry_mode, .. }
-        | ChangeDetached::Rewrite { entry_mode, .. } => entry_mode.is_tree(),
-        ChangeDetached::Modification {
-            previous_entry_mode,
-            entry_mode,
-            ..
-        } => previous_entry_mode.is_tree() && entry_mode.is_tree(),
+/// ```c
+/// strvec_pushl(&show.args, "--no-pager", "show", "--stat", "--summary",
+///              "--no-abbrev-commit", "--diff-merges=first-parent",
+///              oid_to_hex(&commit->object.oid), NULL);
+/// show.git_cmd = 1;
+/// if (run_command(&show))
+///         die(_("unable to start 'show' for object '%s'"),
+///             oid_to_hex(&commit->object.oid));
+/// ```
+///
+/// The child inherits git's post-setup state: its cwd is the top of the work
+/// tree, and `$GIT_DIR` is exported the way `setup_discovered_git_dir()`
+/// (setup.c:1239-1241) records it — `.git` as found when the command was started
+/// there, an absolute path otherwise. Under `bisect run` stdout is the
+/// `BISECT_RUN` descriptor [`with_stdout_to`] installed, which the child shares.
+fn show_commit(ctx: &Ctx, hex: &str) -> Result<()> {
+    let workdir = crate::hooks::absolutize(ctx.repo.workdir().unwrap_or(&ctx.git_dir));
+    let git_dir = absolutize_git_dir(&workdir, &ctx.git_dir);
+    // `fflush(NULL)` in `start_command()`, before the fork.
+    crate::cstdio::flush();
+    let _ = std::io::stdout().flush();
+    let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
+    cmd.args([
+        "--no-pager",
+        "show",
+        "--stat",
+        "--summary",
+        "--no-abbrev-commit",
+        "--diff-merges=first-parent",
+        hex,
+    ])
+    .current_dir(&workdir);
+    if std::env::var_os("GIT_DIR").is_none() {
+        cmd.env("GIT_DIR", git_dir);
+    }
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err(crate::fatal::die(format!("unable to start 'show' for object '{hex}'"))),
     }
 }
 
-fn change_path(change: &ChangeDetached) -> &[u8] {
-    match change {
-        ChangeDetached::Addition { location, .. }
-        | ChangeDetached::Deletion { location, .. }
-        | ChangeDetached::Modification { location, .. }
-        | ChangeDetached::Rewrite { location, .. } => location,
-    }
-}
-
-fn trim_trailing_newlines(mut s: &[u8]) -> &[u8] {
-    while let Some(&last) = s.last() {
-        if last == b'\n' || last == b'\r' {
-            s = &s[..s.len() - 1];
-        } else {
-            break;
-        }
-    }
-    s
-}
-
-/// Turn one tree change into a diffstat row, counting lines with git's own
-/// (Myers + indent heuristic) diff so the numbers match.
-fn stat_entry(repo: &gix::Repository, change: &ChangeDetached) -> Result<StatEntry> {
-    match change {
-        ChangeDetached::Addition {
-            location,
-            entry_mode,
-            id,
-            ..
-        } => {
-            let content = content_of(repo, *id, entry_mode.is_commit())?;
-            let name = quote_path(location);
-            let summary = Some(format!("create mode {:06o} {name}", entry_mode.value()));
-            if is_binary(&content) {
-                return Ok(StatEntry {
-                    name,
-                    added: 0,
-                    deleted: 0,
-                    binary: Some((0, content.len() as u64)),
-                    summary,
-                });
-            }
-            Ok(StatEntry {
-                name,
-                added: count_lines(&[], &content),
-                deleted: 0,
-                binary: None,
-                summary,
-            })
-        }
-        ChangeDetached::Deletion {
-            location,
-            entry_mode,
-            id,
-            ..
-        } => {
-            let content = content_of(repo, *id, entry_mode.is_commit())?;
-            let name = quote_path(location);
-            let summary = Some(format!("delete mode {:06o} {name}", entry_mode.value()));
-            if is_binary(&content) {
-                return Ok(StatEntry {
-                    name,
-                    added: 0,
-                    deleted: 0,
-                    binary: Some((content.len() as u64, 0)),
-                    summary,
-                });
-            }
-            Ok(StatEntry {
-                name,
-                added: 0,
-                deleted: count_lines(&content, &[]),
-                binary: None,
-                summary,
-            })
-        }
-        ChangeDetached::Modification {
-            location,
-            previous_entry_mode,
-            previous_id,
-            entry_mode,
-            id,
-        } => {
-            let name = quote_path(location);
-            let summary = (previous_entry_mode.value() != entry_mode.value()).then(|| {
-                format!(
-                    "mode change {:06o} => {:06o} {name}",
-                    previous_entry_mode.value(),
-                    entry_mode.value()
-                )
-            });
-            if previous_id == id {
-                return Ok(StatEntry {
-                    name,
-                    added: 0,
-                    deleted: 0,
-                    binary: None,
-                    summary,
-                });
-            }
-            let old = content_of(repo, *previous_id, previous_entry_mode.is_commit())?;
-            let new = content_of(repo, *id, entry_mode.is_commit())?;
-            if is_binary(&old) || is_binary(&new) {
-                return Ok(StatEntry {
-                    name,
-                    added: 0,
-                    deleted: 0,
-                    binary: Some((old.len() as u64, new.len() as u64)),
-                    summary,
-                });
-            }
-            let input = InternedInput::new(old.as_slice(), new.as_slice());
-            let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
-            Ok(StatEntry {
-                name,
-                added: diff.count_additions(),
-                deleted: diff.count_removals(),
-                binary: None,
-                summary,
-            })
-        }
-        // Never produced: rewrite tracking is off, matching diff-tree's default.
-        ChangeDetached::Rewrite { .. } => bail!("rename/copy detection is not supported"),
-    }
-}
-
-fn count_lines(old: &[u8], new: &[u8]) -> u32 {
-    let input = InternedInput::new(old, new);
-    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
-    if old.is_empty() {
-        diff.count_additions()
+/// `$GIT_DIR` as `setup_discovered_git_dir()` sets it: the relative `.git` when the
+/// repository was discovered from the top of its work tree, the absolute path in
+/// every other case (setup.c:1221-1222 `real_pathdup` for a discovery from below).
+fn absolutize_git_dir(workdir: &Path, git_dir: &Path) -> PathBuf {
+    let abs = crate::hooks::absolutize(git_dir);
+    let at_top = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cwd.canonicalize().ok())
+        .zip(workdir.canonicalize().ok())
+        .is_some_and(|(cwd, top)| cwd == top);
+    if at_top && abs.canonicalize().ok() == workdir.join(".git").canonicalize().ok() {
+        PathBuf::from(".git")
     } else {
-        diff.count_removals()
+        abs
     }
 }
-
-/// The bytes to diff: a blob straight from the odb, a submodule as the
-/// `Subproject commit <oid>` line git substitutes.
-fn content_of(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Result<Vec<u8>> {
-    if is_submodule {
-        Ok(format!("Subproject commit {}\n", id.to_hex()).into_bytes())
-    } else {
-        Ok(repo.find_object(id)?.detach().data)
-    }
-}
-
-/// git's binary heuristic: a NUL byte within the first 8000 bytes.
-fn is_binary(data: &[u8]) -> bool {
-    data.iter().take(8000).any(|&b| b == 0)
-}
-
-/// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
-/// case the whole name double-quoted with C escapes. The table and the
-/// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
-/// other verb that prints a path.
-fn quote_path(path: impl AsRef<[u8]>) -> String {
-    crate::quote::quoted_name_string(path.as_ref())
-}
-
-/// The rows [`super::diffstat::show_stats`] renders.
-fn stat_rows(files: &[StatEntry]) -> Vec<diffstat::StatFile> {
-    files
-        .iter()
-        .map(|f| match f.binary {
-            Some((old, new)) => diffstat::StatFile {
-                print_name: f.name.clone().into_bytes(),
-                added: new,
-                deleted: old,
-                binary: true,
-                is_unmerged: false,
-            },
-            None => diffstat::StatFile::text(
-                f.name.clone().into_bytes(),
-                u64::from(f.added),
-                u64::from(f.deleted),
-            ),
-        })
-        .collect()
-}
-
-/// The `--stat` block plus the `--summary` lines, as `show_diff_tree()` prints
-/// them. This is `diff-tree`'s geometry — `builtin/bisect.c` never calls
-/// `init_diffstat_widths()` — so it is a flat 80 columns and ignores `$COLUMNS`.
-fn render_stat(files: &[StatEntry]) -> String {
-    let mut out = Vec::new();
-    diffstat::show_stats(
-        &mut out,
-        &stat_rows(files),
-        &StatWidths::plumbing(),
-        &super::diff_color::DiffColors::disabled(),
-    );
-    let mut out = String::from_utf8_lossy(&out).into_owned();
-    for f in files {
-        if let Some(line) = &f.summary {
-            out.push_str(&format!(" {line}\n"));
-        }
-    }
-    out
-}
-
-
 
 #[cfg(test)]
 mod tests {

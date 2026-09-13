@@ -528,6 +528,9 @@ enum ConfigCallback {
     Status,
     /// `git_commit_config` (builtin/commit.c:1669).
     Commit,
+    /// `git_checkout_config` (builtin/checkout.c:1277), installed by
+    /// `checkout_main()` for `checkout`, `switch` and `restore`.
+    Checkout,
     /// `grep_cmd_config` (builtin/grep.c:297).
     Grep,
     /// `git_blame_config` (builtin/blame.c:714).
@@ -548,14 +551,27 @@ enum ConfigCallback {
 /// `stash` is `DiffBasic` even though `git stash show` reaches the UI layer
 /// through the diff it runs: the choice here is per verb, and taking the
 /// narrower layer under-matches on that one subcommand rather than refusing
-    /// `git_checkout_config` (builtin/checkout.c:1277), installed by
-    /// `checkout_main()` for `checkout`, `switch` and `restore`.
-    Checkout,
 /// `stash list` for a key git lets through.
 fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
     match sub {
+        // `cmd_reflog()` hands `show` — named, or implied by a first token that is
+        // no subcommand — to `cmd_log_reflog()` (builtin/reflog.c:154, :491),
+        // which runs `repo_config(the_repository, git_log_config, &cfg)`
+        // (builtin/log.c:792). `list`, `exists`, `expire`, `delete`, `drop` and
+        // `write` install no diff callback, and stock 2.55.0 runs them under
+        // `-c color.diff=bogus` at exit 0 where `reflog` and `reflog show` die.
+        "reflog" => {
+            let first = args.iter().map(String::as_str).find(|a| *a != "reflog");
+            match first {
+                Some("list" | "exists" | "expire" | "delete" | "drop" | "write") => {
+                    ConfigCallback::Default
+                }
+                _ => ConfigCallback::Log,
+            }
+        }
         "status" => ConfigCallback::Status,
         "commit" => ConfigCallback::Commit,
+        "checkout" | "switch" | "restore" => ConfigCallback::Checkout,
         "log" | "show" | "whatchanged" => ConfigCallback::Log,
         "format-patch" => ConfigCallback::Format,
         "diff" | "range-diff" => ConfigCallback::DiffUi,
@@ -597,7 +613,6 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "diff-files",
     "diff-index",
     "diff-tree",
-        "checkout" | "switch" | "restore" => ConfigCallback::Checkout,
     "fsck",
     "gc",
     "hash-object",
@@ -612,21 +627,6 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "merge-octopus",
     "merge-one-file",
     "merge-resolve",
-        // `cmd_reflog()` hands `show` — named, or implied by a first token that is
-        // no subcommand — to `cmd_log_reflog()` (builtin/reflog.c:154, :491),
-        // which runs `repo_config(the_repository, git_log_config, &cfg)`
-        // (builtin/log.c:792). `list`, `exists`, `expire`, `delete`, `drop` and
-        // `write` install no diff callback, and stock 2.55.0 runs them under
-        // `-c color.diff=bogus` at exit 0 where `reflog` and `reflog show` die.
-        "reflog" => {
-            let first = args.iter().map(String::as_str).find(|a| *a != "reflog");
-            match first {
-                Some("list" | "exists" | "expire" | "delete" | "drop" | "write") => {
-                    ConfigCallback::Default
-                }
-                _ => ConfigCallback::Log,
-            }
-        }
     "mktree",
     "prune",
     "prune-packed",
@@ -1328,6 +1328,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::Format => crate::log_config::validate_format(&repo),
                     ConfigCallback::Status => crate::status_config::validate_status(&repo),
                     ConfigCallback::Commit => crate::status_config::validate_commit(&repo),
+                    ConfigCallback::Checkout => crate::cmd_config::validate_checkout(&repo),
                     ConfigCallback::Grep => crate::cmd_config::validate_grep(&repo),
                     ConfigCallback::Blame => crate::cmd_config::validate_blame(&repo),
                     ConfigCallback::Fetch => crate::cmd_config::validate_fetch(&repo),
@@ -1377,7 +1378,6 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // Interactive hunk selection (`add -p`, `reset -p`, `checkout -p`,
     // `restore -p`, `commit -p`/`-i`) writes nothing itself: it renders hunks,
     // waits on the user, and hands each accepted selection to a `git apply`
-                    ConfigCallback::Checkout => crate::cmd_config::validate_checkout(&repo),
     // CHILD, which takes the lane for the microseconds it needs. Holding the
     // lane in the parent would (a) block every other zvcs writer for as long as
     // the user reads, and (b) deadlock the child, which would find the lane busy

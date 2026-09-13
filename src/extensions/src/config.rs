@@ -1178,6 +1178,105 @@ pub fn multi_values(repo: &gix::Repository, key: &str) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// repo_config_get_string() / repo_config_get_pathname() and git_die_config()
+// ---------------------------------------------------------------------------
+
+/// The merged configuration a `repo_config_get_*()` reader consults: the
+/// repository's, or with no repository the system/global cascade plus the
+/// command line, which is what `the_repository`'s configset holds before setup
+/// finds a git directory.
+fn occurrences_for(repo: Option<&gix::Repository>) -> Vec<Occurrence> {
+    match repo {
+        Some(repo) => ordered_occurrences(repo),
+        None => ordered_occurrences_in(&global_config()),
+    }
+}
+
+/// `git_die_config()` (config.c:2561-2577): report `err` through `error()`, then
+/// die naming where the **last** value of `key` came from.
+///
+/// ```c
+/// if (err) { … error_fn(err, params); … }
+/// if (repo_config_get_value_multi(r, key, &values))
+///         BUG("for key '%s' we must have a value to report on", key);
+/// kv_info = values->items[values->nr - 1].util;
+/// git_die_config_linenr(key, kv_info->filename, kv_info->linenr);
+/// ```
+///
+/// `key` is printed as the caller spells it — git passes its own literal — and
+/// looked up case-insensitively. The exit is taken here, as `die()` takes it,
+/// after flushing whatever stdout already holds (`exit()` flushes stdio).
+pub fn die_config(repo: Option<&gix::Repository>, key: &str, err: Option<&str>) -> ! {
+    use std::io::Write as _;
+
+    if let Some(err) = err {
+        eprintln!("error: {err}");
+    }
+    let wanted = normalize_key(key);
+    let occurrences: Vec<Occurrence> = occurrences_for(repo);
+    let Some(last) = with_lines(occurrences).into_iter().rev().find(|v| v.key == wanted) else {
+        panic!("BUG: for key '{key}' we must have a value to report on");
+    };
+    let _ = std::io::stdout().flush();
+    eprintln!("fatal: {}", last.origin.die_linenr(key));
+    std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
+}
+
+/// `repo_config_get_string()` (config.c:2374-2383): the last value of `key`, or
+/// `None` when it is not set. A valueless last occurrence is
+/// `git_config_string()`'s `config_error_nonbool()` (config.c:1300-1306,
+/// 3552-3555), which the reader turns into [`die_config`]:
+///
+/// ```text
+/// error: missing value for '<key>'
+/// fatal: unable to parse '<key>' from command-line config
+/// ```
+pub fn config_get_string(repo: Option<&gix::Repository>, key: &str) -> Option<String> {
+    let wanted = normalize_key(key);
+    let last = occurrences_for(repo).into_iter().rev().find(|o| o.key == wanted)?;
+    match last.value {
+        Some(value) => Some(value),
+        None => die_config(repo, key, Some(&format!("missing value for '{key}'"))),
+    }
+}
+
+/// `repo_config_get_pathname()` (config.c:2436-2445) through
+/// `git_config_pathname()` (config.c:1308-1329): the value with `~` expanded, or
+/// `None` when unset or when a `:(optional)` path names a missing file (stat'd
+/// from `cwd`, the directory git is standing in). A valueless key dies as
+/// [`config_get_string`] does; a `~user` that cannot be expanded dies on its own:
+///
+/// ```c
+/// path = interpolate_path(value, 0);
+/// if (!path)
+///         die(_("failed to expand user dir in: '%s'"), value);
+/// ```
+pub fn config_get_pathname(
+    repo: Option<&gix::Repository>,
+    key: &str,
+    cwd: &std::path::Path,
+) -> Option<PathBuf> {
+    let raw = config_get_string(repo, key)?;
+    let (optional, value) = match raw.strip_prefix(":(optional)") {
+        Some(rest) => (true, rest),
+        None => (false, raw.as_str()),
+    };
+    let Some(path) = crate::setup::interpolate_path(value) else {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        eprintln!("fatal: failed to expand user dir in: '{value}'");
+        std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
+    };
+    // `is_missing_file()` (wrapper.c): `stat()` failing with `ENOENT`.
+    if optional
+        && std::fs::metadata(cwd.join(&path)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return None;
+    }
+    Some(path)
+}
+
 /// `repo_settings_get_big_file_threshold()`'s `git_config_ulong()` refusing
 /// `core.bigFileThreshold`, as the message after `fatal: `, or `None` when the
 /// effective value parses (or is not set).
@@ -1199,10 +1298,16 @@ pub fn big_file_threshold_refusal(repo: &gix::Repository) -> Option<String> {
 }
 
 pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
+    with_lines(ordered_occurrences(repo))
+}
+
+/// Attach each occurrence's [`ValueOrigin`], re-reading every file once for the
+/// line numbers.
+fn with_lines(occurrences: Vec<Occurrence>) -> Vec<ConfigValue> {
     use std::collections::HashMap;
 
     let mut lines: HashMap<PathBuf, FileLines> = HashMap::new();
-    ordered_occurrences(repo)
+    occurrences
         .into_iter()
         .map(|o| {
             let origin = match &o.path {
@@ -1275,11 +1380,16 @@ struct Occurrence {
 /// A `Source::Cli` value no override accounts for (a layer a caller appended to
 /// a private snapshot) is kept where the snapshot has it.
 fn ordered_occurrences(repo: &gix::Repository) -> Vec<Occurrence> {
+    ordered_occurrences_in(repo.config_snapshot().plumbing())
+}
+
+/// [`ordered_occurrences`] over any merged read — the repository snapshot, or
+/// [`global_config`] where there is no repository.
+fn ordered_occurrences_in(config: &gix::config::File) -> Vec<Occurrence> {
     use gix::bstr::ByteSlice as _;
     use gix::config::Source;
     use std::collections::HashMap;
 
-    let config = repo.config_snapshot().plumbing().clone();
     let mut snapshot: Vec<(Source, Occurrence)> = Vec::new();
     for sec in config.sections() {
         let header = sec.header();

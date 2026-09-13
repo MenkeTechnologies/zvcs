@@ -178,9 +178,18 @@ pub fn discover() -> Result<gix::Repository, gix::discover::Error> {
     let mut trust: gix::sec::trust::Mapping<gix::open::Options> = Default::default();
     trust.full = trust.full.cli_overrides(overrides.iter().cloned());
     trust.reduced = trust.reduced.cli_overrides(overrides.iter().cloned());
+    // The same upward-search options `gix::discover(".")` uses above: a
+    // `GIT_CEILING_DIRECTORIES` with no entry above the search directory is "no
+    // ceiling at all" (`ceil_offset = min_offset - 2` in
+    // `setup_git_directory_gently_1()`, setup.c), never a refusal. The default
+    // `upwards::Options` errors instead, so any `-c` on the command line turned
+    // `GIT_CEILING_DIRECTORIES=<repo>/src git -c a=b status` into a failure.
     gix::ThreadSafeRepository::discover_with_environment_overrides_opts(
         ".",
-        Default::default(),
+        gix::discover::upwards::Options {
+            match_ceiling_dir_or_error: false,
+            ..Default::default()
+        },
         trust,
     )
     .map(Into::into)

@@ -238,27 +238,17 @@ impl Mailmap {
     pub fn read(repo: Option<&gix::Repository>) -> Mailmap {
         let mut map = Mailmap::default();
 
-        let (mailmap_file, mailmap_blob) = match repo {
-            Some(repo) => {
-                let config = repo.config_snapshot();
-                (
-                    config.string("mailmap.file").map(|v| v.to_str_lossy().into_owned()),
-                    config.string("mailmap.blob").map(|v| v.to_str_lossy().into_owned()),
-                )
-            }
-            None => (
-                crate::config::global_config()
-                    .string("mailmap.file")
-                    .map(|v| v.to_str_lossy().into_owned()),
-                None,
-            ),
-        };
         let cwd: PathBuf = match repo {
             Some(repo) => crate::setup::setup_cwd(repo),
             None => std::env::current_dir().ok(),
         }
         .unwrap_or_default();
-        let mailmap_file = mailmap_file.and_then(|raw| config_pathname(&raw, &cwd));
+        // `repo_config_get_pathname(repo, "mailmap.file", …)` then
+        // `repo_config_get_string(repo, "mailmap.blob", …)` (mailmap.c:216-217):
+        // a valueless key dies through `git_die_config()`, the file first.
+        let mailmap_file = crate::config::config_get_pathname(repo, "mailmap.file", &cwd)
+            .map(|path| path.to_string_lossy().into_owned());
+        let mailmap_blob = crate::config::config_get_string(repo, "mailmap.blob");
 
         // `is_bare_repository()` (environment.c:131-135): `core.bare` not false,
         // and no work tree.
@@ -322,25 +312,6 @@ impl Mailmap {
         self.map_user(&mut email, &mut name);
         (name.to_vec(), email.to_vec())
     }
-}
-
-/// `git_config_pathname()` (config.c:1308-1329) for a value that is present:
-/// `:(optional)` naming a missing file is unset. A `~user` that cannot be
-/// expanded dies there; that is left to the configuration reader, and the key is
-/// treated as unset here.
-fn config_pathname(raw: &str, cwd: &Path) -> Option<String> {
-    let (optional, value) = match raw.strip_prefix(":(optional)") {
-        Some(rest) => (true, rest),
-        None => (false, raw),
-    };
-    let path = crate::setup::interpolate_path(value)?;
-    // `is_missing_file()` (wrapper.c): `stat()` failing with `ENOENT`.
-    if optional
-        && std::fs::metadata(cwd.join(&path)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-    {
-        return None;
-    }
-    Some(path.to_string_lossy().into_owned())
 }
 
 /// `split_ident_line()` (ident.c:275-309) reduced to what `rewrite_ident_line()`

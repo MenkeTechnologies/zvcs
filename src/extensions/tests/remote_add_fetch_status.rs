@@ -72,7 +72,10 @@ fn remote_add_f_reports_a_failed_fetch() {
     assert_eq!(String::from_utf8_lossy(&listed.stdout), "origin\n");
 }
 
-/// `remote update` shares the fetch-status bug and the same fix.
+/// `remote update` shares the fetch-status bug. It reports it differently: the
+/// fetch is a `git fetch --multiple --all` child, which fetches a lone remote
+/// directly and dies with the transport's message, and `git remote` turns that
+/// 128 into 1 without adding a line of its own.
 #[test]
 fn remote_update_reports_a_failed_fetch() {
     let (repo, home) = fixture("update");
@@ -84,9 +87,32 @@ fn remote_update_reports_a_failed_fetch() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        stderr.ends_with("error: Could not fetch origin\n"),
+        stderr.ends_with("and the repository exists.\n") && !stderr.contains("ould not fetch"),
         "stderr: {stderr:?}"
     );
+}
+
+/// A child that dies before it fetches anything — here on a configuration value
+/// `git fetch` refuses — is still a non-zero `run_command()`: exit 1, not the
+/// child's 128, and no `Fetching` line ahead of the refusal.
+#[test]
+fn remote_update_maps_a_dying_fetch_to_one() {
+    let (repo, home) = fixture("update-die");
+    let missing = repo.join("no-such-remote");
+    assert!(run(&repo, &home, &["remote", "add", "o", missing.to_str().unwrap()]).status.success());
+
+    for args in [&["remote", "update"][..], &["remote", "update", "o"][..]] {
+        let mut argv = vec!["-c", "core.logAllRefUpdates=none"];
+        argv.extend_from_slice(args);
+        let out = run(&repo, &home, &argv);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "fatal: bad boolean config value 'none' for 'core.logallrefupdates'\n",
+            "{args:?}"
+        );
+    }
 }
 
 /// The success path keeps its exit code and says nothing about failing.

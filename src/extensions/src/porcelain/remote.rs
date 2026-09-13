@@ -92,7 +92,7 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
         Some("set-url") => set_url(&repo, &rest[1..]),
         Some("show") => show(&repo, &rest[1..], verbose),
         Some("prune") => prune(&repo, &rest[1..]),
-        Some("update") => update(&repo, &rest[1..]),
+        Some("update") => update(&repo, &rest[1..], verbose),
         Some(other) => {
             eprintln!("error: unknown subcommand: `{other}'");
             usage(USAGE_MAIN)
@@ -2401,26 +2401,50 @@ fn stale_tracking_refs(repo: &gix::Repository, name: &str) -> Result<Vec<String>
 }
 
 /// `git remote update [-p] [<group>|<remote>]…` — fetch from every named
-/// remote (all of them by default), then optionally prune.
+/// remote (all of them by default).
 ///
-/// Port of git's `update()`, which builds a `git fetch --multiple <args>`
-/// command line: with no operand it asks for the `default` group, and when the
-/// last operand is `default` while `remotes.default` is configured nowhere it
-/// swaps that operand for `--all`. Those two branches behave differently, and
-/// the difference is where `remote.<name>.skipFetchAll` lives:
+/// ```c
+/// strvec_push(&cmd.args, "fetch");
 ///
-///   * the `--all` branch enumerates the configured remotes and drops the ones
-///     `skipFetchAll` (or its deprecated synonym `skipDefaultUpdate`) marks, and
-///     when exactly one survives git fetches it directly — `cmd_fetch` refuses
-///     to "do fetch_multiple() of one", so no `Fetching <name>` line is printed;
-///   * a named group or remote is fetched whatever the skip flags say, and is
-///     always announced.
+/// if (prune != -1)
+///         strvec_push(&cmd.args, prune ? "--prune" : "--no-prune");
+/// if (verbose)
+///         strvec_push(&cmd.args, "-v");
+/// strvec_push(&cmd.args, "--multiple");
+/// if (argc < 2)
+///         strvec_push(&cmd.args, "default");
+/// for (i = 1; i < argc; i++)
+///         strvec_push(&cmd.args, argv[i]);
 ///
-/// The announcement goes to stdout, as git's `printf` in `fetch_multiple` does.
-fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
-    let mut do_prune = false;
-    let mut pos: Vec<&str> = Vec::new();
-    for a in args {
+/// if (strcmp(cmd.args.v[cmd.args.nr-1], "default") == 0) {
+///         repo_config(the_repository, get_remote_default, &default_defined);
+///         if (!default_defined) {
+///                 strvec_pop(&cmd.args);
+///                 strvec_push(&cmd.args, "--all");
+///         }
+/// }
+///
+/// cmd.git_cmd = 1;
+/// return run_command(&cmd);
+/// ```
+///
+/// (`update()`, builtin/remote.c:1701-1739.) Everything past the command line —
+/// which remotes a group or `--all` names, `skipFetchAll`, the `Fetching <name>`
+/// lines, the refusals — belongs to that `git fetch` child, and so does the exit:
+/// a child that dies with 128 is a non-zero `run_command()`, which `cmd_remote()`'s
+/// `return !!fn(argc, argv, prefix, repo)` (:1959) reports as 1. Calling the fetch
+/// in this process instead let its `die()` end `git remote` itself with 128.
+fn update(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCode> {
+    let mut prune: Option<bool> = None;
+    let mut operands: Vec<String> = Vec::new();
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        // `parse_options()` stops at `--` and `--end-of-options`: what follows is an
+        // operand even when it looks like an option, and reaches `git fetch` as one.
+        if a == "--" || a == "--end-of-options" {
+            operands.extend(rest.cloned());
+            break;
+        }
         if let Some(code) = help_requested(a, "p", USAGE_UPDATE) {
             return Ok(code);
         }
@@ -2429,107 +2453,44 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             Err(code) => return Ok(code),
         };
         match resolved.as_ref() {
-            "-p" | "--prune" => do_prune = true,
-            "--no-prune" => do_prune = false,
+            "-p" | "--prune" => prune = Some(true),
+            "--no-prune" => prune = Some(false),
             s if s.starts_with('-') && s.len() > 1 => {
                 unknown_option(s);
                 return usage(USAGE_UPDATE);
             }
-            _ => pos.push(a.as_str()),
+            _ => operands.push(a.clone()),
         }
     }
 
-    let known: Vec<String> = repo
-        .remote_names()
-        .iter()
-        .map(|n| n.to_str_lossy().into_owned())
-        .collect();
-
-    // git appends the literal `default` when no operand was given, then rewrites
-    // a trailing `default` to `--all` unless `remotes.default` exists.
-    let cfg = repo.config_snapshot();
-    let mut wanted: Vec<&str> = pos.clone();
-    if wanted.is_empty() {
-        wanted.push("default");
+    let mut cmd: Vec<String> = vec!["fetch".to_string()];
+    if let Some(prune) = prune {
+        cmd.push(if prune { "--prune" } else { "--no-prune" }.to_string());
     }
-    let default_group_defined = cfg
-        .plumbing()
-        .strings_by("remotes", None::<&BStr>, "default")
-        .is_some();
-    let all = wanted.last() == Some(&"default") && !default_group_defined;
-    if all {
-        wanted.pop();
-        // The rewrite leaves `git fetch --multiple <rest> --all`, and `--all`
-        // refuses to share the command line with an operand.
-        if !wanted.is_empty() {
-            eprintln!("fatal: fetch --all does not take a repository argument");
-            return Ok(ExitCode::from(1));
-        }
+    if verbose {
+        cmd.push("-v".to_string());
     }
+    cmd.push("--multiple".to_string());
+    if operands.is_empty() {
+        cmd.push("default".to_string());
+    }
+    cmd.extend(operands);
 
-    let mut targets: Vec<String> = Vec::new();
-    for want in wanted {
-        if known.iter().any(|n| n.as_str() == want) {
-            targets.push(want.to_string());
-            continue;
-        }
-        let group = cfg
+    if cmd.last().is_some_and(|last| last == "default") {
+        // `get_remote_default()` (builtin/remote.c:1690-1699): any `remotes.default`.
+        let default_defined = repo
+            .config_snapshot()
             .plumbing()
-            .strings_by("remotes", None::<&BStr>, want)
-            .unwrap_or_default();
-        if group.is_empty() {
-            eprintln!("fatal: no such remote or remote group: {want}");
-            return Ok(ExitCode::from(1));
-        }
-        for entry in group {
-            for member in entry.to_str_lossy().split_whitespace() {
-                targets.push(member.to_string());
-            }
+            .strings_by("remotes", None::<&BStr>, "default")
+            .is_some();
+        if !default_defined {
+            cmd.pop();
+            cmd.push("--all".to_string());
         }
     }
 
-    // Only the `--all` branch consults the skip flags, and only it collapses a
-    // one-remote run into a silent single fetch.
-    let mut announce = true;
-    if all {
-        targets.extend(known.iter().filter(|n| !skip_fetch_all(repo, n)).cloned());
-        announce = targets.len() > 1;
-    }
-
-    for name in &targets {
-        if announce {
-            println!("Fetching {name}");
-        }
-        // ```c
-        // strvec_push(&cmd.args, "fetch");
-        // if (prune != -1)
-        //         strvec_push(&cmd.args, prune ? "--prune" : "--no-prune");
-        // ```
-        //
-        // (`update()`, builtin/remote.c:1601-1607.) `--prune` is handed to the
-        // fetch and is not a `prune` of its own: the stale refs are deleted by
-        // the fetch, which reports them as `- [deleted]` rows on stderr like any
-        // other ref it touched. Running `prune_one()` beside the fetch printed
-        // `git remote prune`'s stdout block — `Pruning <name>`, the URL and a
-        // `* [pruned]` line per ref — that `git remote update` never emits.
-        let mut fetch_args: Vec<String> = Vec::new();
-        if do_prune {
-            fetch_args.push("--prune".to_string());
-        }
-        fetch_args.push(name.clone());
-        // Same as the `add -f` arm above: an ordinary fetch failure comes back
-        // as `Ok(ExitCode::from(128))`, so `is_err()` alone let
-        // `git remote update` walk on to the next remote and exit 0.
-        let failed = match super::fetch::fetch(&fetch_args) {
-            Ok(code) => code != ExitCode::SUCCESS,
-            Err(_) => true,
-        };
-        if failed {
-            eprintln!("error: Could not fetch {name}");
-            return Ok(ExitCode::from(1));
-        }
-    }
-    Ok(ExitCode::SUCCESS)
+    let code = super::fetch::run_git_cmd(&cmd);
+    Ok(ExitCode::from(u8::from(code != 0)))
 }
 
 /// git's `remote->skip_default_update` for `<name>`: the effective value of

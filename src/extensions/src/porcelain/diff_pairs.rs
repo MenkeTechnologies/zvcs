@@ -1427,16 +1427,22 @@ pub(crate) fn render_raw_stream(
             // this command's `index` lines (only `core.abbrev` does).
             "--abbrev" | "--no-abbrev" => {}
             _ if s.starts_with("--abbrev=") => {}
+            // `diff_opt_unified()` (diff.c:5353-5367): `strtol()` must consume the whole
+            // value, else `error: --unified expects a numerical value` and parse-options'
+            // callback-error exit 129 — whichever of `-U<n>` / `--unified=<n>` was typed.
             "-U" => {
-                opts.ctx = parse_ctx(&want_value!(s.len()))?;
+                opts.ctx = match unified_ctx(&want_value!(s.len())) {
+                    Ok(n) => n,
+                    Err(code) => return Ok(code),
+                };
                 opts.formats.or_patch();
             }
-            _ if s.starts_with("-U") => {
-                opts.ctx = parse_ctx(&s[2..])?;
-                opts.formats.or_patch();
-            }
-            _ if s.starts_with("--unified=") => {
-                opts.ctx = parse_ctx(&s["--unified=".len()..])?;
+            _ if s.starts_with("-U") || s.starts_with("--unified=") => {
+                let value = s.strip_prefix("--unified=").unwrap_or(&s[2..]);
+                opts.ctx = match unified_ctx(value) {
+                    Ok(n) => n,
+                    Err(code) => return Ok(code),
+                };
                 opts.formats.or_patch();
             }
             "--unified" => opts.formats.patch = true,
@@ -2085,6 +2091,17 @@ fn append_prefixed(out: &mut Vec<u8>, lp: &[u8], body: &[u8]) {
         out.extend_from_slice(lp);
         out.extend_from_slice(line);
     }
+}
+
+/// `diff_opt_unified()`'s value check, reported as parse-options reports a callback
+/// error: the message alone on stderr and exit 129.
+fn unified_ctx(value: &str) -> std::result::Result<u32, Status> {
+    if let Err(msg) = crate::diffopt::check("unified", Some(value)) {
+        eprintln!("error: {msg}");
+        return Err(Status::from(129));
+    }
+    let n = crate::diffopt::strtol_long(value).unwrap_or(0);
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 fn parse_ctx(s: &str) -> Result<u32> {

@@ -1125,7 +1125,8 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // result is memoised in the ledger. gix re-runs the whole history walk and
     // per-step diff on every invocation; git does too, but roughly twice as
     // fast — caching sidesteps the race entirely, and the entry is valid in any
-    // clone holding those commits.
+    // clone holding those commits with the same grafts, shallow boundaries and
+    // replace refs.
     //
     // Only a full-file blame is cached: `-L` narrows the walk, so its outcome is
     // not the whole file's attribution.
@@ -1160,13 +1161,18 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // stops the dig at a date the key does not name (and one `approxidate()` resolves against the
     // wall clock, so it is not even stable within a day), the second substitutes the ancestry the
     // walk follows. Both would share an entry with the plain blame they are not.
+    //
+    // The ancestry itself is the last input the commit id does not pin: see
+    // [`ancestry_stamp`]. A shallow clone and a full clone hold the same suspect and
+    // blame it to different commits.
     let algo_key = format!(
-        "{:?}|w={}|M={:?}|C={:?}|1p={}",
+        "{:?}|w={}|M={:?}|C={:?}|1p={}|anc={:016x}",
         opts.diff_algorithm,
         opts.ignore_whitespace,
         opts.detect_moved,
         opts.detect_copied,
-        opts.first_parent
+        opts.first_parent,
+        ancestry_stamp(&repo)
     );
     let cache_key = (opts.ranges.is_empty()
         && ignore_revs.is_empty()
@@ -1487,6 +1493,53 @@ fn finish_progress(
 /// Run-length encode an attribution: consecutive lines from the same commit,
 /// advancing together in both files, collapse to one record
 /// `final_start,orig_start,count,commit[,source_name]`.
+/// What this repository substitutes for the history its objects record — the
+/// part of a blame the `(commit, path)` key does not name.
+///
+/// git reads a commit's parents through the graft table, which holds
+/// `info/grafts` and every `shallow` boundary (`parse_commit_buffer()`,
+/// commit.c:554-581):
+///
+/// ```c
+/// graft = lookup_commit_graft(r, &item->object.oid);
+/// …
+/// if (graft && (graft->nr_parent < 0 || !grafts_keep_true_parents))
+///         ; /* do not parse the header's parents */
+/// ```
+///
+/// and it reads every object through `lookup_replace_object()` (odb.c:558), on
+/// by default (`read_replace_refs = 1`, replace-object.c:90). A shallow clone's
+/// boundary commit therefore takes every line its real ancestors wrote, and a
+/// replace ref can move lines anywhere. The blame cache lives machine-wide, so a
+/// key without this let a full clone's attribution be served in a shallow clone
+/// of the same history, naming commits that clone does not have
+/// (`An object with id … could not be found`), where git prints `^<boundary>`.
+///
+/// The stamp hashes exactly the two tables the walk consults — gix's graft table
+/// and the object store's replacement list — so a repository with neither
+/// (every ordinary clone) shares one value and keeps sharing its entries.
+fn ancestry_stamp(repo: &gix::Repository) -> u64 {
+    let mut state = Vec::new();
+    for (id, graft) in repo.commit_grafts().iter() {
+        state.extend_from_slice(id.as_bytes());
+        match graft {
+            gix::revwalk::graft::Graft::Shallow => state.extend_from_slice(&u32::MAX.to_le_bytes()),
+            gix::revwalk::graft::Graft::Parents(parents) => {
+                state.extend_from_slice(&(parents.len() as u32).to_le_bytes());
+                for parent in parents {
+                    state.extend_from_slice(parent.as_bytes());
+                }
+            }
+        }
+    }
+    state.push(0);
+    for (original, replacement) in repo.objects.store_ref().replacements() {
+        state.extend_from_slice(original.as_bytes());
+        state.extend_from_slice(replacement.as_bytes());
+    }
+    crate::rcache::hash_key(&state)
+}
+
 fn encode_runs(lines: &[Line]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;

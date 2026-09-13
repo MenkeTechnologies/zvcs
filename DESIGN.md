@@ -456,7 +456,13 @@ the one that wrote it. The blame memo was keyed `(suspect, path, algo)` with
 `opts.bottom` outside the key, so one `git blame A..B -- f` poisoned every later
 plain blame of that file everywhere, persisted, with nothing to indicate it had
 happened (fixed in v0.16.0 by keeping a bottom-limited blame out of the cache
-entirely, the treatment `--reverse` and `--ignore-rev` already had). The rule
+entirely, the treatment `--reverse` and `--ignore-rev` already had). The same
+key also left out the ancestry: git takes a commit's parents from the graft table
+(`info/grafts` plus every `shallow` boundary, commit.c:554-581) and reads objects
+through replace refs (odb.c:558), so a full clone's attribution was served in a
+`--depth 1` clone of the same history and died naming a commit that clone does
+not hold. The blame key now ends in `anc=<hash>` over gix's graft table and the
+store's replacement list, which every ordinary clone shares. The rule
 that follows is the one `blame.rs` now states case by case: an option that
 changes the answer either appears in the key or disqualifies the entry, and the
 cache carries no way to check that for itself.

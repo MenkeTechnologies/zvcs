@@ -1565,6 +1565,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // there — a `--single-branch` clone follows that `HEAD`, and its refspec then matches
     // nothing. Either way the clone succeeds and checks nothing out.
     let mut cloned_empty = false;
+    // git's `refs` — whether `transport_get_remote_refs()` returned anything at all.
+    // `process_ref_v2()` hands an `unborn HEAD` line to `unborn_head_target` and adds no
+    // ref for it (connect.c:417-435), so a remote with no commits yields `refs == NULL`,
+    // and `update_remote_refs()` then skips `write_remote_refs()` (builtin/clone.c:554-558).
+    let mut remote_advertised_refs = false;
     // git's `transport_ls_refs_options.unborn_head_target`: protocol v2's `unborn`
     // extension reports the branch the remote's own HEAD names even when that branch does
     // not exist yet, and `update_head()` makes the clone's HEAD a symref to it
@@ -1591,11 +1596,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             eprintln!("done.");
         }
     };
-    let mut warn_empty = |quiet: bool| {
-        if !quiet {
-            eprintln!("warning: You appear to have cloned an empty repository.");
-        }
-    };
+    // `warning()` is not gated on `option_verbosity`, so `-q` prints it too.
+    let warn_empty = || eprintln!("warning: You appear to have cloned an empty repository.");
 
     // git names the remote in the diagnostic a missing `--branch` dies with, and the name it uses
     // is the one this clone is about to write: `-o`/`--origin`, else `clone.defaultRemoteName`,
@@ -1681,10 +1683,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 // repository has to be kept explicitly: `PrepareFetch` deletes the
                 // destination it created when it is dropped after a failed fetch.
                 Err(gix::clone::fetch::Error::Fetch(
-                    gix::remote::fetch::Error::NoMapping { .. },
+                    gix::remote::fetch::Error::NoMapping { num_remote_refs, .. },
                 )) if branch.is_none() => {
                     cloned_empty = true;
-                    warn_empty(quiet);
+                    remote_advertised_refs = num_remote_refs > 0;
+                    warn_empty();
                     say_done();
                     // An empty clone is a *successful* clone in git — `checkout()` runs and
                     // returns, `junk_mode` moves on, and the repository stays.
@@ -1702,10 +1705,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 .remote_refs
                 .iter()
                 .any(|r| r.unpack().0 == tracking_head.as_bytes());
-            if outcome.ref_map.mappings.is_empty() {
+            remote_advertised_refs = advertises_refs(&outcome.ref_map);
+            if mapped_refs_empty(&outcome.ref_map) {
                 cloned_empty = true;
                 unborn_head = unborn_head_target(&outcome.ref_map);
-                warn_empty(quiet);
+                warn_empty();
             }
             say_done();
             note_remote_head(&outcome.ref_map);
@@ -1722,10 +1726,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     (checkout, outcome)
                 }
                 Err(gix::clone::fetch::Error::Fetch(
-                    gix::remote::fetch::Error::NoMapping { .. },
+                    gix::remote::fetch::Error::NoMapping { num_remote_refs, .. },
                 )) if branch.is_none() => {
                     cloned_empty = true;
-                    warn_empty(quiet);
+                    remote_advertised_refs = num_remote_refs > 0;
+                    warn_empty();
                     say_done();
                     // An empty clone is a *successful* clone in git — `checkout()` runs and
                     // returns, `junk_mode` moves on, and the repository stays.
@@ -1737,10 +1742,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
                 }
             };
-            if outcome.ref_map.mappings.is_empty() {
+            remote_advertised_refs = advertises_refs(&outcome.ref_map);
+            if mapped_refs_empty(&outcome.ref_map) {
                 cloned_empty = true;
                 unborn_head = unborn_head_target(&outcome.ref_map);
-                warn_empty(quiet);
+                warn_empty();
             }
             say_done();
             note_remote_head(&outcome.ref_map);
@@ -1780,8 +1786,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // `junk_mode = JUNK_LEAVE_REPO;` (builtin/clone.c:1629), immediately before
             // `checkout()`: from here on a failure keeps the repository and only warns.
             junk.leave();
-            // Check out the branch `HEAD` points to. This is a no-op for an empty
-            // remote, leaving an empty repository exactly like git does.
+            // ```c
+            // if (option_no_checkout)
+            //         return 0;
+            // ```
+            //
+            // (`checkout()`, builtin/clone.c:652-653.) An empty clone set
+            // `option_no_checkout` next to its warning (builtin/clone.c:1560-1563), so
+            // nothing is unpacked and HEAD is never resolved.
+            if cloned_empty {
+                checkout.persist();
+                return Ok(());
+            }
+            // Check out the branch `HEAD` points to.
             // `checkout()` unpacks `HEAD`'s tree with `opts.verbose_update =
             // (option_verbosity >= 0)` (builtin/clone.c:682), after returning early for an
             // unborn `HEAD`, so `prepare` only runs for a tree that is checked out.
@@ -1870,10 +1887,21 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `initial_ref_transaction_commit()`, which puts them straight into `packed-refs` — so
     // the files backend creates that file even for a clone that stored no ref at all,
     // leaving it with nothing but the header. gitoxide runs no transaction when there is
-    // nothing to write, so the empty file is written here.
+    // nothing to write, so the empty file is written here. A remote that advertised no
+    // ref at all never reaches `write_remote_refs()` (`if (refs)`, builtin/clone.c:554),
+    // so it gets no file.
     if cloned_empty {
         let packed = git_dir.join("packed-refs");
-        if !packed.exists() {
+        // A single-branch fetch whose refspec came out empty sent ls-refs no `refs/heads/`
+        // prefix, so what the remote had under it is known only from the probe.
+        let probe_advertised_refs = single_outcome
+            .lock()
+            .expect("clone is single-threaded here")
+            .as_ref()
+            .is_some_and(|probe| {
+                probe.advertised_head_or_branch || (probe.advertised_tag && tags != Some(Tags::None))
+            });
+        if (remote_advertised_refs || probe_advertised_refs) && !packed.exists() {
             std::fs::write(&packed, "# pack-refs with: peeled fully-peeled sorted \n")?;
         }
         // ```c
@@ -1895,13 +1923,30 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         // A single-branch plan already asked the remote what its HEAD names — including the
         // `unborn` answer — while building its refspec, so that probe supplies the target
         // when the fetch itself never got far enough to report one.
-        let unborn_head = unborn_head.or_else(|| {
-            single_outcome
-                .lock()
-                .expect("clone is single-threaded here")
-                .as_ref()
-                .and_then(|(_, head_target)| head_target.clone())
-        });
+        //
+        // ```c
+        // } else {
+        //         branch = to_free = repo_default_branch_name(the_repository, 0);
+        //         unborn_head = xstrfmt("refs/heads/%s", branch);
+        // }
+        // ```
+        //
+        // (builtin/clone.c:1569-1572.) A remote that sent no `unborn` line — protocol v0/v1,
+        // or `lsrefs.unborn` turned off — leaves the clone on this machine's default branch,
+        // and the branch config is installed for it all the same.
+        let unborn_head = unborn_head
+            .or_else(|| {
+                single_outcome
+                    .lock()
+                    .expect("clone is single-threaded here")
+                    .as_ref()
+                    .and_then(|probe| probe.head_target.clone())
+            })
+            .or_else(|| {
+                gix::open(&git_dir)
+                    .ok()
+                    .map(|repo| format!("refs/heads/{}", default_branch_name(&repo)))
+            });
         if let Some(target) = unborn_head.as_deref().filter(|t| t.starts_with("refs/heads/")) {
             std::fs::write(git_dir.join("HEAD"), format!("ref: {target}\n"))?;
             if !bare {
@@ -2058,7 +2103,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             .lock()
             .expect("clone is single-threaded here")
             .as_ref()
-            .and_then(|(fetched, _)| fetched.clone())
+            .and_then(|probe| probe.fetched.clone())
             .filter(|name| name.starts_with("refs/tags/"));
         unpack_followed_tags(&git_dir, mapped_tag.as_deref())?;
     }
@@ -2120,7 +2165,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         !(mirror && remote_advertised_tracking_head)
     } else {
         match &*single_outcome.lock().expect("clone is single-threaded here") {
-            Some((fetched, head_target)) => head_target.as_deref() != fetched.as_deref(),
+            Some(probe) => probe.head_target.as_deref() != probe.fetched.as_deref(),
             // `update_remote_refs()` writes `refs/remotes/<name>/HEAD` from
             // `remote_head_points_at`, which `guess_remote_head()` leaves NULL when the
             // remote's HEAD names a branch it does not advertise — so there is no ref for
@@ -2424,7 +2469,24 @@ enum Refspecs {
 /// being fetched, the branch the remote's `HEAD` points at)`. Shared with the
 /// `configure_remote` closure, which is the only place that talks to the remote
 /// early enough to know either.
-type SingleOutcome = std::sync::Arc<std::sync::Mutex<Option<(Option<String>, Option<String>)>>>;
+type SingleOutcome = std::sync::Arc<std::sync::Mutex<Option<SingleProbe>>>;
+
+/// What the `--single-branch` ls-refs probe learned.
+#[derive(Clone, Default)]
+struct SingleProbe {
+    /// The ref the clone is restricted to.
+    fetched: Option<String>,
+    /// The branch the remote's `HEAD` names, born or not.
+    head_target: Option<String>,
+    /// A non-unborn `HEAD` or `refs/heads/*` was advertised. Those are the
+    /// `ref-prefix`es git's ls-refs asks for — `+refs/heads/*` from
+    /// `refspec_appendf(&remote->fetch, ...)` and `HEAD` for `wants_head`
+    /// (builtin/clone.c:1320, :1421-1436) — so any of them makes `refs` non-NULL.
+    advertised_head_or_branch: bool,
+    /// A `refs/tags/*` was advertised, which counts only when `TAG_REFSPEC` was
+    /// appended (builtin/clone.c:1414-1419).
+    advertised_tag: bool,
+}
 
 impl Refspecs {
     /// The concrete fetch refspecs for this plan. `Single` performs an ls-refs
@@ -2444,10 +2506,9 @@ impl Refspecs {
             Refspecs::Bare => vec!["+refs/heads/*:refs/heads/*".to_string()],
             Refspecs::Wildcard => vec![format!("+refs/heads/*:refs/remotes/{remote_name}/*")],
             Refspecs::Single { branch, bare } => {
-                let (fetched, head_target) =
-                    resolve_single_ref(repo, url, branch.as_deref(), connect_options, server_options)?;
-                *outcome.lock().expect("clone is single-threaded here") =
-                    Some((fetched.clone(), head_target));
+                let probe = resolve_single_ref(repo, url, branch.as_deref(), connect_options, server_options)?;
+                let fetched = probe.fetched.clone();
+                *outcome.lock().expect("clone is single-threaded here") = Some(probe);
                 match fetched {
                     Some(full) => vec![single_branch_refspec(&full, remote_name, *bare)],
                     // "If the HEAD at the remote did not point at any branch when
@@ -2483,7 +2544,7 @@ fn resolve_single_ref(
     branch: Option<&str>,
     connect_options: &gix::remote::connect::Options,
     server_options: &[gix::bstr::BString],
-) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SingleProbe, Box<dyn std::error::Error + Send + Sync>> {
     let remote = repo.remote_at(url.clone())?;
     let connection = remote
         .connect_with_options(gix::remote::Direction::Fetch, connect_options.clone())?
@@ -2536,9 +2597,25 @@ fn resolve_single_ref(
                     .ok_or_else(|| format!("Remote branch {name} not found in upstream"))?,
             )
         }
-        None => head_target.clone(),
+        // `guess_remote_head(head, refs, REMOTE_GUESS_HEAD_QUIET)` (builtin/clone.c:455-458)
+        // only answers with a branch the remote advertised. A `HEAD` that is unborn, or a
+        // symref to a missing branch, leaves `mapped_refs` empty and
+        // `remote_head_points_at` NULL, so `write_refspec_config()` writes no
+        // `remote.<name>.fetch` (builtin/clone.c:810-823).
+        None => head_target.clone().filter(|target| advertised(target)),
     };
-    Ok((fetched, head_target))
+    let born = || {
+        map.remote_refs
+            .iter()
+            .filter(|r| !matches!(r, Ref::Unborn { .. }))
+            .map(|r| r.unpack().0)
+    };
+    Ok(SingleProbe {
+        fetched,
+        head_target,
+        advertised_head_or_branch: born().any(|name| name == "HEAD" || name.starts_with(b"refs/heads/")),
+        advertised_tag: born().any(|name| name.starts_with(b"refs/tags/")),
+    })
 }
 
 /// The remote name this clone will use, with git's precedence: `-o`/`--origin`,
@@ -3709,6 +3786,26 @@ fn unborn_head_target(ref_map: &gix::remote::fetch::RefMap) -> Option<String> {
         }
         _ => None,
     })
+}
+
+/// Whether git's `mapped_refs` is empty: `wanted_peer_refs()` runs `get_fetch_map()` over
+/// the remote's own `fetch` refspecs only (builtin/clone.c:443-471). The
+/// `HEAD:refs/remotes/<name>/HEAD` refspec gitoxide adds for itself is implicit and maps
+/// even an unborn `HEAD`, so its mappings do not count.
+fn mapped_refs_empty(ref_map: &gix::remote::fetch::RefMap) -> bool {
+    !ref_map
+        .mappings
+        .iter()
+        .any(|m| matches!(m.spec_index, gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)))
+}
+
+/// Whether `transport_get_remote_refs()` returned a non-NULL list: an `unborn` line is
+/// reported through `unborn_head_target` and is not a ref (connect.c:417-435).
+fn advertises_refs(ref_map: &gix::remote::fetch::RefMap) -> bool {
+    ref_map
+        .remote_refs
+        .iter()
+        .any(|r| !matches!(r, gix::protocol::handshake::Ref::Unborn { .. }))
 }
 
 /// The first directory on the way to `path` that does not exist, absolute — what

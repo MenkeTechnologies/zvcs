@@ -804,12 +804,18 @@ pub(super) fn mark_seen_per_spec(
         if seen.contains(&i) || is_exclude_spec(spec) || spec.is_empty() {
             continue;
         }
+        // `:(attr:…)` elements are checked in attr.c's default direction,
+        // `GIT_ATTR_CHECKIN` (attr.h:202-206; builtin/add.c never changes it): the
+        // work tree's `.gitattributes` first, the index's only where it is absent.
+        // The walk that staged these paths already reads them that way
+        // (`Repository::dirwalk`), so an index-only read here left an untracked
+        // `.gitattributes` unseen and `add ':(attr:text)'` died with "did not match".
         let mut ps = repo.pathspec(
             true,
             std::slice::from_ref(&patterns[i]),
             false,
             index,
-            gix::worktree::stack::state::attributes::Source::IdMapping,
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
         )?;
         if paths.iter().any(|p| ps.is_included(p.as_bstr(), Some(false))) {
             seen.insert(i);
@@ -955,19 +961,38 @@ pub(super) fn unmatched_pathspec_check(
         // the element *after* the prefix pass, which is the only form a worktree path
         // can be built from. The message still quotes `original`, i.e. `spec`.
         let relative = c.resolved.get(i).map(String::as_str).unwrap_or(spec.as_str());
+        // `path` is `pathspec.items[i].match`: the element with its magic parsed
+        // off. `:(attr:-text)` has the empty match and `:(attr:text)f` the match
+        // `f`, so testing the typed text instead made both die where git — which
+        // skips the first and finds the second on disk — exits 0. The two
+        // PATHSPEC_* bits the test reads are the parsed `icase` signature and the
+        // `glob` search mode (magic or `GIT_GLOB_PATHSPECS` alike).
+        let parsed = repo
+            .pathspec_defaults_inherit_ignore_case(false)
+            .ok()
+            .and_then(|defaults| gix::pathspec::parse(relative.as_bytes(), defaults).ok());
+        let (path, glob_or_icase) = match &parsed {
+            Some(p) => (
+                p.path().to_str_lossy().into_owned(),
+                p.signature.contains(gix::pathspec::MagicSignature::ICASE)
+                    || p.search_mode == gix::pathspec::SearchMode::PathAwareGlob,
+            ),
+            None => (relative.to_string(), !is_literal_spec(spec)),
+        };
         // `if (!path[0]) continue;` — "don't complain at 'git add .' on empty repo".
         // A `.` at the prefix resolves to the empty match, which selects everything.
-        if relative.is_empty() || relative == "." {
+        if path.is_empty() || path == "." {
             continue;
         }
         let on_disk = repo
-            .workdir_path(BStr::new(relative.as_bytes()))
+            .workdir_path(BStr::new(path.as_bytes()))
             .is_some_and(|abs| std::fs::symlink_metadata(abs).is_ok());
 
-        // `(magic & (PATHSPEC_GLOB | PATHSPEC_ICASE)) || !file_exists(path)`: a
-        // wildcard or `:(icase)` element is judged purely on whether the matcher
-        // found anything, never on whether its literal text names a file.
-        if !on_disk || !is_literal_spec(spec) || c.mode == SpecMode::Refresh {
+        // `(magic & (PATHSPEC_GLOB | PATHSPEC_ICASE)) || !file_exists(path)`
+        // (builtin/add.c:654-655): a `:(glob)` or `:(icase)` element is judged
+        // purely on whether the matcher found anything; any other element — a
+        // bare wildcard included — dies only when its match names no file.
+        if !on_disk || glob_or_icase || c.mode == SpecMode::Refresh {
             // `if (ignore_missing) { if (is_excluded(...)) dir_add_ignored(...); }`
             // (builtin/add.c:562-567): the flag exists to answer "would this path be
             // ignored if it existed", so the element joins the gitignore block
@@ -1008,6 +1033,24 @@ pub(super) fn unmatched_pathspec_check(
             // `dir_add_ignored()` records `pathspec.items[i].match`, so the block
             // below lists the repo-relative form, not the element as typed.
             SpecMode::Add => {
+                // `dir.ignored` only holds what `fill_directory()` kept, and the walk
+                // keeps a path only once `match_pathspec()` — attribute filter
+                // included (dir.c:365-367) — accepts it. An `:(attr:…)` element
+                // whose file exists but carries other attributes was never matched,
+                // so it is neither seen nor ignored: git exits 0 without a word.
+                let has_attrs = parsed.as_ref().is_some_and(|p| !p.attributes.is_empty());
+                if has_attrs {
+                    let mut single = repo.pathspec(
+                        true,
+                        std::slice::from_ref(&relative),
+                        false,
+                        index,
+                        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+                    )?;
+                    if !single.is_included(BStr::new(path.as_bytes()), Some(false)) {
+                        continue;
+                    }
+                }
                 ignored.insert(relative);
             }
             SpecMode::Renormalize | SpecMode::Refresh => {}

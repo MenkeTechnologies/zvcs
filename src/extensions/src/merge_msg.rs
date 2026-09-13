@@ -279,11 +279,17 @@ fn render_one<'r, 's>(
 
         // Rename/delete (merge-ort.c:3206-3211): `theirs` is the rename (a
         // rewrite carrying source and destination), `ours` the deletion. The
-        // renaming operand is the one whose tree holds the new name.
+        // renaming operand is `target_index = pair->score` (merge-ort.c:3108-3118),
+        // the stage the renamed blob is recorded at. Neither tree need hold the
+        // new name: a directory rename can have moved it (t6423 7d, 10b).
         Err(ResolutionFailure::OursDeletedTheirsRenamed) => {
             let src = theirs.source_location().to_owned();
             let dst = theirs.location().to_owned();
-            let (rename_branch, delete_branch) = operands.split_at(repo, dst.as_bstr())?;
+            let (rename_branch, delete_branch) = if conflict.entries()[1].is_some() {
+                (operands.label1, operands.label2)
+            } else {
+                (operands.label2, operands.label1)
+            };
             out.push(Message {
                 // git's primary path is the new name, followed by the old one.
                 paths: vec![dst.clone(), src.clone()],

@@ -675,6 +675,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         None => {}
     }
 
+    // `if (file_exists("<apply_dir>/applying")) die(...)` (builtin/rebase.c:1266-1269):
+    // straight after `rebase_config()` and before `parse_options`, so a `git am`
+    // session refuses every rebase invocation, `--skip`/`--abort` included.
+    if repo.git_dir().join("rebase-apply").join("applying").exists() {
+        crate::git_fatal!("It looks like 'git am' is in progress. Cannot rebase.");
+    }
+
     // --- parse_options ----------------------------------------------------
     let mut i = 0;
     let mut no_more_options = false;

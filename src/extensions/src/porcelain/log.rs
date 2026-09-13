@@ -3982,11 +3982,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `commit_match()` greps the mailmapped headers when a mailmap is in effect,
         // which is what makes `--author=<canonical>` find an aliased commit. The
         // format-only load above does not enable it: git ties this to `revs->mailmap`.
-        ident_map: use_mailmap.then(|| mailmap.clone()).flatten().map(|m| {
-            let m = m.clone();
-            std::sync::Arc::new(move |name: &[u8], email: &[u8]| m.mapped(name, email))
-                as crate::revfilter::IdentMapper
-        }),
+        mailmap: mailmap.clone(),
         author_res: crate::revfilter::compile_patterns(
             &author_pats,
             grep_dialect,
@@ -4005,23 +4001,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             grep_ignore_case,
             crate::revfilter::Origin::CommandLine,
         )?,
+        // `--grep-reflog`: the `reflog` header field, matched against the
+        // `reflog <message>` line `commit_match()` prepends under `-g`.
+        reflog_res: crate::revfilter::compile_patterns(
+            &reflog_pats,
+            grep_dialect,
+            grep_ignore_case,
+            crate::revfilter::Origin::Header,
+        )?,
         all_match: grep_all_match,
         invert_grep: grep_invert,
+        output_encoding: crate::revfilter::log_output_encoding(&repo, log_encoding.as_deref()),
     };
-    // `prep_header_patterns()` (grep.c:705-751) ORs the patterns within one header
-    // field and requires a hit in every field, and `--invert-grep`'s
-    // `no_body_match` only ever inverts the body — so the `reflog` field is one
-    // more AND-ed group beside `--author`/`--committer`, kept here rather than in
-    // the shared [`crate::revfilter::CommitFilter`] because only `-g` feeds it.
-    let reflog_res = crate::revfilter::compile_patterns(
-        &reflog_pats,
-        grep_dialect,
-        grep_ignore_case,
-        crate::revfilter::Origin::Header,
-    )?;
     // revision.c:3203-3204, after `compile_grep_patterns()` (:3178) has had its
     // chance to reject the pattern itself.
-    if !walk_reflogs && !reflog_res.is_empty() {
+    if !walk_reflogs && !commit_filter.reflog_res.is_empty() {
         eprintln!("fatal: the option '--grep-reflog' requires '--walk-reflogs'");
         return Ok(ExitCode::from(128));
     }
@@ -4166,7 +4160,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         None => repo,
     };
     if !commit_filter.is_empty()
-        || !reflog_res.is_empty()
         || since.is_some()
         || since_as_filter.is_some()
         || until.is_some()
@@ -4190,16 +4183,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             {
                 continue;
             }
-            if !commit_filter.matches(&commit)? {
-                continue;
-            }
             // `get_reflog_message()` strips the entry's trailing newline, which is
             // the form [`ReflogEntry::message`] already holds.
-            if !reflog_res.is_empty() {
-                let message = node.reflog.as_ref().map_or(&[][..], |rl| rl.message.as_slice());
-                if !reflog_res.iter().any(|re| re.is_match(message)) {
-                    continue;
-                }
+            let reflog_message = node.reflog.as_ref().map(|rl| rl.message.as_slice());
+            if !commit_filter.matches_with(&commit, reflog_message, None)? {
+                continue;
             }
             kept.push(node);
         }
@@ -4788,16 +4776,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // then `i18n.commitEncoding`, and UTF-8 when none of them is set. The two config
     // keys write the *same* two slots the option does, so `--encoding=none` (the
     // empty string) still beats a configured `i18n.logOutputEncoding`.
-    let output_encoding = match log_encoding {
-        Some(v) => v,
-        None => {
-            let cfg = repo.config_snapshot();
-            cfg.string("i18n.logOutputEncoding")
-                .or_else(|| cfg.string("i18n.commitEncoding"))
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "UTF-8".to_string())
-        }
-    };
+    let output_encoding = crate::revfilter::log_output_encoding(&repo, log_encoding.as_deref());
     // `reencode_string_len()` delegates to `iconv(3)`; this port's stand-in is
     // `encoding_rs`, which has no UTF-16/UTF-32 *encoder* — see
     // `crate::porcelain::mailinfo::encode_to`. git's own UTF-16 output is

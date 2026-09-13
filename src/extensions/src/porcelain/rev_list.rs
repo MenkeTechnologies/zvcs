@@ -977,6 +977,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut ignore_case = false;
     let mut all_match = false;
     let mut invert_grep = false;
+    // `git_log_output_encoding`: `--encoding=<enc>`, with `none` stored as the
+    // empty string (revision.c:2701-2707).
+    let mut log_encoding: Option<String> = None;
 
     // git's argument vector, with each `--stdin` line spliced in *at the position
     // the option was written*: `setup_revisions()` calls
@@ -1387,6 +1390,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     );
                     return Ok(ExitCode::from(128));
                 }
+                log_encoding = Some(if v == "none" { String::new() } else { v.to_string() });
             }
             "--no-walk" => no_walk = true,
             "--do-walk" => no_walk = false,
@@ -2415,7 +2419,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // commit is about to be shown rather than during the walk.
     let cfilter = CommitFilter {
         // `rev-list` loads no mailmap, so its header greps see the recorded identities.
-        ident_map: None,
+        mailmap: None,
         author_res: compile_patterns(
             &author_pats,
             dialect,
@@ -2434,8 +2438,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             ignore_case,
             crate::revfilter::Origin::CommandLine,
         )?,
+        reflog_res: Vec::new(),
         all_match,
         invert_grep,
+        output_encoding: crate::revfilter::log_output_encoding(&repo, log_encoding.as_deref()),
     };
     if !cfilter.is_empty() {
         let mut kept = Vec::with_capacity(commits.len());

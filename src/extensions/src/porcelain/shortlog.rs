@@ -116,7 +116,7 @@ use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
 use super::pretty_pad::{FlushType, PadState, WrapState};
-use crate::revfilter::{compile_patterns, ident_line, Dialect};
+use crate::revfilter::{compile_patterns, Dialect};
 
 /// `cmd_shortlog()`'s `struct option options[]` (builtin/shortlog.c), in table
 /// order, as [`super::resolve_long`] reads it.
@@ -249,11 +249,11 @@ struct Filters {
     boundary: bool,
     ancestry_path: bool,
     order: Order,
-    /// `--grep` patterns compiled to byte regexes, filled in after the parse
-    /// loop once the final dialect and `-i` are known.
-    grep_res: Vec<regex::bytes::Regex>,
-    /// `--author` patterns compiled to byte regexes, same timing as `grep_res`.
-    author_res: Vec<regex::bytes::Regex>,
+    /// `revs.grep_filter`: the `--grep`/`--author` patterns compiled to byte
+    /// regexes, filled in after the parse loop once the final dialect and `-i` are
+    /// known. `cmd_shortlog()` reads its mailmap into `log->mailmap`, never
+    /// `rev.mailmap`, so `commit_match()` greps the recorded identities.
+    commit_filter: crate::revfilter::CommitFilter,
 }
 
 /// One commit as produced by the walk, before any per-commit filtering.
@@ -301,8 +301,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         boundary: false,
         ancestry_path: false,
         order: Order::Default,
-        grep_res: Vec::new(),
-        author_res: Vec::new(),
+        commit_filter: crate::revfilter::CommitFilter::default(),
     };
 
     // `--group` is a bitfield in git; only a single field is ported, so track
@@ -711,20 +710,27 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     // Compile the message/ident patterns to byte regexes now that the dialect
     // and `-i` are final. git's default is POSIX basic; `-E`/`-P` extended/perl,
     // `-F` a literal. A pattern that cannot compile is git's fatal regcomp error.
-    filters.grep_res = compile_patterns(
+    filters.commit_filter.grep_res = compile_patterns(
         &filters.grep,
         filters.dialect,
         filters.ignore_case,
         crate::revfilter::Origin::CommandLine,
     )?;
-    filters.author_res = compile_patterns(
+    filters.commit_filter.author_res = compile_patterns(
         &filters.author,
         filters.dialect,
         filters.ignore_case,
         crate::revfilter::Origin::Header,
     )?;
+    filters.commit_filter.all_match = filters.all_match;
+    filters.commit_filter.invert_grep = filters.invert_grep;
 
     let repo = crate::setup::discover().ok();
+    // Outside a repository shortlog reads stdin and never reaches `commit_match()`.
+    filters.commit_filter.output_encoding = repo.as_ref().map_or_else(
+        || "UTF-8".to_string(),
+        |repo| crate::revfilter::log_output_encoding(repo, None),
+    );
     let mailmap = repo
         .as_ref()
         .map(|repo| crate::mailmap::Mailmap::read(Some(repo)))
@@ -1058,7 +1064,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             if !time_matches(&commit, &filters)? {
                 continue;
             }
-            if !message_matches(&commit, &filters)? {
+            if !filters.commit_filter.matches(&commit)? {
                 continue;
             }
             kept.push((item.id, shown_parents));
@@ -1645,38 +1651,6 @@ fn time_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> {
         return Ok(false);
     }
     Ok(true)
-}
-
-/// git's grep machinery: `--author` header patterns are ANDed with the message
-/// result, `--grep` message patterns are ORed unless `--all-match`, and
-/// `--invert-grep` flips the message result only. Patterns are compiled byte
-/// regexes (`compile_patterns`), so BRE/ERE/PCRE and `-F` literals all work.
-fn message_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> {
-    if filters.author_res.is_empty() && filters.grep_res.is_empty() {
-        return Ok(true);
-    }
-
-    if !filters.author_res.is_empty() {
-        let line = ident_line(commit.author()?);
-        if !filters
-            .author_res
-            .iter()
-            .any(|re| re.is_match(line.as_bytes()))
-        {
-            return Ok(false);
-        }
-    }
-    if filters.grep_res.is_empty() {
-        return Ok(true);
-    }
-
-    let message = commit.message_raw()?;
-    let hit = if filters.all_match {
-        filters.grep_res.iter().all(|re| re.is_match(message))
-    } else {
-        filters.grep_res.iter().any(|re| re.is_match(message))
-    };
-    Ok(hit != filters.invert_grep)
 }
 
 

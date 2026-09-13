@@ -4656,21 +4656,15 @@ fn parse_author_ident(s: &str) -> Result<(String, String)> {
 fn find_author_by_nickname(repo: &gix::Repository, nickname: &str) -> Result<String> {
     let mailmap = std::sync::Arc::new(crate::mailmap::Mailmap::read(Some(repo)));
     let filter = crate::revfilter::CommitFilter {
-        ident_map: Some({
-            let m = mailmap.clone();
-            std::sync::Arc::new(move |name: &[u8], email: &[u8]| m.mapped(name, email))
-                as crate::revfilter::IdentMapper
-        }),
+        mailmap: Some(mailmap.clone()),
         author_res: crate::revfilter::compile_patterns(
             std::slice::from_ref(&nickname.to_string()),
             crate::revfilter::Dialect::Basic,
             true,
             crate::revfilter::Origin::Header,
         )?,
-        committer_res: Vec::new(),
-        grep_res: Vec::new(),
-        all_match: false,
-        invert_grep: false,
+        output_encoding: crate::revfilter::log_output_encoding(repo, None),
+        ..crate::revfilter::CommitFilter::default()
     };
 
     // `--all`: every ref, plus `HEAD`, peeled to the commits they name.

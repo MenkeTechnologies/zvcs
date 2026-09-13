@@ -3170,6 +3170,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         || !ref_selections.is_empty()
         || !bisect_selections.is_empty();
     if !positive_from_args {
+        // `if (get_oid_with_context(revs->repo, revs->def, 0, &oid, &oc))
+        //         diagnose_missing_default(revs->def);` (revision.c:3125-3130): the
+        // default goes through `get_oid_basic()` like any operand, which is where
+        // `core.warnAmbiguousRefs` is read and where a `refs/heads/HEAD` next to
+        // `HEAD` is warned about — ahead of the unborn-branch fatal below.
+        crate::objname::resolve(&repo, "HEAD");
         let head = repo.head()?;
         if head.is_unborn() && !all {
             let branch = head

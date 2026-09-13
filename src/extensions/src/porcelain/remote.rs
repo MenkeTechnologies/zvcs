@@ -340,6 +340,31 @@ fn unknown_option(arg: &str) {
 // ---------------------------------------------------------------------------
 
 /// True when `remote.<name>.*` exists in any readable config scope.
+/// The ref-store half of `read_config()` (remote.c:630-650), which every
+/// `remote_get()`, `remote_is_configured()` and `for_each_remote()` runs before
+/// it reads a single `remote.*` key:
+///
+/// ```c
+/// if (startup_info->have_repository && !early) {
+///         const char *head_ref = refs_resolve_ref_unsafe(
+///                 get_main_ref_store(repo), "HEAD", 0, NULL, &flag);
+/// ```
+///
+/// That lookup is the command's first use of the ref store, so a setting
+/// `ref_store_init()` refuses (`-c core.logAllRefUpdates=none`) dies here, before
+/// any remote is listed, looked up or written. The remote config itself is read
+/// through gitoxide by the callers.
+fn read_config(repo: &gix::Repository) {
+    get_main_ref_store(repo);
+}
+
+/// `get_main_ref_store(the_repository)`: building the store is where
+/// [`crate::setup`]'s first-use refusal fires, and looking up `HEAD` is the
+/// cheapest store entry gitoxide offers.
+fn get_main_ref_store(repo: &gix::Repository) {
+    let _ = repo.find_reference("HEAD");
+}
+
 fn remote_exists(repo: &gix::Repository, name: &str) -> bool {
     repo.remote_names().iter().any(|n| n.to_str_lossy() == name)
 }
@@ -586,6 +611,8 @@ fn effective_specs(repo: &gix::Repository, name: &str, key: &str) -> Vec<String>
 /// it from the config section without applying the name-as-URL fallback that
 /// `show` and `get-url` use.
 fn list(repo: &gix::Repository, verbose: bool) -> Result<ExitCode> {
+    // `show_all()` → `for_each_remote()` (builtin/remote.c:1401, remote.c:865-868).
+    read_config(repo);
     for name in repo.remote_names() {
         let name = name.to_str_lossy();
         if !verbose {
@@ -712,14 +739,18 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     let (name, url) = (pos[0], pos[1]);
 
-    if !valid_remote_name(name) {
-        return fatal(format!("'{name}' is not a valid remote name"));
-    }
+    // builtin/remote.c:213-225 in order: the mirror refusal, `remote_get()`
+    // (whose `read_config()` is the ref store's first use), the collision, and
+    // only then the name check.
     if !tracks.is_empty() && mirror == Mirror::Push {
         return fatal("specifying branches to track makes sense only with fetch mirrors");
     }
+    read_config(repo);
     if remote_exists(repo, name) {
         return error(format!("remote {name} already exists."), 3);
+    }
+    if !valid_remote_name(name) {
+        return fatal(format!("'{name}' is not a valid remote name"));
     }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -876,6 +907,8 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     let (old, new) = (pos[0], pos[1]);
 
+    // `oldremote = remote_get(rename.old_name)` (builtin/remote.c:882).
+    read_config(repo);
     if !remote_exists(repo, old) {
         return error(format!("No such remote: '{old}'"), 2);
     }
@@ -1063,6 +1096,8 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     let name = pos[0];
 
+    // `remote = remote_get(argv[0])` (builtin/remote.c:1030).
+    read_config(repo);
     if !remote_exists(repo, name) {
         return error(format!("No such remote: '{name}'"), 2);
     }
@@ -1135,6 +1170,11 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// `refs/remotes/<name>/HEAD` symref. `-a` contacts the remote and derives the
 /// branch from its advertised HEAD.
 fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    // `struct ref_store *refs = get_main_ref_store(the_repository);` is a
+    // declaration initializer (builtin/remote.c:1552), so the store is built
+    // before `parse_options()` runs: even `set-head -h` dies on a refused
+    // `core.logAllRefUpdates`.
+    get_main_ref_store(repo);
     let mut auto = false;
     let mut delete = false;
     let mut pos: Vec<&str> = Vec::new();
@@ -1263,6 +1303,8 @@ fn set_branches(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         eprintln!("error: no remote specified");
         return usage(USAGE_SET_BRANCHES);
     };
+    // `set_remote_branches()` → `remote_get(remotename)` (builtin/remote.c:1768).
+    read_config(repo);
     if !remote_exists(repo, name) {
         return error(format!("No such remote '{name}'"), 2);
     }
@@ -1317,6 +1359,8 @@ fn get_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         return usage(USAGE_GET_URL);
     }
     let name = pos[0];
+    // `remote = remote_get(remotename)` (builtin/remote.c:1826).
+    read_config(repo);
     if !remote_exists(repo, name) {
         return error(format!("No such remote '{name}'"), 2);
     }
@@ -1376,6 +1420,8 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     let name = pos[0];
     let value = pos[1];
+    // `remote = remote_get(remotename)` (builtin/remote.c:1883).
+    read_config(repo);
     if !remote_exists(repo, name) {
         return error(format!("No such remote '{name}'"), 2);
     }
@@ -1519,6 +1565,9 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
         return list(repo, verbose);
     }
     for name in &names {
+        // `get_remote_ref_states()` opens with `remote_get(name)`
+        // (builtin/remote.c:1151), ahead of the transport and every line printed.
+        read_config(repo);
         // Without `-n`, contact the remote once; a failure is fatal, exactly as
         // git's `transport_get_remote_refs` dies.
         // ```c
@@ -2116,6 +2165,9 @@ fn prune(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// Prune `<name>`, returning `false` when the remote could not be contacted
 /// (the `fatal:` line has already been printed in that case).
 fn prune_one(repo: &gix::Repository, name: &str, dry_run: bool) -> Result<bool> {
+    // `prune_remote()` → `get_remote_ref_states()` → `remote_get()`
+    // (builtin/remote.c:1632, 1151).
+    read_config(repo);
     let stale = match stale_tracking_refs(repo, name) {
         Ok(stale) => stale,
         Err(e) => {

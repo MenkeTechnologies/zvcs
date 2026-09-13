@@ -1076,7 +1076,14 @@ fn format_refusal(sub: &str) -> Option<String> {
     // the config *reader*, so it precedes every reading below — and it prints its
     // own `error:` line ahead of the reader's `fatal:`.
     if !FORMAT_GENTLE_VERBS.contains(&sub) {
-        if let Some((diagnostic, fatal)) = crate::config::extension_value_refusal() {
+        // Named the way [`config_file_gate`] names it: `cmd_init_db()` reads the
+        // config through `set_git_dir(real_path(…))`, so `init` spells the file
+        // absolutely where a `RUN_SETUP` verb keeps the relative `.git/config`.
+        let naming = match sub {
+            "init" | "init-db" => crate::config::GitDirNaming::Absolute,
+            _ => crate::config::GitDirNaming::AsDiscovered,
+        };
+        if let Some((diagnostic, fatal)) = crate::config::extension_value_refusal(naming) {
             eprintln!("error: {diagnostic}");
             return Some(fatal);
         }

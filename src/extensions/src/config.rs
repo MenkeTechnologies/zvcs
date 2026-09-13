@@ -1675,18 +1675,71 @@ pub fn first_bad_config_line(bytes: &[u8]) -> Option<usize> {
 /// message, and gitoxide's parser renders it as an empty value rather than as an
 /// absent one — so an empty value is passed over here rather than reported as the
 /// wrong half of the pair.
-pub fn extension_value_refusal() -> Option<(String, String)> {
-    for candidate in config_file_sequence(ConfigScopes::Repository, GitDirNaming::AsDiscovered) {
+pub fn extension_value_refusal(naming: GitDirNaming) -> Option<(String, String)> {
+    for candidate in config_file_sequence(ConfigScopes::Repository, naming) {
         let Ok(bytes) = std::fs::read(&candidate.path) else {
             continue;
         };
-        let Some((key, value, line)) = first_invalid_extension_value(&bytes) else {
+        // Both refusals come from the one `check_repo_format()` pass over the
+        // file, so whichever key sits first is the one reported.
+        let extension = first_invalid_extension_value(&bytes).map(|(key, value, line)| {
+            (format!("invalid value for '{key}': '{value}'"), line)
+        });
+        let worktree = first_valueless_core_worktree(&bytes)
+            .map(|line| ("missing value for 'core.worktree'".to_string(), line));
+        let Some((diagnostic, line)) = [extension, worktree]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(_, line)| *line)
+        else {
             continue;
         };
         return Some((
-            format!("invalid value for '{key}': '{value}'"),
+            diagnostic,
             format!("bad config line {line} in file {}", candidate.shown),
         ));
+    }
+    None
+}
+
+/// The 1-based line of the first valueless `core.worktree` in `bytes`.
+///
+/// `check_repo_format()` ends by handing every key to `read_worktree_config()`
+/// (setup.c:613), which answers `if (!value) return config_error_nonbool(var);`
+/// for `core.worktree` (setup.c:519-521) — so a bare `worktree` under `[core]`
+/// stops the reader with `missing value for 'core.worktree'` and the reader's
+/// `bad config line`. `worktree =` carries the empty string, not NULL, and passes.
+/// gitoxide represents the NULL form as a `Value` that no `KeyValueSeparator`
+/// preceded.
+fn first_valueless_core_worktree(bytes: &[u8]) -> Option<usize> {
+    use gix::bstr::ByteSlice as _;
+    use gix::config::parse::EventRef;
+
+    let events = gix::config::parse::Events::from_bytes(bytes, None).ok()?;
+    let mut line = 1usize;
+    let mut in_core = false;
+    let mut at_worktree = false;
+    for event in events.iter() {
+        match event {
+            EventRef::Newline(nl) => {
+                line += nl.iter().filter(|&&b| b == b'\n').count();
+            }
+            EventRef::SectionHeader {
+                name,
+                subsection_name,
+                ..
+            } => {
+                in_core = subsection_name.is_none()
+                    && name.to_str_lossy().eq_ignore_ascii_case("core");
+                at_worktree = false;
+            }
+            EventRef::SectionValueName(name) => {
+                at_worktree = in_core && name.to_str_lossy().eq_ignore_ascii_case("worktree");
+            }
+            EventRef::Whitespace(_) => {}
+            EventRef::Value(_) if at_worktree => return Some(line),
+            _ => at_worktree = false,
+        }
     }
     None
 }

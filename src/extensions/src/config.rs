@@ -1205,11 +1205,10 @@ fn occurrences_for(repo: Option<&gix::Repository>) -> Vec<Occurrence> {
 /// ```
 ///
 /// `key` is printed as the caller spells it — git passes its own literal — and
-/// looked up case-insensitively. The exit is taken here, as `die()` takes it,
-/// after flushing whatever stdout already holds (`exit()` flushes stdio).
+/// looked up case-insensitively. The exit is taken here, as `die()` takes it:
+/// both lines go to stderr first, then whatever stdout still holds is flushed,
+/// as `exit()` flushes stdio.
 pub fn die_config(repo: Option<&gix::Repository>, key: &str, err: Option<&str>) -> ! {
-    use std::io::Write as _;
-
     if let Some(err) = err {
         eprintln!("error: {err}");
     }
@@ -1218,8 +1217,15 @@ pub fn die_config(repo: Option<&gix::Repository>, key: &str, err: Option<&str>) 
     let Some(last) = with_lines(occurrences).into_iter().rev().find(|v| v.key == wanted) else {
         panic!("BUG: for key '{key}' we must have a value to report on");
     };
+    die_128(&last.origin.die_linenr(key))
+}
+
+/// `die()`: `fatal: <message>` on stderr, flush stdout as `exit()` does, exit 128.
+fn die_128(message: &str) -> ! {
+    use std::io::Write as _;
+
+    eprintln!("fatal: {message}");
     let _ = std::io::stdout().flush();
-    eprintln!("fatal: {}", last.origin.die_linenr(key));
     std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
 }
 
@@ -1263,10 +1269,7 @@ pub fn config_get_pathname(
         None => (false, raw.as_str()),
     };
     let Some(path) = crate::setup::interpolate_path(value) else {
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-        eprintln!("fatal: failed to expand user dir in: '{value}'");
-        std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
+        die_128(&format!("failed to expand user dir in: '{value}'"))
     };
     // `is_missing_file()` (wrapper.c): `stat()` failing with `ENOENT`.
     if optional

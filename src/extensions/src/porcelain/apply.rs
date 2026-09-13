@@ -1152,6 +1152,24 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         patches.retain(|p| use_patch(p, &prefix, &o.limits, o.has_include));
     }
 
+    // `parse_chunk()` (apply.c:2262-2268) gives every patch `use_patch()` admits its
+    // `ws_rule` from `whitespace_rule()`, whose `git_check_attr()` (ws.c:90 → attr.c:1330)
+    // resolves the default attribute source before anything is checked or written —
+    // so `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish dies here, under
+    // `--check` and `--stat` alike, and outside a repository names that instead
+    // (attr.c:1216-1226). An excluded patch never asks.
+    if !patches.is_empty() {
+        let refusal = match crate::setup::discover() {
+            Ok(repo) => super::pack_objects::bad_default_attr_source(&repo),
+            Err(_) => std::env::var_os("GIT_ATTR_SOURCE")
+                .map(|_| "cannot use --attr-source or GIT_ATTR_SOURCE without repo"),
+        };
+        if let Some(message) = refusal {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    }
+
     // `apply_patch()` links each parsed patch onto the list it will walk, and under
     // `-R` it *prepends* instead of appending: `if (!list || !state->apply_in_reverse)
     // { *listp = patch; listp = &patch->next; } else { patch->next = list; list =

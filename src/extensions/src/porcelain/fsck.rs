@@ -2718,8 +2718,8 @@ fn probe_insert(table: &mut [Option<ObjectId>], id: ObjectId) {
 ///
 /// `None` when the tail is not reconstructible — `--no-full` (which skips the
 /// packs entirely, leaving the odb listing this port takes `all` from wider than
-/// what git created) or more than one pack, whose relative order is
-/// `rearrange_packed_git()`'s mtime sort.
+/// what git created) or packs whose visiting order [`pack_scan_order`] cannot
+/// determine.
 fn loose_scan_order(repo: &gix::Repository, check_full: bool) -> Option<Vec<ObjectId>> {
     let mut out = loose_only_scan_order(repo);
     if has_packs(repo) {
@@ -2738,64 +2738,71 @@ fn loose_scan_order(repo: &gix::Repository, check_full: bool) -> Option<Vec<Obje
 /// only then calls `fsck_obj_buffer()` per entry. So the order is the pack's own
 /// layout, not its index's.
 ///
-/// `None` unless there is exactly one pack across every odb source, because
-/// with two the order the packs are *visited* in is not a property of the
-/// repository at all. `builtin/fsck.c:1092` walks `repo_for_each_pack`, which
-/// returns `store->packs.head` without re-sorting (packfile.c:1093-1104), and
-/// that list is built by `packfile_store_prepare()`:
+/// Packs are visited source by source (`repo_for_each_pack`, packfile.h:185-236),
+/// and within one source in the order of that source's own list, which
+/// `packfile_store_prepare()` builds and sorts:
 ///
 /// ```c
 /// prepare_packed_git_one(store->source);
 /// sort_packs(&store->packs.head, sort_pack);
 /// ```
 ///
-/// (packfile.c:1071-1085.) Each of its three layers loses a different piece of
-/// determinism, and the combination is what this refuses to guess:
+/// (packfile.c:1071-1085.) `sort_pack()` compares `pack_local` and then
+/// `mtime`, younger first, "and returns 0 on a full tie" (packfile.c:1044-1069).
+/// Every pack of one source shares that source's `local` flag
+/// (`prepare_pack()` passes `data->source->local`, packfile.c:991-1004), so
+/// within a source only `mtime` decides — `st_mtime` of the **.pack** file
+/// (packfile.c:840-851), whole seconds. When those seconds are pairwise
+/// distinct the order is fully determined, and that is the case answered here.
+///
+/// A tie is refused (`None`), because a tie leaves the order to state that is
+/// not a property of the repository:
 ///
 /// * `prepare_packed_git_one()` enumerates `<objdir>/pack` with a bare
-///   `readdir()` — no `string_list`, no sort (packfile.c:944-977, the loop at
-///   :968) — and appends each pack to the tail (`packfile_list_append()`,
-///   packfile.c:106-123). So the pre-sort list is raw directory order.
-/// * `sort_pack()` compares `pack_local` and then `mtime`, "and returns 0 on a
-///   full tie" (packfile.c:1044-1069). `p->mtime` is `st_mtime` of the **.pack**
-///   file (packfile.c:840-851) — whole seconds — so two packs written in the
-///   same second, which is exactly what a partial clone's own pack and the
-///   checkout's lazy-fetch pack are, tie.
-/// * `sort_packs` is `DEFINE_LIST_SORT` (packfile.c:1042), a **stable**
-///   linked-list mergesort whose merge takes from the first list on equality
-///   ("Combine two sorted lists. Take from `list` on equality.", mergesort.h:4,
-///   :10). A tie therefore preserves the readdir order above rather than
-///   breaking it by name.
+///   `readdir()` and appends each pack to the tail (`packfile_list_append()`,
+///   packfile.c:106-123), and `sort_packs` is `DEFINE_LIST_SORT`
+///   (packfile.c:1042), a stable mergesort that keeps that order on equality
+///   (mergesort.h:4, :10).
+/// * A packed-object lookup moves its pack to the head of the list
+///   (`packfile_list_prepend`, packfile.c:2149-2168), and `cmd_fsck`'s
+///   `odb_reprepare()` (builtin/fsck.c:1066) re-sorts that list without
+///   re-appending the packs it already holds (`packfile_store_load_pack()`
+///   returns the `packs_by_path` entry, packfile.c:872-894) — so a tie also
+///   depends on which packs `snapshot_refs()` happened to read from.
 ///
-/// And even readdir order is not the last word: a packed-object lookup moves its
-/// pack to the head of the list (`packfile_list_prepend`, packfile.c:2159-2166),
-/// and `builtin/fsck.c:1066`'s `odb_reprepare()` re-sorts *that* list — so the
-/// order also depends on which packs earlier work in the same process happened
-/// to read from.
+/// A source with a `multi-pack-index` and more than one pack is refused too:
+/// `prepare_pack()` skips the packs the midx covers (packfile.c:998-1000) and
+/// `packfile_store_get_packs()` loads them afterwards through
+/// `prepare_midx_pack()` (packfile.c:1093-1104), an ordering this does not
+/// replay.
 ///
 /// The consequence is not cosmetic: this order is the object-creation sequence
 /// [`replay_obj_hash`] needs, so without it [`SlotOrder`] falls back to the
 /// home-slot argument and refuses any report whose lines share a collision
-/// cluster. One pack has no order to get wrong, which is why that is the case
-/// this answers.
+/// cluster.
 fn pack_scan_order(repo: &gix::Repository) -> Option<Vec<ObjectId>> {
+    use std::os::unix::fs::MetadataExt;
+
     let hash = repo.object_hash();
-    let mut found: Option<Vec<(u64, ObjectId)>> = None;
+    let mut out: Vec<ObjectId> = Vec::new();
     for objdir in odb_sources(repo) {
         let dir = objdir.join("pack");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // (.pack mtime in whole seconds, the pack's ids in pack-offset order)
+        let mut packs: Vec<(i64, Vec<ObjectId>)> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(base) = name.strip_suffix(".idx") else {
                 continue;
             };
-            if !dir.join(format!("{base}.pack")).is_file() {
+            // `add_packed_git()` drops a pack whose `.pack` is not a regular file.
+            let Ok(meta) = std::fs::metadata(dir.join(format!("{base}.pack"))) else {
                 continue;
-            }
-            if found.is_some() {
-                return None;
+            };
+            if !meta.is_file() {
+                continue;
             }
             let index = pack::index::File::at(dir.join(&name), hash).ok()?;
             let mut byte_offsets: Vec<(u64, ObjectId)> = index
@@ -2803,16 +2810,21 @@ fn pack_scan_order(repo: &gix::Repository) -> Option<Vec<ObjectId>> {
                 .map(|entry| (entry.pack_offset, entry.oid))
                 .collect();
             byte_offsets.sort();
-            found = Some(byte_offsets);
+            packs.push((meta.mtime(), byte_offsets.into_iter().map(|(_, id)| id).collect()));
+        }
+        if packs.len() > 1 && dir.join("multi-pack-index").exists() {
+            return None;
+        }
+        // Younger first; any tie is unorderable (see above).
+        packs.sort_by(|a, b| b.0.cmp(&a.0));
+        if packs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return None;
+        }
+        for (_, ids) in packs {
+            out.extend(ids);
         }
     }
-    Some(
-        found
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect(),
-    )
+    Some(out)
 }
 
 /// The loose half of [`loose_scan_order`].

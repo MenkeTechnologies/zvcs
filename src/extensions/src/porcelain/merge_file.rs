@@ -228,6 +228,12 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
                     } else {
                         rest.to_string()
                     };
+                    // label_cb() (builtin/merge-file.c:23-34) refuses a fourth
+                    // label as it is parsed; parse_options() turns the callback's
+                    // error into exit 129 with no usage block (parse-options.c:1200-1201).
+                    if label_args.len() >= 3 {
+                        return Ok(option_error("too many labels on the command line"));
+                    }
                     label_args.push(value);
                     break;
                 }
@@ -236,7 +242,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if operands.len() != 3 || label_args.len() > 3 {
+    if operands.len() != 3 {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
@@ -504,37 +510,39 @@ fn errno_text(err: &std::io::Error) -> String {
     }
 }
 
-/// Read one operand as a blob for `--object-id`.
+/// Read one operand as a blob for `--object-id` (builtin/merge-file.c:125-132).
 ///
-/// A raw hex object id is looked up directly, so naming a non-blob reproduces
-/// git's `unable to read blob object` failure; any other revision spec must
-/// resolve to a blob, as git's blob-context lookup requires.
+/// `repo_get_oid()` failing is the `object '%s' does not exist` error (exit
+/// 255). A name that resolves is never checked for existence or type there: a
+/// full-length hex is taken verbatim by `get_oid_basic()`
+/// (object-name.c:689-702), and any name may resolve to a tree or commit. The
+/// empty blob id is read from `/dev/null` without touching the odb; every other
+/// id goes through `read_mmblob()` (xdiff-interface.c:179-195), which yields an
+/// empty buffer for the null id and otherwise dies with `unable to read blob
+/// object <hex>` (exit 128) when the object is missing or not a blob.
 fn read_blob(
     repo: &gix::Repository,
     spec: &str,
     quiet: bool,
 ) -> std::result::Result<Vec<u8>, ExitCode> {
-    let missing = || {
+    let Some(oid) = crate::objname::resolve(repo, spec) else {
         if !quiet {
             eprintln!("error: object '{spec}' does not exist");
         }
-        ExitCode::from(255)
+        return Err(ExitCode::from(255));
     };
-    let is_hex = spec.len() >= 4 && spec.chars().all(|c| c.is_ascii_hexdigit());
-
-    let object = match repo.rev_parse_single(spec) {
-        Ok(id) => id.object().map_err(|_| missing())?,
-        Err(_) => return Err(missing()),
-    };
-    if object.kind != gix::object::Kind::Blob {
-        if is_hex {
-            if !quiet {
-                eprintln!("fatal: unable to read blob object {}", object.id.to_hex());
-            }
-            return Err(ExitCode::from(128));
-        }
-        return Err(missing());
+    if oid == gix::ObjectId::empty_blob(oid.kind()) || oid.is_null() {
+        return Ok(Vec::new());
     }
-    // `gix::Object` implements Drop, so its buffer cannot be moved out.
-    Ok(object.data.clone())
+    match repo.find_object(oid) {
+        // `gix::Object` implements Drop, so its buffer cannot be moved out.
+        Ok(object) if object.kind == gix::object::Kind::Blob => Ok(object.data.clone()),
+        _ => {
+            // `-q` has already pointed stderr at /dev/null, so die() is silent too.
+            if !quiet {
+                eprintln!("fatal: unable to read blob object {}", oid.to_hex());
+            }
+            Err(ExitCode::from(128))
+        }
+    }
 }

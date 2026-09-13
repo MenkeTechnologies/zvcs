@@ -266,3 +266,41 @@ fn earlier_invalid_value_is_fatal() {
     assert_eq!(our_first, "error: unknown style 'bogus' given for 'merge.conflictstyle'");
     cleanup(&repo);
 }
+
+/// `label_cb()` (builtin/merge-file.c:23-34) refuses a fourth `-L` while
+/// options are still being parsed: only the `error:` line, no usage block, and
+/// exit 129 from `parse_options()`.
+#[test]
+fn fourth_label_is_refused_without_usage() {
+    let (repo, home) = setup("labels");
+    let out = run(BIN, &repo, &home, &["-p", "-L", "a", "-L", "b", "-L", "c", "-L", "d", "cur", "base", "oth"]);
+    assert_eq!(out.status.code(), Some(129));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "error: too many labels on the command line\n");
+    cleanup(&repo);
+}
+
+/// `--object-id` resolves each operand with `repo_get_oid()` alone: the empty
+/// blob id is read from `/dev/null` and the null id is an empty buffer in
+/// `read_mmblob()`, neither consulting the odb, while a resolved non-blob dies
+/// with `unable to read blob object <hex>` (builtin/merge-file.c:125-132,
+/// xdiff-interface.c:179-195).
+#[test]
+fn object_id_empty_null_and_non_blob_operands() {
+    let (repo, home) = setup("objid");
+    let blob = |name: &str| {
+        let out = Command::new(BIN).args(["hash-object", "-w", name]).current_dir(&repo).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let (cur, oth) = (blob("cur"), blob("oth"));
+    for base in ["e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", "0000000000000000000000000000000000000000"] {
+        let out = assert_matches_git(&repo, &home, &["-p", "--object-id", &cur, base, &oth]);
+        assert_eq!(out.status.code(), Some(1), "one conflict against base {base}");
+        assert!(out.stderr.is_empty(), "base {base}: {:?}", String::from_utf8_lossy(&out.stderr));
+    }
+    let tree = Command::new(BIN).args(["mktree"]).stdin(std::process::Stdio::null()).current_dir(&repo).output().unwrap();
+    let tree = String::from_utf8(tree.stdout).unwrap().trim().to_owned();
+    let out = assert_matches_git(&repo, &home, &["-p", "--object-id", &cur, &tree, &oth]);
+    assert_eq!(out.status.code(), Some(128));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), format!("fatal: unable to read blob object {tree}\n"));
+    cleanup(&repo);
+}

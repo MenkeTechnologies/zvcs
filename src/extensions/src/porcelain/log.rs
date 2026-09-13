@@ -829,9 +829,19 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // built-in note display through where the same format on the command line
     // would not.
     let (mut pretty, mut terminator) = (Pretty::Medium, false);
+    // pretty.c's `static char *user_format`: `save_user_format()` overwrites it for
+    // every `CMIT_FMT_USERFORMAT` selection (a format string, a `pretty.<name>`
+    // holding one, or `reference`), and nothing clears it when a later option picks
+    // a built-in. `userformat_find_requirements(NULL, &w)` reads it
+    // (pretty.c:1966-1998), so `--format=%N --oneline` still asks for notes. Only
+    // its `w.notes` answer is consumed here, so that is what is kept.
+    let mut user_format_wants_notes = false;
     if let Some(spec) = cfg_pretty.as_deref() {
         match get_commit_format(Some(&repo), spec)? {
             Some((p, t)) => {
+                if saves_user_format(&p) {
+                    user_format_wants_notes = userformat_wants(&p, &['N']);
+                }
                 pretty = p;
                 terminator = t;
             }
@@ -1323,6 +1333,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         } else if let Some(v) = a.strip_prefix("--pretty=") {
             match get_commit_format(Some(&repo), v)? {
                 Some((p, t)) => {
+                    if saves_user_format(&p) {
+                        user_format_wants_notes = userformat_wants(&p, &['N']);
+                    }
                     pretty = p;
                     terminator = t;
                     pretty_given = true;
@@ -1338,6 +1351,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // `--pretty=abc`).
             match get_commit_format(Some(&repo), v)? {
                 Some((p, t)) => {
+                    if saves_user_format(&p) {
+                        user_format_wants_notes = userformat_wants(&p, &['N']);
+                    }
                     pretty = p;
                     terminator = t;
                     pretty_given = true;
@@ -4713,11 +4729,19 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // Relative dates (`%cr`/`%ar`, `--date=relative`) are measured against now.
     let now = now_secs();
 
-    // `cmd_log_init_finish()`: with no `--notes`/`--no-notes` of its own, a run
-    // shows notes when the caller picked no format at all — or picked a user
-    // format, where they surface only through `%N`. `--pretty=oneline` and the
-    // other built-ins therefore stay silent unless asked.
-    if !notes_opt.given && (!pretty_given || matches!(pretty, Pretty::User(_))) {
+    // `cmd_log_init_finish()` (builtin/log.c:325-329):
+    //
+    // ```c
+    // memset(&w, 0, sizeof(w));
+    // userformat_find_requirements(NULL, &w);
+    // if (!rev->show_notes_given && (!rev->pretty_given || w.notes))
+    //         rev->show_notes = 1;
+    // ```
+    //
+    // With no `--notes`/`--no-notes` of its own, a run shows notes when the caller
+    // picked no format, or when the last saved user format expands `%N` — even if
+    // a built-in chosen after it is what renders.
+    if !notes_opt.given && (!pretty_given || user_format_wants_notes) {
         notes_opt.show_only();
     }
     let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
@@ -9980,6 +10004,13 @@ fn userformat_wants_paren(pretty: &Pretty, name: &str) -> bool {
     false
 }
 
+/// `save_user_format()` runs for this selection: `get_commit_format()` saves a
+/// format string, and a `cmt_fmt_map` entry whose format is `CMIT_FMT_USERFORMAT`
+/// — `reference` or a `pretty.<name>` holding a format string (pretty.c:199-221).
+fn saves_user_format(pretty: &Pretty) -> bool {
+    matches!(pretty, Pretty::User(_) | Pretty::Reference)
+}
+
 /// Does this format use `%S`? git's `userformat_find_requirements()` answers the
 /// same question and `cmd_log_init_finish()` turns `rev->show_source` on for it,
 /// which is why `git log --format=%S` names the tip without `--source` on the
@@ -14541,6 +14572,20 @@ mod option_surface_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `userformat_find_requirements()`'s `w.notes` over the saved user format:
+    /// `%%N` is a literal, a magic prefix still counts, and `reference` saves a
+    /// format that never asks for notes.
+    #[test]
+    fn saved_user_format_notes_requirement() {
+        let wants = |p: &Pretty| saves_user_format(p) && userformat_wants(p, &['N']);
+        assert!(wants(&Pretty::User("%N".into())));
+        assert!(wants(&Pretty::User("%+N".into())));
+        assert!(!wants(&Pretty::User("%%N".into())));
+        assert!(!wants(&Pretty::Reference));
+        assert!(saves_user_format(&Pretty::Reference));
+        assert!(!saves_user_format(&Pretty::Oneline));
+    }
 
     // Every expectation below was verified against stock `git log -- <spec>` on a
     // real repository with git 2.55.0: a bracket pathspec is a wildcard pathspec,

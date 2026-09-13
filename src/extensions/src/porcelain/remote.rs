@@ -613,27 +613,43 @@ fn effective_specs(repo: &gix::Repository, name: &str, key: &str) -> Vec<String>
 fn list(repo: &gix::Repository, verbose: bool) -> Result<ExitCode> {
     // `show_all()` → `for_each_remote()` (builtin/remote.c:1401, remote.c:865-868).
     read_config(repo);
+    // `get_one_entry()` (builtin/remote.c:1366-1394) builds every entry before
+    // `show_all()` prints any, reading `remote.<name>.partialclonefilter` with
+    // `repo_config_get_string_tmp()` for a remote with a URL — so a valueless
+    // filter dies through `git_die_config()` before anything is printed, and a
+    // valued one is appended to the fetch line as ` [<filter>]`.
+    // The entries are built with or without `-v`; only the printing differs.
+    let mut lines: Vec<String> = Vec::new();
     for name in repo.remote_names() {
         let name = name.to_str_lossy();
+        let fetch = effective_urls(repo, &name, "url");
+        let filter = fetch.first().and_then(|_| {
+            crate::config::config_get_string(Some(repo), &format!("remote.{name}.partialclonefilter"))
+        });
         if !verbose {
-            println!("{name}");
+            lines.push(name.into_owned());
             continue;
         }
-        let fetch = effective_urls(repo, &name, "url");
         let push = effective_urls(repo, &name, "pushurl");
         match fetch.first() {
-            Some(url) => println!("{name}\t{url} (fetch)"),
-            None => println!("{name}\t"),
+            Some(url) => {
+                let filter = filter.map(|f| format!(" [{f}]")).unwrap_or_default();
+                lines.push(format!("{name}\t{url} (fetch){filter}"));
+            }
+            None => lines.push(format!("{name}\t")),
         }
         if push.is_empty() {
             if let Some(url) = fetch.first() {
-                println!("{name}\t{url} (push)");
+                lines.push(format!("{name}\t{url} (push)"));
             }
         } else {
             for url in &push {
-                println!("{name}\t{url} (push)");
+                lines.push(format!("{name}\t{url} (push)"));
             }
         }
+    }
+    for line in lines {
+        println!("{line}");
     }
     Ok(ExitCode::SUCCESS)
 }

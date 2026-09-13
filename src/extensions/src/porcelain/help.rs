@@ -2098,30 +2098,15 @@ fn is_executable_file(path: &Path) -> bool {
 /// printed, so it is dropped here too.
 pub(crate) fn alias_names() -> Vec<String> {
     let repo = crate::setup::discover().ok();
-    let snapshot = repo.as_ref().map(|r| r.config_snapshot());
-    let globals;
-    let file = match snapshot.as_ref() {
-        Some(s) => s.plumbing(),
-        None => match gix::config::File::from_globals() {
-            Ok(f) => {
-                globals = f;
-                &globals
-            }
-            Err(_) => return Vec::new(),
-        },
-    };
-    let Some(sections) = file.sections_by_name("alias") else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for section in sections {
-        for (name, _) in section.body() {
-            // git's config parser lower-cases value names before its alias
-            // listing sees them, so `[alias] Foo` lists as `foo`.
-            out.push(name.to_string().to_lowercase());
-        }
-    }
-    out
+    // `list_aliases()` is a `repo_config()` callback that appends the name after
+    // `alias.` for every occurrence, in callback order. The keys come already
+    // normalised — section and variable lower-cased — so `[alias] Foo` lists as
+    // `foo`. The ordered walk hands each `-c` over once; the raw snapshot sees a
+    // valued one twice once the overrides are recorded for `setup::discover`.
+    crate::config::config_keys_in_order(repo.as_ref())
+        .into_iter()
+        .filter_map(|key| key.strip_prefix("alias.").map(str::to_string))
+        .collect()
 }
 
 /// `completion.commands`, the edit script `--list-cmds=config` applies
@@ -2131,21 +2116,9 @@ pub(crate) fn alias_names() -> Vec<String> {
 /// `setup_git_directory_gently()` for exactly that reason (git.c:83-87).
 pub(crate) fn completion_commands() -> Option<String> {
     let repo = crate::setup::discover().ok();
-    let snapshot = repo.as_ref().map(|r| r.config_snapshot());
-    let globals;
-    let file = match snapshot.as_ref() {
-        Some(s) => s.plumbing(),
-        None => match gix::config::File::from_globals() {
-            Ok(f) => {
-                globals = f;
-                &globals
-            }
-            Err(_) => return None,
-        },
-    };
-    file.string("completion.commands")
-        .map(|v| String::from_utf8_lossy(&v).into_owned())
-        .filter(|v| !v.is_empty())
+    // `repo_config_get_string_tmp()` (help.c:422), which dies through
+    // `git_die_config()` on a valueless key.
+    crate::config::config_get_string(repo.as_ref(), "completion.commands").filter(|v| !v.is_empty())
 }
 
 /// The members of one `git help` common-command group — the five

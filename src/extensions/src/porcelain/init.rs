@@ -645,10 +645,9 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         // the name gix already chose matches, the HEAD repoint below is a no-op.
         let branch_name = match initial_branch.clone() {
             Some(name) => name,
-            None => repo
-                .config_snapshot()
-                .string("init.defaultBranch")
-                .map(|v| v.to_string())
+            // `repo_default_branch_name()` (refs.c:700): `repo_config_get_string()`,
+            // which dies through `git_die_config()` on a valueless key.
+            None => crate::config::config_get_string(Some(&repo), "init.defaultbranch")
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "master".to_string()),
         };

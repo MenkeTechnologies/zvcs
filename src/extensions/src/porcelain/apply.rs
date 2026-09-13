@@ -984,8 +984,10 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // Every action it can name is honoured here on the same terms as the flag, so a
     // `--whitespace` on the command line simply replaces it.
     if let Ok(repo) = crate::setup::discover() {
-        if let Some(v) = repo.config_snapshot().string("apply.whitespace") {
-            let v = v.to_str_lossy();
+        // `git_apply_config()` (apply.c:50-55) reads both keys with
+        // `repo_config_get_string()`, which dies through `git_die_config()` on a
+        // valueless key.
+        if let Some(v) = crate::config::config_get_string(Some(&repo), "apply.whitespace") {
             match classify_whitespace(&v) {
                 action @ (WsAction::Silent | WsAction::Warn | WsAction::Error | WsAction::Fix) => {
                     o.ws = action;
@@ -999,9 +1001,8 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
         // `apply.ignorewhitespace`, read straight after it (apply.c:132) and just
         // as fatal when the value is neither the off-spelling nor `change`.
-        if let Some(v) = repo.config_snapshot().string("apply.ignorewhitespace") {
-            let v = v.to_str_lossy();
-            match v.as_ref() {
+        if let Some(v) = crate::config::config_get_string(Some(&repo), "apply.ignorewhitespace") {
+            match v.as_str() {
                 "no" | "false" | "never" | "none" => o.ignore_ws = false,
                 "change" => o.ignore_ws = true,
                 _ => {

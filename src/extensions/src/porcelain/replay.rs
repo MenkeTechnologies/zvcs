@@ -436,20 +436,21 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
 
     // --- get_ref_action_mode ---------------------------------------------
-    let configured = repo
-        .config_snapshot()
-        .string("replay.refAction")
-        .map(|v| v.to_str_lossy().into_owned());
-    let ref_mode = match (&ref_action, &configured) {
-        (Some(v), _) => match parse_ref_action(v) {
+    // The command-line option wins and the key is then never read
+    // (builtin/replay.c:35-40); `repo_config_get_string_tmp()` dies through
+    // `git_die_config()` on a valueless key.
+    let ref_mode = match &ref_action {
+        Some(v) => match parse_ref_action(v) {
             Some(m) => m,
             None => return fatal(&format!("invalid --ref-action value: '{v}'")),
         },
-        (None, Some(v)) => match parse_ref_action(v) {
-            Some(m) => m,
-            None => return fatal(&format!("invalid replay.refAction value: '{v}'")),
+        None => match crate::config::config_get_string(Some(&repo), "replay.refAction") {
+            Some(v) => match parse_ref_action(&v) {
+                Some(m) => m,
+                None => return fatal(&format!("invalid replay.refAction value: '{v}'")),
+            },
+            None => RefAction::Update,
         },
-        (None, None) => RefAction::Update,
     };
 
     let mode = if revert_name.is_some() {

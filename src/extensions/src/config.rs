@@ -1193,6 +1193,13 @@ fn occurrences_for(repo: Option<&gix::Repository>) -> Vec<Occurrence> {
     }
 }
 
+/// Every configured key, normalised, in the order a `repo_config(r, fn, data)`
+/// callback is handed them — each occurrence once, the command line spelled as
+/// typed — from the same merged read [`config_get_string`] uses.
+pub fn config_keys_in_order(repo: Option<&gix::Repository>) -> Vec<String> {
+    occurrences_for(repo).into_iter().map(|o| o.key).collect()
+}
+
 /// `git_die_config()` (config.c:2561-2577): report `err` through `error()`, then
 /// die naming where the **last** value of `key` came from.
 ///
@@ -1212,12 +1219,19 @@ pub fn die_config(repo: Option<&gix::Repository>, key: &str, err: Option<&str>) 
     if let Some(err) = err {
         eprintln!("error: {err}");
     }
+    die_128(&die_config_linenr(repo, key))
+}
+
+/// The `fatal:` message [`die_config`] ends with — `git_die_config_linenr()` for
+/// the last value of `key` — for a reader whose `die()` has to wait (the lazily
+/// built ref store).
+pub fn die_config_linenr(repo: Option<&gix::Repository>, key: &str) -> String {
     let wanted = normalize_key(key);
     let occurrences: Vec<Occurrence> = occurrences_for(repo);
     let Some(last) = with_lines(occurrences).into_iter().rev().find(|v| v.key == wanted) else {
         panic!("BUG: for key '{key}' we must have a value to report on");
     };
-    die_128(&last.origin.die_linenr(key))
+    last.origin.die_linenr(key)
 }
 
 /// `die()`: `fatal: <message>` on stderr, flush stdout as `exit()` does, exit 128.

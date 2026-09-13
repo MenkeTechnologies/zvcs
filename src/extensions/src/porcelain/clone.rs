@@ -3396,11 +3396,11 @@ impl BundleTransport {
     }
 }
 
-/// `repo_default_branch_name()`: `init.defaultBranch`, or `master`.
+/// `repo_default_branch_name()`: `init.defaultBranch`, or `master`. The key is
+/// read with `repo_config_get_string()` (refs.c:700), which dies through
+/// `git_die_config()` on a valueless key.
 fn default_branch_name(repo: &gix::Repository) -> String {
-    repo.config_snapshot()
-        .string("init.defaultBranch")
-        .map(|v| v.to_string())
+    crate::config::config_get_string(Some(repo), "init.defaultbranch")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "master".to_string())
 }

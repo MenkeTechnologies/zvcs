@@ -1028,11 +1028,10 @@ fn branch_tips(repo: &gix::Repository) -> Result<std::collections::HashMap<Objec
 /// The `#` here is git's literal `#`, not `comment_line_str`; git formats the
 /// default as the string `"# %s"` regardless of `core.commentChar`.
 fn instruction_format(repo: &gix::Repository) -> String {
-    let configured = repo
-        .config_snapshot()
-        .string("rebase.instructionFormat")
-        .map(|v| v.to_string())
-        .unwrap_or_default();
+    // `repo_config_get_string()` (sequencer.c:6180), which dies through
+    // `git_die_config()` on a valueless key.
+    let configured =
+        crate::config::config_get_string(Some(repo), "rebase.instructionFormat").unwrap_or_default();
     if configured.is_empty() {
         return "# %s".to_string();
     }

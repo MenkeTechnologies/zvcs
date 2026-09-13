@@ -246,10 +246,11 @@ enum Strategy {
 /// git only reads the key when the selection is config-driven: a `--task` run
 /// never looks at it, and so never rejects a bad value.
 fn configured_strategy(repo: &gix::Repository) -> std::result::Result<Option<Strategy>, String> {
-    let Some(value) = repo.config_snapshot().string("maintenance.strategy") else {
+    // `repo_config_get_string_tmp()` (builtin/gc.c:1978), which dies through
+    // `git_die_config()` on a valueless key.
+    let Some(value) = crate::config::config_get_string(Some(repo), "maintenance.strategy") else {
         return Ok(None);
     };
-    let value = value.to_string();
     match value.to_ascii_lowercase().as_str() {
         "gc" => Ok(Some(Strategy::Gc)),
         "geometric" => Ok(Some(Strategy::Geometric)),

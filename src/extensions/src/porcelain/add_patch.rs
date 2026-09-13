@@ -478,8 +478,10 @@ impl Config {
             file_old_color: init_color(&snap, use_color_diff, "diff.old", GIT_COLOR_RED),
             file_new_color: init_color(&snap, use_color_diff, "diff.new", GIT_COLOR_GREEN),
             reset_color_diff: if use_color_diff { GIT_COLOR_RESET.into() } else { String::new() },
-            diff_filter: snap.string("interactive.diffFilter").map(|v| v.to_string()),
-            diff_algorithm: snap.string("diff.algorithm").map(|v| v.to_string()),
+            // `repo_config_get_string()` for both (add-patch.c:366-371), which dies
+            // through `git_die_config()` on a valueless key.
+            diff_filter: crate::config::config_get_string(Some(repo), "interactive.difffilter"),
+            diff_algorithm: crate::config::config_get_string(Some(repo), "diff.algorithm"),
             single_key: snap.boolean("interactive.singleKey").unwrap_or(false),
         };
 

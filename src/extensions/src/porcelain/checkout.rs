@@ -2273,6 +2273,10 @@ enum Dwim {
 /// <remote>/<name>` across every configured remote. `checkout.defaultRemote`
 /// disambiguates a multi-remote match. Mirrors `switch`'s identical resolver.
 fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
+    // `unique_tracking_name()` (checkout.c:50-56) reads the key before looking at
+    // any remote, with `repo_config_get_string_tmp()`, which dies through
+    // `git_die_config()` on a valueless key.
+    let default_remote = crate::config::config_get_string(Some(repo), "checkout.defaultremote");
     let mut matches: Vec<String> = Vec::new();
     for remote in repo.remote_names() {
         let remote = remote.to_str_lossy();
@@ -2307,8 +2311,7 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
         0 => Ok(Dwim::None),
         1 => Ok(Dwim::One(format!("{}/{name}", matches[0]))),
         n => {
-            if let Some(def) = repo.config_snapshot().string("checkout.defaultRemote") {
-                let def = def.to_str_lossy().into_owned();
+            if let Some(def) = default_remote {
                 if matches.contains(&def) {
                     return Ok(Dwim::One(format!("{def}/{name}")));
                 }

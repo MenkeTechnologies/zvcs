@@ -1282,6 +1282,10 @@ enum Dwim {
 /// Find the remote-tracking branch a bare `<name>` should DWIM to: `refs/remotes/
 /// <remote>/<name>` across every configured remote.
 fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
+    // `unique_tracking_name()` (checkout.c:50-56) reads the key before looking at
+    // any remote, with `repo_config_get_string_tmp()`, which dies through
+    // `git_die_config()` on a valueless key.
+    let default_remote = crate::config::config_get_string(Some(repo), "checkout.defaultremote");
     let mut matches: Vec<String> = Vec::new();
     for remote in repo.remote_names() {
         let remote = remote.to_str_lossy();
@@ -1305,8 +1309,7 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
         n => {
             // checkout.defaultRemote disambiguates: if it names one of the
             // matching remotes, DWIM to that one instead of erroring.
-            if let Some(def) = repo.config_snapshot().string("checkout.defaultRemote") {
-                let def = def.to_str_lossy().into_owned();
+            if let Some(def) = default_remote {
                 if matches.contains(&def) {
                     return Ok(Dwim::One(format!("{def}/{name}")));
                 }

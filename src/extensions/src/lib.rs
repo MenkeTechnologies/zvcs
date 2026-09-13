@@ -276,6 +276,11 @@ pub fn handle_options(
             // [`listcmds::parseopt`]); the split is kept here.
             s if s.starts_with("--list-cmds=") => {
                 let spec = &s["--list-cmds=".len()..];
+                // `handle_options()` has already pushed every `-c` ahead of this
+                // option (git.c:264-269, 325) when `list_cmds()` reads
+                // `completion.commands`, so the valueless ones — which only
+                // `setup::discover` carries — must be recorded before it answers.
+                setup::set_cli_overrides(overrides);
                 return Handled::Exit(match spec {
                     "parseopt" => listcmds::parseopt(),
                     _ => listcmds::list_cmds(spec),

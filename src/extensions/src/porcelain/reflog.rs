@@ -138,7 +138,18 @@ const USAGE: &str = r"usage: git reflog [show] [<log-options>] [<ref>]
 ///     an empty file, as git leaves it.
 ///   * `write` and `drop` bail — not ported.
 ///
-/// # Argument grammar for `show`
+/// # `show`
+///
+/// `cmd_reflog_show()` hands its argv to `cmd_log_reflog()`
+/// (builtin/reflog.c:143-155), so `git reflog [show]` runs through
+/// [`super::log`]'s `Flavor::Reflog` — the same walk, pretty-printer, `--notes`,
+/// `log.decorate` and colour painting as `git log -g`. Only `-h`/`--help-all` are
+/// answered here, by `cmd_reflog_show`'s own option table.
+///
+/// The renderer documented in the rest of this section is what
+/// [`reflog_show_as_log`] still runs for `git stash list`.
+///
+/// # Argument grammar of the stash-list renderer
 ///
 /// `git reflog show` is `git log -g --abbrev-commit --pretty=oneline`, so it takes
 /// the whole `git log` option vocabulary. Stock git processes argv strictly left to
@@ -272,9 +283,10 @@ const USAGE: &str = r"usage: git reflog [show] [<log-options>] [<ref>]
 ///
 ///   * Diff output that needs the rest of git's diff driver — `-p`, `--patch`,
 ///     `--stat` (column-width scaling against the terminal width), `--dirstat`.
-///   * `%C(...)` color placeholders and `--color=always`. (The `%d`/`%D` ref
-///     decorations and the `%ar`/`%cr` relative and `%ai`/`%at` date atoms are
-///     supported.)
+///   * `%C(...)` color placeholders and `--color=always` in this renderer; the
+///     `reflog show` route colours through `git log`'s printer instead. (The
+///     `%d`/`%D` ref decorations and the `%ar`/`%cr` relative and `%ai`/`%at`
+///     date atoms are supported.)
 ///   * The `email`/`mboxrd` patch `--pretty` formats, which need git's mbox driver.
 ///     These are deferred: when a filter (a date limiter or a pathspec) drops every
 ///     entry the format is never exercised and the command succeeds with empty
@@ -350,7 +362,10 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
             {
                 return Ok(super::show_usage(SHOW_USAGE));
             }
-            show(&repo, rest, Tweak::Reflog).map(ExitCode::from)
+            // `cmd_reflog_show()` is `cmd_log_reflog()` (builtin/reflog.c:154), so
+            // the walk, the pretty-printer and its colours are `git log`'s own.
+            drop(repo);
+            super::log::reflog_show(rest)
         }
         "list" => list(&repo, rest),
         "exists" => exists(&repo, rest),
@@ -386,19 +401,7 @@ pub fn reflog_show_as_log(args: &[String]) -> Result<ExitCode> {
 /// read back, so `list_stash()`'s caller needs the number rather than the code.
 pub fn reflog_show_as_log_status(args: &[String]) -> Result<u8> {
     let repo = crate::setup::discover()?;
-    show(&repo, args, Tweak::Log)
-}
-
-/// Which of git's two reflog-walk entry points is running.
-///
-/// Named after the `setup_revision_opt::tweak` hook that is the actual
-/// difference between them; see [`reflog_show_as_log`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tweak {
-    /// `git reflog show`: no tweak, so `--first-parent` never diffs a merge.
-    Reflog,
-    /// `git log -g`: `--first-parent` promotes merges to a first-parent diff.
-    Log,
+    show(&repo, args)
 }
 
 /// One reflog line, already flipped into git's newest-first order.
@@ -957,7 +960,7 @@ impl Decorations {
 }
 
 /// `git reflog show` — render the log of each `<ref>` (default `HEAD`).
-fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
+fn show(repo: &gix::Repository, rest: &[String]) -> Result<u8> {
     let full_hex = repo.object_hash().len_in_hex();
     // `core.quotePath` is read once, into the flag every `quote_c_style()` caller
     // shares, exactly as `git_default_core_config()` does.
@@ -1397,7 +1400,7 @@ fn show(repo: &gix::Repository, rest: &[String], tweak: Tweak) -> Result<u8> {
         }
     }
 
-    render(repo, &sections, &opts, full_hex, &unimplemented, tweak)
+    render(repo, &sections, &opts, full_hex, &unimplemented)
 }
 
 /// Walk the collected sections and write git's output for them.
@@ -1414,12 +1417,13 @@ fn render(
     opts: &Opts,
     full_hex: usize,
     unimplemented: &Option<String>,
-    tweak: Tweak,
 ) -> Result<u8> {
     let fallback_len = abbrev_len(repo, full_hex);
-    // `diff_merges_default_to_first_parent()`, which only `git log`'s tweak hook
-    // calls. Without it a merge entry has no diff in any format.
-    let first_parent_merges = opts.first_parent && tweak == Tweak::Log;
+    // `diff_merges_default_to_first_parent()`, which `git log`'s
+    // `log_setup_revisions_tweak()` calls (builtin/log.c:815-823). Every caller of
+    // this renderer is `git log -g` (`git stash list`); `git reflog show` goes
+    // through `log::reflog_show`. Without it a merge entry has no diff in any format.
+    let first_parent_merges = opts.first_parent;
     // The field date format (`%ad`/`%cd`, the `Date:` header lines): an explicit
     // `--date=` wins, then `log.date`, then git's default layout.
     let field_fmt: DateFormat = opts

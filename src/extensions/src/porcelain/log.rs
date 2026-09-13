@@ -672,11 +672,27 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 pub(crate) enum Flavor {
     Log,
     WhatChanged,
+    /// `cmd_log_reflog()` (builtin/log.c:780-813), which `git reflog show` runs:
+    /// the reflog walk is on from the start (`init_reflog_walk`, :795), and after
+    /// `cmd_log_init_defaults()` has applied `format.pretty` and
+    /// `log.abbrevCommit` it forces `abbrev_commit = 1`,
+    /// `commit_format = CMIT_FMT_ONELINE` and `use_terminator = 1` (:801-804) —
+    /// none of which sets `pretty_given`, so notes still show. It passes a zeroed
+    /// `setup_revision_opt` apart from `def`, so no tweak runs: `--first-parent`
+    /// selects no merge diff and `log.follow` is never promoted. Headers are
+    /// always shown (:805), as under [`Flavor::Log`].
+    Reflog,
 }
 
 /// `git whatchanged`: `cmd_log()` under [`Flavor::WhatChanged`].
 pub(crate) fn whatchanged(args: &[String]) -> Result<ExitCode> {
     log_flavored(args, Flavor::WhatChanged)
+}
+
+/// `git reflog show`: `cmd_log_reflog()` under [`Flavor::Reflog`]. `args` is
+/// what follows the `show` subcommand (or the whole implicit-`show` argv).
+pub(crate) fn reflog_show(args: &[String]) -> Result<ExitCode> {
+    log_flavored(args, Flavor::Reflog)
 }
 
 pub fn log(args: &[String]) -> Result<ExitCode> {
@@ -825,6 +841,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         }
     }
+    // `rev.commit_format = CMIT_FMT_ONELINE; rev.use_terminator = 1;`
+    // (builtin/log.c:803-804), after `cmd_log_init_defaults()` read `format.pretty`.
+    if flavor == Flavor::Reflog {
+        pretty = Pretty::Oneline;
+        terminator = true;
+    }
     // `-z`: `line_termination = 0` — the raw/name records use NUL field and record
     // separators and stop C-quoting, and the per-commit record terminator/separator
     // becomes NUL too.
@@ -837,7 +859,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `pretty` (which starts at the same `medium` a `--pretty=medium` selects).
     let mut pretty_given = false;
     let mut notes_opt = super::notes::DisplayOpt::default();
-    let mut abbrev_commit = cfg_abbrev_commit;
+    // `rev.abbrev_commit = 1` (builtin/log.c:802) overrides `log.abbrevCommit`
+    // for `reflog show`; `--no-abbrev-commit` on the command line still wins.
+    let mut abbrev_commit = cfg_abbrev_commit || flavor == Flavor::Reflog;
     // `--show-signature` / `--no-show-signature` (`rev_info.show_signature`), which
     // `show_log()` consults at log-tree.c:851. Off unless asked for; `log.showSignature`
     // is not read here (see the module header).
@@ -952,7 +976,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut expand_tabs: Option<usize> = None;
     // `-g`/`--walk-reflogs` (`revs->reflog_info`): walk each named ref's reflog,
     // newest entry first, instead of the history reachable from its tip.
-    let mut walk_reflogs = false;
+    // `cmd_log_reflog()` calls `init_reflog_walk()` before any argument is read.
+    let mut walk_reflogs = flavor == Flavor::Reflog;
     // `revs->date_mode_explicit`: whether `--date=` was given on the command line,
     // which is what the `-g` selector consults (`log.date` alone does not).
     let mut date_explicit = false;
@@ -1045,6 +1070,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // matched through the shared `revfilter` so log and shortlog agree.
     let mut grep_pats: Vec<String> = Vec::new();
     let mut author_pats: Vec<String> = Vec::new();
+    // `--grep-reflog=<pat>`: `add_header_grep(revs, GREP_HEADER_REFLOG, optarg)`
+    // (revision.c:2680-2681), matched against the fake `reflog <message>` header
+    // `commit_match()` prepends under `-g` (revision.c:4105-4109).
+    let mut reflog_pats: Vec<String> = Vec::new();
     let mut committer_pats: Vec<String> = Vec::new();
     let mut grep_dialect = crate::revfilter::Dialect::Basic;
     let mut grep_ignore_case = false;
@@ -1926,6 +1955,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             grep_all_match = true;
         } else if a == "--invert-grep" {
             grep_invert = true;
+        // `parse_long_opt("grep-reflog", argv, &optarg)`: the value attached or in
+        // the next argv slot, and a missing one is `die("Option '--%s' requires a
+        // value")` (diff.c:5380-5399).
+        } else if a == "--grep-reflog" || a.starts_with("--grep-reflog=") {
+            match a.split_once('=') {
+                Some((_, v)) => reflog_pats.push(v.to_string()),
+                None => {
+                    i += 1;
+                    let Some(v) = args.get(i) else {
+                        eprintln!("fatal: Option '--grep-reflog' requires a value");
+                        return Ok(ExitCode::from(128));
+                    };
+                    reflog_pats.push(v.clone());
+                }
+            }
         // `--max-age`/`--min-age` set the very same `revs->max_age`/`revs->min_age`
         // as `--since`/`--until` (revision.c:2379-2393); only the value parser
         // differs — [`parse_age`]'s raw epoch instead of `approxidate()`. Both
@@ -3221,6 +3265,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         && since_as_filter.is_none()
         && until.is_none()
         && author_pats.is_empty()
+        && reflog_pats.is_empty()
         && committer_pats.is_empty()
         && grep_pats.is_empty()
         && pickaxe_s.is_none()
@@ -3230,7 +3275,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         && order == Order::Default;
     // A suppressed `whatchanged` record does not consume its `--max-count`, so the
     // walk cannot stop at `skip + max_count` commits there.
-    let budget = (unfiltered && max_count.is_some() && flavor == Flavor::Log)
+    let budget = (unfiltered && max_count.is_some() && flavor != Flavor::WhatChanged)
         .then(|| skip.saturating_add(max_count.unwrap_or(0)));
     // `-g`: `get_revision_1()` calls `next_reflog_entry()` in place of popping the
     // frontier, so the list is the reflog entries themselves rather than anything
@@ -3963,6 +4008,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         all_match: grep_all_match,
         invert_grep: grep_invert,
     };
+    // `prep_header_patterns()` (grep.c:705-751) ORs the patterns within one header
+    // field and requires a hit in every field, and `--invert-grep`'s
+    // `no_body_match` only ever inverts the body — so the `reflog` field is one
+    // more AND-ed group beside `--author`/`--committer`, kept here rather than in
+    // the shared [`crate::revfilter::CommitFilter`] because only `-g` feeds it.
+    let reflog_res = crate::revfilter::compile_patterns(
+        &reflog_pats,
+        grep_dialect,
+        grep_ignore_case,
+        crate::revfilter::Origin::Header,
+    )?;
+    // revision.c:3203-3204, after `compile_grep_patterns()` (:3178) has had its
+    // chance to reject the pattern itself.
+    if !walk_reflogs && !reflog_res.is_empty() {
+        eprintln!("fatal: the option '--grep-reflog' requires '--walk-reflogs'");
+        return Ok(ExitCode::from(128));
+    }
     // Pickaxe `-G<regex>` compiles once, in the same dialect as --grep.
     let pickaxe_g_re = match &pickaxe_g {
         Some(p) => Some(crate::revfilter::build_regex(
@@ -4104,6 +4166,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         None => repo,
     };
     if !commit_filter.is_empty()
+        || !reflog_res.is_empty()
         || since.is_some()
         || since_as_filter.is_some()
         || until.is_some()
@@ -4129,6 +4192,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             if !commit_filter.matches(&commit)? {
                 continue;
+            }
+            // `get_reflog_message()` strips the entry's trailing newline, which is
+            // the form [`ReflogEntry::message`] already holds.
+            if !reflog_res.is_empty() {
+                let message = node.reflog.as_ref().map_or(&[][..], |rl| rl.message.as_slice());
+                if !reflog_res.iter().any(|re| re.is_match(message)) {
+                    continue;
+                }
             }
             kept.push(node);
         }
@@ -4317,7 +4388,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // render loop there, counting records actually printed.
     let print_limit = match flavor {
         Flavor::WhatChanged => max_count,
-        Flavor::Log => {
+        Flavor::Log | Flavor::Reflog => {
             if let Some(limit) = max_count {
                 nodes.truncate(limit);
             }

@@ -100,6 +100,30 @@ pub fn set_cli_overrides(overrides: &[crate::ConfigOverride]) {
     let _ = DOUBLE_DELIVERED.set(valued);
 }
 
+/// Every `-c` override on this command line, in argv order, as `(key, value)` with
+/// `None` for a bare `-c key` — the list `git_config_from_parameters()`
+/// (config.c:731-790) hands the config callback after the `GIT_CONFIG_COUNT`
+/// entries.
+///
+/// Spelled from what the user typed, not from the snapshot: gitoxide parses a
+/// `Source::Cli` override with its config-file parser, which drops unquoted
+/// trailing blanks and anything after `;` or `#`, while git keeps the value
+/// byte for byte. `git_config_parse_parameter()` splits on the first `=`, so a
+/// key never contains one.
+pub fn command_line_overrides() -> Vec<(String, Option<String>)> {
+    use gix::bstr::ByteSlice as _;
+
+    CLI_OVERRIDES.get().map_or_else(Vec::new, |overrides| {
+        overrides
+            .iter()
+            .map(|o| match o.split_once_str("=") {
+                Some((k, v)) => (k.to_str_lossy().into_owned(), Some(v.to_str_lossy().into_owned())),
+                None => (o.to_str_lossy().into_owned(), None),
+            })
+            .collect()
+    })
+}
+
 /// The `-c key=value` overrides this process hands to `gix` **twice**.
 ///
 /// `push_config_override` writes every valued override into the

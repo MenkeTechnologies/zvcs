@@ -375,30 +375,21 @@ fn parse_magnitude(rest: &str) -> Result<u64, &'static str> {
 /// Only the sub-section-less form is understood, which is all any of the keys read
 /// through here have; a `key` containing no `.` yields `None`.
 pub fn last_value_with_origin(repo: &gix::Repository, key: &str) -> Option<(String, String)> {
-    use gix::bstr::ByteSlice as _;
-
-    let (section, name) = key.split_once('.')?;
-    let config = repo.config_snapshot().plumbing().clone();
-    let mut found: Option<(String, Option<PathBuf>)> = None;
-    for sec in config.sections() {
-        let header = sec.header();
-        if header.subsection_name().is_some() || !header.name().to_string().eq_ignore_ascii_case(section) {
-            continue;
-        }
-        let path = sec.meta().path.clone();
-        for value in sec.body().values(name) {
-            found = Some((value.to_str_lossy().into_owned(), path.clone()));
-        }
-    }
-    let (raw, path) = found?;
-    let origin = match path {
-        Some(p) => {
-            let shown = p.to_string_lossy();
-            format!(" in file {}", shown.strip_prefix("./").unwrap_or(&shown))
-        }
+    key.split_once('.')?;
+    let last = last_occurrence(repo, key)?;
+    let origin = match &last.path {
+        Some(p) => format!(" in file {}", shown_path(p)),
         None => String::new(),
     };
-    Some((raw, origin))
+    Some((last.value.unwrap_or_default(), origin))
+}
+
+/// The last occurrence of the dotted `key` in [`ordered_occurrences`] order —
+/// git's last-value-wins over the same sequence the callback walk sees, so a
+/// `-c` value is the bytes typed rather than gitoxide's re-parse of them.
+fn last_occurrence(repo: &gix::Repository, key: &str) -> Option<Occurrence> {
+    let wanted = normalize_key(key);
+    ordered_occurrences(repo).into_iter().rev().find(|o| o.key == wanted)
 }
 
 /// The last value configured for the dotted `<section>.<key>`, distinguishing a
@@ -428,21 +419,8 @@ pub fn last_value_with_origin(repo: &gix::Repository, key: &str) -> Option<(Stri
 /// Only the **last** occurrence of a name within one section is classified this
 /// way; earlier repeats of the same name are only reachable through `values()`.
 pub fn last_value_implicit(repo: &gix::Repository, key: &str) -> Option<Option<String>> {
-    use gix::bstr::ByteSlice as _;
-
-    let (section, name) = key.split_once('.')?;
-    let config = repo.config_snapshot().plumbing().clone();
-    let mut found: Option<Option<String>> = None;
-    for sec in config.sections() {
-        let header = sec.header();
-        if header.subsection_name().is_some() || !header.name().to_string().eq_ignore_ascii_case(section) {
-            continue;
-        }
-        if let Some(v) = sec.body().value_implicit(name) {
-            found = Some(v.map(|raw| raw.to_str_lossy().into_owned()));
-        }
-    }
-    found
+    key.split_once('.')?;
+    last_occurrence(repo, key).map(|o| o.value)
 }
 
 /// git's `git_config_ulong` for the dotted `key`: `Ok(None)` when unset,
@@ -1221,14 +1199,88 @@ pub fn big_file_threshold_refusal(repo: &gix::Repository) -> Option<String> {
 }
 
 pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
+    use std::collections::HashMap;
+
+    let mut lines: HashMap<PathBuf, FileLines> = HashMap::new();
+    ordered_occurrences(repo)
+        .into_iter()
+        .map(|o| {
+            let origin = match &o.path {
+                None => ValueOrigin::CommandLine,
+                Some(p) => {
+                    let index = lines.entry(p.clone()).or_insert_with(|| FileLines::read(p));
+                    match index.next_line(&o.section, o.subsection.as_deref(), &o.name) {
+                        Some(line) => ValueOrigin::File {
+                            path: shown_path(p),
+                            line,
+                        },
+                        // A file whose text could not be re-parsed leaves the
+                        // origin unknown; naming a line we did not find would be
+                        // worse than naming none, and the command-line shape is
+                        // the one git prints when it has no file to name.
+                        None => ValueOrigin::CommandLine,
+                    }
+                }
+            };
+            ConfigValue {
+                key: o.key,
+                value: o.value,
+                origin,
+            }
+        })
+        .collect()
+}
+
+/// One configured value in callback order, before [`walk_config`] looks up the
+/// line it sits on. The targeted last-value readers need the order and the
+/// value but not the line, and skipping [`FileLines`] keeps them from re-reading
+/// every config file per lookup.
+struct Occurrence {
+    /// Normalised as [`ConfigValue::key`] is.
+    key: String,
+    value: Option<String>,
+    /// The file behind the value, `None` for command-line and environment ones.
+    path: Option<PathBuf>,
+    section: String,
+    subsection: Option<String>,
+    name: String,
+}
+
+/// Every configured value in git's callback order, with this port's two
+/// deliveries of the command line folded back into git's one.
+///
+/// # The command line, in command-line order
+///
+/// `do_git_config_sequence()` (config.c:1570-1602) ends with
+/// `git_config_from_parameters()` (config.c:731-790), which hands the callback
+/// the `GIT_CONFIG_COUNT` entries first and then every `-c` in the order it was
+/// typed, valued and valueless interleaved. This port delivers a `-c` to `gix`
+/// through two channels instead (see [`crate::setup::double_delivered`]): a
+/// valued one is appended to the `GIT_CONFIG_COUNT` triple *and* handed over as
+/// `Source::Cli`, a valueless one only as `Source::Cli`. Walking the snapshot
+/// as-is therefore put every valued `-c` (the environment copy) ahead of every
+/// valueless one, so `git -c core.editor -c core.abbrev=bogus branch` reported
+/// `core.abbrev` where git reports the valueless `core.editor` it met first.
+///
+/// So the command line is not read back from the snapshot at all. The
+/// environment copies are dropped — the *last* environment occurrences of each
+/// `(key, value)` pair, because `push_config_override` appends them after any
+/// `GIT_CONFIG_COUNT` the process inherited — and so are the `Source::Cli`
+/// sections the overrides produced; [`crate::setup::command_line_overrides`] is
+/// spliced in where those sections began, spelled as typed. That also keeps the
+/// bytes gitoxide's parser would have changed: `-c 'feature.experimental= '`
+/// reached the `Source::Cli` section as the empty string, which reads as
+/// false, where git refuses `' '`.
+///
+/// A `Source::Cli` value no override accounts for (a layer a caller appended to
+/// a private snapshot) is kept where the snapshot has it.
+fn ordered_occurrences(repo: &gix::Repository) -> Vec<Occurrence> {
     use gix::bstr::ByteSlice as _;
+    use gix::config::Source;
     use std::collections::HashMap;
 
     let config = repo.config_snapshot().plumbing().clone();
-    let mut lines: HashMap<PathBuf, FileLines> = HashMap::new();
-    let mut echoes = CliEcho::new();
-    let mut out = Vec::new();
-
+    let mut snapshot: Vec<(Source, Occurrence)> = Vec::new();
     for sec in config.sections() {
         let header = sec.header();
         let section = header.name().to_string().to_ascii_lowercase();
@@ -1255,40 +1307,103 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
             } else {
                 all.get(index).map(|v| v.to_str_lossy().into_owned())
             };
-
             let key = match &subsection {
                 Some(sub) => format!("{section}.{sub}.{name}"),
                 None => format!("{section}.{name}"),
             };
-            // One `-c key=value` arrives on two sources; git's callback runs
-            // once per configured value, so the second copy is not a second
-            // occurrence. See [`CliEcho`].
-            if echoes.is_echo(meta.source, &key, value.as_deref()) {
-                continue;
-            }
-            let origin = match &path {
-                None => ValueOrigin::CommandLine,
-                Some(p) => {
-                    let index = lines
-                        .entry(p.clone())
-                        .or_insert_with(|| FileLines::read(p));
-                    match index.next_line(&section, subsection.as_deref(), &name) {
-                        Some(line) => ValueOrigin::File {
-                            path: shown_path(p),
-                            line,
-                        },
-                        // A file whose text could not be re-parsed leaves the
-                        // origin unknown; naming a line we did not find would be
-                        // worse than naming none, and the command-line shape is
-                        // the one git prints when it has no file to name.
-                        None => ValueOrigin::CommandLine,
-                    }
-                }
-            };
-            out.push(ConfigValue { key, value, origin });
+            snapshot.push((
+                meta.source,
+                Occurrence {
+                    key,
+                    value,
+                    path: path.clone(),
+                    section: section.clone(),
+                    subsection: subsection.clone(),
+                    name,
+                },
+            ));
         }
     }
+
+    let overrides = crate::setup::command_line_overrides();
+    if overrides.is_empty() {
+        return snapshot.into_iter().map(|(_, o)| o).collect();
+    }
+
+    let mut drop = vec![false; snapshot.len()];
+    // The environment copy of each valued `-c`, matched on the exact bytes the
+    // triple carries and taken from the end.
+    let mut env_copies: HashMap<(String, String), usize> = HashMap::new();
+    for (key, value) in crate::setup::double_delivered() {
+        *env_copies.entry((normalize_key(key), value.clone())).or_default() += 1;
+    }
+    for (i, (source, o)) in snapshot.iter().enumerate().rev() {
+        if *source != Source::Env {
+            continue;
+        }
+        let Some(value) = &o.value else { continue };
+        if let Some(n) = env_copies.get_mut(&(o.key.clone(), value.clone())) {
+            if *n > 0 {
+                *n -= 1;
+                drop[i] = true;
+            }
+        }
+    }
+    // The `Source::Cli` sections the overrides produced, one occurrence per
+    // override of that key.
+    let mut cli_copies: HashMap<String, usize> = HashMap::new();
+    for (key, _) in &overrides {
+        *cli_copies.entry(normalize_key(key)).or_default() += 1;
+    }
+    for (i, (source, o)) in snapshot.iter().enumerate() {
+        if *source != Source::Cli {
+            continue;
+        }
+        if let Some(n) = cli_copies.get_mut(&o.key) {
+            if *n > 0 {
+                *n -= 1;
+                drop[i] = true;
+            }
+        }
+    }
+
+    // `git_config_from_parameters()` runs after every file and the environment
+    // triple, which in gitoxide's source order is ahead of the first
+    // `Source::Cli`/`Api`/`EnvOverride` section.
+    let splice_at = snapshot
+        .iter()
+        .position(|(s, _)| matches!(s, Source::Cli | Source::Api | Source::EnvOverride))
+        .unwrap_or(snapshot.len());
+    let mut out = Vec::with_capacity(snapshot.len());
+    let mut command_line = Some(overrides);
+    for (i, (_, o)) in snapshot.into_iter().enumerate() {
+        if i == splice_at {
+            out.extend(command_line.take().into_iter().flatten().map(occurrence_from_argv));
+        }
+        if !drop[i] {
+            out.push(o);
+        }
+    }
+    out.extend(command_line.take().into_iter().flatten().map(occurrence_from_argv));
     out
+}
+
+/// A `-c key[=value]` as the callback receives it.
+fn occurrence_from_argv((key, value): (String, Option<String>)) -> Occurrence {
+    let key = normalize_key(&key);
+    let (section, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
+    let (subsection, name) = match rest.rsplit_once('.') {
+        Some((sub, name)) => (Some(sub.to_owned()), name.to_owned()),
+        None => (None, rest.to_owned()),
+    };
+    Occurrence {
+        section: section.to_owned(),
+        subsection,
+        name,
+        key,
+        value,
+        path: None,
+    }
 }
 
 /// The second copy of a `-c key=value`, discounted once per override.

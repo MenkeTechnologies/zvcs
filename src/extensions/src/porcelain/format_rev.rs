@@ -363,7 +363,7 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
     // Built once: `%aN`/`%aE`/`%cN`/`%cE` always resolve through the mailmap,
     // regardless of `log.mailmap`. An absent `.mailmap` yields an empty snapshot
     // whose resolution is the identity, matching git.
-    let mailmap = repo.open_mailmap();
+    let mailmap = crate::mailmap::Mailmap::read(Some(&repo));
 
     let in_term = if null_input { b'\0' } else { b'\n' };
     let out_term = if null_output { b'\0' } else { b'\n' };
@@ -959,7 +959,7 @@ fn emit_rev(
     repo: &gix::Repository,
     record: &[u8],
     format: &Format,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let Ok(id) = repo.rev_parse_single(record.as_bstr()) else {
@@ -987,7 +987,7 @@ fn emit_text(
     record: &[u8],
     format: &Format,
     hex_len: usize,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let mut i = 0;
@@ -1028,7 +1028,7 @@ fn render(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     format: &Format,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let cr = commit.decode()?;
@@ -1051,7 +1051,7 @@ fn render_user(
     commit: &gix::Commit<'_>,
     cr: &gix::objs::CommitRef<'_>,
     items: &[Item],
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     // The deferred state `struct format_commit_context` carries.
@@ -1143,7 +1143,7 @@ fn render_placeholder(
     commit: &gix::Commit<'_>,
     cr: &gix::objs::CommitRef<'_>,
     ph: &Ph,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let id = commit.id;
@@ -1185,13 +1185,9 @@ fn render_placeholder(
                         Who::Author => cr.author()?,
                         Who::Committer => cr.committer()?,
                     };
-                    let resolved = mailmap.try_resolve_ref(sig);
-                    let val = if *email {
-                        resolved.and_then(|r| r.email).unwrap_or(sig.email)
-                    } else {
-                        resolved.and_then(|r| r.name).unwrap_or(sig.name)
-                    };
-                    out.extend_from_slice(val.as_bytes());
+                    let (mut name, mut mail): (&[u8], &[u8]) = (sig.name, sig.email);
+                    mailmap.map_user(&mut mail, &mut name);
+                    out.extend_from_slice(if *email { mail } else { name });
                 }
                 Ph::Subject => out.extend_from_slice(&subject(&msg[subject_off(msg)..])),
                 Ph::SanitizedSubject => {

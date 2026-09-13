@@ -34,6 +34,7 @@ pub mod jobpool;
 pub mod jobrun;
 pub mod listcmds;
 pub mod lock;
+pub mod mailmap;
 pub mod merge_apply;
 pub mod merge_guard;
 pub mod merge_msg;

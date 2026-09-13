@@ -731,8 +731,8 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     let repo = crate::setup::discover().ok();
     let mailmap = repo
         .as_ref()
-        .map(gix::Repository::open_mailmap)
-        .unwrap_or_default();
+        .map(|repo| crate::mailmap::Mailmap::read(Some(repo)))
+        .unwrap_or_else(|| crate::mailmap::Mailmap::read(None));
 
     // git's revision setup runs outside a repository too (shortlog can read
     // stdin), but rejects any positional argument there — a revision, a `^rev`
@@ -1699,7 +1699,7 @@ fn message_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> 
 fn commit_records(
     repo: &gix::Repository,
     ids: &[(ObjectId, Option<Vec<ObjectId>>)],
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     opts: &Opts,
 ) -> Result<Vec<(Vec<BString>, BString)>> {
     // Sixteen commits per worker: one record is a single object read plus a
@@ -1761,7 +1761,7 @@ fn one_record(
     repo: &gix::Repository,
     id: ObjectId,
     parents: Option<&[ObjectId]>,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     opts: &Opts,
 ) -> Result<(Vec<BString>, BString)> {
     let commit = repo.find_commit(id)?;
@@ -1791,7 +1791,7 @@ fn group_keys(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parents: Option<&[ObjectId]>,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     opts: &Opts,
 ) -> Result<Vec<BString>> {
     let mut keys: Vec<BString> = Vec::new();
@@ -1852,7 +1852,7 @@ fn expand_format(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parents: Option<&[ObjectId]>,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     fmt: &str,
     date_format: Option<&str>,
 ) -> Result<BString> {
@@ -1927,7 +1927,7 @@ fn expand_one(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parents: Option<&[ObjectId]>,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     bytes: &[u8],
     at: &mut usize,
     date_format: Option<&str>,
@@ -2055,21 +2055,20 @@ fn expand_one(
                     return unconsumed(at);
                 };
                 i += 1;
-                let (mapped_name, mapped_email) = match mailmap.try_resolve_ref(sig) {
-                    Some(resolved) => (resolved.name, resolved.email),
-                    None => (None, None),
-                };
+                // `format_person_part()` (pretty.c:806-807): `mailmap_name()`.
+                let (mut mapped_name, mut mapped_email): (&[u8], &[u8]) = (sig.name, sig.email);
+                mailmap.map_user(&mut mapped_email, &mut mapped_name);
                 match which {
                     b'n' => out.extend_from_slice(sig.name),
                     b'e' => out.extend_from_slice(sig.email),
-                    b'N' => out.extend_from_slice(mapped_name.unwrap_or(sig.name)),
-                    b'E' => out.extend_from_slice(mapped_email.unwrap_or(sig.email)),
+                    b'N' => out.extend_from_slice(mapped_name),
+                    b'E' => out.extend_from_slice(mapped_email),
                     // `%al`/`%aL`: the local-part of the email (up to the first
                     // `@`). git's `format_person_part` runs the mailmap for `L`
                     // (part `N`/`E`/`L`) before taking the local-part, so `L`
                     // reads the resolved address and `l` the commit's own.
                     b'l' => out.extend_from_slice(local_part(sig.email)),
-                    b'L' => out.extend_from_slice(local_part(mapped_email.unwrap_or(sig.email))),
+                    b'L' => out.extend_from_slice(local_part(mapped_email.as_bstr())),
                     // Date sub-forms. `%at`/`%ct` epoch, `%ai`/`%ci` ISO,
                     // `%aI`/`%cI` strict ISO, `%aD`/`%cD` RFC2822, `%as`/`%cs`
                     // short (always, independent of `--date`), `%ad`/`%cd` the
@@ -2224,20 +2223,18 @@ fn local_part(email: &BStr) -> &[u8] {
 /// This is git's `%aN` / `%aN <%aE>` (or the `%c*` pair for `--committer`).
 fn format_ident(
     sig: gix::actor::SignatureRef<'_>,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     email: bool,
 ) -> BString {
-    // `ResolvedSignature` is not `Copy`, so read both fields out in one go.
-    let (mapped_name, mapped_email) = match mailmap.try_resolve_ref(sig) {
-        Some(resolved) => (resolved.name, resolved.email),
-        None => (None, None),
-    };
+    // `insert_one_record()` (shortlog.c:111): `map_user()` over the pair.
+    let (mut mapped_name, mut mapped_email): (&[u8], &[u8]) = (sig.name, sig.email);
+    mailmap.map_user(&mut mapped_email, &mut mapped_name);
 
-    let mut out = BString::from(mapped_name.unwrap_or(sig.name).to_vec());
+    let mut out = BString::from(mapped_name.to_vec());
     if email {
         out.push(b' ');
         out.push(b'<');
-        out.extend_from_slice(mapped_email.unwrap_or(sig.email));
+        out.extend_from_slice(mapped_email);
         out.push(b'>');
     }
     out
@@ -2356,7 +2353,7 @@ fn render(groups: &BTreeMap<BString, Group>, opts: &Opts, out: &mut Vec<u8>) {
 /// then take the first non-blank line of the message body as the subject.
 fn read_from_stdin(
     groups: &mut BTreeMap<BString, Group>,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     opts: &Opts,
 ) -> Result<()> {
     let mut buf = Vec::new();

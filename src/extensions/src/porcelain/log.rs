@@ -3971,16 +3971,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         nodes.retain(|n| n.parents.len() <= max);
     }
 
-    // `--use-mailmap` / `log.mailmap`: loaded once (worktree `.mailmap`, then
-    // `mailmap.blob`, then `mailmap.file`) and shared by every rendered record.
-    // `%aN`/`%aE`/`%cN`/`%cE` resolve through the mailmap whether or not the header
-    // formats do, so a format that names one loads it even under `--no-use-mailmap`.
-    let format_maps_identities = match &pretty {
-        Pretty::User(f) => format_names_mapped_identity(f),
-        _ => false,
-    };
-    let mailmap = (use_mailmap || format_maps_identities)
-        .then(|| std::sync::Arc::new(Mailmap::load(&repo)));
+    // `--use-mailmap` / `log.mailmap`: `rev->mailmap`, read once (builtin/log.c:342-346)
+    // and shared by every rendered record. `%aN`/`%aE` read their own copy.
+    let mailmap = use_mailmap
+        .then(|| std::sync::Arc::new(Mailmap::read(Some(&repo))));
 
     // `--grep`/`--author`/`--committer` header/message filtering, applied during
     // selection — before `--skip`/`--max-count`, exactly as git does.
@@ -4837,7 +4831,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         decorate,
         source_mode,
         mailmap: use_mailmap.then(|| mailmap.as_deref()).flatten(),
-        identity_mailmap: mailmap.as_deref(),
         terminator,
         rec_term: if z { 0u8 } else { b'\n' },
         empty_user_format,
@@ -6528,9 +6521,6 @@ struct EntryParams<'a> {
     /// `--use-mailmap` / `log.mailmap`: the loaded mailmap, or `None` when the
     /// identities are shown as recorded.
     mailmap: Option<&'a Mailmap>,
-    /// The mailmap `%aN`/`%aE`/`%cN`/`%cE` read, which is loaded even when the
-    /// header formats are not routed through one.
-    identity_mailmap: Option<&'a Mailmap>,
     terminator: bool,
     /// `-z`: the byte a `tformat:` record is terminated with.
     rec_term: u8,
@@ -6749,7 +6739,6 @@ fn entry_block_from(
         },
         show_signature: p.show_signature,
         mailmap: p.mailmap,
-        identity_mailmap: p.identity_mailmap,
         notes: p.notes,
         notes_shown: p.notes_shown,
         repo,
@@ -8589,16 +8578,21 @@ pub(super) fn email_config(repo: &gix::Repository) -> (String, bool) {
 ///
 /// Shared by `--pretty=email`'s author block and `git show`'s annotated-tag
 /// header, which `show_tag_object()` puts through the same `pp_user_info()`.
+///
+/// `pp_user_info()` runs `map_user()` over the identity first when the context
+/// carries a mailmap (pretty.c:539-540).
 pub(super) fn write_identity_headers_for(
     sb: &mut String,
     who: &gix::actor::SignatureRef<'_>,
     encode: bool,
+    mailmap: Option<&Mailmap>,
 ) -> Result<()> {
     let date = who.time()?.format(gix::date::time::format::GIT_RFC2822)?;
-    let name = who.name.to_str().map_err(|_| {
+    let (name, mail) = mapped_ident(who.name, who.email, mailmap);
+    let name = name.to_str().map_err(|_| {
         anyhow!("identity name is not valid UTF-8; RFC2047 encoding needs a known charset")
     })?;
-    let mail = who.email.to_str().map_err(|_| {
+    let mail = mail.to_str().map_err(|_| {
         anyhow!("identity email is not valid UTF-8; RFC2047 encoding needs a known charset")
     })?;
     super::format_patch::write_identity_headers(sb, name, mail, &date, encode);
@@ -8610,6 +8604,7 @@ pub(super) fn email_body(
     commit: &gix::Commit<'_>,
     pretty: &Pretty,
     style: EmailStyle,
+    mailmap: Option<&Mailmap>,
 ) -> Result<()> {
     let raw = commit.message_raw()?;
     let author = commit.author()?;
@@ -8618,7 +8613,7 @@ pub(super) fn email_body(
     // `pp_header()` → `pp_user_info(pp, "Author", …)`, whose mail branch writes
     // `From:` and then the RFC2822 `Date:` (pretty.c:516-595). `add_merge_info()`
     // returns early for a mail format, so a merge has no `Merge:` line here.
-    write_identity_headers_for(&mut sb, &author, style.encode_headers)?;
+    write_identity_headers_for(&mut sb, &author, style.encode_headers, mailmap)?;
 
     let msg = super::format_patch::skip_blank_lines(raw);
     let (title, rest) = super::format_patch::format_subject(msg);
@@ -8891,7 +8886,6 @@ pub(crate) fn format_commit(
         decorate: DecorateStyle::Off,
         source: None,
         mailmap: None,
-        identity_mailmap: None,
         // `rebase -i` renders its instruction lines with no notes; `%N` in an
         // instruction format expands to nothing, as it does under git.
         notes: &[],
@@ -9508,16 +9502,10 @@ fn expand_one(
                     Some('n') => out.extend_from_slice(&rl.who_name),
                     Some('e') => out.extend_from_slice(&rl.who_email),
                     Some('N') => out.extend_from_slice(
-                        ctx.identity_mailmap
-                            .and_then(|m| m.lookup(&rl.who_name, &rl.who_email))
-                            .and_then(|info| info.name.as_deref())
-                            .unwrap_or(&rl.who_name),
+                        mapped_ident(&rl.who_name, &rl.who_email, Some(Mailmap::for_pretty(ctx.repo))).0,
                     ),
                     Some('E') => out.extend_from_slice(
-                        ctx.identity_mailmap
-                            .and_then(|m| m.lookup(&rl.who_name, &rl.who_email))
-                            .and_then(|info| info.email.as_deref())
-                            .unwrap_or(&rl.who_email),
+                        mapped_ident(&rl.who_name, &rl.who_email, Some(Mailmap::for_pretty(ctx.repo))).1,
                     ),
                     Some('s') => out.extend_from_slice(&rl.message),
                     _ => unreachable!("check_format rejected this already"),
@@ -10757,12 +10745,13 @@ fn expand_person(
     match part {
         Some('n') => out.extend_from_slice(who.name),
         Some('e') => out.extend_from_slice(who.email),
-        Some('N') => out.extend_from_slice(mapped_name(who, ctx.identity_mailmap)),
-        Some('E') => out.extend_from_slice(mapped_email(who, ctx.identity_mailmap)),
+        Some('N') => out.extend_from_slice(mapped_name(who, Some(Mailmap::for_pretty(ctx.repo)))),
+        Some('E') => out.extend_from_slice(mapped_email(who, Some(Mailmap::for_pretty(ctx.repo)))),
         Some('l') => out.extend_from_slice(&local_part(who.email)),
-        Some('L') => {
-            out.extend_from_slice(&local_part(mapped_email(who, ctx.identity_mailmap)))
-        }
+        Some('L') => out.extend_from_slice(&local_part(mapped_email(
+            who,
+            Some(Mailmap::for_pretty(ctx.repo)),
+        ))),
         Some('d') => expand_date(out, who, date_mode, ctx.now)?,
         Some('D') => expand_date(out, who, DateMode::Rfc, ctx.now)?,
         Some('i') => expand_date(out, who, DateMode::Iso, ctx.now)?,
@@ -10912,7 +10901,6 @@ pub(crate) fn rev_list_pretty_body(
         decorate: DecorateStyle::Off,
         source: None,
         mailmap: None,
-        identity_mailmap: None,
         // `cmd_rev_list` never calls `init_display_notes`, so `rev-list --pretty`
         // prints no notes even where `log` would.
         notes: &[],
@@ -10942,7 +10930,7 @@ pub(crate) fn rev_list_pretty_body(
         // only `show_log()` calls — `rev-list` prints its own `commit <oid>`
         // header instead, above this body.
         Pretty::Email | Pretty::MboxRd => {
-            email_body(&mut out, commit, pretty, EmailStyle::REV_LIST)?;
+            email_body(&mut out, commit, pretty, EmailStyle::REV_LIST, None)?;
         }
         Pretty::User(fmt) => expand_format(&mut out, commit, fmt, &ctx)?,
         Pretty::Reference => {
@@ -11054,8 +11042,6 @@ pub(crate) struct ShowEntry<'a> {
     pub(crate) decorations: Option<&'a Decorations>,
     /// `--use-mailmap` / `log.mailmap`, for the `Author:`/`Commit:` lines.
     pub(crate) mailmap: Option<&'a Mailmap>,
-    /// The mailmap `%aN`/`%aE`/`%cN`/`%cE` resolve through regardless of the flag.
-    pub(crate) identity_mailmap: Option<&'a Mailmap>,
     /// The notes trees whose `Notes[ (<ref>)]:` blocks follow the message.
     pub(crate) notes: &'a [super::notes::Tree],
     /// Whether the notes display is on at all — see [`RenderCtx::notes_shown`].
@@ -11150,7 +11136,6 @@ impl<'r> EntryRenderer<'r> {
             decorate: opts.decorate,
             source: opts.source,
             mailmap: opts.mailmap,
-            identity_mailmap: opts.identity_mailmap,
             notes: opts.notes,
             notes_shown: opts.notes_shown,
             repo: self.repo,
@@ -11225,12 +11210,8 @@ struct RenderCtx<'a> {
     /// the built-in header formats through `.mailmap`. `None` leaves the
     /// identities as the commit recorded them. git applies it in `pp_user_info`
     /// only, so `oneline`, `raw` and user formats are unaffected — `%aN`/`%aE`
-    /// consult the mailmap on their own, independent of this flag.
+    /// read [`Mailmap::for_pretty`] on their own, independent of this flag.
     mailmap: Option<&'a Mailmap>,
-    /// The mailmap `%aN`/`%aE`/`%cN`/`%cE` resolve through. Loaded whenever a format
-    /// asks for them, even under `--no-use-mailmap`, which is what
-    /// `format_person_part()` does.
-    identity_mailmap: Option<&'a Mailmap>,
     /// The notes trees whose `Notes[ (<ref>)]:` blocks follow the message. Empty
     /// when notes are off; a user format reaches them only through `%N`.
     notes: &'a [super::notes::Tree],
@@ -11423,7 +11404,7 @@ fn render_entry(
         Pretty::Email | Pretty::MboxRd => {
             writeln!(out, "From {} Mon Sep 17 00:00:00 2001", commit.id())?;
             write_signature_block(out, commit, ctx)?;
-            email_body(out, commit, pretty, ctx.email)?;
+            email_body(out, commit, pretty, ctx.email, ctx.mailmap)?;
             // ```c
             // if ((ctx.fmt != CMIT_FMT_USERFORMAT) &&
             //     ctx.notes_message && *ctx.notes_message) {
@@ -11643,27 +11624,10 @@ fn write_reflog_header(out: &mut Vec<u8>, ctx: &RenderCtx<'_>) {
     out.push(b'\n');
 }
 
-/// Write git's `<label> <name> <<email>>` header line, mapped through the
-/// mailmap when `--use-mailmap` / `log.mailmap` supplied one — git's
-/// `pp_user_info`, which is the single place the built-in formats resolve an
-/// identity.
-/// Whether a user format names `%aN`, `%aE`, `%cN` or `%cE` — the placeholders that
-/// resolve through `.mailmap` on their own, so their presence is what decides
-/// whether one has to be loaded.
-pub(crate) fn format_names_mapped_identity(fmt: &str) -> bool {
-    let bytes = fmt.as_bytes();
-    bytes.windows(3).any(|w| {
-        w[0] == b'%' && matches!(w[1], b'a' | b'c') && matches!(w[2], b'N' | b'E')
-    })
-}
-
 /// `format_person_part()`'s `N`: the mailmap's name for an identity, or the one the
 /// commit recorded when nothing maps it.
 fn mapped_name<'a>(sig: &'a gix::actor::SignatureRef<'a>, mailmap: Option<&'a Mailmap>) -> &'a [u8] {
-    mailmap
-        .and_then(|m| m.lookup(sig.name, sig.email))
-        .and_then(|info| info.name.as_deref())
-        .unwrap_or(sig.name)
+    mapped_ident(sig.name, sig.email, mailmap).0
 }
 
 /// `format_person_part()`'s `E`: the same for the address.
@@ -11671,27 +11635,32 @@ fn mapped_email<'a>(
     sig: &'a gix::actor::SignatureRef<'a>,
     mailmap: Option<&'a Mailmap>,
 ) -> &'a [u8] {
-    mailmap
-        .and_then(|m| m.lookup(sig.name, sig.email))
-        .and_then(|info| info.email.as_deref())
-        .unwrap_or(sig.email)
+    mapped_ident(sig.name, sig.email, mailmap).1
 }
 
+/// `(name, email)` after `map_user()` (mailmap.c:300-336) when a mailmap is in
+/// effect, as recorded otherwise.
+pub(crate) fn mapped_ident<'a>(
+    name: &'a [u8],
+    email: &'a [u8],
+    mailmap: Option<&'a Mailmap>,
+) -> (&'a [u8], &'a [u8]) {
+    let (mut name, mut email) = (name, email);
+    if let Some(map) = mailmap {
+        map.map_user(&mut email, &mut name);
+    }
+    (name, email)
+}
+
+/// `pp_user_info()` (pretty.c:539-540): the `Author:`/`Commit:` header line, run
+/// through `map_user()` when the pretty context carries a mailmap.
 pub(crate) fn write_person(
     out: &mut Vec<u8>,
     label: &[u8],
     sig: &gix::actor::SignatureRef<'_>,
     mailmap: Option<&Mailmap>,
 ) {
-    let (mut name, mut email): (&[u8], &[u8]) = (sig.name, sig.email);
-    if let Some(info) = mailmap.and_then(|m| m.lookup(name, email)) {
-        if let Some(e) = &info.email {
-            email = e;
-        }
-        if let Some(n) = &info.name {
-            name = n;
-        }
-    }
+    let (name, email) = mapped_ident(sig.name, sig.email, mailmap);
     out.extend_from_slice(label);
     out.extend_from_slice(name);
     out.extend_from_slice(b" <");
@@ -11699,102 +11668,9 @@ pub(crate) fn write_person(
     out.extend_from_slice(b">\n");
 }
 
-/// git's mailmap lookup structure (`mailmap.c`), built from the entries
-/// gitoxide parsed out of the repository's mailmap sources.
-///
-/// `gix_mailmap::Snapshot::resolve` cannot be used directly: it also normalizes
-/// the *case* of the address to the mailmap's spelling, even for an entry that
-/// only renames the author. git leaves the address exactly as the commit
-/// recorded it there, so `Renamed Nick <NICK@X.com>` keeps its capitals. Only
-/// the lookup is reimplemented here; finding, reading and parsing the mailmap
-/// files is still gitoxide's (`Repository::open_mailmap`).
-#[derive(Default)]
-pub(crate) struct Mailmap {
-    /// Keyed by the ASCII-lowercased old email, which is how git's `strcasecmp`
-    /// comparison behaves.
-    by_email: HashMap<Vec<u8>, MailmapEmail>,
-}
+/// The shared port of `mailmap.c`.
+pub(crate) use crate::mailmap::Mailmap;
 
-/// All entries sharing one commit email — git's `struct mailmap_entry`.
-#[derive(Default)]
-struct MailmapEmail {
-    /// The mapping used when no `<old-name>` qualifier matched.
-    simple: MailmapInfo,
-    /// Name-qualified mappings, keyed by the ASCII-lowercased old name.
-    by_name: HashMap<Vec<u8>, MailmapInfo>,
-}
-
-/// The replacement name and/or email a matched entry supplies — git's
-/// `struct mailmap_info`. An entry with neither is "no match".
-#[derive(Default)]
-pub(crate) struct MailmapInfo {
-    name: Option<Vec<u8>>,
-    email: Option<Vec<u8>>,
-}
-
-impl Mailmap {
-    /// Load every mailmap source gitoxide knows about (worktree `.mailmap`, then
-    /// `mailmap.blob`, then `mailmap.file`) and index it git's way.
-    pub(crate) fn load(repo: &gix::Repository) -> Mailmap {
-        let snapshot = repo.open_mailmap();
-        let mut map = Mailmap::default();
-        // git's `add_mapping`: a name-qualified line owns its own sub-entry, an
-        // unqualified line overrides only the fields it carries.
-        for entry in snapshot.entries() {
-            let slot = map.by_email.entry(lower_ascii(entry.old_email())).or_default();
-            match entry.old_name() {
-                None => {
-                    if let Some(n) = entry.new_name() {
-                        slot.simple.name = Some(n.to_vec());
-                    }
-                    if let Some(e) = entry.new_email() {
-                        slot.simple.email = Some(e.to_vec());
-                    }
-                }
-                Some(old_name) => {
-                    slot.by_name.insert(
-                        lower_ascii(old_name),
-                        MailmapInfo {
-                            name: entry.new_name().map(|n| n.to_vec()),
-                            email: entry.new_email().map(|e| e.to_vec()),
-                        },
-                    );
-                }
-            }
-        }
-        map
-    }
-
-    /// git's `map_user`: find the email, then prefer a name-qualified sub-entry
-    /// when one matches, else fall back to the unqualified mapping.
-    /// The identity as the mailmap reports it: each half replaced where a mapping
-    /// covers it, kept as recorded otherwise.
-    pub(crate) fn mapped(&self, name: &[u8], email: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        match self.lookup(name, email) {
-            None => (name.to_vec(), email.to_vec()),
-            Some(info) => (
-                info.name.clone().unwrap_or_else(|| name.to_vec()),
-                info.email.clone().unwrap_or_else(|| email.to_vec()),
-            ),
-        }
-    }
-
-    fn lookup(&self, name: &[u8], email: &[u8]) -> Option<&MailmapInfo> {
-        let slot = self.by_email.get(&lower_ascii(email))?;
-        let info = if slot.by_name.is_empty() {
-            &slot.simple
-        } else {
-            slot.by_name.get(&lower_ascii(name)).unwrap_or(&slot.simple)
-        };
-        (info.name.is_some() || info.email.is_some()).then_some(info)
-    }
-}
-
-/// The ASCII-lowercased lookup key for a mailmap email or name, matching the
-/// `strcasecmp` git compares them with.
-fn lower_ascii(s: &[u8]) -> Vec<u8> {
-    s.iter().map(u8::to_ascii_lowercase).collect()
-}
 
 /// Write a raw-format identity line: `<role> <name> <<email>> <seconds> +ZZZZ`.
 fn write_raw_ident(out: &mut Vec<u8>, role: &[u8], sig: &gix::actor::SignatureRef<'_>) -> Result<()> {

@@ -1845,7 +1845,7 @@ fn collect_commit_info(
     // (`builtin/blame.c:177-184`), so every identity blame prints — human column,
     // porcelain `author`/`author-mail`, `committer`/`committer-mail` — is the mapped one.
     // There is no `--no-use-mailmap` to turn it off; blame has no such option.
-    let mailmap = repo.open_mailmap();
+    let mailmap = crate::mailmap::Mailmap::read(Some(repo));
     let mut info: HashMap<ObjectId, CommitInfo> = HashMap::new();
     for line in lines {
         if info.contains_key(&line.commit_id) {
@@ -1859,14 +1859,8 @@ fn collect_commit_info(
             let committer = commit.committer()?;
             // `map_user()` rewrites only the name and the e-mail; the timestamp it
             // is handed is left alone, so the date columns keep the commit's own.
-            let author_id = mailmap.resolve_cow(author);
-            let committer_id = mailmap.resolve_cow(committer);
-            let (author_name, author_mail) =
-                (author_id.name.as_ref().to_vec(), author_id.email.as_ref().to_vec());
-            let (committer_name, committer_mail) = (
-                committer_id.name.as_ref().to_vec(),
-                committer_id.email.as_ref().to_vec(),
-            );
+            let (author_name, author_mail) = mailmap.mapped(author.name, author.email);
+            let (committer_name, committer_mail) = mailmap.mapped(committer.name, committer.email);
             let author_time = author.time().ok();
             let committer_time = committer.time().ok();
             // Reduced to owned values before the struct literal: the iterator

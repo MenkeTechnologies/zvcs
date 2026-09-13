@@ -560,7 +560,7 @@ fn shortlog(
 ) -> Result<()> {
     use std::collections::BTreeMap;
 
-    let mailmap = repo.open_mailmap();
+    let mailmap = crate::mailmap::Mailmap::read(Some(repo));
     let mut groups: BTreeMap<BString, Vec<BString>> = BTreeMap::new();
 
     let walk = repo
@@ -572,10 +572,7 @@ fn shortlog(
     for info in walk {
         let commit = info?.object()?;
         let sig = commit.author()?.trim();
-        let ident = match mailmap.try_resolve_ref(sig) {
-            Some(resolved) => BString::from(resolved.name.unwrap_or(sig.name).to_vec()),
-            None => BString::from(sig.name.to_vec()),
-        };
+        let ident = BString::from(mailmap.mapped(sig.name, sig.email).0);
 
         let message = commit.message()?;
         let subject = message.summary();

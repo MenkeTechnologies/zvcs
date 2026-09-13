@@ -1,15 +1,9 @@
 //! `git check-mailmap` — show canonical names and email addresses of contacts.
 //!
-//! A faithful port of git's `builtin/check-mailmap.c` together with the two
-//! routines it leans on: `split_ident_line()` from `ident.c` (which decides what
-//! part of a contact is the name and what part is the email) and `map_user()`
-//! from `mailmap.c` (the two-level, case-insensitive email → name lookup). The
-//! mailmap *files* are parsed by the vendored `gix-mailmap` crate; the lookup
-//! structure and the replacement rules are reimplemented here because
-//! `gix_mailmap::Snapshot::resolve` deliberately case-normalises the email even
-//! when the matched entry carries no replacement address, which git does not do
-//! (`<BuGs@x.com>` against an entry mapping only a name keeps the input casing).
-//! Going through git's own structure keeps stdout byte-identical.
+//! A faithful port of git's `builtin/check-mailmap.c` together with
+//! `split_ident_line()` from `ident.c` (which decides what part of a contact is
+//! the name and what part is the email). Reading the mailmap sources and
+//! `map_user()` are the shared [`crate::mailmap`] port of `mailmap.c`.
 //!
 //! Covered: `<contact>...`, `--stdin`, `--mailmap-file=<file>`,
 //! `--mailmap-blob=<blob>`, their `--no-` forms, `--`, `-h`, unique-prefix
@@ -19,18 +13,12 @@
 //! `--mailmap-file`, each later source overriding earlier ones). Exit codes
 //! match: 0 on success, 128 for `fatal: no contacts specified`, 129 for every
 //! usage error and for `-h`.
-//!
-//! Known deviation: line-level mailmap parsing is `gix-mailmap`'s, which trims
-//! whitespace inside `<...>` where git keeps it verbatim. Only mailmap files
-//! with padded addresses are affected; lookups are unchanged for well-formed
-//! files.
 
 use anyhow::Result;
-use std::collections::BTreeMap;
 use std::io::{BufWriter, Read, Write};
 use std::process::ExitCode;
 
-use gix::bstr::{BStr, BString, ByteSlice};
+use crate::mailmap::Mailmap;
 
 /// The exact `usage_with_options` block git prints for `-h` and usage errors.
 const USAGE: &str = "\
@@ -178,7 +166,15 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    let map = load_mailmap(&repo, &opts);
+    // cmd_check_mailmap() (builtin/check-mailmap.c:66-70): the configured
+    // sources, then `--mailmap-blob`, then `--mailmap-file`.
+    let mut map = Mailmap::read(Some(&repo));
+    if let Some(blob) = &opts.mailmap_blob {
+        map.read_blob(&repo, blob);
+    }
+    if let Some(file) = &opts.mailmap_file {
+        map.read_file(file);
+    }
 
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
@@ -246,14 +242,7 @@ fn emit(out: &mut impl Write, map: &Mailmap, contact: &[u8]) -> Result<()> {
     let (mut name, mut mail): (&[u8], &[u8]) =
         split_ident(contact).unwrap_or((b"".as_slice(), contact));
 
-    if let Some(info) = map.lookup(name, mail) {
-        if let Some(e) = &info.email {
-            mail = e;
-        }
-        if let Some(n) = &info.name {
-            name = n;
-        }
-    }
+    map.map_user(&mut mail, &mut name);
 
     if !name.is_empty() {
         out.write_all(name)?;
@@ -285,143 +274,4 @@ fn split_ident(line: &[u8]) -> Option<(&[u8], &[u8])> {
 /// `isspace` in the C locale, which is what git's ident parser sees.
 fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
-}
-
-/// The replacement name and/or email a matched mailmap entry supplies —
-/// git's `struct mailmap_info`.
-#[derive(Default)]
-struct Info {
-    name: Option<Vec<u8>>,
-    email: Option<Vec<u8>>,
-}
-
-impl Info {
-    /// git's `map_user` treats an entry with neither field set as "no match".
-    fn is_empty(&self) -> bool {
-        self.name.is_none() && self.email.is_none()
-    }
-}
-
-/// All entries sharing one commit email — git's `struct mailmap_entry`.
-#[derive(Default)]
-struct EmailEntry {
-    /// The mapping used when no `<old-name>` qualifier matched.
-    simple: Info,
-    /// Name-qualified mappings, keyed by the ASCII-lowercased old name.
-    by_name: BTreeMap<Vec<u8>, Info>,
-}
-
-/// The mailmap lookup structure, keyed by ASCII-lowercased old email.
-///
-/// git compares both keys with `strcasecmp`, so folding to lowercase bytes on
-/// insert and lookup reproduces its matching exactly.
-#[derive(Default)]
-struct Mailmap {
-    by_email: BTreeMap<Vec<u8>, EmailEntry>,
-}
-
-impl Mailmap {
-    /// git's `add_mapping`: a name-qualified line replaces its sub-entry
-    /// wholesale, an unqualified line overrides only the fields it carries.
-    fn add(&mut self, entry: gix::mailmap::Entry<'_>) {
-        let slot = self.by_email.entry(lower(entry.old_email())).or_default();
-        match entry.old_name() {
-            None => {
-                if let Some(n) = entry.new_name() {
-                    slot.simple.name = Some(n.to_vec());
-                }
-                if let Some(e) = entry.new_email() {
-                    slot.simple.email = Some(e.to_vec());
-                }
-            }
-            Some(old_name) => {
-                slot.by_name.insert(
-                    lower(old_name),
-                    Info {
-                        name: entry.new_name().map(|n| n.to_vec()),
-                        email: entry.new_email().map(|e| e.to_vec()),
-                    },
-                );
-            }
-        }
-    }
-
-    /// git's `map_user`: find the email, then prefer a name-qualified sub-entry
-    /// when one matches, else fall back to the unqualified mapping.
-    fn lookup(&self, name: &[u8], email: &[u8]) -> Option<&Info> {
-        let slot = self.by_email.get(&lower(email))?;
-        let info = if slot.by_name.is_empty() {
-            &slot.simple
-        } else {
-            slot.by_name.get(&lower(name)).unwrap_or(&slot.simple)
-        };
-        (!info.is_empty()).then_some(info)
-    }
-}
-
-/// The ASCII-lowercased lookup key for an email or name.
-fn lower(s: &[u8]) -> Vec<u8> {
-    s.iter().map(u8::to_ascii_lowercase).collect()
-}
-
-/// Merge one mailmap source, skipping unparsable lines as git does.
-fn merge(map: &mut Mailmap, bytes: &[u8]) {
-    for entry in gix::mailmap::parse_ignore_errors(bytes) {
-        map.add(entry);
-    }
-}
-
-/// Read every mailmap source in git's precedence order — later sources win.
-///
-/// Unreadable files and unresolvable blobs are skipped silently, matching
-/// `read_mailmap`, which never fails an operation over a missing mailmap.
-fn load_mailmap(repo: &gix::Repository, opts: &Opts) -> Mailmap {
-    let mut map = Mailmap::default();
-
-    let cfg = repo.config_snapshot();
-    // In a bare repository git defaults `mailmap.blob` to `HEAD:.mailmap`.
-    let cfg_blob: Option<BString> = match cfg.string("mailmap.blob") {
-        Some(spec) => Some(spec),
-        None if repo.workdir().is_none() => Some(BString::from("HEAD:.mailmap")),
-        None => None,
-    };
-    let cfg_file = cfg.trusted_path("mailmap.file").ok().flatten();
-
-    // 1. `.mailmap` at the top of the working tree.
-    if let Some(root) = repo.workdir() {
-        merge_file(&mut map, root.join(".mailmap"));
-    }
-    // 2. the configured `mailmap.blob`, or the bare-repository default.
-    if let Some(spec) = &cfg_blob {
-        merge_blob(&mut map, repo, spec.as_bstr());
-    }
-    // 3. the configured `mailmap.file`.
-    if let Some(path) = &cfg_file {
-        merge_file(&mut map, path);
-    }
-    // 4. `--mailmap-blob`, then 5. `--mailmap-file`, which therefore wins.
-    if let Some(spec) = &opts.mailmap_blob {
-        merge_blob(&mut map, repo, spec.as_str().into());
-    }
-    if let Some(path) = &opts.mailmap_file {
-        merge_file(&mut map, path);
-    }
-
-    map
-}
-
-/// Merge a mailmap file, ignoring it when it cannot be read.
-fn merge_file(map: &mut Mailmap, path: impl AsRef<std::path::Path>) {
-    if let Ok(bytes) = std::fs::read(path) {
-        merge(map, &bytes);
-    }
-}
-
-/// Merge the blob a revspec names, ignoring it when it cannot be resolved.
-fn merge_blob(map: &mut Mailmap, repo: &gix::Repository, spec: &BStr) {
-    if let Ok(id) = repo.rev_parse_single(spec) {
-        if let Ok(obj) = id.object() {
-            merge(map, &obj.data);
-        }
-    }
 }

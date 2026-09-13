@@ -1393,15 +1393,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         );
         Some(super::log::build_decorations(&repo, &filter)?)
     };
-    // `--use-mailmap` / `log.mailmap`: loaded once and shared by every commit.
-    // `%aN`/`%aE`/`%cN`/`%cE` resolve through the mailmap whether or not the header
-    // formats do, so a format that names one loads it even under `--no-use-mailmap`
-    // — `format_person_part()` reads `pp->mailmap` unconditionally.
-    let format_maps_identities = match &pretty {
-        Pretty::User(f) => super::log::format_names_mapped_identity(f),
-        _ => false,
-    };
-    let mailmap = (use_mailmap || format_maps_identities).then(|| Mailmap::load(&repo));
+    // `--use-mailmap` / `log.mailmap`: `rev->mailmap`, read once and shared by every
+    // commit. `%aN`/`%aE` read their own copy ([`Mailmap::for_pretty`]).
+    let mailmap = use_mailmap.then(|| Mailmap::read(Some(&repo)));
 
     // git resolves every revision before rendering anything, so a bad revision
     // produces no stdout at all even when an earlier one was fine. Ranges (`a..b`),
@@ -1925,7 +1919,6 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         decorate,
         decorations: decorations.as_ref(),
         mailmap: use_mailmap.then(|| mailmap.as_ref()).flatten(),
-        identity_mailmap: mailmap.as_ref(),
         terminator,
         renderer: &renderer,
         rename_warn: &rename_warn,
@@ -2373,10 +2366,6 @@ struct DisplayOpts<'a> {
     /// `--use-mailmap` / `log.mailmap`: rewrites the `Author:`/`Commit:` lines
     /// through `.mailmap`. `None` shows the identity as the commit recorded it.
     mailmap: Option<&'a Mailmap>,
-    /// The mailmap `%aN`/`%aE`/`%cN`/`%cE` resolve through. `format_person_part()`
-    /// consults it whether or not `--use-mailmap` is on, so a format that names
-    /// one loads it even under `--no-use-mailmap`.
-    identity_mailmap: Option<&'a Mailmap>,
     /// `get_commit_format`'s terminator/separator answer for the selected format,
     /// which is `show_log()`'s `opt->use_terminator`.
     terminator: bool,
@@ -2602,6 +2591,7 @@ fn show_tag(
                 &mut sb,
                 &tagger,
                 disp.email.encode_headers,
+                None,
             )?;
             out.extend_from_slice(sb.as_bytes());
         }
@@ -3357,7 +3347,6 @@ fn show_commit_record(
             decorate: disp.decorate,
             decorations: disp.decorations,
             mailmap: disp.mailmap,
-            identity_mailmap: disp.identity_mailmap,
             notes: disp.notes,
             notes_shown: disp.notes_shown,
             expand_tabs: disp.expand_tabs,

@@ -3871,37 +3871,14 @@ fn parse_leading_i32(s: &str) -> i32 {
 /// rewriting the one line it would have found is the same thing, because
 /// `map_user()` only ever replaces the `Name <email>` span.
 fn apply_mailmap_to_line(repo: &gix::Repository, wholine: &[u8]) -> Vec<u8> {
-    let Some(lt) = wholine.iter().position(|&b| b == b'<') else {
-        return wholine.to_vec();
-    };
-    let Some(gt) = wholine[lt..].iter().position(|&b| b == b'>').map(|i| lt + i) else {
-        return wholine.to_vec();
-    };
-    // `split_ident_line()` trims the run of blanks before the `<`.
-    let name_end = wholine[..lt]
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map_or(0, |i| i + 1);
-    let name = &wholine[..name_end];
-    let email = &wholine[lt + 1..gt];
-
-    let mailmap = repo.open_mailmap();
-    let sig = gix::actor::SignatureRef {
-        name: name.into(),
-        email: email.into(),
-        time: "0 +0000",
-    };
-    let (mapped_name, mapped_email) = match mailmap.try_resolve_ref(sig) {
-        Some(resolved) => (resolved.name, resolved.email),
-        None => return wholine.to_vec(),
-    };
-
-    let mut out = mapped_name.unwrap_or(name.into()).to_vec();
-    out.extend_from_slice(b" <");
-    out.extend_from_slice(mapped_email.unwrap_or(email.into()));
-    out.push(b'>');
-    out.extend_from_slice(&wholine[gt + 1..]);
-    out
+    // `grab_person()` loads the mailmap once (`if (!mailmap.items)
+    // read_mailmap(...)`, ref-filter.c:1755-1756).
+    static MAILMAP: std::sync::OnceLock<crate::mailmap::Mailmap> = std::sync::OnceLock::new();
+    let mailmap = MAILMAP.get_or_init(|| crate::mailmap::Mailmap::read(Some(repo)));
+    let mut line = b"who ".to_vec();
+    line.extend_from_slice(wholine);
+    crate::mailmap::apply_mailmap_to_header(&mut line, &[b"who "], mailmap);
+    line.split_off(4)
 }
 
 /// Run `f` over the signature `w` names on `obj`, or return `None` when the

@@ -1751,7 +1751,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     let matcher = build_matcher(&repo, &extra.pathspec)?;
 
 
-    let mailmap = repo.open_mailmap();
+    let mailmap = crate::mailmap::Mailmap::read(Some(&repo));
     // `--notes[=<ref>]`/`--no-notes` are passed straight to the `git log`
     // upstream runs, so the display refs are the ones that log would have used.
     // Loaded once per range because upstream runs one log per range: a ref that
@@ -1895,7 +1895,7 @@ pub(super) fn show_range_diff(
         Err(_) => return Ok(Err(could_not_parse_log(repo, range2))),
     };
 
-    let mailmap = repo.open_mailmap();
+    let mailmap = crate::mailmap::Mailmap::read(Some(&repo));
     let notes = super::notes::load_display(repo, &opts.notes)?;
     let mut a = read_patches(repo, ends1, &mailmap, None, &opts.abbrev, &notes)?;
     let mut b = read_patches(repo, ends2, &mailmap, None, &opts.abbrev, &notes)?;
@@ -2680,7 +2680,7 @@ fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<O
 fn read_patches(
     repo: &gix::Repository,
     (tips, hidden): (Vec<ObjectId>, Vec<ObjectId>),
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     matcher: Option<&PathMatcher>,
     abbrev: &Abbrev,
     notes: &[super::notes::Tree],
@@ -2790,7 +2790,7 @@ fn build_patch(
     repo: &gix::Repository,
     id: ObjectId,
     index: usize,
-    mailmap: &gix::mailmap::Snapshot,
+    mailmap: &crate::mailmap::Mailmap,
     matcher: Option<&PathMatcher>,
     abbrev: &Abbrev,
     notes: &[super::notes::Tree],
@@ -2801,13 +2801,8 @@ fn build_patch(
     // upstream's header filter; `Date:` and `commit` are dropped.
     let mut text: Vec<u8> = Vec::new();
     let sig = commit.author()?;
-    let raw_name: &[u8] = sig.name.as_ref();
-    let raw_email: &[u8] = sig.email.as_ref();
-    let resolved = mailmap.try_resolve(sig);
-    let (name, email): (&[u8], &[u8]) = match &resolved {
-        Some(s) => (s.name.as_ref(), s.email.as_ref()),
-        None => (raw_name, raw_email),
-    };
+    let (mut name, mut email): (&[u8], &[u8]) = (sig.name.as_ref(), sig.email.as_ref());
+    mailmap.map_user(&mut email, &mut name);
     text.extend_from_slice(b" ## Metadata ##\nAuthor: ");
     text.extend_from_slice(name);
     text.extend_from_slice(b" <");

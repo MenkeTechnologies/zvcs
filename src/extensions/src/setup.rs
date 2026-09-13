@@ -366,7 +366,7 @@ fn is_inside_dir(dir: &Path) -> bool {
 /// It only shows up where the two directories overlap: `GIT_DIR=. GIT_WORK_TREE=<repo>`
 /// run from `<repo>/.git` is inside the git directory as the shell sees it and
 /// outside it as git does, because git moved to `<repo>` first.
-fn setup_cwd(repo: &gix::Repository) -> Option<PathBuf> {
+pub(crate) fn setup_cwd(repo: &gix::Repository) -> Option<PathBuf> {
     let cwd = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
     Some(match work_tree(repo) {
         Some(top) if cwd.starts_with(&top) => top,

@@ -614,6 +614,12 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             };
             match mode {
                 Mode::Type => println!("{}", header.kind()),
+                // `case 's'` (builtin/cat-file.c:154-169): under `--use-mailmap` a
+                // commit or tag reports its length after the identities are rewritten.
+                _ if use_mailmap && matches!(header.kind(), Kind::Commit | Kind::Tag) => {
+                    let mm = crate::mailmap::Mailmap::read(Some(&repo));
+                    println!("{}", apply_mailmap(&repo.find_object(oid)?.data, &mm).len());
+                }
                 _ => println!("{}", header.size()),
             }
             Ok(ExitCode::SUCCESS)
@@ -648,7 +654,7 @@ fn print_object(
     if kind == Kind::Tree {
         write_tree_listing(&mut out, data, oid.kind())?;
     } else if use_mailmap && matches!(kind, Kind::Commit | Kind::Tag) {
-        let mm = repo.open_mailmap();
+        let mm = crate::mailmap::Mailmap::read(Some(repo));
         out.write_all(&apply_mailmap(data, &mm))?;
     } else {
         // blob / commit / tag: raw content, no added newline.
@@ -696,7 +702,7 @@ fn type_mode(
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     if use_mailmap && matches!(want, Kind::Commit | Kind::Tag) {
-        let mm = repo.open_mailmap();
+        let mm = crate::mailmap::Mailmap::read(Some(repo));
         out.write_all(&apply_mailmap(&peeled.data, &mm))?;
     } else {
         out.write_all(&peeled.data)?;
@@ -1473,7 +1479,7 @@ fn run_batch(
 
     let repo = crate::setup::discover()?;
     let mailmap = if use_mailmap {
-        Some(repo.open_mailmap())
+        Some(crate::mailmap::Mailmap::read(Some(&repo)))
     } else {
         None
     };
@@ -1660,7 +1666,7 @@ fn handle_command(
     buffer: bool,
     delim: u8,
     filter: Option<&ObjFilter>,
-    mailmap: Option<&gix::mailmap::Snapshot>,
+    mailmap: Option<&crate::mailmap::Mailmap>,
     transform: Option<&mut Transform<'_>>,
     follow_symlinks: bool,
 ) -> Result<CommandResult> {
@@ -1779,7 +1785,7 @@ fn process_request(
     want_contents: bool,
     delim: u8,
     filter: Option<&ObjFilter>,
-    mailmap: Option<&gix::mailmap::Snapshot>,
+    mailmap: Option<&crate::mailmap::Mailmap>,
     split_rest: bool,
     transform: Option<&mut Transform<'_>>,
     follow_symlinks: bool,
@@ -1920,7 +1926,7 @@ fn emit_follow(
     want_contents: bool,
     delim: u8,
     filter: Option<&ObjFilter>,
-    mailmap: Option<&gix::mailmap::Snapshot>,
+    mailmap: Option<&crate::mailmap::Mailmap>,
     transform: Option<&mut Transform<'_>>,
 ) -> Result<EmitOutcome> {
     match resolve_follow_symlinks(repo, name) {
@@ -2209,9 +2215,17 @@ fn emit_object(
     rest: &[u8],
     want_contents: bool,
     delim: u8,
-    mailmap: Option<&gix::mailmap::Snapshot>,
+    mailmap: Option<&crate::mailmap::Mailmap>,
     transform: Option<&mut Transform<'_>>,
 ) -> Result<EmitOutcome> {
+    // `batch_object_write()` (builtin/cat-file.c:545-553): under `--use-mailmap` a
+    // commit or tag is rewritten before its info line is formatted, so
+    // `%(objectsize)` and the default format report the rewritten length.
+    let mapped = match (mailmap, kind) {
+        (Some(mm), Kind::Commit | Kind::Tag) => Some(apply_mailmap(&repo.find_object(oid)?.data, mm)),
+        _ => None,
+    };
+    let size = mapped.as_ref().map_or(size, |data| data.len() as u64);
     let mut info = Vec::new();
     let disk = if fmt.has_disk_size {
         disk_size(repo, oid)?
@@ -2261,13 +2275,9 @@ fn emit_object(
                 },
             }
         } else {
-            let object = repo.find_object(oid)?;
-            // `%(objectsize)` above stays the on-disk size; mailmap only rewrites
-            // the emitted bytes of commit/tag objects.
-            if let (Some(mm), true) = (mailmap, matches!(kind, Kind::Commit | Kind::Tag)) {
-                out.write_all(&apply_mailmap(&object.data, mm))?;
-            } else {
-                out.write_all(&object.data)?;
+            match &mapped {
+                Some(data) => out.write_all(data)?,
+                None => out.write_all(&repo.find_object(oid)?.data)?,
             }
         }
         out.write_all(&[delim])?;
@@ -2277,89 +2287,13 @@ fn emit_object(
 
 // ---- mailmap ---------------------------------------------------------------
 
-/// Port of git's `apply_mailmap_to_header` + `rewrite_ident_line`: rewrite the
-/// author/committer/tagger identities in a commit or tag object using the
-/// mailmap, leaving every other byte (timestamps, message, signatures) intact.
-fn apply_mailmap(buf: &[u8], mm: &gix::mailmap::Snapshot) -> Vec<u8> {
-    const HEADERS: [&[u8]; 3] = [b"author ", b"committer ", b"tagger "];
-    let mut out = Vec::with_capacity(buf.len());
-    let mut i = 0;
-    loop {
-        // End of headers: a blank line or the end of the buffer. Copy the rest.
-        if i >= buf.len() || buf[i] == b'\n' {
-            out.extend_from_slice(&buf[i..]);
-            break;
-        }
-        let line_end = buf[i..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| i + p)
-            .unwrap_or(buf.len());
-        let line = &buf[i..line_end];
-
-        let mut matched = false;
-        for h in HEADERS {
-            if let Some(person) = line.strip_prefix(h) {
-                out.extend_from_slice(h);
-                match rewrite_ident(person, mm) {
-                    Some(rewritten) => out.extend_from_slice(&rewritten),
-                    None => out.extend_from_slice(person),
-                }
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
-            out.extend_from_slice(line);
-        }
-
-        if line_end < buf.len() {
-            out.push(b'\n');
-            i = line_end + 1;
-        } else {
-            i = line_end;
-        }
-    }
+/// `replace_idents_using_mailmap()` (builtin/cat-file.c:74-83): the object with
+/// its author/committer/tagger identities run through the mailmap. The result's
+/// length is the size every `--use-mailmap` report prints.
+fn apply_mailmap(buf: &[u8], mm: &crate::mailmap::Mailmap) -> Vec<u8> {
+    let mut out = buf.to_vec();
+    crate::mailmap::apply_mailmap_to_header(&mut out, &[b"author ", b"committer ", b"tagger "], mm);
     out
-}
-
-/// Rewrite a single `name <email> <time>` ident using the mailmap. Returns the
-/// replacement for `person` (everything after the `author `/`committer `/
-/// `tagger ` keyword), or `None` if the mailmap leaves it unchanged.
-fn rewrite_ident(person: &[u8], mm: &gix::mailmap::Snapshot) -> Option<Vec<u8>> {
-    // Locate `<email>` the way git's `split_ident_line` does.
-    let lt = person.iter().position(|&b| b == b'<')?;
-    let gt_rel = person[lt + 1..].iter().position(|&b| b == b'>')?;
-    let gt = lt + 1 + gt_rel;
-    let mail = &person[lt + 1..gt];
-
-    // The name is everything before `<`, with trailing whitespace trimmed.
-    let mut name_end = lt;
-    while name_end > 0 && (person[name_end - 1] == b' ' || person[name_end - 1] == b'\t') {
-        name_end -= 1;
-    }
-    let name = &person[..name_end];
-
-    let sig = gix::actor::SignatureRef {
-        name: name.as_bstr(),
-        email: mail.as_bstr(),
-        time: "",
-    };
-    let resolved = mm.resolve_cow(sig);
-    let new_name = resolved.name.as_ref().to_vec();
-    let new_mail = resolved.email.as_ref().to_vec();
-    if new_name.as_slice() == name && new_mail.as_slice() == mail {
-        return None;
-    }
-
-    // Rebuild `name <email>`, preserving the ` <time> <tz>` tail after `>`.
-    let mut rebuilt = Vec::with_capacity(person.len());
-    rebuilt.extend_from_slice(&new_name);
-    rebuilt.extend_from_slice(b" <");
-    rebuilt.extend_from_slice(&new_mail);
-    rebuilt.push(b'>');
-    rebuilt.extend_from_slice(&person[gt + 1..]);
-    Some(rebuilt)
 }
 
 /// `ls-tree`-style listing: `<mode6> <type> <hash>\t<name>` per entry.

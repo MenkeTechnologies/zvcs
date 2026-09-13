@@ -4654,7 +4654,7 @@ fn parse_author_ident(s: &str) -> Result<(String, String)> {
 /// walk yields supplies the identity — mailmapped as well, which is why an
 /// address the mailmap rewrites away matches nothing.
 fn find_author_by_nickname(repo: &gix::Repository, nickname: &str) -> Result<String> {
-    let mailmap = std::sync::Arc::new(super::log::Mailmap::load(repo));
+    let mailmap = std::sync::Arc::new(crate::mailmap::Mailmap::read(Some(repo)));
     let filter = crate::revfilter::CommitFilter {
         ident_map: Some({
             let m = mailmap.clone();

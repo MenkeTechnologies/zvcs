@@ -868,16 +868,23 @@ fn apply_directory_rename_modifications(
         // along to the destination (`process_renames()`, merge-ort.c:3192-3211),
         // and with `path_conflict` set they stay there as stages.
         // `detect_and_apply()` takes them back for a rename/rename(1to2).
+        let as_entry = |e: NameEntry| ConflictIndexEntry {
+            mode: e.mode,
+            id: e.id,
+            path_hint: None,
+        };
+        let file_stage = |info: &PathInfo, stage: usize| info.stages[stage].filter(|e| !e.mode.is_tree());
         if let Some(source) = paths.get(pair.one.as_bstr()) {
-            for stage in [MERGE_BASE, 3 - side] {
-                entries[stage] = source.stages[stage]
-                    .filter(|e| !e.mode.is_tree())
-                    .map(|e| ConflictIndexEntry {
-                        mode: e.mode,
-                        id: e.id,
-                        path_hint: None,
-                    });
-            }
+            entries[MERGE_BASE] = file_stage(source, MERGE_BASE).map(as_entry);
+            entries[3 - side] = file_stage(source, 3 - side).map(as_entry);
+        }
+        // When the other side already has a version at the new path, that is
+        // the stage: two renames of one source meeting there are a
+        // rename/rename(1to1), and `process_renames()` only adds the base to
+        // the entry both landed on (merge-ort.c:2983-2995; t6423 13c, where
+        // A's x/d -> y/d meets B's x/d -> z/d moved to y/d).
+        if let Some(existing) = paths.get(new_path.as_bstr()).and_then(|dest| file_stage(dest, 3 - side)) {
+            entries[3 - side] = Some(as_entry(existing));
         }
     }
 

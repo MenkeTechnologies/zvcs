@@ -161,7 +161,7 @@ fn a_fleet_that_reads_completely_says_nothing_about_unreadable_repositories() {
     ok(&home, &r, &["commit", "-q", "--allow-empty", "-m", "c0"]);
     ok(&home, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
 
-    for verb in ["zdirty", "zcommits", "ztags", "zpristine", "zorphans"] {
+    for verb in ["zdirty", "zcommits", "ztags", "zpristine", "zorphans", "zsize"] {
         let out = both(&home, &root, &[verb]);
         assert!(!out.contains("unreadable"), "`git {verb}` reported an unreadable repository in a healthy fleet:\n{out}");
     }
@@ -190,4 +190,69 @@ fn a_property_is_not_asserted_about_a_repository_that_was_not_read() {
     assert!(orphans.contains("2 unreadable"), "zorphans must disclose what it could not read:\n{orphans}");
 
     restore(&root);
+}
+
+#[test]
+fn a_size_that_could_not_be_measured_is_not_reported_as_zero() {
+    let Some((root, home)) = fixture("size") else {
+        eprintln!("skipping: this process can read a 0o000 directory (running as root?)");
+        return;
+    };
+
+    // `dir_size` answered 0 for a directory it could not open, which is what it
+    // answers for an empty one, and that 0 went into a total presented as the
+    // size of the fleet.
+    let out = both(&home, &root, &["zsize"]);
+    assert_eq!(
+        out.matches("(unreadable)").count(),
+        2,
+        "a repository whose size could not be measured must not print a size:\n{out}"
+    );
+    assert!(out.contains("2 unreadable"), "the total must disclose what it left out:\n{out}");
+    assert!(!out.contains("0B"), "an unmeasurable repository must not be reported as empty:\n{out}");
+
+    restore(&root);
+}
+
+#[test]
+fn a_partially_readable_tree_reports_its_size_as_a_floor() {
+    use std::os::unix::fs::PermissionsExt;
+    // A repository that opens fine but has one unreadable directory inside it:
+    // the walk cannot enter, so the number it returns is a floor. Printing that
+    // as the size is a precise-looking answer that is simply short.
+    let root = std::env::temp_dir().join(format!("zvcs-unread-partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    ok(&home, &repo, &["init", "-q", "-b", "main"]);
+    ok(&home, &repo, &["config", "user.email", "t@example"]);
+    ok(&home, &repo, &["config", "user.name", "T"]);
+    std::fs::write(repo.join("f.txt"), b"v\n").unwrap();
+    ok(&home, &repo, &["add", "f.txt"]);
+    ok(&home, &repo, &["commit", "-q", "-m", "c0"]);
+    ok(&home, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
+
+    let objects = repo.join(".git/objects");
+    std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let enforced = std::fs::read_dir(&objects).is_err();
+    if !enforced {
+        eprintln!("skipping: this process can read a 0o000 directory (running as root?)");
+        let _ = std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+
+    let out = both(&home, &root, &["zsize"]);
+    assert!(
+        out.contains("at least"),
+        "a size the walk could not finish must be reported as a floor:\n{out}"
+    );
+    assert!(!out.contains("(unreadable)"), "the repository itself opened fine:\n{out}");
+
+    let _ = std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&root);
 }

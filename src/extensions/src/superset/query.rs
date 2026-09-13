@@ -300,42 +300,110 @@ fn remote_lines(repo: &gix::Repository) -> String {
 pub fn zsize(args: &[String]) -> Result<ExitCode> {
     let (json, args) = json_flag(args);
     let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
-    let sizes = parallel_map(&repos, |gd, _| dir_size(gd));
-    let mut rows: Vec<(u64, String)> = repos
+    let sizes = parallel_map(&repos, |gd, _| dir_size_checked(gd));
+    let mut rows: Vec<(Option<DirSize>, String)> = repos
         .iter()
         .zip(&sizes)
         .map(|((_, wd), s)| (*s, wd.display().to_string()))
         .collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0.map(|d| d.bytes).unwrap_or(0)));
     if json {
-        emit_json(rows.iter().map(|(size, path)| serde_json::json!({"repo": path, "bytes": size})));
+        // A repository that could not be read has no size; `null` says that,
+        // where a 0 would read as "empty".
+        emit_json(rows.iter().map(|(size, path)| {
+            serde_json::json!({
+                "repo": path,
+                "bytes": size.map(|d| d.bytes),
+                "complete": size.map(|d| d.complete),
+            })
+        }));
         return Ok(ExitCode::SUCCESS);
     }
-    let total: u64 = sizes.iter().sum();
+    // Only what was actually measured is in the total.
+    let total: u64 = sizes.iter().flatten().map(|d| d.bytes).sum();
+    let unread = unreadable(&sizes);
+    let partial = sizes.iter().flatten().filter(|d| !d.complete).count();
     let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
     for (size, path) in &rows {
-        println!("{:<width$}  {:>8}", path, crate::superset::gitls::human_size(*size));
+        match size {
+            // `at least` because a tree the walk could not fully enter gives a
+            // floor, and a floor printed as a size is a number that is wrong.
+            Some(d) if d.complete => {
+                println!("{:<width$}  {:>8}", path, crate::superset::gitls::human_size(d.bytes))
+            }
+            Some(d) => println!(
+                "{:<width$}  {:>8}  (at least — part of the tree was unreadable)",
+                path,
+                crate::superset::gitls::human_size(d.bytes)
+            ),
+            None => println!("{path:<width$}  (unreadable)"),
+        }
     }
-    eprintln!("zsize: {} total across {} repos", crate::superset::gitls::human_size(total), rows.len());
+    let floor = if partial > 0 { "at least " } else { "" };
+    eprintln!(
+        "zsize: {floor}{} total across {} repos{}",
+        crate::superset::gitls::human_size(total),
+        rows.len(),
+        unreadable_note(unread)
+    );
     Ok(ExitCode::SUCCESS)
 }
 
 /// Recursively sum regular-file sizes under `p`, not following symlinks.
 pub(crate) fn dir_size(p: &Path) -> u64 {
-    let mut total = 0;
-    let Ok(entries) = std::fs::read_dir(p) else { return 0 };
+    measure(p).bytes
+}
+
+/// What a directory walk found, and whether it saw all of it.
+#[derive(Clone, Copy)]
+pub(crate) struct DirSize {
+    pub bytes: u64,
+    /// False when some directory below `p` could not be read, so `bytes` is a
+    /// floor rather than the size.
+    pub complete: bool,
+}
+
+/// Bytes under `p`, or `None` when `p` itself cannot be read.
+///
+/// `dir_size` answers 0 for a directory it cannot open, which is the same thing
+/// it answers for an empty one — so `zsize` reported `0B` against a repository
+/// whose git dir had been removed or whose permissions denied it, and summed
+/// that 0 into a total presented as the size of the fleet. A partially readable
+/// tree was worse: the number looked precise and was short by whatever the walk
+/// could not enter.
+pub(crate) fn dir_size_checked(p: &Path) -> Option<DirSize> {
+    if std::fs::read_dir(p).is_err() {
+        return None;
+    }
+    Some(measure(p))
+}
+
+/// The walk itself: sums what it can reach and records whether anything was out
+/// of reach.
+fn measure(p: &Path) -> DirSize {
+    let mut out = DirSize { bytes: 0, complete: true };
+    let Ok(entries) = std::fs::read_dir(p) else {
+        return DirSize { bytes: 0, complete: false };
+    };
     for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
+        let Ok(ft) = entry.file_type() else {
+            out.complete = false;
+            continue;
+        };
         if ft.is_symlink() {
             continue;
         }
         if ft.is_dir() {
-            total += dir_size(&entry.path());
+            let sub = measure(&entry.path());
+            out.bytes += sub.bytes;
+            out.complete &= sub.complete;
         } else if let Ok(m) = entry.metadata() {
-            total += m.len();
+            out.bytes += m.len();
+        } else {
+            out.complete = false;
         }
     }
-    total
+    out
 }
 
 /// `git zage [selectors]` — how long ago each repo's HEAD commit was made.

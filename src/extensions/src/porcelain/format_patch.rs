@@ -2312,6 +2312,26 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--topo-order" => o.order = Order::Topo,
             "--date-order" => o.order = Order::DateTopo,
             "--author-date-order" => o.order = Order::AuthorDateTopo,
+            // `--date` is `parse_long_opt("date", …)` + `parse_date_format()`
+            // (revision.c:2664-2667; diff.c:5380-5399): stuck or separate value,
+            // a bare trailing `--date` and an unknown format both die. The parsed
+            // mode is never read here, because the mail header prints its date as
+            // `DATE_MODE(RFC2822)` regardless of `pp->date_mode` (pretty.c:609-613)
+            // and the cover letter pins `DATE_RFC2822` too (builtin/log.c:1431).
+            "--date" => {
+                if i + 1 >= args.len() {
+                    return Ok(Parsed::Exit(fatal("Option '--date' requires a value")));
+                }
+                i += 1;
+                if let Err(e) = crate::showdate::parse_date_format(&args[i]) {
+                    return Ok(Parsed::Exit(fatal(&e.to_string())));
+                }
+            }
+            s if s.starts_with("--date=") => {
+                if let Err(e) = crate::showdate::parse_date_format(&s["--date=".len()..]) {
+                    return Ok(Parsed::Exit(fatal(&e.to_string())));
+                }
+            }
             "--no-walk" => o.no_walk = true,
             s if s.starts_with("--no-walk=") => {
                 match &s["--no-walk=".len()..] {

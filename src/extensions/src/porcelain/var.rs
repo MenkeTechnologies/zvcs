@@ -524,7 +524,7 @@ fn config_paths(sources: &[Source]) -> Option<Vec<BString>> {
 /// The entries come from the same walker `git config --list` uses, so the two
 /// listings agree on order, multivars, synthetic gitoxide layers and `-c` echoes.
 fn list_config(cfg: &ConfigFile, out: &mut impl Write) -> Result<()> {
-    super::config::for_each_entry(cfg, |key, value, implicit, _meta| {
+    super::config::for_each_entry(cfg, true, |key, value, implicit, _meta| {
         out.write_all(key.as_bytes())?;
         if !implicit {
             out.write_all(b"=")?;

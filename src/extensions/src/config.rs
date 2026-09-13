@@ -1325,24 +1325,71 @@ fn ordered_occurrences(repo: &gix::Repository) -> Vec<Occurrence> {
         }
     }
 
+    let view: Vec<(Source, &str, Option<&str>)> = snapshot
+        .iter()
+        .map(|(source, o)| (*source, o.key.as_str(), o.value.as_deref()))
+        .collect();
+    let Some(splice) = command_line_splice(&view) else {
+        return snapshot.into_iter().map(|(_, o)| o).collect();
+    };
+    let mut out = Vec::with_capacity(snapshot.len());
+    let mut command_line = Some(splice.overrides);
+    for (i, (_, o)) in snapshot.into_iter().enumerate() {
+        if i == splice.at {
+            out.extend(command_line.take().into_iter().flatten().map(occurrence_from_argv));
+        }
+        if !splice.drop[i] {
+            out.push(o);
+        }
+    }
+    out.extend(command_line.take().into_iter().flatten().map(occurrence_from_argv));
+    out
+}
+
+/// Where a walk over a merged snapshot folds this port's two deliveries of the
+/// command line back into git's one: which entries to skip, and the argv-order
+/// `-c` list to walk in their place, starting at index `at`.
+pub(crate) struct CommandLineSplice {
+    /// `drop[i]` is set for the environment copy of a valued `-c` and for the
+    /// `Source::Cli` entries the overrides produced.
+    pub(crate) drop: Vec<bool>,
+    /// [`crate::setup::command_line_overrides`], spelled as typed.
+    pub(crate) overrides: Vec<(String, Option<String>)>,
+    /// The index the overrides are walked ahead of; `drop.len()` for the end.
+    pub(crate) at: usize,
+}
+
+/// Plan the splice [`ordered_occurrences`] describes over a merged walk given
+/// as `(source, normalized key, value)` in snapshot order. `None` when this
+/// command line carries no `-c`, so the walk stands as it is.
+///
+/// Only a *merged* read may be spliced: `git -c a.b=1 config --file x --list`
+/// reads `x` alone (`config_with_options()`, config.c:1634-1645: only
+/// `do_git_config_sequence()` calls `git_config_from_parameters()`, config.c:1601), so a scoped
+/// file whose own entries happen to be `Source::Cli` must not lose one to an
+/// override of the same key.
+pub(crate) fn command_line_splice(entries: &[(gix::config::Source, &str, Option<&str>)]) -> Option<CommandLineSplice> {
+    use gix::config::Source;
+    use std::collections::HashMap;
+
     let overrides = crate::setup::command_line_overrides();
     if overrides.is_empty() {
-        return snapshot.into_iter().map(|(_, o)| o).collect();
+        return None;
     }
 
-    let mut drop = vec![false; snapshot.len()];
+    let mut drop = vec![false; entries.len()];
     // The environment copy of each valued `-c`, matched on the exact bytes the
     // triple carries and taken from the end.
     let mut env_copies: HashMap<(String, String), usize> = HashMap::new();
     for (key, value) in crate::setup::double_delivered() {
         *env_copies.entry((normalize_key(key), value.clone())).or_default() += 1;
     }
-    for (i, (source, o)) in snapshot.iter().enumerate().rev() {
+    for (i, (source, key, value)) in entries.iter().enumerate().rev() {
         if *source != Source::Env {
             continue;
         }
-        let Some(value) = &o.value else { continue };
-        if let Some(n) = env_copies.get_mut(&(o.key.clone(), value.clone())) {
+        let Some(value) = value else { continue };
+        if let Some(n) = env_copies.get_mut(&((*key).to_owned(), (*value).to_owned())) {
             if *n > 0 {
                 *n -= 1;
                 drop[i] = true;
@@ -1355,11 +1402,11 @@ fn ordered_occurrences(repo: &gix::Repository) -> Vec<Occurrence> {
     for (key, _) in &overrides {
         *cli_copies.entry(normalize_key(key)).or_default() += 1;
     }
-    for (i, (source, o)) in snapshot.iter().enumerate() {
+    for (i, (source, key, _)) in entries.iter().enumerate() {
         if *source != Source::Cli {
             continue;
         }
-        if let Some(n) = cli_copies.get_mut(&o.key) {
+        if let Some(n) = cli_copies.get_mut(*key) {
             if *n > 0 {
                 *n -= 1;
                 drop[i] = true;
@@ -1370,22 +1417,11 @@ fn ordered_occurrences(repo: &gix::Repository) -> Vec<Occurrence> {
     // `git_config_from_parameters()` runs after every file and the environment
     // triple, which in gitoxide's source order is ahead of the first
     // `Source::Cli`/`Api`/`EnvOverride` section.
-    let splice_at = snapshot
+    let at = entries
         .iter()
-        .position(|(s, _)| matches!(s, Source::Cli | Source::Api | Source::EnvOverride))
-        .unwrap_or(snapshot.len());
-    let mut out = Vec::with_capacity(snapshot.len());
-    let mut command_line = Some(overrides);
-    for (i, (_, o)) in snapshot.into_iter().enumerate() {
-        if i == splice_at {
-            out.extend(command_line.take().into_iter().flatten().map(occurrence_from_argv));
-        }
-        if !drop[i] {
-            out.push(o);
-        }
-    }
-    out.extend(command_line.take().into_iter().flatten().map(occurrence_from_argv));
-    out
+        .position(|(s, _, _)| matches!(s, Source::Cli | Source::Api | Source::EnvOverride))
+        .unwrap_or(entries.len());
+    Some(CommandLineSplice { drop, overrides, at })
 }
 
 /// A `-c key[=value]` as the callback receives it.
@@ -1423,10 +1459,9 @@ fn occurrence_from_argv((key, value): (String, Option<String>)) -> Occurrence {
 /// `Source::Cli`, and as `12 ` — byte for byte what argv held — through the
 /// environment. git keeps the blank and refuses the value
 /// (`bad numeric config value '12 ' for 'test.v': invalid unit`), so discounting
-/// the environment copy silently made the port *accept* it. The cost is the
-/// origin `--show-origin` prints for such a value, `environment:` where stock
-/// says `command line:`. A wrong label is visible to whoever reads it; a
-/// silently different value is not.
+/// the environment copy silently made the port *accept* it. `git config`'s own
+/// walk no longer goes through this: it replays the command line as typed, in
+/// argv order, from [`command_line_splice`].
 ///
 /// Both copies sort after every file, so keeping the environment one leaves the
 /// last-one-wins order over file configuration exactly where it was.
@@ -1473,7 +1508,7 @@ impl CliEcho {
 
 /// A config key in the spelling the snapshot walk produces: section and value
 /// name lower-cased, subsection left alone (`git_config_parse_key`).
-fn normalize_key(key: &str) -> String {
+pub(crate) fn normalize_key(key: &str) -> String {
     let Some((section, rest)) = key.split_once('.') else {
         return key.to_ascii_lowercase();
     };

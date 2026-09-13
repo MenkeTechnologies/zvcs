@@ -131,6 +131,8 @@ where
                 )?
                 .unwrap_or(false),
             filter: self.filter.as_ref().map(gix_protocol::fetch::filter::Filter::as_str),
+            no_progress: con.no_progress,
+            sideband: con.sideband.clone(),
         };
         let context = gix_protocol::fetch::Context {
             handshake: &mut handshake,

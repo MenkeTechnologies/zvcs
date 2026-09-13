@@ -35,6 +35,8 @@ where
             handshake: self.handshake,
             trace: self.trace,
             server_options: self.server_options,
+            no_progress: self.no_progress,
+            sideband: self.sideband,
         }
     }
 
@@ -90,6 +92,18 @@ where
         self.transport_options = Some(config);
         self
     }
+
+    /// Decide how a fetch through this connection reports the server's progress: `no_progress` asks the server
+    /// not to send any (git's `args->no_progress`), and `sideband` receives the messages it does send, unparsed.
+    pub fn set_transfer_progress(
+        &mut self,
+        no_progress: bool,
+        sideband: Option<gix_protocol::fetch::Sideband>,
+    ) -> &mut Self {
+        self.no_progress = no_progress;
+        self.sideband = sideband;
+        self
+    }
 }
 
 /// Access
@@ -142,6 +156,8 @@ where
             handshake: self.handshake,
             trace: self.trace,
             server_options: self.server_options,
+            no_progress: self.no_progress,
+            sideband: self.sideband,
         }
     }
 }

@@ -45,6 +45,15 @@ pub enum ProgressId {
     DecodedBytes,
     /// The amount of bytes written to the index file.
     IndexBytesWritten,
+    /// The pack's delta objects, counted as each one is resolved: what `index-pack` reports as
+    /// `Resolving deltas` (`builtin/index-pack.c:1340-1343`, incremented at `:1080`).
+    ///
+    /// Initialized with the amount of deltas, and dropped once all of them are resolved.
+    ResolveDeltas,
+    /// Created only for a thin pack, just before [`ProgressId::ResolveDeltas`] is dropped, with the amount of
+    /// base objects taken from the object database to complete the pack as its maximum. It's the count of
+    /// `index-pack`'s `completed with %d local objects` (`builtin/index-pack.c:1392-1396`).
+    LocalBaseObjects,
 }
 
 impl From<ProgressId> for gix_features::progress::Id {
@@ -55,6 +64,8 @@ impl From<ProgressId> for gix_features::progress::Id {
             ProgressId::ResolveObjects => *b"IWRO",
             ProgressId::DecodedBytes => *b"IWDB",
             ProgressId::IndexBytesWritten => *b"IWBW",
+            ProgressId::ResolveDeltas => *b"IWRD",
+            ProgressId::LocalBaseObjects => *b"IWLB",
         }
     }
 }
@@ -127,8 +138,9 @@ pub(super) mod function {
         decompressed_progress.init(None, progress::bytes());
         let mut pack_entries_end: u64 = 0;
         let mut num_ref_deltas = 0usize;
+        let mut num_deltas = 0usize;
 
-        for entry in entries {
+        while let Some(entry) = entries.next() {
             let crate::data::input::Entry {
                 header,
                 pack_offset,
@@ -141,6 +153,9 @@ pub(super) mod function {
             } = entry?;
 
             decompressed_progress.inc_by(decompressed_size as usize);
+            if header.is_delta() {
+                num_deltas += 1;
+            }
 
             let entry_len = u64::from(header_size) + compressed_size;
             pack_entries_end = pack_offset + entry_len;
@@ -191,8 +206,13 @@ pub(super) mod function {
             }
             last_seen_trailer = trailer;
             num_objects += 1;
-            objects_progress.inc();
+            // What arrived in the pack, which is what `index-pack` counts (`builtin/index-pack.c:1264-1288`).
+            // The base objects a thin pack is completed with are spliced into `entries` from the object
+            // database without drawing down the entries the pack header announced, so they don't count.
+            objects_progress.set(anticipated_num_objects.saturating_sub(entries.size_hint().0));
         }
+        let num_received_objects = anticipated_num_objects.saturating_sub(entries.size_hint().0);
+        let num_local_base_objects = num_objects.saturating_sub(num_received_objects);
         let num_objects: u32 = num_objects
             .try_into()
             .map_err(|_| Error::IteratorInvariantTooManyObjects(num_objects))?;
@@ -204,6 +224,9 @@ pub(super) mod function {
 
         root_progress.inc();
 
+        let mut deltas_progress =
+            root_progress.add_child_with_id("resolving deltas".into(), ProgressId::ResolveDeltas.into());
+        deltas_progress.init(Some(num_deltas), progress::count("deltas"));
         let (resolver, pack) = make_resolver().map_err(gix_hash::io::Error::from)?;
         if num_ref_deltas != 0 {
             let bases = ref_delta::resolve_bases(
@@ -219,17 +242,27 @@ pub(super) mod function {
                 .map_err(|pack_offset| Error::UnresolvedRefDelta { pack_offset })?;
         }
         let sorted_pack_offsets_by_oid = {
+            let deltas = &deltas_progress;
             let traverse::Outcome { roots, children } = tree.traverse(
                 resolver,
                 &pack,
                 pack_entries_end,
-                |data,
-                 _progress,
-                 traverse::Context {
-                     entry,
-                     decompressed: bytes,
-                     ..
-                 }| { modify_base(data, entry, bytes, object_hash) },
+                move |data,
+                      _progress,
+                      traverse::Context {
+                          entry,
+                          decompressed: bytes,
+                          level,
+                          ..
+                      }| {
+                    let resolved = modify_base(data, entry, bytes, object_hash);
+                    // A delta is any object below the root of its delta tree. Its `entry.header` can't tell:
+                    // the traversal has already replaced it with the base's object type.
+                    if resolved.is_ok() && level != 0 {
+                        deltas.inc();
+                    }
+                    resolved
+                },
                 traverse::Options {
                     object_progress: Box::new(
                         root_progress.add_child_with_id("Resolving".into(), ProgressId::ResolveObjects.into()),
@@ -242,6 +275,12 @@ pub(super) mod function {
                     alloc_limit_bytes,
                 },
             )?;
+            if num_local_base_objects != 0 {
+                let mut local_bases_progress = root_progress
+                    .add_child_with_id("local base objects".into(), ProgressId::LocalBaseObjects.into());
+                local_bases_progress.init(Some(num_local_base_objects), progress::count("objects"));
+            }
+            drop(deltas_progress);
             root_progress.inc();
 
             let mut items = roots;

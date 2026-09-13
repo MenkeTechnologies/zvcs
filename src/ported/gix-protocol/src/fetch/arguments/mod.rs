@@ -173,6 +173,29 @@ impl Arguments {
         }
     }
 
+    /// Ask the server not to send progress, git's `args->no_progress`.
+    ///
+    /// It goes where git puts it, right behind `thin-pack`: among the capabilities of the first `want` for
+    /// protocol v0/v1 (`fetch-pack.c:409-410`), and as its own argument line for v2 (`fetch-pack.c:1424-1427`).
+    /// For v0/v1 the caller checks that the server advertised `no-progress` first (`fetch-pack.c:1205-1208`).
+    #[cfg(any(feature = "async-client", feature = "blocking-client"))]
+    pub fn use_no_progress(&mut self) {
+        match self.version {
+            gix_transport::Protocol::V0 | gix_transport::Protocol::V1 => {
+                let features = self
+                    .features_for_first_want
+                    .as_mut()
+                    .expect("call use_no_progress before first want()");
+                let at = features.iter().position(|f| f == "thin-pack").map_or(features.len(), |i| i + 1);
+                features.insert(at, "no-progress".into());
+            }
+            gix_transport::Protocol::V2 => {
+                let at = self.args.iter().position(|a| a == "thin-pack").map_or(self.args.len(), |i| i + 1);
+                self.args.insert(at, "no-progress".into());
+            }
+        }
+    }
+
     /// Add the given `feature`, unconditionally.
     ///
     /// Note that sending an unknown or unsupported feature may cause the remote to terminate

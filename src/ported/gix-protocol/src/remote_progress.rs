@@ -27,6 +27,8 @@ impl RemoteProgress<'_> {
     /// Parse `text`, which is interpreted as error if `is_error` is true, as [`RemoteProgress`] and call the respective
     /// methods on the given `progress` instance.
     pub fn translate_to_progress(is_error: bool, text: &[u8], progress: &mut impl gix_features::progress::Progress) {
+        // Sideband payloads are handed over unmodified; a line's own newline is not part of its text.
+        let text = text.strip_suffix(b"\n").unwrap_or(text);
         fn progress_name(current: Option<String>, action: &[u8]) -> String {
             match current {
                 Some(current) => format!(

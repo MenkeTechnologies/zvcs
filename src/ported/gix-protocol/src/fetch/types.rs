@@ -22,6 +22,26 @@ pub struct Options<'a> {
     /// The server has to advertise the `filter` capability for this, and the objects it withholds have to be
     /// obtainable later from a *promisor remote* - see `git`'s `Documentation/technical/partial-clone.adoc`.
     pub filter: Option<&'a str>,
+    /// git's `args->no_progress` (`transport.c:452`): ask the server to send no progress, as the `no-progress`
+    /// capability for protocol v0/v1 (`fetch-pack.c:410`, only when advertised - `:1205-1208`) and as the
+    /// `no-progress` argument for v2 (`fetch-pack.c:1426-1427`).
+    pub no_progress: bool,
+    /// Where the remote's sideband messages go instead of the parsed [`RemoteProgress`](crate::RemoteProgress)
+    /// reporting, if anywhere.
+    pub sideband: Option<Sideband>,
+}
+
+/// A receiver for the remote's sideband messages as they arrived: band 2 (progress) with `is_error == false`
+/// and band 3 (error) with `is_error == true`, each payload unmodified.
+///
+/// This is the input git's `demultiplex_sideband()` (`sideband.c:301`) turns into `remote: ` lines.
+#[derive(Clone)]
+pub struct Sideband(pub std::sync::Arc<std::sync::Mutex<dyn FnMut(bool, &[u8]) + Send>>);
+
+impl std::fmt::Debug for Sideband {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sideband")
+    }
 }
 
 /// For use in [`crate::Handshake::prepare_lsrefs_or_extract_refmap()`] and [`fetch`](crate::fetch()).

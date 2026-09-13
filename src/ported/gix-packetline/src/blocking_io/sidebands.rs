@@ -1,7 +1,7 @@
 use std::{io, io::BufRead};
 
 use super::read::StreamingPeekableIter;
-use crate::{BandRef, PacketLineRef, TextRef, U16_HEX_BYTES, read::ProgressAction};
+use crate::{BandRef, PacketLineRef, U16_HEX_BYTES, read::ProgressAction};
 
 /// An implementor of [`BufRead`][io::BufRead] yielding packet lines on each call to [`read_line()`][io::BufRead::read_line()].
 /// It's also possible to hide the underlying packet lines using the [`Read`][io::Read] implementation which is useful
@@ -151,15 +151,16 @@ where
                                 }
                                 break (U16_HEX_BYTES + ENCODED_BAND, d.len());
                             }
+                            // The payload goes out as it arrived, line breaks included: git's
+                            // `demultiplex_sideband()` (sideband.c:368-406) keys its redraws on
+                            // the `\r` and `\n` a progress packet carries.
                             BandRef::Progress(d) => {
-                                let text = TextRef::from(d).0;
-                                if handle_progress(false, text).is_break() {
+                                if handle_progress(false, d).is_break() {
                                     return Err(std::io::Error::other("interrupted by user"));
                                 }
                             }
                             BandRef::Error(d) => {
-                                let text = TextRef::from(d).0;
-                                if handle_progress(true, text).is_break() {
+                                if handle_progress(true, d).is_break() {
                                     return Err(std::io::Error::other("interrupted by user"));
                                 }
                             }

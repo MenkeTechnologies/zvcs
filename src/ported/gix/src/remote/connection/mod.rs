@@ -24,6 +24,10 @@ where
     pub(crate) trace: bool,
     /// Protocol-v2 server options to send with every request made through this connection.
     pub(crate) server_options: Vec<BString>,
+    /// Ask the server for no progress when fetching; see [`gix_protocol::fetch::Options::no_progress`].
+    pub(crate) no_progress: bool,
+    /// Where the server's sideband messages go when fetching; see [`gix_protocol::fetch::Options::sideband`].
+    pub(crate) sideband: Option<gix_protocol::fetch::Sideband>,
 }
 
 /// Like [`Connection`], but without borrowing its remote or repository.
@@ -39,6 +43,8 @@ where
     pub(crate) trace: bool,
     /// Protocol-v2 server options to send with every request made through this connection.
     pub(crate) server_options: Vec<BString>,
+    pub(crate) no_progress: bool,
+    pub(crate) sideband: Option<gix_protocol::fetch::Sideband>,
 }
 
 mod access;

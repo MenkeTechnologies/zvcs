@@ -94,6 +94,8 @@ impl<'repo> Remote<'repo> {
             transport: gix_protocol::SendFlushOnDrop::new(transport, trace),
             trace,
             server_options: Vec::new(),
+            no_progress: false,
+            sideband: None,
         }
     }
 

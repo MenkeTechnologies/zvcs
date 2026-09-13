@@ -7,7 +7,7 @@ use std::{
 use futures_io::{AsyncBufRead, AsyncRead};
 
 use super::read::StreamingPeekableIter;
-use crate::{BandRef, PacketLineRef, TextRef, U16_HEX_BYTES, decode, read::ProgressAction};
+use crate::{BandRef, PacketLineRef, U16_HEX_BYTES, decode, read::ProgressAction};
 
 type ReadLineResult<'a> = Option<std::io::Result<Result<PacketLineRef<'a>, decode::Error>>>;
 /// An implementor of [`AsyncBufRead`] yielding packet lines on each call to `read_line()`.
@@ -291,15 +291,14 @@ where
                                             }
                                             break (U16_HEX_BYTES + ENCODED_BAND, d.len());
                                         }
+                                        // Unmodified, as in the blocking reader.
                                         BandRef::Progress(d) => {
-                                            let text = TextRef::from(d).0;
-                                            if handle_progress(false, text).is_break() {
+                                            if handle_progress(false, d).is_break() {
                                                 return Poll::Ready(Err(io::Error::other("interrupted by user")));
                                             }
                                         }
                                         BandRef::Error(d) => {
-                                            let text = TextRef::from(d).0;
-                                            if handle_progress(true, text).is_break() {
+                                            if handle_progress(true, d).is_break() {
                                                 return Poll::Ready(Err(io::Error::other("interrupted by user")));
                                             }
                                         }

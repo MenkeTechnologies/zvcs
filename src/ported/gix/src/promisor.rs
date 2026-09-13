@@ -271,6 +271,8 @@ pub fn fetch(repo: &crate::Repository, promisor: &Remote, ids: &[gix_hash::Objec
             tags: gix_protocol::fetch::Tags::None,
             reject_shallow_remote: false,
             filter: promisor.filter.as_deref(),
+            no_progress: false,
+            sideband: None,
         },
     )?;
 

@@ -55,6 +55,8 @@ pub async fn fetch<P, T, E>(
         tags,
         reject_shallow_remote,
         filter,
+        no_progress,
+        sideband,
     }: Options<'_>,
 ) -> Result<Option<Outcome>, Error>
 where
@@ -81,6 +83,13 @@ where
     crate::fetch::Response::check_required_features(protocol_version, &fetch_features)?;
     let sideband_all = fetch_features.iter().any(|(n, _)| *n == "sideband-all");
     let mut arguments = Arguments::new(protocol_version, fetch_features, trace_packetlines);
+    // A v0/v1 server that did not advertise `no-progress` gets progress requested anyway:
+    // `else args->no_progress = 0;` (fetch-pack.c:1205-1208). v2 sends the argument unconditionally.
+    if no_progress
+        && (matches!(protocol_version, gix_transport::Protocol::V2) || handshake.capabilities.contains("no-progress"))
+    {
+        arguments.use_no_progress();
+    }
     if matches!(tags, Tags::Included) {
         if !arguments.can_use_include_tag() {
             return Err(Error::MissingServerFeature {
@@ -140,7 +149,7 @@ where
                 };
                 let mut reader = arguments.send(transport, is_done).await?;
                 if sideband_all {
-                    setup_remote_progress(&mut progress, &mut reader, should_interrupt);
+                    setup_remote_progress(&mut progress, &mut reader, sideband.as_ref(), should_interrupt);
                 }
                 let response =
                     crate::fetch::Response::from_line_reader(protocol_version, &mut reader, is_done, !is_done).await?;
@@ -150,7 +159,7 @@ where
                     progress.step();
                     progress.set_name("receiving pack".into());
                     if !sideband_all {
-                        setup_remote_progress(&mut progress, &mut reader, should_interrupt);
+                        setup_remote_progress(&mut progress, &mut reader, sideband.as_ref(), should_interrupt);
                     }
                     break 'negotiation reader;
                 }
@@ -295,12 +304,21 @@ fn add_shallow_args(
 fn setup_remote_progress<'a>(
     progress: &mut dyn gix_features::progress::DynNestedProgress,
     reader: &mut Box<dyn ExtendedBufRead<'a> + Unpin + 'a>,
+    sideband: Option<&crate::fetch::Sideband>,
     should_interrupt: &'a AtomicBool,
 ) {
     reader.set_progress_handler(Some(Box::new({
         let mut remote_progress = progress.add_child_with_id("remote".to_string(), ProgressId::RemoteProgress.into());
+        let sideband = sideband.cloned();
         move |is_err: bool, data: &[u8]| {
-            crate::RemoteProgress::translate_to_progress(is_err, data, &mut remote_progress);
+            match &sideband {
+                Some(crate::fetch::Sideband(handler)) => {
+                    if let Ok(mut handler) = handler.lock() {
+                        (&mut *handler)(is_err, data);
+                    }
+                }
+                None => crate::RemoteProgress::translate_to_progress(is_err, data, &mut remote_progress),
+            }
             if should_interrupt.load(Ordering::Relaxed) {
                 std::ops::ControlFlow::Break(())
             } else {

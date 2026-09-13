@@ -79,9 +79,12 @@ fn advise_once(event: &str) -> bool {
 /// `adjust_git_path()` splices in verbatim (`path.c:400-401`) — is resolved by
 /// git against the work tree root, not against the current directory.
 fn paths(repo: &gix::Repository, event: &str) -> Result<(PathBuf, String)> {
-    let (dir, shown_dir) = match repo.config_snapshot().trusted_path("core.hooksPath")? {
+    // `repo_settings_get_hooks_path()` (repo-settings.c:204-209):
+    // `repo_config_get_pathname()`, which dies through `git_die_config()` on a
+    // valueless key and on a `~user` it cannot expand.
+    let cwd = crate::setup::setup_cwd(repo).unwrap_or_default();
+    let (dir, shown_dir) = match crate::config::config_get_pathname(Some(repo), "core.hookspath", &cwd) {
         Some(p) => {
-            let p = p.to_path_buf();
             let on_disk = match repo.workdir() {
                 Some(top) if p.is_relative() => top.join(&p),
                 _ => p.clone(),

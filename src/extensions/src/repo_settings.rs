@@ -270,6 +270,14 @@ impl RepoSettings {
             index_version = Some(v);
         }
 
+        // repo-settings.c:107-130: `core.untrackedcache` and
+        // `fetch.negotiationalgorithm` through `repo_config_get_string_tmp()`,
+        // whose only refusal is `git_die_config()` for a valueless key; any
+        // spelling is otherwise accepted here (`fetch` validates the algorithm
+        // itself).
+        crate::config::config_get_string(Some(repo), "core.untrackedcache");
+        crate::config::config_get_string(Some(repo), "fetch.negotiationalgorithm");
+
         // repo-settings.c:82-85. `pack.readReverseIndex` takes a literal default
         // of 1; `pack.useBitmapBoundaryTraversal` takes the cascaded value, so
         // `feature.experimental` survives here where it did not at line 78.

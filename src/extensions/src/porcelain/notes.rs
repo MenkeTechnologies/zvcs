@@ -2428,16 +2428,14 @@ fn config_merge_strategy(
     repo: &gix::Repository,
     notes_ref: &str,
 ) -> std::result::Result<Strategy, ExitCode> {
-    let config = repo.config_snapshot();
-    let file = config.plumbing();
     // git BUGs if the notes ref is not under refs/notes/, so the per-ref key is
     // only consulted when the prefix is present.
     if let Some(name) = notes_ref.strip_prefix("refs/notes/") {
-        if let Some(s) = notes_strategy_config(file, Some(name))? {
+        if let Some(s) = notes_strategy_config(repo, Some(name)) {
             return Ok(s);
         }
     }
-    if let Some(s) = notes_strategy_config(file, None)? {
+    if let Some(s) = notes_strategy_config(repo, None) {
         return Ok(s);
     }
     Ok(Strategy::Manual)
@@ -2446,61 +2444,25 @@ fn config_merge_strategy(
 /// The effective `notes[.<subsection>].mergeStrategy` value, parsed. `Ok(None)`
 /// when unset; a present-but-invalid value prints git's config error and yields
 /// exit 128.
-fn notes_strategy_config(
-    file: &gix::config::File,
-    subsection: Option<&str>,
-) -> std::result::Result<Option<Strategy>, ExitCode> {
-    // Walk the merged config in order so the last definition wins, keeping the
-    // winning value's source metadata for the error message.
-    let mut winner: Option<(BString, gix::config::file::Metadata)> = None;
-    for section in file.sections() {
-        let header = section.header();
-        if !header.name().to_string().eq_ignore_ascii_case("notes") {
-            continue;
-        }
-        // Subsection names are matched case-sensitively, byte for byte, exactly
-        // as git compares the `notes.<name>` subsection.
-        match (subsection, header.subsection_name()) {
-            (Some(want), Some(have)) if have == want => {}
-            (None, None) => {}
-            _ => continue,
-        }
-        if let Some(v) = section.body().value("mergeStrategy") {
-            winner = Some((v, section.meta().clone()));
-        }
-    }
-    let Some((value, meta)) = winner else {
-        return Ok(None);
+fn notes_strategy_config(repo: &gix::Repository, subsection: Option<&str>) -> Option<Strategy> {
+    // `git_config_get_notes_strategy()` (builtin/notes.c:873-886):
+    // `repo_config_get_string()`, which dies through `git_die_config()` on a
+    // valueless key, then `git_die_config()` again for a name
+    // `parse_notes_merge_strategy()` rejects. The subsection keeps its case, as
+    // git's configset keys do.
+    let key = match subsection {
+        Some(name) => format!("notes.{name}.mergeStrategy"),
+        None => "notes.mergeStrategy".to_string(),
     };
-    match parse_strategy(&value.to_str_lossy()) {
-        Some(s) => Ok(Some(s)),
-        None => {
-            let key = match subsection {
-                Some(name) => format!("notes.{name}.mergeStrategy"),
-                None => "notes.mergeStrategy".to_string(),
-            };
-            Err(notes_config_fatal(&key, &value.to_str_lossy(), &meta))
-        }
+    let value = crate::config::config_get_string(Some(repo), &key)?;
+    match parse_strategy(&value) {
+        Some(s) => Some(s),
+        None => crate::config::die_config(
+            Some(repo),
+            &key,
+            Some(&format!("unknown notes merge strategy {value}")),
+        ),
     }
-}
-
-/// `notes-utils.c:git_config_get_notes_strategy()` reaching `git_die_config()`:
-/// the `error:` reason then a `fatal:` naming the config source, exit 128. gix
-/// records no per-value line number, so the `at line <n>` tail git appends is
-/// omitted — the same limitation the crate's other config-fatal paths carry.
-fn notes_config_fatal(key: &str, value: &str, meta: &gix::config::file::Metadata) -> ExitCode {
-    eprintln!("error: unknown notes merge strategy {value}");
-    let origin = match meta.source {
-        gix::config::Source::Cli | gix::config::Source::Env => {
-            format!("unable to parse '{key}' from command-line config")
-        }
-        _ => match &meta.path {
-            Some(path) => format!("bad config variable '{key}' in file '{}'", path.display()),
-            None => format!("bad config variable '{key}'"),
-        },
-    };
-    eprintln!("fatal: {origin}");
-    ExitCode::from(128)
 }
 
 /// Move a notes ref, writing git's `notes: `-prefixed reflog line.

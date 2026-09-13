@@ -192,7 +192,8 @@ pub fn discover() -> Result<gix::Repository, gix::discover::Error> {
 
 /// What `ref_store_init()` (refs.c:2322-2342) would die with when the main ref
 /// store is first created, once a repository has been found.
-static REF_STORE_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+/// The `error:` line (for `git_die_config()`'s valueless case), then the `fatal:` one.
+static REF_STORE_REFUSAL: std::sync::OnceLock<Option<(Option<String>, String)>> = std::sync::OnceLock::new();
 
 /// Record the refusal for [`ref_store_first_use`] and install that hook.
 ///
@@ -216,11 +217,18 @@ static REF_STORE_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceL
 fn arm_ref_store_refusal(repo: &gix::Repository) {
     REF_STORE_REFUSAL.get_or_init(|| {
         let raw = crate::config::last_value_implicit(repo, "core.logallrefupdates")?;
-        let raw = raw?;
+        // `repo_config_get_string_tmp()` (repo-settings.c:184) dies through
+        // `git_die_config()` on a valueless key, `error:` line first.
+        let Some(raw) = raw else {
+            return Some((
+                Some("missing value for 'core.logallrefupdates'".to_string()),
+                crate::config::die_config_linenr(Some(repo), "core.logallrefupdates"),
+            ));
+        };
         if raw.eq_ignore_ascii_case("always") || crate::optint::maybe_bool(&raw).is_some() {
             return None;
         }
-        Some(format!("bad boolean config value '{raw}' for 'core.logallrefupdates'"))
+        Some((None, format!("bad boolean config value '{raw}' for 'core.logallrefupdates'")))
     });
     gix::refs::file::set_first_use_hook(ref_store_first_use);
     PACKED_REFS_TIMEOUT_REFUSAL
@@ -245,7 +253,11 @@ fn packed_refs_lock_first_use() {
 
 /// The ref store's first-use hook: `die()` with the recorded refusal, if any.
 fn ref_store_first_use() {
-    if let Some(Some(message)) = REF_STORE_REFUSAL.get() {
+    if let Some(Some((error, message))) = REF_STORE_REFUSAL.get() {
+        if let Some(error) = error {
+            crate::trace2::error(error);
+            eprintln!("error: {error}");
+        }
         crate::trace2::error(message);
         eprintln!("fatal: {message}");
         std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
@@ -1905,12 +1917,9 @@ fn protocol_config(kind: &str) -> ProtocolAllow {
 /// outside — `protocol.*.allow` has to work for `git clone`, which has no
 /// repository yet.
 fn transport_config_string(key: &str) -> Option<String> {
-    match gix::discover(".") {
-        Ok(repo) => repo.config_snapshot().string(key).map(|v| v.to_string()),
-        Err(_) => crate::config::global_config()
-            .string(key)
-            .map(|v| v.to_string()),
-    }
+    // `repo_config_get_string()` dies through `git_die_config()` on a valueless key.
+    let repo = gix::discover(".").ok();
+    crate::config::config_get_string(repo.as_ref(), key)
 }
 
 /// `parse_protocol_config()` (transport.c:1072-1083): the three words, matched

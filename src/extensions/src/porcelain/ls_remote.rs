@@ -293,8 +293,9 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     // The vendored connect reports the same condition in its own words ("Choose
     // between 1 and 2"), which is both a different sentence and a different set —
     // `0` is legal to git.
-    if let Some(v) = repo.config_snapshot().string("protocol.version") {
-        let v = v.to_string();
+    // `repo_config_get_string_tmp()` dies through `git_die_config()` on a
+    // valueless key.
+    if let Some(v) = crate::config::config_get_string(Some(&repo), "protocol.version") {
         if !matches!(v.as_str(), "0" | "1" | "2") {
             eprintln!("fatal: unknown value for config 'protocol.version': {v}");
             return Ok(ExitCode::from(128));

@@ -847,11 +847,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // (`repo-settings.c`) and dies, so validate it here to the same effect —
     // matching git's case-insensitive comparison, which gitoxide's own parser
     // does not do.
-    if let Some(algo) = repo
-        .config_snapshot()
-        .string("fetch.negotiationAlgorithm")
-        .map(|v| v.to_string())
-    {
+    // `repo_config_get_string_tmp()` (repo-settings.c:120), which dies through
+    // `git_die_config()` on a valueless key.
+    if let Some(algo) = crate::config::config_get_string(Some(&repo), "fetch.negotiationalgorithm") {
         if !["skipping", "noop", "consecutive", "default"]
             .iter()
             .any(|k| algo.eq_ignore_ascii_case(k))
@@ -870,10 +868,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // advertised `bundle.heuristic`, which is what makes the incremental case
     // cheap: `fetch_bundle_uri` then reads `fetch.bundleCreationToken` and skips
     // every bundle the repository already has.
-    let bundle_uri = repo
-        .config_snapshot()
-        .string("fetch.bundleURI")
-        .map(|v| v.to_string());
+    // `repo_config_get_string_tmp()` (builtin/fetch.c:2695), which dies through
+    // `git_die_config()` on a valueless key.
+    let bundle_uri = crate::config::config_get_string(Some(&repo), "fetch.bundleuri");
     if let Some(uri) = bundle_uri.as_deref() {
         let (failed, _has_heuristic) = super::bundle::uri::fetch_bundle_uri(&repo, uri);
         if failed {
@@ -2296,9 +2293,10 @@ fn refspec_collision(validate: &gix::refspec::match_group::validate::Error) -> O
 /// for a value outside the three git knows — the commands that care validate the
 /// value themselves and refuse before they reach this.
 fn protocol_version(repo: &gix::Repository) -> u8 {
-    repo.config_snapshot()
-        .string("protocol.version")
-        .and_then(|v| v.to_str().ok().and_then(|v| v.parse::<u8>().ok()))
+    // `get_protocol_version_config()` (protocol.c:27): `repo_config_get_string_tmp()`,
+    // which dies through `git_die_config()` on a valueless key.
+    crate::config::config_get_string(Some(repo), "protocol.version")
+        .and_then(|v| v.parse::<u8>().ok())
         .filter(|v| matches!(v, 0 | 1 | 2))
         .unwrap_or(2)
 }

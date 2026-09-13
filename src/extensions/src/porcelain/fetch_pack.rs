@@ -791,6 +791,27 @@ fn hex2chr(hi: u8, lo: u8) -> Option<u8> {
     Some(digit(hi)? << 4 | digit(lo)?)
 }
 
+/// The connect options for `dest`: over the local transport, the `upload-pack`
+/// of this installation.
+///
+/// `git_connect()` spawns `git-upload-pack` through `git_exec_path()`
+/// (connect.c, `conn->git_cmd = 1` for a local path), so stock `fetch-pack`
+/// always talks to its own release's server. Left to itself the vendored
+/// transport runs whatever `git` `PATH` finds first — on a machine with another
+/// zvcs installed, an older server whose `deepen-relative` answer wrote a
+/// shallow boundary the request never asked for. `fetch` already pins its
+/// program the same way ([`super::fetch::local_service_program`]).
+fn own_upload_pack(remote: &gix::Remote<'_>) -> gix::remote::connect::Options {
+    gix::remote::connect::Options {
+        upload_pack: super::fetch::local_service_program(
+            remote.url(gix::remote::Direction::Fetch),
+            None,
+            "upload-pack",
+        ),
+        ..Default::default()
+    }
+}
+
 /// Every ref the remote advertises, as `(full name, id)` pairs.
 ///
 /// The id is the ref's own target, so an annotated tag reports the tag object
@@ -801,7 +822,9 @@ fn list_refs(repo: &gix::Repository, dest: &str) -> Result<Vec<(String, ObjectId
     let remote = repo.remote_at(dest)?.with_fetch_tags(Tags::None);
     // With no refspecs configured, the server must not pre-filter by prefix or
     // the listing would come back empty.
-    let (ref_map, _handshake) = remote.connect(gix::remote::Direction::Fetch)?.ref_map(
+    let (ref_map, _handshake) = remote
+        .connect_with_options(gix::remote::Direction::Fetch, own_upload_pack(&remote))?
+        .ref_map(
         gix::progress::Discard,
         gix::remote::ref_map::Options {
             prefix_from_spec_as_filter_on_remote: false,
@@ -936,7 +959,7 @@ fn receive(
 
     let should_interrupt = AtomicBool::new(false);
     let outcome = remote
-        .connect(gix::remote::Direction::Fetch)?
+        .connect_with_options(gix::remote::Direction::Fetch, own_upload_pack(&remote))?
         .prepare_fetch(
             gix::progress::Discard,
             gix::remote::ref_map::Options::default(),
@@ -1086,13 +1109,20 @@ fn explode(repo: &gix::Repository, bundle: gix::odb::pack::bundle::write::Outcom
     let mut inflate = gix::zlib::Inflate::default();
     let mut cache = gix::odb::pack::cache::Never;
 
+    use gix::odb::pack::Find as _;
     for idx in 0..bundle.index.num_objects() {
         let id = bundle.index.oid_at_index(idx).to_owned();
+        // `write_object_file()` returns early for an object the repository
+        // already has — `freshen_packed_object() || freshen_loose_object()`
+        // (object-file.c) — so `unpack-objects` never duplicates a packed object
+        // as a loose one. The vendored loose writer persists unconditionally, so
+        // the test is made here, against the pre-fetch object set.
+        if before.objects.contains(&id) {
+            continue;
+        }
         // Resolving through the index reconstructs `OFS_DELTA`/`REF_DELTA`
         // chains, including thin-pack bases gix-pack appended while writing.
         let (object, _location) = bundle.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache)?;
-        // Skips ids the object database already holds, which is git's
-        // "objects that already exist are not unpacked".
         before
             .write_buf_with_known_id(object.kind, object.data, id)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1122,12 +1152,12 @@ fn looks_like_object_hash(name: &str) -> bool {
 /// A scratch directory under the git dir, removed on drop so the intermediate
 /// pack never survives an early return. It lives beside `objects/pack` so the
 /// renames stay on one filesystem.
-struct Scratch {
-    path: PathBuf,
+pub(super) struct Scratch {
+    pub(super) path: PathBuf,
 }
 
 impl Scratch {
-    fn new(repo: &gix::Repository) -> Result<Self> {
+    pub(super) fn new(repo: &gix::Repository) -> Result<Self> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())

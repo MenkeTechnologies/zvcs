@@ -285,12 +285,20 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal("No pathspec was given. Which files should I remove?"));
     }
 
-    // 3. Open the repository and require a working tree.
+    // 3. Open the repository; only a removal that touches the work tree needs one.
+    //
+    // ```c
+    // if (!index_only)
+    //         setup_work_tree(the_repository);
+    // ```
+    //
+    // (builtin/rm.c:298-299.) `git rm --cached` edits the index alone, so a bare
+    // repository with an index answers it like any other.
     let repo = crate::setup::discover()?;
-    let workdir = match repo.workdir() {
-        Some(w) => w.to_owned(),
-        None => return Err(crate::fatal::need_work_tree()),
-    };
+    if !opts.cached {
+        crate::dispatch::setup_work_tree()?;
+    }
+    let workdir = repo.workdir().map(std::path::Path::to_owned);
 
     // Serialize the whole read-modify-write of the index through the repo
     // coordinator so concurrent zvcs writers queue FCFS instead of racing
@@ -324,7 +332,11 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
 
     // 5. Snapshot the index entries (owned) so matching/safety reads don't hold a
     //    borrow across the later mutation.
-    let index = repo.open_index()?;
+    // `repo_read_index()` (builtin/rm.c:305) reads a missing index as an empty
+    // one, so an index-less bare repository reports the unmatched pathspec
+    // instead of an I/O error.
+    let snapshot = repo.index_or_empty()?;
+    let index = gix::index::File::clone(&snapshot);
     let targets_all: Vec<Target> = {
         let backing = index.path_backing();
         index
@@ -672,7 +684,9 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             // until one is not empty — and stopping at `startup_info->original_cwd`, so a
             // `git rm -r .` run from inside a directory does not delete the directory the
             // caller is standing in. That guard is [`crate::worktree::prune_empty_dirs`]'s.
-            crate::worktree::prune_empty_dirs(&workdir, &abs);
+            if let Some(workdir) = &workdir {
+                crate::worktree::prune_empty_dirs(workdir, &abs);
+            }
         }
     }
 
@@ -680,13 +694,14 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     //     the edited file. Only for full removal — `--cached` leaves `.gitmodules`
     //     untouched (the worktree submodule survives, now untracked), matching git.
     let mut index = index;
-    let gitmodules_update = if has_submodule && !opts.cached {
+    // A full removal passed `setup_work_tree()` in step 3, so the work tree is there.
+    let gitmodules_update = if let (true, Some(workdir)) = (has_submodule && !opts.cached, &workdir) {
         let removed_paths: Vec<&BString> = selected
             .iter()
             .filter(|t| t.mode == Mode::COMMIT)
             .map(|t| &t.path)
             .collect();
-        update_gitmodules(&repo, &workdir, &removed_paths, &submodule_name_by_path)?
+        update_gitmodules(&repo, workdir, &removed_paths, &submodule_name_by_path)?
     } else {
         None
     };
@@ -741,14 +756,37 @@ fn worktree_blob(
     mode: Mode,
     hash_kind: gix::hash::Kind,
 ) -> Result<Option<ObjectId>> {
-    let Some(abs) = repo.workdir_path(path.as_bstr()) else {
-        return Ok(None);
+    // `check_local_mod()` stats `lstat(ce->name, &st)` (builtin/rm.c:142): relative
+    // to the cwd setup left, which is the top of the work tree when there is one
+    // and wherever the command was started when there is not (`rm --cached` in a
+    // bare repository, which never passed `setup_work_tree()`).
+    let abs = match repo.workdir_path(path.as_bstr()) {
+        Some(abs) => abs,
+        None => gix::path::from_bstr(path.as_bstr()).into_owned(),
     };
     let meta = match std::fs::symlink_metadata(&abs) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => crate::git_fatal!("failed to stat {}: {e}", path.to_str_lossy()),
+        // `if (!is_missing_file_error(errno)) warning_errno(_("failed to stat '%s'"), …);`
+        // then `continue` either way (builtin/rm.c:142-146): ENOENT and ENOTDIR
+        // are silent, anything else warns, and the path is never refused.
+        Err(e) => {
+            use std::io::ErrorKind::{NotADirectory, NotFound};
+            if !matches!(e.kind(), NotFound | NotADirectory) {
+                eprintln!(
+                    "warning: failed to stat '{}': {}",
+                    path.to_str_lossy(),
+                    crate::external::strerror(&e)
+                );
+            }
+            return Ok(None);
+        }
     };
+    // "if a file was removed and it is now a directory, that is the same as
+    // ENOENT as far as git is concerned" (builtin/rm.c:149-157); gitlinks never
+    // reach here.
+    if meta.is_dir() {
+        return Ok(None);
+    }
 
     let content: Vec<u8> = if mode == Mode::SYMLINK || meta.is_symlink() {
         use std::os::unix::ffi::OsStrExt;

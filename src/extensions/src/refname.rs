@@ -288,8 +288,32 @@ pub fn all_ref_names(repo: &gix::Repository) -> Vec<String> {
 /// `core.warnAmbiguousRefs`, the `strict` argument most callers pass.
 /// `repo_settings_get_warn_ambiguous_refs()` (`repo-settings.c:196-202`) defaults
 /// it to 1, so only an explicit false turns it off.
+///
+/// ```c
+/// if (repo->settings.warn_ambiguous_refs < 0)
+///         repo_cfg_bool(repo, "core.warnambiguousrefs",
+///                       &repo->settings.warn_ambiguous_refs, 1);
+/// ```
+///
+/// `repo_cfg_bool()` ends in `git_config_bool()`, which dies on a value it
+/// cannot read, and the setting is only read at the moment a caller asks for it
+/// — a ref-name dwim that matched (`refs.c:828`, `:873`), a full-hex operand
+/// (`object-name.c:691`), `%(refname:short)` (`ref-filter.c:2233`),
+/// `--abbrev-ref` (`builtin/rev-parse.c:920`). So the `die()` lives here, and a
+/// command that never asks stays quiet: stock 2.55.0 with
+/// `-c core.warnAmbiguousRefs==` dies in `rev-parse HEAD` and `log` but not in
+/// `branch` or `ls-files`. It ends the process for the reason
+/// [`crate::objname::resolve_with_flags`] does: the callers answer with a
+/// `bool`, below every return path that could carry the refusal.
 pub fn warn_ambiguous_refs(repo: &gix::Repository) -> bool {
-    repo.config_snapshot().boolean("core.warnAmbiguousRefs") != Some(false)
+    match crate::repo_settings::config_bool_strict(repo, "core.warnambiguousrefs") {
+        Ok(v) => v.unwrap_or(true),
+        Err(message) => {
+            crate::trace2::error(&message);
+            eprintln!("fatal: {message}");
+            std::process::exit(crate::fatal::EXIT_FATAL as i32);
+        }
+    }
 }
 
 #[cfg(test)]

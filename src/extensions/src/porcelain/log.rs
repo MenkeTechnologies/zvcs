@@ -9604,9 +9604,25 @@ fn parse_color_spec(
 }
 
 /// Write a built-in format's commit object name — `<hash>` for `oneline`, the
-/// `commit <hash>` header otherwise — in `color.diff.commit`. git's span covers
-/// exactly the prefix and the hash: `--parents`, `--source` and the decorations
-/// that follow it are all outside, each opening their own color.
+/// `commit <hash>` header otherwise — in `color.diff.commit`. git's span runs
+/// from the prefix through the `--parents`/`--children` ids and the `-m`
+/// ` (from <oid>)` insert ([`RenderCtx::extra`]), and resets before `--source`
+/// and the decorations, which `show_decorations()` writes afterwards:
+///
+/// ```c
+/// fputs(diff_get_color_opt(&opt->diffopt, DIFF_COMMIT), opt->diffopt.file);
+/// ...
+/// if (opt->print_parents)
+///         show_parents(commit, abbrev_commit, opt->diffopt.file);
+/// if (opt->children.name)
+///         show_children(opt, commit, abbrev_commit);
+/// if (parent)
+///         fprintf(opt->diffopt.file, " (from %s)", ...);
+/// fputs(diff_get_color_opt(&opt->diffopt, DIFF_RESET), opt->diffopt.file);
+/// show_decorations(opt, commit);
+/// ```
+///
+/// (log-tree.c:811-828.)
 fn write_commit_name(out: &mut Vec<u8>, prefix: &[u8], id: &str, ctx: &RenderCtx<'_>) {
     let color = &ctx.colors.commit;
     if !color.is_empty() {
@@ -9617,6 +9633,7 @@ fn write_commit_name(out: &mut Vec<u8>, prefix: &[u8], id: &str, ctx: &RenderCtx
     // after the `commit ` the header formats print.
     out.extend_from_slice(ctx.mark.as_bytes());
     out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&ctx.extra);
     if !color.is_empty() {
         out.extend_from_slice(b"\x1b[m");
     }
@@ -11251,7 +11268,6 @@ fn render_entry(
     match pretty {
         Pretty::Oneline => {
             write_commit_name(out, b"", &id, ctx);
-            out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` between the hash and subject.
             if ctx.decorate != DecorateStyle::Off {
@@ -11342,7 +11358,6 @@ fn render_entry(
             // `medium` gets: the `--abbrev-commit` name, `--parents`/`--children`
             // ids, `--source`, and the `--decorate` suffix.
             write_commit_name(out, b"commit ", &id, ctx);
-            out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             if ctx.decorate != DecorateStyle::Off {
                 expand_decoration(
@@ -11386,7 +11401,6 @@ fn render_entry(
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
             let author = commit.author()?;
             write_commit_name(out, b"commit ", &id, ctx);
-            out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` after the commit id.
             if ctx.decorate != DecorateStyle::Off {

@@ -265,12 +265,13 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
     if base.len() == repo.object_hash().len_in_hex()
         && base.bytes().all(|b| b.is_ascii_hexdigit())
     {
+        // object-name.c:690-692 — the setting is asked after the skip flag and
+        // before the per-process switch, so `cat-file --batch`, which turns the
+        // switch off, still dies on an unreadable value.
         if flags.skip_ambiguity_check
+            || !crate::refname::warn_ambiguous_refs(repo)
             || !WARN_ON_OBJECT_REFNAME_AMBIGUITY.load(Ordering::Relaxed)
         {
-            return true;
-        }
-        if repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
             return true;
         }
         if crate::porcelain::rev_parse::dwim_ref_matches(repo, base).is_empty() {
@@ -282,9 +283,13 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
         }
         return true;
     }
-    if flags.quiet || repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
-        return false;
-    }
+    // The setting is not read up front: `repo_dwim_ref()`/`repo_dwim_log()` ask
+    // for it the moment a rule matches (`refs.c:828`, `refs.c:873`), whatever
+    // the flags, and a name no rule matches never asks at all — so
+    // `-c core.warnAmbiguousRefs==` kills `rev-parse HEAD` but not a lookup of an
+    // abbreviated object id. The reads below sit after each count for that
+    // reason.
+    //
     // A reflog operand is counted by a different function and measured over a
     // different name. `get_oid_basic()` cuts the selector off (`len = at`) before
     // it reaches the warning, and the count it tests is `repo_dwim_log()`'s — how
@@ -310,6 +315,9 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
         if logs_found == 0 {
             return false;
         }
+        if !crate::refname::warn_ambiguous_refs(repo) || flags.quiet {
+            return false;
+        }
         if logs_found > 1 || short_oid_unambiguous(repo, reflog_base) {
             eprintln!("warning: refname '{reflog_base}' is ambiguous.");
         }
@@ -322,6 +330,9 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
     // anything still carrying one.
     let refs_found = crate::porcelain::rev_parse::dwim_ref_matches(repo, base).len();
     if refs_found == 0 {
+        return false;
+    }
+    if !crate::refname::warn_ambiguous_refs(repo) || flags.quiet {
         return false;
     }
     if refs_found > 1 || short_oid_unambiguous(repo, base) {

@@ -860,7 +860,6 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
         _ => std::borrow::Cow::Borrowed(name),
     };
     let name: &str = rewritten.as_ref();
-    let stop_at_first = repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false);
     let mut found = Vec::new();
     for rule in [
         name.to_owned(),
@@ -915,7 +914,9 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
             },
             TargetRef::Object(_) => r.name().as_bstr().to_string(),
         });
-        if stop_at_first {
+        // refs.c:828 — asked inside the `if (r)` arm, so only a rule that
+        // matched reads the setting, and an unreadable value dies right here.
+        if !crate::refname::warn_ambiguous_refs(repo) {
             break;
         }
     }

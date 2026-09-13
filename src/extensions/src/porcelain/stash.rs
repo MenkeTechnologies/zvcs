@@ -2914,7 +2914,7 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
 /// Re-apply an autostash `W` commit onto the *current* `HEAD` with a real
 /// three-way merge — the case `apply`/`pop` refuse. The three sides are the
 /// stash's base (`W`'s first parent tree = `HEAD` when the stash was made),
-/// *ours* (the current `HEAD` tree, e.g. the just-rebased tip), and *theirs*
+/// *ours* (the current index's tree, e.g. the just-rebased tip), and *theirs*
 /// (the stashed worktree tree `W`). Prints git's `Applied autostash.` on a clean
 /// apply, or the conflict notice (leaving the changes recoverable) otherwise.
 /// Returns the conflicted paths (empty on a clean apply).
@@ -2926,8 +2926,15 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
     }
     let base = repo.find_commit(parents[0])?.tree_id()?.detach();
     let theirs = commit.tree_id()?.detach();
-    let ours = repo.head_tree_id()?.detach();
     let old_index = repo.index_or_load_from_head()?.into_owned();
+    // *Ours* is the index, not `HEAD`: `do_apply_stash()` merges onto
+    // `write_index_as_tree(&c_tree, …)` (builtin/stash.c:661-663, 711) and
+    // unstages back to that same `c_tree` (:744). The two only differ when the
+    // caller staged something `HEAD` does not have — a fast-forward `merge
+    // --squash --autostash`, whose `finish()` applies the stash with the squash
+    // result staged over an unmoved `HEAD` (builtin/merge.c:539-541). Merging onto
+    // `HEAD` there reverted every squashed path to the pre-merge content.
+    let ours = super::merge::index_tree(repo, &old_index)?;
 
     // `do_apply_stash()`'s labels, which is what a stash conflict is marked with
     // wherever it is applied from: `Updated upstream` / `Stash base` / `Stashed changes`.
@@ -2977,8 +2984,8 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
     if applied.conflicts.is_empty() {
         // three_way_merge already wrote the merged content to the worktree. git's
         // autostash re-applies with `stash apply` (no `--index`), so the restored
-        // changes stay UNSTAGED: reset the index to HEAD rather than persisting the
-        // merged index, leaving worktree-vs-index as the user's local changes.
+        // changes stay UNSTAGED: reset the index to `c_tree` rather than persisting
+        // the merged index, leaving worktree-vs-index as the user's local changes.
         let mut head_index = repo.index_from_tree(&ours)?;
         // `apply_autostash()` re-applies with `git stash apply` and **no** `--index`, so
         // `do_apply_stash()` finishes in `unstage_changes_unless_new(&c_tree)`

@@ -89,9 +89,11 @@
 //! * `--autostash`/`--no-autostash` and `merge.autoStash`: a dirty worktree is
 //!   snapshotted into a stash-like commit parked under the `MERGE_AUTOSTASH` ref
 //!   (`Created autostash: <id>`), the merge runs against the clean tree, and the
-//!   changes are re-applied afterwards (`Applied autostash.`). A merge that stops
-//!   early — conflict, `--squash`, `--no-commit` — leaves the ref in place and
-//!   prints git's ``When finished, apply stashed changes with `git stash pop` ``.
+//!   changes are re-applied afterwards (`Applied autostash.`). A strategy merge that
+//!   stops early — conflict, `--squash`, `--no-commit` — leaves the ref in place and
+//!   prints git's ``When finished, apply stashed changes with `git stash pop` ``
+//!   once, whenever the option is on. A fast-forward `--squash`, a fast-forward
+//!   whose checkout is refused, and a merge no strategy handled apply it instead.
 //! * `-S`/`--gpg-sign[=<keyid>]`/`--no-gpg-sign` and `commit.gpgsign`: the merge
 //!   commit is signed through `gpg.program` with `-S<keyid>`, else
 //!   `user.signingKey`, else the committer identity (git's `get_signing_key()`),
@@ -1485,7 +1487,8 @@ fn merge_with_strategies(
         } else {
             eprintln!("Merge with strategy {} failed.", picks[0].name);
         }
-        end_autostash(repo, stash, false)?;
+        // `apply_autostash_ref()`, builtin/merge.c:1846-1847.
+        end_autostash(repo, stash, true)?;
         return Ok(ExitCode::from(2));
     };
 
@@ -2245,7 +2248,8 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         }
         let stash = begin_autostash(&repo, opts)?;
         if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, None)? {
-            end_autostash(&repo, stash, false)?;
+            // `checkout_fast_forward()` refused: `apply_autostash_ref()`, builtin/merge.c:1682.
+            end_autostash(&repo, stash, true)?;
             return Ok(code);
         }
         update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
@@ -2261,7 +2265,9 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
         }
         run_post_merge(&repo, true)?;
-        end_autostash(&repo, stash, false)?;
+        // `finish()` with a `new_head` applies the stash even under `--squash`
+        // (builtin/merge.c:539-541).
+        end_autostash(&repo, stash, true)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -2288,7 +2294,8 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     }
     let stash = begin_autostash(&repo, opts)?;
     if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, None)? {
-        end_autostash(&repo, stash, false)?;
+        // `apply_autostash_ref()`, builtin/merge.c:1682.
+        end_autostash(&repo, stash, true)?;
         return Ok(code);
     }
     update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
@@ -2933,20 +2940,12 @@ fn stop_for_conflicts(
     if !opts.quiet {
         println!("Automatic merge failed; fix conflicts and then commit the result.");
     }
-    // ```c
-    // if (autostash)
-    //         printf(_("When finished, apply stashed changes with `git stash pop`\n"));
-    // ```
-    //
-    // (`suggest_conflicts()`, builtin/merge.c.) Keyed on the *option*, not on
-    // whether a stash was created: measured against stock 2.55.0, a
-    // `--autostash` merge that conflicts prints the line whether the worktree was
-    // dirty (`Created autostash: …` first) or clean (no stash at all). The
-    // `MERGE_AUTOSTASH` the merge leaves behind is what `git merge --continue`
-    // and `git merge --abort` restore, and this is the only line that says so.
-    if opts.autostash {
-        println!("When finished, apply stashed changes with `git stash pop`");
-    }
+    // `cmd_merge()`'s tail after `suggest_conflicts()` (builtin/merge.c:1872-1874),
+    // printed whether the worktree was dirty (`Created autostash: …` first) or
+    // clean. The `MERGE_AUTOSTASH` the merge leaves behind is what `git merge
+    // --continue` and `git merge --abort` restore, and this is the only line that
+    // says so — `end_autostash()` below leaves the ref without a second copy.
+    print_autostash_notice(opts);
     end_autostash(repo, stash, false)?;
     return Ok(ExitCode::from(1));
 }
@@ -3056,6 +3055,7 @@ fn finalize_clean(
         println!("Squash commit -- not updating HEAD");
         write_squash_msg(repo, targets, local_id)?;
         run_post_merge(repo, true)?;
+        print_autostash_notice(opts);
         end_autostash(repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -3069,6 +3069,7 @@ fn finalize_clean(
         // `git merge --no-commit --no-ff -m mm <side>` is `mm\n`).
         std::fs::write(git_dir.join("MERGE_MSG"), format!("{message}\n"))?;
         eprintln!("Automatic merge went well; stopped before committing as requested");
+        print_autostash_notice(opts);
         end_autostash(repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -4295,13 +4296,30 @@ fn begin_autostash(repo: &gix::Repository, opts: &Opts) -> Result<Option<ObjectI
     Ok(Some(id))
 }
 
+/// ```c
+/// if (autostash)
+///         printf(_("When finished, apply stashed changes with `git stash pop`\n"));
+/// ```
+///
+/// (builtin/merge.c:1873-1874.) The single tail every strategy-path stop runs
+/// through — a conflict, `--squash` and `--no-commit` alike — keyed on the
+/// option and not on whether a stash was made. It is the only place merge
+/// prints the line: every other early exit applies the stash instead.
+fn print_autostash_notice(opts: &Opts) {
+    if opts.autostash {
+        println!("When finished, apply stashed changes with `git stash pop`");
+    }
+}
+
 /// The other half: `apply_autostash_ref()` once the merge produced a new `HEAD`,
 /// or — when it stopped early (conflict, `--squash`, `--no-commit`) — git's
 /// pointer at the stash it left behind under `MERGE_AUTOSTASH`.
 fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool) -> Result<()> {
     let Some(id) = stash else { return Ok(()) };
+    // Not applied: the stash stays under `MERGE_AUTOSTASH` for `--continue`,
+    // `--abort` or `git stash pop`. The notice saying so is
+    // [`print_autostash_notice`]'s, on the strategy tail only.
     if !applied {
-        println!("When finished, apply stashed changes with `git stash pop`");
         return Ok(());
     }
     // The shared apply reports on stdout for `rebase`; merge's own notices go to

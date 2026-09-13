@@ -444,6 +444,13 @@ where
                                     editor.remove(toc(our_location))?;
                                     pick_our_tree(side, our_tree, their_tree)
                                         .remove_existing_leaf(our_location.as_bstr());
+                                    // The merged result is re-emitted below as an addition at the
+                                    // rename's destination, which stands for that path from now on. The
+                                    // rename's own leaf there would otherwise pair a path the modifying
+                                    // side added beneath it with the rename for a content merge (t6423 11c,
+                                    // `y/c/d` against `x/c -> y/c`), where merge-ort sees a file/directory
+                                    // conflict at `y/c` (merge-ort.c:4123-4181).
+                                    pick_our_tree(side, their_tree, our_tree).remove_leaf(their_location.as_bstr());
                                     let final_location = None;
                                     let new_change = Change::Addition {
                                         location: their_location.to_owned(),

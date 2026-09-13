@@ -468,8 +468,12 @@ impl TreeNodes {
         }
 
         if cursor.is_leaf_node() {
+            // A directory whose every change was resolved away (a rename source that
+            // `remove_leaf()` dropped) is left as a node without children or change.
+            // Nothing of *ours* is at its path any more (t6423 12m with
+            // `merge.directoryRenames=false`, B's symlink at the emptied `dir/subdir`).
             PossibleConflict::Match {
-                change_idx: cursor.change_idx.expect("leaf nodes always have a change"),
+                change_idx: cursor.change_idx?,
             }
         } else {
             PossibleConflict::TreeToNonTree {

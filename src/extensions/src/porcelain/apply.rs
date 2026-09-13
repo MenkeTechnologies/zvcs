@@ -1536,6 +1536,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             staged.insert(old.clone(), None);
             ops.push(Op {
                 name,
+                said: say_patch_name(p),
                 remove: Some(old),
                 prune_dirs: true,
                 create: None,
@@ -1591,6 +1592,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
         ops.push(Op {
             name,
+            said: say_patch_name(p),
             remove: if p.is_copy { None } else { p.old_name.clone() },
             prune_dirs: p.is_rename,
             create: Some((new, mode, data)),
@@ -1815,7 +1817,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         let nrej = op.applied.iter().filter(|a| !**a).count();
         if nrej == 0 {
             if verbosity(&o).verbose {
-                eprintln!("Applied patch {} cleanly.", op.name);
+                eprintln!("Applied patch {} cleanly.", op.said);
             }
             continue;
         }
@@ -1825,7 +1827,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             o.quiet(),
             &format!(
                 "Applying patch {} with {nrej} {}...",
-                op.name,
+                op.said,
                 if nrej == 1 { "reject" } else { "rejects" }
             ),
         );
@@ -2316,7 +2318,12 @@ fn to_index_mode(mode: u32) -> IndexMode {
 /// verbatim during the write phase (git's `write_out_one_result`: remove the
 /// pre-image path, then create the post-image path).
 struct Op {
-    name: String, // display name for the verbose `Applied patch <name> cleanly.`
+    /// The post-image path, raw: what `write_out_one_reject()` names the `.rej` file
+    /// and its `diff a/<name> b/<name>` header after.
+    name: String,
+    /// `say_patch_name()`'s rendering, for `Applied patch %s cleanly.` and
+    /// `Applying patch %s with N reject(s)...` (apply.c:4732, 4749).
+    said: String,
     remove: Option<String>,
     prune_dirs: bool,
     create: Option<(String, u32, Vec<u8>)>,

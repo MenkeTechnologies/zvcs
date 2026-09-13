@@ -315,11 +315,12 @@ fn render_one<'r, 's>(
             let src = ours.source_location().to_owned();
             let our_dst = ours.location().to_owned();
             let their_dst = theirs.location().to_owned();
-            let (dst1, dst2) = if operands.holds(repo, our_dst.as_bstr())? {
-                (our_dst, their_dst)
-            } else {
-                (their_dst, our_dst)
-            };
+            // `pathnames[1]` and `pathnames[2]` are side 1's and side 2's new
+            // names (merge-ort.c:2971-2973), and `changes_in_resolution()`
+            // already yields operand 1's rename first. Neither operand's tree
+            // need hold its destination once a directory rename moved it
+            // (t6423 7c, 10c, 11e, 12h).
+            let (dst1, dst2) = (our_dst, their_dst);
             // git content-merges the two destinations against the shared base
             // *before* reporting the rename (merge-ort.c:3011), naming the merge
             // after the **source** path. The stage entries recorded for this

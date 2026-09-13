@@ -672,15 +672,6 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // database behind that git leaves.
     let scratch = repo.clone().with_object_memory();
 
-    // An unborn HEAD has no base to stash against. `do_create_stash()` says so on
-    // stderr — unprefixed, and not at all under `-q` — and returns -1.
-    if repo.head_id().is_err() {
-        if !opts.quiet {
-            eprintln!("You do not have the initial commit yet");
-        }
-        return Ok(ExitCode::FAILURE);
-    }
-
     // A pathspec naming nothing git tracks is an error, before any work — git
     // reports the normalized spec, magic prefix and all. `do_push_stash()` runs
     // this check ahead of `repo_refresh_and_write_index()`, and only when the
@@ -710,10 +701,32 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         }
     }
 
-    // `do_push_stash()` continues with `repo_refresh_and_write_index()`, which
+    // `do_push_stash()` continues with `repo_refresh_and_write_index()`
+    // (builtin/stash.c:1720), which dies at the first racily clean entry it has to
+    // hash under a bad `--attr-source` — see
+    // [`super::read_tree::StatCtx::refresh_dies_on_attr_source`] — and otherwise
     // fails on an unmerged index after announcing every conflicted path.
+    if let Some(death) =
+        super::read_tree::StatCtx::refresh_dies_on_attr_source(repo, &*repo.index_or_empty()?, |_| true)?
+    {
+        for path in &death.unmerged {
+            println!("{path}: needs merge");
+        }
+        return death.die();
+    }
     if let Some(code) = refuse_unmerged_index(repo)? {
         return Ok(code);
+    }
+
+    // An unborn HEAD has no base to stash against. `do_create_stash()` says so on
+    // stderr — unprefixed, and not at all under `-q` — and returns -1; it gets
+    // there only after the pathspec check and the refresh above
+    // (builtin/stash.c:1701-1724, 1520-1532).
+    if repo.head_id().is_err() {
+        if !opts.quiet {
+            eprintln!("You do not have the initial commit yet");
+        }
+        return Ok(ExitCode::FAILURE);
     }
 
     // `check_changes()` decides whether there is anything to take *before*
@@ -1952,6 +1965,19 @@ pub(crate) fn create_snapshot(repo: &gix::Repository) -> Result<Option<ObjectId>
 /// `create_stash` (builtin/stash.c): the message is every remaining arg joined
 /// by a space (no option parsing), and a clean tree prints nothing (exit 0).
 fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    // `check_changes_tracked_files()` hashes a racily clean entry in
+    // `run_diff_files()`, and whatever it lets through reaches
+    // `do_create_stash()`'s refresh (builtin/stash.c:1521) — which, unborn HEAD
+    // included, hashes every entry its stat cannot vouch for before it looks at
+    // HEAD. Either way the first such entry dies on a bad `--attr-source`.
+    if let Some(death) =
+        super::read_tree::StatCtx::refresh_dies_on_attr_source(repo, &*repo.index_or_empty()?, |_| true)?
+    {
+        for path in &death.unmerged {
+            println!("{path}: needs merge");
+        }
+        return death.die();
+    }
     if repo.head_id().is_err() {
         eprintln!("You do not have the initial commit yet");
         return Ok(ExitCode::FAILURE);
@@ -2419,6 +2445,9 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // restored here, whatever `stash.index` says, so the staged state a stash
     // captured comes back staged on the new branch.
     let repo = crate::setup::discover()?;
+    if let Some(code) = refresh_before_apply(&repo)? {
+        return Ok(code);
+    }
     let restored = match restore_stash_commit(&repo, commit_id, true, &ConflictLabels::default())? {
         Ok(restored) => restored,
         Err(code) => return Ok(code),
@@ -2521,6 +2550,9 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
     }
     let commit_id = stash.id;
 
+    if let Some(code) = refresh_before_apply(repo)? {
+        return Ok(code);
+    }
     let restored = match restore_stash_commit(repo, commit_id, opts.restore_index, &opts.labels)? {
         Ok(restored) => restored,
         // `--index` could not replay the stash's staged state onto ours: git
@@ -2549,6 +2581,23 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
         return do_drop_stash(repo, &stash, opts.quiet);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `do_apply_stash()` opens with `repo_refresh_and_write_index()`
+/// (builtin/stash.c:656-659), whose content compare of a racily clean entry dies
+/// on a bad `--attr-source` — see
+/// [`super::read_tree::StatCtx::refresh_dies_on_attr_source`]. It is a `die()`, so
+/// `pop` never gets to say the entry was kept.
+fn refresh_before_apply(repo: &gix::Repository) -> Result<Option<ExitCode>> {
+    let Some(death) =
+        super::read_tree::StatCtx::refresh_dies_on_attr_source(repo, &*repo.index_or_empty()?, |_| true)?
+    else {
+        return Ok(None);
+    };
+    for path in &death.unmerged {
+        println!("{path}: needs merge");
+    }
+    death.die().map(Some)
 }
 
 /// Restore the stash onto the current tree with a three-way merge, shared by

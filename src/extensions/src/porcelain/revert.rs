@@ -867,6 +867,11 @@ fn continue_single_pick(
         eprintln!("fatal: revert failed");
         return Ok(Err(ExitCode::from(128)));
     }
+    // The child is `git commit`, whose `git_config(git_commit_config, &s)`
+    // (builtin/commit.c) runs before anything it checks — so a value that
+    // callback refuses (`diff.context=no`) dies there, ahead of the
+    // unmerged-paths report below.
+    crate::status_config::validate_commit(repo).map_err(|r| r.into_error())?;
 
     let mut index = repo.open_index()?;
     if index.entries().iter().any(|e| e.stage_raw() != 0) {

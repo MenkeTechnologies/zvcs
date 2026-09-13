@@ -2032,6 +2032,11 @@ fn continue_single_pick(
     let Some(raw) = stopped else {
         return Ok(Err(sequencer_failed("no cherry-pick or revert in progress")));
     };
+    // The child is `git commit`, whose `git_config(git_commit_config, &s)`
+    // (builtin/commit.c) runs before anything it checks — so a value that
+    // callback refuses (`diff.context=no`) dies there, ahead of the
+    // unmerged-paths report below.
+    crate::status_config::validate_commit(repo).map_err(|r| r.into_error())?;
     let pick_id = ObjectId::from_hex(raw.trim().as_bytes())
         .map_err(|e| anyhow::anyhow!("invalid CHERRY_PICK_HEAD: {e}"))?;
     let pick = repo.find_commit(pick_id)?;

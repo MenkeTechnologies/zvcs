@@ -623,7 +623,9 @@ fn navigation(mut base: &str) -> (&str, bool) {
 /// handed, and whether that frame is one of the two that drop `GET_OID_QUIETLY`.
 ///
 /// `None` is the fixed point — neither `peel_onion()` nor `get_oid_1()`'s
-/// `~<n>`/`^<n>` block has anything left to cut, so `get_oid_basic()` is next.
+/// `~<n>`/`^<n>` block has anything left to cut, so `get_oid_basic()` is next —
+/// or the frame whose `~<n>`/`^<n>` count `get_oid_1()` refuses with
+/// `MISSING_OBJECT`, below which nothing runs at all ([`stops_at_missing_count`]).
 ///
 /// Split out of [`navigation`] because the reduction is not only a way of
 /// arriving at a name: `peel_onion()` runs, and can `error()`, at *every* step
@@ -642,7 +644,65 @@ fn navigation_step(base: &str) -> Option<(&str, bool)> {
     // `get_oid_1()`: trailing digits, then one `~` or `^`, then recurse on
     // what precedes it.
     let head = base.trim_end_matches(|c: char| c.is_ascii_digit());
-    head.strip_suffix(['~', '^']).filter(|rest| !rest.is_empty()).map(|rest| (rest, true))
+    let rest = head.strip_suffix(['~', '^']).filter(|rest| !rest.is_empty())?;
+    // The count is parsed before the recursion, and a count that does not fit
+    // ends the frame (`object-name.c:1105-1119`):
+    //
+    // ```c
+    // while (cp < name + len) {
+    //         unsigned int digit = *cp++ - '0';
+    //         if (unsigned_mult_overflows(num, 10))
+    //                 return MISSING_OBJECT;
+    //         num *= 10;
+    //         if (unsigned_add_overflows(num, digit))
+    //                 return MISSING_OBJECT;
+    //         num += digit;
+    // }
+    // if (!num && len1 == len - 1)
+    //         num = 1;
+    // else if (num > INT_MAX)
+    //         return MISSING_OBJECT;
+    // ```
+    //
+    // Everything above `INT_MAX` is refused, whether or not it wraps an
+    // `unsigned int` first, so one test covers all three returns. No
+    // `get_parent()`/`get_nth_ancestor()` call is made, so nothing below this
+    // frame runs: no `get_oid_basic()`, so no ambiguity warning, no reflog
+    // warning and no `@{u}` die, and no `get_short_oid()`, so no ambiguity
+    // report. The reduction stops *here*, on a name still carrying its
+    // `~<n>`/`^<n>` — which none of those readers can match, since it is not
+    // hex, not a refname (`check_refname_format()` bans `~` and `^`) and does
+    // not end in `}` — and so every one of them stays silent, as stock 2.55.0
+    // does for `cat-file -t <ambiguous-prefix>~99999999999`. A `^{<type>}`
+    // frame that encloses the overflow fails the same way: its inner
+    // `get_oid_1()` returns non-zero and `peel_onion()` gives up before
+    // `repo_peel_to_type()` (`object-name.c:959-960`).
+    if count_is_missing_object(base, head) {
+        return None;
+    }
+    Some((rest, true))
+}
+
+/// Whether `get_oid_1()` returns `MISSING_OBJECT` for `base` while parsing its
+/// trailing count, `head` being `base` with the digits trimmed off.
+fn count_is_missing_object(base: &str, head: &str) -> bool {
+    let count = &base[head.len()..];
+    !count.is_empty() && count.parse::<u64>().map_or(true, |num| num > i32::MAX as u64)
+}
+
+/// Whether [`ambiguity_base`] stopped on a `~<n>`/`^<n>` frame whose count
+/// `get_oid_1()` refused, so `get_oid_basic()` is never called for `spec`.
+///
+/// [`navigation_step`]'s early stop already leaves such a name unmatchable for
+/// every reader that looks at the name *whole*. `interpret_branch_mark()`'s
+/// callers are the exception: [`upstream_mark_at`] and [`push_mark_at`] find a
+/// mark at any `@`, not only at the end (`lonely@{u}xyz` dies in stock), so
+/// `@{u}~99999999999` would still reach the `die()` that stock 2.55.0 never
+/// raises for it.
+fn stops_at_missing_count(base: &str) -> bool {
+    let head = base.trim_end_matches(|c: char| c.is_ascii_digit());
+    head.strip_suffix(['~', '^']).is_some_and(|rest| !rest.is_empty())
+        && count_is_missing_object(base, head)
 }
 
 /// Whether resolving `spec` reaches `get_oid_basic()` with `GET_OID_QUIETLY`
@@ -2406,6 +2466,9 @@ pub fn reflog_reach_warning(repo: &gix::Repository, spec: &str) -> Option<String
 /// two applies and a tie goes to the upstream mark.
 pub fn upstream_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String> {
     let base = ambiguity_base(spec);
+    if stops_at_missing_count(base) {
+        return None;
+    }
     let at = match (upstream_mark_at(base), push_mark_at(base)) {
         (Some(u), Some(p)) if p < u => return push_mark_fatal(repo, spec),
         (None, Some(_)) => return push_mark_fatal(repo, spec),
@@ -2520,6 +2583,9 @@ pub fn push_mark_at(base: &str) -> Option<usize> {
 ///     "no local tracking branch" arm rather than "has no remote for pushing".
 pub fn push_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String> {
     let base = ambiguity_base(spec);
+    if stops_at_missing_count(base) {
+        return None;
+    }
     let at = push_mark_at(base)?;
     let named = &base[..at];
     if named.contains(':') {

@@ -1215,11 +1215,27 @@ where
                                         break 'outer;
                                     }
                                 }
+                                // The additions stand for both destinations from now on, so the
+                                // renames' own leaves there must not be matched again: the other
+                                // side's addition at a destination was content-merged with the stale
+                                // leaf and then once more with the addition (t6423 5c, 11e). Each
+                                // addition keeps the path its side gave the file for labels
+                                // (`pathnames[side]`, merge-ort.c:2826-2845).
+                                if our_addition.is_some() || their_addition.is_some() {
+                                    our_tree.remove_leaf(ours.location().as_bstr());
+                                    their_tree.remove_leaf(theirs.location().as_bstr());
+                                }
+                                let our_label = our_changes[ours_idx].label_location().clone();
+                                let their_label = their_changes[theirs_idx].label_location().clone();
                                 if let Some(addition) = our_addition {
+                                    let label = (addition.location() != our_label).then_some(our_label);
                                     push_deferred((addition, Some(ours_idx)), our_changes);
+                                    our_changes.last_mut().expect("just pushed").location_before_directory_rename = label;
                                 }
                                 if let Some(addition) = their_addition {
+                                    let label = (addition.location() != their_label).then_some(their_label);
                                     push_deferred((addition, Some(theirs_idx)), their_changes);
+                                    their_changes.last_mut().expect("just pushed").location_before_directory_rename = label;
                                 }
                             }
                             (

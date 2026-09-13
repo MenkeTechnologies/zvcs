@@ -129,9 +129,16 @@ where
         buf
     }
 
-    if outer_side.is_swapped() {
+    // The labels follow the ids, which are resourced by `outer_side` above, and so
+    // do the paths paired with them. The paths only differ when a rename or
+    // directory rename is involved: t6423 11e with `B A` wrote `B:y/c` against
+    // `A:z/c` where merge-ort writes `B:z/c` against `A:y/c` (merge-ort.c:2137-2144).
+    let (our_location, their_location) = if outer_side.is_swapped() {
         (labels.current, labels.other) = (labels.other, labels.current);
-    }
+        (their_location, our_location)
+    } else {
+        (our_location, their_location)
+    };
 
     let (ancestor, current, other);
     let labels = if our_location == their_location {

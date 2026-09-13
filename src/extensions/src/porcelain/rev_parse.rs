@@ -60,10 +60,11 @@
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
 //! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
-//! `--is-shallow-repository`, `--show-superproject-working-tree`, `--bisect`,
-//! `--default`, `--prefix`, `--revs-only`/`--no-revs`/`--flags`/`--no-flags`,
+//! `--sq`, `--not`, `--bisect`, `--default <rev>`, `--prefix <dir>`,
 //! `--end-of-options`, `--all-objects` and `--exclude-hidden=`. Options git does
-//! *not* recognize are echoed, which is what git itself does with them.
+//! *not* recognize are echoed — through `show_flag()`'s `DO_FLAGS` /
+//! `DO_REVS`-or-`DO_NOREV` gate, which `--revs-only`, `--no-revs`, `--flags` and
+//! `--no-flags` narrow — which is what git itself does with them.
 
 use anyhow::Result;
 use std::io::Write;
@@ -120,14 +121,79 @@ struct Opts {
     /// `repo_settings_get_warn_ambiguous_refs()`; `--abbrev-ref=strict` and
     /// `--abbrev-ref=loose` pin it (`builtin/rev-parse.c:917-930`).
     abbrev_ref_strict: Option<bool>,
-    /// git's `DO_FLAGS`: echo unrecognized options. Cleared by `--verify`/`--short`.
-    echo_flags: bool,
-    /// git's `DO_NONFLAGS`: echo path arguments. Cleared by `--verify`/`--short`.
-    echo_paths: bool,
+    /// git's `static int filter = ~0` (`builtin/rev-parse.c:38-41`): which of
+    /// [`DO_REVS`], [`DO_NOREV`], [`DO_FLAGS`] and [`DO_NONFLAGS`] may still print.
+    /// Only ever narrowed — by `--revs-only`, `--no-revs`, `--flags`,
+    /// `--no-flags`, and by `--verify`/`--short`, which clear
+    /// `DO_FLAGS | DO_NOREV`.
+    filter: u8,
     /// `--path-format=(absolute|relative)`, git's `enum format_type format`
     /// (`builtin/rev-parse.c:721`). It is plain scan state, so it governs only the
     /// path-printing options that come *after* it on the command line.
     format: Format,
+}
+
+/// `#define DO_REVS 1` … `#define DO_NONFLAGS 8` (`builtin/rev-parse.c:38-41`).
+const DO_REVS: u8 = 1;
+const DO_NOREV: u8 = 2;
+const DO_FLAGS: u8 = 4;
+const DO_NONFLAGS: u8 = 8;
+
+impl Opts {
+    /// `show_flag()`'s gate (`builtin/rev-parse.c:193-203`): flags at all, and
+    /// then `DO_REVS` for a flag [`is_rev_argument`] claims, `DO_NOREV` otherwise.
+    fn shows_flag(&self, arg: &str) -> bool {
+        let kind = if is_rev_argument(arg) { DO_REVS } else { DO_NOREV };
+        self.filter & DO_FLAGS != 0 && self.filter & kind != 0
+    }
+
+    /// `show_file()`'s gate (`builtin/rev-parse.c:253-256`).
+    fn shows_files(&self) -> bool {
+        self.filter & (DO_NONFLAGS | DO_NOREV) == DO_NONFLAGS | DO_NOREV
+    }
+}
+
+/// `is_rev_argument()` (`builtin/rev-parse.c:59-106`): the flags that belong to
+/// the revision walk rather than to output formatting. An entry ending in `=`
+/// matches by prefix, the rest exactly, and `-<digit>` is the old `head -N`.
+fn is_rev_argument(arg: &str) -> bool {
+    const REV_ARGS: &[&str] = &[
+        "--all",
+        "--bisect",
+        "--dense",
+        "--branches=",
+        "--branches",
+        "--header",
+        "--ignore-missing",
+        "--max-age=",
+        "--max-count=",
+        "--min-age=",
+        "--no-merges",
+        "--min-parents=",
+        "--no-min-parents",
+        "--max-parents=",
+        "--no-max-parents",
+        "--objects",
+        "--objects-edge",
+        "--parents",
+        "--pretty",
+        "--remotes=",
+        "--remotes",
+        "--glob=",
+        "--sparse",
+        "--tags=",
+        "--tags",
+        "--topo-order",
+        "--date-order",
+        "--unpacked",
+    ];
+    let bytes = arg.as_bytes();
+    if bytes.first() == Some(&b'-') && bytes.get(1).is_some_and(u8::is_ascii_digit) {
+        return true;
+    }
+    REV_ARGS
+        .iter()
+        .any(|s| arg == *s || (s.ends_with('=') && arg.starts_with(s)))
 }
 
 impl Default for Opts {
@@ -139,8 +205,7 @@ impl Default for Opts {
             sym: Sym::No,
             abbrev_ref: false,
             abbrev_ref_strict: None,
-            echo_flags: true,
-            echo_paths: true,
+            filter: DO_REVS | DO_NOREV | DO_FLAGS | DO_NONFLAGS,
             format: Format::Default,
         }
     }
@@ -156,10 +221,6 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--not",
     "--default",
     "--prefix",
-    "--revs-only",
-    "--no-revs",
-    "--flags",
-    "--no-flags",
     "--bisect",
     "--end-of-options",
     "--all-objects",
@@ -321,17 +382,24 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // After an explicit `--`, everything is a pathspec: echo it (when paths
         // are being echoed) and move on. No existence check, no flag parsing.
         if dashdash {
-            if o.echo_paths {
+            if o.shows_files() {
                 emit(&mut out, arg.as_bytes())?;
             }
             continue;
         }
 
-        // `--` terminates options. git echoes the separator itself while flags or
-        // revs are still being echoed (`DO_FLAGS`/`DO_REVS`), i.e. not under
-        // `--verify`/`--short`.
+        // `--` terminates options:
+        //
+        // ```c
+        // if (filter & (DO_FLAGS | DO_REVS))
+        //         show_file(arg, 0);
+        // ```
+        //
+        // (`builtin/rev-parse.c:787-793`), and `show_file()` itself prints only
+        // under `DO_NONFLAGS | DO_NOREV` — so `--verify`/`--short` and
+        // `--revs-only` swallow the separator while `--no-flags` keeps it.
         if !as_is && arg == "--" {
-            if o.echo_flags {
+            if o.filter & (DO_FLAGS | DO_REVS) != 0 && o.shows_files() {
                 emit(&mut out, arg.as_bytes())?;
             }
             dashdash = true;
@@ -395,7 +463,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     }
                 }
                 Opt::Unknown => {
-                    if o.echo_flags {
+                    if o.shows_flag(arg) {
                         emit(&mut out, arg.as_bytes())?;
                     }
                 }
@@ -407,10 +475,14 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // `if (show_file(arg, output_prefix) && as_is < 2)
+        //         verify_filename(prefix, arg, 0);` (`builtin/rev-parse.c:751-753`):
+        // a path that is not printed is not checked either.
         if as_is {
-            if o.echo_paths {
-                emit(&mut out, arg.as_bytes())?;
+            if !o.shows_files() {
+                continue;
             }
+            emit(&mut out, arg.as_bytes())?;
             if !is_worktree_path(&repo, arg) {
                 out.flush()?;
                 eprintln!(
@@ -702,9 +774,14 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
                 as_is = true;
-                if o.echo_paths {
-                    emit(&mut out, arg.as_bytes())?;
+                // `if (!show_file(arg, output_prefix)) continue;`
+                // (`builtin/rev-parse.c:1185-1187`): under `--revs-only` or
+                // `--no-flags`' sibling filters the operand is neither echoed nor
+                // required to exist.
+                if !o.shows_files() {
+                    continue;
                 }
+                emit(&mut out, arg.as_bytes())?;
                 if !is_worktree_path(&repo, arg) {
                     out.flush()?;
                     // `verify_filename(prefix, arg, 1)` → `die_verify_filename()`:
@@ -1251,17 +1328,20 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
     match arg {
         "--verify" => {
             o.verify = true;
-            o.echo_flags = false;
-            o.echo_paths = false;
+            o.filter &= !(DO_FLAGS | DO_NOREV);
         }
+        // `builtin/rev-parse.c:846-861`.
+        "--revs-only" => o.filter &= !DO_NOREV,
+        "--no-revs" => o.filter &= !DO_REVS,
+        "--flags" => o.filter &= !DO_NONFLAGS,
+        "--no-flags" => o.filter &= !DO_FLAGS,
         "-q" | "--quiet" => o.quiet = true,
         "--short" => {
             // `--short` implies `--verify` in stock git; that is where the
             // otherwise surprising `fatal: Needed a single revision` comes from
             // for invocations like `rev-parse --short --git-dir`.
             o.verify = true;
-            o.echo_flags = false;
-            o.echo_paths = false;
+            o.filter &= !(DO_FLAGS | DO_NOREV);
             o.abbrev = Some(0);
         }
         "--symbolic" => o.sym = Sym::AsIs,
@@ -1339,8 +1419,7 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
             if let Some(n) = arg.strip_prefix("--short=") {
                 let n = strtoul_as_int(n);
                 o.verify = true;
-                o.echo_flags = false;
-                o.echo_paths = false;
+                o.filter &= !(DO_FLAGS | DO_NOREV);
                 o.abbrev = Some(if n < 4 { 4 } else { n as usize });
             } else {
                 return Ok(Opt::Unknown);
@@ -1833,6 +1912,10 @@ fn show_rev(
     known_full: Option<&BStr>,
     reversed: bool,
 ) -> Result<()> {
+    // `if (!(filter & DO_REVS)) return;` (`builtin/rev-parse.c:146-147`).
+    if o.filter & DO_REVS == 0 {
+        return Ok(());
+    }
     // Build the rendered text without the newline first. `None` means "print
     // nothing" — and for a `^rev` exclude the `^` is suppressed along with it,
     // which is why `rev-parse --abbrev-ref ^HEAD~1` prints an empty result
@@ -2377,11 +2460,11 @@ fn positional_option(
 ///
 /// (`builtin/rev-parse.c:241-251`.) `approxidate()` — not `approxidate_careful()` —
 /// so a string it cannot read is silently "now" rather than an error:
-/// `--since=bogusdate` prints the current epoch second. `DO_REVS` is only ever
-/// cleared by `--no-revs`, which this port still refuses, so the gate reduces to
-/// `DO_FLAGS`: `--verify` and `--short` clear it and the rewrite disappears.
+/// `--since=bogusdate` prints the current epoch second. `--verify`/`--short`
+/// clear `DO_FLAGS` and `--no-revs` clears `DO_REVS`; either makes the rewrite
+/// disappear.
 fn show_datestring(out: &mut impl Write, o: &Opts, flag: &str, datestr: &str) -> Result<()> {
-    if !o.echo_flags {
+    if o.filter & (DO_FLAGS | DO_REVS) != DO_FLAGS | DO_REVS {
         return Ok(());
     }
     let when = crate::date::approxidate(datestr);

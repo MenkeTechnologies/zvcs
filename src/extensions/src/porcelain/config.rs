@@ -2559,7 +2559,7 @@ fn lowercase_key_pattern(pattern: &str) -> String {
 /// with `values(name)[n]` — so an `a=1 / b=2 / a=3` section yields `a=1`, `b=2`,
 /// `a=3`. Section and value names are lower-cased (git-normalized); subsection
 /// case is preserved.
-fn for_each_entry(
+pub(crate) fn for_each_entry(
     file: &gix::config::File,
     mut emit: impl FnMut(&str, &[u8], bool, &gix::config::file::Metadata) -> Result<()>,
 ) -> Result<()> {

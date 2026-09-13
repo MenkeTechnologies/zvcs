@@ -516,63 +516,23 @@ fn config_paths(sources: &[Source]) -> Option<Vec<BString>> {
     (!paths.is_empty()).then_some(paths)
 }
 
-/// Config layers that exist only inside gitoxide and have no counterpart in
-/// stock git, so `git var -l` must not print them.
+/// `git var -l`'s configuration half: `git_config(show_config, NULL)`
+/// (builtin/var.c:89), whose callback prints `var=value`, or the bare `var`
+/// when the value is `NULL` (builtin/var.c:73-80) — a name written with no `=`.
+/// `name =` is an empty value, not a missing one, and keeps its `=`.
 ///
-/// `gix` synthesizes a `Source::EnvOverride` layer from the ambient environment
-/// (`GIT_COMMITTER_NAME` → `gitoxide.committer.nameFallback`,
-/// `GIT_TERMINAL_PROMPT` → `gitoxide.credentials.terminalPrompt`, …), and zvcs
-/// injects its own defaults through `Source::Api`. Neither is git configuration.
-/// `Source::Env` (`GIT_CONFIG_COUNT`) and `Source::Cli` (`git -c`) are real and
-/// stay visible. Same rule as `git config --list` applies in `config.rs`.
-fn is_synthetic(source: Source) -> bool {
-    matches!(source, Source::EnvOverride | Source::Api)
-}
-
-/// `git var -l`'s configuration half — every `key=value` from the merged config
-/// in file order, with section and value names lower-cased (git-normalized) and
-/// subsection case preserved. Verified byte-identical to `git config --list`,
-/// which is what `builtin/var.c` delegates this half to.
+/// The entries come from the same walker `git config --list` uses, so the two
+/// listings agree on order, multivars, synthetic gitoxide layers and `-c` echoes.
 fn list_config(cfg: &ConfigFile, out: &mut impl Write) -> Result<()> {
-    let mut echoes = crate::config::CliEcho::new();
-    for section in cfg.sections() {
-        if is_synthetic(section.meta().source) {
-            continue;
+    super::config::for_each_entry(cfg, |key, value, implicit, _meta| {
+        out.write_all(key.as_bytes())?;
+        if !implicit {
+            out.write_all(b"=")?;
+            out.write_all(value)?;
         }
-        let header = section.header();
-        let section_name = header.name().to_string().to_lowercase();
-        let subsection = header.subsection_name().map(ToString::to_string);
-
-        // Multivars keep their *file* order, not a per-key grouping: git prints
-        // `foo.a=1 / foo.b=2 / foo.a=3` for a body in that order. `value_names()`
-        // walks the body and repeats a name once per occurrence, so the nth
-        // occurrence of a name pairs with `values(name)[n]`.
-        let mut occurrence: Vec<(String, usize)> = Vec::new();
-        for raw_name in section.value_names() {
-            let lname = raw_name.to_lowercase();
-            let nth = occurrence.iter().filter(|(n, _)| *n == lname).count();
-            occurrence.push((lname, nth));
-        }
-
-        for (value_name, nth) in &occurrence {
-            let Some(value) = section.values(value_name).into_iter().nth(*nth) else {
-                continue;
-            };
-            let key = match &subsection {
-                Some(sub) => format!("{section_name}.{sub}.{value_name}"),
-                None => format!("{section_name}.{value_name}"),
-            };
-            // One `-c key=value` is one printed line, however many sources this
-            // port delivered it on. See `crate::config::CliEcho`.
-            if echoes.is_echo(section.meta().source, &key, std::str::from_utf8(&value).ok()) {
-                continue;
-            }
-            write!(out, "{key}=")?;
-            out.write_all(&value)?;
-            out.write_all(b"\n")?;
-        }
-    }
-    Ok(())
+        out.write_all(b"\n")?;
+        Ok(())
+    })
 }
 
 /// `getenv` semantics: present-but-empty is a value, not an absence.

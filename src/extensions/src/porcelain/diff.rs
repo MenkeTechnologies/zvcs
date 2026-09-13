@@ -4428,7 +4428,10 @@ fn collect_tree_index(
     ita_invisible: bool,
 ) -> Result<()> {
     let tree_id = tree_id_for(repo, spec)?;
-    let index = repo.index_or_load_from_head()?;
+    // `repo_read_index()` finding no index file is an empty index, not HEAD's
+    // tree (read-cache.c:2218 `if (!must_exist && errno == ENOENT)`), so a bare
+    // repository, or one whose `.git/index` is gone, shows every path as deleted.
+    let index = repo.index_or_empty()?;
     let start = deltas.len();
     repo.tree_index_status(
         &tree_id,

@@ -343,7 +343,6 @@ enum Resume {
     Skip,
     Abort,
     Quit,
-    Retry,
     AllowEmpty,
     ShowPatch(Sub),
 }
@@ -639,11 +638,6 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         Resume::AllowEmpty => am_resolve(&repo, &state_dir, &cli, true),
         Resume::Skip => am_skip(&repo, &state_dir, &cli),
         Resume::Abort => am_abort(&repo, &state_dir),
-        // git has no `--retry` verb; this port accepts the token in `parse` but
-        // there is no faithful behavior to drive, so it stays an honest refusal.
-        Resume::Retry => crate::git_fatal!(
-            "`git am --retry` is not a git verb; there is no upstream behavior to port"
-        ),
     }
 }
 
@@ -915,7 +909,10 @@ fn parse_long(
         "skip" => cmdmode(o, tok, Resume::Skip, attached)?,
         "abort" => cmdmode(o, tok, Resume::Abort, attached)?,
         "quit" => cmdmode(o, tok, Resume::Quit, attached)?,
-        "retry" => cmdmode(o, tok, Resume::Retry, attached)?,
+        // `OPT_CMDMODE(0, "retry", &resume_mode, ..., RESUME_APPLY)`
+        // (builtin/am.c:2418-2420): the same mode a bare `git am` inside a live
+        // session falls into, spelled as a verb so it conflicts with the others.
+        "retry" => cmdmode(o, tok, Resume::Apply, attached)?,
         "allow-empty" => cmdmode(o, tok, Resume::AllowEmpty, attached)?,
         "show-current-patch" => {
             let sub = match attached {
@@ -2736,17 +2733,9 @@ fn do_commit(
     if !no_verify && !crate::hooks::run(repo, "pre-applypatch", &[], None)? {
         return Ok(Some(ExitCode::from(1)));
     }
-    // `fmt_ident(..., IDENT_STRICT)` refuses an empty author name; our
-    // `commit-tree` would instead accept an empty gix signature, so reproduce
-    // git's failure here rather than write a commit git would not.
-    if info.author_name.trim().is_empty() {
-        eprintln!(
-            "fatal: empty ident name (for <{}>) not allowed",
-            info.author_email.to_str_lossy()
-        );
-        return Ok(Some(ExitCode::from(128)));
-    }
-
+    // `write_index_as_tree()` (builtin/am.c:1677) runs first, and it writes the
+    // index back with its cache-tree filled in — so even a commit that dies on
+    // the ident below leaves that index behind.
     let tree = match capture(ctx.cmd("write-tree"))? {
         Some(t) => t,
         None => {
@@ -2758,6 +2747,17 @@ fn do_commit(
     let parent = repo.head_id().ok().map(|id| id.detach());
     if parent.is_none() && !quiet {
         eprintln!("applying to an empty history");
+    }
+
+    // `fmt_ident(..., IDENT_STRICT)` (builtin/am.c:1691) refuses an empty author
+    // name; our `commit-tree` would instead accept an empty gix signature, so
+    // reproduce git's failure here rather than write a commit git would not.
+    if info.author_name.trim().is_empty() {
+        eprintln!(
+            "fatal: empty ident name (for <{}>) not allowed",
+            info.author_email.to_str_lossy()
+        );
+        return Ok(Some(ExitCode::from(128)));
     }
 
     let mut ct = ctx.cmd("commit-tree");

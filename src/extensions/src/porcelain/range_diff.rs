@@ -1997,7 +1997,7 @@ fn io_reason(e: &std::io::Error) -> String {
 
 /// The errno `git_parse_unsigned()` sets, which parse-options turns into two
 /// different messages: `EINVAL` (malformed) and `ERANGE` (out of bounds).
-enum MagnitudeError {
+pub(super) enum MagnitudeError {
     /// `EINVAL`: not a non-negative integer with an optional k/m/g suffix.
     Invalid,
     /// `ERANGE`: parsed, but overflowed `uintmax_t` or exceeded the bound.
@@ -2108,7 +2108,7 @@ fn git_parse_unsigned(value: &str, max: u64) -> Result<u64, MagnitudeError> {
 ///
 /// Unlike [`git_parse_unsigned`] a `-` is not rejected up front: it is the sign
 /// `strtoimax` accepts, so `--creation-factor=-1k` is -1024.
-fn git_parse_signed(value: &str, min: i64, max: i64) -> Result<i64, MagnitudeError> {
+pub(super) fn git_parse_signed(value: &str, min: i64, max: i64) -> Result<i64, MagnitudeError> {
     let bytes = value.as_bytes();
 
     // `strtoimax(value, &end, 0)`: skip leading isspace, take an optional sign,

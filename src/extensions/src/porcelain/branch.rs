@@ -1455,6 +1455,8 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // `print_ref_list()` (builtin/branch.c:476-477) has no `filter_is_base()`
         // call, so `%(is-base:<x>)` is always empty under `git branch`.
         run_is_base: false,
+        // `print_ref_list()` sorts the whole array before formatting any of it.
+        can_iterate: false,
         detached_head_first,
         // `filter.verbose = !!verbose` (builtin/branch.c), which is what makes `-v` drop a branch
         // whose object is missing while a plain listing still names it.
@@ -1464,6 +1466,19 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let lines = match ref_filter::filter_and_format(&spec)? {
         ref_filter::Listing::Lines(lines) => lines,
         ref_filter::Listing::Exit(code) => return Ok(code),
+        // `--column` collects into a string list and dies before printing it
+        // (builtin/branch.c:484-492); otherwise every earlier line was written.
+        ref_filter::Listing::Partial(lines, e) => {
+            if !super::column::active(o.colopts) {
+                let mut out: Vec<u8> = Vec::new();
+                for line in lines {
+                    out.extend_from_slice(&line);
+                    out.push(b'\n');
+                }
+                std::io::stdout().write_all(&out)?;
+            }
+            return Err(e);
+        }
     };
 
     if super::column::active(o.colopts) {

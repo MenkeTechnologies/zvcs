@@ -35,7 +35,7 @@ use gix::objs::Kind;
 
 use super::for_each_ref::{
     self, filter_is_base, format_ref, is_packed, load, parse_atom, parse_format, passes_filters,
-    peel_chain, short_name, sort_refs, Atom, AtomCtx, AtomError, ErrKind, Field, Filters, Item,
+    peel_chain, populate_for_sort, short_name, sort_refs, Atom, AtomCtx, AtomError, ErrKind, Field, Filters, Item,
     NameMod, QuoteStyle, RefInfo, RenderCtx, SortKey,
 };
 use crate::refsort::Prereleases;
@@ -174,6 +174,11 @@ pub(super) struct ListSpec<'a> {
     /// `git branch --format='%(is-base:<x>)'` renders empty for *every* branch,
     /// including the one `git for-each-ref` picks out of the same refs.
     pub(super) run_is_base: bool,
+    /// Whether the verb lists through `filter_and_format_refs()`, which formats
+    /// each ref as it is iterated whenever `can_do_iterative_format()` allows
+    /// (ref-filter.c:3385-3445). `print_ref_list()` always builds and sorts the
+    /// whole array first (builtin/branch.c:464-497).
+    pub(super) can_iterate: bool,
     /// `REF_SORTING_DETACHED_HEAD_FIRST`. It is a flag *on the sorting nodes*
     /// (`ref_sorting_set_sort_flags_all`, builtin/branch.c:881-882), so it has
     /// no effect when there are none: `ref_array_sort()` runs only
@@ -204,6 +209,9 @@ pub(super) struct ListSpec<'a> {
 pub(super) enum Listing {
     Lines(Vec<Vec<u8>>),
     Exit(ExitCode),
+    /// A ref died while formatting after these lines were already formatted —
+    /// and, in git, already written: print them, then return the error.
+    Partial(Vec<Vec<u8>>, anyhow::Error),
 }
 
 /// git's `print_ref_list()` / `filter_and_format_refs()`: filter, size, verify,
@@ -304,6 +312,41 @@ pub(super) fn filter_and_format(spec: &ListSpec<'_>) -> Result<Listing> {
         filter_is_base(repo, &mut refs, &is_base_atoms);
     }
 
+    // `used_atom[]`: the sort keys were parsed in `cmd_branch()` / `cmd_tag()`
+    // before the format was verified, in command-line order (`sorts` is
+    // reversed above).
+    let used: Vec<&Atom> = sorts
+        .iter()
+        .rev()
+        .map(|s| &s.atom)
+        .chain(items.iter().filter_map(|it| match it {
+            Item::Atom(a) => Some(a),
+            _ => None,
+        }))
+        .collect();
+
+    // `can_do_iterative_format()` (ref-filter.c:3385-3417): a single plain
+    // `refname` key (or none), no `ahead-behind`/`is-base` atom and no
+    // `--merged`/`--no-merged`. Anything else sorts the whole array, filling
+    // every ref before any output — see [`populate_for_sort`].
+    let iterative = spec.can_iterate
+        && match sorts.as_slice() {
+            [] => true,
+            [only] => {
+                matches!(only.atom.field, Field::RefName(_))
+                    && !only.descending
+                    && !only.versioned
+                    && !spec.ignore_case
+            }
+            _ => false,
+        }
+        && spec.filters.merged.is_empty()
+        && spec.filters.no_merged.is_empty()
+        && !used.iter().any(|a| matches!(a.field, Field::AheadBehind(_) | Field::IsBase(..)));
+    if !iterative && !sorts.is_empty() {
+        populate_for_sort(&used, &refs)?;
+    }
+
     // `ref_array_sort()` (ref-filter.c:3556-3560) runs `QSORT_S` only
     // `if (sorting)`. An empty `--sort` list is therefore not "sort by refname" —
     // it is *no sort at all*, and the array keeps `do_filter_refs()`'s iteration
@@ -331,10 +374,13 @@ pub(super) fn filter_and_format(spec: &ListSpec<'_>) -> Result<Listing> {
 
     let mut lines: Vec<Vec<u8>> = Vec::new();
     for info in &refs {
-        let line = match format_ref(&ctx, &items, info, quote_style, color_reset_at_eol)? {
-            Ok(line) => line,
+        let line = match format_ref(&ctx, &items, &used, info, quote_style, color_reset_at_eol) {
+            Ok(Ok(line)) => line,
             // Every stack error git raises while formatting reaches `die()`.
-            Err(msg) => return Ok(Listing::Exit(for_each_ref::fatal(&msg))),
+            Ok(Err(msg)) if lines.is_empty() => return Ok(Listing::Exit(for_each_ref::fatal(&msg))),
+            Ok(Err(msg)) => return Ok(Listing::Partial(lines, crate::fatal::die(msg))),
+            Err(e) if lines.is_empty() => return Err(e),
+            Err(e) => return Ok(Listing::Partial(lines, e)),
         };
         if spec.omit_empty && line.is_empty() {
             continue;
@@ -649,7 +695,7 @@ pub(super) fn pretty_print_ref(
         worktrees: std::cell::OnceCell::new(),
     };
     Ok(
-        match format_ref(&ctx, items, &info, QuoteStyle::None, false)? {
+        match format_ref(&ctx, items, &atoms(items, &sorts).collect::<Vec<_>>(), &info, QuoteStyle::None, false)? {
             Ok(line) => Ok(line),
             Err(msg) => Err(for_each_ref::fatal(&msg)),
         },

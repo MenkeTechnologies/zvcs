@@ -384,7 +384,7 @@ impl Blob<'_> {
 
 /// `strtol(s, &end, 10)` over ASCII: the value and how many bytes it consumed.
 /// Zero consumed bytes is C's "no conversion performed".
-fn strtol(s: &str) -> (i64, usize) {
+pub(super) fn strtol(s: &str) -> (i64, usize) {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {

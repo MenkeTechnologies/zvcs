@@ -3341,7 +3341,7 @@ fn strtoumax0(value: &str) -> Option<(Option<u64>, &str)> {
 /// and `+3` pass while `3x`, `0x10` (base 10 stops at the `x`), the empty string and
 /// `99999999999999999999` do not — all five verified against git 2.55.0 through
 /// `git blame -- <path> --max-count=<v>`.
-fn strtol_i(s: &str) -> Option<i32> {
+pub(super) fn strtol_i(s: &str) -> Option<i32> {
     // Rust's own parser is the guard: it rejects leading whitespace, trailing
     // characters, an empty string and anything outside `i32`, and accepts exactly
     // the optional sign `strtol` does. Only the whitespace skip has to be added.

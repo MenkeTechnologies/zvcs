@@ -344,15 +344,31 @@ pub(super) enum Who {
 pub(super) enum PersonPart {
     /// The whole `Name <email> <secs> <tz>` tuple.
     Full,
+    /// `%(author:<anything>)`, `%(committer:…)`, `%(tagger:…)`: accepted, and
+    /// never filled. `valid_atom[]` gives these atoms no parser, so the argument
+    /// is not checked (ref-filter.c:958, 962, 966, 1102), but `grab_person()`
+    /// matches on the atom *name as written* and skips a name whose tail after
+    /// the header is not `name`, `email` or `date` (ref-filter.c:1745-1749) —
+    /// `:…` included, the empty `%(author:)` too. The value stays NULL and
+    /// `fill_missing_values()` renders it empty.
+    Unfilled,
     /// `%(authorname[:mailmap])`, git's `N_RAW` / `N_MAILMAP`.
     Name { mailmap: bool },
     /// `%(authoremail[:<opts>])`, git's `EO_*` bit set.
     Email(EmailOpt),
-    /// `%(authordate[:<fmt>])`. `None` is the *no colon at all* case, which is
-    /// the only one git leaves as `FIELD_TIME` for sorting (`grab_date()` sets
-    /// `v->atom->type = FIELD_STR` the moment a format is spelled out, even
-    /// `:default`).
-    Date(Option<crate::showdate::DateMode>),
+    /// `%(authordate[:<fmt>])`, carrying the format exactly as written. `None`
+    /// is the *no colon at all* case, which is the only one git leaves as
+    /// `FIELD_TIME` for sorting (`grab_date()` sets `v->atom->type = FIELD_STR`
+    /// the moment a format is spelled out, even `:default`).
+    ///
+    /// The format is not parsed here because git does not parse it at parse
+    /// time: date atoms have no parser, and `grab_date()` hands the text after
+    /// the colon to `parse_date_format()` only when it fills a value
+    /// (ref-filter.c:1692-1696). Its `die()`s therefore fire per object —
+    /// never for a run with no matching object — and `%(authordate:)`, whose
+    /// empty argument the parser table would have nulled, still reaches it as
+    /// `""` and dies `unknown date format `. See [`populate_value_errors`].
+    Date(Option<String>),
 }
 
 /// `email_atom_option_parser`'s bit set: `EO_RAW` is the empty one.
@@ -559,13 +575,13 @@ fn strtoul_ui(s: &str) -> Option<u32> {
     t.parse::<u32>().ok()
 }
 
-/// `git_parse_maybe_bool()` (parse.c:166-192) restricted to what a placeholder
-/// argument can carry: the three true and three false spellings, then any
-/// integer (non-zero is true). `None` is git's `-1`.
+/// `git_parse_maybe_bool()` (parse.c:166-192): the three true and three false
+/// spellings in any case, the empty string as false, then `git_parse_int()` —
+/// base auto-detected, a `k`/`m`/`g` suffix allowed, range `int` — with any
+/// non-zero value true. `None` is git's `-1`.
 ///
-/// Distinct from [`maybe_bool`], which is `match_atom_bool_arg`'s much narrower
-/// `true`/`false`-only test — `%(describe:tags=yes)` and `%(trailers:only=yes)`
-/// really do disagree.
+/// Both `%(trailers:<key>=<bool>)` (`match_placeholder_bool_arg`) and
+/// `%(describe:tags=<bool>)` (`match_atom_bool_arg`, ref-filter.c:373) call it.
 fn git_parse_maybe_bool(value: Option<&str>) -> Option<bool> {
     let Some(v) = value else { return Some(true) };
     if v.is_empty() {
@@ -576,7 +592,9 @@ fn git_parse_maybe_bool(value: Option<&str>) -> Option<bool> {
             return Some(answer);
         }
     }
-    v.parse::<i64>().ok().map(|n| n != 0)
+    super::range_diff::git_parse_signed(v, i64::from(i32::MIN), i64::from(i32::MAX))
+        .ok()
+        .map(|n| n != 0)
 }
 
 /// `match_placeholder_arg_value()` (pretty.c:1195-1224): peel `<candidate>`,
@@ -1534,6 +1552,33 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         worktrees: std::cell::OnceCell::new(),
     };
 
+    // `used_atom[]`: `verify_ref_format()` runs before `ref_sorting_options()`
+    // (builtin/for-each-ref.c:71-77), so the format's atoms come first, then the
+    // sort keys in command-line order — `sorts` was reversed above.
+    let used: Vec<&Atom> = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Atom(a) => Some(a),
+            _ => None,
+        })
+        .chain(sorts.iter().rev().map(|s| &s.atom))
+        .collect();
+
+    // `can_do_iterative_format()` (ref-filter.c:3385-3417). The default
+    // `refname` key is always there (builtin/for-each-ref.c:60), so any
+    // `--sort` makes a second node; `--ignore-case` flags the one node.
+    // Iteratively, each ref is filled and written before the next is looked
+    // at. Otherwise `ref_array_sort()` fills every ref before the first line
+    // is written — see [`populate_for_sort`].
+    let iterative = sort_specs.is_empty()
+        && !ignore_case
+        && filters.merged.is_empty()
+        && filters.no_merged.is_empty()
+        && !used.iter().any(|a| matches!(a.field, Field::AheadBehind(_) | Field::IsBase(..)));
+    if !iterative {
+        populate_for_sort(&used, &refs)?;
+    }
+
     let mut refs = sort_refs(&ctx, refs, &sorts, ignore_case, &prereleases)?;
     if let Some(n) = count {
         refs.truncate(n);
@@ -1541,10 +1586,20 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
 
     let mut out: Vec<u8> = Vec::new();
     for info in &refs {
-        let line = match format_ref(&ctx, &items, info, quote_style, color_reset_at_eol)? {
-            Ok(line) => line,
+        // git writes each line as soon as it is formatted (ref-filter.c:3641-3645,
+        // and `filter_and_format_one()` when iterating), so a ref that dies
+        // leaves every earlier line on stdout.
+        let line = match format_ref(&ctx, &items, &used, info, quote_style, color_reset_at_eol) {
+            Ok(Ok(line)) => line,
             // Every stack error git raises while formatting reaches `die()`.
-            Err(msg) => return Ok(fatal(&msg)),
+            Ok(Err(msg)) => {
+                std::io::stdout().write_all(&out)?;
+                return Ok(fatal(&msg));
+            }
+            Err(e) => {
+                std::io::stdout().write_all(&out)?;
+                return Err(e);
+            }
         };
         if omit_empty && line.is_empty() {
             continue;
@@ -1600,9 +1655,14 @@ struct Frame {
 ///
 /// `Ok(Err(msg))` is a stack error — a `%(then)` with no `%(if)`, an unbalanced
 /// `%(end)` — which git turns into `die()`.
+///
+/// `used` is every atom of the run in `used_atom[]` order, for
+/// [`populate_value_errors`]: the first `%(…)` of the format fills them all, so
+/// a format that is nothing but literal text never raises those failures.
 pub(super) fn format_ref(
     ctx: &RenderCtx<'_>,
     items: &[Item],
+    used: &[&Atom],
     info: &RefInfo,
     quote_style: QuoteStyle,
     color_reset_at_eol: bool,
@@ -1611,6 +1671,10 @@ pub(super) fn format_ref(
         ($($arg:tt)*) => {
             return Ok(Err(format!($($arg)*)))
         };
+    }
+
+    if items.iter().any(|it| !matches!(it, Item::Lit(_))) {
+        populate_value_errors(used, info)?;
     }
 
     let mut stack: Vec<Frame> = vec![Frame {
@@ -1893,7 +1957,10 @@ pub(super) fn parse_format(
                 // `expected format: %(align:<width>,<position>)`, not an
                 // unrecognized-argument error (`ref-filter.c:1092-1101`).
                 let arg = arg.filter(|a| !a.is_empty());
-                match name {
+                // The container atoms are matched by `atom_type`, which the
+                // deref `*` does not change (ref-filter.c:1040-1042, 2546-2569):
+                // `%(*end)` closes a frame like `%(end)`.
+                match name.strip_prefix('*').unwrap_or(name) {
                     "end" => items.push(Item::End),
                     "align" => items.push(Item::AlignStart(parse_align(arg)?)),
                     "if" => items.push(Item::IfStart(parse_if(arg)?)),
@@ -1949,34 +2016,48 @@ fn parse_if(arg: Option<&str>) -> std::result::Result<Cmp, AtomError> {
     })
 }
 
-/// Parse `%(align:<opts>)` options: a width and an optional position, given
-/// positionally (`25,left`) or by key (`width=25,position=left`), in any order.
+/// `align_atom_parser()` (ref-filter.c:821-872): a width and an optional
+/// position, given positionally (`25,left`) or by key (`width=25,position=left`),
+/// in any order, each token tried as `position=`, `width=`, a bare width and a
+/// bare position in that order.
+///
+/// Widths are `strtoul_ui()`. The width starts at `~0U` and the "no width"
+/// test is against that sentinel, so an explicit `4294967295` is refused as
+/// missing too.
 fn parse_align(opts: Option<&str>) -> std::result::Result<AlignSpec, AtomError> {
-    let missing = || fatal_atom("expected format: %(align:<width>,<position>)");
-    let opts = opts.ok_or_else(missing)?;
-    let mut width: Option<usize> = None;
+    let opts = opts.ok_or_else(|| fatal_atom("expected format: %(align:<width>,<position>)"))?;
+    let mut width = u32::MAX;
     let mut position = AlignPos::Left;
-    for tok in opts.split(',') {
-        if let Some(w) = tok.strip_prefix("width=") {
-            width = Some(w.parse().map_err(|_| missing())?);
-        } else if let Some(p) = tok.strip_prefix("position=") {
-            position = parse_align_pos(p)?;
-        } else if let Ok(w) = tok.parse::<usize>() {
-            width = Some(w);
+    for s in opts.split(',') {
+        if let Some(p) = s.strip_prefix("position=") {
+            position = parse_align_position(p)
+                .ok_or_else(|| fatal_atom(format!("unrecognized position:{p}")))?;
+        } else if let Some(w) = s.strip_prefix("width=") {
+            width = strtoul_ui(w).ok_or_else(|| fatal_atom(format!("unrecognized width:{w}")))?;
+        } else if let Some(w) = strtoul_ui(s) {
+            width = w;
+        } else if let Some(p) = parse_align_position(s) {
+            position = p;
         } else {
-            position = parse_align_pos(tok)?;
+            return Err(fatal_atom(format!("unrecognized %(align) argument: {s}")));
         }
     }
-    let width = width.ok_or_else(missing)?;
-    Ok(AlignSpec { width, position })
+    if width == u32::MAX {
+        return Err(fatal_atom("positive width expected with the %(align) atom"));
+    }
+    Ok(AlignSpec {
+        width: width as usize,
+        position,
+    })
 }
 
-fn parse_align_pos(p: &str) -> std::result::Result<AlignPos, AtomError> {
-    match p {
-        "left" => Ok(AlignPos::Left),
-        "right" => Ok(AlignPos::Right),
-        "middle" => Ok(AlignPos::Middle),
-        other => Err(fatal_atom(format!("unrecognized %(align) argument: {other}"))),
+/// `parse_align_position()` (ref-filter.c:810-819).
+fn parse_align_position(s: &str) -> Option<AlignPos> {
+    match s {
+        "right" => Some(AlignPos::Right),
+        "middle" => Some(AlignPos::Middle),
+        "left" => Some(AlignPos::Left),
+        _ => None,
     }
 }
 
@@ -2112,7 +2193,9 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
     // (`ref-filter.c:1092-1101`). Every atom parser therefore sees `%(refname:)` as
     // `%(refname)`, including the ones whose no-argument case is itself a fatal —
     // `%(align:)` is `expected format: %(align:<width>,<position>)`, not an
-    // unrecognized-argument error.
+    // unrecognized-argument error. The value-filling code reads the atom *name*
+    // instead, which still has its colon, so `raw_m` is kept for it.
+    let raw_m = m;
     let m = m.filter(|a| !a.is_empty());
     // `err_bad_arg()` cuts the atom at its first colon but keeps the deref `*`:
     // `%(*parent:bogus)` is `unrecognized %(*parent) argument: bogus`
@@ -2123,17 +2206,19 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
         name.to_string()
     };
 
-    // Reject a modifier on an atom that takes none, naming the offending atom.
-    let bare = |m: Option<&str>| -> std::result::Result<(), AtomError> {
+    // `err_no_arg()` (ref-filter.c:264-270) for the parsers that refuse any
+    // argument. Each caller passes the atom's name as a literal —
+    // `err_no_arg(err, "objecttype")` — so a deref `*` is never part of it.
+    let no_arg = |m: Option<&str>, literal: &str| -> std::result::Result<(), AtomError> {
         match m {
             None => Ok(()),
-            Some(m) => Err(fatal_atom(format!("unrecognized %({dname}) argument: {m}"))),
+            Some(_) => Err(fatal_atom(format!("%({literal}) does not take arguments"))),
         }
     };
 
     let field = match name {
         "refname" | "symref" => {
-            let m = parse_name_mod(name, m)?;
+            let m = parse_name_mod(&dname, m)?;
             if name == "refname" {
                 Field::RefName(m)
             } else {
@@ -2142,8 +2227,9 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
         }
         // `%(objectname)`, `%(tree)` and `%(parent)` share `oid_atom_parser`.
         "objectname" => Field::ObjectName(parse_oid_mod(spec, &dname, m)?),
+        // `objecttype_atom_parser` (ref-filter.c:470-481).
         "objecttype" => {
-            bare(m)?;
+            no_arg(m, "objecttype")?;
             Field::ObjectType
         }
         "objectsize" => match m {
@@ -2176,21 +2262,18 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
             Field::Raw(size)
         }
         "upstream" | "push" => {
-            let rr = parse_remote_ref(name, m)?;
+            let rr = parse_remote_ref(&dname, m)?;
             if name == "upstream" {
                 Field::Upstream(rr)
             } else {
                 Field::Push(rr)
             }
         }
-        "flag" => {
-            bare(m)?;
-            Field::Flag
-        }
-        "worktreepath" => {
-            bare(m)?;
-            Field::WorktreePath
-        }
+        // `flag` and `worktreepath` carry no parser in `valid_atom[]`
+        // (ref-filter.c:982, 985), and `populate_value()` fills them by
+        // `atom_type` (ref-filter.c:2477, 2524): an argument is ignored.
+        "flag" => Field::Flag,
+        "worktreepath" => Field::WorktreePath,
         "describe" => Field::Describe(parse_describe(m)?),
         "ahead-behind" => {
             let Some(arg) = m else {
@@ -2221,7 +2304,7 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
         // outright and otherwise asks `oid_object_info_extended()` for
         // `OBJECT_INFO_DELTA_BASE`.
         "deltabase" => {
-            bare(m).map_err(|_| fatal_atom("%(deltabase) does not take arguments"))?;
+            no_arg(m, "deltabase")?;
             Field::DeltaBase
         }
         // `is_base_atom_parser` (ref-filter.c:913-926): the operand is mandatory
@@ -2248,24 +2331,42 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
         // `verify_ref_format`'s `reject_atom`: `for-each-ref` has no "rest of the
         // line" to report, so the atom parses and is then refused.
         "rest" => {
-            bare(m)
-                .map_err(|_| fatal_atom("%(rest) does not take arguments"))?;
+            no_arg(m, "rest")?;
             return Err(fatal_atom(format!("this command reject atom %({spec})")));
         }
+        // `head_atom_parser` (ref-filter.c:928-938).
         "HEAD" => {
-            bare(m)?;
+            no_arg(m, "HEAD")?;
             Field::Head
         }
+        // `color_atom_parser` (ref-filter.c:384-399). `color_parse()` is the
+        // non-quiet `color_parse_mem_1(value, len, dst, 0)`, whose failure is
+        // `error(_("invalid color value: %.*s"))` (color.c:364) printed on the
+        // spot, before the parser's own message reaches `die()`.
         "color" => match m {
             None => return Err(fatal_atom("expected format: %(color:<color>)")),
-            Some(spec) => match parse_color(spec) {
-                Some(escape) => Field::Color(if ctx.color_on { escape } else { Vec::new() }),
-                None => return Err(fatal_atom(format!("invalid color value: {spec}"))),
+            Some(spec) => match super::color::parse_color_spec(spec) {
+                Some(escape) => Field::Color(if ctx.color_on { escape.into_bytes() } else { Vec::new() }),
+                None => {
+                    eprintln!("error: invalid color value: {spec}");
+                    return Err(fatal_atom(format!("unrecognized color: %(color:{spec})")));
+                }
             },
         },
+        // No parser for any of the four (ref-filter.c:958, 962, 966, 970), so
+        // the argument is never rejected. What differs is filling:
+        // `grab_person()` skips `author:…`/`committer:…`/`tagger:…` by name
+        // (see [`PersonPart::Unfilled`]), while the creator tail selects by
+        // `atom_type == ATOM_CREATOR` and copies the line whatever the name
+        // carries (ref-filter.c:1797-1800), so `%(creator:mailmap)` is
+        // `%(creator)`.
         "author" | "committer" | "tagger" | "creator" => {
-            bare(m)?;
-            Field::Person(who(name), PersonPart::Full)
+            let part = if raw_m.is_some() && name != "creator" {
+                PersonPart::Unfilled
+            } else {
+                PersonPart::Full
+            };
+            Field::Person(who(name), part)
         }
         // `person_name_atom_parser` (ref-filter.c:755-767): `N_RAW` or `N_MAILMAP`.
         "authorname" | "committername" | "taggername" => {
@@ -2289,17 +2390,12 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
         // `grab_date` (ref-filter.c:1677-1720) reads the format straight off the
         // atom name and hands it to `parse_date_format()`, so a date atom takes
         // the whole `--date=` vocabulary, `format:<strftime>` included, and both
-        // of that function's `die()`s reach the user verbatim.
-        "authordate" | "committerdate" | "taggerdate" | "creatordate" => {
-            let mode = match m {
-                None => None,
-                Some(spec) => Some(
-                    crate::showdate::parse_date_format(spec)
-                        .map_err(|e| fatal_atom(e.to_string()))?,
-                ),
-            };
-            Field::Person(who(name.trim_end_matches("date")), PersonPart::Date(mode))
-        }
+        // of that function's `die()`s reach the user verbatim — when a value is
+        // filled, not here (see [`PersonPart::Date`]).
+        "authordate" | "committerdate" | "taggerdate" | "creatordate" => Field::Person(
+            who(name.trim_end_matches("date")),
+            PersonPart::Date(raw_m.map(str::to_string)),
+        ),
         // `subject_atom_parser` (ref-filter.c:527-538).
         "subject" => Field::Contents(match m {
             None => ContentPart::Subject,
@@ -2309,7 +2405,7 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
         // `body_atom_parser` (ref-filter.c:517-525) sets `C_BODY_DEP`, which is
         // *not* `%(contents:body)`: it keeps a trailing signature block.
         "body" => {
-            bare(m)?;
+            no_arg(m, "body")?;
             Field::Contents(ContentPart::BodyDep)
         }
         // `trailers_atom_parser` (ref-filter.c:570-610).
@@ -2378,9 +2474,11 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
         _ => return Err(fatal_atom(format!("unknown field name: {spec}"))),
     };
 
-    if deref && matches!(field, Field::RefName(_) | Field::SymRef(_) | Field::Head) {
-        return Err(fatal_atom(format!("`*` has no meaning on %({dname})")));
-    }
+    // No atom refuses the deref `*`: `parse_ref_filter_atom()` only strips it
+    // (ref-filter.c:1041-1042). `%(*refname)` and `%(*symref)` render with
+    // `^{}` appended, `%(*HEAD)` renders as `%(HEAD)` (ref-filter.c:2540-2601),
+    // and `%(*push)` fails every ref it is filled for — see
+    // [`populate_value_errors`].
     Ok(Atom { deref, field })
 }
 
@@ -2388,6 +2486,9 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
 /// last recognised rendering wins, `nobracket` is an independent flag, and any
 /// unrecognised token falls back to being read as a `%(refname)` modifier
 /// applied to the *whole* argument (which is where a typo is reported).
+///
+/// `name` is the atom's name with its deref `*`, which is what `atom->name`
+/// hands `refname_atom_parser_internal()` for its `err_bad_arg()`.
 fn parse_remote_ref(name: &str, arg: Option<&str>) -> std::result::Result<RemoteRef, AtomError> {
     let Some(arg) = arg else {
         return Ok(RemoteRef {
@@ -2443,15 +2544,6 @@ fn match_arg_value<'a>(to_parse: &'a str, key: &str) -> Option<(Option<&'a str>,
     Some((value, rest))
 }
 
-/// git's `git_parse_maybe_bool` restricted to the spellings the atom parsers see.
-fn maybe_bool(v: &str) -> Option<bool> {
-    match v {
-        "1" | "yes" | "true" => Some(true),
-        "0" | "no" | "false" => Some(false),
-        _ => None,
-    }
-}
-
 /// git's `describe_atom_parser`: translate `%(describe:<opts>)` into the
 /// argument vector handed to the `describe` subprocess. Each iteration retries
 /// the whole option list against every known key, so an unrecognised key is
@@ -2461,12 +2553,14 @@ fn parse_describe(arg: Option<&str>) -> std::result::Result<Vec<String>, AtomErr
     let mut rest = arg.unwrap_or("");
     while !rest.is_empty() {
         let bad = rest;
+        // `match_atom_bool_arg()` (ref-filter.c:356-382): a bare key is true, a
+        // value goes through the full `git_parse_maybe_bool()`, and a value that
+        // does not parse makes the key not match at all.
         if let Some((v, next)) = match_arg_value(rest, "tags") {
             let on = match v {
                 None => true,
-                Some(v) => match maybe_bool(v) {
+                Some(v) => match git_parse_maybe_bool(Some(v)) {
                     Some(b) => b,
-                    // An unparseable boolean makes the key not match at all.
                     None => return Err(fatal_atom(format!("unrecognized %(describe) argument: {bad}"))),
                 },
             };
@@ -2474,22 +2568,28 @@ fn parse_describe(arg: Option<&str>) -> std::result::Result<Vec<String>, AtomErr
             rest = next;
             continue;
         }
+        // ```c
+        // if (strtol(argval, &endptr, 10) < 0)
+        //         return strbuf_addf_ret(err, -1, _("positive value expected %s=%s"), ...);
+        // if (endptr - argval != arglen)
+        //         return strbuf_addf_ret(err, -1, _("cannot fully parse %s=%s"), ...);
+        // ```
+        // (ref-filter.c:663-670): the sign test comes first, so `-5x` is not a
+        // parse failure, and `strtol()` skips leading blanks and saturates, so
+        // ` 5` and an over-long number are accepted and passed on verbatim.
         if let Some((v, next)) = match_arg_value(rest, "abbrev") {
             let v = v.unwrap_or("");
             if v.is_empty() {
                 return Err(fatal_atom("argument expected for describe:abbrev"));
             }
-            match v.parse::<i64>() {
-                Ok(n) if n >= 0 => args.push(format!("--abbrev={v}")),
-                Ok(_) => {
-                    return Err(fatal_atom(format!(
-                        "positive value expected describe:abbrev={v}"
-                    )))
-                }
-                Err(_) => {
-                    return Err(fatal_atom(format!("cannot fully parse describe:abbrev={v}")))
-                }
+            let (value, consumed) = super::line_log::strtol(v);
+            if value < 0 {
+                return Err(fatal_atom(format!("positive value expected describe:abbrev={v}")));
             }
+            if consumed != v.len() {
+                return Err(fatal_atom(format!("cannot fully parse describe:abbrev={v}")));
+            }
+            args.push(format!("--abbrev={v}"));
             rest = next;
             continue;
         }
@@ -2518,23 +2618,33 @@ fn parse_describe(arg: Option<&str>) -> std::result::Result<Vec<String>, AtomErr
     Ok(args)
 }
 
-/// The `:short` / `:lstrip=` / `:rstrip=` family shared by `%(refname)` and
-/// `%(symref)`.
+/// `refname_atom_parser_internal()` (ref-filter.c:401-420): the `:short` /
+/// `:lstrip=` / `:rstrip=` family shared by `%(refname)`, `%(symref)` and the
+/// refname fallback of `%(upstream)` / `%(push)`.
+///
+/// `name` is `atom->name` with its deref `*`; `err_bad_arg()` cuts it at the
+/// colon. The count is `strtol_i()`, and its failure has its own message —
+/// which says `lstrip=` even for the `strip=` spelling.
 fn parse_name_mod(name: &str, m: Option<&str>) -> std::result::Result<NameMod, AtomError> {
     Ok(match m {
         None => NameMod::Full,
         Some("short") => NameMod::Short,
         Some(m) => {
-            let bad = || fatal_atom(format!("unrecognized %({name}) argument: {m}"));
             if let Some(n) = m
                 .strip_prefix("lstrip=")
                 .or_else(|| m.strip_prefix("strip="))
             {
-                NameMod::LStrip(n.parse::<i64>().map_err(|_| bad())?)
+                let n = super::blame::strtol_i(n).ok_or_else(|| {
+                    fatal_atom(format!("Integer value expected refname:lstrip={n}"))
+                })?;
+                NameMod::LStrip(i64::from(n))
             } else if let Some(n) = m.strip_prefix("rstrip=") {
-                NameMod::RStrip(n.parse::<i64>().map_err(|_| bad())?)
+                let n = super::blame::strtol_i(n).ok_or_else(|| {
+                    fatal_atom(format!("Integer value expected refname:rstrip={n}"))
+                })?;
+                NameMod::RStrip(i64::from(n))
             } else {
-                return Err(bad());
+                return Err(fatal_atom(format!("unrecognized %({name}) argument: {m}")));
             }
         }
     })
@@ -2557,9 +2667,11 @@ fn parse_oid_mod(
         Some("short") => NameLen::Auto,
         Some(m) => match m.strip_prefix("short=") {
             Some(n) => {
-                let len = n
-                    .parse::<usize>()
-                    .ok()
+                // `strtoul_ui(arg, 10, &atom->u.oid.length) || length == 0`
+                // (ref-filter.c:745-747): blanks and a `+` are fine, a value
+                // that does not fit `unsigned int` is not.
+                let len = strtoul_ui(n)
+                    .map(|v| v as usize)
                     .filter(|&v| v != 0)
                     .ok_or_else(|| {
                         // `_("positive value expected '%s' in %%(%s)"), arg, atom->name`
@@ -2574,104 +2686,6 @@ fn parse_oid_mod(
             }
         },
     })
-}
-
-/// git's `color_parse`, reduced to the spellings `%(color:...)` actually sees:
-/// `reset`, attribute words, colour names (with a `bright` prefix), 0-255
-/// palette indices and `#rrggbb`, in git's "attributes, foreground, background"
-/// order.
-fn parse_color(spec: &str) -> Option<Vec<u8>> {
-    if spec == "reset" {
-        return Some(b"\x1b[m".to_vec());
-    }
-    let mut attrs: Vec<String> = Vec::new();
-    let mut colors: Vec<String> = Vec::new();
-    for token in spec.split_whitespace() {
-        if let Some(code) = attribute_code(token) {
-            attrs.push(code.to_string());
-            continue;
-        }
-        if colors.len() >= 2 {
-            return None;
-        }
-        let background = colors.len() == 1;
-        match color_code(token, background) {
-            // `normal` names "whatever the terminal already uses", which git
-            // renders by emitting nothing for that slot.
-            Some(None) => colors.push(String::new()),
-            Some(Some(code)) => colors.push(code),
-            None => return None,
-        }
-    }
-    let codes: Vec<String> = attrs
-        .into_iter()
-        .chain(colors.into_iter().filter(|c| !c.is_empty()))
-        .collect();
-    if codes.is_empty() {
-        return Some(Vec::new());
-    }
-    Some(format!("\x1b[{}m", codes.join(";")).into_bytes())
-}
-
-/// The SGR code for a git attribute word, if `token` is one.
-fn attribute_code(token: &str) -> Option<&'static str> {
-    Some(match token {
-        "bold" => "1",
-        "dim" => "2",
-        "italic" => "3",
-        "ul" | "underline" => "4",
-        "blink" => "5",
-        "reverse" => "7",
-        "strike" => "9",
-        "nobold" => "22",
-        "nodim" => "22",
-        "noitalic" => "23",
-        "noul" | "nounderline" => "24",
-        "noblink" => "25",
-        "noreverse" => "27",
-        "nostrike" => "29",
-        _ => return None,
-    })
-}
-
-/// The SGR code for one colour token. `Some(None)` is `normal`, which prints
-/// nothing; `None` is a parse failure.
-fn color_code(token: &str, background: bool) -> Option<Option<String>> {
-    const NAMES: [&str; 8] = [
-        "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
-    ];
-    let base = if background { 40 } else { 30 };
-
-    if token == "normal" {
-        return Some(None);
-    }
-    if token == "default" {
-        return Some(Some((base + 9).to_string()));
-    }
-    if let Some(rest) = token.strip_prefix("bright") {
-        let idx = NAMES.iter().position(|n| *n == rest)?;
-        return Some(Some((base + 60 + idx as i32).to_string()));
-    }
-    if let Some(idx) = NAMES.iter().position(|n| *n == token) {
-        return Some(Some((base + idx as i32).to_string()));
-    }
-    if let Some(hex) = token.strip_prefix('#') {
-        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let c = |r: std::ops::Range<usize>| u8::from_str_radix(&hex[r], 16).expect("hex");
-            return Some(Some(format!(
-                "{};2;{};{};{}",
-                base + 8,
-                c(0..2),
-                c(2..4),
-                c(4..6)
-            )));
-        }
-        return None;
-    }
-    match token.parse::<u16>() {
-        Ok(n) if n <= 255 => Some(Some(format!("{};5;{n}", base + 8))),
-        _ => None,
-    }
 }
 
 /// Map a person atom's stem onto the header it reads.
@@ -2780,6 +2794,11 @@ pub(super) fn sort_refs(
     ignore_case: bool,
     prereleases: &Prereleases<'_>,
 ) -> Result<Vec<RefInfo>> {
+    // `qsort_s()` never calls the comparator for fewer than two elements, so no
+    // key of a lone ref is ever filled here.
+    if refs.len() < 2 {
+        return Ok(refs);
+    }
     // Precompute each ref's key values: rendering can fail, and a comparator
     // cannot propagate errors.
     let mut rows: Vec<(Vec<Key>, RefInfo)> = Vec::with_capacity(refs.len());
@@ -2974,26 +2993,31 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
         Field::RefName(m) => {
             // `get_refname()` (ref-filter.c:2337-2342) short-circuits ahead of
             // `show_ref()`, so the description is not lstripped or shortened.
-            if let Some(desc) = &info.head_desc {
-                return Ok(desc.clone());
-            }
-            return Ok(match m {
-                NameMod::Full => info.refname.clone(),
-                NameMod::Short => info.short.clone(),
-                NameMod::LStrip(n) => refsort::strip_components(&info.refname, *n, true),
-                NameMod::RStrip(n) => refsort::strip_components(&info.refname, *n, false),
-            })
+            let name = match &info.head_desc {
+                Some(desc) => desc.clone(),
+                None => match m {
+                    NameMod::Full => info.refname.clone(),
+                    NameMod::Short => info.short.clone(),
+                    NameMod::LStrip(n) => refsort::strip_components(&info.refname, *n, true),
+                    NameMod::RStrip(n) => refsort::strip_components(&info.refname, *n, false),
+                },
+            };
+            return Ok(deref_refname(atom, name));
         }
         Field::SymRef(m) => {
-            if info.symref.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Ok(match m {
-                NameMod::Full => info.symref.clone(),
-                NameMod::Short => info.symref_short.clone(),
-                NameMod::LStrip(n) => refsort::strip_components(&info.symref, *n, true),
-                NameMod::RStrip(n) => refsort::strip_components(&info.symref, *n, false),
-            });
+            // `get_symref()` (ref-filter.c:2329-2335): no symref is `""`, which
+            // a deref still suffixes.
+            let name = if info.symref.is_empty() {
+                Vec::new()
+            } else {
+                match m {
+                    NameMod::Full => info.symref.clone(),
+                    NameMod::Short => info.symref_short.clone(),
+                    NameMod::LStrip(n) => refsort::strip_components(&info.symref, *n, true),
+                    NameMod::RStrip(n) => refsort::strip_components(&info.symref, *n, false),
+                }
+            };
+            return Ok(deref_refname(atom, name));
         }
         Field::Color(escape) => return Ok(escape.clone()),
         Field::Head => {
@@ -3094,6 +3118,22 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
         | Field::IsBase(..)
         | Field::AheadBehind(_) => unreachable!("handled above"),
     }
+}
+
+/// The tail of `populate_value()`'s specials loop for `%(refname)` and
+/// `%(symref)` (ref-filter.c:2598-2601):
+///
+/// ```c
+/// if (!deref)
+///         v->s = xstrdup(refname);
+/// else
+///         v->s = xstrfmt("%s^{}", refname);
+/// ```
+fn deref_refname(atom: &Atom, mut name: Vec<u8>) -> Vec<u8> {
+    if atom.deref {
+        name.extend_from_slice(b"^{}");
+    }
+    name
 }
 
 /// git's `%(upstream)` / `%(push)` branch of `populate_value`, plus the
@@ -3703,6 +3743,13 @@ fn tag_of<'a>(repo: &gix::Repository, obj: &'a ObjInfo) -> Result<Option<TagRef<
 /// separate call that never reaches the creator tail. That output is a read of
 /// freed memory, so it is not a specification: reproducing it would encode one
 /// allocator's behaviour as this port's contract. `%(creator)` is answered here.
+///
+/// The same holds for `%(creator:<anything>)`. The atom has no parser, so
+/// `%(creator:mailmap)` is accepted and filled from the unmapped line exactly
+/// as `%(creator)` is (ref-filter.c:970, 1799-1800) — the argument is ignored,
+/// not honoured — and it goes empty under the same freed-memory condition.
+/// That emptiness is the one argument-handling behaviour of this module that
+/// is deliberately not reproduced.
 
 fn render_person(
     repo: &gix::Repository,
@@ -3725,6 +3772,14 @@ fn render_person(
         (Who::Tagger, Kind::Tag) | (Who::Creator, Kind::Tag) => b"tagger",
         _ => return Ok(Vec::new()),
     };
+    // `grab_date()` parses the format before it looks at the line at all
+    // (ref-filter.c:1692-1705), and `find_wholine()` answers `""` rather than
+    // NULL for a missing header, so the `die()` does not depend on the header
+    // being there. [`populate_value_errors`] has normally raised it already.
+    let date_mode = match part {
+        PersonPart::Date(Some(spec)) => Some(date_format(spec)?),
+        _ => None,
+    };
 
     let wants_mailmap = match part {
         PersonPart::Name { mailmap } => *mailmap,
@@ -3745,10 +3800,114 @@ fn render_person(
     Ok(match part {
         // `copy_line()`: the header line as it stands.
         PersonPart::Full => wholine.to_vec(),
+        PersonPart::Unfilled => Vec::new(),
         PersonPart::Name { .. } => copy_name(wholine),
         PersonPart::Email(opt) => copy_email(wholine, *opt),
-        PersonPart::Date(mode) => grab_date(wholine, mode.as_ref()),
+        PersonPart::Date(_) => grab_date(wholine, date_mode.as_ref()),
     })
+}
+
+/// [`populate_value_errors`] for a listing `ref_array_sort()` is about to sort:
+/// `cmp_ref_sorting()` fills `a` then `b` of every comparison and dies on the
+/// first failure (ref-filter.c:3480-3483), so every ref of two or more is
+/// filled before any line is written.
+///
+/// Which ref dies first is the one `QSORT_S` compares first. Neither
+/// `config.mak.uname` nor the Makefile defines `HAVE_ISO_QSORT_S` for the
+/// supported platforms, so that is `git_qsort_s()`'s merge sort
+/// (compat/qsort_s.c), whose first comparison is decided by the lengths alone:
+/// see [`msort_first_compared`]. Its later comparisons depend on the key
+/// values, but no later order is observable here — the only failure that
+/// names its ref, `%(*push)`, fails for every ref alike, and the date `die()`s
+/// do not name one — so the rest are checked in array order.
+pub(super) fn populate_for_sort(used: &[&Atom], refs: &[RefInfo]) -> Result<()> {
+    if refs.len() < 2 {
+        return Ok(());
+    }
+    let first = msort_first_compared(refs.len());
+    populate_value_errors(used, &refs[first])?;
+    for info in refs {
+        populate_value_errors(used, info)?;
+    }
+    Ok(())
+}
+
+/// The index of `a` in the first `cmp(b1, b2)` call `msort_with_tmp()` makes
+/// on `n >= 2` elements (compat/qsort_s.c): it recurses into the left
+/// `n / 2` elements, then the right `n - n / 2`, and only then merges from the
+/// front of each half — so the first comparison is inside the leftmost half
+/// that still has two elements, or else the merge of `b[0]` with `b[n1]`.
+fn msort_first_compared(n: usize) -> usize {
+    let n1 = n / 2;
+    let n2 = n - n1;
+    if n1 >= 2 {
+        msort_first_compared(n1)
+    } else if n2 >= 2 {
+        n1 + msort_first_compared(n2)
+    } else {
+        0
+    }
+}
+
+/// `parse_date_format()` as `grab_date()` reaches it: both of its `die()`s are
+/// fatal for the whole run.
+fn date_format(spec: &str) -> Result<crate::showdate::DateMode> {
+    crate::showdate::parse_date_format(spec).map_err(|e| crate::fatal::die(e.to_string()))
+}
+
+/// The failures `populate_value()` can raise for one ref once its atoms have
+/// parsed — raised here, for every used atom at once, because git fills every
+/// value of a ref the first time any one of them is asked for
+/// (`get_ref_atom_value()`, ref-filter.c:2652-2662). That first ask is the
+/// first `%(…)` of the format — container atoms included, so these come ahead
+/// of a `%(then)`-without-`%(if)` — or, for a sorted listing, the first
+/// comparison.
+///
+/// `used` is git's `used_atom[]` order: format atoms and sort keys, in the
+/// order the command parsed them.
+///
+/// * `%(*push)`: `remote_ref_atom_parser` sets `push` only for a name that is
+///   `push` or starts `push:` (ref-filter.c:429-430), so the deref form falls
+///   through every special (`atom_type == ATOM_PUSH && atom->u.remote_ref.push`,
+///   ref-filter.c:2502) with a NULL value, and a NULL `SOURCE_NONE` value is
+///   `missing object %s for %s` (ref-filter.c:2605-2609).
+/// * A date format `parse_date_format()` rejects, in `grab_values()`'s order:
+///   `grab_person("author")` then `("committer")` — whose tail fills
+///   `creatordate` — for a commit, `grab_person("tagger")` for a tag, the
+///   ref's own object before the peeled one (ref-filter.c:2127-2151,
+///   2619-2645). A tree or blob fills no person atom and so never dies.
+///
+/// The one `grab_person()` behaviour not reproduced is its read of freed
+/// memory; see [`render_person`].
+///
+/// [`populate_for_sort`] is the caller for a sorted listing.
+pub(super) fn populate_value_errors(used: &[&Atom], info: &RefInfo) -> Result<()> {
+    if used.iter().any(|a| a.deref && matches!(a.field, Field::Push(_))) {
+        crate::git_fatal!(
+            "missing object {} for {}",
+            info.obj.id,
+            String::from_utf8_lossy(&info.refname)
+        );
+    }
+    let objects = [(false, Some(&info.obj)), (true, info.peeled.as_ref())];
+    for (deref, obj) in objects {
+        let Some(obj) = obj else { continue };
+        let order: &[Who] = match obj.kind {
+            Kind::Commit => &[Who::Author, Who::Committer, Who::Creator],
+            Kind::Tag => &[Who::Tagger, Who::Creator],
+            Kind::Tree | Kind::Blob => &[],
+        };
+        for who in order {
+            for atom in used.iter().filter(|a| a.deref == deref) {
+                if let Field::Person(w, PersonPart::Date(Some(spec))) = &atom.field {
+                    if w == who {
+                        date_format(spec)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `find_wholine()` (ref-filter.c:1581-1598): the bytes of the `<who> ` header
@@ -4429,6 +4588,16 @@ mod tests {
             parse_describe(Some("match=")).unwrap_err().msg,
             "value expected describe:match="
         );
+    }
+
+    // `msort_with_tmp()` recurses left then right before merging, so the first
+    // comparison sits in the leftmost half that still holds two elements: for
+    // three that is the right-hand pair, for four the left-hand one.
+    #[test]
+    fn msort_first_comparison_follows_the_recursion() {
+        for (n, first) in [(2, 0), (3, 1), (4, 0), (5, 0), (6, 1), (7, 1), (8, 0), (12, 1)] {
+            assert_eq!(msort_first_compared(n), first, "n = {n}");
+        }
     }
 
     // git's atom table gives `object`/`type`/`tag`/`numparent` no parser, so a

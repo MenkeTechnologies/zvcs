@@ -1157,6 +1157,8 @@ fn list_tags(
         // `list_tags()` goes through `filter_and_format_refs()`, which does call
         // `filter_is_base()` (ref-filter.c:3440).
         run_is_base: true,
+        // `list_tags()` ends in `filter_and_format_refs()` (builtin/tag.c:75).
+        can_iterate: true,
         // `FILTER_REFS_TAGS` never produces one, and `cmd_tag()` does not set the
         // flag anyway.
         detached_head_first: false,
@@ -1167,6 +1169,11 @@ fn list_tags(
     let out_lines = match super::ref_filter::filter_and_format(&spec)? {
         super::ref_filter::Listing::Lines(l) => l,
         super::ref_filter::Listing::Exit(code) => return Ok(code),
+        // The lines git wrote before the ref that died.
+        super::ref_filter::Listing::Partial(l, e) => {
+            write_lines(l, colopts)?;
+            return Err(e);
+        }
     };
     write_lines(out_lines, colopts)
 }

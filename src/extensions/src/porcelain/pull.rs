@@ -1054,14 +1054,14 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if let Some(f) = f_address_family {
         fetch_args.push(f.into());
     }
-    // `--all` fans out over every configured remote and takes no repository
-    // argument; otherwise git hands the whole `<remote> [<refspec>…]` tail to the
-    // fetch (`run_fetch()` in `builtin/pull.c`). The refspecs select what is
+    // git hands the whole `<remote> [<refspec>…]` tail to the fetch whether or not
+    // `--all` was given (`run_fetch()`, builtin/pull.c:579-583: `if (repo)
+    // strvec_push(repo); strvec_pushv(refspecs)`), so `pull --all <remote>` is the
+    // fetch's own refusal — `fetch --all does not take a repository argument` —
+    // before anything is written to `FETCH_HEAD`. The refspecs select what is
     // downloaded, and the remote's configured refspecs still update the tracking
     // ref that the merge or rebase below reads, via the opportunistic second stage.
-    if !f_all {
-        fetch_args.extend(positionals.iter().map(|p| (*p).to_string()));
-    }
+    fetch_args.extend(positionals.iter().map(|p| (*p).to_string()));
     // Network / bad-remote failures surface as `Err`; a ref-rejection returns a
     // non-success code with the summary already printed. The tracking-ref check
     // below then reports the missing upstream, as git's pull does.
@@ -1096,6 +1096,19 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // refs the integration step would need were never written.
     if f_dry_run {
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // `get_merge_heads()` opens `FETCH_HEAD` with `xfopen()` (builtin/pull.c:393)
+    // before `die_no_merge_candidates()` is ever considered, so a fetch that wrote
+    // no file dies here. `--append` is how that happens: without it the fetch
+    // truncates `FETCH_HEAD` into existence even when there was nothing to fetch.
+    let fetch_head = repo.git_dir().join("FETCH_HEAD");
+    if let Err(err) = std::fs::metadata(&fetch_head) {
+        crate::git_fatal!(
+            "could not open '{}' for reading: {}",
+            crate::setup::git_path_display(&repo, &fetch_head),
+            crate::external::strerror(&err)
+        );
     }
 
     // Resolve which remote-tracking ref the fetched upstream lands at.

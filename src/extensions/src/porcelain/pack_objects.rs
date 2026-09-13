@@ -909,6 +909,16 @@ fn execute(st: &State) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+    // Every enumeration but `--cruft`'s adds entries through a path that calls
+    // `no_try_delta()` (builtin/pack-objects.c:1891, 3859, 4179), so the first
+    // object added reaches the attribute source; the cruft entries are added
+    // without a name and never do.
+    if !st.cruft && !counts.is_empty() {
+        if let Some(message) = bad_default_attr_source(&repo) {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    }
     // git reports the object list it just built as `Enumerating objects`, a
     // count with no total because the traversal is what decides the total.
     {
@@ -4448,13 +4458,22 @@ fn collect_counts(
         // Here `--unpacked` *adds* the loose objects rather than restricting the
         // set: it is the one rev-list-implying option `--stdin-packs` accepts,
         // and it means "the named packs, plus whatever no pack covers".
-        let mut ids = objects_in_named_packs(repo, stdin);
+        let named = resolve_named_packs(repo, stdin, b'^')?;
+        let mut ids = objects_in_packs(repo, &named.include);
         if st.unpacked {
             ids.extend(loose_objects(repo));
         }
+        // `ignore_packed_keep_in_core = 1` before either enumeration, so
+        // `want_object_in_pack()` refuses anything an excluded pack also holds —
+        // a loose copy added by `--unpacked` included.
+        let excluded: HashSet<ObjectId> = objects_in_packs(repo, &named.exclude).into_iter().collect();
+        ids.retain(|id| !excluded.contains(id));
         ids
     } else if st.cruft {
-        let covered: HashSet<ObjectId> = objects_in_named_packs(repo, stdin).into_iter().collect();
+        // `read_cruft_objects()`: a `-` line names a discard pack, anything else
+        // a fresh one; fresh packs are kept in core, so their objects stay out.
+        let named = resolve_named_packs(repo, stdin, b'-')?;
+        let covered: HashSet<ObjectId> = objects_in_packs(repo, &named.include).into_iter().collect();
         let mut ids = loose_objects(repo);
         for index in super::prune::pack_indices(repo, repo.objects.store_ref().path()) {
             ids.extend((0..index.num_objects()).map(|n| index.oid_at_index(n).to_owned()));
@@ -4866,27 +4885,146 @@ fn push_cache_tree(tree: &gix::index::extension::Tree, out: &mut Vec<ObjectId>) 
     }
 }
 
-/// The object ids held by the packs named on stdin, one name per line.
+/// The two pack lists a `--stdin-packs` or `--cruft` invocation reads, each
+/// resolved to the `.idx` of a pack the object store holds.
+struct NamedPacks {
+    /// `include_packs` (`--stdin-packs`) or `fresh_packs` (`--cruft`).
+    include: Vec<std::path::PathBuf>,
+    /// `exclude_packs` (`^name`) or `discard_packs` (`-name`).
+    exclude: Vec<std::path::PathBuf>,
+}
+
+/// `read_packs_list_from_stdin()` / `read_cruft_objects()` (builtin/pack-objects.c):
+/// read one pack name per `strbuf_getline()` line — `\n` and one preceding `\r`
+/// stripped, nothing else trimmed, empty lines skipped — splitting on the
+/// `prefix` byte, then match each name exactly against `pack_basename()` of every
+/// pack `get_all_packs()` knows, alternates included.
 ///
-/// git accepts a pack's index name, its data name, or the bare base name; all
-/// three are resolved against `objects/pack`.
-fn objects_in_named_packs(repo: &gix::Repository, stdin: &[u8]) -> Vec<ObjectId> {
-    let dir = repo.objects.store_ref().path().join("pack");
+/// The name is matched whole, so `pack-<hash>.idx` or a bare `pack-<hash>`
+/// names nothing, and an unmatched one is `die(_("could not find pack '%s'"))`.
+/// Which unmatched name git reports depends on the mode:
+///
+///   * `--cruft` keeps two `string_list_sort()`ed lists and
+///     `mark_pack_kept_in_core()` walks fresh before discard, so it is the
+///     first unmatched name in byte order, fresh list first.
+///   * `--stdin-packs` (git 2.55.0 `stdin_packs_read_input()`) keys one `strmap`
+///     by name and `stdin_packs_add_pack_entries()` dies inside
+///     `strmap_for_each_entry()`, so it is the first unmatched name in hashmap
+///     iteration order — see [`strmap_iteration_order`].
+fn resolve_named_packs(repo: &gix::Repository, stdin: &[u8], prefix: u8) -> Result<NamedPacks, String> {
+    let mut include: Vec<Vec<u8>> = Vec::new();
+    let mut exclude: Vec<Vec<u8>> = Vec::new();
+    // `--stdin-packs` puts a name that is both included and `^`-excluded in one
+    // strmap entry; `strmap_put()` of a present key keeps its first position.
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for line in stdin.split_inclusive(|b| *b == b'\n') {
+        let line = line.strip_suffix(b"\n").map_or(line, |l| l.strip_suffix(b"\r").unwrap_or(l));
+        let name = match line.split_first() {
+            None => continue,
+            Some((b, rest)) if *b == prefix => {
+                exclude.push(rest.to_vec());
+                rest
+            }
+            Some(_) => {
+                include.push(line.to_vec());
+                line
+            }
+        };
+        if !keys.iter().any(|k| k == name) {
+            keys.push(name.to_vec());
+        }
+    }
+    include.sort();
+    exclude.sort();
+
+    let mut dirs = vec![repo.objects.store_ref().path().to_path_buf()];
+    if let Ok(alternates) = repo.objects.store_ref().alternate_db_paths() {
+        dirs.extend(alternates);
+    }
+    // `prepare_packed_git_one()` registers a pack for each `.idx` whose `.pack`
+    // exists; `pack_basename()` answers the `.pack` file name.
+    let mut known: Vec<(Vec<u8>, std::path::PathBuf)> = Vec::new();
+    for dir in dirs {
+        let dir = dir.join("pack");
+        for name in super::prune::read_dir_raw(&dir).unwrap_or_default() {
+            let name = name.to_string_lossy().into_owned();
+            let Some(base) = name.strip_suffix(".idx") else { continue };
+            let pack_name = format!("{base}.pack");
+            if dir.join(&pack_name).is_file() {
+                known.push((pack_name.into_bytes(), dir.join(&name)));
+            }
+        }
+    }
+
+    let lookup = |name: &[u8]| known.iter().find(|(pack_name, _)| pack_name == name).map(|(_, idx)| idx.clone());
+    let missing = |name: &[u8]| format!("could not find pack '{}'", String::from_utf8_lossy(name));
+    let unmatched_first: Vec<&[u8]> = if prefix == b'^' {
+        strmap_iteration_order(&keys)
+    } else {
+        include.iter().chain(exclude.iter()).map(Vec::as_slice).collect()
+    };
+    if let Some(name) = unmatched_first.into_iter().find(|name| lookup(name).is_none()) {
+        return Err(missing(name));
+    }
+    let resolve = |names: &[Vec<u8>]| names.iter().filter_map(|name| lookup(name)).collect();
+    Ok(NamedPacks { include: resolve(&include), exclude: resolve(&exclude) })
+}
+
+/// The order `strmap_for_each_entry()` visits `keys`, inserted in the given
+/// order into a fresh `STRMAP_INIT` (git 2.55.0 hashmap.c, strmap.c).
+///
+/// `strhash()` is 32-bit FNV-1 (hashmap.c:10-16). The table starts at
+/// `HASHMAP_INITIAL_SIZE` 64 buckets and quadruples once the count passes 80%
+/// of the size (hashmap.c:70-92, `hashmap_add()` :232-250); an entry goes to
+/// bucket `hash & (tablesize - 1)` at the *head* of its chain, and `rehash()`
+/// (:115-133) re-inserts old buckets in index order, head-first again.
+/// `hashmap_iter_next()` (:295-309) walks buckets in index order, each chain
+/// from its head.
+fn strmap_iteration_order(keys: &[Vec<u8>]) -> Vec<&[u8]> {
+    fn strhash(key: &[u8]) -> u32 {
+        key.iter().fold(0x811c_9dc5_u32, |hash, &c| hash.wrapping_mul(0x0100_0193) ^ u32::from(c))
+    }
+    fn head_insert(table: &mut [Vec<usize>], hash: u32, entry: usize) {
+        let bucket = (hash as usize) & (table.len() - 1);
+        table[bucket].insert(0, entry);
+    }
+    let hashes: Vec<u32> = keys.iter().map(|k| strhash(k)).collect();
+    let mut table: Vec<Vec<usize>> = vec![Vec::new(); 64];
+    for (n, &hash) in hashes.iter().enumerate() {
+        head_insert(&mut table, hash, n);
+        if n + 1 > table.len() * 80 / 100 {
+            let grown = table.len() << 2;
+            let old = std::mem::replace(&mut table, vec![Vec::new(); grown]);
+            for entry in old.into_iter().flatten() {
+                head_insert(&mut table, hashes[entry], entry);
+            }
+        }
+    }
+    table.into_iter().flatten().map(|n| keys[n].as_slice()).collect()
+}
+
+/// `compute_default_attr_source()` (git 2.55.0 attr.c:1201-1228) as the first
+/// `git_check_attr()` reaches it: `--attr-source`/`GIT_ATTR_SOURCE` naming
+/// nothing `repo_get_oid_treeish()` resolves is `die(_("bad --attr-source or
+/// GIT_ATTR_SOURCE"))`. `attr.tree` sets `ignore_bad_attr_tree`, so only the
+/// environment can make this fatal.
+///
+/// `pack-objects` makes that first check from `no_try_delta()`
+/// (builtin/pack-objects.c:1514-1523) as soon as it adds an object to the
+/// packing list, so an empty set never dies. Returns the `fatal:` body.
+pub(crate) fn bad_default_attr_source(repo: &gix::Repository) -> Option<&'static str> {
+    let spec = std::env::var("GIT_ATTR_SOURCE").ok()?;
+    crate::objname::resolve(repo, &spec)
+        .is_none()
+        .then_some("bad --attr-source or GIT_ATTR_SOURCE")
+}
+
+/// Every object id the given pack indices list, in index order.
+fn objects_in_packs(repo: &gix::Repository, indices: &[std::path::PathBuf]) -> Vec<ObjectId> {
     let hash = repo.object_hash();
     let mut out = Vec::new();
-    for line in stdin.split(|b| *b == b'\n') {
-        let Ok(name) = std::str::from_utf8(line) else { continue };
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        let base = name
-            .strip_suffix(".idx")
-            .or_else(|| name.strip_suffix(".pack"))
-            .unwrap_or(name);
-        let Ok(index) = pack::index::File::at(dir.join(format!("{base}.idx")), hash) else {
-            continue;
-        };
+    for path in indices {
+        let Ok(index) = pack::index::File::at(path, hash) else { continue };
         out.extend((0..index.num_objects()).map(|n| index.oid_at_index(n).to_owned()));
     }
     out

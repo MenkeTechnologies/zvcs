@@ -1026,9 +1026,30 @@ fn reset_cmd(args: &[String]) -> Result<ExitCode> {
     // moved the worktree, so there is nothing to move back and `git checkout` is
     // not run at all — running it anyway reports the transition git stays silent
     // about.
+    //
+    // A checkout that fails leaves the session exactly as it was:
+    //
+    // ```c
+    // if (run_command(&cmd)) {
+    //         error(_("could not check out original"
+    //                 " HEAD '%s'. Try 'git bisect"
+    //                 " reset <commit>'."), branch.buf);
+    //         strbuf_release(&branch);
+    //         return -1;
+    // }
+    // ```
+    //
+    // (`bisect_reset()`, builtin/bisect--helper.c:229-235, v2.39.0-rc2.) An
+    // unmerged index, or a `.git` subdirectory as cwd where the child `checkout`
+    // dies with `this operation must be run in a work tree`, both end here.
     if let Some(target) = target {
-        if !ctx.file("BISECT_HEAD").exists() {
-            checkout_and_report(&ctx, &target)?;
+        if !ctx.file("BISECT_HEAD").exists()
+            && !run_checkout(&["--ignore-other-worktrees", &target, "--"])?
+        {
+            eprintln!(
+                "error: could not check out original HEAD '{target}'. Try 'git bisect reset <commit>'."
+            );
+            return Ok(ExitCode::from(1));
         }
     }
     clean_state(&ctx)?;
@@ -1074,90 +1095,37 @@ fn clean_state(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Check `target` out quietly, then emit git's transition messages on stderr
-/// (this crate's `checkout` prints them on stdout, which bisect must not do).
-fn checkout_and_report(ctx: &Ctx, target: &str) -> Result<()> {
-    let head = ctx.repo.head()?;
-    let was_detached = head.is_detached();
-    let old_branch = head
-        .referent_name()
-        .map(|n| n.shorten().to_str_lossy().into_owned());
-    let old_id = head.id().map(|id| id.detach());
-    drop(head);
-
-    // `bisect reset <commit>` takes any commit-ish, so `target` is routinely not
-    // a valid ref name at all (`HEAD~1`); `try_find_reference` reports that as an
-    // error rather than "absent", which must not abort the reset.
-    let branch_ref = format!("refs/heads/{target}");
-    let target_is_branch = matches!(
-        ctx.repo.try_find_reference(branch_ref.as_str()),
-        Ok(Some(_))
-    );
-
-    // Already sitting on the branch bisect started from — the overwhelmingly
-    // common shape, since `bisect start` records the branch it was invoked on
-    // and `bisect reset` is usually run after a `bisect good`/`bad` that landed
-    // back there. git has *no* short-circuit for it: `bisect_reset()` spawns the
-    // checkout whenever a target was resolved and `BISECT_HEAD` is absent,
-    //
-    // ```c
-    // if (branch.len && !refs_ref_exists(get_main_ref_store(the_repository), "BISECT_HEAD")) {
-    //         struct child_process cmd = CHILD_PROCESS_INIT;
-    //
-    //         cmd.git_cmd = 1;
-    //         strvec_pushl(&cmd.args, "checkout", "--ignore-other-worktrees", NULL);
-    // ```
-    // (`builtin/bisect.c:261-265`)
-    //
-    // and `git checkout <current branch>` still moves HEAD through
-    // `update_refs_for_switch()`, which writes `checkout: moving from X to X`
-    // unconditionally. Returning early here dropped that entry, which silently
-    // renumbered every older `HEAD@{n}` for anything reading the reflog
-    // afterwards. So run the checkout either way and only vary the message.
-    let already_on = !was_detached && target_is_branch && old_branch.as_deref() == Some(target);
-
-    // git runs the checkout through `run_command()`, so its output is flushed
-    // by the child's `exit()` before anything printed after it here; see
-    // `crate::cstdio::run_command`.
-    {
-        let _child = crate::cstdio::run_command();
-        super::checkout::checkout(&["-q".to_string(), target.to_string()])?;
-    }
-
-    // ```c
-    // if (!opts->quiet && !old_branch_info->path && old_branch_info->commit &&
-    //     new_branch_info->commit != old_branch_info->commit)
-    //         orphaned_commit_warning(old_branch_info->commit, new_branch_info->commit);
-    // ```
-    //
-    // (`update_refs_for_switch()`, builtin/checkout.c.) The warning is skipped when
-    // the move does not change the commit — leaving a detached HEAD that already
-    // sits on the branch's tip orphans nothing, so git prints only the
-    // `Switched to branch` line.
-    if was_detached {
-        let new_id = ctx.repo.head_id().ok().map(|id| id.detach());
-        if let Some(id) = old_id {
-            if new_id != Some(id) {
-                eprintln!("Previous HEAD position was {}", describe(&ctx.repo, id)?);
+/// git's `cmd.git_cmd = 1; strvec_pushl(&cmd.args, "checkout", …); run_command(&cmd)`:
+/// run `git checkout <args>` as a child and report whether it exited 0.
+///
+/// The child is unquiet: every transition line (`Already on`, `Switched to
+/// branch`, `Previous HEAD position was`, `HEAD is now at`) and the stdout
+/// report of local modifications and upstream tracking are `checkout`'s own.
+/// `git checkout <current branch>` still writes `checkout: moving from X to X`
+/// to the reflog, which is why the checkout runs even when HEAD is already there.
+///
+/// Its output is flushed before anything the caller prints afterwards; see
+/// [`crate::cstdio::run_command`]. A `die()` inside the in-process checkout has
+/// not printed yet, so it is rendered here as the child's `fatal:` line.
+///
+/// `checkout` is a `NEED_WORK_TREE` builtin, and the child gets that gate from
+/// `run_builtin()` like any other invocation — so from a cwd inside `.git`, where
+/// setup finds no work tree, the child dies with `this operation must be run in
+/// a work tree` before checking anything out.
+fn run_checkout(args: &[&str]) -> Result<bool> {
+    let _child = crate::cstdio::run_command();
+    let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    match crate::dispatch::setup_work_tree().and_then(|()| super::checkout::checkout(&argv)) {
+        Ok(code) => Ok(code == ExitCode::SUCCESS),
+        Err(err) => {
+            if let Some(f) = err.downcast_ref::<crate::fatal::Fatal>() {
+                eprintln!("fatal: {}", f.0);
+            } else if err.downcast_ref::<crate::fatal::Silent>().is_none() {
+                return Err(err);
             }
+            Ok(false)
         }
     }
-    if already_on {
-        eprintln!("Already on '{target}'");
-    } else if target_is_branch {
-        eprintln!("Switched to branch '{target}'");
-    } else {
-        let id = ctx.repo.head_id()?.detach();
-        eprintln!("HEAD is now at {}", describe(&ctx.repo, id)?);
-    }
-    Ok(())
-}
-
-/// `<abbreviated oid> <subject>`, as used by checkout's transition messages.
-fn describe(repo: &gix::Repository, id: ObjectId) -> Result<String> {
-    use gix::prelude::ObjectIdExt;
-    let short = id.attach(repo).shorten_or_id().to_string();
-    Ok(format!("{short} {}", subject(repo, id)?))
 }
 
 // --- subcommand: start -------------------------------------------------------
@@ -1257,16 +1225,48 @@ fn start(args: &[String]) -> Result<ExitCode> {
         must_write_terms = true;
     }
 
-    // Restarting a live session first returns the worktree to where it began.
-    if ctx.in_progress() {
+    // ```c
+    // if (!is_empty_or_missing_file(git_path_bisect_start())) {
+    //         /* Reset to the rev from where we started */
+    //         strbuf_read_file(&start_head, git_path_bisect_start(), 0);
+    //         strbuf_trim(&start_head);
+    //         if (!no_checkout) {
+    //                 … "checkout", start_head.buf, "--" …
+    //                 if (run_command(&cmd)) {
+    //                         res = error(_("checking out '%s' failed."
+    //                                  " Try 'git bisect start "
+    //                                  "<valid-branch>'."),
+    //                                start_head.buf);
+    //                         goto finish;
+    // …
+    // /*
+    //  * Get rid of any old bisect state.
+    //  */
+    // if (bisect_clean_state())
+    //         return BISECT_FAILED;
+    // ```
+    //
+    // (`bisect_start()`, builtin/bisect--helper.c:762-805, v2.39.0-rc2.) A
+    // restarted session keeps the head it was *first* started from, even under
+    // `--no-checkout` where nothing is checked out, and the clean runs whether or
+    // not a session existed — so a `BISECT_TERMS` left behind by a marking word
+    // typed before any `start` does not survive into the new session.
+    let start_head = if ctx.in_progress() {
         let start_head = std::fs::read_to_string(ctx.file("BISECT_START"))?
             .trim()
             .to_owned();
-        checkout_and_report(&ctx, &start_head)?;
-        clean_state(&ctx)?;
-    }
+        if !no_checkout && !run_checkout(&[&start_head, "--"])? {
+            eprintln!(
+                "error: checking out '{start_head}' failed. Try 'git bisect start <valid-branch>'."
+            );
+            return Ok(ExitCode::from(1));
+        }
+        start_head
+    } else {
+        head_label(&ctx.repo)?
+    };
+    clean_state(&ctx)?;
 
-    let start_head = head_label(&ctx.repo)?;
     std::fs::create_dir_all(ctx.refs_dir())?;
     std::fs::write(ctx.file("BISECT_START"), format!("{start_head}\n"))?;
     std::fs::write(ctx.file("BISECT_NAMES"), bisect_names(args, pathspec_pos))?;
@@ -1757,7 +1757,16 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
     // the reachable case: it reads as an empty log rather than as an error
     // without the size test. A `stat()` that fails for any reason other than
     // `ENOENT` is `die_errno("could not stat '%s'")` instead.
-    match std::fs::metadata(file) {
+    //
+    // The name is taken as typed, but `RUN_SETUP` has already moved git to the
+    // top of the worktree, so a relative log path resolves from there and not
+    // from the subdirectory the command was typed in.
+    let ctx = Ctx::open()?;
+    let path = match ctx.repo.workdir() {
+        Some(top) if Path::new(file).is_relative() => top.join(file),
+        _ => PathBuf::from(file),
+    };
+    match std::fs::metadata(&path) {
         Ok(md) if md.len() == 0 => {
             eprintln!("error: cannot read file '{file}' for replaying");
             return Ok(ExitCode::from(1));
@@ -1769,12 +1778,28 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         }
         Err(e) => crate::git_fatal!("could not stat '{file}': {}", crate::errno_text(&e)),
     }
-    let Ok(content) = std::fs::read_to_string(file) else {
-        eprintln!("error: cannot read file '{file}' for replaying");
+
+    // ```c
+    // if (bisect_reset(NULL))
+    //         return BISECT_FAILED;
+    //
+    // fp = fopen(filename, "r");
+    // if (!fp)
+    //         return BISECT_FAILED;
+    // ```
+    //
+    // (`bisect_replay()`, builtin/bisect--helper.c:1044-1049, v2.39.0-rc2.) The
+    // session is reset *before* the log is opened, and the reset unlinks
+    // `BISECT_LOG` — so replaying the live log in place (`git bisect replay
+    // .git/BISECT_LOG`) checks the start branch out, then finds nothing to open
+    // and fails at exit 1 without another word.
+    if reset_cmd(&[])? != ExitCode::SUCCESS {
+        return Ok(ExitCode::from(1));
+    }
+    let Ok(content) = std::fs::read_to_string(&path) else {
         return Ok(ExitCode::from(1));
     };
 
-    let ctx = Ctx::open()?;
     for raw in content.lines() {
         let line = raw.trim_start();
         let Some(rest) = line

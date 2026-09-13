@@ -908,6 +908,15 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     to_pack.sort_by_key(|id| (rank.get(id).copied().unwrap_or(usize::MAX), *id));
     to_pack.dedup();
 
+    // The `pack-objects` child `cmd_repack()` runs checks the `delta` attribute
+    // of the first object it adds (`no_try_delta()`), which is where a bad
+    // `--attr-source` dies — so a run with nothing to pack does not.
+    if !to_pack.is_empty() {
+        if let Some(message) = super::pack_objects::bad_default_attr_source(&repo) {
+            crate::git_fatal!("{message}");
+        }
+    }
+
     // `write_filtered_pack()` (`repack-filtered.c`) drives the second pack with
     // `pack-objects --stdin-packs`, fed the existing non-kept and cruft packs
     // with the just-written pack excluded by `^`. So it holds what those packs

@@ -2183,7 +2183,9 @@ fn edit_description(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // `exists = !read_branch_desc(&buf, branch_name)` — the *merged* configuration
     // answers this, so a description inherited from an included file still makes
     // an emptied buffer an unset rather than a no-op.
-    let existing = snap.string(key.as_str()).map(|v| v.to_string());
+    // `read_branch_desc()` (branch.c:353-364) is `repo_config_get_string()`, which
+    // dies through `git_die_config()` on a valueless key.
+    let existing = crate::config::config_get_string(Some(&repo), &key);
 
     // ```c
     // if (!buf.len || buf.buf[buf.len-1] != '\n')

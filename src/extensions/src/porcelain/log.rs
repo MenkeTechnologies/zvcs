@@ -9902,11 +9902,11 @@ impl DecorationFilter {
             .collect();
 
         // `log.initialDecorationSet=all` relaxes the filter exactly as
-        // `--clear-decorations` does.
+        // `--clear-decorations` does. `repo_config_get_string()` (builtin/log.c:242-245)
+        // dies through `git_die_config()` on a valueless key.
         if use_default
-            && snap
-                .string("log.initialDecorationSet")
-                .is_some_and(|v| v.to_str_lossy() == "all")
+            && crate::config::config_get_string(Some(repo), "log.initialdecorationset")
+                .is_some_and(|v| v == "all")
         {
             use_default = false;
         }
@@ -13240,7 +13240,9 @@ fn emit_shortstat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
 /// splits it on commas, keeps the specs it can parse, and warns about the rest.
 pub(super) fn graph_colors(repo: &gix::Repository) -> Vec<String> {
     const RESET: &str = "\x1b[m";
-    let Some(spec) = repo.config_snapshot().string("log.graphColors") else {
+    // `repo_config_get_string(opt->repo, "log.graphcolors", &string)` (graph.c:362),
+    // which dies through `git_die_config()` on a valueless key.
+    let Some(spec) = crate::config::config_get_string(Some(repo), "log.graphcolors") else {
         // git's `column_colors_ansi`.
         return [
             "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[34m", "\x1b[35m", "\x1b[36m", "\x1b[1;31m",

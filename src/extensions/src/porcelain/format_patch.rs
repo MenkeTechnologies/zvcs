@@ -5791,11 +5791,11 @@ fn read_cover_description(repo: &gix::Repository, opts: &Opts) -> Result<Vec<u8>
     let Some(branch) = opts.branch_name.as_deref().filter(|b| !b.is_empty()) else {
         return Ok(Vec::new());
     };
+    // `read_branch_desc()` (branch.c:353-364): `repo_config_get_string()`, which
+    // dies through `git_die_config()` on a valueless key.
     let key = format!("branch.{branch}.description");
-    Ok(repo
-        .config_snapshot()
-        .string(&key)
-        .map(|v| v.to_vec())
+    Ok(crate::config::config_get_string(Some(repo), &key)
+        .map(String::into_bytes)
         .unwrap_or_default())
 }
 

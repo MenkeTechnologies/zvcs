@@ -252,11 +252,10 @@ pub(crate) fn resolve_notes_ref(repo: &gix::Repository, override_ref: Option<&st
             return env;
         }
     }
-    let snapshot = repo.config_snapshot();
-    if let Some(v) = snapshot.string("core.notesRef") {
-        return v.to_str_lossy().into_owned();
-    }
-    "refs/notes/commits".to_string()
+    // `repo_config_get_string(repo, "core.notesref", …)` (notes.c:1009), which dies
+    // through `git_die_config()` on a valueless key.
+    crate::config::config_get_string(Some(repo), "core.notesref")
+        .unwrap_or_else(|| "refs/notes/commits".to_string())
 }
 
 /// `notes.c:expand_notes_ref()` — a bare name becomes `refs/notes/<name>`, a

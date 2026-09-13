@@ -356,8 +356,11 @@ fn render_one<'r, 's>(
             let old_path = ours.location().to_owned();
             let new_path = their_unique_location.clone();
             // `df_file_index` picks the side that is *not* the directory, and
-            // names that operand (merge-ort.c:4165-4166).
-            let (file_branch, _) = operands.split_at(repo, old_path.as_bstr())?;
+            // names that operand (merge-ort.c:4165-4166). That is the stage the
+            // file is recorded at; its operand's tree need not hold the file at
+            // `old_path`, when a rename or directory rename put it there (t6423 11d).
+            let file_in_operand1 = conflict.entries()[1].is_some_and(|e| !e.mode.is_tree());
+            let file_branch = if file_in_operand1 { operands.label1 } else { operands.label2 };
             out.push(Message {
                 paths: vec![new_path.clone(), old_path.clone()],
                 ctype: "CONFLICT (file/directory)",

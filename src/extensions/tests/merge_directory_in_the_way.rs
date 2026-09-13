@@ -57,6 +57,31 @@ impl Fixture {
         f
     }
 
+    /// t6423 7e, with its branch names: base `z/{b,c}` and `x/d`; `A` moves `z/` to `y/`,
+    /// deletes `x/d` and adds `x/d/f` and `y/d/g`; `B` moves `x/d` to `z/d`.
+    fn transitive_rename_delete_with_directories_in_the_way(tag: &str) -> Self {
+        let f = Fixture::new(tag);
+        f.git(&["init", "-q", "-b", "main", "."]);
+        f.write("z/b", "b\n");
+        f.write("z/c", "c\n");
+        f.write("x/d", "d1\n");
+        f.git(&["add", "z", "x"]);
+        f.git(&["commit", "-qm", "O"]);
+        f.git(&["branch", "A"]);
+        f.git(&["branch", "B"]);
+        f.git(&["checkout", "-q", "A"]);
+        f.git(&["mv", "z", "y"]);
+        f.git(&["rm", "-q", "x/d"]);
+        f.write("x/d/f", "f\n");
+        f.write("y/d/g", "g\n");
+        f.git(&["add", "x/d/f", "y/d/g"]);
+        f.git(&["commit", "-qm", "A"]);
+        f.git(&["checkout", "-q", "B"]);
+        f.git(&["mv", "x/d", "z/"]);
+        f.git(&["commit", "-qm", "B"]);
+        f
+    }
+
     /// t6423 12m.
     fn symlink_replaces_renamed_directory(tag: &str) -> Self {
         let f = Fixture::new(tag);
@@ -174,6 +199,35 @@ fn a_cleared_side1_stage_is_written_without_a_conflict_too() {
 
     let (code, out, err) = f.run(&["-c", "merge.directoryRenames=true", "merge-tree", "--write-tree", "B", "A"]);
     assert_eq!((code, out.as_str(), err.as_str()), (0, "ec21e7e59289f085e95dbd651305a6eb44b4bcb4\n", ""));
+}
+
+/// B's `x/d -> z/d` follows A's `z/ -> y/` to `y/d`, meets A's deletion of `x/d`, and
+/// the rename/delete's `y/d` is moved aside for A's `y/d/g`. The base the rename brought
+/// along goes with it: stage 1 at `y/d~B` next to B's version. It was left out.
+#[test]
+fn a_rename_delete_moved_aside_keeps_the_base_stage() {
+    let f = Fixture::transitive_rename_delete_with_directories_in_the_way("base");
+    for (mode, first_line) in [
+        ("conflict", "CONFLICT (file location): x/d renamed to z/d in B, inside a directory that was renamed in A, suggesting it should perhaps be moved to y/d.\n"),
+        ("true", "Path updated: x/d renamed to z/d in B, inside a directory that was renamed in A; moving it to y/d.\n"),
+    ] {
+        let (code, out, err) = f.run(&["-c", &format!("merge.directoryRenames={mode}"), "merge-tree", "--write-tree", "A", "B"]);
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "79bf2ef24bff2af81ebd7ad7542eda37f1cd8fc3\n\
+                 100644 6f1852975b9306ae5d8dfdf0d4cb1f5cb36ac229 1\ty/d~B\n\
+                 100644 6f1852975b9306ae5d8dfdf0d4cb1f5cb36ac229 3\ty/d~B\n\
+                 \n\
+                 {first_line}\
+                 CONFLICT (rename/delete): x/d renamed to y/d in B, but deleted in A.\n\
+                 CONFLICT (file/directory): directory in the way of y/d from B; moving it to y/d~B instead.\n"
+            ),
+            "merge.directoryRenames={mode}"
+        );
+        assert_eq!(code, 1);
+    }
 }
 
 /// Without directory renames the symlink stays at `dir/subdir`, whose directory

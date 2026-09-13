@@ -207,6 +207,11 @@ pub struct TrackedChange {
     /// merge-ort moves the path's `conflict_info` but leaves `pathnames[side]` alone
     /// (merge-ort.c:2826-2845), so content merges still label this side with it.
     pub location_before_directory_rename: Option<BString>,
+    /// The base version a rename brought along to this change's path. merge-ort copies the
+    /// old path's stage 1 into the destination's `conflict_info` (`process_renames()`,
+    /// merge-ort.c:3192-3195), and that stage stays with the file wherever
+    /// `process_entry()` moves it (merge-ort.c:4148-4157).
+    pub carried_base: Option<ConflictIndexEntry>,
 }
 
 impl TrackedChange {
@@ -257,6 +262,7 @@ pub fn track(change: ChangeRef<'_>, changes: &mut ChangeList) {
         was_written: is_tree,
         needs_tree_insertion: None,
         location_before_directory_rename: None,
+        carried_base: None,
     });
 }
 

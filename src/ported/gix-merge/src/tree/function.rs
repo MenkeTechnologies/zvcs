@@ -831,6 +831,17 @@ where
                                         [None, index_entry(our_mode, our_id), index_entry(their_mode, their_id)],
                                     )
                                 } else {
+                                    // A directory moves the file aside with every stage the file
+                                    // has, including a base a rename brought to its path
+                                    // (merge-ort.c:4148-4157; t6423 7e, x/d -> y/d deleted on the
+                                    // side that added y/d/g).
+                                    let carried_base = if our_mode.is_tree() {
+                                        their_changes[theirs_idx].carried_base
+                                    } else if their_mode.is_tree() {
+                                        our_changes[ours_idx].carried_base
+                                    } else {
+                                        None
+                                    };
                                     // Actually this has a preference, as symlinks are always left in place with the other side renamed.
                                     let (
                                         logical_side,
@@ -859,13 +870,21 @@ where
                                         tree_with_rename,
                                         label_of_side_to_be_moved,
                                     )?;
+                                    let file_path_hint = if their_mode.is_tree() {
+                                        our_path_hint
+                                    } else {
+                                        their_path_hint
+                                    };
                                     let mut conflict = Conflict::without_resolution(
                                         ResolutionFailure::OursAddedTheirsAddedTypeMismatch {
                                             their_unique_location: renamed_location.clone(),
                                         },
                                         (ours, theirs, logical_side, outer_side),
                                         [
-                                            None,
+                                            carried_base.map(|base| ConflictIndexEntry {
+                                                path_hint: Some(file_path_hint),
+                                                ..base
+                                            }),
                                             index_entry_at_path(&our_mode, &our_id, our_path_hint),
                                             index_entry_at_path(&their_mode, &their_id, their_path_hint),
                                         ],
@@ -1301,6 +1320,13 @@ where
                                     entry_mode: *rewritten_mode,
                                     id: *rewritten_id,
                                 };
+                                // "copying the existing stage(s) from oldinfo over the newinfo"
+                                // (merge-ort.c:3187-3195): the re-emitted destination keeps the base.
+                                let carried_base = ConflictIndexEntry {
+                                    mode: *source_entry_mode,
+                                    id: *source_id,
+                                    path_hint: None,
+                                };
 
                                 if should_fail_on_conflict(Conflict::without_resolution(
                                     ResolutionFailure::OursDeletedTheirsRenamed,
@@ -1336,10 +1362,9 @@ where
                                 if tree_conflicts.is_none()
                                     || (matches!(tree_conflicts, Some(ResolveWith::Ours)) && ours_is_rewrite)
                                 {
-                                    push_deferred(
-                                        (our_addition, None),
-                                        pick_our_changes_mut(side, their_changes, our_changes),
-                                    );
+                                    let rename_side = pick_our_changes_mut(side, their_changes, our_changes);
+                                    push_deferred((our_addition, None), rename_side);
+                                    rename_side.last_mut().expect("just pushed").carried_base = Some(carried_base);
                                 }
                             }
                             (
@@ -1611,6 +1636,7 @@ fn push_deferred((change, ours_idx): (Change, Option<usize>), changes: &mut Chan
         was_written: false,
         needs_tree_insertion: Some(ours_idx),
         location_before_directory_rename: None,
+        carried_base: None,
     });
 }
 

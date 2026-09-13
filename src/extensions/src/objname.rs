@@ -283,12 +283,18 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
         }
         return true;
     }
+    // A quiet caller is re-examining an operand it has already resolved, and the
+    // count below would repeat `repo_dwim_ref()`'s own `ignoring dangling symref`
+    // warning a second time for one lookup — stock `rev-parse
+    // refs/heads/<dangling>` prints it twice, not three times.
+    if flags.quiet {
+        return false;
+    }
     // The setting is not read up front: `repo_dwim_ref()`/`repo_dwim_log()` ask
-    // for it the moment a rule matches (`refs.c:828`, `refs.c:873`), whatever
-    // the flags, and a name no rule matches never asks at all — so
-    // `-c core.warnAmbiguousRefs==` kills `rev-parse HEAD` but not a lookup of an
-    // abbreviated object id. The reads below sit after each count for that
-    // reason.
+    // for it the moment a rule matches (`refs.c:828`, `refs.c:873`), and a name
+    // no rule matches never asks at all — so `-c core.warnAmbiguousRefs==` kills
+    // `rev-parse HEAD` but not a lookup of an abbreviated object id. The reads
+    // below sit after each count for that reason.
     //
     // A reflog operand is counted by a different function and measured over a
     // different name. `get_oid_basic()` cuts the selector off (`len = at`) before
@@ -315,7 +321,7 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
         if logs_found == 0 {
             return false;
         }
-        if !crate::refname::warn_ambiguous_refs(repo) || flags.quiet {
+        if !crate::refname::warn_ambiguous_refs(repo) {
             return false;
         }
         if logs_found > 1 || short_oid_unambiguous(repo, reflog_base) {
@@ -332,7 +338,7 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
     if refs_found == 0 {
         return false;
     }
-    if !crate::refname::warn_ambiguous_refs(repo) || flags.quiet {
+    if !crate::refname::warn_ambiguous_refs(repo) {
         return false;
     }
     if refs_found > 1 || short_oid_unambiguous(repo, base) {

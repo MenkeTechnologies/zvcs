@@ -960,8 +960,24 @@ fn apply_long(
         // `--no-contains`, sharing their `filter.with_commit` slot.
         ("contains" | "with", _) => o.contains.push(val()),
         ("no-contains" | "without", _) => o.no_contains.push(val()),
-        ("merged", _) => o.merged.push(val()),
-        ("no-merged", _) => o.no_merged.push(val()),
+        // `OPT_MERGED`/`OPT_NO_MERGED` run `parse_opt_merge_filter()`
+        // (ref-filter.c:3735-3757) while argv is still being parsed, so its
+        // `die(_("malformed object name %s"))` and its `option `%s' must point
+        // to a commit` error outrank everything decided after `parse_options()`
+        // returns — the one-action tally included. `git branch --no-merged
+        // --list --show-current` therefore dies on `--list` as an object name
+        // (the option ate it as its value) instead of printing the usage block.
+        ("merged" | "no-merged", _) => {
+            let spec = val();
+            let repo = crate::setup::discover()?;
+            if let Err(e) = crate::objname::parse_opt_merge_filter(&repo, &spec, opt.name) {
+                return Ok(Some(e.report()));
+            }
+            match opt.name {
+                "merged" => o.merged.push(spec),
+                _ => o.no_merged.push(spec),
+            }
+        }
         ("abbrev", false) => {
             o.abbrev = match value {
                 None => None,

@@ -703,14 +703,17 @@ where
                                     } else {
                                         outer_side.swapped()
                                     };
+                                    // Each side is labelled with the path it gave the file,
+                                    // before a directory rename moved it (`pathnames[side]`,
+                                    // merge-ort.c:2137-2144): `A:y/wham` against `B:z/wham`.
                                     let (merged_blob_id, resolution) = perform_blob_merge(
                                         labels,
                                         objects,
                                         blob_merge,
                                         &mut diff_state.buf1,
                                         &mut write_blob_to_odb,
-                                        (location, *our_id, merged_mode),
-                                        (location, *their_id, merged_mode),
+                                        (our_changes[ours_idx].label_location(), *our_id, merged_mode),
+                                        (their_changes[theirs_idx].label_location(), *their_id, merged_mode),
                                         (location, their_id.kind().null(), merged_mode),
                                         (0, side),
                                         &options,

@@ -1387,6 +1387,19 @@ fn export_config_parameter(over: &ConfigOverride) {
     std::env::set_var("GIT_CONFIG_PARAMETERS", out);
 }
 
+/// `git_config_push_parameter()` (config.c:466-501): split `text` at its first `=` —
+/// the value is kept intact rather than the key — and append the pair to
+/// `GIT_CONFIG_PARAMETERS`, so every child started afterwards reads it as if it had
+/// been given `-c`. A `text` with no `=` is the bool-only form. The running process'
+/// own configuration is untouched, as in the C.
+pub(crate) fn git_config_push_parameter(text: &str) {
+    let (key, value) = match text.split_once('=') {
+        Some((key, value)) => (key, Some(value.to_string())),
+        None => (text, None),
+    };
+    export_config_parameter(&ConfigOverride { key: key.to_string(), value });
+}
+
 /// `sq_quote()` (quote.c): wrap in single quotes, and spell an embedded quote
 /// as `'\''` — close the run, an escaped quote, reopen.
 fn sq_quote(s: &str) -> String {

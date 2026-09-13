@@ -1276,11 +1276,42 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // `--auto-maintenance`/`--auto-gc`, the last thing `cmd_fetch()` does. `run_auto_maintenance()`
     // decides for itself whether anything is due, from `maintenance.auto`/`gc.auto`.
     //
-    // Deviation: under `--refetch` git first pushes `maintenance.incremental-repack.auto=-1` into the
-    // child's config so the duplicate objects a refetch leaves behind are consolidated into one pack.
-    // That mechanism is `GIT_CONFIG_PARAMETERS`, which nothing in this build reads, so the hint is
-    // dropped and the child picks its tasks from the repository's own configuration.
-    if opts.auto_maintenance && !opts.dry_run {
+    // ```c
+    // if (refetch) {
+    //         int opt_val;
+    //         if (repo_config_get_int(the_repository, "gc.autopacklimit", &opt_val))
+    //                 opt_val = -1;
+    //         if (opt_val != 0)
+    //                 git_config_push_parameter("gc.autoPackLimit=1");
+    //         if (repo_config_get_int(the_repository, "maintenance.incremental-repack.auto", &opt_val))
+    //                 opt_val = -1;
+    //         if (opt_val != 0)
+    //                 git_config_push_parameter("maintenance.incremental-repack.auto=-1");
+    // }
+    // ```
+    //
+    // (builtin/fetch.c:2869-2885.) A refetch leaves every object duplicated in a second pack, so
+    // the maintenance child is told to consolidate unless the repository switched that task off
+    // with a `0`. The hints travel in `GIT_CONFIG_PARAMETERS`, which the child reads at startup;
+    // a value that does not parse as an integer is `git_config_int()`'s `die()`.
+    //
+    // `--dry-run` gates neither half: `cmd_fetch()` only clears `write_fetch_head` for it
+    // (:2688-2690), and `git fetch --dry-run --refetch` starts `maintenance run --auto` and dies
+    // on a bad `gc.autoPackLimit` like any other refetch. `--negotiate-only` is what skips
+    // them, through `if (negotiate_only) goto cleanup;` (:2850-2851).
+    if opts.auto_maintenance && !opts.negotiate_only {
+        if opts.refetch {
+            for (key, hint) in [
+                ("gc.autopacklimit", "gc.autoPackLimit=1"),
+                ("maintenance.incremental-repack.auto", "maintenance.incremental-repack.auto=-1"),
+            ] {
+                let configured = crate::cmd_config::repo_config_get_int(&repo, key)
+                    .map_err(|rejection| rejection.into_error())?;
+                if configured.unwrap_or(-1) != 0 {
+                    crate::git_config_push_parameter(hint);
+                }
+            }
+        }
         super::maintenance::run_auto_maintenance(&repo, opts.quiet)?;
     }
 

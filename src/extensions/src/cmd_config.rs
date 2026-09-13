@@ -96,6 +96,17 @@ pub fn validate_fetch(repo: &gix::Repository) -> Result<(), Rejection> {
     Ok(())
 }
 
+/// `repo_config_get_int()` (config.c): the last value configured for `key`, `None` when
+/// the key is unset, and `git_config_int()`'s `die_bad_number()` for one that does not
+/// parse. `key` is the canonical spelling — section and name lowercase, a subsection
+/// as written.
+pub fn repo_config_get_int(repo: &gix::Repository, key: &str) -> Result<Option<i64>, Rejection> {
+    match walk_config(repo).into_iter().filter(|v| v.key == key).last() {
+        Some(v) => int_value(&v, key).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// `repo_config(r, repack_config, &ctx)` — `repack`.
 pub fn validate_repack(repo: &gix::Repository) -> Result<(), Rejection> {
     let mut out = defaults();

@@ -165,11 +165,12 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--all-objects",
 ];
 
-const UNIMPLEMENTED_PREFIX: &[&str] = &[
-    "--exclude-hidden=",
-    "--default=",
-    "--prefix=",
-];
+/// `--default` and `--prefix` are matched with `strcmp()` and take `argv[++i]`
+/// (`builtin/rev-parse.c:832-845`), so a `--default=<rev>` / `--prefix=<dir>`
+/// spelling is not those options at all: it falls through to `show_flag()` and
+/// is echoed like any other unknown flag. Only the separate-argument forms are
+/// listed in [`UNIMPLEMENTED_EXACT`].
+const UNIMPLEMENTED_PREFIX: &[&str] = &["--exclude-hidden="];
 
 pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // `show_usage_if_asked(argc, argv, builtin_rev_parse_usage)`
@@ -1156,6 +1157,25 @@ fn endpoint(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
     crate::objname::resolve_quiet(repo, name)
 }
 
+/// `strtoul(s, NULL, 10)` stored into a C `int`: optional leading whitespace and
+/// sign, then as many decimal digits as there are, with no error for an empty or
+/// non-numeric string (it is 0). The `unsigned long` wraps on overflow and on a
+/// `-`, and the assignment keeps the low 32 bits.
+fn strtoul_as_int(s: &str) -> i32 {
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let value = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0u64, |acc, d| acc.wrapping_mul(10).wrapping_add(u64::from(d - b'0')));
+    let value = if negative { value.wrapping_neg() } else { value };
+    value as u32 as i32
+}
+
 /// `die_no_single_rev` in stock git: silent exit 1 under `--quiet`, else fatal.
 fn die_single(quiet: bool) -> ExitCode {
     if quiet {
@@ -1302,14 +1322,26 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
                 };
                 return Ok(Opt::Consumed);
             }
+            // ```c
+            // abbrev = strtoul(arg, NULL, 10);
+            // if (abbrev < MINIMUM_ABBREV)
+            //         abbrev = MINIMUM_ABBREV;
+            // else if ((int)the_hash_algo->hexsz <= abbrev)
+            //         abbrev = the_hash_algo->hexsz;
+            // ```
+            //
+            // (`builtin/rev-parse.c:888-899`.) `strtoul()` never fails: an empty
+            // or non-numeric value is 0, and the result lands in the `static int
+            // abbrev`, so a negative spelling wraps to a negative int. Both are
+            // under `MINIMUM_ABBREV` and become 4 — `--short=` is `--short=4`.
+            // The `hexsz` ceiling is applied where the id is rendered
+            // ([`render_id`]), which knows the repository's hash.
             if let Some(n) = arg.strip_prefix("--short=") {
-                let n: usize = n
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("{arg} is not a valid abbreviation length"))?;
+                let n = strtoul_as_int(n);
                 o.verify = true;
                 o.echo_flags = false;
                 o.echo_paths = false;
-                o.abbrev = Some(n.max(1));
+                o.abbrev = Some(if n < 4 { 4 } else { n as usize });
             } else {
                 return Ok(Opt::Unknown);
             }

@@ -819,6 +819,236 @@ fn patterns_include(patterns: &[Pattern], path: &str) -> bool {
     }
 }
 
+// --- unpack_trees()' sparse loops --------------------------------------------
+
+/// `enum pattern_match_result` (dir.h).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternMatch {
+    Undecided,
+    NotMatched,
+    Matched,
+    MatchedRecursive,
+}
+
+/// The `struct pattern_list` `populate_from_existing_patterns()` hands
+/// `unpack_trees()` (unpack-trees.c:1804-1811): `info/sparse-checkout` read with
+/// `use_cone_patterns = cfg->core_sparse_checkout_cone` (dir.c:3513).
+pub(crate) struct UnpackPatterns {
+    sparsity: Sparsity,
+    /// `pl->full_cone`: a bare `/*` line sets it, a `!/*/` line clears it
+    /// (dir.c:731-741).
+    full_cone: bool,
+}
+
+impl UnpackPatterns {
+    /// The pattern file as `unpack_trees()` reads it, with `cone` the in-process
+    /// `core_sparse_checkout_cone` rather than whatever the file's writer set since.
+    pub(crate) fn load(repo: &gix::Repository, cone: bool) -> Result<Self> {
+        let lines = read_pattern_file(repo)?;
+        let mut full_cone = false;
+        for l in &lines {
+            match l.trim_end_matches('\r') {
+                "/*" => full_cone = true,
+                "!/*/" => full_cone = false,
+                _ => {}
+            }
+        }
+        Ok(UnpackPatterns {
+            sparsity: if cone {
+                Sparsity::Cone(Cone::new(cone_dirs(&lines)))
+            } else {
+                Sparsity::Patterns(parse_patterns(&lines))
+            },
+            full_cone,
+        })
+    }
+
+    /// `path_matches_pattern_list()` (dir.c:1502-1566) for `path`, whose last
+    /// component starts at `basename`.
+    fn matches(&self, path: &[u8], basename: usize, is_dir: bool) -> PatternMatch {
+        match &self.sparsity {
+            Sparsity::Patterns(patterns) => {
+                // `last_matching_pattern_from_list()`: the last pattern that matches decides.
+                let hit = patterns.iter().rev().find(|p| {
+                    p.matches_repo_relative_path(
+                        path.as_bstr(),
+                        (basename != 0).then_some(basename),
+                        Some(is_dir),
+                        Case::Sensitive,
+                        WildMode::NO_MATCH_SLASH_LITERAL,
+                    )
+                });
+                match hit {
+                    Some(p) if p.is_negative() => PatternMatch::NotMatched,
+                    Some(_) => PatternMatch::Matched,
+                    None => PatternMatch::Undecided,
+                }
+            }
+            Sparsity::Cone(_) if self.full_cone => PatternMatch::Matched,
+            Sparsity::Cone(cone) => cone.match_result(&path.to_str_lossy()),
+            Sparsity::Full => PatternMatch::Matched,
+        }
+    }
+
+    fn use_cone_patterns(&self) -> bool {
+        self.sparsity.is_cone()
+    }
+
+    /// `mark_new_skip_worktree()` (unpack-trees.c:1799-1827) over the entries of
+    /// `index` that `select` admits, setting `SKIP_WORKTREE` on each unmerged-free
+    /// entry and clearing it again on every entry the patterns take in. The
+    /// `Updating index flags` meter `clear_ce_flags()` starts when
+    /// `show_progress` (unpack-trees.c:1765-1797) is drawn over every entry of the
+    /// index, selected or not.
+    pub(crate) fn mark_new_skip_worktree(
+        &self,
+        index: &mut gix::index::File,
+        select: &dyn Fn(usize) -> bool,
+        show_progress: bool,
+    ) -> std::result::Result<(), crate::progress::DelayError> {
+        let paths: Vec<BString> = {
+            let backing = index.path_backing();
+            index.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+        };
+        let selected: Vec<bool> = (0..paths.len()).map(select).collect();
+        let dirs: Vec<bool> = index.entries().iter().map(|e| e.mode == Mode::COMMIT).collect();
+
+        // 1. Pretend the narrowest worktree: only unmerged entries are checked out.
+        let mut skip: Vec<bool> = index
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                if selected[i] {
+                    e.stage_raw() == 0
+                } else {
+                    e.flags.contains(Flags::SKIP_WORKTREE)
+                }
+            })
+            .collect();
+
+        // 2. Widen worktree according to sparse-checkout file.
+        let meter = crate::progress::Meter::delayed("Updating index flags", paths.len(), show_progress)?;
+        let mut walk = ClearFlags {
+            pl: self,
+            paths: &paths,
+            dirs: &dirs,
+            selected: &selected,
+            skip: &mut skip,
+            meter,
+        };
+        let mut prefix = Vec::new();
+        walk.clear_1(0, paths.len(), &mut prefix, PatternMatch::Undecided, 0);
+        walk.meter.stop("done");
+
+        for (entry, skip) in index.entries_mut().iter_mut().zip(skip) {
+            if skip {
+                entry.flags.insert(Flags::SKIP_WORKTREE | Flags::EXTENDED);
+            } else {
+                entry.flags.remove(Flags::SKIP_WORKTREE);
+                if !entry.flags.contains(Flags::INTENT_TO_ADD) {
+                    entry.flags.remove(Flags::EXTENDED);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The state `clear_ce_flags_1()` and `clear_ce_flags_dir()` share through
+/// their arguments and `istate->progress`.
+struct ClearFlags<'a> {
+    pl: &'a UnpackPatterns,
+    paths: &'a [BString],
+    dirs: &'a [bool],
+    selected: &'a [bool],
+    skip: &'a mut [bool],
+    meter: crate::progress::Meter,
+}
+
+impl ClearFlags<'_> {
+    /// `clear_ce_flags_1()` (unpack-trees.c:1673-1755) over `nr` entries from
+    /// `start`; returns how many it consumed.
+    fn clear_1(&mut self, start: usize, nr: usize, prefix: &mut Vec<u8>, default_match: PatternMatch, mut progress_nr: usize) -> usize {
+        let end = start + nr;
+        let mut i = start;
+        while i != end {
+            self.meter.set(progress_nr);
+
+            if !self.selected[i] {
+                i += 1;
+                progress_nr += 1;
+                continue;
+            }
+
+            let name = self.paths[i].as_slice();
+            if !prefix.is_empty() && !name.starts_with(prefix) {
+                break;
+            }
+
+            if let Some(len) = name[prefix.len()..].find_byte(b'/') {
+                // If it's a directory, try whole directory match first.
+                prefix.extend_from_slice(&name[prefix.len()..prefix.len() + len]);
+                let processed = self.clear_dir(i, end - i, prefix, len, default_match, progress_nr);
+                if processed != 0 {
+                    i += processed;
+                    progress_nr += processed;
+                    prefix.truncate(prefix.len() - len);
+                    continue;
+                }
+
+                prefix.push(b'/');
+                let processed = self.clear_1(i, end - i, prefix, default_match, progress_nr);
+                i += processed;
+                progress_nr += processed;
+                prefix.truncate(prefix.len() - len - 1);
+                continue;
+            }
+
+            // Non-directory.
+            let mut ret = self.pl.matches(name, prefix.len(), self.dirs[i]);
+            if ret == PatternMatch::Undecided {
+                ret = default_match;
+            }
+            if matches!(ret, PatternMatch::Matched | PatternMatch::MatchedRecursive) {
+                self.skip[i] = false;
+            }
+            i += 1;
+            progress_nr += 1;
+        }
+
+        self.meter.set(progress_nr);
+        nr - (end - i)
+    }
+
+    /// `clear_ce_flags_dir()` (unpack-trees.c:1618-1666): `prefix` names the
+    /// directory, its last `basename_len` bytes being its own name.
+    fn clear_dir(&mut self, start: usize, nr: usize, prefix: &mut Vec<u8>, basename_len: usize, default_match: PatternMatch, progress_nr: usize) -> usize {
+        let orig_ret = self.pl.matches(prefix, prefix.len() - basename_len, true);
+        prefix.push(b'/');
+
+        // If undecided, use matching result of parent dir in defval.
+        let ret = if orig_ret == PatternMatch::Undecided { default_match } else { orig_ret };
+
+        let count = self.paths[start..start + nr]
+            .iter()
+            .take_while(|name| name.starts_with(prefix))
+            .count();
+
+        let rc = if self.pl.use_cone_patterns() && orig_ret == PatternMatch::MatchedRecursive {
+            self.skip[start..start + count].iter_mut().for_each(|s| *s = false);
+            count
+        } else if self.pl.use_cone_patterns() && orig_ret == PatternMatch::NotMatched {
+            count
+        } else {
+            self.clear_1(start, count, prefix, ret, progress_nr)
+        };
+
+        prefix.pop();
+        rc
+    }
+}
+
 // --- cone model ------------------------------------------------------------
 
 /// A cone-mode sparsity definition: the recursive directories plus every
@@ -881,9 +1111,12 @@ impl Cone {
     /// as `root.txt`, and stock prints only the second.
     fn matches(&self, path: &str) -> bool {
         // dir.c:1584 — `if (!*path … ) return 1`.
-        if path.is_empty() {
-            return true;
-        }
+        path.is_empty() || self.match_result(path) != PatternMatch::NotMatched
+    }
+
+    /// The cone branch of `path_matches_pattern_list()` itself, with the answer it
+    /// gives rather than whether that answer includes the path.
+    fn match_result(&self, path: &str) -> PatternMatch {
         let mut parent = String::with_capacity(path.len() + 2);
         parent.push('/');
         parent.push_str(path);
@@ -896,15 +1129,19 @@ impl Cone {
             parent.rfind('/').unwrap_or(0)
         };
         if self.has_recursive(&parent) {
-            return true;
+            return PatternMatch::MatchedRecursive;
         }
         if slash_pos == 0 {
-            return true;
+            return PatternMatch::Matched;
         }
         if self.has_parent(&parent[..slash_pos]) {
-            return true;
+            return PatternMatch::Matched;
         }
-        self.contains_parent(path)
+        if self.contains_parent(path) {
+            PatternMatch::MatchedRecursive
+        } else {
+            PatternMatch::NotMatched
+        }
     }
 
     /// `hashmap_contains_path(&pl->recursive_hashmap, …)` for a name carrying

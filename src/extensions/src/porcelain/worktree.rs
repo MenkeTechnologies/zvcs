@@ -801,15 +801,30 @@ fn render_porcelain(worktrees: &[Wt], nul: bool) -> String {
 }
 
 fn render_plain(repo: &gix::Repository, worktrees: &[Wt], verbose: bool) -> String {
-    // `measure_widths()`: the path column is the widest path, the id column the
-    // longest abbreviation across every worktree.
+    // `measure_widths()` (builtin/worktree.c:1041-1062): the path column is the
+    // widest path, the id column starts at `int abbrev = DEFAULT_ABBREV`
+    // (builtin/worktree.c:1107) and only ever widens to a longer abbreviation:
+    //
+    //     sha1_len = strlen(repo_find_unique_abbrev(the_repository, &wt[i]->head_oid, *abbrev));
+    //     if (sha1_len > *abbrev)
+    //             *abbrev = sha1_len;
+    //
+    // So the configured width is a floor on the column even where it exceeds
+    // every printed id: `core.abbrev=off` is `GIT_MAX_HEXSZ` (64), and
+    // `show_worktree()`'s `"%-*s "` (builtin/worktree.c:1011) pads a 40-hex name
+    // out to it.
+    let default_abbrev = default_abbrev(repo);
     let paths: Vec<String> = worktrees.iter().map(|w| path_to_string(&w.path)).collect();
     let shas: Vec<String> = worktrees
         .iter()
-        .map(|w| abbrev_hex(repo, w.oid()))
+        .map(|w| abbrev_hex(repo, w.oid(), default_abbrev))
         .collect();
     let path_max = paths.iter().map(|p| p.chars().count()).max().unwrap_or(0);
-    let sha_max = shas.iter().map(String::len).max().unwrap_or(0);
+    let sha_max = shas
+        .iter()
+        .map(|s| s.len() as i64)
+        .fold(default_abbrev, i64::max)
+        .max(0) as usize;
 
     let mut out = String::new();
     for ((wt, path), sha) in worktrees.iter().zip(&paths).zip(&shas) {
@@ -877,41 +892,59 @@ fn parse_expiry(text: &str) -> Option<u64> {
 /// v2.55.0) hands `odb_find_abbrev_len()` a starting length and lets it grow only
 /// while something else shares the prefix (odb.c:918-971); nothing shares the
 /// prefix of an id the object database has never seen, so the starting length is
-/// the answer. gitoxide's `shorten()` instead fails when the object is missing,
-/// which is why the fall-back is a truncation and not `shorten_or_id()`'s whole
-/// name — that is what made `git worktree list` on a repository whose
+/// the answer. [`crate::abbrev::unique_abbrev`] returns that starting length for a
+/// missing object; gitoxide's `shorten_or_id()` printed the whole name, which is
+/// what made `git worktree list` on a repository whose
 /// `extensions.objectFormat` disagrees with its refs print all 64 hex characters
 /// where git prints ten.
-fn abbrev_hex(repo: &gix::Repository, oid: ObjectId) -> String {
-    let len = hex_len(repo);
+fn abbrev_hex(repo: &gix::Repository, oid: ObjectId, default_abbrev: i64) -> String {
+    let hexsz = repo.object_hash().len_in_hex();
+    // `repo_find_unique_abbrev_r()` (object-name.c:586-600): a negative length is
+    // the automatic one, and a length at or past `hexsz` is the whole name.
+    let len = if default_abbrev < 0 {
+        crate::abbrev::auto_abbrev(repo, hexsz)
+    } else {
+        default_abbrev as usize
+    };
     if oid.is_null() {
-        return "0".repeat(len);
+        return "0".repeat(len.min(hexsz));
     }
-    match oid.attach(repo).shorten() {
-        Ok(prefix) => prefix.to_string(),
-        Err(_) => oid.to_hex_with_len(len).to_string(),
-    }
+    crate::abbrev::unique_abbrev(repo, &oid, len)
 }
 
-/// The configured `core.abbrev`, falling back to git's automatic length which
-/// scales with the number of packed objects.
-fn hex_len(repo: &gix::Repository) -> usize {
-    let hexsz = repo.object_hash().len_in_hex();
-    let auto = || {
-        let count = repo.objects.packed_object_count().unwrap_or(0);
-        let bits = 64 - count.leading_zeros();
-        (bits.div_ceil(2).max(7) as usize).min(hexsz)
+/// git's `GIT_MAX_HEXSZ` (hash.h): the SHA-256 hex width, whatever this
+/// repository's own hash is.
+const GIT_MAX_HEXSZ: i64 = 64;
+
+/// `DEFAULT_ABBREV`, which is `default_abbrev` (object-name.h:137) as
+/// `git_default_core_config()` sets it (environment.c:349-363):
+///
+///     if (!strcasecmp(value, "auto"))
+///             default_abbrev = -1;
+///     else if (!git_parse_maybe_bool_text(value))
+///             default_abbrev = GIT_MAX_HEXSZ;
+///     else {
+///             int abbrev = git_config_int(var, value, ctx->kvi);
+///             ...
+///             default_abbrev = abbrev;
+///     }
+///
+/// The raw value, not a width resolved against this repository: `-1` for
+/// `auto` (and for no key at all), `64` for a false-y word even under SHA-1,
+/// and a number past `hexsz` kept as written, because `measure_widths()` uses
+/// it as the id column's starting width. An unreadable value never gets here —
+/// the config reader has already died on it.
+fn default_abbrev(repo: &gix::Repository) -> i64 {
+    let Some(value) = repo.config_snapshot().string("core.abbrev") else {
+        return -1;
     };
-    match repo.config_snapshot().string("core.abbrev") {
-        None => auto(),
-        Some(value) => match &*value.to_str_lossy() {
-            "auto" => auto(),
-            // `core.abbrev=no|off|false` disables abbreviation entirely.
-            "no" | "off" | "false" => hexsz,
-            other => other
-                .parse::<usize>()
-                .map_or_else(|_| auto(), |n| n.clamp(4, hexsz)),
-        },
+    let value = value.to_str_lossy();
+    if value.eq_ignore_ascii_case("auto") {
+        -1
+    } else if crate::optint::maybe_bool_text(&value) == Some(false) {
+        GIT_MAX_HEXSZ
+    } else {
+        crate::optint::config_int(&value).unwrap_or(-1)
     }
 }
 

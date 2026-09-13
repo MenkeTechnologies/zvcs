@@ -99,6 +99,13 @@ impl StageOne {
             }
             config.append(worktree_config)?;
         }
+        // `git --bare` leaves `is_bare_repository_cfg = 1` (git.c:258, v2.55.0) until a
+        // `core.bare` replaces it: setup's `read_worktree_config()` (setup.c:798-801) when there
+        // is no common directory, and `git_default_core_config()` (environment.c:339-342) once
+        // the configuration is read in any case.
+        if crate::open::bare_repository_cfg() {
+            is_bare = is_bare.or(Some(true));
+        }
         let precompose_unicode = Core::PRECOMPOSE_UNICODE
             .enrich_error(config.boolean(Core::PRECOMPOSE_UNICODE))
             .with_leniency(lenient)

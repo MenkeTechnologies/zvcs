@@ -3442,6 +3442,9 @@ fn clean_index(repo: &gix::Repository, ctx: &Ctx, rev: &str) -> Result<bool> {
     ] {
         let _ = std::fs::remove_file(repo.git_dir().join(name));
     }
+    // …and `remove_merge_branch_state()`'s last step, `save_autostash_ref(r,
+    // "MERGE_AUTOSTASH")` (branch.c:837).
+    super::reset::save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
     Ok(true)
 }
 

@@ -62,6 +62,22 @@ pub(crate) enum ImplicitWorkTree {
     None,
 }
 
+/// git's `is_bare_repository_cfg = 1` from `git --bare` (git.c:256-258, v2.55.0).
+static BARE_REPOSITORY_CFG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record `git --bare`: the process-global `is_bare_repository_cfg` starts at 1 instead of -1
+/// (environment.c:49), so every repository opened afterwards is bare unless its own
+/// `core.bare` says otherwise. Like the C global it is not inherited by child processes, which
+/// see only the `GIT_DIR` and `GIT_IMPLICIT_WORK_TREE` the flag also sets.
+pub fn set_bare_repository_cfg() {
+    BARE_REPOSITORY_CFG.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_bare_repository_cfg()`] was called.
+pub fn bare_repository_cfg() -> bool {
+    BARE_REPOSITORY_CFG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The error returned by [`crate::open()`].
 #[derive(Debug, thiserror::Error)]
 #[expect(missing_docs)]

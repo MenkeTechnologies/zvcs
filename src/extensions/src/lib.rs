@@ -334,6 +334,10 @@ pub fn handle_options(
             // `setenv(…, 0)` so an inherited `$GIT_DIR` still wins, and turns off
             // the implicit work tree. git dies from `xgetcwd()` when the cwd
             // cannot be read, which is `die_errno` and so 128.
+            //
+            // Before any of that it sets `is_bare_repository_cfg = 1`
+            // (git.c:256-258), which setup then consults ahead of `core.worktree`
+            // (setup.c:1144-1153).
             "--bare" => {
                 let cwd = match std::env::current_dir() {
                     Ok(p) => p,
@@ -342,6 +346,7 @@ pub fn handle_options(
                         return Handled::Exit(ExitCode::from(fatal::EXIT_FATAL));
                     }
                 };
+                gix::open::set_bare_repository_cfg();
                 if std::env::var_os("GIT_DIR").is_none() {
                     std::env::set_var("GIT_DIR", cwd);
                 }

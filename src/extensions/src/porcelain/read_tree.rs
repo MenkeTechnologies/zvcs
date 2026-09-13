@@ -673,6 +673,18 @@ fn finish(o: Opts) -> Result<ExitCode> {
         let flag = if o.update { "-u" } else { "-i" };
         return fatal(format!("{flag} is meaningless without -m, --reset, or --prefix"));
     }
+    // ```c
+    // if (opts.merge && !opts.index_only)
+    //         setup_work_tree(the_repository);
+    // ```
+    //
+    // (builtin/read-tree.c:231-232.) `opts.merge` is already 1 for `--reset` and
+    // `--prefix` too (`stage = opts.merge = 1`, :205), so every merge-like form
+    // without `-i` refuses in a bare repository — `-u` or not — and does so
+    // before "you must specify at least one tree to merge" (:239).
+    if o.merge_like() && !o.index_only {
+        crate::dispatch::setup_work_tree()?;
+    }
     if o.merge_like() && tree_ids.is_empty() {
         return fatal("you must specify at least one tree to merge");
     }

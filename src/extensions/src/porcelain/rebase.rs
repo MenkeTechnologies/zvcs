@@ -3802,6 +3802,9 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
     ] {
         let _ = std::fs::remove_file(repo.git_dir().join(f));
     }
+    // `remove_branch_state()`'s `save_autostash_ref(r, "MERGE_AUTOSTASH")`
+    // (branch.c:837), before `finish_rebase()` (builtin/rebase.c:1417-1418).
+    super::reset::save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
     // Re-apply any autostash the interrupted rebase saved, onto the restored
     // orig-head tree, before dropping the state dir that holds its reference.
     let autostash = read_autostash(repo);
@@ -4268,6 +4271,9 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
             ] {
                 let _ = std::fs::remove_file(repo.git_dir().join(f));
             }
+            // `remove_branch_state()`'s `save_autostash_ref(r, "MERGE_AUTOSTASH")`
+            // (branch.c:837), before `finish_rebase()` (builtin/rebase.c:1417-1418).
+            super::reset::save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
             // `finish_rebase()` (builtin/rebase.c) is what `ACTION_ABORT` ends in, and it
             // runs `apply_autostash(state_dir_path("autostash", opts))` *before*
             // `remove_dir_recursively(state_dir)` — the snapshot's only reference lives in

@@ -720,6 +720,9 @@ fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
             ] {
                 let _ = std::fs::remove_file(git_dir.join(name));
             }
+            // `remove_merge_branch_state()` ends in `save_autostash_ref(r,
+            // "MERGE_AUTOSTASH")` (branch.c:837).
+            super::reset::save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Abort => sequencer_rollback(repo, &git_dir),

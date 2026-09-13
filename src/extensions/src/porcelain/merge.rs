@@ -1580,6 +1580,9 @@ fn quit() -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     remove_merge_state(repo.git_dir(), false);
+    // `remove_merge_branch_state()` (builtin/merge.c:1452) ends in
+    // `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837).
+    super::reset::save_autostash_ref(&repo, MERGE_AUTOSTASH)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1596,6 +1599,23 @@ fn abort() -> Result<ExitCode> {
     }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    // ```c
+    // if (!refs_read_ref(get_main_ref_store(the_repository), "MERGE_AUTOSTASH", &stash_oid))
+    //         refs_delete_ref(get_main_ref_store(the_repository),
+    //                         "", "MERGE_AUTOSTASH", &stash_oid, REF_NO_DEREF);
+    // ```
+    //
+    // (builtin/merge.c:1430-1433.) Dropped before the `git reset --merge`, so its
+    // `remove_branch_state()` has no autostash to file under `refs/stash`; the
+    // snapshot is re-applied once the reset is done (:1438-1441).
+    let stash = repo
+        .find_reference(MERGE_AUTOSTASH)
+        .ok()
+        .and_then(|r| r.target().try_id().map(ToOwned::to_owned));
+    if stash.is_some() {
+        crate::sequencer::delete_state_ref(&repo, MERGE_AUTOSTASH)?;
+    }
 
     let head = repo.head()?;
     let head_id = head
@@ -1620,6 +1640,10 @@ fn abort() -> Result<ExitCode> {
     // entries.
     super::checkout::append_head_log(&repo, Some(head_id), Some(head_id), "reset: moving to HEAD");
     remove_merge_state(repo.git_dir(), true);
+    // `apply_autostash_oid(stash_oid_hex)` (builtin/merge.c:1438-1441).
+    if let Some(id) = stash {
+        super::stash::apply_autostash(&repo, id, false)?;
+    }
 
     Ok(ExitCode::SUCCESS)
 }
@@ -2281,6 +2305,9 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // records its own `AUTO_MERGE`. Removing the merge state first would leave
     // the file behind, which is exactly what `git pull --autostash` was doing.
     remove_merge_state(repo.git_dir(), false);
+    // …whose last step is `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837);
+    // `end_autostash()` above already consumed the ref, as `finish()` does.
+    super::reset::save_autostash_ref(&repo, MERGE_AUTOSTASH)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -3172,6 +3199,9 @@ fn finalize_clean(
     // stash apply` child writes its own `AUTO_MERGE`, and only then is the merge
     // state cleared. Clearing first left that file behind.
     remove_merge_state(git_dir, false);
+    // `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837), which finds the
+    // ref already consumed by `end_autostash()`.
+    super::reset::save_autostash_ref(repo, MERGE_AUTOSTASH)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -4809,6 +4839,9 @@ fn continue_merge(opts: &Opts) -> Result<ExitCode> {
         };
         println!("[{branch_label} {short}] {subject}");
     }
+    // `git merge --continue` is `cmd_commit()` (builtin/merge.c:1467-1468), whose
+    // last act is `apply_autostash_ref(the_repository, "MERGE_AUTOSTASH", …)`.
+    super::commit::apply_merge_autostash(&repo)?;
     Ok(ExitCode::SUCCESS)
 }
 

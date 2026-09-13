@@ -92,6 +92,12 @@
 //!     `--max-count`, `<a>...<b>`, magic or wildcard pathspecs, …) with
 //!     `unsupported rev-list argument`. Accepting one and ignoring it would
 //!     silently rewrite a different set of commits than the user asked for.
+//!     A flag is first handed to `git rev-parse` and `git rev-list` exactly as
+//!     the script hands it (lines 322-336, see [`rev_list_flags`]), so a flag
+//!     `rev-list` refuses — an unknown option, a `--filter` switch written
+//!     after the revisions, `--since` in `--stdin` mode — ends in the script's
+//!     own `Could not get the commits`; only a flag `rev-list` accepts reaches
+//!     the refusal.
 //!   * **`git commit-tree`'s ident handling is probed before anything is
 //!     rewritten.** The script's whole ident mechanism is `GIT_AUTHOR_DATE` in
 //!     git's raw `@<timestamp> <tz>` form, and it is the `git` on `PATH` that
@@ -576,6 +582,21 @@ fn run(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // Line 69's `eval "$functions"` runs line 14,
+    // `EMPTY_TREE=$(git hash-object -t tree /dev/null)` — the script's first `git`
+    // child, ahead of the warning and of `-h`. `hash-object` parses the config
+    // through `git_default_config()` (no repository settings block), so a value
+    // that callback refuses prints its `fatal:` here; the assignment swallows the
+    // exit status and the script carries on.
+    if let Ok(repo) = crate::setup::discover() {
+        if let Err(rejection) = crate::default_config::validate(&repo) {
+            let msg = rejection.into_fatal();
+            if !msg.is_empty() {
+                eprintln!("fatal: {msg}");
+            }
+        }
+    }
+
     // Script lines 86-98. The guard is `test -z "$A$B"`, i.e. both variables
     // empty or unset. It runs before anything else, `-h` included.
     let squelched = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
@@ -596,6 +617,16 @@ fn run(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = crate::setup::discover()?;
+    // `git-sh-setup`'s `git_dir_init`: `GIT_DIR=$(git rev-parse --git-dir) ||
+    // exit` (git-sh-setup.sh:327). `rev-parse` reads the repository settings
+    // block and then `git_default_config()`, and dies on the first value either
+    // refuses; the bare `exit` propagates its 128.
+    if let Err(msg) = crate::repo_settings::RepoSettings::load(&repo) {
+        return die_with_status(128, &format!("fatal: {msg}"));
+    }
+    if let Err(rejection) = crate::default_config::validate(&repo) {
+        return die_with_status(128, &format!("fatal: {}", rejection.into_fatal()));
+    }
     let git_dir = repo.path().canonicalize()?;
 
     // `git_dir_init` with `SUBDIRECTORY_OK` unset: `git rev-parse --show-cdup`
@@ -1057,6 +1088,9 @@ fn rewrite(
     // that is exactly `hexsz` hex digits is decoded without the object database
     // ever being asked (see [`crate::objname`]). Its `fatal:` goes to stderr and
     // the script's own `die` follows it.
+    if !selection.flags.is_empty() {
+        return rev_list_flags(ctx, opts, rev_args, &selection);
+    }
     if let Some(id) = selection.bad_object {
         eprintln!("fatal: bad object {id}");
         return die("Could not get the commits");
@@ -2062,6 +2096,86 @@ struct Selection {
     /// revision nor a file, in a run whose ref list came out empty, reports
     /// `You must specify a ref to rewrite.` at exit 1 — not the ambiguity.
     ambiguous: Option<String>,
+    /// The `-`-prefixed arguments outside the ported selection set, in order.
+    flags: Vec<String>,
+}
+
+/// Lines 322-336 run for real, for an `"$@"` that carries flags.
+///
+/// The script never judges a flag itself. `git rev-parse --revs-only` puts the
+/// flags `is_rev_argument()` claims (`--max-age=`, `--no-merges`, …) into
+/// `../parse` along with the revisions; `git rev-parse --sq --no-revs` hands
+/// every other flag back into `"$@"` (`show_flag()`, builtin/rev-parse.c:171-180,
+/// plus the `--` it passes on at :736-741); and `git rev-list --reverse
+/// --topo-order --default HEAD --parents --simplify-merges --stdin "$@"`
+/// decides — its usage block for an option it does not know (`--msg-filter=cat`
+/// placed after a revision), `invalid option '<opt>' in --stdin mode` for one
+/// the stdin reader rejects — followed by the script's
+/// `die "Could not get the commits"`. Those outcomes are reproduced by running
+/// the same three children. A flag `rev-list` accepts selects commits this
+/// port's walk does not model, so that run is still refused rather than
+/// rewriting a different set of commits.
+///
+/// Two stated substitutions:
+///
+///   * `"$@"` comes from `git rev-parse --no-revs`, one word per output line,
+///     rather than from `--sq` through `eval`: this build's `rev-parse` does not
+///     implement `--sq`. The word list is the same except for an argument that
+///     itself contains a newline, which this splits.
+///   * `--default HEAD` is left off the `rev-list` line. It changes nothing
+///     while `../parse` names a revision — `setup_revisions()` only consults the
+///     default when `!revs->pending.nr && !revs->rev_input_given`
+///     (revision.c:2942) — and this build's `rev-list` refuses the option with
+///     its usage block, which would turn every flag, valid or not, into
+///     `Could not get the commits`. An empty `../parse`, where the default
+///     would matter, is not run at all and falls through to the refusal.
+///
+/// The `rev-parse` children run with stderr closed: their ambiguity warnings
+/// are already accounted for by [`warn_rev_args`].
+fn rev_list_flags(ctx: &Ctx, opts: &Opts, rev_args: &[String], selection: &Selection) -> Result<ExitCode> {
+    use std::process::Stdio;
+
+    let rev_parse = |mode: &str| -> Result<Vec<u8>> {
+        Ok(ctx
+            .git(&["rev-parse", mode])
+            .args(rev_args)
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| anyhow::anyhow!("could not run git rev-parse: {e}"))?
+            .stdout)
+    };
+    // Line 322: `git rev-parse --revs-only "$@" >../parse`.
+    let parse = rev_parse("--revs-only")?;
+    // Lines 324-332. `$dashdash` is always empty here: a flag makes `$nonrevs`
+    // non-empty, so the subdirectory is appended bare.
+    let no_revs = rev_parse("--no-revs")?;
+    let mut words: Vec<String> = ByteSlice::lines(&no_revs[..])
+        .map(|line| line.to_str_lossy().into_owned())
+        .collect();
+    if !opts.filter_subdir.is_empty() {
+        words.push(opts.filter_subdir.clone());
+    }
+    if parse.is_empty() {
+        anyhow::bail!("unsupported rev-list argument: {}", selection.flags[0]);
+    }
+
+    // Lines 334-336.
+    let mut child = ctx
+        .git(&["rev-list", "--reverse", "--topo-order", "--parents", "--simplify-merges", "--stdin"])
+        .args(&words)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("could not run git rev-list: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A `rev-list` that dies on its arguments before reading stdin closes
+        // the pipe; that broken pipe is not the failure being reported.
+        let _ = stdin.write_all(&parse);
+    }
+    if !child.wait()?.success() {
+        return die("Could not get the commits");
+    }
+    anyhow::bail!("unsupported rev-list argument: {}", selection.flags[0])
 }
 
 /// What one revision argument resolved to, splitting the case
@@ -2258,8 +2372,14 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
             saw_rev = true;
             continue;
         }
+        // A flag is dropped by line 269's `--no-flags` and printed by line 313's
+        // `--no-revs`, so it never touches the ref list but always makes
+        // `$nonrevs` non-empty. Whether it is valid is `rev-list`'s call at line
+        // 334 — see [`rev_list_flags`].
         if arg.starts_with('-') {
-            anyhow::bail!("unsupported rev-list argument: {arg}");
+            sel.flags.push(arg.clone());
+            sel.saw_nonrev = true;
+            continue;
         }
         match resolve_arg(repo, arg) {
             Resolved::Commit(id) => {

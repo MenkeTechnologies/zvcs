@@ -677,12 +677,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // plus `fsck_finish()`'s report for one that is absent or is not a blob.
     // `--connectivity-only` skips both, since it skips `fsck_source()` and
     // `fsck_finish()` alike.
+    // `fsck_blobs()` asks `is_promisor_object()` about every blob it cannot read
+    // (fsck.c:1336-1340), and the first such call builds the promisor set — see
+    // step 3c.
+    let mut finish_asked_promisor = false;
     if !opt.connectivity_only {
         errors |= lint_special_blobs(
             &repo,
             &msg_config,
             &gitmodules_found,
             &gitattributes_found,
+            has_promisor_remote.then_some(promisor),
+            &mut finish_asked_promisor,
             &mut msg_lines,
         );
     }
@@ -793,12 +799,31 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // opens each object with `lookup_object()` (packfile.c:2733) — a lookup of
     // an object the scan already created, which moves it back to its home slot.
     let mut promisor_pass_done = !has_promisor_remote;
-    if has_promisor_remote && (snapshot_missed || heads.is_empty()) {
+    if has_promisor_remote && snapshot_missed {
         // `snapshot_ref()` asks `is_promisor_object()` about a head it cannot
         // parse (builtin/fsck.c:554-555), which runs the pass before the scan
-        // has created anything; with no snapshot head at all the pass runs at
-        // a reflog's or an index entry's `mark_object()` instead. Neither
-        // position is replayed.
+        // has created anything. That position is not replayed.
+        creation_modeled = false;
+        promisor_pass_done = true;
+    } else if finish_asked_promisor {
+        // `fsck_finish()` (builtin/fsck.c:1103-1104) asked first, about a
+        // `.gitmodules`/`.gitattributes` blob it could not read (fsck.c:1336-1340),
+        // before `process_refs()` (:1108) looks up any head. Its earlier reads of the
+        // blobs it could read moved packs about in khash order, which is not
+        // replayed, so only a single pack leaves the list order known; no head
+        // has been re-read yet, so nothing else moved a pack either.
+        promisor_pass_done = true;
+        match &pack_lists {
+            Some(lists) if lists.pack_count() < 2 => {
+                for promised in lists.promisor_pass(None) {
+                    state.note(promised);
+                }
+            }
+            _ => creation_modeled = false,
+        }
+    } else if has_promisor_remote && heads.is_empty() {
+        // With no snapshot head at all the pass runs at a reflog's or an index
+        // entry's `mark_object()` instead, which is not replayed.
         creation_modeled = false;
         promisor_pass_done = true;
     }
@@ -2310,6 +2335,8 @@ fn lint_special_blobs(
     msg_config: &MsgConfig,
     gitmodules_found: &HashMap<ObjectId, u8>,
     gitattributes_found: &HashMap<ObjectId, u8>,
+    promised: Option<&HashSet<ObjectId>>,
+    asked_promisor: &mut bool,
     msg_lines: &mut Vec<(Slot, ObjectId, String)>,
 ) -> u8 {
     let mut errors = 0u8;
@@ -2335,6 +2362,15 @@ fn lint_special_blobs(
         let (kind, data) = match repo.find_object(id) {
             Ok(object) => (object.kind, object.data.clone()),
             Err(_) => {
+                // `fsck_blobs()`: an unreadable blob is first put to
+                // `is_promisor_object()` (fsck.c:1338-1340), which is only ever
+                // non-empty with a promisor remote (packfile.c:2787).
+                if let Some(promised) = promised {
+                    *asked_promisor = true;
+                    if promised.contains(&id) {
+                        continue;
+                    }
+                }
                 // `fsck_blobs()`: unreadable, and reported once per sweep.
                 for (present, slot, msg, label) in [
                     (as_modules, Slot::FinishGitmodules, &GITMODULES_MISSING, ".gitmodules"),

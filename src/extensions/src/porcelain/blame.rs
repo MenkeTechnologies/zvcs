@@ -4268,6 +4268,18 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
             let mut pos = std::mem::take(&mut opts.pre);
             match pos.len() {
                 0 => return Ok(Targets::Usage),
+                // (2a), `builtin/blame.c:1155-1157`: with no work tree to read a final
+                // image from, a lone operand that names a revision is not a path.
+                // ```c
+                // if (argc == 2 && is_a_rev(argv[1]) && !repo_get_work_tree(the_repository))
+                //         die("missing <path> to blame");
+                // ```
+                1 if repo.workdir().is_none() && is_a_rev(repo, &pos[0]) => {
+                    let mut err = std::io::stderr().lock();
+                    writeln!(err, "fatal: missing <path> to blame")?;
+                    err.flush()?;
+                    return Ok(Targets::Fatal(ExitCode::from(128)));
+                }
                 1 => (vec![], pos.pop().unwrap()),
                 // Two positionals: `blame <path> <rev>` if the last is a rev,
                 // otherwise `blame <rev> <path>`.
@@ -4304,6 +4316,31 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
     };
     if let Some(code) = setup_revisions(repo, &revs, &mut queued)? {
         return Ok(Targets::Fatal(code));
+    }
+
+    // `builtin/blame.c:1166-1177`: a bare repository has no work tree to build the
+    // fake final commit from, so an empty pending list blames `HEAD` itself — which
+    // `setup_scoreboard()` then names in `no such path %s in HEAD`.
+    // ```c
+    // if (!revs.pending.nr && is_bare_repository()) {
+    //         if (!refs_resolve_ref_unsafe(..., "HEAD", RESOLVE_REF_READING, &head_oid, NULL) ||
+    //             !(head_commit = lookup_commit_reference_gently(revs.repo, &head_oid, 1)))
+    //                 die("no such ref: HEAD");
+    //         add_pending_object(&revs, &head_commit->object, "HEAD");
+    // }
+    // ```
+    if queued.pending.is_empty() && repo.is_bare() {
+        let head = repo
+            .head_id()
+            .ok()
+            .map(|id| crate::sequencer::peel_id(repo, id.detach()));
+        let Some(crate::sequencer::Side::Commit(head)) = head else {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "fatal: no such ref: HEAD")?;
+            err.flush()?;
+            return Ok(Targets::Fatal(ExitCode::from(128)));
+        };
+        queue_pending(repo, &mut queued, false, "HEAD".to_string(), head);
     }
 
     if opts.reverse {

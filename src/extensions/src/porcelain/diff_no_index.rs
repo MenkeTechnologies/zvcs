@@ -573,6 +573,19 @@ const NOT_IN_NO_INDEX: &[&str] = &[
     "--no-expand-tabs",
 ];
 
+/// `diff_opt_find_object()` (diff.c:4968-4986): the object is resolved during the
+/// option scan, and a name that does not resolve — which is every name when no
+/// repository was found — is `error: unable to resolve '<arg>'`, exit 129.
+fn resolve_find_object(arg: &str) -> std::result::Result<(), ExitCode> {
+    match crate::setup::discover() {
+        Ok(repo) => crate::objname::find_object(&repo, arg).map(|_| ()).map_err(|e| e.report()),
+        Err(_) => {
+            eprintln!("error: unable to resolve '{arg}'");
+            Err(ExitCode::from(129))
+        }
+    }
+}
+
 /// `git diff --no-index <a> <b>`.
 pub(crate) fn run(args: &[String]) -> Result<ExitCode> {
     run_with(args, false)
@@ -659,6 +672,8 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // The other `OPT_STRING`/`OPT_INTEGER` entries whose value may stand as the next
     // argument instead of being glued on with `=`.
     let mut pending: Option<String> = None;
+    // `--find-object=<object>`: `options->objfind`, see [`resolve_find_object`].
+    let mut find_object = false;
 
     for a in args {
         if let Some(flag) = pending.take() {
@@ -671,6 +686,10 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                     Err(code) => return Ok(code),
                 },
                 "--line-prefix" => line_prefix = a.as_bytes().to_vec(),
+                "--find-object" => match resolve_find_object(a) {
+                    Ok(()) => find_object = true,
+                    Err(code) => return Ok(code),
+                },
                 "--diff-filter" => {
                     if let Err(bad) = filter.accumulate(a) {
                         eprintln!("error: unknown change class '{bad}' in --diff-filter={a}");
@@ -722,6 +741,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                 | "--output"
                 | "--inter-hunk-context"
                 | "--line-prefix"
+                | "--find-object"
                 | "--diff-filter"
                 | "--ws-error-highlight"
         ) || diff_color::needs_separate_value(a)
@@ -1093,6 +1113,12 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                 abbrev = (v != 0).then_some(v as usize);
                 no_abbrev = v == 0;
             }
+            s if s.starts_with("--find-object=") => {
+                match resolve_find_object(&s["--find-object=".len()..]) {
+                    Ok(()) => find_object = true,
+                    Err(code) => return Ok(code),
+                }
+            }
             // `parse_options()` rejects these outright: they belong to
             // `cmd_diff()`, not to the no-index parser, and never reach it.
             s if NOT_IN_NO_INDEX.contains(&s) => {
@@ -1385,6 +1411,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
         };
+    // `diffcore_pickaxe()`'s objfind arm keeps a pair only when a side is
+    // `DIFF_FILE_VALID` with an oid in the set (diffcore-pickaxe.c). A no-index
+    // filespec never has a valid oid, so `--find-object` drops every pair.
+    let (out, changed, paints, check_failed) = match find_object {
+        true => (Vec::new(), false, Vec::new(), false),
+        false => (out, changed, paints, check_failed),
+    };
 
     if !opts.fmt.quiet {
         let painted = diff_color::colorize_patch_ex(

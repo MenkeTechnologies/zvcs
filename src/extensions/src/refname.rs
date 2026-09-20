@@ -316,6 +316,27 @@ pub fn warn_ambiguous_refs(repo: &gix::Repository) -> bool {
     }
 }
 
+/// The environment override `repo_default_branch_name()` consults before it
+/// reads `init.defaultBranch`:
+///
+/// ```c
+/// const char *env = getenv("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME");
+///
+/// if (env && *env)
+///         ret = xstrdup(env);
+/// if (!ret && repo_config_get_string(r, config_key, &ret) < 0)
+///         die(_("could not retrieve `%s`"), config_display_key);
+/// ```
+/// (`refs.c:691-701`, v2.55.0)
+///
+/// A set, non-empty value wins outright: the config key is not read at all when
+/// it is present, so a valueless `init.defaultBranch` cannot die on this path.
+/// Every caller of `repo_default_branch_name()` — `git init`, `git clone` of an
+/// empty repository, `git var GIT_DEFAULT_BRANCH` — sees it.
+pub fn default_branch_name_override() -> Option<String> {
+    std::env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME").ok().filter(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

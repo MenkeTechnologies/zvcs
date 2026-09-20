@@ -3396,13 +3396,16 @@ impl BundleTransport {
     }
 }
 
-/// `repo_default_branch_name()`: `init.defaultBranch`, or `master`. The key is
-/// read with `repo_config_get_string()` (refs.c:700), which dies through
+/// `repo_default_branch_name()`: the `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME`
+/// override (refs.c:696-699), else `init.defaultBranch`, else `master`. The key
+/// is read with `repo_config_get_string()` (refs.c:700), which dies through
 /// `git_die_config()` on a valueless key.
 fn default_branch_name(repo: &gix::Repository) -> String {
-    crate::config::config_get_string(Some(repo), "init.defaultbranch")
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "master".to_string())
+    crate::refname::default_branch_name_override().unwrap_or_else(|| {
+        crate::config::config_get_string(Some(repo), "init.defaultbranch")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "master".to_string())
+    })
 }
 
 /// `guess_remote_head(head, refs, 0)` (remote.c:2492-2545, v2.55.0) over an

@@ -645,11 +645,15 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         // the name gix already chose matches, the HEAD repoint below is a no-op.
         let branch_name = match initial_branch.clone() {
             Some(name) => name,
-            // `repo_default_branch_name()` (refs.c:700): `repo_config_get_string()`,
-            // which dies through `git_die_config()` on a valueless key.
-            None => crate::config::config_get_string(Some(&repo), "init.defaultbranch")
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "master".to_string()),
+            // `repo_default_branch_name()` (refs.c:696-700): the
+            // `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` override first, then
+            // `repo_config_get_string()`, which dies through `git_die_config()` on a
+            // valueless key.
+            None => crate::refname::default_branch_name_override().unwrap_or_else(|| {
+                crate::config::config_get_string(Some(&repo), "init.defaultbranch")
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "master".to_string())
+            }),
         };
 
         // Repoint the unborn HEAD symref to the resolved branch. This is a ref

@@ -200,7 +200,11 @@ fn resolve(name: &str, cfg: &ConfigFile) -> Result<Option<Vec<BString>>> {
             // rejects it — naming the config key in its display spelling and the
             // value it read, so an empty `init.defaultBranch` reports an empty
             // value rather than falling back to `master`.
-            let name = cfg_str(cfg, "init.defaultBranch").unwrap_or_else(|| "master".into());
+            // `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` is consulted ahead of the config
+            // key and suppresses reading it entirely (refs.c:696-700).
+            let name = crate::refname::default_branch_name_override()
+                .or_else(|| cfg_str(cfg, "init.defaultBranch"))
+                .unwrap_or_else(|| "master".into());
             let composed: std::result::Result<gix::refs::FullName, _> =
                 format!("refs/heads/{name}").try_into();
             if composed.is_err() {

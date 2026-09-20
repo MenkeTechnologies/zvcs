@@ -320,8 +320,10 @@ struct DryRun {
     /// (builtin/commit.c:571-574).
     amend: bool,
     /// `-v`/`--verbose`, which `run_status()` forwards as `s->verbose`
-    /// (builtin/commit.c:575) so the report ends with the staged patch.
-    verbose: bool,
+    /// (builtin/commit.c:575) so the report ends with the staged patch. A count,
+    /// because `OPT__VERBOSE` is `OPT_COUNTUP`: a second `-v` labels that patch
+    /// and appends the unstaged one.
+    verbose: u32,
 }
 
 /// git's `enum commit_whence` (commit.h): where the commit being recorded came
@@ -737,7 +739,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut trailer_args: Vec<String> = Vec::new();
     let mut template_arg: Option<String> = None;
     let mut status_flag: Option<bool> = None;
-    let mut verbose: Option<bool> = None;
+    // `verbose = -1; /* unspecified */` (builtin/commit.c:1820) before
+    // `OPT__VERBOSE`, which is `OPT_COUNTUP`: each `-v` adds one from a floor of
+    // zero and `--no-verbose` resets to zero, so `None` here is git's `-1`.
+    let mut verbose: Option<u32> = None;
     // `--no-post-rewrite` suppresses the `post-rewrite` hook an amend fires.
     let mut post_rewrite = true;
     let mut gpg_sign = GpgSign::Unset;
@@ -872,8 +877,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--fixup=") => fixup_arg = Some(s["--fixup=".len()..].to_string()),
             // `-v`/`--verbose` appends the staged diff below a scissors line in the
             // commit-message editor and truncates the message there afterward.
-            "-v" | "--verbose" => verbose = Some(true),
-            "--no-verbose" => verbose = Some(false),
+            "-v" | "--verbose" => verbose = Some(verbose.unwrap_or(0) + 1),
+            "--no-verbose" => verbose = Some(0),
             // Everything after `--` is a pathspec, even if it looks like a flag.
             "--" => positional_only = true,
             "--amend" => amend = true,
@@ -990,7 +995,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                         'q' => quiet = true,
                         'n' => verify = false,
                         's' => signoff = true,
-                        'v' => verbose = Some(true),
+                        'v' => verbose = Some(verbose.unwrap_or(0) + 1),
                         'e' => edit_flag = Some(true),
                         'o' => only_flag = true,
                         'i' => include_flag = true,
@@ -1420,9 +1425,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 // `cmd_commit` *before* it branches to `dry_run_commit()`
                 // (builtin/commit.c:1827-1828), so `commit.verbose` reaches the dry
                 // run just as `-v` does.
-                verbose: verbose.unwrap_or_else(|| {
-                    repo.config_snapshot().boolean("commit.verbose") == Some(true)
-                }),
+                verbose: resolve_verbose(verbose, &repo.config_snapshot()),
             },
         );
     }
@@ -1439,9 +1442,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut deferred_fatal: Option<String> = None;
     for f in &file_args {
         let content = if f == "-" {
-            let mut s = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
-            s
+            // `if (strbuf_read(&sb, 0, 0) < 0) die_errno(_("could not read log
+            // from standard input"));` (builtin/commit.c:810-811) — a raw byte
+            // read, so a non-UTF-8 log message (an ISO8859-1 one under
+            // `i18n.commitEncoding`, say) is accepted rather than refused. Read
+            // bytes and convert the same way the `-F <file>` arm below does;
+            // `read_to_string` used to die here with `stream did not contain
+            // valid UTF-8`, which git never does.
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
+            String::from_utf8_lossy(&bytes).into_owned()
         } else {
             // `if (strbuf_read_file(&sb, logfile, 0) < 0) die_errno(_("could not
             // read log file '%s'"), logfile);` (builtin/commit.c) — `die_errno`,
@@ -1989,7 +1999,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // once `prepare_to_commit()` can see the message body, below.
     let (mut comment, comment_char_is_auto) = comment_prefix_full(&snap);
     // `-v`/`--verbose` (`commit.verbose`) appends the staged diff under a cut line.
-    let verbose = verbose.unwrap_or_else(|| snap.boolean("commit.verbose") == Some(true));
+    let verbose = resolve_verbose(verbose, &snap);
     // `--status`/`--no-status`, defaulting to `commit.status` (git's `include_status`).
     let include_status = status_flag.unwrap_or_else(|| snap.boolean("commit.status") != Some(false));
     // `-t`/`--template <file>` beats `commit.template`; both seed the buffer and
@@ -2222,7 +2232,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             true => super::status::Reference::AmendParent,
             false => super::status::Reference::Commit,
         };
-        match super::status::commit_template_block(reference, untracked_arg.as_deref(), &comment) {
+        match super::status::commit_template_block(
+            reference,
+            untracked_arg.as_deref(),
+            &comment,
+            verbose,
+            // `s->added_cut_line`: the scissors line above this block, which
+            // `--cleanup=scissors` already wrote (builtin/commit.c:963, :986).
+            cleanup == Cleanup::Scissors,
+        ) {
             Ok(block) => buf.push_str(&block),
             Err(e) => {
                 std::fs::write(&msg_path, &buf)?;
@@ -2241,9 +2259,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         let differs = parent_tree_id.is_some() && !unchanged;
         let orderfile = super::status::configured_orderfile(&repo)?;
         super::status::diffcore_order_read(&repo, orderfile.as_deref(), differs)?;
-    }
-    if use_editor && include_status && verbose {
-        append_verbose_diff(&repo, &msg_path, cleanup)?;
     }
 
     // `--trailer <token>[(=|:)<value>]`: git runs
@@ -2349,7 +2364,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     }
-    message = cleanup_message(&std::fs::read_to_string(&msg_path)?, &comment, cleanup, verbose);
+    message =
+        cleanup_message(&std::fs::read_to_string(&msg_path)?, &comment, cleanup, verbose > 0);
 
     // An untouched template aborts the commit — `template_untouched()`, which
     // compares the cleaned-up template against the cleaned-up result.
@@ -3028,7 +3044,7 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     }
     // `s->verbose = verbose` (builtin/commit.c:575): the dry run ends with the
     // staged patch, which the status engine already knows how to append.
-    if o.verbose {
+    for _ in 0..o.verbose {
         sargs.push("--verbose".to_string());
     }
 
@@ -3721,41 +3737,10 @@ fn committer_ident_sufficiently_given(snap: &gix::config::Snapshot<'_>) -> bool 
 /// git's `wt_status_add_cut_line()`: the `>8` scissors line plus the two-line
 /// explanation, each commented with the configured prefix.
 fn scissors_line(comment: &str) -> String {
-    format!(
-        "{comment} ------------------------ >8 ------------------------\n\
-         {comment} Do not modify or remove the line above.\n\
-         {comment} Everything below it will be ignored.\n"
-    )
-}
-
-/// `-v`/`--verbose`: append the staged diff below a cut line so the editor shows
-/// what is about to be committed. git renders it in-process; we run this very
-/// binary's `diff --cached`, whose output is the same, straight into the buffer.
-/// The message is truncated at the cut line afterward, so the diff never lands in
-/// the commit.
-fn append_verbose_diff(
-    repo: &gix::Repository,
-    msg_path: &std::path::Path,
-    cleanup: Cleanup,
-) -> Result<()> {
-    use std::io::Write as _;
-    let comment = comment_prefix(&repo.config_snapshot());
-    let mut file = std::fs::OpenOptions::new().append(true).open(msg_path)?;
-    // `--cleanup=scissors` already put the cut line above the status block, and
-    // git never writes a second one.
-    if cleanup != Cleanup::Scissors {
-        file.write_all(scissors_line(&comment).as_bytes())?;
-    }
-    file.flush()?;
-    let exe = crate::hosted::git_exe()?;
-    let workdir = repo.workdir().unwrap_or_else(|| repo.git_dir()).to_owned();
-    let _ = std::process::Command::new(exe)
-        .args(["diff", "--cached"])
-        .current_dir(&workdir)
-        .stdout(file)
-        .stderr(std::process::Stdio::null())
-        .status();
-    Ok(())
+    super::status::CUT_LINE
+        .lines()
+        .map(|line| format!("{comment} {line}\n"))
+        .collect()
 }
 
 /// `--trailer <token>[(=|:)<value>]` — git spawns

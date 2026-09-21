@@ -3,23 +3,43 @@
 //! Four of the six subcommands are genuinely ported. Two are pure config
 //! manipulation and need nothing beyond `gix-config`:
 //!
-//!   * `register [--config-file <path>]` â appends the repository's realpath to
+//!   * `register [--config-file <path>]` - appends the repository's realpath to
 //!     `maintenance.repo` in the global config (or `--config-file`), sets
 //!     `maintenance.auto = false` in the repository's own config, and sets
 //!     `maintenance.strategy = incremental` there when no value is already
-//!     visible in the merged config. Idempotent, silent, exit 0. Each config
-//!     file is written through a `<path>.lock` sibling, as git's config writer
-//!     does, so a config that cannot be locked reports `error: could not lock
-//!     config file <path>` plus git's `fatal: unable to add 'maintenance.repo'
-//!     value of '<path>'` and exits 128 rather than claiming a write it did not
-//!     perform.
-//!   * `unregister [--config-file <path>] [-f|--force]` â removes that entry
-//!     again, dropping the `[maintenance]` section once it holds nothing else
-//!     (git's `git_config_set` does the same). Silent, exit 0; a config that
-//!     cannot be locked is `fatal: unable to unset 'maintenance.repo' value of
-//!     '<path>'`, exit 128, unless `--force` was given. Without
-//!     `--force` an unregistered repository yields git's
-//!     `fatal: repository '<path>' is not registered` on stderr, exit 128.
+//!     visible in the merged config. Idempotent, silent, exit 0. The
+//!     "already listed" test reads the *merged* configuration and ignores
+//!     `--config-file`, which names only where a new value would be written
+//!     (builtin/gc.c:2127), so a repository listed in its own local config is not
+//!     registered again. A config that cannot be locked reports `config.c`'s
+//!     `error:` line plus git's `fatal: unable to add 'maintenance.repo' value of
+//!     '<path>'` and exits 128 rather than claiming a write it did not perform.
+//!   * `unregister [--config-file <path>] [-f|--force]` - removes that entry
+//!     again, dropping the `[maintenance]` section once it holds nothing else.
+//!     Here the membership test *does* honour `--config-file` and asks that file
+//!     alone (builtin/gc.c:2190-2196), so without the flag the list git searches
+//!     and the file it then writes need not be the same: a repository listed only
+//!     in the local config is found, the removal from the global file reports
+//!     `CONFIG_NOTHING_SET`, and git dies `fatal: unable to unset
+//!     'maintenance.repo' value of '<path>'` at 128 - which `--force` does *not*
+//!     swallow (`rc && (!force || rc == CONFIG_NOTHING_SET)`), unlike a config
+//!     that could not be locked. A repository listed nowhere is
+//!     `fatal: repository '<path>' is not registered`, exit 128, silent under
+//!     `--force`.
+//!
+//!     Both subcommands read the registry through git's
+//!     `repo_config_get_string_multi()`, whose `check_multi_string()`
+//!     (config.c:1873-1890) fails the whole lookup with
+//!     `error: missing value for 'maintenance.repo'` as soon as one entry was
+//!     written with no `=`. That is an `error:`, not a `die()`: `register` goes on
+//!     to add a duplicate and `unregister` goes on to refuse.
+//!
+//!     Every config write goes through the same
+//!     `repo_config_set_multivar_in_file_gently()` port `git config` writes
+//!     through ([`crate::config_store::set_multivar_in_file`]), so the rewritten
+//!     file keeps git's own shape - a key line removed whole, a section its last
+//!     key just left behind removed with it, and an appended key spelled
+//!     `\t<name> = <value>`.
 //!
 //! The third needs no substrate at all, once git's actual rule is pinned down:
 //!
@@ -78,7 +98,9 @@ use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use gix::bstr::{BStr, BString, ByteSlice};
+use gix::bstr::{BString, ByteSlice};
+
+use crate::config_store::ValuePattern;
 
 /// git's top-level usage block, byte-for-byte (49 bytes, git 2.55.0).
 const TOP_USAGE: &str = "usage: git maintenance <subcommand> [<options>]\n\
@@ -1863,45 +1885,156 @@ fn register_sub(args: &[String]) -> Result<ExitCode> {
 
     // Repository-local config first, matching git's ordering: `auto` is set
     // unconditionally, `strategy` only when nothing already provides a value.
+    // Both writes go through the same `repo_config_set_multivar_in_file_gently()`
+    // port `git config` uses, so a key appended to a section that already exists
+    // is spelled the way git spells it (`\tauto = false`) rather than the way
+    // `gix`'s section editor would (`auto=false`).
     let local_path = repo.common_dir().join("config");
-    let mut local = load_config(&local_path)?;
-    local.set_raw_value("maintenance.auto", "false")?;
+    let mut sets: Vec<(&str, &str)> = vec![("maintenance.auto", "false")];
     if repo.config_snapshot().string("maintenance.strategy").is_none() {
-        local.set_raw_value("maintenance.strategy", "incremental")?;
+        sets.push(("maintenance.strategy", "incremental"));
     }
-    // `repo_config_set()` is the non-gently spelling: it dies on the write it
-    // could not perform rather than carrying on.
-    if let Err(ConfigWriteFailed(msg)) = write_config(&local_path, &local) {
-        eprintln!("{msg}");
-        eprintln!("fatal: could not set 'maintenance.auto' to 'false'");
-        return Ok(ExitCode::from(128));
+    for (key, value) in sets {
+        // `repo_config_set()` is the non-gently spelling: it dies on the write it
+        // could not perform rather than carrying on.
+        if let Err(err) = store_key(&local_path, key, Some(value.as_bytes()), ValuePattern::Any, false)
+        {
+            report_store_error(&err);
+            eprintln!("fatal: could not set '{key}' to '{value}'");
+            return Ok(ExitCode::from(128));
+        }
     }
+
+    // The membership test is against the *merged* configuration, whatever
+    // `--config-file` says: `repo_config_get_string_multi(the_repository, key,
+    // &list)` (builtin/gc.c:2127) never consults `config_file`, which only names
+    // where the new value would be written. So a repository already listed in its
+    // own local config — or in the system one — is not registered again.
+    let found = registered_paths(&repo_registry(&repo))
+        .is_some_and(|paths| paths.iter().any(|value| value == &maintpath));
 
     // Then the registry itself: the global config, or `--config-file`.
     let target = match config_file {
         Some(path) => path,
         None => global_config_path()?,
     };
-    let mut file = load_config(&target)?;
-    let already = file
-        .raw_values(REPO_KEY)
-        .unwrap_or_default()
-        .iter()
-        .any(|value| value == &maintpath);
-    if !already {
-        file.section_mut_or_create_new("maintenance", None::<&BStr>)?
-            .push("repo", Some(maintpath.as_bstr()))?;
-        if let Err(ConfigWriteFailed(msg)) = write_config(&target, &file) {
-            eprintln!("{msg}");
-            eprintln!(
-                "fatal: unable to add '{REPO_KEY}' value of '{}'",
-                maintpath.to_str_lossy()
-            );
-            return Ok(ExitCode::from(128));
+    if !found {
+        // `CONFIG_REGEX_NONE` as the value-pattern and `flags = 0`
+        // (builtin/gc.c:2146-2148): a pattern that matches nothing, so the new
+        // value is appended rather than replacing one of the existing ones.
+        if let Err(err) = store_repo_key(&target, Some(maintpath.as_slice()), ValuePattern::Never, false)
+        {
+            return Ok(store_failure(err, "unable to add", &maintpath));
         }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `repo_config_get_string_multi(the_repository, "maintenance.repo", &list)`
+/// (builtin/gc.c:2127, 2196), as both subcommands consume it: the configured
+/// values in config order, or `None` for the `err != 0` branch neither of them
+/// enters.
+///
+/// `check_multi_string()` (config.c:1873-1890) fails the whole lookup as soon as
+/// one entry was written without a value, printing `error: missing value for
+/// '<key>'` and returning -1 — an `error:`, not a `die()`, so the exit code is
+/// whatever the caller goes on to produce. Both callers read a failed lookup as
+/// "this repository is not listed", which is why one valueless entry makes
+/// `register` add a duplicate and `unregister` refuse.
+fn registered_paths(values: &[Option<BString>]) -> Option<Vec<BString>> {
+    if values.iter().any(Option::is_none) {
+        eprintln!("error: missing value for '{REPO_KEY}'");
+        return None;
+    }
+    Some(values.iter().flatten().cloned().collect())
+}
+
+/// Every occurrence of `maintenance.repo` in the repository's merged
+/// configuration, in config order, with a valueless one spelled `None`.
+fn repo_registry(repo: &gix::Repository) -> Vec<Option<BString>> {
+    let snapshot = repo.config_snapshot();
+    collect_repo_key(snapshot.plumbing())
+}
+
+/// The same, restricted to one configuration file — `git_configset_add_file()`
+/// over a fresh config set (builtin/gc.c:2190-2195).
+fn repo_registry_in_file(path: &Path) -> Result<Vec<Option<BString>>> {
+    Ok(collect_repo_key(&load_config(path)?))
+}
+
+/// Walk `file` for `maintenance.repo`, keeping the distinction `values()` loses:
+/// a name written with no `=` is a real occurrence whose value is absent.
+fn collect_repo_key(file: &gix::config::File) -> Vec<Option<BString>> {
+    file.sections()
+        .filter(|section| {
+            section.header().name().to_str_lossy().eq_ignore_ascii_case("maintenance")
+                && section.header().subsection_name().is_none()
+        })
+        .flat_map(|section| section.values_implicit("repo"))
+        .collect()
+}
+
+/// `repo_config_set_multivar_in_file_gently(the_repository, config_file,
+/// "maintenance.repo", …)` — the one primitive both subcommands write through,
+/// shared with `git config` rather than reimplemented on top of `gix`'s section
+/// editor, so the rewritten file has git's own shape (a key line removed whole,
+/// and a section its last key just left behind removed with it).
+fn store_repo_key(
+    target: &Path,
+    value: Option<&[u8]>,
+    pattern: ValuePattern<'_>,
+    multi_replace: bool,
+) -> std::result::Result<(), crate::config_store::StoreError> {
+    store_key(target, REPO_KEY, value, pattern, multi_replace)
+}
+
+/// The same for any `<section>.<name>` key, with the parent directory created
+/// first the way `git_config_set_multivar_in_file_gently()` does before it takes
+/// the lock.
+fn store_key(
+    target: &Path,
+    key: &str,
+    value: Option<&[u8]>,
+    pattern: ValuePattern<'_>,
+    multi_replace: bool,
+) -> std::result::Result<(), crate::config_store::StoreError> {
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    crate::config_store::set_multivar_in_file(
+        target,
+        key,
+        key,
+        key.rfind('.').expect("the key has a section"),
+        value,
+        pattern,
+        None,
+        multi_replace,
+    )
+}
+
+/// The `error:` line `config.c` prints for a store failure before the caller's
+/// own `fatal:`. `CONFIG_NOTHING_SET` has none — it is not a file problem.
+fn report_store_error(err: &crate::config_store::StoreError) {
+    use crate::config_store::StoreError;
+    match err {
+        StoreError::Io(io) => eprintln!("error: could not lock config file: {}", errno_text(io)),
+        StoreError::InvalidFile => eprintln!("error: invalid config file"),
+        StoreError::InvalidPattern(pattern) => eprintln!("error: invalid pattern: {pattern}"),
+        StoreError::NothingSet => {}
+    }
+}
+
+/// git's `die(_("unable to {add,unset} '%s' value of '%s'"), key, maintpath)`,
+/// preceded by whatever `config.c` already had to say about the file itself.
+fn store_failure(err: crate::config_store::StoreError, verb: &str, maintpath: &BString) -> ExitCode {
+    report_store_error(&err);
+    eprintln!(
+        "fatal: {verb} '{REPO_KEY}' value of '{}'",
+        maintpath.to_str_lossy()
+    );
+    ExitCode::from(128)
 }
 
 /// `git maintenance unregister [--config-file <path>] [-f|--force]`.
@@ -1919,21 +2052,24 @@ fn unregister_sub(args: &[String]) -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
     let maintpath = maintpath(&repo)?;
 
+    // Unlike `register`, this lookup *does* honour `--config-file`: git builds a
+    // config set out of that one file and asks it instead of the repository
+    // (builtin/gc.c:2190-2196). Without the flag it is the merged configuration,
+    // which is not the file the removal then targets — the two can disagree, and
+    // the `CONFIG_NOTHING_SET` branch below is what that disagreement produces.
+    let listed = match &config_file {
+        Some(path) => repo_registry_in_file(path)?,
+        None => repo_registry(&repo),
+    };
+    let found =
+        registered_paths(&listed).is_some_and(|paths| paths.iter().any(|value| value == &maintpath));
+
     let target = match config_file {
         Some(path) => path,
         None => global_config_path()?,
     };
-    let mut file = load_config(&target)?;
 
-    let matches: Vec<usize> = file
-        .raw_values(REPO_KEY)
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, value)| (value == &maintpath).then_some(i))
-        .collect();
-
-    if matches.is_empty() {
+    if !found {
         if force {
             return Ok(ExitCode::SUCCESS);
         }
@@ -1944,39 +2080,26 @@ fn unregister_sub(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    {
-        let mut values = file.raw_values_mut(REPO_KEY)?;
-        // Descending, so no removal shifts an index that is still to be removed.
-        for i in matches.into_iter().rev() {
-            values.delete(i);
-        }
-    }
+    // `CONFIG_FLAGS_MULTI_REPLACE | CONFIG_FLAGS_FIXED_VALUE` with a NULL value
+    // (builtin/gc.c:2215-2217): remove every entry whose value is literally this
+    // path.
+    let Err(err) = store_repo_key(
+        &target,
+        None,
+        ValuePattern::Fixed(maintpath.to_str().expect("maintpath is UTF-8")),
+        true,
+    ) else {
+        return Ok(ExitCode::SUCCESS);
+    };
 
-    // git's config writer drops a section that its last value just left empty.
-    let emptied: Vec<_> = file
-        .sections_and_ids()
-        .filter(|(section, _)| {
-            section.header().name().to_str_lossy() == "maintenance" && section.body().is_void()
-        })
-        .map(|(_, id)| id)
-        .collect();
-    for id in emptied {
-        file.remove_section_by_id(id);
+    // `if (rc && (!force || rc == CONFIG_NOTHING_SET))` — `--force` swallows a
+    // file that could not be locked, but *not* `CONFIG_NOTHING_SET`: the lookup
+    // above found the repository somewhere the write cannot reach it, and saying
+    // nothing would claim an unregistration that did not happen.
+    if force && !matches!(err, crate::config_store::StoreError::NothingSet) {
+        return Ok(ExitCode::SUCCESS);
     }
-
-    // `rc && (!force || rc == CONFIG_NOTHING_SET)`: a lock that could not be
-    // taken is `CONFIG_NO_LOCK`, which `--force` swallows.
-    if let Err(ConfigWriteFailed(msg)) = write_config(&target, &file) {
-        eprintln!("{msg}");
-        if !force {
-            eprintln!(
-                "fatal: unable to unset '{REPO_KEY}' value of '{}'",
-                maintpath.to_str_lossy()
-            );
-            return Ok(ExitCode::from(128));
-        }
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(store_failure(err, "unable to unset", &maintpath))
 }
 
 /// Outcome of parsing the option set shared by `register` and `unregister`.
@@ -2087,63 +2210,6 @@ fn load_config(path: &Path) -> Result<gix::config::File> {
     } else {
         Ok(gix::config::File::default())
     }
-}
-
-/// The `error:` line `config.c` prints when it cannot write a config file. git
-/// reports it and then dies with a second, caller-specific `fatal:` line, so the
-/// two are kept apart here.
-struct ConfigWriteFailed(String);
-
-/// Serialize `file` back over `path` the way `git_config_set_multivar_in_file_gently()`
-/// does: the new content is written to a `<path>.lock` sibling created with
-/// `O_EXCL` and renamed into place, so a config that cannot be locked is never
-/// touched and the command can report the failure instead of claiming success.
-/// `lock_file()` resolves symlinks before appending `.lock`, so the lock lands
-/// beside the real file. Everything untouched round-trips byte-for-byte.
-fn write_config(path: &Path, file: &gix::config::File) -> std::result::Result<(), ConfigWriteFailed> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let real = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        Some(parent) => std::fs::canonicalize(parent)
-            .unwrap_or_else(|_| parent.to_owned())
-            .join(path.file_name().unwrap_or_default()),
-        None => path.to_owned(),
-    };
-    let mut lock = real.clone().into_os_string();
-    lock.push(".lock");
-    let lock = PathBuf::from(lock);
-
-    let no_lock = |e: &std::io::Error| {
-        ConfigWriteFailed(format!(
-            "error: could not lock config file {}: {}",
-            path.display(),
-            errno_text(e)
-        ))
-    };
-    let mut out = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-    {
-        Ok(f) => f,
-        Err(e) => return Err(no_lock(&e)),
-    };
-    let write = std::io::Write::write_all(&mut out, &file.to_bstring())
-        .and_then(|()| out.sync_all())
-        .and_then(|()| {
-            drop(out);
-            std::fs::rename(&lock, &real)
-        });
-    if let Err(e) = write {
-        let _ = std::fs::remove_file(&lock);
-        return Err(ConfigWriteFailed(format!(
-            "error: could not write config file {}: {}",
-            path.display(),
-            errno_text(&e)
-        )));
-    }
-    Ok(())
 }
 
 /// `strerror(errno)`, which is what git's `error_errno()` appends.

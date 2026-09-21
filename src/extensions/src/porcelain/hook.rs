@@ -26,6 +26,10 @@
 //!     `advice.ignoredHook` hint for a non-executable hookdir script.
 //!   * The known-hook-event check, the friendly-name/event collision fatals, and
 //!     the usage/exit-129 paths for a missing or unknown subcommand.
+//!   * A hook that never starts: `error: cannot run <cmd>: <strerror>` when the
+//!     program word is slash-free and nothing on `PATH` answers, else
+//!     `fatal: cannot exec '<cmd>': <strerror>`, with 1 ORed into the exit code
+//!     and the remaining hooks abandoned (see [`report_start_failure`]).
 //!
 //! Not covered — rejected with a precise message rather than diverging silently:
 //! parallel execution (`-j`/`--jobs`/`hook.jobs`/`hook.<event>.jobs` greater
@@ -470,7 +474,19 @@ fn run(args: &[String]) -> Result<ExitCode> {
             .stdin(stdin)
             .stdout(Stdio::from(stderr.try_clone()?))
             .stderr(Stdio::inherit());
-        let status = child.status()?;
+        let status = match child.status() {
+            Ok(status) => status,
+            Err(e) => {
+                report_start_failure(cmd, traditional, &e);
+                // `notify_start_failure()` (hook.c:638-647) ORs 1 into the result
+                // and returns 1; `pp_start_one()` turns that into
+                // `pp->shutdown = 1` (run-command.c:1679-1680), so no later hook
+                // is started and the hookdir script queued behind a broken
+                // configured command never runs.
+                rc |= 1;
+                break;
+            }
+        };
         // A signal-terminated hook has no exit code; git surfaces its failure as
         // a non-zero status, so saturate rather than treat it as success.
         rc |= status.code().unwrap_or(255);
@@ -664,6 +680,89 @@ fn hookdir_hook(repo: &gix::Repository, event: &str) -> Result<Option<PathBuf>> 
 /// go through unconverted.
 fn shell_command(command: &[u8], args: &[String]) -> Command {
     crate::external::prepare_shell_cmd(std::ffi::OsStr::from_bytes(command), args)
+}
+
+/// git's two diagnostics for a hook that never got off the ground, chosen the way
+/// `start_command()` chooses between them.
+///
+/// `prepare_cmd()` (run-command.c:435-444) PATH-resolves the program word itself
+/// when it holds no directory separator, and returns -1 *before* the fork when
+/// nothing on `PATH` answers — with `errno` forced to `ENOENT` (run-command.c:442).
+/// `start_command()` reports that as `error: cannot run %s: %s`
+/// (run-command.c:757-762), through the ordinary error routine.
+///
+/// Everything else fails inside the forked child, which posts its `errno` back up
+/// the notify pipe; `child_err_spew()` prints it as `fatal: cannot exec '%s': %s`
+/// (run-command.c:403-405) — `fatal:` rather than `error:` because line 384
+/// installs the *die* message routine for the duration.
+///
+/// Both name `cmd->args.v[0]`: the command as configured, never the resolved path
+/// and never the `SHELL_PATH` wrapper `prepare_shell_cmd()` may have put in front
+/// of it.
+fn report_start_failure(command: &[u8], traditional: bool, err: &std::io::Error) {
+    let shown = String::from_utf8_lossy(command);
+    if locate_in_path(program_word(command, traditional)).is_none() {
+        // `errno = ENOENT` (run-command.c:442) regardless of why the scan came up
+        // empty, so the text is that of ENOENT and not of the spawn's own error.
+        let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
+        eprintln!(
+            "error: cannot run {shown}: {}",
+            crate::external::strerror(&enoent)
+        );
+    } else {
+        eprintln!(
+            "fatal: cannot exec '{shown}': {}",
+            crate::external::strerror(err)
+        );
+    }
+}
+
+/// `prepare_cmd()`'s `out->v[1]` — the word the `locate_in_PATH()` test at
+/// run-command.c:435 is applied to.
+///
+/// A traditional hook is a path pushed as argv[0] with no shell (hook.c:611-622),
+/// and a configured one-liner holding a shell metacharacter has already had
+/// `SHELL_PATH` prepended by `prepare_shell_cmd()` (run-command.c:293-305), so in
+/// both of those cases the word is not the command string.
+fn program_word(command: &[u8], traditional: bool) -> &[u8] {
+    if !traditional && crate::external::needs_shell(command) {
+        crate::external::SHELL_PATH.as_bytes()
+    } else {
+        command
+    }
+}
+
+/// Port of `locate_in_PATH()` (run-command.c:191-221).
+///
+/// A word holding a directory separator is not a `PATH` lookup at all — exec takes
+/// it as written (run-command.c:429-434) — so it answers `Some` for itself and
+/// leaves the outcome to the exec. Otherwise each `PATH` entry is tried in order,
+/// an empty entry meaning the current directory per POSIX, and the first
+/// [`is_executable`] hit wins.
+fn locate_in_path(word: &[u8]) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(word));
+    if word.contains(&b'/') {
+        return Some(path.to_owned());
+    }
+    let var = std::env::var_os("PATH")?;
+    if var.is_empty() {
+        return None;
+    }
+    std::env::split_paths(&var)
+        .map(|dir| match dir.as_os_str().is_empty() {
+            true => path.to_owned(),
+            false => dir.join(path),
+        })
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Port of `is_executable()` (run-command.c:131-171): a *regular* file — `stat`,
+/// not `lstat` — carrying the owner execute bit.
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|md| md.is_file() && md.permissions().mode() & u32::from(libc::S_IXUSR) != 0)
+        .unwrap_or(false)
 }
 
 /// The bare strerror text of an I/O error, without Rust's ` (os error N)` tail,

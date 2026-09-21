@@ -277,23 +277,23 @@ fn lookup_paths(key: &str) -> Result<Lookup> {
             continue;
         }
 
-        // `values()` silently skips entries written without `=`; git treats
-        // those as a fatal "missing value". Compare against every occurrence of
-        // the name to notice one.
-        let values = section.values(&parsed.name);
-        let occurrences = section
-            .value_names()
-            .filter(|n| n.eq_ignore_ascii_case(&parsed.name))
-            .count();
-        if occurrences > 0 {
+        // `git_configset_get_string_multi()` runs `check_multi_string()` over every
+        // collected item and fails on the first whose string is NULL — a name
+        // written with no `=` (config.c:1873-1890). `values()` cannot see that
+        // distinction: gix's parser emits an empty `Value` event for a valueless
+        // name too, so an implicit entry arrives there as an empty string and is
+        // indistinguishable from `key =`. `values_implicit()` is the accessor that
+        // keeps them apart, reporting an implicit entry as `None`.
+        let values = section.values_implicit(&parsed.name);
+        if !values.is_empty() {
             found = true;
-        }
-        if occurrences != values.len() {
-            eprintln!("error: missing value for '{key}'");
-            return Ok(Lookup::Bad);
         }
         let source = section.meta().source;
         for value in values {
+            let Some(value) = value else {
+                eprintln!("error: missing value for '{key}'");
+                return Ok(Lookup::Bad);
+            };
             let shown = value.to_string();
             if echoes.is_echo(source, key, Some(&shown)) {
                 continue;
@@ -314,6 +314,15 @@ fn lookup_paths(key: &str) -> Result<Lookup> {
     };
     let mut paths = Vec::with_capacity(raw.len());
     for value in raw {
+        // `interpolate_path("")` (path.c:698-733) takes neither the `%(prefix)/`
+        // nor the `~` branch and copies the string through, so an empty value
+        // stays empty and `git -C ''` runs the child where it stands. gix refuses
+        // an empty path outright (gix-config-value/src/path.rs:170-172), so that
+        // one value is carried past it rather than through it.
+        if value.is_empty() {
+            paths.push(std::path::PathBuf::new());
+            continue;
+        }
         let path = gix::config::Path::from(value).interpolate(context)?;
         paths.push(path);
     }

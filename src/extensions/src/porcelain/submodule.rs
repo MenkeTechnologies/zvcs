@@ -189,8 +189,11 @@ const SUBCOMMANDS: &[&str] = &[
 /// All eleven subcommands are ported. A `.gitmodules` url that is relative
 /// (`./`, `../`) is resolved the way git's `resolve_relative_url` →
 /// `relative_url()` (remote.c:2933) does, against `remote.<default>.url` or —
-/// when the superproject has none, so it is its own upstream — the current
-/// directory. What still bails is, in `update`, the clone/fetch-shaping flags
+/// when the superproject has none, so it is its own upstream — the *top of the
+/// working tree*, which is where `setup_git_directory()` leaves a builtin
+/// standing and therefore what its `xgetcwd()` reads, whatever directory the
+/// user typed the command in. What still bails is, in `update`, the
+/// clone/fetch-shaping flags
 /// (`--reference`, `--dissociate`, `--recommend-shallow`, `--single-branch`,
 /// `--filter`, `--require-init`) and a `!command` update strategy.
 ///
@@ -601,7 +604,6 @@ fn init_repo(
     let config_path = repo.common_dir().join("config");
     let mut config = ConfigFile::from_path_no_includes(config_path.clone(), Source::Local)?;
     let mut dirty = false;
-    let mut messages: Vec<String> = Vec::new();
 
     for entry in &entries {
         // `get_submodule_displaypath()` (builtin/submodule--helper.c:116-133): a
@@ -615,6 +617,11 @@ fn init_repo(
             None => display_path(entry.path.as_bstr(), prefix.as_ref()),
         };
         let Some(sub) = find_submodule(&submodules, &entry.path) else {
+            // git writes each key through `repo_config_set_gently()` as it goes,
+            // so everything registered before this `die()` is already on disk.
+            if dirty {
+                persist(&config_path, &config)?;
+            }
             eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
             return Ok(128);
         };
@@ -635,6 +642,11 @@ fn init_repo(
                 .and_then(|m| m.string_by("submodule", Some(sub_name), "url"))
                 .filter(|u| !u.is_empty());
             let Some(url) = url else {
+                // `submodule.<name>.active` was set a few lines up and git had
+                // already written it by the time it reached this `die()`.
+                if dirty {
+                    persist(&config_path, &config)?;
+                }
                 eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
                 return Ok(128);
             };
@@ -655,11 +667,17 @@ fn init_repo(
             };
             config.set_raw_value_by("submodule", Some(sub_name), "url", url.as_bstr())?;
             dirty = true;
+            // git prints this line to stderr (verified against git 2.55.0:
+            // `git submodule init 1>out 2>err` leaves `out` empty) from inside
+            // `init_submodule()`, one submodule at a time. It has to go out here
+            // and not at the end of the walk, because `resolve_relative_url()`
+            // just above may have written a `warning:` line of its own and the
+            // two interleave per submodule.
             if !quiet {
-                messages.push(format!(
+                eprintln!(
                     "Submodule '{sub_name}' ({}) registered for path '{display}'",
                     url.to_str_lossy()
-                ));
+                );
             }
         }
 
@@ -692,12 +710,6 @@ fn init_repo(
 
     if dirty {
         persist(&config_path, &config)?;
-    }
-    // git's `init_submodule` prints this line to stderr (verified against git
-    // 2.55.0: `git submodule init 1>out 2>err` leaves `out` empty), so the port
-    // must too, or a caller redirecting stdout loses parity.
-    for line in messages {
-        eprintln!("{line}");
     }
     Ok(0)
 }
@@ -981,6 +993,15 @@ fn summary_changes(
         if !patterns.is_empty() && !ps.is_included(path.as_bstr(), Some(false)) {
             continue;
         }
+        // An unmerged path never reaches the ordinary comparison: both diff
+        // commands special-case it before they ever look at the work tree.
+        let stages = unmerged_stages(index, &path);
+        if let Some(lowest) = stages.first() {
+            if let Some(change) = unmerged_change(repo, &path, lowest, rev, files, cached, &null) {
+                changes.push(change);
+            }
+            continue;
+        }
         // `--files` diffs the index against the work tree; otherwise the left
         // side is the named commit's tree.
         let src = if files {
@@ -1034,15 +1055,107 @@ fn summary_changes(
     Ok(changes)
 }
 
-/// Every stage-0 gitlink of the index, keyed by path.
+/// The one filepair a conflicted `path` contributes to `submodule summary`'s
+/// diff, or `None` when it contributes none.
+///
+/// `git diff-files` (diff-lib.c:154-227) queues `diff_unmerge()` — an empty
+/// source — and sets only `pair->two->mode` from `lstat()`, so the pair reads
+/// `:000000 160000 <null> <null> U`.
+///
+/// `git diff-index --cached` (diff-lib.c:467-474) queues the same empty pair
+/// and fills `pair->one` from the *tree*, so it reads
+/// `:160000 000000 <tree oid> <null> U`.
+///
+/// `git diff-index` without `--cached` takes neither branch — `cached` is false
+/// there — and falls through to `show_modified()`, which compares the tree
+/// against the index entry and reports a null destination because an unmerged
+/// entry carries no stat data to match: `:160000 160000 <tree oid> <null> M`.
+///
+/// In the two `!cached` shapes `generate_submodule_summary()` then replaces the
+/// null destination with the submodule's own `HEAD`
+/// (builtin/submodule--helper.c:1025-1031), which is what [`worktree_entry`]
+/// does for the merged case.
+fn unmerged_change(
+    repo: &gix::Repository,
+    path: &BString,
+    lowest: &gix::index::Entry,
+    rev: Option<&ObjectId>,
+    files: bool,
+    cached: bool,
+    null: &ObjectId,
+) -> Option<Change> {
+    let head_of_submodule = || {
+        let full = repo.workdir()?.join(&*gix::path::from_bstr(path.as_bstr()));
+        gix::open(full).ok()?.head_id().ok().map(|id| id.detach())
+    };
+    if files {
+        // `wt_mode = ce_mode_from_stat(ce, st.st_mode)`, and `canon_mode()` maps
+        // a directory to `S_IFGITLINK`. A path that is gone leaves `wt_mode` 0.
+        let full = repo.workdir()?.join(&*gix::path::from_bstr(path.as_bstr()));
+        let mod_dst = match std::fs::symlink_metadata(&full) {
+            Ok(meta) if meta.is_dir() => GITLINK,
+            Ok(_) => return None,
+            Err(_) => 0,
+        };
+        return Some(Change {
+            path: path.clone(),
+            mod_src: 0,
+            oid_src: *null,
+            mod_dst,
+            oid_dst: head_of_submodule().unwrap_or(*null),
+            status: 'U',
+        });
+    }
+    let (mod_src, oid_src) = match rev {
+        Some(rev) => entry_of_tree(repo, rev, path)?,
+        None => return None,
+    };
+    if cached {
+        return Some(Change {
+            path: path.clone(),
+            mod_src,
+            oid_src,
+            mod_dst: 0,
+            oid_dst: *null,
+            status: 'U',
+        });
+    }
+    Some(Change {
+        path: path.clone(),
+        mod_src,
+        oid_src,
+        mod_dst: lowest.mode.bits(),
+        oid_dst: head_of_submodule().unwrap_or(*null),
+        status: 'M',
+    })
+}
+
+/// Every gitlink of the index, keyed by path. Both diff commands walk the whole
+/// index, unmerged stages included — `run_diff_files` has an explicit
+/// `if (ce_stage(ce))` branch (diff-lib.c:154) and `do_oneway_diff` another
+/// (diff-lib.c:467) — so a conflicted submodule is a candidate path like any
+/// other.
 fn gitlinks_of_index(index: &gix::index::State) -> HashMap<BString, ObjectId> {
     let mut out = HashMap::new();
     for entry in index.entries() {
-        if entry.mode == gix::index::entry::Mode::COMMIT && entry.stage_raw() == 0 {
-            out.insert(entry.path(index).to_owned(), entry.id);
+        if entry.mode == gix::index::entry::Mode::COMMIT {
+            out.entry(entry.path(index).to_owned()).or_insert(entry.id);
         }
     }
     out
+}
+
+/// The unmerged (stage 1/2/3) index entries at `path`, lowest stage first.
+/// Empty for a path the index holds at stage 0, which is the merged case.
+fn unmerged_stages<'a>(
+    index: &'a gix::index::State,
+    path: &BString,
+) -> Vec<&'a gix::index::Entry> {
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.stage_raw() != 0 && e.path(index) == path.as_bstr())
+        .collect()
 }
 
 /// Every gitlink reachable from the commit `rev`, keyed by its full path.
@@ -1441,10 +1554,26 @@ fn foreach_repo(
         }
 
         if recursive {
+            // ```c
+            // if (run_command(&cpr))
+            //         die(_("run_command returned non-zero status while "
+            //               "recursing in the nested submodules of %s\n."),
+            //             displaypath);
+            // ```
+            //
+            // (builtin/submodule--helper.c:422-425.) The recursion is a child
+            // `submodule--helper foreach` for git, so *every* level that a
+            // failure passes through reports it under its own display path; the
+            // deepest `for %s` line is followed by one of these per enclosing
+            // submodule.
             let nested = format!("{display}/");
             let code = foreach_repo(&sub_repo, cmd, quiet, true, Some(&nested), None)?;
             if code != 0 {
-                return Ok(code);
+                eprintln!(
+                    "fatal: run_command returned non-zero status while recursing in the \
+                     nested submodules of {display}\n."
+                );
+                return Ok(128);
             }
         }
     }
@@ -1783,8 +1912,38 @@ fn sync_one(
 /// git's `sub->url` is the literal string from the file, never a round-tripped
 /// URL. `None` when the file is absent or unparsable, which git treats as "no
 /// mappings".
+/// ```c
+/// file = repo_worktree_path(repo, GITMODULES_FILE);
+/// if (file_exists(file)) {
+///         config_source.file = file;
+/// } else if (repo_get_oid(repo, GITMODULES_INDEX, &oid) >= 0 ||
+///            repo_get_oid(repo, GITMODULES_HEAD, &oid) >= 0) {
+///         config_source.blob = oidstr = xstrdup(oid_to_hex(&oid));
+/// }
+/// ```
+///
+/// (submodule-config.c:795-806.) With no `.gitmodules` in the working tree the
+/// mappings still come from `:.gitmodules`, then from `HEAD:.gitmodules` — which
+/// is how `git submodule deinit` still knows a removed submodule's url.
 fn read_gitmodules(repo: &gix::Repository) -> Option<ConfigFile> {
-    ConfigFile::from_path_no_includes(gitmodules_path(repo), Source::Local).ok()
+    if repo.workdir().is_none() {
+        return None;
+    }
+    let path = gitmodules_path(repo);
+    if path.exists() {
+        return ConfigFile::from_path_no_includes(path, Source::Local).ok();
+    }
+    let blob = repo
+        .rev_parse_single(":.gitmodules")
+        .or_else(|_| repo.rev_parse_single("HEAD:.gitmodules"))
+        .ok()?;
+    let data = blob.object().ok()?.detach().data;
+    ConfigFile::from_bytes_no_includes(
+        &data,
+        gix::config::file::Metadata::from(Source::Local),
+        Default::default(),
+    )
+    .ok()
 }
 
 /// Where the worktree `.gitmodules` lives, falling back to the current directory
@@ -1842,7 +2001,12 @@ fn up_path(path: &BStr) -> String {
 ///
 /// A superproject with no `remote.<default>.url` *is* its own upstream, so the
 /// anchor becomes the current directory — which is why a submodule cloned from
-/// a plain local superproject ends up with an absolute url.
+/// a plain local superproject ends up with an absolute url. That `xgetcwd()` is
+/// the *top of the working tree*, not the directory the user typed the command
+/// in: `setup_git_directory()` has already chdir'd there and handed the builtin
+/// the leftover as `prefix`. Anchoring on the process cwd instead would make
+/// `git submodule sync` run from a subdirectory resolve `../../sub` one level
+/// too deep for every level of nesting.
 fn resolve_relative_url(
     repo: &gix::Repository,
     rel_url: &BStr,
@@ -1864,10 +2028,23 @@ fn resolve_relative_url(
                      Assuming this repository is its own authoritative upstream."
                 );
             }
-            gix::path::into_bstr(std::env::current_dir()?).into_owned()
+            gix::path::into_bstr(git_directory_cwd(repo)?).into_owned()
         }
     };
     Ok(relative_url(remote_url.as_ref(), rel_url, up_path))
+}
+
+/// What `xgetcwd()` returns inside a git builtin: the top of the working tree,
+/// because `setup_git_directory()` chdir'd there before `cmd_submodule__helper`
+/// ran. Only a repository without a working tree leaves the process where it
+/// started.
+fn git_directory_cwd(repo: &gix::Repository) -> Result<std::path::PathBuf> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(std::env::current_dir()?);
+    };
+    // `getcwd(3)` hands back a resolved, absolute path; the discovered workdir
+    // may be relative or carry symlinked components.
+    Ok(workdir.canonicalize().unwrap_or_else(|_| workdir.to_owned()))
 }
 
 /// remote.c's `relative_url()` (remote.c:2933), verbatim.
@@ -2041,10 +2218,9 @@ fn set_url(args: &[String], mut quiet: bool) -> Result<ExitCode> {
 
     // `config_set_in_gitmodules_file_gently`; a failure here returns 1 and the
     // sync below never runs.
-    let modules_path = gitmodules_path(&repo);
     {
         let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-        let mut modules = ConfigFile::from_path_no_includes(modules_path.clone(), Source::Local)?;
+        let (modules_path, mut modules) = gitmodules_for_write(&repo)?;
         modules.set_raw_value_by(
             "submodule",
             Some(sub_name.as_bstr()),
@@ -3990,9 +4166,8 @@ fn set_branch_apply(branch: Option<String>, path: String) -> Result<ExitCode> {
     let sub_name = sub.name().to_owned();
     let sub_name = sub_name.as_bstr();
 
-    let modules_path = gitmodules_path(&repo);
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    let mut modules = ConfigFile::from_path_no_includes(modules_path.clone(), Source::Local)?;
+    let (modules_path, mut modules) = gitmodules_for_write(&repo)?;
 
     match branch {
         // `set-branch --branch <b>`: write the key, keyed by submodule name.
@@ -4016,6 +4191,22 @@ fn set_branch_apply(branch: Option<String>, path: String) -> Result<ExitCode> {
             }
         }
     }
+}
+
+/// The worktree `.gitmodules` opened for writing, as
+/// `config_set_in_gitmodules_file_gently()` opens it: through
+/// `git_config_set_in_file_gently(GITMODULES_FILE, …)`, which *creates* the file
+/// when it is not there. It is reachable with no worktree copy — `set-branch`
+/// and `set-url` resolve the submodule's name through the index or `HEAD` copy
+/// (see [`read_gitmodules`]) and never consult `is_writing_gitmodules_ok()`.
+fn gitmodules_for_write(repo: &gix::Repository) -> Result<(std::path::PathBuf, ConfigFile)> {
+    let path = gitmodules_path(repo);
+    let file = if path.exists() {
+        ConfigFile::from_path_no_includes(path.clone(), Source::Local)?
+    } else {
+        ConfigFile::new(gix::config::file::Metadata::from(Source::Local).at(&path))
+    };
+    Ok((path, file))
 }
 
 /// A `submodule.<name>.<field>` config key, built structurally so submodule
@@ -4391,6 +4582,125 @@ fn repo_prefix(repo: &gix::Repository) -> Result<Option<BString>> {
     })
 }
 
+/// path.c's `normalize_path_copy_len()` (path.c:1121) for a POSIX path: collapse
+/// runs of `/`, drop `.` components and resolve `..` against what precedes it.
+/// `None` is git's `-1` — a `..` that would climb above the first component —
+/// and its caller in `module_add` ignores the failure, leaving the path as the
+/// user typed it (the C normalizes in place and writes nothing before it gives
+/// up).
+fn normalize_path_copy(src: &str) -> Option<String> {
+    let src = src.as_bytes();
+    let mut dst: Vec<u8> = Vec::with_capacity(src.len());
+    let mut i = 0;
+
+    // `end = src + offset_1st_component(src)` — on POSIX, the leading `/` of an
+    // absolute path, which `..` may never eat into.
+    if src.first() == Some(&b'/') {
+        dst.push(b'/');
+        i = 1;
+    }
+    let dst0 = dst.len();
+    while src.get(i) == Some(&b'/') {
+        i += 1;
+    }
+
+    loop {
+        if src.get(i) == Some(&b'.') {
+            match (src.get(i + 1), src.get(i + 2)) {
+                // (1) "." and ends -- ignore and terminate.
+                (None, _) => break,
+                // (2) "./" -- ignore them, eat slash and continue.
+                (Some(b'/'), _) => {
+                    i += 2;
+                    while src.get(i) == Some(&b'/') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // (3) ".." and ends -- strip one and terminate.
+                (Some(b'.'), None) => {
+                    i += 2;
+                    if !up_one(&mut dst, dst0) {
+                        return None;
+                    }
+                    break;
+                }
+                // (4) "../" -- strip one, eat slash and continue.
+                (Some(b'.'), Some(b'/')) => {
+                    i += 3;
+                    while src.get(i) == Some(&b'/') {
+                        i += 1;
+                    }
+                    if !up_one(&mut dst, dst0) {
+                        return None;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Copy up to the next '/', and eat all '/'.
+        let mut sep = false;
+        while let Some(&c) = src.get(i) {
+            i += 1;
+            if c == b'/' {
+                sep = true;
+                break;
+            }
+            dst.push(c);
+        }
+        if sep {
+            dst.push(b'/');
+            while src.get(i) == Some(&b'/') {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    String::from_utf8(dst).ok()
+}
+
+/// `normalize_path_copy_len`'s `up_one:` label: drop the trailing `/` and then
+/// the component before it. `false` is its `return -1`.
+fn up_one(dst: &mut Vec<u8>, dst0: usize) -> bool {
+    // `dst--; if (dst <= dst0) return -1;` — stepping onto the trailing '/' and
+    // refusing when that lands at or before the start of the relative part.
+    if dst.len() <= dst0 + 1 {
+        return false;
+    }
+    dst.pop();
+    while dst.len() > dst0 && dst.last() != Some(&b'/') {
+        dst.pop();
+    }
+    true
+}
+
+/// dir.c's `strip_dir_trailing_slashes()` (dir.c:3386): trailing `/`s go, but
+/// never the last character — `"/"` stays `"/"`.
+fn strip_dir_trailing_slashes(dir: &str) -> &str {
+    let b = dir.as_bytes();
+    let mut end = b.len();
+    while end > 1 && b[end - 1] == b'/' {
+        end -= 1;
+    }
+    &dir[..end]
+}
+
+/// submodule-config.c's `check_submodule_name()` (submodule-config.c:214): no
+/// empty name, and no `..` as a path component. `true` is its `0`.
+fn check_submodule_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // Every component, including the first — the C jumps into the middle of its
+    // loop so that the string start counts as a separator. It splits on
+    // `is_xplatform_dir_sep()`, backslash included, so the rule reads the same on
+    // every platform.
+    name.split(['/', '\\']).all(|component| component != "..")
+}
+
 /// git's `get_submodule_displaypath`: the repository-root-relative `path`
 /// re-expressed relative to `prefix` (itself root-relative, with a trailing `/`).
 fn display_path(path: &BStr, prefix: Option<&BString>) -> String {
@@ -4445,9 +4755,15 @@ fn pathdiff_relative(from: &std::path::Path, to: &std::path::Path) -> String {
 /// <repository> [<path>]` — git's `module_add` (builtin/submodule--helper.c:3642).
 ///
 /// The order of the checks is the order git makes them, because the message a
-/// wrong invocation gets depends on it: the url is resolved first, then the path
-/// is matched against the index, then against the working tree, and only then is
-/// anything cloned.
+/// wrong invocation gets depends on it: `<path>` is joined with the `prefix`,
+/// the url is resolved, `<path>` is normalized, then it is matched against the
+/// index, then against the working tree, then the name is checked for reuse and
+/// for a `..` component, and only then is anything cloned.
+///
+/// Run from a subdirectory the command is not the same command: `<path>` is
+/// relative to that directory (submodule--helper.c:3701-3706) and a relative
+/// `<repository>` is refused outright (submodule--helper.c:3710-3712), because
+/// the url would be resolved against the superproject instead.
 ///
 /// The clone itself is `add_submodule()` → `clone_submodule()`: a re-exec of this
 /// binary's own `clone` with `--no-checkout --separate-git-dir <modules/<name>>`
@@ -4509,8 +4825,8 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     };
     // `add_data.sm_path = git_url_basename(add_data.repo, 0, 0)` — the url's last
     // component with any trailing slashes and a trailing `.git` removed.
-    let path = match rest.get(1) {
-        Some(p) => p.trim_end_matches('/').to_string(),
+    let mut path = match rest.get(1) {
+        Some(p) => p.clone(),
         None => {
             let base = url.trim_end_matches('/').rsplit('/').next().unwrap_or(&url);
             base.strip_suffix(".git").unwrap_or(base).to_string()
@@ -4521,10 +4837,34 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     }
 
     let repo = crate::setup::discover()?;
-    let workdir = repo
-        .workdir()
-        .ok_or_else(|| anyhow::anyhow!("a working tree is required"))?
-        .to_path_buf();
+    // `repo_get_work_tree()` is the resolved absolute path `setup_git_directory()`
+    // chdir'd to, which is why git's messages name `/…/super/s2` and never the
+    // `/…/super/d/../s2` a discovered-relative workdir would produce.
+    if repo.workdir().is_none() {
+        bail!("a working tree is required");
+    }
+    let workdir = git_directory_cwd(&repo)?;
+    // `git submodule` runs `cd_to_toplevel` and then re-enters the helper with
+    // `-C "$wt_prefix"` (git-submodule.sh:25,144), so the helper sees the very
+    // directory the user typed the command in and `setup_git_directory()` hands
+    // it back as `prefix`. Everything below is keyed off it.
+    let prefix = repo_prefix(&repo)?;
+
+    // ```c
+    // if (prefix && *prefix && !is_absolute_path(add_data.sm_path)) {
+    //         char *sm_path = add_data.sm_path;
+    //         add_data.sm_path = xstrfmt("%s%s", prefix, sm_path);
+    // }
+    // ```
+    //
+    // (builtin/submodule--helper.c:3701-3706.) `<path>` is relative to the
+    // *current* directory; every check past this point wants it relative to the
+    // top of the working tree.
+    if let Some(pfx) = &prefix {
+        if !path.starts_with('/') {
+            path = format!("{}{path}", pfx.to_str_lossy());
+        }
+    }
 
     // ```c
     // if (starts_with_dot_dot_slash(add_data.repo) || starts_with_dot_slash(add_data.repo)) {
@@ -4542,6 +4882,15 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     // what lands in `.git/config`; `.gitmodules` keeps the argument as typed, so a
     // `./sub` there stays portable while this checkout's config points at a real path.
     let realrepo = if url.starts_with("./") || url.starts_with("../") {
+        // `if (prefix) die(_("Relative path can only be used from the toplevel
+        // of the working tree"));` — the anchor `resolve_relative_url` would use
+        // is the superproject root, so a `../sub` typed from a subdirectory would
+        // not mean what the user wrote.
+        if prefix.is_some() {
+            crate::git_fatal!(
+                "Relative path can only be used from the toplevel of the working tree"
+            );
+        }
         resolve_relative_url(&repo, BStr::new(url.as_bytes()), None, true)?
             .to_str_lossy()
             .into_owned()
@@ -4549,6 +4898,19 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         url.clone()
     } else {
         crate::git_fatal!("repo URL: '{url}' must be absolute or begin with ./|../");
+    };
+
+    // ```c
+    // normalize_path_copy(add_data.sm_path, add_data.sm_path);
+    // strip_dir_trailing_slashes(add_data.sm_path);
+    // ```
+    //
+    // (builtin/submodule--helper.c:3728-3729.) `d/../s2` is the submodule `s2`,
+    // and `./s2//` is the submodule `s2`; both spellings have to collapse before
+    // the path reaches the index, `.gitmodules` and the default submodule name.
+    let path = {
+        let normalized = normalize_path_copy(&path).unwrap_or(path);
+        strip_dir_trailing_slashes(&normalized).to_string()
     };
 
     // `die_on_index_match(add_data.sm_path, force)`: a *pathspec* match, so a path
@@ -4590,6 +4952,9 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         let exe = crate::hosted::git_exe()?;
         let probe = std::process::Command::new(exe)
             .args(["add", "--dry-run", "--ignore-missing", "--no-warn-embedded-repo", "--", &path])
+            // `run_command` inherits the helper's cwd, and the helper's cwd is
+            // the top of the working tree — `sm_path` is relative to it.
+            .current_dir(&workdir)
             .stdout(std::process::Stdio::null())
             .output()?;
         if !probe.status.success() {
@@ -4599,7 +4964,53 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         }
     }
 
-    let name = name.unwrap_or_else(|| path.clone());
+    let mut name = name.unwrap_or_else(|| path.clone());
+
+    // ```c
+    // existing = submodule_from_name(the_repository, null_oid(the_hash_algo), add_data.sm_name);
+    // if (existing && existing->path && strcmp(existing->path, add_data.sm_path)) {
+    //         if (!force)
+    //                 die(_("submodule name '%s' already used for path '%s'"),
+    //                     add_data.sm_name, existing->path);
+    //         for (int i = 1; ; i++) { … "%s%d" … }
+    // }
+    // ```
+    //
+    // (builtin/submodule--helper.c:3754-3775.) Reusing a name for a second path
+    // would make the two submodules share one `modules/<name>` git directory;
+    // `--force` sidesteps that by appending the first free number instead.
+    let modules = read_gitmodules(&repo);
+    let recorded_path = |n: &str| -> Option<String> {
+        modules.as_ref().and_then(|m| {
+            m.string_by("submodule", Some(n.into()), "path")
+                .map(|p| p.to_str_lossy().into_owned())
+        })
+    };
+    if let Some(existing) = recorded_path(&name) {
+        if existing != path {
+            if !force {
+                crate::git_fatal!("submodule name '{name}' already used for path '{existing}'");
+            }
+            let mut i = 1u32;
+            let candidate = loop {
+                let candidate = format!("{name}{i}");
+                if recorded_path(&candidate).is_none() {
+                    break candidate;
+                }
+                i += 1;
+            };
+            name = candidate;
+        }
+    }
+
+    // `if (check_submodule_name(add_data.sm_name)) die(_("'%s' is not a valid
+    // submodule name"), add_data.sm_name);` (builtin/submodule--helper.c:3777).
+    // Without it a `--name ../evil` would place the submodule's repository
+    // outside `modules/`.
+    if !check_submodule_name(&name) {
+        crate::git_fatal!("'{name}' is not a valid submodule name");
+    }
+
     let sm_gitdir = submodule_name_to_gitdir(&repo, BStr::new(name.as_bytes()))?;
 
     // ---- add_submodule (submodule--helper.c:3404) ---------------------------
@@ -4669,8 +5080,14 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         if child_code(cmd.status()?) != 0 {
             crate::git_fatal!("unable to checkout submodule '{path}'");
         }
+        // `clone_submodule()` ends in `connect_work_tree_and_git_dir()`
+        // (builtin/submodule--helper.c:1899), which rewrites the absolute
+        // `gitdir:` that `--separate-git-dir` left behind as the relative one git
+        // writes. It belongs to the clone alone: an *existing* repository that
+        // `add_submodule` merely adopted keeps its own `.git` directory in place
+        // until `git submodule absorbgitdirs` moves it.
+        connect_work_tree_and_git_dir(&abs, &sm_gitdir)?;
     }
-    connect_work_tree_and_git_dir(&abs, &sm_gitdir)?;
 
     // ---- configure_added_submodule (submodule--helper.c:3518) ---------------
     let local_config = repo.common_dir().join("config");
@@ -4692,12 +5109,9 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         .map_err(|_| anyhow::anyhow!("the cloned submodule has an unborn HEAD"))?
         .detach();
     let cacheinfo = format!("160000,{},{}", head.to_hex(), path);
-    let staged = crate::dispatch::run(
-        "update-index",
-        &["--add".to_string(), "--cacheinfo".to_string(), cacheinfo],
-    )?;
-    if staged != ExitCode::SUCCESS {
-        return Ok(staged);
+    let staged = run_at_toplevel(&workdir, &["update-index", "--add", "--cacheinfo", &cacheinfo])?;
+    if staged != 0 {
+        return Ok(ExitCode::from(staged));
     }
 
     // `config_submodule_in_gitmodules(name, "url", add_data->repo)`: the *argument*,
@@ -4719,14 +5133,26 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     }
     std::fs::write(&gitmodules, file.to_bstring())?;
 
-    let staged = crate::dispatch::run(
-        "add",
-        &["--force".to_string(), "--".to_string(), ".gitmodules".to_string()],
-    )?;
-    if staged != ExitCode::SUCCESS {
-        return Ok(staged);
+    let staged = run_at_toplevel(&workdir, &["add", "--force", "--", ".gitmodules"])?;
+    if staged != 0 {
+        return Ok(ExitCode::from(staged));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One of `configure_added_submodule`'s `run_command()` children. They are
+/// spawned rather than dispatched in-process because every path they are given
+/// — `sm_path`, `.gitmodules` — is relative to the top of the working tree,
+/// which is where git's helper is standing and where a `git submodule add` run
+/// from a subdirectory is not.
+fn run_at_toplevel(workdir: &std::path::Path, args: &[&str]) -> Result<u8> {
+    let exe = crate::hosted::git_exe()?;
+    let status = std::process::Command::new(exe)
+        .args(args)
+        .current_dir(workdir)
+        .env_remove("GIT_PREFIX")
+        .status()?;
+    Ok(child_code(status))
 }
 
 #[cfg(test)]

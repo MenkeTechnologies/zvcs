@@ -26,14 +26,24 @@ use std::process::ExitCode;
 ///   * Service selection for the smart routes, so the `403` answers for an
 ///     unknown, disabled, or unauthenticated service are exact, plus the `415
 ///     Unsupported Media Type` answer for a POST with the wrong `Content-Type`.
+///   * The smart-HTTP routes themselves. `GET /info/refs?service=…` writes the
+///     `application/x-git-<svc>-advertisement` header, the `# service=git-<svc>`
+///     banner and flush that a v0/v1 client expects (and that a v2 one does not
+///     get), then runs `<svc> --http-backend-info-refs .`; `POST
+///     /git-{upload-pack,upload-archive,receive-pack}` writes the
+///     `…-result` header and runs `<svc> --stateless-rpc .`, with the request
+///     body fed in by `run_service` — buffered whole for `upload-pack`,
+///     streamed for the others, inflated first when the body arrived
+///     `Content-Encoding: gzip`, and refused past `http.maxrequestbuffer` /
+///     `GIT_HTTP_MAX_REQUEST_BUFFER`. `HTTP_GIT_PROTOCOL` becomes the child's
+///     `GIT_PROTOCOL`, so a v2 client is served v2.
+///   * The CGI variables git tests for NULL rather than for a value, where a
+///     set-but-empty one is not the same as an absent one: `REQUEST_METHOD=`
+///     reaches the route table and comes back a `400`, `GIT_HTTP_EXPORT_ALL=`
+///     exports, and `GIT_HTTP_MAX_REQUEST_BUFFER=` is a parse failure and so a
+///     `500`.
 ///
-/// NOT ported — these `bail!` instead of emitting plausible-looking output:
-///   * The smart-HTTP payloads themselves: `GET /info/refs?service=…` and
-///     `POST /git-{upload-pack,upload-archive,receive-pack}`. Stock git runs
-///     `upload-pack --http-backend-info-refs` / `--stateless-rpc` as a child.
-///     The vendored gitoxide has no server side at all — `gix-protocol` ships
-///     only `fetch`/`handshake`/`ls_refs` clients — so there is nothing to port
-///     onto, and shelling out to stock git would defeat the purpose.
+/// NOT ported:
 ///   * A `~user` project root (git's `interpolate_path` in `enter_repo`).
 ///
 /// Known, documented deviations: the repository-ownership check that stock
@@ -45,7 +55,10 @@ pub fn http_backend(_args: &[String]) -> Result<ExitCode> {
 
     // cmd_main: REQUEST_METHOD is mandatory; HEAD is served exactly like GET
     // (the web server drops the body).
-    let Some(mut method) = env("REQUEST_METHOD") else {
+    // `getenv` is checked for NULL only (http-backend.c:777), so `REQUEST_METHOD=`
+    // is a method that matches no route rather than a missing one: the request
+    // reaches the route table and comes back out as `bad_request`.
+    let Some(mut method) = std::env::var("REQUEST_METHOD").ok() else {
         return Ok(die(&mut hdr, "No REQUEST_METHOD from server"));
     };
     if method == "HEAD" {
@@ -82,7 +95,11 @@ pub fn http_backend(_args: &[String]) -> Result<ExitCode> {
             &format!("Not a git repository: '{repo_path}'"),
         ));
     };
-    if env("GIT_HTTP_EXPORT_ALL").is_none() && !git_dir.join("git-daemon-export-ok").exists() {
+    // http-backend.c:814 tests `getenv(...)` for NULL, not for a value, so
+    // `GIT_HTTP_EXPORT_ALL=` exports the repository just as `=1` does.
+    if std::env::var_os("GIT_HTTP_EXPORT_ALL").is_none()
+        && !git_dir.join("git-daemon-export-ok").exists()
+    {
         return Ok(not_found(
             &mut hdr,
             &format!("Repository not exported: '{repo_path}'"),
@@ -106,11 +123,23 @@ pub fn http_backend(_args: &[String]) -> Result<ExitCode> {
     // pack routes are plain file serving and are unaffected either way.
     crate::namespace::apply(&mut repo)?;
     let repo = repo;
-    let cfg = HttpConfig::read(&repo);
+    let cfg = match HttpConfig::read(&repo) {
+        Ok(cfg) => cfg,
+        Err(msg) => return Ok(die(&mut hdr, &msg)),
+    };
+
+    // http-backend.c:822-824: the `Git-Protocol` request header reaches the
+    // service as `GIT_PROTOCOL`. `setenv(..., 0)` does not overwrite, so an
+    // environment the server set itself wins.
+    if let Some(proto) = std::env::var_os("HTTP_GIT_PROTOCOL") {
+        if std::env::var_os("GIT_PROTOCOL").is_none() {
+            std::env::set_var("GIT_PROTOCOL", proto);
+        }
+    }
 
     match cmd.imp {
         Imp::Head => get_head(&mut hdr, &repo, &cfg),
-        Imp::InfoRefs => get_info_refs(&mut hdr, &repo, &cfg),
+        Imp::InfoRefs => get_info_refs(&mut hdr, &repo, &cfg, &git_dir),
         Imp::TextFile => get_text_file(&mut hdr, &repo, &cfg, &arg),
         Imp::InfoPacks => get_info_packs(&mut hdr, &repo, &cfg),
         Imp::LooseObject => get_local_file(
@@ -137,7 +166,7 @@ pub fn http_backend(_args: &[String]) -> Result<ExitCode> {
             "application/x-git-packed-objects-toc",
             Cache::Forever,
         ),
-        Imp::ServiceRpc => service_rpc(&mut hdr, &cfg, &arg),
+        Imp::ServiceRpc => service_rpc(&mut hdr, &cfg, &arg, &git_dir),
     }
 }
 
@@ -456,17 +485,50 @@ struct HttpConfig {
     upload_pack: Option<bool>,
     receive_pack: Option<bool>,
     upload_archive: Option<bool>,
+    /// http-backend.c:31's `max_request_buffer`, after `http.maxrequestbuffer`
+    /// (:255) and then `GIT_HTTP_MAX_REQUEST_BUFFER` (:820) have had their say.
+    max_request_buffer: u64,
 }
 
 impl HttpConfig {
-    fn read(repo: &gix::Repository) -> Self {
+    /// `Err` carries a `die` text: both buffer-size readers reject a value they
+    /// cannot parse rather than falling back to the default.
+    fn read(repo: &gix::Repository) -> Result<Self, String> {
         let cfg = repo.config_snapshot();
-        HttpConfig {
+        let mut max_request_buffer = 10 * 1024 * 1024;
+
+        // `repo_config_get_ulong` (http-backend.c:255) goes through
+        // `git_config_ulong`, so a bad value is `die_bad_number`, naming the file
+        // it came from. Last value wins, as for every `repo_config_get_*`.
+        if let Some(v) = crate::config::walk_config(repo)
+            .into_iter()
+            .filter(|v| v.key == "http.maxrequestbuffer")
+            .next_back()
+        {
+            let raw = v.value.as_deref().unwrap_or("");
+            max_request_buffer = crate::config::parse_config_ulong(raw).map_err(|reason| {
+                format!(
+                    "bad numeric config value '{raw}' for 'http.maxrequestbuffer'{}: {reason}",
+                    v.origin.bad_number_clause()
+                )
+            })?;
+        }
+
+        // `git_env_ulong` (http-backend.c:820) overrides the config, and dies
+        // naming only the variable when the value does not parse — which
+        // includes an empty one, since it checks for NULL alone.
+        if let Some(raw) = std::env::var("GIT_HTTP_MAX_REQUEST_BUFFER").ok() {
+            max_request_buffer = crate::config::parse_config_ulong(&raw)
+                .map_err(|_| "failed to parse GIT_HTTP_MAX_REQUEST_BUFFER".to_string())?;
+        }
+
+        Ok(HttpConfig {
             getanyfile: cfg.boolean("http.getanyfile").unwrap_or(true),
             upload_pack: cfg.boolean("http.uploadpack"),
             receive_pack: cfg.boolean("http.receivepack"),
             upload_archive: cfg.boolean("http.uploadarchive"),
-        }
+            max_request_buffer,
+        })
     }
 }
 
@@ -550,7 +612,12 @@ fn resolve_symref_chain(repo: &gix::Repository, start: &str) -> Option<String> {
 
 /// `get_info_refs`: the dumb `<oid>\t<ref>` listing, with a `^{}` line after
 /// every tag object. The smart form (`?service=…`) is not ported.
-fn get_info_refs(hdr: &mut Headers, repo: &gix::Repository, cfg: &HttpConfig) -> Result<ExitCode> {
+fn get_info_refs(
+    hdr: &mut Headers,
+    repo: &gix::Repository,
+    cfg: &HttpConfig,
+    git_dir: &std::path::Path,
+) -> Result<ExitCode> {
     hdr.nocache();
 
     if let Some(service_name) = query_parameter("service") {
@@ -558,11 +625,28 @@ fn get_info_refs(hdr: &mut Headers, repo: &gix::Repository, cfg: &HttpConfig) ->
             Ok(s) => s,
             Err(code) => return Ok(code),
         };
-        crate::git_fatal!(
-            "smart HTTP advertisement for {svc:?} needs a server-side {svc} \
-             (git runs `{svc} --http-backend-info-refs`); the vendored gitoxide \
-             has no server implementation — gix-protocol is client-only"
+        hdr.str(
+            "Content-Type",
+            &format!("application/x-git-{svc}-advertisement"),
         );
+        hdr.end();
+
+        // http-backend.c:559-562: v0 and v1 clients get the `# service=` banner
+        // and a flush ahead of the advertisement; a v2 client gets neither,
+        // because `serve.c` opens with its own capability list.
+        if super::upload_pack::protocol_version_from_env() != 2 {
+            let mut banner = Vec::new();
+            pkt_line(&mut banner, format!("# service=git-{svc}\n").as_bytes());
+            banner.extend_from_slice(b"0000");
+            write_stdout(&banner);
+        }
+
+        return Ok(run_service(
+            &[svc, "--http-backend-info-refs", "."],
+            false,
+            git_dir,
+            cfg.max_request_buffer,
+        ));
     }
 
     if let Err(code) = select_getanyfile(hdr, cfg) {
@@ -721,7 +805,12 @@ fn git_path(repo: &gix::Repository, name: &str) -> PathBuf {
 
 /// `service_rpc`: the `403` and `415` answers are exact; the RPC body itself
 /// has no substrate to run against.
-fn service_rpc(hdr: &mut Headers, cfg: &HttpConfig, service_name: &str) -> Result<ExitCode> {
+fn service_rpc(
+    hdr: &mut Headers,
+    cfg: &HttpConfig,
+    service_name: &str,
+    git_dir: &std::path::Path,
+) -> Result<ExitCode> {
     let svc = match select_service(hdr, cfg, service_name) {
         Ok(s) => s,
         Err(code) => return Ok(code),
@@ -740,11 +829,360 @@ fn service_rpc(hdr: &mut Headers, cfg: &HttpConfig, service_name: &str) -> Resul
         return Ok(ExitCode::SUCCESS);
     }
 
-    crate::git_fatal!(
-        "smart HTTP RPC for {svc:?} needs a server-side {svc} \
-         (git runs `{svc} --stateless-rpc .` and pipes the request body into it); \
-         the vendored gitoxide has no server implementation — gix-protocol is client-only"
-    )
+    hdr.nocache();
+    hdr.str("Content-Type", &format!("application/x-git-{svc}-result"));
+    hdr.end();
+
+    // http-backend.c:660-663: every service but `upload-archive` is run with
+    // `--stateless-rpc`, and the repository is always named `.` — the child is
+    // started inside the directory `enter_repo` chose.
+    let argv: Vec<&str> = if svc == "upload-archive" {
+        vec![svc, "."]
+    } else {
+        vec![svc, "--stateless-rpc", "."]
+    };
+    // `rpc_service[]` (http-backend.c:42-46) sets `buffer_input` for
+    // `upload-pack` alone: its request is small and has no terminating flush
+    // the child can block on, so the whole body is read before the child sees
+    // any of it.
+    Ok(run_service(
+        &argv,
+        svc == "upload-pack",
+        git_dir,
+        cfg.max_request_buffer,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Running the service (http-backend.c: run_service and its request feeders)
+// ---------------------------------------------------------------------------
+
+/// `run_service`: start the named server command as a child of this process,
+/// feed it the request body, and take its exit status.
+///
+/// git runs it as a `git` child (`cld.git_cmd = 1`), so this spawns the zvcs
+/// `git` binary rather than calling in-process: `upload-pack` and
+/// `receive-pack` own their stdin and stdout for the length of the exchange,
+/// and a child is the only way to hand them fd 0 and fd 1 unencumbered by the
+/// header bytes this process has already written.
+///
+/// git closes its own fd 1 right after `start_command`
+/// (http-backend.c:507) so the server sees EOF as soon as the child exits; that
+/// is reproduced here, because it is what makes a later `die` emit its `fatal:`
+/// line with no `Status: 500` block behind the body.
+fn run_service(
+    argv: &[&str],
+    buffer_input: bool,
+    git_dir: &std::path::Path,
+    max_request_buffer: u64,
+) -> ExitCode {
+    let encoding = std::env::var("HTTP_CONTENT_ENCODING").unwrap_or_default();
+    let gzipped = encoding == "gzip" || encoding == "x-gzip";
+    let user = env("REMOTE_USER").unwrap_or_else(|| "anonymous".into());
+    let host = env("REMOTE_ADDR").unwrap_or_else(|| "(none)".into());
+
+    let req_len = match content_length() {
+        Ok(len) => len,
+        Err(raw) => {
+            return die(
+                &mut Headers::default(),
+                &format!("failed to parse CONTENT_LENGTH: {raw}"),
+            )
+        }
+    };
+
+    let Ok(exe) = crate::hosted::git_exe() else {
+        // `start_command` failing is `exit(1)` with nothing on stdout.
+        return ExitCode::from(1);
+    };
+    let mut cld = std::process::Command::new(exe);
+    cld.args(argv).current_dir(git_dir);
+    // http-backend.c:492-496: the pushing user's identity, for `receive-pack`'s
+    // reflog. `getenv` guards, so an identity the server set survives.
+    if std::env::var_os("GIT_COMMITTER_NAME").is_none() {
+        cld.env("GIT_COMMITTER_NAME", &user);
+    }
+    if std::env::var_os("GIT_COMMITTER_EMAIL").is_none() {
+        cld.env("GIT_COMMITTER_EMAIL", format!("{user}@http.{host}"));
+    }
+
+    let feed = buffer_input || gzipped || req_len.is_some();
+    cld.stdin(if feed {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::inherit()
+    });
+    let mut child = match cld.spawn() {
+        Ok(c) => c,
+        Err(_) => return ExitCode::from(1),
+    };
+
+    // http-backend.c:507's `close(1)`, and it is observable: every `die` from
+    // here on is `die_webcgi`, which tries to write `Status: 500` to a fd that
+    // is no longer open, so the request body is followed by the `fatal:` line
+    // on stderr and nothing more on stdout. The child kept its own copy of fd 1
+    // when it was spawned.
+    // SAFETY: fd 1 is not touched again by this process — `write_stdout`
+    // already discards its errors — and the header bytes were flushed by
+    // `Headers::end` before the child started.
+    unsafe {
+        libc::close(1);
+    }
+
+    if feed {
+        let mut sink = child.stdin.take().expect("stdin was piped");
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let fed = if gzipped {
+            inflate_request(
+                &mut input,
+                &mut sink,
+                argv[0],
+                buffer_input,
+                req_len,
+                max_request_buffer,
+            )
+        } else if buffer_input {
+            copy_request(&mut input, &mut sink, argv[0], req_len, max_request_buffer)
+        } else {
+            pipe_fixed_length(
+                &mut input,
+                &mut sink,
+                argv[0],
+                req_len.expect("feed implies a length"),
+            )
+        };
+        // `close(out)`: the child must see EOF before it can answer.
+        drop(sink);
+        if let Err(err) = fed {
+            // git's `clean_on_exit` kills the child from its atexit handler.
+            let _ = child.kill();
+            let _ = child.wait();
+            return die(&mut Headers::default(), &err);
+        }
+    }
+
+    match child.wait() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        _ => ExitCode::from(1),
+    }
+}
+
+/// `get_content_length`: the body length, or `None` for "read to EOF". `Err`
+/// carries the unparseable value for git's `die`.
+fn content_length() -> Result<Option<u64>, String> {
+    let Some(raw) = env("CONTENT_LENGTH") else {
+        return Ok(None);
+    };
+    // `git_parse_ssize_t` is the same grammar as `git_parse_ulong` bounded by
+    // `ssize_t`; a negative value fails to parse rather than meaning "to EOF".
+    match crate::config::parse_config_ulong(&raw) {
+        Ok(v) if v <= i64::MAX as u64 => Ok(Some(v)),
+        _ => Err(raw),
+    }
+}
+
+/// `read_request_eof`: the whole body, refusing to grow past the cap.
+fn read_request_eof(input: &mut impl Read, max_request_buffer: u64) -> Result<Vec<u8>, String> {
+    let max = max_request_buffer.max(8192);
+    let mut alloc = 8192usize;
+    let mut buf = vec![0u8; alloc];
+    let mut len = 0usize;
+    loop {
+        len += read_in_full(input, &mut buf[len..alloc])?;
+        // A short read out of `read_in_full` is EOF.
+        if len < alloc {
+            buf.truncate(len);
+            return Ok(buf);
+        }
+        if alloc as u64 == max {
+            return Err(format!(
+                "request was larger than our maximum size ({max}); \
+                 try setting GIT_HTTP_MAX_REQUEST_BUFFER"
+            ));
+        }
+        // git's `alloc_nr(x)`.
+        alloc = (alloc + 16) * 3 / 2;
+        if alloc as u64 > max {
+            alloc = max as usize;
+        }
+        buf.resize(alloc, 0);
+    }
+}
+
+/// `read_request_fixed_len`.
+fn read_request_fixed_len(
+    input: &mut impl Read,
+    req_len: u64,
+    max_request_buffer: u64,
+) -> Result<Vec<u8>, String> {
+    if max_request_buffer < req_len {
+        return Err(format!(
+            "request was larger than our maximum size ({max_request_buffer}): \
+             {req_len}; try setting GIT_HTTP_MAX_REQUEST_BUFFER"
+        ));
+    }
+    let mut buf = vec![0u8; req_len as usize];
+    let got = read_in_full(input, &mut buf)?;
+    buf.truncate(got);
+    Ok(buf)
+}
+
+/// `read_request`: the fixed-length reader when `CONTENT_LENGTH` said so, the
+/// read-to-EOF one otherwise.
+fn read_request(
+    input: &mut impl Read,
+    req_len: Option<u64>,
+    max_request_buffer: u64,
+) -> Result<Vec<u8>, String> {
+    match req_len {
+        Some(len) => read_request_fixed_len(input, len, max_request_buffer),
+        None => read_request_eof(input, max_request_buffer),
+    }
+}
+
+/// `copy_request`: read the body whole, then hand it over.
+fn copy_request(
+    input: &mut impl Read,
+    out: &mut impl Write,
+    prog_name: &str,
+    req_len: Option<u64>,
+    max_request_buffer: u64,
+) -> Result<(), String> {
+    let buf = read_request(input, req_len, max_request_buffer)?;
+    write_to_child(out, &buf, prog_name)
+}
+
+/// `pipe_fixed_length`: stream exactly `req_len` bytes across, 8 KiB at a time.
+fn pipe_fixed_length(
+    input: &mut impl Read,
+    out: &mut impl Write,
+    prog_name: &str,
+    req_len: u64,
+) -> Result<(), String> {
+    let mut buf = [0u8; 8192];
+    let mut remaining = req_len;
+    while remaining > 0 {
+        let chunk = std::cmp::min(remaining, buf.len() as u64) as usize;
+        let n = input
+            .read(&mut buf[..chunk])
+            .map_err(|e| format!("Reading request failed: {}", errno_text(&e)))?;
+        if n == 0 {
+            break;
+        }
+        write_to_child(out, &buf[..n], prog_name)?;
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// `inflate_request`: the body arrived `Content-Encoding: gzip`, so it is
+/// inflated on the way to the child. git initialises the stream with
+/// `git_inflate_init_gzip_only()` — windowBits 15 + 16 — which rejects a bare
+/// zlib or raw-deflate body rather than guessing at it.
+fn inflate_request(
+    input: &mut impl Read,
+    out: &mut impl Write,
+    prog_name: &str,
+    buffer_input: bool,
+    req_len: Option<u64>,
+    max_request_buffer: u64,
+) -> Result<(), String> {
+    let mut stream = zlib_rs::Inflate::new(true, 15 + 16);
+    let mut in_buf = [0u8; 8192];
+    let mut out_buf = [0u8; 8192];
+    let mut full_request: Option<Vec<u8>> = None;
+    let mut spent = false;
+    let mut remaining = req_len;
+
+    loop {
+        let chunk: &[u8] = if buffer_input {
+            if spent {
+                &[]
+            } else {
+                full_request = Some(read_request(input, req_len, max_request_buffer)?);
+                spent = true;
+                full_request.as_deref().expect("just filled")
+            }
+        } else {
+            let want = match remaining {
+                Some(left) if left <= in_buf.len() as u64 => left as usize,
+                _ => in_buf.len(),
+            };
+            let n = input
+                .read(&mut in_buf[..want])
+                .map_err(|e| format!("Reading request failed: {}", errno_text(&e)))?;
+            if let Some(left) = remaining.as_mut() {
+                *left -= n as u64;
+            }
+            &in_buf[..n]
+        };
+        if chunk.is_empty() {
+            return Err("request ended in the middle of the gzip stream".into());
+        }
+
+        let mut consumed = 0usize;
+        while consumed < chunk.len() {
+            let before_in = stream.total_in();
+            let before_out = stream.total_out();
+            let status = stream
+                .decompress(
+                    &chunk[consumed..],
+                    &mut out_buf,
+                    zlib_rs::InflateFlush::NoFlush,
+                )
+                .map_err(|e| {
+                    format!("zlib error inflating request, result {}", inflate_errno(&e))
+                })?;
+            consumed += (stream.total_in() - before_in) as usize;
+            let produced = (stream.total_out() - before_out) as usize;
+            write_to_child(out, &out_buf[..produced], prog_name)?;
+            if status == zlib_rs::Status::StreamEnd {
+                return Ok(());
+            }
+            if produced == 0 && stream.total_in() == before_in {
+                // No progress in either direction: the stream is wedged, and
+                // looping would spin. git's zlib returns an error here.
+                return Err("zlib error inflating request, result -5".into());
+            }
+        }
+    }
+}
+
+/// zlib's own `Z_*` result codes, which is what git's message quotes.
+fn inflate_errno(err: &zlib_rs::InflateError) -> i32 {
+    match err {
+        zlib_rs::InflateError::NeedDict { .. } => 2,
+        zlib_rs::InflateError::StreamError => -2,
+        zlib_rs::InflateError::DataError => -3,
+        zlib_rs::InflateError::MemError => -4,
+    }
+}
+
+/// `write_to_child`.
+fn write_to_child(out: &mut impl Write, buf: &[u8], prog_name: &str) -> Result<(), String> {
+    out.write_all(buf)
+        .map_err(|_| format!("unable to write to '{prog_name}'"))
+}
+
+/// `read_in_full`: fill `buf`, stopping early only at EOF.
+fn read_in_full(input: &mut impl Read, buf: &mut [u8]) -> Result<usize, String> {
+    let mut len = 0usize;
+    while len < buf.len() {
+        match input.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("error reading request body: {}", errno_text(&e))),
+        }
+    }
+    Ok(len)
+}
+
+/// pkt-line framing, for the one packet `http-backend` writes itself.
+fn pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
+    out.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+    out.extend_from_slice(payload);
 }
 
 // ---------------------------------------------------------------------------

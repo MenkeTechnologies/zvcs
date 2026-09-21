@@ -107,6 +107,12 @@ ignore = "0.4"
 serde_json = "1"
 # Terminal paging: dup2/isatty/close to splice the pager onto fd 1/2, as git does.
 libc = "0.2"
+# `http-backend`'s `inflate_request`, which git initialises with
+# `git_inflate_init_gzip_only()` (windowBits = 15 + 16) to decode a
+# `Content-Encoding: gzip` request body. Already in the tree as `gix-zlib`'s only
+# dependency; `gix::zlib::Decompress` cannot be asked for the gzip wrapper, so
+# the backing crate is used directly.
+zlib-rs = "0.6"
 # Interactive line editor for `git zrepl` (history, cursor motion, ctrl-c/ctrl-d).
 # It brings crossterm 0.29 into the tree.
 # Only the interactive (tty) path uses it; piped stdin stays a raw line reader.

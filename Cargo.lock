@@ -4345,6 +4345,7 @@ dependencies = [
  "sha2",
  "toml",
  "unicode-width",
+ "zlib-rs",
  "zvcs-native",
 ]
 

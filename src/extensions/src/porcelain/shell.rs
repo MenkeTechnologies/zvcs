@@ -31,8 +31,9 @@
 //!   * **`split_cmdline()`** ported from git's `alias.c`, including the quirk
 //!     that `argv[0]` always exists (so `-c ""` and `-c "   "` both reach the
 //!     exec attempt and fail with `unrecognized command '<raw>'`), and the
-//!     `unclosed quote` diagnostic: `fatal: invalid command format '<raw>':
-//!     unclosed quote`, exit 128.
+//!     both `split_cmdline_strerror()` diagnostics this parser can produce:
+//!     `fatal: invalid command format '<raw>': unclosed quote` and
+//!     `fatal: invalid command format '<raw>': cmdline ends with \`, exit 128.
 //!   * **`is_valid_cmd_name()`** (no `.` and no `/` anywhere) and
 //!     `make_cmd()` (`git-shell-commands/<name>`). In `-c` mode an invalid name
 //!     or any exec failure both yield `fatal: unrecognized command '<argv[2]>'`
@@ -43,7 +44,7 @@
 //!     becomes ours; exec failure → 127), the silent `help` invocation, the
 //!     `git> ` prompt on stderr, `quit`/`logout`/`exit`/`bye`, the empty-line
 //!     no-op, `unrecognized command '<prog>'` on ENOENT, `invalid command
-//!     format '<line>'` for a name with `.`/`/`, and EOF printing a newline to
+//!     format '<prog>'` for a name with `.`/`/`, and EOF printing a newline to
 //!     stderr and exiting 0.
 //!
 //! Two deliberate deviations, both unobservable in normal use:
@@ -122,8 +123,9 @@ pub fn shell(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let Some(argv) = split_cmdline(&prog) else {
-        return die(&format!("invalid command format '{original}': unclosed quote"));
+    let argv = match split_cmdline(&prog) {
+        Ok(argv) => argv,
+        Err(why) => return die(&format!("invalid command format '{original}': {why}")),
     };
 
     if is_valid_cmd_name(&argv[0]) {
@@ -208,9 +210,16 @@ fn run_shell() -> Result<ExitCode> {
             line.pop();
         }
 
-        let Some(argv) = split_cmdline(&line) else {
-            emit(b"invalid command format '", &line, b"': unclosed quote\n")?;
-            continue;
+        let argv = match split_cmdline(&line) {
+            Ok(argv) => argv,
+            Err(why) => {
+                emit(
+                    b"invalid command format '",
+                    &line,
+                    format!("': {why}\n").as_bytes(),
+                )?;
+                continue;
+            }
         };
         let prog = &argv[0];
 
@@ -234,7 +243,9 @@ fn run_shell() -> Result<ExitCode> {
                 Err(_) => {}
             }
         } else {
-            emit(b"invalid command format '", &line, b"'\n")?;
+            // shell.c:133 quotes `prog` — argv[0] alone — not the whole line,
+            // unlike the `split_cmdline` failure above which quotes `rawargs`.
+            emit(b"invalid command format '", prog, b"'\n")?;
         }
     }
 }
@@ -252,12 +263,16 @@ fn cd_to_homedir() -> Option<ExitCode> {
     None
 }
 
-/// `alias.c: split_cmdline()`. `None` is git's `unclosed quote` failure.
+/// `alias.c: split_cmdline()`. `Err` carries what `split_cmdline_strerror()`
+/// would render for the negative return: `alias.c` has three codes, of which
+/// this parser can produce two — `SPLIT_CMDLINE_BAD_ENDING` for a `\` with
+/// nothing behind it and `SPLIT_CMDLINE_UNCLOSED_QUOTE` for a quote that never
+/// closes. (`SPLIT_CMDLINE_ARGC_OVERFLOW` needs `INT_MAX` words.)
 ///
 /// Note that `argv[0]` is seeded before the scan, so the result always holds at
 /// least one (possibly empty) element — the behaviour that makes `-c ""` fail
 /// as an exec attempt rather than as a parse error.
-fn split_cmdline(cmdline: &[u8]) -> Option<Vec<Vec<u8>>> {
+fn split_cmdline(cmdline: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut cur: Vec<u8> = Vec::new();
     let mut quoted = 0u8;
@@ -282,7 +297,7 @@ fn split_cmdline(cmdline: &[u8]) -> Option<Vec<Vec<u8>>> {
             if c == b'\\' && quoted != b'\'' {
                 src += 1;
                 if src >= cmdline.len() {
-                    break;
+                    return Err("cmdline ends with \\");
                 }
             }
             cur.push(cmdline[src]);
@@ -291,10 +306,10 @@ fn split_cmdline(cmdline: &[u8]) -> Option<Vec<Vec<u8>>> {
     }
 
     if quoted != 0 {
-        return None;
+        return Err("unclosed quote");
     }
     out.push(cur);
-    Some(out)
+    Ok(out)
 }
 
 /// `quote.c: sq_dequote()` with `next == NULL`: the whole string must be one

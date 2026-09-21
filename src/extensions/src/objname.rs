@@ -2826,6 +2826,20 @@ fn reflog_read(repo: &gix::Repository, spec: &str) -> Option<(ReadRefAt, i64, i6
     // `repo_dwim_ref("HEAD")` reports HEAD's *target*; `repo_dwim_log` reports the
     // ref whose log was found. Either way an unborn HEAD resolves to nothing and
     // the operand fails, which is what makes a stale `logs/HEAD` a fatal.
+    // `repo_dwim_log()` opens with `substitute_branch_name(r, &str, &len, 0)`
+    // (refs.c:840-844), so the ref half of the operand is rewritten before any
+    // `ref_rev_parse_rules` spelling is tried: `<branch>@{u}@{1}` reads the log
+    // of the upstream's full name. `reflog.rs`'s own `substitute_branch_name()`
+    // leaves the `@{u}` family alone on purpose (`git reflog drop @{u}` reports
+    // a missing reflog rather than the upstream `die()`), so the rewrite is
+    // applied here instead — where `get_oid_basic()` applies it. A mark that
+    // names no upstream is left as typed and simply fails to resolve; the
+    // `die()` for it has already been raised by [`resolve`].
+    let substituted = match interpret_branch_name(repo, base) {
+        Some(Ok(rewritten)) => Some(rewritten),
+        _ => None,
+    };
+    let base = substituted.as_deref().unwrap_or(base);
     let full = if base.is_empty() {
         crate::refname::resolve_ref_reading(repo, "HEAD")?
     } else {

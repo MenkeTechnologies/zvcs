@@ -586,10 +586,22 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // `get_oid()`, before rev-parse has a failed operand to
                     // report, so it replaces the "ambiguous argument" block rather
                     // than preceding it (`refs.c`, via `substitute_branch_name()`).
-                    if let Some(message) = crate::objname::upstream_mark_fatal(&repo, name) {
-                        out.flush()?;
-                        eprintln!("fatal: {message}");
-                        return Ok(ExitCode::from(128));
+                    // `--quiet` is `flags |= GET_OID_QUIETLY`
+                    // (builtin/rev-parse.c:866-870), which reaches
+                    // `interpret_branch_mark()` as
+                    // `nonfatal_dangling_mark = !fatal`
+                    // (`fatal = !(flags & GET_OID_QUIETLY)`, object-name.c:686,
+                    // passed on at :744-748). With it set the mark is not a
+                    // `die()` at all — it returns -1 (object-name.c:1456-1462),
+                    // the operand merely fails to resolve, and rev-parse ends on
+                    // `die_no_single_rev(quiet)`'s silent exit 1 or, without
+                    // `--verify`, on the ordinary `ambiguous argument` block.
+                    if !o.quiet {
+                        if let Some(message) = crate::objname::upstream_mark_fatal(&repo, name) {
+                            out.flush()?;
+                            eprintln!("fatal: {message}");
+                            return Ok(ExitCode::from(128));
+                        }
                     }
                     warn_ambiguous_refname(&repo, name, o.quiet);
                     if let ControlFlow::Break(code) =

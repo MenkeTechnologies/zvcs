@@ -1265,7 +1265,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // the selector offers.
     // `--fixup=reword:` sets git's `only` with no pathspec at all, which commits
     // HEAD's tree and leaves whatever is staged staged.
-    let only_mode = (!pathspecs.is_empty() || fixup_reword) && !include_flag && !interactive;
+    //
+    // So does a plain `-o`/`--only`: `prepare_index()` takes the as-is branch only
+    // for `if (!only && !pathspec.nr)` (builtin/commit.c:481), and everything past
+    // it is `commit_style = COMMIT_PARTIAL` (:516). An `--only` that named no path
+    // reached this port as an ordinary whole-index commit, so `git commit --amend
+    // --only` recorded the staged contents git's false index (HEAD's tree plus the
+    // named paths, of which there are none) leaves out -- the documented "ignores
+    // staged contents" behaviour, which only `--amend` and `--allow-empty` are
+    // allowed to ask for (:390-392).
+    let only_mode =
+        (only_flag || !pathspecs.is_empty() || fixup_reword) && !include_flag && !interactive;
 
     // `-z` promotes an unset (or explicitly long) format to porcelain, and any
     // format at all implies a dry run — git's `finalize_deferred_config()` plus
@@ -2430,9 +2440,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // Under `--cleanup=verbatim` any non-empty buffer counts as a message, so a
     // file of nothing but newlines commits with an empty subject rather than
     // aborting.
+    // `if (cleanup_mode == COMMIT_MSG_CLEANUP_NONE && sb->len) return 0;` then
+    // `rest_is_empty(sb, 0)` (sequencer.c:1229-1233) — so whitespace *and*
+    // sign-off lines are nothing, and only `verbatim` lets a buffer of either
+    // stand as a message.
     let empty_message = match cleanup {
-        Cleanup::Verbatim => message.is_empty(),
-        _ => message.trim().is_empty(),
+        Cleanup::Verbatim if !message.is_empty() => false,
+        _ => rest_is_empty(&message),
     };
     if empty_message && !allow_empty_message {
         // Not a `die()`: `commit.c:1906-1909` writes this with `fprintf(stderr,
@@ -3774,17 +3788,48 @@ fn apply_trailers(msg_path: &std::path::Path, trailers: &[String]) -> Result<()>
     Ok(())
 }
 
-/// Port of `template_untouched()` (builtin/commit.c): true when the cleaned-up
-/// message is the cleaned-up template with nothing but blanks and comments added,
-/// which aborts the commit. `verbatim` cleanup exempts a non-empty message.
-fn template_untouched(message: &str, template: &str, cleanup: Cleanup, comment: &str) -> bool {
+/// ```c
+/// static int rest_is_empty(const struct strbuf *sb, int start)
+/// {
+///         /* Check if the rest is just whitespace and Signed-off-by's. */
+///         for (i = start; i < sb->len; i++) {
+///                 ...
+///                 if (strlen(sign_off_header) <= eol - i &&
+///                     starts_with(sb->buf + i, sign_off_header)) {
+///                         i = eol;
+///                         continue;
+///                 }
+///                 while (i < eol)
+///                         if (!isspace(sb->buf[i++]))
+///                                 return 0;
+///         }
+///         return 1;
+/// }
+/// ```
+///
+/// (sequencer.c:1186-1210.) A `Signed-off-by: ` line counts as nothing: a
+/// message that is only sign-offs is an empty message, which is what makes `git
+/// commit -s` on an otherwise blank buffer refuse rather than record a commit
+/// whose subject is the sign-off. Comment lines are *not* exempt here — they are
+/// already gone by the time this runs, stripped by `cleanup_message()`.
+fn rest_is_empty(rest: &str) -> bool {
+    /// `sign_off_header` (commit.h).
+    const SIGN_OFF_HEADER: &str = "Signed-off-by: ";
+    rest.split('\n')
+        .all(|line| line.starts_with(SIGN_OFF_HEADER) || line.chars().all(|c| c.is_ascii_whitespace()))
+}
+
+/// Port of `template_untouched()` (sequencer.c:1240-1256): true when the
+/// cleaned-up message is the cleaned-up template with nothing after it that
+/// `rest_is_empty()` counts, which aborts the commit. `verbatim` cleanup exempts
+/// a non-empty message.
+fn template_untouched(message: &str, template: &str, cleanup: Cleanup, _comment: &str) -> bool {
     if cleanup == Cleanup::Verbatim && !message.is_empty() {
         return false;
     }
+    // `if (!skip_prefix(sb->buf, tmpl.buf, &start)) start = sb->buf;`
     let rest = message.strip_prefix(template).unwrap_or(message);
-    // `rest_is_empty()`: only whitespace and comment lines may follow.
-    rest.lines()
-        .all(|l| l.trim().is_empty() || l.starts_with(comment))
+    rest_is_empty(rest)
 }
 
 /// Settle `s->verbose` the way `cmd_commit()` does:

@@ -424,6 +424,34 @@ fn canonical<'a>(
     }
 }
 
+/// A `PARSE_OPT_NOARG` entry handed an attached value:
+///
+/// ```c
+/// if (unset && p->opt)
+///         return error(_("%s takes no value"), optname(opt, flags));
+/// …
+/// if (!(flags & OPT_SHORT) && p->opt && (opt->flags & PARSE_OPT_NOARG))
+///         return error(_("%s takes no value"), optname(opt, flags));
+/// ```
+///
+/// (`do_get_value()`, parse-options.c:138-143.) The refusal is the one line and exit 129
+/// with **no** usage block, unlike an unknown option. `optname()` quotes the table entry's
+/// own name rather than the abbreviation that was typed — so `--incl=x` names
+/// `include-untracked` — and keeps the `no-` prefix for the negated spelling.
+///
+/// `tok` is the token *after* [`canonical`] has respelled it, which is what carries the
+/// full name; `None` means the token is not a valueless option and parsing continues.
+fn reject_attached_value(tok: &str, table: &'static [LongOpt]) -> Option<ExitCode> {
+    let (stem, _) = tok.split_once('=')?;
+    let bare = stem.trim_start_matches('-');
+    let named = bare.strip_prefix("no-").unwrap_or(bare);
+    if !table.iter().any(|o| o.name == named && o.arg == Arg::None) {
+        return None;
+    }
+    eprintln!("error: option `{bare}' takes no value");
+    Some(ExitCode::from(129))
+}
+
 /// `parse_options()`' built-in `-h`: the usage block on stdout, exit 129. It
 /// fires wherever the flag appears in the subcommand's own arguments.
 ///
@@ -603,18 +631,6 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             store_stash(&repo, &args[1..])
         }
-        Some(flag) if flag.starts_with('-') => {
-            // Implicit push with options, e.g. `git stash -m msg` or `git stash -u`.
-            // `cmd_stash` re-enters `push_stash()` with `push_assumed` set, which
-            // renders `git_stash_usage` against push's option table — the same
-            // option surface as `git stash push`, a different usage block.
-            let opts = match parse_push_options(args, STASH_PUSH_USAGE, true)? {
-                Ok(o) => o,
-                Err(code) => return Ok(code),
-            };
-            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            push(&repo, &opts)
-        }
         // Neither body is ported, but `parse_options()` runs before either one,
         // so the option surface is still git's: `-h` and `--help-all` print the
         // sub-command's block on stdout and an unclaimed flag is refused with it
@@ -659,7 +675,39 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             }
             crate::git_fatal!("`stash {sub}` is not ported")
         }
-        Some(other) => crate::git_fatal!("{other} is not a stash command"),
+        // ```c
+        // if (fn)
+        //         return !!fn(argc, argv, prefix, repo);
+        // else if (!argc)
+        //         return !!push_stash_unassumed(0, NULL, prefix, repo);
+        //
+        // /* Assume 'stash push' */
+        // strvec_push(&args, "push");
+        // strvec_pushv(&args, argv);
+        // …
+        // ret = !!push_stash(args.nr, args_copy, prefix, 1);
+        // ```
+        //
+        // (`cmd_stash`, builtin/stash.c:2495-2510.) The subcommand table is matched by
+        // `OPT_SUBCOMMAND` alone: a word that names none of its entries is not an error
+        // there, it is simply left in `argv` and handed to `push_stash()` with
+        // `push_assumed` set. So `git stash bogus` is refused by *push*'s
+        // `PARSE_OPT_STOP_AT_NON_OPTION` — `subcommand wasn't specified; 'push' can't be
+        // assumed due to unexpected token 'bogus'` — and never by a "not a stash command"
+        // of this port's own. That matters beyond the wording: with `--patch` the same
+        // token is a pathspec, so `git stash -p bogus` is a real invocation.
+        Some(_) => {
+            // Implicit push with options, e.g. `git stash -m msg` or `git stash -u`.
+            // `cmd_stash` re-enters `push_stash()` with `push_assumed` set, which
+            // renders `git_stash_usage` against push's option table — the same
+            // option surface as `git stash push`, a different usage block.
+            let opts = match parse_push_options(args, STASH_PUSH_USAGE, true)? {
+                Ok(o) => o,
+                Err(code) => return Ok(code),
+            };
+            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+            push(&repo, &opts)
+        }
     }
 }
 
@@ -1865,21 +1913,28 @@ fn first_hunk_line(
 }
 
 /// Whether `theirs` merges into `ours` over `base` without conflicts, reporting
-/// the blocked paths when it does not.
+/// the blocked paths when it does not and the merged tree when it does.
 ///
-/// This is a question, not a step: git asks it with `git apply --cached --check`, which
-/// writes nothing. The tree merge that answers it here resolves content merges, and
-/// resolving one means writing the merged blob — so it runs against a memory-backed
-/// handle and the object database is left exactly as it was.
+/// The failure side is a question, not a step: git asks it with `git apply --cached
+/// --check`, which writes nothing. The tree merge that answers it here resolves content
+/// merges, and resolving one means writing the merged blob — so it runs against a
+/// memory-backed handle and a *refused* merge leaves the object database exactly as it
+/// was.
+///
+/// A clean merge is the other half of `apply_cached()` (builtin/stash.c:441-453) and does
+/// write: `git apply --cached` stages the patched blobs and
+/// `write_index_as_tree(&index_tree, …)` (builtin/stash.c:686-688) records the tree. So the
+/// memory the merge filled is flushed to the real database before the tree id is handed
+/// back — the caller goes on to expand that tree into the index.
 fn merge_trees_cleanly(
     repo: &gix::Repository,
     base: ObjectId,
     ours: ObjectId,
     theirs: ObjectId,
-) -> Result<std::result::Result<(), Vec<BString>>> {
-    let repo = &repo.clone().with_object_memory();
+) -> Result<std::result::Result<ObjectId, Vec<BString>>> {
+    let mut mem = repo.clone().with_object_memory();
     let labels = gix::merge::blob::builtin_driver::text::Labels::default();
-    let merge = repo.merge_trees(base, ours, theirs, labels, repo.tree_merge_options()?)?;
+    let merge = mem.merge_trees(base, ours, theirs, labels, mem.tree_merge_options()?)?;
     let unresolved = gix::merge::tree::TreatAsUnresolved::git();
     let blocked: Vec<BString> = merge
         .conflicts
@@ -1887,10 +1942,17 @@ fn merge_trees_cleanly(
         .filter(|c| c.is_unresolved(unresolved))
         .map(|c| c.changes_in_resolution().0.location().to_owned())
         .collect();
-    match blocked.is_empty() {
-        true => Ok(Ok(())),
-        false => Ok(Err(blocked)),
+    if !blocked.is_empty() {
+        return Ok(Err(blocked));
     }
+    let mut merge = merge;
+    let tree = merge.tree.write()?.detach();
+    let written = mem.objects.take_object_memory().expect("object memory was just enabled");
+    for (_id, (kind, data)) in written.iter() {
+        gix::objs::Write::write_buf(repo, *kind, data)
+            .map_err(|e| anyhow!("failed to write stash index-merge object: {e}"))?;
+    }
+    Ok(Ok(tree))
 }
 
 /// `repo_refresh_and_write_index()` refusing an unmerged index, which is how a
@@ -2448,7 +2510,7 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     if let Some(code) = refresh_before_apply(&repo)? {
         return Ok(code);
     }
-    let restored = match restore_stash_commit(&repo, commit_id, true, &ConflictLabels::default())? {
+    let restored = match restore_stash_commit(&repo, commit_id, true, false, &ConflictLabels::default())? {
         Ok(restored) => restored,
         Err(code) => return Ok(code),
     };
@@ -2553,7 +2615,7 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
     if let Some(code) = refresh_before_apply(repo)? {
         return Ok(code);
     }
-    let restored = match restore_stash_commit(repo, commit_id, opts.restore_index, &opts.labels)? {
+    let restored = match restore_stash_commit(repo, commit_id, opts.restore_index, opts.quiet, &opts.labels)? {
         Ok(restored) => restored,
         // `--index` could not replay the stash's staged state onto ours: git
         // reports it and stops before the worktree is touched — and a `pop` says
@@ -2621,6 +2683,7 @@ fn restore_stash_commit(
     repo: &gix::Repository,
     commit_id: ObjectId,
     restore_index: bool,
+    quiet: bool,
     labels: &ConflictLabels,
 ) -> Result<std::result::Result<bool, ExitCode>> {
     let commit = repo.find_commit(commit_id)?;
@@ -2677,8 +2740,22 @@ fn restore_stash_commit(
     // for `-S`: the diff here is the stash's own (`w_commit^!`), so its hunks
     // are the ones that failed.
     let has_index = restore_index && i_tree != base_tree && i_tree != c_tree;
+    // `write_index_as_tree(&index_tree, …)` (builtin/stash.c:686-688) — the tree of the
+    // index *after* `apply_cached()` put the stash's staged patch on top of it, which is
+    // the stash's `I` tree only when the index started out at the stash's base. With HEAD
+    // moved on since the stash was taken, `i_tree` names the older content and restoring it
+    // would roll the index back over the newer commit; the merged tree is what git stages.
+    let mut index_tree = i_tree;
+    // `unclean()` (merge-ort-wrappers.c:15-28) is the first thing
+    // `merge_ort_nonrecursive()` does: `repo_index_has_changes(opt->repo, head, &sb)`, i.e.
+    // the index against the merge's *ours* tree. It can only fail under `--index`, because
+    // that is the only arm that moves the index out from under `c_tree` — see the
+    // `reset_head()` note below. The paths come back space-joined in one `%s`.
+    let mut unclean: Option<Vec<BString>> = None;
     if has_index {
-        if let Err(blocked) = merge_trees_cleanly(repo, base_tree, c_tree, i_tree)? {
+        match merge_trees_cleanly(repo, base_tree, c_tree, i_tree)? {
+            Ok(merged) => index_tree = merged,
+            Err(blocked) => {
             for path in blocked {
                 if let Some(line) = first_hunk_line(repo, base_tree, i_tree, &path) {
                     eprintln!("error: patch failed: {path}:{line}");
@@ -2687,6 +2764,7 @@ fn restore_stash_commit(
             }
             eprintln!("error: conflicts in index. Try without --index.");
             return Ok(Err(ExitCode::FAILURE));
+            }
         }
         // The `--index` arm ends on `reset_head()`, which is
         // `git reset --quiet --refresh` as a *child command*
@@ -2708,11 +2786,44 @@ fn restore_stash_commit(
         // standalone `reset: moving to HEAD`. That is why stock's failed merge over
         // a staged change leaves exactly one `merge <heads>: updating HEAD` line:
         // this reset writes it, and merge itself writes nothing.
+        //
+        // The reset also *moves the index*: a mixed reset naming no revision reloads it
+        // from `HEAD`, dropping whatever `apply_cached()` had just staged there along with
+        // anything the caller had staged. The merge that follows then compares that index
+        // against `c_tree`, the tree the index held a moment earlier — so any staged work
+        // at all makes `unclean()` refuse the whole apply. Rewriting the index is only
+        // observable when `HEAD`'s tree and `c_tree` actually differ, which is exactly the
+        // case that refuses; when they agree the reset is a content no-op and the entries
+        // (and their stat data) are left alone.
         if let Ok(head_id) = repo.head_id() {
             let id = head_id.detach();
             let msg = super::reset::reflog_message("updating HEAD", Some("HEAD"));
             super::checkout::append_head_log(repo, Some(id), Some(id), &msg);
             super::reset::set_orig_head(repo, id)?;
+
+            let head_tree = repo.find_commit(id)?.tree_id()?.detach();
+            if head_tree != c_tree {
+                write_target_index(
+                    repo,
+                    head_tree,
+                    &old_index,
+                    &HashMap::new(),
+                    CacheTree::LikeMixedReset { touched: HashSet::new() },
+                )?;
+                old_index = repo.open_index()?;
+                let (head_map, ours_map) = (tree_map(repo, head_tree)?, tree_map(repo, c_tree)?);
+                let changed: Vec<BString> = head_map
+                    .keys()
+                    .chain(ours_map.keys())
+                    .filter(|p| head_map.get(*p) != ours_map.get(*p))
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<BString>>()
+                    .into_iter()
+                    .collect();
+                if !changed.is_empty() {
+                    unclean = Some(changed);
+                }
+            }
         }
     }
 
@@ -2725,41 +2836,66 @@ fn restore_stash_commit(
         return Err(crate::parseopt::silent(crate::fatal::EXIT_FATAL));
     }
 
-    // `merge_trees()` (merge-recursive.c): a merge whose base already equals the
-    // other side has nothing to bring in and says so on stdout, `-q` included — which
-    // is what an entry holding only untracked files looks like from here.
-    if w_tree == base_tree {
-        println!("Already up to date.");
-    }
-
     let should_interrupt = AtomicBool::new(false);
-    let labels = gix::merge::blob::builtin_driver::text::Labels {
-        ancestor: labels.base.as_deref().map(|l| BStr::new(l.as_bytes())),
-        // `o.branch1` / `o.branch2` — the names a conflict's markers carry.
-        current: Some(BStr::new(labels.ours.as_bytes())),
-        other: Some(BStr::new(labels.theirs.as_bytes())),
-    };
-    let merged = crate::merge_apply::three_way_merge_guarded(
-        repo,
-        base_tree,
-        c_tree,
-        w_tree,
-        &old_index,
-        labels,
-        &should_interrupt,
-        true,
-        &crate::merge_apply::StrategyOptions::default(),
-        c_tree,
-    )?;
     // A merge that did not come out clean — an unresolved conflict, or a checkout
     // the local changes refused — leaves the index restore undone. git says so
     // when `--index` asked for one, then jumps straight to the untracked files:
     // `if (ret) { … if (index) "Index was not unstashed."; goto restore_untracked; }`.
-    let mut applied = match merged {
-        crate::merge_apply::Merged::Applied(applied) => Some(applied),
-        crate::merge_apply::Merged::Refused(clobber) => {
-            clobber.report("merge");
-            None
+    let mut applied = if let Some(paths) = unclean {
+        // ```c
+        // if (head && repo_index_has_changes(opt->repo, head, &sb)) {
+        //         error(_("Your local changes to the following files would be overwritten by merge:\n  %s"),
+        //               sb.buf);
+        // ```
+        //
+        // (`unclean()`, merge-ort-wrappers.c:19-24.) One `%s`, so the paths land on a single
+        // indented line separated by spaces — not the one-per-line block
+        // `unpack_trees()` renders for the same sentence. It returns before the
+        // `Already up to date.` shortcut, so an untracked-only entry refused here says
+        // nothing else.
+        let listed: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        eprintln!(
+            "error: Your local changes to the following files would be overwritten by merge:\n  {}",
+            listed.join(" ")
+        );
+        None
+    } else {
+        // `merge_trees()` (merge-recursive.c): a merge whose base already equals the
+        // other side has nothing to bring in and says so on stdout, `-q` included — which
+        // is what an entry holding only untracked files looks like from here.
+        if w_tree == base_tree {
+            println!("Already up to date.");
+        }
+        let labels = gix::merge::blob::builtin_driver::text::Labels {
+            ancestor: labels.base.as_deref().map(|l| BStr::new(l.as_bytes())),
+            // `o.branch1` / `o.branch2` — the names a conflict's markers carry.
+            current: Some(BStr::new(labels.ours.as_bytes())),
+            other: Some(BStr::new(labels.theirs.as_bytes())),
+        };
+        let merged = crate::merge_apply::three_way_merge_guarded(
+            repo,
+            base_tree,
+            c_tree,
+            w_tree,
+            &old_index,
+            labels,
+            &should_interrupt,
+            // `if (quiet) o.verbosity = 0;` (builtin/stash.c:705-706), which
+            // `merge_ort_nonrecursive()` turns into
+            // `show_msgs = !!opt->verbosity` before handing it to
+            // `merge_switch_to_result()` (merge-ort-wrappers.c:45-49). So `-q` takes the
+            // merge's own `Auto-merging <path>` / `CONFLICT (content): …` block with it,
+            // not just the trailing `git status`.
+            !quiet,
+            &crate::merge_apply::StrategyOptions::default(),
+            c_tree,
+        )?;
+        match merged {
+            crate::merge_apply::Merged::Applied(applied) => Some(applied),
+            crate::merge_apply::Merged::Refused(clobber) => {
+                clobber.report("merge");
+                None
+            }
         }
     };
     // `merge_switch_to_result()`'s `write_auto_merge` region again — `stash
@@ -2813,7 +2949,7 @@ fn restore_stash_commit(
             // `reset_tree(&index_tree, 0, 0)` (builtin/stash.c:741) — `unpack_trees()`
             // with `oneway_merge`, whose parting repair proves every node of an index
             // that is an exact expansion of a tree the repository already has.
-            (i_tree, CacheTree::LikeUnpackTrees)
+            (index_tree, CacheTree::LikeUnpackTrees)
         } else {
             // `unstage_changes_unless_new(&c_tree)` (builtin/stash.c:744) is not a
             // `read-tree`: it mutates the *merge's* index one `add_index_entry()` at a
@@ -3954,6 +4090,9 @@ fn parse_push_options(
                 Ok(name) => name,
                 Err(code) => return Ok(Err(code)),
             };
+            if let Some(code) = reject_attached_value(resolved.as_ref(), PUSH_OPTS) {
+                return Ok(Err(code));
+            }
             resolved.as_ref()
         };
         // A value still owed is taken verbatim, even past `--`; otherwise these
@@ -4139,6 +4278,9 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
                 Ok(name) => name,
                 Err(code) => return Ok(Err(code)),
             };
+            if let Some(code) = reject_attached_value(resolved.as_ref(), SAVE_OPTS) {
+                return Ok(Err(code));
+            }
             resolved.as_ref()
         };
         if patch_opts.awaiting_value() || !rest_are_words {

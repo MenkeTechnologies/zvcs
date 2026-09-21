@@ -102,6 +102,42 @@ fn script(repo: &Path, name: &str, body: &str) {
     }
 }
 
+/// Whether this platform delivers a signalled death through the wrapper
+/// `do_bisect_run()` uses — `sh -c <command> <command>`, which is
+/// `prepare_shell_cmd()`'s shape (bisect.rs, run-command.c).
+///
+/// A `/bin/sh` that exec's the script leaves the script's own process as the
+/// direct child, so killing it is `WIFSIGNALED` for the caller. A `/bin/sh` that
+/// forks and waits instead reports the job itself — printing `Terminated` — and
+/// then exits 143 normally, so the signal never reaches zvcs and the
+/// `died of signal` line cannot be produced by any implementation. Observed on
+/// the GitHub ubuntu and macos runners; not reproducible on macOS bash 3.2,
+/// where the probe below answers true.
+///
+/// Probing is the honest way to tell those apart: the rest of the case still
+/// runs everywhere, and the one assertion that depends on the platform being
+/// able to produce the condition is skipped visibly rather than silently.
+#[cfg(unix)]
+fn shell_forwards_a_signalled_death(dir: &Path) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    let probe = dir.join("probe-signal.sh");
+    std::fs::write(&probe, "#!/bin/sh\nkill -TERM $$\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("./probe-signal.sh")
+        .arg("./probe-signal.sh")
+        .current_dir(dir)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn the signal probe");
+    let _ = std::fs::remove_file(&probe);
+    status.signal().is_some()
+}
+
 /// A command that exits 127 on the commit under test and then dies of a signal on
 /// the known-good revision: the second answer is not a verdict, so the run ends.
 #[test]
@@ -115,7 +151,17 @@ fn a_verification_that_dies_of_a_signal_ends_the_run() {
     let o = run(&repo, &home, &["bisect", "run", "./s.sh"]);
     assert_eq!(o.status.code(), Some(1), "{:?}", o.status);
     let err = String::from_utf8_lossy(&o.stderr);
-    assert!(err.contains("error: './s.sh' died of signal 15\n"), "{err}");
+    if shell_forwards_a_signalled_death(&repo) {
+        assert!(err.contains("error: './s.sh' died of signal 15\n"), "{err}");
+    } else {
+        // The platform reported the job itself and exited normally, so no
+        // implementation can see WIFSIGNALED here. Everything below still holds:
+        // a non-verdict answer ends the run without recording anything.
+        eprintln!(
+            "note: /bin/sh does not forward a signalled death through `sh -c`; \
+             skipping only the `died of signal` line"
+        );
+    }
     assert!(
         err.contains("error: unable to verify './s.sh' on 'good' revision\n"),
         "{err}"

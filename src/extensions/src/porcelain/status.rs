@@ -180,6 +180,8 @@ pub(crate) fn commit_template_block(
     reference: Reference,
     untracked: Option<&str>,
     comment: &str,
+    verbose: u32,
+    added_cut_line: bool,
 ) -> Result<String> {
     let mut args = vec!["--long".to_string()];
     // `handle_untracked_files_arg()` ran before `prepare_to_commit()`, so the
@@ -187,10 +189,27 @@ pub(crate) fn commit_template_block(
     if let Some(u) = untracked {
         args.push(format!("--untracked-files={u}"));
     }
+    // `s->verbose = verbose` (builtin/commit.c:575): `-v`'s patch is part of the
+    // very same `wt_status_print()` that writes the block, not something appended
+    // afterwards — which is what puts it below the cut line and above `No changes`.
+    for _ in 0..verbose {
+        args.push("--verbose".to_string());
+    }
     let mut body = String::new();
-    status_report(&args, reference, Some(Template { comment, out: &mut body }))?;
+    status_report(
+        &args,
+        reference,
+        Some(Template { comment, out: &mut body, added_cut_line }),
+    )?;
     Ok(body)
 }
+
+/// `cut_line` plus `wt_status_append_cut_line()`'s two-line explanation
+/// (wt-status.c:1136-1146), uncommented: the editor block's comment-prefix pass
+/// adds the prefix that `strbuf_commented_addf()` adds for git.
+pub(crate) const CUT_LINE: &str = "------------------------ >8 ------------------------\n\
+     Do not modify or remove the line above.\n\
+     Everything below it will be ignored.\n";
 
 /// [`commit_template_block`]'s destination and the comment string it commits to.
 struct Template<'a> {
@@ -198,6 +217,10 @@ struct Template<'a> {
     comment: &'a str,
     /// `s->fp`, which for the editor block is `COMMIT_EDITMSG` rather than stdout.
     out: &'a mut String,
+    /// `s->added_cut_line`: `prepare_to_commit()` already wrote the scissors line
+    /// itself under `--cleanup=scissors` (builtin/commit.c:963, :986), and
+    /// `wt_status_add_cut_line()` never writes a second one.
+    added_cut_line: bool,
 }
 
 /// What the staged half of the report is measured against: git's `s->reference`,
@@ -854,6 +877,17 @@ fn status_report(
         }
     };
     let unborn = reference_tree.is_none();
+    // `opt.def = s->is_initial ? empty_tree_oid_hex(s->repo->hash_algo) :
+    // s->reference` (wt-status.c:1173), as an argument for the `git diff
+    // --cached` that renders the `-v` patch. `HEAD` is that command's own
+    // default, so only the other two answers have to be spelled out.
+    let verbose_base: Option<String> = if unborn {
+        Some(gix::ObjectId::empty_tree(repo.object_hash()).to_string())
+    } else if reference.spec() != "HEAD" {
+        Some(reference.spec().to_string())
+    } else {
+        None
+    };
 
     // `MERGE_HEAD` is what makes git treat the run as "from merge": it both
     // enables the in-progress banner and suppresses the unstage hint.
@@ -1429,6 +1463,8 @@ fn status_report(
                 comment_prefix.as_deref(),
                 colopts,
                 verbose,
+                template.as_ref().map(|t| t.added_cut_line),
+                verbose_base.as_deref(),
                 repo.workdir(),
                 path_prefix,
                 submodule_summary_limit,
@@ -4174,6 +4210,14 @@ fn render_long(
     comment_prefix: Option<&str>,
     colopts: u32,
     verbose: u32,
+    // `s->fp != stdout`: `Some(s->added_cut_line)` when the body is the
+    // `COMMIT_EDITMSG` block, `None` for a report on stdout. Only the first form
+    // writes a cut line above the verbose patch and forces its color off.
+    template_cut: Option<bool>,
+    // `opt.def` for the verbose patch (wt-status.c:1173): the extra revision
+    // argument `git diff --cached` needs to be measured against `s->reference`,
+    // or `None` when its own `HEAD` default is already that tree.
+    verbose_base: Option<&str>,
     workdir: Option<&std::path::Path>,
     prefix: Option<&[u8]>,
     // git's `s->submodule_summary` once the `--ignore-submodules=all` gate has
@@ -4671,23 +4715,54 @@ fn render_long(
     // and so pick up `status.displayCommentPrefix`; the patch bodies bypass it,
     // which is what the sentinel/`blocks` splice below reproduces.
     if verbose > 0 {
+        // ```c
+        // if (s->fp != stdout) {
+        //         rev.diffopt.use_color = GIT_COLOR_NEVER;
+        //         wt_status_add_cut_line(s);
+        // }
+        // ```
+        //
+        // (wt-status.c:1189-1194.) The patch that goes into `COMMIT_EDITMSG` is
+        // what the scissors line exists to cut off, so the block writes one here
+        // — unless `prepare_to_commit()` already did under `--cleanup=scissors`,
+        // which `s->added_cut_line` records. A report on stdout gets neither the
+        // cut line nor the forced-off color.
+        if let Some(added_cut_line) = template_cut {
+            if !added_cut_line {
+                out.push_str(CUT_LINE);
+            }
+        }
         // git only overrides the prefixes on the branch that also prints the
         // header, so a `-v` (or a `-vv` with nothing committable) leaves the diff
         // on its configured defaults — `diff.noprefix` / `diff.mnemonicprefix`
         // then apply to it, exactly as they do to `git diff --cached`.
         let labelled = verbose > 1 && committable;
         if labelled {
+            // `if (s->fp != stdout) wt_longstatus_print_trailer(s)`
+            // (wt-status.c:1197-1198): the editor block separates the cut line
+            // from the labelled patch with one empty (commented) line.
+            if template_cut.is_some() {
+                out.push_str(&trailer());
+            }
             out.push_str(&h("Changes to be committed:\n"));
         }
         let mut staged_args: Vec<&str> = vec!["--cached"];
+        if template_cut.is_some() {
+            staged_args.push("--no-color");
+        }
         if labelled {
             staged_args.extend_from_slice(&["--src-prefix=c/", "--dst-prefix=i/"]);
         }
-        // `opt.def = s->reference` again (wt-status.c:1173): the verbose patch is
-        // measured against the same commit the staged section was, so an `--amend`
-        // report diffs the index against `HEAD^1` rather than `HEAD`.
-        if !unborn && reference.spec() != "HEAD" {
-            staged_args.push(reference.spec());
+        // `opt.def = s->is_initial ? empty_tree_oid_hex(...) : s->reference`
+        // (wt-status.c:1173): the verbose patch is measured against the same tree
+        // the staged section was, so an `--amend` report diffs the index against
+        // `HEAD^1`, and one whose reference does not resolve against the empty
+        // tree. The second case is not the same as letting `git diff --cached`
+        // pick its own default: amending a root commit leaves `HEAD` resolvable
+        // while `HEAD^1` is not, and the patch must still show the whole tree as
+        // new files rather than the empty difference from `HEAD`.
+        if let Some(base) = verbose_base {
+            staged_args.push(base);
         }
         out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
         blocks.push(verbose_patch(workdir, &staged_args));
@@ -4700,10 +4775,11 @@ fn render_long(
             out.push_str(&h(&format!("{}\n", "-".repeat(50))));
             out.push_str(&h("Changes not staged for commit:\n"));
             out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
-            blocks.push(verbose_patch(
-                workdir,
-                &["--src-prefix=i/", "--dst-prefix=w/"],
-            ));
+            let mut work_args: Vec<&str> = vec!["--src-prefix=i/", "--dst-prefix=w/"];
+            if template_cut.is_some() {
+                work_args.push("--no-color");
+            }
+            blocks.push(verbose_patch(workdir, &work_args));
         }
     }
 

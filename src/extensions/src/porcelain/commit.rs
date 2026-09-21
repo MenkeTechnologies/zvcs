@@ -3773,6 +3773,37 @@ fn template_untouched(message: &str, template: &str, cleanup: Cleanup, comment: 
         .all(|l| l.trim().is_empty() || l.starts_with(comment))
 }
 
+/// Settle `s->verbose` the way `cmd_commit()` does:
+///
+/// ```c
+/// verbose = -1; /* unspecified */
+/// ...
+/// if (verbose == -1)
+///         verbose = (config_commit_verbose < 0) ? 0 : config_commit_verbose;
+/// ```
+///
+/// (builtin/commit.c:1820, :1827-1828.) The command line wins outright, and
+/// `commit.verbose` only speaks for an unspecified one. That config is read with
+/// `git_config_bool_or_int()` (builtin/commit.c:1688-1691), so it takes both a
+/// boolean spelling and a number — and a *negative* number is floored to zero
+/// rather than being the truthy value `if (s->verbose)` would otherwise see.
+fn resolve_verbose(cli: Option<u32>, snap: &gix::config::Snapshot<'_>) -> u32 {
+    if let Some(n) = cli {
+        return n;
+    }
+    // `git_parse_maybe_bool_text()` first (config.c): the boolean spellings
+    // answer 1/0, anything else falls through to `git_config_int()`.
+    let Some(raw) = snap.string("commit.verbose") else {
+        return 0;
+    };
+    let raw = raw.to_string();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => 1,
+        "false" | "no" | "off" | "" => 0,
+        other => other.parse::<i64>().unwrap_or(0).max(0) as u32,
+    }
+}
+
 /// Resolve `--cleanup=<mode>` (else `commit.cleanup`) into git's
 /// `commit_msg_cleanup_mode` — a port of `get_cleanup_mode()`, whose `default`
 /// and `scissors` answers both depend on whether an editor is used.

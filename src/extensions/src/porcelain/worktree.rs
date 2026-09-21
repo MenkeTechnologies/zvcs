@@ -2176,6 +2176,15 @@ fn add(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // worktree.c:848-849, after every `--orphan` pairing and before the argument
+    // count is looked at: `--reason` is only ever the text `--lock` writes into
+    // the administrative `locked` file, so on its own it is refused rather than
+    // quietly dropped.
+    if lock_reason.is_some() && !lock_it {
+        eprintln!("fatal: the option '--reason' requires '--lock'");
+        return Ok(ExitCode::from(128));
+    }
+
     // `if (ac < 1 || ac > 2) usage_with_options(…)` (worktree.c:643) — the block
     // alone, no `error:` line, for either side of the range.
     if positional.len() > 2 {
@@ -2267,6 +2276,54 @@ fn add(args: &[String]) -> Result<ExitCode> {
     .then(|| unique_tracking_name(&repo, &dwim_name))
     .flatten();
 
+    // worktree.c:877-912, `add()`'s DWIM chain. Every arm that can end up with no
+    // start point consults `can_use_local_refs()` — the two `ac < 2` arms through
+    // `dwim_orphan()`, `--detach` and an explicit `HEAD` directly — so the
+    // `HEAD points to an invalid (or orphaned) reference.` warning is emitted
+    // here, once, ahead of the `Preparing worktree` line. The explicit `--orphan`
+    // arms (worktree.c:877-882) ask nothing, which is why this whole block is
+    // skipped for them.
+    if !orphan {
+        if detach {
+            // worktree.c:883-885.
+            if branch_arg == "HEAD" {
+                can_use_local_refs(&repo, quiet)?;
+            }
+        } else if commit_ish.is_none() {
+            // worktree.c:886-898. `-b` takes `dwim_orphan(…, remote = 0)`
+            // unconditionally; the bare form runs `dwim_branch()` first and only
+            // asks when that found nothing — an existing local branch of the
+            // path's name, or the remote-tracking branch `--guess-remote` picked,
+            // is a source branch and settles it.
+            let dwim_branch_found = new_branch.is_none()
+                && (guessed_start.is_some()
+                    || repo
+                        .try_find_reference(format!("refs/heads/{dwim_name}").as_str())
+                        .ok()
+                        .flatten()
+                        .is_some());
+            if !dwim_branch_found {
+                match dwim_orphan(
+                    &repo,
+                    quiet,
+                    force,
+                    guess_remote,
+                    opt_track.is_some(),
+                    checkout,
+                    new_branch.is_none(),
+                )? {
+                    DwimOrphan::No => {}
+                    DwimOrphan::Yes => orphan = true,
+                    DwimOrphan::Fatal => return Ok(ExitCode::from(128)),
+                }
+            }
+        } else if branch_arg == "HEAD" {
+            // worktree.c:910-911: the `ac == 2` arm asks the same question when
+            // the `<commit-ish>` spelled out is `HEAD`.
+            can_use_local_refs(&repo, quiet)?;
+        }
+    }
+
     // worktree.c:919-930, the floor every `add` passes through before anything is
     // created: `if (!opts.orphan && !lookup_commit_reference_by_name(branch))` is
     // `die(_("invalid reference: %s"), branch)`, and `attempt_hint = !opts.quiet &&
@@ -2306,14 +2363,18 @@ fn add(args: &[String]) -> Result<ExitCode> {
         Some(start) => start,
         None => match resolve_start(&repo, new_branch.as_deref(), force_branch, detach, commit_ish, &dwim_name, guessed_start.as_deref()) {
             Ok(start) => start,
-            Err(e) => {
-                match invalid_reference(&repo, branch_arg, path_arg, new_branch.as_deref(), quiet, commit_ish.is_none())? {
-                    Some(code) => return Ok(code),
-                    // `dwim_orphan()` inferred `--orphan` instead of dying, which is
-                    // the unborn-worktree floor this port does not build; let the
-                    // resolver's own failure stand.
-                    None => return Err(e),
-                }
+            // worktree.c:919-930 is unconditional once `--orphan` was neither
+            // given nor inferred: whatever the start point was meant to be, it
+            // does not resolve.
+            Err(_) => {
+                return invalid_reference(
+                    &repo,
+                    branch_arg,
+                    path_arg,
+                    new_branch.as_deref(),
+                    quiet,
+                    commit_ish.is_none(),
+                )
             }
         },
     };
@@ -2622,14 +2683,9 @@ fn invalid_reference(
     new_branch: Option<&str>,
     quiet: bool,
     ac_lt_2: bool,
-) -> Result<Option<ExitCode>> {
-    // `can_use_local_refs()` (worktree.c:691-701) runs on every `ac < 2` arm —
-    // through `dwim_orphan()` for the two DWIM branches and directly for
-    // `--detach` — so its warning belongs to all of them and to none of the
-    // `ac == 2` ones.
-    if ac_lt_2 && !can_use_local_refs(repo, quiet)? {
-        return Ok(None);
-    }
+) -> Result<ExitCode> {
+    // `can_use_local_refs()` has already been asked by whichever arm of the DWIM
+    // chain ran (worktree.c:883-911); this floor only reports.
     if !quiet && ac_lt_2 {
         // Both texts end in a newline, so `vadvise()` emits a blank `hint:` line
         // between the block and its `Disable this message with …` trailer.
@@ -2657,7 +2713,132 @@ fn invalid_reference(
         };
     }
     eprintln!("fatal: invalid reference: {branch}");
-    Ok(Some(ExitCode::from(128)))
+    Ok(ExitCode::from(128))
+}
+
+/// What `dwim_orphan()` (builtin/worktree.c:746-763) concluded.
+enum DwimOrphan {
+    /// A source branch exists, so `--orphan` is not inferred.
+    No,
+    /// Nothing to start from: `--orphan` is inferred.
+    Yes,
+    /// `die()`, either because the inferred `--orphan` contradicts an option that
+    /// was given or because `can_use_remote_refs()` found a remote but no refs.
+    Fatal,
+}
+
+/// Port of `dwim_orphan()` (builtin/worktree.c:746-763). Reached by both `ac < 2`
+/// arms of `add()`; `remote` distinguishes them, since only the bare
+/// `worktree add <path>` form lets `--guess-remote` supply a start point.
+///
+/// The order matters: `can_use_remote_refs()`'s own `die()` comes out *before*
+/// the `No possible source branch` line, and the two option-conflict refusals
+/// come out after it.
+fn dwim_orphan(
+    repo: &gix::Repository,
+    quiet: bool,
+    force: bool,
+    guess_remote: bool,
+    opt_track: bool,
+    checkout: bool,
+    remote: bool,
+) -> Result<DwimOrphan> {
+    if can_use_local_refs(repo, quiet)? {
+        return Ok(DwimOrphan::No);
+    }
+    if remote {
+        match can_use_remote_refs(repo, force, guess_remote)? {
+            RemoteRefs::Usable => return Ok(DwimOrphan::No),
+            RemoteRefs::Stop => {
+                eprintln!(
+                    "fatal: No local or remote refs exist despite at least one remote\n\
+                     present, stopping; use 'add -f' to override or fetch a remote first"
+                );
+                return Ok(DwimOrphan::Fatal);
+            }
+            RemoteRefs::None => {}
+        }
+    }
+    if !quiet {
+        eprintln!("No possible source branch, inferring '--orphan'");
+    }
+    // The inferred `--orphan` is then checked against the same two options the
+    // explicit spelling is (worktree.c:842-847), and reported the same way: the
+    // message names `--orphan` even though the user never typed it.
+    if opt_track {
+        eprintln!("fatal: options '--orphan' and '--track' cannot be used together");
+        return Ok(DwimOrphan::Fatal);
+    }
+    if !checkout {
+        eprintln!("fatal: options '--orphan' and '--no-checkout' cannot be used together");
+        return Ok(DwimOrphan::Fatal);
+    }
+    Ok(DwimOrphan::Yes)
+}
+
+/// What `can_use_remote_refs()` (builtin/worktree.c:716-770) found.
+enum RemoteRefs {
+    /// `--guess-remote` is on and at least one remote-tracking ref resolves.
+    Usable,
+    /// Nothing usable, and nothing worth stopping over.
+    None,
+    /// No refs at all but a remote is configured — git stops rather than invent
+    /// an unborn branch on top of a repository that was probably just not
+    /// fetched yet. `-f` overrides.
+    Stop,
+}
+
+/// Port of `can_use_remote_refs()` (builtin/worktree.c:716-770).
+fn can_use_remote_refs(repo: &gix::Repository, force: bool, guess_remote: bool) -> Result<RemoteRefs> {
+    if !guess_remote {
+        return Ok(RemoteRefs::None);
+    }
+    // `refs_for_each_remote_ref()` with `first_valid_ref`: any `refs/remotes/*`
+    // that actually resolves.
+    let any = repo
+        .references()?
+        .prefixed("refs/remotes/")?
+        .filter_map(std::result::Result::ok)
+        .any(|mut r| r.peel_to_id_in_place().is_ok());
+    if any {
+        return Ok(RemoteRefs::Usable);
+    }
+    if !force && default_remote_is_configured(repo) {
+        return Ok(RemoteRefs::Stop);
+    }
+    Ok(RemoteRefs::None)
+}
+
+/// `remote_get(NULL)` (remote.c:793-824, :832-836) reduced to the one bit
+/// `can_use_remote_refs()` reads: whether it answers with a remote at all.
+///
+/// `remotes_remote_for_branch()` (remote.c:666-680) picks the name —
+/// `branch.<current>.remote` if it is set, otherwise the sole configured remote
+/// when there is exactly one, otherwise `origin` — and reports whether the name
+/// came from configuration (`explicit`). `remotes_remote_get_1()` then keeps the
+/// result only if `valid_remote()` holds, meaning a URL was configured …
+/// except that an *explicit* name that names nothing gets `add_url_alias()`
+/// applied to it (remote.c:816-817), which installs the name itself as the URL
+/// and so makes it valid. That is why `branch.main.remote = other` counts as a
+/// remote even with no `remote.other.*` section at all, while a bare defaulted
+/// `origin` in a repository with no remotes does not.
+fn default_remote_is_configured(repo: &gix::Repository) -> bool {
+    let snapshot = repo.config_snapshot();
+    let explicit = repo
+        .head_name()
+        .ok()
+        .flatten()
+        .and_then(|n| snapshot.string(&format!("branch.{}.remote", n.shorten())))
+        .map(|v| v.to_string());
+    if explicit.is_some() {
+        return true;
+    }
+    let names = repo.remote_names();
+    let name = match names.len() {
+        1 => names.iter().next().map(|n| n.to_string()).unwrap_or_default(),
+        _ => "origin".to_string(),
+    };
+    repo.find_remote(name.as_str()).is_ok()
 }
 
 /// Port of `can_use_local_refs()` (worktree.c:691-701): whether the repository

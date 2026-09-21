@@ -2093,6 +2093,26 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         _ => None,
     };
 
+    // ```c
+    // if (clean_message_contents)
+    //         strbuf_stripspace(&sb, NULL);
+    // ```
+    //
+    // (builtin/commit.c:924-925), with `clean_message_contents = (cleanup_mode !=
+    // COMMIT_MSG_CLEANUP_NONE)` (:773) — turned back off by the one seed that
+    // must reach the editor byte for byte, a `-t <file>` template (:887). The
+    // `NULL` comment string means whitespace only: trailing blanks trimmed, runs
+    // of blank lines collapsed, leading and trailing blank lines dropped.
+    //
+    // It runs before the sign-off and before the buffer is written, so this is
+    // the text the editor, the hooks, `--trailer` and `template_untouched()` all
+    // see. Without it `git commit -e -F <file>` opened the editor on the file's
+    // own leading blank line, and every line of the block below it was one line
+    // further down than git puts it.
+    if cleanup != Cleanup::Verbatim && template_seed.is_none() {
+        buf = cleanup_message(&buf, &comment, Cleanup::Whitespace, false);
+    }
+
     // `-s`/`--signoff` appends `Signed-off-by:` *before* the buffer is written, so
     // the editor and the `--trailer` pass both see it — `append_signoff()`
     // (sequencer.c) called from `prepare_to_commit()`.

@@ -59,6 +59,12 @@ use gix::refs::Target;
 
 use super::{Arg, LongOpt};
 
+/// `cmd_restore()`'s short options, the same table read a character at a time:
+/// `-S`, `-W`, `-2`, `-3`, `-m`, `-q` and `-p` take no value, while
+/// `-s`/`--source` and the `OPT_DIFF_UNIFIED` `-U` require one.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "SW23mqph", values: "sU", optargs: "", number: false };
+
 /// `cmd_restore()`'s option table (builtin/checkout.c:2187), in the order
 /// `parse_options_concat()` builds it: `restore_options[]`, then
 /// `add_common_options()`, then `add_checkout_path_options()`.
@@ -401,6 +407,14 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let mut patch_opts = super::reset::PatchDiffOpts::without_auto_advance();
     let mut patch_mode = false;
 
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461), which is
+    // what makes `git restore -SW <path>` the same as `-S -W <path>`. It used
+    // to be written out again below, over a hand-written list that did not
+    // know `-U` takes a value, so `git restore -2U 3 -p` refused ``switch
+    // `U'``.
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
+
     let mut i = 0;
     while i < args.len() {
         // A value still owed to `-U`/`--inter-hunk-context` is taken verbatim,
@@ -569,47 +583,6 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 eprintln!("error: unknown option `{}'", &s[2..]);
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
-            }
-            // A short cluster, walked the way `parse_options_step()` walks one
-            // (parse-options.c:1061-1107): every character is an option of its own, a
-            // value-taking one swallows the rest of the token or the next argv element, and
-            // the first character the table does not claim is named alone. This is what
-            // makes `git restore -SW <path>` the same as `-S -W <path>`.
-            s if s.starts_with('-') && !s.starts_with("--") && s.len() > 2 => {
-                for (off, c) in s.char_indices().skip(1) {
-                    let rest = &s[off + c.len_utf8()..];
-                    match c {
-                        'S' => staged = Some(true),
-                        'W' => worktree = Some(true),
-                        '2' => pick = Some(Pick::Ours),
-                        '3' => pick = Some(Pick::Theirs),
-                        'm' => merge_flag = true,
-                        'q' => {}
-                        'p' => patch_mode = true,
-                        'h' => return Ok(super::show_usage(USAGE)),
-                        's' => {
-                            source = Some(match rest.is_empty() {
-                                false => rest.to_string(),
-                                true => {
-                                    i += 1;
-                                    match args.get(i) {
-                                        Some(v) => v.clone(),
-                                        None => {
-                                            eprintln!("error: switch `s' requires a value");
-                                            return Ok(ExitCode::from(129));
-                                        }
-                                    }
-                                }
-                            });
-                            break;
-                        }
-                        _ => {
-                            eprintln!("error: unknown switch `{c}'");
-                            eprint!("{USAGE}");
-                            return Ok(ExitCode::from(129));
-                        }
-                    }
-                }
             }
             s if s.starts_with('-') && s != "-" => {
                 eprintln!("error: unknown switch `{}'", &s[1..2]);

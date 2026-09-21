@@ -169,6 +169,13 @@ use gix::objs::tree::EntryMode;
 use super::interpret_trailers::TrailerConfig;
 use super::{Arg, LongOpt};
 
+/// `builtin_commit_options[]`'s short options, the same table read a character
+/// at a time: `-m`, `-F`, `-C`, `-c`, `-t` and the `OPT_DIFF_UNIFIED` `-U`
+/// require a value, while `-u`/`--untracked-files` and `-S`/`--gpg-sign` are
+/// `PARSE_OPT_OPTARG` and take only an *attached* one.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "aqnsveoizph", values: "mFCctU", optargs: "uS", number: false };
+
 /// `cmd_commit()`'s `struct option builtin_commit_options[]` (builtin/commit.c),
 /// in table order, as [`super::resolve_long`] reads it.
 ///
@@ -758,6 +765,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // git's `commit` has no `--auto-advance`, unlike `add`/`reset`/`checkout`.
     let mut patch_opts = super::reset::PatchDiffOpts::without_auto_advance();
 
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461). It used to
+    // be written out again below, over a hand-written character list that did
+    // not know `-U` takes a value, so `git commit -aU 3 -p` refused ``switch
+    // `U'`` where stock reaches the `--unified` requires `--patch` fatal.
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
+
     let mut i = 0;
     while i < args.len() {
         // A value still owed to `-U`/`--unified`/`--inter-hunk-context` is taken
@@ -983,90 +997,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("-u") && s.len() > 2 => {
                 untracked_arg = Some(s[2..].to_string())
             }
-            // A bundled short-flag cluster, e.g. `-am <msg>`, `-qam <msg>`,
-            // `-amMSG`. git's parse-options treats every char as its own option;
-            // the first one that takes a value consumes the rest of the cluster,
-            // or the next argv element when the cluster ends there.
-            s if s.len() > 1 && s.starts_with('-') => {
-                let cluster = &s[1..];
-                for (off, c) in cluster.char_indices() {
-                    match c {
-                        'a' => all = true,
-                        'q' => quiet = true,
-                        'n' => verify = false,
-                        's' => signoff = true,
-                        'v' => verbose = Some(verbose.unwrap_or(0) + 1),
-                        'e' => edit_flag = Some(true),
-                        'o' => only_flag = true,
-                        'i' => include_flag = true,
-                        'p' => patch_interactive = true,
-                        'z' => null_term = true,
-                        // Optional-value short flags: bare in a cluster they take
-                        // their default, an attached value ends the cluster.
-                        'u' | 'S' => {
-                            let rest = &cluster[off + c.len_utf8()..];
-                            match c {
-                                'u' => {
-                                    untracked_arg = Some(if rest.is_empty() {
-                                        "all".to_string()
-                                    } else {
-                                        rest.to_string()
-                                    })
-                                }
-                                _ => {
-                                    gpg_sign = GpgSign::On(
-                                        (!rest.is_empty()).then(|| rest.to_string()),
-                                    )
-                                }
-                            }
-                            if !rest.is_empty() {
-                                break;
-                            }
-                        }
-                        'm' | 'F' | 'C' | 'c' | 't' => {
-                            // Value-taking flags consume the rest of the cluster,
-                            // else the next argv element. `-c` also sets reedit.
-                            let rest = &cluster[off + c.len_utf8()..];
-                            let val = match rest.is_empty() {
-                                // `optname(opt, OPT_SHORT)`: the character, not
-                                // the token — ``switch `m'``, never ``option `-m'``.
-                                true => crate::parseopt::get_arg(
-                                    args,
-                                    &mut i,
-                                    crate::parseopt::OptName::Short(c),
-                                )?
-                                .to_string(),
-                                false => rest.to_string(),
-                            };
-                            match c {
-                                'm' => messages.push(val),
-                                'F' => file_args.push(val),
-                                'C' => reuse_arg = Some(val),
-                                'c' => {
-                                    reuse_arg = Some(val);
-                                    reedit = true;
-                                }
-                                't' => template_arg = Some(val),
-                                _ => unreachable!(),
-                            }
-                            break;
-                        }
-                        // parse_options_step() tests `internal_help` inside the
-                        // short-option loop, so `-h` answers wherever it lands
-                        // in a cluster — on stdout at 129, with no `error:` line.
-                        'h' => return Ok(super::show_usage(USAGE)),
-                        // `PARSE_OPT_UNKNOWN` for the character parsing stopped
-                        // at, against the synthetic `-<rest>` token the C builds
-                        // at parse-options.c:1095 — which also carries the
-                        // non-ASCII case, where git names the whole token.
-                        _ => {
-                            return Ok(super::unknown_option(
-                                &format!("-{}", &cluster[off..]),
-                                USAGE,
-                            ))
-                        }
-                    }
-                }
+            // `if (internal_help && *ctx->opt == 'h') goto show_usage`
+            // (parse-options.c:1069-1070, 1087-1088): reached once the clump
+            // loop has applied everything in front of it, on stdout at 129 with
+            // no `error:` line — a help request is not a rejection.
+            "-h" => return Ok(super::show_usage(USAGE)),
+            // `PARSE_OPT_UNKNOWN` for the character parsing stopped at. The
+            // clump loop has already handed this arm the synthetic `-<rest>`
+            // token the C builds at parse-options.c:1095, which also carries
+            // the non-ASCII case, where git names the whole token.
+            s if s.starts_with('-') && s != "-" => {
+                return Ok(super::unknown_option(s, USAGE))
             }
             // A bare positional argument is a pathspec (git's `--only` mode).
             _ => pathspecs.push(args[at].clone()),

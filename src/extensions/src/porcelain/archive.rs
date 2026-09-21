@@ -424,6 +424,11 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     let mut literal = false;
     let mut i = 0;
 
+    // `parse_short_opt()`'s character loop, so `-lv` is `-l -v` and `-v0` is
+    // `-v` then the `OPTION_NUMBER` entry that sets the compression level
+    // (parse-options.c:441-452).
+    let args = &crate::parseopt::expand_short(args, SHORT_OPTS)[..];
+
     while i < args.len() {
         let a = args[i].as_str();
         if literal {
@@ -1060,6 +1065,19 @@ const OUTER_OPTS: &[super::LongOpt] = &[
     super::LongOpt { name: "exec", neg: false, arg: super::Arg::Required },
 ];
 
+/// `write_archive()`'s own short options (builtin/archive.c, archive.c:678-700):
+/// `-l`, `-v` and `-h` take no value, `-o` is an `OPT_FILENAME`, and `-NUM` is
+/// the `OPTION_NUMBER` entry the format backend reads as a compression level.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "lvh", values: "o", optargs: "", number: true };
+
+/// The outer table's single short option. Its `PARSE_OPT_KEEP_ALL` keeps a word
+/// whose *first* character is not `o` whole, which is what the clump loop does
+/// with an unknown character anyway — so `-vo out` reaches the inner parse
+/// intact and `-o out` does not.
+const OUTER_SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "", values: "o", optargs: "", number: false };
+
 /// `parse_options(argc, argv, prefix, local_opts, NULL, PARSE_OPT_KEEP_ALL)`
 /// (builtin/archive.c:97-98).
 ///
@@ -1074,6 +1092,7 @@ fn parse_outer(args: &[String]) -> std::result::Result<Outer, ExitCode> {
     };
     let mut i = 0;
     let mut literal = false;
+    let args = &crate::parseopt::expand_short(args, OUTER_SHORT_OPTS)[..];
     while i < args.len() {
         let a = args[i].as_str();
         // `PARSE_OPT_KEEP_DASHDASH`: the `--` stays in argv, and option parsing

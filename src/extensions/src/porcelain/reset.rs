@@ -376,6 +376,11 @@ impl PatchDiffOpts {
 /// `--inter-hunk-context` are `PARSE_OPT_NONEG` too, so none of the seven has a
 /// `--no-` spelling. `no-refresh` is an entry spelled with its own `no-`, which
 /// parse-options reads as the *unset* sense of `refresh`.
+/// `cmd_reset()`'s short options (builtin/reset.c's `options[]`): `-q`, `-p`
+/// and `-N` take no value, `-U`/`--unified` requires one.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "qpNh", values: "U", optargs: "", number: false };
+
 const LONG_OPTS: &[super::LongOpt] = &[
     super::LongOpt { name: "quiet",                       neg: true,  arg: super::Arg::None },
     super::LongOpt { name: "no-refresh",                  neg: true,  arg: super::Arg::None },
@@ -447,6 +452,11 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     let repo = repo;
 
     // ---- 1. Parse flags, honoring the `--` paths separator. ----
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461), so `-qN`
+    // is `-q -N`. `-U` is the one short option here that requires a value, so
+    // it takes the rest of its word (builtin/reset.c's `options[]`).
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
     let mut mode: Option<ResetMode> = None;
     let mut quiet = false;
     let mut refresh = true;

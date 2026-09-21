@@ -507,6 +507,248 @@ pub fn silent(code: u8) -> anyhow::Error {
     anyhow::Error::new(crate::fatal::Silent(code))
 }
 
+// ---------------------------------------------------------------------------
+// parse_short_opt()'s character loop
+// ---------------------------------------------------------------------------
+//
+// A short option in git is a *character*, never a word. `parse_options_step()`
+// points `ctx->opt` at the second byte of the argument and then keeps calling
+// `parse_short_opt()` until the word is exhausted:
+//
+// ```c
+//         if (arg[1] != '-') {
+//                 ctx->opt = arg + 1;
+//                 switch (parse_short_opt(ctx, options)) {
+//                 ...
+//                 while (ctx->opt) {
+//                         switch (parse_short_opt(ctx, options)) {
+//                         case PARSE_OPT_UNKNOWN:
+//                                 if (internal_help && *ctx->opt == 'h')
+//                                         goto show_usage;
+//                                 /* fake a short option thing to hide the fact
+//                                  * that we may have started to parse aggregated
+//                                  * stuff */
+//                                 ctx->argv[0] = xstrdup(ctx->opt - 1);
+//                                 *(char *)ctx->argv[0] = '-';
+//                                 goto unknown;
+// ```
+// (parse-options.c:1061-1107)
+//
+// and `parse_short_opt()` itself decides how much of the word one character
+// eats:
+//
+// ```c
+//         for (; options->type != OPTION_END; options++) {
+//                 if (options->short_name == *p->opt) {
+//                         p->opt = p->opt[1] ? p->opt + 1 : NULL;
+//                         return get_value(p, options, OPT_SHORT);
+//                 }
+//                 if (options->type == OPTION_NUMBER)
+//                         numopt = options;
+//         }
+//         if (numopt && isdigit(*p->opt)) {
+//                 size_t len = 1;
+//                 while (isdigit(p->opt[len]))
+//                         len++;
+//                 arg = xmemdupz(p->opt, len);
+//                 p->opt = p->opt[len] ? p->opt + len : NULL;
+// ```
+// (parse-options.c:426-461)
+//
+// The whole word behind the matched character survives in `p->opt`, and what
+// happens to it is decided by the option's *type*, in `get_arg()`:
+//
+// ```c
+//         if (p->opt) {
+//                 *arg = p->opt;
+//                 p->opt = NULL;
+//         } else if (p->argc > 1) {
+//                 p->argc--;
+//                 *arg = *++p->argv;
+//         } else
+//                 return error(_("%s requires a value"), optname(opt, flags));
+// ```
+// (parse-options.c:47-62)
+//
+// So a value-taking character swallows the *rest of the word* whatever it looks
+// like (`git diff -U3p` is `error: --unified expects a numerical value`, not
+// `-U 3` plus `-p`), an option carrying `PARSE_OPT_NOARG` leaves the rest for
+// the next character, and a `PARSE_OPT_OPTARG` option takes an attached value
+// but never a detached one (`git diff -Mp` is `error: invalid argument to
+// find-renames`), which is why its token cannot be split at all.
+
+/// One command's short-option table, as much of it as the clump loop needs:
+/// the three shapes `get_arg()` distinguishes, plus whether the table carries
+/// an `OPTION_NUMBER` entry, which makes a run of digits one option
+/// (parse-options.c:441-452).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Shorts<'a> {
+    /// Characters whose options take no value.
+    pub flags: &'a str,
+    /// Characters whose options require one.
+    pub values: &'a str,
+    /// Characters whose options take an optional *attached* value.
+    pub optargs: &'a str,
+    /// The table has an `OPTION_NUMBER` entry, so `-v0` is `-v` then `-0`.
+    pub number: bool,
+}
+
+impl<'a> Shorts<'a> {
+    /// A table of flags only, the common case.
+    pub const fn flags(flags: &'a str) -> Shorts<'a> {
+        Shorts { flags, values: "", optargs: "", number: false }
+    }
+}
+
+/// `parse_options_step()`'s short-option loop as an argv rewrite: every clumped
+/// short option is handed back as the separate words git would have read it as,
+/// so a command that matches whole tokens (`"-q" | "--quiet"`) sees what
+/// `parse_short_opt()` would have fed it one character at a time.
+///
+/// A word this table does not fully own is left where git leaves it. An unknown
+/// character ends the clump and the remainder is emitted as the synthetic
+/// `-<rest>` token `parse_options_step()` builds before `goto unknown`
+/// (parse-options.c:1095-1096), so the caller's own refusal names the character
+/// parsing stopped at — ``unknown switch `Z' `` for `-vZ`, not `` `vZ' ``.
+///
+/// Only the option part of the line is rewritten: `--` ends the rewrite and its
+/// tail is copied through untouched, since those words are pathspecs whatever
+/// they start with.
+pub fn expand_short(args: &[String], table: Shorts<'_>) -> Vec<String> {
+    expand(args, table, Mode { stop_at_non_option: false, owned_words_only: false })
+}
+
+/// [`expand_short`] for a command parsed with `PARSE_OPT_STOP_AT_NON_OPTION`.
+///
+/// Option parsing there ends at the first `*arg != '-' || !arg[1]` token
+/// (parse-options.c:1023-1030), and every word behind it is an operand however
+/// it is spelled — `git config user.name -ab` stores the literal `-ab`. The
+/// rewrite has to stop at the same place or it invents a second operand.
+pub fn expand_short_to_operand(args: &[String], table: Shorts<'_>) -> Vec<String> {
+    expand(args, table, Mode { stop_at_non_option: true, owned_words_only: false })
+}
+
+/// [`expand_short`] for a command that parses its argv in more than one pass,
+/// where a word is rewritten only when this table owns it from end to end.
+///
+/// `git show` is the case: `cmd_log_init()` sweeps `builtin_log_options` first
+/// and `setup_revisions()` reaches the diff table afterwards, and the two are
+/// not interchangeable. `git show -qp` works, because the first pass matches
+/// `q` and hands `-p` to the second; `git show -pq` is `fatal: unrecognized
+/// argument: -q`, because the pass that owns `q` stopped at the unknown `p`
+/// before it could be reached. A rewritten token carries no record of which
+/// pass synthesized it, so splitting a word this table does not fully own would
+/// hand the other pass an option stock never lets it see. Leaving such a word
+/// whole is the conservative half of the difference: the command still refuses
+/// it, which is what stock does too.
+pub fn expand_short_owned_words(args: &[String], table: Shorts<'_>) -> Vec<String> {
+    expand(args, table, Mode { stop_at_non_option: false, owned_words_only: true })
+}
+
+/// The two ways the rewrite narrows itself, each a property of the command
+/// being parsed rather than of `parse_short_opt()`.
+#[derive(Clone, Copy)]
+struct Mode {
+    /// `PARSE_OPT_STOP_AT_NON_OPTION`: stop at the first operand.
+    stop_at_non_option: bool,
+    /// Rewrite only a word this table owns from end to end; see
+    /// [`expand_short_owned_words`].
+    owned_words_only: bool,
+}
+
+fn expand(args: &[String], table: Shorts<'_>, mode: Mode) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        // `if (*arg != '-' || !arg[1])`: a positional or a lone `-`. A `--`
+        // word is `parse_long_opt()`'s.
+        let operand = !a.starts_with('-') || a.as_str() == "-";
+        if a == "--" || (operand && mode.stop_at_non_option) {
+            out.push(a.clone());
+            out.extend(rest.cloned());
+            return out;
+        }
+        if operand || a.starts_with("--") {
+            out.push(a.clone());
+            continue;
+        }
+        let mut word = Vec::new();
+        let owes = expand_word(&a[1..], table, &mut word);
+        // In owned-words mode the synthetic remainder token
+        // `parse_options_step()` builds at parse-options.c:1095-1096 is the
+        // tell that this table did not finish the word: put the word back.
+        let unowned = mode.owned_words_only
+            && word.last().is_some_and(|last| {
+                last.starts_with('-') && !claimed(last.chars().nth(1).unwrap_or('-'), table)
+            });
+        match unowned {
+            true => out.push(a.clone()),
+            false => out.extend(word),
+        }
+        // `get_arg()`'s detached form: the word ended on an option that still
+        // owes a value, so the next word is that value and is never looked at
+        // as an option (parse-options.c:47-62). Copying it through here is what
+        // keeps a value that happens to look like a clump — `git commit -m -ab`
+        // — from being rewritten.
+        if owes {
+            if let Some(v) = rest.next() {
+                out.push(v.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Whether one character reaches an entry of `table` at all.
+fn claimed(c: char, table: Shorts<'_>) -> bool {
+    table.flags.contains(c)
+        || table.values.contains(c)
+        || table.optargs.contains(c)
+        || (table.number && c.is_ascii_digit())
+}
+
+/// One `-xyz` word, split the way `parse_short_opt()` would have consumed it.
+///
+/// Returns whether the word ran out on an option that still owes a value, i.e.
+/// whether `get_arg()` would take the *next* argv word.
+fn expand_word(body: &str, table: Shorts<'_>, out: &mut Vec<String>) -> bool {
+    let mut at = 0;
+    while at < body.len() {
+        let c = body[at..].chars().next().expect("a char boundary");
+        let tail = &body[at + c.len_utf8()..];
+
+        if table.flags.contains(c) {
+            out.push(format!("-{c}"));
+            at += c.len_utf8();
+            continue;
+        }
+        if table.values.contains(c) {
+            // `get_arg()`: `p->opt` is the value if anything is left of the
+            // word, and the next argv word if not.
+            out.push(format!("-{c}"));
+            if !tail.is_empty() {
+                out.push(tail.to_string());
+                return false;
+            }
+            return true;
+        }
+        if table.optargs.contains(c) {
+            out.push(format!("-{c}{tail}"));
+            return false;
+        }
+        if table.number && c.is_ascii_digit() {
+            let len = body[at..].find(|d: char| !d.is_ascii_digit()).unwrap_or(body.len() - at);
+            out.push(format!("-{}", &body[at..at + len]));
+            at += len;
+            continue;
+        }
+        // `ctx->argv[0] = xstrdup(ctx->opt - 1); *ctx->argv[0] = '-';`
+        out.push(format!("-{}", &body[at..]));
+        return false;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +926,113 @@ mod tests {
         );
         // The index must not move: nothing was consumed.
         assert_eq!(i, 1);
+    }
+
+    /// A flag clump is the separate words git reads it as, and the characters
+    /// in front of an unknown one are still consumed — `git branch -vZ` applies
+    /// `-v` and then refuses `Z` alone.
+    #[test]
+    fn a_clump_of_flags_becomes_one_word_per_character() {
+        let t = Shorts::flags("spq");
+        assert_eq!(expand_short(&v(&["-sp"]), t), v(&["-s", "-p"]));
+        assert_eq!(expand_short(&v(&["-spq", "HEAD"]), t), v(&["-s", "-p", "-q", "HEAD"]));
+        // `ctx->argv[0] = xstrdup(ctx->opt - 1)`: the refusal names `Z`, and
+        // everything behind it rides along in the synthetic token.
+        assert_eq!(expand_short(&v(&["-sZp"]), t), v(&["-s", "-Zp"]));
+        assert_eq!(OptName::typed("-Zp"), OptName::Short('Z'));
+    }
+
+    /// `get_arg()`: a required value is the rest of the word, or the next word
+    /// when the option ends the word. Both forms reach the command as `-m` plus
+    /// one value word.
+    #[test]
+    fn a_value_taking_character_swallows_the_rest_of_the_word() {
+        let t = Shorts { flags: "q", values: "m", optargs: "", number: false };
+        assert_eq!(expand_short(&v(&["-qm", "x"]), t), v(&["-q", "-m", "x"]));
+        assert_eq!(expand_short(&v(&["-qmx"]), t), v(&["-q", "-m", "x"]));
+        // Whatever is left is the value, options included: `git diff -U3p` is
+        // one bad `--unified` value and not `-U 3` plus `-p`.
+        let u = Shorts { flags: "p", values: "U", optargs: "", number: false };
+        assert_eq!(expand_short(&v(&["-U3p"]), u), v(&["-U", "3p"]));
+        assert_eq!(expand_short(&v(&["-pU3"]), u), v(&["-p", "-U", "3"]));
+    }
+
+    /// `PARSE_OPT_OPTARG` takes an attached value and never a detached one, so
+    /// its token must stay glued: `git diff -Mp` is `-M` with the value `p`.
+    #[test]
+    fn an_optarg_character_keeps_its_word_glued() {
+        let t = Shorts { flags: "p", values: "", optargs: "M", number: false };
+        assert_eq!(expand_short(&v(&["-Mp"]), t), v(&["-Mp"]));
+        assert_eq!(expand_short(&v(&["-pM"]), t), v(&["-p", "-M"]));
+        assert_eq!(expand_short(&v(&["-pM50"]), t), v(&["-p", "-M50"]));
+    }
+
+    /// `OPTION_NUMBER` (parse-options.c:441-452): a run of digits is one option
+    /// and parsing continues behind it, which is what makes `git archive -v0`
+    /// hand `-0` to the format backend.
+    #[test]
+    fn a_digit_run_is_one_option_when_the_table_has_a_number_entry() {
+        let t = Shorts { flags: "v", values: "", optargs: "", number: true };
+        assert_eq!(expand_short(&v(&["-v0"]), t), v(&["-v", "-0"]));
+        assert_eq!(expand_short(&v(&["-v12v"]), t), v(&["-v", "-12", "-v"]));
+        // Without the entry a digit is just an unknown character.
+        assert_eq!(expand_short(&v(&["-v0"]), Shorts::flags("v")), v(&["-v", "-0"]));
+        assert_eq!(expand_short(&v(&["-v12v"]), Shorts::flags("v")), v(&["-v", "-12v"]));
+    }
+
+    /// A detached value is a *value*, so it is copied through without being
+    /// looked at — `get_arg()` reads `*++p->argv` and never `parse_short_opt()`
+    /// (parse-options.c:52-54). Without that the rewrite reads an operand as a
+    /// clump, which is how `git commit -m -ab` would have become `-m -a -b`.
+    #[test]
+    fn a_detached_value_is_never_rewritten() {
+        let t = Shorts { flags: "ab", values: "m", optargs: "", number: false };
+        assert_eq!(expand_short(&v(&["-m", "-ab"]), t), v(&["-m", "-ab"]));
+        // …and only that one word: the next is an option again.
+        assert_eq!(
+            expand_short(&v(&["-am", "-ab", "-ab"]), t),
+            v(&["-a", "-m", "-ab", "-a", "-b"])
+        );
+        // An *attached* value ends the word, so the next one is an option again.
+        assert_eq!(expand_short(&v(&["-mx", "-ab"]), t), v(&["-m", "x", "-a", "-b"]));
+        // A value that is itself an option word is still just a value, and only
+        // that one word is skipped.
+        assert_eq!(expand_short(&v(&["-m", "-m", "-ab"]), t), v(&["-m", "-m", "-a", "-b"]));
+    }
+
+    /// An operand is not an option however it is spelled, so its characters are
+    /// never matched against the table.
+    #[test]
+    fn an_operand_is_not_a_clump() {
+        let t = Shorts { flags: "ab", values: "m", optargs: "", number: false };
+        // `am` is a path, not `-a -m`, and it does not eat the word behind it.
+        assert_eq!(expand_short(&v(&["am", "-ab"]), t), v(&["am", "-a", "-b"]));
+    }
+
+    /// Owned-words mode rewrites a word only when the table finishes it, and
+    /// still steps over a detached value rather than rewriting it.
+    #[test]
+    fn owned_words_mode_leaves_a_word_it_does_not_finish() {
+        let t = Shorts { flags: "ab", values: "m", optargs: "", number: false };
+        assert_eq!(expand_short_owned_words(&v(&["-ab"]), t), v(&["-a", "-b"]));
+        // `Z` is in no entry, so the whole word goes back the way it came —
+        // where plain `expand_short` would have produced `-a` plus `-Zb`.
+        assert_eq!(expand_short_owned_words(&v(&["-aZb"]), t), v(&["-aZb"]));
+        assert_eq!(expand_short(&v(&["-aZb"]), t), v(&["-a", "-Zb"]));
+        assert_eq!(expand_short_owned_words(&v(&["-m", "-ab"]), t), v(&["-m", "-ab"]));
+    }
+
+    /// Nothing outside the option part of the line is touched: long options, a
+    /// lone `-`, an operand, and every word behind `--`.
+    #[test]
+    fn only_clumped_short_options_are_rewritten() {
+        let t = Shorts::flags("sp");
+        assert_eq!(
+            expand_short(&v(&["--stat", "-", "-s", "x", "--", "-sp", "-x"]), t),
+            v(&["--stat", "-", "-s", "x", "--", "-sp", "-x"])
+        );
+        // A word that is already one option is handed back byte for byte.
+        assert_eq!(expand_short(&v(&["-s"]), t), v(&["-s"]));
     }
 
     /// `PARSE_OPT_LASTARG_DEFAULT` consumes whatever follows and falls back to

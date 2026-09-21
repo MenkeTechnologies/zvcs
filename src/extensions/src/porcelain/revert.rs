@@ -288,6 +288,12 @@ struct Options {
     mode: Option<Cmd>,
 }
 
+/// `cmd_revert()`'s short options (builtin/revert.c's `options[]`): `-e`, `-n`
+/// and `-s` take no value, `-m` and `-X` require one, and `-S`/`--gpg-sign`
+/// carries `PARSE_OPT_OPTARG`.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "ensh", values: "mX", optargs: "S", number: false };
+
 pub fn revert(args: &[String]) -> Result<ExitCode> {
     // `dispatch` hands over the operand list without the verb; tolerate a
     // leading literal `revert` so the module also works if it is ever wired
@@ -308,6 +314,13 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
     // applied only when neither was.
     let mut gpg_sign_explicit = false;
     let mut reference_explicit = false;
+
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461), so `-ne`
+    // is `-n -e`. `-m` and `-X` require a value and `--gpg-sign` is
+    // `PARSE_OPT_OPTARG`, so `-Skey` is a key id and `-S key` is not
+    // (builtin/revert.c's `options[]`).
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
 
     let mut i = 0;
     while i < args.len() {

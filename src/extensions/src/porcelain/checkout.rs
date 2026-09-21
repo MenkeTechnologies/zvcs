@@ -186,6 +186,12 @@ const USAGE: &str = r"usage: git checkout [<options>] <branch>
 /// `parse_long_opt()` skips them (parse-options.c:544-545) and they are absent
 /// here. The five `PARSE_OPT_NONEG` entries are the two writeout-stage selectors
 /// and the two diff-context integers.
+/// `checkout_main()`'s short options (builtin/checkout.c's `options[]`): `-b`,
+/// `-B` and `-U` require a value, `--track` is `PARSE_OPT_OPTARG` so `-tdirect`
+/// is a track mode and `-t direct` is not, and the rest take none.
+pub(super) const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "23dflmpqh", values: "bBU", optargs: "t", number: false };
+
 pub(super) const LONG_OPTS: &[super::LongOpt] = {
     use super::{Arg, LongOpt};
     &[
@@ -303,6 +309,13 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut merge = false;
     let mut conflict_style: Option<String> = None;
 
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461), so `-qb`
+    // is `-q -b`. It runs *after* the `args[0] == "-b"` test above, which
+    // `cmd_checkout()` makes on the raw argv: `git checkout -bnb` is one word
+    // there and does not get `switch -c`'s behaviour.
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
+
     let mut i = 0;
     while i < args.len() {
         let orig = args[i].as_str();
@@ -365,7 +378,17 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // tracking already implemented here; `inherit` needs upstream-inheritance
         // substrate that is not vendored, so it errors honestly rather than
         // silently behaving like `direct`. An unknown value is git's 129.
-        if let Some(val) = a.strip_prefix("--track=") {
+        // `-t<mode>` is the same option: `get_value()` hands a short option the
+        // rest of its word with no `=` to strip (parse-options.c:48-50), so
+        // `-tdirect` is `--track=direct` and `-t direct` is a bare `--track`
+        // followed by a start point. `parse_opt_tracking_mode()` spells its
+        // refusal `--track` whichever form was typed — measured against stock
+        // 2.55.0: `git checkout -t2` is ``error: option `--track' expects
+        // "direct" or "inherit"``.
+        if let Some(val) = a.strip_prefix("--track=").or_else(|| match a.starts_with("--") {
+            true => None,
+            false => a.strip_prefix("-t").filter(|rest| !rest.is_empty()),
+        }) {
             match val {
                 "direct" => track = Some(true),
                 "inherit" => bail!(

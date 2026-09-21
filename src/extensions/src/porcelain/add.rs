@@ -71,6 +71,12 @@ use super::{Arg, LongOpt};
 /// `--unified` and `--inter-hunk-context` come from `OPT_DIFF_UNIFIED` /
 /// `OPT_DIFF_INTERHUNK_CONTEXT`, both `PARSE_OPT_NONEG`, so neither has a `--no-`
 /// spelling; every other entry does.
+/// `cmd_add()`'s short options (builtin/add.c's `builtin_add_options`): nine
+/// toggles, plus the `OPT_DIFF_UNIFIED` `-U` the interactive hunk selector
+/// shares with `reset` and `checkout`, which requires a value.
+pub(super) const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "nvfAuNpieh", values: "U", optargs: "", number: false };
+
 pub(super) const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "dry-run",                     neg: true,  arg: Arg::None },
     LongOpt { name: "verbose",                     neg: true,  arg: Arg::None },
@@ -146,6 +152,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let mut edit_interactive = false;
     let mut pathspecs: Vec<String> = Vec::new();
     let mut positional_only = false;
+
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461). It used to
+    // be spelled out again below, over a hand-written list of nine toggles that
+    // knew nothing of `-U`'s value, so `git add -AU 3 -p` refused ``switch
+    // `U'``.
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
 
     let mut i = 0;
     while i < args.len() {
@@ -281,31 +294,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // `edit_interactive` is an `OPT_BOOL`, so its unset writes 0 — the
             // ordinary add, whatever an earlier `-e` asked for.
             "--no-edit" => edit_interactive = false,
-            // `-h` is handled by `parse_options()` before any other switch in the
-            // same bundle, so `git add -hv` still prints the table.
-            other if other.starts_with('-')
-                && !other.starts_with("--")
-                && other[1..].contains('h') =>
-            {
-                return print_usage();
-            }
-            // Bundled short flags like `-nv`; every char must be a known toggle.
-            other if other.starts_with('-') && !other.starts_with("--") && other.len() > 1 => {
-                for c in other[1..].chars() {
-                    match c {
-                        'n' => dry_run = true,
-                        'v' => verbose = true,
-                        'f' => force = true,
-                        'A' => all = true,
-                        'u' => update_only = true,
-                        'N' => intent_to_add = true,
-                        'p' => patch_interactive = true,
-                        'i' => add_interactive = true,
-                        'e' => edit_interactive = true,
-                        _ => return usage_error(format!("unknown switch `{c}'")),
-                    }
-                }
-            }
+            // `if (internal_help && *ctx->opt == 'h') goto show_usage`
+            // (parse-options.c:1069-1070, 1087-1088): reached once the clump
+            // loop has already applied everything in front of it, which is what
+            // makes `git add -vh` print the table and `git add -Zh` refuse `Z`.
+            "-h" => return print_usage(),
             other if other.starts_with('-') => return Ok(super::unknown_option(other, USAGE)),
             // A non-option argument is handed back unchanged by the resolver.
             _ => pathspecs.push(a.to_string()),
@@ -2729,13 +2722,6 @@ fn print_usage_all() -> Result<ExitCode> {
     Ok(ExitCode::from(129))
 }
 
-/// A usage error (git exit 129): unknown option/switch. git names the offending
-/// option, then prints the same table `-h` does — on stderr this time.
-fn usage_error(msg: String) -> Result<ExitCode> {
-    eprintln!("error: {msg}");
-    eprint!("{USAGE}");
-    Ok(ExitCode::from(129))
-}
 
 /// A fatal argument error (git exit 128).
 fn usage_fatal(msg: String) -> Result<ExitCode> {

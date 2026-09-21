@@ -576,6 +576,20 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // `parse_options` already consumed the *first* `--`, so this only ever fires
     // on a second one — and when it does, `seen_dashdash` also declares every
     // argument in front of it a revision.
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461) over the
+    // diff table, which is where every short option fast-export understands
+    // lives: its own table declares none, so stage 1 keeps `-DM` whole and
+    // `diff_opt_parse()` is what splits it. Only a word the diff table owns end
+    // to end is rewritten — the synthetic `-<rest>` token a clump leaves behind
+    // (parse-options.c:1095-1096) is not offered to `handle_revision_opt()`
+    // again, so splitting a word the table does not finish would hand the sweep
+    // below an option stock never lets it see.
+    let expanded = crate::parseopt::expand_short_owned_words(
+        &rest.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+        super::diff::DIFF_SHORT_OPTS,
+    );
+    let mut rest: Vec<&str> = expanded.iter().map(String::as_str).collect();
+
     let mut seen_dashdash = false;
     if let Some(p) = rest.iter().position(|t| *t == "--") {
         pathspecs.extend(rest[p + 1..].iter().map(|t| t.to_string()));

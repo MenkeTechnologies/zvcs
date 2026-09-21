@@ -372,6 +372,21 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `git_log_output_encoding` (environment.c:51), set by `--encoding=<enc>`.
     let mut log_encoding: Option<String> = None;
 
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461) over the
+    // *diff* table, the one `setup_revisions()` reaches through
+    // `diff_opt_parse()` — this is what makes `git show -sp` the same as
+    // `-s -p`. A character the diff table does not claim ends the clump and
+    // rides on in the synthetic `-<rest>` token (parse-options.c:1095-1096),
+    // which is what `handle_revision_opt()`'s whole-word `strcmp()`s see.
+    //
+    // `builtin_log_options`' own `-q` and `-L` are deliberately *not* in this
+    // table, and the rewrite only touches a word the diff table owns from end
+    // to end — see [`crate::parseopt::expand_short_owned_words`] for why the
+    // two passes cannot be merged into one.
+    let expanded =
+        crate::parseopt::expand_short_owned_words(args, super::diff::DIFF_SHORT_OPTS);
+    let args = &expanded[..];
+
     for (idx, a) in args.iter().enumerate() {
         let s = a.as_str();
         // parse_options_step()'s `internal_help`. `git show` is `builtin/log.c`,

@@ -34,6 +34,12 @@ fn parse_score(arg: &str) -> Option<u32> {
 /// `parse_options` renders `blame_opt_usage` through that name, so
 /// `git annotate -h` differs from `git blame -h` in exactly that one line
 /// (verified against git 2.55.0 with `diff <(git blame -h) <(git annotate -h)`).
+/// `cmd_blame()`'s short options (builtin/blame.c's `options[]`): ten toggles,
+/// `-L` and `-S` requiring a value, and the two `PARSE_OPT_OPTARG` scores `-C`
+/// and `-M`, which take an attached value only.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "bceflnpstwh", values: "LS", optargs: "CM", number: false };
+
 /// `cmd_blame()`'s `struct option options[]` (builtin/blame.c), in table order,
 /// as [`super::resolve_long`] reads it. `--diff-algorithm` is the only
 /// `PARSE_OPT_NONEG` entry. `-b`, `-c`, `-t`, `-l`, `-s`, `-w`, `-S`, `-C`, `-M`
@@ -5067,6 +5073,16 @@ impl Options {
         // `post.is_some()` means a `--` separator was seen.
         let mut pre: Vec<String> = Vec::new();
         let mut post: Option<Vec<String>> = None;
+
+        // `parse_short_opt()`'s character loop (parse-options.c:426-461), so
+        // `-ln` is `-l -n`. `-L` and `-S` require a value; `-C` and `-M` are
+        // `PARSE_OPT_OPTARG` scores, so `-C2` is a score and `-C 2` is not.
+        // A character this table does not claim ends the clump and rides on in
+        // the synthetic `-<rest>` token (parse-options.c:1095-1096), which is
+        // what the revision-option arms below then see — `cmd_blame()` passes
+        // `PARSE_OPT_KEEP_UNKNOWN_OPT`.
+        let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+        let args = &expanded[..];
 
         let mut i = 0;
         while i < args.len() {

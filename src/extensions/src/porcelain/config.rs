@@ -1064,6 +1064,11 @@ fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(Into::into).or_else(std::env::home_dir)
 }
 
+/// `cmd_config_actions()`'s short options (builtin/config.c:73, 103, 113,
+/// 1381-1382): `-l`, `-e` and `-z` take no value, `-f` and `-t` require one.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "lezh", values: "ft", optargs: "", number: false };
+
 pub fn config(args: &[String]) -> Result<ExitCode> {
     // `cmd_config()`'s outer `parse_options()` is nothing but `OPT_SUBCOMMAND`s: a leading `list`,
     // `get`, `set`, `unset`, `rename-section`, `remove-section` or `edit` selects a subcommand
@@ -1080,6 +1085,14 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Some(Err(code)) => return Ok(code),
         None => args,
     };
+
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461), so `-ef`
+    // is `-e -f`. `-l`, `-e` and `-z` are `OPT_CMDMODE`/`OPT_BOOL`; `-f` is an
+    // `OPT_STRING` and `-t` an `OPT_CALLBACK`, both with a required value, so
+    // each takes the rest of its word (builtin/config.c:73, 103, 113,
+    // 1381-1382).
+    let expanded = crate::parseopt::expand_short_to_operand(args, SHORT_OPTS);
+    let args = &expanded[..];
 
     let mut mode = Mode::Auto;
     let mut scope = Scope::Default;

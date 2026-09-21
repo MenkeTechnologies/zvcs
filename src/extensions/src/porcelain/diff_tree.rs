@@ -515,6 +515,17 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     /// option before that point was cancelled and must not be replayed.
     let mut formats_cleared_at: Option<usize> = None;
 
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461) over the
+    // diff table, so `-Rp` is `-R -p`. Only a word the table owns end to end is
+    // rewritten: the synthetic `-<rest>` token a clump leaves behind
+    // (parse-options.c:1095-1096) is not offered to `handle_revision_opt()`
+    // again but falls into `cmd_diff_tree()`'s own leftover loop, so splitting
+    // a word the diff table does not finish would hand that loop an option
+    // stock never lets it see.
+    let expanded =
+        crate::parseopt::expand_short_owned_words(args, super::diff::DIFF_SHORT_OPTS);
+    let args = &expanded[..];
+
     // git scans the whole argument list for a literal `--` up front; when one is
     // present every argument before it must be a revision.
     let seen_dashdash = args.iter().any(|a| a == "--");

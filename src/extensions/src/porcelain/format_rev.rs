@@ -243,6 +243,11 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
     // option on its own is inert — see the `Ph::Notes` check below.
     let mut notes: Vec<String> = Vec::new();
 
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461): `-z` and
+    // `-h` are the whole short table, so `-hz` is `-h -z`.
+    let expanded = crate::parseopt::expand_short(args, crate::parseopt::Shorts::flags("zh"));
+    let args = &expanded[..];
+
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();

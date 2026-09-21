@@ -164,6 +164,11 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
     let mut o = Opts::default();
     let mut positional_only = false;
 
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461) over
+    // `add`'s table, which `stage` shares byte for byte.
+    let expanded = crate::parseopt::expand_short(args, super::add::SHORT_OPTS);
+    let args = &expanded[..];
+
     let mut i = 0;
     // `parse_options()` stops at the first switch it cannot serve here, so the
     // delegating arms below leave the scan rather than keep reading argv: git
@@ -341,39 +346,13 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
             // Recognized git flags that this port does not implement: name them.
             "-e" | "--edit" => bail!("--edit is not supported"),
 
-            // `-h` is handled by `parse_options()` before any other switch in the
-            // same bundle, so `git stage -hv` still prints the table — `git add`'s
-            // table, byte for byte, since both verbs share one option set.
-            other if other.starts_with('-')
-                && !other.starts_with("--")
-                && other[1..].contains('h') =>
-            {
-                o.delegate = true;
-                break 'argv;
-            }
-            // Bundled short flags like `-nv`; every char must be a known toggle.
-            other if other.starts_with('-') && !other.starts_with("--") && other.len() > 1 => {
-                for c in other[1..].chars() {
-                    match c {
-                        'n' => o.dry_run = true,
-                        'v' => o.verbose = true,
-                        'f' => o.force = true,
-                        'A' => o.addremove = Some(true),
-                        'u' => o.update = true,
-                        'N' => o.intent_to_add = true,
-                        'p' => o.patch_interactive = true,
-                        'i' => o.add_interactive = true,
-                        'e' => bail!("--edit is not supported"),
-                        // parse-options reports the *first* unknown switch and
-                        // stops; `add` re-reads the same argv and renders it.
-                        _ => {
-                            o.delegate = true;
-                            break 'argv;
-                        }
-                    }
-                }
-            }
-            other if other.starts_with("--") && other != "--" => {
+            // `if (internal_help && *ctx->opt == 'h') goto show_usage`
+            // (parse-options.c:1069-1070, 1087-1088), and parse-options' own
+            // refusal for anything else: `add` re-reads the same argv and
+            // renders it, and the clump loop above has already handed it the
+            // remainder as the `-<rest>` word git would report
+            // (parse-options.c:1095-1096).
+            other if other.starts_with('-') && other != "--" => {
                 o.delegate = true;
                 break 'argv;
             }

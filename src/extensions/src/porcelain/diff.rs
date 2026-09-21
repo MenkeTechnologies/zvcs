@@ -1212,6 +1212,31 @@ struct Analysis {
     images: Option<(Vec<u8>, Vec<u8>)>,
 }
 
+/// `diff_opt_parse()`'s short options (`parseopts[]`, diff.c:6041-6300), the
+/// table every verb that ends in `setup_revisions()` shares.
+///
+/// `-U`, `-X`, `-B`, `-M` and `-C` carry `PARSE_OPT_OPTARG`, so their value is
+/// only ever the rest of the word — `git diff -Mp` is `error: invalid argument
+/// to find-renames`, not `-M` followed by `-p`. `-l` (`OPT_INTEGER`), `-I`,
+/// `-S`, `-G` and `-O` (`OPT_FILENAME`) require one, so each swallows the rest
+/// of the word or takes the next: `git diff -U3p` is `error: --unified expects
+/// a numerical value`.
+/// It holds no `h`: `diff_opt_parse()` is reached with the command's own
+/// `parse_options()` already past, so a mid-clump `-h` is nothing to it —
+/// `git show -ph` is `fatal: unrecognized argument: -h`, not the usage block.
+pub(crate) const DIFF_SHORT_OPTS: crate::parseopt::Shorts<'static> = crate::parseopt::Shorts {
+    flags: "psuWDwbaRz",
+    values: "lIOSG",
+    optargs: "UXBMC",
+    number: false,
+};
+
+/// [`DIFF_SHORT_OPTS`] with `h`, for `cmd_diff()`, which has no option table of
+/// its own: `parse_options()`' `internal_help` is still live when the diff
+/// table is read, so `git diff -ph` prints the usage block.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "psuWDwbaRzh", ..DIFF_SHORT_OPTS };
+
 // ---------------------------------------------------------------------------
 // entry point
 // ---------------------------------------------------------------------------
@@ -1644,6 +1669,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // not glued on with `=`; parse-options consumes it before anything else, `--`
     // included. This holds the flag still waiting for that value.
     let mut pending_value: Option<String> = None;
+
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461) over the
+    // diff table, so `-pw` is `-p -w`. A character the table does not claim
+    // ends the clump and rides on in the synthetic `-<rest>` token
+    // (parse-options.c:1095-1096), which keeps every revision option and every
+    // unknown switch exactly where it was.
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
 
     for (arg_idx, a) in args.iter().enumerate() {
         if let Some(flag) = pending_value.take() {

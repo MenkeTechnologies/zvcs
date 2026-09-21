@@ -912,6 +912,23 @@ enum Parsed {
 /// the path (128), never on the flag. Flags we have not ported are therefore
 /// recorded and reported only after every argument has been validated.
 fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461) over the
+    // diff table, which is the one pass `diff-files` has: `setup_revisions()`
+    // tries `handle_revision_opt()`'s whole-word `strcmp()`s first and only
+    // then hands the word to `diff_opt_parse()`. So `-RB` is `-R -B`, while
+    // `-01` stays whole and reaches `handle_revision_opt()` as `--max-count=1`.
+    //
+    // Only a word the diff table owns end to end is rewritten, because the
+    // synthetic `-<rest>` token a clump leaves behind (parse-options.c:1095-1096)
+    // is *not* offered to `handle_revision_opt()` again: it lands in the
+    // leftover argv, where `cmd_diff_files()`'s `while (1 < argc && argv[1][0]
+    // == '-')` loop knows only `--base`, `--ours`, `--theirs` and `-q`. That is
+    // why `git diff-files -c` prints a combined diff while `git diff-files -Rc`
+    // is the usage block, and a single rewrite cannot tell the two `-c`s apart.
+    let expanded =
+        crate::parseopt::expand_short_owned_words(args, super::diff::DIFF_SHORT_OPTS);
+    let args = &expanded[..];
+
     let mut opts = Opts {
         fmt: 0,
         format: Format::Raw,

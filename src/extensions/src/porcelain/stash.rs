@@ -375,6 +375,22 @@ pub(super) const PUSH_OPTS: &[LongOpt] = &[
     LongOpt { name: "pathspec-file-nul", neg: true, arg: Arg::None },
 ];
 
+/// `push_stash()`'s short options, the same table read a character at a time:
+/// `-k`, `-S`, `-p`, `-q`, `-u` and `-a` take no value, while `-m` and the
+/// `OPT_DIFF_UNIFIED` `-U` require one (builtin/stash.c:1917-1938).
+pub(super) const PUSH_SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "kSpquah", values: "mU", optargs: "", number: false };
+
+/// `store_stash()`'s table (builtin/stash.c:1159-1164): `OPT__QUIET` and an
+/// `OPT_STRING` message.
+pub(super) const STORE_SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "qh", values: "m", optargs: "", number: false };
+
+/// `apply_stash()`, `pop_stash()` and `drop_stash()` (builtin/stash.c:780-791,
+/// 886-891, 862-865) share one short option, `OPT__QUIET`.
+pub(super) const QUIET_SHORT_OPTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts::flags("qh");
+
 /// `save_stash()`'s table (builtin/stash.c:2024-2043): `push`'s first ten
 /// entries. The two pathspec options are `push`-only, so `git stash save
 /// --pathspec-from-file=x` is an unknown option where `push` accepts it.
@@ -3746,6 +3762,11 @@ fn set_prev(line: &mut Vec<u8>, prev: &[u8]) -> Result<()> {
 /// With one entry in the table an abbreviation can never be ambiguous, so
 /// `--q`, `--quie`, `--n` and `--no` all resolve — as they do in stock.
 fn parse_drop_options(args: &[String]) -> std::result::Result<(bool, Vec<String>), ExitCode> {
+    // `OPT__QUIET` is the whole table, so a clump can only be `-q` repeated —
+    // but an unknown character behind one still has to name itself
+    // (parse-options.c:1086-1097).
+    let expanded = crate::parseopt::expand_short(args, QUIET_SHORT_OPTS);
+    let args = &expanded[..];
     let mut quiet = false;
     let mut named = Vec::new();
     let mut only_names = false;
@@ -4066,6 +4087,15 @@ fn parse_push_options(
     // `OPT_DIFF_UNIFIED`/`OPT_DIFF_INTERHUNK_CONTEXT`/`--[no-]auto-advance`, the
     // hunk selector's knobs, parsed by the same helper `reset -p` uses.
     let mut patch_opts = super::reset::PatchDiffOpts::default();
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461), so `-qm x`
+    // is `-q -m x`. `push_assumed` is git's `PARSE_OPT_STOP_AT_NON_OPTION`
+    // (builtin/stash.c:1941-1945), which ends option parsing — and so the
+    // rewrite — at the first operand.
+    let expanded = match push_assumed {
+        true => crate::parseopt::expand_short_to_operand(args, PUSH_SHORT_OPTS),
+        false => crate::parseopt::expand_short(args, PUSH_SHORT_OPTS),
+    };
+    let args = &expanded[..];
     let mut i = 0;
     while i < args.len() {
         let orig = args[i].as_str();
@@ -4266,6 +4296,11 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
     let mut words: Vec<String> = Vec::new();
     let mut rest_are_words = false;
     let mut patch_opts = super::reset::PatchDiffOpts::default();
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461): `save`
+    // reads `push`'s first ten entries, so `-qm x` is `-q -m x` here too
+    // (builtin/stash.c:2024-2043).
+    let expanded = crate::parseopt::expand_short(args, PUSH_SHORT_OPTS);
+    let args = &expanded[..];
     let mut i = 0;
     while i < args.len() {
         let orig = args[i].as_str();
@@ -4368,6 +4403,10 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
 /// positional `<commit>`. Port of `store_stash`'s option table, which requires
 /// precisely one non-option argument.
 fn parse_store_options(args: &[String]) -> Result<(Option<String>, bool, String)> {
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461): `-qm x`
+    // is `-q -m x` (builtin/stash.c:1159-1164).
+    let expanded = crate::parseopt::expand_short(args, STORE_SHORT_OPTS);
+    let args = &expanded[..];
     let mut message = None;
     let mut quiet = false;
     let mut positionals: Vec<String> = Vec::new();
@@ -4469,6 +4508,11 @@ fn parse_apply_options(
     /// rather than assume: an entry missing from the table never resolves, and
     /// `parse_long_opt()` answers `PARSE_OPT_UNKNOWN` for it.
     let held = |name: &str| table.iter().any(|o| o.name == name);
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461). `OPT__QUIET`
+    // is the only short option apply, pop and drop declare
+    // (builtin/stash.c:780-791, 886-891).
+    let expanded = crate::parseopt::expand_short(args, QUIET_SHORT_OPTS);
+    let args = &expanded[..];
     let mut i = 0;
     while i < args.len() {
         let orig = args[i].as_str();

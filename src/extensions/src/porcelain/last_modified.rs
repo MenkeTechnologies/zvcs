@@ -84,6 +84,12 @@ struct Opts {
 
 /// `git last-modified` — see the module docs for the covered surface.
 pub fn last_modified(args: &[String]) -> Result<ExitCode> {
+    // `parse_short_opt()`'s character loop (parse-options.c:426-461), so `-rt`
+    // is `-r -t`. `-r`, `-t`, `-z` and `-h` are the whole short table and none
+    // of them takes a value.
+    let expanded = crate::parseopt::expand_short(args, crate::parseopt::Shorts::flags("rtzh"));
+    let args = &expanded[..];
+
     let mut max_depth: i32 = 0;
     let mut show_trees = false;
     let mut nul = false;

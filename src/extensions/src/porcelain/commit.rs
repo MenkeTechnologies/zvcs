@@ -4351,6 +4351,32 @@ impl StagedSet {
 /// is staged as mode 160000 from that submodule's checked-out HEAD, which is what
 /// git's `add_to_index()` does for `S_ISDIR` via `index_path()`'s
 /// `resolve_gitlink_ref()`.
+/// `prefix_path()` (setup.c): the repository-root-relative literal a pathspec
+/// names — the current directory's prefix joined with the spec, with `.` and
+/// `..` components resolved away and no trailing slash. A spec that is already
+/// rooted (a leading `/`, git's `:(top)` shorthand) keeps what follows it.
+fn prefix_path(spec: &[u8], cwd_prefix: &[u8]) -> Vec<u8> {
+    let joined: Vec<u8> = match spec.first() {
+        Some(b'/') => spec[1..].to_vec(),
+        _ => {
+            let mut j = cwd_prefix.to_vec();
+            j.extend_from_slice(spec);
+            j
+        }
+    };
+    let mut out: Vec<&[u8]> = Vec::new();
+    for part in joined.split(|&b| b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out.join(&b'/')
+}
+
 fn stage_pathspecs(
     repo: &gix::Repository,
     pathspecs: &[String],
@@ -4507,11 +4533,23 @@ fn stage_pathspecs(
     // left alone), which is why the whole `known` set is searched, not just the
     // paths that were restaged.
     let mut unmatched = false;
+    // `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_FULL, prefix, argv)`
+    // (builtin/commit.c:365-367) spells every spec from the top of the work tree
+    // before `ce_path_match()` ever sees it, so the literal compared against the
+    // index is `prefix_path()`'s: the current directory's prefix joined with the
+    // spec, with `.` and `..` resolved away. Comparing the spec as typed instead
+    // meant a `git commit <path>` run anywhere but the top of the work tree
+    // reported every path as unknown -- `b.txt` from `bar/` never equals the
+    // `bar/b.txt` the index holds -- and refused the commit. The walk itself was
+    // already prefix-aware, which is why only the specs this loop looks at (the
+    // literal ones) were affected.
+    let cwd_prefix = crate::setup::prefix_bytes(repo);
     for p in pathspecs {
         if p == "." || p.starts_with(':') || p.contains(['*', '?', '[']) {
             continue;
         }
-        let pb = p.as_bytes();
+        let pb = prefix_path(p.as_bytes(), &cwd_prefix);
+        let pb = pb.as_slice();
         let mut prefix = pb.to_vec();
         prefix.push(b'/');
         let matched = known

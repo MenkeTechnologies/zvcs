@@ -1172,13 +1172,35 @@ fn finish_mixed(
     quiet: bool,
     refresh: bool,
 ) -> Result<()> {
-    if !quiet && refresh && repo.workdir().is_some() {
+    // ```c
+    // int flags = quiet ? REFRESH_QUIET : REFRESH_IN_PORCELAIN;
+    // …
+    // if (!no_refresh && repo_get_work_tree(the_repository)) {
+    // ```
+    //
+    // (builtin/reset.c:493-506.) `--quiet` selects the flag word, it does not skip
+    // the refresh: a quiet reset still rewrites the stat data of every entry
+    // `read_from_tree()` just replaced. Gating the whole refresh on it left those
+    // entries with the zeroed stat the rebuild gave them, so the very next
+    // `diff-files` called each of them modified.
+    if refresh && repo.workdir().is_some() {
         // `cmd_reset` times the refresh and, past two seconds, points at the
         // `--no-refresh` that would have skipped it.
         let t0 = std::time::Instant::now();
-        refresh_index_report(repo, index)?;
+        super::update_index::refresh_index(
+            repo,
+            index,
+            super::update_index::RefreshFlags {
+                quiet,
+                in_porcelain: !quiet,
+                ..Default::default()
+            },
+            Some("Unstaged changes after reset:"),
+            None,
+        )?;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
-        if elapsed_ms > REFRESH_INDEX_DELAY_WARNING_IN_MS
+        if !quiet
+            && elapsed_ms > REFRESH_INDEX_DELAY_WARNING_IN_MS
             && crate::advice::Advice::ResetNoRefresh.enabled_in(repo)
         {
             crate::advice::Advice::ResetNoRefresh.advise_plain_in(
@@ -1196,75 +1218,6 @@ fn finish_mixed(
     // entry and so invalidates only the paths that actually moved.
     super::write_tree::carry_cache_tree_invalidating_changes(repo, old_index, index);
     crate::index_racy::write(repo, index)?;
-    Ok(())
-}
-
-/// `refresh_index(..., REFRESH_IN_PORCELAIN, "Unstaged changes after reset:")`.
-///
-/// Prints one `<status>\t<path>` line per index entry that disagrees with the
-/// worktree, under a header emitted lazily before the first line, and folds the
-/// refreshed stat data of merely-stale entries back into `index`. Paths are written
-/// as raw bytes because `refresh_index` does no quoting.
-fn refresh_index_report(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
-    use gix::status::index_worktree::Item;
-    use gix::status::plumbing::index_as_worktree::{Change as Wt, EntryStatus};
-
-    let mut changed: Vec<(BString, &'static str)> = Vec::new();
-    let mut fresh: HashMap<BString, Stat> = HashMap::new();
-
-    let iter = repo
-        .status(gix::progress::Discard)?
-        .index(gix::worktree::IndexPersistedOrInMemory::InMemory(index.clone()))
-        .untracked_files(gix::status::UntrackedFiles::None)
-        .index_worktree_options_mut(|opts| opts.dirwalk_options = None)
-        .into_index_worktree_iter(Vec::new())?;
-
-    for item in iter {
-        if let Item::Modification { rela_path, status, .. } = item? {
-            // read-cache.c picks the format string in this order: deleted, then
-            // intent-to-add, then typechange, then modified; unmerged entries are
-            // reported as `U` because reset does not pass REFRESH_UNMERGED.
-            let code = match status {
-                EntryStatus::Change(Wt::Removed) => "D",
-                EntryStatus::IntentToAdd => "A",
-                EntryStatus::Change(Wt::Type { .. }) => "T",
-                EntryStatus::Change(Wt::Modification { .. })
-                | EntryStatus::Change(Wt::SubmoduleModification(_)) => "M",
-                EntryStatus::Conflict { .. } => "U",
-                EntryStatus::NeedsUpdate(stat) => {
-                    fresh.insert(rela_path, stat);
-                    continue;
-                }
-            };
-            changed.push((rela_path, code));
-        }
-    }
-
-    // git walks the index, which is sorted by path; the status iterator is not.
-    changed.sort_by(|a, b| a.0.cmp(&b.0));
-    if !changed.is_empty() {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        out.write_all(b"Unstaged changes after reset:\n")?;
-        for (path, code) in &changed {
-            out.write_all(code.as_bytes())?;
-            out.write_all(b"\t")?;
-            out.write_all(&path[..])?;
-            out.write_all(b"\n")?;
-        }
-        out.flush()?;
-    }
-
-    if !fresh.is_empty() {
-        let backing = index.path_backing().to_owned();
-        for e in index.entries_mut() {
-            let path = e.path_in(&backing).to_owned();
-            if let Some(stat) = fresh.get(&path) {
-                e.stat = *stat;
-            }
-        }
-    }
-
     Ok(())
 }
 

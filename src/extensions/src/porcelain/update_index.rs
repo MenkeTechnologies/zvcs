@@ -328,6 +328,70 @@ struct Ctx {
 struct Die;
 
 impl Ctx {
+    /// A context with nothing set but what `refresh_index()` reads: the
+    /// repository, the index, the worktree and the three config values
+    /// (`core.fileMode`, `core.symlinks`, the stat-comparison options) that
+    /// `ce_match_stat_basic()` consults. Used by [`refresh_index`] so the
+    /// non-`update-index` callers run the very same walk.
+    fn for_refresh(repo: gix::Repository, index: gix::index::File) -> Result<Self> {
+        let workdir = repo.workdir().map(|w| {
+            normalize_lexically(&std::fs::canonicalize(w).unwrap_or_else(|_| w.to_owned()))
+        });
+        let stat_opts = repo.stat_options()?;
+        let cfg = repo.config_snapshot();
+        let trust_executable_bit = cfg.boolean("core.fileMode").unwrap_or(true);
+        let has_symlinks = cfg.boolean("core.symlinks").unwrap_or(true);
+        let ignore_stat = cfg.boolean("core.ignoreStat") == Some(true);
+        drop(cfg);
+        Ok(Ctx {
+            index_version: None,
+            repo,
+            index,
+            workdir,
+            prefix: String::new(),
+            dirty: false,
+            something_changed: false,
+            has_errors: false,
+            force_write: false,
+            split_index: None,
+            allow_add: false,
+            allow_remove: false,
+            allow_replace: false,
+            force_remove: false,
+            info_only: false,
+            verbose: false,
+            ignore_skip_worktree_entries: false,
+            refresh_quiet: false,
+            allow_unmerged: false,
+            ignore_missing: false,
+            ignore_submodules: false,
+            mark_valid: None,
+            mark_skip_worktree: None,
+            mark_fsmonitor: None,
+            set_executable_bit: None,
+            trust_executable_bit,
+            has_symlinks,
+            ignore_stat,
+            stat_opts,
+            filters: None,
+            filters_quiet: None,
+        })
+    }
+
+    /// `update-index`'s own `REFRESH_*` word: the four flags its options set,
+    /// with `really` coming from `--really-refresh` rather than from config.
+    fn refresh_flags(&self, really: bool) -> RefreshFlags {
+        RefreshFlags {
+            really,
+            allow_unmerged: self.allow_unmerged,
+            quiet: self.refresh_quiet,
+            ignore_missing: self.ignore_missing,
+            ignore_submodules: self.ignore_submodules,
+            ignore_skip_worktree: false,
+            in_porcelain: false,
+        }
+    }
+
     /// The `trust_executable_bit`/`has_symlinks` pair `ce_mode_from_stat()` reads,
     /// already resolved from config when the context was built.
     fn mode_rules(&self) -> ModeRules {
@@ -781,12 +845,14 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                 }
 
                 "refresh" => {
-                    if refresh(ctx, false)?.is_err() {
+                    let flags = ctx.refresh_flags(false);
+                    if refresh(ctx, flags, None, None)?.is_err() {
                         return Ok(Outcome::Die);
                     }
                 }
                 "really-refresh" => {
-                    if refresh(ctx, true)?.is_err() {
+                    let flags = ctx.refresh_flags(true);
+                    if refresh(ctx, flags, None, None)?.is_err() {
                         return Ok(Outcome::Die);
                     }
                 }
@@ -2002,14 +2068,161 @@ fn remove_path_entries(ctx: &mut Ctx, path: &BStr) {
 
 /// git's `refresh_index`: re-`lstat` every entry, silently repair stale stat data
 /// whose content still matches, and report the rest as `<path>: needs update`.
-fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
+/// What a shared `refresh_index()` run leaves behind for its caller.
+pub(super) struct RefreshOutcome {
+    /// git's return value: at least one path was reported.
+    pub(super) has_errors: bool,
+    /// At least one entry's stat data was rewritten, so the index must be saved.
+    pub(super) dirty: bool,
+}
+
+/// `refresh_index()` for the builtins that are not `update-index`.
+///
+/// `git add --refresh` is `refresh()` (builtin/add.c:123-134) and `git reset
+/// --mixed` is `cmd_reset()`'s `refresh_index(the_repository->index, flags,
+/// NULL, NULL, _("Unstaged changes after reset:"))` (builtin/reset.c:500-506);
+/// both are the same read-cache.c walk this file already ports for
+/// `update-index --refresh`, which is why they share it rather than
+/// re-deciding "is this entry stale" against a status walk. A status walk gets
+/// the zero-`sd_size` case wrong — `ie_modified()` re-reads the content instead
+/// of trusting a size difference when the recorded size is 0
+/// (read-cache.c:476-489) — and that is exactly the state a `read-tree` or a
+/// `reset --mixed` leaves behind, so neither verb was refreshing the entries it
+/// had just written.
+///
+/// The index is moved through a scratch [`Ctx`] and moved back, so nothing is
+/// copied.
+pub(super) fn refresh_index(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    flags: RefreshFlags,
+    header: Option<&str>,
+    matches: Option<&mut dyn FnMut(&BStr) -> bool>,
+) -> Result<RefreshOutcome> {
+    let placeholder = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    let mut ctx = Ctx::for_refresh(repo.clone(), std::mem::replace(index, placeholder))?;
+    let step = refresh(&mut ctx, flags, header, matches);
+    *index = std::mem::replace(&mut ctx.index, gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    ));
+    // `refresh()` has no `die()` of its own; the one fatal it can raise (a bad
+    // `--attr-source`) comes back as an error, not as a `Die`.
+    let _ = step?;
+    Ok(RefreshOutcome { has_errors: ctx.has_errors, dirty: ctx.dirty })
+}
+
+/// The `REFRESH_*` flags `refresh_index()` reads out of its `flags` word
+/// (read-cache.h). `update-index` passes the first four, `git add --refresh`
+/// passes `IGNORE_SKIP_WORKTREE` plus `QUIET`/`IN_PORCELAIN`, and `git reset
+/// --mixed` passes `QUIET`/`IN_PORCELAIN` alone.
+#[derive(Clone, Copy, Default)]
+pub(super) struct RefreshFlags {
+    /// `REFRESH_REALLY`: stat an assume-unchanged entry anyway.
+    pub(super) really: bool,
+    /// `REFRESH_UNMERGED`: pass over conflicted paths without a word.
+    pub(super) allow_unmerged: bool,
+    /// `REFRESH_QUIET`: report nothing (the unmerged line excepted).
+    pub(super) quiet: bool,
+    /// `REFRESH_IGNORE_MISSING`: a path that is gone is not a failure.
+    pub(super) ignore_missing: bool,
+    /// `REFRESH_IGNORE_SUBMODULES`: leave gitlinks alone.
+    pub(super) ignore_submodules: bool,
+    /// `REFRESH_IGNORE_SKIP_WORKTREE`: skip entries carrying the bit outright.
+    pub(super) ignore_skip_worktree: bool,
+    /// `REFRESH_IN_PORCELAIN`: `M\t<path>` under a header rather than
+    /// `<path>: needs update`.
+    pub(super) in_porcelain: bool,
+}
+
+/// Which of `refresh_index()`'s five format strings a reported path takes
+/// (read-cache.c:1514-1518).
+#[derive(Clone, Copy)]
+enum RefreshReport {
+    Modified,
+    Deleted,
+    TypeChange,
+    Added,
+    Unmerged,
+}
+
+/// ```c
+/// static void show_file(const char * fmt, const char * name, int in_porcelain,
+///                       int * first, const char *header_msg)
+/// {
+///         if (in_porcelain && *first && header_msg) {
+///                 printf("%s\n", header_msg);
+///                 *first = 0;
+///         }
+///         printf(fmt, name);
+/// }
+/// ```
+///
+/// (read-cache.c:1450-1458.) The header is porcelain-only and is emitted lazily,
+/// before the first line and never without one. Paths go out as raw bytes:
+/// `refresh_index()` does no quoting.
+fn show_refresh_file(
+    kind: RefreshReport,
+    path: &BStr,
+    flags: RefreshFlags,
+    first: &mut bool,
+    header: Option<&str>,
+) {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if flags.in_porcelain {
+        if *first {
+            if let Some(h) = header {
+                let _ = writeln!(out, "{h}");
+            }
+            *first = false;
+        }
+        let code = match kind {
+            RefreshReport::Modified => "M",
+            RefreshReport::Deleted => "D",
+            RefreshReport::TypeChange => "T",
+            RefreshReport::Added => "A",
+            RefreshReport::Unmerged => "U",
+        };
+        let _ = out.write_all(code.as_bytes());
+        let _ = out.write_all(b"\t");
+        let _ = out.write_all(path);
+        let _ = out.write_all(b"\n");
+    } else {
+        let tail: &[u8] = match kind {
+            RefreshReport::Unmerged => b": needs merge\n",
+            _ => b": needs update\n",
+        };
+        let _ = out.write_all(path);
+        let _ = out.write_all(tail);
+    }
+    let _ = out.flush();
+}
+
+/// `refresh_index()` (read-cache.c:1482-1610) over `ctx.index`.
+///
+/// `matches` is the `pathspec`/`ce_path_match()` pair: an entry it declines is
+/// `filtered`, which means skipped entirely — except that a conflicted path is
+/// still stepped over stage by stage, just not reported. `None` is git's
+/// `pathspec == NULL`, every entry.
+fn refresh(
+    ctx: &mut Ctx,
+    flags: RefreshFlags,
+    header: Option<&str>,
+    mut matches: Option<&mut dyn FnMut(&BStr) -> bool>,
+) -> Result<Step> {
     if ctx.workdir.is_none() {
         return Err(crate::fatal::need_work_tree());
     }
+    let mut first = true;
 
     let mut i = 0;
     while i < ctx.index.entries().len() {
-        let (path, id, mode, flags, stat, stage) = {
+        let (path, id, mode, eflags, stat, stage) = {
             let backing = ctx.index.path_backing();
             let e = &ctx.index.entries()[i];
             (
@@ -2022,10 +2235,19 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
             )
         };
 
-        if ctx.ignore_submodules && mode == Mode::COMMIT {
+        if flags.ignore_submodules && mode == Mode::COMMIT {
             i += 1;
             continue;
         }
+        if flags.ignore_skip_worktree && eflags.contains(Flags::SKIP_WORKTREE) {
+            i += 1;
+            continue;
+        }
+
+        let filtered = match matches.as_mut() {
+            Some(m) => !m(path.as_bstr()),
+            None => false,
+        };
 
         // Conflicted paths cannot be refreshed; skip all their stages at once.
         if stage != 0 {
@@ -2036,18 +2258,33 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
                 }
                 i += 1;
             }
+            if flags.allow_unmerged {
+                continue;
+            }
             // Note that `-q` deliberately does *not* silence this one; git
             // reports unmerged paths regardless.
-            if !ctx.allow_unmerged {
-                println!("{path}: needs merge");
-                ctx.has_errors = true;
+            if !filtered {
+                show_refresh_file(
+                    RefreshReport::Unmerged,
+                    path.as_bstr(),
+                    flags,
+                    &mut first,
+                    header,
+                );
             }
+            ctx.has_errors = true;
+            continue;
+        }
+
+        if filtered {
+            i += 1;
             continue;
         }
 
         // The skip-worktree bit is always honoured; assume-unchanged only until
         // `--really-refresh` tells us to stat regardless.
-        if flags.contains(Flags::SKIP_WORKTREE) || (!really && flags.contains(Flags::ASSUME_VALID))
+        if eflags.contains(Flags::SKIP_WORKTREE)
+            || (!flags.really && eflags.contains(Flags::ASSUME_VALID))
         {
             i += 1;
             continue;
@@ -2060,12 +2297,24 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
         let meta = match gix::index::fs::Metadata::from_path_no_follow(&abs) {
             Ok(m) => m,
             Err(e) => {
-                if ctx.ignore_missing && e.kind() == std::io::ErrorKind::NotFound {
+                if flags.ignore_missing && e.kind() == std::io::ErrorKind::NotFound {
                     i += 1;
                     continue;
                 }
-                if !ctx.refresh_quiet {
-                    println!("{path}: needs update");
+                if !flags.quiet {
+                    // `cache_errno == ENOENT` is the deleted arm, which outranks
+                    // every other format (read-cache.c:1590-1599).
+                    let kind = if e.kind() == std::io::ErrorKind::NotFound {
+                        RefreshReport::Deleted
+                    } else if eflags.contains(Flags::INTENT_TO_ADD) {
+                        RefreshReport::Added
+                    } else {
+                        RefreshReport::Modified
+                    };
+                    show_refresh_file(kind, path.as_bstr(), flags, &mut first, header);
+                    // `if (quiet) continue;` sits ABOVE the `has_errors = 1`
+                    // (read-cache.c:1588-1601), so a quiet refresh reports nothing
+                    // and exits 0 however stale the entry was.
                     ctx.has_errors = true;
                 }
                 i += 1;
@@ -2076,8 +2325,14 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
         // Gitlinks ignore stat data entirely: only the nested HEAD matters.
         if mode == Mode::COMMIT {
             let ok = meta.is_dir() && gitlink_head(&abs) == Some(id);
-            if !ok && !ctx.refresh_quiet {
-                println!("{path}: needs update");
+            if !ok && !flags.quiet {
+                show_refresh_file(
+                    RefreshReport::Modified,
+                    path.as_bstr(),
+                    flags,
+                    &mut first,
+                    header,
+                );
                 ctx.has_errors = true;
             }
             i += 1;
@@ -2120,8 +2375,15 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
         if up_to_date {
             ctx.index.entries_mut()[i].stat = new_stat;
             ctx.dirty = true;
-        } else if !ctx.refresh_quiet {
-            println!("{path}: needs update");
+        } else if !flags.quiet {
+            let kind = if eflags.contains(Flags::INTENT_TO_ADD) {
+                RefreshReport::Added
+            } else if (changed & TYPE_CHANGED) != 0 {
+                RefreshReport::TypeChange
+            } else {
+                RefreshReport::Modified
+            };
+            show_refresh_file(kind, path.as_bstr(), flags, &mut first, header);
             ctx.has_errors = true;
         }
         i += 1;

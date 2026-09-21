@@ -477,7 +477,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
 
     // --- index snapshot: read-only, drives staging decisions and deletions.
     // The authoritative mutation index is re-read under the lock further below.
-    let index = if repo.index_path().exists() {
+    let mut index = if repo.index_path().exists() {
         repo.open_index()?
     } else {
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
@@ -583,6 +583,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // [`super::read_tree::StatCtx::refresh_dies_on_attr_source`] — before its own
     // unmatched-pathspec loop. `-v` is `REFRESH_IN_PORCELAIN`, which names a
     // conflicted path `U\t<path>` under the header instead of `<path>: needs merge`.
+    // Whether the `--refresh` walk below rewrote any entry's stat data, so the
+    // index has to be saved even though nothing was staged.
+    let mut refreshed_index = false;
     if refresh {
         let mut ps = repo.pathspec(
             true,
@@ -598,6 +601,36 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             super::stage::print_refresh_unmerged(&death.unmerged, verbose);
             return death.die();
         }
+
+        // ```c
+        // unsigned int flags = REFRESH_IGNORE_SKIP_WORKTREE |
+        //             (verbose ? REFRESH_IN_PORCELAIN : REFRESH_QUIET);
+        //
+        // seen = xcalloc(pathspec->nr, 1);
+        // refresh_index(repo->index, flags, pathspec, seen,
+        //               _("Unstaged changes after refreshing the index:"));
+        // ```
+        //
+        // (builtin/add.c:130-134.) This is the whole of what `--refresh` does, and
+        // it has to be the real `refresh_index()` walk: deciding staleness from a
+        // status walk instead gets the zero-`sd_size` entries a `read-tree` leaves
+        // behind wrong, so `git add --refresh` after a `read-tree` refreshed
+        // nothing at all. `refresh_index()`'s own return value is discarded here —
+        // `refresh()` folds only its sparse-path advice into the exit status — so a
+        // path it reports still exits 0.
+        let outcome = super::update_index::refresh_index(
+            &repo,
+            &mut index,
+            super::update_index::RefreshFlags {
+                ignore_skip_worktree: true,
+                quiet: !verbose,
+                in_porcelain: verbose,
+                ..Default::default()
+            },
+            Some("Unstaged changes after refreshing the index:"),
+            Some(&mut |p: &BStr| ps.is_included(p, Some(false))),
+        )?;
+        refreshed_index = outcome.dirty;
     }
     // ```c
     // /* Set up the default git porcelain excludes */
@@ -1299,8 +1332,16 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     }
 
     // `--refresh` only refreshes the stat cache (invisible to the object/ref/index
-    // logical state) and never adds content: nothing more to write here.
+    // logical state) and never adds content — but the refreshed stat still has to
+    // land on disk: `cmd_add()` falls through to the same
+    // `write_locked_index(..., COMMIT_LOCK | SKIP_IF_UNCHANGED)` every other form
+    // reaches (builtin/add.c:517, 610-612).
     if refresh {
+        if refreshed_index {
+            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+            super::write_tree::prepare_offset_table(&repo, &mut index);
+            crate::index_racy::write(&repo, &mut index)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
 

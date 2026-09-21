@@ -461,6 +461,21 @@ impl ValueType {
                 ValueType::Bool | ValueType::BoolOrInt | ValueType::BoolOrStr => {
                     return Ok(b"true".to_vec());
                 }
+                // ```c
+                // if (!value)
+                //         return config_error_nonbool(var);
+                // ```
+                //
+                // opens `git_config_pathname()` (config.c:1316), `git_config_color()`
+                // (config.c:1361) and `git_config_expiry_date()` (config.c:1352) alike:
+                // these three have no reading of a valueless key, so the callback
+                // `error()`s — `missing value for '<key>'` (config.c:3552) — and the
+                // parse aborts with its own `bad config line` line. The port fed them an
+                // empty string instead, so `git config --path bool.var` printed a blank
+                // line and exited 0.
+                ValueType::Path | ValueType::Color | ValueType::ExpiryDate => {
+                    return Err(TypeError::Callback(format!("error: missing value for '{key}'")));
+                }
                 _ => {}
             }
         }
@@ -1439,6 +1454,13 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::GetColor if !(1..=2).contains(&positional.len()) => {
             return usage_error("wrong number of arguments, should be from 1 to 2");
         }
+        // `check_argc(argc, 2, 3)` (builtin/config.c:1541): `--replace-all` needs the
+        // value it collapses to, and takes an optional value-pattern after it. Without
+        // the check a one-operand `--replace-all <name>` set the key to the empty string
+        // and exited 0 where git refuses the command line.
+        Mode::ReplaceAll if !(2..=3).contains(&positional.len()) => {
+            return usage_error("wrong number of arguments, should be from 2 to 3");
+        }
         _ => {}
     }
 
@@ -1907,6 +1929,25 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         },
         // `--get`/`--get-all`/`--get-regexp <name> <value-pattern>`: the optional
         // second operand filters the returned values by an ERE (`!` inverts).
+        // ```c
+        // else if (display_opts.type == TYPE_COLOR && !strlen(argv[0]) &&
+        //          display_opts.default_value)
+        //         ret = get_color(&location_opts, "", display_opts.default_value);
+        // ```
+        //
+        // (`cmd_config_get()`, builtin/config.c:1094-1096.) `git config get --type=color
+        // --default=<c> ""` is the subcommand spelling of `--get-color "" <c>`: an empty
+        // slot matches nothing, so the default is what gets parsed and printed. Only the
+        // subcommand has this arm — the legacy `--get --type=color ""` still parses the
+        // key and refuses it.
+        Mode::Get
+            if from_subcommand
+                && d.ty == Some(ValueType::Color)
+                && positional[0].is_empty()
+                && d.default_value.is_some() =>
+        {
+            get_color(file, d.command_line, "", d.default_value.as_deref())
+        }
         Mode::Get => get(file, positional[0], false, positional.get(1).copied(), &d),
         Mode::GetAll => get(file, positional[0], true, positional.get(1).copied(), &d),
         Mode::GetKeyRegexp | Mode::GetKeyRegexpAll => get_regexp(
@@ -2352,7 +2393,23 @@ fn write_origin(out: &mut impl Write, d: &Display, meta: &gix::config::file::Met
         // no filename.
         Some(path) => {
             out.write_all(b"file:")?;
-            out.write_all(origin_path(d, meta.source, &path.to_string_lossy()).as_bytes())?;
+            let text = path.to_string_lossy();
+            let shown = origin_path(d, meta.source, &text);
+            // ```c
+            // if (opts->end_nul)
+            //         strbuf_addstr(buf, kvi->filename ? kvi->filename : "");
+            // else
+            //         quote_c_style(kvi->filename ? kvi->filename : "", buf, NULL, 0);
+            // ```
+            //
+            // (`show_config_origin()`, builtin/config.c:236-247.) A name carrying a
+            // double quote, a control byte or — with `core.quotePath` on — a high byte
+            // is C-quoted, so the tab-separated column stays parsable. Under `--null`
+            // the name is written raw, since the NUL already delimits it.
+            match d.null {
+                true => out.write_all(shown.as_bytes())?,
+                false => out.write_all(&crate::quote::quoted_name_bytes(shown.as_bytes()))?,
+            }
         }
         None if d.stdin => out.write_all(b"standard input:")?,
         None => out.write_all(origin_word(meta.source).as_bytes())?,
@@ -2798,7 +2855,23 @@ pub(crate) fn for_each_entry(
         }
         let header = section.header();
         let section_name = header.name().to_string().to_lowercase();
-        let subsection = header.subsection_name().map(ToString::to_string);
+        // ```c
+        // if (!iskeychar(c) && c != '.')
+        //         return -1;
+        // strbuf_addch(name, tolower(c));
+        // ```
+        //
+        // (`get_base_var()`, config.c:983-997.) The old-fashioned `[section.SubSection]`
+        // header is read by this loop, which lower-cases every byte of it — the dot
+        // included — so its subsection is case-insensitive. Only the extended
+        // `[section "SubSection"]` form goes through `get_extended_base_var()`
+        // (config.c:943-981), which copies the quoted run verbatim. The port kept the
+        // case for both, so `section.subsection.key` did not find a value written under
+        // `[section.SubSection]`.
+        let subsection = header.subsection_name().map(|sub| match header.is_legacy() {
+            true => sub.to_string().to_lowercase(),
+            false => sub.to_string(),
+        });
 
         let mut occurrence: Vec<(String, usize)> = Vec::new();
         for raw_name in section.value_names() {
@@ -3444,8 +3517,17 @@ fn param_metadata() -> gix::config::file::Metadata {
 ///   `unable to parse default color value` and `main()`'s `-1`, which the shell
 ///   sees as 255.
 fn get_color(file: &gix::config::File, command_line: bool, slot: &str, def_color: Option<&str>) -> Result<ExitCode> {
-    let key = parse_key(slot)?;
-    let wanted = key_of(&key);
+    // ```c
+    // static int git_get_color_config(const char *var, const char *value, …)
+    // {
+    //         if (!strcmp(var, data->get_color_slot)) {
+    // ```
+    //
+    // (builtin/config.c:759-760.) The slot is compared to each entry's key as typed and
+    // never parsed, so `git config --get-color "" red` is not a bad key — it is a slot
+    // nothing is named, which falls through to the default. The port ran the slot through
+    // `git_config_parse_key()` first and refused the empty one outright.
+    let wanted = slot.to_owned();
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

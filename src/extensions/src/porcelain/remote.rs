@@ -365,8 +365,37 @@ fn get_main_ref_store(repo: &gix::Repository) {
     let _ = repo.find_reference("HEAD");
 }
 
+/// `remote_is_configured(remote, 1)` — every `git remote` subcommand's
+/// existence test (builtin/remote.c:219, :883, :892, :1031, :1769, :1827,
+/// :1884), and `in_repo` is not decoration:
+///
+/// ```c
+/// int remote_is_configured(struct remote *remote, int in_repo)
+/// {
+///         if (!remote)
+///                 return 0;
+///         if (in_repo)
+///                 return remote->configured_in_repo;
+///         return !!remote->origin;
+/// }
+/// ```
+///
+/// `configured_in_repo` is set only while reading a `remote.<name>.*` key whose
+/// scope is `CONFIG_SCOPE_LOCAL` or `CONFIG_SCOPE_WORKTREE` (remote.c:502-504),
+/// so a key in `~/.gitconfig` names no remote here. That is why
+/// `git config --global remote.upstream.prune true` does not make
+/// `git remote rename origin upstream` a collision — the port answered from the
+/// merged configuration and refused the rename with `remote upstream already
+/// exists.`
 fn remote_exists(repo: &gix::Repository, name: &str) -> bool {
-    repo.remote_names().iter().any(|n| n.to_str_lossy() == name)
+    let cfg = repo.config_snapshot();
+    let found = cfg.plumbing().sections().any(|section| {
+        section.header().name() == "remote"
+            && matches!(section.meta().source, Source::Local | Source::Worktree)
+            && section.header().subsection_name().map(|s| s.to_str_lossy().into_owned())
+                == Some(name.to_string())
+    });
+    found
 }
 
 /// git accepts a remote name exactly when it can stand in the destination of
@@ -767,6 +796,43 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     if !valid_remote_name(name) {
         return fatal(format!("'{name}' is not a valid remote name"));
+    }
+    // ```c
+    // static int check_remote_collision(struct remote *remote, void *data)
+    // {
+    //         const char *name = data;
+    //         const char *p;
+    //
+    //         if (skip_prefix(name, remote->name, &p) && *p == '/')
+    //                 die(_("remote name '%s' is a subset of existing remote '%s'"),
+    //                     name, remote->name);
+    //         if (skip_prefix(remote->name, name, &p) && *p == '/')
+    //                 die(_("remote name '%s' is a superset of existing remote '%s'"),
+    //                     name, remote->name);
+    //
+    //         return 0;
+    // }
+    // …
+    // for_each_remote(check_remote_collision, (void *)name);
+    // ```
+    //
+    // (builtin/remote.c:162-175, :227.) `outer` and `outer/inner` would both
+    // want `refs/remotes/outer/…`, and one of them would end up owning the
+    // other's tracking refs — so the second is refused before anything is
+    // written. This was absent, and `git remote add outer/inner url` succeeded
+    // next to an existing `outer`.
+    for existing in repo.remote_names() {
+        let existing = existing.to_str_lossy();
+        if name.strip_prefix(existing.as_ref()).is_some_and(|p| p.starts_with('/')) {
+            return fatal(format!(
+                "remote name '{name}' is a subset of existing remote '{existing}'"
+            ));
+        }
+        if existing.strip_prefix(name).is_some_and(|p| p.starts_with('/')) {
+            return fatal(format!(
+                "remote name '{name}' is a superset of existing remote '{existing}'"
+            ));
+        }
     }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -1444,29 +1510,51 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     let key = if push { "pushurl" } else { "url" };
 
-    // git compiles the --delete argument as an extended regular expression.
-    let delete_re = if delete {
-        match regex::bytes::RegexBuilder::new(value).unicode(false).build() {
-            Ok(re) => Some(re),
-            Err(_) => return fatal(format!("Invalid old URL pattern: {value}")),
-        }
-    } else {
-        None
+    // ```c
+    // if (delete_mode)
+    //         oldurl = newurl;
+    // …
+    // /* Special cases that add new entry. */
+    // if ((!oldurl && !delete_mode) || add_mode) {
+    //         if (add_mode)
+    //                 repo_config_set_multivar(the_repository, name_buf.buf, newurl, "^$", 0);
+    //         else
+    //                 repo_config_set(the_repository, name_buf.buf, newurl);
+    //         goto out;
+    // }
+    //
+    // /* Old URL specified. Demand that one matches. */
+    // if (regcomp(&old_regex, oldurl, REG_EXTENDED))
+    //         die(_("Invalid old URL pattern: %s"), oldurl);
+    //
+    // for (size_t i = 0; i < urlset->nr; i++)
+    //         if (!regexec(&old_regex, urlset->v[i], 0, NULL, 0))
+    //                 matches++;
+    //         else
+    //                 negative_matches++;
+    // if (!delete_mode && !matches)
+    //         die(_("No such URL found: %s"), oldurl);
+    // if (delete_mode && !negative_matches && !push_mode)
+    //         die(_("Will not delete all non-push URLs"));
+    //
+    // if (!delete_mode)
+    //         repo_config_set_multivar(the_repository, name_buf.buf, newurl, oldurl, 0);
+    // else
+    //         repo_config_set_multivar(the_repository, name_buf.buf, NULL, oldurl,
+    //                                  CONFIG_FLAGS_MULTI_REPLACE);
+    // ```
+    //
+    // (builtin/remote.c:1880-1927.) Two things this port had wrong: `<oldurl>`
+    // is an *extended regular expression* that every matching URL is rewritten
+    // through — `git remote set-url --push <name> foo qu+x` renames `quux` —
+    // and a pattern that matches nothing is fatal. Comparing `<oldurl>`
+    // literally against the last value instead meant
+    // `git remote set-url someremote zot bar` silently did nothing and exited 0
+    // where git dies with `No such URL found: bar`.
+    let oldurl: Option<&str> = match delete {
+        true => Some(value),
+        false => pos.get(2).copied(),
     };
-
-    // Deleting every non-push URL would leave the remote unusable; git refuses
-    // when the pattern matches all of them (no URL fails to match).
-    if let Some(re) = delete_re.as_ref() {
-        if !push {
-            let survives = effective_urls(repo, name, "url")
-                .into_iter()
-                .filter(|u| !re.is_match(u.as_bytes()))
-                .count();
-            if survives == 0 {
-                return fatal("Will not delete all non-push URLs");
-            }
-        }
-    }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -1479,47 +1567,67 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             .map(|v| v.to_str_lossy().into_owned())
             .collect();
 
-        let updated: Vec<String> = if append {
-            let mut v = current.clone();
-            v.push(value.to_string());
-            v
-        } else if let Some(re) = delete_re.as_ref() {
-            current
+        let Some(oldurl) = oldurl else {
+            // `repo_config_set()` / the `add_mode` multivar append: neither
+            // reads the existing list, and neither can fail.
+            if append {
+                section.push(key, value)?;
+            } else {
+                section.set(key, value)?;
+            }
+            drop(section);
+            persist(&path, &file)?;
+            return Ok(ExitCode::SUCCESS);
+        };
+        if append {
+            section.push(key, value)?;
+            drop(section);
+            persist(&path, &file)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let re = match regex::bytes::RegexBuilder::new(oldurl).unicode(false).build() {
+            Ok(re) => re,
+            Err(_) => {
+                drop(section);
+                return fatal(format!("Invalid old URL pattern: {oldurl}"));
+            }
+        };
+        // `urlset` is `remote->url` / `remote->pushurl`, the *merged*
+        // configuration's list, which is what `effective_urls()` computes.
+        let urlset = effective_urls(repo, name, key);
+        let matches = urlset.iter().filter(|u| re.is_match(u.as_bytes())).count();
+        let negative_matches = urlset.len() - matches;
+        if !delete && matches == 0 {
+            drop(section);
+            return fatal(format!("No such URL found: {oldurl}"));
+        }
+        if delete && negative_matches == 0 && !push {
+            drop(section);
+            return fatal("Will not delete all non-push URLs");
+        }
+
+        let updated: Vec<String> = match delete {
+            true => current
                 .clone()
                 .into_iter()
                 .filter(|u| !re.is_match(u.as_bytes()))
-                .collect()
-        } else if let Some(old) = pos.get(2) {
-            current
+                .collect(),
+            false => current
                 .clone()
                 .into_iter()
-                .map(|u| {
-                    if u.as_str() == *old {
-                        value.to_string()
-                    } else {
-                        u
-                    }
+                .map(|u| match re.is_match(u.as_bytes()) {
+                    true => value.to_string(),
+                    false => u,
                 })
-                .collect()
-        } else if current.is_empty() {
-            vec![value.to_string()]
-        } else {
-            // Replace the last configured URL, leaving any earlier ones alone.
-            let mut v = current.clone();
-            let last = v.len() - 1;
-            v[last] = value.to_string();
-            v
+                .collect(),
         };
 
         // git writes through `repo_config_set*`, which edits the value where it already
         // stands (config.c) — so `remote.<name>.url` keeps its place ahead of the `fetch`
         // line the remote was created with. Rebuilding the key from scratch moved it to
         // the end of the section.
-        if append {
-            // `repo_config_set_multivar(name, newurl, "^$", 0)`: a pattern no existing
-            // value matches, which is git's way of spelling "append".
-            section.push(key, value)?;
-        } else if updated == current {
+        if updated == current {
             // Nothing matched, so there is nothing to write.
         } else if updated.len() == current.len() && current.len() == 1 {
             // `repo_config_set()`: replace the one value in place.

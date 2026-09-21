@@ -564,6 +564,10 @@ enum ConfigCallback {
     DiffUi,
     /// `git_log_config` (builtin/log.c:462).
     Log,
+    /// The same `git_log_config`, reached through the `git log` child
+    /// `list_stash()` spawns — so the refusal is the child's, but the status the
+    /// user sees is `cmd_stash`'s `!!fn(...)` (builtin/stash.c:2496): exit 1.
+    StashList,
     /// `git_format_config` (builtin/log.c:978).
     Format,
     /// `git_status_config` (builtin/commit.c:1451).
@@ -623,8 +627,26 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "log" | "show" | "whatchanged" => ConfigCallback::Log,
         "format-patch" => ConfigCallback::Format,
         "diff" | "range-diff" => ConfigCallback::DiffUi,
-        "diff-files" | "diff-index" | "diff-tree" | "stash" | "merge-tree" | "cherry-pick"
-        | "revert" => ConfigCallback::DiffBasic,
+        // `list_stash()` and `show_stash()` are not the rest of `git stash`:
+        // the first runs a `git log` child (builtin/stash.c:820-830), the second
+        // a diff through `cmd_diff`'s UI layer, while every other subcommand
+        // stops at `git_diff_basic_config` (builtin/stash.c:994). Measured on
+        // 2.55.0 with `-c <key>=bogus`: `stash list` dies for `color.ui`,
+        // `color.diff`, `diff.context`, `log.date` and `format.pretty` at exit
+        // **1** — `cmd_stash` turns the child's failure into `!!fn(...)`
+        // (builtin/stash.c:2496) — `stash show` dies for the diff-UI keys only,
+        // at 128, and leaves `log.date` / `format.pretty` alone.
+        "stash" => {
+            let first = args.iter().map(String::as_str).find(|a| *a != "stash");
+            match first {
+                Some("list") => ConfigCallback::StashList,
+                Some("show") => ConfigCallback::DiffUi,
+                _ => ConfigCallback::DiffBasic,
+            }
+        }
+        "diff-files" | "diff-index" | "diff-tree" | "merge-tree" | "cherry-pick" | "revert" => {
+            ConfigCallback::DiffBasic
+        }
         "grep" => ConfigCallback::Grep,
         "blame" | "annotate" => ConfigCallback::Blame,
         "fetch" => ConfigCallback::Fetch,
@@ -1219,6 +1241,13 @@ fn config_file_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
 }
 
+/// Whether `refs/stash` exists, i.e. whether `list_stash()` would reach its
+/// `git log` child at all (builtin/stash.c:963-964). Used only to decide
+/// whether that child's config refusals are owed.
+fn stash_ref_exists(repo: &gix::Repository) -> bool {
+    repo.try_find_reference("refs/stash").ok().flatten().is_some()
+}
+
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // Fleet command log: record this invocation when `git zcommands` has turned
     // logging on. A single `stat` (no work) when it is off, so the hot path pays
@@ -1405,6 +1434,40 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::DiffBasic => crate::diff_config::validate_basic(&repo),
                     ConfigCallback::DiffUi => crate::diff_config::validate_ui(&repo),
                     ConfigCallback::Log => crate::log_config::validate_log(&repo),
+                    // Two callbacks, two exit codes. `cmd_stash` installs
+                    // `git_diff_basic_config` in the parent (builtin/stash.c:994),
+                    // so a key *that* callback reads dies there like any other
+                    // fatal, at 128. Everything else `git_log_config` reads is
+                    // refused by the `git log` child `list_stash()` spawns, and
+                    // `cmd_stash` flattens the child's status to `!!fn(...)`
+                    // (builtin/stash.c:2496) — exit 1. Measured on 2.55.0:
+                    // `-c diff.renameLimit=bogus stash list` exits 128,
+                    // `-c color.ui=bogus stash list` exits 1.
+                    // The child's half is owed only when there *is* a child.
+                    // `list_stash()` returns before spawning anything when the
+                    // stash ref is absent:
+                    //
+                    //     if (!refs_ref_exists(get_main_ref_store(the_repository), ref_stash))
+                    //             return 0;
+                    //
+                    // (builtin/stash.c:963-964), so `git -c color.ui=bogus stash
+                    // list` is silent at 0 with an empty stash and the fatal at 1
+                    // with an entry. The parent's `git_diff_basic_config` runs
+                    // either way.
+                    ConfigCallback::StashList => match crate::diff_config::validate_basic(&repo) {
+                        Err(rejection) => Err(rejection),
+                        Ok(()) if !stash_ref_exists(&repo) => Ok(()),
+                        Ok(()) => match crate::log_config::validate_log(&repo) {
+                            Ok(()) => Ok(()),
+                            Err(rejection) => {
+                                let fatal = rejection.into_fatal();
+                                if !fatal.is_empty() {
+                                    eprintln!("fatal: {fatal}");
+                                }
+                                return Err(anyhow::Error::new(crate::fatal::Silent(1)));
+                            }
+                        },
+                    },
                     ConfigCallback::Format => crate::log_config::validate_format(&repo),
                     ConfigCallback::Status => crate::status_config::validate_status(&repo),
                     ConfigCallback::Commit => crate::status_config::validate_commit(&repo),

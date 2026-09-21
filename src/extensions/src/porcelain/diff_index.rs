@@ -2083,11 +2083,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // need the two sides' bytes and, for the patch, the rendered hunks; every other
         // format reads only the recorded modes and ids.
         let workdir = repo.workdir().map(Path::to_path_buf);
-        // `--color[=<when>]` / `--no-color`, falling back to `color.diff` /
-        // `diff.color` / `color.ui` and the terminal test.
+        // `--color[=<when>]` / `--no-color` and, with no switch given, the
+        // terminal test alone: `git diff-index` loads `git_diff_basic_config`
+        // (`builtin/diff-index.c:31`, `/* no "diff" UI options */`), so
+        // `color.diff` and `color.ui` cannot turn color on here. The
+        // `color.diff.<slot>` palette that same callback does read still applies.
         let colors = diff_color::DiffColors::resolve(
             &repo,
-            diff_color::resolve_color(&repo, opts.color_when),
+            diff_color::resolve_color_plumbing(opts.color_when),
         );
         let ws_rule = diff_color::whitespace_rule_cfg(&repo);
         let extra = match opts.move_word.resolve(&repo) {

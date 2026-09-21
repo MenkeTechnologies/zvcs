@@ -1215,17 +1215,22 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<u8> {
             // remaining arguments would otherwise reach.
             s if s == "--color" || s.starts_with("--color=") => {
                 let when = s.strip_prefix("--color=");
-                match when {
+                // `git_config_colorbool` compares with `strcasecmp` (color.c:386-391),
+                // so the value grammar is case-insensitive; the one parser for it is
+                // `diff_color::parse_color_when`.
+                match when.map(|v| (v, super::diff_color::parse_color_when(v))) {
                     // A missing value is the option's `defval`, `always`.
                     None => note_first(&mut unimplemented, a.to_owned()),
-                    Some(v) if v.eq_ignore_ascii_case("always") => {
+                    Some((_, Some(super::diff_color::ColorWhen::Always))) => {
                         note_first(&mut unimplemented, a.to_owned());
                     }
                     // Both are "no color" for a non-terminal stdout, which is what
                     // this renderer already produces.
-                    Some(v)
-                        if v.eq_ignore_ascii_case("never") || v.eq_ignore_ascii_case("auto") => {}
-                    Some(_) => {
+                    Some((
+                        _,
+                        Some(super::diff_color::ColorWhen::Never | super::diff_color::ColorWhen::Auto),
+                    )) => {}
+                    Some((_, None)) => {
                         eprintln!(
                             "error: option `color' expects \"always\", \"auto\", or \"never\""
                         );

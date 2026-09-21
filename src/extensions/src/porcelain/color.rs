@@ -395,9 +395,18 @@ fn config_bool(value: &str) -> bool {
 /// git's `check_auto_color(1)`: color on `auto` when stdout is a terminal, or when
 /// output is going to a pager that `color.pager` (default true) allows to receive
 /// color — in both cases only if the terminal is not `dumb`.
-fn auto_color_stdout(repo: &gix::Repository) -> bool {
+pub(crate) fn auto_color_stdout(repo: &gix::Repository) -> bool {
     let to_terminal = std::io::stdout().is_terminal() || (pager_in_use() && pager_use_color(repo));
     to_terminal && !terminal_is_dumb()
+}
+
+/// The same `check_auto_color(1)` for a command that never installs a config
+/// callback reaching `color.pager`, so `pager_use_color` keeps its initializer
+/// (`pager.c:9`, `int pager_use_color = 1`). The plumbing diff commands are in
+/// that position: they load `git_diff_basic_config`, which never calls
+/// `git_default_config`, so `environment.c:688` never runs for them.
+pub(crate) fn auto_color_stdout_unconfigured() -> bool {
+    (std::io::stdout().is_terminal() || pager_in_use()) && !terminal_is_dumb()
 }
 
 /// git's `pager_in_use`: the `GIT_PAGER_IN_USE` environment flag, parsed as a

@@ -2571,10 +2571,18 @@ fn spec_base(spec: &BStr, cwd_prefix: &[u8]) -> Vec<u8> {
 fn color_wanted(when: Option<&str>) -> Result<bool, ()> {
     match when {
         None => Ok(true),
-        Some(v) if v.eq_ignore_ascii_case("always") => Ok(true),
-        Some(v) if v.eq_ignore_ascii_case("never") => Ok(false),
-        Some(v) if v.eq_ignore_ascii_case("auto") => Ok(std::io::stdout().is_terminal()),
-        Some(_) => Err(()),
+        // One value grammar for the whole port: `diff_color::parse_color_when`
+        // is the `git_config_colorbool(NULL, arg)` case-insensitive match.
+        Some(v) => match super::diff_color::parse_color_when(v) {
+            Some(super::diff_color::ColorWhen::Always) => Ok(true),
+            Some(super::diff_color::ColorWhen::Never) => Ok(false),
+            // `want_color_fd(1, GIT_COLOR_AUTO)` is `check_auto_color(1)`
+            // (color.c:405-416) — a terminal or a pager, and never a `dumb` one.
+            Some(super::diff_color::ColorWhen::Auto) => {
+                Ok(super::color::auto_color_stdout_unconfigured())
+            }
+            None => Err(()),
+        },
     }
 }
 

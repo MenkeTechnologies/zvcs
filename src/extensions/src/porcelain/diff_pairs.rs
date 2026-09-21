@@ -1800,10 +1800,17 @@ pub(crate) fn render_raw_stream(
             }
         }
     }
-    // `--color[=<when>]` / `--no-color`, falling back to `color.diff` / `diff.color`
-    // / `color.ui` and the terminal test.
-    let colors =
-        diff_color::DiffColors::resolve(&repo, diff_color::resolve_color(&repo, opts.color_when));
+    // `--color[=<when>]` / `--no-color` and, with no switch given, the terminal
+    // test alone: `git diff-pairs` loads `git_diff_basic_config`
+    // (`builtin/diff-pairs.c:59`), as does the `diff-tree`
+    // (`builtin/diff-tree.c:127`) that reaches this renderer through
+    // [`render_raw_stream`], so `color.diff` and `color.ui` cannot turn color on
+    // here. The `color.diff.<slot>` palette that same callback does read still
+    // applies.
+    let colors = diff_color::DiffColors::resolve(
+        &repo,
+        diff_color::resolve_color_plumbing(opts.color_when),
+    );
     let ws_rule = diff_color::whitespace_rule_cfg(&repo);
     let mut extra = match move_word.resolve(&repo) {
         Ok(e) => e,

@@ -11,6 +11,9 @@ use gix::objs::tree::EntryKind;
 
 use super::filespec::{content_of, count_changed_lines_ws, is_binary};
 use super::diff_color;
+// `--color=<when>` (and `--color`/`--no-color`): whether `%C`/`%d` emit ANSI.
+// One tri-state for the whole port, so the value grammar cannot drift.
+use super::diff_color::ColorWhen;
 use super::diffstat::{self, StatWidths};
 use super::line_log;
 use super::pretty_pad::{FlushType, PadState, WrapState};
@@ -1105,7 +1108,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut right_only = false;
     let mut date_mode = cfg_date_mode;
     let mut show_root = cfg_show_root;
-    let mut color = ColorWhen::Auto;
+    // `OPT_COLOR_FLAG(&rev.diffopt.use_color, …)`. `None` is "no switch given",
+    // which is not the same state as `--color=auto`: only the former lets the
+    // config decide (diff.c:5161 vs color.c:432-439).
+    let mut color: Option<ColorWhen> = None;
     let mut order = Order::Default;
     // `git_log_output_encoding` (environment.c:51), set by `--encoding=<enc>`.
     let mut log_encoding: Option<String> = None;
@@ -1849,17 +1855,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             no_merges = true;
         } else if a == "--color" {
             // Bare `--color` is git's `--color=always`.
-            color = ColorWhen::Always;
+            color = Some(ColorWhen::Always);
         } else if a == "--no-color" {
-            color = ColorWhen::Never;
+            color = Some(ColorWhen::Never);
         } else if let Some(v) = a.strip_prefix("--color=") {
-            match v {
-                "always" => color = ColorWhen::Always,
-                "never" => color = ColorWhen::Never,
-                "auto" => color = ColorWhen::Auto,
-                _ => {
-                    eprintln!("fatal: invalid color value: {v}");
-                    return Ok(ExitCode::from(128));
+            // `OPT_COLOR_FLAG`'s `parse_opt_color_flag_cb` (parse-options-cb.c:50)
+            // hands the value to `git_config_colorbool(NULL, arg)`, which compares
+            // with `strcasecmp` (color.c:386-391) — so `--color=ALWAYS` is
+            // `always`. Anything it does not know is the callback's
+            // `error()` at exit 129, which the pre-scan already reports.
+            match diff_color::parse_color_when(v) {
+                Some(when) => color = Some(when),
+                None => {
+                    eprintln!("error: option `color' expects \"always\", \"auto\", or \"never\"");
+                    return Ok(ExitCode::from(129));
                 }
             }
         // `revs->expand_tabs_in_log`: how wide a tab is when the message is
@@ -1912,7 +1921,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // the two color spellings, so a `--color-words` anywhere on the line turns
             // the whole of `git log`'s output — header included — colored.
             if move_word_color == Some(diff_color::ColorWhen::Always) {
-                color = ColorWhen::Always;
+                color = Some(ColorWhen::Always);
                 move_word_color = None;
             }
         // `--output-indicator-new`/`-old`/`-context=<char>` (`diff_opt_char()`,
@@ -4809,14 +4818,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         (flavor == Flavor::WhatChanged || patch_opts.diff_filter.is_some()) && !want_names && !patch;
     // Whether `%C`/`%d` emit ANSI: git's auto rule is "stdout is a terminal, or we
     // are paging to one" — `pager::maybe_setup` records the latter via the env flag.
-    let want_color = match color {
-        ColorWhen::Always => true,
-        ColorWhen::Never => false,
-        // git routes `git log`'s coloring through the diff machinery, so the
-        // config switch is `color.diff` falling back to `color.ui`; `auto` then
-        // asks whether stdout is a terminal or a `color.pager` pager.
-        ColorWhen::Auto => super::color::want_color_stdout(&repo, "diff"),
-    };
+    // git routes `git log`'s coloring through the diff machinery, so an absent
+    // switch is `color.diff` — with its `diff.color` alias — falling back to
+    // `color.ui`, and `--color=auto` asks only whether stdout is a terminal or a
+    // `color.pager` pager. One helper for both, shared with `git diff`.
+    let want_color = diff_color::resolve_color(&repo, color);
     // `--color-moved` / `--word-diff` layered over their config defaults, and the
     // palette the re-emit pass paints with. `log_tree_commit()` hands the diff
     // machinery the same `o->use_color` the header was written under, so a patch body
@@ -14732,15 +14738,6 @@ pub(crate) enum DateMode {
     /// platform `strftime(3)` git calls, and `-local`/`human` read the process's zone through
     /// `localtime_r()`, neither of which this file's arithmetic can stand in for.
     Show(crate::showdate::DateMode),
-}
-
-/// `--color=<when>` (and `--color`/`--no-color`): whether `%C`/`%d` emit ANSI.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ColorWhen {
-    Always,
-    Never,
-    /// Color when stdout is a terminal (or we are paging to one).
-    Auto,
 }
 
 /// The empty-argument refusal `-S`/`-G` share (`diff_opt_pickaxe_string()`,

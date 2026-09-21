@@ -1148,15 +1148,21 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             // `OPT__COLOR` is `PARSE_OPT_OPTARG`: a bare `--color` never eats
             // the next argument, it just means "always".
             "--color" => {
+                // `git_config_colorbool(NULL, arg)` compares with `strcasecmp`
+                // (color.c:385-395), so the value grammar is case-insensitive;
+                // `diff_color::parse_color_when` is the one parser for it.
                 color_when = match rest {
-                    None | Some("always") => ColorWhen::Always,
-                    Some("never") => ColorWhen::Never,
-                    Some("auto") => ColorWhen::Auto,
-                    Some(_) => {
-                        return Ok(option_error(
-                            "option `color' expects \"always\", \"auto\", or \"never\"",
-                        ))
-                    }
+                    None => ColorWhen::Always,
+                    Some(v) => match super::diff_color::parse_color_when(v) {
+                        Some(super::diff_color::ColorWhen::Always) => ColorWhen::Always,
+                        Some(super::diff_color::ColorWhen::Never) => ColorWhen::Never,
+                        Some(super::diff_color::ColorWhen::Auto) => ColorWhen::Auto,
+                        None => {
+                            return Ok(option_error(
+                                "option `color' expects \"always\", \"auto\", or \"never\"",
+                            ))
+                        }
+                    },
                 }
             }
             "--no-color" => color_when = ColorWhen::Never,

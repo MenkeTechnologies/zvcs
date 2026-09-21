@@ -337,7 +337,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     // `OPT__COLOR(&format.use_color, …)` (builtin/tag.c:535). Unset falls through
     // to `color.ui`, whose default is `auto`, which `want_color()` resolves
     // against stdout.
-    let mut color_when: Option<String> = None;
+    let mut color_when: Option<super::diff_color::ColorWhen> = None;
     // Column layout state, seeded from `column.ui` / `column.tag` before the
     // command line is parsed so a `--column` flag overrides the config (git's
     // `git_column_config` runs during config, `parseopt_column_callback` after).
@@ -424,8 +424,8 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "--no-omit-empty" => omit_empty = false,
             "--create-reflog" => create_reflog = true,
             "--no-create-reflog" => create_reflog = false,
-            "--color" => color_when = Some("always".to_string()),
-            "--no-color" => color_when = Some("never".to_string()),
+            "--color" => color_when = Some(super::diff_color::ColorWhen::Always),
+            "--no-color" => color_when = Some(super::diff_color::ColorWhen::Never),
             // `OPT_BOOL`'s unset writes 0 — which is *not* the same as leaving
             // `opt.sign` at -1, because a written 0 is what stops `tag.gpgSign`
             // from turning signing back on.
@@ -489,7 +489,22 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                     super::column::parseopt_column(&mut colopts, Some(rest), false)
                         .map_err(|m| anyhow!("{m}"))?;
                 } else if let Some(rest) = a.strip_prefix("--color=") {
-                    color_when = Some(rest.to_string());
+                    // `parse_opt_color_flag_cb` (parse-options-cb.c:50) runs the
+                    // value through `git_config_colorbool(NULL, arg)`, which with a
+                    // NULL variable name knows only `never`/`always`/`auto`, compared
+                    // with `strcasecmp` (color.c:385-395). Anything else is that
+                    // callback's `error()` and parse-options' exit 129 — one line on
+                    // stderr, no usage block — raised here at parse time, the way
+                    // parse-options raises it, rather than being silently accepted.
+                    match super::diff_color::parse_color_when(rest) {
+                        Some(when) => color_when = Some(when),
+                        None => {
+                            eprintln!(
+                                "error: option `color' expects \"always\", \"auto\", or \"never\""
+                            );
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
                 } else if let Some(rest) = a.strip_prefix("--points-at=") {
                     points_at.push(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--contains=") {
@@ -746,9 +761,12 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     // `want_color(format.use_color)`: the option when it was given, else
     // `color.ui`, with `auto` decided by stdout. `git tag` has no `color.tag`
     // slot of its own.
-    let color_on = match color_when.as_deref() {
-        Some(v) => super::color::want_color_stdout_raw(&repo, Some(v)),
-        None => super::color::want_color_stdout(&repo, "ui"),
+    let color_on = match color_when {
+        Some(super::diff_color::ColorWhen::Always) => true,
+        Some(super::diff_color::ColorWhen::Never) => false,
+        Some(super::diff_color::ColorWhen::Auto) | None => {
+            super::color::want_color_stdout(&repo, "ui")
+        }
     };
 
     // `sorting = ref_sorting_options(&sorting_options);` (builtin/tag.c:593) runs

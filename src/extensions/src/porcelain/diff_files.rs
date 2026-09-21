@@ -2029,10 +2029,15 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         .ok_or_else(|| crate::fatal::need_work_tree())?
         .to_owned();
     let hash_kind = repo.object_hash();
-    // `--color[=<when>]` / `--no-color`, falling back to `color.diff` /
-    // `diff.color` / `color.ui` and the terminal test.
-    let colors =
-        diff_color::DiffColors::resolve(repo, diff_color::resolve_color(repo, opts.color_when));
+    // `--color[=<when>]` / `--no-color` and, with no switch given, the terminal
+    // test alone: `git diff-files` loads `git_diff_basic_config`
+    // (`builtin/diff-files.c:34`, `/* no "diff" UI options */`), so `color.diff`
+    // and `color.ui` cannot turn color on here. The `color.diff.<slot>` palette
+    // that same callback does read still applies.
+    let colors = diff_color::DiffColors::resolve(
+        repo,
+        diff_color::resolve_color_plumbing(opts.color_when),
+    );
     let ws_rule = diff_color::whitespace_rule_cfg(repo);
     let extra = match opts.move_word.resolve(repo) {
         Ok(e) => e,

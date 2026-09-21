@@ -642,13 +642,9 @@ fn config_branch_track(repo: &gix::Repository) -> Track {
     }
 }
 
-/// `--color[=<when>]` tri-state, matching `git branch`'s default of `auto`.
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum ColorWhen {
-    Auto,
-    Always,
-    Never,
-}
+// `--color[=<when>]` is the shared tri-state — one value grammar and one
+// resolution rule for the whole port.
+use super::diff_color::ColorWhen;
 
 /// Parsed `git branch` command line.
 struct Opts {
@@ -681,7 +677,9 @@ struct Opts {
     /// `-u <up>` / `--set-upstream-to=<up>`: the upstream spec to install.
     set_upstream_to: Option<String>,
     unset_upstream: bool,
-    color: ColorWhen,
+    /// `None` is "no `--color` switch given", which is not `--color=auto`: only
+    /// the former lets `color.branch` / `color.ui` decide.
+    color: Option<ColorWhen>,
     /// Column layout state (git's `colopts`), seeded from `column.ui`/`column.branch`
     /// and refined by `--column[=<opts>]` / `--no-column`.
     colopts: u32,
@@ -818,7 +816,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         track: Track::Unset,
         set_upstream_to: None,
         unset_upstream: false,
-        color: ColorWhen::Auto,
+        color: None,
         colopts: super::column::DISABLED,
         abbrev: None,
         contains: Vec::new(),
@@ -1215,19 +1213,26 @@ fn apply_long(
         ("set-upstream-to", true) => o.set_upstream_to = None,
         ("unset-upstream", n) => o.unset_upstream = !n,
         ("color", false) => {
+            // `OPT__COLOR`'s `parse_opt_color_flag_cb` (parse-options-cb.c:50)
+            // sends the value through `git_config_colorbool(NULL, arg)`, which
+            // with a NULL variable name knows only `never`/`always`/`auto` and
+            // compares them with `strcasecmp` (color.c:385-395). The boolean
+            // spellings a *config* value may use — `false` among them — are not
+            // accepted here, and a missing value is the option's `defval`.
             o.color = match value.as_deref() {
-                None | Some("always") => ColorWhen::Always,
-                Some("never" | "false") => ColorWhen::Never,
-                Some("auto") => ColorWhen::Auto,
-                Some(_) => {
-                    return value_error(
-                        "option `color' expects \"always\", \"auto\", or \"never\"",
-                    )
-                    .map(Some)
-                }
+                None => Some(ColorWhen::Always),
+                Some(v) => match super::diff_color::parse_color_when(v) {
+                    Some(when) => Some(when),
+                    None => {
+                        return value_error(
+                            "option `color' expects \"always\", \"auto\", or \"never\"",
+                        )
+                        .map(Some)
+                    }
+                },
             }
         }
-        ("color", true) => o.color = ColorWhen::Never,
+        ("color", true) => o.color = Some(ColorWhen::Never),
         ("remotes", _) => o.mode = ListMode::Remotes,
         ("all", _) => o.mode = ListMode::All,
         // `--with` / `--without` are the hidden aliases of `--contains` /
@@ -1467,11 +1472,16 @@ pub(crate) const COLOR_SLOTS: [&str; 7] = [
 /// Decide whether `git branch` colors its output and, if so, resolve every slot's
 /// SGR. Mirrors git: `--color` overrides, else `color.branch` falling back to
 /// `color.ui` (default `auto`); `auto` colors only on a terminal.
-fn resolve_colors(repo: &gix::Repository, when: ColorWhen) -> Colors {
+fn resolve_colors(repo: &gix::Repository, when: Option<ColorWhen>) -> Colors {
     let on = match when {
-        ColorWhen::Always => true,
-        ColorWhen::Never => false,
-        ColorWhen::Auto => super::color::want_color_stdout(repo, "branch"),
+        Some(ColorWhen::Always) => true,
+        Some(ColorWhen::Never) => false,
+        // An explicit `--color=auto` is `GIT_COLOR_AUTO` in `branch_use_color`,
+        // which `want_color_fd` answers from the terminal alone
+        // (color.c:435-439); the config is only consulted for the sentinel an
+        // absent switch leaves behind (color.c:432-434).
+        Some(ColorWhen::Auto) => super::color::auto_color_stdout(repo),
+        None => super::color::want_color_stdout(repo, "branch"),
     };
     if !on {
         return Colors {

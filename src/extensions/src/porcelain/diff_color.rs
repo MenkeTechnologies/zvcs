@@ -1079,7 +1079,21 @@ fn emit_line_0(
             break 'body;
         }
         if let Some(s) = set {
-            if set_sign.is_some_and(|sg| sg != s) {
+            // `if (set_sign && set != set_sign) fputs(reset, file);` (diff.c:793).
+            // The comparison there is on the `const char *` each
+            // `diff_get_color_opt()` returned, i.e. on the address of a slot in
+            // `diff_colors[]` — it asks whether the two colors came from
+            // *different slots*, not whether they spell the same escape. The
+            // only path that reaches here with both set is
+            // `emit_line_ws_markup()`'s `else if (!ws)` (diff.c:1385) under
+            // `dual_color_diffed_diffs`, and there `set_sign` is always the
+            // outer `DIFF_FILE_NEW`/`DIFF_FILE_OLD` (or a moved-line variant)
+            // while `set` is re-picked from the *_BOLD/*_DIM/FRAGINFO group
+            // (diff.c:1488-1496, :1533-1541) — never the same slot. So the
+            // reset is unconditional whenever a sign color was written, even
+            // when the two slots happen to hold identical escapes, which is
+            // exactly the case `range-diff --dual-color` hits.
+            if set_sign.is_some() {
                 out.extend_from_slice(reset.as_bytes());
             }
             out.extend_from_slice(s.as_bytes());
@@ -2627,13 +2641,53 @@ pub(crate) fn parse_color_when(arg: &str) -> Option<ColorWhen> {
 }
 
 /// Resolve the final on/off answer: an explicit `--color=<when>` wins over the
-/// config, and `auto` (like an unset flag) defers to `color.diff` / `color.ui`
-/// and the terminal test.
+/// config, and only an *absent* switch defers to `color.diff` / `color.ui`.
+///
+/// `--color=auto` is not the same as no switch. It writes `GIT_COLOR_AUTO` into
+/// `options->use_color`, and `want_color_fd` answers that from the terminal
+/// alone (`check_auto_color`, color.c:435-439) — it never falls back to
+/// `git_use_color_default`, which is the only path `color.ui` reaches
+/// (color.c:432-434). Only an unset switch leaves `use_color` at
+/// `diff_use_color_default` (diff.c:5161), the value `color.diff` / `diff.color`
+/// / `color.ui` set. So `git -c color.ui=always diff --color=auto | cat` is
+/// uncolored, while `git -c color.ui=always diff | cat` is colored.
 pub(crate) fn resolve_color(repo: &gix::Repository, when: Option<ColorWhen>) -> bool {
     match when {
         Some(ColorWhen::Always) => true,
         Some(ColorWhen::Never) => false,
-        Some(ColorWhen::Auto) | None => want_diff_color(repo),
+        Some(ColorWhen::Auto) => super::color::auto_color_stdout(repo),
+        None => want_diff_color(repo),
+    }
+}
+
+/// The same answer for the *plumbing* diff commands — `diff-tree`, `diff-index`,
+/// `diff-files` and `diff-pairs` — which never consult the enablement config.
+///
+/// Each of them loads `git_diff_basic_config`, and git spells out why:
+///
+/// ```text
+/// builtin/diff-tree.c:127   repo_config(the_repository, git_diff_basic_config, NULL); /* no "diff" UI options */
+/// builtin/diff-index.c:31   repo_config(the_repository, git_diff_basic_config, NULL); /* no "diff" UI options */
+/// builtin/diff-files.c:34   repo_config(the_repository, git_diff_basic_config, NULL); /* no "diff" UI options */
+/// builtin/diff-pairs.c:59   repo_config(repo, git_diff_basic_config, NULL);
+/// ```
+///
+/// `git_diff_basic_config` (diff.c:478) has no `color.diff` / `diff.color` arm —
+/// that one lives in `git_diff_ui_config` (diff.c:363-366) — and never reaches
+/// the `git_color_config` call (diff.c:472) that would read `color.ui`. So
+/// `diff_use_color_default` stays at its initializer `GIT_COLOR_UNKNOWN`
+/// (diff.c:60), and `want_color_fd` substitutes `git_use_color_default`, itself
+/// still at its initializer `GIT_COLOR_AUTO` (color.c:12, color.c:432-434). An
+/// unset `--color` is therefore `auto` no matter what `color.ui` says.
+///
+/// The palette is the other half of that split: `git_diff_basic_config` *does*
+/// read `color.diff.<slot>` / `diff.color.<slot>` (diff.c:491-499), so
+/// [`DiffColors::resolve`] still applies a user's slot specs here.
+pub(crate) fn resolve_color_plumbing(when: Option<ColorWhen>) -> bool {
+    match when {
+        Some(ColorWhen::Always) => true,
+        Some(ColorWhen::Never) => false,
+        Some(ColorWhen::Auto) | None => super::color::auto_color_stdout_unconfigured(),
     }
 }
 

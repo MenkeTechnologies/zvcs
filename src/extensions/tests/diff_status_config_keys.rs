@@ -70,6 +70,13 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     ok(&repo, &home, &["commit", "-q", "-m", "c0"]);
     std::fs::write(repo.join("f"), "one\nthree\n").unwrap();
     ok(&repo, &home, &["commit", "-qam", "c1"]);
+    // One stash entry, because `list_stash()` returns before spawning its `git
+    // log` child when `refs/stash` is absent (builtin/stash.c:963-964). Without
+    // an entry, `git -c color.ui=bogus stash list` is silent at 0 in stock git
+    // and the child-owed refusals below would be asserted against a child that
+    // never runs.
+    std::fs::write(repo.join("f"), "one\nfour\n").unwrap();
+    ok(&repo, &home, &["stash", "push", "-q", "-m", "s"]);
     (repo, home)
 }
 
@@ -101,9 +108,30 @@ const BASIC_ONLY_VERBS: &[&[&str]] = &[
     &["diff-files"],
     &["diff-index", "HEAD"],
     &["diff-tree", "HEAD"],
-    &["stash", "list"],
     &["merge-tree", "HEAD", "HEAD"],
 ];
+/// `git stash list` is on *both* layers, which is why it is not in the list
+/// above. `cmd_stash` installs `git_diff_basic_config` in the parent
+/// (builtin/stash.c:994) — so the basic keys die there at 128, like any other
+/// fatal — and `list_stash()` then runs a `git log` child, which refuses
+/// everything `git_log_config` reads. `cmd_stash` flattens that child's status
+/// to `!!fn(...)` (builtin/stash.c:2496), so those refusals arrive at exit 1
+/// with the same text. Measured on git 2.55.0:
+///
+/// ```text
+/// $ git -c diff.renameLimit=bogus stash list; echo $?
+/// fatal: bad numeric config value 'bogus' for 'diff.renamelimit': invalid unit
+/// 128
+/// $ git -c color.ui=bogus stash list; echo $?
+/// fatal: bad boolean config value 'bogus' for 'color.ui'
+/// 1
+/// $ git -c diff.relative=bogus stash list; echo $?
+/// fatal: bad boolean config value 'bogus' for 'diff.relative'
+/// 1
+/// ```
+const CHILD_LOG_VERBS: &[&[&str]] = &[&["stash", "list"]];
+/// The status those verbs report for a refusal raised in the child.
+const CHILD_FATAL: i32 = 1;
 /// Verbs that colour but never diff.
 const COLOR_ONLY_VERBS: &[&[&str]] =
     &[&["branch"], &["tag"], &["grep", "one"], &["clean", "-n"], &["show-branch"]];
@@ -224,6 +252,13 @@ fn the_ui_keys_are_refused_by_porcelain_and_ignored_by_plumbing() {
             argv.extend_from_slice(verb);
             let out = run(&repo, &home, &argv);
             assert_eq!(stderr(&out), "", "plumbing must ignore {assignment} ({verb:?})");
+        }
+        for verb in CHILD_LOG_VERBS {
+            let mut argv = vec!["-c", assignment];
+            argv.extend_from_slice(verb);
+            let out = run(&repo, &home, &argv);
+            assert_eq!(stderr(&out), *want, "for -c {assignment} {verb:?}");
+            assert_eq!(code(&out), CHILD_FATAL, "for -c {assignment} {verb:?}");
         }
     }
 }
@@ -422,6 +457,13 @@ fn color_ui_is_a_boolean_for_the_porcelain_and_invisible_to_the_plumbing() {
         argv.extend_from_slice(verb);
         let out = run(&repo, &home, &argv);
         assert_eq!(stderr(&out), "", "plumbing must ignore color.ui ({verb:?})");
+    }
+    for verb in CHILD_LOG_VERBS {
+        let mut argv = vec!["-c", "color.ui=bogus"];
+        argv.extend_from_slice(verb);
+        let out = run(&repo, &home, &argv);
+        assert_eq!(stderr(&out), want, "for {verb:?}");
+        assert_eq!(code(&out), CHILD_FATAL, "for {verb:?}");
     }
 
     // `git_config_colorbool` takes three words before it reaches the boolean, and
